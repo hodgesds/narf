@@ -30,7 +30,7 @@ pub(crate) fn sys_times(ctx: &mut dyn TrapContext) {
                                                                    // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
                                                                    // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

@@ -45,10 +45,6 @@ use super::*;
 /// rather than tidied — a caller that renices a group it partly owns sees
 /// success on Linux, and "tidying" it into an error would break that.
 pub(crate) fn sys_setpriority(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
-    const ESRCH: i64 = 3;
-    const EACCES: i64 = 13;
-    const EINVAL: i64 = 22;
     const PRIO_PROCESS: i64 = 0;
     const PRIO_PGRP: i64 = 1;
     const PRIO_USER: i64 = 2;
@@ -62,7 +58,7 @@ pub(crate) fn sys_setpriority(ctx: &mut dyn TrapContext) {
         PRIO_PGRP => WhoScope::Pgrp,
         PRIO_USER => WhoScope::User,
         _ => {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };

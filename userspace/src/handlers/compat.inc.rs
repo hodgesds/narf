@@ -561,8 +561,7 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
     path: &str,
     follow_final: bool,
 ) -> Result<alloc::string::String, i64> {
-    const ELOOP: i64 = -40;
-    const EXDEV: i64 = -18;
+    use crate::errno::wire::{ELOOP, EXDEV};
     let scope = current_resolve_scope();
 
     // `RESOLVE_IN_ROOT` — "treat the directory referred to by dirfd as the
@@ -956,7 +955,7 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
         return Ok(alloc::string::String::from(raw));
     }
     if dirfd < 0 {
-        return Err(-9); // -EBADF
+        return Err(-EBADF); // -EBADF
     }
     let is_directory = fd::with_table(task, |table| {
         table
@@ -964,11 +963,11 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
             .map(|entry| entry.ops.as_dir().is_some())
     })
     .flatten()
-    .ok_or(-9i64)?;
+    .ok_or(-EBADF)?;
     if !is_directory {
-        return Err(-20); // -ENOTDIR
+        return Err(-ENOTDIR); // -ENOTDIR
     }
-    let base = fd_path_for_task(task, dirfd as u32).ok_or(-9i64)?;
+    let base = fd_path_for_task(task, dirfd as u32).ok_or(-EBADF)?;
     Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
 }
 
@@ -1014,15 +1013,11 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 /// shell following `a -> b -> a` reports "No such file" for a link that
 /// plainly exists.
 fn path_lookup_errno(path: &str) -> i64 {
-    const ENOENT: i64 = 2;
-    const ENOTDIR: i64 = 20;
-    const ELOOP: i64 = 40;
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
     let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
         return ENOENT;
     };
-    const EACCES: i64 = 13;
     let task = current_task_id();
     let mut prefix = alloc::string::String::new();
     for comp in parent.split('/').filter(|c| !c.is_empty()) {
@@ -1512,7 +1507,7 @@ fn do_execve_resolved(
     // fails. Both execve and execveat funnel through here, which is the
     // same consolidation Linux relies on.
     if nproc_exceeded_blocks_exec(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -1551,7 +1546,7 @@ fn do_execve_resolved(
         && narf_filesystem::any_restricted_mounts()
         && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOEXEC != 0
     {
-        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        ctx.set_return(errno_ret(EACCES)); // -EACCES
         return;
     }
 
@@ -1580,7 +1575,7 @@ fn do_execve_resolved(
         Some(v) => v,
         None => {
             // Faulting argv array pointer → EFAULT.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -1588,7 +1583,7 @@ fn do_execve_resolved(
         Some(v) => v,
         None => {
             // Faulting envp array pointer → EFAULT.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -1631,14 +1626,14 @@ fn do_execve_resolved(
         }) {
             Some(Some(Ok(o))) => o,
             // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
-            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-2),
+            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-ENOENT),
             // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
             // Loud: a silent EIO here cost a full debugging session (bash
             // reports only "Input/output error").
             Some(None) => {
                 use core::fmt::Write as _;
                 let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
-                return Err(-5);
+                return Err(-EIO);
             }
             // A real FS error → EIO.
             Some(Some(Err(e))) => {
@@ -1647,15 +1642,15 @@ fn do_execve_resolved(
                     narf_console::Writer,
                     "EXECVE-EIO resolve err={e:?} path={ep}"
                 );
-                return Err(-5);
+                return Err(-EIO);
             }
         };
         let file_size = ops.stat().size as usize;
         if file_size == 0 {
-            return Err(-8); // ENOEXEC — empty file is not an executable
+            return Err(-ENOEXEC); // ENOEXEC — empty file is not an executable
         }
         if file_size > 64 * 1024 * 1024 {
-            return Err(-7); // E2BIG
+            return Err(-E2BIG); // E2BIG
         }
         let mut buf = alloc::vec![0u8; file_size];
         let mut off = 0usize;
@@ -1669,7 +1664,7 @@ fn do_execve_resolved(
                         narf_console::Writer,
                         "EXECVE-EIO read err={e:?} off={off} size={file_size} path={ep}"
                     );
-                    return Err(-5);
+                    return Err(-EIO);
                 }
                 // Only a genuinely-wedged device exhausts the 2G-poll
                 // backstop. Loud, then EIO — never silently truncate.
@@ -1679,7 +1674,7 @@ fn do_execve_resolved(
                         narf_console::Writer,
                         "EXECVE-EIO read overrun off={off} size={file_size} path={ep}"
                     );
-                    return Err(-5);
+                    return Err(-EIO);
                 }
             }
         }
@@ -1707,7 +1702,7 @@ fn do_execve_resolved(
     if let Some(bytes) = image_override {
         if bytes.len() < 64 {
             // Too small to be a valid ELF → ENOEXEC.
-            ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+            ctx.set_return(errno_ret(ENOEXEC));
             return;
         }
         elf_buf = bytes;
@@ -1723,7 +1718,7 @@ fn do_execve_resolved(
             };
             if buf.len() >= 2 && &buf[..2] == b"#!" {
                 if depth >= 4 {
-                    ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+                    ctx.set_return(errno_ret(ELOOP)); // -ELOOP
                     return;
                 }
                 depth += 1;
@@ -1741,7 +1736,7 @@ fn do_execve_resolved(
                 };
                 if interp.is_empty() {
                     // Shebang with an empty interpreter name → ENOEXEC.
-                    ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+                    ctx.set_return(errno_ret(ENOEXEC));
                     return;
                 }
                 let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
@@ -1757,7 +1752,7 @@ fn do_execve_resolved(
             }
             if buf.len() < 64 {
                 // Too small for a valid ELF and not a shebang → ENOEXEC.
-                ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+                ctx.set_return(errno_ret(ENOEXEC));
                 return;
             }
             elf_buf = buf;
@@ -1808,12 +1803,12 @@ fn do_execve_resolved(
         // executed _start against an unrelocated GOT and killed the fresh
         // process at rip=0 (#PF errcode 0x15, instruction fetch at 0).
         Err(crate::process::ProcessLoadError::InterpUnavailable) => {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT)); // -ENOENT
             return;
         }
         Err(_) => {
             // Malformed ELF (bad magic, unsupported class, etc.) → ENOEXEC.
-            ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+            ctx.set_return(errno_ret(ENOEXEC));
             return;
         }
     };
@@ -1982,7 +1977,7 @@ fn do_execve_resolved(
             // old one. Linux's execve returns only on failure, so any value
             // a caller can observe must be an error, and -ENOSYS says this
             // kernel could not perform the exec here.
-            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+            ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
             return;
         }
     };
@@ -2039,7 +2034,7 @@ fn do_execve_resolved(
     // Fallback path — execve not wired (e.g. early boot or test). -ENOSYS
     // for the same reason as the no-user-ctx arm above: 0 from execve is
     // "you are now the new program".
-    ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+    ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
 }
 
 /// A `TrapContext` proxy that overrides the syscall args while forwarding
@@ -2233,8 +2228,6 @@ pub(crate) fn copy_user_cstr_checked(
     ptr: u64,
     max_len: usize,
 ) -> Result<alloc::string::String, i64> {
-    const EFAULT: i64 = 14;
-    const ENAMETOOLONG: i64 = 36;
     if ptr == 0 || max_len == 0 || max_len > 65536 {
         return Err(EFAULT);
     }
@@ -2352,10 +2345,6 @@ fn copy_user_path_raw(ptr: u64, len: usize) -> Option<alloc::string::String> {
 // with EINVAL (-22) so a malicious/buggy userspace cannot force a
 // multi-gigabyte kernel allocation.
 
-/// Linux EFAULT errno value (14).
-pub(crate) const EFAULT_CODE: u64 = 14;
-/// Linux EINVAL errno value (22).
-const EINVAL_CODE: u64 = 22;
 /// 16 MiB per-call cap.
 const MAX_USER_COPY: usize = 16 * 1024 * 1024;
 
@@ -2531,14 +2520,14 @@ pub(crate) mod kernel_buf_scope {
 #[inline]
 pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if len > MAX_USER_COPY {
-        return Err(EINVAL_CODE);
+        return Err(EINVAL as u64);
     }
     if ptr == 0 {
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     // Reject integer overflow of the range end.
     if ptr.checked_add(len as u64).is_none() {
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
@@ -2557,7 +2546,7 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
             {
                 return Ok(());
             }
-            return Err(EFAULT_CODE);
+            return Err(EFAULT as u64);
         }
     }
     Ok(())
@@ -2588,7 +2577,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: dst is a live kernel slice; src is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort (a validated-
@@ -2600,7 +2589,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile read of each in-range user
     // byte (no fault-fixup surface implemented there).
@@ -2643,7 +2632,7 @@ pub(crate) unsafe fn cmpxchg_user_u32(uptr: u64, old: u32, new: u32) -> Result<u
         // Unreachable via the futex paths (alignment is checked at syscall
         // entry), but an unaligned `ldxr` is an alignment fault on aarch64
         // rather than a slow split access, so refuse rather than trap.
-        return Err(EINVAL_CODE);
+        return Err(EINVAL as u64);
     }
     let ptr = uptr as *mut u32;
     #[cfg(target_arch = "x86_64")]
@@ -2651,12 +2640,12 @@ pub(crate) unsafe fn cmpxchg_user_u32(uptr: u64, old: u32, new: u32) -> Result<u
     // cmpxchg opens the SMAP bracket itself and catches an unrecoverable
     // fault as Err instead of a kernel panic.
     unsafe {
-        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT_CODE)
+        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT as u64)
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: as above, via the EL1 exclusive-monitor sequence.
     unsafe {
-        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT_CODE)
+        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT as u64)
     }
     // SAFETY: any other target — no fault-fixup surface is implemented
     // there, so fall back to a plain atomic on the mapped user word.
@@ -2715,7 +2704,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: src is a live kernel slice; dst is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort as Err — see
@@ -2724,7 +2713,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::uaccess::copy_user_guarded(dst, src.as_ptr(), src.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile write of each in-range user
     // byte (no fault-fixup surface implemented there).
@@ -3173,7 +3162,7 @@ pub(crate) fn mnt_want_write(path: &str) -> Result<(), i64> {
         return Ok(());
     }
     if current_mount_flags_at(path) & narf_filesystem::mnt_flags::READONLY != 0 {
-        return Err(-30); // -EROFS
+        return Err(-EROFS); // -EROFS
     }
     Ok(())
 }
@@ -6934,8 +6923,6 @@ fn futex_timeout_deadline(
     absolute: bool,
     realtime: bool,
 ) -> Result<Option<u64>, i64> {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     if timeout_ptr == 0 {
         return Ok(None);
     }
@@ -6983,7 +6970,6 @@ fn futex_wake_op(
     // `arch_futex_atomic_op_inuser` reports an op it does not implement as
     // -ENOSYS, not -EINVAL (`arch/x86/include/asm/futex.h`); so does the
     // cmp switch in `futex_atomic_op_inuser`.
-    const ENOSYS: i64 = 38;
     // Linux keys BOTH words through `get_futex_key` before touching either
     // (`kernel/futex/waitwake.c::futex_wake_op`). `uaddr` was keyed by the
     // caller; keying `uaddr2` here is what makes a skewed second address
@@ -7174,8 +7160,6 @@ pub(crate) fn get_futex_key_flags(
     flags: u64,
 ) -> Result<FutexKey, i64> {
     use handler_sys_futex_wait::{FUTEX2_MPOL, FUTEX2_NUMA, FUTEX2_SIZE_MASK, FUTEX_NO_NODE};
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let numa = flags & FUTEX2_NUMA != 0;
     let word = 1u64 << (flags & FUTEX2_SIZE_MASK);
     let span = futex2_word_span(flags);
@@ -7781,8 +7765,6 @@ fn futex_wait_core(
     park_cap_ns: u64,
     flags: u64,
 ) {
-    const EAGAIN: i64 = 11;
-    const EFAULT: i64 = 14;
     // The address is validated ONLY here, by the shared funnel. This helper
     // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
     // kept reporting a spurious wake for a null word after the classic
@@ -9014,8 +8996,8 @@ fn current_socket_result(fd: u32) -> Result<alloc::sync::Arc<crate::socket::Sock
         table.get(fd).map(|entry| entry.ops.clone())
     })
         .flatten()
-        .ok_or(9i64)?; // EBADF
-    socket_from_file_ops(ops).ok_or(88) // ENOTSOCK
+        .ok_or(EBADF)?;
+    socket_from_file_ops(ops).ok_or(ENOTSOCK)
 }
 
 /// Install the kernel-held admin authority returned by a successful stack
@@ -9123,12 +9105,12 @@ fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAd
     let len = raw_len as i32;
     // move_addr_to_kernel: ulen < 0 || ulen > sizeof(sockaddr_storage) → EINVAL.
     if !(0..=128).contains(&len) || len < 2 {
-        return Err(22); // -EINVAL (no room for a complete sa_family_t)
+        return Err(EINVAL); // no room for a complete sa_family_t
     }
     let mut buf = alloc::vec![0u8; len as usize];
     // SAFETY: copy_from_user range-validates the whole address (catching a NULL
     // or faulting ptr) and SMAP-brackets the read.
-    unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| 14i64)?; // -EFAULT
+    unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| EFAULT)?;
     Ok(crate::socket::SockAddr {
         family: u16::from_le_bytes([buf[0], buf[1]]),
         body: buf[2..].to_vec(),
@@ -9172,22 +9154,22 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     let sock = match current_socket_result(fd) {
         Ok(s) => {
             if flags_bad {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL (flags)
+                ctx.set_return(errno_ret(EINVAL)); // -EINVAL (flags)
                 return;
             }
             s
         }
         // EBADF (absent fd) is reported regardless of the flags.
         Err(9) => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF)); // -EBADF
             return;
         }
         // A present non-socket fd: the flag check precedes -ENOTSOCK in Linux.
         Err(88) => {
             if flags_bad {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL (flags)
+                ctx.set_return(errno_ret(EINVAL)); // -EINVAL (flags)
             } else {
-                ctx.set_return(SyscallReturn::ok((-88i64) as u64)); // -ENOTSOCK
+                ctx.set_return(errno_ret(ENOTSOCK)); // -ENOTSOCK
             }
             return;
         }
@@ -9251,7 +9233,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     // connection and keep serving, which is what EMFILE tells
                     // it to do. EPERM reads as a permission fault and takes
                     // the server down instead.
-                    ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+                    ctx.set_return(errno_ret(EMFILE)); // -EMFILE
                     return;
                 }
             };
@@ -9270,7 +9252,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             let task = current_task_id();
             let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
-                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+                ctx.set_return(errno_ret(EAGAIN)); // -EAGAIN
                 return;
             }
             if let (Some(uctx), Some(hook)) = (
@@ -9317,12 +9299,12 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 // unreachable — hook() longjmps to the executor
             }
             // No executor (kernel-test context): surface EAGAIN.
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
         }
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
+        _ => ctx.set_return(errno_ret(EINVAL)), // -EINVAL (unreachable)
     }
 }
 
@@ -9341,15 +9323,15 @@ fn parse_scm_rights_fds(
         return Ok(out);
     }
     if ctrl_ptr == 0 {
-        return Err(14); // EFAULT
+        return Err(EFAULT);
     }
     if !(16..=MAX_USER_COPY).contains(&ctrl_len) {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     let mut ctrl = alloc::vec![0u8; ctrl_len];
     // SAFETY: ctrl sized to ctrl_len; copy_from_user range-validates + SMAP.
     if unsafe { copy_from_user(&mut ctrl, ctrl_ptr) }.is_err() {
-        return Err(14); // EFAULT
+        return Err(EFAULT);
     }
     let task = current_task_id();
     // Walk cmsg records (8-byte aligned).
@@ -9359,7 +9341,7 @@ fn parse_scm_rights_fds(
         let level = i32::from_le_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
         let ctype = i32::from_le_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
         if cmsg_len < 16 || off + cmsg_len > ctrl_len {
-            return Err(22); // EINVAL
+            return Err(EINVAL);
         }
         if level == SOL_SOCKET && ctype == SCM_RIGHTS {
             let nfds = (cmsg_len - 16) / 4;
@@ -9367,7 +9349,7 @@ fn parse_scm_rights_fds(
                 let fpos = off + 16 + i * 4;
                 let fd = i32::from_le_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
                 if fd < 0 {
-                    return Err(9); // EBADF
+                    return Err(EBADF);
                 }
                 let Some(passed) = fd::with_table(task, |t| {
                     let (ops, description, status_flags) = t.export_description(fd as u32)?;
@@ -9378,7 +9360,7 @@ fn parse_scm_rights_fds(
                     })
                 })
                 .flatten() else {
-                    return Err(9); // EBADF: send no payload or partial rights
+                    return Err(EBADF); // send no payload or partial rights
                 };
                 out.push(passed);
             }
@@ -9965,8 +9947,6 @@ pub(crate) fn timerfd_arc_from_fd_checked(
     task: u64,
     fd: u32,
 ) -> Result<alloc::sync::Arc<crate::io_mux::TimerFd>, i64> {
-    const EBADF: i64 = 9;
-    const EINVAL: i64 = 22;
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()))
         .flatten()
         .ok_or(EBADF)?;
@@ -11331,9 +11311,7 @@ mod aio {
     use narf_lib::sync::IrqSafeSpinLock;
 
     // ── errno constants (negated on return, Linux convention) ────────
-    const EINVAL: i64 = -22;
-    const EBADF: i64 = -9;
-    const EFAULT: i64 = -14;
+    use crate::errno::wire::{EBADF, EFAULT, EINVAL};
 
     // ── Linux <uapi/linux/aio_abi.h> opcodes ─────────────────────────
     const IOCB_CMD_PREAD: u16 = 0;
@@ -11954,7 +11932,7 @@ mod aio {
             // ERESTARTNOHAND to EINTR at the syscall boundary, as
             // `sys_rt_sigsuspend` does.
             if interrupted && !had_completions {
-                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+                ctx.set_return(crate::errno::to_ret(crate::errno::EINTR));
             }
         }
     }

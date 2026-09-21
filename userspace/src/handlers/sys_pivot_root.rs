@@ -1,14 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-const ENOENT: i64 = 2;
-const EBUSY: i64 = 16;
-const ENOTDIR: i64 = 20;
-
-#[inline]
-fn fail(errno: i64) -> SyscallReturn {
-    SyscallReturn::ok((-errno) as u64)
-}
 
 /// `fs/namespace.c::SYSCALL_DEFINE2(pivot_root)` → `path_pivot_root`:
 ///
@@ -43,20 +35,20 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     // terminator in the stored root and consumed the put_old pointer as a
     // length, so successful calls installed a path such as "/new_root\0".
     let new_root = match copy_user_cstr_checked(args.arg0, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             // `user_path_at` on an unreadable name → -EFAULT.
-            ctx.set_return(fail(errno));
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     let put_old = match copy_user_cstr_checked(args.arg1, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(fail(errno));
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     // new_root / put_old are resolved against the caller's cwd like any path
     // argument. The canonical container idiom is
     // `fchdir(new_root_fd); pivot_root(".", ".")` — systemd's
@@ -92,7 +84,7 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
         } else {
             ENOENT
         };
-        ctx.set_return(fail(errno));
+        ctx.set_return(errno_ret(errno));
         return;
     }
     // `new_mnt == root_mnt` → -EBUSY ("loop, on the same file system"): the
@@ -100,7 +92,7 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     // swap would have nothing to move the old root onto. NARF compares the
     // task root path, which is the whole of its root identity.
     if new_root_resolved.trim_end_matches('/') == prior_root.trim_end_matches('/') {
-        ctx.set_return(fail(EBUSY));
+        ctx.set_return(errno_ret(EBUSY));
         return;
     }
     // Bind-mount prior_root at put_old_resolved so the old root is

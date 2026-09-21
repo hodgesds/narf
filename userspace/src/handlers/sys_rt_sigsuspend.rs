@@ -31,8 +31,6 @@ pub(crate) fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let set_uptr = args.arg0;
     let sigsetsize = args.arg1;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
 
     // `if (sigsetsize != sizeof(sigset_t)) return -EINVAL;` — a size
     // mismatch is a malformed argument, checked before the pointer.

@@ -16,14 +16,14 @@ pub(crate) fn sys_fchmodat2(ctx: &mut dyn TrapContext) {
 
 fn metadata_errno(error: narf_filesystem::FsError) -> i64 {
     match error {
-        narf_filesystem::FsError::NotFound => -2, // -ENOENT
-        narf_filesystem::FsError::PermissionDenied => -13, // -EACCES
-        narf_filesystem::FsError::InvalidPath => -22, // -EINVAL
-        narf_filesystem::FsError::NoSpace => -28, // -ENOSPC
-        narf_filesystem::FsError::QuotaExceeded => -122, // -EDQUOT
-        narf_filesystem::FsError::ReadOnly => -30, // -EROFS
-        narf_filesystem::FsError::Unsupported => -95, // -EOPNOTSUPP
-        _ => -5,                                  // -EIO
+        narf_filesystem::FsError::NotFound => ENOENT,
+        narf_filesystem::FsError::PermissionDenied => EACCES,
+        narf_filesystem::FsError::InvalidPath => EINVAL,
+        narf_filesystem::FsError::NoSpace => ENOSPC,
+        narf_filesystem::FsError::QuotaExceeded => EDQUOT,
+        narf_filesystem::FsError::ReadOnly => EROFS,
+        narf_filesystem::FsError::Unsupported => EOPNOTSUPP,
+        _ => EIO,
     }
 }
 
@@ -32,18 +32,18 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
     const AT_EMPTY_PATH: u64 = 0x1000;
 
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     let args = *ctx.args();
     let raw = match copy_user_cstr_checked(args.arg1, 4096) {
-            Ok(path) => path,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
 
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH != 0 {
@@ -56,12 +56,12 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
                     {
                         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
                         Some(Err(error)) => {
-                            ctx.set_return(SyscallReturn::ok(metadata_errno(error) as u64));
+                            ctx.set_return(errno_ret(metadata_errno(error)));
                         }
-                        None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+                        None => ctx.set_return(errno_ret(EIO)),
                     }
                 } else {
-                    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+                    ctx.set_return(errno_ret(ENOENT));
                 }
             } else if dirfd >= 0 {
                 let proxy_args = SyscallArgs {
@@ -78,10 +78,10 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
                 };
                 sys_fchmod(&mut proxy);
             } else {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                ctx.set_return(errno_ret(EBADF));
             }
         } else {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT));
         }
         return;
     }
@@ -106,7 +106,7 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
     // return -EPERM; }` — an append-only file's PERMISSIONS are frozen
     // too, or the restriction could be lifted by re-permissioning it.
     if path_inode_flags(&path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let mode = (args.arg2 as u32 & 0o7777) as u16;
@@ -122,9 +122,9 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
                 ctx.set_return(SyscallReturn::ok(0));
             }
             Some(Err(error)) => {
-                ctx.set_return(SyscallReturn::ok(metadata_errno(error) as u64));
+                ctx.set_return(errno_ret(metadata_errno(error)));
             }
-            None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+            None => ctx.set_return(errno_ret(EIO)),
         }
         return;
     }
@@ -138,12 +138,12 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
                 ctx.set_return(SyscallReturn::ok(0));
             }
             Some(Err(error)) => {
-                ctx.set_return(SyscallReturn::ok(metadata_errno(error) as u64));
+                ctx.set_return(errno_ret(metadata_errno(error)));
             }
-            None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+            None => ctx.set_return(errno_ret(EIO)),
         }
         return;
     }
 
-    ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+    ctx.set_return(errno_ret(ENOENT));
 }

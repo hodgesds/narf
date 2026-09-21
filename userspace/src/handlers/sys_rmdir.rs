@@ -12,12 +12,12 @@ pub(crate) fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let path = match copy_user_cstr_checked(ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let path = resolve_cwd_path(current_task_id(), &path);
@@ -61,6 +61,6 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
         Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rmdir_errno(e))),
         // The parent path/filesystem didn't resolve, or the async poll never
         // completed → the target directory can't exist. Linux: ENOENT.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
+        _ => ctx.set_return(errno_ret(ENOENT)),
     }
 }

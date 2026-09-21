@@ -23,10 +23,9 @@ pub(crate) const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 /// an EINVAL the libc can fall back from. (glibc and musl both pass
 /// exactly 24 here, so this rejects only genuinely mismatched callers.)
 pub(crate) fn sys_set_robust_list(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
     let a = *ctx.args();
     if a.arg1 != ROBUST_LIST_HEAD_SIZE {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();

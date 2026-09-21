@@ -78,7 +78,7 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     // exist. LINUX-GAP: Linux accepts the named ones; only a genuinely
     // unknown `advice` is EINVAL there.
     if !accepted {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `!PAGE_ALIGNED(start)`, `len_in && !PAGE_ALIGN(len_in)`, and the
@@ -89,7 +89,7 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
         || (args.arg1 != 0 && len == 0)
         || args.arg0.checked_add(len).is_none()
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `start + PAGE_ALIGN(len_in) == start` — nothing to do, and Linux says
@@ -131,7 +131,7 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
             .perms_covering(base, len)
             .is_some_and(|p| p.contains(narf_memory::RegionPerms::FILE_DEMAND));
         if !writable && !file_backed {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
     }
@@ -144,9 +144,9 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
             // request spans an unmapped gap.
             Err(narf_memory::AddressSpaceError::AlignmentMismatch)
             | Err(narf_memory::AddressSpaceError::OutOfRange) => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64))
+                ctx.set_return(errno_ret(EINVAL))
             }
-            Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+            Err(_) => ctx.set_return(errno_ret(ENOMEM)),
         },
         // These values are performance hints only. NARF has no readahead,
         // KSM, THP promotion, or active LRU aging policy to tune yet, so a
@@ -165,7 +165,7 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
             if as_ref.range_fully_mapped(base, len) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+                ctx.set_return(errno_ret(ENOMEM));
             }
         }
     }

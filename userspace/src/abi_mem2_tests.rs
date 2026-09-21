@@ -331,7 +331,6 @@ kernel_test_in!("syscall_abi", smoke_abi_mem2_pkey_free_unallocated_neg);
 
 fn smoke_abi_mem2_pkey_alloc_exhaust_neg() -> TestResult {
     with_setup(|| {
-        const ENOSPC: i64 = -28;
         // At most 15 keys can ever be live (1..16), so 16 attempts always
         // reach the full-bitmap ENOSPC arm regardless of the start state.
         for _ in 0..16 {

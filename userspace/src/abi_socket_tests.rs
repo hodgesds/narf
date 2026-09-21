@@ -1690,7 +1690,6 @@ kernel_test_in!(
 // MSG_OOB is unsupported on AF_UNIX (no CONFIG_AF_UNIX_OOB) → a send with it is
 // -EOPNOTSUPP, both stream and datagram (Linux unix_stream/dgram_sendmsg).
 fn smoke_abi_socket_send_msg_oob_eopnotsupp() -> TestResult {
-    const EOPNOTSUPP: i64 = -95;
     const MSG_OOB: u64 = 0x1;
     with_setup(|| {
         let mut sv = [0u8; 8];
@@ -1752,7 +1751,6 @@ kernel_test_in!(
 // A stream connect to a path where a DATAGRAM socket is bound is -EPROTOTYPE
 // (Linux unix_find_bsd `sk->sk_type != type`), not ECONNREFUSED/ENOENT.
 fn smoke_abi_socket_stream_connect_wrong_type_eprototype() -> TestResult {
-    const EPROTOTYPE: i64 = -91;
     with_memfs("/m", "m", &[], || {
         let d = open_unix(SOCK_DGRAM)?;
         let (addr, alen) = unix_sockaddr(b"/m/dsock");

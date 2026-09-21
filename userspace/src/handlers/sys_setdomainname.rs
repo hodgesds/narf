@@ -15,11 +15,11 @@ pub(crate) fn sys_setdomainname(ctx: &mut dyn TrapContext) {
     // Same per-UTS-namespace rule as `sethostname`:
     // `ns_capable(current->nsproxy->uts_ns->user_ns, CAP_SYS_ADMIN)`.
     if !uts_admin(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     if len > HOSTNAME_MAX {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let s = if len == 0 {
@@ -28,7 +28,7 @@ pub(crate) fn sys_setdomainname(ctx: &mut dyn TrapContext) {
         match copy_user_path(buf, len) {
             Some(s) => s,
             None => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         }

@@ -14,7 +14,7 @@ pub(crate) fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     // `do_readlinkat`.
     let buf_len = args.arg3 as u32 as i32 as i64;
     if buf_len <= 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `getname_flags` is the first thing every path syscall does, and it has
@@ -25,12 +25,12 @@ pub(crate) fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if path_str.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();

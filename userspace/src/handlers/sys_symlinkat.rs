@@ -20,21 +20,21 @@ pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
     let newdirfd = args.arg1 as i64;
     let link_ptr = args.arg2;
     let target_str = match copy_user_cstr_checked(target_ptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     let link_str = match copy_user_cstr_checked(link_ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if link_str.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();

@@ -30,7 +30,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let sock = match current_socket_result(fd) {
         Ok(socket) => socket,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -41,7 +41,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let dest = match import_sendto_addr(addr_ptr, addr_len) {
         Ok(addr) => addr,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -74,7 +74,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         // Send never yields Accepted/Received/Addr; keep the match total.
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+        _ => ctx.set_return(errno_ret(EINVAL)),
     }
 }
 
@@ -84,18 +84,18 @@ fn import_sendto_addr(ptr: u64, raw_len: u64) -> Result<Option<crate::socket::So
     }
     let len = raw_len as i32;
     if !(0..=128).contains(&len) {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     if len == 0 {
         return Ok(None);
     }
     if len < 2 {
-        return Err(22); // no complete sa_family_t
+        return Err(EINVAL); // no complete sa_family_t
     }
     let mut bytes = alloc::vec![0u8; len as usize];
     // SAFETY: copy_from_user validates the complete address range and opens the
     // architecture user-access window.
-    unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| 14i64)?;
+    unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| EFAULT)?;
     Ok(Some(crate::socket::SockAddr {
         family: u16::from_ne_bytes([bytes[0], bytes[1]]),
         body: bytes[2..].to_vec(),
@@ -111,7 +111,7 @@ pub(super) fn socket_send_would_block(
     const MSG_DONTWAIT: u32 = 0x40;
     let task = current_task_id();
     if flags & MSG_DONTWAIT != 0 || socket_listener_nonblock(task, fd, sock) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
     if park_reexecute_on_fd(
@@ -123,5 +123,5 @@ pub(super) fn socket_send_would_block(
     }
     // Kernel-test/non-stackful context cannot sleep; expose the retryable
     // condition rather than fabricating a zero-byte successful send.
-    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+    ctx.set_return(errno_ret(EAGAIN));
 }

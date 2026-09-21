@@ -18,8 +18,6 @@ use super::*;
 /// wrote a slot no `ioprio_get` on a member would ever read; the table is
 /// now per-task, as in Linux where ioprio lives in the task's io_context.
 pub(crate) fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EINVAL: i64 = 22;
     const IOPRIO_WHO_PROCESS: i64 = 1;
     const IOPRIO_WHO_PGRP: i64 = 2;
     const IOPRIO_WHO_USER: i64 = 3;
@@ -35,7 +33,7 @@ pub(crate) fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
     // before the `which` switch in Linux.
     //
     if ioprio >> 13 >= IOPRIO_NR_CLASSES {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `ioprio_check_cap`: the real-time class is privileged.
@@ -56,7 +54,7 @@ pub(crate) fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
         && !capable(CAP_SYS_NICE)
         && !capable(CAP_SYS_ADMIN)
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let scope = match which {
@@ -64,13 +62,13 @@ pub(crate) fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
         IOPRIO_WHO_PGRP => WhoScope::Pgrp,
         IOPRIO_WHO_USER => WhoScope::User,
         _ => {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
     let targets = resolve_who_targets(scope, who, current_task_id());
     if targets.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
     for t in targets {

@@ -10,7 +10,7 @@ pub(crate) fn sys_setsid(ctx: &mut dyn TrapContext) {
     let pgid_rows = pgids.get_or_insert_with(BTreeMap::new);
     let current_pgid = pgid_rows.get(&task).copied().unwrap_or(task);
     if current_pgid == task || pgid_rows.values().any(|&pgid| pgid == task) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 

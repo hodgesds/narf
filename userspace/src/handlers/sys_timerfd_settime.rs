@@ -43,8 +43,6 @@ use super::*;
 ///     reinterpreting the sign bit as an enormous positive delay — a timer
 ///     that silently never fires instead of an EINVAL at the call.
 pub(crate) fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     /// `include/uapi/linux/timerfd.h`: TFD_TIMER_ABSTIME (1<<0) |
     /// TFD_TIMER_CANCEL_ON_SET (1<<1) — `TFD_SETTIME_FLAGS` in fs/timerfd.c.
     const TFD_SETTIME_FLAGS: u32 = 0x3;
@@ -80,7 +78,7 @@ pub(crate) fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     // SAFETY: copy_from_user range-validates `new_value_ptr` (including the
     // null case) and SMAP-brackets the 32-byte read.
     if unsafe { copy_from_user(&mut buf, new_value_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let interval_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -93,7 +91,7 @@ pub(crate) fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
         || !timespec64_valid(interval_sec, interval_ns)
         || !timespec64_valid(value_sec, value_ns)
     {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -105,7 +103,7 @@ pub(crate) fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let tfd = match timerfd_arc_from_fd_checked(task, fd) {
         Ok(t) => t,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -150,7 +148,7 @@ pub(crate) fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
         // SAFETY: copy_to_user range-validates `old_value_ptr` and
         // SMAP-brackets the write of the 32-byte itimerspec `buf`.
         if unsafe { copy_to_user(old_value_ptr, &buf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

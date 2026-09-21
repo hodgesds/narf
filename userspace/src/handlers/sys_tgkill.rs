@@ -8,7 +8,7 @@ use super::*;
 pub(crate) fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let tgid = args.arg0;
-    let esrch = SyscallReturn::ok((-3i64) as u64);
+    let esrch = errno_ret(ESRCH);
     let tid = match signal_tid_from_user(current_task_id(), args.arg1) {
         Some(tid) => tid,
         None => {
@@ -18,7 +18,7 @@ pub(crate) fn sys_tgkill(ctx: &mut dyn TrapContext) {
     };
     let signum = args.arg2 as u32;
     if signum > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // ESRCH for a dead/never-existed tid — no more phantom pending

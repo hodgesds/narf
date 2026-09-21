@@ -32,7 +32,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
 
     // fs/splice.c::vmsplice checks flags before touching the fd or iovec.
     if flags & !SPLICE_F_ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -46,13 +46,13 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
     })
     .flatten();
     let Some((ops, status_flags)) = resolved else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     // O_PATH is not O_RDONLY: Linux opens it without FMODE_READ or
     // FMODE_WRITE, so the f_mode check returns EBADF before import_iovec.
     if status_flags & crate::fd::O_PATH != 0 {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     let access_mode = status_flags & crate::fd::O_ACCMODE;
@@ -61,7 +61,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
         crate::fd::O_RDONLY => VmspliceDirection::FromPipe,
         _ => {
             // No FMODE_READ or FMODE_WRITE (the Linux O_PATH shape).
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -69,7 +69,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
     // import_iovec happens only after fd/f_mode validation. Linux accepts
     // nr_segs == 0 without reading uiov, including a NULL uiov pointer.
     if nr > IOV_MAX {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let iov = if nr == 0 {
@@ -79,7 +79,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
         match unsafe { copy_from_user_vec(iov_ptr, nr * 16) } {
             Ok(bytes) => bytes,
             Err(e) => {
-                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+                ctx.set_return(errno_ret(e as i64));
                 return;
             }
         }
@@ -87,7 +87,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
     let total_len = match validate_vmsplice_iovecs(&iov, nr) {
         Ok(total) => total,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            ctx.set_return(errno_ret(errno as i64));
             return;
         }
     };
@@ -100,7 +100,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
 
     // get_pipe_info() lives inside vmsplice_to_{pipe,user}, after import_iovec.
     if ops.pipe_capacity().is_none() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF: not a pipe
+        ctx.set_return(errno_ret(EBADF)); // EBADF: not a pipe
         return;
     }
     match direction {
@@ -119,7 +119,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
             } else {
                 // A pipe-shaped provider without a supported read-end
                 // transaction cannot satisfy SPLICE_TO_USER.
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+                ctx.set_return(errno_ret(EBADF));
             }
         }
     }
@@ -191,7 +191,7 @@ fn validate_vmsplice_iovecs(iov_buf: &[u8], nr: usize) -> Result<usize, u64> {
         // copy_iovec_from_user reads iov_len through ssize_t and rejects a
         // value with the sign bit set before initializing the iterator.
         if len_raw > isize::MAX as u64 {
-            return Err(EINVAL_CODE);
+            return Err(EINVAL as u64);
         }
         let len = len_raw as usize;
         if len == 0 {
@@ -221,7 +221,7 @@ fn vmsplice_to_pipe(
         ops.poll_readiness() & narf_filesystem::POLL_OUT == 0 && ops.write_should_block();
     if pipe_full {
         if flags & SPLICE_F_NONBLOCK != 0 {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
         if park_reexecute_on_fd(
@@ -252,7 +252,7 @@ fn vmsplice_to_pipe(
                 Ok(outcome) => outcome,
                 Err(_) => {
                     if total == 0 {
-                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        ctx.set_return(errno_ret(EFAULT));
                         return;
                     }
                     break;
@@ -266,7 +266,7 @@ fn vmsplice_to_pipe(
                 Ok(bytes) => bytes,
                 Err(_) => {
                     if total == 0 {
-                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        ctx.set_return(errno_ret(EFAULT));
                         return;
                     }
                     break;
@@ -281,7 +281,7 @@ fn vmsplice_to_pipe(
                 // No byte was committed, so the syscall is still safe to
                 // return EAGAIN or park and re-execute.
                 if flags & SPLICE_F_NONBLOCK != 0 {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 if park_reexecute_on_fd(
@@ -302,14 +302,14 @@ fn vmsplice_to_pipe(
             Err(narf_filesystem::FsError::BrokenPipe) => {
                 if total == 0 {
                     raise_signal_pending(current_task_id(), 13); // SIGPIPE
-                    ctx.set_return(SyscallReturn::ok((-32i64) as u64)); // EPIPE
+                    ctx.set_return(errno_ret(EPIPE));
                     return;
                 }
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
                 if flags & SPLICE_F_NONBLOCK != 0 {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 if park_reexecute_on_fd(
@@ -323,14 +323,14 @@ fn vmsplice_to_pipe(
             }
             Err(narf_filesystem::FsError::BadFd) | Err(narf_filesystem::FsError::ReadOnly) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+                    ctx.set_return(errno_ret(EBADF));
                     return;
                 }
                 break;
             }
             Err(_) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                    ctx.set_return(errno_ret(EIO));
                     return;
                 }
                 break;
@@ -372,7 +372,7 @@ fn vmsplice_from_pipe(
                     break;
                 }
                 if flags & SPLICE_F_NONBLOCK != 0 {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 let ops: &dyn narf_filesystem::FileOps = match pipe {
@@ -391,14 +391,14 @@ fn vmsplice_from_pipe(
             }
             Err(VmspliceReadError::User(errno)) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    ctx.set_return(errno_ret(errno as i64));
                     return;
                 }
                 break;
             }
             Err(VmspliceReadError::BadFd) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+                    ctx.set_return(errno_ret(EBADF));
                     return;
                 }
                 break;

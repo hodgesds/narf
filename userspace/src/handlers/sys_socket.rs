@@ -25,7 +25,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
             | crate::socket::AF_BYPASS
             | crate::socket::AF_NETLINK
     ) {
-        ctx.set_return(SyscallReturn::ok((-97i64) as u64)); // -EAFNOSUPPORT
+        ctx.set_return(errno_ret(EAFNOSUPPORT));
         return;
     }
     let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
@@ -65,7 +65,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
         // the errno Linux uses when a NETLINK_ROUTE admin operation is refused
         // for lack of CAP_NET_ADMIN — the right verdict for a denied privileged
         // capability. Verified correct as EPERM (kept explicit).
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let new_fd = match fd::install(task, crate::fd::FdEntry {
@@ -87,7 +87,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
         None => {
             // Linux socket() → sock_map_fd → get_unused_fd_flags: a full
             // per-process descriptor table is -EMFILE.
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
             return;
         }
     };

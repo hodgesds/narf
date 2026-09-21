@@ -19,7 +19,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
         // SAFETY: non-zero user timespec[2] pointer; copy_from_user
         // range-validates and SMAP-brackets the 32-byte read.
         if unsafe { copy_from_user(&mut buf, a.arg2) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let slot = |o: usize| -> Result<Option<u64>, ()> {
@@ -37,7 +37,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
         match (slot(0), slot(16)) {
             (Ok(at), Ok(mt)) => (at, mt),
             _ => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -55,7 +55,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
         // futimens(fd) form — set times through the open fd's FileOps.
         // In Linux do_utimes_fd(fd, times, flags): if (flags) return -EINVAL;
         if flags != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         let fd = a.arg0 as u32;
@@ -68,7 +68,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
                 crate::mqueue::notify_attrib_fd(task, fd);
                 ctx.set_return(SyscallReturn::ok(0));
             }
-            None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // -EBADF
+            None => ctx.set_return(errno_ret(EBADF)),
         }
         return;
     }
@@ -76,14 +76,14 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const AT_EMPTY_PATH: u64 = 0x1000;
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     let raw = match copy_user_cstr_checked(a.arg1, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(errno)); // -EFAULT
             return;
         }
     };
@@ -91,7 +91,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
     let dirfd = a.arg0 as i64;
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
         if dirfd >= 0 {
@@ -105,7 +105,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                    ctx.set_return(errno_ret(EBADF));
                     return;
                 }
             }
@@ -119,7 +119,7 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(r as u64));
             return;
         } else {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     }

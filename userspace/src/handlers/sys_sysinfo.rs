@@ -7,7 +7,7 @@ use super::*;
 pub(crate) fn sys_sysinfo(ctx: &mut dyn TrapContext) {
     let buf = ctx.args().arg0;
     if buf == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let uptime_secs = (narf_scheduler::narf_time::monotonic_ns() / 1_000_000_000) as i64;
@@ -39,7 +39,7 @@ pub(crate) fn sys_sysinfo(ctx: &mut dyn TrapContext) {
                                                        // SAFETY: `buf` is the user `struct sysinfo*` (non-zero); copy_to_user
                                                        // range-validates the 112-byte write.
     if unsafe { copy_to_user(buf, &si) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

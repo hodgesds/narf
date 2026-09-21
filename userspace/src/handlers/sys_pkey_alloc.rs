@@ -6,7 +6,7 @@ pub(crate) fn sys_pkey_alloc(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     // Linux defines no flags; any non-zero value is EINVAL.
     if a.arg0 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -20,5 +20,5 @@ pub(crate) fn sys_pkey_alloc(ctx: &mut dyn TrapContext) {
             return;
         }
     }
-    ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // ENOSPC
+    ctx.set_return(errno_ret(ENOSPC));
 }

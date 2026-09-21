@@ -1,9 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-const EPERM: i64 = 1;
-const ENOEXEC: i64 = 8;
-const EFBIG: i64 = 27;
 
 #[inline]
 fn fail(errno: i64) -> SyscallReturn {

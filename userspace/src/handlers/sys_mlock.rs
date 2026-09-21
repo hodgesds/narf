@@ -6,11 +6,11 @@ use super::*;
 pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
     match error {
         narf_memory::AddressSpaceError::OutOfRange
-        | narf_memory::AddressSpaceError::AlignmentMismatch => 22, // EINVAL
+        | narf_memory::AddressSpaceError::AlignmentMismatch => EINVAL,
         narf_memory::AddressSpaceError::Unmapped
         | narf_memory::AddressSpaceError::LockLimit
         | narf_memory::AddressSpaceError::MappingLimit
-        | narf_memory::AddressSpaceError::StackLimit => 12, // ENOMEM
+        | narf_memory::AddressSpaceError::StackLimit => ENOMEM,
         narf_memory::AddressSpaceError::LockFailed
         | narf_memory::AddressSpaceError::AllocationFailed
         | narf_memory::AddressSpaceError::StaleMapping
@@ -19,7 +19,7 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
         | narf_memory::AddressSpaceError::Overlap
         | narf_memory::AddressSpaceError::InvalidNode
         | narf_memory::AddressSpaceError::SharedMapping
-        | narf_memory::AddressSpaceError::NoDemotionTarget => 11, // EAGAIN
+        | narf_memory::AddressSpaceError::NoDemotionTarget => EAGAIN,
     }
 }
 
@@ -59,7 +59,7 @@ pub(super) fn mlock_align_range(start: u64, len: u64) -> Result<Option<(u64, u64
     let start = start & !0xFFF;
     let end = start.wrapping_add(len);
     if end < start {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     if end == start {
         return Ok(None); // success, nothing to lock
@@ -91,7 +91,7 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let authority = current_mlock_authority();
     if !can_do_mlock(authority) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let (start, len) = match mlock_align_range(args.arg0, args.arg1) {
@@ -101,7 +101,7 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
             return;
         }
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -121,6 +121,6 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         // Linux: EINVAL for malformed/range-overflow input, ENOMEM for a VMA
         // coverage hole, and EAGAIN when eager population cannot complete.
-        Err(error) => ctx.set_return(SyscallReturn::ok((-mlock_errno(error)) as u64)),
+        Err(error) => ctx.set_return(errno_ret(mlock_errno(error))),
     }
 }

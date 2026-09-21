@@ -35,16 +35,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::handlers::{copy_from_user_vec, current_task_id};
 use crate::syscall::{SyscallReturn, TrapContext};
 
-// ── errno (negated-long convention) ─────────────────────────────────
-const EINVAL: i64 = 22;
-const EBADF: i64 = 9;
-const EMFILE: i64 = 24;
-const EFAULT: i64 = 14;
-const EACCES: i64 = 13;
-
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
+use crate::errno::{to_ret as err, *};
 
 // ── Landlock FS access-right bits (ABI v1) ──────────────────────────
 const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;

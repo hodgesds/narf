@@ -18,6 +18,7 @@
 //! `FsError::BrokenPipe`, which the Linux syscall layer translates to
 //! SIGPIPE plus `EPIPE`.
 
+use crate::errno::*;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -536,11 +537,11 @@ impl PipeShared {
     /// occupancy is EBUSY, and backing-allocation failure is ENOMEM.
     fn set_capacity(&self, arg: u32) -> Result<usize, u64> {
         if arg > (1u32 << 31) {
-            return Err(22); // EINVAL
+            return Err(EINVAL as u64);
         }
         let requested = (arg as usize).max(PIPE_BUF).next_power_of_two();
         if requested > PIPE_MAX_BYTES {
-            return Err(1); // EPERM: no CAP_SYS_RESOURCE/root bypass in NARF
+            return Err(EPERM as u64); // no CAP_SYS_RESOURCE/root bypass in NARF
         }
         if requested == self.capacity() {
             return Ok(requested);
@@ -559,7 +560,7 @@ impl PipeShared {
         let mut q = self.queue.lock();
         let requested_frames = requested / PIPE_BUF;
         if q.len() > requested || q.occupied_frames() > requested_frames {
-            return Err(16); // EBUSY
+            return Err(EBUSY as u64);
         }
         if q.capacity() != requested {
             q.bytes.replace_storage(replacement);

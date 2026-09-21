@@ -24,13 +24,13 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     // Native sendmsg never admits the in-kernel compat marker. Linux checks it
     // before fdget(), so it wins even for an invalid descriptor.
     if flags & MSG_CMSG_COMPAT != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let sock = match current_socket_result(fd) {
         Ok(socket) => socket,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -46,7 +46,7 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             if errno == 32 && flags & crate::socket::MSG_NOSIGNAL == 0 {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
         }
     }
 }
@@ -207,19 +207,19 @@ fn import_sendmsg_addr(ptr: u64, signed_len: i32) -> Result<Option<crate::socket
         return Ok(None);
     }
     if signed_len < 0 {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     let len = core::cmp::min(signed_len as usize, 128);
     if len == 0 {
         return Ok(None);
     }
     if len < 2 {
-        return Err(22);
+        return Err(EINVAL);
     }
     let mut bytes = alloc::vec![0u8; len];
     // SAFETY: guarded import of the clamped sockaddr_storage prefix.
     if unsafe { copy_from_user(&mut bytes, ptr) }.is_err() {
-        return Err(14); // EFAULT
+        return Err(EFAULT);
     }
     Ok(Some(crate::socket::SockAddr {
         family: u16::from_ne_bytes([bytes[0], bytes[1]]),

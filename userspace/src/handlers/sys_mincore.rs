@@ -29,7 +29,7 @@ pub(crate) fn sys_mincore(ctx: &mut dyn TrapContext) {
     let addr = a.arg0;
     let vec_ptr = a.arg2;
     if addr & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `access_ok(start, len)`. Structural range rejection does not need the
@@ -42,14 +42,14 @@ pub(crate) fn sys_mincore(ctx: &mut dyn TrapContext) {
             .and_then(|len| addr.checked_add(len & !0xFFF))
             .is_none_or(|end| end > AddressSpace::USER_HALF_END)
     {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     // `access_ok(vec, pages)` — one output byte per (rounded-up) page, and
     // Linux answers a bad buffer here rather than after the walk.
     let pages = (a.arg1 >> 12) + u64::from(a.arg1 & 0xFFF != 0);
     if pages != 0 && validate_user_range(vec_ptr, pages as usize).is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let as_ref = match current_address_space() {
@@ -62,14 +62,14 @@ pub(crate) fn sys_mincore(ctx: &mut dyn TrapContext) {
     let out = match as_ref.residency_range(VirtAddr::new(addr), a.arg1) {
         Ok(out) => out,
         Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
     // SAFETY: `vec_ptr` is the user residency-vector pointer; copy_to_user
     // range-validates the `pages`-byte write.
     if !out.is_empty() && unsafe { copy_to_user(vec_ptr, &out) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

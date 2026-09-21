@@ -1,11 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-const ENOENT: i64 = 2;
-const EFAULT: i64 = 14;
-const ENOTDIR: i64 = 20;
-const EINVAL: i64 = 22;
-const ENAMETOOLONG: i64 = 36;
 
 #[inline]
 fn fail(errno: i64) -> SyscallReturn {

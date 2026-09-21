@@ -16,10 +16,9 @@ use super::*;
 ///     probes this range before validating a priority — an EPERM there
 ///     reads as "not permitted to ask", not "no such policy".
 pub(crate) fn sys_sched_get_priority_max(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
     let policy = ctx.args().arg0 as i32;
     match priority_max_for_policy(policy) {
         Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-EINVAL) as u64)),
+        None => ctx.set_return(errno_ret(EINVAL)),
     }
 }

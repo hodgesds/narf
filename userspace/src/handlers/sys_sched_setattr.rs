@@ -3,34 +3,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-const EINVAL: i64 = -22;
-const E2BIG: i64 = -7;
-const EFAULT: i64 = -14;
-const ESRCH: i64 = -3;
-
-/// `sched_copy_attr` — the size-negotiation half, which is unlike every
-/// other extensible struct in the ABI and worth spelling out:
-///
-/// ```text
-/// if (!size) size = SCHED_ATTR_SIZE_VER0;               /* ABI quirk */
-/// if (size < SCHED_ATTR_SIZE_VER0 || size > PAGE_SIZE) goto err_size;
-/// ret = copy_struct_from_user(attr, sizeof(*attr), uattr, size);
-/// if (ret == -E2BIG) goto err_size;
-/// ...
-/// err_size:
-///         put_user(sizeof(*attr), &uattr->size);
-///         return -E2BIG;
-/// ```
-///
-/// Three things differ from the usual rule. A size of ZERO is not an error
-/// — it means VER0, a deliberate compatibility quirk for callers that zero
-/// the struct and fill in only what they need. An UNDERSIZED struct is
-/// -E2BIG, not the -EINVAL that `mnt_id_req` and `ns_id_req` answer. And
-/// every one of those failures WRITES THE REQUIRED SIZE BACK into the
-/// caller's `size` field, which is the only way a caller compiled against a
-/// different struct version discovers what this kernel wants.
-///
-/// Returns the normalised attr bytes, or a negative errno.
+/// Returns the normalised attr bytes, or a positive errno.
 fn copy_attr(uattr: u64) -> Result<[u8; SCHED_ATTR_SIZE], i64> {
     // `err_size` writes `sizeof(*attr)` back before failing. Best-effort:
     // the errno stands even if the caller's buffer turned out unwritable,
@@ -113,13 +86,13 @@ pub(crate) fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
     // is not told about the second one first.
     let pid = a.arg0 as u32 as i32;
     if uattr == 0 || pid < 0 || a.arg2 != 0 {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let attr = match copy_attr(uattr) {
         Ok(a) => a,
         Err(e) => {
-            ctx.set_return(SyscallReturn::ok(e as u64));
+            ctx.set_return(errno_ret(e));
             return;
         }
     };
@@ -128,7 +101,7 @@ pub(crate) fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
     // value that would be negative as a signed int.
     let policy = i32::from_ne_bytes(attr[4..8].try_into().unwrap());
     if policy < 0 {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `CLASS(find_get_task, p)(pid); if (!p) return -ESRCH;` — pid 0 is the
@@ -137,7 +110,7 @@ pub(crate) fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
     let task = match resolve_sched_target(pid as u64) {
         Some(t) => t,
         None => {
-            ctx.set_return(SyscallReturn::ok(ESRCH as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
     };

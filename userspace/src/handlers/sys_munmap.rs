@@ -34,7 +34,6 @@ use super::*;
 ///
 /// Returns the page-aligned range on success, or the POSIX-positive errno.
 fn validate_munmap_range(base: u64, requested_len: u64) -> Result<(VirtAddr, u64), i64> {
-    const EINVAL: i64 = 22;
     if base & 0xFFF != 0 || requested_len == 0 {
         return Err(EINVAL);
     }
@@ -58,7 +57,6 @@ fn munmap_current_locked(
     base: VirtAddr,
     len: u64,
 ) -> Result<(), i64> {
-    const ENOMEM: i64 = 12;
     crate::mapped_file::publish_current_punch(as_ref.identity(), base.as_u64(), len, || {
         // SAFETY: every caller holds `as_ref.with_vma_transaction()`.
         unsafe { as_ref.punch_fixed_locked_for_syscall(base, len) }
@@ -69,7 +67,6 @@ fn munmap_current_locked(
 /// Returns the rounded length on success, or the POSIX-positive errno.
 #[cfg(target_arch = "x86_64")]
 fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u64, i64> {
-    const ENOMEM: i64 = 12;
     let (base, len) = validate_munmap_range(base, requested_len)?;
     // Everything past here is the teardown transaction, not the arguments:
     // an allocation failure while splitting, or a backing shape NARF cannot
@@ -105,7 +102,7 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
     let (base, len) = match validate_munmap_range(args.arg0, args.arg1) {
         Ok(range) => range,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -113,7 +110,7 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
     // Unmapping a sealed range is the operation sealing exists to prevent —
     // it leaves a hole that can be filled with a different mapping.
     if handler_sys_mseal::range_is_sealed(as_ref.identity(), base.as_u64(), len) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -136,7 +133,7 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
     if let Some(result) = fast_result {
         ctx.set_return(match result {
             Ok(()) => SyscallReturn::ok(0),
-            Err(errno) => SyscallReturn::ok((-errno) as u64),
+            Err(errno) => errno_ret(errno),
         });
         return;
     }
@@ -158,7 +155,7 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         // EINVAL for a malformed range, ENOMEM when the teardown itself
         // could not be completed.
-        Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        Err(errno) => ctx.set_return(errno_ret(errno)),
     }
 }
 

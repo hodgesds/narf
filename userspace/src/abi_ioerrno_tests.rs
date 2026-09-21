@@ -10,9 +10,6 @@
 //! already-registered epoll fd, or a contended flock.
 use crate::abi_test_support::*;
 
-const ELOOP: i64 = -40;
-const EOPNOTSUPP: i64 = -95;
-
 /// Canonical-but-unmapped user address: in the user half, so `access_ok`
 /// accepts it, but no page backs it, so the guarded copy faults.
 const BAD_PTR: u64 = 0x0001_0000_0000_0000;
@@ -504,7 +501,6 @@ kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fallocate_pipe_espipe);
 fn smoke_abi_ioerrno_fallocate_overflow_efbig() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"")], || {
         let fd = open_rw(b"/abi/f\0")?;
-        const EFBIG: i64 = -27;
         expect(
             call(
                 Syscall::Fallocate.raw(),
@@ -984,7 +980,6 @@ kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fsync_bad_fd);
 
 const SEEK_DATA: u64 = 3;
 const SEEK_HOLE: u64 = 4;
-const ENXIO: i64 = -6;
 
 fn smoke_abi_ioerrno_lseek_seek_data_past_eof() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
@@ -2783,7 +2778,6 @@ fn smoke_abi_ioerrno_linkat_across_filesystems_is_exdev() -> TestResult {
     const AT_EMPTY_PATH: u64 = 0x1000;
     const O_TMPFILE_BIT: u64 = 0o20_000_000;
     const O_RDWR: u64 = 2;
-    const EXDEV: i64 = -18;
 
     // Filesystem A is the harness's mount; B is a SECOND, independent MemFs
     // mounted inside it. Two instances, so their superblocks differ — which is

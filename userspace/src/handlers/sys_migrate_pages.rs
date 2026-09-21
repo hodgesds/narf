@@ -39,7 +39,7 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
     // get_nodes() x2 — both node masks are read and validated before the
     // target task is looked up.
     if a.arg1 == 0 || a.arg1 > 64 || a.arg2 == 0 || a.arg3 == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut old_bytes = [0u8; 8];
@@ -49,7 +49,7 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
     // SAFETY: copy_from_user validates the new-nodemask word.
     let new_ok = unsafe { copy_from_user(&mut new_bytes, a.arg3) }.is_ok();
     if !old_ok || !new_ok {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let old_nodes = u64::from_ne_bytes(old_bytes);
@@ -72,7 +72,7 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
         || old_nodes & !online_mask != 0
         || new_nodes & !online_mask != 0
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -87,7 +87,7 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
             Some(outer) if outer == task || outer == visible_pid => {}
             // The pid did not resolve in the caller's namespace at all.
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
             // It resolved to some outer id: ESRCH only if no task answers to
@@ -101,8 +101,8 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
             Some(outer) => {
                 let live = pid_to_task_raw(outer).is_some()
                     || narf_scheduler::task_affinity(narf_scheduler::TaskId(outer)).is_some();
-                let errno: i64 = if live { 1 } else { 3 }; // EPERM : ESRCH
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                let errno: i64 = if live { EPERM } else { ESRCH };
+                ctx.set_return(errno_ret(errno));
                 return;
             }
         }
@@ -114,6 +114,6 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
     // SAFETY: the current task owns/uses this live address space.
     match unsafe { as_ref.migrate_pages_between(old_nodes, new_nodes) } {
         Ok(failed) => ctx.set_return(SyscallReturn::ok(failed as u64)),
-        Err(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+        Err(_) => ctx.set_return(errno_ret(EINVAL)),
     }
 }

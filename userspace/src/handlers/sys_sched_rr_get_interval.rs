@@ -28,15 +28,12 @@ use super::*;
 /// The destination is written only after the pid resolves, per the
 /// `if (retval == 0)` guard above.
 pub(crate) fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let args = *ctx.args();
     // `pid_t` is `int` — the argument is the low 32 bits, sign-extended.
     let pid = args.arg0 as i32;
     let buf = args.arg1;
     if pid < 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `find_process_by_pid(pid)` resolves in the CALLER's pid namespace;
@@ -44,7 +41,7 @@ pub(crate) fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
     let caller = current_task_id();
     if pid != 0 {
         let Some(outer) = accept_pid_from(caller, pid as u64) else {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         };
         let resolved = proc_pid_to_tid(outer);
@@ -52,7 +49,7 @@ pub(crate) fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
         // unregistered pid, so an existence check is what actually
         // implements `if (!p) return -ESRCH;`.
         if resolved != caller && crate::task::task_get(resolved).is_none() {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
     }
@@ -63,7 +60,7 @@ pub(crate) fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
     // SAFETY: copy_to_user range-validates `buf` (including the null case)
     // and SMAP-brackets the 16-byte write.
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

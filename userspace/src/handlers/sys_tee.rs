@@ -33,7 +33,7 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     if flags & !SPLICE_F_ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if len == 0 {
@@ -41,20 +41,20 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
         return;
     }
     let Some(input) = copy_fd_endpoint(task, fd_in) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     let Some(output) = copy_fd_endpoint(task, fd_out) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     if !input.readable() || !output.writable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     // tee(2) is defined only between two distinct pipes.
     if !input.is_pipe() || !output.is_pipe() {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Compare anonymous-pipe queues without touching their lazily-maintained
@@ -81,7 +81,7 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
         |(read, write)| read.shares_pipe_with(write),
     );
     if same_pipe {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -115,9 +115,9 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
             }
             Err(narf_filesystem::FsError::BrokenPipe) => {
                 raise_signal_pending(task, 13); // SIGPIPE
-                ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+                ctx.set_return(errno_ret(EPIPE));
             }
-            Err(error) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
+            Err(error) => ctx.set_return(errno_ret(copy_fs_errno(error))),
         }
         return;
     }
@@ -135,11 +135,11 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
             || input.nonblocking()
             || output.nonblocking();
         if nonblock {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
         if has_interrupting_signal(task) {
-            ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+            ctx.set_return(errno_ret(EINTR));
             return;
         }
         // Nothing has been consumed, so re-executing the whole tee is safe.
@@ -151,7 +151,7 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
             return;
         }
         // Kernel-test context cannot park; report the non-blocking answer.
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -162,7 +162,7 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
                 || input.nonblocking()
                 || output.nonblocking()
             {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
             if park_reexecute_on_fd(
@@ -172,14 +172,14 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
             ) {
                 return;
             }
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
         }
         Some(Err(narf_filesystem::FsError::BrokenPipe)) => {
             raise_signal_pending(task, 13); // SIGPIPE
-            ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+            ctx.set_return(errno_ret(EPIPE));
         }
-        Some(Err(error)) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+        Some(Err(error)) => ctx.set_return(errno_ret(copy_fs_errno(error))),
+        None => ctx.set_return(errno_ret(EIO)),
     }
 }
 
@@ -198,12 +198,12 @@ fn tee_wait(
     const SPLICE_F_NONBLOCK: u64 = 0x2;
     let source_empty = input.ops.poll_readiness() & narf_filesystem::POLL_IN == 0;
     if flags & SPLICE_F_NONBLOCK != 0 || input.nonblocking() || output.nonblocking() {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
     if source_empty && has_interrupting_signal(task) {
         // `ipipe_prep` returns -ERESTARTSYS from the source wait only.
-        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+        ctx.set_return(errno_ret(EINTR));
         return;
     }
     // Nothing has been consumed or published, so re-executing the whole tee is
@@ -223,5 +223,5 @@ fn tee_wait(
         return;
     }
     // Kernel-test context cannot park; report the non-blocking answer.
-    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+    ctx.set_return(errno_ret(EAGAIN));
 }

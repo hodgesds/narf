@@ -15,7 +15,7 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
     let ops = fd::with_table(task, |t| t.get(fd).map(|entry| entry.ops.clone())).flatten();
     let Some(ops) = ops else {
         // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     // `fs/sync.c::vfs_fsync_range` opens with
@@ -28,7 +28,7 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
         use narf_filesystem::FileType;
         let ty = ops.stat().mode.file_type;
         if ty == FileType::Fifo || ty == FileType::Socket {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
@@ -37,7 +37,7 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
     // writeback; commit those bytes before the filesystem's own fsync so
     // fsync retains its Linux data-before-metadata ordering.
     if crate::mapped_file::flush_current_file(&ops).is_err() {
-        ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // -EIO
+        ctx.set_return(errno_ret(EIO));
         return;
     }
     match poll_blocking(ops.fsync(data_only)) {
@@ -49,8 +49,8 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
         // handed (a log writer whose output is a pipe) treat EINVAL as
         // "nothing to flush" and EIO as data loss.
         Some(Err(narf_filesystem::FsError::Unsupported)) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)) // -EINVAL
+            ctx.set_return(errno_ret(EINVAL))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+        _ => ctx.set_return(errno_ret(EIO)),
     }
 }

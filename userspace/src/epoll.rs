@@ -14,6 +14,7 @@ use core::sync::atomic::Ordering;
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::errno::{to_ret, *};
 use crate::fd;
 use crate::handlers::current_task_id;
 use crate::syscall::{SyscallReturn, TrapContext};
@@ -1193,7 +1194,7 @@ fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
         //
         // LINUX-GAP: `ep_alloc` failing separately is -ENOMEM; NARF has no
         // distinct allocation-failure path here, so that half stands.
-        None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+        None => ctx.set_return(to_ret(EMFILE)),
     }
 }
 
@@ -1207,7 +1208,7 @@ fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
 pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0 as u32;
     if flags & !crate::fd::O_CLOEXEC != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(to_ret(EINVAL));
         return;
     }
     create_epoll(ctx, flags & crate::fd::O_CLOEXEC != 0);
@@ -1232,7 +1233,7 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
 pub fn sys_epoll_create(ctx: &mut dyn TrapContext) {
     let size = ctx.args().arg0 as i32;
     if size <= 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(to_ret(EINVAL));
         return;
     }
     create_epoll(ctx, false);
@@ -1244,26 +1245,19 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let op = args.arg1 as u32;
     let tfd = args.arg2 as i32;
     let ev_ptr = args.arg3 as *const u8;
-    const EBADF: SyscallReturn = SyscallReturn::ok((-9i64) as u64);
-    const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
-    const EEXIST: SyscallReturn = SyscallReturn::ok((-17i64) as u64);
-    const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
-    const EPERM: SyscallReturn = SyscallReturn::ok((-1i64) as u64);
-    const ENOENT: SyscallReturn = SyscallReturn::ok((-2i64) as u64);
-    const ELOOP: SyscallReturn = SyscallReturn::ok((-40i64) as u64);
     let task = current_task_id();
 
     // `SYSCALL_DEFINE4(epoll_ctl)` imports the event word before anything
     // else, so a faulting `event` outranks even a closed epfd.
     let event = if op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD {
         if ev_ptr.is_null() {
-            ctx.set_return(EFAULT);
+            ctx.set_return(to_ret(EFAULT));
             return;
         }
         match read_epoll_event(ev_ptr as u64) {
             Ok(v) => Some(v),
             Err(_) => {
-                ctx.set_return(EFAULT);
+                ctx.set_return(to_ret(EFAULT));
                 return;
             }
         }
@@ -1274,7 +1268,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let ops = match epoll_ops(task, epfd) {
         Some(o) => o,
         None => {
-            ctx.set_return(EBADF);
+            ctx.set_return(to_ret(EBADF));
             return;
         }
     };
@@ -1290,7 +1284,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let (target_ops, target_offset) = match target {
         Some(target) => target,
         None => {
-            ctx.set_return(EBADF);
+            ctx.set_return(to_ret(EBADF));
             return;
         }
     };
@@ -1307,7 +1301,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     // here and both must stay addable. It defaults to true, so only backends
     // that positively declare themselves unpollable are refused.
     if !target_ops.can_poll() {
-        ctx.set_return(EPERM);
+        ctx.set_return(to_ret(EPERM));
         return;
     }
     // Both "epfd names itself" and "epfd is not an epoll" are -EINVAL, and
@@ -1315,13 +1309,13 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     // is on the open file description (`fd_file(f) == fd_file(tf)`), not the
     // descriptor number, so a dup() of epfd is caught too.
     if Arc::ptr_eq(&ops, &target_ops) {
-        ctx.set_return(EINVAL);
+        ctx.set_return(to_ret(EINVAL));
         return;
     }
     let instance = match as_epoll(&ops) {
         Some(i) => i,
         None => {
-            ctx.set_return(EINVAL);
+            ctx.set_return(to_ret(EINVAL));
             return;
         }
     };
@@ -1336,14 +1330,14 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             // EP_MAX_NESTS.
             if let Some(target) = as_epoll(&target_ops) {
                 if core::ptr::eq(target, instance) || epoll_reaches(task, target, instance, 1) {
-                    ctx.set_return(ELOOP);
+                    ctx.set_return(to_ret(ELOOP));
                     return;
                 }
             }
             if instance.ctl_add(tfd, &target_ops, target_offset, events, data, &ops) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(EEXIST);
+                ctx.set_return(to_ret(EEXIST));
             }
         }
         EPOLL_CTL_MOD => {
@@ -1351,17 +1345,17 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             if instance.ctl_mod(tfd, &target_ops, events, data, &ops) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(ENOENT);
+                ctx.set_return(to_ret(ENOENT));
             }
         }
         EPOLL_CTL_DEL => {
             if instance.ctl_del(tfd, &target_ops, task) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(ENOENT);
+                ctx.set_return(to_ret(ENOENT));
             }
         }
-        _ => ctx.set_return(EINVAL),
+        _ => ctx.set_return(to_ret(EINVAL)),
     }
 }
 
@@ -1420,7 +1414,7 @@ pub fn sys_epoll_pwait2(ctx: &mut dyn TrapContext) {
             Err(_) => {
                 // `SYSCALL_DEFINE6(epoll_pwait2)`:
                 // `if (get_timespec64(&ts, timeout)) return -EFAULT;`
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(to_ret(EFAULT));
                 return;
             }
         }
@@ -1452,9 +1446,6 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     let timeout_ms = timeout_override.unwrap_or(args.arg3 as i32);
     let sigmask_ptr = args.arg4;
     let sigsetsize = args.arg5;
-    const EBADF: SyscallReturn = SyscallReturn::ok((-9i64) as u64);
-    const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
-    const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
     // `fs/eventpoll.c`: `EP_MAX_EVENTS = INT_MAX / sizeof(struct epoll_event)`.
     const EP_MAX_EVENTS: i64 = i32::MAX as i64 / EPOLL_EVENT_SIZE as i64;
     let task = current_task_id();
@@ -1473,7 +1464,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     let mut old_mask = None;
     if is_pwait && sigmask_ptr != 0 {
         if sigsetsize != 8 {
-            ctx.set_return(EINVAL);
+            ctx.set_return(to_ret(EINVAL));
             return;
         }
         let mut buf = [0u8; 8];
@@ -1483,7 +1474,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
             let mask = u64::from_ne_bytes(buf); // user sigset_t == NARF N-1 layout
             old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
         } else {
-            ctx.set_return(EFAULT);
+            ctx.set_return(to_ret(EFAULT));
             return;
         }
     }
@@ -1515,28 +1506,28 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
         Some(o) => o,
         None => {
             restore(task, old_mask);
-            ctx.set_return(EBADF);
+            ctx.set_return(to_ret(EBADF));
             return;
         }
     };
     // `maxevents` is an `int`; the register's upper half is not part of it.
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         restore(task, old_mask);
-        ctx.set_return(EINVAL);
+        ctx.set_return(to_ret(EINVAL));
         return;
     }
     // access_ok over the WHOLE output array, before any of it is written.
     let span = (maxevents as usize).saturating_mul(EPOLL_EVENT_SIZE);
     if crate::handlers::validate_user_range(events_ptr as u64, span).is_err() {
         restore(task, old_mask);
-        ctx.set_return(EFAULT);
+        ctx.set_return(to_ret(EFAULT));
         return;
     }
     let instance = match as_epoll(&ops) {
         Some(i) => i,
         None => {
             restore(task, old_mask);
-            ctx.set_return(EINVAL); // not an epoll fd
+            ctx.set_return(to_ret(EINVAL)); // not an epoll fd
             return;
         }
     };
@@ -1635,7 +1626,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                     restore(task, old_mask);
                     // The array was access_ok'd above; a fault here is a
                     // racing unmap, and `ep_send_events` reports it as -EFAULT.
-                    ctx.set_return(EFAULT);
+                    ctx.set_return(to_ret(EFAULT));
                     return;
                 }
             }
@@ -1690,7 +1681,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                                 if let Some(old) = old_mask {
                                     crate::handlers::set_signal_mask_for_task(task, old);
                                 }
-                                ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                                ctx.set_return(to_ret(EINTR));
                                 // SAFETY: `uctx_ptr` is the in-flight task's
                                 // `UserTaskCtx` from `CURRENT`, live for this trap;
                                 // `sleep_deadline_ns` is an atomic field, so the

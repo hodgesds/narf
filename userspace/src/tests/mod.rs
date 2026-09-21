@@ -2,6 +2,10 @@
 
 pub(crate) use alloc::sync::Arc;
 
+#[allow(unused_imports)]
+pub(crate) use crate::errno::to_ret as errno_ret;
+#[allow(unused_imports)]
+pub(crate) use crate::errno::*;
 pub(crate) use narf_kernel_test::{kernel_test_in, TestResult};
 pub(crate) use narf_lib::sync::IrqSafeSpinLock;
 pub(crate) use narf_memory::AddressSpace;

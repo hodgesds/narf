@@ -17,14 +17,14 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     let (vaddr, slice_len) = match crate::socket::registered_buffer_slice(task, buf_id, off, len) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
     let sock = match current_socket_result(fd) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -37,7 +37,7 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     let mut kbuf = alloc::vec![0u8; n_bytes];
     // SAFETY: vaddr is a pinned user VA from a registered buffer.
     if unsafe { copy_from_user(&mut kbuf, vaddr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     match sock.dispatch_op(crate::socket::SocketOp::Send {
@@ -51,6 +51,6 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (no other variant expected for Send)
+        _ => ctx.set_return(errno_ret(EINVAL)), // no other variant expected for Send
     }
 }

@@ -7,8 +7,6 @@ pub(crate) fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
     const ARCH_GET_GS: u64 = 0x1004;
-    const EINVAL: i64 = 22;
-    const EFAULT: i64 = 14;
 
     let args = *ctx.args();
     let code = args.arg0;

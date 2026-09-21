@@ -11,7 +11,7 @@ pub(crate) fn sys_close_range(ctx: &mut dyn TrapContext) {
     const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
     const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
     if first > last || flags & !(CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;

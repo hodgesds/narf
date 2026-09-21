@@ -32,7 +32,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         | __WCLONE
         | __WALL;
     if options & !VALID_WAIT_OPTIONS != 0 || options & (WUNTRACED | WEXITED | WCONTINUED) == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -50,8 +50,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         P_PID => match accept_pid_from(current_task_id(), id as u64) {
             Some(o) => o as i64,
             None => {
-                const ECHILD: i64 = 10;
-                ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+                ctx.set_return(errno_ret(ECHILD));
                 return;
             }
         },
@@ -66,7 +65,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
                 pgid_from_user(id as u64)
             };
             if want_pgid == 0 {
-                ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
+                ctx.set_return(errno_ret(ECHILD));
                 return;
             }
             -1
@@ -93,13 +92,13 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
                 Some(p) => p as i64,
                 // Bad fd, or an fd that isn't a pidfd: EBADF (Linux).
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+                    ctx.set_return(errno_ret(EBADF));
                     return;
                 }
             }
         }
         _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -176,8 +175,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // unbounded, and invisible to the park-check heuristic because that path
     // does not tick `dbg_park_checks` either.
     if !has_living_child(parent, want_pid, want_pgid, options) {
-        const ECHILD: i64 = 10;
-        ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+        ctx.set_return(errno_ret(ECHILD));
         return;
     }
 
@@ -231,5 +229,5 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // A blocking waitid with no task context cannot safely park. It must not
     // masquerade as a successful reap: Linux reports ECHILD when there is no
     // eligible child, while a successful waitid must fill siginfo_t.
-    ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
+    ctx.set_return(errno_ret(ECHILD));
 }

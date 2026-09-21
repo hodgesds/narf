@@ -36,13 +36,13 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     let raw = match copy_user_cstr_checked(args.arg0, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     // No LOOKUP_EMPTY here either — `getname()` rejects "" with -ENOENT.
     if raw.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();
@@ -58,7 +58,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
         .resolve_absolute(&resolved, |_fs, _rel| true)
         .unwrap_or(false);
     if !covered {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     // LOOKUP_DIRECTORY: a target that resolves to a file, device or fifo is
@@ -67,7 +67,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // below.)
     match stat_ino_path_dir_aware_ext(&resolved, true) {
         Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => {
-            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+            ctx.set_return(errno_ret(ENOTDIR));
             return;
         }
         Some(_) => {}
@@ -84,7 +84,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
             // `path_lookup_errno` classifies the failure the way
             // `link_path_walk` does, so the caller learns whether the name is
             // missing, is not a directory, cannot be searched, or loops.
-            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(&resolved)) as u64));
+            ctx.set_return(errno_ret(path_lookup_errno(&resolved)));
             return;
         }
     }
@@ -101,7 +101,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // directory it cannot search gets -EACCES rather than -EPERM — it
     // learns which of the two problems it has.
     if !dir_search_permitted(&resolved, task) {
-        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        ctx.set_return(errno_ret(EACCES));
         return;
     }
     // `fs/open.c::SYSCALL_DEFINE1(chroot)`:
@@ -110,7 +110,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // chroot inside it. `capable()` here would ask the host question and
     // refuse every containerised caller.
     if !capable_in_own_ns(CAP_SYS_CHROOT) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     set_root_dir(task, resolved);

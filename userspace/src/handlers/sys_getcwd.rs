@@ -47,7 +47,7 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // succeeds. That is a smaller divergence than answering a valid path for
     // a directory that no longer exists.
     if stat_ino_path_dir_aware_ext(&cwd, true).is_none() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     // The kernel's `len`: the path plus its NUL terminator. This is both the
@@ -67,18 +67,18 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // an unbounded retry loop, not a wrong errno.
     const PATH_MAX: usize = 4096;
     if needed > PATH_MAX {
-        ctx.set_return(SyscallReturn::ok((-36i64) as u64)); // -ENAMETOOLONG
+        ctx.set_return(errno_ret(ENAMETOOLONG));
         return;
     }
     if needed > len {
         // Buffer too small for the path + NUL → ERANGE, ahead of any check
         // on `buf` itself (Linux never touches the buffer on this path).
-        ctx.set_return(SyscallReturn::ok((-34i64) as u64)); // -ERANGE
+        ctx.set_return(errno_ret(ERANGE));
         return;
     }
     if buf.is_null() {
         // A NULL destination that WAS big enough is the copy_to_user arm.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Build NUL-terminated cwd in kernel memory, then copy_to_user.
@@ -90,7 +90,7 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf as u64, &kbuf) }.is_err() {
         // Faulting destination buffer → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(needed as u64));

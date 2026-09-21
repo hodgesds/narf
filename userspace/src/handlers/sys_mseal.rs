@@ -97,17 +97,17 @@ pub(crate) fn sys_mseal(ctx: &mut dyn TrapContext) {
     // `flags` is reserved and must be zero — the check comes first, before
     // the address is even looked at.
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if start & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let len = len_in.wrapping_add(0xFFF) & !0xFFF;
     // "Check to see whether len was rounded up from small -ve to zero."
     if len_in != 0 && len == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if len == 0 {
@@ -116,7 +116,7 @@ pub(crate) fn sys_mseal(ctx: &mut dyn TrapContext) {
         return;
     }
     let Some(end) = start.checked_add(len) else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // range overflow
+        ctx.set_return(errno_ret(EINVAL)); // range overflow
         return;
     };
     let as_ref = match current_address_space() {
@@ -131,7 +131,7 @@ pub(crate) fn sys_mseal(ctx: &mut dyn TrapContext) {
     // recorded, so a partially-valid request seals nothing rather than
     // leaving the caller with half a seal it cannot inspect or undo.
     if !as_ref.range_fully_mapped(narf_memory::VirtAddr::new(start), len) {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     add_sealed(as_ref.identity(), start, end);

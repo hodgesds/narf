@@ -37,11 +37,11 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
         // ENOTDIR, same as Linux fchdir on a non-directory fd.
         Some(p) if p.starts_with('/') => p,
         Some(_) => {
-            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+            ctx.set_return(errno_ret(ENOTDIR));
             return;
         }
         None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -53,7 +53,7 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
         // The descriptor exists but its path does not name a directory —
         // `d_can_lookup()` failing, i.e. -ENOTDIR (never -ENOENT: the fd
         // pinned the object, so it cannot have gone missing).
-        ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+        ctx.set_return(errno_ret(ENOTDIR));
         return;
     }
     // `error = file_permission(fd_file(f), MAY_EXEC | MAY_CHDIR);` — the
@@ -62,7 +62,7 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
     // permissions can have changed since the open, and Linux re-checks
     // here rather than trusting the fd.
     if !dir_search_permitted(&abs, task) {
-        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        ctx.set_return(errno_ret(EACCES));
         return;
     }
     task_map_set(&CWD_TABLE, task, user_abs);

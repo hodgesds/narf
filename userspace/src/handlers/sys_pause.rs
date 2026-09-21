@@ -21,7 +21,7 @@ pub(crate) fn sys_pause(ctx: &mut dyn TrapContext) {
             // Bake EINTR into the saved frame so that when the poll loop
             // breaks the park on a pending signal and re-enters user mode,
             // pause(2) returns -EINTR; the next pause re-issue delivers it.
-            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+            ctx.set_return(errno_ret(EINTR));
             uc.sleep_deadline_ns
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -51,5 +51,5 @@ pub(crate) fn sys_pause(ctx: &mut dyn TrapContext) {
     if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
         return;
     }
-    ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+    ctx.set_return(errno_ret(EINTR));
 }

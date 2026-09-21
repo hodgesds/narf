@@ -5,16 +5,16 @@ pub(crate) fn sys_access(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let mode = args.arg1 as u32;
     if mode & !7 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let raw = match copy_user_cstr_checked(args.arg0, 4096) {
-            Ok(path) => path,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     let path = resolve_cwd_path(current_task_id(), &raw);
     access_path(ctx, &path, mode);
 }
@@ -32,20 +32,20 @@ fn faccessat_common(ctx: &mut dyn TrapContext, flags: u64) {
     let args = *ctx.args();
     let mode = args.arg2 as u32;
     if mode & !7 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     const AT_EACCESS: u64 = 0x200;
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const AT_EMPTY_PATH: u64 = 0x1000;
     if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let raw = match copy_user_cstr_checked(args.arg1, 4096) {
         Ok(path) => path,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -62,7 +62,7 @@ fn faccessat_common(ctx: &mut dyn TrapContext, flags: u64) {
     // kills every sandboxed service 203/EXIT_EXEC.
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
         if dirfd >= 0 {
@@ -71,7 +71,7 @@ fn faccessat_common(ctx: &mut dyn TrapContext, flags: u64) {
             ctx.set_return(if valid {
                 SyscallReturn::ok(0)
             } else {
-                SyscallReturn::ok((-9i64) as u64) // -EBADF
+                errno_ret(EBADF)
             });
             return;
         } else if dirfd == -100 {
@@ -79,7 +79,7 @@ fn faccessat_common(ctx: &mut dyn TrapContext, flags: u64) {
             access_path(ctx, &path, mode);
             return;
         } else {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     }
@@ -107,7 +107,7 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
         match poll_blocking(file.access(mode)) {
             Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
             Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
-                ctx.set_return(SyscallReturn::ok((-13i64) as u64))
+                ctx.set_return(errno_ret(EACCES))
             }
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
                 let st = file.stat();
@@ -128,11 +128,11 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
                     // error and `generic_permission` passes anything that
                     // is not -EACCES straight out to the caller.
                     Some(Err(narf_filesystem::FsError::Unsupported)) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                     Some(Err(_)) => {
-                        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     // `poll_blocking` gave up — the park failed or the
@@ -151,7 +151,7 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
                     acl.as_ref(),
                 );
             }
-            _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+            _ => ctx.set_return(errno_ret(EIO)),
         }
         return;
     }
@@ -168,7 +168,7 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
         // consumers in `filesystem/src/posix_acl.rs`.
         set_access_result(ctx, mode, dir.dir_mode(), uid, gid, true, None);
     } else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+        ctx.set_return(errno_ret(ENOENT));
     }
 }
 
@@ -200,7 +200,7 @@ fn set_access_result(
         request,
         acl,
     );
-    ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));
+    ctx.set_return(if allowed { SyscallReturn::ok(0) } else { errno_ret(EACCES) });
 }
 
 pub(crate) fn sys_chown(ctx: &mut dyn TrapContext) {
@@ -221,13 +221,13 @@ fn chown_legacy(ctx: &mut dyn TrapContext, flags: u64) {
     // Forward legacy chown(path, uid, gid) to the fchownat ABI.
     let path_uptr = args.arg0;
     let _path_str = match copy_user_cstr_checked(path_uptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,

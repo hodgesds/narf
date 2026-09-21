@@ -24,6 +24,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::errno::*;
+
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Serializes allocation/release across a nested PID-namespace chain so a
@@ -170,26 +172,21 @@ impl PidNamespace {
     }
 
     fn bind_outer_locked(&self, outer: u64, requested: Option<u64>) -> Result<u64, u64> {
-        const EAGAIN: u64 = 11;
-        const ENOMEM: u64 = 12;
-        const EEXIST: u64 = 17;
-        const EINVAL: u64 = 22;
-
         if outer == 0 {
-            return Err(EINVAL);
+            return Err(EINVAL as u64);
         }
         // The initial namespace has nothing to bind: a task's id there IS
         // its outer id. Recording one would be a second, redundant copy of
         // the identity map that could then drift from it.
         if self.identity {
             return match requested {
-                Some(want) if want != outer => Err(EEXIST),
+                Some(want) if want != outer => Err(EEXIST as u64),
                 _ => Ok(outer),
             };
         }
         if let Some(&inner) = self.outer_to_inner.lock().get(&outer) {
             return match requested {
-                Some(want) if want != inner => Err(EEXIST),
+                Some(want) if want != inner => Err(EEXIST as u64),
                 _ => Ok(inner),
             };
         }
@@ -197,21 +194,21 @@ impl PidNamespace {
         let watermark = self.watermark.load(Ordering::Relaxed);
         let init_alive = self.inner_to_outer.lock().contains_key(&1);
         if watermark > 1 && !init_alive {
-            return Err(ENOMEM);
+            return Err(ENOMEM as u64);
         }
 
         let inner = match requested {
             Some(want) => {
                 if want == 0 || want > crate::PID_MAX {
-                    return Err(EINVAL);
+                    return Err(EINVAL as u64);
                 }
                 if want != 1 && !init_alive {
-                    return Err(EINVAL);
+                    return Err(EINVAL as u64);
                 }
                 let mut free = self.free.lock();
                 if want < watermark {
                     if !free.remove(&want) {
-                        return Err(EEXIST);
+                        return Err(EEXIST as u64);
                     }
                 } else {
                     for skipped in watermark..want {
@@ -228,7 +225,7 @@ impl PidNamespace {
                     candidate
                 } else {
                     if watermark == 0 || watermark > crate::PID_MAX {
-                        return Err(EAGAIN);
+                        return Err(EAGAIN as u64);
                     }
                     self.watermark.store(watermark + 1, Ordering::Relaxed);
                     watermark
@@ -236,7 +233,7 @@ impl PidNamespace {
             }
         };
         if self.inner_to_outer.lock().contains_key(&inner) {
-            return Err(EEXIST);
+            return Err(EEXIST as u64);
         }
         self.inner_to_outer.lock().insert(inner, outer);
         self.outer_to_inner.lock().insert(outer, inner);
@@ -529,7 +526,7 @@ pub fn clone_pid_levels(parent_task: u64, new_pid: bool) -> Result<usize, u64> {
     let base = ns_for_children(parent_task);
     let base_level = base.as_ref().map_or(0, |ns| ns.level());
     if new_pid && base_level >= 32 {
-        return Err(28); // ENOSPC, matching create_pid_namespace().
+        return Err(ENOSPC as u64); // ENOSPC, matching create_pid_namespace().
     }
     Ok(base_level + usize::from(new_pid) + 1)
 }
@@ -543,14 +540,11 @@ pub fn prepare_clone(
     new_pid: bool,
     new_pid_owner: Option<Arc<crate::namespaces::UserNamespace>>,
 ) -> Result<PreparedPidClone, u64> {
-    const EAGAIN: u64 = 11;
-    const EINVAL: u64 = 22;
-
     let base = ns_for_children(parent_task);
     let active = if new_pid {
         let base_level = base.as_ref().map_or(0, |ns| ns.level());
         if base_level >= 32 {
-            return Err(28); // ENOSPC
+            return Err(ENOSPC as u64);
         }
         Some(PidNamespace::new_child(base, new_pid_owner))
     } else {
@@ -558,13 +552,13 @@ pub fn prepare_clone(
     };
     let chain = PidNamespace::chain_from(active.clone());
     if requested.len() > chain.len() + 1 {
-        return Err(EINVAL);
+        return Err(EINVAL as u64);
     }
     if requested
         .iter()
         .any(|&tid| tid <= 0 || tid as u64 > crate::PID_MAX)
     {
-        return Err(EINVAL);
+        return Err(EINVAL as u64);
     }
 
     // Linux's checkpoint_restore_ns_capable() is evaluated separately for
@@ -584,7 +578,7 @@ pub fn prepare_clone(
             &owner,
             crate::handlers::CAP_SYS_ADMIN,
         ) {
-            return Err(1); // EPERM
+            return Err(EPERM as u64);
         }
     }
 
@@ -594,7 +588,7 @@ pub fn prepare_clone(
         None => {
             let pid = crate::alloc_pid().raw();
             if pid == 0 {
-                return Err(EAGAIN);
+                return Err(EAGAIN as u64);
             }
             pid
         }
@@ -691,7 +685,7 @@ pub fn fork_return_to_parent(parent_task: u64, child_outer: u64, child_self_inne
 pub fn unshare_pid_ns_for_children(task: u64) -> Result<Arc<PidNamespace>, u64> {
     let parent = ns_for_children(task);
     if parent.as_ref().is_some_and(|ns| ns.level() >= 32) {
-        return Err(28); // ENOSPC, create_pid_namespace(MAX_PID_NS_LEVEL)
+        return Err(ENOSPC as u64); // ENOSPC, create_pid_namespace(MAX_PID_NS_LEVEL)
     }
     let ns = PidNamespace::new_child(parent, Some(crate::namespaces::current_user_ns(task)));
     let mut g = TASK_PID_NS_FOR_CHILDREN.lock();
@@ -907,7 +901,7 @@ mod tests {
                 }
             }
         }
-        if !matches!(unshare_pid_ns_for_children(TASK), Err(28)) {
+        if !matches!(unshare_pid_ns_for_children(TASK), Err(e) if e == ENOSPC as u64) {
             return TestResult::Fail("PID namespace nesting beyond level 32 did not return ENOSPC");
         }
 

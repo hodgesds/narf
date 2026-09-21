@@ -45,9 +45,6 @@ use super::*;
 /// pid that does not exist, and never learn either happened. Every arm
 /// below except EACCES is now enforced.
 pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EPERM: i64 = 1;
-    const EINVAL: i64 = 22;
     let args = *ctx.args();
     // `pid_t` is `int`: the arguments are the low 32 bits, sign-extended.
     // Reading the full register let a negative pgid arrive as a huge
@@ -67,12 +64,12 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
     // `if (pgid < 0) return -EINVAL;` — note this fires for a negative pgid
     // even when `pid` also names no task.
     if pgid_arg < 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // A negative `pid` can never resolve; find_task_by_vpid gives -ESRCH.
     if pid_arg < 0 {
-        ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
 
@@ -89,7 +86,7 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
     let target_exists =
         target != 0 && (target == me || crate::task::task_get(target).is_some());
     if !target_exists {
-        ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
 
@@ -97,7 +94,7 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
     // be moved between process groups. NARF marks a thread by mapping its
     // TaskId onto a DIFFERENT process key; a group leader is its own key.
     if process_state_key(target) != target {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -116,12 +113,12 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
             // that is neither the caller nor its child is reported as
             // NON-EXISTENT rather than forbidden, so an unrelated process
             // cannot be probed for existence through setpgid.
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
         // `if (task_session(p) != task_session(group_leader)) return -EPERM;`
         if read_sid(target) != caller_session {
-            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         // LINUX-GAP: the `-EACCES` arm (`!(p->flags & PF_FORKNOEXEC)` — the
@@ -133,7 +130,7 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
     // `err = -EPERM; if (p->signal->leader) goto out;` — a session leader's
     // process group is its session and cannot be changed.
     if is_session_leader(target) {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -157,7 +154,7 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
         match session_of_pgrp(group) {
             Some(session) if session == caller_session => group,
             _ => {
-                ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
         }
@@ -168,7 +165,7 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
         // PGID_TABLE is boot-initialised; an absent table is a kernel bug,
         // not a caller error. Linux has no such state, so there is no errno
         // to mirror — ESRCH is the closest ("no such process to record").
-        ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
     m.insert(target, value);

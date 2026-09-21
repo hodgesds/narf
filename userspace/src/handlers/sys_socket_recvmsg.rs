@@ -12,12 +12,12 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
     let sock = match current_socket_result(fd) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if msg_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // read_user_u64/u32 use SMAP bracket internally.
@@ -33,7 +33,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         total_cap = total_cap.saturating_add(read_user_u64(base + 8) as usize);
     }
     if total_cap > MAX_USER_COPY {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut staging = alloc::vec![0u8; total_cap];
@@ -166,6 +166,6 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
+        _ => ctx.set_return(errno_ret(EINVAL)), // unreachable
     }
 }

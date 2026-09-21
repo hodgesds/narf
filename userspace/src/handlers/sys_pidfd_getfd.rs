@@ -10,7 +10,7 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
     let pidfd = a.arg0 as u32;
     let targetfd = a.arg1 as u32;
     if a.arg2 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -21,7 +21,7 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
     {
         Some(p) => p,
         None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF (not a pidfd)
+            ctx.set_return(errno_ret(EBADF)); // EBADF (not a pidfd)
             return;
         }
     };
@@ -31,20 +31,20 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
         match pid_to_task_raw(target_pid) {
             Some(t) => t,
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
         }
     };
     if !ptrace_may_access(task, target_tid) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let entry = fd::with_table(target_tid, |t| t.get(targetfd).cloned()).flatten();
     let mut entry = match entry {
         Some(e) => e,
         None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -57,7 +57,7 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
             // `kernel/pid.c::SYSCALL_DEFINE3(pidfd_getfd)` ends in
             // `get_unused_fd_flags`, so a full table is -EMFILE. -EBADF here
             // would blame the caller's descriptor arguments, which were fine.
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
         }
     }
 }

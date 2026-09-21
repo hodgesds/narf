@@ -9,8 +9,6 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     // Linux errno: bad fd → -EBADF; bad whence / negative or overflowing
     // result → -EINVAL (was a blanket InvalidOp).
-    let ebadf = SyscallReturn::ok((-9i64) as u64);
-    let einval = SyscallReturn::ok((-22i64) as u64);
     let resolved = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         Some((entry.ops.clone(), t.description(fd)?))
@@ -18,14 +16,14 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     let (ops, description) = match resolved {
         Some(Some(v)) => v,
         _ => {
-            ctx.set_return(ebadf);
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
     let _position_guard = match poll_blocking(description.position_lock.lock()) {
         Some(guard) => guard,
         None => {
-            ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+            ctx.set_return(errno_ret(EIO));
             return;
         }
     };
@@ -40,7 +38,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
         use narf_filesystem::FileType;
         let ty = ops.stat().mode.file_type;
         if ty == FileType::Fifo || ty == FileType::Socket {
-            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            ctx.set_return(errno_ret(ESPIPE));
             return;
         }
     }
@@ -62,7 +60,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
         // more data" — the loop-termination condition of a sparse copy.
         let eof = ops.stat().size;
         if (offset as u64) >= eof {
-            ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+            ctx.set_return(errno_ret(ENXIO));
             return;
         }
         match poll_blocking(ops.seek(offset as u64, whence as u32)) {
@@ -76,7 +74,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
             // A filesystem that DOES map extents and found no such
             // data/hole at or after `offset` is reporting end-of-data.
             Some(Err(_)) => {
-                ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                ctx.set_return(errno_ret(ENXIO));
                 return;
             }
         }
@@ -93,14 +91,14 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
             SEEK_CUR => current as i64,
             SEEK_END => ops.stat().size as i64,
             _ => {
-                ctx.set_return(einval);
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         };
         let new_off = match base.checked_add(offset) {
             Some(v) if v >= 0 => v,
             _ => {
-                ctx.set_return(einval);
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         };

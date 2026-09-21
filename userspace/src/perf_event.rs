@@ -1,3 +1,5 @@
+use crate::errno::to_ret as errno_ret;
+use crate::errno::*;
 use crate::fd::{self, FdEntry};
 use crate::handlers::{copy_from_user, copy_to_user, current_task_id};
 use crate::syscall::{SyscallReturn, TrapContext};
@@ -3694,18 +3696,18 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // Reject unknown flags per Linux
     // PERF_FLAG_FD_NO_GROUP = 1, PERF_FLAG_FD_OUTPUT = 2, PERF_FLAG_PID_CGROUP = 4, PERF_FLAG_FD_CLOEXEC = 8
     if (flags & !15) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Redirected output and cgroup attachment require the mmap/sampling and
     // cgroup implementations. Do not silently create a differently scoped event.
     if flags & (2 | 4) != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
 
     if attr_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
 
@@ -3722,7 +3724,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // `copy_from_user` validates the user range and SMAP-brackets the read, so a bad
     // user address yields Err rather than faulting the kernel.
     if unsafe { copy_from_user(size_slice, attr_ptr + 4) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
 
@@ -3731,7 +3733,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
 
     if !(PERF_ATTR_SIZE_VER0..=4096).contains(&size) {
-        ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // E2BIG
+        ctx.set_return(errno_ret(E2BIG));
         return;
     }
 
@@ -3753,7 +3755,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // (`to_read <= size_of::<PerfEventAttr>()`); `attr_ptr` is the non-null user
     // pointer. `copy_from_user` validates the user range and SMAP-brackets the read.
     if unsafe { copy_from_user(&mut attr_bytes[..to_read], attr_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
 
@@ -3766,23 +3768,23 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             // `attr_ptr + i` stays within the user-declared `size` window (i < size).
             // `copy_from_user` validates the user range and SMAP-brackets the read.
             if unsafe { copy_from_user(extra_slice, attr_ptr + i as u64) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             if extra_byte != 0 {
-                ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // E2BIG
+                ctx.set_return(errno_ret(E2BIG));
                 return;
             }
         }
     }
 
     if attr.__reserved_2 != 0 || attr.__reserved_3 != 0 || attr.config3 != 0 || attr.config4 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     if attr.read_format & !PERF_FORMAT_SUPPORTED != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -3792,44 +3794,44 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // compatibility.
     let unsupported_attr_flags = attr.flags & !PERF_ATTR_IMPLEMENTED;
     if unsupported_attr_flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
 
     if attr.sample_period_or_freq != 0
         && (attr.sample_type == 0 || attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0)
     {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if attr.flags & PERF_ATTR_FLAG_FREQ != 0
         && (attr.sample_period_or_freq == 0 || attr.sample_period_or_freq > 1_000_000)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if attr.flags & PERF_ATTR_FLAG_SAMPLE_ID_ALL != 0
         && attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0
     {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0
         && attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER != 0
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if attr.flags & PERF_ATTR_FLAG_SIGTRAP != 0
         && (pid == -1 || attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC == 0)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0
         && attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -3839,13 +3841,13 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     if attr.sample_type & PERF_SAMPLE_REGS_USER != 0
         && attr.sample_regs_user & !supported_user_regs != 0
     {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if attr.sample_type & PERF_SAMPLE_STACK_USER != 0
         && attr.sample_stack_user as usize > PERF_MAX_USER_STACK_SAMPLE
     {
-        ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // E2BIG
+        ctx.set_return(errno_ret(E2BIG));
         return;
     }
     // Linux overlays these two fields in a union; requesting both is
@@ -3853,12 +3855,12 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     if attr.sample_type & PERF_SAMPLE_WEIGHT != 0
         && attr.sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     if !is_supported_event(&attr) {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if attr.type_ == PERF_TYPE_TRACEPOINT {
@@ -3879,7 +3881,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         match crate::handlers::accept_pid_from(task, pid as u64) {
             Some(outer) => outer,
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
         }
@@ -3893,7 +3895,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             Some(target) => target,
             None if target_outer == task => task,
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
         }
@@ -3910,35 +3912,35 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     };
 
     if cpu != -1 && (cpu < 0 || !narf_lib::smp::is_online(cpu as u32)) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if pid == -1 && cpu == -1 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let group_leader = if group_fd != -1 {
         let leader =
             fd::with_table(task, |t| t.get(group_fd as u32).map(|e| Arc::clone(&e.ops))).flatten();
         let Some(leader) = leader else {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         let Some(leader_event) = leader
             .as_any()
             .and_then(|any| any.downcast_ref::<PerfEventFile>())
         else {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         if leader_event.target_task != target_task || leader_event.target_cpu != cpu {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         // Linux permits these scheduling constraints only on the leader; the
         // complete group inherits them and is scheduled atomically.
         if attr.flags & (PERF_ATTR_FLAG_PINNED | PERF_ATTR_FLAG_EXCLUSIVE) != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         Some(leader)
@@ -3971,7 +3973,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     || event.attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
             });
         if conflict {
-            ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+            ctx.set_return(errno_ret(EBUSY));
             return;
         }
     }
@@ -4040,11 +4042,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 } {
                     Ok(counter) => counter,
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
-                        ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+                        ctx.set_return(errno_ret(EBUSY));
                         return;
                     }
                     Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                 };
@@ -4055,11 +4057,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 match allocate_pmu_on(cpu as usize, event, count_kernel, count_user) {
                     Ok(counter) => (Some(event), Some(counter)),
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
-                        ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+                        ctx.set_return(errno_ret(EBUSY));
                         return;
                     }
                     Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                 }
@@ -4067,7 +4069,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         } else if matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
             (None, None)
         } else {
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+            ctx.set_return(errno_ret(EOPNOTSUPP));
             return;
         }
     };
@@ -4079,11 +4081,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             let probe = match unsafe { event.allocate(count_kernel, count_user) } {
                 Ok(counter) => counter,
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
-                    ctx.set_return(SyscallReturn::ok((-16i64) as u64));
+                    ctx.set_return(errno_ret(EBUSY));
                     return;
                 }
                 Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                    ctx.set_return(errno_ret(EOPNOTSUPP));
                     return;
                 }
             };
@@ -4095,11 +4097,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             match unsafe { event.allocate(count_kernel, count_user) } {
                 Ok(counter) => (Some(event), Some(counter)),
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
-                    ctx.set_return(SyscallReturn::ok((-16i64) as u64));
+                    ctx.set_return(errno_ret(EBUSY));
                     return;
                 }
                 Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                    ctx.set_return(errno_ret(EOPNOTSUPP));
                     return;
                 }
             }
@@ -4107,7 +4109,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     } else if matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
         (None, None)
     } else {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     };
 
@@ -4130,7 +4132,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 if let Some(counter) = pmu_counter {
                     release_pmu_on(counter);
                 }
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             let validation_counter;
@@ -4149,7 +4151,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 } {
                     Ok(counter) => counter,
                     Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                 };
@@ -4158,7 +4160,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             let armed = arm_pmu_on(*counter, period);
             if armed.is_err() {
                 release_pmu_on(*counter);
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             let _ = pause_pmu_on(*counter);
@@ -4171,7 +4173,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         {
             attr.sample_period_or_freq
         } else {
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+            ctx.set_return(errno_ret(EOPNOTSUPP));
             return;
         }
     } else {
@@ -4188,7 +4190,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     // SAFETY: open still exclusively owns this current-CPU allocation.
                     let _ = unsafe { counter.release() };
                 }
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             let validation;
@@ -4200,7 +4202,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 {
                     Ok(counter) => counter,
                     Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                 };
@@ -4226,7 +4228,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     // SAFETY: validation counter remains live and current-CPU-owned.
                     let _ = unsafe { (*counter).release() };
                 }
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             // SAFETY: the live current-CPU counter remains owned by this open path.
@@ -4340,7 +4342,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         if let Some(counter) = pmu_counter {
             release_pmu_on(counter);
         }
-        ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // EMFILE
+        ctx.set_return(errno_ret(EMFILE));
     }
 }
 

@@ -27,7 +27,7 @@ pub(crate) fn sys_reboot(ctx: &mut dyn TrapContext) {
     let magic1 = a.arg0 as u32 as u64;
     let magic2 = a.arg1 as u32 as u64;
     if magic1 != LINUX_REBOOT_MAGIC1 || !matches!(magic2, MAGIC2 | MAGIC2A | MAGIC2B | MAGIC2C) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     match a.arg2 as u32 as u64 {
@@ -42,6 +42,6 @@ pub(crate) fn sys_reboot(ctx: &mut dyn TrapContext) {
             let _ = writeln!(narf_console::Writer, "reboot: Power down");
             narf_power::system::power_off();
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+        _ => ctx.set_return(errno_ret(EINVAL)),
     }
 }

@@ -32,7 +32,6 @@ use super::*;
 ///     real uid. That is what makes `setreuid(-1, other)` a reversible
 ///     drop but `setreuid(other, other)` a permanent one.
 pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
     const NOCHANGE: u32 = u32::MAX; // (uid_t)-1
     let a = *ctx.args();
     let ruid = a.arg0 as u32;
@@ -54,11 +53,11 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() {
             if ruid != NOCHANGE && !uns.uid_is_mapped(ruid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if euid != NOCHANGE && !uns.uid_is_mapped(euid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -66,7 +65,7 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
     let old = read_uidgid(task);
 
     if ruid != NOCHANGE && ruid != old.uid && ruid != old.euid && !capable_in_own_ns(CAP_SETUID) {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     if euid != NOCHANGE
@@ -75,7 +74,7 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
         && euid != old.suid
         && !capable_in_own_ns(CAP_SETUID)
     {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -101,5 +100,5 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
         // RLIMIT_NPROC, it arms the next execve instead. See the helper.
         flag_nproc_exceeded(task);
     }
-    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-EPERM) as u64 }));
+    ctx.set_return(if ok { SyscallReturn::ok(0) } else { errno_ret(EPERM) });
 }

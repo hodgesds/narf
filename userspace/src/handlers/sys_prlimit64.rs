@@ -17,7 +17,7 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut buf, new_ptr) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
@@ -36,7 +36,7 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         match read_rlimit(caller, resource) {
             Some(prior) => prior,
             None => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -46,11 +46,11 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         let Some(task) = (pid >= 0)
             .then(|| prlimit_target_task(caller, pid as u64))
             .flatten() else {
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            ctx.set_return(errno_ret(ESRCH));
             return;
         };
         if !prlimit_permission(caller, task.tid) {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
 
@@ -66,7 +66,7 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         ) {
             Ok(prior) => prior,
             Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                ctx.set_return(errno_ret(errno));
                 return;
             }
         }
@@ -80,7 +80,7 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(old_ptr, &buf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

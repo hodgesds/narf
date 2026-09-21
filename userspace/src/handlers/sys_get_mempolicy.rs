@@ -21,12 +21,12 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
         || (flags & MPOL_F_MEMS_ALLOWED != 0 && flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0)
         || (addr != 0 && flags & MPOL_F_ADDR == 0)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let online_nodes = numa_node_count().min(64);
     if nodemask_ptr != 0 && a.arg2 < online_nodes as u64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -41,7 +41,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
         if nodemask_ptr != 0 {
             // SAFETY: copy_to_user validates the user pointer/length.
             if unsafe { copy_to_user(nodemask_ptr, &allowed.to_le_bytes()) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         }
@@ -51,11 +51,11 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
 
     let as_ref = if flags & MPOL_F_ADDR != 0 {
         let Some(as_ref) = current_address_space() else {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         };
         if !as_ref.contains_address(VirtAddr::new(addr)) {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         Some(as_ref)
@@ -92,7 +92,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
                 }
             };
             let Some(phys) = phys else {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             };
             numa_node_for_phys(phys) as i32
@@ -102,7 +102,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
                 policy_mode,
                 narf_memory::MPOL_INTERLEAVE | narf_memory::MPOL_WEIGHTED_INTERLEAVE
             ) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let mask = mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(task));
@@ -116,7 +116,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
         };
         // SAFETY: mode_ptr is the user int out-pointer; copy_to_user validates it.
         if unsafe { copy_to_user(mode_ptr, &out_word.to_le_bytes()) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

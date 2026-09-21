@@ -1,13 +1,12 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
-/// `FD_PREPARE` + `fd_publish` over `get_unused_fd_flags`: a descriptor table
-/// at RLIMIT_NOFILE is -EMFILE. These arms only became reachable when the fd
-/// table started enforcing the limit, and the -EBADF they inherited blamed
-/// the caller's ioctl descriptor, which was perfectly valid.
-const EMFILE: i64 = 24;
-
+// `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
+// `FD_PREPARE` + `fd_publish` over `get_unused_fd_flags`: a descriptor table
+// at RLIMIT_NOFILE is -EMFILE (the shared `errno::EMFILE`). These arms only
+// became reachable when the fd table started enforcing the limit, and the
+// -EBADF they inherited blamed the caller's ioctl descriptor, which was
+// perfectly valid.
 pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -45,7 +44,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // SAFETY: the UAPI argument is a single `int`; copy_from_user
         // range-validates the four bytes.
         if unsafe { copy_from_user(&mut raw, arg as u64) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let on = i32::from_ne_bytes(raw) != 0;
@@ -102,7 +101,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // SAFETY: the UAPI argument is a single `int`; copy_to_user
         // range-validates the four bytes.
         if unsafe { copy_to_user(arg as u64, &flags.to_ne_bytes()) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         ctx.set_return(SyscallReturn::ok(0));
@@ -112,7 +111,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         let mut raw = [0u8; 4];
         // SAFETY: as above — a single `int` argument.
         if unsafe { copy_from_user(&mut raw, arg as u64) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let requested = u32::from_ne_bytes(raw);
@@ -133,14 +132,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         if (requested ^ current) & narf_filesystem::FS_PRIVILEGED_FL != 0
             && !capable(CAP_LINUX_IMMUTABLE)
         {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         // `vfs_fileattr_set` -> `may_fileattr_set` requires ownership:
         // "Verify that we are the owner or have CAP_FOWNER".
         let (uid, gid) = ops.owners();
         if !inode_owner_or_capable(task, uid, gid) {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         let result = match ops.set_inode_flags(requested) {
@@ -149,7 +148,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // did: userspace would believe a file is immutable while
             // nothing enforces it. ENOTTY is what an unsupported ioctl
             // reports.
-            Err(_) => -25i64,
+            Err(_) => -ENOTTY,
         };
         ctx.set_return(SyscallReturn::ok(result as u64));
         return;
@@ -168,7 +167,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // SAFETY: both snapshot UAPIs are _IOW with an exact 4096-byte
         // argument; copy_from_user validates the complete range.
         if unsafe { copy_from_user(&mut input, arg as u64) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let source_fd = i64::from_ne_bytes(input[0..8].try_into().unwrap());
@@ -187,7 +186,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
                         Ok(n) if (72..=4096).contains(&n) => n,
                         _ => {
-                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                     };
@@ -196,7 +195,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 // SAFETY: the UAPI size is page-bounded and copy_from_user
                 // validates the separately pointed-to inheritance payload.
                 if unsafe { copy_from_user(&mut payload, inherit_ptr) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
                 let inherit_flags = u64::from_ne_bytes(payload[0..8].try_into().unwrap());
@@ -204,7 +203,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     match usize::try_from(u64::from_ne_bytes(payload[8..16].try_into().unwrap())) {
                         Ok(count) => count,
                         Err(_) => {
-                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                     };
@@ -213,7 +212,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     || u64::from_ne_bytes(payload[24..32].try_into().unwrap()) != 0
                     || inherit_size != 72usize.saturating_add(count.saturating_mul(8))
                 {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 let mut limit = [0u64; 5];
@@ -222,7 +221,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     *value = u64::from_ne_bytes(payload[off..off + 8].try_into().unwrap());
                 }
                 if limit[0] & !0x3f != 0 {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 let mut parents = alloc::vec::Vec::with_capacity(count);
@@ -246,11 +245,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         };
         let raw_name = &input[name_offset..];
         let Some(end) = raw_name.iter().position(|&byte| byte == 0) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let Ok(name) = core::str::from_utf8(&raw_name[..end]) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let source = fd::with_table(task, |t| {
@@ -273,12 +272,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         };
         let rc = match result {
             Some(Ok(())) => 0,
-            Some(Err(narf_filesystem::FsError::CrossDevice)) => -18, // EXDEV
-            Some(Err(narf_filesystem::FsError::ReadOnly)) => -30,    // EROFS
-            Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // EOPNOTSUPP
-            Some(Err(narf_filesystem::FsError::NotFound)) => -2,     // ENOENT
-            Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122, // EDQUOT
-            _ => -(EINVAL_CODE as i64),
+            Some(Err(narf_filesystem::FsError::CrossDevice)) => -EXDEV,
+            Some(Err(narf_filesystem::FsError::ReadOnly)) => -EROFS,
+            Some(Err(narf_filesystem::FsError::Unsupported)) => -EOPNOTSUPP,
+            Some(Err(narf_filesystem::FsError::NotFound)) => -ENOENT,
+            Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -EDQUOT,
+            _ => -(EINVAL),
         };
         ctx.set_return(SyscallReturn::ok(rc as u64));
         return;
@@ -292,19 +291,19 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // SAFETY: copy_from_user validates the user range and performs the
         // architecture's required user-access bracketing.
         if unsafe { copy_from_user(&mut oldfd_bytes, arg as u64) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let oldfd = u32::from_ne_bytes(oldfd_bytes);
         let source = fd::with_table(task, |t| t.get(oldfd).map(|e| e.ops.clone())).flatten();
         let Some(source) = source else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let cloned = match narf_filesystem::fuse_conn::DevFuse::clone_endpoint(&ops, &source) {
             Ok(cloned) => cloned,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         };
@@ -334,46 +333,46 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // SAFETY: copy_from_user validates and brackets the declared UAPI
         // `struct fuse_backing_map`.
         if unsafe { copy_from_user(&mut map, arg as u64) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let backing_fd = i32::from_ne_bytes(map[0..4].try_into().unwrap());
         let flags = u32::from_ne_bytes(map[4..8].try_into().unwrap());
         let padding = u64::from_ne_bytes(map[8..16].try_into().unwrap());
         if backing_fd < 0 || flags != 0 || padding != 0 {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         let backing =
             fd::with_table(task, |t| t.get(backing_fd as u32).map(|e| e.ops.clone())).flatten();
         let Some(backing) = backing else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         match conn.register_backing(backing) {
             Ok(id) => ctx.set_return(SyscallReturn::ok(id as u64)),
             Err(narf_filesystem::FsError::Unsupported) => {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
             }
-            Err(_) => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            Err(_) => ctx.set_return(errno_ret(EINVAL)),
         }
         return;
     }
     if cmd == narf_filesystem::fuse_conn::DevFuse::DEV_IOC_BACKING_CLOSE {
         let Some(conn) = narf_filesystem::fuse_conn::DevFuse::connection_of(&ops) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let mut id_bytes = [0u8; core::mem::size_of::<u32>()];
         // SAFETY: copy_from_user validates and brackets the u32 argument.
         if unsafe { copy_from_user(&mut id_bytes, arg as u64) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let id = i32::from_ne_bytes(id_bytes);
         match conn.unregister_backing(id) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            Err(_) => ctx.set_return(errno_ret(EINVAL)),
         }
         return;
     }
@@ -511,7 +510,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             });
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-EMFILE) as u64)),
+            None => ctx.set_return(errno_ret(EMFILE)),
         }
         return;
     }
@@ -529,8 +528,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             let dmabuf = match narf_filesystem::drm_prime_export(card_idx, handle) {
                 Some(o) => o,
                 None => {
-                    const ENOENT: i64 = 2;
-                    ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
+                    ctx.set_return(errno_ret(ENOENT));
                     return;
                 }
             };
@@ -547,7 +545,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
                     ctx.set_return(SyscallReturn::ok(0));
                 }
-                None => ctx.set_return(SyscallReturn::ok((-EMFILE) as u64)),
+                None => ctx.set_return(errno_ret(EMFILE)),
             }
             return;
         }
@@ -568,8 +566,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
             }
             None => {
-                const EINVAL: i64 = 22;
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                ctx.set_return(errno_ret(EINVAL));
             }
         }
         return;
@@ -617,7 +614,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     });
                 match new_fd {
                     Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-                    None => ctx.set_return(SyscallReturn::ok((-EMFILE) as u64)),
+                    None => ctx.set_return(errno_ret(EMFILE)),
                 }
                 return;
             }
@@ -638,7 +635,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             let user_size = ((cmd >> 16) & 0x3FFF) as usize;
             const PIDFD_INFO_SIZE_VER0: usize = 64;
             if user_size < PIDFD_INFO_SIZE_VER0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             const PIDFD_INFO_PID: u64 = 1 << 0;
@@ -676,7 +673,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // min(user-declared size, our struct) bytes.
             // SAFETY: Valid memory or trusted environment
             if unsafe { copy_to_user(arg as u64, &info[..n]) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             ctx.set_return(SyscallReturn::ok(0));
@@ -694,7 +691,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 // ENOTTY. Do this before the generic filesystem-ioctl relay:
                 // an arbitrary command's encoded direction must not make a
                 // pipe ioctl touch its otherwise-ignored argument pointer.
-                ctx.set_return(SyscallReturn::ok((-25i64) as u64));
+                ctx.set_return(errno_ret(ENOTTY));
                 return;
             }
             // Linux restricted FUSE ioctls derive their transfer buffers
@@ -709,7 +706,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 // SAFETY: the encoded ioctl input size bounds the copy and
                 // copy_from_user validates the entire user range.
                 if unsafe { copy_from_user(&mut input, arg as u64) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
             }
@@ -722,7 +719,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 // SAFETY: the fixed UAPI structure is 48 bytes and
                 // copy_from_user validates the whole pointed-to range.
                 if unsafe { copy_from_user(&mut input, arg as u64) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
             }
@@ -742,7 +739,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
                         Ok(n) if (72..=4096).contains(&n) => n,
                         _ => {
-                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                     };
@@ -752,7 +749,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 // SAFETY: the UAPI size is capped at one page and
                 // copy_from_user validates the complete pointed-to range.
                 if unsafe { copy_from_user(&mut input[old_len..], inherit_ptr) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
             }
@@ -783,7 +780,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 0x0000_942e, // QUOTA_RESCAN_WAIT
             ];
             if BTRFS_QUOTA_IOCTLS.contains(&cmd) && !task_capable(task, CAP_SYS_ADMIN) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             match poll_blocking(ops.ioctl_async(cmd, arg as u64, &input, out_size)) {
@@ -792,7 +789,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                         // SAFETY: output length was bounded by _IOC_SIZE in
                         // the filesystem layer; copy_to_user validates arg.
                         if unsafe { copy_to_user(arg as u64, &reply.output) }.is_err() {
-                            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                            ctx.set_return(errno_ret(EFAULT));
                             return;
                         }
                     }
@@ -806,44 +803,44 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
                 Some(Err(narf_filesystem::FsError::Busy)) => {
                     let errno = match cmd {
-                        0x5000_940f | 0x5000_943f => -39, // ENOTEMPTY
-                        0x4010_942a => -17,               // EEXIST
-                        _ => -16,                         // EBUSY
+                        0x5000_940f | 0x5000_943f => -ENOTEMPTY,
+                        0x4010_942a => -EEXIST,
+                        _ => -EBUSY,
                     };
-                    ctx.set_return(SyscallReturn::ok((errno as i64) as u64));
+                    ctx.set_return(SyscallReturn::ok(errno as u64));
                 }
                 Some(Err(narf_filesystem::FsError::NotFound)) => {
-                    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+                    ctx.set_return(errno_ret(ENOENT));
                 }
                 Some(Err(narf_filesystem::FsError::NoSpace)) => {
-                    ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                    ctx.set_return(errno_ret(ENOSPC));
                 }
                 Some(Err(narf_filesystem::FsError::ReadOnly)) => {
-                    ctx.set_return(SyscallReturn::ok((-30i64) as u64));
+                    ctx.set_return(errno_ret(EROFS));
                 }
                 Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
-                    ctx.set_return(SyscallReturn::ok((-122i64) as u64));
+                    ctx.set_return(errno_ret(EDQUOT));
                 }
                 Some(Err(narf_filesystem::FsError::NotConnected)) => {
                     // ENOTCONN. btrfs answers every qgroup ioctl this way when
                     // quotas are off, rather than ENOENT, so `btrfs qgroup
                     // show` can say "quotas are not enabled" instead of
                     // reporting a missing qgroup.
-                    ctx.set_return(SyscallReturn::ok((-107i64) as u64));
+                    ctx.set_return(errno_ret(ENOTCONN));
                 }
-                _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+                _ => ctx.set_return(errno_ret(EINVAL)),
             }
         }
         Err(narf_filesystem::FsError::PermissionDenied) => {
             // EACCES = 13
-            ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+            ctx.set_return(errno_ret(EACCES));
         }
         Err(narf_filesystem::FsError::NoSuchProcess) => {
             // ESRCH — TIOCSPGRP for a process group that does not exist.
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+            ctx.set_return(errno_ret(ESRCH));
         }
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            ctx.set_return(errno_ret(EPERM));
         }
         Err(narf_filesystem::FsError::InvalidData)
             if cmd == 0x541B
@@ -851,20 +848,20 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         {
             // pipe_ioctl(FIONREAD) returns put_user() directly, so an invalid
             // result pointer is EFAULT rather than an invalid ioctl argument.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
         }
         Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
         }
         Err(narf_filesystem::FsError::Busy) => {
             // EBUSY = 16. A device ioctl that reports the resource is held —
             // e.g. DRM_IOCTL_SET_MASTER when another client already holds DRM
             // master. Without this arm the direct ioctl path folds Busy into
             // the blanket -EINVAL below, giving the wrong errno.
-            ctx.set_return(SyscallReturn::ok((-16i64) as u64));
+            ctx.set_return(errno_ret(EBUSY));
         }
         Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
         }
     }
 }

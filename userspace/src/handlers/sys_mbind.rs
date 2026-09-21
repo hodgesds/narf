@@ -39,7 +39,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
     const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
     const MPOL_MF_VALID: u64 = MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL;
     if !mpol_mode_valid(mode) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // get_nodes() — before do_mbind's flag validation, so EFAULT wins.
@@ -47,7 +47,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         let mut bytes = [0u8; 8];
         // SAFETY: copy_from_user validates the one-word nodemask.
         if unsafe { copy_from_user(&mut bytes, a.arg3) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         u64::from_ne_bytes(bytes)
@@ -55,27 +55,27 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         0
     };
     if a.arg5 & !MPOL_MF_VALID != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if a.arg5 & MPOL_MF_MOVE_ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: no ambient CAP_SYS_NICE.
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     if !mpol_policy_shape_valid(mode, nodemask) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Page-align the range like Linux (addr must be page-aligned;
     // EINVAL otherwise).
     if addr & 0xFFF != 0 || a.arg4 > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let len = match len.checked_add(4095) {
         Some(v) => v & !4095,
         None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -84,7 +84,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         return;
     }
     let Some(end) = addr.checked_add(len) else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     };
     let maxnode_mask = if a.arg4 == 0 || a.arg4 == 64 {
@@ -99,7 +99,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         (1u64 << online) - 1
     };
     if nodemask & !maxnode_mask != 0 || nodemask & !online_mask != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -110,7 +110,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
     }
     let allowed = narf_scheduler::task_mems_allowed(task) & online_mask;
     if !mpol_initial_nodemask_valid(mode, nodemask, allowed) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut flags = a.arg5;
@@ -132,7 +132,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
             )
         };
         if policy_nodes == 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         let Some(as_ref) = current_address_space() else {
@@ -150,11 +150,11 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         } {
             Ok(failed) => strict_failed = failed != 0 && flags & MPOL_MF_STRICT != 0,
             Err(narf_memory::AddressSpaceError::Unmapped) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                ctx.set_return(errno_ret(ENOMEM));
                 return;
             }
         }
@@ -199,7 +199,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         ranges.sort_by_key(|&(start, _, _)| start);
     }
     if strict_failed {
-        ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+        ctx.set_return(errno_ret(EIO));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

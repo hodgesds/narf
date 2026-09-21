@@ -7,13 +7,13 @@ use super::*;
 pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     if a.arg3 != 0 || a.arg0 & 0xFFF != 0 || a.arg2 >= numa_node_count() as u64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let len = match a.arg1.checked_add(4095) {
         Some(v) => v & !4095,
         None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -22,7 +22,7 @@ pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
         return;
     }
     let Some(end) = a.arg0.checked_add(len) else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     };
     // Home-node anchors live on the same range policies `mbind` installed,
@@ -46,7 +46,7 @@ pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
                 updated.push((start, range_len, policy));
                 updated.extend(iter);
                 *ranges = updated;
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             let overlap_start = start.max(a.arg0);
@@ -67,6 +67,6 @@ pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
     if changed {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // ENOENT
+        ctx.set_return(errno_ret(ENOENT));
     }
 }

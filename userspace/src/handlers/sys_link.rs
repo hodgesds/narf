@@ -13,19 +13,19 @@ pub(crate) fn sys_link(ctx: &mut dyn TrapContext) {
     let old_raw = match copy_user_cstr_checked(args.arg0, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     let new_raw = match copy_user_cstr_checked(args.arg1, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if old_raw.is_empty() || new_raw.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     link_impl(ctx, &old_raw, &new_raw);

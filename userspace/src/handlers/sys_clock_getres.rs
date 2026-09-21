@@ -28,7 +28,7 @@ pub(crate) fn sys_clock_getres(ctx: &mut dyn TrapContext) {
     let id = args.arg0;
     let buf = args.arg1;
     if !clock_id_supported(id) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if buf != 0 {
@@ -46,7 +46,7 @@ pub(crate) fn sys_clock_getres(ctx: &mut dyn TrapContext) {
         // range-validates the 16-byte write.
         if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
             // Faulting timespec buffer → EFAULT.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

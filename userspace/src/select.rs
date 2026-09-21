@@ -19,12 +19,7 @@ use crate::syscall::{Syscall, SyscallReturn, TrapContext};
 /// select syscalls may pass larger bitmaps when the fdtable has grown.
 pub const FD_SETSIZE: usize = 1024;
 pub const FD_SET_BYTES: usize = FD_SETSIZE / 8;
-
-const EBADF: i64 = 9;
-const ENOMEM: i64 = 12;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const EINTR: i64 = 4;
+use crate::errno::{to_ret, *};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum SelectError {
@@ -76,19 +71,14 @@ pub(crate) struct SelectParkSnapshot {
 unsafe impl Send for SelectParkSnapshot {}
 
 #[inline]
-fn errno(value: i64) -> SyscallReturn {
-    SyscallReturn::ok((-value) as u64)
-}
-
-#[inline]
 fn result_to_return(result: Result<usize, SelectError>) -> SyscallReturn {
     match result {
         Ok(count) => SyscallReturn::ok(count as u64),
-        Err(SelectError::BadFd) => errno(EBADF),
-        Err(SelectError::NoMem) => errno(ENOMEM),
-        Err(SelectError::Fault) => errno(EFAULT),
-        Err(SelectError::Invalid) => errno(EINVAL),
-        Err(SelectError::Interrupted) => errno(EINTR),
+        Err(SelectError::BadFd) => to_ret(EBADF),
+        Err(SelectError::NoMem) => to_ret(ENOMEM),
+        Err(SelectError::Fault) => to_ret(EFAULT),
+        Err(SelectError::Invalid) => to_ret(EINVAL),
+        Err(SelectError::Interrupted) => to_ret(EINTR),
     }
 }
 
@@ -504,7 +494,7 @@ pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
         let mut pair = [0u8; 16];
         // SAFETY: guarded user copy validates the complete sigset argpack.
         if unsafe { crate::handlers::copy_from_user(&mut pair, args.arg5) }.is_err() {
-            ctx.set_return(errno(EFAULT));
+            ctx.set_return(to_ret(EFAULT));
             return;
         }
         (
@@ -534,13 +524,13 @@ pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
         None
     } else {
         if sigmask_size != size_of::<u64>() as u64 {
-            ctx.set_return(errno(EINVAL));
+            ctx.set_return(to_ret(EINVAL));
             return;
         }
         let mut bytes = [0u8; size_of::<u64>()];
         // SAFETY: size was validated and guarded copy checks the pointed set.
         if unsafe { crate::handlers::copy_from_user(&mut bytes, sigmask_ptr) }.is_err() {
-            ctx.set_return(errno(EFAULT));
+            ctx.set_return(to_ret(EFAULT));
             return;
         }
         Some(u64::from_ne_bytes(bytes))

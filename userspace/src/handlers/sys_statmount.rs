@@ -159,20 +159,20 @@ fn mnt_id_req_from_user(req: u64, by_fd: bool) -> Result<(u32, u64, u64, u64), i
     let mut size_buf = [0u8; 4];
     // SAFETY: `copy_from_user` range-validates `req` and brackets the read.
     if unsafe { copy_from_user(&mut size_buf, req) }.is_err() {
-        return Err(-14); // -EFAULT
+        return Err(EFAULT);
     }
     let usize_bytes = u64::from(u32::from_ne_bytes(size_buf));
     if usize_bytes > PAGE {
-        return Err(-7); // -E2BIG
+        return Err(E2BIG);
     }
     if usize_bytes < VER0 {
-        return Err(-22); // -EINVAL
+        return Err(EINVAL);
     }
     let known = core::cmp::min(usize_bytes as usize, VER1);
     let mut buf = [0u8; VER1];
     // SAFETY: `known` <= VER1 and lies inside the caller-declared struct.
     if unsafe { copy_from_user(&mut buf[..known], req) }.is_err() {
-        return Err(-14);
+        return Err(EFAULT);
     }
     // `copy_struct_from_user`: every byte past the struct this kernel knows
     // must be zero, or -E2BIG. A caller who set a field this kernel would
@@ -182,10 +182,10 @@ fn mnt_id_req_from_user(req: u64, by_fd: bool) -> Result<(u32, u64, u64, u64), i
         // SAFETY: the tail lies inside the caller-declared struct.
         let tail = match unsafe { copy_from_user_vec(req + VER1 as u64, rest) } {
             Ok(v) => v,
-            Err(_) => return Err(-14),
+            Err(_) => return Err(EFAULT),
         };
         if tail.iter().any(|&b| b != 0) {
-            return Err(-7); // -E2BIG
+            return Err(E2BIG);
         }
     }
     let mnt_fd = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
@@ -194,16 +194,16 @@ fn mnt_id_req_from_user(req: u64, by_fd: bool) -> Result<(u32, u64, u64, u64), i
     let mnt_ns_id = u64::from_ne_bytes(buf[24..32].try_into().unwrap());
     if by_fd {
         if mnt_id != 0 || mnt_ns_id != 0 {
-            return Err(-22);
+            return Err(EINVAL);
         }
     } else {
         if mnt_fd != 0 && mnt_ns_id != 0 {
-            return Err(-22);
+            return Err(EINVAL);
         }
         // "The first valid unique mount id is MNT_UNIQUE_ID_OFFSET + 1."
         // LSMT_ROOT is u64::MAX and so passes this on its own.
         if mnt_id <= MNT_UNIQUE_ID_OFFSET {
-            return Err(-22);
+            return Err(EINVAL);
         }
     }
     Ok((mnt_fd, mnt_id, param, mnt_ns_id))
@@ -260,26 +260,26 @@ pub(crate) fn sys_listmount(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let (req, out_ptr, nr, flags) = (a.arg0, a.arg1, a.arg2, a.arg3);
     if flags & !LISTMOUNT_REVERSE != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // "If the mount namespace really has more than 1 million mounts the
     // caller must iterate over the mount namespace (and reconsider their
     // system design...)."
     if nr > MAXCOUNT {
-        ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+        ctx.set_return(errno_ret(EOVERFLOW));
         return;
     }
     // `access_ok` on the whole output array, BEFORE the request is read, so
     // an unwritable buffer is -EFAULT rather than a partial enumeration.
     if nr != 0 && validate_user_range(out_ptr, (nr as usize).saturating_mul(8)).is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let (_, mnt_id, last_mnt_id, _) = match mnt_id_req_from_user(req, false) {
         Ok(v) => v,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -292,7 +292,7 @@ pub(crate) fn sys_listmount(ctx: &mut dyn TrapContext) {
             Some(m) => m.3.clone(),
             // `lookup_mnt_in_ns` came back NULL.
             None => {
-                ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+                ctx.set_return(errno_ret(ENOENT));
                 return;
             }
         }
@@ -320,7 +320,7 @@ pub(crate) fn sys_listmount(ctx: &mut dyn TrapContext) {
         // SAFETY: the range was validated above and `bytes` is exactly
         // `ids.len() * 8` long.
         if unsafe { copy_to_user(out_ptr, &bytes) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }
@@ -332,7 +332,7 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let (req, buf, bufsize, flags) = (a.arg0, a.arg1, a.arg2, a.arg3);
     if flags & !STATMOUNT_BY_FD != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // STATMOUNT_BY_FD asks for the mount behind an open descriptor. NARF has
@@ -341,29 +341,29 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     // caller can tell "this kernel refuses the flag" from "this kernel does
     // not know the flag".
     if flags & STATMOUNT_BY_FD != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if validate_user_range(buf, bufsize as usize).is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let (_, mnt_id, mask, _) = match mnt_id_req_from_user(req, false) {
         Ok(v) => v,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     // `prepare_kstatmount`: asking for a string with no room past the fixed
     // struct is -EOVERFLOW, decided before the mount is even looked up.
     if mask & STATMOUNT_STRING_REQ != 0 && bufsize as usize == STATMOUNT_SIZE {
-        ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+        ctx.set_return(errno_ret(EOVERFLOW));
         return;
     }
     let mounts = visible_mounts();
     let Some(m) = mounts.iter().find(|m| m.0 == mnt_id) else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     };
     let (unique, parent_unique, old_id, path, fstype, mnt_opts, sb_opts) =
@@ -459,13 +459,13 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     sm.size = (copysize + strs.len()) as u32;
     if !strs.is_empty() {
         if (bufsize as usize) < STATMOUNT_SIZE + strs.len() {
-            ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+            ctx.set_return(errno_ret(EOVERFLOW));
             return;
         }
         // SAFETY: the whole `bufsize` range was validated above, and this
         // write stays inside it (checked immediately above).
         if unsafe { copy_to_user(buf + STATMOUNT_SIZE as u64, &strs) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }
@@ -476,7 +476,7 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: as above — `copysize` <= STATMOUNT_SIZE and <= bufsize.
     if unsafe { copy_to_user(buf, &raw[..copysize]) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

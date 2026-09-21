@@ -25,8 +25,6 @@ use super::*;
 /// Note the flags check comes FIRST, before the buffer is examined, so
 /// `getrandom(NULL, 0, 0xdeadbeef)` is -EINVAL, not -EFAULT.
 pub(crate) fn sys_getrandom(ctx: &mut dyn TrapContext) {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     /// `include/uapi/linux/random.h`.
     const GRND_NONBLOCK: u32 = 0x0001;
     const GRND_RANDOM: u32 = 0x0002;
@@ -58,7 +56,7 @@ pub(crate) fn sys_getrandom(ctx: &mut dyn TrapContext) {
         return;
     }
     if len > MAX_USER_COPY {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Generate random bytes into a kernel buffer, then copy to user

@@ -744,7 +744,6 @@ fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
         const GROUP_PID: u64 = 0xEC80;
         const SIBLING_TID: u64 = 0xEC01; // non-leader sibling thread of GROUP_PID
         const SIGTERM: u64 = 15;
-        const ESRCH: i64 = -3;
 
         crate::pid_ns::__test_reset();
         let result = (|| {
@@ -805,7 +804,6 @@ fn smoke_abi_pidns_wait_unbound_inner_echild() -> TestResult {
         const VICTIM_TASK: u64 = 0xEA00; // root-ns child registered at OUTER pid 3
         const VICTIM_PID: u64 = 3;
         const P_PID: u64 = 1;
-        const ECHILD: i64 = -10;
 
         crate::pid_ns::__test_reset();
         let result = (|| {
@@ -969,7 +967,6 @@ fn smoke_abi_pidns_perf_event_open_resolves_in_caller_pid_ns() -> TestResult {
         const WORKER_PID: u64 = 0xB061;
         const VICTIM_TASK: u64 = 0xB600; // registered at OUTER pid 3
         const VICTIM_PID: u64 = 3;
-        const ESRCH: i64 = -3;
 
         // Software CPU-clock event: type_=PERF_TYPE_SOFTWARE(1), size=144,
         // config=PERF_COUNT_SW_CPU_CLOCK(0). cpu=-1 follows the task.
@@ -1417,9 +1414,6 @@ kernel_test_in!("syscall_abi", smoke_abi_listns_enumerates_and_pages);
 fn smoke_abi_listns_argument_rules() -> TestResult {
     use crate::namespaces::ns_type;
     with_setup(|| {
-        const E2BIG: i64 = -7;
-        const EOPNOTSUPP: i64 = -95;
-        const EOVERFLOW: i64 = -75;
         let mut out = [0u64; 8];
         let mut call_with = |req: &[u8], nr: u64, flags: u64| {
             call(
@@ -1948,7 +1942,6 @@ fn smoke_abi_nsfs_identity_ioctls() -> TestResult {
         // -ENOTTY, and so is one with the right number but the wrong
         // argument size — that is what `nsfs_ioctl_valid` is for, and
         // without it a caller's mis-sized buffer would be written anyway.
-        const ENOTTY: i64 = -25;
         if call(Syscall::Ioctl.raw(), a2(fd as u64, nsio(0x7e), 0)) != Some(ENOTTY) {
             return Err("an undefined nsfs ioctl must be -ENOTTY");
         }
@@ -2131,7 +2124,6 @@ kernel_test_in!("syscall_abi", smoke_abi_nsfs_mnt_info_and_traversal);
 fn smoke_abi_nsfs_file_handle_round_trip() -> TestResult {
     use crate::namespaces::{ns_type, HeldNs, UtsNamespace};
     const AT_EMPTY_PATH: u64 = 0x1000;
-    const ESTALE: i64 = -116;
     with_setup(|| {
         let ns = UtsNamespace::new_default();
         let id = ns.id();

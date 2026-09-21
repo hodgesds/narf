@@ -30,11 +30,11 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
     // whole register.
     let addr = ctx.args().arg0;
     if addr & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let Some(as_ref) = current_address_space() else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     };
     let as_key = shm_as_key(&as_ref);
@@ -63,7 +63,7 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
             })
     };
     let Some(attachment) = attachment else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     };
     debug_assert_eq!(attachment.base, addr);
@@ -74,21 +74,21 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
     let mut live_regions = alloc::vec::Vec::new();
     for &(base, len) in &attachment.fragments {
         let Some(end) = base.checked_add(len) else {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let mut cursor = base;
         while cursor < end {
             let Some(region) = as_ref.lookup(VirtAddr::new(cursor)) else {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             };
             let Some(region_end) = cursor.checked_add(region.len) else {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             };
             if region.base.as_u64() != cursor || region.len == 0 || region_end > end {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             live_regions.push((cursor, region.len));
@@ -97,7 +97,7 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
     }
     for &(base, _) in &live_regions {
         if as_ref.unmap_region(VirtAddr::new(base)).is_err() {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
@@ -127,7 +127,7 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
         let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
         let object = (attachment.ipc_ns, attachment.shmid);
         let Some(seg) = map.get_mut(&object) else {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         seg.nattch = seg.nattch.saturating_sub(1);

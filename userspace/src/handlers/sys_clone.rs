@@ -76,5 +76,5 @@ pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
     // Not implemented on this build config → ENOSYS.
-    ctx.set_return(SyscallReturn::ok((-38i64) as u64));
+    ctx.set_return(errno_ret(ENOSYS));
 }

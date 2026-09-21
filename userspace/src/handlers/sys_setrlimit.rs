@@ -6,7 +6,7 @@ pub(crate) fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     let resource = args.arg0 as usize;
     let in_ptr = args.arg1;
     if in_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Read two u64s from user buffer under the SMAP bracket.
@@ -15,7 +15,7 @@ pub(crate) fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut buf, in_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
@@ -30,6 +30,6 @@ pub(crate) fn sys_setrlimit(ctx: &mut dyn TrapContext) {
         may_raise_hard,
     ) {
         Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        Err(errno) => ctx.set_return(errno_ret(errno)),
     }
 }

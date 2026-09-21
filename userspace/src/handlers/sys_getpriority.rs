@@ -25,8 +25,6 @@ use super::*;
 /// PRIO_PGRP and PRIO_USER used to take the -EINVAL arm; the selection is
 /// now shared with setpriority and the ioprio pair via `resolve_who_targets`.
 pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EINVAL: i64 = 22;
     const PRIO_PROCESS: i64 = 0;
     const PRIO_PGRP: i64 = 1;
     const PRIO_USER: i64 = 2;
@@ -39,7 +37,7 @@ pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
         PRIO_PGRP => WhoScope::Pgrp,
         PRIO_USER => WhoScope::User,
         _ => {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -62,6 +60,6 @@ pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
     }
     match best {
         Some(wire) => ctx.set_return(SyscallReturn::ok(wire as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-ESRCH) as u64)),
+        None => ctx.set_return(errno_ret(ESRCH)),
     }
 }

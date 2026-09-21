@@ -35,17 +35,16 @@ pub(crate) fn sys_sync_file_range(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
-    let einval = SyscallReturn::ok((-22i64) as u64);
     if flags & !VALID_FLAGS != 0 {
-        ctx.set_return(einval);
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let endbyte = offset.wrapping_add(nbytes);
     if (offset as i64) < 0 || (endbyte as i64) < 0 || endbyte < offset {
-        ctx.set_return(einval);
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // A pipe or socket has no page cache to write back.
@@ -54,6 +53,6 @@ pub(crate) fn sys_sync_file_range(ctx: &mut dyn TrapContext) {
         FileType::File | FileType::Block | FileType::Dir | FileType::Symlink => {
             ctx.set_return(SyscallReturn::ok(0))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-29i64) as u64)), // -ESPIPE
+        _ => ctx.set_return(errno_ret(ESPIPE)),
     }
 }

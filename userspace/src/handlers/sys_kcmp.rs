@@ -11,7 +11,7 @@ pub(crate) fn sys_kcmp(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let kind = a.arg2;
     if kind >= KCMP_TYPES {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let me = current_task_id();
@@ -32,7 +32,7 @@ pub(crate) fn sys_kcmp(ctx: &mut dyn TrapContext) {
     let (t1, t2) = match (resolve(a.arg0), resolve(a.arg1)) {
         (Some(x), Some(y)) => (x, y),
         _ => {
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
     };

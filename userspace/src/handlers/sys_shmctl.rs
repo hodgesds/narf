@@ -142,7 +142,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
     // screens the low 32 bits of each register, not the whole thing, and it
     // runs ahead of the dispatch: a negative shmid outranks an unknown cmd.
     if signed_shmid < 0 || signed_cmd < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let shmid = signed_shmid as u32 as u64;
@@ -162,7 +162,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 // here returned 0, which IPC_INFO's caller reads as "the
                 // struct shminfo you asked for is filled in", over a buffer
                 // nothing wrote.
-                ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+                ctx.set_return(errno_ret(ENOSYS));
                 return;
             };
             let shmmax = (vtable.max_len)();
@@ -185,7 +185,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             shm_put_u64(&mut out, 32, SHMMNI.saturating_mul(shmmax / 4096));
             // SAFETY: Linux snapshots limits/index before validating copyout.
             if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(max_index));
             }
@@ -225,7 +225,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                                                        // shm_swp, swap_attempts, and swap_successes remain zero.
                                                        // SAFETY: Linux snapshots namespace usage before copyout.
             if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(max_index));
             }
@@ -240,7 +240,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                     .and_then(|map| map.get(&object))
                     .filter(|seg| !seg.removed)
                 else {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 };
                 // `err = -EACCES; if (ipcperms(ns, &shp->shm_perm, S_IRUGO))`.
@@ -250,7 +250,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 // rather than the -EPERM the mutating commands use for "not
                 // yours to change". SHM_STAT_ANY deliberately skips it.
                 if cmd != SHM_STAT_ANY && !shm_ipc_allowed(seg, 0o4) {
-                    ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+                    ctx.set_return(errno_ret(EACCES));
                     return;
                 }
                 (
@@ -273,7 +273,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             // SAFETY: `buf` is the native shmid64_ds output pointer; the
             // guarded helper validates and copies the complete structure.
             if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT { 0 } else { shmid }));
             }
@@ -285,7 +285,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             let input = match unsafe { copy_from_user_vec(a.arg2, SHMID64_SIZE) } {
                 Ok(input) => input,
                 Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
             };
@@ -300,13 +300,13 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             else {
                 // ipc_obtain_object_check: the id names nothing (IPC_RMID
                 // unpublishes the id, so a reaped segment lands here too).
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             };
             if !shm_ipc_owner(seg) {
                 // ipcctl_obtain_check's pre-seeded err: not owner, not
                 // creator, no CAP_SYS_ADMIN. Ownership, not the mode bits.
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             // ipc_update_perm rejects ids the caller's user namespace cannot
@@ -314,7 +314,7 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             let (uid, gid) = match shm_ids_from_user(uid, gid) {
                 Ok(ids) => ids,
                 Err(()) => {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
             };
@@ -333,12 +333,12 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 .filter(|seg| !seg.removed)
             else {
                 // shm_obtain_object_check failed.
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             };
             if !shm_ipc_owner(seg) {
                 // Neither CAP_IPC_LOCK nor uid/cuid: -EPERM, never -EACCES.
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             let privileged = current_ucred().uid == 0;
@@ -348,11 +348,11 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             // non-zero limit — callers back off on one and give up on the
             // other.
             if cmd == SHM_LOCK && !privileged && !can_do_mlock(authority) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             let Some(vtable) = shmem_vtable() else {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             };
             let locked = cmd == SHM_LOCK;
@@ -376,16 +376,16 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                     ) {
                         Ok(()) => {}
                         Err(ShmemLockError::Limit) => {
-                            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                            ctx.set_return(errno_ret(ENOMEM));
                             return;
                         }
                         Err(ShmemLockError::NotFound) => {
-                            ctx.set_return(SyscallReturn::ok((-43i64) as u64));
+                            ctx.set_return(errno_ret(EIDRM));
                             return;
                         }
                     }
                 } else if !(vtable.unlock)(seg.handle) {
-                    ctx.set_return(SyscallReturn::ok((-43i64) as u64));
+                    ctx.set_return(errno_ret(EIDRM));
                     return;
                 }
                 seg.locked = locked;
@@ -400,11 +400,11 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                     // Already reaped, or never existed: `ipc_rmid()` drops the
                     // id from the IDR immediately, so a second IPC_RMID sees
                     // -EINVAL rather than -EIDRM even while attachments live.
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 };
                 if !shm_ipc_owner(seg) {
-                    ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+                    ctx.set_return(errno_ret(EPERM));
                     return;
                 }
                 seg.removed = true;
@@ -425,6 +425,6 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
         // ksys_shmctl's `default:`. The native entry point does *not* strip
         // IPC_64, so `IPC_STAT | IPC_64` is an unknown command here exactly
         // as it is on Linux; only the ipc(2) multiplexer parses that tag.
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL
+        _ => ctx.set_return(errno_ret(EINVAL)),
     }
 }

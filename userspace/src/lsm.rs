@@ -11,15 +11,7 @@
 use crate::handlers::{copy_from_user, copy_to_user};
 use crate::syscall::{SyscallReturn, TrapContext};
 
-// ── errno (negated-long convention) ─────────────────────────────────
-const E2BIG: i64 = 7;
-const EINVAL: i64 = 22;
-const EFAULT: i64 = 14;
-const EOPNOTSUPP: i64 = 95;
-
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
+use crate::errno::{to_ret as err, *};
 
 // LSM module ids (uapi/linux/lsm.h).
 const LSM_ID_CAPABILITY: u64 = 100;

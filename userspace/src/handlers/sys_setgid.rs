@@ -19,14 +19,13 @@ use super::*;
 /// other way round from setuid's (positive rather than negated) but tests
 /// the same two ids.
 pub(crate) fn sys_setgid(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
     let task = current_task_id();
     let gid = ctx.args().arg0 as u32;
     #[cfg(feature = "container")]
     {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() && !uns.gid_is_mapped(gid) {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
@@ -44,7 +43,7 @@ pub(crate) fn sys_setgid(ctx: &mut dyn TrapContext) {
             e.fsgid = gid;
         })
     } else {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     };
     if ok {
@@ -52,6 +51,6 @@ pub(crate) fn sys_setgid(ctx: &mut dyn TrapContext) {
     } else {
         // Internal: the cred table is uninitialized (unreachable for a live
         // task). -EPERM is setgid's permission-failure errno.
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
     }
 }

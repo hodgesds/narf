@@ -17,7 +17,7 @@ fn scatter_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> Result<(),
     if bytes.is_empty() {
         Ok(())
     } else {
-        Err(EFAULT_CODE)
+        Err(EFAULT as u64)
     }
 }
 
@@ -44,7 +44,7 @@ fn scatter_fanotify_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> R
     if bytes.is_empty() {
         Ok(())
     } else {
-        Err(EFAULT_CODE)
+        Err(EFAULT as u64)
     }
 }
 
@@ -57,17 +57,17 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     let Some(endpoint) = copy_fd_endpoint(task, fd_num) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     if !endpoint.readable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     let iovecs = match import_rw_iovecs(args.arg1, args.arg2 as usize) {
         Ok(iovecs) => iovecs,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            ctx.set_return(errno_ret(errno as i64));
             return;
         }
     };
@@ -91,7 +91,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             scatter_fanotify_to_iovecs(&iovecs, bytes)
         }) {
             Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            Err(errno) => ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64)),
+            Err(errno) => ctx.set_return(errno_ret(errno as i64)),
         }
         return;
     }
@@ -109,19 +109,19 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         match outcome {
             Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             Err(handler_sys_read::TransactionalReadError::User(errno)) => {
-                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                ctx.set_return(errno_ret(errno as i64));
             }
             Err(handler_sys_read::TransactionalReadError::BadFd) => {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+                ctx.set_return(errno_ret(EBADF));
             }
             Err(handler_sys_read::TransactionalReadError::WouldBlock)
                 if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() =>
             {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
             }
             Err(handler_sys_read::TransactionalReadError::WouldBlock) => {
                 if has_interrupting_signal(task) {
-                    ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                    ctx.set_return(errno_ret(EINTR));
                 } else if handler_sys_read::park_blocking_read(ctx, endpoint.ops.as_ref()) {
                     return;
                 } else {
@@ -138,7 +138,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         match poll_blocking(endpoint.description.position_lock.lock()) {
             Some(guard) => Some(guard),
             None => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                ctx.set_return(errno_ret(EIO));
                 return;
             }
         }
@@ -159,16 +159,16 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             Ok(n) if n <= want => n,
             Ok(_) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
                 if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                 } else if has_interrupting_signal(task) {
-                    ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                    ctx.set_return(errno_ret(EINTR));
                 } else if handler_sys_read::park_blocking_read(ctx, endpoint.ops.as_ref()) {
                     return;
                 } else {
@@ -179,7 +179,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             Err(narf_filesystem::FsError::WouldBlock) => break,
             Err(error) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    ctx.set_return(errno_ret(copy_fs_errno(error)));
                     return;
                 }
                 break;
@@ -213,7 +213,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             total += copied;
             offset = offset.saturating_add(copied as u64);
             if total == 0 {
-                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                ctx.set_return(errno_ret(errno as i64));
                 return;
             }
             break;

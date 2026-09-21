@@ -19,15 +19,12 @@ use super::*;
 /// pointer for "that process went away". Both of those arms, plus the
 /// trailing copy fault, previously returned a bare -1 → EPERM.
 pub(crate) fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let args = *ctx.args();
     // `pid_t` is `int` — the argument is the low 32 bits, sign-extended.
     let pid = args.arg0 as i32;
     let out = args.arg1;
     if out == 0 || pid < 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `pid` is resolved in the CALLER's pid namespace (Linux
@@ -39,7 +36,7 @@ pub(crate) fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
         caller
     } else {
         let Some(outer) = accept_pid_from(caller, pid as u64) else {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         };
         let resolved = proc_pid_to_tid(outer);
@@ -52,7 +49,7 @@ pub(crate) fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
         // real process that does. The caller always resolves, even in
         // syscall-unit fixtures that never populate the task registry.
         if resolved != caller && crate::task::task_get(resolved).is_none() {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
         resolved
@@ -64,7 +61,7 @@ pub(crate) fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
     // SAFETY: `out` is the user sched_param pointer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
     if unsafe { copy_to_user(out, &val.to_ne_bytes()) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

@@ -2134,7 +2134,7 @@ fn smoke_userspace_execve_rejects_short_elf() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
     };
-    if r != SyscallReturn::ok((-14i64) as u64) {
+    if r != errno_ret(EFAULT) {
         return TestResult::Fail("bad execve pathname pointer should return -EFAULT");
     }
     crate::syscall::__test_clear_global();
@@ -2200,7 +2200,7 @@ fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult 
     crate::syscall::__test_clear_global();
     // load completed but no user ctx → bail with -ENOSYS.
     match r {
-        Some(r) if r == SyscallReturn::ok((-38i64) as u64) => TestResult::Pass,
+        Some(r) if r == errno_ret(ENOSYS) => TestResult::Pass,
         Some(r) if r.value == 0 => {
             TestResult::Fail("execve reported success after bailing for lack of a user ctx")
         }
@@ -2360,7 +2360,7 @@ fn smoke_userspace_execve_does_not_leak_pid() -> TestResult {
     }
     crate::syscall::__test_clear_global();
 
-    if ctx.ret != Some(SyscallReturn::ok((-38i64) as u64)) {
+    if ctx.ret != Some(errno_ret(ENOSYS)) {
         return TestResult::Fail("execve fixture drifted: expected the no-user-ctx bail");
     }
     if after != before {

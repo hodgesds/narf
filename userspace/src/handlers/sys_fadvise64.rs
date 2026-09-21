@@ -37,15 +37,15 @@ pub(crate) fn sys_fadvise64(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     if endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::Fifo {
-        ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+        ctx.set_return(errno_ret(ESPIPE));
         return;
     }
     if (len as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if !matches!(
@@ -57,7 +57,7 @@ pub(crate) fn sys_fadvise64(ctx: &mut dyn TrapContext) {
             | POSIX_FADV_DONTNEED
             | POSIX_FADV_NOREUSE
     ) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

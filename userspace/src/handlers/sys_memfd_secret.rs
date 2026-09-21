@@ -25,7 +25,7 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
             });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+            None => ctx.set_return(errno_ret(EMFILE)),
         }
     }
 }

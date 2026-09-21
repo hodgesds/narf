@@ -43,11 +43,11 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     // (`!= sizeof(sigset_t)` → -EINVAL) BEFORE it reads the set, then the set
     // copy-in reports -EFAULT (which also covers a NULL `set_in`).
     if sigsetsize != 8 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if set_in == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Read the user sigset through the SMAP-bracketed helper (a raw
@@ -59,7 +59,7 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     // SAFETY: set_in != 0 + sigsetsize == 8 checked above; copy_from_user
     // range-validates and SMAP-brackets the 8-byte read.
     if unsafe { copy_from_user(&mut set_buf, set_in) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let set = u64::from_ne_bytes(set_buf);
@@ -142,7 +142,7 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     // `is_restartable_syscall`).
     if (signal_pending_of(task) & !signal_mask_of(task) & !set) != 0 {
         clear_routing(uctx_opt);
-        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+        ctx.set_return(errno_ret(EINTR));
         return;
     }
 
@@ -155,7 +155,7 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomics only.
         if unsafe { (*u).sigwait_interrupted.load(Ordering::Acquire) } {
             clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+            ctx.set_return(errno_ret(EINTR));
             return;
         }
     }
@@ -172,14 +172,14 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         // SMAP-brackets the 16-byte timespec read.
         if unsafe { copy_from_user(&mut ts, timeout_in) }.is_err() {
             clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let sec = i64::from_ne_bytes(ts[..8].try_into().unwrap());
         let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         let dur_ns = (sec as u64)
@@ -188,7 +188,7 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         if dur_ns == 0 {
             // {0,0} = pure poll; nothing was pending above.
             clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
         if let Some(u) = uctx_opt {
@@ -204,7 +204,7 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
             };
             if narf_scheduler::narf_time::monotonic_ns() >= deadline {
                 clear_routing(uctx_opt);
-                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
         }
@@ -243,5 +243,8 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     // park on — degrade to the historical one-shot -1 answer the ABI
     // tests pin, exactly like pause's no-executor tail.
     clear_routing(uctx_opt);
+    // Deliberately a raw -1, not `errno_ret(EPERM)`: this is the historical
+    // sentinel the ABI tests pin, not a considered errno. Naming it EPERM
+    // would assert a meaning it does not have. See the note above.
     ctx.set_return(SyscallReturn::ok((-1i64) as u64));
 }

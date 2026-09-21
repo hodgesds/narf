@@ -33,7 +33,6 @@ use super::*;
 /// always returned 0, so it neither enforced the rule nor kept the three
 /// ids distinct enough to express it.
 pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
     const NOCHANGE: u32 = u32::MAX; // (uid_t)-1
     let a = *ctx.args();
     let (ruid, euid, suid) = (a.arg0 as u32, a.arg1 as u32, a.arg2 as u32);
@@ -54,15 +53,15 @@ pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() {
             if ruid != NOCHANGE && !uns.uid_is_mapped(ruid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if euid != NOCHANGE && !uns.uid_is_mapped(euid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if suid != NOCHANGE && !uns.uid_is_mapped(suid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -83,7 +82,7 @@ pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
     // "new" means: requested, and not already one of the three ids held.
     let is_new = |v: u32| v != NOCHANGE && v != old.uid && v != old.euid && v != old.suid;
     if (is_new(ruid) || is_new(euid) || is_new(suid)) && !capable_in_own_ns(CAP_SETUID) {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -110,6 +109,6 @@ pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
         flag_nproc_exceeded(task);
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
     }
 }

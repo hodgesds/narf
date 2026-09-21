@@ -1,17 +1,11 @@
 #[allow(unused_imports)]
 use super::*;
 
-const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
 /// What `copy_user_cstr_checked` returns for a name that reaches the cap
 /// with no terminator. Linux reports that case as -ENOENT, not
 /// -ENAMETOOLONG — see the mapping below.
-const ENAMETOOLONG_FROM_COPY: i64 = 36;
+const ENAMETOOLONG_FROM_COPY: i64 = ENAMETOOLONG;
 
-#[inline]
-fn fail(errno: i64) -> SyscallReturn {
-    SyscallReturn::ok((-errno) as u64)
-}
 
 /// `delete_module(2)` — `kernel/module/main.c::SYSCALL_DEFINE2(delete_module)`.
 ///
@@ -41,7 +35,7 @@ pub(crate) fn sys_delete_module(ctx: &mut dyn TrapContext) {
     // here, so an unprivileged caller cannot use this syscall to probe which
     // addresses are mapped.
     if !capable(CAP_SYS_MODULE) {
-        ctx.set_return(fail(EPERM));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -56,7 +50,7 @@ pub(crate) fn sys_delete_module(ctx: &mut dyn TrapContext) {
         // MODULE_NAME_LEN` in Linux, which is -ENOENT, not the
         // -ENAMETOOLONG a path syscall would give.
         Err(ENAMETOOLONG_FROM_COPY) => {
-            ctx.set_return(fail(ENOENT));
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
         Err(e) => {
@@ -65,7 +59,7 @@ pub(crate) fn sys_delete_module(ctx: &mut dyn TrapContext) {
         }
     };
     if name.is_empty() {
-        ctx.set_return(fail(ENOENT));
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
 

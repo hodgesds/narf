@@ -17,7 +17,7 @@ pub(crate) fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
     let _action = args.arg1;
     let in_ptr = args.arg2;
     if in_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let task = current_task_id();
@@ -25,7 +25,7 @@ pub(crate) fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
     // SAFETY: `in_ptr` is the user termios pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the read into `bytes`.
     if unsafe { copy_from_user(&mut bytes, in_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // SAFETY: `bytes` is `size_of::<KTermios>()` bytes; KTermios is repr(C) of POD

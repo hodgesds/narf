@@ -23,7 +23,7 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
     let info = match import_queued_siginfo(a.arg3) {
         Ok(info) => info,
         Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -31,32 +31,32 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
     let user_tid = a.arg1 as i32;
     // Linux rejects both zero and negative identifiers after importing uinfo.
     if user_tgid <= 0 || user_tid <= 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if siginfo_requires_self_target(info)
         && user_tid != linux_tid_for_task(current_task_id()) as i32
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let sig = a.arg2 as u32;
     let caller = current_task_id();
     let Some(tgid) = accept_pid_from(caller, user_tgid as u64) else {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
     let Some(target) = signal_tid_from_user(caller, user_tid as u64) else {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
     // ESRCH for a vanished target + tgid consistency (see sys_tgkill).
     if !signal_target_exists(target) || task_to_pid_raw(target).unwrap_or(target) != tgid {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
     if sig > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if sig == 0 {
@@ -67,7 +67,7 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
     let depth = match sigqueue_deliver_imported(target, sig, info) {
         Some(d) => d,
         None => {
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
     };

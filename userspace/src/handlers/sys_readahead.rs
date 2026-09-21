@@ -22,17 +22,17 @@ pub(crate) fn sys_readahead(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     if !endpoint.readable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     match endpoint.ops.stat().mode.file_type {
         narf_filesystem::FileType::File | narf_filesystem::FileType::Block => {
             ctx.set_return(SyscallReturn::ok(0))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL
+        _ => ctx.set_return(errno_ret(EINVAL)),
     }
 }

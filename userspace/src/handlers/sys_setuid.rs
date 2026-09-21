@@ -29,7 +29,6 @@ use super::*;
 /// previous behaviour) meant any process could become uid 0 by asking,
 /// and that a legitimate temporary drop became permanent.
 pub(crate) fn sys_setuid(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
     let task = current_task_id();
     let uid = ctx.args().arg0 as u32;
     // In a non-root user-ns, setuid is only allowed to an id mapped in
@@ -38,7 +37,7 @@ pub(crate) fn sys_setuid(ctx: &mut dyn TrapContext) {
     {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() && !uns.uid_is_mapped(uid) {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
@@ -53,21 +52,21 @@ pub(crate) fn sys_setuid(ctx: &mut dyn TrapContext) {
         }) {
             // Internal: the cred table is uninitialized (unreachable for a
             // live task). -EPERM is setuid's permission-failure errno.
-            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
     } else {
         // Unprivileged: only to the real or the saved uid, and only the
         // effective/fs ids move.
         if uid != old.uid && uid != old.suid {
-            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         if !write_uidgid(task, |e| {
             e.euid = uid;
             e.fsuid = uid;
         }) {
-            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
     }

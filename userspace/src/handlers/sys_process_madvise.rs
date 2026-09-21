@@ -13,7 +13,7 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
     let iovcnt = a.arg2 as usize;
     let advice = a.arg3 as i32;
     if iovcnt > 1024 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -24,7 +24,7 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
     {
         Some(p) => p,
         None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -34,7 +34,7 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
     // as mem2_smoke `mem2-fail: process_madvise`).
     let self_pid = task_to_pid_raw(task).unwrap_or(task);
     if target_pid != task && target_pid != self_pid {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM (foreign AS)
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let as_ref = match current_address_space() {
@@ -47,7 +47,7 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
     let iov = match read_iovecs(a.arg1, iovcnt) {
         Some(v) => v,
         None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };

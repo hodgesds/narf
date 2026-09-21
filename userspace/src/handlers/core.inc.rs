@@ -1171,7 +1171,7 @@ fn open_impl(
     let reservation = match fd::reserve(current_task_id()) {
         Some(reservation) => reservation,
         None => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE)); // -EMFILE
             return;
         }
     };
@@ -1196,7 +1196,7 @@ fn open_impl(
     // optional empty path this way; opening cwd produced a regular fd that it
     // added to epoll, yielding an infinite readable-at-EOF loop.
     if path_owned_raw.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT)); // -ENOENT
         return;
     }
     // Resolve relative paths against the task's cwd and collapse
@@ -1224,7 +1224,7 @@ fn open_impl(
     // ELOOP, matching the flag's sibling `RESOLVE_NO_SYMLINKS`: what the
     // caller hit was a link it asked not to traverse.
     if proc_magic_path && current_resolve_scope().is_some_and(|s| s.no_magiclinks) {
-        ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+        ctx.set_return(errno_ret(ELOOP)); // -ELOOP
         return;
     }
     let mut fast_create = if mnt_len == 0
@@ -1286,7 +1286,7 @@ fn open_impl(
                     crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
-                None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+                None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
             }
             return;
         }
@@ -1315,7 +1315,7 @@ fn open_impl(
                         narf_filesystem::new_anon_memfile()
                     }
                     _ => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                 };
@@ -1327,13 +1327,13 @@ fn open_impl(
                     });
                 match new_fd {
                     Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-                    None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+                    None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
                 }
             }
             // Directory resolves but its FS can't hold an anonymous inode,
             // or the path doesn't name a directory at all: EOPNOTSUPP so
             // the caller falls back rather than treating it as fatal.
-            _ => ctx.set_return(SyscallReturn::ok((-95i64) as u64)), // -EOPNOTSUPP
+            _ => ctx.set_return(errno_ret(EOPNOTSUPP)), // -EOPNOTSUPP
         }
         return;
     }
@@ -1367,7 +1367,7 @@ fn open_impl(
         if let Some(lops) = leaf {
             if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
                 if flags & O_PATH == 0 {
-                    ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+                    ctx.set_return(errno_ret(ELOOP)); // -ELOOP
                     return;
                 }
                 let new_fd = reservation.install(crate::fd::FdEntry {
@@ -1381,7 +1381,7 @@ fn open_impl(
                         crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                         ctx.set_return(SyscallReturn::ok(n as u64));
                     }
-                    None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+                    None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
                 }
                 return;
             }
@@ -1417,7 +1417,7 @@ fn open_impl(
         let mount_owned = match copy_user_path(mnt_ptr, mnt_len) {
             Some(s) => s,
             None => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(errno_ret(EFAULT)); // -EFAULT
                 return;
             }
         };
@@ -1458,7 +1458,7 @@ fn open_impl(
                     crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
-                None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+                None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
             }
             return;
         }
@@ -1561,11 +1561,11 @@ fn open_impl(
                     o
                 }
                 Some(Some(Err(narf_filesystem::FsError::NoSpace))) => {
-                    ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                    ctx.set_return(errno_ret(ENOSPC));
                     return;
                 }
                 Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
-                    ctx.set_return(SyscallReturn::ok((-122i64) as u64));
+                    ctx.set_return(errno_ret(EDQUOT));
                     return;
                 }
                 Some(Some(Err(error))) => {
@@ -1597,7 +1597,7 @@ fn open_impl(
                     return;
                 }
                 None | Some(None) => {
-                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // -EIO
+                    ctx.set_return(errno_ret(EIO)); // -EIO
                     return;
                 }
             }
@@ -1608,7 +1608,7 @@ fn open_impl(
             // daemon that opens an optional file (e.g. redis probing for
             // dump.rdb) sees ENOENT and continues instead of treating it
             // as a fatal EPERM. Native callers detect the negative range.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT)); // -ENOENT
             return;
         }
     };
@@ -1641,7 +1641,7 @@ fn open_impl(
                 crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                 ctx.set_return(SyscallReturn::ok(n as u64));
             }
-            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+            None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
         }
         return;
     }
@@ -1656,12 +1656,12 @@ fn open_impl(
             Some(index) => match narf_filesystem::devfs_pty::pts_lookup(index) {
                 Some(pty) => Arc::new(narf_filesystem::devfs_pty::PtySlave::new(pty)),
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                    ctx.set_return(errno_ret(ENXIO)); // -ENXIO
                     return;
                 }
             },
             None => {
-                ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                ctx.set_return(errno_ret(ENXIO)); // -ENXIO
                 return;
             }
         };
@@ -1715,11 +1715,11 @@ fn open_impl(
                     // A stored ACL that does not decode is NOT a fallback to
                     // mode bits: check_acl returns the decode error unchanged.
                     Some(Err(narf_filesystem::FsError::Unsupported)) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        ctx.set_return(errno_ret(EOPNOTSUPP));
                         return;
                     }
                     Some(Err(_)) => {
-                        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     None => None,
@@ -1745,7 +1745,7 @@ fn open_impl(
             ) {
                 // -EACCES, not the generic `fail` (-1/-EPERM). Linux open(2)
                 // reserves EPERM for a different class of failure.
-                ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                ctx.set_return(errno_ret(EACCES));
                 return;
             }
         }
@@ -1765,7 +1765,7 @@ fn open_impl(
     if narf_filesystem::any_restricted_mounts() {
         let mnt = current_mount_flags_at(path);
         if want_w && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
-            ctx.set_return(SyscallReturn::ok((-30i64) as u64)); // -EROFS
+            ctx.set_return(errno_ret(EROFS)); // -EROFS
             return;
         }
         if mnt & narf_filesystem::mnt_flags::NODEV != 0 {
@@ -1775,7 +1775,7 @@ fn open_impl(
                 narf_filesystem::FileType::Special | narf_filesystem::FileType::Block
             ) {
                 // `may_open`'s device arm is -EACCES, not EPERM.
-                ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                ctx.set_return(errno_ret(EACCES));
                 return;
             }
         }
@@ -1795,13 +1795,13 @@ fn open_impl(
         const O_TRUNC: u64 = 0o1000;
         let iflags = ops.inode_flags();
         if want_w && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            ctx.set_return(errno_ret(EPERM)); // -EPERM
             return;
         }
         if iflags & narf_filesystem::FS_APPEND_FL != 0
             && ((want_w && flags & O_APPEND == 0) || flags & O_TRUNC != 0)
         {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            ctx.set_return(errno_ret(EPERM)); // -EPERM
             return;
         }
     }
@@ -1871,7 +1871,7 @@ fn open_impl(
         }) {
         Some(n) => n,
         None => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE)); // -EMFILE
             return;
         }
     };
@@ -1932,7 +1932,7 @@ fn open_fifo(
     // must NOT register a writer (that would be observable to a later reader
     // as a phantom peer). Checked before building the handle.
     if can_write && !can_read && nonblock && shared.reader_count() == 0 {
-        ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+        ctx.set_return(errno_ret(ENXIO)); // -ENXIO
         return;
     }
 
@@ -1962,7 +1962,7 @@ fn open_fifo(
             // `!0u64` is the `-1` sentinel in disguise and reached userspace
             // as EPERM — which for a FIFO open reads as "you may not open
             // this pipe", a permission problem the caller cannot retry.
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE)); // -EMFILE
             return;
         }
     };
@@ -2124,11 +2124,11 @@ fn fanotify_read_to_user(
     // -EMFILE and the queue keeps its events, rather than delivering metadata
     // that names descriptors which were never installed.
     let Some(reserved) = fd::with_table_alloc(task, |table| table.reserve_fds(fd_count)).flatten() else {
-        return Err(24); // -EMFILE
+        return Err(EMFILE as u64);
     };
     if reserved.len() != fd_count {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     let mut reserved_iter = reserved.iter().copied();
     let mut installs = alloc::vec::Vec::with_capacity(fd_count);
@@ -2168,7 +2168,7 @@ fn fanotify_read_to_user(
     });
     if installed != Some(true) {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     Ok(staging.len())
 }
@@ -2195,7 +2195,7 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
         let last_page = last & !0xfff;
         loop {
             if !aspace.contains_address(VirtAddr::new(page)) {
-                return Err(EFAULT_CODE);
+                return Err(EFAULT as u64);
             }
             if page == last_page {
                 return Ok(());
@@ -2211,7 +2211,7 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
     if kernel_buf_scope::active() && !in_user_half(ptr) {
         return Ok(());
     }
-    Err(EFAULT_CODE)
+    Err(EFAULT as u64)
 }
 
 fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
@@ -2291,7 +2291,6 @@ const F_GET_RW_HINT: u64 = 1035;
 const F_SET_RW_HINT: u64 = 1036;
 
 /// Linux EAGAIN value (11).
-const EAGAIN_CODE: u64 = 11;
 /// Linux EPERM (1) — returned as the value of the failed syscall
 /// (sign-flipped at libc; we follow the existing -1 convention).
 const _EPERM: u64 = 1;
@@ -2460,12 +2459,12 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
         const S_IFDIR_M: u64 = 0o040000;
         match mode & S_IFMT {
             0 | S_IFREG | S_IFCHR_M | S_IFBLK_M | S_IFIFO_M | S_IFSOCK => {}
-            S_IFDIR_M => return SyscallReturn::ok((-1i64) as u64), // -EPERM
-            _ => return SyscallReturn::ok((-22i64) as u64),        // -EINVAL
+            S_IFDIR_M => return errno_ret(EPERM), // -EPERM
+            _ => return errno_ret(EINVAL),        // -EINVAL
         }
     }
     if raw_path.is_empty() {
-        return SyscallReturn::ok((-2i64) as u64); // -ENOENT
+        return errno_ret(ENOENT); // -ENOENT
     }
     // `raw_path` is already the caller's path string; `sys_mknodat` has
     // applied its dirfd so a relative path is resolved against the dirfd's
@@ -2477,14 +2476,14 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
         if t.is_empty() {
             // No LOOKUP_EMPTY on this path, so `getname()` rejects "" with
             // -ENOENT rather than the sentinel's EPERM.
-            return SyscallReturn::ok((-2i64) as u64);
+            return errno_ret(ENOENT);
         }
         t
     };
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            return SyscallReturn::ok((-2i64) as u64); // -ENOENT
+            return errno_ret(ENOENT); // -ENOENT
         }
     };
     if let Err(errno) = mnt_want_write(path_ref) {
@@ -2511,7 +2510,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     // they carry no such authority, which is why the check names only the
     // two device types.
     if (fmt == S_IFCHR || fmt == S_IFBLK) && !capable(CAP_MKNOD) {
-        return SyscallReturn::ok((-1i64) as u64); // -EPERM
+        return errno_ret(EPERM); // -EPERM
     }
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
@@ -2521,7 +2520,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
         {
             let _ = poll_blocking(parent.unlink(&leaf));
         } else {
-            return SyscallReturn::ok((-17i64) as u64); // -EEXIST
+            return errno_ret(EEXIST); // -EEXIST
         }
     }
     // S_IFDIR never reaches here: `may_mknod` rejected it with -EPERM above,
@@ -2586,7 +2585,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
         // that rather than a blanket error. The sentinel reached userspace as
         // EPERM, colliding with the one genuine EPERM this syscall has
         // (S_IFDIR, screened above).
-        None => SyscallReturn::ok((-5i64) as u64), // -EIO
+        None => errno_ret(EIO), // -EIO
     }
 }
 
@@ -2911,7 +2910,7 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // `cp_new_stat(&stat, statbuf)` — the destination is inspected only now
     // that the path has resolved, so a bad path outranks a bad statbuf.
     if out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT)); // -EFAULT
         return;
     }
     // Report the device node's rdev (major:minor) for PATH stat too: seatd /
@@ -2931,7 +2930,7 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -3049,21 +3048,21 @@ const SEEK_END: u64 = 2;
 fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2,     // -ENOENT  may_delete_dentry: d_is_negative
-        FsError::InvalidPath => -21, // -EISDIR  may_delete_dentry: d_is_dir(victim)
+        FsError::NotFound => -ENOENT,  // may_delete_dentry: d_is_negative
+        FsError::InvalidPath => -EISDIR,  // may_delete_dentry: d_is_dir(victim)
         // `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)`, whose two
         // failures are these: sb_permission gives EROFS, the mode check EACCES.
-        FsError::ReadOnly => -30,         // -EROFS
-        FsError::PermissionDenied => -13, // -EACCES
+        FsError::ReadOnly => -EROFS,
+        FsError::PermissionDenied => -EACCES,
         // may_delete_dentry: IS_APPEND / check_sticky / IS_IMMUTABLE.
-        FsError::OperationNotPermitted => -1, // -EPERM
-        FsError::Busy => -16,                 // -EBUSY   is_local_mountpoint
-        FsError::SymlinkLoop => -40,          // -ELOOP   path walk
+        FsError::OperationNotPermitted => -EPERM,
+        FsError::Busy => -EBUSY,  // is_local_mountpoint
+        FsError::SymlinkLoop => -ELOOP,  // path walk
         // From `dir->i_op->unlink` itself.
-        FsError::NoSpace => -28,        // -ENOSPC
-        FsError::QuotaExceeded => -122, // -EDQUOT
-        FsError::Io(_) => -5,           // -EIO
-        _ => -1,                        // -EPERM  `if (!dir->i_op->unlink)`
+        FsError::NoSpace => -ENOSPC,
+        FsError::QuotaExceeded => -EDQUOT,
+        FsError::Io(_) => -EIO,
+        _ => -EPERM,  // `if (!dir->i_op->unlink)`
     };
     code as u64
 }
@@ -3089,13 +3088,13 @@ fn bind_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
         // `kern_path(old_name, ...)` could not resolve the source.
-        FsError::NotFound => -2, // -ENOENT
-        FsError::PermissionDenied => -1, // -EPERM
-        FsError::ReadOnly => -30, // -EROFS
-        FsError::Busy => -16,    // -EBUSY
+        FsError::NotFound => -ENOENT,
+        FsError::PermissionDenied => -EPERM,
+        FsError::ReadOnly => -EROFS,
+        FsError::Busy => -EBUSY,
         // do_loopback's `err = -EINVAL` default: a source that resolves but
         // may not be bound.
-        _ => -22, // -EINVAL
+        _ => -EINVAL,
     };
     code as u64
 }
@@ -3105,21 +3104,21 @@ fn bind_errno(e: narf_filesystem::FsError) -> u64 {
 fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2, // -ENOENT
+        FsError::NotFound => -ENOENT,
         // ENOTEMPTY rather than the EBUSY `vfs_rmdir` uses for a mountpoint:
         // NARF's directory backends signal a non-empty victim as `Busy`, and
         // that is overwhelmingly the case a caller of rmdir is in. The
         // mountpoint case is caught before the filesystem is reached.
-        FsError::Busy => -39,        // -ENOTEMPTY  from ->rmdir
-        FsError::InvalidPath => -20, // -ENOTDIR    may_delete_dentry: !d_is_dir
-        FsError::ReadOnly => -30,    // -EROFS      inode_permission
-        FsError::PermissionDenied => -13, // -EACCES     inode_permission
-        FsError::OperationNotPermitted => -1, // -EPERM      sticky / immutable
-        FsError::NoSpace => -28,              // -ENOSPC     from ->rmdir
-        FsError::QuotaExceeded => -122,       // -EDQUOT     ditto
-        FsError::Io(_) => -5,                 // -EIO
-        FsError::Unsupported => -1,           // -EPERM      `if (!dir->i_op->rmdir)`
-        _ => -1,                              // -EPERM
+        FsError::Busy => -ENOTEMPTY,  // from ->rmdir
+        FsError::InvalidPath => -ENOTDIR,  // may_delete_dentry: !d_is_dir
+        FsError::ReadOnly => -EROFS,  // inode_permission
+        FsError::PermissionDenied => -EACCES,  // inode_permission
+        FsError::OperationNotPermitted => -EPERM,  // sticky / immutable
+        FsError::NoSpace => -ENOSPC,  // from ->rmdir
+        FsError::QuotaExceeded => -EDQUOT,  // ditto
+        FsError::Io(_) => -EIO,
+        FsError::Unsupported => -EPERM,  // `if (!dir->i_op->rmdir)`
+        _ => -EPERM,
     };
     code as u64
 }
@@ -3133,21 +3132,22 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
 fn rename_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2,        // -ENOENT
-        FsError::Busy => -17,           // -EEXIST
-        FsError::InvalidPath => -22,    // -EINVAL
-        FsError::CrossDevice => -18,    // -EXDEV
-        FsError::ReadOnly => -30,       // -EROFS   inode_permission
-        FsError::QuotaExceeded => -122, // -EDQUOT
+        FsError::NotFound => -ENOENT,
+        FsError::Busy => -EEXIST,
+        FsError::InvalidPath => -EINVAL,
+        FsError::CrossDevice => -EXDEV,
+        FsError::ReadOnly => -EROFS,  // inode_permission
+        FsError::QuotaExceeded => -EDQUOT,
         // `vfs_rename` reaches both `may_delete_dentry` and
         // `may_create_dentry`, so the same inode_permission failures apply,
         // and the filesystem's own ->rename supplies the rest.
-        FsError::PermissionDenied => -13, // -EACCES
-        FsError::OperationNotPermitted => -1, // -EPERM
-        FsError::SymlinkLoop => -40,          // -ELOOP
-        FsError::NoSpace => -28,              // -ENOSPC
-        FsError::Io(_) => -5,                 // -EIO
-        _ => -1,
+        FsError::PermissionDenied => -EACCES,
+        FsError::OperationNotPermitted => -EPERM,
+        FsError::SymlinkLoop => -ELOOP,
+        FsError::NoSpace => -ENOSPC,
+        FsError::Io(_) => -EIO,
+        // "everything else → EPERM", per the doc comment above.
+        _ => -EPERM,
     };
     code as u64
 }
@@ -3408,10 +3408,7 @@ fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
 /// it); a move across mounts is a genuine `EXDEV` and every caller falls
 /// back to copy+unlink on it.
 fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
-    const EXDEV: i64 = -18;
-    const ENOENT: i64 = -2;
-    const ENOTDIR: i64 = -20;
-    const EISDIR: i64 = -21;
+    use crate::errno::wire::{EISDIR, ENOENT, ENOTDIR, EXDEV};
     let res = current_resolve_two_parents_absolute(
         old_abs,
         new_abs,
@@ -3493,7 +3490,7 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
 /// caller's libc expects.
 fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     if old_raw.is_empty() || new_raw.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT)); // -ENOENT
         return;
     }
     let task = current_task_id();
@@ -3509,7 +3506,7 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     // `vfs_link`: `if (IS_APPEND(inode) || IS_IMMUTABLE(inode)) return
     // -EPERM;` — a new NAME for an immutable inode is a change to it.
     if path_inode_flags(&old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM)); // -EPERM
         return;
     }
     // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
@@ -3520,7 +3517,7 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         return;
     }
     let (Some(old_split), Some(new_split)) = (old_path.rfind('/'), new_path.rfind('/')) else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL)); // EINVAL
         return;
     };
     if old_path[..old_split] != new_path[..new_split] {
@@ -3537,15 +3534,15 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
                 ctx.set_return(SyscallReturn::ok(0));
             }
             Some(Some(Err(narf_filesystem::FsError::NotFound))) => {
-                ctx.set_return(SyscallReturn::ok((-2i64) as u64))
+                ctx.set_return(errno_ret(ENOENT))
             }
             Some(Some(Err(narf_filesystem::FsError::Busy))) => {
-                ctx.set_return(SyscallReturn::ok((-17i64) as u64))
+                ctx.set_return(errno_ret(EEXIST))
             }
             Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
-                ctx.set_return(SyscallReturn::ok((-122i64) as u64))
+                ctx.set_return(errno_ret(EDQUOT))
             }
-            _ => ctx.set_return(SyscallReturn::ok((-18i64) as u64)),
+            _ => ctx.set_return(errno_ret(EXDEV)),
         }
         return;
     }
@@ -3562,13 +3559,13 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         // link(2) errno map: missing source → ENOENT, existing dest →
         // EEXIST, directory source / no-hard-link fs → EPERM.
         Some(Some(Err(narf_filesystem::FsError::NotFound))) => {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64))
+            ctx.set_return(errno_ret(ENOENT))
         }
         Some(Some(Err(narf_filesystem::FsError::Busy))) => {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64))
+            ctx.set_return(errno_ret(EEXIST))
         }
         Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
-            ctx.set_return(SyscallReturn::ok((-122i64) as u64))
+            ctx.set_return(errno_ret(EDQUOT))
         }
         // `fs/namei.c::vfs_link` surfaces the filesystem's own error rather
         // than a blanket one; the `-1` sentinel here reached userspace as
@@ -3577,7 +3574,7 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         Some(Some(Err(error))) => {
             ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+        _ => ctx.set_return(errno_ret(EIO)), // -EIO
     }
 }
 
@@ -3612,26 +3609,26 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
         }
         // `fs/namei.c::vfs_link`, and `may_create_dentry` before it.
         // Name already taken — linkat never replaces (EEXIST).
-        Some(Err(narf_filesystem::FsError::Busy)) => -17, // -EEXIST
-        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122, // -EDQUOT
+        Some(Err(narf_filesystem::FsError::Busy)) => -EEXIST,
+        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -EDQUOT,
         // `vfs_link`: `if (!dir->i_op->link) return -EPERM;`. A filesystem
         // with no link operation is EPERM, not EOPNOTSUPP — `link(2)` lists
         // EPERM for exactly this ("the filesystem does not support the
         // creation of hard links") and does not list EOPNOTSUPP at all, so a
         // caller matching the documented set never saw this answer.
-        Some(Err(narf_filesystem::FsError::Unsupported)) => -1, // -EPERM
+        Some(Err(narf_filesystem::FsError::Unsupported)) => -EPERM,
         // `vfs_link`'s `if (dir->i_sb != inode->i_sb) return -EXDEV;`. The
         // comparison happens in the backend, which is the only place that
         // knows which filesystem an `Arc<dyn FileOps>` belongs to; it reports
         // the mismatch as `CrossDevice` and this turns it into the errno `cp`
         // and `mv` look for before falling back to a copy.
-        Some(Err(narf_filesystem::FsError::CrossDevice)) => -18, // -EXDEV
-        Some(Err(narf_filesystem::FsError::NotFound)) => -2,     // -ENOENT
-        Some(Err(narf_filesystem::FsError::ReadOnly)) => -30,    // -EROFS
-        Some(Err(narf_filesystem::FsError::PermissionDenied)) => -13, // -EACCES
-        Some(Err(narf_filesystem::FsError::NoSpace)) => -28,     // -ENOSPC
-        Some(Err(narf_filesystem::FsError::Io(_))) => -5,        // -EIO
-        _ => -1,                                                 // -EPERM
+        Some(Err(narf_filesystem::FsError::CrossDevice)) => -EXDEV,
+        Some(Err(narf_filesystem::FsError::NotFound)) => -ENOENT,
+        Some(Err(narf_filesystem::FsError::ReadOnly)) => -EROFS,
+        Some(Err(narf_filesystem::FsError::PermissionDenied)) => -EACCES,
+        Some(Err(narf_filesystem::FsError::NoSpace)) => -ENOSPC,
+        Some(Err(narf_filesystem::FsError::Io(_))) => -EIO,
+        _ => -EPERM,
     }
 }
 
@@ -3664,7 +3661,7 @@ fn readlink_impl(
     // branches on exactly this errno (`if (errno != EINVAL) return 0;`), so
     // the wrong one aborts a device walk instead of continuing it.
     if buf_len <= 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL)); // -EINVAL
         return;
     }
     let buf_len = buf_len as usize;
@@ -3706,8 +3703,8 @@ fn readlink_impl(
     // therefore report EINVAL (not the generic -1 → EPERM, which aborted
     // realpath at the first directory component); a path that names nothing
     // reports ENOENT.
-    let einval = SyscallReturn::ok((-22i64) as u64); // -EINVAL: exists, not a symlink
-    let enoent = SyscallReturn::ok((-2i64) as u64); // -ENOENT: nothing here
+    let einval = errno_ret(EINVAL); // -EINVAL: exists, not a symlink
+    let enoent = errno_ret(ENOENT); // -ENOENT: nothing here
     let file = match file {
         Some(f) => f,
         None => {
@@ -3741,7 +3738,7 @@ fn readlink_impl(
             return;
         }
         None => {
-            ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // -EIO
+            ctx.set_return(errno_ret(EIO)); // -EIO
             return;
         }
     };
@@ -3750,7 +3747,7 @@ fn readlink_impl(
     // — so it is -EFAULT, reached only after the size and the symlink checks.
     // SAFETY: buf_ptr is a user VA; copy_to_user range-validates it; n <= buf_len.
     if unsafe { copy_to_user(buf_ptr as u64, &staging[..n]) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(n as u64));
@@ -3944,7 +3941,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::NotConnected => 107,
         narf_filesystem::FsError::BrokenPipe => 32,
         narf_filesystem::FsError::BadFd => 9,
-        narf_filesystem::FsError::WouldBlock => EAGAIN_CODE as i64,
+        narf_filesystem::FsError::WouldBlock => EAGAIN,
     }
 }
 
@@ -3963,7 +3960,7 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
         return Ok(());
     }
     let Some(end) = ptr.checked_add(len as u64) else {
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     };
     let last = if len == 0 { ptr } else { end - 1 };
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3977,7 +3974,7 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
             {
                 return Ok(());
             }
-            return Err(EFAULT_CODE);
+            return Err(EFAULT as u64);
         }
     }
     Ok(())
@@ -3994,7 +3991,7 @@ fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<Impor
         return Ok(alloc::vec::Vec::new());
     }
     if iovcnt > LINUX_IOV_MAX {
-        return Err(22); // EINVAL
+        return Err(EINVAL as u64);
     }
     // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
     let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
@@ -5512,10 +5509,10 @@ pub(crate) const CAP_LINUX_IMMUTABLE: u32 = 9;
 /// while an appending one is not.
 fn immutable_check(flags: u32, write: bool, appending: bool) -> Result<(), i64> {
     if flags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
-        return Err(-1); // -EPERM
+        return Err(-EPERM); // -EPERM
     }
     if write && !appending && flags & narf_filesystem::FS_APPEND_FL != 0 {
-        return Err(-1);
+        return Err(-EPERM);
     }
     Ok(())
 }
@@ -5672,7 +5669,6 @@ fn cap_fork(parent: u64, child: u64) {
 ///
 /// Returns the new credential, or `Err(EPERM)`.
 fn cap_capset(old: Caps, effective: u64, permitted: u64, inheritable: u64) -> Result<Caps, i64> {
-    const EPERM: i64 = 1;
     let subset = |a: u64, b: u64| a & !b == 0;
     // `cap_inh_is_capped()` is 1 on any kernel without SECURE_NO_CAP_AMBIENT
     // relaxation, which is the configuration NARF models.
@@ -5906,7 +5902,7 @@ fn xattr_at_path(dfd: i64, path_ptr: u64, at_flags: u32) -> Result<(alloc::strin
         if raw.is_empty() {
             if at_flags & XATTR_AT_EMPTY_PATH == 0 {
                 // `getname` rejects "" without AT_EMPTY_PATH: -ENOENT.
-                return Err(-2);
+                return Err(-ENOENT);
             }
             true
         } else {
@@ -6463,11 +6459,11 @@ fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u
     if size == 0 {
         ctx.set_return(SyscallReturn::ok(value.len() as u64));
     } else if size < value.len() {
-        ctx.set_return(SyscallReturn::ok((-34i64) as u64));
+        ctx.set_return(errno_ret(ERANGE));
     // SAFETY: `ptr` is the caller's output buffer; `copy_to_user`
     // range-validates and SMAP-brackets the write.
     } else if unsafe { copy_to_user(ptr, value) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT)); // EFAULT
     } else {
         ctx.set_return(SyscallReturn::ok(value.len() as u64));
     }
@@ -6521,12 +6517,12 @@ fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         return;
     }
     if size < names.len() {
-        ctx.set_return(SyscallReturn::ok((-34i64) as u64)); // ERANGE
+        ctx.set_return(errno_ret(ERANGE)); // ERANGE
         return;
     }
     // SAFETY: a.arg1 is the user list buffer; copy_to_user range-validates it.
     if !names.is_empty() && unsafe { copy_to_user(a.arg1, &names) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT)); // EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(names.len() as u64));
@@ -6643,7 +6639,7 @@ fn utimes_common(ctx: &mut dyn TrapContext, raw_path: &str, tv_ptr: u64) {
         // SAFETY: non-zero user timeval[2] pointer; copy_from_user
         // range-validates and SMAP-brackets the 32-byte read.
         if unsafe { copy_from_user(&mut buf, tv_ptr) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let tv = |o: usize| -> u64 {
@@ -6725,7 +6721,7 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
         match accept_pid_from(current_task_id(), pid) {
             Some(outer) => pid = outer,
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH)); // ESRCH
                 return;
             }
         }
@@ -6736,7 +6732,7 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let riovcnt = a.arg4 as usize;
     let flags = a.arg5;
     if flags != 0 || liovcnt > 1024 || riovcnt > 1024 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL)); // EINVAL
         return;
     }
 
@@ -6750,7 +6746,7 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let cur_as = match current_address_space() {
         Some(c) => c,
         None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT)); // EFAULT
             return;
         }
     };
@@ -6766,16 +6762,16 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
             Some(tid) => match narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)) {
                 Some(r) if Arc::ptr_eq(&r, &cur_as) => {}
                 Some(_) => {
-                    ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM (cross-AS)
+                    ctx.set_return(errno_ret(EPERM)); // EPERM (cross-AS)
                     return;
                 }
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH)); // ESRCH
                     return;
                 }
             },
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH)); // ESRCH
                 return;
             }
         }
@@ -6784,14 +6780,14 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let local = match read_iovecs(local_ptr, liovcnt) {
         Some(v) => v,
         None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT)); // EFAULT
             return;
         }
     };
     let remote = match read_iovecs(remote_ptr, riovcnt) {
         Some(v) => v,
         None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT)); // EFAULT
             return;
         }
     };
@@ -6818,7 +6814,7 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
         match unsafe { copy_from_user_vec(base, take) } {
             Ok(chunk) => buf.extend_from_slice(&chunk),
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT)); // EFAULT
                 return;
             }
         }
@@ -6835,7 +6831,7 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
         // SAFETY: `base` is a user address in the (current) AS; copy_to_user
         // range-validates and SMAP-brackets the write.
         if unsafe { copy_to_user(base, &buf[off..off + take]) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT)); // EFAULT
             return;
         }
         off += take;
@@ -7806,13 +7802,13 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     let use_current_pos = v2 && pos == u64::MAX;
 
     if !use_current_pos && (pos as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL)); // -EINVAL
         return;
     }
 
     let task = current_task_id();
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF)); // -EBADF
         return;
     };
     // Positioned I/O on a pipe/FIFO/socket is -ESPIPE: streams never carry
@@ -7823,7 +7819,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         use narf_filesystem::FileType;
         let ty = endpoint.ops.stat().mode.file_type;
         if ty == FileType::Fifo || ty == FileType::Socket {
-            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            ctx.set_return(errno_ret(ESPIPE)); // -ESPIPE
             return;
         }
     }
@@ -7833,7 +7829,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         endpoint.readable()
     };
     if !permitted {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF)); // -EBADF
         return;
     }
 
@@ -7882,11 +7878,11 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         let flags = a.arg5 & 0xffff_ffff;
         if flags != 0 {
             if flags & !RWF_SUPPORTED != 0 {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                ctx.set_return(errno_ret(EOPNOTSUPP)); // -EOPNOTSUPP
                 return;
             }
             if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL)); // -EINVAL
                 return;
             }
             // NARF has no FMODE_NOWAIT, no atomic-write support and no
@@ -7896,7 +7892,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             // Linux gives -EOPNOTSUPP for the same call on the same kind of
             // memory-backed file.
             if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                ctx.set_return(errno_ret(EOPNOTSUPP)); // -EOPNOTSUPP
                 return;
             }
             // LINUX-GAP, and deliberately loud. These three change where the
@@ -7923,7 +7919,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             // -EOPNOTSUPP is a documented answer for a file that cannot honour
             // an RWF_ bit, and callers already branch on it.
             if flags & (RWF_APPEND | RWF_NOAPPEND | RWF_NOSIGNAL) != 0 {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                ctx.set_return(errno_ret(EOPNOTSUPP)); // -EOPNOTSUPP
                 return;
             }
             // What remains is honourable as-is: RWF_DSYNC / RWF_SYNC promise
@@ -8041,19 +8037,19 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             // bug; Linux's iterators can never exceed the iov length.
             Ok(_) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
             Err(narf_filesystem::FsError::BrokenPipe) => {
                 raise_signal_pending(task, 13); // SIGPIPE even after a prefix
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+                    ctx.set_return(errno_ret(EPIPE));
                     return;
                 }
                 break;
@@ -8413,7 +8409,7 @@ fn mprotect_core(
             .iter()
             .any(|old| mdwe_denies(task, *old, perms.prot_only()))
         {
-            return Err(13); // EACCES
+            return Err(EACCES);
         }
         let transition = narf_memory::wx::classify_mprotect_range(
             intersecting.into_iter(),
@@ -8427,14 +8423,14 @@ fn mprotect_core(
             narf_memory::wx::WxTransition::NeedsCapJit => {
                 let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id()) else {
                     // No JIT capability for the RW→RX flip → EACCES.
-                    return Err(13);
+                    return Err(EACCES);
                 };
                 // Underlying range error (empty/gapped) → ENOMEM.
-                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| 12)
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ENOMEM)
             }
             narf_memory::wx::WxTransition::Allow => {
                 // Empty/gapped range → ENOMEM.
-                as_ref.mprotect_range(base, len, perms).map_err(|_| 12)
+                as_ref.mprotect_range(base, len, perms).map_err(|_| ENOMEM)
             }
         }
     }
@@ -8482,7 +8478,7 @@ fn mprotect_core(
 /// That makes the arm unreachable in production and permanently reachable in
 /// tests, which is the combination that lets a wrong answer sit unnoticed.
 fn no_address_space() -> SyscallReturn {
-    SyscallReturn::ok((-12i64) as u64) // -ENOMEM
+    errno_ret(ENOMEM) // -ENOMEM
 }
 
 pub(crate) fn terminate_current_task(
@@ -8639,7 +8635,7 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
     if (pending & !mask) != 0 {
         if let Some(hook) = signal_delivery_hook() {
             // EINTR
-            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+            ctx.set_return(errno_ret(EINTR));
             hook(ctx, syscall_no);
             return true;
         }
@@ -9174,7 +9170,7 @@ fn current_user_tls_base() -> Option<u64> {
 /// any child state. The returned value is a positive errno number.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn validate_clone_args(ca: &CloneArgs, legacy: bool, requested_tids: &[i32]) -> Result<(), u64> {
-    const EINVAL: u64 = 22;
+    const EINVAL: u64 = crate::errno::EINVAL as u64;
     const CLONE_DETACHED: u64 = 0x0040_0000;
     const CLONE_PARENT: u64 = 0x0000_8000;
     const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -9288,7 +9284,7 @@ fn clone_parent_link(parent_task: u64, flags: u64, requested_signal: u8) -> Resu
     // caller's group-leader exit_signal. A namespace init has no reusable
     // parent and Linux rejects CLONE_PARENT with EINVAL.
     let parent_pid = task_to_pid_raw(parent_task).unwrap_or(parent_task);
-    child_link_get(parent_pid).ok_or(22)
+    child_link_get(parent_pid).ok_or(EINVAL as u64)
 }
 
 #[doc(hidden)]
@@ -9315,7 +9311,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         || (flags & CLONE_PARENT_SETTID != 0
             && validate_user_range(ca.parent_tid, core::mem::size_of::<i32>()).is_err())
     {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let parent_pid = current_task_id();
@@ -9336,7 +9332,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         None => {
             // A Linux process cannot clone without an mm/task context. Treat
             // failure to resolve that context like task-state allocation.
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
@@ -9351,14 +9347,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // would report. The two errnos mean very different things to a caller
     // deciding whether to retry.
     if nproc_fork_would_exceed(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
     // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
     // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
     if !narf_scheduler::user_nproc_available() {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -9391,7 +9387,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             Ok(a) => a,
             Err(_) => {
                 // COW dup allocation failed → ENOMEM.
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                ctx.set_return(errno_ret(ENOMEM));
                 return;
             }
         };
@@ -9416,7 +9412,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         let reserved = crate::fd::with_table_alloc(parent_pid, |table| table.reserve_fds(1))
             .flatten();
         let Some(fd) = reserved.and_then(|fds| fds.first().copied()) else {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // EMFILE
+            ctx.set_return(errno_ret(EMFILE)); // EMFILE
             return;
         };
         let fd_bytes = (fd as i32).to_ne_bytes();
@@ -9426,7 +9422,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             let _ = crate::fd::with_table(parent_pid, |table| {
                 table.release_reserved(&[fd]);
             });
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT)); // EFAULT
             return;
         }
         Some(fd)
@@ -9552,7 +9548,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
                     table.release_reserved(&[fd]);
                 });
             }
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         let allocated = match requested_tids.first().copied() {
@@ -9560,7 +9556,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             None => {
                 let pid = crate::alloc_pid().raw();
                 if pid == 0 {
-                    Err(EAGAIN_CODE)
+                    Err(EAGAIN as u64)
                 } else {
                     Ok(pid)
                 }
@@ -10946,7 +10942,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
             // not a completed wait. Returning success leaves userspace with a
             // zeroed siginfo_t, which systemd interprets as an unknown child
             // state. Linux reports ECHILD when no eligible child exists.
-            ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
+            ctx.set_return(errno_ret(ECHILD)); // ECHILD
             return;
         }
     };
@@ -10990,7 +10986,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
                 let _ = take_wait_rusage_ptr(parent);
                 uc.wait_child_pending
                     .store(false, core::sync::atomic::Ordering::Release);
-                ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
+                ctx.set_return(errno_ret(ECHILD)); // ECHILD
                 return;
             }
         };
@@ -11035,7 +11031,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
             // waitpid loop then re-issues the wait). If no hook is installed
             // (test contexts) fall back to a bare -EINTR.
             if !maybe_deliver_signal_before_yield(ctx, SYSCALL_NUM_NONE) {
-                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+                ctx.set_return(errno_ret(EINTR)); // -EINTR
             }
             return;
         }
@@ -13571,7 +13567,7 @@ pub(crate) fn may_delete_in(
     let (dir_uid, _) = dir.dir_owners();
     if dir.dir_mode() & 0o1000 != 0 && !sticky_permits_removal(dir_uid, victim_uid, victim_gid, task)
     {
-        return Err(-1); // -EPERM
+        return Err(-EPERM); // -EPERM
     }
     Ok(())
 }
@@ -13678,7 +13674,7 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, vals: [u3
                 // out-pointer is -EFAULT. The sentinel said EPERM, which for
                 // a credential query reads as "you may not ask" rather than
                 // "your pointer is bad".
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(errno_ret(EFAULT)); // -EFAULT
                 return;
             }
         }
@@ -13892,7 +13888,7 @@ fn fsize_check_write(
     }
     if pos >= limit {
         raise_signal_pending(task, SIGXFSZ);
-        return Err(27); // -EFBIG
+        return Err(EFBIG);
     }
     Ok(count.min((limit - pos) as usize))
 }
@@ -13919,7 +13915,7 @@ fn fsize_check_resize(task: u64, current_size: u64, new_size: u64) -> Result<(),
     let limit = fsize_limit(task);
     if limit != RLIM_INFINITY && new_size > limit {
         raise_signal_pending(task, SIGXFSZ);
-        return Err(27); // -EFBIG
+        return Err(EFBIG);
     }
     Ok(())
 }
@@ -14225,20 +14221,20 @@ fn update_rlimit_atomic(
     may_raise_hard: bool,
 ) -> Result<RLimitPair, i64> {
     if resource >= RLIMIT_COUNT {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     let key = process_state_key(task);
     let mut g = RLIMIT_TABLE.lock();
-    let state = g.as_mut().ok_or(22i64)?;
+    let state = g.as_mut().ok_or(EINVAL)?;
     if let Some(owner) = owner {
         // Revalidate while holding RLIMIT_TABLE. Reap takes this lock before
         // removing the task-registry entry, so it cannot slip between this
         // check and the row transaction. This replaces the old unbounded set
         // of every TaskId ever reaped without allowing a retained Arc<Task>
         // from a raced prlimit64 to recreate the dead process's row.
-        let registered = crate::task::task_get(task).ok_or(3i64)?;
+        let registered = crate::task::task_get(task).ok_or(ESRCH)?;
         if !alloc::sync::Arc::ptr_eq(owner, &registered) {
-            return Err(3); // ESRCH
+            return Err(ESRCH);
         }
     }
     let prior = state
@@ -14248,7 +14244,7 @@ fn update_rlimit_atomic(
         .unwrap_or_else(default_rlimits)[resource];
     if let Some(value) = new_value {
         if value.cur > value.max {
-            return Err(22); // EINVAL
+            return Err(EINVAL);
         }
         if value.max > prior.max && !may_raise_hard {
             // `do_prlimit`: raising the hard ceiling requires CAP_SYS_RESOURCE
@@ -14257,7 +14253,7 @@ fn update_rlimit_atomic(
             // transaction, keeping the table independent of the credential and
             // namespace lock order. pam_limits (and any Limit* that raises a
             // hard limit) relies on root holding this.
-            return Err(1); // EPERM
+            return Err(EPERM);
         }
         let new_row = !state.rows.contains_key(&key);
         let row = state.rows.entry(key).or_insert_with(default_rlimits);

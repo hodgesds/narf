@@ -31,7 +31,6 @@ use super::*;
 /// the source (bump its counter); parked waiters re-arm and re-evaluate
 /// against the destination word themselves. Reports `nr_wake` released.
 pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
     let args = *ctx.args();
     let waiters = args.arg0;
     // `unsigned int flags`, `int nr_wake`, `int nr_requeue` — all 32-bit.
@@ -87,7 +86,7 @@ pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
         match unsafe { copy_from_user(&mut word, src) } {
             Ok(()) => {
                 if u64::from(u32::from_ne_bytes(word)) != entries[0].val {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
             }

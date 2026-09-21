@@ -35,9 +35,6 @@ use super::*;
 ///   retrying with a bigger buffer.
 /// * An unwritable destination is -EFAULT, matching `copy_to_user`.
 pub(crate) fn sys_gethostname(ctx: &mut dyn TrapContext) {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
-    const ENAMETOOLONG: i64 = 36;
     let args = *ctx.args();
     let buf = args.arg0;
     // `int len` — 32-bit and signed.

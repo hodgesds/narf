@@ -34,12 +34,12 @@ pub(crate) fn sys_mknodat(ctx: &mut dyn TrapContext) {
     let raw = match copy_user_cstr_checked(args.arg1, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if raw.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     // Resolve a relative pathname against the dirfd (absolute paths and

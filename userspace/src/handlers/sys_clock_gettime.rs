@@ -37,7 +37,7 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
         // a wall-clock reading. An error the caller can see is the whole
         // point: on -EINVAL it falls back to a clock this kernel does have.
         _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -47,7 +47,7 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     // NULL)` is therefore -EINVAL, not -EFAULT. Linux never checks timespec
     // alignment either (copy_to_user handles unaligned stores).
     if buf == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Write the timespec (two i64s: tv_sec, tv_nsec) under the SMAP bracket.
@@ -59,7 +59,7 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         // Faulting timespec buffer → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

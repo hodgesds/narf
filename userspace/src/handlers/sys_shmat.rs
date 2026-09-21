@@ -50,7 +50,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let object = (ipc_ns, shmid);
 
     if signed_shmid < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if base != 0 {
@@ -58,16 +58,16 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             if flg & SHM_RND != 0 {
                 base &= !(SHMLBA - 1);
                 if base == 0 && flg & SHM_REMAP != 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
             } else if base & 0xFFF != 0 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
     } else if flg & SHM_REMAP != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -81,11 +81,11 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             .and_then(|map| map.get_mut(&object))
             .filter(|seg| !seg.removed)
         else {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         if !shm_ipc_allowed(seg, request) {
-            ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+            ctx.set_return(errno_ret(EACCES));
             return;
         }
         // Reserve backing lifetime against a racing IPC_RMID.
@@ -97,13 +97,13 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         Some(value) => value & !0xFFF,
         None => {
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
     if base != 0 && flg & SHM_REMAP == 0 && base.checked_add(reserve_len).is_none() {
         shm_cancel_attach(object);
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -112,7 +112,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         None => {
             // No shmem backend in this kernel — same answer `shmget` gives.
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+            ctx.set_return(errno_ret(ENOSYS));
             return;
         }
     };
@@ -123,7 +123,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             // function's answer for that, two arms up, where
             // `reserve_mmap_va_aligned` comes back empty.
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
@@ -131,7 +131,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         base = as_ref.reserve_mmap_va_aligned(reserve_len, SHMLBA);
         if base == 0 {
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     }
@@ -201,17 +201,17 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         Ok(map_len) => map_len,
         Err(narf_memory::AddressSpaceError::Overlap) if flg & SHM_REMAP == 0 => {
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         Err(narf_memory::AddressSpaceError::LockLimit) => {
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
         Err(_) => {
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
@@ -225,7 +225,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     if unsafe { as_ref.materialize_range(VirtAddr::new(base), map_len) }.is_err() {
         let _ = as_ref.unmap_region(VirtAddr::new(base));
         shm_cancel_attach(object);
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
 
@@ -233,7 +233,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     if fragments.try_reserve_exact(1).is_err() {
         let _ = as_ref.unmap_region(VirtAddr::new(base));
         shm_cancel_attach(object);
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     fragments.push((base, map_len));
@@ -254,7 +254,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     if !registered {
         let _ = as_ref.unmap_region(VirtAddr::new(base));
         shm_cancel_attach(object);
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     let now = shm_now_seconds();

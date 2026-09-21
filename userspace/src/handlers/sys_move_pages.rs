@@ -113,11 +113,11 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
     // LINUX-GAP: Linux has no cap on `count` (it chunks the arrays); NARF
     // bounds it so one call cannot ask for an unbounded kernel allocation.
     if count > (1 << 20) || flags & !(MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if flags & MPOL_MF_MOVE_ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: no root/ambient privilege.
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let task = current_task_id();
@@ -131,7 +131,7 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
             Some(outer) if outer == task || outer == visible_pid => {}
             // The pid did not resolve in the caller's namespace at all.
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
             // It resolved to some outer id: ESRCH only if no task answers to
@@ -145,8 +145,8 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
             Some(outer) => {
                 let live = pid_to_task_raw(outer).is_some()
                     || narf_scheduler::task_affinity(narf_scheduler::TaskId(outer)).is_some();
-                let errno: i64 = if live { 1 } else { 3 }; // EPERM : ESRCH
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                let errno: i64 = if live { EPERM } else { ESRCH };
+                ctx.set_return(errno_ret(errno));
                 return;
             }
         }
@@ -156,7 +156,7 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
         return;
     }
     if pages_ptr == 0 || status_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let Some(as_ref) = current_address_space() else {
@@ -167,14 +167,14 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
     let mut page_bytes = alloc::vec![0u8; count * 8];
     // SAFETY: copy_from_user range-validates the pointer array.
     if unsafe { copy_from_user(&mut page_bytes, pages_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut node_bytes = if nodes_ptr != 0 {
         let mut bytes = alloc::vec![0u8; count * 4];
         // SAFETY: copy_from_user range-validates the target-node array.
         if unsafe { copy_from_user(&mut bytes, nodes_ptr) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         Some(bytes)
@@ -191,44 +191,44 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
             let target = i32::from_ne_bytes(nodes[noff..noff + 4].try_into().unwrap());
             if target < 0 || target as u32 >= numa_node_count() {
                 not_moved += 1;
-                -22 // EINVAL
+                -EINVAL as i32
             } else {
                 // SAFETY: the live current AS owns its root and backing list.
                 match unsafe { as_ref.migrate_page_to_node(VirtAddr::new(va), target as usize) } {
                     Ok(_) => target,
                     Err(narf_memory::AddressSpaceError::Unmapped) => {
                         not_moved += 1;
-                        -2 // ENOENT
+                        -ENOENT as i32
                     }
                     Err(narf_memory::AddressSpaceError::SharedMapping) => {
                         match migrate_registry_shared_page(&as_ref, va, target as usize) {
                             Ok(()) => target,
                             Err(_) => {
                                 not_moved += 1;
-                                -13 // EACCES for device/non-registry shared pages.
+                                -EACCES as i32
                             }
                         }
                     }
                     Err(narf_memory::AddressSpaceError::InvalidNode) => {
                         not_moved += 1;
-                        -22 // EINVAL
+                        -EINVAL as i32
                     }
                     Err(_) => {
                         not_moved += 1;
-                        -12 // ENOMEM / replacement failure
+                        -ENOMEM as i32
                     }
                 }
             }
         } else {
             mapped_phys(&as_ref, va)
                 .map(|phys| numa_node_for_phys(phys) as i32)
-                .unwrap_or(-2) // ENOENT: page is not present.
+                .unwrap_or(-ENOENT as i32)
         };
         statuses[i * 4..i * 4 + 4].copy_from_slice(&status.to_ne_bytes());
     }
     // SAFETY: copy_to_user range-validates the status array.
     if unsafe { copy_to_user(status_ptr, &statuses) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(not_moved));

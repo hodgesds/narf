@@ -543,7 +543,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     match resolve_fasync_task(task, who, false) {
                         Some(target) => crate::fd::FasyncOwner::Process(target),
                         None => {
-                            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                            ctx.set_return(errno_ret(ESRCH));
                             return;
                         }
                     }
@@ -782,13 +782,13 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     .unwrap_or(0) as i64,
                 SEEK_END => ops.stat().size as i64,
                 _ => {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
             };
             // `if (l->l_start > OFFSET_MAX - start) return -EOVERFLOW;`
             let Some(abs_start) = origin.checked_add(uf.l_start) else {
-                ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+                ctx.set_return(errno_ret(EOVERFLOW));
                 return;
             };
             let mut uf = uf;
@@ -798,7 +798,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // that filled the field in (as it would for F_GETLK) learns the
             // struct means something different here.
             if is_ofd && uf.l_pid != 0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let req = crate::fd::locks::Lock {
@@ -826,7 +826,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 )
             };
             if lock_start < 0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let native = narf_filesystem::FileLock {
@@ -949,7 +949,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     if is_signal_pending(task) {
                         crate::fd::locks::drop_waiter(key, task);
                         clear_flock_routing();
-                        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+                        ctx.set_return(errno_ret(EINTR));
                         return;
                     }
                     // Park ~1ms with RIP rewound so the WHOLE fcntl
@@ -1000,10 +1000,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     }
                     crate::fd::locks::drop_waiter(key, task);
                     clear_flock_routing();
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                 }
                 Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                 }
             }
             return;
@@ -1093,7 +1093,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 });
                 match resized {
                     Some(Ok(cap)) => SyscallReturn::ok(cap as u64),
-                    Some(Err(errno)) => SyscallReturn::ok((-(errno as i64)) as u64),
+                    Some(Err(errno)) => errno_ret(errno as i64),
                     // FIFOs expose pipe_capacity too. Their fixed backing is a
                     // compatibility implementation: validate Linux's global
                     // size errors, then report the live capacity.

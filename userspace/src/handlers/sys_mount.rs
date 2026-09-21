@@ -51,15 +51,15 @@ fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string:
 fn mount_attach_errno(e: narf_filesystem::FsError) -> SyscallReturn {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2,              // -ENOENT — nothing to attach
-        FsError::Busy => -16,                 // -EBUSY  — target in use
-        FsError::PermissionDenied => -1,      // -EPERM  — revoked authority
-        FsError::OperationNotPermitted => -1, // -EPERM
-        FsError::NoSpace => -28,              // -ENOSPC
-        FsError::Unsupported => -95,          // -EOPNOTSUPP
-        _ => -22,                             // -EINVAL
+        FsError::NotFound => ENOENT,
+        FsError::Busy => EBUSY,
+        FsError::PermissionDenied => EPERM,
+        FsError::OperationNotPermitted => EPERM,
+        FsError::NoSpace => ENOSPC,
+        FsError::Unsupported => EOPNOTSUPP,
+        _ => EINVAL,
     };
-    SyscallReturn::ok(code as u64)
+    errno_ret(code)
 }
 
 // `include/uapi/linux/mount.h`. Neither bit is in the shared `MS_*` block
@@ -117,10 +117,10 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // errno replies (negated-long convention). Every failure carries a
     // specific errno (a bare -1 would map to EPERM), matching Linux mount(2).
-    let einval = SyscallReturn::ok((-22i64) as u64); // EINVAL — bad argument
-    let enodev = SyscallReturn::ok((-19i64) as u64); // ENODEV — unknown fstype
-    let ebusy = SyscallReturn::ok((-16i64) as u64); // EBUSY — target in use
-    let enoent = SyscallReturn::ok((-2i64) as u64); // ENOENT — missing source
+    let einval = errno_ret(EINVAL); // EINVAL — bad argument
+    let enodev = errno_ret(ENODEV); // ENODEV — unknown fstype
+    let ebusy = errno_ret(EBUSY); // EBUSY — target in use
+    let enoent = errno_ret(ENOENT); // ENOENT — missing source
 
     // Linux `mount(2)`: (const char *source, const char *target,
     // const char *filesystemtype, unsigned long mountflags, const void *data).
@@ -151,44 +151,44 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         alloc::string::String::new()
     } else {
         match copy_user_cstr_checked(args.arg2, 4096) {
-                Ok(s) => s,
-                Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            Ok(s) => s,
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
                 return;
-                }
             }
+        }
     };
     // A NULL source is legal (MS_REMOUNT / propagation changes pass one).
     let source = if args.arg0 == 0 {
         alloc::string::String::new()
     } else {
         match copy_user_cstr_checked(args.arg0, 4096) {
-                Ok(s) => s,
-                Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            Ok(s) => s,
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
                 return;
-                }
             }
+        }
     };
     // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=64M").
     let data = if args.arg4 == 0 {
         alloc::string::String::new()
     } else {
         match copy_user_cstr_checked(args.arg4, 4096) {
-                Ok(data) => data,
-                Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            Ok(data) => data,
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
                 return;
-                }
             }
+        }
     };
     let target_raw = match copy_user_cstr_checked(args.arg1, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     // `path_mount` runs after `do_mount` has resolved the target: it discards
     // the legacy mount magic before any flag is read, then rejects MS_NOUSER —
     // the in-kernel-only bit that marks a mount userspace may not request.
@@ -220,7 +220,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // host question refuses a container that unshared its own mount
     // namespace, which is the one place mounting is supposed to be allowed.
     if !mount_admin(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -306,7 +306,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             let result = current_fs_arc_at(&target).map(|fs| fs.reconfigure(&data));
             ctx.set_return(match result {
                 Some(Ok(())) => SyscallReturn::ok(0),
-                Some(Err(narf_filesystem::FsError::NoSpace)) => SyscallReturn::ok((-28i64) as u64),
+                Some(Err(narf_filesystem::FsError::NoSpace)) => errno_ret(ENOSPC),
                 Some(Err(_)) => einval,
                 None => enoent,
             });
@@ -335,11 +335,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(narf_filesystem::FsError::NoSpace) => {
-                ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                ctx.set_return(errno_ret(ENOSPC));
                 return;
             }
             Err(narf_filesystem::FsError::Unsupported) => {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             Err(_) => {
@@ -487,11 +487,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                 };
             }
             Err(narf_filesystem::FsError::NoSpace) => {
-                ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                ctx.set_return(errno_ret(ENOSPC));
                 return;
             }
             Err(narf_filesystem::FsError::Unsupported) => {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
             Err(_) => {

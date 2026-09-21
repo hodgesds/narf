@@ -25,8 +25,6 @@ use super::*;
 /// wrote. The table is now per-task and the selection is shared with
 /// getpriority/setpriority.
 pub(crate) fn sys_ioprio_get(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EINVAL: i64 = 22;
     const IOPRIO_WHO_PROCESS: i64 = 1;
     const IOPRIO_WHO_PGRP: i64 = 2;
     const IOPRIO_WHO_USER: i64 = 3;
@@ -39,7 +37,7 @@ pub(crate) fn sys_ioprio_get(ctx: &mut dyn TrapContext) {
         IOPRIO_WHO_PGRP => WhoScope::Pgrp,
         IOPRIO_WHO_USER => WhoScope::User,
         _ => {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -52,6 +50,6 @@ pub(crate) fn sys_ioprio_get(ctx: &mut dyn TrapContext) {
     }
     match best {
         Some(v) => ctx.set_return(SyscallReturn::ok(v as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-ESRCH) as u64)),
+        None => ctx.set_return(errno_ret(ESRCH)),
     }
 }

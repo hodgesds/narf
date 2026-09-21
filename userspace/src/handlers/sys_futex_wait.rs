@@ -77,7 +77,6 @@ pub(crate) fn futex2_flags_valid(flags: u64) -> bool {
 /// with a faulting `timeout` pointer is -EINVAL, not -EFAULT. Returns
 /// `Ok(None)` when no timeout was supplied.
 pub(crate) fn futex2_deadline(timeout_ptr: u64, clockid: i32) -> Result<Option<u64>, i64> {
-    const EINVAL: i64 = 22;
     if timeout_ptr == 0 {
         return Ok(None);
     }
@@ -109,8 +108,6 @@ pub(crate) fn futex2_deadline(timeout_ptr: u64, clockid: i32) -> Result<Option<u
 /// and retry the fast path". Reported as the bare -1 it arrived as EPERM,
 /// which a pthread mutex has no retry rule for.
 pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
-    const ETIMEDOUT: i64 = 110;
     let args = *ctx.args();
     // `unsigned int flags` / `clockid_t clockid` are 32-bit; `val` and
     // `mask` are `unsigned long`.

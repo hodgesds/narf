@@ -24,20 +24,17 @@ use super::*;
 /// gets the supported version written back, even when it also passed a
 /// null `datap`.
 pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let a = *ctx.args();
     let hdrp = a.arg0;
     let datap = a.arg1;
     if hdrp == 0 {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut hdr = [0u8; 8];
     // SAFETY: hdrp checked non-zero; copy_from_user range-validates the read.
     if unsafe { copy_from_user(&mut hdr, hdrp) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let version = u32::from_le_bytes(hdr[..4].try_into().unwrap());
@@ -48,7 +45,7 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
             hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
             // SAFETY: hdrp validated by the read above; same 8-byte range.
             let _ = unsafe { copy_to_user(hdrp, &hdr) };
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -66,7 +63,7 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
         match accept_pid_from(task, pid as u64) {
             Some(outer) => outer,
             None => {
-                ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
         }
@@ -74,14 +71,14 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
         0
     };
     if target_pid != 0 && target_pid != self_pid {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // `copy_from_user(&kdata, data, copybytes)` is the LAST check, after the
     // version and the pid: a null/faulting `datap` is -EFAULT, and it must
     // not pre-empt the -EINVAL version handshake above.
     if datap == 0 {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // SAFETY: datap checked non-zero above; copy_from_user_vec range-validates
@@ -89,7 +86,7 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
     let buf = match unsafe { copy_from_user_vec(datap, ndata * 12) } {
         Ok(b) => b,
         Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -116,6 +113,6 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
             write_caps(task, new);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        Err(errno) => ctx.set_return(errno_ret(errno)),
     }
 }

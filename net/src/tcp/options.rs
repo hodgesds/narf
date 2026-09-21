@@ -401,9 +401,9 @@ mod tests {
         let mut state = OptionsState::new();
         state.timestamps_active = true;
         state.ts_recent = 100;
-        assert!(state.paws_reject(50));
-        assert!(!state.paws_reject(100));
-        assert!(!state.paws_reject(150));
+        assert!(state.paws_reject(50, 0, 0));
+        assert!(!state.paws_reject(100, 0, 0));
+        assert!(!state.paws_reject(150, 0, 0));
     }
 
     #[test]

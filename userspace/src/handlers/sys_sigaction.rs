@@ -13,7 +13,7 @@ pub(crate) fn sys_sigaction(ctx: &mut dyn TrapContext) {
     // (array size NSIG=65), i.e. 1..=NSIG-1. The blanket-EINVAL fold used to hide
     // this behind an `invalid_op()`; return the exact errno AND reject signal 0.
     if signum == 0 || signum >= NSIG {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Linux `do_sigaction`: `act && sig_kernel_only(sig)` → -EINVAL. SIGKILL(9)
@@ -25,7 +25,7 @@ pub(crate) fn sys_sigaction(ctx: &mut dyn TrapContext) {
     // (`default_signal_delivery_restricted_active`) would then run that handler
     // instead of terminating, breaking the uncatchable-signal invariant.
     if signum == 9 || signum == 19 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -37,7 +37,7 @@ pub(crate) fn sys_sigaction(ctx: &mut dyn TrapContext) {
                 // No handler table for the task — a NARF-internal condition, not
                 // a Linux-reachable path; EINVAL is the least-wrong answer
                 // (matches sys_rt_sigaction).
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         };

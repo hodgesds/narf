@@ -16,17 +16,17 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     }
     if size > 4096 {
         // Linux caps extensible syscall structs at one page.
-        ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // -E2BIG
+        ctx.set_return(errno_ret(E2BIG));
         return;
     }
     if size < 64 {
         // CLONE_ARGS_SIZE_VER0 is the oldest accepted wire shape.
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if uargs == 0 {
         // NULL clone_args pointer → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
 
@@ -42,7 +42,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut raw[..copy_len], uargs) }.is_err() {
         // Faulting clone_args buffer → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Forward-compatible larger structs are accepted only when every byte
@@ -53,17 +53,17 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
         let mut tail = [0u8; 64];
         let n = core::cmp::min(tail.len(), size - tail_off);
         let Some(src) = uargs.checked_add(tail_off as u64) else {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         };
         // SAFETY: src is the checked user pointer at the current tail offset;
         // copy_from_user range-validates the n-byte read.
         if unsafe { copy_from_user(&mut tail[..n], src) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         if tail[..n].iter().any(|&byte| byte != 0) {
-            ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // -E2BIG
+            ctx.set_return(errno_ret(E2BIG));
             return;
         }
         tail_off += n;
@@ -78,15 +78,15 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
         || (ca.set_tid == 0 && ca.set_tid_size != 0)
         || (ca.set_tid != 0 && ca.set_tid_size == 0)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if ca.exit_signal > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if ca.flags & CLONE_INTO_CGROUP != 0 && (size < CLONE_ARGS_MIN || ca.cgroup > i32::MAX as u64) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut requested_tids = [0i32; 32];
@@ -96,7 +96,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
         // returned by NARF's capability policy.
         let Some(bytes) = (ca.set_tid_size as usize).checked_mul(core::mem::size_of::<i32>())
         else {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         // SAFETY: requested_tids is a contiguous i32 array and bytes is bounded
@@ -107,7 +107,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
         // SAFETY: copy_from_user validates the checked byte range; the shape
         // checks above bound it to the fixed buffer.
         if unsafe { copy_from_user(set_tid, ca.set_tid) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }
@@ -133,5 +133,5 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     // Not implemented on this arch → ENOSYS (glibc's clone3→clone fallback keys on it).
-    ctx.set_return(SyscallReturn::ok((-38i64) as u64));
+    ctx.set_return(errno_ret(ENOSYS));
 }

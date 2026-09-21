@@ -5,7 +5,7 @@ use super::*;
 pub(crate) fn sys_pkey_free(ctx: &mut dyn TrapContext) {
     let key = ctx.args().arg0;
     if key == 0 || key >= 16 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -25,6 +25,6 @@ pub(crate) fn sys_pkey_free(ctx: &mut dyn TrapContext) {
     if allocated {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
     }
 }

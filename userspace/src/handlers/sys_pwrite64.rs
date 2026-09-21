@@ -15,28 +15,28 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     let offset = args.arg3;
 
     if (offset as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     {
         use narf_filesystem::FileType;
         let ty = endpoint.ops.stat().mode.file_type;
         if ty == FileType::Fifo || ty == FileType::Socket {
-            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            ctx.set_return(errno_ret(ESPIPE));
             return;
         }
     }
     if !endpoint.writable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     if let Err(errno) = validate_rw_user_range(ptr, requested) {
-        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+        ctx.set_return(errno_ret(errno as i64));
         return;
     }
     let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
@@ -55,7 +55,7 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     let count = match fsize_check_write(task, offset, count, || endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::File) {
         Ok(c) => c,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -67,7 +67,7 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
             Ok(bytes) => bytes,
             Err(errno) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    ctx.set_return(errno_ret(errno as i64));
                     return;
                 }
                 break;
@@ -80,27 +80,27 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
             Ok(n) if n <= payload.len() => n,
             Ok(_) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
             Err(narf_filesystem::FsError::WouldBlock) => break,
             Err(narf_filesystem::FsError::BrokenPipe) => {
                 raise_signal_pending(task, 13); // SIGPIPE even after a prefix
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+                    ctx.set_return(errno_ret(EPIPE));
                     return;
                 }
                 break;
             }
             Err(error) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    ctx.set_return(errno_ret(copy_fs_errno(error)));
                     return;
                 }
                 break;

@@ -18,19 +18,19 @@ pub(crate) fn sys_socket_setsockopt(ctx: &mut dyn TrapContext) {
     let sock = match current_socket_result(fd) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if val_len == 0 || val_len > 256 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut buf = alloc::vec![0u8; val_len];
     // SAFETY: AS active; SMAP bracket inside copy_from_user. A NULL/faulting
     // optval is caught here → -EFAULT.
     if unsafe { copy_from_user(&mut buf, val_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     match sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
@@ -43,6 +43,6 @@ pub(crate) fn sys_socket_setsockopt(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
+        _ => ctx.set_return(errno_ret(EINVAL)), // unreachable
     }
 }
