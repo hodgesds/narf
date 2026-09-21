@@ -21,6 +21,7 @@
 //! when the IP stack lands — `dispatch_op` switches on family,
 //! everything below shares the SocketFile/FdEntry plumbing.
 
+use crate::errno;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
@@ -594,24 +595,24 @@ impl SockError {
     /// Map onto the libc-style errno value the user sees on -1.
     pub fn errno(self) -> i32 {
         match self {
-            Self::BadFd => 9,               // EBADF
-            Self::NoMemory => 12,           // ENOMEM
-            Self::InvalidArg => 22,         // EINVAL
-            Self::NotSupported => 95,       // ENOTSUP
-            Self::NotConnected => 107,      // ENOTCONN
-            Self::AlreadyConnected => 56,   // EISCONN
-            Self::WouldBlock => 11,         // EAGAIN
-            Self::AddrInUse => 98,          // EADDRINUSE
-            Self::AddrNotAvail => 99,       // EADDRNOTAVAIL
-            Self::ConnectionRefused => 111, // ECONNREFUSED
-            Self::Pipe => 32,               // EPIPE
-            Self::InProgress => 115,        // EINPROGRESS
-            Self::Range => 34,              // ERANGE
-            Self::NoEntry => 2,             // ENOENT
-            Self::NoDevice => 19,           // ENODEV
-            Self::PermDenied => 1,          // EPERM
-            Self::MsgSize => 90,            // EMSGSIZE
-            Self::ProtoType => 91,          // EPROTOTYPE
+            Self::BadFd => errno::EBADF as i32,
+            Self::NoMemory => errno::ENOMEM as i32,
+            Self::InvalidArg => errno::EINVAL as i32,
+            Self::NotSupported => errno::EOPNOTSUPP as i32, // ENOTSUP
+            Self::NotConnected => errno::ENOTCONN as i32,
+            Self::AlreadyConnected => errno::EISCONN as i32,
+            Self::WouldBlock => errno::EAGAIN as i32,
+            Self::AddrInUse => errno::EADDRINUSE as i32,
+            Self::AddrNotAvail => errno::EADDRNOTAVAIL as i32,
+            Self::ConnectionRefused => errno::ECONNREFUSED as i32,
+            Self::Pipe => errno::EPIPE as i32,
+            Self::InProgress => errno::EINPROGRESS as i32,
+            Self::Range => errno::ERANGE as i32,
+            Self::NoEntry => errno::ENOENT as i32,
+            Self::NoDevice => errno::ENODEV as i32,
+            Self::PermDenied => errno::EPERM as i32,
+            Self::MsgSize => errno::EMSGSIZE as i32,
+            Self::ProtoType => errno::EPROTOTYPE as i32,
         }
     }
 }
