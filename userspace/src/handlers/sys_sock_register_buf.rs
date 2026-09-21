@@ -15,7 +15,7 @@ pub(crate) fn sys_sock_register_buf(ctx: &mut dyn TrapContext) {
     // SZ_1G || !ulen) return -EFAULT`). NARF does not implement sparse (NULL +
     // len 0) registrations, so both bad-base and zero-len reject with -EFAULT.
     if ptr == 0 || len == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     match crate::socket::register_user_buffer(task, ptr, len) {
@@ -23,6 +23,6 @@ pub(crate) fn sys_sock_register_buf(ctx: &mut dyn TrapContext) {
         // register_user_buffer only rejects ptr==0/len==0, both handled above,
         // so a None here would be an unexpected internal failure → -EFAULT
         // (same buffer-validation class).
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // -EFAULT
+        None => ctx.set_return(errno_ret(EFAULT)),
     }
 }

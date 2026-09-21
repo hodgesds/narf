@@ -33,15 +33,15 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
         crate::socket::SOCK_STREAM | crate::socket::SOCK_SEQPACKET | crate::socket::SOCK_DGRAM
     );
     if !family_known {
-        ctx.set_return(SyscallReturn::ok((-97i64) as u64)); // -EAFNOSUPPORT
+        ctx.set_return(errno_ret(EAFNOSUPPORT));
         return;
     }
     if domain != crate::socket::AF_UNIX {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if !kind_ok {
-        ctx.set_return(SyscallReturn::ok((-94i64) as u64)); // -ESOCKTNOSUPPORT
+        ctx.set_return(errno_ret(ESOCKTNOSUPPORT));
         return;
     }
     let (a, b) = crate::socket::SocketFile::unix_pair(kind);
@@ -70,7 +70,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let (fd_a, fd_b) = match fd::install_pair(task, mk(a), mk(b)) {
         Some(fds) => fds,
         None => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
             return;
         }
     };
@@ -85,7 +85,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
             t.close(fd_a);
             t.close(fd_b)
         });
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

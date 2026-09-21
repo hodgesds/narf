@@ -16,13 +16,13 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
     // Linux performs both checks before touching the message vector, including
     // when vlen is zero.
     if flags & MSG_CMSG_COMPAT != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let sock = match current_socket_result(fd) {
         Ok(socket) => socket,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };

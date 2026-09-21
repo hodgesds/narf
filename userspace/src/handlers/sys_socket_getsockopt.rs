@@ -16,7 +16,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     let sock = match current_socket_result(fd) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -52,7 +52,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         };
         if copy_len > 0 {
             if validate_user_range(val_ptr, copy_len).is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             let mut buf = alloc::vec![0u8; copy_len];
@@ -71,7 +71,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     if val_ptr == 0 {
         // Linux: the option handler copies the value into optval; a NULL buffer
         // faults → -EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     if in_len == 0 {
@@ -103,7 +103,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             // SAFETY: copy_to_user range-validates `len_ptr` and
             // SMAP-brackets the 4-byte write.
             if unsafe { copy_to_user(len_ptr, &zero) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         }
@@ -126,7 +126,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     // Validate the output range before allocating — prevents OOM from a
     // user-supplied in_len larger than MAX_USER_COPY.
     if validate_user_range(val_ptr, in_len).is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut buf = alloc::vec![0u8; in_len];
@@ -202,6 +202,6 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
+        _ => ctx.set_return(errno_ret(EINVAL)), // unreachable
     }
 }

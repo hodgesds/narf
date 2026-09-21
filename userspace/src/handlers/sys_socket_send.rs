@@ -30,7 +30,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let sock = match current_socket_result(fd) {
         Ok(socket) => socket,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -41,7 +41,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let dest = match import_sendto_addr(addr_ptr, addr_len) {
         Ok(addr) => addr,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -74,7 +74,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         // Send never yields Accepted/Received/Addr; keep the match total.
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+        _ => ctx.set_return(errno_ret(EINVAL)),
     }
 }
 

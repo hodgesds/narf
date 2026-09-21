@@ -11,14 +11,14 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     let sock = match current_socket_result(fd) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     let addr = match copy_user_addr_result(addr_ptr, addr_len) {
         Ok(a) => a,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -46,6 +46,6 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
+        _ => ctx.set_return(errno_ret(EINVAL)), // unreachable
     }
 }

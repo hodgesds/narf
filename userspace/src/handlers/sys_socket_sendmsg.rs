@@ -24,13 +24,13 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     // Native sendmsg never admits the in-kernel compat marker. Linux checks it
     // before fdget(), so it wins even for an invalid descriptor.
     if flags & MSG_CMSG_COMPAT != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let sock = match current_socket_result(fd) {
         Ok(socket) => socket,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -46,7 +46,7 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             if errno == 32 && flags & crate::socket::MSG_NOSIGNAL == 0 {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
         }
     }
 }
