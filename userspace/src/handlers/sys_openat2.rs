@@ -5,9 +5,9 @@ use super::*;
 
 // Pre-negated spellings: this file returns its errnos verbatim. The
 // explicit import shadows the positive `E*` from `use super::*`.
-use crate::errno::wire::{E2BIG, EFAULT, EINVAL};
+use crate::errno::wire::{E2BIG, EBADF, EFAULT, EINVAL};
 // Guard the shadowing above — see the note in sys_quotactl.rs.
-const _: () = assert!(EINVAL == -22 && E2BIG == -7 && EFAULT == -14);
+const _: () = assert!(EINVAL == -22 && E2BIG == -7 && EFAULT == -14 && EBADF == -9);
 
 /// `OPEN_HOW_SIZE_VER0` — `sizeof(struct open_how)`:
 /// `{ __u64 flags; __u64 mode; __u64 resolve; }`. Still the latest version.
@@ -230,7 +230,7 @@ fn build_scope(task: u64, dirfd: u64, resolve: u64) -> Result<ResolveScope, i64>
     } else {
         // A scoped resolution against a descriptor that is not a directory
         // — or not open at all — has no root to be measured from.
-        fd_path_for_task(task, dirfd as u32).ok_or(-9i64)?
+        fd_path_for_task(task, dirfd as u32).ok_or(EBADF)?
     };
     scope.root = apply_chroot(&root);
     Ok(scope)
