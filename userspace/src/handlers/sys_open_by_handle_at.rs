@@ -6,8 +6,22 @@ pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
     const EINVAL: i64 = 22;
     const ESTALE: i64 = 116;
     const EFAULT: i64 = 14;
+    const EBADF: i64 = 9;
+    const AT_FDCWD: i64 = -100;
     let a = *ctx.args();
-    // mount_fd (arg0) is ignored (single namespace; AT_FDCWD also accepted).
+    let mount_fd = a.arg0 as i64;
+    if mount_fd != AT_FDCWD {
+        if mount_fd < 0 {
+            ctx.set_return(SyscallReturn::ok((-EBADF) as u64));
+            return;
+        }
+        let valid =
+            fd::with_table(current_task_id(), |t| t.get(mount_fd as u32).is_some()).unwrap_or(false);
+        if !valid {
+            ctx.set_return(SyscallReturn::ok((-EBADF) as u64));
+            return;
+        }
+    }
     let mut hdr = [0u8; 8];
     // SAFETY: copy_from_user validates the 8-byte header read.
     if unsafe { copy_from_user(&mut hdr, a.arg1) }.is_err() {

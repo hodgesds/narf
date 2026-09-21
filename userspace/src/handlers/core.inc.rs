@@ -2429,7 +2429,7 @@ const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
 //
 // unlinkat honours AT_REMOVEDIR (0x200) — when set, route to rmdir.
 
-const AT_REMOVEDIR: u64 = 0x200;
+pub(crate) const AT_REMOVEDIR: u64 = 0x200;
 
 /// Shared node-creation used by both `mknod` and `mknodat`. `S_IFDIR` creates
 /// a directory; `S_IFCHR`/`S_IFBLK` create a device node via the directory's

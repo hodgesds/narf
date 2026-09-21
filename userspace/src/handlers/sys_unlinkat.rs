@@ -21,12 +21,16 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
     let path_uptr = args.arg1;
     let flags = args.arg2;
     let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64)); // EFAULT
             return;
-            }
-        };
+        }
+    };
+    if flags & !AT_REMOVEDIR != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     let task = current_task_id();
     let joined = match resolve_at_path(task, dirfd, &path_str) {
         Ok(p) => p,

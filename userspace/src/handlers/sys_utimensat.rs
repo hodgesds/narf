@@ -43,9 +43,21 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
         }
     };
 
+    if at.is_none() && mt.is_none() {
+        // Nothing to do, we must not even check the path (Linux fs/utimes.c:153).
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
     let task = current_task_id();
+    let flags = a.arg3;
     if a.arg1 == 0 {
         // futimens(fd) form — set times through the open fd's FileOps.
+        // In Linux do_utimes_fd(fd, times, flags): if (flags) return -EINVAL;
+        if flags != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            return;
+        }
         let fd = a.arg0 as u32;
         let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
         match ops {
@@ -61,25 +73,62 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+
     let raw = match copy_user_cstr_checked(a.arg1, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
             return;
-            }
-        };
-    // Relative path against a real directory fd (AT_FDCWD / absolute
-    // pass through) — same prepend as sys_readlinkat / sys_linkat.
-    const AT_FDCWD: i64 = -100;
+        }
+    };
+
     let dirfd = a.arg0 as i64;
-    let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        raw
-    } else {
-        match fd_path_for_task(task, dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
+    if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
+        }
+        if dirfd >= 0 {
+            let ops =
+                fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.clone())).flatten();
+            match ops {
+                Some(o) => {
+                    let _ = o.set_times(at, mt);
+                    crate::mqueue::notify_attrib_fd(task, dirfd as u32);
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                    return;
+                }
             }
-            _ => raw,
+        } else if dirfd == -100 {
+            let path = resolve_cwd_path(task, ".");
+            let r = set_path_times(&path, at, mt);
+            if r == 0 {
+                let is_dir = resolve_dir_absolute(&path).is_some();
+                crate::mqueue::notify_attrib(&path, is_dir);
+            }
+            ctx.set_return(SyscallReturn::ok(r as u64));
+            return;
+        } else {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+    }
+
+    let eff = match resolve_at_path(task, dirfd, &raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
     };
     let path = resolve_cwd_path(task, &eff);

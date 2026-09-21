@@ -13,16 +13,13 @@ pub(crate) fn sys_futimesat(ctx: &mut dyn TrapContext) {
             return;
             }
         };
-    const AT_FDCWD: i64 = -100;
     let dirfd = a.arg0 as i64;
-    let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        raw
-    } else {
-        match fd_path_for_task(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            _ => raw,
+    let task = current_task_id();
+    let eff = match resolve_at_path(task, dirfd, &raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
     };
     utimes_common(ctx, &eff, a.arg2);

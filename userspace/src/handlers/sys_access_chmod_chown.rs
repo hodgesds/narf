@@ -20,21 +20,37 @@ pub(crate) fn sys_access(ctx: &mut dyn TrapContext) {
 }
 
 pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
+    faccessat_common(ctx, 0);
+}
+
+pub(crate) fn sys_faccessat2(ctx: &mut dyn TrapContext) {
+    let flags = ctx.args().arg3;
+    faccessat_common(ctx, flags);
+}
+
+fn faccessat_common(ctx: &mut dyn TrapContext, flags: u64) {
     let args = *ctx.args();
     let mode = args.arg2 as u32;
     if mode & !7 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    const AT_EACCESS: u64 = 0x200;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     let raw = match copy_user_cstr_checked(args.arg1, 4096) {
-            Ok(path) => path,
-            Err(errno) => {
+        Ok(path) => path,
+        Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-            }
-        };
-    const AT_FDCWD: i64 = -100;
+        }
+    };
     let dirfd = args.arg0 as i64;
+    let task = current_task_id();
     // AT_EMPTY_PATH (faccessat2 flags = arg3): an empty path names the fd
     // ITSELF. glibc's access_fd() does faccessat2(fd, "", X_OK, AT_EMPTY_PATH)
     // to test an O_PATH fd for executability, which systemd's
@@ -44,31 +60,37 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
     // relative-join arm below appends "/" to the fd's path, turning a
     // regular-file fd into a directory-shaped path that misses (ENOENT) and
     // kills every sandboxed service 203/EXIT_EXEC.
-    if raw.is_empty() && dirfd >= 0 {
-        let valid =
-            fd::with_table(current_task_id(), |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
-        ctx.set_return(if valid {
-            SyscallReturn::ok(0)
-        } else {
-            SyscallReturn::ok((-9i64) as u64) // -EBADF
-        });
-        return;
-    }
-    let effective = if raw.starts_with('/') || dirfd == AT_FDCWD {
-        raw
-    } else if dirfd >= 0 {
-        match fd_path_for_task(current_task_id(), dirfd as u32) {
-            Some(base) => alloc::format!("{}/{}", base.trim_end_matches('/'), raw),
-            None => {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-                return;
-            }
+    if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
         }
-    } else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        return;
+        if dirfd >= 0 {
+            let valid =
+                fd::with_table(task, |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
+            ctx.set_return(if valid {
+                SyscallReturn::ok(0)
+            } else {
+                SyscallReturn::ok((-9i64) as u64) // -EBADF
+            });
+            return;
+        } else if dirfd == -100 {
+            let path = resolve_cwd_path(task, ".");
+            access_path(ctx, &path, mode);
+            return;
+        } else {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+    }
+    let effective = match resolve_at_path(task, dirfd, &raw) {
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
     };
-    let path = resolve_cwd_path(current_task_id(), &effective);
+    let path = resolve_cwd_path(task, &effective);
     access_path(ctx, &path, mode);
 }
 

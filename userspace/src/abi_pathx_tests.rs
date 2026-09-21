@@ -1561,6 +1561,251 @@ kernel_test_in!(
     smoke_abi_pathx_openat_dirfd_enotdir_and_ebadf
 );
 
+fn smoke_abi_pathx_unlinkat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. Invalid flags -> -EINVAL (-22).
+        match call(
+            Syscall::Unlinkat.raw(),
+            a2(AT_FDCWD, rel.as_ptr() as u64, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("unlinkat with invalid flags must return -EINVAL"),
+        }
+
+        // 2. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(Syscall::Unlinkat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("unlinkat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 3. Unallocated dirfd -> -EBADF (-9).
+        match call(Syscall::Unlinkat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("unlinkat with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_unlinkat_flags_and_dirfd_errno
+);
+
+fn smoke_abi_pathx_utimensat_futimesat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. futimens mode (path == NULL) with non-zero flags -> -EINVAL (-22).
+        match call(Syscall::Utimensat.raw(), a3(fd, 0, 0, 1)) {
+            Some(EINVAL) => {}
+            _ => return Err("utimensat with null path and flags != 0 must return -EINVAL"),
+        }
+
+        // 2. Invalid flags in path mode -> -EINVAL (-22).
+        match call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD, rel.as_ptr() as u64, 0, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("utimensat with invalid flags must return -EINVAL"),
+        }
+
+        // 3. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(Syscall::Utimensat.raw(), a3(fd, rel.as_ptr() as u64, 0, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("utimensat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 4. Unallocated dirfd -> -EBADF (-9).
+        match call(
+            Syscall::Utimensat.raw(),
+            a3(9999, rel.as_ptr() as u64, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("utimensat with unallocated dirfd must return -EBADF"),
+        }
+
+        // 5. futimesat with non-directory dirfd -> -ENOTDIR (-20).
+        match call(Syscall::Futimesat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("futimesat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 6. futimesat with unallocated dirfd -> -EBADF (-9).
+        match call(Syscall::Futimesat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("futimesat with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_utimensat_futimesat_flags_and_dirfd_errno
+);
+
+fn smoke_abi_pathx_faccessat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. faccessat2 with invalid flags -> -EINVAL (-22).
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(AT_FDCWD, rel.as_ptr() as u64, 0, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("faccessat2 with invalid flags must return -EINVAL"),
+        }
+
+        // 2. faccessat with non-directory dirfd -> -ENOTDIR (-20).
+        match call(Syscall::Faccessat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("faccessat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 3. faccessat with unallocated dirfd -> -EBADF (-9).
+        match call(Syscall::Faccessat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("faccessat with unallocated dirfd must return -EBADF"),
+        }
+
+        // 4. faccessat2 with non-directory dirfd -> -ENOTDIR (-20).
+        match call(Syscall::Faccessat2.raw(), a3(fd, rel.as_ptr() as u64, 0, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("faccessat2 with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 5. faccessat2 with unallocated dirfd -> -EBADF (-9).
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(9999, rel.as_ptr() as u64, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("faccessat2 with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_faccessat_flags_and_dirfd_errno
+);
+
+fn smoke_abi_pathx_handle_at_and_execveat_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. name_to_handle_at with invalid flags -> -EINVAL (-22).
+        let mut handle_buf = [0u8; 128];
+        handle_buf[0..4].copy_from_slice(&120u32.to_ne_bytes());
+        let mut mnt_id: i32 = 0;
+        match call(
+            Syscall::NameToHandleAt.raw(),
+            a4(
+                AT_FDCWD,
+                file_path.as_ptr() as u64,
+                handle_buf.as_mut_ptr() as u64,
+                (&mut mnt_id) as *mut i32 as u64,
+                0x8888,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("name_to_handle_at with invalid flags must return -EINVAL"),
+        }
+
+        // 2. name_to_handle_at with non-directory dirfd -> -ENOTDIR (-20).
+        match call(
+            Syscall::NameToHandleAt.raw(),
+            a4(
+                fd,
+                rel.as_ptr() as u64,
+                handle_buf.as_mut_ptr() as u64,
+                (&mut mnt_id) as *mut i32 as u64,
+                0,
+            ),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("name_to_handle_at with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 3. open_by_handle_at with invalid mountdirfd -> -EBADF (-9).
+        match call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(9999, handle_buf.as_ptr() as u64, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("open_by_handle_at with invalid mountdirfd must return -EBADF"),
+        }
+
+        // 4. execveat with invalid flags -> -EINVAL (-22).
+        match call(
+            Syscall::Execveat.raw(),
+            a4(AT_FDCWD, file_path.as_ptr() as u64, 0, 0, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("execveat with invalid flags must return -EINVAL"),
+        }
+
+        // 5. execveat with non-directory dirfd -> -ENOTDIR (-20).
+        match call(
+            Syscall::Execveat.raw(),
+            a4(fd, rel.as_ptr() as u64, 0, 0, 0),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("execveat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 6. execveat with unallocated dirfd -> -EBADF (-9).
+        match call(
+            Syscall::Execveat.raw(),
+            a4(9999, rel.as_ptr() as u64, 0, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("execveat with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_handle_at_and_execveat_errno);
+
 // ── sd-device chase() of a DRM /sys/dev/char/226:0 symlink ───────────
 //
 // systemd-logind resolves each seat-master DRM device by devnum:

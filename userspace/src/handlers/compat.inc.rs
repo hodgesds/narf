@@ -10186,7 +10186,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Faccessat2,
         "faccessat2",
-        RawFnHandler(sys_faccessat),
+        RawFnHandler(sys_faccessat2),
     );
     table.install_raw(
         Syscall::Fchmodat2,
@@ -12625,7 +12625,9 @@ pub(crate) use handler_sys_timerfd_gettime::*;
 pub use handler_sys_umount2_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use {
-    handler_sys_access_chmod_chown::{sys_access, sys_chown, sys_faccessat, sys_lchown},
+    handler_sys_access_chmod_chown::{
+        sys_access, sys_chown, sys_faccessat, sys_faccessat2, sys_lchown,
+    },
     handler_sys_adjtimex::sys_adjtimex,
     handler_sys_at2_reshape::sys_at2_reshape,
     handler_sys_bootstrap::sys_bootstrap,
