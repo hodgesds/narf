@@ -1224,8 +1224,6 @@ kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_create_cloexec);
 
 fn smoke_abi_time_timerfd_create_neg() -> TestResult {
     with_setup(|| {
-        const EINVAL: i64 = -22;
-        const EPERM: i64 = -1;
         const CLOCK_REALTIME: u64 = 0;
         const CLOCK_MONOTONIC: u64 = 1;
         const CLOCK_BOOTTIME: u64 = 7;

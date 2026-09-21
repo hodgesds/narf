@@ -1876,7 +1876,6 @@ fn install_pidfd(pid: u64, alive: bool) -> Result<u32, &'static str> {
 /// unknown flag is reported rather than silently ignored — and a caller
 /// cannot use a bad fd to mask a flag this kernel does not implement.
 fn smoke_abi_mem_process_mrelease_validation() -> TestResult {
-    const EAGAIN: i64 = -11;
     with_setup(|| {
         // A non-zero flag is rejected even with a bogus fd, which is what
         // pins the ORDER rather than just the errno.

@@ -25,8 +25,6 @@ const BPF_PROG_QUERY: u64 = 16;
 const BPF_RAW_TRACEPOINT_OPEN: u64 = 17;
 const BPF_BTF_LOAD: u64 = 18;
 
-const EOPNOTSUPP: i64 = -95;
-
 /// Atomic probe program types NARF keeps distinct at attach time.
 const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: u32 = 24;
@@ -963,9 +961,6 @@ const BPF_MAP_LOOKUP_ELEM: u64 = 1;
 const BPF_MAP_UPDATE_ELEM: u64 = 2;
 const BPF_MAP_DELETE_ELEM: u64 = 3;
 const BPF_MAP_GET_NEXT_KEY: u64 = 4;
-
-/// `abi_test_support` does not name it; the map family is the only caller.
-const E2BIG: i64 = -7;
 
 // `enum bpf_map_type`.
 const BPF_MAP_TYPE_UNSPEC: u32 = 0;
@@ -2843,7 +2838,6 @@ fn ld_map_idx_delete_prog(index: i32, key: i32) -> [u8; 40] {
 const PROG_LOAD_EXT_LEN: usize = 152;
 const PL_FD_ARRAY: usize = 120;
 const PL_FD_ARRAY_CNT: usize = 148;
-const EPROTO: i64 = -71;
 
 /// Load using the extended `prog_load` shape that reaches `fd_array_cnt`.
 fn load_prog_fd_array_raw(insns: &[u8], fd_array: u64, fd_array_cnt: u32) -> Option<i64> {
@@ -4334,9 +4328,6 @@ const BPF_ATTACH_TYPE_NONSENSE: u32 = 4242;
 
 /// `BPF_PROG_TYPE_SYSCALL` — NARF's `Context::Sleepable`.
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
-
-const EBUSY: i64 = -16;
-const ENOSPC: i64 = -28;
 
 fn bpf(cmd: u64, attr: &[u8; ATTR_LEN]) -> Option<i64> {
     call(

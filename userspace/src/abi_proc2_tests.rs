@@ -1696,11 +1696,6 @@ kernel_test_in!(
 // Every arm below used to answer with the bare -1 sentinel (= EPERM) or
 // with ENOSYS.
 
-/// EIO — ptrace's dialect for a bad request code, a bad USER-area
-/// offset, an unreadable tracee word, or an invalid resume signal.
-/// Not in the shared errno table, so it lives here.
-const EIO: i64 = -5;
-
 const PTRACE_PEEKDATA: u64 = 2;
 const PTRACE_PEEKUSER: u64 = 3;
 const PTRACE_POKEUSER: u64 = 6;
@@ -2378,7 +2373,6 @@ kernel_test_in!(
 /// root again, so matching only the effective pair would hand it over.
 fn smoke_abi_proc2_ptrace_attach_requires_same_user() -> TestResult {
     const PTRACE_ATTACH: u64 = 16;
-    const EPERM: i64 = -1;
     with_setup(|| {
         const TRACER_TASK: u64 = 0xB400;
         const TRACER_PID: u64 = 0xB400;
@@ -2455,7 +2449,6 @@ fn smoke_abi_proc2_ptrace_attach_honours_dumpable() -> TestResult {
     const PTRACE_ATTACH: u64 = 16;
     const PTRACE_DETACH: u64 = 17;
     const PR_SET_DUMPABLE: u64 = 4;
-    const EPERM: i64 = -1;
     with_setup(|| {
         const TRACER_TASK: u64 = 0xB410;
         const TRACER_PID: u64 = 0xB410;

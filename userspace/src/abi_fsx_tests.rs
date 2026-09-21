@@ -18,15 +18,12 @@ use crate::abi_test_support::*;
 
 // ENODATA is the wire value the xattr handlers use for "no such attribute";
 // it isn't in the shared harness errno set, so define it locally.
-const ENODATA: i64 = -61;
 
 // EBUSY isn't in the shared harness errno set either; pivot_root's
 // "loop, on the same file system" arm needs it.
-const EBUSY: i64 = -16;
 
 // E2BIG isn't in the shared harness errno set; `setxattr`'s
 // XATTR_SIZE_MAX rejection needs it. (ERANGE and EOPNOTSUPP are.)
-const E2BIG: i64 = -7;
 
 // A user-half address with nothing mapped behind it: every copy_from_user
 // against it faults, which is how the -EFAULT arms below are reached.
@@ -888,7 +885,6 @@ fn smoke_abi_fsx_readonly_mount_refuses_writes() -> TestResult {
     with_setup(|| {
         const MS_RDONLY: u64 = 1 << 0;
         const MS_REMOUNT: u64 = 1 << 5;
-        const EROFS: i64 = -30;
         let target = b"/abi-ro\0";
         let source = b"tmpfs\0";
         let fstype = b"tmpfs\0";
@@ -3257,7 +3253,6 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_open_by_handle_at_pos);
 fn smoke_abi_fsx_open_by_handle_at_neg() -> TestResult {
     with_setup(|| {
         // A handle whose handle_type marker is wrong → ESTALE (-116).
-        const ESTALE: i64 = -116;
         let mut hbuf = [0u8; 32];
         hbuf[0..4].copy_from_slice(&4u32.to_ne_bytes()); // handle_bytes
         hbuf[4..8].copy_from_slice(&0x1234i32.to_ne_bytes()); // wrong type
@@ -3686,7 +3681,6 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_attr_errno_ordering);
 
 fn smoke_abi_fsx_open_tree_attr_validation_and_cleanup() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
-        const E2BIG: i64 = -7;
         let path = b"/abi\0";
         let mut extended = [0u8; 40];
         extended[39] = 1;
@@ -3716,7 +3710,6 @@ kernel_test_in!(
 
 fn smoke_abi_fsx_open_tree_attr_fault_and_size_errno() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
-        const E2BIG: i64 = -7;
         let path = b"/abi\0";
         let base = SyscallArgs {
             arg0: (-100i64) as u64,

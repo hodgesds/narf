@@ -1169,7 +1169,6 @@ fn smoke_abi_proc_pidfd_getfd_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_pos);
 
 fn smoke_abi_proc_pidfd_getfd_eperm() -> TestResult {
-    const EPERM: i64 = -1;
     with_setup(|| {
         const CALLER_TASK: u64 = 0xB500;
         const CALLER_PID: u64 = 0xB500;
@@ -1529,7 +1528,6 @@ fn smoke_abi_proc_wait4_pgid_echild_when_group_empty() -> TestResult {
         const CHILD_TASK: u64 = 0x7200_0201;
         const CHILD_PID: u64 = 0x7200_1201; // living child in group A
         const WNOHANG: u64 = 1;
-        const ECHILD: i64 = -10;
 
         let result = (|| {
             wt_register(PARENT, PARENT_PID, PARENT);
@@ -1800,9 +1798,6 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_badarg);
 
 fn smoke_abi_proc_clone3_errno_matrix() -> TestResult {
     with_setup(|| {
-        const E2BIG: i64 = -7;
-        const ENOMEM: i64 = -12;
-
         // Size validation precedes pointer access, matching Linux.
         if call(Syscall::Clone3.raw(), a1(0, 4097)) != Some(E2BIG) {
             return Err("clone3 oversized struct must return -E2BIG before EFAULT");
@@ -2004,7 +1999,6 @@ fn smoke_abi_proc_execve_missing_path_enoent() -> TestResult {
         // existing. Guards that regression.
         let path = b"/abi/does-not-exist\0";
         let r = call_raw(Syscall::Execve.raw(), a3(path.as_ptr() as u64, 0, 0, 0));
-        const ENOENT: i64 = -2;
         if r.status == SyscallReturn::OK && (r.value as i64) == ENOENT {
             Ok(())
         } else {
@@ -2419,7 +2413,6 @@ const SECBIT_NOROOT_LOCKED: u64 = 1 << 1;
 /// running later — including code an attacker controls — cannot turn it
 /// back off.
 fn smoke_abi_proc_prctl_securebits_locks() -> TestResult {
-    const EPERM: i64 = -1;
     with_setup(|| {
         // Set NOROOT and lock it.
         let want = SECBIT_NOROOT | SECBIT_NOROOT_LOCKED;
@@ -2465,7 +2458,6 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_securebits_locks);
 /// and `PR_SET_SECUREBITS` could not reach the one `cap_emulate_setxuid`
 /// actually read.
 fn smoke_abi_proc_prctl_keepcaps_is_a_securebit() -> TestResult {
-    const EPERM: i64 = -1;
     with_setup(|| {
         // Set through KEEPCAPS, observe through SECUREBITS.
         if call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS_OPT, 1)) != Some(0) {

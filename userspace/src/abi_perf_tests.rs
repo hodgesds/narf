@@ -24,8 +24,6 @@ const PERF_EVENT_IOC_PERIOD: u64 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
 const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
-const EOPNOTSUPP: i64 = -95;
-const E2BIG: i64 = -7;
 
 fn smoke_abi_perf_event_open_validation() -> TestResult {
     with_setup(|| {

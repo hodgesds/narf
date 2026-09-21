@@ -99,7 +99,6 @@ fn smoke_abi_path_openat_nofollow_symlink() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         const O_PATH: u64 = 0o10000000;
         const O_NOFOLLOW: u64 = 0o400000;
-        const ELOOP: i64 = -40;
         // /p/lnk -> f
         let target = b"f\0";
         let link = b"/p/lnk\0";
@@ -1578,7 +1577,6 @@ kernel_test_in!("syscall_abi", smoke_abi_path_rename_dir_ok);
 // the user as "Invalid cross-device link" with the config never written.
 
 /// EXDEV isn't in the shared errno table yet (nothing else returns it).
-const EXDEV: i64 = -18;
 const O_WRONLY_CREAT: u64 = 1 | 0o100;
 
 /// `openat(AT_FDCWD, path, O_WRONLY|O_CREAT, 0644)`, returning the fd.

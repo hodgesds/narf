@@ -900,7 +900,6 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_nonzero_flags_neg);
 /// against a different struct version learns what this kernel wants, and
 /// without it a too-small caller can only guess.
 fn smoke_abi_sched_setattr_short_size_neg() -> TestResult {
-    const E2BIG: i64 = -7;
     with_setup(|| {
         let mut attr = [0u8; 48];
         attr[..4].copy_from_slice(&16u32.to_le_bytes());
@@ -950,7 +949,6 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_zero_size_means_ver0);
 /// set and believes is in effect. A VER1 caller asking for util clamping
 /// would think it got it.
 fn smoke_abi_sched_setattr_rejects_set_fields_past_ver0() -> TestResult {
-    const E2BIG: i64 = -7;
     with_setup(|| {
         // VER1-sized, tail all zero: accepted, because nothing was asked for.
         let mut attr = [0u8; 56];

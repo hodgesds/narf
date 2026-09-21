@@ -9,8 +9,6 @@
 use crate::abi_test_support::*;
 
 // EOPNOTSUPP is not in the harness errno set; LSM/keyctl use it.
-const EOPNOTSUPP: i64 = -95;
-const ENOKEY: i64 = -126;
 
 // Open a MemFs-backed file via the Linux open(2) ABI (arg0 = NUL-term
 // absolute path, arg1 = flags) and return its fd. Used by the I/O tests.

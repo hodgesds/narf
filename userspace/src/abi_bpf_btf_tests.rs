@@ -13,9 +13,6 @@ use crate::abi_test_support::*;
 
 const BPF_BTF_LOAD: u64 = 18;
 
-const EOPNOTSUPP: i64 = -95;
-const E2BIG: i64 = -7;
-
 /// A `union bpf_attr` big enough for the `btf` sub-struct.
 const ATTR_LEN: usize = 64;
 

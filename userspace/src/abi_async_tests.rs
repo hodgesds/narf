@@ -522,7 +522,6 @@ const FUTEX2_SIZE_U32: u64 = 0x02;
 const FUTEX2_SIZE_U64: u64 = 0x03;
 const FUTEX2_BAD_BIT: u64 = 0x10;
 // Not in the shared errno table.
-const ETIMEDOUT: i64 = -110;
 // A canonical-hole pointer: 8-byte aligned (so it clears the futex
 // alignment gate) but unmapped, which is what makes it an EFAULT probe.
 const FUTEX_BAD_PTR: u64 = 0x0001_0000_0000_0000;
@@ -1942,8 +1941,6 @@ kernel_test_in!(
 
 fn smoke_abi_async_futex_null_word_is_always_efault() -> TestResult {
     with_setup(|| {
-        const EFAULT: i64 = -14;
-
         // `futex(uaddr, op, ...)` — every op that takes a user word, with
         // and without the PRIVATE bit, since the private path is a separate
         // branch in the handler.

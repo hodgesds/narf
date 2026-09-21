@@ -22,8 +22,6 @@
 use crate::abi_test_support::*;
 
 // Wire values not in the shared harness set.
-const ENODATA: i64 = -61;
-const EOVERFLOW: i64 = -75;
 
 // Linux setxattr flags.
 const XATTR_CREATE: u64 = 1;
@@ -2646,7 +2644,6 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattrat_removexattrat);
 /// is told so rather than having it silently dropped.
 fn smoke_abi_fsx2_xattrat_args_size_rules() -> TestResult {
     const AT_FDCWD: u64 = (-100i64) as u64;
-    const E2BIG: i64 = -7;
     with_memfs("/xat3", "xat3", &[("f", b"hi")], || {
         let path = b"/xat3/f\0";
         let name = b"user.k\0";
@@ -3165,7 +3162,6 @@ kernel_test_in!(
 /// caller passing a `/proc/self/mountinfo` id and silently addressing a
 /// different mount than it meant.
 fn smoke_abi_fsx2_mnt_id_req_version_rules() -> TestResult {
-    const E2BIG: i64 = -7;
     const LSMT_ROOT: u64 = u64::MAX;
     with_memfs("/lsm3", "lsm3", &[("f", b"hi")], || {
         let mut ids = [0u64; 8];
@@ -3208,7 +3204,6 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_mnt_id_req_version_rules);
 /// the call is safe to use against a live mount table. Paging one id at a
 /// time must reach exactly the same set as one big call.
 fn smoke_abi_fsx2_listmount_flags_limits_and_cursor() -> TestResult {
-    const EOVERFLOW: i64 = -75;
     const LISTMOUNT_REVERSE: u64 = 1;
     const LSMT_ROOT: u64 = u64::MAX;
     with_memfs("/lsm4", "lsm4", &[("f", b"hi")], || {
@@ -3289,8 +3284,6 @@ kernel_test_in!(
 /// does not know, and the two answers are deliberately different: -EINVAL
 /// means "no such flag", -EOPNOTSUPP means "that flag, not here".
 fn smoke_abi_fsx2_statmount_flags_and_overflow() -> TestResult {
-    const EOVERFLOW: i64 = -75;
-    const EOPNOTSUPP: i64 = -95;
     const STATMOUNT_BY_FD: u64 = 1;
     const LSMT_ROOT: u64 = u64::MAX;
     with_memfs("/lsm5", "lsm5", &[("f", b"hi")], || {
@@ -3638,7 +3631,6 @@ kernel_test_in!(
 /// kinds of unsettable bit.
 fn smoke_abi_fsx2_file_attr_size_and_flag_rules() -> TestResult {
     const AT_FDCWD: u64 = (-100i64) as u64;
-    const E2BIG: i64 = -7;
     const FS_XFLAG_HASATTR: u64 = 0x8000_0000; // in FS_XFLAG_RDONLY_MASK
     with_memfs("/fattr2", "fattr2", &[("f", b"hi")], || {
         let path = c"/fattr2/f";

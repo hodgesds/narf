@@ -59,14 +59,9 @@ const MSG_STAT: u64 = 11;
 const MSG_INFO: u64 = 12;
 const MSG_STAT_ANY: u64 = 13;
 const IPCMNI_IDX_MASK: u64 = (1 << 15) - 1;
-const E2BIG: i64 = -7;
-const EFBIG: i64 = -27;
-const ENOMSG: i64 = -42;
 const MSG_NOERROR: u64 = 0o10000;
 const MSG_COPY: u64 = 0o40000;
 const SEM_UNDO: i16 = 0o10000;
-const EIDRM: i64 = -43;
-const ENOSPC: i64 = -28;
 const BAD_PTR: u64 = 0x0001_0000_0000_0000;
 
 const O_CREAT: u64 = 0o100;

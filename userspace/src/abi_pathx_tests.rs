@@ -1080,7 +1080,6 @@ fn smoke_abi_pathx_openat2_beneath_escape_is_exdev() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         const O_PATH: u64 = 0o10000000;
         const RESOLVE_BENEATH: u64 = 0x08;
-        const EXDEV: i64 = -18;
         let dir = b"/p2\0";
         let dfd = match call_open(dir.as_ptr() as u64, O_PATH) {
             Some(fd) if fd >= 0 => fd as u64,
@@ -1235,7 +1234,6 @@ kernel_test_in!(
 /// still reports a genuinely missing name correctly, rather than having been
 /// turned into an ELOOP machine.
 fn smoke_abi_pathx_stat_symlink_loop_is_eloop() -> TestResult {
-    const ELOOP: i64 = -40;
     with_memfs("/loopfs", "loopfs", &[("real", b"hi")], || {
         // /loopfs/a -> b, /loopfs/b -> a: a two-hop cycle.
         for (target, link) in [
@@ -1310,7 +1308,6 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_stat_symlink_loop_is_eloop);
 /// `chdir(2)` resolves with LOOKUP_FOLLOW|LOOKUP_DIRECTORY, so a cyclic path
 /// is -ELOOP there too — it shares the same failure classifier as stat.
 fn smoke_abi_pathx_chdir_symlink_loop_is_eloop() -> TestResult {
-    const ELOOP: i64 = -40;
     with_memfs("/loopcd", "loopcd", &[("real", b"hi")], || {
         for (target, link) in [
             (b"b\0".as_slice(), b"/loopcd/a\0".as_slice()),
@@ -3118,7 +3115,6 @@ fn smoke_abi_pathx_listdir_neg() -> TestResult {
             return Err("listdir(\"\") must be -ENOENT");
         }
         // Over-long pathname → -ENAMETOOLONG.
-        const ENAMETOOLONG: i64 = -36;
         if listdir(p, 8192, 0, out, 128) != Some(ENAMETOOLONG) {
             return Err("listdir with an over-long path must be -ENAMETOOLONG");
         }
@@ -4506,8 +4502,6 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_IN_ROOT: u64 = 0x10;
 const RESOLVE_CACHED: u64 = 0x20;
-const ELOOP: i64 = -40;
-const EXDEV: i64 = -18;
 
 fn openat2_how(flags: u64, mode: u64, resolve: u64) -> [u8; 24] {
     let mut how = [0u8; 24];
@@ -4531,7 +4525,6 @@ fn openat2_at(dirfd: u64, path: &[u8], how: &[u8; 24]) -> Option<i64> {
 /// both — but the two syscalls genuinely differ and the code should not be
 /// "tidied" into agreeing.
 fn smoke_abi_pathx_openat2_struct_rules() -> TestResult {
-    const E2BIG: i64 = -7;
     with_memfs("/o2", "o2", &[("f", b"hi")], || {
         let path = b"/o2/f\0";
         let how = openat2_how(0, 0, 0);
@@ -4693,7 +4686,6 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_scoped);
 /// with -EAGAIN — which is what the flag is for. Claiming success would be
 /// the wrong answer; so would pretending the flag does not exist.
 fn smoke_abi_pathx_openat2_magiclinks_and_cached() -> TestResult {
-    const EAGAIN: i64 = -11;
     with_memfs("/o2m", "o2m", &[("f", b"hi")], || {
         let path = b"/o2m/f\0";
         if openat2_at(AT_FDCWD, path, &openat2_how(0, 0, RESOLVE_CACHED)) != Some(EAGAIN) {
