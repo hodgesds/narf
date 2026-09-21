@@ -8996,8 +8996,8 @@ fn current_socket_result(fd: u32) -> Result<alloc::sync::Arc<crate::socket::Sock
         table.get(fd).map(|entry| entry.ops.clone())
     })
         .flatten()
-        .ok_or(9i64)?; // EBADF
-    socket_from_file_ops(ops).ok_or(88) // ENOTSOCK
+        .ok_or(EBADF)?;
+    socket_from_file_ops(ops).ok_or(ENOTSOCK)
 }
 
 /// Install the kernel-held admin authority returned by a successful stack
@@ -9105,12 +9105,12 @@ fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAd
     let len = raw_len as i32;
     // move_addr_to_kernel: ulen < 0 || ulen > sizeof(sockaddr_storage) → EINVAL.
     if !(0..=128).contains(&len) || len < 2 {
-        return Err(22); // -EINVAL (no room for a complete sa_family_t)
+        return Err(EINVAL); // no room for a complete sa_family_t
     }
     let mut buf = alloc::vec![0u8; len as usize];
     // SAFETY: copy_from_user range-validates the whole address (catching a NULL
     // or faulting ptr) and SMAP-brackets the read.
-    unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| 14i64)?; // -EFAULT
+    unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| EFAULT)?;
     Ok(crate::socket::SockAddr {
         family: u16::from_le_bytes([buf[0], buf[1]]),
         body: buf[2..].to_vec(),
@@ -9323,15 +9323,15 @@ fn parse_scm_rights_fds(
         return Ok(out);
     }
     if ctrl_ptr == 0 {
-        return Err(14); // EFAULT
+        return Err(EFAULT);
     }
     if !(16..=MAX_USER_COPY).contains(&ctrl_len) {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     let mut ctrl = alloc::vec![0u8; ctrl_len];
     // SAFETY: ctrl sized to ctrl_len; copy_from_user range-validates + SMAP.
     if unsafe { copy_from_user(&mut ctrl, ctrl_ptr) }.is_err() {
-        return Err(14); // EFAULT
+        return Err(EFAULT);
     }
     let task = current_task_id();
     // Walk cmsg records (8-byte aligned).
@@ -9341,7 +9341,7 @@ fn parse_scm_rights_fds(
         let level = i32::from_le_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
         let ctype = i32::from_le_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
         if cmsg_len < 16 || off + cmsg_len > ctrl_len {
-            return Err(22); // EINVAL
+            return Err(EINVAL);
         }
         if level == SOL_SOCKET && ctype == SCM_RIGHTS {
             let nfds = (cmsg_len - 16) / 4;
@@ -9349,7 +9349,7 @@ fn parse_scm_rights_fds(
                 let fpos = off + 16 + i * 4;
                 let fd = i32::from_le_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
                 if fd < 0 {
-                    return Err(9); // EBADF
+                    return Err(EBADF);
                 }
                 let Some(passed) = fd::with_table(task, |t| {
                     let (ops, description, status_flags) = t.export_description(fd as u32)?;
@@ -9360,7 +9360,7 @@ fn parse_scm_rights_fds(
                     })
                 })
                 .flatten() else {
-                    return Err(9); // EBADF: send no payload or partial rights
+                    return Err(EBADF); // send no payload or partial rights
                 };
                 out.push(passed);
             }

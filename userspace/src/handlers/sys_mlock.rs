@@ -59,7 +59,7 @@ pub(super) fn mlock_align_range(start: u64, len: u64) -> Result<Option<(u64, u64
     let start = start & !0xFFF;
     let end = start.wrapping_add(len);
     if end < start {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     if end == start {
         return Ok(None); // success, nothing to lock

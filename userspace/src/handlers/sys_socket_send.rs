@@ -84,18 +84,18 @@ fn import_sendto_addr(ptr: u64, raw_len: u64) -> Result<Option<crate::socket::So
     }
     let len = raw_len as i32;
     if !(0..=128).contains(&len) {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     if len == 0 {
         return Ok(None);
     }
     if len < 2 {
-        return Err(22); // no complete sa_family_t
+        return Err(EINVAL); // no complete sa_family_t
     }
     let mut bytes = alloc::vec![0u8; len as usize];
     // SAFETY: copy_from_user validates the complete address range and opens the
     // architecture user-access window.
-    unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| 14i64)?;
+    unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| EFAULT)?;
     Ok(Some(crate::socket::SockAddr {
         family: u16::from_ne_bytes([bytes[0], bytes[1]]),
         body: bytes[2..].to_vec(),

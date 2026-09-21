@@ -2124,7 +2124,7 @@ fn fanotify_read_to_user(
     // -EMFILE and the queue keeps its events, rather than delivering metadata
     // that names descriptors which were never installed.
     let Some(reserved) = fd::with_table_alloc(task, |table| table.reserve_fds(fd_count)).flatten() else {
-        return Err(24); // -EMFILE
+        return Err(EMFILE as u64);
     };
     if reserved.len() != fd_count {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
@@ -3991,7 +3991,7 @@ fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<Impor
         return Ok(alloc::vec::Vec::new());
     }
     if iovcnt > LINUX_IOV_MAX {
-        return Err(22); // EINVAL
+        return Err(EINVAL as u64);
     }
     // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
     let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
@@ -8409,7 +8409,7 @@ fn mprotect_core(
             .iter()
             .any(|old| mdwe_denies(task, *old, perms.prot_only()))
         {
-            return Err(13); // EACCES
+            return Err(EACCES);
         }
         let transition = narf_memory::wx::classify_mprotect_range(
             intersecting.into_iter(),
@@ -8423,14 +8423,14 @@ fn mprotect_core(
             narf_memory::wx::WxTransition::NeedsCapJit => {
                 let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id()) else {
                     // No JIT capability for the RW→RX flip → EACCES.
-                    return Err(13);
+                    return Err(EACCES);
                 };
                 // Underlying range error (empty/gapped) → ENOMEM.
-                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| 12)
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ENOMEM)
             }
             narf_memory::wx::WxTransition::Allow => {
                 // Empty/gapped range → ENOMEM.
-                as_ref.mprotect_range(base, len, perms).map_err(|_| 12)
+                as_ref.mprotect_range(base, len, perms).map_err(|_| ENOMEM)
             }
         }
     }
@@ -9284,7 +9284,7 @@ fn clone_parent_link(parent_task: u64, flags: u64, requested_signal: u8) -> Resu
     // caller's group-leader exit_signal. A namespace init has no reusable
     // parent and Linux rejects CLONE_PARENT with EINVAL.
     let parent_pid = task_to_pid_raw(parent_task).unwrap_or(parent_task);
-    child_link_get(parent_pid).ok_or(22)
+    child_link_get(parent_pid).ok_or(EINVAL as u64)
 }
 
 #[doc(hidden)]
@@ -13888,7 +13888,7 @@ fn fsize_check_write(
     }
     if pos >= limit {
         raise_signal_pending(task, SIGXFSZ);
-        return Err(27); // -EFBIG
+        return Err(EFBIG);
     }
     Ok(count.min((limit - pos) as usize))
 }
@@ -13915,7 +13915,7 @@ fn fsize_check_resize(task: u64, current_size: u64, new_size: u64) -> Result<(),
     let limit = fsize_limit(task);
     if limit != RLIM_INFINITY && new_size > limit {
         raise_signal_pending(task, SIGXFSZ);
-        return Err(27); // -EFBIG
+        return Err(EFBIG);
     }
     Ok(())
 }
@@ -14221,20 +14221,20 @@ fn update_rlimit_atomic(
     may_raise_hard: bool,
 ) -> Result<RLimitPair, i64> {
     if resource >= RLIMIT_COUNT {
-        return Err(22); // EINVAL
+        return Err(EINVAL);
     }
     let key = process_state_key(task);
     let mut g = RLIMIT_TABLE.lock();
-    let state = g.as_mut().ok_or(22i64)?;
+    let state = g.as_mut().ok_or(EINVAL)?;
     if let Some(owner) = owner {
         // Revalidate while holding RLIMIT_TABLE. Reap takes this lock before
         // removing the task-registry entry, so it cannot slip between this
         // check and the row transaction. This replaces the old unbounded set
         // of every TaskId ever reaped without allowing a retained Arc<Task>
         // from a raced prlimit64 to recreate the dead process's row.
-        let registered = crate::task::task_get(task).ok_or(3i64)?;
+        let registered = crate::task::task_get(task).ok_or(ESRCH)?;
         if !alloc::sync::Arc::ptr_eq(owner, &registered) {
-            return Err(3); // ESRCH
+            return Err(ESRCH);
         }
     }
     let prior = state
@@ -14244,7 +14244,7 @@ fn update_rlimit_atomic(
         .unwrap_or_else(default_rlimits)[resource];
     if let Some(value) = new_value {
         if value.cur > value.max {
-            return Err(22); // EINVAL
+            return Err(EINVAL);
         }
         if value.max > prior.max && !may_raise_hard {
             // `do_prlimit`: raising the hard ceiling requires CAP_SYS_RESOURCE
@@ -14253,7 +14253,7 @@ fn update_rlimit_atomic(
             // transaction, keeping the table independent of the credential and
             // namespace lock order. pam_limits (and any Limit* that raises a
             // hard limit) relies on root holding this.
-            return Err(1); // EPERM
+            return Err(EPERM);
         }
         let new_row = !state.rows.contains_key(&key);
         let row = state.rows.entry(key).or_insert_with(default_rlimits);
