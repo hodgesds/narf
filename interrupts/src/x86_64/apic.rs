@@ -150,7 +150,18 @@ pub unsafe fn init_bsp() {
     // SAFETY: Valid memory or trusted environment
     let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
     if confirm & APIC_BASE_EXTD == 0 {
-        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
+        // Record the firmware-provided LAPIC base rather than assuming the
+        // architectural default: IA32_APIC_BASE[35:12] is where Linux's
+        // `apic.c` reads it from, and firmware is free to relocate it.
+        // `remap_mmio` ioremaps whatever we latch here.
+        LAPIC_PHYS.store(
+            confirm & 0x0000_000F_FFFF_F000,
+            core::sync::atomic::Ordering::Release,
+        );
+        // SAFETY: pre-`init_mmu`, so boot.S's low identity window still
+        // covers the LAPIC page and `lapic_reg` resolves to a physical
+        // address that is mapped. `remap_mmio` takes over after the CR3
+        // handoff.
         unsafe {
             init_lapic_xapic();
         }
@@ -205,16 +216,17 @@ pub unsafe fn init_bsp() {
 ///   0x370  LVT Error
 ///
 /// # Safety
-/// - LAPIC MMIO base must be identity-mapped + accessible.
+/// - LAPIC MMIO must be reachable through `lapic_reg` (boot identity
+///   window before `init_mmu`, the `remap_mmio` window after).
 /// - APIC_BASE.EN must already be set.
 unsafe fn init_lapic_xapic() {
-    let sivr = (XAPIC_MMIO_BASE + 0x0F0) as *mut u32;
-    let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
-    let lvt_thermal = (XAPIC_MMIO_BASE + 0x330) as *mut u32;
-    let lvt_perf = (XAPIC_MMIO_BASE + 0x340) as *mut u32;
-    let lvt_lint0 = (XAPIC_MMIO_BASE + 0x350) as *mut u32;
-    let lvt_lint1 = (XAPIC_MMIO_BASE + 0x360) as *mut u32;
-    let lvt_error = (XAPIC_MMIO_BASE + 0x370) as *mut u32;
+    let sivr = lapic_reg(0x0F0);
+    let lvt_timer = lapic_reg(0x320);
+    let lvt_thermal = lapic_reg(0x330);
+    let lvt_perf = lapic_reg(0x340);
+    let lvt_lint0 = lapic_reg(0x350);
+    let lvt_lint1 = lapic_reg(0x360);
+    let lvt_error = lapic_reg(0x370);
     // SAFETY: caller upholds MMIO + EN preconditions. Each write
     // is an aligned 32-bit write to an architected LVT register.
     // SAFETY: Valid memory or trusted environment
@@ -268,8 +280,8 @@ fn apic_error_handler() {
         }
     } else {
         // xAPIC ESR at MMIO offset 0x280.
-        let esr_reg = (XAPIC_MMIO_BASE + 0x280) as *mut u32;
-        // SAFETY: in xAPIC mode the LAPIC MMIO window is identity-mapped
+        let esr_reg = lapic_reg(0x280);
+        // SAFETY: in xAPIC mode the LAPIC MMIO window is reachable via `lapic_reg`
         // (low 4 GiB) and EN is set, so this 32-bit aligned write/read
         // to the architected ESR register at base+0x280 is valid.
         // SAFETY: Valid memory or trusted environment
@@ -327,10 +339,10 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
     //   0x320  LVT_TIMER       (mask bit 16, periodic bit 17, vector low 8)
     //   0x380  TIMER_INIT_CT
     //   0x3E0  TIMER_DIVIDE_CONF
-    let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
-    let init_ct = (XAPIC_MMIO_BASE + 0x380) as *mut u32;
-    let div_conf = (XAPIC_MMIO_BASE + 0x3E0) as *mut u32;
-    // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB) per init_bsp
+    let lvt_timer = lapic_reg(0x320);
+    let init_ct = lapic_reg(0x380);
+    let div_conf = lapic_reg(0x3E0);
+    // SAFETY: LAPIC MMIO is reachable via `lapic_reg` per init_bsp
     // contract. Writes are aligned 32-bit to architected registers.
     // SAFETY: Valid memory or trusted environment
     unsafe {
@@ -550,8 +562,8 @@ pub unsafe fn stop_timer() {
         return;
     }
     // xAPIC MMIO path — mirror of start_timer's fallback.
-    let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
-    let init_ct = (XAPIC_MMIO_BASE + 0x380) as *mut u32;
+    let lvt_timer = lapic_reg(0x320);
+    let init_ct = lapic_reg(0x380);
     // SAFETY: same as start_timer.
     unsafe {
         core::ptr::write_volatile(init_ct, 0);
@@ -578,8 +590,8 @@ pub unsafe fn eoi() {
         // IRQ of a given priority, blocking all further deliveries
         // — the symptom is "first tick fires then nothing". This
         // is the canonical mainframe Linux pattern (`native_apic_mem_eoi`).
-        let eoi_reg = (XAPIC_MMIO_BASE + 0x0B0) as *mut u32;
-        // SAFETY: in xAPIC mode the LAPIC MMIO window is identity-mapped
+        let eoi_reg = lapic_reg(0x0B0);
+        // SAFETY: in xAPIC mode the LAPIC MMIO window is reachable via `lapic_reg`
         // (low 4 GiB) with EN set, so this 32-bit aligned write to the
         // architected EOI register at base+0xB0 is valid and has no
         // side effect beyond acknowledging the in-service IRQ.
@@ -609,12 +621,12 @@ pub unsafe fn self_ipi(vector: u8) {
         //   [19:18] = 01 (self), [14] = 1 (level assert),
         //   [7:0]   = vector
         let icr_low: u32 = (vector as u32) | (1 << 14) | (1 << 18);
-        // SAFETY: LAPIC MMIO identity-mapped; high half irrelevant
+        // SAFETY: LAPIC MMIO reached via `lapic_reg`; high half irrelevant
         // for self-shorthand but Intel mandates writing it first.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let icr_hi_reg = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
-            let icr_lo_reg = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+            let icr_hi_reg = lapic_reg(0x310);
+            let icr_lo_reg = lapic_reg(0x300);
             core::ptr::write_volatile(icr_hi_reg, 0);
             core::ptr::write_volatile(icr_lo_reg, icr_low);
         }
@@ -637,7 +649,7 @@ const APIC_ICR_MSR: u32 = 0x0000_0830;
 /// equivalent translation.
 ///
 /// # Safety
-/// `init_bsp` must have run. LAPIC MMIO identity-mapped.
+/// `init_bsp` must have run. LAPIC MMIO reached via `lapic_reg`.
 #[inline]
 pub unsafe fn wrmsr_icr(icr: u64) {
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
@@ -655,12 +667,12 @@ pub unsafe fn wrmsr_icr(icr: u64) {
         let dest_apic_id = (icr >> 32) & 0xFF;
         let icr_high = (dest_apic_id << 24) as u32;
         let icr_low = (icr & 0xFFFF_FFFF) as u32;
-        // SAFETY: LAPIC MMIO identity-mapped; spec mandates writing
+        // SAFETY: LAPIC MMIO reached via `lapic_reg`; spec mandates writing
         // ICR_HIGH before ICR_LOW (LOW write triggers send).
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let icr_hi_reg = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
-            let icr_lo_reg = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+            let icr_hi_reg = lapic_reg(0x310);
+            let icr_lo_reg = lapic_reg(0x300);
             core::ptr::write_volatile(icr_hi_reg, icr_high);
             core::ptr::write_volatile(icr_lo_reg, icr_low);
         }
@@ -681,17 +693,16 @@ pub unsafe fn wrmsr_icr(icr: u64) {
 /// which dispatches on the same flag.
 ///
 /// # Safety
-/// `init_bsp` must have run. LAPIC MMIO is identity-mapped per
-/// init_bsp contract.
+/// `init_bsp` must have run. LAPIC MMIO is reached via `lapic_reg`.
 #[inline]
 pub unsafe fn apic_id() -> u32 {
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // SAFETY: MSR 0x802 is x2APIC APIC_ID — read-only.
         unsafe { rdmsr(0x0000_0802) as u32 }
     } else {
-        let id_reg = (XAPIC_MMIO_BASE + 0x20) as *const u32;
-        // SAFETY: caller guarantees init_bsp ran, so the LAPIC MMIO
-        // window is identity-mapped; this 32-bit aligned read of the
+        let id_reg = lapic_reg(0x20);
+        // SAFETY: caller guarantees init_bsp ran, so `lapic_reg` resolves
+        // to a mapped window; this 32-bit aligned read of the
         // architected APIC_ID register at base+0x20 has no side effects.
         // SAFETY: Valid memory or trusted environment
         let raw = unsafe { core::ptr::read_volatile(id_reg) };
@@ -700,10 +711,74 @@ pub unsafe fn apic_id() -> u32 {
     }
 }
 
-/// Default xAPIC MMIO base. Used as the fallback when x2APIC isn't
-/// active. APIC_BASE_MSR can carry a different base in theory, but
-/// every consumer board we'd run on leaves this default in place.
+/// Architectural default xAPIC MMIO base, used until `init_bsp` reads the
+/// real one out of IA32_APIC_BASE. This is a PHYSICAL address; never
+/// dereference it directly — go through [`lapic_reg`].
 const XAPIC_MMIO_BASE: u64 = 0xFEE0_0000;
+
+/// Physical base of the LAPIC register page, from IA32_APIC_BASE[35:12].
+/// Linux (`arch/x86/kernel/apic/apic.c`) honours the MSR rather than
+/// assuming the default, because firmware may relocate the window.
+static LAPIC_PHYS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(XAPIC_MMIO_BASE);
+
+/// Virtual address of the ioremap'd LAPIC page, or 0 before
+/// [`remap_mmio`] has run.
+///
+/// The LAPIC is brought up in `init_bsp`, which runs BEFORE `init_mmu`
+/// installs the final page tables, so the earliest accesses necessarily go
+/// through boot.S's low identity window at the physical address. That
+/// window does not exist in the kernel's own tables: `init_mmu` maps RAM
+/// through a direct map at a RANDOMIZED base and nothing maps the low
+/// 4 GiB, so every xAPIC access after the CR3 handoff faults on a raw
+/// physical pointer. `remap_mmio` closes that gap.
+static LAPIC_VA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Pointer to LAPIC register `offset`.
+///
+/// Returns the ioremap'd virtual address once [`remap_mmio`] has run, and
+/// the physical address before that — which is only dereferenceable while
+/// boot.S's identity window is still live, i.e. exactly the early-boot
+/// window in which it is the only option.
+#[inline]
+fn lapic_reg(offset: u64) -> *mut u32 {
+    let va = LAPIC_VA.load(core::sync::atomic::Ordering::Acquire);
+    let base = if va != 0 {
+        va as u64
+    } else {
+        LAPIC_PHYS.load(core::sync::atomic::Ordering::Acquire)
+    };
+    (base + offset) as *mut u32
+}
+
+/// Move LAPIC register access off the boot identity window and onto an
+/// `ioremap` mapping. Called by the frame right after `init_mmu` installs
+/// the final page tables, mirroring `gic::remap_mmio` on aarch64.
+///
+/// Idempotent, and a no-op when x2APIC is active (that path uses MSRs and
+/// never touches MMIO). The mapping must be `Device`, not a direct-map
+/// pointer: LAPIC registers are MMIO and must not be cached.
+pub fn remap_mmio() {
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if LAPIC_VA.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    let phys = LAPIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: the architectural LAPIC register page, owned by this CPU
+    // package and mapped uncached.
+    if let Ok(m) = unsafe {
+        narf_memory::ioremap::ioremap(phys, 0x1000, narf_memory::ioremap::MmioAttrs::Device)
+    } {
+        LAPIC_VA.store(m.va() as usize, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// True once the LAPIC MMIO window has been remapped (diagnostics/tests).
+pub fn mmio_remapped() -> bool {
+    LAPIC_VA.load(core::sync::atomic::Ordering::Acquire) != 0
+}
 
 /// Send an INIT IPI (assert) to the target APIC.
 ///
@@ -731,9 +806,9 @@ pub unsafe fn send_init_ipi(target_apic_id: u32) {
         // xAPIC MMIO fallback. ICR_HI carries the destination
         // APIC ID in bits 24..31; ICR_LO carries the IPI fields.
         // Writing ICR_LO triggers the IPI, so write ICR_HI first.
-        let lapic_hi = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
-        let lapic_lo = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
-        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
+        let lapic_hi = lapic_reg(0x310);
+        let lapic_lo = lapic_reg(0x300);
+        // SAFETY: LAPIC MMIO is reached via `lapic_reg`.
         unsafe {
             core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
             core::ptr::write_volatile(lapic_lo, icr_lo);
@@ -760,9 +835,9 @@ pub unsafe fn send_nmi_ipi(target_apic_id: u32) {
             wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
         }
     } else {
-        let lapic_hi = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
-        let lapic_lo = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
-        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB). Write HI (dest)
+        let lapic_hi = lapic_reg(0x310);
+        let lapic_lo = lapic_reg(0x300);
+        // SAFETY: LAPIC MMIO is reached via `lapic_reg`. Write HI (dest)
         // before LO (triggers the IPI).
         unsafe {
             core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
@@ -795,9 +870,9 @@ pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
             wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
         }
     } else {
-        let lapic_hi = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
-        let lapic_lo = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
-        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
+        let lapic_hi = lapic_reg(0x310);
+        let lapic_lo = lapic_reg(0x300);
+        // SAFETY: LAPIC MMIO is reached via `lapic_reg`.
         unsafe {
             core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
             core::ptr::write_volatile(lapic_lo, icr_lo);
@@ -827,7 +902,7 @@ pub unsafe fn init_ap() {
     // MMIO instead. Cross-CPU IPI senders already route through
     // xAPIC MMIO when X2APIC_ACTIVE is false.
     if !X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
-        // SAFETY: LAPIC MMIO is identity-mapped + APIC_BASE.EN set.
+        // SAFETY: LAPIC MMIO is reached via `lapic_reg`; APIC_BASE.EN set.
         unsafe {
             init_lapic_xapic();
         }
@@ -1194,7 +1269,7 @@ pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
         if X2APIC_ACTIVE.load(Ordering::Acquire) {
             wrmsr(APIC_LVT_TIMER_MSR, lvt);
         } else {
-            let lvt_ptr = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
+            let lvt_ptr = lapic_reg(0x320);
             core::ptr::write_volatile(lvt_ptr, lvt as u32);
         }
         // SDM 10.5.4.1: a serializing MFENCE between the LVT

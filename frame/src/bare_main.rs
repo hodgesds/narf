@@ -1587,6 +1587,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             narf_memory::text_poke::enable_write_protect();
                         }
 
+                        // Move the LAPIC onto an ioremap window now that the
+                        // final tables are live. In xAPIC mode (no x2APIC, or
+                        // firmware refused IA32_APIC_BASE.EXTD — common on
+                        // Renoir/Phoenix) every LAPIC access is MMIO, and it
+                        // has been reaching its registers at their PHYSICAL
+                        // base through boot.S's identity window. That window
+                        // is not in the tables just installed, so without this
+                        // the next LAPIC touch #PFs on 0xFEE0_0020. Same move
+                        // aarch64 makes for the GIC below. No-op under x2APIC.
+                        narf_interrupts::x86_64::apic::remap_mmio();
+                        if narf_interrupts::x86_64::apic::mmio_remapped() {
+                            let _ = writeln!(console::Writer, "  apic: xAPIC MMIO remapped");
+                        }
+
                         // The kernel direct map now covers all installed
                         // RAM (the low 512 GiB identity window), so the
                         // frame allocator may hand out frames above 4 GiB.
