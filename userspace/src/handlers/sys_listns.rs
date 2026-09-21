@@ -38,19 +38,19 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
     let (req, out_ptr, nr, flags) = (a.arg0, a.arg1, a.arg2, a.arg3);
 
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // "If the mount namespace really has more than 1 million..." — the same
     // cap `listmount` carries, and for the same reason.
     if nr > LISTNS_MAXCOUNT {
-        ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+        ctx.set_return(errno_ret(EOVERFLOW));
         return;
     }
     // `access_ok` on the whole array BEFORE the request is read, so an
     // unwritable buffer is -EFAULT rather than a partial enumeration.
     if nr != 0 && validate_user_range(out_ptr, (nr as usize).saturating_mul(8)).is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
 
@@ -61,23 +61,23 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
     // SAFETY: `req` is the user `struct ns_id_req`; copy_from_user
     // range-validates it and brackets the read.
     if unsafe { copy_from_user(&mut size_buf, req) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let usize_bytes = u64::from(u32::from_ne_bytes(size_buf));
     if usize_bytes > 4096 {
-        ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // -E2BIG
+        ctx.set_return(errno_ret(E2BIG));
         return;
     }
     if usize_bytes < NS_ID_REQ_SIZE_VER0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut buf = [0u8; NS_ID_REQ_SIZE_VER0 as usize];
     let known = core::cmp::min(usize_bytes, NS_ID_REQ_SIZE_VER0) as usize;
     // SAFETY: `known` <= the struct size and lies inside the caller's.
     if unsafe { copy_from_user(&mut buf[..known], req) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Every byte past the struct this kernel knows must be zero, or -E2BIG.
@@ -87,12 +87,12 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
         let tail = match unsafe { copy_from_user_vec(req + NS_ID_REQ_SIZE_VER0, rest) } {
             Ok(v) => v,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         };
         if tail.iter().any(|&b| b != 0) {
-            ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // -E2BIG
+            ctx.set_return(errno_ret(E2BIG));
             return;
         }
     }
@@ -104,7 +104,7 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
     // `if (kreq->spare != 0) return -EINVAL;` — a reserved field a caller
     // set is a caller expecting something this kernel does not do.
     if spare != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `if (kreq->ns_type & ~NS_ALL) return -EOPNOTSUPP;` — deliberately NOT
@@ -112,7 +112,7 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
     // namespaces of that type" are different answers, and a caller probing
     // for a flavour this kernel does not know needs to tell them apart.
     if req_ns_type & !ns_type::ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
 
@@ -136,7 +136,7 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
             match crate::namespaces::ns_tree_lookup(other) {
                 Some(e) if e.ns_type == ns_type::USER => Some(other),
                 _ => {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
             }
@@ -181,7 +181,7 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
             crate::namespaces::ns_tree_first_at(at, tree_type, None)
         };
         if first.is_none() {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
     }
@@ -210,7 +210,7 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
         // SAFETY: the range was validated above and `bytes` is exactly
         // `ids.len() * 8` long.
         if unsafe { copy_to_user(out_ptr, &bytes) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

@@ -9,7 +9,7 @@ pub(crate) fn sys_getsid(ctx: &mut dyn TrapContext) {
         match accept_pid_from(current_task_id(), pid) {
             Some(outer) => proc_pid_to_tid(outer),
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
         }

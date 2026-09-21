@@ -5672,7 +5672,6 @@ fn cap_fork(parent: u64, child: u64) {
 ///
 /// Returns the new credential, or `Err(EPERM)`.
 fn cap_capset(old: Caps, effective: u64, permitted: u64, inheritable: u64) -> Result<Caps, i64> {
-    const EPERM: i64 = 1;
     let subset = |a: u64, b: u64| a & !b == 0;
     // `cap_inh_is_capped()` is 1 on any kernel without SECURE_NO_CAP_AMBIENT
     // relaxation, which is the configuration NARF models.
@@ -9174,7 +9173,7 @@ fn current_user_tls_base() -> Option<u64> {
 /// any child state. The returned value is a positive errno number.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn validate_clone_args(ca: &CloneArgs, legacy: bool, requested_tids: &[i32]) -> Result<(), u64> {
-    const EINVAL: u64 = 22;
+    const EINVAL: u64 = crate::errno::EINVAL as u64;
     const CLONE_DETACHED: u64 = 0x0040_0000;
     const CLONE_PARENT: u64 = 0x0000_8000;
     const CLONE_NEWNS: u64 = 0x0002_0000;

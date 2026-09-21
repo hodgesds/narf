@@ -24,8 +24,6 @@ use super::*;
 ///     registered. The value is the kernel's own ABI version, which is why
 ///     `set_robust_list` refuses any other length in the first place.
 pub(crate) fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EFAULT: i64 = 14;
     let a = *ctx.args();
     let head_out = a.arg1;
     let len_out = a.arg2;
@@ -37,7 +35,7 @@ pub(crate) fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
         current_task_id()
     } else {
         let Some(outer) = accept_pid_from(current_task_id(), a.arg0) else {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         };
         proc_pid_to_tid(outer)
@@ -60,13 +58,13 @@ pub(crate) fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
     }
     .is_err()
     {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // SAFETY: `head_out` is the user `void**` out-pointer; copy_to_user
     // range-validates the 8-byte write.
     if unsafe { copy_to_user(head_out, &head.to_ne_bytes()) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

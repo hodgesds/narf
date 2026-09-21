@@ -23,7 +23,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     // NARF does not yet implement Linux's signal-scope override flags. Reject
     // every nonzero value before touching the fd or user siginfo.
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -34,7 +34,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     let pid = match pid {
         Some(p) => p,
         None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -49,16 +49,16 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         let info = match import_queued_siginfo(a.arg2) {
             Ok(info) => info,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         };
         if info.signo != signum {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         if siginfo_requires_self_target(info) && target != task {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         Some(info)
@@ -66,11 +66,11 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     // A pidfd keeps its numeric identity after exit; signal delivery must still
     // resolve a live task. This also precedes signal-number validation in Linux.
     if !signal_target_exists(target) {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
     if signum > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // sig 0 is an existence/permission probe — don't queue anything.
@@ -83,7 +83,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         // sigwait consumer can't strand the bit over an emptied queue (the sigq
         // spurious-sival=0 bug). A full queue is EAGAIN with nothing delivered.
         if sigqueue_deliver_imported(target, signum, info).is_none() {
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
     } else {

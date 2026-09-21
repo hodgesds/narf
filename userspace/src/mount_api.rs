@@ -40,22 +40,9 @@ use crate::handlers::{
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
-// ── errno (negated-long convention) ─────────────────────────────────
-const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
-const E2BIG: i64 = 7;
-const EBADF: i64 = 9;
-const EMFILE: i64 = 24;
-const EFAULT: i64 = 14;
-const EBUSY: i64 = 16;
-const EINVAL: i64 = 22;
-const ENODEV: i64 = 19;
-const EOPNOTSUPP: i64 = 95;
-const ENOSPC: i64 = 28;
+use crate::errno::to_ret as err;
+use crate::errno::*;
 
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
 fn ok(v: u64) -> SyscallReturn {
     SyscallReturn::ok(v)
 }

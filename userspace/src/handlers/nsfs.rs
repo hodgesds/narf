@@ -24,16 +24,6 @@ const NSIO: u32 = 0xb7;
 /// the header with `offsetof`, not counted by hand.
 const MNT_NS_INFO_SIZE_VER0: u32 = 16;
 
-const EPERM: i64 = -1;
-const ENOENT: i64 = -2;
-const ESRCH: i64 = -3;
-const EFAULT: i64 = -14;
-const EINVAL: i64 = -22;
-const EMFILE: i64 = -24;
-const ENOTTY: i64 = -25;
-const EOPNOTSUPP: i64 = -95;
-const ESTALE: i64 = -116;
-
 fn ioc_type(cmd: u32) -> u32 {
     (cmd >> 8) & 0xff
 }
@@ -103,10 +93,10 @@ pub(crate) fn nsfs_ioctl(task: u64, held: &HeldNs, cmd: u32, arg: usize) -> i64 
     // turns into -ENOTTY before userspace sees it, the same answer the
     // unknown-extensible arm gives directly.
     if !nsfs_ioctl_valid(cmd) {
-        return ENOTTY;
+        return -ENOTTY;
     }
     if !may_use(task, cmd) {
-        return EPERM;
+        return -EPERM;
     }
     match ioc_nr(cmd) {
         1 => get_userns(task, held),
@@ -120,14 +110,14 @@ pub(crate) fn nsfs_ioctl(task: u64, held: &HeldNs, cmd: u32, arg: usize) -> i64 
         // question, which is why it type-checks first and then shares a body.
         5 | 13 => {
             if ioc_nr(cmd) == 5 && held.flavour() != NsFlavour::Mnt {
-                return EINVAL;
+                return -EINVAL;
             }
             write_u64(arg, held.id())
         }
         6..=9 => pidns_translate(task, held, ioc_nr(cmd), arg),
         10 => mnt_get_info(held, cmd, arg),
         11 | 12 => mnt_get_adjoined(task, held, cmd, arg, ioc_nr(cmd) == 12),
-        _ => ENOTTY,
+        _ => -ENOTTY,
     }
 }
 
@@ -136,7 +126,7 @@ fn write_u64(arg: usize, v: u64) -> i64 {
     // range-validates the eight bytes.
     match unsafe { copy_to_user(arg as u64, &v.to_ne_bytes()) } {
         Ok(_) => 0,
-        Err(_) => EFAULT,
+        Err(_) => -EFAULT,
     }
 }
 
@@ -158,7 +148,7 @@ fn publish(task: u64, held: HeldNs) -> i64 {
         },
     ) {
         Some(f) => i64::from(f),
-        None => EMFILE,
+        None => -EMFILE,
     }
 }
 
@@ -181,7 +171,7 @@ fn publish(task: u64, held: HeldNs) -> i64 {
 /// container would hand out a route to the host's user namespace.
 fn owner_in_callers_reach(task: u64, held: &HeldNs) -> Result<Arc<crate::namespaces::UserNamespace>, i64> {
     let Some(owner) = crate::namespaces::owner_user_ns_of(held) else {
-        return Err(EPERM);
+        return Err(-EPERM);
     };
     let mine = crate::namespaces::current_user_ns(task).id();
     let mut cursor = Some(owner.clone());
@@ -191,7 +181,7 @@ fn owner_in_callers_reach(task: u64, held: &HeldNs) -> Result<Arc<crate::namespa
         }
         cursor = ns.parent().cloned();
     }
-    Err(EPERM)
+    Err(-EPERM)
 }
 
 fn get_userns(task: u64, held: &HeldNs) -> i64 {
@@ -218,7 +208,7 @@ fn get_parent(task: u64, held: &HeldNs) -> i64 {
             let active =
                 crate::pid_ns::ns_of(task).map_or(crate::namespaces::init_ns_id::PID, |ns| ns.id());
             let Some(parent) = n.parent() else {
-                return EPERM;
+                return -EPERM;
             };
             let mut cursor = Some(parent.clone());
             while let Some(ns) = cursor {
@@ -227,9 +217,9 @@ fn get_parent(task: u64, held: &HeldNs) -> i64 {
                 }
                 cursor = ns.parent();
             }
-            EPERM
+            -EPERM
         }
-        _ => EINVAL,
+        _ => -EINVAL,
     }
 }
 
@@ -240,7 +230,7 @@ fn get_parent(task: u64, held: &HeldNs) -> i64 {
 /// rather than a host uid it has no business learning.
 fn get_owner_uid(task: u64, held: &HeldNs, arg: usize) -> i64 {
     let HeldNs::User(ns) = held else {
-        return EINVAL;
+        return -EINVAL;
     };
     let seen = crate::namespaces::current_user_ns(task)
         .translate_uid_from_host(ns.owner_uid())
@@ -249,7 +239,7 @@ fn get_owner_uid(task: u64, held: &HeldNs, arg: usize) -> i64 {
     // range-validates the four bytes.
     match unsafe { copy_to_user(arg as u64, &seen.to_ne_bytes()) } {
         Ok(_) => 0,
-        Err(_) => EFAULT,
+        Err(_) => -EFAULT,
     }
 }
 
@@ -262,7 +252,7 @@ fn get_owner_uid(task: u64, held: &HeldNs, arg: usize) -> i64 {
 /// PID — the same identification `clone_pid_levels` already makes.
 fn pidns_translate(task: u64, held: &HeldNs, nr: u32, arg: usize) -> i64 {
     let HeldNs::Pid(target) = held else {
-        return EINVAL;
+        return -EINVAL;
     };
     let want = arg as u64;
     let answer = if matches!(nr, 6 | 7) {
@@ -279,7 +269,7 @@ fn pidns_translate(task: u64, held: &HeldNs, nr: u32, arg: usize) -> i64 {
     match answer {
         // `if (!ret) ret = -ESRCH;` — pid 0 names no task, so a translation
         // that lands there is reported absent rather than returned.
-        None | Some(0) => ESRCH,
+        None | Some(0) => -ESRCH,
         Some(v) => v as i64,
     }
 }
@@ -297,21 +287,21 @@ fn write_mnt_ns_info(arg: usize, ns: &narf_filesystem::MountNamespace) -> i64 {
     // caller struct that the rest is untouched.
     match unsafe { copy_to_user(arg as u64, &buf) } {
         Ok(_) => 0,
-        Err(_) => EFAULT,
+        Err(_) => -EFAULT,
     }
 }
 
 fn mnt_get_info(held: &HeldNs, cmd: u32, arg: usize) -> i64 {
     let HeldNs::Mnt(ns) = held else {
-        return EINVAL;
+        return -EINVAL;
     };
     // `if (!uinfo) return -EINVAL;` — INFO alone rejects a null buffer,
     // because reporting into it is the command's entire job.
     if arg == 0 {
-        return EINVAL;
+        return -EINVAL;
     }
     if ioc_size(cmd) < MNT_NS_INFO_SIZE_VER0 {
-        return EINVAL;
+        return -EINVAL;
     }
     write_mnt_ns_info(arg, ns)
 }
@@ -339,17 +329,17 @@ fn mnt_get_info(held: &HeldNs, cmd: u32, arg: usize) -> i64 {
 /// about the system, the per-namespace check is about each namespace.
 fn mnt_get_adjoined(task: u64, held: &HeldNs, cmd: u32, arg: usize, previous: bool) -> i64 {
     let HeldNs::Mnt(ns) = held else {
-        return EINVAL;
+        return -EINVAL;
     };
     if ioc_size(cmd) < MNT_NS_INFO_SIZE_VER0 {
-        return EINVAL;
+        return -EINVAL;
     }
     let mut from = ns.id();
     loop {
         let Some(entry) =
             crate::namespaces::ns_tree_adjoined(from, crate::namespaces::ns_type::MNT, previous)
         else {
-            return ENOENT;
+            return -ENOENT;
         };
         from = entry.id;
         // The fd must OWN the namespace, so recover the `Arc` from the tree
@@ -417,46 +407,46 @@ pub(crate) fn encode_handle(held: &HeldNs) -> [u8; NSFS_FILE_HANDLE_SIZE] {
 pub(crate) fn decode_handle(task: u64, fid: &[u8]) -> Result<HeldNs, i64> {
     // `if (fh_len < NSFS_FID_SIZE_U32_VER0) return NULL;`
     if fid.len() < NSFS_FILE_HANDLE_SIZE {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     }
     // `if ((fh_len > NSFS_FID_SIZE_U32_LATEST) && memchr_inv(...))` — bytes
     // past the struct this kernel knows must be zero, or the handle was
     // written by something that knows more than we do.
     if fid[NSFS_FILE_HANDLE_SIZE..].iter().any(|&b| b != 0) {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     }
     let ns_id = u64::from_ne_bytes(fid[0..8].try_into().unwrap());
     let ns_type = u32::from_ne_bytes(fid[8..12].try_into().unwrap());
     let ns_inum = u32::from_ne_bytes(fid[12..16].try_into().unwrap());
     // `if (!fid->ns_id) return NULL;` — id 0 names nothing, ever.
     if ns_id == 0 {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     }
     // `if (!fid->ns_inum != !fid->ns_type) return NULL;` — both set, or
     // neither. One without the other is a half-written handle.
     if (ns_inum == 0) != (ns_type == 0) {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     }
     let Some(live) = crate::namespaces::ns_tree_lookup_object(ns_id) else {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     };
     if ns_inum != 0 && ns_inum != crate::namespaces::ns_inum(ns_id) {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     }
     if ns_type != 0 && ns_type != live.ns_type {
-        return Err(ESTALE);
+        return Err(-ESTALE);
     }
     let Some(held) = crate::namespaces::held_from_ns_object(&live.object, live.ns_type) else {
         // `default: return ERR_PTR(-EOPNOTSUPP);` — a flavour this kernel
         // does not model.
-        return Err(EOPNOTSUPP);
+        return Err(-EOPNOTSUPP);
     };
     // `if (owning_ns && !may_see_all_namespaces()) return ERR_PTR(-EPERM);`
     // — a caller that is NOT in the namespace needs system-wide visibility
     // to open it by handle. Without this a handle would be a way around
     // every check `/proc/<pid>/ns/` enforces.
     if !crate::namespaces::task_is_in_namespace(task, &held) && !may_see_all_namespaces(task) {
-        return Err(EPERM);
+        return Err(-EPERM);
     }
     Ok(held)
 }

@@ -43,7 +43,6 @@ use super::*;
 /// inode mode check, the setgid-directory rules — over any file whose group
 /// it chose to claim.
 pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
     const NOCHANGE: u32 = u32::MAX; // (gid_t)-1
     let a = *ctx.args();
     let rgid = a.arg0 as u32;
@@ -65,11 +64,11 @@ pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() {
             if rgid != NOCHANGE && !uns.gid_is_mapped(rgid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if egid != NOCHANGE && !uns.gid_is_mapped(egid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -77,7 +76,7 @@ pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
     let old = read_uidgid(task);
 
     if rgid != NOCHANGE && rgid != old.gid && rgid != old.egid && !capable_in_own_ns(CAP_SETGID) {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     if egid != NOCHANGE
@@ -86,7 +85,7 @@ pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
         && egid != old.sgid
         && !capable_in_own_ns(CAP_SETGID)
     {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -106,5 +105,5 @@ pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
         }
         e.fsgid = e.egid;
     });
-    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-EPERM) as u64 }));
+    ctx.set_return(if ok { SyscallReturn::ok(0) } else { errno_ret(EPERM) });
 }

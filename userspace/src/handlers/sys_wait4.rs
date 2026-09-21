@@ -11,7 +11,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     const VALID_WAIT_OPTIONS: u32 =
         WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WCLONE | __WALL;
     if options & !VALID_WAIT_OPTIONS != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -33,8 +33,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         match accept_pid_from(parent, want_pid as u64) {
             Some(outer) => want_pid = outer as i64,
             None => {
-                const ECHILD: i64 = 10;
-                ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+                ctx.set_return(errno_ret(ECHILD));
                 return;
             }
         }
@@ -50,8 +49,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         raw if raw < -1 => {
             let g = pgid_from_user((-raw) as u64);
             if g == 0 {
-                const ECHILD: i64 = 10;
-                ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+                ctx.set_return(errno_ret(ECHILD));
                 return;
             }
             g
@@ -121,8 +119,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // blocks forever (observed: stress-ng's parent `wait4(-1)` hanging after
     // its only worker exited, so the whole run never completes).
     if !has_living_child(parent, want_pid, want_pgid, options) {
-        const ECHILD: i64 = 10;
-        ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+        ctx.set_return(errno_ret(ECHILD));
         return;
     }
 

@@ -10,18 +10,18 @@ pub(crate) fn sys_tkill(ctx: &mut dyn TrapContext) {
     let tid = match signal_tid_from_user(current_task_id(), args.arg0) {
         Some(tid) => tid,
         None => {
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
     };
     let signum = args.arg1 as u32;
     if signum > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // ESRCH for a dead/never-existed tid (Linux tkill(2)).
     if !signal_target_exists(tid) {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
     // Null signal: existence/permission probe only — queue nothing (see sys_kill).

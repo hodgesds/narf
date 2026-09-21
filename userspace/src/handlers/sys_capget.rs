@@ -22,20 +22,17 @@ use super::*;
 /// path or a caller compiled against a newer header can never discover what
 /// this kernel speaks.
 pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
-    const ESRCH: i64 = 3;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let a = *ctx.args();
     let hdrp = a.arg0;
     let datap = a.arg1;
     if hdrp == 0 {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut hdr = [0u8; 8];
     // SAFETY: hdrp checked non-zero; copy_from_user range-validates the read.
     if unsafe { copy_from_user(&mut hdr, hdrp) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let version = u32::from_le_bytes(hdr[..4].try_into().unwrap());
@@ -56,7 +53,11 @@ pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
             // that before allocating, so reporting -EINVAL here made it give
             // up instead of retrying.
             let probe = datap == 0;
-            ctx.set_return(SyscallReturn::ok(if probe { 0 } else { (-EINVAL) as u64 }));
+            ctx.set_return(if probe {
+                SyscallReturn::ok(0)
+            } else {
+                errno_ret(EINVAL)
+            });
             return;
         }
     };
@@ -66,7 +67,7 @@ pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
         return;
     }
     if pid < 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `cap_get_target_pid()` resolves the header pid with
@@ -85,7 +86,7 @@ pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
             Some(outer) if outer == self_pid => task,
             Some(outer) => proc_pid_to_tid(outer),
             None => {
-                ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
         }
@@ -107,7 +108,7 @@ pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: datap checked non-zero; copy_to_user range-validates the write.
     if unsafe { copy_to_user(datap, &out) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

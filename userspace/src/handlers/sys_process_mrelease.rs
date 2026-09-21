@@ -15,11 +15,6 @@ use super::*;
 /// hold, or the call is -EINVAL. Without it this would be a way for any
 /// caller holding a pidfd to destroy a LIVE process's memory.
 pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = -22;
-    const ESRCH: i64 = -3;
-    const EBADF: i64 = -9;
-    const EAGAIN: i64 = -11;
-
     let a = *ctx.args();
     let pidfd = a.arg0 as u32;
     let flags = a.arg1 as u32;
@@ -28,7 +23,7 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
     // so a caller passing a flag this kernel does not know is told so rather
     // than having its unknown intent silently ignored.
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -39,7 +34,7 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
         t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
     })
     .flatten() else {
-        ctx.set_return(SyscallReturn::ok(EBADF as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
 
@@ -47,7 +42,7 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
     // valid but the process behind it is gone. A pidfd deliberately outlives
     // its process, so this is the ordinary race, not an error in the caller.
     let Some(target) = pid_to_task_raw(target_pid) else {
-        ctx.set_return(SyscallReturn::ok(ESRCH as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
 
@@ -55,7 +50,7 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
     // with no mm has nothing to release. In NARF that is a kernel task, or
     // one whose address space has already been torn down.
     let Some(mm) = address_space_of_task(target) else {
-        ctx.set_return(SyscallReturn::ok(ESRCH as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
 
@@ -68,7 +63,7 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
     // SIGKILL is a death that has been decided but not yet executed — which
     // is precisely the window this syscall exists to shorten.
     if !task_will_free_mem(target) {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -83,10 +78,12 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
     // the -EAGAIN the caller is expected to retry.
     let sole_owner = Arc::strong_count(&mm) == 1;
     let r = match mm.reap_anonymous_owned(sole_owner) {
-        narf_memory::oom::ReapOutcome::Reaped(_) | narf_memory::oom::ReapOutcome::Nothing => 0,
-        narf_memory::oom::ReapOutcome::Blocked => EAGAIN,
+        narf_memory::oom::ReapOutcome::Reaped(_) | narf_memory::oom::ReapOutcome::Nothing => {
+            SyscallReturn::ok(0)
+        }
+        narf_memory::oom::ReapOutcome::Blocked => errno_ret(EAGAIN),
     };
-    ctx.set_return(SyscallReturn::ok(r as u64));
+    ctx.set_return(r);
 }
 
 /// `__task_will_free_mem` — is this task's memory on its way out anyway?

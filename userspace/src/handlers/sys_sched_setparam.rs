@@ -34,10 +34,6 @@ use super::*;
 /// headroom, SCHED_DEADLINE always requiring privilege) are unreachable
 /// while every task is SCHED_OTHER.
 pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
-    const ESRCH: i64 = 3;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     /// `MAX_RT_PRIO - 1` (include/linux/sched/prio.h: MAX_RT_PRIO = 100).
     const MAX_RT_PRIO_MINUS_1: i32 = 99;
     let args = *ctx.args();
@@ -46,7 +42,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     let pid = args.arg0 as i32;
     let inp = args.arg1;
     if inp == 0 || pid < 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Read one i32 from user space under the SMAP bracket.
@@ -54,7 +50,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     // SAFETY: `inp` is the user sched_param pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
     if unsafe { copy_from_user(&mut buf, inp) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let val = i32::from_ne_bytes(buf);
@@ -66,7 +62,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
         caller
     } else {
         let Some(outer) = accept_pid_from(caller, pid as u64) else {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         };
         let resolved = proc_pid_to_tid(outer);
@@ -74,7 +70,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
         // identity mapping for an unregistered pid, so the existence check
         // is what implements it.
         if resolved != caller && crate::task::task_get(resolved).is_none() {
-            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
         resolved
@@ -82,13 +78,13 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
 
     // Priority range, then the policy/priority agreement rule.
     if !(0..=MAX_RT_PRIO_MINUS_1).contains(&val) {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `rt_policy(policy) != (attr->sched_priority != 0)`. Every NARF task
     // is SCHED_OTHER, so rt_policy is false and only 0 agrees with it.
     if val != 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -100,7 +96,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     // — measured in the TARGET's user namespace, like setpriority's.
     if target.uid != caller_euid && target.euid != caller_euid && !capable_over_task(task, CAP_SYS_NICE)
     {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -110,7 +106,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
         None => {
             // Internal: the sched-param table is uninitialized (unreachable
             // for a live task). -EPERM is a valid setscheduler errno.
-            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
     };

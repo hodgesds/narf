@@ -56,13 +56,6 @@ const ST_PRIVATE_EXPEDITED_SYNC_CORE: u32 = 1 << 5;
 const ST_PRIVATE_EXPEDITED_RSEQ_READY: u32 = 1 << 6;
 const ST_PRIVATE_EXPEDITED_RSEQ: u32 = 1 << 7;
 
-const EINVAL: i64 = -22;
-const EPERM: i64 = -1;
-/// A task with no address space cannot carry a registration. Not a Linux
-/// arm — every `membarrier` caller there has an mm — so it reuses the
-/// -ENOMEM the rest of this kernel answers for the same condition.
-const NO_MM: i64 = -12;
-
 /// Every command in `enum membarrier_cmd` except QUERY itself.
 const ALL_CMDS: i32 = CMD_GLOBAL
     | CMD_GLOBAL_EXPEDITED
@@ -119,7 +112,7 @@ fn barrier_all() -> i64 {
     } else {
         // Reported available at entry but unavailable now: a CPU came online
         // between the two reads. Refusing is the only honest answer.
-        EINVAL
+        -EINVAL
     }
 }
 
@@ -133,7 +126,7 @@ fn private_expedited(as_ref: &alloc::sync::Arc<narf_memory::AddressSpace>) -> i6
     if as_ref.membarrier_state() & ST_PRIVATE_EXPEDITED_READY == 0 {
         // "Registration is required" — an unregistered mm gets -EPERM, not
         // a silent success, so a caller that skipped REGISTER finds out.
-        return EPERM;
+        return -EPERM;
     }
     // Linux: `atomic_read(&mm->mm_users) == 1 || num_online_cpus() == 1`.
     // A single-threaded process has no peer thread whose accesses could
@@ -215,7 +208,7 @@ pub(crate) fn sys_membarrier(ctx: &mut dyn TrapContext) {
         flags == 0
     };
     if !flags_ok {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -233,7 +226,7 @@ pub(crate) fn sys_membarrier(ctx: &mut dyn TrapContext) {
         // Not a single defined command bit, or one this configuration does
         // not implement (SYNC_CORE, RSEQ). Linux's `default:` arm and its
         // `CONFIG`-off arms both answer -EINVAL.
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -254,21 +247,21 @@ pub(crate) fn sys_membarrier(ctx: &mut dyn TrapContext) {
         CMD_GLOBAL_EXPEDITED => barrier_all(),
         CMD_REGISTER_GLOBAL_EXPEDITED => match mm() {
             Some(as_ref) => register(&as_ref, ST_GLOBAL_EXPEDITED, ST_GLOBAL_EXPEDITED_READY),
-            None => NO_MM,
+            None => -ENOMEM,
         },
         CMD_PRIVATE_EXPEDITED => match mm() {
             Some(as_ref) => private_expedited(&as_ref),
-            None => NO_MM,
+            None => -ENOMEM,
         },
         CMD_REGISTER_PRIVATE_EXPEDITED => match mm() {
             Some(as_ref) => register(&as_ref, ST_PRIVATE_EXPEDITED, ST_PRIVATE_EXPEDITED_READY),
-            None => NO_MM,
+            None => -ENOMEM,
         },
         CMD_GET_REGISTRATIONS => match mm() {
             Some(as_ref) => get_registrations(as_ref.membarrier_state()),
-            None => NO_MM,
+            None => -ENOMEM,
         },
-        _ => EINVAL,
+        _ => -EINVAL,
     };
     ctx.set_return(SyscallReturn::ok(r as u64));
 }

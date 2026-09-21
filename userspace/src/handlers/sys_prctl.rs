@@ -30,11 +30,10 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
     let op = args.arg0 as u32 as u64;
     let arg_a = args.arg1;
     let arg_b = args.arg2;
-    /// A user pointer the caller handed us is unreadable/unwritable:
-    /// `put_user`/`copy_to_user` failure, which every pointer-taking
-    /// prctl option reports as EFAULT.
-    const EFAULT_CODE: i64 = -14;
-    let fail = SyscallReturn::ok(EFAULT_CODE as u64);
+    // A user pointer the caller handed us is unreadable/unwritable:
+    // `put_user`/`copy_to_user` failure, which every pointer-taking
+    // prctl option reports as EFAULT.
+    let fail = errno_ret(EFAULT);
     let task = current_task_id();
 
     match op {
@@ -69,7 +68,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // (the subsystem is absent), not EFAULT (the caller's pointer
             // was fine) and certainly not EPERM.
             if !modify_prctl(task, |s| s.name = name) {
-                ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // ENOSYS
+                ctx.set_return(errno_ret(ENOSYS));
                 return;
             }
             // Mirror into PROC_COMM so /proc/[pid]/comm reflects the new name.
@@ -105,7 +104,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // `kernel/sys.c`: `if (!valid_signal(arg2)) { error = -EINVAL;
             // break; }`, and `valid_signal(sig)` is `sig <= _NSIG` (64).
             if arg_a > 64 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             modify_prctl(task, |s| s.pdeathsig = arg_a as u32);
@@ -143,14 +142,14 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // the same bit, so two stores would let them disagree about
             // which one `cap_emulate_setxuid` obeys.
             if arg_a > 1 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             // The lock is why this is EPERM and not EINVAL: the request is
             // well-formed, the caller has simply given up the right to make
             // it.
             if issecure(task, SECURE_KEEP_CAPS_LOCKED) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             let bits = task_securebits(task);
@@ -198,7 +197,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // meant a caller asking for the root-only dump mode was told
             // it got it.
             if arg_a > 1 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             modify_prctl(task, |s| s.dumpable = arg_a != 0);
@@ -223,7 +222,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // could be installed unprivileged saw it flip off. Rejecting
             // 0 with EINVAL is both what Linux does and the safe answer.
             if arg_a != 1 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             modify_prctl(task, |s| s.no_new_privs = true);
@@ -240,7 +239,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             match arg_a {
                 PR_CAP_AMBIENT_CLEAR_ALL => {
                     if arg_b != 0 {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     ambient_clear_all(task);
@@ -248,7 +247,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                 }
                 PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER | PR_CAP_AMBIENT_IS_SET => {
                     if arg_b > CAP_LAST_CAP {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     let cap = arg_b as u32;
@@ -265,7 +264,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                             if ambient_raise(task, cap) {
                                 ctx.set_return(SyscallReturn::ok(0));
                             } else {
-                                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                                ctx.set_return(errno_ret(EPERM));
                             }
                         }
                         PR_CAP_AMBIENT_LOWER => {
@@ -279,12 +278,12 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                         }
                     }
                 }
-                _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+                _ => ctx.set_return(errno_ret(EINVAL)),
             }
         }
         PR_CAPBSET_READ => {
             if arg_a > CAP_LAST_CAP {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
             } else {
                 // Every valid cap is "in the bounding set" — NARF doesn't
                 // model one.
@@ -293,7 +292,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
         }
         PR_CAPBSET_DROP => {
             if arg_a > CAP_LAST_CAP {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
             } else {
                 // Accept-and-ignore: nothing to drop from.
                 ctx.set_return(SyscallReturn::ok(0));
@@ -335,7 +334,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                 set_task_securebits(task, arg_a);
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                ctx.set_return(errno_ret(EPERM));
             }
         }
         21 /* PR_GET_SECCOMP */ => {
@@ -364,7 +363,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // syscall outside {read, write, _exit, sigreturn}, and no
             // filter program is evaluated. See sys_seccomp.rs.
             if arg_a != 1 && arg_a != 2 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let mode = arg_a as u32;
@@ -425,7 +424,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // already reports, and rejecting it would break callers that
             // only set it opportunistically.
             if arg_a != 1 && arg_a != 2 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             ctx.set_return(SyscallReturn::ok(0));
@@ -459,21 +458,21 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // it, so an attacker who gains control of it cannot simply turn
             // W^X back off before mapping the page it wants.
             if arg_b != 0 || args.arg3 != 0 || args.arg4 != 0 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if arg_a & !(PR_MDWE_REFUSE_EXEC_GAIN | PR_MDWE_NO_INHERIT) != 0 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if arg_a & PR_MDWE_NO_INHERIT != 0 && arg_a & PR_MDWE_REFUSE_EXEC_GAIN == 0 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let task = current_task_id();
             let current_bits = task_mdwe(task);
             if current_bits != 0 && current_bits != arg_a {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             set_task_mdwe(task, arg_a);
@@ -483,7 +482,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // `prctl_get_mdwe`: `if (arg2 || arg3 || arg4 || arg5) return
             // -EINVAL; return get_current_mdwe();`
             if arg_a != 0 || arg_b != 0 || args.arg3 != 0 || args.arg4 != 0 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             ctx.set_return(SyscallReturn::ok(task_mdwe(current_task_id())));
@@ -496,7 +495,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // A -1/EPERM sentinel here made systemd treat a feature probe (e.g.
             // PR_SET_MDWE on this pre-6.3-style kernel) as a hard error instead
             // of degrading gracefully.
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
         }
     }
 }

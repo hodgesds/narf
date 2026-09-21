@@ -21,10 +21,6 @@ use super::*;
 /// buffer, and a buffer that cannot hold the first published version is
 /// simply a bad argument.
 pub(crate) fn sys_sched_getattr(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = -22;
-    const EFAULT: i64 = -14;
-    const ESRCH: i64 = -3;
-
     let a = *ctx.args();
     let uattr = a.arg1;
     let pid = a.arg0 as u32 as i32;
@@ -35,11 +31,11 @@ pub(crate) fn sys_sched_getattr(ctx: &mut dyn TrapContext) {
         || !(SCHED_ATTR_SIZE_VER0..=4096).contains(&usize_bytes)
         || a.arg3 != 0
     {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let Some(task) = handler_sys_sched_setattr::resolve_sched_target(pid as u64) else {
-        ctx.set_return(SyscallReturn::ok(ESRCH as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
 
@@ -56,7 +52,7 @@ pub(crate) fn sys_sched_getattr(ctx: &mut dyn TrapContext) {
 
     // SAFETY: copy_to_user range-validates the write.
     if unsafe { copy_to_user(uattr, &buf) }.is_err() {
-        ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // `if (usize > ksize) clear_user(dst + size, rest);` — ZERO the rest of

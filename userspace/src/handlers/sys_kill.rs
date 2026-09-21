@@ -5,8 +5,8 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let spec = args.arg0 as i64;
     let signum = args.arg1 as u32;
-    let einval = SyscallReturn::ok((-22i64) as u64);
-    let esrch = SyscallReturn::ok((-3i64) as u64);
+    let einval = errno_ret(EINVAL);
+    let esrch = errno_ret(ESRCH);
     // Linux _NSIG = 64; NARF's bit-N bitmap represents 1..=63 (see
     // SIGNAL_PENDING) — signal 64 (SIGRTMAX) is rejected like an
     // out-of-range signal.

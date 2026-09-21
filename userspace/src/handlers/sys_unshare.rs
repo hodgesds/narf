@@ -1,12 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-const EINVAL: i64 = 22;
-
-#[inline]
-fn fail(errno: i64) -> SyscallReturn {
-    SyscallReturn::ok((-errno) as u64)
-}
 
 // The exact set `kernel/fork.c::check_unshare_flags` accepts. `unshare(2)`
 // takes an `unsigned long`, so every other bit — including the whole upper
@@ -77,7 +71,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     // `check_unshare_flags` runs before anything is unshared: an unsupported
     // bit leaves the caller's namespaces untouched.
     if flags & !UNSHARE_VALID_FLAGS != 0 {
-        ctx.set_return(fail(EINVAL));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -108,7 +102,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     if flags & (CLONE_NEWUSER | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0
         && !thread_group_empty(current_task_id())
     {
-        ctx.set_return(fail(EINVAL));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -141,8 +135,8 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
             e.gid = 0;
             e.euid = 0;
             e.egid = 0;
-            e.fsuid = 0;
             e.fsgid = 0;
+            e.fsuid = 0;
         });
         // `set_cred_user_ns`: full permitted/effective/bounding, empty
         // inheritable/ambient — worth everything inside the new namespace and
@@ -161,7 +155,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     // `if (!ns_capable(user_ns, CAP_SYS_ADMIN)) return -EPERM;` — against the
     // caller's user namespace, which the block above may just have replaced.
     if flags & NS_NEEDS_SYS_ADMIN != 0 && !capable_in_own_ns(CAP_SYS_ADMIN) {
-        ctx.set_return(fail(1)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -177,7 +171,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     if flags & CLONE_NEWPID != 0 {
         let task = current_task_id();
         if let Err(errno) = crate::pid_ns::unshare_pid_ns_for_children(task) {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            ctx.set_return(errno_ret(errno as i64));
             return;
         }
         any = true;

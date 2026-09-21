@@ -14,18 +14,18 @@ pub(crate) fn sys_execve(ctx: &mut dyn TrapContext) {
 
     if path_uptr == 0 {
         // Linux: execve with a NULL pathname pointer faults → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
 
     // Step 1: copy the pathname from user memory under SMAP.
     let path_owned = match copy_user_cstr_checked(path_uptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             // Faulting pathname buffer (or no NUL within 4096) → EFAULT.
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     do_execve_resolved(ctx, path_owned, argv_uptr, envp_uptr, None);
 }

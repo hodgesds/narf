@@ -1,13 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-const EBADF: i64 = 9;
-const EINVAL: i64 = 22;
-
-#[inline]
-fn fail(errno: i64) -> SyscallReturn {
-    SyscallReturn::ok((-errno) as u64)
-}
 
 /// `kernel/nsproxy.c::SYSCALL_DEFINE2(setns, int fd, int flags)`:
 ///
@@ -57,7 +50,7 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
 
     // `fd_empty(f)` → -EBADF.
     if fd < 0 || !crate::fd::with_table(caller, |t| t.get(fd as u32).is_some()).unwrap_or(false) {
-        ctx.set_return(fail(EBADF));
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
 
@@ -96,17 +89,17 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
             // descriptor or asked for the wrong namespace type, telling it
             // its privileges were the problem when its argument was.
             if nstype != 0 && nstype & held.flavour().clone_flag() == 0 {
-                ctx.set_return(fail(EINVAL));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             match setns_install_check(caller, &held) {
                 SetnsVerdict::Ok => {}
                 SetnsVerdict::Einval => {
-                    ctx.set_return(fail(EINVAL));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 SetnsVerdict::Eperm => {
-                    ctx.set_return(fail(1)); // -EPERM
+                    ctx.set_return(errno_ret(EPERM));
                     return;
                 }
             }
@@ -144,7 +137,7 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
             } else {
                 // The fd names a namespace, but not one of the type the
                 // caller asked for — Linux's `ns->ns_type != flags`.
-                ctx.set_return(fail(EINVAL));
+                ctx.set_return(errno_ret(EINVAL));
             }
             return;
         }
@@ -156,5 +149,5 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
     // translation — a containment hazard reachable by any caller passing a
     // stray integer, and non-Linux. No caller or test depended on it (#34),
     // so the number is rejected here as Linux's final `else` does.
-    ctx.set_return(fail(EINVAL));
+    ctx.set_return(errno_ret(EINVAL));
 }

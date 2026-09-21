@@ -13,6 +13,6 @@ pub(crate) fn sys_sched_setscheduler(ctx: &mut dyn TrapContext) {
     if matches!(base_policy, 0 | 1 | 2 | 3 | 5) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
     }
 }

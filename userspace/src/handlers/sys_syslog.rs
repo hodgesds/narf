@@ -93,7 +93,7 @@ fn emit(buf: u64, len: usize, from: u64, written: u64, live: usize) -> i64 {
     // the caller-declared capacity.
     match unsafe { copy_to_user(buf, &tmp[..got]) } {
         Ok(_) => got as i64,
-        Err(_) => -14, // -EFAULT
+        Err(_) => -EFAULT,
     }
 }
 
@@ -105,10 +105,6 @@ fn emit(buf: u64, len: usize, from: u64, written: u64, live: usize) -> i64 {
 /// `server_read_dev_kmsg` falls back to this when `/dev/kmsg` is
 /// unavailable, and `dmesg` uses it unless told to use `/dev/kmsg`.
 pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = -22;
-    const EPERM: i64 = -1;
-    const EFAULT: i64 = -14;
-
     let a = *ctx.args();
     // `int type` and `int len` — sign-extend from 32 bits, because a caller
     // passing a negative length must reach the `len < 0` check below rather
@@ -122,7 +118,7 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
     // error;` — BEFORE the action is even looked at, so an unprivileged
     // caller cannot learn which actions exist by probing errnos.
     if syslog_action_restricted(action) && !task_capable(task, CAP_SYSLOG) {
-        ctx.set_return(SyscallReturn::ok(EPERM as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -136,12 +132,12 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
             // The order matters: a null buffer with len 0 is EINVAL, not a
             // successful no-op.
             if buf == 0 || len < 0 {
-                EINVAL
+                -EINVAL
             } else if len == 0 {
                 0
             } else if validate_user_range(buf, len as usize).is_err() {
                 // `if (!access_ok(buf, len)) return -EFAULT;`
-                EFAULT
+                -EFAULT
             } else {
                 let (written, live) = narf_console::klog::span();
                 if action == ACTION_READ {
@@ -209,7 +205,7 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
         // but asking for a level below the floor silently gets the floor.
         ACTION_CONSOLE_LEVEL => {
             if !(1..=8).contains(&len) {
-                EINVAL
+                -EINVAL
             } else {
                 let want = core::cmp::max(len as u32, narf_console::klog::MINIMUM_CONSOLE_LOGLEVEL);
                 narf_console::klog::set_console_loglevel(want);
@@ -234,7 +230,7 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
         // `error = log_buf_len;`
         ACTION_SIZE_BUFFER => narf_console::klog::RING_CAPACITY as i64,
 
-        _ => EINVAL,
+        _ => -EINVAL,
     };
     ctx.set_return(SyscallReturn::ok(r as u64));
 }

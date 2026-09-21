@@ -41,7 +41,6 @@ use super::*;
 ///     given and rgid otherwise, then wrote that single value to BOTH gid
 ///     and egid. `setresgid(100, 200, -1)` left the real gid at 200.
 pub(crate) fn sys_setresgid(ctx: &mut dyn TrapContext) {
-    const EPERM: i64 = 1;
     const NOCHANGE: u32 = u32::MAX; // (gid_t)-1
     let a = *ctx.args();
     let (rgid, egid, sgid) = (a.arg0 as u32, a.arg1 as u32, a.arg2 as u32);
@@ -62,15 +61,15 @@ pub(crate) fn sys_setresgid(ctx: &mut dyn TrapContext) {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() {
             if rgid != NOCHANGE && !uns.gid_is_mapped(rgid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if egid != NOCHANGE && !uns.gid_is_mapped(egid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if sgid != NOCHANGE && !uns.gid_is_mapped(sgid) {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -91,7 +90,7 @@ pub(crate) fn sys_setresgid(ctx: &mut dyn TrapContext) {
     // "new" means: requested, and not already one of the three ids held.
     let is_new = |v: u32| v != NOCHANGE && v != old.gid && v != old.egid && v != old.sgid;
     if (is_new(rgid) || is_new(egid) || is_new(sgid)) && !capable_in_own_ns(CAP_SETGID) {
-        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -108,5 +107,5 @@ pub(crate) fn sys_setresgid(ctx: &mut dyn TrapContext) {
         // `new->fsgid = new->egid;` — the POSSIBLY-UPDATED effective gid.
         e.fsgid = e.egid;
     });
-    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-EPERM) as u64 }));
+    ctx.set_return(if ok { SyscallReturn::ok(0) } else { errno_ret(EPERM) });
 }

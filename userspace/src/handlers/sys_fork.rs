@@ -73,7 +73,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // would report. The two errnos mean very different things to a caller
     // deciding whether to retry.
     if nproc_fork_would_exceed(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -81,7 +81,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         Some(a) => a,
         None => {
             // No live address space (internal) → ENOMEM.
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
@@ -91,7 +91,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // exceeded. Without this an uncapped fork loop floods the per-CPU ready
     // queues + kernel heap (and, under SMP, every core + the shootdown path).
     if !narf_scheduler::user_nproc_available() {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -102,7 +102,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         Ok(a) => a,
         Err(_) => {
             // COW dup allocation failed → ENOMEM.
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
@@ -182,7 +182,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let pid_plan = match crate::pid_ns::prepare_clone(parent_pid, &[], false, None) {
         Ok(plan) => plan,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            ctx.set_return(errno_ret(errno as i64));
             return;
         }
     };
@@ -195,7 +195,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let child_pid = {
         let pid = crate::alloc_pid();
         if pid.raw() == 0 {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
         pid

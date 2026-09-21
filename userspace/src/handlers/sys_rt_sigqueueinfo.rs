@@ -27,7 +27,7 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
     let info = match import_queued_siginfo(a.arg2) {
         Ok(info) => info,
         Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -38,7 +38,7 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
     if siginfo_requires_self_target(info)
         && user_pid != linux_tid_for_task(current_task_id()) as i32
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let pid = if user_pid > 0 {
@@ -47,19 +47,19 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         None
     };
     let Some(pid) = pid else {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+        ctx.set_return(errno_ret(ESRCH));
         return;
     };
     let target = pid_to_task_raw(pid).unwrap_or(pid);
     // ESRCH for a vanished target (Linux rt_sigqueueinfo(2)).
     if !signal_target_exists(target) {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
     // kill_pid_info reaches signal validation only after resolving a live
     // target, so a missing target wins over an invalid signum.
     if sig > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Signal 0 is an existence/permission probe; imported siginfo is not queued.
@@ -75,7 +75,7 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         None => {
             // Target's queued-signal budget exhausted (RLIMIT_SIGPENDING
             // analogue): deliver nothing, tell the sender to back off.
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
     };
