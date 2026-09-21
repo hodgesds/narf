@@ -956,7 +956,7 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
         return Ok(alloc::string::String::from(raw));
     }
     if dirfd < 0 {
-        return Err(-9); // -EBADF
+        return Err(-EBADF); // -EBADF
     }
     let is_directory = fd::with_table(task, |table| {
         table
@@ -964,11 +964,11 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
             .map(|entry| entry.ops.as_dir().is_some())
     })
     .flatten()
-    .ok_or(-9i64)?;
+    .ok_or(-EBADF)?;
     if !is_directory {
-        return Err(-20); // -ENOTDIR
+        return Err(-ENOTDIR); // -ENOTDIR
     }
-    let base = fd_path_for_task(task, dirfd as u32).ok_or(-9i64)?;
+    let base = fd_path_for_task(task, dirfd as u32).ok_or(-EBADF)?;
     Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
 }
 
@@ -1551,7 +1551,7 @@ fn do_execve_resolved(
         && narf_filesystem::any_restricted_mounts()
         && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOEXEC != 0
     {
-        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        ctx.set_return(errno_ret(EACCES)); // -EACCES
         return;
     }
 
@@ -1580,7 +1580,7 @@ fn do_execve_resolved(
         Some(v) => v,
         None => {
             // Faulting argv array pointer → EFAULT.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -1588,7 +1588,7 @@ fn do_execve_resolved(
         Some(v) => v,
         None => {
             // Faulting envp array pointer → EFAULT.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
@@ -1631,14 +1631,14 @@ fn do_execve_resolved(
         }) {
             Some(Some(Ok(o))) => o,
             // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
-            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-2),
+            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-ENOENT),
             // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
             // Loud: a silent EIO here cost a full debugging session (bash
             // reports only "Input/output error").
             Some(None) => {
                 use core::fmt::Write as _;
                 let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
-                return Err(-5);
+                return Err(-EIO);
             }
             // A real FS error → EIO.
             Some(Some(Err(e))) => {
@@ -1647,15 +1647,15 @@ fn do_execve_resolved(
                     narf_console::Writer,
                     "EXECVE-EIO resolve err={e:?} path={ep}"
                 );
-                return Err(-5);
+                return Err(-EIO);
             }
         };
         let file_size = ops.stat().size as usize;
         if file_size == 0 {
-            return Err(-8); // ENOEXEC — empty file is not an executable
+            return Err(-ENOEXEC); // ENOEXEC — empty file is not an executable
         }
         if file_size > 64 * 1024 * 1024 {
-            return Err(-7); // E2BIG
+            return Err(-E2BIG); // E2BIG
         }
         let mut buf = alloc::vec![0u8; file_size];
         let mut off = 0usize;
@@ -1669,7 +1669,7 @@ fn do_execve_resolved(
                         narf_console::Writer,
                         "EXECVE-EIO read err={e:?} off={off} size={file_size} path={ep}"
                     );
-                    return Err(-5);
+                    return Err(-EIO);
                 }
                 // Only a genuinely-wedged device exhausts the 2G-poll
                 // backstop. Loud, then EIO — never silently truncate.
@@ -1679,7 +1679,7 @@ fn do_execve_resolved(
                         narf_console::Writer,
                         "EXECVE-EIO read overrun off={off} size={file_size} path={ep}"
                     );
-                    return Err(-5);
+                    return Err(-EIO);
                 }
             }
         }
@@ -1707,7 +1707,7 @@ fn do_execve_resolved(
     if let Some(bytes) = image_override {
         if bytes.len() < 64 {
             // Too small to be a valid ELF → ENOEXEC.
-            ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+            ctx.set_return(errno_ret(ENOEXEC));
             return;
         }
         elf_buf = bytes;
@@ -1723,7 +1723,7 @@ fn do_execve_resolved(
             };
             if buf.len() >= 2 && &buf[..2] == b"#!" {
                 if depth >= 4 {
-                    ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+                    ctx.set_return(errno_ret(ELOOP)); // -ELOOP
                     return;
                 }
                 depth += 1;
@@ -1741,7 +1741,7 @@ fn do_execve_resolved(
                 };
                 if interp.is_empty() {
                     // Shebang with an empty interpreter name → ENOEXEC.
-                    ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+                    ctx.set_return(errno_ret(ENOEXEC));
                     return;
                 }
                 let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
@@ -1757,7 +1757,7 @@ fn do_execve_resolved(
             }
             if buf.len() < 64 {
                 // Too small for a valid ELF and not a shebang → ENOEXEC.
-                ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+                ctx.set_return(errno_ret(ENOEXEC));
                 return;
             }
             elf_buf = buf;
@@ -1808,12 +1808,12 @@ fn do_execve_resolved(
         // executed _start against an unrelocated GOT and killed the fresh
         // process at rip=0 (#PF errcode 0x15, instruction fetch at 0).
         Err(crate::process::ProcessLoadError::InterpUnavailable) => {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT)); // -ENOENT
             return;
         }
         Err(_) => {
             // Malformed ELF (bad magic, unsupported class, etc.) → ENOEXEC.
-            ctx.set_return(SyscallReturn::ok((-8i64) as u64));
+            ctx.set_return(errno_ret(ENOEXEC));
             return;
         }
     };
@@ -1982,7 +1982,7 @@ fn do_execve_resolved(
             // old one. Linux's execve returns only on failure, so any value
             // a caller can observe must be an error, and -ENOSYS says this
             // kernel could not perform the exec here.
-            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+            ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
             return;
         }
     };
@@ -2039,7 +2039,7 @@ fn do_execve_resolved(
     // Fallback path — execve not wired (e.g. early boot or test). -ENOSYS
     // for the same reason as the no-user-ctx arm above: 0 from execve is
     // "you are now the new program".
-    ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+    ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
 }
 
 /// A `TrapContext` proxy that overrides the syscall args while forwarding
@@ -3173,7 +3173,7 @@ pub(crate) fn mnt_want_write(path: &str) -> Result<(), i64> {
         return Ok(());
     }
     if current_mount_flags_at(path) & narf_filesystem::mnt_flags::READONLY != 0 {
-        return Err(-30); // -EROFS
+        return Err(-EROFS); // -EROFS
     }
     Ok(())
 }
@@ -9172,22 +9172,22 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     let sock = match current_socket_result(fd) {
         Ok(s) => {
             if flags_bad {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL (flags)
+                ctx.set_return(errno_ret(EINVAL)); // -EINVAL (flags)
                 return;
             }
             s
         }
         // EBADF (absent fd) is reported regardless of the flags.
         Err(9) => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF)); // -EBADF
             return;
         }
         // A present non-socket fd: the flag check precedes -ENOTSOCK in Linux.
         Err(88) => {
             if flags_bad {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL (flags)
+                ctx.set_return(errno_ret(EINVAL)); // -EINVAL (flags)
             } else {
-                ctx.set_return(SyscallReturn::ok((-88i64) as u64)); // -ENOTSOCK
+                ctx.set_return(errno_ret(ENOTSOCK)); // -ENOTSOCK
             }
             return;
         }
@@ -9251,7 +9251,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     // connection and keep serving, which is what EMFILE tells
                     // it to do. EPERM reads as a permission fault and takes
                     // the server down instead.
-                    ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+                    ctx.set_return(errno_ret(EMFILE)); // -EMFILE
                     return;
                 }
             };
@@ -9270,7 +9270,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             let task = current_task_id();
             let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
-                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+                ctx.set_return(errno_ret(EAGAIN)); // -EAGAIN
                 return;
             }
             if let (Some(uctx), Some(hook)) = (
@@ -9317,12 +9317,12 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 // unreachable — hook() longjmps to the executor
             }
             // No executor (kernel-test context): surface EAGAIN.
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
         }
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
+        _ => ctx.set_return(errno_ret(EINVAL)), // -EINVAL (unreachable)
     }
 }
 
@@ -11954,7 +11954,7 @@ mod aio {
             // ERESTARTNOHAND to EINTR at the syscall boundary, as
             // `sys_rt_sigsuspend` does.
             if interrupted && !had_completions {
-                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+                ctx.set_return(crate::errno::to_ret(crate::errno::EINTR));
             }
         }
     }
