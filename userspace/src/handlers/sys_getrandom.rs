@@ -62,24 +62,20 @@ pub(crate) fn sys_getrandom(ctx: &mut dyn TrapContext) {
     // Generate random bytes into a kernel buffer, then copy to user
     // space under the SMAP bracket.
     let mut kbuf = alloc::vec![0u8; len];
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let v = next_random_u32();
-        kbuf[i] = (v & 0xFF) as u8;
-        kbuf[i + 1] = ((v >> 8) & 0xFF) as u8;
-        kbuf[i + 2] = ((v >> 16) & 0xFF) as u8;
-        kbuf[i + 3] = ((v >> 24) & 0xFF) as u8;
-        i += 4;
-    }
-    if i < len {
-        let v = next_random_u32();
-        let mut shift = 0u32;
-        while i < len {
-            kbuf[i] = ((v >> shift) & 0xFF) as u8;
-            i += 1;
-            shift += 8;
-        }
-    }
+    // The same ChaCha20 pool `/dev/random` and `/dev/urandom` read from
+    // (`drivers/char/random.c` backs `getrandom(2)` with the identical CRNG).
+    //
+    // This used to assemble the buffer from `next_random_u32()`, which tries
+    // RDSEED, then RDRAND, then a Park-Miller LCG seeded from
+    // `monotonic_ns ^ cycles`. `rdseed_u64` is a stub returning None, and on
+    // aarch64 so is `rdrand_u64` — so on that arch every getrandom(2) byte
+    // came from a clock-seeded LCG, which is trivially invertible from a few
+    // outputs. That is the interface glibc/musl `arc4random`, TLS and SSH key
+    // generation, and stack-canary/ASLR seeding all draw from. The CSPRNG
+    // module exists precisely to replace that LCG (its header cites the
+    // Wave-13/Wave-35 audits) and already prefers RNDRRS/RNDR on aarch64;
+    // getrandom simply never used it.
+    narf_filesystem::csprng::fill(&mut kbuf);
     // SAFETY: `ptr` is the user buffer (non-zero, `len <= MAX_USER_COPY`, both
     // checked above); copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     // SAFETY: Valid memory or trusted environment
