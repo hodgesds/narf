@@ -242,21 +242,30 @@ impl FileOps for PidFdFile {
     }
 
     fn poll_readiness(&self) -> u32 {
+        // Readiness is driven SOLELY by the `exited` flag, which `notify_exit`
+        // sets only AFTER `on_child_exit` has published the child's PENDING_EXITS
+        // reap entry (see `on_child_exit`'s ordering note). This is load-bearing
+        // for correctness, not just a cache: an EPOLLONESHOT supervisor (systemd
+        // pidfd_spawn) gets exactly ONE readiness delivery, which disarms the
+        // interest. If the pidfd reported readable before the reap entry existed,
+        // that single delivery would fire against an empty queue —
+        // `waitid(P_PIDFD)` returns nothing, the oneshot never re-fires, and the
+        // child is a permanent unreaped zombie (the whole boot then hangs behind
+        // that service's start job).
+        //
+        // A PRIOR version added a `task_has_exited(tid)` fallback here so a pidfd
+        // still signalled if `notify_exit`'s store was ever missed. But
+        // `task_has_exited` goes true at `mark_zombie`, which runs BEFORE the reap
+        // entry is published — so the fallback made the pidfd readable in exactly
+        // the pre-entry window, causing the premature EPOLLONESHOT disarm above.
+        // `notify_exit` now runs reliably on every exit path (both branches of
+        // `on_child_exit`, after the push), so the flag alone is authoritative and
+        // the fallback is both redundant and actively harmful.
         if self.state.exited.load(Ordering::Acquire) {
-            return POLL_IN;
+            POLL_IN
+        } else {
+            0
         }
-        // Authoritative fallback. The `exited` flag is a cache set by
-        // `notify_exit(pid)`, which is missed when the pid is released back to
-        // the allocation pool (forget_pid) before the exiting task's observer
-        // fires — leaving this pidfd un-signalable forever, so a supervisor
-        // (systemd, Qt forkfd) blocks on a process that already exited. Consult
-        // the target's real task state, keyed on the reuse-safe TaskId: a
-        // zombie or already-reaped leader means the process exited.
-        let tid = self.state.tid.load(Ordering::Acquire);
-        if tid != 0 && crate::task::task_has_exited(tid) {
-            return POLL_IN;
-        }
-        0
     }
 
     fn pidfd_target_pid(&self) -> Option<u64> {

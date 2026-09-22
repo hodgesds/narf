@@ -12414,36 +12414,28 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
     crate::ptrace::release_process(child_pid);
 
-    // Wave-61: notify any pidfd_open()'d watchers that the target
-    // exited, regardless of whether a parent reaps it.
-    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
-    // Diagnostic: does the exiting process's pid match a minted pidfd? A
-    // `pidfd_found=false` for a comm that systemd pidfd_spawn'd (e.g.
-    // systemd-user-ru) means the pidfd was minted under a DIFFERENT pid than
-    // the one the exit path reports — so its POLLIN-on-exit never fires and
-    // systemd supervises a ghost (start job hangs "running"). Pair with the
-    // PIDFD-MINT line at the CLONE_PIDFD site.
-    #[cfg(feature = "cgroup")]
-    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
-        use core::fmt::Write as _;
-        let comm = proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
-        let _ = writeln!(
-            narf_console::Writer,
-            "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
-            child_pid,
-            child_tid,
-            comm,
-            _pidfd_found
-        );
-    }
-
+    // pidfd exit-notification (`pidfd::notify_exit`, Wave-61) is DELIBERATELY
+    // deferred: for a PARENTED child it fires only AFTER the PENDING_EXITS reap
+    // entry is published below (see the ordering note there). Publishing the
+    // pidfd POLLIN before the reapable entry let a systemd-style reaper — which
+    // supervises pidfd_spawn children with an EPOLLONESHOT pidfd, so epoll
+    // delivers the exit exactly ONCE and disarms — consume its single wake
+    // against an empty PENDING_EXITS: `waitid(P_PIDFD)` found nothing, the
+    // oneshot never re-fired, and the child stayed an unreaped zombie forever,
+    // hanging the boot behind that service's start job (observed as ~15 stuck
+    // zombies under a parked `epoll_wait`, each pidfd `last_mask=POLL_IN`,
+    // disarmed, with a now-present reap entry). Only reachable with working
+    // cross-CPU IPIs (x2APIC), where the notify's resched runs the reaper on
+    // another CPU inside the notify→push window.
     let parent = match wait_recipient {
         Some(p) => p,
         None => {
-            // No registered parent — orphan. Drain the staged status
-            // so a re-used pid doesn't see stale state, release the
-            // refcounted Task, and return the PID to the pool
-            // immediately since no one will reap it.
+            // No registered parent — orphan. No reap entry will ever be pushed,
+            // so there is nothing to order the pidfd notify against: notify any
+            // pidfd_open()'d watchers now, drain the staged status so a re-used
+            // pid doesn't see stale state, release the refcounted Task, and
+            // return the PID to the pool immediately since no one will reap it.
+            let _ = crate::pidfd::notify_exit(child_pid);
             let _ = take_pending_termination(child_pid);
             release_reaped_task(child_pid);
             crate::release_pid(crate::ProcessId(child_pid));
@@ -12471,6 +12463,30 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
                     ptraced,
                 });
         }
+    }
+    // (1b) NOW that the reapable entry is published, notify pidfd watchers. This
+    // MUST follow the PENDING_EXITS push (it does not precede it): a reaper woken
+    // by this pidfd POLLIN — systemd watches pidfd_spawn children EPOLLONESHOT,
+    // one delivery then disarm — must find the entry when it calls
+    // `waitid(P_PIDFD)`, or the oneshot is spent and never re-fires. Ordered
+    // exactly like the SIGCHLD and wait4 wakes below (all post-push).
+    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
+    // Diagnostic: a `pidfd_found=false` for a comm systemd pidfd_spawn'd means
+    // the pidfd was minted under a DIFFERENT pid than the exit reports (its
+    // POLLIN-on-exit never fires; systemd supervises a ghost). Pairs with the
+    // PIDFD-MINT line at the CLONE_PIDFD site.
+    #[cfg(feature = "cgroup")]
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
+        use core::fmt::Write as _;
+        let comm = proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
+        let _ = writeln!(
+            narf_console::Writer,
+            "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
+            child_pid,
+            child_tid,
+            comm,
+            _pidfd_found
+        );
     }
     // (2) Deliver the clone-selected parent signal. An exit_signal of zero
     // deliberately sends no signal, while the zombie remains waitable via
