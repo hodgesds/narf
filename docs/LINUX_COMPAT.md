@@ -457,10 +457,47 @@ FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
 
 **Real gaps (would be implemented, aren't yet / are thin):**
 
-- `ptrace` → `ENOSYS` unless `linux-compat` is on (`handlers.rs:~17581`).
-- `utime`/`utimes` and `set_robust_list`/`get_robust_list` are no-ops.
+> Audited 2026-09-22 against the tree. Three entries were removed as
+> already-implemented:
+>
+> - `utime`/`utimes` were listed as no-ops. `sys_utime` parses `utimbuf`
+>   and calls `set_path_times`; `sys_utimensat` is implemented too. Both
+>   are installed in the syscall table.
+> - `set_robust_list`/`get_robust_list` were listed as no-ops. The head is
+>   stored AND walked at exit — `robust_list_exit_walk` runs from
+>   `sys_exit_task`, which IS the installed `Syscall::ExitTask` handler, and
+>   sets `FUTEX_OWNER_DIED`. That walk is the whole point of the interface.
+> - `ptrace` was listed as `ENOSYS` unless `linux-compat` is on, citing
+>   `handlers.rs:~17581`. No `linux-compat` feature exists — not in any
+>   Cargo.toml, and no `cfg` refers to it — and `handlers` is a directory
+>   now. `Syscall::Ptrace` installs `handlers/sys_ptrace.rs`, which forwards
+>   to `crate::ptrace::sys_ptrace`: TRACEME/ATTACH/SEIZE with pid-namespace
+>   translation, and EIO (as Linux does) for an unrecognised request.
+>
+> Verifying an entry means following the syscall table to the code that
+> actually runs. This one is easy to get wrong in BOTH directions, and this
+> audit managed both before landing: two functions are named `sys_ptrace`,
+> so "the implementation exists" does not establish it is reached, and the
+> shim that is reached carried a stale doc comment calling itself "a stub
+> returning ENOSYS" long after it began forwarding. That comment is now
+> corrected at the source. Entries here are claims about the code; check one
+> to the table before acting on it.
+
 - New mount API (`fsopen`/`fsconfig`/`fsmount`) is present but thin; `mount`
-  fstype breadth is the real systemd gate (mount propagation flags are no-ops).
+  fstype breadth is the real systemd gate. Mount propagation flags ARE
+  no-ops — `sys_mount` returns 0 for a propagation-only change without
+  touching state (`sys_mount.rs`, the `MS_PROPAGATION` early return).
+- `mount(2)` does not require its target to exist. `do_mount` resolves it
+  with `user_path_at` before `path_mount` runs, so Linux answers -ENOENT
+  ahead of both the MS_NOUSER -EINVAL and the `may_mount()` -EPERM; NARF
+  registers a mount at a path with no node and reports success. Closing it
+  is not a handler change: mounts are string-prefix routing over a flat
+  `Vec<Mount>`, so the check needs a filesystem covering the path, and the
+  kernel-test image mounts no root at all. Two attempts stalled on the
+  fixture side — the mount smokes tear the mount table down between cases,
+  so a fixture root is either latched (and lost after the first reset) or
+  recreated (and loses the directories already made). The harness's
+  root-filesystem lifetime has to be settled first.
 - systemd as PID 1 is **in progress** (reaches early init, not a full boot).
 - Namespace breadth is partial and mostly gated behind `container`; abstract
   AF_UNIX / rtnetlink / udev-event firing are noted as systemd gates.
