@@ -825,65 +825,6 @@ mod current_user_task_source_tests {
 // uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
 // returns a reaped result, not a re-execute) — that handler parks natively.
 
-/// Bounded lost-wake backstop period for an infinite `net_io_wait` park (the
-/// ~10 ms fallback re-poll that task #32 removed, restored for the io-wait case
-/// only). See `park_fire_deadline_ns`.
-pub(crate) const NET_IO_WAIT_BACKSTOP_NS: u64 = 10_000_000;
-
-/// Absolute-ns time at which a park's wheel timer should fire.
-///
-/// Task #32 removed the global 10 ms lost-wake backstop on the premise that every
-/// readiness source fires a durable targeted wake. That holds for per-fd
-/// `Readiness` arms, finite parks, and the gen/word-guarded futex & signal parks,
-/// but NOT for a generic infinite `net_io_wait` park: `IO_WAKERS` is unlatched
-/// and this park's generation
-/// "guard" only REFRESHES — never COMPARES — its snapshot (see
-/// `refresh_io_wait_generation_after_registration`), so a `notify` /
-/// `wake_io_owner` landing in the scan→`register_io_waiter` window is dropped and
-/// the task strands forever on an inert `u64::MAX` timer. That is the CachyOS
-/// greeter wedge: PARK-CENSUS shows every task parked on socket I/O
-/// (`netio=true`, `deadline=u64::MAX`), SMP=1 included (so it is a same-CPU
-/// check-then-park race, not a cross-CPU IPI loss). The `UserTaskCtx` field docs
-/// still describe this backstop as live ("~10 ms lost-wake backstop (infinite
-/// parks and io-parks both arm it)"); this realigns the code with that contract
-/// for the io-wait case only:
-/// - a FINITE park fires at its real `deadline_ns` (the io-waiter normally wakes
-///   it earlier);
-/// - an INFINITE generic `net_io_wait` park re-polls after
-///   `NET_IO_WAIT_BACKSTOP_NS`, so a lost inbound-I/O wake costs one backstop
-///   period, not a permanent wedge;
-/// - an INFINITE per-fd `Readiness` park stays timerless because its arm-vs-set
-///   lock makes a wake durable;
-/// - any OTHER infinite park keeps `u64::MAX` (inert timer): futex/signal
-///   re-check their own condition after registering and cannot lose a wake.
-pub(crate) fn park_fire_deadline_ns(
-    deadline_ns: u64,
-    now_ns: u64,
-    net_io_wait: bool,
-    durable_io_wait: bool,
-) -> u64 {
-    if deadline_ns == u64::MAX && net_io_wait && !durable_io_wait {
-        now_ns.saturating_add(NET_IO_WAIT_BACKSTOP_NS)
-    } else {
-        deadline_ns
-    }
-}
-
-/// Record the readiness generation observed after an I/O waiter has been
-/// registered, without cancelling its park.
-///
-/// `narf_net::readiness::generation()` is intentionally global: it closes the
-/// crate-layering gap for sources that cannot name a particular waiter. That
-/// also means a changed generation is not a predicate on this task's poll or
-/// epoll interest set. Linux's `ep_poll()` queues the task and does its final
-/// ready-list check under the epoll wait-queue lock; it does not return a
-/// successful empty wait because another file became ready. NARF keeps the
-/// waiter registered and refreshes the advisory snapshot instead. The existing
-/// 10 ms I/O backstop guarantees a true scan→register lost wake is retried.
-pub(crate) fn refresh_io_wait_generation_after_registration(uc: &UserTaskCtx, observed: u64) {
-    uc.epoll_park_gen.store(observed, Ordering::Release);
-}
-
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
 /// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
@@ -1010,25 +951,39 @@ fn park_should_block(
                 if crate::handlers::register_io_waiter(task_id, waker.clone()) {
                     // A targeted wake (wake_io_owner) landed in the scan→register
                     // window and was latched; re-execute instead of parking so the
-                    // re-scan picks up the readiness. This is the precise close of
-                    // the lost-wake race (the io-wait backstop below is now only a
-                    // safety net for the untargeted broadcast path).
+                    // re-scan picks up the readiness. This closes the lost-wake
+                    // race for the TARGETED wake path.
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
                 }
-                refresh_io_wait_generation_after_registration(
-                    uc,
-                    narf_net::readiness::generation(),
-                );
+                // Now close the window for the UNTARGETED / broadcast wake too
+                // (net/src/readiness.rs contract): the scan site snapshotted the
+                // pre-scan readiness generation into `epoll_park_gen`.
                 let encoded_epfd = uc.epoll_wait_fd.load(Ordering::Acquire);
-                if encoded_epfd != 0
-                    && crate::epoll::epoll_fd_has_ready(task_id, (encoded_epfd - 1) as u32)
-                {
-                    // Ready after the first userspace-facing scan but before
-                    // waiter registration. The waiter is now installed, so a
-                    // later transition is covered; do one immediate
-                    // re-execution for the already-level-ready event instead
-                    // of relying on the timer-wheel backstop.
+                if encoded_epfd != 0 {
+                    // EPOLL: the per-fd ready-list re-check is authoritative, so
+                    // advance the snapshot and consult it (no coarse-generation
+                    // re-exec, which would spin on unrelated-fd activity).
+                    uc.epoll_park_gen
+                        .store(narf_net::readiness::generation(), Ordering::Release);
+                    if crate::epoll::epoll_fd_has_ready(task_id, (encoded_epfd - 1) as u32) {
+                        // Ready after the first userspace-facing scan but before
+                        // waiter registration. The waiter is now installed, so a
+                        // later transition is covered; do one immediate
+                        // re-execution for the already-level-ready event.
+                        crate::handlers::drop_io_waiter(task_id);
+                        uc.sleep_deadline_ns.store(0, Ordering::Release);
+                        return false;
+                    }
+                } else if crate::poll::installed_poll_files_ready(task_id) {
+                    // NON-epoll poll(2)/select: authoritatively re-check THIS
+                    // waiter's own installed poll files (not the coarse global
+                    // generation). Re-execute iff one is ready now — including a
+                    // readiness that raced the scan→register window — so the
+                    // syscall's re-scan delivers it; otherwise fall through and
+                    // park. Exact per-fd: no spin on unrelated fd activity, no
+                    // dropped wake. A blocking recv (no poll files) returns false
+                    // and parks on its socket's targeted io-owner wake.
                     crate::handlers::drop_io_waiter(task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
@@ -1155,12 +1110,10 @@ fn park_should_block(
             // `accept()` with no io/futex waker) NEVER fires and the task
             // strands. This only bit the own-stack park path; the longjmp
             // `UserTaskFuture::poll` already used `ns_to_cycles`.
-            let fire_ns = park_fire_deadline_ns(
-                deadline,
-                now,
-                uc.net_io_wait.load(Ordering::Acquire),
-                durable_io_wait,
-            );
+            // No lost-wake backstop: an infinite `net_io_wait` park now arms NO
+            // fallback timer because its check→register race is closed above
+            // (targeted latch + generation compare / epoll ready-list re-check).
+            let fire_ns = deadline;
             // An infinite park with a durable condition waker needs no timer
             // slot. Registering an inert u64::MAX entry still takes the global
             // wheel lock on every park and cancel, serializing unrelated CPUs.
@@ -2228,29 +2181,43 @@ impl core::future::Future for UserTaskFuture {
                         cx.waker().clone(),
                     ) {
                         // A targeted wake landed in the scan→register window and
-                        // was latched; re-execute instead of parking (precise
-                        // lost-wake close; the backstop is now only the broadcast
-                        // safety net).
+                        // was latched; re-execute instead of parking. Closes the
+                        // lost-wake race for the TARGETED wake path.
                         this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
                         cx.waker().wake_by_ref();
                         return core::task::Poll::Pending;
                     }
-                    // The global readiness generation is advisory, not a
-                    // readiness predicate for this task's interest set. Keep
-                    // the waiter parked after refreshing it; a true missed
-                    // source wake is retried by the I/O backstop instead of
-                    // making unrelated activity spin epoll/poll in userspace.
-                    refresh_io_wait_generation_after_registration(
-                        &this.task.uctx,
-                        narf_net::readiness::generation(),
-                    );
+                    // Close the window for the UNTARGETED / broadcast wake too
+                    // (net/src/readiness.rs contract): the scan site snapshotted
+                    // the pre-scan readiness generation into `epoll_park_gen`.
                     let encoded_epfd = this.task.uctx.epoll_wait_fd.load(Ordering::Acquire);
-                    if encoded_epfd != 0
-                        && crate::epoll::epoll_fd_has_ready(
+                    if encoded_epfd != 0 {
+                        // EPOLL: the per-fd ready-list re-check is authoritative,
+                        // so advance the snapshot and consult it (no coarse-
+                        // generation re-exec that would spin on unrelated fds).
+                        this.task
+                            .uctx
+                            .epoll_park_gen
+                            .store(narf_net::readiness::generation(), Ordering::Release);
+                        if crate::epoll::epoll_fd_has_ready(
                             crate::handlers::current_task_id(),
                             (encoded_epfd - 1) as u32,
-                        )
-                    {
+                        ) {
+                            crate::handlers::drop_io_waiter(crate::handlers::current_task_id());
+                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                            cx.waker().wake_by_ref();
+                            return core::task::Poll::Pending;
+                        }
+                    } else if crate::poll::installed_poll_files_ready(
+                        crate::handlers::current_task_id(),
+                    ) {
+                        // NON-epoll poll(2)/select: authoritatively re-check THIS
+                        // waiter's own installed poll files (not the coarse global
+                        // generation) — re-execute iff one is ready now (including a
+                        // readiness that raced the scan→register window), else park.
+                        // Exact per-fd: no 100% spin on unrelated fd activity, no
+                        // dropped wake. A blocking recv (no poll files) returns false
+                        // and parks on its socket's targeted io-owner wake.
                         crate::handlers::drop_io_waiter(crate::handlers::current_task_id());
                         this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
                         cx.waker().wake_by_ref();
@@ -2359,51 +2326,14 @@ impl core::future::Future for UserTaskFuture {
                     // external wake, NOT the timer tick, could revive it, so a
                     // single lost readiness wake wedged it permanently; and
                     // (2) the self-wake tick-paced its re-poll, gating off-box
-                    // round-trips at ~16.7 ms. Task #32 removed the global 10 ms
-                    // backstop; a non-io infinite park (pause / futex / signal)
-                    // now arms NO timer and relies purely on its durable wake —
-                    // the futex / signal wake (re-polled PROMPTLY by the
-                    // scheduler's EXTERNAL_WAKE fast-repoll) — because those paths
-                    // re-check their own condition after registering and cannot
-                    // lose a wake. An infinite NET_IO_WAIT park, however, STILL
-                    // arms the bounded lost-wake backstop (see
-                    // `park_fire_deadline_ns`): `IO_WAKERS` is unlatched and the
-                    // io-wait gen guard only refreshes its snapshot, so a wake
-                    // racing scan→register would otherwise strand the task forever
-                    // (the CachyOS greeter wedge). A per-fd Readiness arm sets
-                    // `durable_io_wait` and stays timerless. sleep_pumps still run
-                    // in the executor's own idle path.
-                    let fire_ns = park_fire_deadline_ns(
-                        deadline,
-                        now,
-                        this.task.uctx.net_io_wait.load(Ordering::Acquire),
-                        durable_io_wait,
-                    );
-                    if fire_ns != u64::MAX {
-                        let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
-                        // `refresh_waker_at`, not `refresh_waker`: keep the slot's
-                        // fire time current across a re-poll (see the finite-park
-                        // note below) so the backstop actually fires.
-                        let refreshed = this.sleep_handle.is_some_and(|h| {
-                            narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
-                                h,
-                                deadline_cycles,
-                                cx.waker().clone(),
-                            )
-                        });
-                        if !refreshed {
-                            this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
-                                deadline_cycles,
-                                cx.waker().clone(),
-                            )
-                            .ok();
-                            if this.sleep_handle.is_none() {
-                                // Wheel full / no arm callback: self-wake so the
-                                // task still makes progress (degraded, not wedged).
-                                cx.waker().wake_by_ref();
-                            }
-                        }
-                    }
+                    // round-trips at ~16.7 ms. NO lost-wake backstop: every
+                    // infinite park — futex/signal (word/gen re-check), per-fd
+                    // Readiness (durable arm-vs-set lock), AND now generic
+                    // NET_IO_WAIT (targeted latch + generation compare / epoll
+                    // ready-list re-check above) — closes its own check→register
+                    // race, so none needs a fallback timer. Arm NO timer and rely
+                    // purely on the durable wake. sleep_pumps still run in the
+                    // executor's own idle path.
                     return core::task::Poll::Pending;
                 }
                 // Finite sleep (sys_sleep / nanosleep): PARK on the timer
@@ -2415,16 +2345,10 @@ impl core::future::Future for UserTaskFuture {
                 // spurious re-poll so we never leak a slot.
 
                 // Finite io-wait park (poll/epoll with a real timeout): arm the
-                // wheel at its REAL deadline. Task #32 deleted the ~10ms lost-wake
-                // clamp — the io-waiter fires a durable wake that normally revives
-                // us long before the timeout, so `park_fire_deadline_ns` is now
-                // the identity (see its doc).
-                let fire_ns = park_fire_deadline_ns(
-                    deadline,
-                    now,
-                    this.task.uctx.net_io_wait.load(Ordering::Acquire),
-                    durable_io_wait,
-                );
+                // wheel at its REAL deadline. No lost-wake clamp — the io-waiter
+                // fires a durable wake that normally revives us long before the
+                // timeout, and the check→register race is closed above.
+                let fire_ns = deadline;
                 let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
                 // `refresh_waker_at` — see the infinite-park note above.
                 let refreshed = this.sleep_handle.is_some_and(|h| {

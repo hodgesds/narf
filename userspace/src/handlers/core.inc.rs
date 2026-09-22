@@ -135,8 +135,11 @@ fn tcb_owner_shard(tcb_id: u32) -> usize {
 /// latch and re-executes instead of parking, closing the scan→register lost-wake
 /// race precisely (no periodic backstop, no global-generation spurious re-exec).
 /// `wake_all_io_waiters` (the untargeted broadcast fallback) does NOT latch — it
-/// has no single target; that rarer race stays covered by the bounded io-wait
-/// backstop in `park_fire_deadline_ns`.
+/// has no single target; that rarer race is closed instead by the non-epoll
+/// `net_io_wait` park's authoritative per-fd re-check after registering
+/// (`poll::installed_poll_files_ready` re-scans the waiter's own installed poll
+/// files; epoll parks use `epoll_fd_has_ready`). No coarse global-generation
+/// re-exec, no periodic backstop.
 struct WakerShard {
     wakers: alloc::collections::BTreeMap<u64, core::task::Waker>,
     pending: alloc::collections::BTreeSet<u64>,
@@ -1307,7 +1310,21 @@ fn open_impl(
     if flags & O_TMPFILE_BIT != 0 && mnt_len == 0 {
         match resolve_dir_absolute(path) {
             Some(dir) if dir.supports_tmpfile() => {
-                let node = match poll_blocking(dir.tmpfile(0o600)) {
+                // Linux `vfs_tmpfile`: the anonymous inode is born with the
+                // CALLER's requested mode (& ~umask) and `inode_init_owner`
+                // ownership — the creating task's fsuid/fsgid — NOT a hardcoded
+                // root:0600. Qt's QSaveFile/QTemporaryFile (KConfig's atomic
+                // config writer) creates via O_TMPFILE then `linkat()`s the node
+                // into place; a root:0600 temp made the plasmalogin greeter's own
+                // ~/.config/kdedefaults/* files unreadable to it (uid 957) once
+                // linked — KConfig reported "inaccessible config location" and the
+                // greeter never rendered.
+                let tmp_mode = if create_mode & 0o7777 != 0 {
+                    (create_mode & !current_umask()) & 0o7777
+                } else {
+                    0o600
+                };
+                let node = match poll_blocking(dir.tmpfile(tmp_mode)) {
                     Some(Ok(node)) => node,
                     Some(Err(narf_filesystem::FsError::Unsupported)) => {
                         // memfs predates the generic tmpfile hook and can
@@ -1319,6 +1336,10 @@ fn open_impl(
                         return;
                     }
                 };
+                // inode_init_owner: stamp the creating task's fsuid/fsgid so a
+                // later `linkat` materialises a file the creator actually owns.
+                let accessor = current_accessor(task);
+                let _ = poll_blocking(node.set_owners(accessor.uid, accessor.gid));
                 let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: node,
                         offset: 0,
@@ -10384,8 +10405,18 @@ fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
             ));
         }
     }
-    // Linux notifies the parent with SIGCHLD on stop/continue too.
-    let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(17));
+    // Linux notifies the parent with SIGCHLD on stop/continue too. Route it
+    // through the canonical raise-notify (not a bare pending-bit set) so a
+    // signalfd-watching parent's epoll readiness EDGE fires — the same lost-reap
+    // class fixed in `on_child_exit` (a cell-backed signalfd only enters epoll's
+    // fast-pass ready-list when its per-fd waker is fired by `wake_signalfds`).
+    if let Some(was_empty) = pending_signal_bits_update(parent, |slot| {
+        let was_empty = *slot == 0;
+        *slot |= sig_bit(17);
+        was_empty
+    }) {
+        signal_raise_notify(parent, was_empty);
+    }
     wake_wait_child_group(parent);
 }
 
@@ -12384,36 +12415,28 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
     crate::ptrace::release_process(child_pid);
 
-    // Wave-61: notify any pidfd_open()'d watchers that the target
-    // exited, regardless of whether a parent reaps it.
-    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
-    // Diagnostic: does the exiting process's pid match a minted pidfd? A
-    // `pidfd_found=false` for a comm that systemd pidfd_spawn'd (e.g.
-    // systemd-user-ru) means the pidfd was minted under a DIFFERENT pid than
-    // the one the exit path reports — so its POLLIN-on-exit never fires and
-    // systemd supervises a ghost (start job hangs "running"). Pair with the
-    // PIDFD-MINT line at the CLONE_PIDFD site.
-    #[cfg(feature = "cgroup")]
-    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
-        use core::fmt::Write as _;
-        let comm = proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
-        let _ = writeln!(
-            narf_console::Writer,
-            "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
-            child_pid,
-            child_tid,
-            comm,
-            _pidfd_found
-        );
-    }
-
+    // pidfd exit-notification (`pidfd::notify_exit`, Wave-61) is DELIBERATELY
+    // deferred: for a PARENTED child it fires only AFTER the PENDING_EXITS reap
+    // entry is published below (see the ordering note there). Publishing the
+    // pidfd POLLIN before the reapable entry let a systemd-style reaper — which
+    // supervises pidfd_spawn children with an EPOLLONESHOT pidfd, so epoll
+    // delivers the exit exactly ONCE and disarms — consume its single wake
+    // against an empty PENDING_EXITS: `waitid(P_PIDFD)` found nothing, the
+    // oneshot never re-fired, and the child stayed an unreaped zombie forever,
+    // hanging the boot behind that service's start job (observed as ~15 stuck
+    // zombies under a parked `epoll_wait`, each pidfd `last_mask=POLL_IN`,
+    // disarmed, with a now-present reap entry). Only reachable with working
+    // cross-CPU IPIs (x2APIC), where the notify's resched runs the reaper on
+    // another CPU inside the notify→push window.
     let parent = match wait_recipient {
         Some(p) => p,
         None => {
-            // No registered parent — orphan. Drain the staged status
-            // so a re-used pid doesn't see stale state, release the
-            // refcounted Task, and return the PID to the pool
-            // immediately since no one will reap it.
+            // No registered parent — orphan. No reap entry will ever be pushed,
+            // so there is nothing to order the pidfd notify against: notify any
+            // pidfd_open()'d watchers now, drain the staged status so a re-used
+            // pid doesn't see stale state, release the refcounted Task, and
+            // return the PID to the pool immediately since no one will reap it.
+            let _ = crate::pidfd::notify_exit(child_pid);
             let _ = take_pending_termination(child_pid);
             release_reaped_task(child_pid);
             crate::release_pid(crate::ProcessId(child_pid));
@@ -12442,12 +12465,40 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
                 });
         }
     }
+    // (1b) NOW that the reapable entry is published, notify pidfd watchers. This
+    // MUST follow the PENDING_EXITS push (it does not precede it): a reaper woken
+    // by this pidfd POLLIN — systemd watches pidfd_spawn children EPOLLONESHOT,
+    // one delivery then disarm — must find the entry when it calls
+    // `waitid(P_PIDFD)`, or the oneshot is spent and never re-fires. Ordered
+    // exactly like the SIGCHLD and wait4 wakes below (all post-push).
+    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
+    // Diagnostic: a `pidfd_found=false` for a comm systemd pidfd_spawn'd means
+    // the pidfd was minted under a DIFFERENT pid than the exit reports (its
+    // POLLIN-on-exit never fires; systemd supervises a ghost). Pairs with the
+    // PIDFD-MINT line at the CLONE_PIDFD site.
+    #[cfg(feature = "cgroup")]
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
+        use core::fmt::Write as _;
+        let comm = proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
+        let _ = writeln!(
+            narf_console::Writer,
+            "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
+            child_pid,
+            child_tid,
+            comm,
+            _pidfd_found
+        );
+    }
     // (2) Deliver the clone-selected parent signal. An exit_signal of zero
     // deliberately sends no signal, while the zombie remains waitable via
     // __WCLONE. Linux do_notify_parent follows the same rule.
     if exit_signal != 0 {
         let signum = u32::from(exit_signal);
-        let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(signum));
+        let was_empty = pending_signal_bits_update(parent, |slot| {
+            let was_empty = *slot == 0;
+            *slot |= sig_bit(signum);
+            was_empty
+        });
         const CLD_EXITED: i32 = 1;
         const CLD_KILLED: i32 = 2;
         const CLD_DUMPED: i32 = 3;
@@ -12460,9 +12511,27 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
         };
         let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
         let _ = store_sigqueue_info(parent, signum, si_code, 0, child_in_parent_ns);
-        // Wake signal/signalfd waiters only after the pending bit and siginfo
-        // are visible; pidfd readiness was published earlier.
-        wake_signal(parent);
+        // Deliver SIGCHLD through the CANONICAL raise-notify path (the same one
+        // kill/tgkill/itimer use) so the parent's signalfd readiness EDGE fires.
+        // A signalfd is a cell-backed epoll source, so epoll's collect_ready fast
+        // pass visits it ONLY when its per-fd persistent waker has pushed it onto
+        // the ready-list (see epoll.rs collect_ready). `signal_raise_notify` bumps
+        // SIGNAL_READABLE_GEN/SIGNAL_RAISE_GEN, fires `wake_signalfds` (which does
+        // that push), and wakes the signal waker. The former hand-rolled
+        // `wake_signal` + `notify(0)` set the pending bit and woke the epoll park,
+        // but NEVER fired the signalfd cell edge — so systemd's epoll_wait, whose
+        // 250 ms timerfd (a non-cell-backed source) keeps returning an event and
+        // thus never falls back to a full level rescan, skipped the readable
+        // signalfd forever. SIGCHLD was never delivered, the child stayed an
+        // unreaped zombie, and a Type=oneshot start job (systemd-tmpfiles-setup)
+        // hung the whole boot. Pairs with the pidfd readiness published above.
+        if let Some(was_empty) = was_empty {
+            signal_raise_notify(parent, was_empty);
+        } else {
+            // No pending-bits slot for the parent (shouldn't happen for a live
+            // waiter): still fire the legacy wakes so nothing regresses.
+            wake_signal(parent);
+        }
         narf_net::readiness::notify(0);
     }
     // (3) Wake any parent task parked in a blocking wait4.  The waker
@@ -16213,6 +16282,109 @@ mod shm_mremap_registry_tests {
         "userspace/sysv_registry",
         smoke_shm_mremap_alias_rejects_partial_sysv_source
     );
+}
+
+/// Regression: a child exiting must fire its parent's SIGCHLD signalfd EDGE, not
+/// merely set the pending bit. A signalfd is a cell-backed epoll source, so
+/// epoll's `collect_ready` fast pass only visits it once its per-fd persistent
+/// waker has pushed it onto the ready-list — which `on_child_exit` must trigger
+/// via the canonical `signal_raise_notify` → `wake_signalfds`. The former
+/// hand-rolled `wake_signal` set the pending bit and woke the signal-interrupt
+/// waker but never fired the signalfd cell, so systemd's epoll_wait (whose 250 ms
+/// timerfd, a non-cell-backed source, keeps it out of a full level rescan)
+/// skipped the readable signalfd forever → the child stayed an unreaped zombie →
+/// a Type=oneshot start job (systemd-tmpfiles-setup) hung the whole boot.
+#[cfg(feature = "kernel-test")]
+mod child_reap_signalfd_tests {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use narf_filesystem::{FileOps, POLL_IN};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// A waker that counts `wake`/`wake_by_ref` calls via an `Arc<AtomicU32>`
+    /// smuggled through the `RawWaker` data pointer — stands in for epoll's
+    /// per-fd ready-list waker (mirrors `lib/src/readiness.rs`'s test waker).
+    fn counting_waker(counter: &alloc::sync::Arc<AtomicU32>) -> Waker {
+        fn clone(p: *const ()) -> RawWaker {
+            // SAFETY: `p` is an Arc<AtomicU32> raw pointer created below.
+            let arc = unsafe { alloc::sync::Arc::from_raw(p as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = alloc::sync::Arc::into_raw(arc);
+            RawWaker::new(alloc::sync::Arc::into_raw(cloned) as *const (), &VTABLE)
+        }
+        fn wake(p: *const ()) {
+            // SAFETY: consumes the Waker's ref, incrementing the counter.
+            let arc = unsafe { alloc::sync::Arc::from_raw(p as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(p: *const ()) {
+            // SAFETY: borrows without consuming.
+            let arc = unsafe { alloc::sync::Arc::from_raw(p as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::SeqCst);
+            let _ = alloc::sync::Arc::into_raw(arc);
+        }
+        fn drop_fn(p: *const ()) {
+            // SAFETY: drops the Waker's ref.
+            unsafe { drop(alloc::sync::Arc::from_raw(p as *const AtomicU32)) };
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+        let raw = alloc::sync::Arc::into_raw(counter.clone()) as *const ();
+        // SAFETY: `raw` + `VTABLE` form a valid RawWaker per the fns above.
+        unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
+    }
+
+    /// Drive `on_child_exit` for a synthetic parent that has a signalfd watching
+    /// `watch_mask` (sig_bit convention), armed epoll-style. Returns
+    /// `(waker_fire_count, reports_poll_in)`.
+    fn run_exit(parent: u64, child: u64, watch_mask: u64) -> (u32, bool) {
+        // What fork/exit set up before on_child_exit: the natural-parent link
+        // with a SIGCHLD exit-signal, and the staged wstatus.
+        super::parent_of_set_with_signal(child, parent, 17); // SIGCHLD
+        super::stage_pending_termination(child, 0);
+
+        let sfd = crate::io_mux::SignalFd::new(watch_mask, parent);
+        let count = alloc::sync::Arc::new(AtomicU32::new(0));
+        let waker = counting_waker(&count);
+        // eppoll_entry-style persistent arm; nothing pending yet.
+        let _ = sfd.arm_readiness_persistent(parent, POLL_IN, &waker);
+
+        super::on_child_exit(child, child);
+
+        let fired = count.load(Ordering::SeqCst);
+        let ready = sfd.poll_readiness() & POLL_IN != 0;
+        // Best-effort residue drain (synthetic ids never collide with real ones).
+        let _ = super::take_pending_termination(child);
+        (fired, ready)
+    }
+
+    /// POSITIVE: a parent whose signalfd watches SIGCHLD must have that fd's
+    /// epoll waker fired AND report POLL_IN after the child exits.
+    fn smoke_on_child_exit_fires_parent_signalfd() -> TestResult {
+        let (fired, ready) = run_exit(0xC0DE_0001, 0xC0DE_0002, super::sig_bit(17));
+        if fired == 0 {
+            return TestResult::Fail(
+                "on_child_exit did not fire the parent's SIGCHLD signalfd waker (lost reap wake)",
+            );
+        }
+        if !ready {
+            return TestResult::Fail("signalfd not POLL_IN after a watched-signal child exit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_on_child_exit_fires_parent_signalfd);
+
+    /// NEGATIVE: a signalfd watching only SIGUSR1 (not SIGCHLD) must NOT report
+    /// POLL_IN when the child's SIGCHLD is delivered — `poll_readiness` respects
+    /// the fd's mask, so epoll delivers nothing even though `wake_signalfds`
+    /// wakes every one of the task's signalfd waiters (a benign spurious wake).
+    fn smoke_on_child_exit_unwatched_signalfd_not_ready() -> TestResult {
+        let (_fired, ready) = run_exit(0xC0DE_0011, 0xC0DE_0012, super::sig_bit(10));
+        if ready {
+            return TestResult::Fail("SIGCHLD made a signalfd not watching it report POLL_IN");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_on_child_exit_unwatched_signalfd_not_ready);
 }
 
 /// Final `ipc_namespace` teardown removes every public id immediately. SHM

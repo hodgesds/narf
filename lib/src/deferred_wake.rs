@@ -130,6 +130,22 @@ pub fn has_pending() -> bool {
     QUEUED_WAKERS.load(Ordering::Relaxed) != DRAINED_WAKERS.load(Ordering::Relaxed)
 }
 
+/// Whether THIS CPU's own deferred-wake queue holds an undrained waker.
+///
+/// Every push targets the pushing CPU's queue (an IRQ handler stashes into
+/// `current_cpu()`'s slots), and only that CPU can `drain_and_wake` it — so the
+/// idle/halt-commit re-scan must ask the PER-CPU question, not the global
+/// [`has_pending`]. Using the global counter there is a correctness+liveness
+/// bug: an empty-queue CPU sees "pending" because a DIFFERENT CPU has an
+/// undrained waker it cannot reach, so it never halts and spins in `run_forever`
+/// (observed as a core stuck at CPL=0 in the steal loop). Bounded scan of this
+/// CPU's fixed slot array under its own lock; no cross-CPU traffic.
+pub fn has_pending_local() -> bool {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    QUEUES[cpu].lock().slots.iter().any(Option::is_some)
+}
+
 /// Drain this CPU's pending queue and call wake() on each. Must
 /// be called from non-IRQ context (the scheduler's
 /// `run_until_empty` idle path is the canonical caller).
