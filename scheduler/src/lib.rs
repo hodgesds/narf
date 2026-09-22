@@ -5113,8 +5113,17 @@ pub fn run_until_empty() {
             // our commit. `swap(false)` consumes it. The wake-list + ready-queue
             // scan remain the backstop for wake sources not routed through the
             // resched signal.
-            let woke_late =
-                NEED_RESCHED[cpu].swap(false, Ordering::SeqCst) || wake_list_pending(cpu) || {
+            let woke_late = NEED_RESCHED[cpu].swap(false, Ordering::SeqCst)
+                || wake_list_pending(cpu)
+                // An IRQ that landed since this round's last `drain_and_wake` may
+                // have stashed a waker in THIS CPU's deferred queue; without
+                // re-checking it under the halted-publish fence the CPU halts
+                // over its own undrained wake (recovered only by the periodic
+                // tick / 2ms backstop). Per-CPU (see `has_pending_local`): the
+                // global counter here would make every CPU refuse to halt while
+                // any peer has an undrained waker.
+                || narf_lib::deferred_wake::has_pending_local()
+                || {
                     let now = narf_time::now_cycles();
                     let q = READY[cpu].lock();
                     q.as_ref()
@@ -5740,7 +5749,9 @@ pub fn run_forever() -> ! {
             // the published-HALTED fence, that wake is slept over indefinitely
             // (a tickless idle AP has no periodic IRQ to rescue it). Mirrors
             // Linux `current_clr_polling_and_test()` before HLT (idle.c).
-            need || nonempty || narf_lib::deferred_wake::has_pending() || wake_list_pending(cpu)
+            need || nonempty
+                || narf_lib::deferred_wake::has_pending_local()
+                || wake_list_pending(cpu)
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
