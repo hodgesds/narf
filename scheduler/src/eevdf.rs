@@ -160,8 +160,11 @@ impl Scheduler for EevdfScheduler {
         waker_cpu: CpuId,
         is_online: &dyn Fn(CpuId) -> bool,
         is_idle: &dyn Fn(CpuId) -> bool,
+        allowed: &dyn Fn(CpuId) -> bool,
     ) -> Option<CpuId> {
         // Reached only when `prev_cpu` (the wakee's cache-warm home) is BUSY.
+        // Every candidate must satisfy the wakee's affinity (`allowed`), exactly
+        // like Linux intersecting `select_idle_sibling` results with p->cpus_ptr.
         let node = narf_acpi::cpu_node(prev_cpu.0);
         let same_node = |c: CpuId| node.is_none() || narf_acpi::cpu_node(c.0) == node;
         // Wake-affine (Linux `wake_affine`): if the WAKER's CPU is idle and on
@@ -172,6 +175,7 @@ impl Scheduler for EevdfScheduler {
             && is_online(waker_cpu)
             && is_idle(waker_cpu)
             && same_node(waker_cpu)
+            && allowed(waker_cpu)
         {
             return Some(waker_cpu);
         }
@@ -182,7 +186,7 @@ impl Scheduler for EevdfScheduler {
         if node.is_some() {
             for i in 1..max {
                 let cpu = CpuId((prev_cpu.0 + i) % max);
-                if is_online(cpu) && is_idle(cpu) && same_node(cpu) {
+                if is_online(cpu) && is_idle(cpu) && same_node(cpu) && allowed(cpu) {
                     return Some(cpu);
                 }
             }
@@ -192,7 +196,7 @@ impl Scheduler for EevdfScheduler {
         // being placed onto another busy CPU.
         for i in 1..max {
             let cpu = CpuId((prev_cpu.0 + i) % max);
-            if is_online(cpu) && is_idle(cpu) {
+            if is_online(cpu) && is_idle(cpu) && allowed(cpu) {
                 return Some(cpu);
             }
         }

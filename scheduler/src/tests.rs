@@ -3459,11 +3459,13 @@ fn smoke_scheduler_select_task_rq_prefers_idle_sibling() -> TestResult {
     let sched = EevdfScheduler;
     // CPUs 0..4 online.
     let online = |c: CpuId| c.0 < 4;
+    // Affinity permits everything unless a case overrides it.
+    let allow_all = |_c: CpuId| true;
 
     // prev_cpu 0 busy, waker == prev (no wake-affine), only cpu 2 idle → the
     // wakee should be placed on the idle sibling cpu 2.
     let only_2_idle = |c: CpuId| c.0 == 2;
-    match sched.select_task_rq(CpuId(0), CpuId(0), &online, &only_2_idle) {
+    match sched.select_task_rq(CpuId(0), CpuId(0), &online, &only_2_idle, &allow_all) {
         Some(t) if t.0 == 2 => {}
         _ => return TestResult::Fail("expected the idle sibling cpu 2"),
     }
@@ -3471,7 +3473,7 @@ fn smoke_scheduler_select_task_rq_prefers_idle_sibling() -> TestResult {
     // Wake-affine: the waker's cpu 3 is idle → prefer it (run the consumer on
     // the producer's CPU / cache domain) even though cpu 2 is also idle.
     let two_and_three_idle = |c: CpuId| c.0 == 2 || c.0 == 3;
-    match sched.select_task_rq(CpuId(0), CpuId(3), &online, &two_and_three_idle) {
+    match sched.select_task_rq(CpuId(0), CpuId(3), &online, &two_and_three_idle, &allow_all) {
         Some(t) if t.0 == 3 => {}
         _ => return TestResult::Fail("expected the waker cpu 3 (wake-affine)"),
     }
@@ -3479,7 +3481,7 @@ fn smoke_scheduler_select_task_rq_prefers_idle_sibling() -> TestResult {
     // No idle sibling → None (leave the wakee on prev_cpu).
     let none_idle = |_c: CpuId| false;
     if sched
-        .select_task_rq(CpuId(0), CpuId(0), &online, &none_idle)
+        .select_task_rq(CpuId(0), CpuId(0), &online, &none_idle, &allow_all)
         .is_some()
     {
         return TestResult::Fail("expected None when no sibling is idle");
@@ -3488,14 +3490,31 @@ fn smoke_scheduler_select_task_rq_prefers_idle_sibling() -> TestResult {
     // Never place onto prev_cpu itself; skip offline CPUs even if they read
     // "idle".
     let all_idle = |_c: CpuId| true;
-    match sched.select_task_rq(CpuId(1), CpuId(1), &online, &all_idle) {
+    match sched.select_task_rq(CpuId(1), CpuId(1), &online, &all_idle, &allow_all) {
         Some(t) if t.0 != 1 && t.0 < 4 => {}
         _ => return TestResult::Fail("must return an online sibling that is not prev_cpu"),
     }
 
+    // AFFINITY filter: even the wake-affine waker CPU (3, idle) is rejected when
+    // the wakee's affinity forbids it — selection must intersect `allowed`
+    // (Linux select_task_rq ∩ p->cpus_ptr). Only cpu 2 is both idle and allowed.
+    let forbid_3 = |c: CpuId| c.0 != 3;
+    match sched.select_task_rq(CpuId(0), CpuId(3), &online, &two_and_three_idle, &forbid_3) {
+        Some(t) if t.0 == 2 => {}
+        _ => return TestResult::Fail("affinity must exclude cpu 3, leaving idle cpu 2"),
+    }
+    // Affinity forbids the ONLY idle sibling → None (keep prev_cpu).
+    let forbid_2 = |c: CpuId| c.0 != 2;
+    if sched
+        .select_task_rq(CpuId(0), CpuId(0), &online, &only_2_idle, &forbid_2)
+        .is_some()
+    {
+        return TestResult::Fail("expected None when the only idle sibling is affinity-forbidden");
+    }
+
     // A policy without a wake-placement model (Fifo) declines — keeps prev_cpu.
     if FifoScheduler
-        .select_task_rq(CpuId(0), CpuId(1), &online, &all_idle)
+        .select_task_rq(CpuId(0), CpuId(1), &online, &all_idle, &allow_all)
         .is_some()
     {
         return TestResult::Fail("default select_task_rq must return None");

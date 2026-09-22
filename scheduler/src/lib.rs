@@ -1014,8 +1014,10 @@ pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
 pub(crate) fn fallback_urgent_wake(cell: &Arc<WakeCell>) {
     let home = cell.cpu.load(Ordering::Acquire);
     hint_urgent_next_on(home, cell.task, Arc::as_ptr(cell));
+    // Urgent (exact) wake: co-locate on `home`, never migrate to an idle sibling
+    // (that would split the producer/consumer pair). Matches the urgent branch
+    // of `wake_by_ref_impl` — kick `home` only.
     resched_remote(home);
-    wake_place_hint(home);
 }
 
 /// Publish a direct target's identity/address space before its continuation is
@@ -3838,8 +3840,9 @@ unsafe fn wake_raw(data: *const ()) {
     // Name this task its home CPU's next-buddy so the dispatch picks it ahead
     // of the tasks already queued in front of it (Linux `set_next_buddy`).
     record_wake_next(home, arc.task);
-    resched_remote(home);
-    wake_place_hint(home);
+    // ttwu: the POLICY selects an idle sibling for a busy home and the CORE
+    // migrates the wakee there and kicks it (or kicks `home` when idle/kept).
+    wake_place_and_kick(Arc::as_ptr(&arc), home, arc.task);
 }
 
 unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
@@ -3879,16 +3882,18 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
             }
         }
         hint_urgent_next_on(dispatch_home, task, ptr);
+        // Exact synchronous wake: already co-located by try_sync_wake_affine —
+        // just kick its (local or home) CPU. No idle-sibling migrate here: that
+        // would split the producer/consumer pair this path is establishing.
+        resched_remote(dispatch_home);
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
-        // Generic wakes may ask an idle sibling to pull work from a busy home.
-        // An exact synchronous wake deliberately does not: its urgent buddy
-        // and one-shot co-location path are trying to establish a stable local
-        // pair, while an idle-sibling pull would immediately split it again.
-        wake_place_hint(dispatch_home);
+        // ttwu placement: the POLICY picks an idle sibling when `home` is busy
+        // and the CORE migrates the wakee there and kicks it (a PUSH at wake).
+        // Stealing is NOT used on the wake path (it stays the periodic balancer).
+        wake_place_and_kick(ptr, dispatch_home, task);
     }
-    resched_remote(dispatch_home);
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -3913,53 +3918,110 @@ pub fn wake_urgent_task(waker: &Waker, expected_task: u64) {
     }
 }
 
-/// Wake-time placement hint — NARF's analogue of Linux's `select_task_rq`.
-/// After a woken task's `home` (prev_cpu) has been kicked, if `home` is BUSY,
-/// ask the scheduler policy ([`Scheduler::select_task_rq`]) which idle sibling
-/// should run the wakee and kick it too, so that sibling PULLS the freshly-woken
-/// task via `try_steal_one` instead of the task waiting behind `home`'s current
-/// slice. `home` is always kicked first (above), so a stale/wrong hint can only
-/// waste one IPI — never strand the wake.
+/// Non-blocking core migrate: move the wakee identified by `cell` from `home`'s
+/// ready queue onto `target`'s, notifying the policy of the Dequeued(Migrated)
+/// transition (the paired Enqueued fires inside `enqueue_on`). Returns `true`
+/// iff the slot moved — in which case `enqueue_on`'s remote path has already
+/// kicked `target` (the `ttwu_queue_wakelist` IPI). The `direct_handoff_slot_eligible`
+/// gate makes this conservative and proven-safe: it moves only a plain, runnable,
+/// affinity-permitted task (Default class, NORMAL prio, unthrottled, no
+/// donation) — RT/budgeted/pinned tasks stay put (their affinity or class
+/// blocks selection anyway). Non-blocking (`try_lock`): any contention returns
+/// `false` so the caller falls back to kicking `home`, so a wake is never lost.
+/// This is the same non-blocking move as [`try_sync_wake_affine`], generalized
+/// to a policy-selected `target` instead of the waker's CPU.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
+    let source = home as usize;
+    if cell.is_null()
+        || source >= READY.len()
+        || (target as usize) >= READY.len()
+        || source == target as usize
+    {
+        return false;
+    }
+    let dest = crate::affinity::CpuId(target);
+    let moved = policy::try_with_scheduler(crate::affinity::CpuId(home), |scheduler| {
+        let mut ready = READY[source].try_lock()?;
+        let queue = ready.as_mut()?;
+        let position = queue.iter().position(|slot| {
+            core::ptr::eq(Arc::as_ptr(&slot.awake), cell)
+                && direct_handoff_slot_eligible(slot, dest)
+        })?;
+        let slot = queue.remove(position)?;
+        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
+            scheduler.on_task_queue_event(
+                crate::affinity::CpuId(home),
+                policy::TaskQueueEvent::Dequeued {
+                    task: policy::TaskMeta::from_slot(&slot),
+                    reason: policy::TaskDequeueReason::Migrated,
+                },
+            );
+        }
+        Some(slot)
+    });
+    match moved {
+        Some(Some(slot)) => {
+            enqueue_on(target as usize, slot, policy::TaskEnqueueReason::Migrated);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Wake-time placement + kick — NARF's `ttwu_queue` mechanism, split exactly
+/// like Linux: the POLICY decides WHERE (`Scheduler::select_task_rq`, the
+/// analogue of `sched_class->select_task_rq`), and the scheduler CORE performs
+/// the mechanical migrate + enqueue + IPI (`set_task_cpu` + `ttwu_queue`).
 ///
-/// No-op when `home` is idle (it wakes and runs the task itself — the common
-/// latency-critical ping-pong case, kept scan-free), when stealing is disabled
-/// (a kicked sibling could not pull), or when the policy declines placement.
+/// On a wake whose `home` (prev_cpu) is BUSY, ask the policy for an idle,
+/// affinity-permitted sibling; if it names one, MIGRATE the wakee's slot there
+/// and let `enqueue_on` kick it. This is a PUSH at wake time — it does NOT rely
+/// on the idle sibling later PULLING the task via work-stealing (Linux uses
+/// stealing only in the periodic/newidle balancer, never on the wake path). If
+/// no idle sibling is offered, keep the task on `home` and `resched_remote(home)`
+/// (an idle home is woken by its IPI; a busy home runs it at its next round).
 ///
-/// Runs in the raw-waker path, which can be IRQ context: it must not allocate
-/// or block. `try_with_scheduler` is a `try_lock` on the per-CPU policy slot,
-/// `select_task_rq` is a bounded alloc-free CPU scan, and `resched_remote` only
-/// IPIs a target that has published `CPU_HALTED`.
-fn wake_place_hint(home: u32) {
-    // Only meaningful with stealing on (the kicked sibling pulls the task via
-    // try_steal_one). The placement decision itself is the policy's
-    // `select_task_rq`, which a policy without a placement model leaves as
-    // `None` (keep prev_cpu) — so there is no separate placement switch.
-    if !STEAL_ENABLED.load(Ordering::Acquire) {
+/// Runs in the raw-waker path (possibly IRQ context): allocation-light,
+/// non-blocking (`try_lock`), bounded CPU scan. Any migrate contention falls
+/// back to the plain `home` kick, so a wake is never dropped.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
+    // Placement is only actionable with migration enabled and a BUSY home. An
+    // idle home is already being IPI'd to run the task itself (the cache-warm,
+    // hot ping-pong path) — never migrate off an idle home.
+    if !STEAL_ENABLED.load(Ordering::Acquire)
+        || (home as usize) >= CPU_HALTED.len()
+        || CPU_HALTED[home as usize].load(Ordering::SeqCst)
+    {
+        resched_remote(home);
         return;
     }
-    // Home idle → `resched_remote(home)` above already woke it and it will run
-    // the task itself; no offload needed, and skipping the scan keeps the hot
-    // latency path (a peer waking a parked task on an idle CPU) free.
-    if CPU_HALTED[home as usize].load(Ordering::SeqCst) {
-        return;
-    }
+    // Affinity predicate for CPU selection (lock-free registry read). `None`
+    // (task not registered) permits any CPU; the migrate's own
+    // `direct_handoff_slot_eligible` affinity check is the authoritative gate.
+    let allowed_set = task_affinity(TaskId(task));
+    let allowed = |c: crate::affinity::CpuId| allowed_set.is_none_or(|s| s.contains(c));
     let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
     let is_idle = |c: crate::affinity::CpuId| {
         (c.0 as usize) < CPU_HALTED.len() && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
     };
-    // The scheduler policy owns wake-time CPU placement (Linux `select_task_rq`).
-    // `home` is the wakee's cache-warm prev_cpu (busy here); the waker is the CPU
-    // running this raw wake.
     let home_id = crate::affinity::CpuId(home);
     let waker = crate::affinity::CpuId(narf_lib::percpu::current_cpu() as u32);
     let target = policy::try_with_scheduler(home_id, |scheduler| {
-        scheduler.and_then(|s| s.select_task_rq(home_id, waker, &is_online, &is_idle))
+        scheduler.and_then(|s| s.select_task_rq(home_id, waker, &is_online, &is_idle, &allowed))
     })
     .flatten();
-    if let Some(target) = target {
-        if target.0 != home {
-            resched_remote(target.0);
+    match target {
+        Some(t) if t.0 != home && allowed(t) => {
+            // CORE mechanism: migrate to the policy-selected idle CPU; on success
+            // `enqueue_on` kicked it. Any contention → kick `home` so the wake
+            // still lands (never dropped).
+            if !try_migrate_wakee_to(home, t.0, cell) {
+                resched_remote(home);
+            }
         }
+        _ => resched_remote(home),
     }
 }
 

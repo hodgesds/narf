@@ -414,11 +414,19 @@ pub trait Scheduler: Any + Send + Sync + 'static {
     }
 
     /// Wake-time CPU placement — NARF's analogue of Linux `select_task_rq`.
-    /// Consulted on the wake path when the wakee's `prev_cpu` (its cache-warm
-    /// home CPU) is BUSY. Returns `Some(cpu)` to run the wakee on an idle
-    /// sibling now, or `None` to keep it on `prev_cpu`. `waker_cpu` is the CPU
-    /// issuing the wake. `is_online` / `is_idle` are per-CPU predicates supplied
-    /// by the core.
+    /// This is the POLICY's decision of WHERE a just-woken task should run; the
+    /// scheduler CORE performs the mechanical migrate + enqueue + IPI
+    /// (`ttwu_queue`). Consulted on the wake path when the wakee's `prev_cpu`
+    /// (its cache-warm home CPU) is BUSY. Returns `Some(cpu)` to run the wakee
+    /// on an idle sibling now, or `None` to keep it on `prev_cpu`. `waker_cpu`
+    /// is the CPU issuing the wake.
+    ///
+    /// The three predicates are supplied by the core: `is_online` and `is_idle`
+    /// report per-CPU state, and `allowed` reports whether the wakee's affinity
+    /// permits that CPU. An implementation MUST only ever return a CPU for which
+    /// `allowed(cpu)` is true (Linux's `select_task_rq` likewise intersects with
+    /// `p->cpus_ptr`); a returned CPU is otherwise the core's authority to
+    /// reject, but honoring `allowed` keeps the selection meaningful.
     ///
     /// Allocation-free and a bounded CPU scan: the raw-waker path that calls
     /// this can be IRQ context.
@@ -428,8 +436,9 @@ pub trait Scheduler: Any + Send + Sync + 'static {
         waker_cpu: CpuId,
         is_online: &dyn Fn(CpuId) -> bool,
         is_idle: &dyn Fn(CpuId) -> bool,
+        allowed: &dyn Fn(CpuId) -> bool,
     ) -> Option<CpuId> {
-        let _ = (prev_cpu, waker_cpu, is_online, is_idle);
+        let _ = (prev_cpu, waker_cpu, is_online, is_idle, allowed);
         None
     }
 
