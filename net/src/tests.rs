@@ -8023,3 +8023,99 @@ fn smoke_resolv_conf_parse_two_ns_and_search() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_resolv_conf_parse_two_ns_and_search);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Loopback must be a REAL route, not one synthesised for dumps.
+//
+// `register_loopback` had no caller outside these tests, so a booted kernel
+// had no "lo" interface, nothing assigned 127.0.0.1/8, and
+// `install_connected_route` therefore never ran — the FIB carried no
+// 127.0.0.0/8 entry, despite route.rs's module doc asserting one is
+// "installed at boot".
+//
+// Two things hid it. Netlink synthesises lo for link/address/route dumps, so
+// `ip addr` / `ip route` showed a loopback the FIB did not have. And AF_INET
+// loopback connects are served in-process by INET_LISTENERS, bypassing
+// routing entirely.
+//
+// What it broke is the path that routes for real: `iface::for_dst` falls back
+// to `primary_in()` on a miss, and that snapshot is what the TCP/UDP/ICMP
+// send paths use to dispatch a frame — so a datagram addressed to 127.0.0.1
+// was handed to the physical NIC and put on the wire.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Provision a loopback interface named "lo" with 127.0.0.1/8, exactly as
+/// `install_net_stack` now does at boot. The kernel-test image does not run
+/// that path — `install_all_hooks` is gated on `boot-init` and, per
+/// bare_main's own note, "never fires under `cargo xtask test`" — so these
+/// cases provision it themselves and pin the MECHANISM the boot wiring
+/// depends on: that giving lo an address yields a working 127.0.0.0/8 route.
+/// The boot call itself is covered by the "net: lo registered" boot line.
+fn ensure_test_loopback() {
+    crate::iface::register_loopback_iface();
+    crate::iface::add_addr("lo", [127, 0, 0, 1], 8);
+}
+
+fn smoke_net_loopback_route_resolves_to_lo() -> TestResult {
+    use crate::ipv4::Ipv4Addr;
+    ensure_test_loopback();
+    let r = match crate::route::route_lookup(Ipv4Addr([127, 0, 0, 1])) {
+        Some(r) => r,
+        None => {
+            return TestResult::Fail("no route for 127.0.0.1 — loopback FIB entry missing");
+        }
+    };
+    if r.iface != "lo" {
+        return TestResult::Fail("127.0.0.1 routed off an interface other than lo");
+    }
+    // The whole /8, as Linux installs it — not just the .1 host address.
+    match crate::route::route_lookup(Ipv4Addr([127, 0, 0, 53])) {
+        Some(r) if r.iface == "lo" => {}
+        _ => return TestResult::Fail("127.0.0.0/8 is not covered (only a host route?)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_loopback_route_resolves_to_lo);
+
+/// The symptom, pinned at the layer that caused it: the snapshot the
+/// TCP/UDP/ICMP send paths stamp frames with must be lo for a loopback
+/// destination. Before the fix `for_dst` missed and fell back to
+/// `primary_in()`, i.e. the physical NIC.
+fn smoke_net_loopback_dst_does_not_egress_physical_nic() -> TestResult {
+    ensure_test_loopback();
+    let snap = match crate::iface::for_dst([127, 0, 0, 1]) {
+        Some(s) => s,
+        None => return TestResult::Fail("for_dst(127.0.0.1) found no interface at all"),
+    };
+    if snap.name != "lo" {
+        return TestResult::Fail("127.0.0.1 would egress a non-loopback interface");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_loopback_dst_does_not_egress_physical_nic);
+
+/// The loopback reentrancy guard must be RELEASED after each transmit, and
+/// must be per-CPU rather than global.
+///
+/// A guard that is claimed and never released leaves that CPU silently
+/// dropping every later loopback frame — the failure mode the "read the CPU
+/// index once" rule in `lo_send_fn` exists to prevent, since a task that
+/// migrates mid-delivery would otherwise clear a different CPU's flag and
+/// strand the one it set. Consecutive sends on the same CPU are what catch
+/// it: the second only succeeds if the first released.
+fn smoke_net_loopback_guard_is_released_between_sends() -> TestResult {
+    ensure_test_loopback();
+    // A minimal well-formed-enough Ethernet frame. rx_handler is free to
+    // ignore it — the subject here is the guard, not parsing.
+    let frame = [0u8; 64];
+    for i in 0..4 {
+        if crate::iface::send_on("lo", &frame).is_err() {
+            return TestResult::Fail(
+                "a loopback send was refused — the reentrancy guard was not released",
+            );
+        }
+        let _ = i;
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_loopback_guard_is_released_between_sends);

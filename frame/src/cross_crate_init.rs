@@ -191,6 +191,46 @@ fn install_net_stack() {
     // via `iface::drain_pump` covers the syscall-context busy
     // wait; this background task picks up frames between syscalls.
     narf_net::tcp_stack::init();
+
+    // Loopback. `register_loopback` had NO caller outside the tests, so a
+    // real boot had no "lo" interface at all — and nothing assigned
+    // 127.0.0.1/8, so `install_connected_route` never ran either and the FIB
+    // carried no 127.0.0.0/8 entry. route.rs's own module doc has always said
+    // "127.0.0.0/8 is a special connected route installed at boot on the 'lo'
+    // interface"; this is what finally makes that true.
+    //
+    // It was invisible from userspace because netlink SYNTHESISES lo for
+    // link, address and route dumps, so `ip addr` and `ip route` showed a
+    // loopback that the kernel's own FIB did not have. And AF_INET loopback
+    // connects never noticed: `SocketState::InetListener` serves 127.0.0.1
+    // in-process through INET_LISTENERS, bypassing routing entirely.
+    //
+    // What did notice is everything that routes for real. `iface::for_dst`
+    // falls back to `primary_in()` when the lookup misses, and that is the
+    // snapshot "TCP / UDP / ICMP send paths use to stamp the source MAC and
+    // dispatch the frame" — so a datagram addressed to 127.0.0.1 was handed
+    // to the physical NIC and put on the wire.
+    {
+        let authority = narf_net::bootstrap_authority();
+        match narf_net::register_loopback(&authority) {
+            Ok(_handle) => {
+                // The dispatch registry `for_dst`/`lookup_in` read is a
+                // DIFFERENT store from the cap-gated device registry above —
+                // NIC drivers call into it directly. Without an entry there a
+                // 127.0.0.0/8 route resolves to an iface dispatch cannot
+                // find, and `for_dst` falls back to the physical NIC.
+                narf_net::iface::register_loopback_iface();
+                // Auto-installs the 127.0.0.0/8 connected route via
+                // `ifaddr::iface_add_addr` -> `route::install_connected_route`.
+                narf_net::iface::add_addr("lo", [127, 0, 0, 1], 8);
+                let _ = writeln!(console::Writer, "  net: lo registered, 127.0.0.1/8");
+            }
+            Err(e) => {
+                let _ = writeln!(console::Writer, "  net: loopback register failed: {e:?}");
+            }
+        }
+    }
+
     let _ = writeln!(
         console::Writer,
         "  net: tcp_stack init; iface count = {}",
