@@ -150,15 +150,10 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
     // mask through the memory -> interrupts IPI bridge must advance every
     // selected CPU's EVER_RECEIVED counter (the IPI handler bumps it on every
     // shootdown delivery).
-    use crate::x86_64::{apic, ipi};
+    use crate::x86_64::ipi;
     use narf_memory::tlb_shootdown;
     if narf_lib::smp::cpu_count() <= 1 {
         return TestResult::Skip("UP boot — no peer CPUs to shoot");
-    }
-    // The shootdown bridge delivers via the x2APIC ICR MSR with no xAPIC
-    // fallback; skip when x2APIC didn't come up (CI's qemu64/xAPIC).
-    if !apic::x2apic_active() {
-        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
     let total = narf_lib::smp::cpu_count();
@@ -207,13 +202,10 @@ kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_tlb_shootdown_target_mask_excludes_unselected_peer() -> TestResult {
-    use crate::x86_64::{apic, ipi};
+    use crate::x86_64::ipi;
 
     if narf_lib::smp::cpu_count() < 3 {
         return TestResult::Skip("need two peer CPUs to observe target exclusion");
-    }
-    if !apic::x2apic_active() {
-        return TestResult::Skip("targeted shootdown IPI requires x2APIC");
     }
 
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
@@ -261,13 +253,9 @@ kernel_test_in!(
 /// (exit 85) instead of returning `Pass` — the guard fails loudly.
 #[cfg(target_arch = "x86_64")]
 fn smoke_smp_shootdown_storm_trap_stacks_hold() -> TestResult {
-    use crate::x86_64::{apic, ipi};
+    use crate::x86_64::ipi;
     if narf_lib::smp::cpu_count() <= 1 {
         return TestResult::Skip("UP boot — no peer CPUs to storm");
-    }
-    // Broadcast goes via the x2APIC ICR MSR with no xAPIC fallback.
-    if !apic::x2apic_active() {
-        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
     // 20k synchronous low-level broadcasts of a kernel high-half VA. Bypass
     // the residency/idle filter deliberately: this is a trap-stack storm
@@ -1662,13 +1650,10 @@ fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
     // The bridge used to no-op for `(Some(tag), None, _)`; it now calls the
     // targeted tag-only primitive. Verify every explicitly selected peer's
     // EVER_RECEIVED counter advances for a tag-only ShootdownRequest.
-    use crate::x86_64::{apic, ipi};
+    use crate::x86_64::ipi;
     use narf_memory::tlb_shootdown;
     if narf_lib::smp::cpu_count() <= 1 {
         return TestResult::Skip("UP boot — no peer CPUs");
-    }
-    if !apic::x2apic_active() {
-        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
     let total = narf_lib::smp::cpu_count();

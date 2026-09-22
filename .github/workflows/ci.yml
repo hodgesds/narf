@@ -280,6 +280,19 @@ jobs:
       - name: cargo xtask iso-boot (firmware UEFI)
         run: cargo xtask iso-boot --arch=${{ matrix.arch }}
 
+      # xAPIC fallback boot. With x2APIC masked off, every LAPIC access is
+      # MMIO instead of an MSR — the path real Renoir/Phoenix firmware puts
+      # us on when it refuses IA32_APIC_BASE.EXTD. It regressed once the
+      # kernel stopped identity-mapping the low 4 GiB: the LAPIC was still
+      # reached at its physical base and the first post-`init_mmu` access
+      # #PF'd on 0xFEE0_0020, which only the nightly OCI job (the one other
+      # place `-x2apic` is set) ever hit. This boot is the cheap guard.
+      - name: cargo xtask boot-smoke (xAPIC fallback, no x2APIC)
+        if: matrix.arch == 'x86_64'
+        env:
+          NARF_QEMU_CPU: "max,-x2apic"
+        run: cargo xtask boot-smoke --arch=x86_64
+
   # ── musl-demo, split into a build-once job + a per-subsystem-group matrix ──
   # The ~80 musl/linux-compat cases are bucketed into coarse subsystem groups
   # (gui, net, signals, ipc, fs, mem, process, linux-compat). `musl-build`

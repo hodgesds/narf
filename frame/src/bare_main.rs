@@ -1052,10 +1052,24 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // rather than the per-CPU baseline.
         narf_scheduler::set_get_kernel_stack_hook(super::x86_64::percpu::kernel_stack_top);
 
-        // TLB-shootdown IPI fan-out — requires x2APIC for ICR MSR
-        // writes. Skipped under xAPIC fallback; cross-CPU
-        // invalidation falls back to the per-CPU INVLPG only.
-        if x2apic_active {
+        // TLB-shootdown IPI fan-out. This used to be gated on
+        // `x2apic_active`, because `send_fixed_ipi` had no xAPIC path and
+        // there was genuinely no way to interrupt a peer without the ICR
+        // MSR. The comment described the consequence as cross-CPU
+        // invalidation falling "back to the per-CPU INVLPG only" — i.e. in
+        // xAPIC mode a shootdown silently left stale TLB entries live on
+        // every other CPU, which is a correctness hole, not a degradation.
+        // It also meant the handler below was never installed, so a peer
+        // that did receive a shootdown IPI had nothing to ACK it and the
+        // sender's ack-wait (documented as one that must not time out)
+        // spun forever.
+        //
+        // `send_fixed_ipi` now programs the xAPIC ICR over MMIO, so every
+        // hook here works in both APIC modes and the gate is gone. The
+        // TSC-deadline backstop is fine either way: it branches on
+        // X2APIC_ACTIVE internally, and IA32_TSC_DEADLINE is an ordinary
+        // MSR gated on CPUID.01H:ECX[24], not an x2APIC register.
+        {
             // Install the TLB-shootdown IPI handler now — APs may
             // call shoot_va once they come up, and the handler must
             // be live before the first IPI lands.
@@ -1585,6 +1599,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: CPL=0, on the BSP, single-threaded.
                         unsafe {
                             narf_memory::text_poke::enable_write_protect();
+                        }
+
+                        // Move the LAPIC onto an ioremap window now that the
+                        // final tables are live. In xAPIC mode (no x2APIC, or
+                        // firmware refused IA32_APIC_BASE.EXTD — common on
+                        // Renoir/Phoenix) every LAPIC access is MMIO, and it
+                        // has been reaching its registers at their PHYSICAL
+                        // base through boot.S's identity window. That window
+                        // is not in the tables just installed, so without this
+                        // the next LAPIC touch #PFs on 0xFEE0_0020. Same move
+                        // aarch64 makes for the GIC below. No-op under x2APIC.
+                        narf_interrupts::x86_64::apic::remap_mmio();
+                        if narf_interrupts::x86_64::apic::mmio_remapped() {
+                            let _ = writeln!(console::Writer, "  apic: xAPIC MMIO remapped");
                         }
 
                         // The kernel direct map now covers all installed
@@ -2424,30 +2452,24 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // gate is only the runtime *migration* enable.
                         // The dynamic-linker / shootdown deadlock + AP
                         // EFER/CR4 gaps are fixed, so we actually enable
-                        // migration here. Still gated on x2APIC: the cross-CPU
-                        // TLB-shootdown broadcast hook is only wired when
-                        // x2APIC is active (see the `set_shootdown_hook` block
-                        // above); under the xAPIC fallback unmap/mprotect
-                        // can't invalidate peer TLBs, so a thread group
-                        // sharing an address space across cores would
-                        // use-after-unmap — there we leave tasks BOOT-pinned.
+                        // migration here. This was additionally gated on
+                        // x2APIC, because the cross-CPU TLB-shootdown hook was
+                        // only wired in that mode: under the xAPIC fallback
+                        // unmap/mprotect could not invalidate peer TLBs, so a
+                        // thread group sharing an address space across cores
+                        // would use-after-unmap, and tasks were left
+                        // BOOT-pinned to one CPU to stay safe. The shootdown
+                        // hooks are now wired in both APIC modes (see the
+                        // `set_shootdown_hook` block above), so the pin — and
+                        // with it single-CPU userspace on every machine whose
+                        // firmware refuses x2APIC — is no longer needed.
                         #[cfg(feature = "user-task-smp")]
                         {
-                            let x2apic_active = narf_interrupts::x86_64::apic::X2APIC_ACTIVE
-                                .load(core::sync::atomic::Ordering::Acquire);
-                            if x2apic_active {
-                                narf_scheduler::enable_user_task_smp();
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  smp: user-task SMP enabled (TLB shootdown wired)"
-                                );
-                            } else {
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  smp: user-task SMP disabled (xAPIC — no cross-CPU \
-                                     TLB shootdown); user tasks stay BOOT-pinned"
-                                );
-                            }
+                            narf_scheduler::enable_user_task_smp();
+                            let _ = writeln!(
+                                console::Writer,
+                                "  smp: user-task SMP enabled (TLB shootdown wired)"
+                            );
                         }
                     }
                 }
