@@ -660,3 +660,134 @@ fn smoke_rand_lcg_dead_code_removed() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/random_e2e", smoke_rand_lcg_dead_code_removed);
+
+// ══════════════════════════════════════════════════════════════════════════
+// The unseeded pool must never reach a reader.
+//
+// `CsprngInner::uninit()` zeroes the whole ChaCha20 state — including the
+// constants `seed()` installs — so an unseeded pool does not merely emit a
+// computable keystream, it emits ALL ZEROS. `init_csprng` had no caller outside
+// the tests (devfs's doc claimed kernel init made one), `fill` consulted
+// `needs_reseed()` but never `CSPRNG_SEEDED`, and `needs_reseed` is false
+// until 1 MiB has been drawn. So a real boot served that fixed keystream to
+// /dev/random, /dev/urandom and getrandom(2) for the first megabyte — which
+// covers essentially all key generation, ASLR and stack-canary seeding.
+//
+// Linux ref: `drivers/char/random.c` — `crng_init` gates extraction, and
+// `crng_make_state` never emits from an uninitialised base_crng.
+// ══════════════════════════════════════════════════════════════════════════
+
+fn smoke_rand_pool_is_seeded_before_any_read() -> TestResult {
+    // Return the pool to factory state FIRST. Without this the case is
+    // vacuous: the shared kernel image runs other cases that call
+    // `init_csprng`, so by the time this one runs the pool is already
+    // seeded and it would pass even with the fix reverted (confirmed — it
+    // did). The subject here is the first reader, so the test has to
+    // manufacture that situation rather than hope for it.
+    crate::csprng::__test_unseed();
+    let mut buf = [0u8; 64];
+    crate::csprng::fill(&mut buf);
+    // `uninit()` zeroes the ENTIRE state, including the ChaCha20 constants
+    // that `seed()` installs — so the block function run over it returns
+    // literally all zeros, not merely a computable keystream. A reader that
+    // arrives first must never see this.
+    if buf.iter().all(|&x| x == 0) {
+        return TestResult::Fail("csprng served all zeros from the UNSEEDED pool");
+    }
+    if !crate::csprng::CSPRNG_SEEDED.load(core::sync::atomic::Ordering::Acquire) {
+        return TestResult::Fail("csprng filled a buffer without ever marking itself seeded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_pool_is_seeded_before_any_read
+);
+
+/// Two draws must differ. A fixed keystream from an unseeded pool would also
+/// fail the case above; this additionally catches a pool that seeds but does
+/// not advance its counter.
+fn smoke_rand_successive_draws_differ() -> TestResult {
+    crate::csprng::__test_unseed();
+    let mut a = [0u8; 64];
+    let mut b = [0u8; 64];
+    crate::csprng::fill(&mut a);
+    crate::csprng::fill(&mut b);
+    if a == b {
+        return TestResult::Fail("two csprng draws returned identical bytes");
+    }
+    if a.iter().all(|&x| x == 0) || b.iter().all(|&x| x == 0) {
+        return TestResult::Fail("csprng returned an all-zero buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/random_e2e", smoke_rand_successive_draws_differ);
+
+/// `/dev/urandom` must never hand a reader all zeros.
+///
+/// The two cases above exercise `csprng::fill` directly; this one goes
+/// through the path userspace actually uses — DevFs lookup, `FileOps::read`.
+/// It reads a full 64-byte ChaCha block plus a tail, so a pool that emits one
+/// zero block and then advances would still be caught.
+///
+/// Note the existing `read_dev_node` helper calls `init_csprng()` before every
+/// read, which is precisely why the device-level cases never caught the
+/// unseeded pool. This one unseeds deliberately and does NOT use that helper.
+fn smoke_rand_urandom_never_returns_all_zeros() -> TestResult {
+    crate::csprng::__test_unseed();
+    let root = DevFs::new().root();
+    let Some(file) = root.lookup("urandom") else {
+        return TestResult::Fail("/dev/urandom not found in DevDir");
+    };
+    let mut buf = vec![0u8; 96];
+    match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(96)) => {}
+        _ => return TestResult::Fail("/dev/urandom read(96) did not return 96 bytes"),
+    }
+    if buf.iter().all(|&b| b == 0) {
+        return TestResult::Fail(
+            "/dev/urandom returned all zeros (unseeded pool reached a reader)",
+        );
+    }
+    // The first block alone being zero is the specific unseeded signature —
+    // catch it even if a later block happens to carry entropy.
+    if buf[..64].iter().all(|&b| b == 0) {
+        return TestResult::Fail("/dev/urandom's first ChaCha block was all zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_urandom_never_returns_all_zeros
+);
+
+/// Same guarantee for `/dev/random` — post-5.18 Linux makes the two
+/// identical, and NARF serves both from this pool, so both need the pin.
+fn smoke_rand_random_never_returns_all_zeros() -> TestResult {
+    crate::csprng::__test_unseed();
+    let root = DevFs::new().root();
+    let Some(file) = root.lookup("random") else {
+        return TestResult::Fail("/dev/random not found in DevDir");
+    };
+    let mut buf = vec![0u8; 96];
+    match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(96)) => {}
+        _ => return TestResult::Fail("/dev/random read(96) did not return 96 bytes"),
+    }
+    if buf.iter().all(|&b| b == 0) {
+        return TestResult::Fail("/dev/random returned all zeros (unseeded pool reached a reader)");
+    }
+    // Check the FIRST block specifically, as the urandom case does. Testing
+    // only the whole buffer makes this order-sensitive: once enough bytes
+    // have been drawn across the image the 1 MiB reseed threshold fires and
+    // seeds the pool for real, so a later-running case can pass even with the
+    // fix reverted. The first block is the unseeded signature.
+    if buf[..64].iter().all(|&b| b == 0) {
+        return TestResult::Fail("/dev/random's first ChaCha block was all zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_random_never_returns_all_zeros
+);

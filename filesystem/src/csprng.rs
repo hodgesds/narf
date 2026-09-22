@@ -207,6 +207,15 @@ fn qr(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32) {
     *b = b.rotate_left(7);
 }
 
+/// Test-only: return the pool to its factory state — all-zero state, seeded
+/// flag clear. Lets a case exercise the first-reader path regardless of what
+/// else in the shared kernel image already seeded it.
+#[doc(hidden)]
+pub fn __test_unseed() {
+    *POOL.lock() = CsprngInner::uninit();
+    CSPRNG_SEEDED.store(false, Ordering::Release);
+}
+
 fn chacha20_block(state: &[u32; 16], out: &mut [u8; 64]) {
     let mut x = *state;
     for _ in 0..10 {
@@ -296,11 +305,29 @@ pub fn init_csprng() {
 /// (bytes_since_reseed ≥ 1 MiB), pulls new hardware entropy and mixes
 /// it in before returning output.
 ///
-/// # Panics
-///
-/// Panics if called before `init_csprng()` in debug builds (the seeded
-/// flag is checked).
+/// Seeds on demand if the pool has never been seeded, so a caller can
+/// never be served the unseeded keystream. That is not belt-and-braces:
+/// `CsprngInner::uninit()` is an ALL-ZERO key and nonce, so an unseeded
+/// pool emits ChaCha20 under a key every reader can compute — the same
+/// bytes on every boot of every machine — and `needs_reseed()` would not
+/// correct it until 1 MiB had been drawn. `init_csprng` had no caller
+/// outside tests, so that is exactly what `/dev/random` and
+/// `/dev/urandom` served. The seeded flag existed but nothing consulted
+/// it; checking it here is what makes the guarantee hold regardless of
+/// whether boot remembered to call `init_csprng`.
 pub fn fill(buf: &mut [u8]) {
+    if !CSPRNG_SEEDED.load(Ordering::Acquire) {
+        // gather_entropy() may take the RDSEED retry loop, so it must run
+        // with the pool lock DROPPED, exactly as the reseed path below does.
+        let entropy = gather_entropy();
+        let mut pool = POOL.lock();
+        // Re-check under the lock: a racing caller may have seeded while we
+        // were gathering. Seeding twice is harmless (`seed` mixes rather than
+        // replaces after the first), but the flag store should be monotonic.
+        pool.seed(&entropy);
+        CSPRNG_SEEDED.store(true, Ordering::Release);
+        drop(pool);
+    }
     // Trigger reseed if needed, then fill.
     let mut pool = POOL.lock();
     if pool.needs_reseed() {
