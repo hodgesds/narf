@@ -589,6 +589,12 @@ pub enum SockError {
     NoDevice,
     /// `EPERM` — the operation needs a capability the caller lacks.
     PermDenied,
+    /// `ENOBUFS` — a multicast listener fell behind and the kernel dropped
+    /// events it had not read. Linux raises this once per congestion episode
+    /// from `netlink_overrun` (`net/netlink/af_netlink.c:350`); it is how
+    /// libudev learns to re-enumerate /sys instead of trusting its event
+    /// stream, so it must be distinguishable from "no events".
+    NoBufs,
 }
 
 impl SockError {
@@ -613,6 +619,7 @@ impl SockError {
             Self::PermDenied => errno::EPERM as i32,
             Self::MsgSize => errno::EMSGSIZE as i32,
             Self::ProtoType => errno::EPROTOTYPE as i32,
+            Self::NoBufs => errno::ENOBUFS as i32,
         }
     }
 }
@@ -3319,6 +3326,26 @@ impl SocketFile {
                 // coldplug replay.
                 if !self.netlink_uevent_subscribed.load(Ordering::Acquire) {
                     return SocketOpResult::Err(SockError::WouldBlock);
+                }
+                // `netlink_overrun` (net/netlink/af_netlink.c:350) reports the
+                // drop BEFORE any further data: the error is socket state, not
+                // a queue entry, and Linux's recvmsg consumes `sk_err` ahead of
+                // dequeuing. Report it here for the same reason — a reader that
+                // received events first would treat the batch as contiguous and
+                // never re-enumerate.
+                //
+                // Taken even when the socket opted out, so the latch cannot
+                // accumulate and fire at some unrelated later recv; Linux
+                // likewise never sets the bit for such a socket.
+                let overrun = {
+                    let mut g = self.state.lock();
+                    match &mut *g {
+                        SocketState::NetlinkUevent { reader } => reader.take_overrun(),
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                if overrun && !self.netlink_no_enobufs.load(Ordering::Acquire) {
+                    return SocketOpResult::Err(SockError::NoBufs);
                 }
                 let ev = {
                     let mut g = self.state.lock();

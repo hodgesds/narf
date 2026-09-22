@@ -161,6 +161,11 @@ impl UeventEnv {
 struct Ring {
     entries: VecDeque<UeventEnv>,
     next_seqnum: u64,
+    /// Lowest seqnum still deliverable: one past the newest event the ring
+    /// has ever evicted. A reader whose cursor sits below this missed
+    /// exactly `floor - cursor` events, which is what lets the netlink
+    /// socket raise ENOBUFS instead of resuming at the tail in silence.
+    floor: u64,
 }
 
 impl Ring {
@@ -168,6 +173,7 @@ impl Ring {
         Self {
             entries: VecDeque::new(),
             next_seqnum: 1,
+            floor: 1,
         }
     }
 
@@ -175,7 +181,13 @@ impl Ring {
         env.seqnum = self.next_seqnum;
         self.next_seqnum += 1;
         if self.entries.len() >= UEVENT_RING_N {
-            self.entries.pop_front();
+            // The evicted event can never be delivered again; raise the
+            // floor past it so every reader still below it learns it lost
+            // data. `pop_front` is the only way an entry leaves the ring,
+            // so this is the complete record of what was dropped.
+            if let Some(dropped) = self.entries.pop_front() {
+                self.floor = dropped.seqnum + 1;
+            }
         }
         self.entries.push_back(env);
     }
@@ -326,7 +338,14 @@ pub fn boot_udevd_replay_reader() -> UeventReader {
     if start == 0 {
         UeventReader::new()
     } else {
-        UeventReader { next_seqnum: start }
+        // No overrun flag set here even though `start` may already be below
+        // the ring's floor — that is the whole failure this fixes, and the
+        // first `drain` detects it against the live floor rather than a
+        // snapshot taken at construction time.
+        UeventReader {
+            next_seqnum: start,
+            overrun: false,
+        }
     }
 }
 
@@ -342,6 +361,14 @@ pub fn boot_udevd_replay_reader() -> UeventReader {
 #[derive(Debug, Clone)]
 pub struct UeventReader {
     next_seqnum: u64,
+    /// Sticky "you missed events" flag — the analogue of Linux's
+    /// `NETLINK_S_CONGESTED` bit. Set when a drain finds the cursor below
+    /// the ring's floor, cleared by [`UeventReader::take_overrun`], so an
+    /// overrun is reported ONCE per episode rather than once per dropped
+    /// event. `netlink_overrun` gets that from `test_and_set_bit`; a
+    /// per-event report would hand a lagging udevd an ENOBUFS storm, which
+    /// is worse than the silence it replaces.
+    overrun: bool,
 }
 
 impl Default for UeventReader {
@@ -355,6 +382,7 @@ impl UeventReader {
     pub fn new() -> Self {
         Self {
             next_seqnum: next_seqnum(),
+            overrun: false,
         }
     }
 
@@ -368,6 +396,7 @@ impl UeventReader {
             .unwrap_or(ring.next_seqnum);
         Self {
             next_seqnum: oldest,
+            overrun: false,
         }
     }
 
@@ -375,6 +404,7 @@ impl UeventReader {
     /// `(UeventEnv, rendered_text)` pairs in FIFO order.  Advances
     /// the cursor so a subsequent call yields only newer events.
     pub fn drain(&mut self, max: usize) -> Vec<UeventEnv> {
+        self.refresh_overrun();
         let ring = UEVENT_RING.lock();
         let (evs, next) = ring.read_from(self.next_seqnum, max);
         drop(ring);
@@ -382,16 +412,62 @@ impl UeventReader {
         evs
     }
 
+    /// Compare the cursor against the ring's floor and latch an overrun if
+    /// events were evicted from under it.
+    ///
+    /// Must run BEFORE the cursor is advanced by a read: once it has been
+    /// fast-forwarded the evidence is gone, which is exactly how this went
+    /// unnoticed. Linux discards the lost messages too — the reader is
+    /// expected to re-enumerate /sys rather than replay — so the cursor
+    /// resyncs to the floor instead of trying to recover them.
+    fn refresh_overrun(&mut self) {
+        let floor = UEVENT_RING.lock().floor;
+        if self.next_seqnum < floor {
+            self.overrun = true;
+            self.next_seqnum = floor;
+        }
+    }
+
+    /// Consume the pending overrun signal, if any.
+    ///
+    /// Mirrors Linux consuming `sk->sk_err`: the netlink socket reports
+    /// -ENOBUFS on ONE receive and then resumes normal delivery. Returns
+    /// true at most once per congestion episode.
+    ///
+    /// Refreshes first, so a caller that checks this BEFORE draining (the
+    /// recv path does, since the error must precede the data) still sees an
+    /// eviction that has not been observed by a read yet.
+    pub fn take_overrun(&mut self) -> bool {
+        self.refresh_overrun();
+        core::mem::take(&mut self.overrun)
+    }
+
+    /// Whether an overrun is pending, without consuming it.
+    pub fn overrun_pending(&self) -> bool {
+        self.overrun
+    }
+
     /// Peek without advancing.
     pub fn peek(&self, max: usize) -> Vec<UeventEnv> {
         let ring = UEVENT_RING.lock();
-        let (evs, _) = ring.read_from(self.next_seqnum, max);
+        let (evs, _) = ring.read_from(self.next_seqnum.max(ring.floor), max);
         evs
     }
 
-    /// True if there are events waiting.
+    /// True if there are events waiting, or an overrun is waiting to be
+    /// reported — a pending ENOBUFS has to make the socket readable, or
+    /// the reader never calls recv and never learns it lost data.
     pub fn has_pending(&self) -> bool {
-        !self.peek(1).is_empty()
+        if self.overrun {
+            return true;
+        }
+        // An eviction that no read has observed yet still owes this reader
+        // an ENOBUFS, so it must count as readable — otherwise poll says
+        // "nothing here", the reader never calls recv, and it never learns
+        // it lost data. `&self` here, so compare without latching; the
+        // latch happens in `take_overrun` on the recv that follows.
+        let floor = UEVENT_RING.lock().floor;
+        self.next_seqnum < floor || !self.peek(1).is_empty()
     }
 }
 
@@ -429,5 +505,10 @@ pub fn __reset_for_test() {
     let mut ring = UEVENT_RING.lock();
     ring.entries.clear();
     ring.next_seqnum = 1;
+    // The floor must rewind with the seqnum counter. Leaving it raised by a
+    // previous test's eviction puts it ABOVE the restarted seqnums, so every
+    // later reader looks permanently overrun and is fast-forwarded past
+    // events that are really there — the whole suite drains nothing.
+    ring.floor = 1;
     BOOT_UDEVD_REPLAY_START.store(0, Ordering::Release);
 }
