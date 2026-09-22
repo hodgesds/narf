@@ -100,11 +100,32 @@ const MS_NOUSER: u64 = 1 << 31;
 /// of them look like a privilege problem.
 ///
 /// LINUX-GAPs still open in this handler, all noted where they occur:
-///   * The target is never required to exist: Linux's `user_path_at` gives
-///     -ENOENT for a missing target and -ENOTDIR for a non-directory one
-///     BEFORE any of the flag handling, and NARF's flat mount table happily
-///     registers a mount at a path that has no node. `do_add_mount`'s -EBUSY
-///     for a target that already carries this same mount is likewise absent.
+///   * The target is never required to exist. `do_mount` resolves it with
+///     `user_path_at` and returns -ENOENT BEFORE `path_mount` runs, so a
+///     missing target outranks both the MS_NOUSER -EINVAL and the
+///     `may_mount()` -EPERM. NARF's flat mount table instead registers a
+///     mount at a path that has no node, so the call reports success and
+///     nothing is there. `do_add_mount`'s -EBUSY for a target that already
+///     carries this same mount is likewise absent.
+///
+///     Closing this needs more than a check here. Mounts are string-prefix
+///     routing over a flat `Vec<Mount>`, not a tree, so "does this target
+///     exist" can only be answered by a filesystem that covers the path —
+///     and NARF mounts a root only when the cmdline carries `root=`. The
+///     kernel-test fixtures mount none at all and mount at paths with no
+///     node throughout; a root MemFs makes them answerable (measured: no
+///     regressions), after which ~65 fixtures still need their bespoke
+///     targets created before the check can be turned on.
+///   * -ENOTDIR is NOT "the target is not a directory". Linux raises it from
+///     `graft_tree`, and it is a MISMATCH test between the two ends:
+///
+///         if (d_is_dir(mp->mp->m_dentry) != d_is_dir(mnt->mnt.mnt_root))
+///                 return -ENOTDIR;
+///
+///     so a file bound onto a file is legal — that is how a container gets
+///     its own /etc/resolv.conf — while a filesystem onto a file, or a file
+///     onto a directory, is -ENOTDIR. Reading this arm as "target must be a
+///     directory" and enforcing that would break file bind mounts.
 ///   * -ENOTBLK (a block-device fstype whose `source` names a non-block file)
 ///     and -EACCES (an unsearchable target directory) have no NARF analogue:
 ///     the block layer here is a flat name→device registry with no file

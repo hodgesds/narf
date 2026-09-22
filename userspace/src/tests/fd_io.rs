@@ -2224,27 +2224,41 @@ kernel_test_in!("userspace", smoke_userspace_copy_file_range_round_trip);
 /// event loop and — under the cooperative own-stack scheduler — starved a
 /// same-CPU peer (dbus-daemon), stalling D-Bus round-trips ~25s.
 #[cfg(target_arch = "x86_64")]
-fn smoke_userspace_eventfd_write_fires_readiness_notify() -> TestResult {
+fn smoke_userspace_eventfd_write_targets_its_readiness_cell() -> TestResult {
     use narf_filesystem::FileOps;
     let ev = crate::io_mux::EventFd::new(0, 0);
     if !ev.readiness_notifies() {
         return TestResult::Fail("eventfd readiness_notifies() must be true so a poll can park");
     }
     let before = narf_net::readiness::generation();
-    // write() adds to the counter and must bump the readiness generation.
     let r = crate::handlers::poll_blocking(ev.write(0, &1u64.to_le_bytes()));
     if !matches!(r, Some(Ok(8))) {
         return TestResult::Fail("eventfd write(8 bytes) did not return 8");
     }
-    if narf_net::readiness::generation() <= before {
-        return TestResult::Fail("eventfd write() did not bump the readiness generation");
+    // write() publishes POLL_IN on THIS fd's durable readiness cell. That is
+    // the wake a parked poll/epoll consumes — both arm the cell, poll via
+    // `arm_readiness_cells` and epoll via `arm_readiness_persistent`.
+    if ev.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("eventfd write() did not publish POLL_IN on its readiness cell");
+    }
+    // ...and must NOT bump the global generation. This case used to assert the
+    // opposite, because `EventFd::write` also called
+    // `narf_net::readiness::notify(0)` — a wake-ALL of every parked io-waiter
+    // system-wide, since an eventfd carries no TCB owner key. glib clients
+    // (kwin) write their wakeup eventfd thousands of times a second, so that
+    // broadcast woke every parked daemon (60k+ observed): an IPI/HLT
+    // thundering herd that starved the actual producer. ab49f057 dropped it
+    // once poll and epoll both armed cells. Asserting its ABSENCE here is what
+    // stops it being reintroduced as "belt and suspenders" a second time.
+    if narf_net::readiness::generation() != before {
+        return TestResult::Fail("eventfd write() bumped the global generation (wake-all herd)");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "userspace",
-    smoke_userspace_eventfd_write_fires_readiness_notify
+    smoke_userspace_eventfd_write_targets_its_readiness_cell
 );
 
 /// `thread_group_live_count` (backs /proc/[pid]/status `Threads:` and
