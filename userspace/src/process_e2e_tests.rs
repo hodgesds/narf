@@ -3572,15 +3572,24 @@ fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_wave61_pidfd_zombie_immediate);
 
-/// Regression: `PidFdFile::poll_readiness` must be AUTHORITATIVE — consult the
-/// target task's real state — not merely cache-driven off the `exited` flag.
-/// `notify_exit(pid)` is missed when the pid is released back to the pool
-/// before the exiting task's observer fires; the flag then stays false and a
-/// supervisor (systemd, Qt forkfd) blocks forever on a process that already
-/// exited. The fallback keys on the immutable, reuse-safe TaskId, so it must
-/// fire once the task is a zombie or gone from the registry — and must NOT
-/// fire while the task is alive.
-fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
+/// Regression: a pidfd must become readable only once the exit has been
+/// PUBLISHED — never merely because the task reached zombie state.
+///
+/// This case used to assert the opposite. `poll_readiness` carried a
+/// `task_has_exited(tid)` fallback that went true at `mark_zombie`, added so a
+/// missed `notify_exit(pid)` could not leave a supervisor blocked forever on a
+/// process that had already exited. But `mark_zombie` runs BEFORE the child's
+/// entry is pushed to PENDING_EXITS, so the fallback made the pidfd readable
+/// while nothing was reapable yet. A systemd-style EPOLLONESHOT reaper then
+/// spent its single delivery on a `waitid(P_PIDFD)` that found nothing, never
+/// re-armed, and the child stayed an unreaped zombie — ~15 of them under a
+/// parked epoll_wait, hanging boot behind those start jobs.
+///
+/// 105f0421 moved `notify_exit` to after the PENDING_EXITS push and dropped
+/// the fallback, so the `exited` flag is set reliably on every exit path and is
+/// authoritative on its own. The ordering is the contract now, and that is what
+/// this pins: zombie-but-unpublished must NOT be readable, published must be.
+fn smoke_pidfd_authoritative_exit_published_ordering() -> TestResult {
     use narf_filesystem::POLL_IN;
 
     crate::pidfd::__test_reset();
@@ -3598,30 +3607,42 @@ fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
         return TestResult::Fail("pidfd for a LIVE task must not be readable via the fallback");
     }
 
-    // Zombie (exited, not yet reaped): flag still unset, but the authoritative
-    // fallback must report POLLIN — this is the fix.
+    // Zombie, but the exit has NOT been published yet. `mark_zombie` runs
+    // before the PENDING_EXITS push, so a pidfd that reported POLLIN here
+    // would hand an EPOLLONESHOT reaper a delivery with nothing to reap.
     crate::task::mark_zombie(TID);
-    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN != 0 {
         let _ = crate::task::release_task(TID);
         crate::pidfd::__test_reset();
         return TestResult::Fail(
-            "pidfd for a ZOMBIE task must be readable via the authoritative fallback",
+            "pidfd went readable at mark_zombie, before the exit was published",
         );
     }
 
-    // Reaped (gone from the registry): still POLLIN.
+    // Publishing the exit is what makes it readable — the order `on_child_exit`
+    // now uses, after the reap entry exists.
+    crate::pidfd::notify_exit(PID);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        let _ = crate::task::release_task(TID);
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("pidfd not readable after the exit was published");
+    }
+
+    // Still readable once the task is gone from the registry: the published
+    // flag, not the task's presence, is what a late poller observes.
     let _ = crate::task::release_task(TID);
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
         crate::pidfd::__test_reset();
-        return TestResult::Fail(
-            "pidfd for a REAPED (gone) task must be readable via the fallback",
-        );
+        return TestResult::Fail("pidfd for a REAPED (gone) task must stay readable");
     }
 
     crate::pidfd::__test_reset();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_pidfd_authoritative_exit_fallback);
+kernel_test_in!(
+    "userspace/process",
+    smoke_pidfd_authoritative_exit_published_ordering
+);
 
 /// Regression (kwin black-screen freeze): a live `mint_for` must NOT inherit a
 /// prior occupant's `exited = true` row for a recycled pid. `forget_pid` clears
