@@ -131,20 +131,22 @@ impl FileOps for EventFd {
                     Err(observed) => cur = observed,
                 }
             }
-            // Wake any task parked in poll/epoll on this eventfd. Without a
-            // readiness notify an eventfd was a "silent" source, so a blocking
-            // poll containing one could NOT park — it fell back to a busy spin
-            // (poll_all_parkable == false). glib's main loop wakes its worker
-            // via an eventfd write, so a Qt/glib client (kwin) polling its bus
-            // socket + a glib wakeup eventfd busy-spun the whole time, and under
-            // the cooperative own-stack scheduler that starved a same-CPU peer
-            // (dbus-daemon couldn't service elogind's GetConnectionUnixUser →
-            // kwin's GetSession timed out at 25s → "no graphical session"). With
-            // this notify the eventfd is parkable, so the poll parks and this
-            // write wakes it promptly. notify(0) = wake-all (an eventfd carries
-            // no kernel TCB key); best-effort, mirrors the AF_UNIX send path.
+            // Wake tasks parked in poll/epoll on THIS eventfd via its durable
+            // readiness cell — a TARGETED wake of just this fd's waiters.
+            // `sync_readiness` sets POLL_IN and fires the cell's wait-queue, which
+            // wakes every poll/epoll waiter armed on it (both arm the cell:
+            // poll via `arm_readiness_cells`, epoll via `arm_readiness_persistent`),
+            // including a glib `g_poll`/ppoll worker on its wakeup eventfd. The
+            // former `narf_net::readiness::notify(0)` here was a wake-ALL broadcast
+            // (an eventfd carries no TCB owner key) kept "belt-and-suspenders"
+            // during the durable-readiness migration — but glib clients write
+            // their wakeup eventfd thousands of times/sec, so each write woke
+            // EVERY parked io-waiter system-wide (a thundering herd: unrelated
+            // system daemons observed woken 60k+ times, an IPI/HLT storm that
+            // starves the actual producer). The cell wake above is the correct
+            // targeted path now that poll+epoll both arm cells, so the broadcast
+            // is dropped.
             self.sync_readiness(POLL_IN);
-            narf_net::readiness::notify(0);
             Ok(8)
         })
     }
