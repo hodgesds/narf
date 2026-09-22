@@ -135,10 +135,11 @@ fn tcb_owner_shard(tcb_id: u32) -> usize {
 /// latch and re-executes instead of parking, closing the scan→register lost-wake
 /// race precisely (no periodic backstop, no global-generation spurious re-exec).
 /// `wake_all_io_waiters` (the untargeted broadcast fallback) does NOT latch — it
-/// has no single target; that rarer race is closed instead by the readiness
-/// GENERATION compare (`user_task::io_wait_generation_raced`), which the non-epoll
-/// `net_io_wait` park runs after registering (epoll parks use the authoritative
-/// `epoll_fd_has_ready` re-check). No periodic backstop.
+/// has no single target; that rarer race is closed instead by the non-epoll
+/// `net_io_wait` park's authoritative per-fd re-check after registering
+/// (`poll::installed_poll_files_ready` re-scans the waiter's own installed poll
+/// files; epoll parks use `epoll_fd_has_ready`). No coarse global-generation
+/// re-exec, no periodic backstop.
 struct WakerShard {
     wakers: alloc::collections::BTreeMap<u64, core::task::Waker>,
     pending: alloc::collections::BTreeSet<u64>,

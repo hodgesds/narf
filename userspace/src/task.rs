@@ -132,9 +132,12 @@ pub struct Task {
         narf_lib::sync::IrqSafeSpinLock<Option<crate::select::SelectParkSnapshot>>,
 }
 
-/// One entry of [`Task::poll_files`]: the resolved file and the offset it
-/// had at poll entry. `None` when the fd named no open file.
-pub type PollFileSlot = Option<(Arc<dyn narf_filesystem::FileOps>, u64)>;
+/// One entry of [`Task::poll_files`]: the resolved file, the offset it had at
+/// poll entry, and the poll interest (`events`) mask. `None` when the fd named
+/// no open file. The events mask lets the park's authoritative re-check
+/// (`poll::installed_poll_files_ready`) query each fd's readiness for THIS
+/// poll's interest without the caller's userspace `pollfd` array.
+pub type PollFileSlot = Option<(Arc<dyn narf_filesystem::FileOps>, u64, u32)>;
 
 impl Task {
     /// Create and register a task under `tid`. The caller must have

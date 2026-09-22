@@ -341,12 +341,14 @@ pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
                     // that is what keeps `/dev/kmsg` re-evaluating as its
                     // reader drains.
                     (Some(entry), Some((_, offset))) => {
-                        entry[i].as_ref().map(|(ops, _)| (ops.clone(), offset))
+                        entry[i].as_ref().map(|(ops, _, _)| (ops.clone(), offset))
                     }
                     // Closed since entry: keep polling the file we hold, at
                     // the offset it had. This is the whole point — the fd
                     // number is gone but the file is not.
-                    (Some(entry), None) => entry[i].clone(),
+                    (Some(entry), None) => {
+                        entry[i].as_ref().map(|(ops, off, _)| (ops.clone(), *off))
+                    }
                     (None, live) => live,
                 }
             })
@@ -457,6 +459,41 @@ pub(crate) fn clear_poll_wait_record(task_id: u64, uc: &crate::user_task::UserTa
 /// [`crate::task::Task::poll_files`]). No-op when a resolution is already
 /// held — the park re-executes this syscall on every wake, and re-resolving
 /// then is precisely the bug this prevents.
+/// Authoritative park re-check for a non-epoll `poll(2)`/`select` waiter: are
+/// ANY of the task's installed poll files ready for their interest RIGHT NOW?
+///
+/// This REPLACES the coarse global readiness-generation compare. The global
+/// generation is bumped by every fd system-wide, so treating an advance as "my
+/// interest is ready" either spins (re-executing forever on unrelated activity)
+/// or, if bounded, drops a wake. Querying each installed fd's ACTUAL readiness
+/// for its recorded events is exact for cell-backed, `readiness_notifies`, and
+/// legacy fds alike: it neither spins on unrelated activity nor misses a wake
+/// that raced the scan→register window (this runs AFTER waiter registration).
+///
+/// Returns `false` when no poll files are installed — a blocking `recv` parks on
+/// its socket's targeted io-owner wake + the `register_io_waiter` latch, not on
+/// a poll-file set. Snapshots under the lock and polls OUTSIDE it: a nested
+/// epoll fd's `poll_readiness_at` re-enters the fd table (see `poll_scan`).
+pub(crate) fn installed_poll_files_ready(task_id: u64) -> bool {
+    let Some(files) = crate::task::task_get_local(task_id).map(|t| t.poll_files.lock().clone())
+    else {
+        return false;
+    };
+    if files.is_empty() {
+        return false;
+    }
+    let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
+    // `.flatten()` skips the `None` slots — an ignored negative-fd entry (poll
+    // skips it), never ready.
+    for (ops, offset, events) in files.iter().flatten() {
+        let mask = ops.poll_readiness_at(*offset) as u16;
+        if mask & ((*events as u16) | always) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
     let Some(t) = crate::task::task_get_local(task_id) else {
         return;
@@ -474,7 +511,11 @@ pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
                     None
                 } else {
                     let entry = tbl.get(item.fd as u32)?;
-                    Some((entry.ops.clone(), tbl.offset(item.fd as u32)?))
+                    Some((
+                        entry.ops.clone(),
+                        tbl.offset(item.fd as u32)?,
+                        item.events as u32,
+                    ))
                 }
             })
             .collect()
@@ -663,11 +704,11 @@ pub(crate) fn poll_wait_kernel(
         Some(deadline) => uctx.sleep_deadline_ns.store(deadline, Ordering::Release),
     }
 
-    // Snapshot the net readiness generation BEFORE the readiness scan below, so
-    // the park routine's non-epoll `net_io_wait` lost-wake guard
-    // (`io_wait_generation_raced`) can detect a `notify` that races our
-    // check→register window. A stale snapshot here would make that guard
-    // re-execute forever (there is no per-fd ready-list for a raw poll set).
+    // Snapshot the net readiness generation (kept for the epoll snapshot
+    // convention). The non-epoll `net_io_wait` park no longer consults it: after
+    // registering, it authoritatively re-checks THIS waiter's own installed poll
+    // files (`installed_poll_files_ready`), which is exact per-fd — so a racing
+    // `notify` cannot be lost and unrelated fd activity cannot spin it.
     uctx.epoll_park_gen
         .store(narf_net::readiness::generation(), Ordering::Release);
     install_poll_files(task_id, fds);

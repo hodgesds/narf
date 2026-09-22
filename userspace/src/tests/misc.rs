@@ -2061,44 +2061,6 @@ kernel_test_in!(
 
 kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 
-/// The 10 ms `NET_IO_WAIT` lost-wake backstop is REMOVED — it masked a real bug.
-/// The former `refresh_io_wait_generation_after_registration` only STORED (never
-/// COMPARED) the readiness generation, so a `notify` racing scan→register was
-/// dropped and the task re-polled only after the backstop period — permanently
-/// wedging on a lost wake (the CachyOS greeter: PARK-CENSUS with every task
-/// parked on socket I/O, `deadline=u64::MAX`, SMP=1 included). The close is now a
-/// genuine generation COMPARE (`io_wait_generation_raced`), so an infinite
-/// non-epoll `net_io_wait` park re-executes on a racing notify instead of arming
-/// a fallback timer. This pins that the compare fires at the exact boundary the
-/// backstop used to cover: an infinite io-wait park whose generation advanced.
-#[cfg(target_arch = "x86_64")]
-fn smoke_userspace_net_io_wait_no_backstop_generation_compare() -> TestResult {
-    use crate::user_task::{io_wait_generation_raced, UserTaskCtx};
-    use core::sync::atomic::Ordering;
-
-    let uc = UserTaskCtx::new();
-    uc.net_io_wait.store(true, Ordering::Release);
-    uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
-
-    // The scan site stores the PRE-scan generation; a `notify` then races the
-    // (would-be) register. `generation()` is monotonic and we bump it ourselves,
-    // so the compare MUST observe the advance regardless of concurrency.
-    uc.epoll_park_gen
-        .store(narf_net::readiness::generation(), Ordering::Release);
-    narf_net::readiness::bump_generation();
-    if !io_wait_generation_raced(&uc) {
-        return TestResult::Fail(
-            "a racing notify must re-execute the infinite io-wait park (no backstop to save it)",
-        );
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test_in!(
-    "userspace",
-    smoke_userspace_net_io_wait_no_backstop_generation_compare
-);
-
 /// The io-waiter LATCH closes the scan->register lost-wake race precisely: a
 /// targeted `wake_io_owner` for a task that has not yet registered its waiter
 /// records a pending latch instead of dropping the wake, and the task's next
@@ -2157,54 +2119,6 @@ fn smoke_userspace_io_waiter_wake_latch() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_io_waiter_wake_latch);
-
-/// A readiness `notify` that races a NON-epoll `net_io_wait` waiter's
-/// registration (poll/select/blocking recv — no per-fd ready-list to re-check)
-/// is a LOST WAKE: the task MUST re-execute so its re-scan observes the
-/// readiness. The generation COMPARE (`io_wait_generation_raced`) detects the
-/// advance; the caller then drops the waiter and clears the park. This INVERTS
-/// the former behavior, which only refreshed the snapshot and kept the task
-/// parked until the (now-deleted) 10 ms backstop — the exact wedge. The compare
-/// then advances the snapshot so a following quiet re-check parks (no spin).
-fn smoke_userspace_io_generation_race_reexecutes_non_epoll() -> TestResult {
-    use crate::user_task::{io_wait_generation_raced, UserTaskCtx};
-    use core::sync::atomic::Ordering;
-
-    let ctx = UserTaskCtx::new();
-    ctx.net_io_wait.store(true, Ordering::Release);
-    ctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
-
-    // Pre-scan snapshot, then an unrelated/broadcast readiness notification lands
-    // in the scan→register window. The waiter is registered; the compare must
-    // report the race so the caller re-executes instead of stranding.
-    ctx.epoll_park_gen
-        .store(narf_net::readiness::generation(), Ordering::Release);
-    narf_net::readiness::bump_generation();
-    if !io_wait_generation_raced(&ctx) {
-        return TestResult::Fail("a generation race must re-execute (not keep the wait parked)");
-    }
-
-    // The compare advanced the snapshot to the observed generation, so a quiet
-    // re-check now parks — no spurious spin. Bounded retry tolerates a rare
-    // background notify slipping in.
-    let mut parked = false;
-    for _ in 0..1000 {
-        let g = narf_net::readiness::generation();
-        ctx.epoll_park_gen.store(g, Ordering::Release);
-        if !io_wait_generation_raced(&ctx) {
-            parked = true;
-            break;
-        }
-    }
-    if !parked {
-        return TestResult::Fail("a quiet re-check after the race must park (no spin)");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "userspace",
-    smoke_userspace_io_generation_race_reexecutes_non_epoll
-);
 
 /// An own-stack task parks by `kernel_switch`, not the legacy longjmp hook.
 /// Requiring that hook before considering the own-stack path turns an

@@ -809,68 +809,6 @@ mod current_user_task_source_tests {
     );
 }
 
-#[cfg(feature = "kernel-test")]
-mod io_wait_generation_tests {
-    use super::{io_wait_generation_raced, UserTaskCtx};
-    use core::sync::atomic::Ordering;
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    /// The scan→register lost-wake close for a NON-epoll `net_io_wait` park
-    /// (poll/select/blocking recv). The scan site snapshots the pre-scan
-    /// readiness generation into `epoll_park_gen`; after the waiter registers,
-    /// `io_wait_generation_raced` MUST report every `notify` that advanced the
-    /// generation in the window (→ re-execute) and advance its snapshot so a
-    /// quiet re-check does NOT re-fire (→ park, no spin). A SINGLE missed advance
-    /// is the permanent greeter wedge that the deleted 10 ms NET_IO_WAIT backstop
-    /// used to mask — so hammer it: 100k racing notifies, none may be lost.
-    fn smoke_io_wait_generation_race_detects_every_notify() -> TestResult {
-        let uc = UserTaskCtx::new();
-
-        // Direction 1 (the wedge direction): a notify landing in the window is
-        // ALWAYS observed. `generation()` is monotonic and we bump it ourselves,
-        // so `current > snapshot` holds regardless of any concurrent bump — this
-        // assertion cannot flake.
-        for _ in 0..100_000u64 {
-            let snapshot = narf_net::readiness::generation();
-            uc.epoll_park_gen.store(snapshot, Ordering::Release);
-            // A readiness `notify` (targeted or the untargeted broadcast) races
-            // our would-be `register_io_waiter` here.
-            narf_net::readiness::bump_generation();
-            let observed = narf_net::readiness::generation();
-            if !io_wait_generation_raced(&uc) {
-                return TestResult::Fail("a notify in the check→register window was LOST");
-            }
-            // The snapshot advanced to at least what the compare observed, so the
-            // race is consumed exactly once (no permanent re-fire, no double-count).
-            if uc.epoll_park_gen.load(Ordering::Acquire) < observed {
-                return TestResult::Fail("snapshot must advance past the observed generation");
-            }
-        }
-
-        // Direction 2 (no spurious spin): a quiet window (snapshot == current
-        // generation, no notify) reports NO race, so the task parks. Bounded
-        // retry tolerates a rare background `notify(0)` (e.g. evdev) slipping in
-        // — it can only fail if the compare is broken and always reports a race.
-        let mut parked = false;
-        for _ in 0..1000 {
-            let g = narf_net::readiness::generation();
-            uc.epoll_park_gen.store(g, Ordering::Release);
-            if !io_wait_generation_raced(&uc) {
-                parked = true;
-                break;
-            }
-        }
-        if !parked {
-            return TestResult::Fail("a quiet check→register window never parked (compare broken)");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "userspace/process",
-        smoke_io_wait_generation_race_detects_every_notify
-    );
-}
-
 // ── Per-task-own-stack syscall park ─────────────────────────────────
 //
 // In the own-stack model a blocking syscall does NOT longjmp back to the
@@ -886,38 +824,6 @@ mod io_wait_generation_tests {
 // mirrors `UserTaskFuture::poll`'s sleep/futex/io/console/signal-stop arms but
 // uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
 // returns a reaped result, not a re-execute) — that handler parks natively.
-
-/// Re-check the net readiness generation after a NON-epoll `net_io_wait` waiter
-/// has registered on `IO_WAKERS`, closing the scan→register lost-wakeup window.
-///
-/// This is the `net/src/readiness.rs` contract, verbatim: the scan site
-/// (poll/select/blocking-recv) snapshotted the readiness generation into
-/// `epoll_park_gen` *before* its readiness check; now that the waiter is
-/// registered, re-read the (global) generation. If it advanced, a `notify`
-/// landed in the check→register window — including the UNTARGETED broadcast
-/// (`wake_all_io_waiters`, evdev, untracked keys) that `IO_WAKERS` cannot latch
-/// for a not-yet-registered task, so the targeted-wake latch consumed by
-/// `register_io_waiter` does not cover it. Returns `true` (the caller must
-/// re-execute the syscall, whose re-scan then observes the readiness) and
-/// advances the snapshot to the observed value so a *standing* generation (no
-/// fresh notify) does not re-fire on the re-executed park. Returns `false` when
-/// nothing raced — safe to park.
-///
-/// EPOLL parks do NOT use this: they have an authoritative per-fd ready-list
-/// re-check (`epoll_fd_has_ready`) that is exact, so consulting the coarse global
-/// generation there would spuriously re-execute on unrelated-fd activity. The
-/// generation compare is reserved for the non-epoll case, which has no ready-list.
-///
-/// Replaces the former `refresh_io_wait_generation_after_registration`, which
-/// only *stored* the post-register generation (never compared it) and therefore
-/// dropped the racing broadcast wake — the bug the deleted 10 ms
-/// `NET_IO_WAIT` backstop used to mask (the CachyOS greeter wedge: every task
-/// parked `netio=true, deadline=u64::MAX`, SMP=1 included).
-pub(crate) fn io_wait_generation_raced(uc: &UserTaskCtx) -> bool {
-    let now_gen = narf_net::readiness::generation();
-    let pre = uc.epoll_park_gen.swap(now_gen, Ordering::AcqRel);
-    now_gen != pre
-}
 
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
@@ -1069,12 +975,15 @@ fn park_should_block(
                         uc.sleep_deadline_ns.store(0, Ordering::Release);
                         return false;
                     }
-                } else if io_wait_generation_raced(uc) {
-                    // NON-epoll net_io_wait (poll/select/blocking recv): no per-fd
-                    // ready-list, so a moved generation is the lost-wake signal —
-                    // re-execute so the re-scan observes the readiness instead of
-                    // parking on an inert timer. This is what the deleted 10 ms
-                    // NET_IO_WAIT backstop used to mask.
+                } else if crate::poll::installed_poll_files_ready(task_id) {
+                    // NON-epoll poll(2)/select: authoritatively re-check THIS
+                    // waiter's own installed poll files (not the coarse global
+                    // generation). Re-execute iff one is ready now — including a
+                    // readiness that raced the scan→register window — so the
+                    // syscall's re-scan delivers it; otherwise fall through and
+                    // park. Exact per-fd: no spin on unrelated fd activity, no
+                    // dropped wake. A blocking recv (no poll files) returns false
+                    // and parks on its socket's targeted io-owner wake.
                     crate::handlers::drop_io_waiter(task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
@@ -2299,12 +2208,16 @@ impl core::future::Future for UserTaskFuture {
                             cx.waker().wake_by_ref();
                             return core::task::Poll::Pending;
                         }
-                    } else if io_wait_generation_raced(&this.task.uctx) {
-                        // NON-epoll net_io_wait (poll/select/blocking recv): no
-                        // per-fd ready-list, so a moved generation is the lost-wake
-                        // signal — re-execute so the re-scan observes readiness
-                        // instead of parking on an inert timer. This is what the
-                        // deleted 10 ms NET_IO_WAIT backstop used to mask.
+                    } else if crate::poll::installed_poll_files_ready(
+                        crate::handlers::current_task_id(),
+                    ) {
+                        // NON-epoll poll(2)/select: authoritatively re-check THIS
+                        // waiter's own installed poll files (not the coarse global
+                        // generation) — re-execute iff one is ready now (including a
+                        // readiness that raced the scan→register window), else park.
+                        // Exact per-fd: no 100% spin on unrelated fd activity, no
+                        // dropped wake. A blocking recv (no poll files) returns false
+                        // and parks on its socket's targeted io-owner wake.
                         crate::handlers::drop_io_waiter(crate::handlers::current_task_id());
                         this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
                         cx.waker().wake_by_ref();

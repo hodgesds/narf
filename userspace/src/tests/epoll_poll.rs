@@ -4418,6 +4418,120 @@ fn smoke_poll_holds_files_across_sibling_close() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_poll_holds_files_across_sibling_close);
 
+/// `poll::installed_poll_files_ready` is the authoritative park re-check that
+/// REPLACED the coarse global readiness-generation compare for a non-epoll
+/// `poll(2)`/`select` waiter. It must be EXACT per-fd: report ready iff one of
+/// THIS waiter's installed poll files is ready for ITS recorded interest — never
+/// spin on unrelated activity (the old generation compare's failure mode) and
+/// never drop a wake. Three arms, mirroring the replaced coverage:
+///   * a file ready for its POLL_IN interest → ready;
+///   * a file whose only readiness is OUTSIDE its interest (POLL_OUT, interest
+///     POLL_IN) → NOT ready — the exactness the generation compare lacked;
+///   * no installed poll files (a blocking recv) → NOT ready, so it parks on its
+///     socket's targeted io-owner wake rather than on the poll-file set.
+fn smoke_installed_poll_files_ready_is_exact_per_fd() -> TestResult {
+    use alloc::sync::Arc;
+
+    /// A mock file whose readiness mask is fixed at construction.
+    #[derive(Debug)]
+    struct FixedReadiness(u32);
+    impl narf_filesystem::FileOps for FixedReadiness {
+        fn read<'a>(
+            &'a self,
+            _off: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness(&self) -> u32 {
+            self.0
+        }
+    }
+
+    // Install one POLL_IN-interest poll file resolving to a `FixedReadiness`.
+    fn install_one(tid: u64, ready_mask: u32) -> Option<()> {
+        let fd = crate::fd::install(
+            tid,
+            crate::fd::FdEntry {
+                ops: Arc::new(FixedReadiness(ready_mask)),
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        )?;
+        let fds = [crate::poll::PollFd {
+            fd: fd as i32,
+            events: narf_filesystem::POLL_IN as u16,
+            revents: 0,
+        }];
+        crate::poll::install_poll_files(tid, &fds);
+        Some(())
+    }
+
+    // (c) No poll files installed → not ready (a blocking recv parks elsewhere).
+    crate::fd::__test_reset();
+    const TID_EMPTY: u64 = 0xFACE_A001;
+    let t_empty = crate::task::Task::new_registered(TID_EMPTY, TID_EMPTY);
+    let empty_ready = crate::poll::installed_poll_files_ready(TID_EMPTY);
+    crate::poll::clear_poll_wait_record(TID_EMPTY, &t_empty.uctx);
+    crate::task::release_task(TID_EMPTY);
+    crate::fd::__test_reset();
+    if empty_ready {
+        return TestResult::Fail("no installed poll files must NOT report ready");
+    }
+
+    // (a) A file ready for its POLL_IN interest → ready.
+    crate::fd::__test_reset();
+    const TID_READY: u64 = 0xFACE_A002;
+    let t_ready = crate::task::Task::new_registered(TID_READY, TID_READY);
+    if install_one(TID_READY, narf_filesystem::POLL_IN).is_none() {
+        crate::task::release_task(TID_READY);
+        return TestResult::Fail("could not install the ready poll fd");
+    }
+    let is_ready = crate::poll::installed_poll_files_ready(TID_READY);
+    crate::poll::clear_poll_wait_record(TID_READY, &t_ready.uctx);
+    crate::task::release_task(TID_READY);
+    crate::fd::__test_reset();
+    if !is_ready {
+        return TestResult::Fail("a poll file ready for its interest must report ready");
+    }
+
+    // (b) Readiness OUTSIDE the interest mask (POLL_OUT, interest POLL_IN) → NOT
+    //     ready. The coarse generation compare would have re-fired here.
+    crate::fd::__test_reset();
+    const TID_MISMATCH: u64 = 0xFACE_A003;
+    let t_mis = crate::task::Task::new_registered(TID_MISMATCH, TID_MISMATCH);
+    if install_one(TID_MISMATCH, narf_filesystem::POLL_OUT).is_none() {
+        crate::task::release_task(TID_MISMATCH);
+        return TestResult::Fail("could not install the mismatch poll fd");
+    }
+    let mismatch_ready = crate::poll::installed_poll_files_ready(TID_MISMATCH);
+    crate::poll::clear_poll_wait_record(TID_MISMATCH, &t_mis.uctx);
+    crate::task::release_task(TID_MISMATCH);
+    crate::fd::__test_reset();
+    if mismatch_ready {
+        return TestResult::Fail("readiness outside the interest mask must NOT report ready");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_installed_poll_files_ready_is_exact_per_fd
+);
+
 /// Nested epoll: a child epoll fd is itself pollable, so a PARENT epoll (or
 /// `poll(2)`) that watches it arms a persistent per-fd waker on the child's OWN
 /// readiness cell. When a fd inside the child becomes ready, the child must
