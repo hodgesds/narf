@@ -804,6 +804,41 @@ jobs:
           cargo xtask test --arch=aarch64 --features cgroup-all,container \
             --subsystem verification
 
+      # Same shape, same reason, x86_64 side: the xAPIC fallback (no x2APIC)
+      # is the path real Renoir/Phoenix firmware puts us on when it refuses
+      # IA32_APIC_BASE.EXTD, and for its whole life no suite ran it. Three
+      # defects accumulated behind that gap — the LAPIC reached at a raw
+      # PHYSICAL address (#PF on 0xFEE0_0020 once the low identity map went
+      # away), `send_fixed_ipi` silently dropping every IPI, and the
+      # TLB-shootdown handler never being installed at all. The last two
+      # meant cross-CPU invalidation quietly left stale TLB entries on peer
+      # CPUs, and a shootdown sender spun forever waiting for acks.
+      #
+      # The boot-smoke job also runs with `-x2apic`, but only proves the
+      # kernel boots. This is the SMP half: multiple CPUs so the shootdown
+      # actually fans out to peers, which is the part that was broken.
+      # Scoped to `interrupts` — a regression guard, not a second full run.
+      #
+      # Capped well below the full-suite 2400s on purpose. The regression
+      # this guards fails by HANGING — a shootdown sender spins forever
+      # waiting for acks that cannot come — so the cap is what turns it
+      # into a CI failure, and an oversized one would burn 40 minutes of a
+      # 60-minute job before reporting. The subsystem itself is tiny (2s of
+      # QEMU locally under KVM), so 600s is ~300x headroom for GHA's TCG
+      # while still failing fast. `timeout-minutes` is a second backstop in
+      # case the hang is upstream of xtask's own cap.
+      - name: cargo xtask test — xAPIC fallback, SMP shootdown
+        if: matrix.arch == 'x86_64'
+        timeout-minutes: 15
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "600"
+          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "600"
+          NARF_QEMU_CPU: "max,-x2apic"
+          NARF_QEMU_SMP: "4"
+        run: |
+          cargo xtask test --arch=x86_64 --features cgroup-all,container \
+            --subsystem interrupts
+
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
     needs: changes
