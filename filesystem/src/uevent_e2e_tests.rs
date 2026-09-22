@@ -981,16 +981,22 @@ kernel_test_in!(
 // ever runs, and `read_from` just skips them: the reader's cursor is below
 // every surviving seqnum, so it silently resumes at the oldest survivor.
 //
-// LINUX-GAP: Linux does not lose a netlink monitor's events quietly. An
-// overrun socket receives -ENOBUFS, which is precisely how libudev learns it
-// must re-enumerate /sys instead of trusting its event stream. NARF has no
-// such signal, so a lagging udevd cannot tell "no events" from "your events
-// were dropped" — the difference between idling correctly and never creating
-// a single /dev node. Pinned here so closing it turns this test red.
+// A reader whose window was evicted must be TOLD. Linux does not lose a
+// netlink monitor's events quietly: an overrun socket receives -ENOBUFS,
+// which is precisely how libudev learns it must re-enumerate /sys instead of
+// trusting its event stream. Without that signal a lagging udevd cannot tell
+// "no events" from "your events were dropped" — the difference between
+// idling correctly and never creating a single /dev node.
 //
-// Linux ref: net/netlink/af_netlink.c::netlink_dump / netlink_overrun.
+// This case used to assert the SILENCE, as a pinned LINUX-GAP. It now
+// asserts the signal: the surviving window is still delivered, but the
+// reader is handed the overrun first.
+//
+// Linux ref: net/netlink/af_netlink.c::netlink_overrun — note it latches
+// once per congestion episode (`test_and_set_bit(NETLINK_S_CONGESTED)`),
+// not once per dropped event.
 
-fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult {
+fn smoke_uevent_boot_replay_reader_is_told_about_the_overrun_window() -> TestResult {
     reset();
 
     // Boot marks the replay boundary once its device projection is complete.
@@ -1038,9 +1044,24 @@ fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult
         return TestResult::Fail("precondition: DRM coldplug events were not evicted");
     }
 
-    // LINUX-GAP assertion: the reader is handed a clean, gap-free-looking
-    // batch. Nothing in the returned data, the cursor, or a status code says
-    // events were dropped. Linux would have raised ENOBUFS by now.
+    // The overrun must be reported, and reported BEFORE the surviving data:
+    // a reader handed events first would treat the batch as contiguous and
+    // never re-enumerate. `has_pending` has to agree, or poll says "nothing
+    // here", recv is never called, and the signal is never collected.
+    if !reader.overrun_pending() && !reader.has_pending() {
+        reset();
+        return TestResult::Fail("overrun left the reader with nothing pending — poll would idle");
+    }
+    if !reader.take_overrun() {
+        reset();
+        return TestResult::Fail("evicted window did not raise an overrun (would be -ENOBUFS)");
+    }
+    // Once per episode, not once per dropped event — a per-event report
+    // would hand a lagging udevd an ENOBUFS storm.
+    if reader.take_overrun() {
+        reset();
+        return TestResult::Fail("overrun latched more than once for a single episode");
+    }
     if events.len() != uevent::UEVENT_RING_N {
         reset();
         return TestResult::Fail("overrun drain did not return exactly the surviving window");
@@ -1055,7 +1076,7 @@ fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult
 }
 kernel_test_in!(
     "uevent_e2e",
-    smoke_uevent_boot_replay_reader_silently_loses_overrun_window
+    smoke_uevent_boot_replay_reader_is_told_about_the_overrun_window
 );
 
 // ══════════════════════════════════════════════════════════════════════════
