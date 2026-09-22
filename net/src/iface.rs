@@ -42,6 +42,58 @@ static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::ne
 pub const QEMU_DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
 pub const QEMU_DEFAULT_GW: [u8; 4] = [10, 0, 2, 2];
 
+/// Loopback transmit: a frame sent on "lo" is immediately received on
+/// "lo". Linux does the same thing — `loopback_xmit` hands the skb straight
+/// to `netif_rx` rather than to any hardware.
+///
+/// The reentrancy guard is the part that is not optional. `rx_handler` can
+/// answer a frame with another frame (a TCP ACK, an ICMP reply), and that
+/// answer routes back to lo and re-enters here. Linux breaks the chain by
+/// queueing to a softirq; NARF delivers inline, so without a guard a
+/// request/reply exchange recurses until the kernel stack is gone. One level
+/// in flight is enough for the deliver-and-reply pattern; anything deeper is
+/// a loop, and dropping is what Linux's backlog overflow does too.
+///
+/// The guard is PER-CPU. Recursion is a property of one call stack, so a
+/// single global flag would make two CPUs transmitting on lo at the same
+/// time drop each other's frames — turning an unrelated peer's traffic into
+/// loss that looks like a network fault. Same shape as the per-CPU staging
+/// in `bypass::classifier`.
+///
+/// The CPU index is read ONCE and used for both the claim and the release:
+/// if this task migrates mid-delivery, the release must still clear the flag
+/// it actually set, or that CPU is left permanently guarded and silently
+/// drops every later loopback frame.
+fn lo_send_fn(frame: &[u8]) -> Result<(), ()> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
+    static IN_LOOPBACK: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+    let cpu = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    if IN_LOOPBACK[cpu].swap(true, Ordering::AcqRel) {
+        return Err(());
+    }
+    let mut buf = frame.to_vec();
+    crate::tcp_stack::rx_handler("lo", &mut buf);
+    IN_LOOPBACK[cpu].store(false, Ordering::Release);
+    Ok(())
+}
+
+/// Register the loopback interface in the routing/dispatch registry.
+///
+/// `narf_net::register_loopback` builds the cap-gated `Loopback` device, but
+/// `for_dst` / `lookup_in` — the path TCP, UDP and ICMP use to pick an egress
+/// interface — read THIS registry, the one NIC drivers call into. Without an
+/// entry here a route to 127.0.0.0/8 resolves to an interface that dispatch
+/// cannot find, `for_dst` falls back to `primary_in()`, and a datagram
+/// addressed to 127.0.0.1 goes out the physical NIC.
+///
+/// Idempotent: `register` replaces a same-named entry.
+pub fn register_loopback_iface() {
+    register("lo", [0u8; 6], lo_send_fn);
+    set_iface_ipv4("lo", [127, 0, 0, 1], [0, 0, 0, 0]);
+}
+
 /// Register a NIC driver as a network interface. Called from the
 /// driver's probe path.
 pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
