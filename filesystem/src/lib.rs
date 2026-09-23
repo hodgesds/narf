@@ -3719,6 +3719,15 @@ impl MountNamespace {
             .collect()
     }
 
+    /// `(path, group_id)` of the mount covering `abs` in this namespace, by the
+    /// longest-prefix + newest-wins rule. Used to find a just-attached mount's
+    /// PARENT mount (call with the new mount's parent directory) to decide
+    /// whether propagation applies.
+    pub fn covering_mount_info(&self, abs: &str) -> Option<(String, u64)> {
+        let q = self.store().inner.lock();
+        covering_mount(&q, abs).map(|m| (m.path.clone(), m.group_id()))
+    }
+
     /// Replace the `MNT_*` flags of the mount at exactly `path` — Linux's
     /// `do_reconfigure_mnt`, which changes an existing attachment rather
     /// than creating one.
@@ -4347,6 +4356,26 @@ impl VfsRegistry {
     pub fn group_id_at(&self, abs: &str) -> Option<u64> {
         let q = self.inner.lock();
         mount_group_id_for(&q, abs)
+    }
+
+    /// Paths of every mount in this registry whose peer-group id is exactly
+    /// `gid` (non-zero). See [`MountNamespace::mount_paths_with_group`].
+    pub fn mount_paths_with_group(&self, gid: u64) -> Vec<String> {
+        if gid == 0 {
+            return Vec::new();
+        }
+        let q = self.inner.lock();
+        q.iter()
+            .filter(|m| m.group_id() == gid)
+            .map(|m| m.path.clone())
+            .collect()
+    }
+
+    /// `(path, group_id)` of the mount covering `abs` — see
+    /// [`MountNamespace::covering_mount_info`].
+    pub fn covering_mount_info(&self, abs: &str) -> Option<(String, u64)> {
+        let q = self.inner.lock();
+        covering_mount(&q, abs).map(|m| (m.path.clone(), m.group_id()))
     }
 
     /// Replace the `MNT_*` flags of the mount at exactly `path`.
