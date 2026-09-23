@@ -86,16 +86,27 @@ pub enum IcmpExtraError {
 
 // ── Generic builder: ICMP error header + original-packet head ─────
 
+/// Largest slice of the offending packet an ICMP error may quote.
+///
+/// RFC 1812 §4.3.2.3 caps the whole ICMP-carrying IP datagram at 576 bytes,
+/// which leaves 576 minus a 20-byte IPv4 header minus the 8-byte ICMP header.
+/// Quoting the entire original instead produced errors as large as the packet
+/// that provoked them — routinely over the egress MTU, so the error could not
+/// be delivered, and the reply to an oversized packet was itself oversized.
+pub const ICMP_ERROR_QUOTE_MAX: usize = 576 - 20 - 8;
+
 /// Build a generic 4-byte-rest-of-header ICMP error message:
 /// `[Type Code Checksum(2) RestOfHeader(4) OriginalIpHeader+8Bytes…]`.
-/// The checksum is filled in over the full message.
+/// The checksum is filled in over the full message. The quoted original is
+/// truncated to [`ICMP_ERROR_QUOTE_MAX`].
 pub fn build_error(typ: u8, code: u8, rest_of_header: u32, original: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + original.len());
+    let quoted = &original[..original.len().min(ICMP_ERROR_QUOTE_MAX)];
+    let mut out = Vec::with_capacity(8 + quoted.len());
     out.push(typ);
     out.push(code);
     out.extend_from_slice(&[0u8; 2]); // checksum placeholder
     out.extend_from_slice(&rest_of_header.to_be_bytes());
-    out.extend_from_slice(original);
+    out.extend_from_slice(quoted);
     let cs = ip_checksum(&out);
     out[2] = (cs >> 8) as u8;
     out[3] = (cs & 0xFF) as u8;

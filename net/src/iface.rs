@@ -60,7 +60,7 @@ fn dev_conf_register(iface_name: &str) {
     let v = DEV_CONF_HOOK.load(Ordering::Acquire);
     if v == 0 {
         // No procfs yet — still seed the value so the datapath has one.
-        narf_lib::sysctl::ipv4::init_device_forwarding(iface_name);
+        narf_lib::sysctl::ipv4::init_device_conf(iface_name);
         return;
     }
     // SAFETY: v was stored by install_dev_conf_hooks as a DevConfFn

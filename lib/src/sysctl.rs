@@ -41,10 +41,25 @@ pub mod ipv4 {
     /// fact, which is how Linux's `devconf_dflt` behaves at device creation.
     pub static IP_FORWARD_DEFAULT: AtomicU32 = AtomicU32::new(0);
 
-    /// Per-interface `net.ipv4.conf.<dev>.forwarding`, for the interfaces
-    /// that have been given an explicit value. Absent means "inherit
-    /// [`IP_FORWARD_DEFAULT`]".
-    static DEV_FORWARDING: IrqSafeSpinLock<Vec<(String, u32)>> = IrqSafeSpinLock::new(Vec::new());
+    /// `net.ipv4.conf.all.send_redirects`. Linux's `IN_DEV_TX_REDIRECTS` is
+    /// an OR of this and the per-interface value, and both default to 1 --
+    /// a router sends redirects unless told not to.
+    pub static SEND_REDIRECTS_ALL: AtomicU32 = AtomicU32::new(1);
+
+    /// `net.ipv4.conf.default.send_redirects`.
+    pub static SEND_REDIRECTS_DEFAULT: AtomicU32 = AtomicU32::new(1);
+
+    /// One interface's `net.ipv4.conf.<dev>.*` values.
+    #[derive(Clone, Debug)]
+    struct DevConf {
+        name: String,
+        forwarding: u32,
+        send_redirects: u32,
+    }
+
+    /// Per-interface conf, for interfaces that have been seeded. Absent means
+    /// "inherit the `conf.default` value".
+    static DEV_CONF: IrqSafeSpinLock<Vec<DevConf>> = IrqSafeSpinLock::new(Vec::new());
 
     /// `net.ipv4.icmp_echo_ignore_all`. Non-zero means: do not answer ICMP
     /// echo requests at all. Linux default 0 (`icmp_sk_init`,
@@ -81,9 +96,9 @@ pub mod ipv4 {
 
     /// As [`device_forwarding`], but the raw value — what procfs prints.
     pub fn device_forwarding_value(iface: &str) -> u32 {
-        let g = DEV_FORWARDING.lock();
-        match g.iter().find(|(name, _)| name == iface) {
-            Some((_, v)) => *v,
+        let g = DEV_CONF.lock();
+        match g.iter().find(|d| d.name == iface) {
+            Some(d) => d.forwarding,
             None => IP_FORWARD_DEFAULT.load(Ordering::Relaxed),
         }
     }
@@ -92,10 +107,56 @@ pub mod ipv4 {
     /// interface, as writing the per-device key does in Linux.
     pub fn set_device_forwarding(iface: &str, on: bool) {
         let v = u32::from(on);
-        let mut g = DEV_FORWARDING.lock();
-        match g.iter_mut().find(|(name, _)| name == iface) {
-            Some(slot) => slot.1 = v,
-            None => g.push((String::from(iface), v)),
+        let mut g = DEV_CONF.lock();
+        match g.iter_mut().find(|d| d.name == iface) {
+            Some(d) => d.forwarding = v,
+            None => {
+                let dflt = SEND_REDIRECTS_DEFAULT.load(Ordering::Relaxed);
+                g.push(DevConf {
+                    name: String::from(iface),
+                    forwarding: v,
+                    send_redirects: dflt,
+                });
+            }
+        }
+    }
+
+    /// True iff this interface may send ICMP Redirects.
+    ///
+    /// Linux: `IN_DEV_TX_REDIRECTS` is `IN_DEV_ORCONF(SEND_REDIRECTS)` — the
+    /// OR of `conf.all` and the interface's own value, unlike forwarding,
+    /// which reads the interface alone. So silencing redirects takes clearing
+    /// both.
+    pub fn device_send_redirects(iface: &str) -> bool {
+        if SEND_REDIRECTS_ALL.load(Ordering::Relaxed) != 0 {
+            return true;
+        }
+        device_send_redirects_value(iface) != 0
+    }
+
+    /// The raw per-interface `send_redirects` value — what procfs prints.
+    pub fn device_send_redirects_value(iface: &str) -> u32 {
+        let g = DEV_CONF.lock();
+        match g.iter().find(|d| d.name == iface) {
+            Some(d) => d.send_redirects,
+            None => SEND_REDIRECTS_DEFAULT.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Set one interface's `conf.<dev>.send_redirects`.
+    pub fn set_device_send_redirects(iface: &str, on: bool) {
+        let v = u32::from(on);
+        let mut g = DEV_CONF.lock();
+        match g.iter_mut().find(|d| d.name == iface) {
+            Some(d) => d.send_redirects = v,
+            None => {
+                let dflt = IP_FORWARD_DEFAULT.load(Ordering::Relaxed);
+                g.push(DevConf {
+                    name: String::from(iface),
+                    forwarding: dflt,
+                    send_redirects: v,
+                });
+            }
         }
     }
 
@@ -116,27 +177,30 @@ pub mod ipv4 {
             return;
         }
         IP_FORWARD_DEFAULT.store(v, Ordering::Relaxed);
-        let mut g = DEV_FORWARDING.lock();
-        for slot in g.iter_mut() {
-            slot.1 = v;
+        let mut g = DEV_CONF.lock();
+        for d in g.iter_mut() {
+            d.forwarding = v;
         }
     }
 
-    /// Give `iface` its starting value, inheriting `conf.default.forwarding`.
+    /// Give `iface` its starting values, inherited from the `conf.default` keys.
     /// Called when an interface is registered, mirroring Linux seeding a new
     /// `in_device`'s cnf from `devconf_dflt`.
-    pub fn init_device_forwarding(iface: &str) {
-        let mut g = DEV_FORWARDING.lock();
-        if g.iter().any(|(name, _)| name == iface) {
+    pub fn init_device_conf(iface: &str) {
+        let mut g = DEV_CONF.lock();
+        if g.iter().any(|d| d.name == iface) {
             return;
         }
-        let dflt = IP_FORWARD_DEFAULT.load(Ordering::Relaxed);
-        g.push((String::from(iface), dflt));
+        g.push(DevConf {
+            name: String::from(iface),
+            forwarding: IP_FORWARD_DEFAULT.load(Ordering::Relaxed),
+            send_redirects: SEND_REDIRECTS_DEFAULT.load(Ordering::Relaxed),
+        });
     }
 
-    /// Drop an interface's setting when it goes away.
-    pub fn forget_device_forwarding(iface: &str) {
-        DEV_FORWARDING.lock().retain(|(name, _)| name != iface);
+    /// Drop an interface's settings when it goes away.
+    pub fn forget_device_conf(iface: &str) {
+        DEV_CONF.lock().retain(|d| d.name != iface);
     }
 
     /// True iff echo requests must be ignored outright.
@@ -155,7 +219,9 @@ pub mod ipv4 {
     pub fn __reset_for_test() {
         IP_FORWARD.store(0, Ordering::Relaxed);
         IP_FORWARD_DEFAULT.store(0, Ordering::Relaxed);
-        DEV_FORWARDING.lock().clear();
+        SEND_REDIRECTS_ALL.store(1, Ordering::Relaxed);
+        SEND_REDIRECTS_DEFAULT.store(1, Ordering::Relaxed);
+        DEV_CONF.lock().clear();
         ICMP_ECHO_IGNORE_ALL.store(0, Ordering::Relaxed);
         ICMP_ECHO_IGNORE_BROADCASTS.store(1, Ordering::Relaxed);
     }

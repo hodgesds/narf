@@ -309,6 +309,18 @@ pub fn register_all() {
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/all/send_redirects",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL),
+        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/default/send_redirects",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT),
+        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
         path: "net/ipv4/conf/default/forwarding",
         read: || read_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT),
         write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT, s)),
@@ -935,14 +947,45 @@ kernel_test_in!("filesystem/procfs/sys_net", smoke_unix_max_dgram_qlen_rw);
 // through a hook installed in `frame::cross_crate_init` — procfs cannot see
 // the net stack to enumerate them itself.
 
-#[derive(Debug)]
-struct DevForwardingFile {
-    iface: alloc::string::String,
+/// Which per-interface key a [`DevConfFile`] serves.
+#[derive(Copy, Clone, Debug)]
+enum DevKey {
+    Forwarding,
+    SendRedirects,
 }
 
-impl super::ProcFile for DevForwardingFile {
+impl DevKey {
+    fn name(self) -> &'static str {
+        match self {
+            DevKey::Forwarding => "forwarding",
+            DevKey::SendRedirects => "send_redirects",
+        }
+    }
+
+    fn get(self, iface: &str) -> u32 {
+        match self {
+            DevKey::Forwarding => narf_lib::sysctl::ipv4::device_forwarding_value(iface),
+            DevKey::SendRedirects => narf_lib::sysctl::ipv4::device_send_redirects_value(iface),
+        }
+    }
+
+    fn set(self, iface: &str, on: bool) {
+        match self {
+            DevKey::Forwarding => narf_lib::sysctl::ipv4::set_device_forwarding(iface, on),
+            DevKey::SendRedirects => narf_lib::sysctl::ipv4::set_device_send_redirects(iface, on),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DevConfFile {
+    iface: alloc::string::String,
+    key: DevKey,
+}
+
+impl super::ProcFile for DevConfFile {
     fn read(&self) -> alloc::vec::Vec<u8> {
-        let v = narf_lib::sysctl::ipv4::device_forwarding_value(&self.iface);
+        let v = self.key.get(&self.iface);
         alloc::format!("{v}\n").into_bytes()
     }
 
@@ -956,25 +999,29 @@ impl super::ProcFile for DevForwardingFile {
         if v > 1 {
             return Err(FsError::InvalidData);
         }
-        narf_lib::sysctl::ipv4::set_device_forwarding(&self.iface, v != 0);
+        self.key.set(&self.iface, v != 0);
         Ok(buf.len())
     }
 }
 
-fn dev_forwarding_path(iface: &str) -> alloc::string::String {
-    alloc::format!("sys/net/ipv4/conf/{iface}/forwarding")
+fn dev_conf_path(iface: &str, key: DevKey) -> alloc::string::String {
+    let k = key.name();
+    alloc::format!("sys/net/ipv4/conf/{iface}/{k}")
 }
 
-/// Publish `/proc/sys/net/ipv4/conf/<iface>/forwarding` and seed the
-/// interface's setting from `conf.default.forwarding`.
+/// Publish `/proc/sys/net/ipv4/conf/<iface>/*` and seed the interface's
+/// settings from the matching `conf.default` keys.
 pub fn register_dev_conf(iface: &str) {
-    narf_lib::sysctl::ipv4::init_device_forwarding(iface);
-    super::register_proc(
-        &dev_forwarding_path(iface),
-        alloc::sync::Arc::new(DevForwardingFile {
-            iface: alloc::string::String::from(iface),
-        }),
-    );
+    narf_lib::sysctl::ipv4::init_device_conf(iface);
+    for key in [DevKey::Forwarding, DevKey::SendRedirects] {
+        super::register_proc(
+            &dev_conf_path(iface, key),
+            alloc::sync::Arc::new(DevConfFile {
+                iface: alloc::string::String::from(iface),
+                key,
+            }),
+        );
+    }
 }
 
 // The per-device conf keys are not `SysctlEntry`s, so they bypass
