@@ -11,9 +11,9 @@
 //! |------------------------------|-------------------------------------------|
 //! | `ip_forward`                 | `narf_lib::sysctl`, gates `net::ip_forward` |
 //! | `tcp_congestion_control`     | `TCP_CONG_ALG` IrqSafeSpinLock<String>   |
-//! | `tcp_timestamps`             | `TCP_TIMESTAMPS` atomic                   |
-//! | `tcp_sack`                   | `TCP_SACK` atomic                         |
-//! | `tcp_window_scaling`         | `TCP_WSCALE` atomic                       |
+//! | `tcp_timestamps`             | `narf_lib::sysctl`, gates TCP options     |
+//! | `tcp_sack`                   | `narf_lib::sysctl`, gates TCP options     |
+//! | `tcp_window_scaling`         | `narf_lib::sysctl`, gates TCP options     |
 //! | `ip_local_port_range`        | `PORT_RANGE_LO/HI` atomics                |
 //! | `icmp_echo_ignore_all`       | `narf_lib::sysctl`, enforced in `icmp_sock` |
 //! | `icmp_echo_ignore_broadcasts`| `narf_lib::sysctl`, enforced in `icmp_sock` |
@@ -37,7 +37,8 @@ use crate::FsError;
 
 // ── net.core atomics ────────────────────────────────────────────────────
 
-static SOMAXCONN: AtomicU32 = AtomicU32::new(128);
+// Consulted by `listen(2)` in `narf-net`; see the ICMP knobs below.
+pub use narf_lib::sysctl::ipv4::SOMAXCONN;
 static NETDEV_MAX_BACKLOG: AtomicU32 = AtomicU32::new(1000);
 static RMEM_DEFAULT: AtomicU32 = AtomicU32::new(212992);
 static RMEM_MAX: AtomicU32 = AtomicU32::new(212992);
@@ -54,7 +55,8 @@ static DEFAULT_QDISC: IrqSafeSpinLock<[u8; 16]> =
 /// Consulted by the IPv4 forwarding path in `narf-net`, so it lives in
 /// `narf_lib::sysctl` for the same reason the ICMP knobs below do.
 pub use narf_lib::sysctl::ipv4::IP_FORWARD;
-static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
+// Stamped on locally-originated packets by `narf-net`.
+pub use narf_lib::sysctl::ipv4::IP_DEFAULT_TTL;
 static TCP_KEEPALIVE_TIME: AtomicU32 = AtomicU32::new(7200);
 static TCP_KEEPALIVE_INTVL: AtomicU32 = AtomicU32::new(75);
 static TCP_KEEPALIVE_PROBES: AtomicU32 = AtomicU32::new(9);
@@ -62,12 +64,11 @@ static TCP_FIN_TIMEOUT: AtomicU32 = AtomicU32::new(60);
 static TCP_MAX_SYN_BACKLOG: AtomicU32 = AtomicU32::new(256);
 static TCP_SYNACK_RETRIES: AtomicU32 = AtomicU32::new(5);
 static TCP_SYN_RETRIES: AtomicU32 = AtomicU32::new(6);
-/// Exposed to TCP options layer. 1 = window scaling enabled by default.
-pub static TCP_WSCALE: AtomicU32 = AtomicU32::new(1);
-/// Exposed to TCP options layer. 1 = timestamps enabled by default.
-pub static TCP_TIMESTAMPS: AtomicU32 = AtomicU32::new(1);
-/// Exposed to TCP options layer. 1 = SACK enabled by default.
-pub static TCP_SACK: AtomicU32 = AtomicU32::new(1);
+// Consulted by the TCP option layer in `narf-net`, so these live in
+// `narf_lib::sysctl` for the same reason the ICMP and forwarding knobs do.
+pub use narf_lib::sysctl::ipv4::TCP_SACK;
+pub use narf_lib::sysctl::ipv4::TCP_TIMESTAMPS;
+pub use narf_lib::sysctl::ipv4::TCP_WINDOW_SCALING as TCP_WSCALE;
 static TCP_ECN: AtomicU32 = AtomicU32::new(2);
 static TCP_NO_METRICS_SAVE: AtomicU32 = AtomicU32::new(0);
 static TCP_MAX_ORPHANS: AtomicU32 = AtomicU32::new(4096);
@@ -221,10 +222,7 @@ pub fn ephemeral_port_range() -> (u16, u16) {
 /// Default TCP options flags (window_scaling, timestamps, sack).
 #[inline]
 pub fn tcp_option_defaults() -> (bool, bool, bool) {
-    let ws = TCP_WSCALE.load(Ordering::Relaxed) != 0;
-    let ts = TCP_TIMESTAMPS.load(Ordering::Relaxed) != 0;
-    let sack = TCP_SACK.load(Ordering::Relaxed) != 0;
-    (ws, ts, sack)
+    narf_lib::sysctl::ipv4::tcp_option_defaults()
 }
 
 // ── Registration ─────────────────────────────────────────────────────────

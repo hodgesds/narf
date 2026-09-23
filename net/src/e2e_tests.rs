@@ -2470,3 +2470,311 @@ kernel_test_in!(
     "net/e2e",
     smoke_ipv4_redirect_offlink_suppressed_and_rate_limited
 );
+
+// ── net.ipv4.tcp_{window_scaling,timestamps,sack} ───────────────────────────
+//
+// The three option knobs were stored in a crate the TCP code cannot see, so
+// `encode_syn_options` offered Window Scale, SACK-Permitted and Timestamps on
+// every SYN no matter what /proc said, and `negotiate` accepted whatever a
+// peer offered. Turning an option off did nothing in either direction.
+//
+// These cases read the SYN that actually leaves the interface.
+//
+// Linux refs: `tcp_syn_options` and `tcp_synack_options` (net/ipv4/
+// tcp_output.c), `tcp_parse_options` (net/ipv4/tcp_input.c).
+
+const TCPO_IFACE: &str = "e2e-tcpo3";
+const TCPO_LOCAL_IP: [u8; 4] = [10, 0, 11, 15];
+const TCPO_GW: [u8; 4] = [10, 0, 11, 2];
+const TCPO_PEER: [u8; 4] = [10, 0, 11, 40];
+
+/// Drive an active open to `peer_port` and return the parsed options of the
+/// SYN that leaves the interface.
+///
+/// `connect` blocks until the handshake completes or a 5 s deadline passes,
+/// and nothing here answers the SYN, so it always returns `Err`. That is
+/// fine and deliberate: the SYN is built and handed to the interface before
+/// the wait begins, which is the whole of what these cases inspect. The
+/// failed connect cleans up its own TCB.
+fn syn_options_emitted(peer_port: u16) -> Option<crate::tcp::options::ParsedOptions> {
+    drain_captured();
+    let _ = core::connect(TCPO_PEER, peer_port);
+    let frames = drain_captured();
+    let off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    for f in frames {
+        if f.len() <= off + TCP_HDR_MIN {
+            continue;
+        }
+        let data_off = ((f[off + 12] >> 4) as usize) * 4;
+        if data_off <= TCP_HDR_MIN || f.len() < off + data_off {
+            continue;
+        }
+        if f[off + 13] & FLAG_SYN == 0 {
+            continue;
+        }
+        return Some(crate::tcp::options::ParsedOptions::parse(
+            &f[off + TCP_HDR_MIN..off + data_off],
+        ));
+    }
+    None
+}
+
+// Defaults are all 1, so a SYN carries all three.
+fn smoke_tcp_syn_offers_all_options_by_default() -> TestResult {
+    full_reset(TCPO_IFACE, TCPO_LOCAL_IP, TCPO_GW);
+    crate::arp_cache::insert(TCPO_IFACE, TCPO_PEER, [0x02, 0x00, 0x00, 0x00, 0x00, 0x40]);
+    crate::tcp_stack::__arp_insert_legacy(TCPO_PEER, [0x02, 0x00, 0x00, 0x00, 0x00, 0x40]);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let parsed = match syn_options_emitted(21001) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SYN captured"),
+    };
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if parsed.wscale.is_none() {
+        return TestResult::Fail("SYN omitted Window Scale at default");
+    }
+    if !parsed.sack_permitted {
+        return TestResult::Fail("SYN omitted SACK-Permitted at default");
+    }
+    if parsed.timestamps.is_none() {
+        return TestResult::Fail("SYN omitted Timestamps at default");
+    }
+    if parsed.mss.is_none() {
+        return TestResult::Fail("SYN omitted MSS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_tcp_syn_offers_all_options_by_default);
+
+// Each knob suppresses its own option on the SYN, and only its own.
+fn smoke_tcp_option_sysctls_suppress_syn_options() -> TestResult {
+    full_reset(TCPO_IFACE, TCPO_LOCAL_IP, TCPO_GW);
+    crate::arp_cache::insert(TCPO_IFACE, TCPO_PEER, [0x02, 0x00, 0x00, 0x00, 0x00, 0x40]);
+    crate::tcp_stack::__arp_insert_legacy(TCPO_PEER, [0x02, 0x00, 0x00, 0x00, 0x00, 0x40]);
+
+    // tcp_window_scaling = 0
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    narf_lib::sysctl::ipv4::TCP_WINDOW_SCALING.store(0, Ordering::Relaxed);
+    let no_ws = match syn_options_emitted(21002) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SYN captured with tcp_window_scaling=0"),
+    };
+
+    // tcp_sack = 0
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    narf_lib::sysctl::ipv4::TCP_SACK.store(0, Ordering::Relaxed);
+    let no_sack = match syn_options_emitted(21003) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SYN captured with tcp_sack=0"),
+    };
+
+    // tcp_timestamps = 0
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    narf_lib::sysctl::ipv4::TCP_TIMESTAMPS.store(0, Ordering::Relaxed);
+    let no_ts = match syn_options_emitted(21004) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SYN captured with tcp_timestamps=0"),
+    };
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if no_ws.wscale.is_some() {
+        return TestResult::Fail("SYN carried Window Scale with tcp_window_scaling=0");
+    }
+    if !no_ws.sack_permitted || no_ws.timestamps.is_none() {
+        return TestResult::Fail("tcp_window_scaling=0 also suppressed another option");
+    }
+    if no_sack.sack_permitted {
+        return TestResult::Fail("SYN carried SACK-Permitted with tcp_sack=0");
+    }
+    if no_sack.wscale.is_none() || no_sack.timestamps.is_none() {
+        return TestResult::Fail("tcp_sack=0 also suppressed another option");
+    }
+    if no_ts.timestamps.is_some() {
+        return TestResult::Fail("SYN carried Timestamps with tcp_timestamps=0");
+    }
+    if no_ts.wscale.is_none() || !no_ts.sack_permitted {
+        return TestResult::Fail("tcp_timestamps=0 also suppressed another option");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_tcp_option_sysctls_suppress_syn_options);
+
+// A disabled option must also be refused when a peer offers it, or the peer
+// could switch back on what this host turned off. Linux gates
+// `tcp_parse_options` on the same sysctls for segments with SYN set.
+fn smoke_tcp_option_sysctls_refuse_peer_offer() -> TestResult {
+    use crate::tcp::options::{OptionsState, ParsedOptions};
+
+    let offered = ParsedOptions {
+        mss: Some(1460),
+        wscale: Some(7),
+        sack_permitted: true,
+        timestamps: Some((1234, 0)),
+        ..Default::default()
+    };
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    let mut on = OptionsState::new();
+    on.negotiate(&offered, 7);
+
+    narf_lib::sysctl::ipv4::TCP_WINDOW_SCALING.store(0, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::TCP_SACK.store(0, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::TCP_TIMESTAMPS.store(0, Ordering::Relaxed);
+    let mut off = OptionsState::new();
+    off.negotiate(&offered, 7);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !on.wscale_active || !on.sack_active || !on.timestamps_active {
+        return TestResult::Fail("peer's options not negotiated at defaults");
+    }
+    if off.wscale_active {
+        return TestResult::Fail("peer's Window Scale accepted with tcp_window_scaling=0");
+    }
+    if off.peer_wscale != 0 {
+        return TestResult::Fail("peer window scale retained with tcp_window_scaling=0");
+    }
+    if off.sack_active {
+        return TestResult::Fail("peer's SACK accepted with tcp_sack=0");
+    }
+    if off.timestamps_active {
+        return TestResult::Fail("peer's Timestamps accepted with tcp_timestamps=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_tcp_option_sysctls_refuse_peer_offer);
+
+// RFC 7323 §3: a SYN-ACK may not carry Timestamps unless the SYN did. The
+// same holds for Window Scale and SACK-Permitted — a SYN-ACK echoes, it does
+// not originate. Before the policy existed, every SYN-ACK offered all three
+// regardless of what the client sent.
+fn smoke_tcp_synack_echoes_only_offered_options() -> TestResult {
+    use crate::tcp::options::{OptionsState, ParsedOptions, SynOptionPolicy};
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // A bare SYN: MSS only.
+    let bare = ParsedOptions {
+        mss: Some(1460),
+        ..Default::default()
+    };
+    let mut state = OptionsState::new();
+    state.negotiate(&bare, 7);
+    let policy = SynOptionPolicy::for_synack(&state);
+
+    let opts = crate::tcp::options::encode_syn_options(1460, 7, 0x1111, 0, policy);
+    let echoed = ParsedOptions::parse(&opts);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if echoed.timestamps.is_some() {
+        return TestResult::Fail("SYN-ACK carried Timestamps the SYN never offered");
+    }
+    if echoed.wscale.is_some() {
+        return TestResult::Fail("SYN-ACK carried Window Scale the SYN never offered");
+    }
+    if echoed.sack_permitted {
+        return TestResult::Fail("SYN-ACK carried SACK-Permitted the SYN never offered");
+    }
+    if echoed.mss.is_none() {
+        return TestResult::Fail("SYN-ACK omitted MSS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_tcp_synack_echoes_only_offered_options);
+
+// ── net.ipv4.ip_default_ttl and net.core.somaxconn ──────────────────────────
+//
+// Two more knobs that were stored where the network stack could not read
+// them. `write_ipv4_header` stamped a literal 64 on every packet this host
+// originates, and `listen(2)` took whatever backlog it was handed.
+//
+// Linux refs: `ip4_dst_hoplimit()` (include/net/route.h) and
+// `__sys_listen_socket()` (net/socket.c).
+
+// The TTL on a packet we originate follows the knob. Driven through the ICMP
+// echo-reply path, which builds its header the same way every other
+// locally-originated packet does.
+fn smoke_ip_default_ttl_stamps_originated_packets() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let body = icmp_echo_request_body(0x7001, 1);
+    drain_captured();
+    crate::icmp_sock::on_icmp_rx_in(0, ICMP_GW, ICMP_LOCAL_IP, &body);
+    let default_ttl = captured_ipv4().first().map(|p| p[8]);
+
+    narf_lib::sysctl::ipv4::IP_DEFAULT_TTL.store(17, Ordering::Relaxed);
+    drain_captured();
+    crate::icmp_sock::on_icmp_rx_in(0, ICMP_GW, ICMP_LOCAL_IP, &body);
+    let custom_ttl = captured_ipv4().first().map(|p| p[8]);
+
+    // 0 would produce a packet that dies on the first hop; the accessor
+    // floors it rather than emitting one.
+    narf_lib::sysctl::ipv4::IP_DEFAULT_TTL.store(0, Ordering::Relaxed);
+    let floored = narf_lib::sysctl::ipv4::ip_default_ttl();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if default_ttl != Some(64) {
+        return TestResult::Fail("originated packet did not carry the default TTL of 64");
+    }
+    if custom_ttl != Some(17) {
+        return TestResult::Fail("originated packet ignored ip_default_ttl");
+    }
+    if floored == 0 {
+        return TestResult::Fail("ip_default_ttl=0 produced a zero TTL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ip_default_ttl_stamps_originated_packets);
+
+// listen(2) clamps its backlog to somaxconn.
+fn smoke_somaxconn_clamps_listen_backlog() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let backlog_of = |id: u32| core::lookup_tcb(id).map(|t| t.lock().backlog);
+
+    // Default somaxconn is 128, so an absurd backlog lands there.
+    let big = match core::listen(RT_LOCAL_IP, 22101, 9999) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("listen failed"),
+    };
+    let clamped_default = backlog_of(big);
+
+    // A backlog under the ceiling is left alone.
+    let small = match core::listen(RT_LOCAL_IP, 22102, 5) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("listen failed"),
+    };
+    let untouched = backlog_of(small);
+
+    // Lowering the knob lowers the ceiling.
+    narf_lib::sysctl::ipv4::SOMAXCONN.store(2, Ordering::Relaxed);
+    let tight = match core::listen(RT_LOCAL_IP, 22103, 9999) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("listen failed"),
+    };
+    let clamped_tight = backlog_of(tight);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    for id in [big, small, tight] {
+        let _ = core::close(id);
+    }
+
+    if clamped_default != Some(128) {
+        return TestResult::Fail("backlog not clamped to the default somaxconn");
+    }
+    if untouched != Some(5) {
+        return TestResult::Fail("backlog below somaxconn was altered");
+    }
+    if clamped_tight != Some(2) {
+        return TestResult::Fail("backlog not clamped to a lowered somaxconn");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_somaxconn_clamps_listen_backlog);

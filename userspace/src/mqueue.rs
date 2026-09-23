@@ -553,6 +553,11 @@ struct InotifyState {
     events: VecDeque<Vec<u8>>,
     /// Monotonic cookie source for pairing IN_MOVED_FROM/IN_MOVED_TO.
     next_cookie: u32,
+    /// True while an `IN_Q_OVERFLOW` record sits in `events`. Linux tracks
+    /// this by testing whether its single pre-allocated overflow event is
+    /// still linked; the effect is the same — at most one overflow record is
+    /// outstanding, however many events are dropped behind it.
+    overflow_queued: bool,
     /// Durable per-fd readiness cell (see `narf_lib::readiness`) — the SOLE
     /// readiness mechanism (there is no edge token). An inotify fd is read-only
     /// and never EOFs, so the cell only ever carries POLL_IN: `set`+`notify` when
@@ -566,9 +571,40 @@ struct InotifyState {
     readiness: Arc<narf_lib::readiness::Readiness>,
 }
 
+/// `IN_Q_OVERFLOW` — the queue overflowed and events were lost.
+const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+
+/// The watch descriptor Linux reports on an overflow record: it belongs to no
+/// watch.
+const OVERFLOW_WD: i32 = -1;
+
 impl InotifyState {
+    /// Queue one event, honouring `fs.inotify.max_queued_events`.
+    ///
+    /// The queue used to be unbounded, so the knob capped nothing and a
+    /// watched directory under churn could grow it without limit while the
+    /// reader was away. Linux drops the event at the ceiling and queues a
+    /// single `IN_Q_OVERFLOW` in its place, which is how a reader learns its
+    /// stream has a hole in it.
+    ///
+    /// Linux ref: `fsnotify_add_event()` in fs/notify/notification.c.
     fn enqueue(&mut self, event: Vec<u8>) {
+        let max = narf_filesystem::procfs::sys_fs::inotify_max_queued_events();
+        if self.events.len() >= max {
+            if !self.overflow_queued {
+                self.events
+                    .push_back(serialize_event(OVERFLOW_WD, IN_Q_OVERFLOW, 0, ""));
+                self.overflow_queued = true;
+            }
+            return;
+        }
         self.events.push_back(event);
+    }
+
+    /// True iff `record` is the overflow marker, by its watch descriptor.
+    fn is_overflow(record: &[u8]) -> bool {
+        record.len() >= 4
+            && i32::from_ne_bytes([record[0], record[1], record[2], record[3]]) == OVERFLOW_WD
     }
 }
 
@@ -1047,6 +1083,11 @@ impl FileOps for InotifyFile {
                         break;
                     }
                     let ev = st.events.pop_front().unwrap();
+                    if InotifyState::is_overflow(&ev) {
+                        // The hole has been reported; a later drop may queue
+                        // another marker.
+                        st.overflow_queued = false;
+                    }
                     buf[written..written + ev.len()].copy_from_slice(&ev);
                     written += ev.len();
                 }
@@ -1163,6 +1204,7 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
                 next_wd: 1,
                 watches: BTreeMap::new(),
                 events: VecDeque::new(),
+                overflow_queued: false,
                 next_cookie: 0,
                 // Fresh instance: no events queued, never writable → mask 0.
                 readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),

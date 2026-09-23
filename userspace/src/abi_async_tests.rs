@@ -2050,3 +2050,140 @@ kernel_test_in!(
     "syscall_abi/async",
     smoke_abi_async_futex_valid_word_still_works
 );
+
+// `fs.inotify.max_queued_events` bounds the per-instance queue.
+//
+// The queue was a plain `VecDeque` with no length check, so the knob capped
+// nothing and a watched path under churn grew it without limit while the
+// reader was away. Linux drops the event at the ceiling and queues one
+// `IN_Q_OVERFLOW` record (wd = -1, no name) in its place, so a reader learns
+// its stream has a hole rather than losing events silently.
+//
+// Linux ref: `fsnotify_add_event()` in fs/notify/notification.c.
+fn smoke_abi_async_inotify_max_queued_events_overflows() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::procfs::sys_fs::INOTIFY_MAX_QUEUED_EVENTS;
+
+    const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+
+    with_memfs("/inoq", "inoq", &[("f", b"....")], || {
+        let restore = INOTIFY_MAX_QUEUED_EVENTS.load(Ordering::Relaxed);
+        INOTIFY_MAX_QUEUED_EVENTS.store(2, Ordering::Relaxed);
+
+        let result = (|| {
+            let (ifd, wd) = watch(b"/inoq/f\0", IN_MODIFY)?;
+            let path = b"/inoq/f\0";
+            let fd = match call_open(path.as_ptr() as u64, O_WRONLY) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open for write failed"),
+            };
+            // Six writes against a ceiling of two.
+            let data = *b"XY";
+            for _ in 0..6 {
+                if call(Syscall::Write.raw(), a2(fd, data.as_ptr() as u64, 2)) != Some(2) {
+                    return Err("write failed");
+                }
+            }
+
+            let evs = read_events(ifd);
+            let overflow = evs
+                .iter()
+                .filter(|e| e.mask & IN_Q_OVERFLOW != 0)
+                .collect::<alloc::vec::Vec<_>>();
+            let real = evs
+                .iter()
+                .filter(|e| e.mask & IN_MODIFY as u32 != 0)
+                .count();
+
+            if real > 2 {
+                return Err("queue grew past fs.inotify.max_queued_events");
+            }
+            if real == 0 {
+                return Err("no events queued at all");
+            }
+            if overflow.len() != 1 {
+                return Err("expected exactly one IN_Q_OVERFLOW record");
+            }
+            // Linux reports the overflow against no watch, with no name.
+            if overflow[0].wd != -1 {
+                return Err("IN_Q_OVERFLOW did not carry wd = -1");
+            }
+            if !overflow[0].name.is_empty() {
+                return Err("IN_Q_OVERFLOW carried a name");
+            }
+            let _ = wd;
+            Ok(())
+        })();
+
+        INOTIFY_MAX_QUEUED_EVENTS.store(restore, Ordering::Relaxed);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_max_queued_events_overflows
+);
+
+// `fs.aio-max-nr` bounds the sum of every live AIO context's nr_events.
+//
+// The reservation was stored per context and never read — the field was
+// literally named `_nr_events` — so the knob bounded nothing and a task could
+// mint contexts reserving any number of events. Linux keeps a global `aio_nr`
+// against the ceiling and answers EAGAIN from `io_setup` when a new context
+// would push the total over.
+//
+// Linux ref: `ioctx_alloc()` in fs/aio.c.
+fn smoke_abi_async_aio_max_nr_limits_contexts() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::procfs::sys_fs::AIO_MAX_NR;
+
+    with_setup(|| {
+        let restore = AIO_MAX_NR.load(Ordering::Relaxed);
+        AIO_MAX_NR.store(64, Ordering::Relaxed);
+
+        let mut id: u64 = 0;
+        let setup = |nr: u64, out: &mut u64| {
+            *out = 0;
+            call(Syscall::IoSetup.raw(), a1(nr, out as *mut u64 as u64))
+        };
+
+        // Half the ceiling is fine.
+        let first = setup(32, &mut id) == Some(0);
+        let first_id = id;
+        // The rest of it is fine too.
+        let mut id2: u64 = 0;
+        let second = setup(32, &mut id2) == Some(0);
+        // One more event now exceeds it.
+        let mut id3: u64 = 0;
+        let refused = setup(1, &mut id3) == Some(EAGAIN);
+
+        // Destroying a context refunds its reservation, so the same request
+        // succeeds afterwards — the counter tracks live contexts, not a
+        // high-water mark.
+        let destroyed = call(Syscall::IoDestroy.raw(), a0(first_id)) == Some(0);
+        let mut id4: u64 = 0;
+        let after_refund = setup(32, &mut id4) == Some(0);
+
+        let _ = call(Syscall::IoDestroy.raw(), a0(id2));
+        let _ = call(Syscall::IoDestroy.raw(), a0(id4));
+        AIO_MAX_NR.store(restore, Ordering::Relaxed);
+
+        if !first || !second {
+            return Err("io_setup within fs.aio-max-nr was refused");
+        }
+        if !refused {
+            return Err("io_setup past fs.aio-max-nr was not -EAGAIN");
+        }
+        if !destroyed {
+            return Err("io_destroy failed");
+        }
+        if !after_refund {
+            return Err("io_destroy did not refund its aio-max-nr reservation");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_aio_max_nr_limits_contexts
+);

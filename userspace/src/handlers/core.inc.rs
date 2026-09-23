@@ -14315,6 +14315,16 @@ fn update_rlimit_atomic(
         if value.cur > value.max {
             return Err(EINVAL);
         }
+        // `fs.nr_open` is the ceiling on RLIMIT_NOFILE's hard limit, and
+        // `do_prlimit` refuses above it with EPERM for everyone — there is no
+        // CAP_SYS_RESOURCE bypass on this one, so the check sits ahead of the
+        // hard-raise authority test. The knob had a public accessor in
+        // `narf-filesystem` and no caller, so it bounded nothing.
+        if resource == RLIMIT_NOFILE_RESOURCE
+            && value.max > narf_filesystem::procfs::sys_fs::nr_open()
+        {
+            return Err(EPERM);
+        }
         if value.max > prior.max && !may_raise_hard {
             // `do_prlimit`: raising the hard ceiling requires CAP_SYS_RESOURCE
             // in the target task's user namespace. The caller's authority is

@@ -5476,3 +5476,104 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fdio_proc_locks_distinguishes_flavours
 );
+
+// `fs.pipe-max-size` caps how far F_SETPIPE_SZ may grow a pipe.
+//
+// `pipe_set_size` used to compare against a local constant holding the same
+// 1 MiB the knob advertises, so the two agreed by coincidence and lowering
+// the knob changed nothing. Linux answers EPERM above the ceiling unless the
+// caller holds CAP_SYS_RESOURCE, which NARF has no way to hold.
+//
+// Linux ref: `pipe_set_size()` in fs/pipe.c.
+fn smoke_abi_fdio_pipe_max_size_sysctl_enforced() -> TestResult {
+    with_setup(|| {
+        use core::sync::atomic::Ordering;
+        use narf_filesystem::procfs::sys_fs::PIPE_MAX_SIZE;
+
+        const F_SETPIPE_SZ: u64 = 1031;
+
+        let restore = PIPE_MAX_SIZE.load(Ordering::Relaxed);
+        let (rd, wr) = make_pipe()?;
+
+        // At the default ceiling a two-page pipe is fine.
+        let grew = call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 8192)) == Some(8192);
+
+        // Lower the ceiling below that and the same request is refused.
+        PIPE_MAX_SIZE.store(4096, Ordering::Relaxed);
+        let refused = call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 8192)) == Some(EPERM);
+        // A request at the lowered ceiling still succeeds, so the knob is a
+        // ceiling and not a blanket refusal.
+        let still_ok = call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 4096)) == Some(4096);
+
+        PIPE_MAX_SIZE.store(restore, Ordering::Relaxed);
+        let _ = call(Syscall::Close.raw(), a0(rd as u64));
+        let _ = call(Syscall::Close.raw(), a0(wr as u64));
+
+        if !grew {
+            return Err("F_SETPIPE_SZ could not grow to two pages at the default ceiling");
+        }
+        if !refused {
+            return Err("F_SETPIPE_SZ above fs.pipe-max-size was not -EPERM");
+        }
+        if !still_ok {
+            return Err("F_SETPIPE_SZ at the lowered ceiling was refused");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_max_size_sysctl_enforced);
+
+// `fs.nr_open` is the ceiling on RLIMIT_NOFILE's hard limit.
+//
+// `do_prlimit` refuses a hard limit above it with EPERM, and there is no
+// CAP_SYS_RESOURCE bypass for this one. The knob had a public accessor in
+// `narf-filesystem` and no caller anywhere, so it bounded nothing.
+//
+// Linux ref: `do_prlimit()` in kernel/sys.c.
+fn smoke_abi_fdio_nr_open_caps_nofile_hard_limit() -> TestResult {
+    with_setup(|| {
+        use core::sync::atomic::Ordering;
+        use narf_filesystem::procfs::sys_fs::NR_OPEN;
+
+        const RLIMIT_NOFILE: u64 = 7;
+
+        let restore = NR_OPEN.load(Ordering::Relaxed);
+        NR_OPEN.store(4096, Ordering::Relaxed);
+
+        // At or under the ceiling is accepted.
+        let under = [1024u64, 4096u64];
+        let ok = call(
+            Syscall::Setrlimit.raw(),
+            a1(RLIMIT_NOFILE, under.as_ptr() as u64),
+        ) == Some(0);
+
+        // Above it is EPERM, even though this task may otherwise raise its
+        // own hard limit.
+        let over = [1024u64, 8192u64];
+        let refused = call(
+            Syscall::Setrlimit.raw(),
+            a1(RLIMIT_NOFILE, over.as_ptr() as u64),
+        ) == Some(EPERM);
+
+        // The ceiling applies to RLIMIT_NOFILE only.
+        const RLIMIT_NPROC: u64 = 6;
+        let other_ok = call(
+            Syscall::Setrlimit.raw(),
+            a1(RLIMIT_NPROC, over.as_ptr() as u64),
+        ) == Some(0);
+
+        NR_OPEN.store(restore, Ordering::Relaxed);
+
+        if !ok {
+            return Err("RLIMIT_NOFILE at fs.nr_open was refused");
+        }
+        if !refused {
+            return Err("RLIMIT_NOFILE above fs.nr_open was not -EPERM");
+        }
+        if !other_ok {
+            return Err("fs.nr_open wrongly capped a different resource");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_nr_open_caps_nofile_hard_limit);

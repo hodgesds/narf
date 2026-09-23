@@ -72,6 +72,60 @@ pub mod ipv4 {
     /// secure value is the default and a fresh boot must already enforce it.
     pub static ICMP_ECHO_IGNORE_BROADCASTS: AtomicU32 = AtomicU32::new(1);
 
+    /// `net.ipv4.ip_default_ttl`. The TTL stamped on packets this host
+    /// originates. Linux default 64 (`IPDEFTTL`), read through
+    /// `ip4_dst_hoplimit()` when the route carries no hoplimit of its own.
+    ///
+    /// Forwarded packets are unaffected: they keep the sender's TTL, minus
+    /// one for this hop.
+    pub static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
+
+    /// `net.core.somaxconn`. The ceiling `listen(2)` clamps its backlog to.
+    /// Linux default 4096 in current kernels; NARF keeps the older 128,
+    /// which is what its procfs default already advertised.
+    pub static SOMAXCONN: AtomicU32 = AtomicU32::new(128);
+
+    /// The TTL to stamp on a locally-originated packet.
+    #[inline]
+    pub fn ip_default_ttl() -> u8 {
+        // The knob is clamped to 1..=255 on write; saturate defensively so a
+        // 0 can never produce a packet that dies on the first hop.
+        IP_DEFAULT_TTL.load(Ordering::Relaxed).clamp(1, 255) as u8
+    }
+
+    /// Clamp a `listen(2)` backlog to `net.core.somaxconn`, as
+    /// `__sys_listen_socket` does before the protocol's own listen runs.
+    #[inline]
+    pub fn clamp_backlog(backlog: usize) -> usize {
+        backlog.min(SOMAXCONN.load(Ordering::Relaxed) as usize)
+    }
+
+    /// `net.ipv4.tcp_window_scaling`. Linux default 1.
+    pub static TCP_WINDOW_SCALING: AtomicU32 = AtomicU32::new(1);
+
+    /// `net.ipv4.tcp_timestamps`. Linux default 1. Linux also accepts 2,
+    /// meaning "on, but without the random per-connection offset"; NARF has
+    /// no such offset, so any non-zero value behaves as 1.
+    pub static TCP_TIMESTAMPS: AtomicU32 = AtomicU32::new(1);
+
+    /// `net.ipv4.tcp_sack`. Linux default 1.
+    pub static TCP_SACK: AtomicU32 = AtomicU32::new(1);
+
+    /// The three TCP option knobs, as `(window_scaling, timestamps, sack)`.
+    ///
+    /// They gate both directions, as in Linux. On a SYN we send, each option
+    /// is offered only if its knob allows (`tcp_syn_options`). On a SYN we
+    /// receive, an option the knob forbids is ignored rather than negotiated
+    /// (`tcp_parse_options` tests them with `!estab`), so a peer cannot turn
+    /// on something this host has switched off.
+    pub fn tcp_option_defaults() -> (bool, bool, bool) {
+        (
+            TCP_WINDOW_SCALING.load(Ordering::Relaxed) != 0,
+            TCP_TIMESTAMPS.load(Ordering::Relaxed) != 0,
+            TCP_SACK.load(Ordering::Relaxed) != 0,
+        )
+    }
+
     /// True iff `net.ipv4.ip_forward` (`conf.all.forwarding`) is set.
     ///
     /// Callers deciding whether to forward a packet want
@@ -219,6 +273,11 @@ pub mod ipv4 {
     pub fn __reset_for_test() {
         IP_FORWARD.store(0, Ordering::Relaxed);
         IP_FORWARD_DEFAULT.store(0, Ordering::Relaxed);
+        IP_DEFAULT_TTL.store(64, Ordering::Relaxed);
+        SOMAXCONN.store(128, Ordering::Relaxed);
+        TCP_WINDOW_SCALING.store(1, Ordering::Relaxed);
+        TCP_TIMESTAMPS.store(1, Ordering::Relaxed);
+        TCP_SACK.store(1, Ordering::Relaxed);
         SEND_REDIRECTS_ALL.store(1, Ordering::Relaxed);
         SEND_REDIRECTS_DEFAULT.store(1, Ordering::Relaxed);
         DEV_CONF.lock().clear();

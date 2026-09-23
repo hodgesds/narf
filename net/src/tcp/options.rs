@@ -193,12 +193,17 @@ impl OptionsState {
     /// Apply the peer's SYN options to our state — called once
     /// when transitioning out of SYN-SENT or SYN-RECEIVED.
     pub fn negotiate(&mut self, peer: &ParsedOptions, our_offered_wscale: u8) {
+        // A knob that is off means the option is not merely un-offered but
+        // un-acceptable: Linux gates `tcp_parse_options` on these sysctls
+        // when `!estab`, so an option arriving on a SYN is never recorded and
+        // the peer cannot switch back on something this host disabled.
+        let (ws_ok, ts_ok, sack_ok) = narf_lib::sysctl::ipv4::tcp_option_defaults();
         if let Some(m) = peer.mss {
             // RFC 9293 §3.7.1: use the *lower* of the two MSS so a
             // small-MSS link in the path doesn't fragment.
             self.peer_mss = m.min(self.our_mss).max(MIN_MSS);
         }
-        if let Some(ws) = peer.wscale {
+        if let (Some(ws), true) = (peer.wscale, ws_ok) {
             self.peer_wscale = ws;
             self.wscale_active = true;
             self.our_wscale = our_offered_wscale;
@@ -209,10 +214,10 @@ impl OptionsState {
             self.our_wscale = 0;
             self.peer_wscale = 0;
         }
-        if peer.timestamps.is_some() {
+        if peer.timestamps.is_some() && ts_ok {
             self.timestamps_active = true;
         }
-        if peer.sack_permitted {
+        if peer.sack_permitted && sack_ok {
             self.sack_active = true;
         }
     }
@@ -303,35 +308,96 @@ impl OptionsState {
     }
 }
 
-/// Encode the options payload for a SYN we send. Includes MSS,
-/// Window Scale, SACK-Permitted, and Timestamps. Caller embeds
-/// the result into a `TcpHeader.options` slot.
-pub fn encode_syn_options(mss: u16, wscale: u8, our_tsval: u32, peer_tsecr: u32) -> Vec<u8> {
+/// Which options a SYN or SYN-ACK may carry.
+///
+/// Two things decide this, and they apply at different times:
+///
+/// - On a SYN we originate, the `net.ipv4.tcp_{window_scaling,timestamps,
+///   sack}` sysctls decide what we are willing to offer. Linux:
+///   `tcp_syn_options`.
+/// - On a SYN-ACK, an option may be echoed only if the incoming SYN carried
+///   it — RFC 7323 §3 is explicit that Timestamps must not appear in a
+///   SYN-ACK unless it appeared in the SYN — *and* only if the sysctl allowed
+///   us to record it in the first place. Linux: `tcp_synack_options`, reading
+///   the `*_ok` flags that `tcp_parse_options` sets under those same sysctls.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SynOptionPolicy {
+    pub wscale: bool,
+    pub sack: bool,
+    pub timestamps: bool,
+}
+
+impl SynOptionPolicy {
+    /// Everything on — the shape of a SYN before any knob is consulted.
+    pub const ALL: Self = Self {
+        wscale: true,
+        sack: true,
+        timestamps: true,
+    };
+
+    /// What this host will offer on a SYN it originates.
+    pub fn from_sysctls() -> Self {
+        let (wscale, timestamps, sack) = narf_lib::sysctl::ipv4::tcp_option_defaults();
+        Self {
+            wscale,
+            sack,
+            timestamps,
+        }
+    }
+
+    /// What a SYN-ACK may echo, given what was negotiated from the peer's
+    /// SYN. `state` has already been through [`OptionsState::negotiate`],
+    /// which applies the sysctls, so this needs no second look at them.
+    pub fn for_synack(state: &OptionsState) -> Self {
+        Self {
+            wscale: state.wscale_active,
+            sack: state.sack_active,
+            timestamps: state.timestamps_active,
+        }
+    }
+}
+
+/// Encode the options payload for a SYN or SYN-ACK we send. MSS is
+/// unconditional; Window Scale, SACK-Permitted and Timestamps appear only if
+/// `policy` allows. Caller embeds the result into a `TcpHeader.options` slot.
+pub fn encode_syn_options(
+    mss: u16,
+    wscale: u8,
+    our_tsval: u32,
+    peer_tsecr: u32,
+    policy: SynOptionPolicy,
+) -> Vec<u8> {
     let mut opts = Vec::with_capacity(20);
     // MSS
     opts.push(OPT_MSS);
     opts.push(4);
     opts.extend_from_slice(&mss.to_be_bytes());
-    // NOP pad so WS lines up.
-    opts.push(OPT_NOP);
-    // Window Scale
-    opts.push(OPT_WINDOW_SCALE);
-    opts.push(3);
-    opts.push(wscale);
-    // SACK-Permitted
-    opts.push(OPT_SACK_PERMITTED);
-    opts.push(2);
-    // NOP pad before TS.
-    opts.push(OPT_NOP);
-    opts.push(OPT_NOP);
-    // Timestamps
-    opts.push(OPT_TIMESTAMPS);
-    opts.push(10);
-    opts.extend_from_slice(&our_tsval.to_be_bytes());
-    opts.extend_from_slice(&peer_tsecr.to_be_bytes());
+    if policy.wscale {
+        // NOP pad so WS lines up.
+        opts.push(OPT_NOP);
+        // Window Scale
+        opts.push(OPT_WINDOW_SCALE);
+        opts.push(3);
+        opts.push(wscale);
+    }
+    if policy.sack {
+        // SACK-Permitted
+        opts.push(OPT_SACK_PERMITTED);
+        opts.push(2);
+    }
+    if policy.timestamps {
+        // NOP pad before TS.
+        opts.push(OPT_NOP);
+        opts.push(OPT_NOP);
+        // Timestamps
+        opts.push(OPT_TIMESTAMPS);
+        opts.push(10);
+        opts.extend_from_slice(&our_tsval.to_be_bytes());
+        opts.extend_from_slice(&peer_tsecr.to_be_bytes());
+    }
     // Pad to 4-byte multiple.
     while opts.len() % 4 != 0 {
-        opts.push(0);
+        opts.push(OPT_NOP);
     }
     opts
 }
@@ -376,7 +442,7 @@ mod tests {
 
     #[test]
     fn parse_finds_all_negotiated_options() {
-        let opts = encode_syn_options(1460, 7, 0xDEADBEEF, 0);
+        let opts = encode_syn_options(1460, 7, 0xDEADBEEF, 0, SynOptionPolicy::ALL);
         let parsed = ParsedOptions::parse(&opts);
         assert_eq!(parsed.mss, Some(1460));
         assert_eq!(parsed.wscale, Some(7));

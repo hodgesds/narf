@@ -60,7 +60,8 @@ use super::congestion::{
     CongestionControl, Cubic, LossEvent, Reno,
 };
 use super::options::{
-    encode_data_options, encode_syn_options, OptionsState, ParsedOptions, DEFAULT_WSCALE, MIN_MSS,
+    encode_data_options, encode_syn_options, OptionsState, ParsedOptions, SynOptionPolicy,
+    DEFAULT_WSCALE, MIN_MSS,
 };
 use super::retransmit::{OutSeg, RttEstimator};
 
@@ -828,6 +829,10 @@ pub fn listen_in(
     backlog: usize,
 ) -> Result<u32, ()> {
     let id = fresh_tcb_id();
+    // `net.core.somaxconn` caps the backlog, as `__sys_listen_socket` does
+    // before handing it to the protocol. The AF_INET path in `narf-userspace`
+    // routes its listen here too, so this is the one place it has to happen.
+    let backlog = narf_lib::sysctl::ipv4::clamp_backlog(backlog);
     let tcb = Tcb::new_listener(id, local_addr, local_port, backlog).with_net_ns(net_ns_id);
     let (id, _arc) = install_tcb(tcb);
     Ok(id)
@@ -1192,6 +1197,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         our_wscale,
         our_ts,
         peer_tsval,
+        negotiated,
     ) = {
         let t = arc.lock();
         let our_ts = tsval_now();
@@ -1207,6 +1213,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
             DEFAULT_WSCALE,
             our_ts,
             t.opts.ts_recent,
+            SynOptionPolicy::for_synack(&t.opts),
         )
     };
     // For a SYN-ACK the TSecr must echo the peer's most recent TSval
@@ -1214,11 +1221,20 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
     // sequence number. A wrong TSecr makes a strict peer (a real Linux
     // host over tap; SLIRP regenerates timestamps so it masked this)
     // reject the SYN-ACK and RST the handshake.
+    // A SYN offers whatever the sysctls allow. A SYN-ACK may only echo what
+    // the peer's SYN carried — `negotiate` ran before this and already
+    // applied those same sysctls to it.
+    let policy = if ack_too {
+        negotiated
+    } else {
+        SynOptionPolicy::from_sysctls()
+    };
     let opts = encode_syn_options(
         mss,
         our_wscale,
         our_ts,
         if ack_too { peer_tsval } else { 0 },
+        policy,
     );
     let flags = if ack_too {
         FLAG_SYN | FLAG_ACK

@@ -11311,7 +11311,7 @@ mod aio {
     use narf_lib::sync::IrqSafeSpinLock;
 
     // ── errno constants (negated on return, Linux convention) ────────
-    use crate::errno::wire::{EBADF, EFAULT, EINVAL};
+    use crate::errno::wire::{EAGAIN, EBADF, EFAULT, EINVAL};
 
     // ── Linux <uapi/linux/aio_abi.h> opcodes ─────────────────────────
     const IOCB_CMD_PREAD: u16 = 0;
@@ -11397,8 +11397,46 @@ mod aio {
     /// caller's sizing hint (Linux uses it to size the mmap ring; we only
     /// keep it for bookkeeping / validation).
     struct AioContext {
-        _nr_events: u32,
+        /// Events this context reserved against the system-wide `aio_nr`.
+        /// Charged at `io_setup` and refunded when the context goes away,
+        /// through `io_destroy` or the exit sweep.
+        nr_events: u32,
         completions: VecDeque<Completion>,
+    }
+
+    /// Linux's global `aio_nr`: the sum of every live context's `nr_events`,
+    /// held against `fs.aio-max-nr`. It used to be stored per context and
+    /// never read -- the field was literally named `_nr_events` -- so the
+    /// knob bounded nothing and a task could mint contexts reserving any
+    /// number of events at all.
+    static AIO_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Charge `n` events against `fs.aio-max-nr`, or refuse.
+    ///
+    /// Linux ref: `ioctx_alloc()` in fs/aio.c, which answers EAGAIN when
+    /// `aio_nr + max_reqs` exceeds the ceiling or wraps.
+    fn aio_charge(n: u32) -> bool {
+        use core::sync::atomic::Ordering;
+        let max = narf_filesystem::procfs::sys_fs::aio_max_nr();
+        let mut cur = AIO_NR.load(Ordering::Relaxed);
+        loop {
+            let next = match cur.checked_add(n as u64) {
+                Some(v) if v <= max => v,
+                _ => return false,
+            };
+            match AIO_NR.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Refund a context's reservation.
+    fn aio_refund(n: u32) {
+        use core::sync::atomic::Ordering;
+        let _ = AIO_NR.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(n as u64))
+        });
     }
 
     /// Per-task context table: tid → (ctx_id → AioContext). Context ids
@@ -11430,9 +11468,15 @@ mod aio {
     /// owned by `tid`. Called from `release_task_tables` so a process that
     /// forgets `io_destroy` doesn't leak. See [[narf-libaio-sync-backend]].
     pub(super) fn release_task_aio(tid: u64) {
+        let mut refund = 0u32;
         if let Some(outer) = AIO_CONTEXTS.lock().as_mut() {
-            outer.remove(&tid);
+            if let Some(inner) = outer.remove(&tid) {
+                refund = inner.values().map(|c| c.nr_events).fold(0, u32::saturating_add);
+            }
         }
+        // Refund off the table lock: a task that forgets `io_destroy` must
+        // not leak its reservation against `fs.aio-max-nr` either.
+        aio_refund(refund);
     }
 
     // ── io_setup(nr_events, aio_context_t *ctx_idp) ──────────────────
@@ -11452,13 +11496,19 @@ mod aio {
             return;
         }
 
+        // `fs.aio-max-nr` bounds the sum of every live context's reservation.
+        if !aio_charge(nr_events) {
+            ctx.set_return(SyscallReturn::ok(EAGAIN as u64));
+            return;
+        }
+
         let id = mint_ctx_id();
         let tid = current_task_id();
         with_task_ctxs(tid, |m| {
             m.insert(
                 id,
                 AioContext {
-                    _nr_events: nr_events,
+                    nr_events,
                     completions: VecDeque::new(),
                 },
             );
@@ -11467,10 +11517,12 @@ mod aio {
         // SAFETY: `ctx_idp` range-validated above; copy_to_user brackets
         // the 8-byte write with STAC/CLAC.
         if unsafe { copy_to_user(ctx_idp, &id.to_le_bytes()) }.is_err() {
-            // Roll back the context we just minted so it doesn't leak.
+            // Roll back the context we just minted so it doesn't leak — the
+            // reservation with it.
             with_task_ctxs(tid, |m| {
                 m.remove(&id);
             });
+            aio_refund(nr_events);
             ctx.set_return(SyscallReturn::ok(EFAULT as u64));
             return;
         }
@@ -11481,8 +11533,9 @@ mod aio {
     pub(super) fn sys_io_destroy(ctx: &mut dyn TrapContext) {
         let ctx_id = ctx.args().arg0;
         let tid = current_task_id();
-        let removed = with_task_ctxs(tid, |m| m.remove(&ctx_id).is_some());
-        if removed {
+        let removed = with_task_ctxs(tid, |m| m.remove(&ctx_id));
+        if let Some(gone) = removed {
+            aio_refund(gone.nr_events);
             ctx.set_return(SyscallReturn::ok(0));
         } else {
             ctx.set_return(SyscallReturn::ok(EINVAL as u64));
