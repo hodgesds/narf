@@ -622,10 +622,18 @@ fn read_sys(subpath: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// hostname read returns "narf\n" by default (after register_all).
+/// hostname reads back the boot default, "narf\n".
+///
+/// Isolation has to run through the file, not the static below it. Once the
+/// UTS hooks are installed the key is backed by the calling task's UTS
+/// namespace, so assigning `HOSTNAME` reaches a store the file no longer
+/// reads -- this case used to do exactly that and passed only because
+/// nothing else had changed the real one.
 fn smoke_kernel_hostname_default() -> TestResult {
     register_all();
-    // Reset hostname to default for test isolation.
+    if let Some(f) = lookup_sys("kernel/hostname") {
+        let _ = f.write(b"narf\n");
+    }
     *HOSTNAME.lock() = String::from("narf");
     match read_sys("kernel/hostname") {
         Some(s) if s == "narf\n" => TestResult::Pass,

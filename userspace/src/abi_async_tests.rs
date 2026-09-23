@@ -2139,7 +2139,11 @@ fn smoke_abi_async_aio_max_nr_limits_contexts() -> TestResult {
 
     with_setup(|| {
         let restore = AIO_MAX_NR.load(Ordering::Relaxed);
-        AIO_MAX_NR.store(64, Ordering::Relaxed);
+        // Earlier cases may still hold contexts, and their reservations are
+        // legitimately charged, so the ceiling has to be set relative to the
+        // live total rather than to an absolute the suite order decides.
+        let base = crate::handlers::aio_test_nr();
+        AIO_MAX_NR.store(base + 64, Ordering::Relaxed);
 
         let mut id: u64 = 0;
         let setup = |nr: u64, out: &mut u64| {
