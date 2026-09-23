@@ -108,10 +108,11 @@ pub use donation::{
 pub use eevdf::EevdfScheduler;
 pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
 pub use policy::{
-    cpu_state, current_scheduler_name, install_scheduler, set_default_policy, ClassScheduler,
-    CpuIdleMeta, CpuSchedContext, CpuState, CpuStateChange, CurrentTask, FifoScheduler,
-    PriorityScheduler, RunQueue, SchedPolicy, SchedRow, Scheduler, SchedulerError,
-    TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskMeta, TaskQueueEvent,
+    active_quantum_unit, cpu_state, current_scheduler_name, current_scheduler_quantum_unit,
+    install_scheduler, set_default_policy, ClassScheduler, CpuIdleMeta, CpuSchedContext, CpuState,
+    CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, RunQueue, SchedPolicy,
+    SchedRow, QuantumUnit, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
+    TaskHandle, TaskMeta, TaskQueueEvent,
 };
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
@@ -1291,6 +1292,7 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
         cpu: CpuId(cpu as u32),
         vfloor: vfloor(cpu),
         elapsed,
+        quantum_unit: policy::active_quantum_unit(),
         current: policy::CurrentTask {
             id: TaskId(current_id),
             class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),

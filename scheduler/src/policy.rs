@@ -58,6 +58,12 @@ pub enum SchedulerError {
     /// it was briefly visible and will receive `on_uninstall` once its last
     /// reference is released.
     Superseded,
+    /// The policy declared [`QuantumUnit::Cycles`], but PMU work-cycle
+    /// scheduling is unavailable — either the `pmu` feature is not compiled in,
+    /// or no usable hardware cycle source (APERF / fixed / GP PMC) was found at
+    /// install (e.g. an un-virtualized-PMU VM). `Cycles` is refused rather than
+    /// silently downgraded so `quantum_unit()` stays a truthful contract.
+    CycleModeUnavailable,
 }
 
 impl From<CapError> for SchedulerError {
@@ -198,6 +204,12 @@ pub struct CpuSchedContext {
     /// until it has consumed a base slice) — the batching guard that keeps a
     /// cooperative producer/consumer from context-switching on every wake.
     pub elapsed: u64,
+    /// The resolved [`QuantumUnit`] the core is enforcing — the unit of
+    /// `current.vruntime`, `vfloor`, and `elapsed`. A policy reads this to keep
+    /// its comparisons and slice magnitudes in the right unit (0.75 ms is a very
+    /// different integer in ns vs PMU-cycles). Equals the installed policy's
+    /// `quantum_unit()` by the install-time validation.
+    pub quantum_unit: QuantumUnit,
 }
 
 /// Lean per-slot projection for eligibility policies (`EevdfScheduler`) — only
@@ -386,9 +398,39 @@ impl<'a> RunQueue<'a> {
 /// `IrqSafeSpinLock` that an IRQ handler could be waiting on. The
 /// detached slot is owned by the executor for the duration of the
 /// poll and re-enqueued after.
+/// The time base a scheduler policy schedules against — a first-class, truthful
+/// property: the unit the slice is ACTUALLY enforced in, resolved at install and
+/// reported via [`current_scheduler_quantum_unit`]. Linux has no analogue (it is
+/// always ns); NARF makes the slice unit a pluggable policy declaration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum QuantumUnit {
+    /// Calibrated wall-time (TSC-derived nanoseconds). The default; always
+    /// available. Enforced coarsely on the periodic tick, or precisely by a
+    /// per-task one-shot slice timer when the `hrtick` feature is active.
+    Nanos = 0,
+    /// PMU work-cycles — actual, frequency-invariant cycles consumed on-core
+    /// (APERF / fixed counter / reserved GP PMC). A genuine computation metric,
+    /// distinct from wall-time. Available only with the `pmu` feature AND a
+    /// usable hardware source; otherwise install is refused with
+    /// [`SchedulerError::CycleModeUnavailable`].
+    Cycles = 1,
+}
+
 pub trait Scheduler: Any + Send + Sync + 'static {
     /// Stable identifier — surfaced by `current_scheduler_name`.
     fn name(&self) -> &'static str;
+
+    /// The time base this policy schedules against. Default
+    /// [`QuantumUnit::Nanos`]: the in-tree policies schedule on calibrated
+    /// wall-time. A policy returns [`QuantumUnit::Cycles`] to opt into PMU
+    /// work-cycle scheduling; the core validates a usable hardware source at
+    /// install (else refuses the install) and publishes the resolved base via
+    /// [`current_scheduler_quantum_unit`]. This is a truthful contract — the core
+    /// enforces the slice in exactly the returned unit, never a silent downgrade.
+    fn quantum_unit(&self) -> QuantumUnit {
+        QuantumUnit::Nanos
+    }
 
     /// Choose one slot from `queue`. Returning `None`, a stale handle, or a
     /// wrong-tier task causes a core-side fallback to the first candidate in
@@ -749,10 +791,16 @@ pub fn install_scheduler<S: Scheduler>(
     s: S,
 ) -> Result<(), SchedulerError> {
     cap.check_live()?;
+    // Resolve + validate the policy's declared time base BEFORE publishing it to
+    // any CPU: a `Cycles` policy with no usable backend is refused here, so there
+    // is no partial install. Publishing the base right before the policy goes
+    // live keeps dispatch's (policy, base) pair consistent.
+    let base = resolve_quantum_unit(s.quantum_unit())?;
     let replacement = Arc::new(PolicyInstance {
         policy: Box::new(s),
     });
     replacement.policy.on_install();
+    store_active_quantum_unit(base);
     let generation = publish_policy(replacement, false);
     // This acquire load is the install operation's linearization point. If no
     // newer ticket exists, our completed walk necessarily published this
@@ -773,6 +821,45 @@ pub fn current_scheduler_name() -> Option<&'static str> {
         .lock()
         .as_ref()
         .map(|published| published.instance.policy.name())
+}
+
+/// The resolved active [`QuantumUnit`], set once at scheduler install — the
+/// single source of truth for the core's clock-selection branch and for the
+/// unit a policy sees. `0` == `Nanos`.
+static ACTIVE_QUANTUM_UNIT: AtomicU8 = AtomicU8::new(QuantumUnit::Nanos as u8);
+
+fn store_active_quantum_unit(base: QuantumUnit) {
+    ACTIVE_QUANTUM_UNIT.store(base as u8, Ordering::Release);
+}
+
+/// The active scheduling time base the core is enforcing (O(1) atomic read).
+/// The hot path selects its clock on this; policy hooks read it (also via
+/// `CpuSchedContext::quantum_unit`) to interpret the values they are handed.
+pub fn active_quantum_unit() -> QuantumUnit {
+    if ACTIVE_QUANTUM_UNIT.load(Ordering::Acquire) == QuantumUnit::Cycles as u8 {
+        QuantumUnit::Cycles
+    } else {
+        QuantumUnit::Nanos
+    }
+}
+
+/// Public reporter for the active scheduling time base (mirrors
+/// [`current_scheduler_name`]). Diagnostics surface this so an operator can see
+/// whether the box is scheduling on wall-time or PMU work-cycles.
+pub fn current_scheduler_quantum_unit() -> QuantumUnit {
+    active_quantum_unit()
+}
+
+/// Resolve a policy's declared time base to the enforceable active base,
+/// validating hardware support. `Nanos` is always enforceable. `Cycles` needs
+/// the `pmu` feature and a usable hardware source (wired in a later commit);
+/// until then it has no backend, so refuse rather than silently downgrade —
+/// keeping `quantum_unit()` a truthful contract.
+fn resolve_quantum_unit(base: QuantumUnit) -> Result<QuantumUnit, SchedulerError> {
+    match base {
+        QuantumUnit::Nanos => Ok(QuantumUnit::Nanos),
+        QuantumUnit::Cycles => Err(SchedulerError::CycleModeUnavailable),
+    }
 }
 
 /// Install the default strict-class scheduler if no scheduler is yet
@@ -817,10 +904,15 @@ pub(crate) fn install_default_if_unset() {
     if CPU_SCHEDULERS.iter().all(|slot| slot.lock().is_some()) {
         return;
     }
-    let replacement = Arc::new(PolicyInstance {
-        policy: default_policy_boxed(),
-    });
+    let policy = default_policy_boxed();
+    // The in-tree defaults are all `Nanos`. Resolve for consistency; if a future
+    // boot default ever declared `Cycles` with no backend, fall back to `Nanos`
+    // rather than refuse — the boot default MUST install something or the box is
+    // unschedulable. (Explicit `install_scheduler` still refuses.)
+    let base = resolve_quantum_unit(policy.quantum_unit()).unwrap_or(QuantumUnit::Nanos);
+    let replacement = Arc::new(PolicyInstance { policy });
     replacement.policy.on_install();
+    store_active_quantum_unit(base);
     let _ = publish_policy(replacement, true);
 }
 

@@ -2948,6 +2948,82 @@ kernel_test_in!(
     smoke_scheduler_faulty_policy_cannot_strand_work
 );
 
+// The in-tree policies all declare the default `QuantumUnit::Nanos`, so the
+// resolved active unit — and both reporters — must read Nanos after install.
+fn smoke_scheduler_quantum_unit_default_nanos() -> TestResult {
+    use crate::{
+        active_quantum_unit, current_scheduler_quantum_unit, install_scheduler, ClassScheduler,
+        QuantumUnit, SchedPolicy,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Class) failed");
+    }
+    if active_quantum_unit() != QuantumUnit::Nanos {
+        return TestResult::Fail("active_quantum_unit not Nanos after Nanos-policy install");
+    }
+    if current_scheduler_quantum_unit() != QuantumUnit::Nanos {
+        return TestResult::Fail("current_scheduler_quantum_unit reporter not Nanos");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_quantum_unit_default_nanos);
+
+// A policy declaring `QuantumUnit::Cycles` must be REFUSED at install while PMU
+// cycle scheduling has no backend (no `pmu` feature) — a truthful contract, not
+// a silent downgrade — and the refusal must leave the active unit AND the live
+// policy untouched (the refuse happens before publication).
+fn smoke_scheduler_cycles_unit_refused_without_pmu() -> TestResult {
+    use crate::{
+        active_quantum_unit, current_scheduler_name, install_scheduler, ClassScheduler, CpuId,
+        QuantumUnit, RunQueue, SchedPolicy, Scheduler, SchedulerError, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct WantsCycles;
+    impl Scheduler for WantsCycles {
+        fn name(&self) -> &'static str {
+            "wants-cycles"
+        }
+        fn quantum_unit(&self) -> QuantumUnit {
+            QuantumUnit::Cycles
+        }
+        fn pick_next(&self, _cpu: CpuId, _queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            None
+        }
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    // Land on a known-good Nanos policy first.
+    let _ = install_scheduler(&cap, ClassScheduler);
+    let before = active_quantum_unit();
+
+    match install_scheduler(&cap, WantsCycles) {
+        Err(SchedulerError::CycleModeUnavailable) => {}
+        Err(_) => return TestResult::Fail("Cycles install failed with the wrong error"),
+        Ok(()) => {
+            let _ = install_scheduler(&cap, ClassScheduler);
+            return TestResult::Fail("Cycles policy installed despite no PMU backend");
+        }
+    }
+
+    if active_quantum_unit() != before || active_quantum_unit() != QuantumUnit::Nanos {
+        return TestResult::Fail("refused Cycles install perturbed the active unit");
+    }
+    if current_scheduler_name() == Some("wants-cycles") {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("refused Cycles policy became the live scheduler");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_cycles_unit_refused_without_pmu
+);
+
 /// EEVDF-lite accounting (Phase 1): a task's `vruntime` is projected into
 /// `TaskMeta`, starts at the CPU's virtual-time floor on admission, and grows
 /// as the task consumes dispatch cycles. An observing policy records the
