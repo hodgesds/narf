@@ -108,6 +108,21 @@ enum Cmd {
     /// SAME redis binary spawned natively on the Linux host and prints
     /// a side-by-side NARF-guest-vs-Linux-host comparison.
     RedisBench(BuildArgs),
+    /// stress-ng PERFORMANCE sweep with a Linux baseline. Boots NARF
+    /// with the Alpine stress rootfs (`REGEN_stress_rootfs.sh`, which
+    /// bakes `/sweep.sh`) and runs a sequential per-stressor bogo-ops
+    /// pass via `chroot_run`; then boots a stock Linux kernel
+    /// (`XTASK_LINUX_KERNEL`, else newest `/boot/vmlinuz-*`) under the
+    /// SAME QEMU config (machine, -cpu, -smp + NUMA topology, RAM,
+    /// accelerator, virtio-blk snapshot of the SAME rootfs image) and
+    /// runs the IDENTICAL `/sweep.sh`, then prints a per-stressor
+    /// bogo-ops/s table with NARF/Linux ratios and the geometric mean.
+    /// Knobs: `XTASK_STRESS_DUR` (per-stressor duration, default 10s),
+    /// `XTASK_STRESS_WORKERS` (workers per stressor, default 2),
+    /// `XTASK_STRESS_LIST` (comma list overriding /sweep.sh's default
+    /// stressor set). Not a test: it gates nothing and asserts
+    /// nothing. It answers "where does NARF stand".
+    StressBench(BuildArgs),
     /// Multi-queue / RSS throughput+latency benchmark. Boots NARF with
     /// the `mt-echo` feature (a multithreaded SO_REUSEPORT echo server:
     /// one Listen TCB per worker thread, distinct flows steered to
@@ -3796,7 +3811,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
             &args.cmd,
             &args.expect,
         ) {
-            Ok(()) => return Ok(()),
+            Ok(_) => return Ok(()),
             Err(e) => {
                 eprintln!("xtask run-interactive: attempt {attempt} failed: {e:#}");
                 last_err = Some(e);
@@ -3808,6 +3823,8 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
 /// Boot `kernel` under QEMU, log in as root, type `typed_cmd`, and assert
 /// `expect` appears on the serial console. One attempt; the caller retries.
+/// Returns the full captured serial transcript so callers that measure
+/// (stress-bench) can parse guest-printed metrics out of it.
 #[allow(clippy::too_many_arguments)]
 fn run_interactive_boot(
     kernel: &Path,
@@ -3818,7 +3835,7 @@ fn run_interactive_boot(
     gpu_backend: GpuBackend,
     typed_cmd: &str,
     expect: &str,
-) -> Result<()> {
+) -> Result<String> {
     use std::io::Write;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
@@ -4283,7 +4300,11 @@ fn run_interactive_boot(
         "\nxtask run-interactive: ok — typed `{}`, saw `{}`",
         typed_cmd, expect,
     );
-    Ok(())
+    let transcript = captured
+        .lock()
+        .map(|g| String::from_utf8_lossy(&g).into_owned())
+        .unwrap_or_default();
+    Ok(transcript)
 }
 
 /// Off-box network serving smoke — see [`Cmd::NetSmoke`]. Boots with the
@@ -6362,6 +6383,509 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     }
     println!("└────────────────────────────────────────────────────────────");
     println!("\nxtask redis-bench: ok");
+    Ok(())
+}
+
+/// One `stress-ng: metrc:` data row from a `--metrics-brief` table.
+/// `rate_real` is the "bogo ops/s (real time)" column — the throughput
+/// number the sweep compares.
+struct StressMetric {
+    name: String,
+    bogo_ops: f64,
+    real_secs: f64,
+    rate_real: f64,
+}
+
+/// Extract the per-stressor metric rows from a serial transcript. The
+/// stress-ng 0.18 table looks like
+///
+///   stress-ng: metrc: [pid] stressor  bogo ops  real time  usr time ...
+///   stress-ng: metrc: [pid]                      (secs)     (secs)  ...
+///   stress-ng: metrc: [pid] cpu          12345      10.00      20.00 ...
+///
+/// so a data row is recognized by its numeric columns (the two header
+/// rows fail the parse). Later rows win on a repeated stressor name so a
+/// re-run inside one boot reports the fresh numbers.
+fn parse_stress_metrics(serial: &str) -> Vec<StressMetric> {
+    let mut out: Vec<StressMetric> = Vec::new();
+    for line in serial.lines() {
+        let Some(pos) = line.find("metrc:") else {
+            continue;
+        };
+        let mut rest = line[pos + "metrc:".len()..].trim_start();
+        if rest.starts_with('[') {
+            match rest.find(']') {
+                Some(close) => rest = rest[close + 1..].trim_start(),
+                None => continue,
+            }
+        }
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // name, bogo ops, real, usr, sys, bogo-ops/s (real),
+        // bogo-ops/s (usr+sys) [, CPU-per-instance %, RSS max ...]
+        if fields.len() < 6 {
+            continue;
+        }
+        let parsed = (
+            fields[1].parse::<f64>(),
+            fields[2].parse::<f64>(),
+            fields[5].parse::<f64>(),
+        );
+        let (bogo_ops, real_secs, rate_real) = match parsed {
+            (Ok(b), Ok(r), Ok(s)) => (b, r, s),
+            _ => continue,
+        };
+        let name = fields[0].to_string();
+        match out.iter_mut().find(|m| m.name == name) {
+            Some(prev) => {
+                *prev = StressMetric {
+                    name,
+                    bogo_ops,
+                    real_secs,
+                    rate_real,
+                }
+            }
+            None => out.push(StressMetric {
+                name,
+                bogo_ops,
+                real_secs,
+                rate_real,
+            }),
+        }
+    }
+    out
+}
+
+/// The host Linux kernel image the baselines boot: `XTASK_LINUX_KERNEL`
+/// verbatim, else the newest `/boot/vmlinuz-*` (skipping `*.old` backup
+/// copies).
+fn host_linux_kernel() -> Result<PathBuf> {
+    if let Ok(k) = std::env::var("XTASK_LINUX_KERNEL") {
+        return Ok(PathBuf::from(k));
+    }
+    let mut cands: Vec<PathBuf> = std::fs::read_dir("/boot")
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("vmlinuz-") && !n.ends_with(".old"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    cands.sort();
+    cands
+        .pop()
+        .or_else(|| {
+            let v = PathBuf::from("/boot/vmlinuz");
+            v.exists().then_some(v)
+        })
+        .ok_or_else(|| anyhow!("no /boot/vmlinuz* on the host (set XTASK_LINUX_KERNEL)"))
+}
+
+/// apples-to-apples Linux baseline for the stress sweep: boot a stock
+/// Linux kernel under the SAME QEMU shape `Arch::qemu_args` gives NARF
+/// (machine, -cpu, -smp + the 2-node HMAT/NUMA topology when
+/// `NARF_QEMU_SMP` is unset, RAM, accelerator) against a `-snapshot`
+/// view of the SAME rootfs image, and run the IDENTICAL `/sweep.sh` via
+/// a busybox-initramfs chroot that mirrors what `chroot_run` sets up on
+/// the NARF side (bind /dev, fresh tmpfs /tmp + /dev/shm). Returns the
+/// captured serial transcript once `SWEEP-DONE` appears.
+fn boot_linux_stress(
+    rootfs: &Path,
+    dur: &str,
+    workers: &str,
+    list: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let busybox = {
+        let local = workspace_root()?.join("verification/data/musl-demo/busybox_static_x86_64");
+        if local.exists() {
+            local
+        } else {
+            PathBuf::from("/usr/bin/busybox")
+        }
+    };
+    if !busybox.exists() {
+        bail!("Linux baseline: need a static busybox (committed or /usr/bin/busybox)");
+    }
+    let kernel = host_linux_kernel().context("Linux baseline")?;
+
+    // Stage the initramfs: busybox + an /init that reproduces the NARF
+    // side's chroot environment around /sweep.sh. `lo` comes up in the
+    // initramfs netns (chroot shares it) so the `sock` stressor has a
+    // loopback to talk over, matching NARF's always-up lo0.
+    let stage = std::env::temp_dir().join("narf-linux-stress");
+    let _ = std::fs::remove_dir_all(&stage);
+    for d in ["bin", "proc", "sys", "dev", "mnt"] {
+        std::fs::create_dir_all(stage.join(d))?;
+    }
+    std::fs::copy(&busybox, stage.join("bin/busybox"))?;
+    let sweep_args = if list.is_empty() {
+        format!("{dur} {workers}")
+    } else {
+        format!("{dur} {workers} {list}")
+    };
+    let init = format!(
+        "#!/bin/busybox sh\n\
+         /bin/busybox mount -t proc proc /proc\n\
+         /bin/busybox mount -t sysfs sysfs /sys\n\
+         /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null\n\
+         /bin/busybox ifconfig lo 127.0.0.1 up 2>/dev/null\n\
+         if ! /bin/busybox mount -t ext2 /dev/vda /mnt; then\n\
+         echo SWEEP-MOUNT-FAIL\n\
+         /bin/busybox poweroff -f\n\
+         fi\n\
+         /bin/busybox mount -o bind /dev /mnt/dev\n\
+         /bin/busybox mkdir -p /mnt/dev/shm\n\
+         /bin/busybox mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /mnt/tmp\n\
+         /bin/busybox mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /mnt/dev/shm\n\
+         /bin/busybox mount -t proc proc /mnt/proc 2>/dev/null\n\
+         /bin/busybox mount -t sysfs sysfs /mnt/sys 2>/dev/null\n\
+         echo LINUX-SWEEP-BOOT\n\
+         PATH=/bin:/usr/bin:/sbin:/usr/sbin LD_LIBRARY_PATH=/usr/lib:/lib \
+         /bin/busybox chroot /mnt /bin/busybox sh /sweep.sh {sweep_args}\n\
+         /bin/busybox poweroff -f\n"
+    );
+    std::fs::write(stage.join("init"), init)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in ["init", "bin/busybox"] {
+            let p = stage.join(f);
+            let mut perm = std::fs::metadata(&p)?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm)?;
+        }
+    }
+    let initramfs = std::env::temp_dir().join("narf-linux-stress.cpio.gz");
+    let pack = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "cd {} && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -1 > {}",
+            stage.display(),
+            initramfs.display()
+        ))
+        .status()
+        .with_context(|| "Linux baseline: building initramfs (need cpio + gzip)")?;
+    if !pack.success() {
+        bail!("Linux baseline: initramfs pack failed");
+    }
+
+    // Mirror `Arch::X86_64::qemu_args` piece by piece so the only
+    // variable is the kernel: same -cpu string (clamped), same -smp and
+    // NUMA/HMAT layout, same RAM split, same accelerator policy.
+    let cpu = Arch::clamp_cpu_phys_bits(
+        std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into()),
+    );
+    let smp = std::env::var("NARF_QEMU_SMP").ok();
+    let mem_mb: u64 = std::env::var("NARF_QEMU_MEM_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&m| m >= 2 && m % 2 == 0)
+        .unwrap_or(1024);
+    let node_mem_mb = mem_mb / 2;
+    let mut args: Vec<String> = vec![
+        "-machine".into(),
+        if smp.is_some() {
+            "q35".into()
+        } else {
+            "q35,hmat=on".into()
+        },
+        "-cpu".into(),
+        cpu,
+        "-smp".into(),
+        smp.clone().unwrap_or_else(|| "16,sockets=2,cores=8".into()),
+        "-m".into(),
+        format!("{mem_mb}M"),
+        "-kernel".into(),
+        kernel.display().to_string(),
+        "-initrd".into(),
+        initramfs.display().to_string(),
+        "-append".into(),
+        "console=ttyS0 panic=-1 quiet".into(),
+        "-nographic".into(),
+        "-no-reboot".into(),
+        "-snapshot".into(),
+        "-drive".into(),
+        format!("if=none,id=vblk0,format=raw,file={}", rootfs.display()),
+        "-device".into(),
+        "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
+    ];
+    if smp.is_none() {
+        args.extend_from_slice(&[
+            "-numa".into(),   "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
+            "-numa".into(),   "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
+            "-object".into(), format!("memory-backend-ram,id=mem0,size={node_mem_mb}M"),
+            "-object".into(), format!("memory-backend-ram,id=mem1,size={node_mem_mb}M"),
+            "-numa".into(),   "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
+            "-numa".into(),   "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
+            "-numa".into(),   "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
+            "-numa".into(),   "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-latency,latency=10".into(),
+            "-numa".into(),   "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
+            "-numa".into(),   "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
+            "-numa".into(),   "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
+            "-numa".into(),   "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
+            "-numa".into(),   "dist,src=0,dst=0,val=10".into(),
+            "-numa".into(),   "dist,src=0,dst=1,val=20".into(),
+            "-numa".into(),   "dist,src=1,dst=0,val=20".into(),
+            "-numa".into(),   "dist,src=1,dst=1,val=10".into(),
+        ]);
+    }
+    if let Some(accel) = bench_accel() {
+        args.push("-accel".into());
+        args.push(accel);
+    }
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args(&args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("Linux baseline: spawn qemu-system-x86_64")?;
+
+    // Stream serial to our stdout (live tail, same as the NARF boot)
+    // while persisting it for the metric parse.
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let cap_r = captured.clone();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        let mut out = std::io::stdout();
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = out.write_all(&buf[..n]);
+                    let _ = out.flush();
+                    if let Ok(mut g) = cap_r.lock() {
+                        g.extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut done = false;
+    while start.elapsed() < Duration::from_secs(timeout_secs) {
+        if let Ok(g) = captured.lock() {
+            if g.windows(b"SWEEP-DONE".len())
+                .any(|w| w == b"SWEEP-DONE")
+            {
+                done = true;
+            }
+        }
+        if done {
+            break;
+        }
+        // The guest powers off after the sweep; a dead child without the
+        // marker is a boot failure worth the transcript tail.
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    let transcript = captured
+        .lock()
+        .map(|g| String::from_utf8_lossy(&g).into_owned())
+        .unwrap_or_default();
+    if !done {
+        let tail: String = transcript
+            .chars()
+            .rev()
+            .take(1200)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        bail!(
+            "Linux baseline: no SWEEP-DONE within {timeout_secs}s. Serial tail:\n{tail}"
+        );
+    }
+    Ok(transcript)
+}
+
+/// See [`Cmd::StressBench`].
+fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask stress-bench: only x86_64 is wired");
+    }
+    let root = workspace_root()?;
+    let disk = virtio_blk_image_path();
+    if !disk.exists() {
+        bail!(
+            "xtask stress-bench: no stress rootfs at {} — run \
+             `sh verification/data/musl-demo/REGEN_stress_rootfs.sh` first",
+            disk.display()
+        );
+    }
+
+    let dur = std::env::var("XTASK_STRESS_DUR").unwrap_or_else(|_| "10s".into());
+    let workers = std::env::var("XTASK_STRESS_WORKERS").unwrap_or_else(|_| "2".into());
+    let list = std::env::var("XTASK_STRESS_LIST").unwrap_or_default();
+    let timeout_secs: u64 = std::env::var("XTASK_STRESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1800);
+
+    // Both boots write scratch into the shared rootfs image; snapshot
+    // mode keeps the base pristine so run N+1 sees the same bits.
+    std::env::set_var("XTASK_QEMU_SNAPSHOT", "1");
+    // The sweep runs every stressor sequentially — far past the default
+    // 120s echo window. Respect an explicit override.
+    if std::env::var_os("XTASK_RI_ECHO_TIMEOUT_SECS").is_none() {
+        std::env::set_var("XTASK_RI_ECHO_TIMEOUT_SECS", timeout_secs.to_string());
+    }
+
+    println!(
+        "xtask stress-bench: sequential sweep, {workers} workers/stressor, {dur} each\n\
+         both guests: same rootfs (snapshot), same -cpu/-smp/RAM/topology, accel={}\n",
+        bench_accel_label()
+    );
+
+    // 1. NARF under QEMU.
+    println!("── NARF (microkernel) under QEMU ──");
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+    let fw_dir = root.join("target").join("firmware");
+    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &build.initramfs_firmware)?;
+    let mut cpio_path = None;
+    if !fw_initramfs.is_empty() {
+        let cpio_entries: Vec<(&str, &[u8])> = fw_initramfs
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+            .collect();
+        let cpio = encode_cpio_newc(&cpio_entries);
+        let p = out_dir.join("initramfs.cpio");
+        std::fs::write(&p, &cpio)
+            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
+        cpio_path = Some(p);
+    }
+    let typed = if list.is_empty() {
+        format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers}")
+    } else {
+        format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers} {list}")
+    };
+    let narf_serial = run_interactive_boot(
+        &kernel,
+        cpio_path.as_ref(),
+        build.arch,
+        &build.display,
+        build.hw_profile,
+        build.gpu_backend,
+        &typed,
+        "SWEEP-DONE",
+    )?;
+    let narf = parse_stress_metrics(&narf_serial);
+    if narf.is_empty() {
+        bail!(
+            "xtask stress-bench: no `stress-ng: metrc:` rows in the NARF transcript — \
+             is /sweep.sh in the rootfs? (re-run REGEN_stress_rootfs.sh)"
+        );
+    }
+
+    // 2. Stock Linux kernel, same QEMU shape, same image, same sweep.
+    println!("\n── Linux (stock kernel) under QEMU ──");
+    let linux = match boot_linux_stress(&disk, &dur, &workers, &list, timeout_secs) {
+        Ok(serial) => {
+            let m = parse_stress_metrics(&serial);
+            if m.is_empty() {
+                println!("  Linux baseline: transcript had no metric rows");
+                None
+            } else {
+                Some(m)
+            }
+        }
+        Err(e) => {
+            println!("  Linux baseline unavailable: {e:#}");
+            None
+        }
+    };
+
+    // 3. Report. Rows in NARF order; a stressor only one side reports
+    // shows n/a and stays out of the geometric mean.
+    println!(
+        "\n┌─ stress-ng sweep (same Alpine stress-ng binary, {workers} workers, {dur}/stressor; bogo-ops/s, real time) ─"
+    );
+    println!(
+        "│ {:<12} {:>16} {:>17} {:>12}",
+        "stressor", "NARF bogo-ops/s", "Linux bogo-ops/s", "NARF/Linux"
+    );
+    let mut log_ratio_sum = 0f64;
+    let mut ratio_count = 0usize;
+    for m in &narf {
+        let lrate = linux
+            .as_ref()
+            .and_then(|l| l.iter().find(|x| x.name == m.name))
+            .map(|x| x.rate_real);
+        match lrate {
+            Some(lr) if lr > 0.0 && m.rate_real > 0.0 => {
+                let ratio = m.rate_real / lr;
+                log_ratio_sum += ratio.ln();
+                ratio_count += 1;
+                println!(
+                    "│ {:<12} {:>16.1} {:>17.1} {:>11.2}x",
+                    m.name, m.rate_real, lr, ratio
+                );
+            }
+            Some(lr) => println!(
+                "│ {:<12} {:>16.1} {:>17.1} {:>12}",
+                m.name, m.rate_real, lr, "n/a"
+            ),
+            None => println!(
+                "│ {:<12} {:>16.1} {:>17} {:>12}",
+                m.name, m.rate_real, "n/a", "n/a"
+            ),
+        }
+    }
+    if let Some(l) = &linux {
+        for m in l {
+            if !narf.iter().any(|n| n.name == m.name) {
+                println!(
+                    "│ {:<12} {:>16} {:>17.1} {:>12}",
+                    m.name, "n/a", m.rate_real, "n/a"
+                );
+            }
+        }
+    }
+    if ratio_count > 0 {
+        println!(
+            "│ geometric mean NARF/Linux over {ratio_count} stressors: {:.2}x",
+            (log_ratio_sum / ratio_count as f64).exp()
+        );
+    }
+    println!("└────────────────────────────────────────────────────────────");
+    // A stressor that ran but produced zero bogo-ops is usually a
+    // worker that died early — call those out instead of hiding them
+    // in a 0.0 row.
+    for m in &narf {
+        if m.bogo_ops == 0.0 && m.real_secs > 0.0 {
+            println!("  note: NARF `{}` completed 0 bogo-ops — worker likely failed", m.name);
+        }
+    }
+    println!("\nxtask stress-bench: ok");
     Ok(())
 }
 
@@ -8888,6 +9412,7 @@ fn main() -> Result<()> {
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
+        Cmd::StressBench(args) => stress_bench_cmd(&args),
         Cmd::MtEchoBench(args) => mt_echo_bench_cmd(&args),
         Cmd::MuslDemo(args) => musl_demo_cmd(&args),
         Cmd::BpfBench(args) => bpf_bench::bpf_bench_cmd(&args),
