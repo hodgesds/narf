@@ -497,6 +497,13 @@ pub fn set_default_ipv4(ipv4: [u8; 4], gateway: [u8; 4]) {
             e.gateway = gateway;
         }
     }
+    // Deliberately does NOT publish a 0.0.0.0/0 route, unlike
+    // `set_iface_ipv4`. This applies to whatever happens to be FIRST in the
+    // registry, which is not necessarily the interface the caller means —
+    // adequate for stamping a field, far too vague to hang a default route
+    // on, since the wrong one silently captures all off-link traffic.
+    // Callers that know the interface name (the DHCP ACK does) call
+    // `set_gateway` themselves.
 }
 
 /// Replace the IPv4 / gateway pair on a named iface. Wave-47: the
@@ -505,12 +512,19 @@ pub fn set_default_ipv4(ipv4: [u8; 4], gateway: [u8; 4]) {
 /// per-iface setter rather than `set_default_ipv4`, which only touches
 /// the first-registered entry.
 pub fn set_iface_ipv4(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
-    let mut g = IFACES.lock();
-    if let Some(v) = g.as_mut() {
-        if let Some(e) = v.iter_mut().find(|e| e.name == name) {
-            e.ipv4 = ipv4;
-            e.gateway = gateway;
+    {
+        let mut g = IFACES.lock();
+        if let Some(v) = g.as_mut() {
+            if let Some(e) = v.iter_mut().find(|e| e.name == name) {
+                e.ipv4 = ipv4;
+                e.gateway = gateway;
+            }
         }
+    }
+    // As in `set_default_ipv4`: the gateway becomes a FIB entry, and the
+    // IFACES lock is dropped before `set_gateway` re-takes it.
+    if gateway != [0u8; 4] {
+        set_gateway(name, gateway);
     }
 }
 
@@ -540,7 +554,17 @@ pub fn get_addrs(iface_name: &str) -> alloc::vec::Vec<(crate::ipv4::Ipv4Addr, u8
 }
 
 /// Install the iface's default gateway as a route (0.0.0.0/0 via
-/// gateway). Called by boot-time static config or DHCP ACK.
+/// gateway).
+///
+/// Called from `set_iface_ipv4` / `set_default_ipv4`, the two places a
+/// gateway is ever configured (static boot config and the DHCP ACK). It
+/// used to have no caller at all: both of those recorded the gateway as an
+/// interface FIELD and nothing published it to the FIB, so no IPv4 default
+/// route existed. Outbound still worked, because `ipv4::send` does its own
+/// subnet comparison and falls back to `binding.gateway` — but the routing
+/// table did not describe what the stack actually did, which shows up as a
+/// missing default in `ip route` / `/proc/net/route`, and as `for_dst`
+/// picking an egress by `primary_in()` fallback rather than by route.
 pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
     use crate::ipv4::Ipv4Addr;
     use crate::route::{Ipv4Net, Route, Scope, TABLE_MAIN};

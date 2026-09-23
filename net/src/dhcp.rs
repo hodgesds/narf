@@ -303,6 +303,14 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
     if let Some(primary) = iface::primary() {
         if primary.name == iface_name {
             iface::set_default_ipv4(ack.yiaddr, ack.gateway);
+            // Publish the lease's gateway as a real default route. The
+            // field alone is not routing: `set_gateway` is what puts
+            // 0.0.0.0/0 in the FIB, and it had no caller at all, so a
+            // DHCP-configured host had no default route. Named explicitly
+            // here because this path knows which interface the lease is for.
+            if ack.gateway != [0u8; 4] {
+                iface::set_gateway(iface_name, ack.gateway);
+            }
         }
     }
 
