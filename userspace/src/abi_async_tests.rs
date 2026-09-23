@@ -2123,3 +2123,67 @@ kernel_test_in!(
     "syscall_abi/async",
     smoke_abi_async_inotify_max_queued_events_overflows
 );
+
+// `fs.aio-max-nr` bounds the sum of every live AIO context's nr_events.
+//
+// The reservation was stored per context and never read — the field was
+// literally named `_nr_events` — so the knob bounded nothing and a task could
+// mint contexts reserving any number of events. Linux keeps a global `aio_nr`
+// against the ceiling and answers EAGAIN from `io_setup` when a new context
+// would push the total over.
+//
+// Linux ref: `ioctx_alloc()` in fs/aio.c.
+fn smoke_abi_async_aio_max_nr_limits_contexts() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::procfs::sys_fs::AIO_MAX_NR;
+
+    with_setup(|| {
+        let restore = AIO_MAX_NR.load(Ordering::Relaxed);
+        AIO_MAX_NR.store(64, Ordering::Relaxed);
+
+        let mut id: u64 = 0;
+        let setup = |nr: u64, out: &mut u64| {
+            *out = 0;
+            call(Syscall::IoSetup.raw(), a1(nr, out as *mut u64 as u64))
+        };
+
+        // Half the ceiling is fine.
+        let first = setup(32, &mut id) == Some(0);
+        let first_id = id;
+        // The rest of it is fine too.
+        let mut id2: u64 = 0;
+        let second = setup(32, &mut id2) == Some(0);
+        // One more event now exceeds it.
+        let mut id3: u64 = 0;
+        let refused = setup(1, &mut id3) == Some(EAGAIN);
+
+        // Destroying a context refunds its reservation, so the same request
+        // succeeds afterwards — the counter tracks live contexts, not a
+        // high-water mark.
+        let destroyed = call(Syscall::IoDestroy.raw(), a0(first_id)) == Some(0);
+        let mut id4: u64 = 0;
+        let after_refund = setup(32, &mut id4) == Some(0);
+
+        let _ = call(Syscall::IoDestroy.raw(), a0(id2));
+        let _ = call(Syscall::IoDestroy.raw(), a0(id4));
+        AIO_MAX_NR.store(restore, Ordering::Relaxed);
+
+        if !first || !second {
+            return Err("io_setup within fs.aio-max-nr was refused");
+        }
+        if !refused {
+            return Err("io_setup past fs.aio-max-nr was not -EAGAIN");
+        }
+        if !destroyed {
+            return Err("io_destroy failed");
+        }
+        if !after_refund {
+            return Err("io_destroy did not refund its aio-max-nr reservation");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_aio_max_nr_limits_contexts
+);

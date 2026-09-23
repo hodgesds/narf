@@ -62,7 +62,8 @@ static INOTIFY_MAX_USER_INSTANCES: AtomicU64 = AtomicU64::new(128);
 /// `fs.inotify.max_queued_events`. Read by the inotify implementation in
 /// `narf-userspace`, which depends on this crate.
 pub static INOTIFY_MAX_QUEUED_EVENTS: AtomicU64 = AtomicU64::new(16384);
-static AIO_MAX_NR: AtomicU64 = AtomicU64::new(65536);
+/// `fs.aio-max-nr`. Read by `io_setup` in `narf-userspace`.
+pub static AIO_MAX_NR: AtomicU64 = AtomicU64::new(65536);
 static EPOLL_MAX_USER_WATCHES: AtomicU64 = AtomicU64::new(1 << 20); // 1 M, Linux default
 static LEASE_BREAK_TIME: AtomicU64 = AtomicU64::new(45);
 
@@ -114,6 +115,14 @@ fn gen_dentry_state() -> String {
 /// learns it missed something rather than silently losing it.
 pub fn inotify_max_queued_events() -> usize {
     INOTIFY_MAX_QUEUED_EVENTS.load(Ordering::Relaxed) as usize
+}
+
+/// System-wide ceiling on the sum of every AIO context's `nr_events`.
+///
+/// Linux keeps a global `aio_nr` against it and answers EAGAIN from
+/// `io_setup` when a new context would push the total over.
+pub fn aio_max_nr() -> u64 {
+    AIO_MAX_NR.load(Ordering::Relaxed)
 }
 
 // ── Registration ─────────────────────────────────────────────────
