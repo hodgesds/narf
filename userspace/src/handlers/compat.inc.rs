@@ -3177,6 +3177,21 @@ pub(crate) fn current_set_mount_flags(path: &str, flags: u64) -> bool {
     }
 }
 
+/// `do_change_type` in the caller's mount namespace (its private table when it
+/// unshared CLONE_NEWNS, else the global registry). Returns false = no mount at
+/// `path` (ENOENT).
+pub(crate) fn current_change_propagation(
+    path: &str,
+    prop: narf_filesystem::MntPropagation,
+    recursive: bool,
+) -> bool {
+    if let Some(ns) = current_mount_namespace() {
+        ns.change_propagation_at(path, prop, recursive)
+    } else {
+        narf_filesystem::registry().change_propagation_at(path, prop, recursive)
+    }
+}
+
 fn current_bind_mount(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     source: &str,

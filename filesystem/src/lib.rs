@@ -2485,6 +2485,24 @@ pub fn resolve_async_ext<'a>(
 /// dropping the mount drops the FS) and the path it's mounted at.
 /// Path is stored as `&'static str` for Stage-3 simplicity — every
 /// mount in the harness today is mount-once-at-boot.
+/// Mount-propagation type, the argument to Linux's `do_change_type`
+/// (`mount --make-{shared,private,slave,unbindable}`). Exactly one is
+/// selected per `mount(2)` call carrying a propagation flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MntPropagation {
+    /// `MS_SHARED` — join/keep a peer group; mounts under it propagate to peers.
+    Shared,
+    /// `MS_PRIVATE` — leave any peer group; no propagation (the default).
+    Private,
+    /// `MS_SLAVE` — receive propagation from the master peer group but do not
+    /// send. LINUX-GAP: NARF has no slave state yet, so this drops the mount to
+    /// private (the safe subset) rather than wiring a one-way master link.
+    Slave,
+    /// `MS_UNBINDABLE` — private and additionally not bind-mountable. LINUX-GAP:
+    /// the unbindable restriction is not tracked yet, so this behaves as private.
+    Unbindable,
+}
+
 pub struct Mount {
     pub path: alloc::string::String,
     pub fs: Arc<dyn FsInstance>,
@@ -2494,6 +2512,13 @@ pub struct Mount {
     /// `path_mount` derives from the caller's `MS_*`. An atomic because
     /// `mount -o remount` changes them in place on a live mount.
     flags: core::sync::atomic::AtomicU64,
+    /// Mount-propagation peer group — Linux's `struct mount.mnt_group_id`.
+    /// `0` means "private" (no propagation, the default). A non-zero value
+    /// is a peer-group id: every mount across every namespace that carries
+    /// the SAME non-zero group id is a peer, and a mount/unmount under any
+    /// one of them propagates to all the others (`MS_SHARED`). Atomic because
+    /// `mount --make-shared`/`--make-private` flip it on a live mount.
+    group_id: core::sync::atomic::AtomicU64,
 }
 
 /// Every `MNT_*` bit that has ever been set on any mount, OR-ed together.
@@ -2571,6 +2596,26 @@ impl Mount {
     /// This mount's `MNT_*` flags.
     pub fn flags(&self) -> u64 {
         self.flags.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// This mount's propagation peer-group id (`0` = private). See the
+    /// `group_id` field and [`alloc_mount_group_id`].
+    pub fn group_id(&self) -> u64 {
+        self.group_id.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this mount is shared (a member of a peer group). Mirrors
+    /// Linux `IS_MNT_SHARED` (`fs/pnode.h`), which is exactly `mnt_group_id`
+    /// being non-zero after `set_mnt_shared`.
+    pub fn is_shared(&self) -> bool {
+        self.group_id() != 0
+    }
+
+    /// Set (or clear, with `0`) this mount's peer-group id in place — Linux's
+    /// `set_mnt_shared` / `change_mnt_propagation` on a live mount.
+    pub fn set_group_id(&self, gid: u64) {
+        self.group_id
+            .store(gid, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2658,6 +2703,12 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
 /// last-wins rule `single_mount_resolution` uses — so the answer always
 /// describes the mount a path operation on `abs` would actually reach.
 fn mount_flags_for(mounts: &[Mount], abs: &str) -> Option<u64> {
+    covering_mount(mounts, abs).map(|mount| mount.flags())
+}
+
+/// The mount covering `abs` by the longest-prefix + newest-wins rule that all
+/// resolution uses. Shared by `mount_flags_for` / `mount_group_id_for`.
+fn covering_mount<'a>(mounts: &'a [Mount], abs: &str) -> Option<&'a Mount> {
     let mut best: Option<&Mount> = None;
     for mount in mounts {
         if !mount_covers_path(&mount.path, abs) {
@@ -2673,7 +2724,11 @@ fn mount_flags_for(mounts: &[Mount], abs: &str) -> Option<u64> {
             best = Some(mount);
         }
     }
-    best.map(|mount| mount.flags())
+    best
+}
+
+fn mount_group_id_for(mounts: &[Mount], abs: &str) -> Option<u64> {
+    covering_mount(mounts, abs).map(|mount| mount.group_id())
 }
 
 #[inline]
@@ -2876,6 +2931,17 @@ fn notify_mount_change() {
 
 fn alloc_mount_id() -> u64 {
     NEXT_MOUNT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Peer-group ids start at 1 so `0` can mean "private" on every mount — the
+/// same convention Linux uses (`mnt_group_id == 0` is "no group").
+static NEXT_MOUNT_GROUP_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a fresh, never-zero mount-propagation peer-group id — Linux's
+/// `mnt_alloc_group_id`. `mount --make-shared` on a private mount calls this
+/// to mint the group the mount (and its future ns-clones) will share.
+pub fn alloc_mount_group_id() -> u64 {
+    NEXT_MOUNT_GROUP_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Reference the global VFS registry.
@@ -3282,6 +3348,19 @@ impl MountNamespace {
                 // A namespace clone copies the mount's flags with it:
                 // `copy_mnt_ns` duplicates each mount, restrictions and all.
                 flags: core::sync::atomic::AtomicU64::new(m.flags()),
+                // Propagation: the clone INHERITS the source mount's peer-group
+                // id, so a shared mount's copy is a genuine PEER of the source
+                // across the two namespaces — Linux `clone_mnt` for a same-
+                // user_ns clone (`mnt_group_id = old->mnt_group_id`, then spliced
+                // into the peer ring; fs/namespace.c). This is exactly what makes
+                // a service sandbox's /run a peer of the host /run so mounts
+                // under it propagate both ways. LINUX-GAP: a clone into a
+                // DIFFERENT user namespace should instead become a SLAVE
+                // (group_id 0, one-way host->child); NARF has no slave state yet,
+                // so cross-user_ns clones are treated as peers. Service sandboxes
+                // are mount namespaces in the same user namespace, so the peer
+                // path is the one that matters here.
+                group_id: core::sync::atomic::AtomicU64::new(m.group_id()),
             })
             .collect();
         let id = alloc_mount_ns_id();
@@ -3618,6 +3697,28 @@ impl MountNamespace {
         mount_flags_for(&q, abs)
     }
 
+    /// The propagation peer-group id of the mount covering `abs` (`0` =
+    /// private), or `None` when no mount covers it. Used by tests and by the
+    /// mountinfo/statmount surfaces.
+    pub fn group_id_at(&self, abs: &str) -> Option<u64> {
+        let q = self.store().inner.lock();
+        mount_group_id_for(&q, abs)
+    }
+
+    /// Paths of every mount in this namespace whose peer-group id is exactly
+    /// `gid` (which must be non-zero). These are the local members of a peer
+    /// group — mount propagation attaches a copy of a new child mount at each.
+    pub fn mount_paths_with_group(&self, gid: u64) -> Vec<String> {
+        if gid == 0 {
+            return Vec::new();
+        }
+        let q = self.store().inner.lock();
+        q.iter()
+            .filter(|m| m.group_id() == gid)
+            .map(|m| m.path.clone())
+            .collect()
+    }
+
     /// Replace the `MNT_*` flags of the mount at exactly `path` — Linux's
     /// `do_reconfigure_mnt`, which changes an existing attachment rather
     /// than creating one.
@@ -3634,6 +3735,19 @@ impl MountNamespace {
             .mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         true
+    }
+
+    /// Namespace-scoped `do_change_type` — see
+    /// [`VfsRegistry::change_propagation_at`]. Operates on this namespace's own
+    /// table (its private mounts), which is where a service that unshared
+    /// CLONE_NEWNS issues `mount --make-shared`.
+    pub fn change_propagation_at(
+        &self,
+        path: &str,
+        prop: MntPropagation,
+        recursive: bool,
+    ) -> bool {
+        self.store().change_propagation_at(path, prop, recursive)
     }
 
     /// Mount identity and hierarchy in attachment order.
@@ -3684,6 +3798,11 @@ impl MountNamespace {
             handle,
             id: alloc_mount_id(),
             flags: core::sync::atomic::AtomicU64::new(flags),
+            // A freshly created mount is PRIVATE (no peer group) until
+            // `mount --make-shared` marks it, exactly as Linux mounts start
+            // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
+            // already-shared parent is handled by the attach path, not here.
+            group_id: core::sync::atomic::AtomicU64::new(0),
         });
         note_mnt_flags(flags);
         self.store()
@@ -4028,6 +4147,11 @@ impl VfsRegistry {
             handle,
             id: alloc_mount_id(),
             flags: core::sync::atomic::AtomicU64::new(flags),
+            // A freshly created mount is PRIVATE (no peer group) until
+            // `mount --make-shared` marks it, exactly as Linux mounts start
+            // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
+            // already-shared parent is handled by the attach path, not here.
+            group_id: core::sync::atomic::AtomicU64::new(0),
         });
         note_mnt_flags(flags);
         self.mountinfo_generation
@@ -4069,6 +4193,11 @@ impl VfsRegistry {
             handle,
             id: alloc_mount_id(),
             flags: core::sync::atomic::AtomicU64::new(flags),
+            // A freshly created mount is PRIVATE (no peer group) until
+            // `mount --make-shared` marks it, exactly as Linux mounts start
+            // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
+            // already-shared parent is handled by the attach path, not here.
+            group_id: core::sync::atomic::AtomicU64::new(0),
         });
         note_mnt_flags(flags);
         self.mountinfo_generation
@@ -4213,6 +4342,13 @@ impl VfsRegistry {
         mount_flags_for(&q, abs)
     }
 
+    /// The propagation peer-group id of the mount covering `abs` (`0` =
+    /// private) in this namespace, or `None` when no mount covers it.
+    pub fn group_id_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        mount_group_id_for(&q, abs)
+    }
+
     /// Replace the `MNT_*` flags of the mount at exactly `path`.
     pub fn set_flags_at(&self, path: &str, flags: u64) -> bool {
         let q = self.inner.lock();
@@ -4226,6 +4362,52 @@ impl VfsRegistry {
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         true
+    }
+
+    /// `fs/namespace.c::do_change_type` — change the propagation type of the
+    /// mount at `path` (and, when `recursive`, every mount beneath it). Returns
+    /// `false` when no mount exists at `path` (the caller maps that to ENOENT,
+    /// as `do_change_type` does when `path_mounted` fails).
+    ///
+    /// `MS_SHARED` mints a fresh peer-group id for any affected mount that is
+    /// still private (Linux `invent_group_ids` + `set_mnt_shared`, distinct id
+    /// per mount so each mountpoint propagates independently). The other types
+    /// drop the mount out of its peer group — full one-way slave and unbindable
+    /// semantics are the LINUX-GAP noted on [`MntPropagation`].
+    pub fn change_propagation_at(
+        &self,
+        path: &str,
+        prop: MntPropagation,
+        recursive: bool,
+    ) -> bool {
+        let q = self.inner.lock();
+        let mut found = false;
+        for m in q.iter() {
+            let affected =
+                m.path == path || (recursive && path_is_proper_descendant(&m.path, path));
+            if !affected {
+                continue;
+            }
+            found = true;
+            match prop {
+                MntPropagation::Shared => {
+                    if m.group_id() == 0 {
+                        m.set_group_id(alloc_mount_group_id());
+                    }
+                }
+                MntPropagation::Private
+                | MntPropagation::Slave
+                | MntPropagation::Unbindable => m.set_group_id(0),
+            }
+        }
+        drop(q);
+        if found {
+            self.mountinfo_generation
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            invalidate_global_mount_caches();
+            notify_mount_change();
+        }
+        found
     }
 
     /// Mount identity and hierarchy in attachment order.
