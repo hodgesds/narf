@@ -388,15 +388,17 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // matters: PRE_ROUTING (and any DNAT in it) runs first, so the decision
     // must read the possibly-rewritten packet, not the frame as it arrived.
     //
-    // NARF has no forwarding plane, so the forward branch collapses to a
-    // drop — the correct outcome for `ip_forward = 0`. Without this step
-    // every packet reaching the stack was delivered as if addressed to us.
+    // A destination that is not ours goes to `ip_forward::try_forward`,
+    // which routes it on when `net.ipv4.ip_forward` allows and otherwise
+    // drops. Without this step every packet reaching the stack was
+    // delivered as if addressed to us.
     {
         let decided = ctx.packet();
         if let Some((ip, _)) = parse_ipv4(decided) {
             if !crate::ip_local::deliver_locally_in(net_ns_id, ip.dst_ip)
                 && !is_dhcp_client_datagram(decided)
             {
+                crate::ip_forward::try_forward(net_ns_id, iface_in, decided);
                 return;
             }
         }

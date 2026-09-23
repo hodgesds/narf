@@ -95,9 +95,18 @@ fn e2e_kernel_hostname_write_propagates() -> TestResult {
 kernel_test_in!("procsys_e2e/kernel", e2e_kernel_hostname_write_propagates);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Smoke 2 — net.ipv4.ip_forward (wired: IP_FORWARD atomic + ip_forward())
+// Smoke 2 — net.ipv4.ip_forward
 //
 // Write "1" → ip_forward() returns true. Set back to "0".
+//
+// This checks the procfs half only: that a write reaches the accessor. It
+// cannot say whether anything obeys the value, because it reads the same
+// atomic it just wrote — true of any knob, enforced or not. The datapath half
+// lives in `net/src/e2e_tests.rs`
+// (`smoke_ipv4_forward_disabled_drops` and friends), which assert on whether
+// a packet actually leaves the interface. The knob was stored and read back
+// correctly for a long time while `narf-net` could not see it at all.
+//
 // Linux ref: net/ipv4/devinet.c IPV4_DEVCONF_ALL, ipv4_forward_change()
 // ═══════════════════════════════════════════════════════════════════════════
 

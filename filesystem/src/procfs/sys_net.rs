@@ -9,7 +9,7 @@
 //!
 //! | Key                          | Wired to                                  |
 //! |------------------------------|-------------------------------------------|
-//! | `ip_forward`                 | `IP_FORWARD` atomic, consulted by routing |
+//! | `ip_forward`                 | `narf_lib::sysctl`, gates `net::ip_forward` |
 //! | `tcp_congestion_control`     | `TCP_CONG_ALG` IrqSafeSpinLock<String>   |
 //! | `tcp_timestamps`             | `TCP_TIMESTAMPS` atomic                   |
 //! | `tcp_sack`                   | `TCP_SACK` atomic                         |
@@ -51,8 +51,9 @@ static DEFAULT_QDISC: IrqSafeSpinLock<[u8; 16]> =
 
 // ── net.ipv4 atomics ────────────────────────────────────────────────────
 
-/// Consulted by the routing path: 1 = forward packets between interfaces.
-pub static IP_FORWARD: AtomicU32 = AtomicU32::new(0);
+/// Consulted by the IPv4 forwarding path in `narf-net`, so it lives in
+/// `narf_lib::sysctl` for the same reason the ICMP knobs below do.
+pub use narf_lib::sysctl::ipv4::IP_FORWARD;
 static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
 static TCP_KEEPALIVE_TIME: AtomicU32 = AtomicU32::new(7200);
 static TCP_KEEPALIVE_INTVL: AtomicU32 = AtomicU32::new(75);
@@ -183,7 +184,7 @@ fn write_bool_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
 /// True iff IP forwarding is globally enabled.
 #[inline]
 pub fn ip_forward() -> bool {
-    IP_FORWARD.load(Ordering::Relaxed) != 0
+    narf_lib::sysctl::ipv4::ip_forward()
 }
 
 /// True iff IPv6 forwarding is globally enabled.

@@ -22,6 +22,11 @@
 pub mod ipv4 {
     use core::sync::atomic::{AtomicU32, Ordering};
 
+    /// `net.ipv4.ip_forward`. Non-zero means: route packets that are not
+    /// addressed to this host out toward their destination instead of
+    /// dropping them. Linux default 0.
+    pub static IP_FORWARD: AtomicU32 = AtomicU32::new(0);
+
     /// `net.ipv4.icmp_echo_ignore_all`. Non-zero means: do not answer ICMP
     /// echo requests at all. Linux default 0 (`icmp_sk_init`,
     /// `net/ipv4/icmp.c`).
@@ -32,6 +37,12 @@ pub mod ipv4 {
     /// Linux default 1 — this is the Smurf-amplification guard, so the
     /// secure value is the default and a fresh boot must already enforce it.
     pub static ICMP_ECHO_IGNORE_BROADCASTS: AtomicU32 = AtomicU32::new(1);
+
+    /// True iff IPv4 forwarding is globally enabled.
+    #[inline]
+    pub fn ip_forward() -> bool {
+        IP_FORWARD.load(Ordering::Relaxed) != 0
+    }
 
     /// True iff echo requests must be ignored outright.
     #[inline]
@@ -47,6 +58,7 @@ pub mod ipv4 {
 
     /// Restore both knobs to their Linux defaults. Test-only.
     pub fn __reset_for_test() {
+        IP_FORWARD.store(0, Ordering::Relaxed);
         ICMP_ECHO_IGNORE_ALL.store(0, Ordering::Relaxed);
         ICMP_ECHO_IGNORE_BROADCASTS.store(1, Ordering::Relaxed);
     }
