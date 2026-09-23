@@ -8119,3 +8119,55 @@ fn smoke_net_loopback_guard_is_released_between_sends() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net", smoke_net_loopback_guard_is_released_between_sends);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Configuring a gateway must install a default ROUTE, not just set a field.
+//
+// `set_gateway` — the only thing that publishes 0.0.0.0/0 to the FIB — had
+// no caller. Both places a gateway is configured (`set_iface_ipv4` for the
+// static boot config, `set_default_ipv4` for the DHCP ACK) recorded it as an
+// interface field and stopped there, so no IPv4 default route ever existed.
+//
+// Outbound traffic still worked, which is why it went unnoticed: `ipv4::send`
+// does its own subnet comparison against `binding.netmask` and falls back to
+// `binding.gateway` for anything off-link, never consulting the FIB. The cost
+// is that the routing table did not describe what the stack actually did —
+// no default in `ip route` / `/proc/net/route`, and `iface::for_dst` picking
+// an egress through its `primary_in()` fallback instead of by route, which is
+// the wrong interface the moment there is more than one.
+// ══════════════════════════════════════════════════════════════════════════
+
+fn smoke_net_gateway_config_installs_default_route() -> TestResult {
+    use crate::ipv4::Ipv4Addr;
+    use crate::route::{Ipv4Net, TABLE_MAIN};
+    const GWIF: &str = "gwtest0";
+    const GW: [u8; 4] = [198, 51, 100, 254];
+
+    // A default route matches EVERY address, so leaving one behind reroutes
+    // the whole FIB for every later case in this image — the first version
+    // of this test did exactly that and broke an unrelated ARP/routing e2e
+    // by sending 8.8.8.8 to loopback. Use a dedicated interface and remove
+    // the route before returning, on every path.
+    crate::iface::register(GWIF, [0x02, 0, 0, 0, 0, 0x99], |_| Ok(()));
+    crate::iface::set_iface_ipv4(GWIF, [198, 51, 100, 2], GW);
+
+    let looked_up = crate::route::route_lookup(Ipv4Addr([203, 0, 113, 7]));
+
+    let default_net = Ipv4Net {
+        addr: Ipv4Addr([0, 0, 0, 0]),
+        prefix_len: 0,
+    };
+    crate::route::route_delete(default_net, GWIF, TABLE_MAIN);
+
+    let r = match looked_up {
+        Some(r) => r,
+        None => {
+            return TestResult::Fail("no route for an off-link address — no default route in FIB");
+        }
+    };
+    if r.nexthop != Ipv4Addr(GW) {
+        return TestResult::Fail("default route did not carry the configured gateway as nexthop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_gateway_config_installs_default_route);
