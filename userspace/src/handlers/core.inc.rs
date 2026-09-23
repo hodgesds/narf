@@ -2897,14 +2897,90 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 /// Write a Linux `struct stat` for a path in the caller's visible namespace.
 /// `raw` may be absolute or relative to the caller's cwd; callers of
 /// `newfstatat(2)` first join its relative pathname to the supplied dirfd.
+/// `fstat`-shaped stat of a descriptor's node, used when a `/proc/self/fd/N`
+/// magic symlink names a pathless/anonymous object (memfd, socket, O_TMPFILE).
+/// Mirrors the `AT_EMPTY_PATH` branch of `sys_newfstatat`.
+fn stat_linux_fd(ctx: &mut dyn TrapContext, n: u32, out_ptr: *mut linux_compat::Stat) {
+    let task = current_task_id();
+    let stat = fd::with_table(task, |t| {
+        t.get(n).map(|e| {
+            (
+                e.ops.stat(),
+                e.ops.owners(),
+                e.ops.rdev(),
+                e.ops.ino(),
+                e.ops.inode_attrs(),
+            )
+        })
+    });
+    let (s, (uid, gid), rdev, ino, attrs) = match stat {
+        Some(Some(tuple)) => tuple,
+        _ => {
+            ctx.set_return(errno_ret(EBADF));
+            return;
+        }
+    };
+    if out_ptr.is_null() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
+    let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
+    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size.
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            &out as *const linux_compat::Stat as *const u8,
+            core::mem::size_of::<linux_compat::Stat>(),
+        )
+    };
+    // SAFETY: `out_ptr` null-checked above; copy_to_user range-validates it.
+    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
     let out_ptr = out_arg as *mut linux_compat::Stat;
+    let task = current_task_id();
+    // `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) is a magic symlink: `stat(2)`
+    // follows it to the object the descriptor refers to. NARF's path resolver
+    // does not walk procfs magic symlinks, so without this the name is taken
+    // literally (chroot-applied to `.../proc/self/fd/N`) and misses with ENOENT.
+    // libacl's `acl_get_file` stats `/proc/self/fd/N` to synthesise a node's
+    // base ACL from its mode on ENODATA; the udev `uaccess` builtin opens
+    // `/dev/dri/card0` O_PATH and hands that fd's `/proc/self/fd/N` to
+    // `devnode_acl` — so a miss here makes `acl_get_file` return NULL, the
+    // builtin skips the setxattr, and card0 never gets the `user:<uid>:rw` ACL
+    // (the greeter's kwin then EACCES's on card0). fexecve/xattr/mount already
+    // resolve this symlink per-call; the stat family must too.
+    let magic_owned;
+    let raw: &str = if let Some(n) = parse_proc_self_fd(raw) {
+        match fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
+            // A descriptor with a real filesystem path: stat that node. The
+            // path is the fd's view (chroot-stripped), so it goes back through
+            // resolve_cwd_path below to re-root under the task's chroot.
+            Some(real) => {
+                magic_owned = real;
+                &magic_owned
+            }
+            // A pathless/anonymous fd (memfd, socket, O_TMPFILE, pipe): there is
+            // no name to walk, so stat the descriptor's node directly, exactly
+            // as `fstat`/`AT_EMPTY_PATH` does.
+            None => {
+                stat_linux_fd(ctx, n, out_ptr);
+                return;
+            }
+        }
+    } else {
+        raw
+    };
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
     // caller's cwd before chroot, so the stat family works from any
     // working directory — not just absolute paths.
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
-    let path_owned = resolve_cwd_path(current_task_id(), raw);
+    let path_owned = resolve_cwd_path(task, raw);
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     // `resolve_absolute` splits an absolute path into (mount, rel).
@@ -6303,7 +6379,14 @@ fn xattr_permission_check(
 /// in-filesystem resolver restarts an absolute target at its own mount root,
 /// which is correct for what it can see and wrong for anything else.
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
-    let (root, rel) = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+    // Resolve in the CALLER's mount namespace, not the global registry: a
+    // sandboxed service (e.g. the udev worker) names a node through its private
+    // namespace (`/run/systemd/mount-rootfs/dev/dri/card0`), which the global
+    // registry cannot resolve — so a global-only lookup missed the DRM node and
+    // the setxattr fell through to the generic path-keyed xattr table instead of
+    // the node's own store. current_resolve_absolute falls back to the global
+    // registry for un-namespaced tasks, so this is a no-op for the common case.
+    let (root, rel) = current_resolve_absolute(path, |fs, rel| {
         (fs.root(), alloc::string::String::from(rel))
     })?;
     match poll_blocking(narf_filesystem::resolve_async_nofollow(root, &rel)) {
