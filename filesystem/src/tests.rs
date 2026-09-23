@@ -6044,3 +6044,142 @@ fn smoke_filesystem_fs_inode_can_poll() -> TestResult {
 }
 
 kernel_test_in!("filesystem", smoke_filesystem_fs_inode_can_poll);
+
+/// A file in a lower layer's SUBDIRECTORY must resolve through the overlay
+/// when the upper does not have that directory at all.
+///
+/// The flat case (a file at the overlay root) is covered by
+/// `smoke_overlay_union_shadow`. This is the nested one, which is what a
+/// real lower layer looks like: the mount-target fixture puts a MemFs upper
+/// over the read-only boot initramfs, and `/lib/modules/narf_test_module.ko`
+/// stopped resolving — the module smokes began skipping — even though the
+/// lower layer was attached.
+fn smoke_overlay_lower_nested_path_resolves() -> TestResult {
+    use crate::{FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    // lower: /lib/modules/mod.ko ; upper: empty.
+    let lower = Arc::new(MemFs::new("ovn-lower"));
+    let lower_root = FsInstance::root(&*lower);
+    let lib = match poll_once_overlay(lower_root.mkdir("lib")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lower mkdir lib failed"),
+    };
+    let modules = match poll_once_overlay(lib.mkdir("modules")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lower mkdir lib/modules failed"),
+    };
+    if poll_once_overlay(modules.create("mod.ko")).is_none() {
+        return TestResult::Fail("lower create lib/modules/mod.ko did not complete");
+    }
+    // Sanity: the path resolves in the lower filesystem on its own.
+    if poll_once_overlay(crate::resolve_async(
+        lower_root.clone(),
+        "lib/modules/mod.ko",
+    ))
+    .and_then(|r| r.ok())
+    .is_none()
+    {
+        return TestResult::Fail("precondition: lower cannot resolve its own nested path");
+    }
+
+    let upper = Arc::new(MemFs::new("ovn-upper"));
+    let ov = OverlayFs::new("ovn", FsInstance::root(&*upper), vec![lower_root]);
+    let ov_root = FsInstance::root(&ov);
+
+    // The directory must be visible...
+    if poll_once_overlay(ov_root.lookup_dir_async("lib"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("overlay did not expose the lower's `lib` directory");
+    }
+    // ...and so must the file two levels down.
+    if poll_once_overlay(crate::resolve_async(ov_root, "lib/modules/mod.ko"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("overlay did not resolve lower's lib/modules/mod.ko");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_lower_nested_path_resolves);
+
+/// A regular file in an initramfs must not answer `lookup_dir`, and must
+/// stay visible when that initramfs is an overlay's lower layer.
+///
+/// `InitramfsDir::lookup_dir` matched any entry whose canonical name equalled
+/// the target, without checking the CPIO mode — so a plain file reported
+/// itself as a directory. Path walking never noticed, because it asks for a
+/// FILE at the last component. An overlay does notice: `lower_file_async`
+/// reads "the lower has a directory by this name" as "therefore not a file"
+/// and stops, so a file in an initramfs lower was invisible through an
+/// overlay while resolving perfectly well directly.
+///
+/// Uses the live boot initramfs, which is what the mount-target fixture puts
+/// an overlay over — that is where this surfaced, as /lib/modules/*.ko
+/// disappearing and the module smokes silently starting to skip.
+fn smoke_overlay_initramfs_lower_file_is_not_a_dir() -> TestResult {
+    use crate::{FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let Some(rootfs) = crate::registry().fs_arc_at("/") else {
+        return TestResult::Skip("no / mounted in this image");
+    };
+    let lower = rootfs.root();
+    // The path the boot image actually ships, and the one this defect hid.
+    // Two levels down, which matters: the bug is in a directory's own
+    // `lookup_dir`, not the root's.
+    const DIR_A: &str = "lib";
+    const DIR_B: &str = "modules";
+    const FILE: &str = "narf_test_module.ko";
+
+    let Some(a) = poll_once_overlay(lower.lookup_dir_async(DIR_A)).and_then(|r| r.ok()) else {
+        return TestResult::Skip("boot rootfs has no /lib");
+    };
+    let Some(sub) = poll_once_overlay(a.lookup_dir_async(DIR_B)).and_then(|r| r.ok()) else {
+        return TestResult::Skip("boot rootfs has no /lib/modules");
+    };
+    if poll_once_overlay(sub.lookup_async(FILE))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Skip("image built without the test module");
+    }
+    let file_name = alloc::string::String::from(FILE);
+    let dirname = DIR_A;
+
+    // The defect, directly: a file must not answer lookup_dir.
+    if poll_once_overlay(sub.lookup_dir_async(&file_name))
+        .and_then(|r| r.ok())
+        .is_some()
+    {
+        return TestResult::Fail("initramfs reported a regular file as a directory");
+    }
+
+    // And the consequence it caused: that file stays reachable under an
+    // overlay whose upper does not contain it.
+    let upper = Arc::new(MemFs::new("ovi-upper"));
+    let ov = OverlayFs::new("ovi", FsInstance::root(&*upper), vec![lower]);
+    let ov_root = FsInstance::root(&ov);
+    let Some(ov_a) = poll_once_overlay(ov_root.lookup_dir_async(dirname)).and_then(|r| r.ok())
+    else {
+        return TestResult::Fail("overlay did not expose the lower's directory");
+    };
+    let Some(ov_sub) = poll_once_overlay(ov_a.lookup_dir_async(DIR_B)).and_then(|r| r.ok()) else {
+        return TestResult::Fail("overlay did not expose the lower's nested directory");
+    };
+    if poll_once_overlay(ov_sub.lookup_async(&file_name))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("overlay hid a regular file present in its initramfs lower");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_overlay_initramfs_lower_file_is_not_a_dir
+);
