@@ -2626,26 +2626,45 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // `poll_to_yield` whose caller still holds the Box alive; the
     // pointer remains valid until poll_to_yield clears it.
     // SAFETY: Valid memory or trusted environment
+    // Read the slice window early (cheap) so the policy's tick hook can run
+    // BEFORE the preemptibility check — Linux `task_tick` accounts regardless of
+    // whether the switch can happen right now.
+    // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
+    // non-null; per the invariant noted there, the Box it points at is kept
+    // alive by the in-progress poll_to_yield, so the atomic reads below
+    // dereference a live `KernelTask`.
+    // SAFETY: Valid memory or trusted environment
+    let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    let now = narf_time::now_cycles();
+    let elapsed = now.saturating_sub(started);
+    let current_id = crate::current_task_id().raw();
+    // Linux `task_tick`: the policy's per-tick hook for the running task — only
+    // for policies that use it (one bool load skips it for the in-tree ZSTs; the
+    // gate covers the DECISION hook only, never the resched STATE below). It may
+    // advance eligibility and call `resched_current()` to request a yield.
+    if crate::policy_wants_tick() {
+        crate::scheduler_on_tick(current_id, elapsed);
+    }
+    // SAFETY: Same live-`KernelTask` invariant as above.
     let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
     if no_preempt {
         // A user task's syscall continuation is deliberately non-preemptible.
         // Make the timer decision now and defer only the context switch, just
-        // as Linux sets TIF_NEED_RESCHED for its exit-to-user loop.
+        // as Linux sets TIF_NEED_RESCHED for its exit-to-user loop. A resched
+        // the hook requested above persists in NEED_RESCHED and is honored there.
         // SAFETY: task_ptr is the live current task established above.
-        defer_user_resched_from_tick(unsafe { &*task_ptr }, narf_time::now_cycles());
+        defer_user_resched_from_tick(unsafe { &*task_ptr }, now);
         return false;
     }
-    // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
-    // non-null; per the invariant noted there, the Box it points at is kept
-    // alive by the in-progress poll_to_yield, so the atomic field reads below
-    // dereference a live `KernelTask`.
-    // SAFETY: Valid memory or trusted environment
-    let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
     // SAFETY: Same live-`KernelTask` invariant as above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
-    let now = narf_time::now_cycles();
-    let slice_expired = now.saturating_sub(started) >= slice;
-    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+    let slice_expired = elapsed >= slice;
+    // Honor a policy/waker reschedule request (Linux TIF_NEED_RESCHED) alongside
+    // slice expiry. Peek, don't consume: the executor's dispatch loop clears it
+    // once we switch, and if we don't preempt (nothing else runnable) it remains
+    // set harmlessly for the next check.
+    let need_resched = crate::need_resched_pending(cpu);
+    if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
     // SAFETY: Same live-`KernelTask` invariant as above.
@@ -2835,8 +2854,17 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     }
     let now = narf_time::now_cycles();
     let started = task.tsc_started.load(Ordering::Acquire);
-    let slice_expired = now.saturating_sub(started) >= task.slice_cycles.load(Ordering::Acquire);
-    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+    let elapsed = now.saturating_sub(started);
+    let current_id = crate::current_task_id().raw();
+    // Linux `task_tick`: per-tick policy hook, gated to the policies that use it
+    // (the DECISION hook only — the resched STATE below is honored regardless).
+    if crate::policy_wants_tick() {
+        crate::scheduler_on_tick(current_id, elapsed);
+    }
+    let slice_expired = elapsed >= task.slice_cycles.load(Ordering::Acquire);
+    // Honor a policy/waker reschedule request alongside slice expiry (peek).
+    let need_resched = crate::need_resched_pending(cpu);
+    if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
     let exec_ctx = task.exec_ctx.load(Ordering::Acquire);
@@ -2941,11 +2969,20 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     }
     // SAFETY: live `task_ptr` as established above.
     let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    let now = narf_time::now_cycles();
+    let elapsed = now.saturating_sub(started);
+    let current_id = crate::current_task_id().raw();
+    // Linux `task_tick`: per-tick policy hook, gated to the policies that use it
+    // (the DECISION hook only — the resched STATE below is honored regardless).
+    if crate::policy_wants_tick() {
+        crate::scheduler_on_tick(current_id, elapsed);
+    }
     // SAFETY: live `task_ptr` as established above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
-    let now = narf_time::now_cycles();
-    let slice_expired = now.saturating_sub(started) >= slice;
-    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+    let slice_expired = elapsed >= slice;
+    // Honor a policy/waker reschedule request alongside slice expiry (peek).
+    let need_resched = crate::need_resched_pending(cpu);
+    if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
     // SAFETY: live `task_ptr` as established above.

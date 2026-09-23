@@ -3024,6 +3024,82 @@ kernel_test_in!(
     smoke_scheduler_cycles_unit_refused_without_pmu
 );
 
+// `resched_current()` (NARF's `resched_curr`) sets THIS CPU's NEED_RESCHED —
+// the state the preempt path folds into its decision. It must NOT touch the
+// slice quantum (the quantum refills at the next dispatch); here we assert only
+// the flag, which is the observable contract of the primitive.
+fn smoke_scheduler_resched_current_sets_need_resched() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::__test_clear_need_resched(cpu);
+    if crate::__test_need_resched(cpu) {
+        return TestResult::Fail("NEED_RESCHED not clear at start");
+    }
+    crate::resched_current();
+    if !crate::__test_need_resched(cpu) {
+        crate::__test_clear_need_resched(cpu);
+        return TestResult::Fail("resched_current() did not set NEED_RESCHED");
+    }
+    crate::__test_clear_need_resched(cpu);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_resched_current_sets_need_resched
+);
+
+// The `on_tick` hook is an OVERHEAD-gated DECISION: `policy_wants_tick()` is
+// false for the in-tree ZST policies (their `on_tick` is a no-op, so the tick
+// path skips the whole hook) and true for a policy that overrides it. The gate
+// only skips the hook — it never gates the resched STATE.
+fn smoke_scheduler_policy_wants_tick_reflects_policy() -> TestResult {
+    use crate::{
+        install_scheduler, ClassScheduler, CpuId, CpuSchedContext, RunQueue, SchedPolicy,
+        Scheduler, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct TicksAndReschedules;
+    impl Scheduler for TicksAndReschedules {
+        fn name(&self) -> &'static str {
+            "ticks-and-reschedules"
+        }
+        fn pick_next(&self, _cpu: CpuId, _queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            None
+        }
+        fn on_tick(&self, _ctx: &CpuSchedContext, _queue: &RunQueue<'_>) {
+            crate::resched_current();
+        }
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    // In-tree ZST policy → the no-op tick hook is skipped.
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install(Class) failed");
+    }
+    if crate::policy_wants_tick() {
+        return TestResult::Fail("in-tree ClassScheduler should not want the tick hook");
+    }
+    // A policy that overrides on_tick → the hook runs for it.
+    if install_scheduler(&cap, TicksAndReschedules).is_err() {
+        return TestResult::Fail("install(TicksAndReschedules) failed");
+    }
+    if !crate::policy_wants_tick() {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("overriding policy should want the tick hook");
+    }
+    // Restore the default so later smokes see the expected policy.
+    let _ = install_scheduler(&cap, ClassScheduler);
+    if crate::policy_wants_tick() {
+        return TestResult::Fail("wants_tick not cleared after reinstalling Class");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_policy_wants_tick_reflects_policy
+);
+
 /// EEVDF-lite accounting (Phase 1): a task's `vruntime` is projected into
 /// `TaskMeta`, starts at the CPU's virtual-time floor on admission, and grows
 /// as the task consumes dispatch cycles. An observing policy records the

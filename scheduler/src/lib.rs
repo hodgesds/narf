@@ -114,6 +114,7 @@ pub use policy::{
     SchedRow, QuantumUnit, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
     TaskHandle, TaskMeta, TaskQueueEvent,
 };
+pub(crate) use policy::policy_wants_tick;
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
 pub use steal::{
@@ -1312,6 +1313,71 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
         None => has_other_runnable_work(current_id),
     })
     .unwrap_or(false)
+}
+
+/// Request a reschedule of the CURRENT CPU's running task — NARF's
+/// `resched_curr`. Sets this CPU's `NEED_RESCHED`; the preempt path
+/// (`try_preempt`/`try_preempt_user`) honors it at the next tick (alongside
+/// slice expiry), switching to the executor to re-pick. A policy calls this from
+/// `Scheduler::on_tick` to force a yield WITHOUT touching the slice quantum,
+/// which refills normally at the next dispatch — so a forced yield never starves
+/// the task.
+pub fn resched_current() {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < NEED_RESCHED.len() {
+        NEED_RESCHED[cpu].store(true, Ordering::Release);
+    }
+}
+
+/// Peek this CPU's pending reschedule request without consuming it. The preempt
+/// path reads this to fold a `resched_current()`/waker request into its slice
+/// decision; the executor's dispatch loop is the authoritative consumer (it
+/// clears the flag once we actually switch), so a peek here never steals it.
+#[inline]
+pub(crate) fn need_resched_pending(cpu: usize) -> bool {
+    cpu < NEED_RESCHED.len() && NEED_RESCHED[cpu].load(Ordering::Acquire)
+}
+
+/// Run the installed policy's per-tick hook for the running task (Linux
+/// `task_tick`). Called once per timer tick from the preempt path. Reads the
+/// cached `CURRENT_SCHED` snapshot (id-guarded; a stale snapshot → skip) to form
+/// the lean context, then invokes `on_tick` under the same non-blocking
+/// (`try_lock`) discipline as `wake_preempt_policy_check` — best-effort and
+/// IRQ-safe: on policy-slot or run-queue contention the tick is simply skipped.
+/// The policy forces a reschedule, if it wants one, by calling
+/// `resched_current()` inside `on_tick`; this returns nothing.
+pub(crate) fn scheduler_on_tick(current_id: u64, elapsed: u64) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= CURRENT_SCHED.len() {
+        return;
+    }
+    let snap = &CURRENT_SCHED[cpu];
+    if snap.id.load(Ordering::Relaxed) != current_id {
+        return;
+    }
+    let dispatch_vruntime = snap.vruntime.load(Ordering::Relaxed);
+    let ctx = policy::CpuSchedContext {
+        cpu: CpuId(cpu as u32),
+        vfloor: vfloor(cpu),
+        elapsed,
+        quantum_unit: policy::active_quantum_unit(),
+        current: policy::CurrentTask {
+            id: TaskId(current_id),
+            class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
+            vruntime: dispatch_vruntime,
+            vdeadline: dispatch_vruntime.wrapping_add(EEVDF_BASE_SLICE),
+        },
+    };
+    let cpu_id = CpuId(cpu as u32);
+    let _ = policy::try_with_scheduler(cpu_id, |scheduler| {
+        if let Some(s) = scheduler {
+            if let Some(q) = READY[cpu].try_lock() {
+                if let Some(d) = q.as_ref() {
+                    s.on_tick(&ctx, &policy::RunQueue::projected(d));
+                }
+            }
+        }
+    });
 }
 
 // ── Wake→run race instrument (boot flag `wake_race`) ────────────────────

@@ -26,7 +26,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::{Any, TypeId};
 use core::fmt;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -432,6 +432,21 @@ pub trait Scheduler: Any + Send + Sync + 'static {
         QuantumUnit::Nanos
     }
 
+    /// Per-timer-tick hook for the task currently running on `ctx.cpu` — NARF's
+    /// analogue of Linux `task_tick`/`entity_tick`. Advance this policy's
+    /// per-task accounting (eligibility / virtual runtime) here, and call
+    /// [`crate::resched_current`] to force the runner to yield (Linux
+    /// `resched_curr`). The slice quantum is untouched and refills at the next
+    /// dispatch, so a forced yield never starves the task. Returns nothing — the
+    /// reschedule is a side effect, exactly as in `task_tick`.
+    ///
+    /// Runs in timer-IRQ / slice-ISR context (IF=0): must be allocation-free and
+    /// must not block or re-enter scheduler installation. Best-effort — the core
+    /// invokes it under non-blocking locks, so a tick may be skipped under
+    /// contention. Default no-op: FIFO / priority / class / eevdf keep the
+    /// core-owned slice behaviour until a policy opts in.
+    fn on_tick(&self, _ctx: &CpuSchedContext, _queue: &RunQueue<'_>) {}
+
     /// Choose one slot from `queue`. Returning `None`, a stale handle, or a
     /// wrong-tier task causes a core-side fallback to the first candidate in
     /// the highest available eligibility tier; policy code cannot strand
@@ -801,6 +816,7 @@ pub fn install_scheduler<S: Scheduler>(
     });
     replacement.policy.on_install();
     store_active_quantum_unit(base);
+    store_policy_wants_tick(replacement.policy.as_ref());
     let generation = publish_policy(replacement, false);
     // This acquire load is the install operation's linearization point. If no
     // newer ticket exists, our completed walk necessarily published this
@@ -862,6 +878,39 @@ fn resolve_quantum_unit(base: QuantumUnit) -> Result<QuantumUnit, SchedulerError
     }
 }
 
+/// Whether the installed policy uses the per-tick `on_tick` hook — resolved once
+/// at install. Purely an OVERHEAD gate for the policy DECISION: it lets the tick
+/// path skip the `on_tick` machinery (context build + policy/run-queue locks + a
+/// virtual call) for policies that don't use it, paying only one atomic-bool
+/// load. It never gates scheduling STATE (`NEED_RESCHED` is honored regardless),
+/// so no reschedule can be dropped by it. `false` == skip the no-op hook.
+static POLICY_WANTS_TICK: AtomicBool = AtomicBool::new(false);
+
+/// The in-tree ZST policies never override `on_tick` (they ride the core's slice
+/// mechanism), so exclude them by type — the tick path then skips a guaranteed
+/// no-op. Mirrors [`observes_queue_events`]. Unknown/external policies default
+/// to `true` (safe: they may override `on_tick`), so the gate never silently
+/// drops a real decision. When a built-in later opts into `on_tick`, drop it
+/// from this exclusion list.
+fn policy_uses_tick(scheduler: &dyn Scheduler) -> bool {
+    let kind = scheduler.type_id();
+    kind != TypeId::of::<FifoScheduler>()
+        && kind != TypeId::of::<PriorityScheduler>()
+        && kind != TypeId::of::<ClassScheduler>()
+        && kind != TypeId::of::<crate::eevdf::EevdfScheduler>()
+}
+
+fn store_policy_wants_tick(scheduler: &dyn Scheduler) {
+    POLICY_WANTS_TICK.store(policy_uses_tick(scheduler), Ordering::Release);
+}
+
+/// Whether the installed policy uses `on_tick` (see [`policy_uses_tick`]). Read
+/// once per tick by the preempt path to skip the hook for the in-tree policies.
+#[inline]
+pub(crate) fn policy_wants_tick() -> bool {
+    POLICY_WANTS_TICK.load(Ordering::Acquire)
+}
+
 /// Install the default strict-class scheduler if no scheduler is yet
 /// installed. Idempotent — re-calling after an explicit
 /// `install_scheduler` is a no-op. Called from `crate::init`.
@@ -913,6 +962,7 @@ pub(crate) fn install_default_if_unset() {
     let replacement = Arc::new(PolicyInstance { policy });
     replacement.policy.on_install();
     store_active_quantum_unit(base);
+    store_policy_wants_tick(replacement.policy.as_ref());
     let _ = publish_policy(replacement, true);
 }
 
