@@ -1038,17 +1038,21 @@ pub enum Syscall {
     /// prior session's grip on the tty before it takes over.
     Vhangup,
 
-    /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the kernel-wide
-    /// hostname (NUL-terminated UTF-8) into the user buffer.
-    /// Returns the byte length excluding the NUL on success, -1 on
-    /// `buf_len < name_len + 1`.
+    /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the calling task's UTS
+    /// namespace hostname (NUL-terminated UTF-8) into the user buffer.
+    /// Returns the byte length excluding the NUL on success,
+    /// `-ENAMETOOLONG` on `buf_len < name_len + 1`.
+    ///
+    /// The same bytes back `/proc/sys/kernel/hostname`, as in Linux, where
+    /// `proc_do_uts_string` resolves the current UTS namespace.
     GetHostname,
 
-    /// `arg0 = buf_ptr`, `arg1 = buf_len`. Replace the kernel-wide
-    /// hostname with the supplied bytes. Stage-4 simplification:
-    /// any task can set the hostname (no cap gate yet — landing
-    /// alongside the cap-table integration). Returns 0 on success,
-    /// -1 on rejection (length cap, malformed UTF-8).
+    /// `arg0 = buf_ptr`, `arg1 = buf_len`. Replace the calling task's UTS
+    /// namespace hostname with the supplied bytes. Requires CAP_SYS_ADMIN in
+    /// that namespace's user namespace — the check comes first, as in
+    /// Linux's `SYSCALL_DEFINE2(sethostname)`, so an unprivileged caller
+    /// gets -EPERM even when the length is also wrong. Returns 0 on success,
+    /// `-EINVAL` past the 64-byte cap, `-EFAULT` on a bad buffer.
     SetHostname,
 
     /// `arg0 = resource` (POSIX RLIMIT_*), `arg1 = rlimit_out_ptr`.

@@ -2332,3 +2332,102 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_caps_setpriority_sys_nice_permits_reduction
 );
+
+// ── /proc/sys/kernel/hostname is the UTS namespace, not a copy of it ──
+//
+// Linux's `proc_do_uts_string` resolves `current->nsproxy->uts_ns`, so the
+// sysctl file and `sethostname(2)`/`gethostname(2)` are the same bytes.
+// NARF kept a separate `String` in `narf-filesystem`, so a write through one
+// was invisible to the other and each read back its own value.
+//
+// Driven through the real file, not the procfs registry, so it covers the
+// path a `hostname` binary actually takes.
+//
+// Linux ref: kernel/utsname_sysctl.c proc_do_uts_string.
+fn smoke_abi_creds_proc_hostname_is_uts_namespace() -> TestResult {
+    with_setup(|| {
+        const PATH: &[u8] = b"/proc/sys/kernel/hostname\0";
+
+        fn gethostname_now() -> Option<alloc::string::String> {
+            let mut buf = [0u8; 128];
+            let n = call(
+                Syscall::GetHostname.raw(),
+                a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+            )?;
+            if n < 0 {
+                return None;
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            Some(alloc::string::String::from_utf8_lossy(&buf[..end]).into_owned())
+        }
+
+        fn proc_read() -> Option<alloc::string::String> {
+            let fd = call_open(PATH.as_ptr() as u64, 0)?;
+            if fd < 0 {
+                return None;
+            }
+            let mut buf = [0u8; 128];
+            let n = call(
+                Syscall::Read.raw(),
+                a2(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+            )?;
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            if n < 0 {
+                return None;
+            }
+            let s = alloc::string::String::from_utf8_lossy(&buf[..n as usize]);
+            Some(s.trim().into())
+        }
+
+        fn proc_write(v: &[u8]) -> Option<i64> {
+            let fd = call_open(PATH.as_ptr() as u64, 1)?; // O_WRONLY
+            if fd < 0 {
+                return Some(fd);
+            }
+            let n = call(
+                Syscall::Write.raw(),
+                a2(fd as u64, v.as_ptr() as u64, v.len() as u64),
+            )?;
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            Some(n)
+        }
+
+        let original = gethostname_now().ok_or("gethostname failed")?;
+
+        // A write through /proc must be what gethostname(2) reports.
+        let wrote = proc_write(b"procfs-host\n").ok_or("writing the sysctl file failed")?;
+        let via_syscall = gethostname_now().ok_or("gethostname failed after the procfs write")?;
+
+        // ...and a write through sethostname(2) must be what /proc reports.
+        let name = b"syscall-host";
+        let set = call(
+            Syscall::SetHostname.raw(),
+            a1(name.as_ptr() as u64, name.len() as u64),
+        );
+        let via_proc = proc_read().ok_or("reading the sysctl file failed")?;
+
+        // Restore whatever was there before.
+        let _ = call(
+            Syscall::SetHostname.raw(),
+            a1(original.as_ptr() as u64, original.len() as u64),
+        );
+
+        if wrote < 0 {
+            return Err("write to /proc/sys/kernel/hostname was rejected");
+        }
+        if via_syscall != "procfs-host" {
+            return Err("gethostname(2) did not see a write made through /proc/sys");
+        }
+        if set != Some(0) {
+            return Err("sethostname failed");
+        }
+        if via_proc != "syscall-host" {
+            return Err("/proc/sys/kernel/hostname did not see a sethostname(2) write");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_creds_proc_hostname_is_uts_namespace
+);

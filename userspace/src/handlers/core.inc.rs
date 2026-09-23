@@ -4680,6 +4680,81 @@ pub(crate) fn ns_capable(target: &crate::namespaces::UserNamespace, cap: u32) ->
 ///
 /// Without the `container` feature there are no namespaces, so every resource
 /// is the host's and the question collapses to plain `capable()`.
+/// Read the calling task's hostname the way `gethostname(2)` and `uname(2)`
+/// resolve it: the task's UTS namespace when it has one, else the global
+/// slot. Also backs `/proc/sys/kernel/hostname`, so the file and the
+/// syscalls cannot disagree -- they used to, because procfs kept a third
+/// copy of its own in `narf-filesystem`.
+pub fn uts_hostname_for_current() -> alloc::string::String {
+    let task = current_task_id();
+    #[cfg(feature = "container")]
+    if let Some(ns) = crate::namespaces::uts_ns_of(task) {
+        return ns.hostname();
+    }
+    let _ = task;
+    HOSTNAME.lock().clone()
+}
+
+/// Write the calling task's hostname, resolving the target exactly as
+/// `sethostname(2)` does.
+///
+/// Linux's `/proc/sys/kernel/hostname` carries no capability check of its
+/// own: the file is root-owned 0644, so an unprivileged `open(O_WRONLY)`
+/// fails with EACCES before any handler runs. NARF's procfs stores a `perms`
+/// word on each sysctl entry and never consults it, so that gate does not
+/// exist here -- which is why the check `sethostname` performs is repeated
+/// on this path. Without it, routing the write to the real UTS namespace
+/// would let an unprivileged task rename the host.
+pub fn uts_set_hostname_for_current(name: &str) -> Result<(), ()> {
+    let task = current_task_id();
+    if !uts_admin(task) {
+        return Err(());
+    }
+    if name.len() > HOSTNAME_MAX {
+        return Err(());
+    }
+    #[cfg(feature = "container")]
+    if let Some(ns) = crate::namespaces::uts_ns_of(task) {
+        ns.set_hostname(name);
+        return Ok(());
+    }
+    let mut g = HOSTNAME.lock();
+    g.clear();
+    g.push_str(name);
+    Ok(())
+}
+
+/// As [`uts_hostname_for_current`], for the NIS domain name.
+pub fn uts_domainname_for_current() -> alloc::string::String {
+    let task = current_task_id();
+    #[cfg(feature = "container")]
+    if let Some(ns) = crate::namespaces::uts_ns_of(task) {
+        return ns.domainname();
+    }
+    let _ = task;
+    DOMAINNAME.lock().clone()
+}
+
+/// As [`uts_set_hostname_for_current`], for the NIS domain name.
+pub fn uts_set_domainname_for_current(name: &str) -> Result<(), ()> {
+    let task = current_task_id();
+    if !uts_admin(task) {
+        return Err(());
+    }
+    if name.len() > HOSTNAME_MAX {
+        return Err(());
+    }
+    #[cfg(feature = "container")]
+    if let Some(ns) = crate::namespaces::uts_ns_of(task) {
+        ns.set_domainname(name);
+        return Ok(());
+    }
+    let mut g = DOMAINNAME.lock();
+    g.clear();
+    g.push_str(name);
+    Ok(())
+}
+
 pub(crate) fn uts_admin(task: u64) -> bool {
     #[cfg(feature = "container")]
     {

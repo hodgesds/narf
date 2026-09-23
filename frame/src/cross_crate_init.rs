@@ -34,6 +34,7 @@ pub fn install_all_hooks() {
     install_proc_path_hooks();
     install_proc_write_hooks();
     install_net_stack();
+    install_uts_sysctl_hooks();
     install_procfs_net_hooks();
     install_proc_mountinfo_hook();
     #[cfg(feature = "container")]
@@ -169,6 +170,20 @@ fn install_proc_path_hooks() {
         narf_userspace::handlers::proc_exe_path,
         narf_userspace::handlers::proc_cwd_path,
         narf_userspace::handlers::proc_root_path,
+    );
+}
+
+/// `/proc/sys/kernel/{hostname,domainname}` are the current UTS namespace's
+/// fields in Linux, not storage of their own. procfs lives in
+/// `narf-filesystem` and namespaces in `narf-userspace`, so the two are
+/// stitched here; without it each kept its own copy and a write through one
+/// was invisible to the other.
+fn install_uts_sysctl_hooks() {
+    narf_filesystem::procfs::sys_kernel::install_uts_hooks(
+        narf_userspace::handlers::uts_hostname_for_current,
+        narf_userspace::handlers::uts_set_hostname_for_current,
+        narf_userspace::handlers::uts_domainname_for_current,
+        narf_userspace::handlers::uts_set_domainname_for_current,
     );
 }
 
