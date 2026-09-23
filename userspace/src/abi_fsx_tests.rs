@@ -4781,3 +4781,74 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx_open_still_refuses_without_an_acl
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// mount(2) requires its target to exist, and says so BEFORE anything else.
+//
+// `do_mount` (fs/namespace.c:4163):
+//     ret = user_path_at(AT_FDCWD, dir_name, LOOKUP_FOLLOW, &path);
+//     if (ret) return ret;
+//     return path_mount(dev_name, &path, type_page, flags, data_page);
+//
+// Both the MS_NOUSER -EINVAL and the `may_mount()` -EPERM live inside
+// `path_mount`, downstream of that lookup, so a missing target outranks
+// both. NARF used to register a mount at a path with no node and report
+// success, which tells a caller using the probe-then-mkdir idiom (systemd,
+// every container runtime) that its mount point already existed.
+//
+// Targets under MOUNT_TARGET_ABSENT_PREFIX are deliberately not created by
+// the fixture, which is what lets these cases observe the -ENOENT.
+// ══════════════════════════════════════════════════════════════════════════
+
+fn smoke_abi_fsx_mount_missing_target_is_enoent() -> TestResult {
+    with_setup(|| {
+        let source = b"none\0";
+        let target = b"/absent-mount-target\0";
+        let fstype = b"tmpfs\0";
+        let args = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), args) {
+            Some(r) if r == ENOENT => Ok(()),
+            _ => Err("mount at a nonexistent target must return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_missing_target_is_enoent);
+
+/// ORDER PIN. The target lookup precedes `path_mount`, so a missing target
+/// beats the MS_NOUSER -EINVAL that an in-kernel-only flag would otherwise
+/// produce. Getting this backwards sends a caller off inspecting its flags
+/// when the real problem is that it never created the mount point.
+fn smoke_abi_fsx_mount_missing_target_beats_einval() -> TestResult {
+    with_setup(|| {
+        const MS_NOUSER: u64 = 1 << 31;
+        let source = b"none\0";
+        let target = b"/absent-mount-target-2\0";
+        let fstype = b"tmpfs\0";
+        let args = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: MS_NOUSER,
+            arg4: 0,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), args) {
+            Some(r) if r == ENOENT => Ok(()),
+            Some(r) if r == EINVAL => {
+                Err("MS_NOUSER -EINVAL won; the target lookup must run first")
+            }
+            _ => Err("mount with a bad flag AND a missing target did not return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_mount_missing_target_beats_einval
+);

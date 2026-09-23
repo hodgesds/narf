@@ -14,6 +14,19 @@ fn current_file_exists(path: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Does `target` name something `mount(2)` could graft onto?
+///
+/// `do_mount` resolves the target with `user_path_at` before calling
+/// `path_mount`, so a target that does not resolve is -ENOENT and nothing
+/// else runs. NARF's mount table is flat, so "resolves" means any of: a
+/// directory, an existing file (binding a file onto a file is legal — see
+/// `graft_tree`), or a path that is already a mount point.
+fn mount_target_exists(target: &str) -> bool {
+    current_mount_list().iter().any(|mount| mount == target)
+        || resolve_dir_absolute(target).is_some()
+        || current_file_exists(target)
+}
+
 /// Split legacy overlayfs `lowerdir=` values. Linux treats an unescaped colon
 /// as a layer separator and permits `\:` and `\\` in pathnames.
 fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string::String>> {
@@ -210,9 +223,49 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // `path_mount` runs after `do_mount` has resolved the target: it discards
-    // the legacy mount magic before any flag is read, then rejects MS_NOUSER —
-    // the in-kernel-only bit that marks a mount userspace may not request.
+    // `do_mount` (fs/namespace.c:4163) resolves the target FIRST and returns
+    // the lookup's error before `path_mount` ever runs:
+    //
+    //     ret = user_path_at(AT_FDCWD, dir_name, LOOKUP_FOLLOW, &path);
+    //     if (ret) return ret;
+    //     return path_mount(dev_name, &path, type_page, flags, data_page);
+    //
+    // The order is load-bearing: a missing target is -ENOENT even for an
+    // unprivileged caller passing an in-kernel-only flag, because both the
+    // MS_NOUSER -EINVAL and the `may_mount()` -EPERM live inside
+    // `path_mount`, downstream of this. Resolving here rather than after
+    // those checks is what keeps "mkdir the target first" distinguishable
+    // from "you may not mount" — the collapse this handler's header comment
+    // is about.
+    let target_path = parse_proc_self_fd(target_raw.as_str())
+        .and_then(|fd| fd_path_for_task(current_task_id(), fd))
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or(target_raw);
+    // Resolve target under the calling task's chroot.
+    let target = apply_chroot(target_path.as_str());
+    // `mount(2)` resolves symlinks in the target before attaching. Fedora's
+    // `/var/mail -> spool/mail` is one ordinary example: binding the link
+    // inode as a file mount makes later namespace remounts fail instead of
+    // binding the directory it names. `/proc/self/fd/N` magic links were
+    // expanded above from their descriptor's backing path; leave other
+    // procfs magic links to the procfs-specific resolver.
+    let target = if target.starts_with("/proc/") {
+        target
+    } else {
+        resolve_vfs_symlink_path(target.as_str(), true).unwrap_or(target)
+    };
+    // The -ENOENT `user_path_at` would have produced. Without it NARF's flat
+    // mount table registered a mount at a path with no node: the call
+    // reported success and nothing was there, so a caller that mounts to a
+    // path it has not created — the "probe, then mkdir" idiom systemd and
+    // every container runtime use — never learned it had to create it.
+    if !mount_target_exists(target.as_str()) {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
+    // `path_mount` then discards the legacy mount magic before any flag is
+    // read, and rejects MS_NOUSER — the in-kernel-only bit that marks a
+    // mount userspace may not request.
     let flags = args.arg3;
     let flags = if flags & MS_MGC_MSK == MS_MGC_VAL {
         flags & !MS_MGC_MSK
@@ -263,12 +316,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // symlink before attaching the mount; treating it as a literal path mounts
     // over the procfs entry instead of the directory and leaves the assembled
     // namespace root absent.
-    let target_path = parse_proc_self_fd(target_raw.as_str())
-        .and_then(|fd| fd_path_for_task(current_task_id(), fd))
-        .filter(|path| path.starts_with('/'))
-        .unwrap_or(target_raw);
-    // Resolve target under the calling task's chroot.
-    let target = apply_chroot(target_path.as_str());
     // Resolve source under chroot too when it's a path (bind / tmpfs
     // source-as-label is harmless to pass through; block-device names
     // don't start with `/` so apply_chroot is a no-op).
@@ -287,11 +334,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // fail instead of binding the directory it names. `/proc/self/fd/N` magic
     // links were expanded above from their descriptor's backing path; leave
     // other procfs magic links to the procfs-specific resolver.
-    let target = if target.starts_with("/proc/") {
-        target
-    } else {
-        resolve_vfs_symlink_path(target.as_str(), true).unwrap_or(target)
-    };
     let source_resolved =
         if !source_resolved.starts_with('/') || source_resolved.starts_with("/proc/") {
             source_resolved
@@ -311,13 +353,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // a request to create another bind. systemd uses this after constructing
     // each service's private mount namespace.
     if (flags & MS_REMOUNT) != 0 {
-        let exists = current_mount_list().iter().any(|mount| mount == &target)
-            || resolve_dir_absolute(target.as_str()).is_some()
-            || current_file_exists(target.as_str());
-        if !exists {
-            ctx.set_return(enoent);
-            return;
-        }
+        // The -ENOENT this branch checked for itself now applies to every
+        // mount(2) above, where `do_mount` applies it.
         // `do_reconfigure_mnt` replaces the mount's flags wholesale, so a
         // remount that omits MS_RDONLY makes a read-only mount writable
         // again. This is the operation systemd uses to seal a service's

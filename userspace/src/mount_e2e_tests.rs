@@ -60,10 +60,48 @@ fn set_task(id: u64) {
     crate::install_task_id_lookup(smoke_task_shim);
 }
 
+/// Create the directory a `mount_args` target names, so the mount has
+/// something to graft onto.
+///
+/// Creates the path the HANDLER will check, not the one the caller typed:
+/// `sys_mount` runs the target through `apply_chroot` first, so a case that
+/// chroots into /cjail and mounts "/x" is really mounting /cjail/x.
+fn ensure_target(target: &[u8]) {
+    let bytes = match target.iter().position(|&b| b == 0) {
+        Some(n) => &target[..n],
+        None => target,
+    };
+    if let Ok(path) = core::str::from_utf8(bytes) {
+        if path.starts_with('/') {
+            let resolved = crate::handlers::apply_chroot_for_test(path);
+            narf_filesystem::__test_ensure_mount_target(&resolved);
+        }
+    }
+}
+
+/// `mount_args` without the target-creation step, for the cases whose
+/// subject IS the missing target.
+fn mount_args_no_target(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0: source.as_ptr() as u64,
+        arg1: target.as_ptr() as u64,
+        arg2: fstype.as_ptr() as u64,
+        arg3: flags,
+        arg4: 0,
+        ..Default::default()
+    }
+}
+
 // Build a SyscallArgs for sys_mount. Linux mount(2) ABI:
 // (source, target, fstype, flags, data). All strings are NUL-terminated —
 // pass byte literals WITH a trailing `\0`.
 fn mount_args(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> SyscallArgs {
+    // `mount(2)` requires its target to resolve. On a real system the mount
+    // point exists because the rootfs shipped it; these smokes drive the
+    // handler against an image with no root filesystem, so the fixture
+    // provides the equivalent. Cases that want to observe the -ENOENT use
+    // `mount_args_no_target`.
+    ensure_target(target);
     SyscallArgs {
         arg0: source.as_ptr() as u64,
         arg1: target.as_ptr() as u64,
@@ -2445,8 +2483,10 @@ fn smoke_remount_flag_update() -> TestResult {
     let remount_live = mount_ok(b"\0", b"/rmnt\0", b"\0", MS_REMOUNT);
 
     // Remount a path that is neither a mount nor an existing dir/file → ENOENT.
+    // Built WITHOUT `mount_args`: that helper creates the target, which is
+    // exactly what this assertion needs absent.
     let mut miss = StubCtx {
-        args: mount_args(b"\0", b"/rmnt_missing\0", b"\0", MS_REMOUNT),
+        args: mount_args_no_target(b"\0", b"/rmnt_missing\0", b"\0", MS_REMOUNT),
         ret: None,
     };
     crate::handlers::sys_mount_for_test(&mut miss);
