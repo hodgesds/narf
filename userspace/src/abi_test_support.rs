@@ -207,9 +207,53 @@ pub fn call(num: u32, args: SyscallArgs) -> Option<i64> {
     }
 }
 
+/// Give a `mount(2)` call a target to graft onto.
+///
+/// `do_mount` resolves the target with `user_path_at` before `path_mount`
+/// runs, so a target that does not exist is -ENOENT and nothing else
+/// happens. On a real system the mount point exists because the rootfs
+/// shipped it. The kernel-test image boots a READ-ONLY `boot-initramfs` at
+/// "/" — `mkdir` on it returns `Unsupported`, exactly as on a real
+/// read-only initramfs — so these cases have no way to create one
+/// themselves, and `__test_ensure_mount_target` supplies the writable root a
+/// real system would have pivoted to.
+///
+/// Hooked here rather than at each call site because the ABI fs cases build
+/// their `SyscallArgs` inline: there are 47 `Syscall::Mount` sites across
+/// abi_fsx/abi_fsx2, and `call_raw` is the one place they all pass through.
+/// A case whose subject IS the missing target passes a path under
+/// [`MOUNT_TARGET_ABSENT_PREFIX`], which is deliberately skipped.
+fn ensure_mount_target_for(num: u32, args: &SyscallArgs) {
+    if num != Syscall::Mount.raw() {
+        return;
+    }
+    let ptr = args.arg1;
+    if ptr == 0 {
+        return;
+    }
+    // Use the SAME validated reader the handler uses. A raw read here faults
+    // the kernel: several cases pass a deliberately bad pointer to assert
+    // -EFAULT, and dereferencing it in the fixture crashed the test image
+    // (QEMU exit 85) rather than failing a case.
+    let Ok(path) = crate::handlers::copy_user_cstr_checked(ptr, 4096) else {
+        return;
+    };
+    let path = path.as_str();
+    if !path.starts_with('/') || path.starts_with(MOUNT_TARGET_ABSENT_PREFIX) {
+        return;
+    }
+    let resolved = crate::handlers::apply_chroot_for_test(path);
+    narf_filesystem::__test_ensure_mount_target(&resolved);
+}
+
+/// Mount targets under this prefix are NOT created by the fixture, so a case
+/// can assert the -ENOENT a missing target produces.
+pub const MOUNT_TARGET_ABSENT_PREFIX: &str = "/absent-";
+
 /// Invoke `num` and return the raw `SyscallReturn` (for tests that need to
 /// distinguish the NARF status, e.g. `InvalidOp` vs `Ok(-errno)`).
 pub fn call_raw(num: u32, args: SyscallArgs) -> SyscallReturn {
+    ensure_mount_target_for(num, &args);
     let mut ctx = AbiCtx { args, ret: None };
     kernel_syscall_entry(num, &mut ctx);
     ctx.ret.unwrap_or_else(|| SyscallReturn::ok(0xDEAD_u64)) // no set_return => sentinel

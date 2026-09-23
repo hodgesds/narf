@@ -3536,7 +3536,18 @@ fn smoke_abi_socket_notify_sendmsg_through_stacked_file_bind() -> TestResult {
             ns.mount_arc(
                 &auth,
                 PRIVATE_MOUNT,
-                alloc::sync::Arc::new(MemFs::with_seeds("notify-private-overmount", &[])),
+                // Seed the bind TARGET into the OVERMOUNT — this is the
+                // filesystem the service's namespace actually sees at
+                // PRIVATE_MOUNT, so a file seeded into the outer mount is
+                // shadowed by it. A file bind mount requires its target to
+                // exist: `do_mount` resolves it before `path_mount`, and
+                // `graft_tree` then compares dir-ness of the two ends. This
+                // case previously relied on NARF attaching a mount at a path
+                // with no node.
+                alloc::sync::Arc::new(MemFs::with_seeds(
+                    "notify-private-overmount",
+                    &[("notify", b"")],
+                )),
             )
             .map_err(|_| "service could not overmount notify parent")?;
 

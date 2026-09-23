@@ -3760,6 +3760,83 @@ impl MountNamespace {
 /// Bootstrap the mount-authority cap. TCB-only path — the kernel
 /// calls this once at boot and hands the result to whatever subsystem
 /// actually mounts the initial root.
+/// Test support: ensure a root filesystem exists and `path` is a directory
+/// inside it, so `mount(2)`'s target check has something to resolve.
+///
+/// `do_mount` calls `user_path_at` before `path_mount`, so a target that
+/// does not resolve is -ENOENT and nothing else runs. On a real system the
+/// mount point exists because the rootfs image shipped it; the kernel-test
+/// image mounts no root at all, so the fixture has to provide one.
+///
+/// The root filesystem instance is held here and RE-MOUNTED if it goes
+/// missing, rather than rebuilt. That distinction is the whole trick: the
+/// mount smokes reset the registry between cases, so a root mounted once
+/// vanishes and later targets cannot be created — but rebuilding it on each
+/// reset yields a fresh, empty MemFs that has lost every directory made so
+/// far. Re-mounting the SAME instance keeps the tree across resets.
+#[doc(hidden)]
+pub fn __test_ensure_mount_target(path: &str) {
+    static ROOT_FS: IrqSafeSpinLock<Option<Arc<dyn FsInstance>>> = IrqSafeSpinLock::new(None);
+
+    // The kernel-test image DOES have a root: `boot-initramfs`, and it is
+    // read-only — `mkdir` on it returns `Unsupported`, exactly as on a real
+    // read-only initramfs. So the fixture supplies the writable root a real
+    // system would have pivoted to.
+    //
+    // As an OVERLAY, not a plain MemFs over "/". Shadowing the initramfs
+    // hides its contents: a bare MemFs root made
+    // `smoke_module_load_real_ko_round_trip` and
+    // `..._staged_ko_is_relocatable_for_this_arch` start skipping, because
+    // `/lib/modules/narf_test_module.ko` stopped resolving. Writes land in
+    // the upper MemFs, reads fall through to the initramfs below, so created
+    // mount points and shipped image content both exist.
+    //
+    // Built once and RE-MOUNTED if it goes missing, rather than rebuilt: the
+    // mount smokes reset the registry between cases, and a rebuilt overlay
+    // would come back with an empty upper, losing every directory made so
+    // far.
+    let fs = {
+        let mut slot = ROOT_FS.lock();
+        if slot.is_none() {
+            let lower = registry().fs_arc_at("/").map(|f| f.root());
+            let upper = Arc::new(MemFs::new("test-root-upper"));
+            let lowers = lower.into_iter().collect::<alloc::vec::Vec<_>>();
+            let overlay =
+                crate::overlayfs::OverlayFs::new("test-rootfs", FsInstance::root(&*upper), lowers);
+            *slot = Some(Arc::new(overlay) as Arc<dyn FsInstance>);
+        }
+        slot.as_ref().map(Arc::clone)
+    };
+    let Some(fs) = fs else { return };
+    let writable_root = registry()
+        .fs_arc_at("/")
+        .map(|f| f.name() == "test-rootfs")
+        .unwrap_or(false);
+    if !writable_root {
+        let auth = bootstrap_mount_authority();
+        let _ = registry().mount_arc(&auth, "/", fs);
+    }
+
+    // Create the directory inside the mount that COVERS the path, not in the
+    // root filesystem. A target under an existing mount (mounting at
+    // "/cjail/x" when a tmpfs is mounted at "/cjail") would otherwise be
+    // created in the root and immediately shadowed, so the handler's own
+    // lookup — longest-prefix-first — would still not find it.
+    registry().resolve_absolute(path, |fs, rel| {
+        let mut dir = fs.root();
+        for comp in rel.split('/').filter(|c| !c.is_empty()) {
+            if let Some(d) = dir.lookup_dir(comp) {
+                dir = d;
+                continue;
+            }
+            match crate::procfs::poll_once(dir.mkdir(comp)) {
+                Some(Ok(d)) => dir = d,
+                _ => return,
+            }
+        }
+    });
+}
+
 pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant> {
     Cap::<MountPoint, Grant>::bootstrap()
 }
