@@ -36,7 +36,6 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_lib::sysctl::ipv4 as sysctl;
 
 use crate::iface;
-use crate::ifaddr;
 use crate::pkt::{
     ip_checksum, parse_ipv4, set_ipv4_checksum, write_eth_header, write_ipv4_header,
     ETHERTYPE_IPV4, ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_ICMP,
@@ -330,37 +329,6 @@ pub fn on_icmp_rx_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body
     deliver_to_raw(net_ns_id, src_ip, icmp_type, icmp_code, icmp_body);
 }
 
-/// True iff `dst` is an IPv4 broadcast or multicast destination as seen by
-/// `iface_name`.
-///
-/// Linux decides this from the route flags (`RTCF_BROADCAST |
-/// RTCF_MULTICAST`) attached to the received skb. NARF's IPv4 receive path
-/// has no route object to carry those flags, so this reconstructs the same
-/// three cases from the address itself plus the interface's configured
-/// prefixes:
-///
-/// - the limited broadcast 255.255.255.255,
-/// - multicast, 224.0.0.0/4,
-/// - a directed broadcast of any subnet configured on `iface_name`
-///   (all host bits set, e.g. 10.0.2.255 for 10.0.2.15/24).
-fn is_broadcast_or_multicast(iface_name: &str, dst: [u8; 4]) -> bool {
-    if dst == [255, 255, 255, 255] {
-        return true;
-    }
-    if (224..=239).contains(&dst[0]) {
-        return true;
-    }
-    let dst_raw = u32::from_be_bytes(dst);
-    ifaddr::iface_addrs(iface_name).iter().any(|a| {
-        // A /31 or /32 has no host bits, so it has no directed broadcast.
-        if a.prefix_len >= 31 {
-            return false;
-        }
-        let mask = ifaddr::prefix_to_mask(a.prefix_len);
-        (a.addr.to_u32() & mask) == (dst_raw & mask) && (dst_raw & !mask) == !mask
-    })
-}
-
 fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) {
     if icmp_body.len() < 8 {
         return;
@@ -385,7 +353,9 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
     // on by default. Checked before `arp_resolve_in` below, which blocks for
     // up to a second and emits an ARP request: a dropped packet must cost
     // nothing, or the drop becomes its own amplifier.
-    if sysctl::icmp_echo_ignore_broadcasts() && is_broadcast_or_multicast(&iface.name, dst_ip) {
+    if sysctl::icmp_echo_ignore_broadcasts()
+        && crate::ip_local::is_broadcast_or_multicast_on(&iface.name, dst_ip)
+    {
         return;
     }
     let dst_mac = match arp_resolve_in(net_ns_id, src_ip, 1000) {

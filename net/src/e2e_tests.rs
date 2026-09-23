@@ -45,7 +45,8 @@ use crate::iface;
 use crate::ipv4::Ipv4Addr;
 use crate::pkt::{
     ip_checksum, set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4,
-    ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
+    ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP,
+    IP_PROTO_UDP,
 };
 use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN};
 use crate::pkt_udp::{UdpHeader, UDP_HDR_LEN};
@@ -1691,6 +1692,23 @@ fn icmp_echo_request_body(id: u16, seq: u16) -> Vec<u8> {
     b
 }
 
+/// Build an Ethernet + IPv4 + ICMP frame carrying `icmp_body`.
+fn build_icmp_frame(src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) -> Vec<u8> {
+    let ip_total = IPV4_HDR_LEN + icmp_body.len();
+    let mut frame = vec![0u8; ETH_HDR_LEN + ip_total];
+    write_eth_header(&mut frame, [0xFF; 6], [0x02; 6], ETHERTYPE_IPV4);
+    write_ipv4_header(
+        &mut frame[ETH_HDR_LEN..],
+        ip_total as u16,
+        IP_PROTO_ICMP,
+        src_ip,
+        dst_ip,
+    );
+    set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
+    frame[ETH_HDR_LEN + IPV4_HDR_LEN..].copy_from_slice(icmp_body);
+    frame
+}
+
 /// True iff any captured frame is an ICMP echo reply.
 fn captured_echo_reply() -> bool {
     let off = ETH_HDR_LEN + IPV4_HDR_LEN;
@@ -1790,3 +1808,146 @@ kernel_test_in!(
     "net/icmp",
     smoke_icmp_echo_ignore_broadcasts_suppresses_directed_broadcast
 );
+
+// ── IPv4 input routing decision ─────────────────────────────────────────────
+//
+// `handle_ipv4` used to run PRE_ROUTING and then LOCAL_IN unconditionally,
+// with no equivalent of `ip_route_input_noref()` in between, so any IPv4
+// packet reaching the stack was delivered as if addressed to us. The socket
+// layer does not recover it: UDP matches on port, namespace and
+// SO_BINDTODEVICE only and never compares a socket's bound address against
+// the datagram's destination.
+//
+// These cases drive whole frames through `rx_handler`, so they cover the
+// decision in its real position rather than calling the predicate directly.
+//
+// Linux ref: `ip_rcv_finish()` → `ip_route_input_noref()`, net/ipv4/route.c.
+
+const RT_IFACE: &str = "e2e-rt7";
+const RT_LOCAL_IP: [u8; 4] = [10, 0, 7, 15];
+const RT_GW: [u8; 4] = [10, 0, 7, 2];
+/// Belongs to nobody here — the destination a foreign frame carries.
+const RT_FOREIGN_IP: [u8; 4] = [192, 0, 2, 77];
+
+/// Bind a wildcard UDP socket, push one frame with `dst_ip` through the full
+/// receive path, and report whether the datagram reached the socket.
+fn udp_frame_delivered(dst_ip: [u8; 4], port: u16) -> Result<bool, &'static str> {
+    let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return Err("udp_bind failed"),
+    };
+    let mut frame = build_udp_frame(RT_GW, dst_ip, 40000, port, b"routing-decision");
+    crate::tcp_stack::rx_handler(RT_IFACE, &mut frame);
+    let mut buf = [0u8; 64];
+    let got = udp_recv(&sock, &mut buf).is_ok();
+    udp_close(&sock);
+    Ok(got)
+}
+
+// The core case: a datagram addressed to someone else must not reach a local
+// socket, while the same datagram addressed to us must.
+fn smoke_ipv4_foreign_destination_not_delivered() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+
+    let local = match udp_frame_delivered(RT_LOCAL_IP, 17701) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let foreign = match udp_frame_delivered(RT_FOREIGN_IP, 17702) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+
+    if !local {
+        return TestResult::Fail("datagram to our own address was not delivered");
+    }
+    if foreign {
+        return TestResult::Fail("datagram to a foreign address was delivered locally");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_foreign_destination_not_delivered);
+
+// Broadcast and multicast are RTN_BROADCAST / RTN_MULTICAST in Linux and
+// still reach `ip_local_deliver`. The routing decision must not turn into a
+// blanket "destination != our address → drop".
+fn smoke_ipv4_broadcast_still_delivered_locally() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+
+    let limited = match udp_frame_delivered([255, 255, 255, 255], 17703) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Directed broadcast of 10.0.7.0/24, the prefix `full_reset` configures.
+    let directed = match udp_frame_delivered([10, 0, 7, 255], 17704) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let multicast = match udp_frame_delivered([224, 0, 0, 251], 17705) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+
+    if !limited {
+        return TestResult::Fail("255.255.255.255 datagram dropped");
+    }
+    if !directed {
+        return TestResult::Fail("directed broadcast datagram dropped");
+    }
+    if !multicast {
+        return TestResult::Fail("multicast datagram dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_broadcast_still_delivered_locally);
+
+// A DHCPOFFER/ACK is addressed to the address being offered, which is not
+// configured yet. NARF's DHCP client sits on the UDP path rather than on
+// AF_PACKET, so the routing decision has to let port 68 through or a lease
+// could never be taken up.
+fn smoke_ipv4_dhcp_reply_survives_routing_decision() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+
+    // Addressed to an address this host does not own — exactly the shape of
+    // an offer for a not-yet-assigned lease.
+    let dhcp = match udp_frame_delivered(RT_FOREIGN_IP, 68) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !dhcp {
+        return TestResult::Fail("DHCP client-port datagram dropped by routing decision");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_dhcp_reply_survives_routing_decision);
+
+// ICMP echo for an address we do not own must go unanswered. Before the
+// routing decision existed, `handle_echo_request` replied to any echo request
+// that reached it, sourcing the reply from the interface's own address.
+fn smoke_icmp_echo_foreign_destination_not_answered() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // Drive the full receive path so the routing decision is in play.
+    drain_captured();
+    let body = icmp_echo_request_body(0x4321, 9);
+    let mut frame = build_icmp_frame(ICMP_GW, [198, 51, 100, 9], &body);
+    crate::tcp_stack::rx_handler(ICMP_IFACE, &mut frame);
+    let answered_foreign = captured_echo_reply();
+
+    drain_captured();
+    let mut frame = build_icmp_frame(ICMP_GW, ICMP_LOCAL_IP, &body);
+    crate::tcp_stack::rx_handler(ICMP_IFACE, &mut frame);
+    let answered_local = captured_echo_reply();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if answered_foreign {
+        return TestResult::Fail("echo request for a foreign address was answered");
+    }
+    if !answered_local {
+        return TestResult::Fail("echo request for our own address was not answered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp", smoke_icmp_echo_foreign_destination_not_answered);
