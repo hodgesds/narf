@@ -59,7 +59,9 @@ pub static PIPE_MAX_SIZE: AtomicU64 = AtomicU64::new(1_048_576);
 static PIPE_USER_PAGES_HARD: AtomicU64 = AtomicU64::new(0);
 static INOTIFY_MAX_USER_WATCHES: AtomicU64 = AtomicU64::new(8192);
 static INOTIFY_MAX_USER_INSTANCES: AtomicU64 = AtomicU64::new(128);
-static INOTIFY_MAX_QUEUED_EVENTS: AtomicU64 = AtomicU64::new(16384);
+/// `fs.inotify.max_queued_events`. Read by the inotify implementation in
+/// `narf-userspace`, which depends on this crate.
+pub static INOTIFY_MAX_QUEUED_EVENTS: AtomicU64 = AtomicU64::new(16384);
 static AIO_MAX_NR: AtomicU64 = AtomicU64::new(65536);
 static EPOLL_MAX_USER_WATCHES: AtomicU64 = AtomicU64::new(1 << 20); // 1 M, Linux default
 static LEASE_BREAK_TIME: AtomicU64 = AtomicU64::new(45);
@@ -103,6 +105,15 @@ fn gen_file_nr() -> String {
 // NARF has no dcache; stub all six as 0.
 fn gen_dentry_state() -> String {
     String::from("0 0 0 0 0 0\n")
+}
+
+/// The per-instance inotify event-queue ceiling.
+///
+/// Linux drops an event that would exceed it and queues a single
+/// `IN_Q_OVERFLOW` record in its place (`fsnotify_add_event`), so a reader
+/// learns it missed something rather than silently losing it.
+pub fn inotify_max_queued_events() -> usize {
+    INOTIFY_MAX_QUEUED_EVENTS.load(Ordering::Relaxed) as usize
 }
 
 // ── Registration ─────────────────────────────────────────────────

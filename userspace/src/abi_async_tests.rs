@@ -2050,3 +2050,76 @@ kernel_test_in!(
     "syscall_abi/async",
     smoke_abi_async_futex_valid_word_still_works
 );
+
+// `fs.inotify.max_queued_events` bounds the per-instance queue.
+//
+// The queue was a plain `VecDeque` with no length check, so the knob capped
+// nothing and a watched path under churn grew it without limit while the
+// reader was away. Linux drops the event at the ceiling and queues one
+// `IN_Q_OVERFLOW` record (wd = -1, no name) in its place, so a reader learns
+// its stream has a hole rather than losing events silently.
+//
+// Linux ref: `fsnotify_add_event()` in fs/notify/notification.c.
+fn smoke_abi_async_inotify_max_queued_events_overflows() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::procfs::sys_fs::INOTIFY_MAX_QUEUED_EVENTS;
+
+    const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+
+    with_memfs("/inoq", "inoq", &[("f", b"....")], || {
+        let restore = INOTIFY_MAX_QUEUED_EVENTS.load(Ordering::Relaxed);
+        INOTIFY_MAX_QUEUED_EVENTS.store(2, Ordering::Relaxed);
+
+        let result = (|| {
+            let (ifd, wd) = watch(b"/inoq/f\0", IN_MODIFY)?;
+            let path = b"/inoq/f\0";
+            let fd = match call_open(path.as_ptr() as u64, O_WRONLY) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open for write failed"),
+            };
+            // Six writes against a ceiling of two.
+            let data = *b"XY";
+            for _ in 0..6 {
+                if call(Syscall::Write.raw(), a2(fd, data.as_ptr() as u64, 2)) != Some(2) {
+                    return Err("write failed");
+                }
+            }
+
+            let evs = read_events(ifd);
+            let overflow = evs
+                .iter()
+                .filter(|e| e.mask & IN_Q_OVERFLOW != 0)
+                .collect::<alloc::vec::Vec<_>>();
+            let real = evs
+                .iter()
+                .filter(|e| e.mask & IN_MODIFY as u32 != 0)
+                .count();
+
+            if real > 2 {
+                return Err("queue grew past fs.inotify.max_queued_events");
+            }
+            if real == 0 {
+                return Err("no events queued at all");
+            }
+            if overflow.len() != 1 {
+                return Err("expected exactly one IN_Q_OVERFLOW record");
+            }
+            // Linux reports the overflow against no watch, with no name.
+            if overflow[0].wd != -1 {
+                return Err("IN_Q_OVERFLOW did not carry wd = -1");
+            }
+            if !overflow[0].name.is_empty() {
+                return Err("IN_Q_OVERFLOW carried a name");
+            }
+            let _ = wd;
+            Ok(())
+        })();
+
+        INOTIFY_MAX_QUEUED_EVENTS.store(restore, Ordering::Relaxed);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_max_queued_events_overflows
+);
