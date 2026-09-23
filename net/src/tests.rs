@@ -6878,8 +6878,8 @@ fn smoke_tcp_sack_scoreboard_blocks_retx() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_sack_scoreboard_blocks_retx);
 
 fn smoke_tcp_options_parse_finds_all() -> TestResult {
-    use crate::tcp::options::{encode_syn_options, ParsedOptions};
-    let opts = encode_syn_options(1460, 7, 0xDEADBEEF, 0);
+    use crate::tcp::options::{encode_syn_options, ParsedOptions, SynOptionPolicy};
+    let opts = encode_syn_options(1460, 7, 0xDEADBEEF, 0, SynOptionPolicy::ALL);
     let parsed = ParsedOptions::parse(&opts);
     if parsed.mss != Some(1460) {
         return TestResult::Fail("MSS option not parsed");
