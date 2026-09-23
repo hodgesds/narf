@@ -1216,6 +1216,20 @@ impl FileOps for ProcStaticFile {
 
 /// Per-pid file with bound `pid` so the generator knows whose
 /// state to render.
+/// Who owns a `/proc/<pid>/*` file.
+///
+/// Linux's `task_dump_owner` stamps the inode with the task's EFFECTIVE
+/// credentials, so a process owns its own proc files and can write the ones
+/// whose mode grants the owner write (`comm`, `uid_map`, ...). Kernel threads
+/// fall back to root, and so does a task we cannot resolve -- root ownership
+/// is the conservative end, denying rather than granting.
+fn task_file_owners(pid: u64) -> (u32, u32) {
+    match task_info(pid, TaskInfoQuery::Basic) {
+        Some(info) => (info.uid, info.gid),
+        None => (0, 0),
+    }
+}
+
 struct ProcPidFile {
     pid: u64,
     field: PidField,
@@ -1303,17 +1317,28 @@ impl FileOps for ProcPidFile {
         })
     }
     fn stat(&self) -> Stat {
-        let mode = if matches!(self.field, PidField::Comm) {
-            Mode::FILE_RW
+        // Linux: `REG("comm", S_IRUGO|S_IWUSR, ...)` -- 0644, so only the
+        // owning task (or a capable one) may rename a process. This reported
+        // `Mode::FILE_RW`, 0666, and these files are root-owned by default,
+        // so the `other` write bit let ANY task rewrite ANY process's comm.
+        let perms = if matches!(self.field, PidField::Comm) {
+            0o644
         } else {
-            Mode::FILE_RO
+            0o444
         };
         Stat {
             size: 0,
             blocks: 0,
-            mode,
+            mode: Mode {
+                file_type: FileType::File,
+                perms,
+            },
             mtime_cycles: 0,
         }
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        task_file_owners(self.pid)
     }
 }
 
@@ -1706,6 +1731,10 @@ impl DirOps for ProcAttrDir {
 #[derive(Debug)]
 struct ProcAttrFile;
 
+// `/proc/<pid>/attr/*` really is 0666 in Linux -- the `ATTR(LSM, name, 0666)`
+// entries in fs/proc/base.c -- because the LSM, not the mode, decides who may
+// write a security label. `Mode::FILE_RW` is therefore correct here, unlike
+// the per-pid and sysctl files that share the constant.
 impl FileOps for ProcAttrFile {
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
@@ -1749,9 +1778,21 @@ impl FileOps for ProcIdMapFile {
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode::FILE_RW,
+            // Linux: `REG("uid_map", S_IRUGO|S_IWUSR, ...)` -- 0644, owner
+            // write only. `Mode::FILE_RW` is 0666, which combined with the
+            // default root ownership let any task write any process's id
+            // maps; the one-shot and capability rules in the write hook were
+            // the only thing standing in the way.
+            mode: Mode {
+                file_type: FileType::File,
+                perms: 0o644,
+            },
             mtime_cycles: 0,
         }
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        task_file_owners(self.pid)
     }
 }
 
@@ -3033,19 +3074,37 @@ fn smoke_procfs_name_is_proc() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs", smoke_procfs_name_is_proc);
 
-/// Smoke: `/proc/<pid>/comm` stat() reports FILE_RW mode.
-fn smoke_comm_file_is_rw() -> TestResult {
+/// Smoke: `/proc/<pid>/comm` is 0644 — readable by all, writable by its owner.
+///
+/// It used to report `Mode::FILE_RW`, and this case asserted that. 0666 plus
+/// the default root ownership of proc files meant the `other` write bit let
+/// ANY task rename ANY process. Linux declares it `S_IRUGO|S_IWUSR` and
+/// stamps the inode with the task's own credentials (`task_dump_owner`), so
+/// the owning task renames itself and nobody else does.
+fn smoke_comm_file_is_owner_write_only() -> TestResult {
     let f = ProcPidFile {
         pid: 1,
         field: PidField::Comm,
     };
-    if f.stat().mode == Mode::FILE_RW {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("/proc/<pid>/comm stat mode should be FILE_RW")
+    let perms = f.stat().mode.perms;
+    if perms != 0o644 {
+        return TestResult::Fail("/proc/<pid>/comm stat mode should be 0644");
     }
+    // The bit that mattered: nothing outside owner may write.
+    if perms & 0o022 != 0 {
+        return TestResult::Fail("/proc/<pid>/comm is group- or world-writable");
+    }
+    // Read-only per-pid files are unaffected.
+    let ro = ProcPidFile {
+        pid: 1,
+        field: PidField::Stat,
+    };
+    if ro.stat().mode.perms != 0o444 {
+        return TestResult::Fail("a read-only per-pid file is no longer 0444");
+    }
+    TestResult::Pass
 }
-kernel_test_in!("filesystem/procfs", smoke_comm_file_is_rw);
+kernel_test_in!("filesystem/procfs", smoke_comm_file_is_owner_write_only);
 
 /// Smoke: write "newname\n" to comm succeeds and hook is exercised.
 fn smoke_comm_write_updates_read() -> TestResult {

@@ -4943,3 +4943,57 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pathx_proc_sys_write_needs_privilege
 );
+
+// ── a non-root task may write its OWN /proc/<pid>/comm ───────────────
+//
+// `/proc/<pid>/comm` is 0644 (`S_IRUGO|S_IWUSR`), so the write depends
+// entirely on the caller owning the file. Linux stamps per-pid inodes with
+// the task's own credentials in `task_dump_owner`; NARF used to leave every
+// proc file root-owned and paper over it with 0666, which let any task
+// rename any process.
+//
+// Tightening the mode to 0644 WITHOUT the ownership half would have broken
+// this case: a uid-1000 task is not root, so only the owner bits can let it
+// rename itself. That makes this the control on `ProcPidFile::owners`.
+//
+// The world-writable half is asserted where the bits live, in
+// `filesystem::procfs::smoke_comm_file_is_owner_write_only` -- a second
+// unprivileged identity cannot be conjured here, because the harness helper
+// moves a task's uid and fsuid together, so the caller would become the
+// owner it is meant to be distinct from.
+//
+// Linux refs: `fs/proc/base.c` REG("comm", ...) and `task_dump_owner()`.
+fn smoke_abi_pathx_proc_comm_owner_may_write() -> TestResult {
+    with_setup(|| {
+        const O_WRONLY: u64 = 1;
+        let path = b"/proc/self/comm\0";
+
+        // Drop to a non-root identity with no DAC override, so the only route
+        // to a successful write is owning the file.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+
+        let wr = call_open(path.as_ptr() as u64, O_WRONLY);
+        let owner_may_write = matches!(wr, Some(v) if v >= 0);
+        if let Some(fd) = wr.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        let rd = call_open(path.as_ptr() as u64, 0);
+        let readable = matches!(rd, Some(v) if v >= 0);
+        if let Some(fd) = rd.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+
+        if !owner_may_write {
+            return Err("a uid-1000 task could not write its own comm — per-pid files are not owned by the task");
+        }
+        if !readable {
+            return Err("/proc/self/comm was not readable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_proc_comm_owner_may_write);
