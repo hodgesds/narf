@@ -2,16 +2,37 @@
 //!
 //! # Fidelity notes
 //!
-//! NARF has a VFS layer but no per-process file-descriptor table larger
-//! than a simple array, no inotify subsystem, and no AIO/epoll engine.
-//! Most keys are therefore **accept-and-log stubs**: writes parse and
-//! store the value so a subsequent read returns the same number, but no
-//! kernel path consults the stored value yet.
+//! Most keys are **accept-and-store**: writes parse and store the value so a
+//! subsequent read returns the same number, and no kernel path consults it.
 //!
-//! Keys that ARE wired (or become wired once their consumer lands):
-//!   - `file-max`       — global fd-table ceiling (VFS alloc checks TBD).
-//!   - `nr_open`        — per-process fd limit (VFS alloc checks TBD).
-//!   - `pipe-max-size`  — enforced by pipe-buffer alloc (TBD).
+//! The code that would obey these lives in `narf-userspace`, which DOES
+//! depend on this crate — so unlike the `net.*` keys there is no
+//! cross-crate obstacle, only a missing caller. A `pub` accessor here is
+//! enough; several existed for a long time with no caller at all.
+//!
+//! Enforced, with the code that obeys it:
+//!   - `nr_open`        — caps RLIMIT_NOFILE's hard limit in the rlimit
+//!     transaction behind setrlimit/prlimit64.
+//!   - `pipe-max-size`  — the ceiling `F_SETPIPE_SZ` may raise a pipe to
+//!     (`userspace::pipe::set_capacity`).
+//!   - `aio-max-nr`     — bounds the sum of every live AIO context's
+//!     `nr_events` (`io_setup`).
+//!   - `inotify/max_queued_events` — bounds each inotify instance's event
+//!     queue, queueing one `IN_Q_OVERFLOW` record when it is reached.
+//!
+//! Accept-and-store, and why — the subsystem exists in every case below
+//! except leases, so these are missing counters rather than missing
+//! features:
+//!   - `file-max` — needs a global count of open file descriptions.
+//!   - `dentry-state` — read-only computed and stubbed at 0: there is no
+//!     dcache to count.
+//!   - `inotify/max_user_watches`, `inotify/max_user_instances`,
+//!     `epoll/max_user_watches` — need per-user counters, and the hard part
+//!     is decrementing on every teardown path (`aio-max-nr` needed three).
+//!   - `pipe-user-pages-hard` — needs per-user pipe page accounting. Linux's
+//!     default of 0 means unlimited, so the visible gap is small.
+//!   - `lease-break-time` — `F_SETLEASE` is a stub returning EINVAL; there
+//!     are no leases to break.
 //!
 //! Everything else stores the written integer in an `AtomicU64`.
 //!
