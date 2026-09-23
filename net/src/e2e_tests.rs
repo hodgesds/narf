@@ -45,7 +45,8 @@ use crate::iface;
 use crate::ipv4::Ipv4Addr;
 use crate::pkt::{
     ip_checksum, set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4,
-    ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
+    ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP,
+    IP_PROTO_UDP,
 };
 use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN};
 use crate::pkt_udp::{UdpHeader, UDP_HDR_LEN};
@@ -1691,6 +1692,23 @@ fn icmp_echo_request_body(id: u16, seq: u16) -> Vec<u8> {
     b
 }
 
+/// Build an Ethernet + IPv4 + ICMP frame carrying `icmp_body`.
+fn build_icmp_frame(src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) -> Vec<u8> {
+    let ip_total = IPV4_HDR_LEN + icmp_body.len();
+    let mut frame = vec![0u8; ETH_HDR_LEN + ip_total];
+    write_eth_header(&mut frame, [0xFF; 6], [0x02; 6], ETHERTYPE_IPV4);
+    write_ipv4_header(
+        &mut frame[ETH_HDR_LEN..],
+        ip_total as u16,
+        IP_PROTO_ICMP,
+        src_ip,
+        dst_ip,
+    );
+    set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
+    frame[ETH_HDR_LEN + IPV4_HDR_LEN..].copy_from_slice(icmp_body);
+    frame
+}
+
 /// True iff any captured frame is an ICMP echo reply.
 fn captured_echo_reply() -> bool {
     let off = ETH_HDR_LEN + IPV4_HDR_LEN;
@@ -1789,4 +1807,666 @@ fn smoke_icmp_echo_ignore_broadcasts_suppresses_directed_broadcast() -> TestResu
 kernel_test_in!(
     "net/icmp",
     smoke_icmp_echo_ignore_broadcasts_suppresses_directed_broadcast
+);
+
+// ── IPv4 input routing decision ─────────────────────────────────────────────
+//
+// `handle_ipv4` used to run PRE_ROUTING and then LOCAL_IN unconditionally,
+// with no equivalent of `ip_route_input_noref()` in between, so any IPv4
+// packet reaching the stack was delivered as if addressed to us. The socket
+// layer does not recover it: UDP matches on port, namespace and
+// SO_BINDTODEVICE only and never compares a socket's bound address against
+// the datagram's destination.
+//
+// These cases drive whole frames through `rx_handler`, so they cover the
+// decision in its real position rather than calling the predicate directly.
+//
+// Linux ref: `ip_rcv_finish()` → `ip_route_input_noref()`, net/ipv4/route.c.
+
+const RT_IFACE: &str = "e2e-rt7";
+const RT_LOCAL_IP: [u8; 4] = [10, 0, 7, 15];
+const RT_GW: [u8; 4] = [10, 0, 7, 2];
+/// Belongs to nobody here — the destination a foreign frame carries.
+const RT_FOREIGN_IP: [u8; 4] = [192, 0, 2, 77];
+
+/// Bind a wildcard UDP socket, push one frame with `dst_ip` through the full
+/// receive path, and report whether the datagram reached the socket.
+fn udp_frame_delivered(dst_ip: [u8; 4], port: u16) -> Result<bool, &'static str> {
+    let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return Err("udp_bind failed"),
+    };
+    let mut frame = build_udp_frame(RT_GW, dst_ip, 40000, port, b"routing-decision");
+    crate::tcp_stack::rx_handler(RT_IFACE, &mut frame);
+    let mut buf = [0u8; 64];
+    let got = udp_recv(&sock, &mut buf).is_ok();
+    udp_close(&sock);
+    Ok(got)
+}
+
+// The core case: a datagram addressed to someone else must not reach a local
+// socket, while the same datagram addressed to us must.
+fn smoke_ipv4_foreign_destination_not_delivered() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+
+    let local = match udp_frame_delivered(RT_LOCAL_IP, 17701) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let foreign = match udp_frame_delivered(RT_FOREIGN_IP, 17702) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+
+    if !local {
+        return TestResult::Fail("datagram to our own address was not delivered");
+    }
+    if foreign {
+        return TestResult::Fail("datagram to a foreign address was delivered locally");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_foreign_destination_not_delivered);
+
+// Broadcast and multicast are RTN_BROADCAST / RTN_MULTICAST in Linux and
+// still reach `ip_local_deliver`. The routing decision must not turn into a
+// blanket "destination != our address → drop".
+fn smoke_ipv4_broadcast_still_delivered_locally() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+
+    let limited = match udp_frame_delivered([255, 255, 255, 255], 17703) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Directed broadcast of 10.0.7.0/24, the prefix `full_reset` configures.
+    let directed = match udp_frame_delivered([10, 0, 7, 255], 17704) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let multicast = match udp_frame_delivered([224, 0, 0, 251], 17705) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+
+    if !limited {
+        return TestResult::Fail("255.255.255.255 datagram dropped");
+    }
+    if !directed {
+        return TestResult::Fail("directed broadcast datagram dropped");
+    }
+    if !multicast {
+        return TestResult::Fail("multicast datagram dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_broadcast_still_delivered_locally);
+
+// A DHCPOFFER/ACK is addressed to the address being offered, which is not
+// configured yet. NARF's DHCP client sits on the UDP path rather than on
+// AF_PACKET, so the routing decision has to let port 68 through or a lease
+// could never be taken up.
+fn smoke_ipv4_dhcp_reply_survives_routing_decision() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+
+    // Addressed to an address this host does not own — exactly the shape of
+    // an offer for a not-yet-assigned lease.
+    let dhcp = match udp_frame_delivered(RT_FOREIGN_IP, 68) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !dhcp {
+        return TestResult::Fail("DHCP client-port datagram dropped by routing decision");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_dhcp_reply_survives_routing_decision);
+
+// ICMP echo for an address we do not own must go unanswered. Before the
+// routing decision existed, `handle_echo_request` replied to any echo request
+// that reached it, sourcing the reply from the interface's own address.
+fn smoke_icmp_echo_foreign_destination_not_answered() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // Drive the full receive path so the routing decision is in play.
+    drain_captured();
+    let body = icmp_echo_request_body(0x4321, 9);
+    let mut frame = build_icmp_frame(ICMP_GW, [198, 51, 100, 9], &body);
+    crate::tcp_stack::rx_handler(ICMP_IFACE, &mut frame);
+    let answered_foreign = captured_echo_reply();
+
+    drain_captured();
+    let mut frame = build_icmp_frame(ICMP_GW, ICMP_LOCAL_IP, &body);
+    crate::tcp_stack::rx_handler(ICMP_IFACE, &mut frame);
+    let answered_local = captured_echo_reply();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if answered_foreign {
+        return TestResult::Fail("echo request for a foreign address was answered");
+    }
+    if !answered_local {
+        return TestResult::Fail("echo request for our own address was not answered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp", smoke_icmp_echo_foreign_destination_not_answered);
+
+// ── IPv4 forwarding (net.ipv4.ip_forward) ───────────────────────────────────
+//
+// The router path. `ip_forward` used to be stored in a crate the network
+// stack could not read, gating nothing: the FORWARD chain was registered but
+// never traversed, no TTL was ever decremented, and no received packet was
+// ever retransmitted. These cases drive frames whose destination is not ours
+// through `rx_handler` and assert on what leaves the interface.
+//
+// Linux ref: `ip_forward()` in net/ipv4/ip_forward.c.
+
+/// Source of the frames being routed — a host behind us, not this box.
+const FWD_SRC_IP: [u8; 4] = [10, 0, 7, 99];
+
+/// Captured IPv4 packets that are the transit traffic itself, not ICMP
+/// advice the router generated alongside it.
+fn captured_forwarded() -> Vec<Vec<u8>> {
+    captured_ipv4()
+        .into_iter()
+        .filter(|p| p[9] != IP_PROTO_ICMP)
+        .collect()
+}
+
+/// Captured frames that are IPv4, with their IP packet offset applied.
+fn captured_ipv4() -> Vec<Vec<u8>> {
+    drain_captured()
+        .into_iter()
+        .filter(|f| {
+            f.len() > ETH_HDR_LEN + IPV4_HDR_LEN
+                && u16::from_be_bytes([f[12], f[13]]) == ETHERTYPE_IPV4
+        })
+        .map(|f| f[ETH_HDR_LEN..].to_vec())
+        .collect()
+}
+
+/// Make this box a router: a default route out `RT_IFACE` via `RT_GW`, whose
+/// MAC `full_reset` pre-seeded, plus a MAC for the host behind us so an ICMP
+/// error can actually be delivered back to it. `full_reset` alone leaves the
+/// FIB empty — `set_default_ipv4` deliberately publishes no route — so
+/// without this every destination is unroutable.
+fn make_router() {
+    iface::set_gateway(RT_IFACE, RT_GW);
+    seed_transit_src();
+}
+
+/// MAC for the host behind us, so an ICMP error addressed to it can be sent.
+fn seed_transit_src() {
+    let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x63];
+    crate::arp_cache::insert(RT_IFACE, FWD_SRC_IP, src_mac);
+    crate::tcp_stack::__arp_insert_legacy(FWD_SRC_IP, src_mac);
+}
+
+/// Push one UDP frame addressed to `dst` through the receive path.
+fn inject_forwardable(dst: [u8; 4], ttl: u8) {
+    drain_captured();
+    let mut frame = build_udp_frame(FWD_SRC_IP, dst, 40001, 17801, b"transit");
+    frame[ETH_HDR_LEN + 8] = ttl;
+    set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
+    crate::tcp_stack::rx_handler(RT_IFACE, &mut frame);
+}
+
+// Default is off, and off must mean dropped rather than routed.
+fn smoke_ipv4_forward_disabled_drops() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let out = captured_ipv4();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !out.is_empty() {
+        return TestResult::Fail("packet was routed with ip_forward=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_disabled_drops);
+
+// With the knob set the packet leaves, one TTL lighter, its header checksum
+// repaired and its destination untouched.
+fn smoke_ipv4_forward_enabled_routes_and_decrements_ttl() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let out = captured_forwarded();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if out.len() != 1 {
+        return TestResult::Fail("expected exactly one forwarded frame");
+    }
+    let pkt = &out[0];
+    if pkt[8] != 63 {
+        return TestResult::Fail("forwarded packet TTL not decremented to 63");
+    }
+    if pkt[16..20] != RT_FOREIGN_IP {
+        return TestResult::Fail("forwarded packet destination was rewritten");
+    }
+    if pkt[12..16] != FWD_SRC_IP {
+        return TestResult::Fail("forwarded packet source was rewritten");
+    }
+    // A checksum that still covers the header sums to zero.
+    if ip_checksum(&pkt[..IPV4_HDR_LEN]) != 0 {
+        return TestResult::Fail("forwarded packet header checksum not repaired");
+    }
+    if !pkt.ends_with(b"transit") {
+        return TestResult::Fail("forwarded packet payload altered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/e2e",
+    smoke_ipv4_forward_enabled_routes_and_decrements_ttl
+);
+
+// A packet out of hops is answered with Time Exceeded rather than routed on.
+// This is both what makes traceroute work through the box and the bound that
+// terminates a routing loop.
+fn smoke_ipv4_forward_ttl_expiry_sends_time_exceeded() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+
+    inject_forwardable(RT_FOREIGN_IP, 1);
+    let out = captured_ipv4();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if out.len() != 1 {
+        return TestResult::Fail("expected exactly one ICMP error frame");
+    }
+    let pkt = &out[0];
+    if pkt[9] != IP_PROTO_ICMP {
+        return TestResult::Fail("TTL expiry did not produce an ICMP packet");
+    }
+    if pkt[16..20] != FWD_SRC_IP {
+        return TestResult::Fail("ICMP error not addressed to the original sender");
+    }
+    let icmp = &pkt[IPV4_HDR_LEN..];
+    if icmp[0] != 11 {
+        return TestResult::Fail("ICMP type is not Time Exceeded (11)");
+    }
+    if icmp[1] != 0 {
+        return TestResult::Fail("ICMP code is not TTL exceeded in transit (0)");
+    }
+    // The quoted packet must be the original, so traceroute can match it.
+    let quoted = &icmp[8..];
+    if quoted.len() < IPV4_HDR_LEN || quoted[16..20] != RT_FOREIGN_IP {
+        return TestResult::Fail("ICMP error does not quote the original header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_ttl_expiry_sends_time_exceeded);
+
+// A destination with no route is reported, not dropped in silence — the
+// sender needs to know its packet died here.
+fn smoke_ipv4_forward_no_route_sends_net_unreachable() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    // Deliberately no `set_gateway`: the FIB stays empty, so the destination
+    // is unroutable while the sender is still reachable on-link.
+    seed_transit_src();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let out = captured_ipv4();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if out.len() != 1 {
+        return TestResult::Fail("expected exactly one ICMP error frame");
+    }
+    let pkt = &out[0];
+    if pkt[9] != IP_PROTO_ICMP {
+        return TestResult::Fail("no-route did not produce an ICMP packet");
+    }
+    if pkt[16..20] != FWD_SRC_IP {
+        return TestResult::Fail("ICMP error not addressed to the original sender");
+    }
+    let icmp = &pkt[IPV4_HDR_LEN..];
+    if icmp[0] != 3 {
+        return TestResult::Fail("ICMP type is not Destination Unreachable (3)");
+    }
+    if icmp[1] != 0 {
+        return TestResult::Fail("ICMP code is not net unreachable (0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_no_route_sends_net_unreachable);
+
+// Forwarding is decided by the INGRESS interface's own setting, which is
+// what `IN_DEV_FORWARD` reads. A global default pointing the other way does
+// not override it — so a box can route off one interface while refusing on
+// another, which is the whole point of the per-device key.
+fn smoke_ipv4_forward_is_per_ingress_interface() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // Default off, this interface on → routed.
+    narf_lib::sysctl::ipv4::set_device_forwarding(RT_IFACE, true);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let on_wins = captured_forwarded().len() == 1;
+
+    // Default on, this interface off → dropped. The per-device value is not
+    // ANDed with or overridden by the default; it simply decides.
+    narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT.store(1, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_device_forwarding(RT_IFACE, false);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let off_wins = captured_forwarded().is_empty();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !on_wins {
+        return TestResult::Fail("interface with forwarding=1 did not route");
+    }
+    if !off_wins {
+        return TestResult::Fail("interface with forwarding=0 routed anyway");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_is_per_ingress_interface);
+
+// Writing net.ipv4.ip_forward is not a plain store. Linux's
+// `inet_forward_change` stamps conf.default and overwrites EVERY interface,
+// so enabling it globally really does turn it on everywhere — including on
+// an interface someone had turned off by hand.
+fn smoke_ipv4_forward_all_write_propagates_to_devices() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // Explicitly off, and it stays off on its own.
+    narf_lib::sysctl::ipv4::set_device_forwarding(RT_IFACE, false);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let off_before = captured_forwarded().is_empty();
+
+    // Global write reaches into the per-interface value.
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+    let dev_now_on = narf_lib::sysctl::ipv4::device_forwarding(RT_IFACE);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let routed_after = captured_forwarded().len() == 1;
+
+    // And a later interface inherits it through conf.default.
+    let inherited = narf_lib::sysctl::ipv4::device_forwarding("e2e-rt7-new");
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !off_before {
+        return TestResult::Fail("interface set to 0 routed before the global write");
+    }
+    if !dev_now_on {
+        return TestResult::Fail("ip_forward=1 did not propagate into the interface");
+    }
+    if !routed_after {
+        return TestResult::Fail("interface did not route after ip_forward=1");
+    }
+    if !inherited {
+        return TestResult::Fail("a new interface did not inherit conf.default.forwarding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/e2e",
+    smoke_ipv4_forward_all_write_propagates_to_devices
+);
+
+// ── IPv4 output fragmentation ───────────────────────────────────────────────
+//
+// A forwarded packet larger than the egress MTU is split when DF is clear and
+// reported with Fragmentation Needed when DF is set. `ip_exceeds_mtu` gates
+// the ICMP on exactly that bit; before fragmentation existed, NARF answered
+// oversized packets that way regardless, which silently broke any sender that
+// had not asked for PMTU discovery.
+//
+// Linux ref: `ip_do_fragment()` in net/ipv4/ip_output.c.
+
+/// Push one oversized UDP frame at the router. `df` picks the header bit.
+fn inject_oversized(payload_len: usize, df: bool) {
+    drain_captured();
+    let payload = alloc::vec![0xABu8; payload_len];
+    let mut frame = build_udp_frame(FWD_SRC_IP, RT_FOREIGN_IP, 40002, 17802, &payload);
+    let word: u16 = if df { 0x4000 } else { 0x0000 };
+    frame[ETH_HDR_LEN + 6..ETH_HDR_LEN + 8].copy_from_slice(&word.to_be_bytes());
+    set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
+    crate::tcp_stack::rx_handler(RT_IFACE, &mut frame);
+}
+
+// DF clear → the packet is split, and the pieces reassemble to the original.
+fn smoke_ipv4_forward_fragments_when_df_clear() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+    // Silence redirects so this case sees only the fragments. The sender is
+    // on-link with the gateway, so it would otherwise also be advised.
+    narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL.store(0, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_device_send_redirects(RT_IFACE, false);
+
+    // MTU is 1500, so a 2000-byte payload cannot go out whole.
+    let payload_len = 2000usize;
+    inject_oversized(payload_len, false);
+    let out = captured_forwarded();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if out.len() < 2 {
+        return TestResult::Fail("oversized packet was not fragmented");
+    }
+
+    let total_payload = payload_len + UDP_HDR_LEN;
+    let mut reassembled = 0usize;
+    for (i, frag) in out.iter().enumerate() {
+        if frag.len() > 1500 {
+            return TestResult::Fail("fragment exceeds the egress MTU");
+        }
+        let ihl = ((frag[0] & 0x0F) as usize) * 4;
+        let total_len = u16::from_be_bytes([frag[2], frag[3]]) as usize;
+        if total_len != frag.len() {
+            return TestResult::Fail("fragment total_length does not match its size");
+        }
+        if ip_checksum(&frag[..ihl]) != 0 {
+            return TestResult::Fail("fragment header checksum is wrong");
+        }
+        let word = u16::from_be_bytes([frag[6], frag[7]]);
+        if word & 0x4000 != 0 {
+            return TestResult::Fail("fragment has DF set");
+        }
+        let off = (word & 0x1FFF) as usize * 8;
+        if off != reassembled {
+            return TestResult::Fail("fragment offset is not contiguous");
+        }
+        let data = total_len - ihl;
+        let last = i + 1 == out.len();
+        let mf = word & 0x2000 != 0;
+        if mf == last {
+            return TestResult::Fail("More Fragments set on the last piece, or clear before it");
+        }
+        // Every piece but the last must be a whole number of 8-byte units.
+        if !last && data % 8 != 0 {
+            return TestResult::Fail("non-final fragment is not a multiple of 8 bytes");
+        }
+        reassembled += data;
+    }
+    if reassembled != total_payload {
+        return TestResult::Fail("fragments do not reassemble to the original length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_fragments_when_df_clear);
+
+// DF set → not split; the sender is told, and told the MTU.
+fn smoke_ipv4_forward_df_set_reports_frag_needed() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+
+    inject_oversized(2000, true);
+    let out = captured_ipv4();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if out.len() != 1 {
+        return TestResult::Fail("expected exactly one ICMP error frame");
+    }
+    let pkt = &out[0];
+    if pkt[9] != IP_PROTO_ICMP {
+        return TestResult::Fail("DF-set oversize did not produce an ICMP packet");
+    }
+    let icmp = &pkt[IPV4_HDR_LEN..];
+    if icmp[0] != 3 {
+        return TestResult::Fail("ICMP type is not Destination Unreachable (3)");
+    }
+    if icmp[1] != 4 {
+        return TestResult::Fail("ICMP code is not Fragmentation Needed (4)");
+    }
+    // The next-hop MTU lives in the low half of the rest-of-header word.
+    let mtu = u16::from_be_bytes([icmp[6], icmp[7]]);
+    if mtu != 1500 {
+        return TestResult::Fail("Fragmentation Needed did not carry the egress MTU");
+    }
+    // The error quotes only the head of the offending packet. Quoting all
+    // 2000 bytes would put the reply over the MTU — an undeliverable answer
+    // to "your packet was too big". RFC 1812 §4.3.2.3 caps it at 576.
+    if pkt.len() > 576 {
+        return TestResult::Fail("ICMP error exceeds the RFC 1812 576-byte cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_df_set_reports_frag_needed);
+
+// ── ICMP Redirect ───────────────────────────────────────────────────────────
+//
+// A packet leaving by the interface it arrived on means the sender picked the
+// wrong first hop, and a router says so. The packet is still forwarded.
+//
+// Linux ref: `ip_rt_send_redirect()` in net/ipv4/route.c.
+
+/// Inject from a sender on our own subnet, so the sender and the next hop
+/// share a link — `inet_addr_onlink`, the condition a redirect needs.
+fn inject_onlink(dst: [u8; 4]) {
+    drain_captured();
+    let mut frame = build_udp_frame(FWD_SRC_IP, dst, 40003, 17803, b"detour");
+    crate::tcp_stack::rx_handler(RT_IFACE, &mut frame);
+}
+
+fn smoke_ipv4_forward_sends_redirect_and_still_forwards() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+
+    // FWD_SRC_IP is 10.0.7.99 and RT_GW is 10.0.7.2, both inside the
+    // 10.0.7.0/24 that `full_reset` configures — so the sender could have
+    // gone straight to the gateway.
+    inject_onlink(RT_FOREIGN_IP);
+    let out = captured_ipv4();
+
+    let mut redirect = None;
+    let mut forwarded = false;
+    for pkt in &out {
+        if pkt[9] == IP_PROTO_ICMP && pkt[IPV4_HDR_LEN] == 5 {
+            redirect = Some(pkt.clone());
+        } else if pkt[16..20] == RT_FOREIGN_IP {
+            forwarded = true;
+        }
+    }
+
+    // With send_redirects cleared on both conf.all and the interface, the
+    // advice stops — the OR in `IN_DEV_TX_REDIRECTS` takes clearing both.
+    narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL.store(0, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_device_send_redirects(RT_IFACE, false);
+    inject_onlink(RT_FOREIGN_IP);
+    let silenced = !captured_ipv4()
+        .iter()
+        .any(|p| p[9] == IP_PROTO_ICMP && p[IPV4_HDR_LEN] == 5);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let redirect = match redirect {
+        Some(r) => r,
+        None => return TestResult::Fail("no ICMP Redirect emitted"),
+    };
+    if !forwarded {
+        return TestResult::Fail("packet was not forwarded alongside the redirect");
+    }
+    if redirect[16..20] != FWD_SRC_IP {
+        return TestResult::Fail("redirect not addressed to the sender");
+    }
+    let icmp = &redirect[IPV4_HDR_LEN..];
+    if icmp[1] != 1 {
+        return TestResult::Fail("redirect code is not Redirect for Host (1)");
+    }
+    // Rest-of-header carries the better first hop.
+    if icmp[4..8] != RT_GW {
+        return TestResult::Fail("redirect does not name the gateway as the better next hop");
+    }
+    if !silenced {
+        return TestResult::Fail("redirect still sent with send_redirects cleared");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/e2e",
+    smoke_ipv4_forward_sends_redirect_and_still_forwards
+);
+
+// A sender that is NOT on the same link as the next hop could not have taken
+// the shortcut, so there is nothing to advise. And a sender that keeps at it
+// is eventually left alone, rather than being answered forever.
+fn smoke_ipv4_redirect_offlink_suppressed_and_rate_limited() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+
+    // A sender from a different subnet: seed its MAC so delivery is possible
+    // and only the on-link test can be what suppresses the redirect.
+    const OFFLINK_SRC: [u8; 4] = [172, 16, 5, 9];
+    let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x71];
+    crate::arp_cache::insert(RT_IFACE, OFFLINK_SRC, mac);
+    crate::tcp_stack::__arp_insert_legacy(OFFLINK_SRC, mac);
+
+    drain_captured();
+    let mut frame = build_udp_frame(OFFLINK_SRC, RT_FOREIGN_IP, 40004, 17804, b"offlink");
+    crate::tcp_stack::rx_handler(RT_IFACE, &mut frame);
+    let offlink_quiet = !captured_ipv4()
+        .iter()
+        .any(|p| p[9] == IP_PROTO_ICMP && p[IPV4_HDR_LEN] == 5);
+
+    // Now hammer from an on-link sender: the budget is 9 per destination.
+    let mut redirects = 0;
+    for _ in 0..15 {
+        inject_onlink(RT_FOREIGN_IP);
+        redirects += captured_ipv4()
+            .iter()
+            .filter(|p| p[9] == IP_PROTO_ICMP && p[IPV4_HDR_LEN] == 5)
+            .count();
+    }
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !offlink_quiet {
+        return TestResult::Fail("redirect sent to an off-link sender");
+    }
+    if redirects == 0 {
+        return TestResult::Fail("no redirects sent to an on-link sender");
+    }
+    if redirects >= 15 {
+        return TestResult::Fail("redirects were not rate limited");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/e2e",
+    smoke_ipv4_redirect_offlink_suppressed_and_rate_limited
 );

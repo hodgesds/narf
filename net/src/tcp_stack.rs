@@ -325,6 +325,34 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
     let _ = ARP_OP_REPLY;
 }
 
+/// True iff this is a UDP datagram to the DHCP client port.
+///
+/// A DHCPOFFER/DHCPACK is addressed to the address being *offered*, which by
+/// definition is not configured yet, so the routing decision above would drop
+/// it and the lease could never be taken up. Linux never hits this because
+/// its DHCP clients receive on AF_PACKET, below the routing decision; NARF's
+/// client is in-kernel on the UDP path (`dhcp::on_udp_in_in`, reached from
+/// `handle_udp`), so the exception has to be made here instead.
+fn is_dhcp_client_datagram(body: &[u8]) -> bool {
+    const DHCP_CLIENT_PORT: u16 = 68;
+    if body.len() < crate::netfilter::IPV4_MIN_HDR_LEN {
+        return false;
+    }
+    if body[9] != IP_PROTO_UDP {
+        return false;
+    }
+    // Fragments past the first carry no L4 header: offset is the low 13 bits
+    // of the flags/fragment word.
+    if u16::from_be_bytes([body[6], body[7]]) & 0x1FFF != 0 {
+        return false;
+    }
+    let ihl = ((body[0] & 0x0F) as usize) * 4;
+    if ihl < crate::netfilter::IPV4_MIN_HDR_LEN || body.len() < ihl + 4 {
+        return false;
+    }
+    u16::from_be_bytes([body[ihl + 2], body[ihl + 3]]) == DHCP_CLIENT_PORT
+}
+
 fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
     //
@@ -352,6 +380,30 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
         return;
     }
+    // ── Input routing decision ──
+    //
+    // Linux runs `ip_route_input_noref()` here, between PRE_ROUTING and
+    // LOCAL_IN, and only RTN_LOCAL / RTN_BROADCAST / RTN_MULTICAST reach
+    // `ip_local_deliver`. Anything else is forwarded or dropped. The order
+    // matters: PRE_ROUTING (and any DNAT in it) runs first, so the decision
+    // must read the possibly-rewritten packet, not the frame as it arrived.
+    //
+    // A destination that is not ours goes to `ip_forward::try_forward`,
+    // which routes it on when `net.ipv4.ip_forward` allows and otherwise
+    // drops. Without this step every packet reaching the stack was
+    // delivered as if addressed to us.
+    {
+        let decided = ctx.packet();
+        if let Some((ip, _)) = parse_ipv4(decided) {
+            if !crate::ip_local::deliver_locally_in(net_ns_id, ip.dst_ip)
+                && !is_dhcp_client_datagram(decided)
+            {
+                crate::ip_forward::try_forward(net_ns_id, iface_in, decided);
+                return;
+            }
+        }
+    }
+
     ctx.hook = crate::netfilter::HookPoint::LocalIn;
     ctx.conntrack_id = None;
     if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {

@@ -71,6 +71,8 @@ pub mod http2;
 pub mod icmp_sock;
 pub mod iface;
 pub mod ifaddr;
+pub mod ip_forward;
+pub mod ip_local;
 pub mod ipv4;
 pub mod ipv6;
 pub mod ipv6_stack;

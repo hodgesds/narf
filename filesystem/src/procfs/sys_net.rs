@@ -9,7 +9,7 @@
 //!
 //! | Key                          | Wired to                                  |
 //! |------------------------------|-------------------------------------------|
-//! | `ip_forward`                 | `IP_FORWARD` atomic, consulted by routing |
+//! | `ip_forward`                 | `narf_lib::sysctl`, gates `net::ip_forward` |
 //! | `tcp_congestion_control`     | `TCP_CONG_ALG` IrqSafeSpinLock<String>   |
 //! | `tcp_timestamps`             | `TCP_TIMESTAMPS` atomic                   |
 //! | `tcp_sack`                   | `TCP_SACK` atomic                         |
@@ -51,8 +51,9 @@ static DEFAULT_QDISC: IrqSafeSpinLock<[u8; 16]> =
 
 // ── net.ipv4 atomics ────────────────────────────────────────────────────
 
-/// Consulted by the routing path: 1 = forward packets between interfaces.
-pub static IP_FORWARD: AtomicU32 = AtomicU32::new(0);
+/// Consulted by the IPv4 forwarding path in `narf-net`, so it lives in
+/// `narf_lib::sysctl` for the same reason the ICMP knobs below do.
+pub use narf_lib::sysctl::ipv4::IP_FORWARD;
 static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
 static TCP_KEEPALIVE_TIME: AtomicU32 = AtomicU32::new(7200);
 static TCP_KEEPALIVE_INTVL: AtomicU32 = AtomicU32::new(75);
@@ -169,6 +170,18 @@ fn write_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Write `ip_forward` / `conf.all.forwarding`, which is not a plain store:
+/// Linux's `inet_forward_change` stamps `conf.default` and overwrites every
+/// interface's setting. See `narf_lib::sysctl::ipv4::set_all_forwarding`.
+fn write_all_forwarding(s: &str) -> Result<(), FsError> {
+    let v = parse_u32(s)?;
+    if v > 1 {
+        return Err(FsError::InvalidData);
+    }
+    narf_lib::sysctl::ipv4::set_all_forwarding(v != 0);
+    Ok(())
+}
+
 fn write_bool_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
     let v = parse_u32(s)?;
     if v > 1 {
@@ -183,7 +196,7 @@ fn write_bool_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
 /// True iff IP forwarding is globally enabled.
 #[inline]
 pub fn ip_forward() -> bool {
-    IP_FORWARD.load(Ordering::Relaxed) != 0
+    narf_lib::sysctl::ipv4::ip_forward()
 }
 
 /// True iff IPv6 forwarding is globally enabled.
@@ -285,7 +298,32 @@ pub fn register_all() {
     register_sysctl(SysctlEntry {
         path: "net/ipv4/ip_forward",
         read: || read_atomic(&IP_FORWARD),
-        write: Some(|s| write_bool_atomic(&IP_FORWARD, s)),
+        write: Some(write_all_forwarding),
+        perms: 0o644,
+    });
+    // Linux presents the same value under both names.
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/all/forwarding",
+        read: || read_atomic(&IP_FORWARD),
+        write: Some(write_all_forwarding),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/all/send_redirects",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL),
+        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/default/send_redirects",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT),
+        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/default/forwarding",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT),
+        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
@@ -896,3 +934,161 @@ fn smoke_unix_max_dgram_qlen_rw() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/sys_net", smoke_unix_max_dgram_qlen_rw);
+
+// ── Per-interface net.ipv4.conf.<dev>.* ─────────────────────────────────
+//
+// These cannot be `SysctlEntry`s: that struct carries a `&'static str` path
+// and zero-argument read/write fns, so an entry has no way to know which
+// interface it belongs to. A `ProcFile` implementation can hold the name,
+// and `register_proc` takes a runtime path, so the per-device keys are
+// registered directly against the procfs registry instead.
+//
+// Registration is driven from `narf-net`, which is where interfaces appear,
+// through a hook installed in `frame::cross_crate_init` — procfs cannot see
+// the net stack to enumerate them itself.
+
+/// Which per-interface key a [`DevConfFile`] serves.
+#[derive(Copy, Clone, Debug)]
+enum DevKey {
+    Forwarding,
+    SendRedirects,
+}
+
+impl DevKey {
+    fn name(self) -> &'static str {
+        match self {
+            DevKey::Forwarding => "forwarding",
+            DevKey::SendRedirects => "send_redirects",
+        }
+    }
+
+    fn get(self, iface: &str) -> u32 {
+        match self {
+            DevKey::Forwarding => narf_lib::sysctl::ipv4::device_forwarding_value(iface),
+            DevKey::SendRedirects => narf_lib::sysctl::ipv4::device_send_redirects_value(iface),
+        }
+    }
+
+    fn set(self, iface: &str, on: bool) {
+        match self {
+            DevKey::Forwarding => narf_lib::sysctl::ipv4::set_device_forwarding(iface, on),
+            DevKey::SendRedirects => narf_lib::sysctl::ipv4::set_device_send_redirects(iface, on),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DevConfFile {
+    iface: alloc::string::String,
+    key: DevKey,
+}
+
+impl super::ProcFile for DevConfFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        let v = self.key.get(&self.iface);
+        alloc::format!("{v}\n").into_bytes()
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
+        let s = core::str::from_utf8(buf).map_err(|_| FsError::InvalidData)?;
+        let v = parse_u32(s.trim())?;
+        if v > 1 {
+            return Err(FsError::InvalidData);
+        }
+        self.key.set(&self.iface, v != 0);
+        Ok(buf.len())
+    }
+}
+
+fn dev_conf_path(iface: &str, key: DevKey) -> alloc::string::String {
+    let k = key.name();
+    alloc::format!("sys/net/ipv4/conf/{iface}/{k}")
+}
+
+/// Publish `/proc/sys/net/ipv4/conf/<iface>/*` and seed the interface's
+/// settings from the matching `conf.default` keys.
+pub fn register_dev_conf(iface: &str) {
+    narf_lib::sysctl::ipv4::init_device_conf(iface);
+    for key in [DevKey::Forwarding, DevKey::SendRedirects] {
+        super::register_proc(
+            &dev_conf_path(iface, key),
+            alloc::sync::Arc::new(DevConfFile {
+                iface: alloc::string::String::from(iface),
+                key,
+            }),
+        );
+    }
+}
+
+// The per-device conf keys are not `SysctlEntry`s, so they bypass
+// `register_all` and the sysctl plumbing entirely. This checks the file
+// really lands in the registry and that reading and writing it moves the
+// value the forwarding datapath consults.
+fn smoke_conf_dev_forwarding_roundtrip() -> TestResult {
+    const DEV: &str = "smoke-conf0";
+    register_all();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    register_dev_conf(DEV);
+
+    let snap = lookup_registry(&["sys", "net", "ipv4", "conf", DEV, "forwarding"]);
+    let f = match snap {
+        Some(ProcNodeSnapshot::File(f)) => f,
+        _ => {
+            narf_lib::sysctl::ipv4::__reset_for_test();
+            return TestResult::Fail("conf/<dev>/forwarding not registered");
+        }
+    };
+
+    // Seeded from conf.default, which the reset put at 0.
+    let initial = core::str::from_utf8(&f.read()).unwrap_or("").trim() == "0";
+    // A write must reach the value the datapath reads, not just the file.
+    let _ = f.write(b"1\n");
+    let after_write = narf_lib::sysctl::ipv4::device_forwarding(DEV);
+    let reads_back = core::str::from_utf8(&f.read()).unwrap_or("").trim() == "1";
+    // A global write that does not CHANGE conf.all propagates nothing, so
+    // this interface keeps the 1 set above. Linux gates `inet_forward_change`
+    // on `*valp != val` the same way, and the distinction matters: otherwise
+    // any write to ip_forward would silently erase per-interface settings.
+    // conf.all is still 0 here, so writing 0 is that no-op.
+    narf_lib::sysctl::ipv4::set_all_forwarding(false);
+    let noop_kept = core::str::from_utf8(&f.read()).unwrap_or("").trim() == "1";
+
+    // A write that does change it propagates into every interface, and is
+    // visible through this file: 0 → 1 → 0 ends with the interface off,
+    // despite having been set to 1 by hand.
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+    narf_lib::sysctl::ipv4::set_all_forwarding(false);
+    let after_global = core::str::from_utf8(&f.read()).unwrap_or("").trim() == "0";
+    // Values outside {0,1} are rejected, as `proc_dointvec_minmax` does.
+    let rejects = f.write(b"2\n").is_err();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !initial {
+        return TestResult::Fail("conf/<dev>/forwarding did not start at conf.default");
+    }
+    if !after_write {
+        return TestResult::Fail("write did not reach device_forwarding()");
+    }
+    if !reads_back {
+        return TestResult::Fail("conf/<dev>/forwarding did not read back 1");
+    }
+    if !noop_kept {
+        return TestResult::Fail("unchanged global write erased the per-device setting");
+    }
+    if !after_global {
+        return TestResult::Fail("global forwarding write not visible per-device");
+    }
+    if !rejects {
+        return TestResult::Fail("conf/<dev>/forwarding accepted a value above 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_conf_dev_forwarding_roundtrip
+);

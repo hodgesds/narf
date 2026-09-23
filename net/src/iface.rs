@@ -33,6 +33,42 @@ pub struct NetIfaceEntry {
     pub net_ns_id: u64,
 }
 
+/// Hook into procfs for publishing an interface's `net.ipv4.conf.<dev>.*`
+/// keys. Installed by `frame::cross_crate_init`, because `narf-net` cannot
+/// see `narf-filesystem` — the same seam the `/proc/net/*` renderers use,
+/// pointing the other way: here the net stack notifies procfs rather than
+/// procfs pulling a snapshot.
+///
+/// Zero means nothing is installed, which is the normal state in unit tests
+/// and before procfs is up. Registration is then simply skipped; the
+/// per-interface values still live in `narf_lib::sysctl` and the datapath
+/// still honours them, so only the /proc files are missing.
+/// There is no companion unregister hook because NARF has no interface
+/// removal path — `register` replaces a same-named entry in place, and
+/// re-registering refreshes rather than duplicates.
+static DEV_CONF_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// `fn(iface_name)` — publish an interface's conf keys.
+pub type DevConfFn = fn(&str);
+
+/// Install the procfs registration hook. Idempotent.
+pub fn install_dev_conf_hook(register: DevConfFn) {
+    DEV_CONF_HOOK.store(register as usize, Ordering::Release);
+}
+
+fn dev_conf_register(iface_name: &str) {
+    let v = DEV_CONF_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        // No procfs yet — still seed the value so the datapath has one.
+        narf_lib::sysctl::ipv4::init_device_conf(iface_name);
+        return;
+    }
+    // SAFETY: v was stored by install_dev_conf_hooks as a DevConfFn
+    // fn-pointer; non-zero confirms it.
+    let f: DevConfFn = unsafe { core::mem::transmute(v) };
+    f(iface_name);
+}
+
 static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
 
 /// Default IP / gateway for the QEMU user-net topology — Stage-1
@@ -111,6 +147,12 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
         link_up: true,
         net_ns_id: 0,
     });
+    drop(g);
+    // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
+    // forwarding value from `conf.default`. Done with IFACES released: the
+    // hook reaches into the procfs registry, which must not be entered under
+    // this lock.
+    dev_conf_register(name);
 }
 
 /// Number of registered interfaces.
