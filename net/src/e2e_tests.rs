@@ -35,6 +35,8 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use ::core::sync::atomic::Ordering;
+
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -42,8 +44,8 @@ use crate::arp_cache;
 use crate::iface;
 use crate::ipv4::Ipv4Addr;
 use crate::pkt::{
-    set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
-    IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
+    ip_checksum, set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4,
+    ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
 };
 use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN};
 use crate::pkt_udp::{UdpHeader, UDP_HDR_LEN};
@@ -1658,3 +1660,133 @@ fn smoke_wave47_arp_request_routes_via_for_dst() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_wave47_arp_request_routes_via_for_dst);
+
+// ── net.ipv4.icmp_echo_ignore_* enforcement ─────────────────────────────────
+//
+// These two sysctls were writable through /proc/sys and readable back, but
+// nothing on the ICMP datapath consulted them: a host told to stop answering
+// pings kept answering. The procfs-side smoke only proved write-then-read,
+// which is true of any unenforced knob. These cases assert at the datapath
+// instead — a reply frame is or is not emitted — so they fail if the checks
+// in `handle_echo_request` are removed.
+//
+// Linux refs: `icmp_echo()` and `icmp_rcv()` in net/ipv4/icmp.c.
+
+const ICMP_IFACE: &str = "e2e-icmp9";
+const ICMP_LOCAL_IP: [u8; 4] = [10, 0, 9, 15];
+const ICMP_GW: [u8; 4] = [10, 0, 9, 2];
+/// Directed broadcast of 10.0.9.0/24, the prefix `full_reset` configures.
+const ICMP_BCAST: [u8; 4] = [10, 0, 9, 255];
+
+/// Build an ICMP echo request body with a valid checksum.
+fn icmp_echo_request_body(id: u16, seq: u16) -> Vec<u8> {
+    let mut b = alloc::vec![0u8; 12];
+    b[0] = ICMP_ECHO_REQUEST;
+    b[1] = 0;
+    b[4..6].copy_from_slice(&id.to_be_bytes());
+    b[6..8].copy_from_slice(&seq.to_be_bytes());
+    b[8..12].copy_from_slice(b"narf");
+    let cs = ip_checksum(&b);
+    b[2..4].copy_from_slice(&cs.to_be_bytes());
+    b
+}
+
+/// True iff any captured frame is an ICMP echo reply.
+fn captured_echo_reply() -> bool {
+    let off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    drain_captured()
+        .iter()
+        .any(|f| f.len() > off && f[off] == ICMP_ECHO_REPLY)
+}
+
+/// Inject an echo request from the gateway (whose MAC `full_reset` pre-seeds
+/// into the ARP cache, so the reply path never blocks) and report whether a
+/// reply went out.
+fn echo_request_answered(dst: [u8; 4], seq: u16) -> bool {
+    drain_captured();
+    let body = icmp_echo_request_body(0x1234, seq);
+    crate::icmp_sock::on_icmp_rx_in(0, ICMP_GW, dst, &body);
+    captured_echo_reply()
+}
+
+// Baseline. With both knobs at their Linux defaults a unicast echo request
+// is answered. Without this the two suppression cases below would pass just
+// as well against a stack that never replies at all.
+fn smoke_icmp_echo_answered_by_default() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let answered = echo_request_answered(ICMP_LOCAL_IP, 1);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !answered {
+        return TestResult::Fail("unicast echo request not answered at defaults");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp", smoke_icmp_echo_answered_by_default);
+
+// net.ipv4.icmp_echo_ignore_all = 1 → no reply.
+fn smoke_icmp_echo_ignore_all_suppresses_reply() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    narf_lib::sysctl::ipv4::ICMP_ECHO_IGNORE_ALL.store(1, Ordering::Relaxed);
+    let answered_when_ignoring = echo_request_answered(ICMP_LOCAL_IP, 2);
+
+    // And the knob is not a one-way latch: clearing it restores replies.
+    narf_lib::sysctl::ipv4::ICMP_ECHO_IGNORE_ALL.store(0, Ordering::Relaxed);
+    let answered_after_clear = echo_request_answered(ICMP_LOCAL_IP, 3);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if answered_when_ignoring {
+        return TestResult::Fail("echo answered despite icmp_echo_ignore_all=1");
+    }
+    if !answered_after_clear {
+        return TestResult::Fail("echo not answered after clearing icmp_echo_ignore_all");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp", smoke_icmp_echo_ignore_all_suppresses_reply);
+
+// net.ipv4.icmp_echo_ignore_broadcasts defaults to 1, so a directed
+// broadcast must go unanswered on a freshly-booted stack — this is the
+// Smurf-amplification guard. Setting it to 0 opts back in.
+fn smoke_icmp_echo_ignore_broadcasts_suppresses_directed_broadcast() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let bcast_default = echo_request_answered(ICMP_BCAST, 4);
+    let mcast_default = echo_request_answered([224, 0, 0, 1], 5);
+    let limited_default = echo_request_answered([255, 255, 255, 255], 6);
+
+    // Unicast is unaffected by this knob.
+    let unicast_default = echo_request_answered(ICMP_LOCAL_IP, 7);
+
+    narf_lib::sysctl::ipv4::ICMP_ECHO_IGNORE_BROADCASTS.store(0, Ordering::Relaxed);
+    let bcast_opted_in = echo_request_answered(ICMP_BCAST, 8);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if bcast_default {
+        return TestResult::Fail("directed broadcast echo answered at default (ignore=1)");
+    }
+    if mcast_default {
+        return TestResult::Fail("multicast echo answered at default (ignore=1)");
+    }
+    if limited_default {
+        return TestResult::Fail("255.255.255.255 echo answered at default (ignore=1)");
+    }
+    if !unicast_default {
+        return TestResult::Fail("unicast echo suppressed by icmp_echo_ignore_broadcasts");
+    }
+    if !bcast_opted_in {
+        return TestResult::Fail("broadcast echo not answered with ignore_broadcasts=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/icmp",
+    smoke_icmp_echo_ignore_broadcasts_suppresses_directed_broadcast
+);

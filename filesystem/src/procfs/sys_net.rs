@@ -15,6 +15,8 @@
 //! | `tcp_sack`                   | `TCP_SACK` atomic                         |
 //! | `tcp_window_scaling`         | `TCP_WSCALE` atomic                       |
 //! | `ip_local_port_range`        | `PORT_RANGE_LO/HI` atomics                |
+//! | `icmp_echo_ignore_all`       | `narf_lib::sysctl`, enforced in `icmp_sock` |
+//! | `icmp_echo_ignore_broadcasts`| `narf_lib::sysctl`, enforced in `icmp_sock` |
 //! | everything else              | accept-and-store in dedicated atomics     |
 //!
 //! Linux refs:
@@ -81,8 +83,13 @@ static TCP_WMEM_MAX: AtomicU32 = AtomicU32::new(4194304);
 static UDP_RMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static UDP_WMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 // icmp
-static ICMP_ECHO_IGNORE_ALL: AtomicU32 = AtomicU32::new(0);
-static ICMP_ECHO_IGNORE_BROADCASTS: AtomicU32 = AtomicU32::new(1);
+//
+// These two live in `narf_lib::sysctl` rather than here: the ICMP datapath
+// in `narf-net` has to read them on every echo request, and `narf-net` and
+// `narf-filesystem` cannot see each other. Keeping a copy here would mean a
+// write to `/proc/sys` reading back correctly while the datapath kept
+// answering from a second, untouched copy.
+use narf_lib::sysctl::ipv4::{ICMP_ECHO_IGNORE_ALL, ICMP_ECHO_IGNORE_BROADCASTS};
 static ICMP_RATELIMIT: AtomicU32 = AtomicU32::new(1000);
 // ephemeral port range
 pub static PORT_RANGE_LO: AtomicU32 = AtomicU32::new(32768);

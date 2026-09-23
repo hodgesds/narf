@@ -28,5 +28,6 @@ pub mod perf;
 pub mod readiness;
 pub mod smp;
 pub mod sync;
+pub mod sysctl;
 
 mod tests;
