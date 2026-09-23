@@ -16,13 +16,17 @@
 //!
 //! ## Permissions
 //!
-//! `perms` is a 9-bit Unix mode stored in the `SysctlEntry`. Read-only
-//! keys use 0o444; writable keys use 0o644 by default. The framework
-//! consults `writable` (i.e. `write_fn.is_some()`) when returning the
-//! stat mode — no separate `perms` field is needed at the VFS layer
-//! because `Mode::FILE_RO` / `Mode::FILE_RW` are sufficient for
-//! Stage-3 consumers. The `perms` field on `SysctlEntry` is preserved
-//! for future Stage-4 permission checks.
+//! `perms` is a 9-bit Unix mode stored in the `SysctlEntry`. Read-only keys
+//! use 0o444; writable keys use 0o644. It reaches `stat(2)`, and therefore
+//! the DAC check `open(2)` runs, through `ProcFile::perms`.
+//!
+//! It did not always. The framework used to derive the stat mode from
+//! `writable()` alone and return `Mode::FILE_RW` — 0o666 — while this field
+//! sat unread "for future Stage-4 permission checks". Proc files are
+//! root-owned, so the `other` write bit in 0o666 is the whole story: every
+//! writable key under `/proc/sys` was world-writable, and an unprivileged
+//! task could set the hostname, enable IP forwarding, or change the
+//! overcommit policy. Linux reports 0644 root:root and refuses the open.
 
 extern crate alloc;
 
@@ -81,6 +85,7 @@ pub fn register_sysctl(entry: SysctlEntry) {
         Arc::new(SysctlProcFile {
             read_fn: entry.read,
             write_fn: entry.write,
+            perms: entry.perms,
         }),
     );
 }
@@ -92,6 +97,10 @@ pub fn register_sysctl(entry: SysctlEntry) {
 struct SysctlProcFile {
     read_fn: fn() -> String,
     write_fn: SysctlWriteFn,
+    /// The entry's declared mode. This used to be stored on `SysctlEntry`
+    /// and dropped on the floor here, so every writable key was reported
+    /// 0666 and any task could write it.
+    perms: u16,
 }
 
 impl core::fmt::Debug for SysctlProcFile {
@@ -109,6 +118,10 @@ impl ProcFile for SysctlProcFile {
 
     fn writable(&self) -> bool {
         self.write_fn.is_some()
+    }
+
+    fn perms(&self) -> u16 {
+        self.perms
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize, FsError> {

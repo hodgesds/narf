@@ -4872,3 +4872,74 @@ fn smoke_abi_pathx_empty_path_returns_enoent() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_empty_path_returns_enoent);
+
+// ── /proc/sys keys are root-only, as their mode says ──────────────────
+//
+// Proc files are root-owned (`FileOps::owners` defaults to `(0, 0)`) and each
+// sysctl entry declares 0444 or 0644. The framework ignored the declared mode
+// and reported `Mode::FILE_RW` -- 0666 -- for anything writable, so the
+// `other` write bit let ANY task set the hostname, enable IP forwarding, or
+// change the overcommit policy. Linux reports 0644 root:root and the open
+// fails before a handler runs.
+//
+// Linux ref: `fs/proc/proc_sysctl.c` builds these inodes with the
+// ctl_table's `mode`; the DAC check is `fs/namei.c::may_open`.
+fn smoke_abi_pathx_proc_sys_write_needs_privilege() -> TestResult {
+    with_setup(|| {
+        const PATH: &[u8] = b"/proc/sys/kernel/hostname\0";
+        const O_WRONLY: u64 = 1;
+
+        // Reading is permitted for everyone -- 0644 grants `other` read.
+        let ro = call_open(PATH.as_ptr() as u64, 0);
+        let readable_as_root = matches!(ro, Some(v) if v >= 0);
+        if let Some(fd) = ro.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // Writable by the privileged harness task.
+        let rw = call_open(PATH.as_ptr() as u64, O_WRONLY);
+        let writable_as_root = matches!(rw, Some(v) if v >= 0);
+        if let Some(fd) = rw.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // Now an unprivileged caller: a non-root fsuid with no DAC override.
+        // Both are needed -- uid 0 would match the file's owner bits, and the
+        // capability alone would override the mode.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        let denied = call_open(PATH.as_ptr() as u64, O_WRONLY);
+        // Reading stays allowed, so this is a write restriction and not a
+        // blanket refusal of the file.
+        let still_readable = call_open(PATH.as_ptr() as u64, 0);
+        if let Some(fd) = still_readable.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // Restore the harness task's identity for everything that follows.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+
+        if !readable_as_root {
+            return Err("/proc/sys/kernel/hostname was not readable");
+        }
+        if !writable_as_root {
+            return Err("/proc/sys/kernel/hostname was not writable by a privileged task");
+        }
+        match denied {
+            Some(v) if v == DAC_EACCES => {}
+            Some(v) if v >= 0 => {
+                return Err("an unprivileged task opened /proc/sys/kernel/hostname for writing")
+            }
+            _ => return Err("unprivileged write open of a /proc/sys key should be -EACCES"),
+        }
+        if !matches!(still_readable, Some(v) if v >= 0) {
+            return Err("an unprivileged task could not read /proc/sys/kernel/hostname");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_proc_sys_write_needs_privilege
+);

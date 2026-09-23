@@ -875,6 +875,22 @@ pub trait ProcFile: Send + Sync + core::fmt::Debug {
         Err(FsError::ReadOnly)
     }
 
+    /// The file's permission bits, as reported by `stat(2)` and therefore as
+    /// the DAC check on `open(2)` sees them.
+    ///
+    /// Proc files are root-owned (`FileOps::owners` defaults to `(0, 0)`), so
+    /// these bits are what decides whether an unprivileged task may write
+    /// one. The default mirrors Linux: 0444 read-only, 0644 writable — NOT
+    /// 0666, which would grant every task write access through the `other`
+    /// bits and made every writable `/proc/sys` key world-writable.
+    fn perms(&self) -> u16 {
+        if self.writable() {
+            0o644
+        } else {
+            0o444
+        }
+    }
+
     /// Last-modified time in monotonic cycles. Default reports the
     /// current monotonic clock so callers that snapshot mtime to
     /// detect a change always observe a fresh value across reads.
@@ -1144,15 +1160,13 @@ impl FileOps for ProcDynFile {
         Box::pin(async move { result })
     }
     fn stat(&self) -> Stat {
-        let mode = if self.file.writable() {
-            Mode::FILE_RW
-        } else {
-            Mode::FILE_RO
-        };
         Stat {
             size: 0,
             blocks: 0,
-            mode,
+            mode: Mode {
+                file_type: FileType::File,
+                perms: self.file.perms(),
+            },
             mtime_cycles: self.file.mtime_cycles(),
         }
     }

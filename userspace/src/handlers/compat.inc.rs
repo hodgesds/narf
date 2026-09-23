@@ -11301,6 +11301,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
 // bracket the transfer with STAC/CLAC. A raw deref of a user VA #PFs
 // under SMAP; there are deliberately no raw user derefs below.
 // ══════════════════════════════════════════════════════════════════════
+/// The live AIO `aio_nr` total, for tests positioning the `fs.aio-max-nr`
+/// ceiling relative to contexts earlier cases still hold.
+pub(crate) fn aio_test_nr() -> u64 {
+    aio::__test_aio_nr()
+}
+
 mod aio {
     use super::{
         copy_from_user, copy_to_user, current_task_id, fd, poll_blocking, validate_user_range,
@@ -11429,6 +11435,13 @@ mod aio {
                 Err(observed) => cur = observed,
             }
         }
+    }
+
+    /// The live `aio_nr` total. Test-only: a case that wants to exercise the
+    /// ceiling has to position it relative to whatever earlier cases left
+    /// charged, since contexts they still hold are legitimately counted.
+    pub(crate) fn __test_aio_nr() -> u64 {
+        AIO_NR.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Refund a context's reservation.
