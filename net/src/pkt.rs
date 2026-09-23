@@ -245,7 +245,7 @@ pub fn write_ipv4_header(
     out[2..4].copy_from_slice(&total_len.to_be_bytes());
     out[4..6].copy_from_slice(&0u16.to_be_bytes()); // ID = 0
     out[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF flag, frag = 0
-    out[8] = 64; // TTL
+    out[8] = narf_lib::sysctl::ipv4::ip_default_ttl(); // net.ipv4.ip_default_ttl
     out[9] = protocol;
     out[10..12].copy_from_slice(&0u16.to_be_bytes()); // checksum placeholder
     out[12..16].copy_from_slice(&src_ip);

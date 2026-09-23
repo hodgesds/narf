@@ -49,8 +49,13 @@ use crate::FsError;
 // read back so its "bump fs.file-max" step is a no-op success.
 static FILE_MAX: AtomicU64 = AtomicU64::new(9_223_372_036_854_775_807);
 // nr_open: per-process fd-table ceiling. Linux default is 1024*1024.
-static NR_OPEN: AtomicU64 = AtomicU64::new(1_048_576);
-static PIPE_MAX_SIZE: AtomicU64 = AtomicU64::new(1_048_576);
+/// `fs.nr_open` — the ceiling on RLIMIT_NOFILE's hard limit, enforced in
+/// `narf-userspace`'s rlimit transaction.
+pub static NR_OPEN: AtomicU64 = AtomicU64::new(1_048_576);
+/// `fs.pipe-max-size`. Read by `pipe_set_size` in `narf-userspace`, which
+/// depends on this crate, so it needs no shared-crate home the way the
+/// `net.*` knobs do — only a public accessor.
+pub static PIPE_MAX_SIZE: AtomicU64 = AtomicU64::new(1_048_576);
 static PIPE_USER_PAGES_HARD: AtomicU64 = AtomicU64::new(0);
 static INOTIFY_MAX_USER_WATCHES: AtomicU64 = AtomicU64::new(8192);
 static INOTIFY_MAX_USER_INSTANCES: AtomicU64 = AtomicU64::new(128);

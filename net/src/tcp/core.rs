@@ -829,6 +829,10 @@ pub fn listen_in(
     backlog: usize,
 ) -> Result<u32, ()> {
     let id = fresh_tcb_id();
+    // `net.core.somaxconn` caps the backlog, as `__sys_listen_socket` does
+    // before handing it to the protocol. The AF_INET path in `narf-userspace`
+    // routes its listen here too, so this is the one place it has to happen.
+    let backlog = narf_lib::sysctl::ipv4::clamp_backlog(backlog);
     let tcb = Tcb::new_listener(id, local_addr, local_port, backlog).with_net_ns(net_ns_id);
     let (id, _arc) = install_tcb(tcb);
     Ok(id)

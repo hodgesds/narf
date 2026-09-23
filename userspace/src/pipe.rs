@@ -33,11 +33,6 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// what `fcntl(F_GETPIPE_SZ)` reports on a fresh pipe.
 const PIPE_DEFAULT_BYTES: usize = 65_536;
 
-/// Linux's default `/proc/sys/fs/pipe-max-size`. NARF has no root user or
-/// `CAP_SYS_RESOURCE` override, so an attempt to grow beyond this ceiling is
-/// the unprivileged Linux `EPERM` case.
-const PIPE_MAX_BYTES: usize = 1_048_576;
-
 /// POSIX `PIPE_BUF` (Linux `include/linux/limits.h`): writes of at most
 /// this many bytes are ATOMIC — `fs/pipe.c::pipe_write` refuses to split
 /// them across a partial buffer ("We must still wake up any pending
@@ -540,7 +535,12 @@ impl PipeShared {
             return Err(EINVAL as u64);
         }
         let requested = (arg as usize).max(PIPE_BUF).next_power_of_two();
-        if requested > PIPE_MAX_BYTES {
+        // `fs.pipe-max-size`. Linux answers EPERM for a request above it
+        // unless the caller holds CAP_SYS_RESOURCE; NARF has no such bypass,
+        // so the knob is the whole of the limit. This used to compare against
+        // a local constant holding the same 1 MiB the knob advertises, so the
+        // two agreed by coincidence and writing /proc changed nothing.
+        if requested > narf_filesystem::procfs::sys_fs::pipe_max_size() as usize {
             return Err(EPERM as u64); // no CAP_SYS_RESOURCE/root bypass in NARF
         }
         if requested == self.capacity() {

@@ -72,6 +72,34 @@ pub mod ipv4 {
     /// secure value is the default and a fresh boot must already enforce it.
     pub static ICMP_ECHO_IGNORE_BROADCASTS: AtomicU32 = AtomicU32::new(1);
 
+    /// `net.ipv4.ip_default_ttl`. The TTL stamped on packets this host
+    /// originates. Linux default 64 (`IPDEFTTL`), read through
+    /// `ip4_dst_hoplimit()` when the route carries no hoplimit of its own.
+    ///
+    /// Forwarded packets are unaffected: they keep the sender's TTL, minus
+    /// one for this hop.
+    pub static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
+
+    /// `net.core.somaxconn`. The ceiling `listen(2)` clamps its backlog to.
+    /// Linux default 4096 in current kernels; NARF keeps the older 128,
+    /// which is what its procfs default already advertised.
+    pub static SOMAXCONN: AtomicU32 = AtomicU32::new(128);
+
+    /// The TTL to stamp on a locally-originated packet.
+    #[inline]
+    pub fn ip_default_ttl() -> u8 {
+        // The knob is clamped to 1..=255 on write; saturate defensively so a
+        // 0 can never produce a packet that dies on the first hop.
+        IP_DEFAULT_TTL.load(Ordering::Relaxed).clamp(1, 255) as u8
+    }
+
+    /// Clamp a `listen(2)` backlog to `net.core.somaxconn`, as
+    /// `__sys_listen_socket` does before the protocol's own listen runs.
+    #[inline]
+    pub fn clamp_backlog(backlog: usize) -> usize {
+        backlog.min(SOMAXCONN.load(Ordering::Relaxed) as usize)
+    }
+
     /// `net.ipv4.tcp_window_scaling`. Linux default 1.
     pub static TCP_WINDOW_SCALING: AtomicU32 = AtomicU32::new(1);
 
@@ -245,6 +273,8 @@ pub mod ipv4 {
     pub fn __reset_for_test() {
         IP_FORWARD.store(0, Ordering::Relaxed);
         IP_FORWARD_DEFAULT.store(0, Ordering::Relaxed);
+        IP_DEFAULT_TTL.store(64, Ordering::Relaxed);
+        SOMAXCONN.store(128, Ordering::Relaxed);
         TCP_WINDOW_SCALING.store(1, Ordering::Relaxed);
         TCP_TIMESTAMPS.store(1, Ordering::Relaxed);
         TCP_SACK.store(1, Ordering::Relaxed);

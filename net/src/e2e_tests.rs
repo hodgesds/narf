@@ -2685,3 +2685,96 @@ fn smoke_tcp_synack_echoes_only_offered_options() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_tcp_synack_echoes_only_offered_options);
+
+// ── net.ipv4.ip_default_ttl and net.core.somaxconn ──────────────────────────
+//
+// Two more knobs that were stored where the network stack could not read
+// them. `write_ipv4_header` stamped a literal 64 on every packet this host
+// originates, and `listen(2)` took whatever backlog it was handed.
+//
+// Linux refs: `ip4_dst_hoplimit()` (include/net/route.h) and
+// `__sys_listen_socket()` (net/socket.c).
+
+// The TTL on a packet we originate follows the knob. Driven through the ICMP
+// echo-reply path, which builds its header the same way every other
+// locally-originated packet does.
+fn smoke_ip_default_ttl_stamps_originated_packets() -> TestResult {
+    full_reset(ICMP_IFACE, ICMP_LOCAL_IP, ICMP_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let body = icmp_echo_request_body(0x7001, 1);
+    drain_captured();
+    crate::icmp_sock::on_icmp_rx_in(0, ICMP_GW, ICMP_LOCAL_IP, &body);
+    let default_ttl = captured_ipv4().first().map(|p| p[8]);
+
+    narf_lib::sysctl::ipv4::IP_DEFAULT_TTL.store(17, Ordering::Relaxed);
+    drain_captured();
+    crate::icmp_sock::on_icmp_rx_in(0, ICMP_GW, ICMP_LOCAL_IP, &body);
+    let custom_ttl = captured_ipv4().first().map(|p| p[8]);
+
+    // 0 would produce a packet that dies on the first hop; the accessor
+    // floors it rather than emitting one.
+    narf_lib::sysctl::ipv4::IP_DEFAULT_TTL.store(0, Ordering::Relaxed);
+    let floored = narf_lib::sysctl::ipv4::ip_default_ttl();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if default_ttl != Some(64) {
+        return TestResult::Fail("originated packet did not carry the default TTL of 64");
+    }
+    if custom_ttl != Some(17) {
+        return TestResult::Fail("originated packet ignored ip_default_ttl");
+    }
+    if floored == 0 {
+        return TestResult::Fail("ip_default_ttl=0 produced a zero TTL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ip_default_ttl_stamps_originated_packets);
+
+// listen(2) clamps its backlog to somaxconn.
+fn smoke_somaxconn_clamps_listen_backlog() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    let backlog_of = |id: u32| core::lookup_tcb(id).map(|t| t.lock().backlog);
+
+    // Default somaxconn is 128, so an absurd backlog lands there.
+    let big = match core::listen(RT_LOCAL_IP, 22101, 9999) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("listen failed"),
+    };
+    let clamped_default = backlog_of(big);
+
+    // A backlog under the ceiling is left alone.
+    let small = match core::listen(RT_LOCAL_IP, 22102, 5) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("listen failed"),
+    };
+    let untouched = backlog_of(small);
+
+    // Lowering the knob lowers the ceiling.
+    narf_lib::sysctl::ipv4::SOMAXCONN.store(2, Ordering::Relaxed);
+    let tight = match core::listen(RT_LOCAL_IP, 22103, 9999) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("listen failed"),
+    };
+    let clamped_tight = backlog_of(tight);
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    for id in [big, small, tight] {
+        let _ = core::close(id);
+    }
+
+    if clamped_default != Some(128) {
+        return TestResult::Fail("backlog not clamped to the default somaxconn");
+    }
+    if untouched != Some(5) {
+        return TestResult::Fail("backlog below somaxconn was altered");
+    }
+    if clamped_tight != Some(2) {
+        return TestResult::Fail("backlog not clamped to a lowered somaxconn");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_somaxconn_clamps_listen_backlog);

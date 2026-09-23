@@ -37,7 +37,8 @@ use crate::FsError;
 
 // ── net.core atomics ────────────────────────────────────────────────────
 
-static SOMAXCONN: AtomicU32 = AtomicU32::new(128);
+// Consulted by `listen(2)` in `narf-net`; see the ICMP knobs below.
+pub use narf_lib::sysctl::ipv4::SOMAXCONN;
 static NETDEV_MAX_BACKLOG: AtomicU32 = AtomicU32::new(1000);
 static RMEM_DEFAULT: AtomicU32 = AtomicU32::new(212992);
 static RMEM_MAX: AtomicU32 = AtomicU32::new(212992);
@@ -54,7 +55,8 @@ static DEFAULT_QDISC: IrqSafeSpinLock<[u8; 16]> =
 /// Consulted by the IPv4 forwarding path in `narf-net`, so it lives in
 /// `narf_lib::sysctl` for the same reason the ICMP knobs below do.
 pub use narf_lib::sysctl::ipv4::IP_FORWARD;
-static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
+// Stamped on locally-originated packets by `narf-net`.
+pub use narf_lib::sysctl::ipv4::IP_DEFAULT_TTL;
 static TCP_KEEPALIVE_TIME: AtomicU32 = AtomicU32::new(7200);
 static TCP_KEEPALIVE_INTVL: AtomicU32 = AtomicU32::new(75);
 static TCP_KEEPALIVE_PROBES: AtomicU32 = AtomicU32::new(9);
