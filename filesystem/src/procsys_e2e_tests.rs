@@ -69,12 +69,18 @@ fn sysctl_write(components: &[&str], val: &[u8]) -> Option<Result<usize, FsError
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Smoke 1 — kernel.hostname (wired: write propagates to HOSTNAME storage)
+// Smoke 1 — kernel.hostname
 //
 // Write "narftest" → read back via sysctl returns "narftest".
-// This is the gethostname() consumer: the HOSTNAME static is the live
-// storage that a sethostname() syscall would also touch.
-// Linux ref: kernel/sys.c sethostname() → uts_ns->name.nodename
+//
+// This checks the procfs half only. It does NOT reach gethostname(2):
+// `sys_kernel.rs`'s HOSTNAME is a separate store from the UTS-namespace
+// hostname that sethostname/gethostname/uname use
+// (`userspace::namespaces`), and nothing bridges the two. In Linux they are
+// the same bytes — `/proc/sys/kernel/hostname` is `uts_ns->name.nodename`
+// via `proc_do_uts_string` — so writing one there changes what the other
+// reads, and here it does not.
+// Linux ref: kernel/utsname_sysctl.c proc_do_uts_string
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn e2e_kernel_hostname_write_propagates() -> TestResult {
@@ -140,9 +146,12 @@ kernel_test_in!("procsys_e2e/net", e2e_net_ip_forward_propagates_to_accessor);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 3 — net.ipv4.tcp_congestion_control "reno"
-//           (wired: TCP_CONG_ALG + tcp_cong_alg_name())
 //
 // Write "reno" → tcp_cong_alg_name() returns "reno". Restore "cubic".
+//
+// Procfs half only, and that is all there is: `tcp_cong_alg_name()` has no
+// caller outside these tests, so the TCP stack does not select its
+// congestion control from this key.
 // Linux ref: net/ipv4/tcp_cong.c tcp_set_default_congestion_control()
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -178,7 +187,12 @@ kernel_test_in!(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 4 — net.ipv4.tcp_timestamps 0
-//           (wired: TCP_TIMESTAMPS atomic + tcp_option_defaults())
+//
+// Procfs half only — this reads back the same atomic it wrote, which is true
+// of any key, enforced or not. The datapath half lives in
+// `net/src/e2e_tests.rs`
+// (`smoke_tcp_option_sysctls_suppress_syn_options` and friends), which assert
+// on the options a real SYN carries.
 //
 // Write "0" → tcp_option_defaults().1 (timestamps) is false.
 // Restore "1".
@@ -218,7 +232,12 @@ kernel_test_in!(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 5 — net.ipv4.tcp_sack 0
-//           (wired: TCP_SACK atomic + tcp_option_defaults())
+//
+// Procfs half only — this reads back the same atomic it wrote, which is true
+// of any key, enforced or not. The datapath half lives in
+// `net/src/e2e_tests.rs`
+// (`smoke_tcp_option_sysctls_suppress_syn_options` and friends), which assert
+// on the options a real SYN carries.
 //
 // Write "0" → tcp_option_defaults().2 (sack) is false.
 // Linux ref: net/ipv4/sysctl_net_ipv4.c tcp_sack
@@ -257,7 +276,12 @@ kernel_test_in!(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 6 — net.ipv4.tcp_window_scaling 0
-//           (wired: TCP_WSCALE atomic + tcp_option_defaults())
+//
+// Procfs half only — this reads back the same atomic it wrote, which is true
+// of any key, enforced or not. The datapath half lives in
+// `net/src/e2e_tests.rs`
+// (`smoke_tcp_option_sysctls_suppress_syn_options` and friends), which assert
+// on the options a real SYN carries.
 //
 // Write "0" → tcp_option_defaults().0 (wscale) is false.
 // Linux ref: net/ipv4/sysctl_net_ipv4.c tcp_window_scaling
@@ -295,10 +319,14 @@ kernel_test_in!(
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Smoke 7 — net.ipv4.ip_local_port_range (wired: PORT_RANGE_LO/HI atomics
-//            + ephemeral_port_range())
+// Smoke 7 — net.ipv4.ip_local_port_range
 //
 // Write "10000 20000" → ephemeral_port_range() == (10000, 20000).
+//
+// Procfs half only. `ephemeral_port_range()` has no caller outside these
+// tests: `tcp::core::fresh_local_port` is a bare incrementing counter and
+// `udp_sock` allocates from its own UDP_EPHEMERAL_MIN/MAX constants, so
+// neither honours this range.
 // Linux ref: net/ipv4/inet_connection_sock.c inet_get_local_port_range()
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -333,9 +361,12 @@ kernel_test_in!(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 8 — net.ipv6.conf.all.forwarding 1
-//           (wired: IPV6_FORWARDING atomic + ipv6_forwarding())
 //
 // Write "1" → ipv6_forwarding() true. Restore "0".
+//
+// Procfs half only: `ipv6_forwarding()` has no caller outside these tests.
+// The IPv4 side is enforced (see `net::ip_forward`); IPv6 has no forwarding
+// path at all.
 // Linux ref: net/ipv6/addrconf.c addrconf_sysctl IPV6_DEVCONF_FORWARDING
 // ═══════════════════════════════════════════════════════════════════════════
 

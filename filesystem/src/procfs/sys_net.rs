@@ -5,19 +5,53 @@
 //! and safe from any context (including IRQ handlers on the read path,
 //! though writes come from userspace).
 //!
-//! ## Wire-up vs. accept-and-store
+//! ## Enforced vs. accept-and-store
 //!
-//! | Key                          | Wired to                                  |
-//! |------------------------------|-------------------------------------------|
-//! | `ip_forward`                 | `narf_lib::sysctl`, gates `net::ip_forward` |
-//! | `tcp_congestion_control`     | `TCP_CONG_ALG` IrqSafeSpinLock<String>   |
-//! | `tcp_timestamps`             | `narf_lib::sysctl`, gates TCP options     |
-//! | `tcp_sack`                   | `narf_lib::sysctl`, gates TCP options     |
-//! | `tcp_window_scaling`         | `narf_lib::sysctl`, gates TCP options     |
-//! | `ip_local_port_range`        | `PORT_RANGE_LO/HI` atomics                |
-//! | `icmp_echo_ignore_all`       | `narf_lib::sysctl`, enforced in `icmp_sock` |
-//! | `icmp_echo_ignore_broadcasts`| `narf_lib::sysctl`, enforced in `icmp_sock` |
-//! | everything else              | accept-and-store in dedicated atomics     |
+//! Most keys here are accept-and-store: the value round-trips through
+//! `/proc` and nothing consults it. That is not always visible from this
+//! crate, because the code that *would* obey a `net.*` key lives in
+//! `narf-net`, which cannot see `narf-filesystem` (no dependency either way;
+//! `frame::cross_crate_init` bridges them with read-only hooks). A key that
+//! must reach the datapath therefore lives in `narf_lib::sysctl`, which both
+//! crates depend on — that, not the presence of an atomic here, is what
+//! makes one enforced.
+//!
+//! Enforced, with the code that obeys it:
+//!
+//! | Key                            | Obeyed by                              |
+//! |--------------------------------|----------------------------------------|
+//! | `ip_forward`                   | `net::ip_forward::try_forward`         |
+//! | `conf/<dev>/forwarding`        | ditto, per ingress interface           |
+//! | `conf/<dev>/send_redirects`    | `net::ip_forward` redirect generation  |
+//! | `ip_default_ttl`               | `net::pkt::write_ipv4_header`          |
+//! | `icmp_echo_ignore_all`         | `net::icmp_sock::handle_echo_request`  |
+//! | `icmp_echo_ignore_broadcasts`  | ditto                                  |
+//! | `tcp_window_scaling`           | `net::tcp::options` (SYN + negotiate)  |
+//! | `tcp_timestamps`               | ditto                                  |
+//! | `tcp_sack`                     | ditto                                  |
+//! | `net/core/somaxconn`           | `net::tcp::core::listen_in`            |
+//!
+//! Accept-and-store — the value is kept and returned, and nothing reads it.
+//! Named individually because each one previously carried, or still carries,
+//! an accessor that reads like a wiring claim:
+//!
+//! - `tcp_congestion_control` / `tcp_cong_alg_name()` — no caller outside
+//!   tests; the TCP stack does not select its algorithm from this.
+//! - `ip_local_port_range` / `ephemeral_port_range()` — no caller outside
+//!   tests. `tcp::core::fresh_local_port` is a bare incrementing counter and
+//!   `udp_sock` has its own `UDP_EPHEMERAL_MIN/MAX` constants.
+//! - `ipv6/conf/all/forwarding` / `ipv6_forwarding()` — no caller outside
+//!   tests.
+//! - everything else registered below.
+//!
+//! ## Write validation
+//!
+//! Each key's accepted range mirrors the `proc_handler` Linux gives it, and
+//! a rejected write is `FsError::InvalidData` → EINVAL, as
+//! `proc_dointvec_minmax` returns. The bound is not always 0..=1 even for a
+//! key that reads like a boolean: `proc_dou8vec_minmax` defaults to 0..=255
+//! when the ctl_table carries no `extra1`/`extra2`, which is how
+//! `tcp_timestamps=2` is a valid Linux setting.
 //!
 //! Linux refs:
 //! - `net/ipv4/sysctl_net_ipv4.c` — `ipv4_table[]` ctl_table array
@@ -175,21 +209,53 @@ fn write_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
 /// Linux's `inet_forward_change` stamps `conf.default` and overwrites every
 /// interface's setting. See `narf_lib::sysctl::ipv4::set_all_forwarding`.
 fn write_all_forwarding(s: &str) -> Result<(), FsError> {
+    // `devinet_sysctl_forward` runs `proc_dointvec`: no 0/1 bound, any
+    // non-zero means on.
     let v = parse_u32(s)?;
-    if v > 1 {
+    if v > i32::MAX as u32 {
         return Err(FsError::InvalidData);
     }
     narf_lib::sysctl::ipv4::set_all_forwarding(v != 0);
     Ok(())
 }
 
-fn write_bool_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
+/// `proc_dou8vec_minmax` — a u8-backed key, rejected with EINVAL outside
+/// `[min, max]`.
+///
+/// Linux defaults the bounds to 0..=255 when the ctl_table carries no
+/// `extra1`/`extra2`, which is why several boolean-looking keys accept far
+/// more than 0 and 1: `tcp_timestamps` takes 2 ("on, without the random
+/// per-connection offset"), and `sysctl -w net.ipv4.tcp_timestamps=2` is a
+/// configuration real systems use. Refusing it is an ABI difference, not a
+/// stricter-is-safer choice.
+fn write_u8_minmax(a: &'static AtomicU32, s: &str, min: u32, max: u32) -> Result<(), FsError> {
     let v = parse_u32(s)?;
-    if v > 1 {
+    if v < min || v > max {
         return Err(FsError::InvalidData);
     }
     a.store(v, Ordering::Relaxed);
     Ok(())
+}
+
+/// `proc_dointvec` / `proc_dointvec_minmax` with `extra1 = SYSCTL_ZERO` — an
+/// int-backed key with no upper bound below `INT_MAX`.
+///
+/// Linux's `proc_dointvec` keys additionally accept negative values and treat
+/// any non-zero as set. NARF stores these in a `u32` and answers EINVAL for a
+/// negative, which is the one place this surface still diverges; no writer in
+/// practice sets a negative here.
+fn write_uint_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
+    let v = parse_u32(s)?;
+    if v > i32::MAX as u32 {
+        return Err(FsError::InvalidData);
+    }
+    a.store(v, Ordering::Relaxed);
+    Ok(())
+}
+
+/// A key Linux bounds to 0..=1 (`extra1 = SYSCTL_ZERO, extra2 = SYSCTL_ONE`).
+fn write_bool_atomic(a: &'static AtomicU32, s: &str) -> Result<(), FsError> {
+    write_u8_minmax(a, s, 0, 1)
 }
 
 // ── Public accessors (consulted by net stack) ────────────────────────────
@@ -235,7 +301,7 @@ pub fn register_all() {
     register_sysctl(SysctlEntry {
         path: "net/core/somaxconn",
         read: || read_atomic(&SOMAXCONN),
-        write: Some(|s| write_atomic(&SOMAXCONN, s)),
+        write: Some(|s| write_uint_atomic(&SOMAXCONN, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
@@ -309,25 +375,28 @@ pub fn register_all() {
     register_sysctl(SysctlEntry {
         path: "net/ipv4/conf/all/send_redirects",
         read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL),
-        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL, s)),
+        write: Some(|s| write_uint_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_ALL, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/conf/default/send_redirects",
         read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT),
-        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT, s)),
+        write: Some(|s| write_uint_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/conf/default/forwarding",
         read: || read_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT),
-        write: Some(|s| write_bool_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT, s)),
+        write: Some(|s| write_uint_atomic(&narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/ip_default_ttl",
         read: || read_atomic(&IP_DEFAULT_TTL),
-        write: Some(|s| write_atomic(&IP_DEFAULT_TTL, s)),
+        // `ip_ttl_min` = 1, `ip_ttl_max` = 255 in sysctl_net_ipv4.c: a TTL of
+        // 0 would put packets on the wire that die at the first hop, so Linux
+        // refuses it rather than accepting and clamping.
+        write: Some(|s| write_u8_minmax(&IP_DEFAULT_TTL, s, 1, 255)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
@@ -415,19 +484,22 @@ pub fn register_all() {
     register_sysctl(SysctlEntry {
         path: "net/ipv4/tcp_window_scaling",
         read: || read_atomic(&TCP_WSCALE),
-        write: Some(|s| write_bool_atomic(&TCP_WSCALE, s)),
+        // `proc_dou8vec_minmax` with no extras — the full u8 range.
+        write: Some(|s| write_u8_minmax(&TCP_WSCALE, s, 0, 255)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/tcp_timestamps",
         read: || read_atomic(&TCP_TIMESTAMPS),
-        write: Some(|s| write_bool_atomic(&TCP_TIMESTAMPS, s)),
+        // `proc_dou8vec_minmax` with no extras — the full u8 range.
+        write: Some(|s| write_u8_minmax(&TCP_TIMESTAMPS, s, 0, 255)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/tcp_sack",
         read: || read_atomic(&TCP_SACK),
-        write: Some(|s| write_bool_atomic(&TCP_SACK, s)),
+        // `proc_dou8vec_minmax` with no extras — the full u8 range.
+        write: Some(|s| write_u8_minmax(&TCP_SACK, s, 0, 255)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
@@ -994,7 +1066,8 @@ impl super::ProcFile for DevConfFile {
     fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
         let s = core::str::from_utf8(buf).map_err(|_| FsError::InvalidData)?;
         let v = parse_u32(s.trim())?;
-        if v > 1 {
+        // `devinet_conf_proc` is `proc_dointvec`: no 0/1 bound here either.
+        if v > i32::MAX as u32 {
             return Err(FsError::InvalidData);
         }
         self.key.set(&self.iface, v != 0);
@@ -1061,8 +1134,11 @@ fn smoke_conf_dev_forwarding_roundtrip() -> TestResult {
     narf_lib::sysctl::ipv4::set_all_forwarding(true);
     narf_lib::sysctl::ipv4::set_all_forwarding(false);
     let after_global = core::str::from_utf8(&f.read()).unwrap_or("").trim() == "0";
-    // Values outside {0,1} are rejected, as `proc_dointvec_minmax` does.
-    let rejects = f.write(b"2\n").is_err();
+    // `devinet_conf_proc` is `proc_dointvec` with no min/max, so a value
+    // above 1 is accepted and any non-zero means on. This case used to
+    // assert the opposite, which was NARF's behaviour and not Linux's.
+    let accepts_two = f.write(b"2\n").is_ok();
+    let two_is_on = narf_lib::sysctl::ipv4::device_forwarding(DEV);
 
     narf_lib::sysctl::ipv4::__reset_for_test();
 
@@ -1081,12 +1157,86 @@ fn smoke_conf_dev_forwarding_roundtrip() -> TestResult {
     if !after_global {
         return TestResult::Fail("global forwarding write not visible per-device");
     }
-    if !rejects {
-        return TestResult::Fail("conf/<dev>/forwarding accepted a value above 1");
+    if !accepts_two {
+        return TestResult::Fail("conf/<dev>/forwarding rejected 2, which Linux accepts");
+    }
+    if !two_is_on {
+        return TestResult::Fail("conf/<dev>/forwarding=2 did not read as enabled");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "filesystem/procfs/sys_net",
     smoke_conf_dev_forwarding_roundtrip
+);
+
+// Write validation must match the `proc_handler` Linux gives each key: the
+// accepted range, and EINVAL (FsError::InvalidData) outside it.
+//
+// The bound is not 0..=1 just because a key reads like a boolean.
+// `proc_dou8vec_minmax` defaults to 0..=255 when the ctl_table carries no
+// extras, which is why `tcp_timestamps=2` -- "on, without the random
+// per-connection offset" -- is a setting real systems use. NARF used to
+// answer EINVAL for it.
+fn smoke_sysctl_write_ranges_match_linux() -> TestResult {
+    register_all();
+
+    let write = |path: &[&str], v: &[u8]| -> Option<bool> {
+        match lookup_registry(path) {
+            Some(ProcNodeSnapshot::File(f)) => Some(f.write(v).is_ok()),
+            _ => None,
+        }
+    };
+
+    // ip_default_ttl: proc_dou8vec_minmax, ip_ttl_min=1, ip_ttl_max=255.
+    let ttl = ["sys", "net", "ipv4", "ip_default_ttl"];
+    let ttl_zero = write(&ttl, b"0\n");
+    let ttl_big = write(&ttl, b"256\n");
+    let ttl_ok = write(&ttl, b"255\n");
+    let _ = write(&ttl, b"64\n");
+
+    // tcp_timestamps: proc_dou8vec_minmax with no extras → 0..=255.
+    let ts = ["sys", "net", "ipv4", "tcp_timestamps"];
+    let ts_two = write(&ts, b"2\n");
+    let ts_big = write(&ts, b"256\n");
+    let _ = write(&ts, b"1\n");
+
+    // icmp_echo_ignore_all: extras are SYSCTL_ZERO/SYSCTL_ONE → 0..=1.
+    let ig = ["sys", "net", "ipv4", "icmp_echo_ignore_all"];
+    let ig_two = write(&ig, b"2\n");
+    let ig_one = write(&ig, b"1\n");
+    let _ = write(&ig, b"0\n");
+
+    // Malformed input is EINVAL everywhere.
+    let junk = write(&ttl, b"banana\n");
+
+    if ttl_zero != Some(false) {
+        return TestResult::Fail("ip_default_ttl accepted 0; Linux bounds it at 1");
+    }
+    if ttl_big != Some(false) {
+        return TestResult::Fail("ip_default_ttl accepted 256");
+    }
+    if ttl_ok != Some(true) {
+        return TestResult::Fail("ip_default_ttl rejected 255");
+    }
+    if ts_two != Some(true) {
+        return TestResult::Fail("tcp_timestamps rejected 2, which Linux accepts");
+    }
+    if ts_big != Some(false) {
+        return TestResult::Fail("tcp_timestamps accepted 256");
+    }
+    if ig_two != Some(false) {
+        return TestResult::Fail("icmp_echo_ignore_all accepted 2; Linux bounds it at 1");
+    }
+    if ig_one != Some(true) {
+        return TestResult::Fail("icmp_echo_ignore_all rejected 1");
+    }
+    if junk != Some(false) {
+        return TestResult::Fail("a non-numeric sysctl write was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_sysctl_write_ranges_match_linux
 );
