@@ -3100,6 +3100,47 @@ kernel_test_in!(
     smoke_scheduler_policy_wants_tick_reflects_policy
 );
 
+// hrtick: a finite slice arms a one-shot wheel entry, and draining the wheel
+// past its deadline fires the static waker → reschedules the entry's CPU. A long
+// slice is used so the real LAPIC does not fire it before the assertion window.
+#[cfg(feature = "hrtick")]
+fn smoke_hrtick_finite_slice_arms_and_fires() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::__test_clear_need_resched(cpu);
+    let now = narf_time::now_cycles();
+    crate::hrtick::arm(cpu, now, 10_000_000);
+    if !crate::hrtick::is_armed(cpu) {
+        return TestResult::Fail("finite-slice hrtick did not register a slice timer");
+    }
+    let _ = narf_time::timer_wheel::fire_due(now.saturating_add(20_000_000));
+    let fired = crate::__test_need_resched(cpu);
+    crate::hrtick::disarm(cpu);
+    crate::__test_clear_need_resched(cpu);
+    if !fired {
+        return TestResult::Fail("hrtick slice-timer fire did not set NEED_RESCHED");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "hrtick")]
+kernel_test_in!("scheduler", smoke_hrtick_finite_slice_arms_and_fires);
+
+// hrtick: an "infinite" (non-preemptible) slice must NOT arm a timer. Checked
+// via the armed state directly, so it is deterministic (no reliance on firing).
+#[cfg(feature = "hrtick")]
+fn smoke_hrtick_infinite_slice_not_armed() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    let now = narf_time::now_cycles();
+    crate::hrtick::arm(cpu, now, u64::MAX / 2);
+    let armed = crate::hrtick::is_armed(cpu);
+    crate::hrtick::disarm(cpu);
+    if armed {
+        return TestResult::Fail("infinite-slice hrtick armed a slice timer");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "hrtick")]
+kernel_test_in!("scheduler", smoke_hrtick_infinite_slice_not_armed);
+
 /// EEVDF-lite accounting (Phase 1): a task's `vruntime` is projected into
 /// `TaskMeta`, starts at the CPU's virtual-time floor on admission, and grows
 /// as the task consumes dispatch cycles. An observing policy records the

@@ -111,6 +111,10 @@ perf-dump = []
 # Detects a global forward-progress stall (the intermittent SMP wedge) and
 # dumps per-CPU scheduler state once for classification. Off by default.
 stall-watchdog = []
+# hrtick (Linux CONFIG_SCHED_HRTICK): per-task one-shot slice timer in the
+# scheduler for precise slice-exhaustion preemption. Forwarded to
+# narf-scheduler. Off by default.
+hrtick = ["narf-scheduler/hrtick"]
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from

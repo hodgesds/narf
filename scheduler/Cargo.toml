@@ -24,6 +24,10 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
 kernel-test = []
+# High-resolution tick (Linux CONFIG_SCHED_HRTICK): per-task one-shot slice
+# timer via the timer wheel, so a task is preempted precisely at slice
+# exhaustion. Off by default (the default build stays byte-identical).
+hrtick = []
 
 # cgroup-v2 cpu + cpuset controller seam: exposes hooks the cgroupfs
 # `cpu` / `cpuset` controllers install at boot to apply per-cgroup

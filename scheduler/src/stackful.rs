@@ -1406,11 +1406,18 @@ fn this_cpu() -> usize {
 /// resume) so the slice window has exactly one origin — the analogue of Linux
 /// resetting the runqueue clock at pick. Under the `hrtick` feature this is also
 /// where the per-task one-shot slice timer is (re)armed, so there is one hook
-/// instead of eight. `cpu` is unused until then.
+/// instead of eight.
 #[inline]
-fn stamp_slice_start(task: &KernelTask, _cpu: usize) {
-    task.tsc_started
-        .store(narf_time::now_cycles(), Ordering::Release);
+fn stamp_slice_start(task: &KernelTask, cpu: usize) {
+    let now = narf_time::now_cycles();
+    task.tsc_started.store(now, Ordering::Release);
+    // hrtick (Linux CONFIG_SCHED_HRTICK): (re)arm the per-task one-shot slice
+    // timer so the task is preempted precisely at slice exhaustion instead of at
+    // the next coarse periodic tick. Compiled out (and `cpu` unused) by default.
+    #[cfg(feature = "hrtick")]
+    crate::hrtick::arm(cpu, now, task.slice_cycles.load(Ordering::Acquire));
+    #[cfg(not(feature = "hrtick"))]
+    let _ = cpu;
 }
 
 /// A `KernelContext` is only ever switched *into* after a `kernel_switch`

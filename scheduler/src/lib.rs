@@ -80,6 +80,9 @@ pub mod priority;
 pub mod stackful;
 pub mod steal;
 
+#[cfg(feature = "hrtick")]
+mod hrtick;
+
 mod tests;
 
 pub use accounting::{
@@ -1767,7 +1770,7 @@ fn resched_remote(target_cpu: u32) {
 /// empty->nonempty edge, not one per wake (`llist_add`'s "first entry" gate).
 /// No-op for self / out-of-range.
 #[inline]
-fn resched_remote_force(target_cpu: u32) {
+pub(crate) fn resched_remote_force(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
     if target_cpu == me || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
         return;
