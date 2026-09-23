@@ -4726,13 +4726,18 @@ pub fn uts_set_hostname_for_current(name: &str) -> Result<(), ()> {
 
 /// As [`uts_hostname_for_current`], for the NIS domain name.
 pub fn uts_domainname_for_current() -> alloc::string::String {
-    let task = current_task_id();
+    // `DOMAINNAME` only exists in the non-container build: with the feature
+    // on, setdomainname(2) and uname(2) both resolve through
+    // `current_uts_ns`, so this mirrors them rather than falling back to a
+    // static that is not compiled.
     #[cfg(feature = "container")]
-    if let Some(ns) = crate::namespaces::uts_ns_of(task) {
-        return ns.domainname();
+    {
+        crate::namespaces::current_uts_ns(current_task_id()).domainname()
     }
-    let _ = task;
-    DOMAINNAME.lock().clone()
+    #[cfg(not(feature = "container"))]
+    {
+        DOMAINNAME.lock().clone()
+    }
 }
 
 /// As [`uts_set_hostname_for_current`], for the NIS domain name.
@@ -4745,13 +4750,15 @@ pub fn uts_set_domainname_for_current(name: &str) -> Result<(), ()> {
         return Err(());
     }
     #[cfg(feature = "container")]
-    if let Some(ns) = crate::namespaces::uts_ns_of(task) {
-        ns.set_domainname(name);
-        return Ok(());
+    {
+        crate::namespaces::current_uts_ns(task).set_domainname(name);
     }
-    let mut g = DOMAINNAME.lock();
-    g.clear();
-    g.push_str(name);
+    #[cfg(not(feature = "container"))]
+    {
+        let mut g = DOMAINNAME.lock();
+        g.clear();
+        g.push_str(name);
+    }
     Ok(())
 }
 
