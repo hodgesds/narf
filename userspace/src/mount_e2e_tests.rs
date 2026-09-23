@@ -3023,8 +3023,8 @@ fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
     const MS_SHARED: u64 = 1 << 20;
     const CLONE_NEWNS: u64 = 0x0002_0000;
     let _kbuf = crate::handlers::kernel_buffers_guard();
-    let task_a: u64 = 0x71_23_a;
-    let task_b: u64 = 0x71_23_b;
+    let task_a: u64 = 0x7123a;
+    let task_b: u64 = 0x7123b;
     const BASE: &str = "/shared_run";
     const SUB: &str = "/shared_run/sub";
 
@@ -3122,8 +3122,8 @@ kernel_test_in!("userspace/mount", smoke_mount_propagates_under_shared_to_peers)
 fn smoke_mount_under_private_does_not_propagate() -> TestResult {
     const CLONE_NEWNS: u64 = 0x0002_0000;
     let _kbuf = crate::handlers::kernel_buffers_guard();
-    let task_a: u64 = 0x71_24_a;
-    let task_b: u64 = 0x71_24_b;
+    let task_a: u64 = 0x7124a;
+    let task_b: u64 = 0x7124b;
     const BASE: &str = "/priv_base";
     const SUB: &str = "/priv_base/sub";
     set_task(task_a);
