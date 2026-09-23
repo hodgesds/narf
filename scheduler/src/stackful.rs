@@ -954,9 +954,7 @@ unsafe fn try_direct_handoff(
             .domain_byte
             .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
         target_ref.exec_ctx.store(root_exec, Ordering::Release);
-        target_ref
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(target_ref, cpu);
         // SAFETY: this entire handoff publication runs on `cpu` with
         // interrupts masked, and the inactive gate proves the slot is empty.
         let previous_root_as = unsafe { direct_state.root_as.replace(root_as) };
@@ -1401,6 +1399,18 @@ fn this_cpu() -> usize {
     } else {
         0
     }
+}
+
+/// Stamp the start of `task`'s slice on `cpu`. Single definition for every
+/// resume/dispatch path (direct handoff, poll_to_yield, preempt-resume, yield-
+/// resume) so the slice window has exactly one origin — the analogue of Linux
+/// resetting the runqueue clock at pick. Under the `hrtick` feature this is also
+/// where the per-task one-shot slice timer is (re)armed, so there is one hook
+/// instead of eight. `cpu` is unused until then.
+#[inline]
+fn stamp_slice_start(task: &KernelTask, _cpu: usize) {
+    task.tsc_started
+        .store(narf_time::now_cycles(), Ordering::Release);
 }
 
 /// A `KernelContext` is only ever switched *into* after a `kernel_switch`
@@ -1868,8 +1878,7 @@ impl KernelTask {
         // Record when this slice started — the trap-handler
         // preempt hook reads `tsc_started` to decide whether
         // we've used our slice.
-        self.tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(self, this_cpu());
         // CURRENT_STACKFUL_TASK is SET to the running task by task_body_rust
         // (at the top of each poll iter) and CLEARED by it before each yield.
         // The executor side must not *set* it to the task (that would let a
@@ -2127,9 +2136,8 @@ impl KernelTask {
             }
         }
         self.exec_ctx.store(exec_ctx as *mut _, Ordering::Release);
-        self.tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
         let cpu = this_cpu();
+        stamp_slice_start(self, cpu);
         let saved_current = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
         if !saved_current.is_null() {
             // SAFETY: `saved_current` is the synchronously executing outer
@@ -2787,9 +2795,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: Valid memory or trusted environment
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
-        (*task_ptr)
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*task_ptr, cpu);
     }
     if kernel_span_paused {
         resume_user_kernel_span();
@@ -2913,9 +2919,7 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(task_ptr, Ordering::Release);
     // SAFETY: the task is still owned by the in-flight poll_to_yield.
     unsafe {
-        (*task_ptr)
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*task_ptr, cpu);
     }
     if kernel_span_paused {
         resume_user_kernel_span();
@@ -3049,9 +3053,7 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     // SAFETY: still our live task (poll_to_yield has not returned).
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
-        (*task_ptr)
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*task_ptr, cpu);
     }
     user_fpu_restore();
     let _ = frame;
@@ -3260,8 +3262,7 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
     // SAFETY: still our live task.
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(p, Ordering::Release);
-        (*p).tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*p, cpu);
         if masked_trap_park {
             (*p).resume_irqs_masked.store(false, Ordering::Release);
         }
@@ -4425,8 +4426,7 @@ pub mod tests {
         }
         let task = KernelTask::new(Forever);
         let task_ptr = &*task as *const KernelTask as *mut KernelTask;
-        task.tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&task, this_cpu());
         task.slice_cycles.store(u64::MAX / 2, Ordering::Release);
         let cpu = this_cpu();
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
