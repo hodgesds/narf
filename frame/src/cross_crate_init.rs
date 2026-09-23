@@ -315,6 +315,17 @@ fn install_procfs_net_hooks() {
     );
     // Register the actual /proc/net/* files on the procfs registry.
     pn::register_all();
+
+    // The reverse direction: let `narf-net` publish each interface's
+    // `/proc/sys/net/ipv4/conf/<dev>/*` keys as it registers the interface.
+    // procfs cannot enumerate interfaces itself, and the per-device keys
+    // cannot be static `SysctlEntry`s, so the net stack drives this.
+    narf_net::iface::install_dev_conf_hook(narf_filesystem::procfs::sys_net::register_dev_conf);
+    // Interfaces registered before this point (the boot-time NICs) predate
+    // the hook, so publish their keys now.
+    for e in narf_net::iface::snapshot_all() {
+        narf_filesystem::procfs::sys_net::register_dev_conf(&e.name);
+    }
 }
 
 #[cfg(feature = "container")]

@@ -2027,7 +2027,7 @@ fn smoke_ipv4_forward_enabled_routes_and_decrements_ttl() -> TestResult {
     full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
     make_router();
     narf_lib::sysctl::ipv4::__reset_for_test();
-    narf_lib::sysctl::ipv4::IP_FORWARD.store(1, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
 
     inject_forwardable(RT_FOREIGN_IP, 64);
     let out = captured_ipv4();
@@ -2068,7 +2068,7 @@ fn smoke_ipv4_forward_ttl_expiry_sends_time_exceeded() -> TestResult {
     full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
     make_router();
     narf_lib::sysctl::ipv4::__reset_for_test();
-    narf_lib::sysctl::ipv4::IP_FORWARD.store(1, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
 
     inject_forwardable(RT_FOREIGN_IP, 1);
     let out = captured_ipv4();
@@ -2109,7 +2109,7 @@ fn smoke_ipv4_forward_no_route_sends_net_unreachable() -> TestResult {
     // is unroutable while the sender is still reachable on-link.
     seed_transit_src();
     narf_lib::sysctl::ipv4::__reset_for_test();
-    narf_lib::sysctl::ipv4::IP_FORWARD.store(1, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
 
     inject_forwardable(RT_FOREIGN_IP, 64);
     let out = captured_ipv4();
@@ -2136,3 +2136,80 @@ fn smoke_ipv4_forward_no_route_sends_net_unreachable() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_ipv4_forward_no_route_sends_net_unreachable);
+
+// Forwarding is decided by the INGRESS interface's own setting, which is
+// what `IN_DEV_FORWARD` reads. A global default pointing the other way does
+// not override it — so a box can route off one interface while refusing on
+// another, which is the whole point of the per-device key.
+fn smoke_ipv4_forward_is_per_ingress_interface() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // Default off, this interface on → routed.
+    narf_lib::sysctl::ipv4::set_device_forwarding(RT_IFACE, true);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let on_wins = captured_ipv4().len() == 1;
+
+    // Default on, this interface off → dropped. The per-device value is not
+    // ANDed with or overridden by the default; it simply decides.
+    narf_lib::sysctl::ipv4::IP_FORWARD_DEFAULT.store(1, Ordering::Relaxed);
+    narf_lib::sysctl::ipv4::set_device_forwarding(RT_IFACE, false);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let off_wins = captured_ipv4().is_empty();
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !on_wins {
+        return TestResult::Fail("interface with forwarding=1 did not route");
+    }
+    if !off_wins {
+        return TestResult::Fail("interface with forwarding=0 routed anyway");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_ipv4_forward_is_per_ingress_interface);
+
+// Writing net.ipv4.ip_forward is not a plain store. Linux's
+// `inet_forward_change` stamps conf.default and overwrites EVERY interface,
+// so enabling it globally really does turn it on everywhere — including on
+// an interface someone had turned off by hand.
+fn smoke_ipv4_forward_all_write_propagates_to_devices() -> TestResult {
+    full_reset(RT_IFACE, RT_LOCAL_IP, RT_GW);
+    make_router();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    // Explicitly off, and it stays off on its own.
+    narf_lib::sysctl::ipv4::set_device_forwarding(RT_IFACE, false);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let off_before = captured_ipv4().is_empty();
+
+    // Global write reaches into the per-interface value.
+    narf_lib::sysctl::ipv4::set_all_forwarding(true);
+    let dev_now_on = narf_lib::sysctl::ipv4::device_forwarding(RT_IFACE);
+    inject_forwardable(RT_FOREIGN_IP, 64);
+    let routed_after = captured_ipv4().len() == 1;
+
+    // And a later interface inherits it through conf.default.
+    let inherited = narf_lib::sysctl::ipv4::device_forwarding("e2e-rt7-new");
+
+    narf_lib::sysctl::ipv4::__reset_for_test();
+
+    if !off_before {
+        return TestResult::Fail("interface set to 0 routed before the global write");
+    }
+    if !dev_now_on {
+        return TestResult::Fail("ip_forward=1 did not propagate into the interface");
+    }
+    if !routed_after {
+        return TestResult::Fail("interface did not route after ip_forward=1");
+    }
+    if !inherited {
+        return TestResult::Fail("a new interface did not inherit conf.default.forwarding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/e2e",
+    smoke_ipv4_forward_all_write_propagates_to_devices
+);

@@ -11,9 +11,16 @@
 //! was ever retransmitted, and `net.ipv4.ip_forward` was stored where the
 //! network stack could not even read it. Writing the knob changed nothing.
 //!
+//! Forwarding is decided per ingress interface, so one interface can route
+//! while another does not — the usual shape for a box with an untrusted
+//! side.
+//!
 //! ## What this does, in Linux's order
 //!
-//! 1. Refuse unless `ip_forward` is set. Default 0, as in Linux.
+//! 1. Refuse unless the INGRESS interface forwards. Linux's
+//!    `IN_DEV_FORWARD` reads `conf.<dev>.forwarding` alone; writing
+//!    `net.ipv4.ip_forward` reaches the datapath by propagating into every
+//!    interface. Default 0, as in Linux.
 //! 2. TTL: a packet arriving with TTL <= 1 dies here, and the sender is told
 //!    with ICMP Time Exceeded / TTL exceeded in transit. This is what makes
 //!    `traceroute` through the box work, and it is the loop bound — every
@@ -64,7 +71,10 @@ const MIN_HDR: usize = 20;
 /// ICMP error. `false` means the caller should drop it, which is also what
 /// happens whenever forwarding is disabled.
 pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
-    if !sysctl::ip_forward() {
+    // `IN_DEV_FORWARD(in_dev)` — the INGRESS interface's own setting, not
+    // the global knob. `net.ipv4.ip_forward` reaches this only by having
+    // been propagated into every interface when it was written.
+    if !sysctl::device_forwarding(iface_in) {
         return false;
     }
     if packet.len() < MIN_HDR {
