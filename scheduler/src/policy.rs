@@ -874,7 +874,22 @@ pub fn current_scheduler_quantum_unit() -> QuantumUnit {
 fn resolve_quantum_unit(base: QuantumUnit) -> Result<QuantumUnit, SchedulerError> {
     match base {
         QuantumUnit::Nanos => Ok(QuantumUnit::Nanos),
-        QuantumUnit::Cycles => Err(SchedulerError::CycleModeUnavailable),
+        // Cycles needs the `pmu` feature AND a usable APERF work-cycle source
+        // (absent on an un-vPMU VM). Refuse otherwise — no silent downgrade.
+        QuantumUnit::Cycles => {
+            #[cfg(feature = "pmu")]
+            {
+                if crate::pmu::available() {
+                    Ok(QuantumUnit::Cycles)
+                } else {
+                    Err(SchedulerError::CycleModeUnavailable)
+                }
+            }
+            #[cfg(not(feature = "pmu"))]
+            {
+                Err(SchedulerError::CycleModeUnavailable)
+            }
+        }
     }
 }
 

@@ -115,6 +115,9 @@ stall-watchdog = []
 # scheduler for precise slice-exhaustion preemption. Forwarded to
 # narf-scheduler. Off by default.
 hrtick = ["narf-scheduler/hrtick"]
+# pmu: enable QuantumUnit::Cycles (APERF work-cycle scheduling) in the
+# scheduler. Forwarded to narf-scheduler. Off by default.
+pmu = ["narf-scheduler/pmu"]
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from

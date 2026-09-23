@@ -3019,10 +3019,7 @@ fn smoke_scheduler_cycles_unit_refused_without_pmu() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "scheduler",
-    smoke_scheduler_cycles_unit_refused_without_pmu
-);
+kernel_test_in!("scheduler", smoke_scheduler_cycles_unit_refused_without_pmu);
 
 // `resched_current()` (NARF's `resched_curr`) sets THIS CPU's NEED_RESCHED —
 // the state the preempt path folds into its decision. It must NOT touch the
@@ -3140,6 +3137,78 @@ fn smoke_hrtick_infinite_slice_not_armed() -> TestResult {
 }
 #[cfg(feature = "hrtick")]
 kernel_test_in!("scheduler", smoke_hrtick_infinite_slice_not_armed);
+
+// pmu: installing a QuantumUnit::Cycles policy must exactly track APERF
+// availability — Ok + active unit Cycles when a work-cycle source exists, else
+// refused with CycleModeUnavailable (no silent downgrade). Adapts to the test
+// host (a VM may or may not expose APERF).
+#[cfg(feature = "pmu")]
+fn smoke_pmu_cycles_install_matches_availability() -> TestResult {
+    use crate::{
+        active_quantum_unit, install_scheduler, ClassScheduler, CpuId, QuantumUnit, RunQueue,
+        SchedPolicy, Scheduler, SchedulerError, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct CyclesPolicy;
+    impl Scheduler for CyclesPolicy {
+        fn name(&self) -> &'static str {
+            "cycles-policy"
+        }
+        fn quantum_unit(&self) -> QuantumUnit {
+            QuantumUnit::Cycles
+        }
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            // Sane default so we never strand work while briefly installed.
+            queue.iter_meta().find_map(|(h, m)| m.runnable.then_some(h))
+        }
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    let _ = install_scheduler(&cap, ClassScheduler);
+    let avail = crate::pmu::available();
+    let res = install_scheduler(&cap, CyclesPolicy);
+    let verdict = if avail {
+        match res {
+            Ok(()) if active_quantum_unit() == QuantumUnit::Cycles => TestResult::Pass,
+            Ok(()) => TestResult::Fail("Cycles installed but active_quantum_unit != Cycles"),
+            Err(_) => TestResult::Fail("Cycles refused despite APERF available"),
+        }
+    } else {
+        match res {
+            Err(SchedulerError::CycleModeUnavailable) => TestResult::Pass,
+            Ok(()) => TestResult::Fail("Cycles installed despite no APERF source"),
+            Err(_) => TestResult::Fail("Cycles refused with the wrong error"),
+        }
+    };
+    let _ = install_scheduler(&cap, ClassScheduler);
+    verdict
+}
+#[cfg(feature = "pmu")]
+kernel_test_in!("scheduler", smoke_pmu_cycles_install_matches_availability);
+
+// pmu: when a work-cycle source exists, APERF advances as work is done. Skipped
+// (trivially passes) on a host without APERF.
+#[cfg(feature = "pmu")]
+fn smoke_pmu_work_cycles_advance() -> TestResult {
+    if !crate::pmu::available() {
+        return TestResult::Pass;
+    }
+    let before = crate::pmu::read_work_cycles();
+    let mut acc = 0u64;
+    for i in 0..200_000u64 {
+        acc = acc.wrapping_add(i);
+    }
+    core::hint::black_box(acc);
+    let after = crate::pmu::read_work_cycles();
+    if after <= before {
+        return TestResult::Fail("APERF work-cycle counter did not advance across work");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "pmu")]
+kernel_test_in!("scheduler", smoke_pmu_work_cycles_advance);
 
 /// EEVDF-lite accounting (Phase 1): a task's `vruntime` is projected into
 /// `TaskMeta`, starts at the CPU's virtual-time floor on admission, and grows

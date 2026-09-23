@@ -83,6 +83,9 @@ pub mod steal;
 #[cfg(feature = "hrtick")]
 mod hrtick;
 
+#[cfg(feature = "pmu")]
+mod pmu;
+
 mod tests;
 
 pub use accounting::{
@@ -110,14 +113,14 @@ pub use donation::{
 };
 pub use eevdf::EevdfScheduler;
 pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
+pub(crate) use policy::policy_wants_tick;
 pub use policy::{
     active_quantum_unit, cpu_state, current_scheduler_name, current_scheduler_quantum_unit,
     install_scheduler, set_default_policy, ClassScheduler, CpuIdleMeta, CpuSchedContext, CpuState,
-    CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, RunQueue, SchedPolicy,
-    SchedRow, QuantumUnit, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
+    CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, QuantumUnit, RunQueue,
+    SchedPolicy, SchedRow, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
     TaskHandle, TaskMeta, TaskQueueEvent,
 };
-pub(crate) use policy::policy_wants_tick;
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
 pub use steal::{
