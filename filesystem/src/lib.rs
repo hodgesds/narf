@@ -4937,10 +4937,21 @@ impl DirOps for InitramfsDir {
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let target = self.child_prefix(name);
-        // Any entry whose canonical name == target/* or == target?
+        // A subdirectory exists if some entry lives UNDER `target/`, or if
+        // `target` is itself an explicit CPIO directory entry.
+        //
+        // The second arm must check the mode. Without it any entry whose name
+        // equals `target` matched — including a plain FILE — so `lookup_dir`
+        // answered "yes, a directory" for a regular file. Path walking did not
+        // notice, because it asks for a file at the last component. An overlay
+        // does: `lower_file_async` treats "the lower has a directory by this
+        // name" as "therefore not a file" and stops, so a file in an initramfs
+        // lower became invisible through an overlay while resolving fine
+        // directly. That is what hid /lib/modules/*.ko once the mount-target
+        // fixture put an overlay over the boot initramfs.
         let any_match = self.entries.iter().any(|e| {
             let canon = canonicalize_cpio_name(e.name);
-            canon == target
+            (canon == target && (e.mode & 0o170000) == 0o040000)
                 || canon
                     .strip_prefix(&target)
                     .and_then(|r| r.strip_prefix('/'))
@@ -5023,12 +5034,14 @@ impl DirOps for InitramfsRoot {
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        // A subdir exists if at least one entry's canonical name
-        // starts with `name/` or is exactly `name` (an explicit
-        // CPIO dir entry).
+        // A subdir exists if at least one entry's canonical name starts with
+        // `name/`, or is exactly `name` AND is an explicit CPIO dir entry.
+        // The mode check is the operative half — see the note on
+        // `InitramfsDir::lookup_dir`: without it a regular file answers
+        // `lookup_dir`, which makes that file invisible underneath an overlay.
         let any_match = self.entries().iter().any(|e| {
             let canon = canonicalize_cpio_name(e.name);
-            canon == name
+            (canon == name && (e.mode & 0o170000) == 0o040000)
                 || canon
                     .strip_prefix(name)
                     .and_then(|r| r.strip_prefix('/'))
