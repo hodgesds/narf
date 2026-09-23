@@ -23,7 +23,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -130,7 +130,70 @@ fn ensure_defaults() {
 
 // ── Read/write handlers ─────────────────────────────────────────
 
+// ── UTS hooks ───────────────────────────────────────────────────
+//
+// `/proc/sys/kernel/{hostname,domainname}` are not storage of their own. In
+// Linux they ARE the current UTS namespace's `nodename`/`domainname`
+// (`proc_do_uts_string` resolves `current->nsproxy->uts_ns`), which is the
+// same memory `sethostname(2)` writes and `gethostname(2)`/`uname(2)` read.
+//
+// NARF used to keep a separate `String` here, so `hostname foo` through
+// /proc and through the syscall updated different variables and each read
+// back its own. These hooks route both to the UTS resolution in
+// `narf-userspace`, which owns namespaces and cannot be seen from this
+// crate; `frame::cross_crate_init` installs them.
+//
+// Before they are installed -- early boot, and unit tests that never bring
+// userspace up -- the statics below still back the files, so a read has
+// something coherent to return. Both sides default to "narf", so the
+// handover does not change the observed value.
+type UtsGetFn = fn() -> String;
+type UtsSetFn = fn(&str) -> Result<(), ()>;
+
+static UTS_HOSTNAME_GET: AtomicUsize = AtomicUsize::new(0);
+static UTS_HOSTNAME_SET: AtomicUsize = AtomicUsize::new(0);
+static UTS_DOMAINNAME_GET: AtomicUsize = AtomicUsize::new(0);
+static UTS_DOMAINNAME_SET: AtomicUsize = AtomicUsize::new(0);
+
+/// Route the UTS sysctl keys at the real namespace state. Idempotent.
+pub fn install_uts_hooks(
+    hostname: UtsGetFn,
+    set_hostname: UtsSetFn,
+    domainname: UtsGetFn,
+    set_domainname: UtsSetFn,
+) {
+    UTS_HOSTNAME_GET.store(hostname as usize, Ordering::Release);
+    UTS_HOSTNAME_SET.store(set_hostname as usize, Ordering::Release);
+    UTS_DOMAINNAME_GET.store(domainname as usize, Ordering::Release);
+    UTS_DOMAINNAME_SET.store(set_domainname as usize, Ordering::Release);
+}
+
+fn uts_get(slot: &AtomicUsize) -> Option<String> {
+    let v = slot.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by install_uts_hooks as a UtsGetFn fn-pointer;
+    // non-zero confirms it.
+    let f: UtsGetFn = unsafe { core::mem::transmute(v) };
+    Some(f())
+}
+
+fn uts_set(slot: &AtomicUsize, v: &str) -> Option<Result<(), ()>> {
+    let p = slot.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY: p was stored by install_uts_hooks as a UtsSetFn fn-pointer;
+    // non-zero confirms it.
+    let f: UtsSetFn = unsafe { core::mem::transmute(p) };
+    Some(f(v))
+}
+
 fn read_hostname() -> String {
+    if let Some(s) = uts_get(&UTS_HOSTNAME_GET) {
+        return format!("{s}\n");
+    }
     ensure_defaults();
     format!("{}\n", HOSTNAME.lock().as_str())
 }
@@ -138,8 +201,17 @@ fn write_hostname(v: &str) -> Result<(), FsError> {
     if v.len() > 64 {
         return Err(FsError::InvalidData);
     }
-    *HOSTNAME.lock() = v.to_string();
-    Ok(())
+    match uts_set(&UTS_HOSTNAME_SET, v) {
+        // The hook refuses without CAP_SYS_ADMIN in the UTS namespace's user
+        // namespace, matching `sethostname(2)`; Linux gets the same outcome
+        // from the file's 0644 root ownership, which NARF does not enforce.
+        Some(Err(())) => Err(FsError::PermissionDenied),
+        Some(Ok(())) => Ok(()),
+        None => {
+            *HOSTNAME.lock() = v.to_string();
+            Ok(())
+        }
+    }
 }
 
 fn read_ostype() -> String {
@@ -153,6 +225,9 @@ fn read_version() -> String {
 }
 
 fn read_domainname() -> String {
+    if let Some(s) = uts_get(&UTS_DOMAINNAME_GET) {
+        return format!("{s}\n");
+    }
     ensure_defaults();
     format!("{}\n", DOMAINNAME.lock().as_str())
 }
@@ -160,8 +235,14 @@ fn write_domainname(v: &str) -> Result<(), FsError> {
     if v.len() > 64 {
         return Err(FsError::InvalidData);
     }
-    *DOMAINNAME.lock() = v.to_string();
-    Ok(())
+    match uts_set(&UTS_DOMAINNAME_SET, v) {
+        Some(Err(())) => Err(FsError::PermissionDenied),
+        Some(Ok(())) => Ok(()),
+        None => {
+            *DOMAINNAME.lock() = v.to_string();
+            Ok(())
+        }
+    }
 }
 
 fn read_pid_max() -> String {
