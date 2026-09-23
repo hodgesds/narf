@@ -48,6 +48,57 @@ pub(crate) fn render_rdev(index: u32) -> u64 {
     (226u64 << 8) | (128 + index as u64)
 }
 
+/// The one extended attribute a DRM node stores: the POSIX ACCESS ACL that
+/// logind's udev `uaccess` builtin writes to grant the active session's user
+/// read/write. Stored on the PER-DEVICE metadata so the ACL an O_PATH-fd
+/// `setxattr` writes is the same one a later `open()` permission check reads.
+const DRM_ACL_XATTR: &str = "system.posix_acl_access";
+
+type DrmMeta = Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm_registry::DrmNodeMetadata>>;
+
+fn drm_node_get_xattr(meta: &DrmMeta, name: &str) -> Result<Vec<u8>, FsError> {
+    if name == DRM_ACL_XATTR {
+        // Missing ACL is ENODATA (FsError::NotFound), NOT "no xattr support":
+        // libacl's acl_get_file synthesises a base ACL from the mode on ENODATA,
+        // but treats EOPNOTSUPP as "this fs has no ACLs" and gives up.
+        meta.lock().access_acl.clone().ok_or(FsError::NotFound)
+    } else {
+        Err(FsError::NotFound)
+    }
+}
+
+fn drm_node_set_xattr(meta: &DrmMeta, name: &str, value: &[u8]) -> Result<(), FsError> {
+    if name == DRM_ACL_XATTR {
+        meta.lock().access_acl = Some(value.to_vec());
+        Ok(())
+    } else {
+        // A non-ACL name on a device node has no store — devtmpfs answers
+        // EOPNOTSUPP, and libacl's ACL path never asks for anything else.
+        Err(FsError::Unsupported)
+    }
+}
+
+fn drm_node_list_xattr(meta: &DrmMeta) -> Vec<u8> {
+    let mut out = Vec::new();
+    if meta.lock().access_acl.is_some() {
+        out.extend_from_slice(DRM_ACL_XATTR.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+fn drm_node_remove_xattr(meta: &DrmMeta, name: &str) -> Result<(), FsError> {
+    if name == DRM_ACL_XATTR {
+        if meta.lock().access_acl.take().is_some() {
+            Ok(())
+        } else {
+            Err(FsError::NotFound)
+        }
+    } else {
+        Err(FsError::NotFound)
+    }
+}
+
 // ── DriCardFile ────────────────────────────────────────────────────────────
 
 /// Placeholder file for `/dev/dri/card<N>` (DRM master node).
@@ -183,13 +234,13 @@ impl FileOps for DriCardFile {
     }
 
     fn stat(&self) -> Stat {
-        let metadata = *self.metadata.lock();
+        let perms = self.metadata.lock().perms;
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: metadata.perms,
+                perms,
             },
             mtime_cycles: 0,
         }
@@ -201,8 +252,8 @@ impl FileOps for DriCardFile {
     }
 
     fn owners(&self) -> (u32, u32) {
-        let metadata = *self.metadata.lock();
-        (metadata.uid, metadata.gid)
+        let m = self.metadata.lock();
+        (m.uid, m.gid)
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
@@ -215,6 +266,29 @@ impl FileOps for DriCardFile {
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         self.metadata.lock().perms = perms & 0o7777;
         Box::pin(async { Ok(()) })
+    }
+
+    // POSIX-ACL xattr storage on the shared per-device metadata — see the
+    // `drm_node_*_xattr` helpers. logind's udev `uaccess` builtin setxattr's the
+    // active session's ACL here; the open-time permission check reads it back.
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        let r = drm_node_get_xattr(&self.metadata, name);
+        Box::pin(async move { r })
+    }
+
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
+        let r = drm_node_set_xattr(&self.metadata, name, value);
+        Box::pin(async move { r })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        let out = drm_node_list_xattr(&self.metadata);
+        Box::pin(async move { Ok(out) })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let r = drm_node_remove_xattr(&self.metadata, name);
+        Box::pin(async move { r })
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/card<N>`. Primary-node fd
@@ -413,13 +487,13 @@ impl FileOps for DriRenderFile {
     }
 
     fn stat(&self) -> Stat {
-        let metadata = *self.metadata.lock();
+        let perms = self.metadata.lock().perms;
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: metadata.perms,
+                perms,
             },
             mtime_cycles: 0,
         }
@@ -431,8 +505,8 @@ impl FileOps for DriRenderFile {
     }
 
     fn owners(&self) -> (u32, u32) {
-        let metadata = *self.metadata.lock();
-        (metadata.uid, metadata.gid)
+        let m = self.metadata.lock();
+        (m.uid, m.gid)
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
@@ -445,6 +519,29 @@ impl FileOps for DriRenderFile {
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         self.metadata.lock().perms = perms & 0o7777;
         Box::pin(async { Ok(()) })
+    }
+
+    // POSIX-ACL xattr storage on the shared per-device metadata — see the
+    // `drm_node_*_xattr` helpers. logind's udev `uaccess` builtin setxattr's the
+    // active session's ACL here; the open-time permission check reads it back.
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        let r = drm_node_get_xattr(&self.metadata, name);
+        Box::pin(async move { r })
+    }
+
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
+        let r = drm_node_set_xattr(&self.metadata, name, value);
+        Box::pin(async move { r })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        let out = drm_node_list_xattr(&self.metadata);
+        Box::pin(async move { Ok(out) })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let r = drm_node_remove_xattr(&self.metadata, name);
+        Box::pin(async move { r })
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/renderD<N+128>`. Render-node
