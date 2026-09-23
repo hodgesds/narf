@@ -101,7 +101,8 @@ fn reschedule(cpu: u32) {
 // is never dereferenced. `clone` reproduces the same (data, vtable); both wake
 // entrypoints reschedule that CPU; `drop` owns nothing.
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake_waker, wake_waker, drop_waker);
+static VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_waker, wake_waker, wake_waker, drop_waker);
 
 fn make_waker(cpu: u32) -> Waker {
     // SAFETY: `VTABLE` is 'static and its fns treat `data` purely as the CPU
