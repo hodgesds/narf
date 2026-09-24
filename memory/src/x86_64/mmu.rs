@@ -228,9 +228,6 @@ fn kernel_window_leaf_needs_exec(phys: u64, len: u64) -> bool {
     overlaps(phys, len, kstart, kend)
 }
 
-/// True if a leaf covering `[phys, phys + len)` must be executable through the
-/// *low identity* map. Same set as the kernel window plus the AP trampoline
-/// window, which only exists at an identity address.
 /// Unmap PML4[0] — the AP trampoline window — once SMP bring-up is done.
 ///
 /// The window is mapped `PRESENT | WRITABLE` and executable, because an AP
@@ -320,6 +317,9 @@ fn pick_direct_map_slot(chunks: u64) -> usize {
     first_aligned + (r as usize % choices) * align
 }
 
+/// True if a leaf covering `[phys, phys + len)` must be executable through the
+/// *low identity* map. Same set as the kernel window plus the AP trampoline
+/// window, which only exists at an identity address.
 fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
     kernel_window_leaf_needs_exec(phys, len)
         || overlaps(
