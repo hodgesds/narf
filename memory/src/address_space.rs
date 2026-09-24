@@ -6094,13 +6094,26 @@ impl AddressSpace {
             region
         };
         drop(regions);
+        // Detach emptied page tables now so the single broadcast below also
+        // retires their cached walks (mmu_gather: detach → flush → free).
+        let reclaimed = self.detach_empty_page_tables(region.base, region.pte_span_pages());
         // ONE cross-CPU invalidation BEFORE any frame is freed for reuse
         // (no-op unless the AS is CLONE_VM-shared — see vm_shared docs).
-        self.flush_region_broadcast(region.base, region.pte_span_pages());
+        // Detached page tables widen it to whole PT granules.
+        match &reclaimed {
+            Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
+            None => self.flush_region_broadcast(region.base, region.pte_span_pages()),
+        }
         #[cfg(target_arch = "x86_64")]
         crate::swap::swap_discard_batch(&swapped_entries);
         if self.root.as_u64() != 0 {
             self.free_region_frames(&region);
+        }
+        if let Some((frames, _, _)) = reclaimed {
+            // SAFETY: every detached table was unhooked from this root and
+            // unregistered, and the broadcast above retired stale walks.
+            // Page tables are never COW-shared.
+            unsafe { crate::frame::free_unique_frame_batch(&frames) };
         }
         Ok(region)
     }
@@ -6247,9 +6260,18 @@ impl AddressSpace {
             }
             drop(regions);
             drop(huge);
-            self.flush_region_broadcast(region.base, region.len >> 12);
+            let reclaimed = self.detach_empty_page_tables(region.base, region.len >> 12);
+            match &reclaimed {
+                Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
+                None => self.flush_region_broadcast(region.base, region.len >> 12),
+            }
             if self.root.as_u64() != 0 {
                 self.free_region_frames(&region);
+            }
+            if let Some((frames, _, _)) = reclaimed {
+                // SAFETY: detached from this root + unregistered above; the
+                // broadcast retired stale walks; tables are never COW-shared.
+                unsafe { crate::frame::free_unique_frame_batch(&frames) };
             }
             return Ok(());
         }
@@ -6532,8 +6554,16 @@ impl AddressSpace {
         // `unmap_region` path). This also replaces the previous PER-PAGE
         // broadcast+ack-wait (`unmap_4kb`) a CLONE_VM AS paid here — an IPI
         // round-trip per punched page under MAP_FIXED churn.
+        let reclaimed = if punched_pages > 0 {
+            self.detach_empty_page_tables(base, (hi - lo) >> 12)
+        } else {
+            None
+        };
         if punched_pages > 0 {
-            self.flush_region_broadcast(base, (hi - lo) >> 12);
+            match &reclaimed {
+                Some((_, rlo, span)) => self.flush_region_broadcast(*rlo, *span),
+                None => self.flush_region_broadcast(base, (hi - lo) >> 12),
+            }
         }
         // Shared owners may return their last frame to an external cache, so
         // release them only after the same remote invalidation that protects
@@ -6547,7 +6577,87 @@ impl AddressSpace {
             // before this batched owner drop.
             crate::frame::free_frame_batch(&to_free);
         }
+        if let Some((frames, _, _)) = reclaimed {
+            // SAFETY: detached from this root + unregistered above; the
+            // broadcast retired stale walks; tables are never COW-shared.
+            unsafe { crate::frame::free_unique_frame_batch(&frames) };
+        }
         Ok(())
+    }
+
+    /// Detach emptied page-table pages covering the just-unmapped
+    /// `[base, base + pages * 4096)` — Linux's `free_pgtables` step at
+    /// munmap. Without this, mmap/munmap churn accumulated page-table pages
+    /// in a live address space without bound (one PT page per 2 MiB of
+    /// churned VA, at a monotonically advancing mmap cursor): invisible to
+    /// resident-page accounting and unreachable by the OOM reaper, a single
+    /// stress-ng malloc pass turned hundreds of MB of RAM into orphaned page
+    /// tables until process exit.
+    ///
+    /// mmu_gather split, sharing the caller's ONE cross-CPU invalidation:
+    /// call after the range's leaves are torn down LOCALLY but BEFORE the
+    /// batched broadcast. Empty PTs (and PDs they empty) are detached under
+    /// the page-table lock; `Some((frames, lo, span))` hands back the
+    /// detached frames plus the PT-granule-rounded window the caller's
+    /// broadcast must cover INSTEAD of the bare region span — a peer CPU
+    /// walking any VA in a detached granule (even an unmapped neighbour of
+    /// the region) may have cached the PD entry, so the invalidation has to
+    /// span whole granules. Only after that broadcast may the caller free
+    /// the frames (`free_unique_frame_batch`); freeing earlier would let a
+    /// stale cached walk descend into a reused frame and write A/D bits into
+    /// it (see `detach_empty_pt`).
+    ///
+    /// Returns `None` (caller broadcasts its own span, nothing to free) when
+    /// nothing was detached or the scratch allocation failed — the tables
+    /// then persist until AS teardown, the old behaviour, which is safe.
+    #[must_use]
+    fn detach_empty_page_tables(
+        &self,
+        base: VirtAddr,
+        pages: u64,
+    ) -> Option<(Vec<crate::frame::PhysFrame>, VirtAddr, u64)> {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (base, pages);
+            None
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.root.as_u64() == 0 || pages == 0 {
+                return None;
+            }
+            const PT_SPAN: u64 = 2 * 1024 * 1024;
+            let lo = base.as_u64() & !(PT_SPAN - 1);
+            let end = base
+                .as_u64()
+                .checked_add(pages << 12)?
+                .checked_next_multiple_of(PT_SPAN)?;
+            let granules = end.saturating_sub(lo).div_ceil(PT_SPAN) as usize;
+            let mut detached: Vec<crate::frame::PhysFrame> = Vec::new();
+            // One slot per candidate PT plus headroom for cascaded PDs.
+            if detached.try_reserve(granules + granules / 512 + 1).is_err() {
+                return None;
+            }
+            let mut granule = lo;
+            while granule < end {
+                // SAFETY: the caller has already torn down every leaf in the
+                // range locally; detach_empty_pt re-validates emptiness under
+                // the per-root page-table lock, so a granule shared with live
+                // neighbouring mappings is left untouched.
+                unsafe {
+                    crate::x86_64::paging::detach_empty_pt(
+                        self.root,
+                        VirtAddr::new(granule),
+                        &mut detached,
+                    );
+                }
+                granule = granule.saturating_add(PT_SPAN);
+            }
+            if detached.is_empty() {
+                return None;
+            }
+            Some((detached, VirtAddr::new(lo), (end - lo) >> 12))
+        }
     }
 
     /// One batched cross-CPU TLB invalidation for `pages` pages starting at
