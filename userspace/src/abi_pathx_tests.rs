@@ -4997,3 +4997,49 @@ fn smoke_abi_pathx_proc_comm_owner_may_write() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_proc_comm_owner_may_write);
+
+// The same ownership requirement for the OTHER writable per-pid files.
+//
+// `PidExtFile` covers oom_score_adj, coredump_filter, loginuid and setgroups.
+// While `Mode::FILE_RW` was 0666 the missing `owners()` override did not show:
+// the `other` write bit let anyone through. At the 0644 that constant now
+// means, a root-owned file cannot be written by the task it describes -- so a
+// process could not set its own oom_score_adj, which is how every OOM-aware
+// service configures itself.
+//
+// Kept separate from the comm case because it is a different `FileOps` impl;
+// dropping its override alone failed NOTHING before this existed.
+fn smoke_abi_pathx_proc_pid_ext_owner_may_write() -> TestResult {
+    with_setup(|| {
+        const O_WRONLY: u64 = 1;
+        let path = b"/proc/self/oom_score_adj\0";
+
+        // Readable by anyone, per S_IRUGO.
+        let rd = call_open(path.as_ptr() as u64, 0);
+        let readable = matches!(rd, Some(v) if v >= 0);
+        if let Some(fd) = rd.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // A non-root task with no DAC override can only get write access by
+        // owning the file, which is what `task_dump_owner` arranges.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        let wr = call_open(path.as_ptr() as u64, O_WRONLY);
+        let owner_may_write = matches!(wr, Some(v) if v >= 0);
+        if let Some(fd) = wr.filter(|v| *v >= 0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+
+        if !readable {
+            return Err("/proc/self/oom_score_adj was not readable");
+        }
+        if !owner_may_write {
+            return Err("a uid-1000 task could not write its own oom_score_adj — PidExtFile does not report task ownership");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_proc_pid_ext_owner_may_write);

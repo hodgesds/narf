@@ -1726,8 +1726,14 @@ fn smoke_fs_mode_constants_match_perms() -> TestResult {
     if Mode::FILE_RO.file_type != FileType::File || Mode::FILE_RO.perms != 0o444 {
         return TestResult::Fail("FILE_RO drifted");
     }
-    if Mode::FILE_RW.file_type != FileType::File || Mode::FILE_RW.perms != 0o666 {
+    // 0644, not 0666: the default a writable node inherits must not hand the
+    // `other` write bit to every task. Two world-writable-file bugs came from
+    // this constant being 0666.
+    if Mode::FILE_RW.file_type != FileType::File || Mode::FILE_RW.perms != 0o644 {
         return TestResult::Fail("FILE_RW drifted");
+    }
+    if Mode::FILE_RW_ALL.file_type != FileType::File || Mode::FILE_RW_ALL.perms != 0o666 {
+        return TestResult::Fail("FILE_RW_ALL drifted");
     }
     if Mode::DIR_RO.file_type != FileType::Dir || Mode::DIR_RO.perms != 0o555 {
         return TestResult::Fail("DIR_RO drifted");

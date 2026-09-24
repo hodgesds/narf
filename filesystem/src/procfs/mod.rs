@@ -1223,7 +1223,7 @@ impl FileOps for ProcStaticFile {
 /// whose mode grants the owner write (`comm`, `uid_map`, ...). Kernel threads
 /// fall back to root, and so does a task we cannot resolve -- root ownership
 /// is the conservative end, denying rather than granting.
-fn task_file_owners(pid: u64) -> (u32, u32) {
+pub(crate) fn task_file_owners(pid: u64) -> (u32, u32) {
     match task_info(pid, TaskInfoQuery::Basic) {
         Some(info) => (info.uid, info.gid),
         None => (0, 0),
@@ -1733,8 +1733,8 @@ struct ProcAttrFile;
 
 // `/proc/<pid>/attr/*` really is 0666 in Linux -- the `ATTR(LSM, name, 0666)`
 // entries in fs/proc/base.c -- because the LSM, not the mode, decides who may
-// write a security label. `Mode::FILE_RW` is therefore correct here, unlike
-// the per-pid and sysctl files that share the constant.
+// write a security label. This is the sole `FILE_RW_ALL` user; everything
+// else writable takes the 0644 default.
 impl FileOps for ProcAttrFile {
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
@@ -1746,7 +1746,7 @@ impl FileOps for ProcAttrFile {
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode::FILE_RW,
+            mode: Mode::FILE_RW_ALL,
             mtime_cycles: 0,
         }
     }
@@ -3817,7 +3817,7 @@ fn smoke_attr_current_empty_and_rw() -> TestResult {
     let Some(node) = dir.lookup("current") else {
         return TestResult::Fail("attr/current must exist");
     };
-    if node.stat().mode != Mode::FILE_RW {
+    if node.stat().mode != Mode::FILE_RW_ALL {
         return TestResult::Fail("attr/current must be RW");
     }
     let mut buf = [0u8; 8];
