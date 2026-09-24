@@ -97,6 +97,27 @@ pub fn kernel_virt_base() -> u64 {
     KERNEL_LINK_BASE + KERNEL_SLIDE.load(Ordering::Relaxed)
 }
 
+/// Physical bounds of the loaded image: `[start, end)`.
+///
+/// Reads a high-half word the linker populated, NOT the addresses of
+/// `__kernel_start` / `__kernel_end`. Those symbols hold physical values
+/// because `.boot` is linked low, and taking their address from kernel-half
+/// code emits a PC-relative page reference across ~512 GiB — beyond aarch64
+/// ADRP's range, which is what forces `code-model=large` there. Linux keeps
+/// the same information in a runtime word (`kimage_voffset`) for the same
+/// reason; the linker can fill this one in directly.
+///
+/// See `.kernel_bounds` in `build/linker/*.ld`.
+#[inline]
+pub fn image_phys_bounds() -> (u64, u64) {
+    unsafe extern "C" {
+        static __kernel_phys_bounds: [u64; 2];
+    }
+    // SAFETY: two linker-populated words inside the image, read-only.
+    let b = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() };
+    (b[0], b[1])
+}
+
 /// Physical address of an in-image kernel-virtual address.
 ///
 /// Use this instead of subtracting a hardcoded base: the constant is right
@@ -181,13 +202,10 @@ mod kaslr_slide_tests {
     /// inside the image, in physical terms, at every slide.
     fn smoke_kaslr_image_bounds_stay_physical() -> TestResult {
         unsafe extern "C" {
-            static __kernel_start: u8;
-            static __kernel_end: u8;
             static __text_start: u8;
             static __text_end: u8;
         }
-        let kstart = core::ptr::addr_of!(__kernel_start) as u64;
-        let kend = core::ptr::addr_of!(__kernel_end) as u64;
+        let (kstart, kend) = image_phys_bounds();
         // These two are virtual and SHOULD move, so convert them.
         let tstart = image_virt_to_phys(core::ptr::addr_of!(__text_start) as u64);
         let tend = image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
@@ -226,12 +244,9 @@ mod kaslr_slide_tests {
     /// with module text, and the first module load would corrupt the kernel.
     #[cfg(target_arch = "x86_64")]
     fn smoke_kaslr_slid_image_clears_module_window() -> TestResult {
-        unsafe extern "C" {
-            static __kernel_end: u8;
-        }
         // Physical, and deliberately not converted — see
         // `smoke_kaslr_image_bounds_stay_physical`.
-        let image_end_phys = core::ptr::addr_of!(__kernel_end) as u64;
+        let image_end_phys = image_phys_bounds().1;
         let top = kernel_virt_base().wrapping_add(image_end_phys);
         if top > crate::module_text::MODULE_VA_BASE {
             return TestResult::Fail("the slid kernel image reaches the module text window");

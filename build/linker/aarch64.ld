@@ -80,6 +80,33 @@ SECTIONS
         __bss_end = .;
     } :data
 
+    /* Physical bounds of the loaded image, as VALUES in a high-half word.
+     *
+     * `__kernel_start` / `__kernel_end` are physical addresses, because `.boot`
+     * is linked at `KERNEL_LOAD_BASE` rather than in the kernel half. Kernel
+     * code must not reference them directly: `addr_of!(sym)` compiles to a
+     * PC-relative page reference (ADRP+ADD on aarch64, a 32-bit signed
+     * absolute on x86_64), and the distance from kernel-half code to a low
+     * symbol is ~512 GiB — beyond ADRP's +/-4 GiB. That is what pins aarch64
+     * to `code-model=large`, and the large model materialises every absolute
+     * address as four MOVZ/MOVK immediates, which a slide cannot patch without
+     * carrying the full target value for ~967k sites.
+     *
+     * Linux has the same split and the same answer: the value lives in a
+     * runtime word (`kimage_voffset`, stored by `head.S`), and `__pa_symbol()`
+     * reads it. Populating the word at link time gets there without the store.
+     *
+     * The values are physical, so they are below `KERNEL_VIRT_BASE` and the
+     * KASLR pass leaves them alone — `relocs.rs` matches on whether the
+     * encoded VALUE moves, not just the field.
+     */
+    .kernel_bounds : AT(ADDR(.kernel_bounds) - KERNEL_VIRT_BASE) ALIGN(8) {
+        __kernel_phys_bounds = .;
+        QUAD(__kernel_start);
+        QUAD(__kernel_end);
+    } :data
+
+
     __kernel_end = . - KERNEL_VIRT_BASE;
 
     /* Physical end of `.text`. `boot.S` builds its L2 tables before the
