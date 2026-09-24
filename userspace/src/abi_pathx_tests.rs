@@ -3429,6 +3429,73 @@ fn smoke_abi_pathx_fstat_errnos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fstat_errnos);
 
+// `stat(2)`/`newfstatat` must follow the `/proc/self/fd/N` magic symlink to the
+// object the descriptor refers to. glibc/libacl's `acl_get_file` stats
+// `/proc/self/fd/N` to read a node's mode (to synthesise a base ACL on ENODATA),
+// and the udev `uaccess` builtin depends on that to ACL `/dev/dri/card0` for the
+// greeter — taking the name literally returned -ENOENT and broke the chain.
+fn smoke_abi_pathx_newfstatat_proc_self_fd_magic_symlink() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hello")], || {
+        let path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the seeded file"),
+        };
+        // Build "/proc/self/fd/<fd>\0" (buffer stays NUL-padded after the digits).
+        let mut pbuf = [0u8; 32];
+        let prefix = b"/proc/self/fd/";
+        pbuf[..prefix.len()].copy_from_slice(prefix);
+        let mut i = prefix.len();
+        let mut digits = [0u8; 20];
+        let (mut v, mut d) = (fd, 0usize);
+        if v == 0 {
+            digits[0] = b'0';
+            d = 1;
+        } else {
+            while v > 0 {
+                digits[d] = b'0' + (v % 10) as u8;
+                v /= 10;
+                d += 1;
+            }
+        }
+        for k in (0..d).rev() {
+            pbuf[i] = digits[k];
+            i += 1;
+        }
+        let mut sb = [0u8; 256];
+        // The magic symlink must resolve to /p2/f — 0, not -ENOENT.
+        match call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, pbuf.as_ptr() as u64, sb.as_mut_ptr() as u64, 0),
+        ) {
+            Some(0) => {}
+            Some(v) if v == ENOENT_E => {
+                return Err(
+                    "newfstatat(/proc/self/fd/N) returned -ENOENT — magic symlink not followed",
+                )
+            }
+            _ => return Err("newfstatat(/proc/self/fd/N) should return 0"),
+        }
+        // A descriptor the table does not hold → -EBADF (the anonymous/bad-fd arm
+        // that `stat_linux_fd` handles).
+        let bad = b"/proc/self/fd/9999\0";
+        match call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, bad.as_ptr() as u64, sb.as_mut_ptr() as u64, 0),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("newfstatat(/proc/self/fd/9999) should return -EBADF for a nonexistent fd"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_newfstatat_proc_self_fd_magic_symlink
+);
+
 // `fs/stat.c::SYSCALL_DEFINE5(statx)` → do_statx → vfs_statx → cp_statx.
 // The mask and sync-type checks precede path resolution; vfs_statx's flag
 // gate precedes the walk; cp_statx's copy comes last.

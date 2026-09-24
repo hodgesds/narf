@@ -26,7 +26,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::{Any, TypeId};
 use core::fmt;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -58,6 +58,12 @@ pub enum SchedulerError {
     /// it was briefly visible and will receive `on_uninstall` once its last
     /// reference is released.
     Superseded,
+    /// The policy declared [`QuantumUnit::Cycles`], but PMU work-cycle
+    /// scheduling is unavailable — either the `pmu` feature is not compiled in,
+    /// or no usable hardware cycle source (APERF / fixed / GP PMC) was found at
+    /// install (e.g. an un-virtualized-PMU VM). `Cycles` is refused rather than
+    /// silently downgraded so `quantum_unit()` stays a truthful contract.
+    CycleModeUnavailable,
 }
 
 impl From<CapError> for SchedulerError {
@@ -161,6 +167,25 @@ impl TaskMeta {
     }
 }
 
+/// Per-CPU load snapshot for tick-driven load balancing. A policy gathers these
+/// for every balance-eligible CPU via [`crate::peer_loads`] inside `on_tick`,
+/// then decides whether to shed work (calling [`crate::migrate_task`]). Carries
+/// exactly what a balance decision needs and the core can read cheaply (O(1) per
+/// CPU): the queued length, whether the CPU is idle-halted, and its EEVDF
+/// virtual-time floor (so a vruntime-ordered policy can compare virtual time
+/// across CPUs). `nr_queued` is the run-queue length — an upper bound on runnable
+/// work (parked tasks inflate it) and `u16::MAX` for a CPU whose queue was
+/// momentarily lock-contended (reported busy so it is never mistaken for a light
+/// target). The running task is off-queue during its poll, so `nr_queued` counts
+/// only *queued* tasks.
+#[derive(Copy, Clone, Debug)]
+pub struct CpuLoad {
+    pub cpu: CpuId,
+    pub nr_queued: u16,
+    pub idle: bool,
+    pub vfloor: u64,
+}
+
 /// Snapshot of the task currently running on a CPU, published by the core at
 /// dispatch and handed to [`Scheduler::wakeup_preempt`]. The running task's
 /// slot is detached from the queue during its poll, so this is how a policy
@@ -193,11 +218,20 @@ pub struct CpuSchedContext {
     pub vfloor: u64,
     /// Snapshot of the task currently running on `cpu`.
     pub current: CurrentTask,
-    /// Cycles the running task has executed since its current dispatch. Lets a
-    /// policy apply RUN_TO_PARITY slice protection (don't preempt the runner
+    /// TSC cycles the running task has executed since its current dispatch. Lets
+    /// a policy apply RUN_TO_PARITY slice protection (don't preempt the runner
     /// until it has consumed a base slice) — the batching guard that keeps a
     /// cooperative producer/consumer from context-switching on every wake.
     pub elapsed: u64,
+    /// The resolved [`QuantumUnit`] the core enforces the per-task SLICE in:
+    /// `Nanos` compares TSC-elapsed against the slice, `Cycles` compares APERF
+    /// work-cycles. It is the unit a policy should size its per-task slice
+    /// magnitudes in (0.75 ms is a very different integer in ns vs PMU-cycles).
+    /// NOTE: only slice expiry is unit-aware — `elapsed`, `vfloor`, and
+    /// `current.vruntime`/`vdeadline` are always TSC cycles (the EEVDF virtual
+    /// clock is TSC-based regardless of the quantum unit). Equals the installed
+    /// policy's `quantum_unit()` by the install-time validation.
+    pub quantum_unit: QuantumUnit,
 }
 
 /// Lean per-slot projection for eligibility policies (`EevdfScheduler`) — only
@@ -386,9 +420,66 @@ impl<'a> RunQueue<'a> {
 /// `IrqSafeSpinLock` that an IRQ handler could be waiting on. The
 /// detached slot is owned by the executor for the duration of the
 /// poll and re-enqueued after.
+/// The time base a scheduler policy schedules against — a first-class, truthful
+/// property: the unit the slice is ACTUALLY enforced in, resolved at install and
+/// reported via [`current_scheduler_quantum_unit`]. Linux has no analogue (it is
+/// always ns); NARF makes the slice unit a pluggable policy declaration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum QuantumUnit {
+    /// Calibrated wall-time (TSC-derived nanoseconds). The default; always
+    /// available. Enforced coarsely on the periodic tick, or precisely by a
+    /// per-task one-shot slice timer when the `hrtick` feature is active.
+    Nanos = 0,
+    /// PMU work-cycles — actual, frequency-invariant cycles consumed on-core
+    /// (APERF / fixed counter / reserved GP PMC). A genuine computation metric,
+    /// distinct from wall-time. Available only with the `pmu` feature AND a
+    /// usable hardware source; otherwise install is refused with
+    /// [`SchedulerError::CycleModeUnavailable`].
+    Cycles = 1,
+}
+
 pub trait Scheduler: Any + Send + Sync + 'static {
     /// Stable identifier — surfaced by `current_scheduler_name`.
     fn name(&self) -> &'static str;
+
+    /// The time base this policy schedules against. Default
+    /// [`QuantumUnit::Nanos`]: the in-tree policies schedule on calibrated
+    /// wall-time. A policy returns [`QuantumUnit::Cycles`] to opt into PMU
+    /// work-cycle scheduling; the core validates a usable hardware source at
+    /// install (else refuses the install) and publishes the resolved base via
+    /// [`current_scheduler_quantum_unit`]. This is a truthful contract — the core
+    /// enforces the slice in exactly the returned unit, never a silent downgrade.
+    fn quantum_unit(&self) -> QuantumUnit {
+        QuantumUnit::Nanos
+    }
+
+    /// Per-timer-tick hook for the task currently running on `ctx.cpu` — NARF's
+    /// analogue of Linux `task_tick`/`entity_tick`. Advance this policy's
+    /// per-task accounting (eligibility / virtual runtime) here, then drive at
+    /// most one of the tick's four actions for the running task T, all as side
+    /// effects (the hook returns nothing):
+    ///   1. let T keep running — call nothing.
+    ///   2. preempt T with a queued task on `ctx.cpu` (LOCAL) —
+    ///      [`crate::resched_current`] (Linux `resched_curr`); the slice quantum
+    ///      is untouched and refills next dispatch, so a forced yield never
+    ///      starves T.
+    ///   3. migrate the running task to another CPU (rare) —
+    ///      [`crate::migrate_task`]`(T's handle, to)`.
+    ///   4. migrate a queued task to a less-loaded/idle CPU —
+    ///      [`crate::migrate_task`]`(handle, to)`.
+    ///
+    /// Only 3 and 4 cross CPUs; the core issues the kick (a reschedule IPI, fired
+    /// only if the target is idle) and does the dequeue/move on `ctx.cpu`'s next
+    /// executor round. To decide 3/4, read cross-CPU load — dispatchable counts,
+    /// idle state, and per-CPU virtual-time floors — via [`crate::peer_loads`].
+    ///
+    /// Runs in timer-IRQ / slice-ISR context (IF=0): must be allocation-free and
+    /// must not block or re-enter scheduler installation. Best-effort — the core
+    /// invokes it under non-blocking locks, so a tick may be skipped under
+    /// contention. Default no-op: FIFO / priority / class / eevdf keep the
+    /// core-owned slice behaviour until a policy opts in.
+    fn on_tick(&self, _ctx: &CpuSchedContext, _queue: &RunQueue<'_>) {}
 
     /// Choose one slot from `queue`. Returning `None`, a stale handle, or a
     /// wrong-tier task causes a core-side fallback to the first candidate in
@@ -598,6 +689,109 @@ impl Scheduler for ClassScheduler {
         }
         best.map(|(handle, _)| handle)
     }
+
+    /// Periodic load balance (Linux `scheduler_tick` -> `load_balance`). Every
+    /// `CLASS_BALANCE_INTERVAL` ticks, if this CPU carries dispatchable surplus
+    /// and a peer is clearly lighter, shed one migratable task to it via
+    /// [`crate::migrate_task`] (push; the core kicks the target). Affinity-pinned
+    /// and address-space (user) tasks are never moved. The actual buffer +
+    /// snapshot live in the `#[inline(never)]` helper so a non-balance tick pays
+    /// only the counter bump, not the peer-load stack frame.
+    fn on_tick(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) {
+        let cpu = ctx.cpu.0 as usize;
+        if cpu >= narf_lib::percpu::MAX_CPUS {
+            return;
+        }
+        let n = CLASS_BALANCE_TICKS[cpu]
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if n % CLASS_BALANCE_INTERVAL == 0 {
+            class_balance_pass(ctx.cpu, queue);
+        }
+    }
+}
+
+/// Per-CPU counter gating [`ClassScheduler`]'s balance pass (keeps per-tick cost
+/// to a single relaxed bump and migrations gentle). Padded to its own cache line:
+/// every CPU bumps its own counter every tick, so an unpadded `[AtomicU32; N]`
+/// (16 per line) would false-share, matching the padding on every other per-CPU
+/// counter in the crate ([`crate::VFloorCell`] / the handoff flags).
+#[repr(align(64))]
+struct BalanceTickCell(AtomicU32);
+
+impl core::ops::Deref for BalanceTickCell {
+    type Target = AtomicU32;
+    fn deref(&self) -> &AtomicU32 {
+        &self.0
+    }
+}
+
+static CLASS_BALANCE_TICKS: [BalanceTickCell; narf_lib::percpu::MAX_CPUS] =
+    [const { BalanceTickCell(AtomicU32::new(0)) }; narf_lib::percpu::MAX_CPUS];
+
+/// Run the balance pass at most once per this many ticks per CPU.
+const CLASS_BALANCE_INTERVAL: u32 = 8;
+
+/// Test-only: clear the balancer's per-CPU tick counters so a request cadence
+/// from one smoke does not carry into the next. Called by
+/// [`crate::__reset_queues_for_test`].
+#[doc(hidden)]
+pub(crate) fn __reset_balance_state_for_test() {
+    for cell in CLASS_BALANCE_TICKS.iter() {
+        cell.store(0, Ordering::Relaxed);
+    }
+}
+
+/// One `ClassScheduler` balance pass for `cpu`. Picks the least-loaded peer (idle
+/// preferred) and, only on a clear imbalance, sheds one runnable, un-pinned,
+/// non-user task whose affinity permits that peer. Kept cheap for the tick path:
+/// an O(1) `len()` early-out, one O(1)-per-peer `peer_loads` snapshot, then a
+/// SINGLE local-queue scan that both counts runnable work and finds the shed
+/// candidate for the chosen target. `#[inline(never)]` keeps the `MAX_CPUS`-wide
+/// `CpuLoad` buffer off the common-tick stack frame.
+#[inline(never)]
+fn class_balance_pass(cpu: CpuId, queue: &RunQueue<'_>) {
+    // Cheap gate: fewer than two queued tasks can never leave a runnable task
+    // local AND shed one, so skip the peer snapshot entirely.
+    if queue.len() < 2 {
+        return;
+    }
+    let mut buf = [CpuLoad {
+        cpu: CpuId(0),
+        nr_queued: 0,
+        idle: false,
+        vfloor: 0,
+    }; narf_lib::percpu::MAX_CPUS];
+    let loads = crate::peer_loads(&mut buf);
+    // `peer_loads` already excludes this CPU's own (lock-contended) entry as busy
+    // and reports only Active/Idle peers; pick the lightest, idle preferred.
+    let Some(target) = loads
+        .iter()
+        .filter(|l| l.cpu != cpu)
+        .min_by_key(|l| (l.nr_queued, !l.idle))
+    else {
+        return;
+    };
+    // Single local scan: count runnable work AND remember the first task that
+    // could move to `target` (runnable, un-pinned, non-user, affinity permits it).
+    let mut my = 0u32;
+    let mut shed: Option<TaskHandle> = None;
+    for (handle, meta) in queue.iter_meta() {
+        if !meta.runnable {
+            continue;
+        }
+        my += 1;
+        if shed.is_none() && !meta.addr_space && meta.affinity.allowed.contains(target.cpu) {
+            shed = Some(handle);
+        }
+    }
+    // Keep at least one runnable task local, and shed only on a clear imbalance.
+    if my < 2 || (my as u16) <= target.nr_queued.saturating_add(1) {
+        return;
+    }
+    if let Some(handle) = shed {
+        crate::migrate_task(handle, target.cpu);
+    }
 }
 
 struct PolicyInstance {
@@ -749,6 +943,13 @@ pub fn install_scheduler<S: Scheduler>(
     s: S,
 ) -> Result<(), SchedulerError> {
     cap.check_live()?;
+    // Resolve + validate the policy's declared time base BEFORE publishing it to
+    // any CPU: a `Cycles` policy with no usable backend is refused here, so there
+    // is no partial install. Publishing the base right before the policy goes
+    // live keeps dispatch's (policy, base) pair consistent.
+    let base = resolve_quantum_unit(s.quantum_unit())?;
+    // Compute the tick gate before `s` is moved into the published instance.
+    let wants_tick = policy_uses_tick(&s);
     let replacement = Arc::new(PolicyInstance {
         policy: Box::new(s),
     });
@@ -759,6 +960,13 @@ pub fn install_scheduler<S: Scheduler>(
     // generation to every CPU. A ticket issued after the load is a later
     // install; a ticket issued before it makes this caller the explicit loser.
     if NEXT_SCHEDULER_GENERATION.load(Ordering::Acquire) == generation.wrapping_add(1) {
+        // Won the linearization: publish the resolved base + tick gate NOW, on the
+        // winning path only. Storing them before the generation check (as before)
+        // let a superseded install leave the live winner with the LOSER's base /
+        // tick flags — e.g. the balancer silently off, or a `Cycles` policy run
+        // under Nanos enforcement (the silent downgrade the design refuses).
+        store_active_quantum_unit(base);
+        POLICY_WANTS_TICK.store(wants_tick, Ordering::Release);
         Ok(())
     } else {
         Err(SchedulerError::Superseded)
@@ -773,6 +981,94 @@ pub fn current_scheduler_name() -> Option<&'static str> {
         .lock()
         .as_ref()
         .map(|published| published.instance.policy.name())
+}
+
+/// The resolved active [`QuantumUnit`], set once at scheduler install — the
+/// single source of truth for the core's clock-selection branch and for the
+/// unit a policy sees. `0` == `Nanos`.
+static ACTIVE_QUANTUM_UNIT: AtomicU8 = AtomicU8::new(QuantumUnit::Nanos as u8);
+
+fn store_active_quantum_unit(base: QuantumUnit) {
+    ACTIVE_QUANTUM_UNIT.store(base as u8, Ordering::Release);
+}
+
+/// The active scheduling time base the core is enforcing (O(1) atomic read).
+/// The hot path selects its clock on this; policy hooks read it (also via
+/// `CpuSchedContext::quantum_unit`) to interpret the values they are handed.
+pub fn active_quantum_unit() -> QuantumUnit {
+    if ACTIVE_QUANTUM_UNIT.load(Ordering::Acquire) == QuantumUnit::Cycles as u8 {
+        QuantumUnit::Cycles
+    } else {
+        QuantumUnit::Nanos
+    }
+}
+
+/// Public reporter for the active scheduling time base (mirrors
+/// [`current_scheduler_name`]). Diagnostics surface this so an operator can see
+/// whether the box is scheduling on wall-time or PMU work-cycles.
+pub fn current_scheduler_quantum_unit() -> QuantumUnit {
+    active_quantum_unit()
+}
+
+/// Resolve a policy's declared time base to the enforceable active base,
+/// validating hardware support. `Nanos` is always enforceable. `Cycles` needs
+/// the `pmu` feature and a usable hardware source (wired in a later commit);
+/// until then it has no backend, so refuse rather than silently downgrade —
+/// keeping `quantum_unit()` a truthful contract.
+fn resolve_quantum_unit(base: QuantumUnit) -> Result<QuantumUnit, SchedulerError> {
+    match base {
+        QuantumUnit::Nanos => Ok(QuantumUnit::Nanos),
+        // Cycles needs the `pmu` feature AND a usable APERF work-cycle source
+        // (absent on an un-vPMU VM). Refuse otherwise — no silent downgrade.
+        QuantumUnit::Cycles => {
+            #[cfg(feature = "pmu")]
+            {
+                if crate::pmu::available() {
+                    Ok(QuantumUnit::Cycles)
+                } else {
+                    Err(SchedulerError::CycleModeUnavailable)
+                }
+            }
+            #[cfg(not(feature = "pmu"))]
+            {
+                Err(SchedulerError::CycleModeUnavailable)
+            }
+        }
+    }
+}
+
+/// Whether the installed policy uses the per-tick `on_tick` hook — resolved once
+/// at install. Purely an OVERHEAD gate for the policy DECISION: it lets the tick
+/// path skip the `on_tick` machinery (context build + policy/run-queue locks + a
+/// virtual call) for policies that don't use it, paying only one atomic-bool
+/// load. It never gates scheduling STATE (`NEED_RESCHED` is honored regardless),
+/// so no reschedule can be dropped by it. `false` == skip the no-op hook.
+static POLICY_WANTS_TICK: AtomicBool = AtomicBool::new(false);
+
+/// These in-tree ZST policies never override `on_tick` (they ride the core's
+/// slice mechanism), so exclude them by type — the tick path then skips a
+/// guaranteed no-op. Mirrors [`observes_queue_events`]. `ClassScheduler` is NOT
+/// excluded: it overrides `on_tick` to run the periodic load balancer (Linux
+/// `scheduler_tick` -> `load_balance`), so the default scheduler takes the tick.
+/// Unknown/external policies default to `true` (safe: they may override
+/// `on_tick`), so the gate never silently drops a real decision. When a built-in
+/// later opts into `on_tick`, drop it from this exclusion list.
+fn policy_uses_tick(scheduler: &dyn Scheduler) -> bool {
+    let kind = scheduler.type_id();
+    kind != TypeId::of::<FifoScheduler>()
+        && kind != TypeId::of::<PriorityScheduler>()
+        && kind != TypeId::of::<crate::eevdf::EevdfScheduler>()
+}
+
+fn store_policy_wants_tick(scheduler: &dyn Scheduler) {
+    POLICY_WANTS_TICK.store(policy_uses_tick(scheduler), Ordering::Release);
+}
+
+/// Whether the installed policy uses `on_tick` (see [`policy_uses_tick`]). Read
+/// once per tick by the preempt path to skip the hook for the in-tree policies.
+#[inline]
+pub(crate) fn policy_wants_tick() -> bool {
+    POLICY_WANTS_TICK.load(Ordering::Acquire)
 }
 
 /// Install the default strict-class scheduler if no scheduler is yet
@@ -817,10 +1113,16 @@ pub(crate) fn install_default_if_unset() {
     if CPU_SCHEDULERS.iter().all(|slot| slot.lock().is_some()) {
         return;
     }
-    let replacement = Arc::new(PolicyInstance {
-        policy: default_policy_boxed(),
-    });
+    let policy = default_policy_boxed();
+    // The in-tree defaults are all `Nanos`. Resolve for consistency; if a future
+    // boot default ever declared `Cycles` with no backend, fall back to `Nanos`
+    // rather than refuse — the boot default MUST install something or the box is
+    // unschedulable. (Explicit `install_scheduler` still refuses.)
+    let base = resolve_quantum_unit(policy.quantum_unit()).unwrap_or(QuantumUnit::Nanos);
+    let replacement = Arc::new(PolicyInstance { policy });
     replacement.policy.on_install();
+    store_active_quantum_unit(base);
+    store_policy_wants_tick(replacement.policy.as_ref());
     let _ = publish_policy(replacement, true);
 }
 

@@ -91,6 +91,19 @@ static SCHED_KNOBS: &[SchedKnob] = &[
         write: None,
     },
     SchedKnob {
+        name: "quantum_unit",
+        read: || {
+            // The unit the installed policy schedules the slice in (Linux is
+            // always ns; NARF makes it first-class). See `QuantumUnit`.
+            let base = match narf_scheduler::current_scheduler_quantum_unit() {
+                narf_scheduler::QuantumUnit::Nanos => "nanos\n",
+                narf_scheduler::QuantumUnit::Cycles => "cycles\n",
+            };
+            String::from(base)
+        },
+        write: None,
+    },
+    SchedKnob {
         name: "steal_strategy",
         read: || {
             let name = narf_scheduler::current_steal_strategy_name().unwrap_or("(none)");

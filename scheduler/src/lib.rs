@@ -80,6 +80,12 @@ pub mod priority;
 pub mod stackful;
 pub mod steal;
 
+#[cfg(feature = "hrtick")]
+mod hrtick;
+
+#[cfg(feature = "pmu")]
+mod pmu;
+
 mod tests;
 
 pub use accounting::{
@@ -107,11 +113,13 @@ pub use donation::{
 };
 pub use eevdf::EevdfScheduler;
 pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
+pub(crate) use policy::policy_wants_tick;
 pub use policy::{
-    cpu_state, current_scheduler_name, install_scheduler, set_default_policy, ClassScheduler,
-    CpuIdleMeta, CpuSchedContext, CpuState, CpuStateChange, CurrentTask, FifoScheduler,
-    PriorityScheduler, RunQueue, SchedPolicy, SchedRow, Scheduler, SchedulerError,
-    TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskMeta, TaskQueueEvent,
+    active_quantum_unit, cpu_state, current_scheduler_name, current_scheduler_quantum_unit,
+    install_scheduler, set_default_policy, ClassScheduler, CpuIdleMeta, CpuLoad, CpuSchedContext,
+    CpuState, CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, QuantumUnit, RunQueue,
+    SchedPolicy, SchedRow, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
+    TaskHandle, TaskMeta, TaskQueueEvent,
 };
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
@@ -1291,6 +1299,7 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
         cpu: CpuId(cpu as u32),
         vfloor: vfloor(cpu),
         elapsed,
+        quantum_unit: policy::active_quantum_unit(),
         current: policy::CurrentTask {
             id: TaskId(current_id),
             class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
@@ -1310,6 +1319,264 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
         None => has_other_runnable_work(current_id),
     })
     .unwrap_or(false)
+}
+
+/// Request a reschedule of the CURRENT CPU's running task — NARF's
+/// `resched_curr`. Sets this CPU's `NEED_RESCHED`; the preempt path
+/// (`try_preempt`/`try_preempt_user`) honors it at the next tick (alongside
+/// slice expiry), switching to the executor to re-pick. A policy calls this from
+/// `Scheduler::on_tick` to force a yield WITHOUT touching the slice quantum,
+/// which refills normally at the next dispatch — so a forced yield never starves
+/// the task.
+pub fn resched_current() {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < NEED_RESCHED.len() {
+        NEED_RESCHED[cpu].store(true, Ordering::Release);
+    }
+}
+
+/// Peek this CPU's pending reschedule request without consuming it. The preempt
+/// path folds a `resched_current()`/waker request into its slice decision and,
+/// when it actually commits the switch, consumes it via [`clear_need_resched`]
+/// (Linux `clear_tsk_need_resched` in `__schedule`). A peek that does NOT lead to
+/// a preempt (nothing else runnable) leaves the flag set for the next check; the
+/// halt-commit `swap(false)` is the backstop that clears it when the CPU idles.
+#[inline]
+pub(crate) fn need_resched_pending(cpu: usize) -> bool {
+    cpu < NEED_RESCHED.len() && NEED_RESCHED[cpu].load(Ordering::Acquire)
+}
+
+/// Consume this CPU's reschedule request at the point a preempt actually commits
+/// to switching to the executor (Linux `clear_tsk_need_resched`). Without this a
+/// stale `NEED_RESCHED` — set by every `resched_remote` to a *running* CPU, IPI
+/// skipped — would re-fire the tick-rate preempt on every subsequent tick until
+/// the CPU next idled, collapsing the effective quantum. Safe against a racing
+/// waker: the wake published its slot to READY/the wake-list BEFORE storing
+/// `NEED_RESCHED`, so the executor's next round dispatches it regardless, and a
+/// wake that arrives after this clear re-sets the flag and is caught by the
+/// halt-commit backstop.
+#[inline]
+pub(crate) fn clear_need_resched(cpu: usize) {
+    if cpu < NEED_RESCHED.len() {
+        NEED_RESCHED[cpu].store(false, Ordering::SeqCst);
+    }
+}
+
+// ── Tick-driven load balancing (Linux `scheduler_tick` -> load_balance) ──────
+//
+// From a tick, a policy's `on_tick` can drive one of four actions for the
+// running task T on CPU C:
+//   1. let T keep running        — call nothing
+//   2. preempt T with a queued task on C (LOCAL) — `resched_current()`
+//   3. migrate the running task elsewhere (rare) — `migrate_task(T, to)`
+//   4. migrate a queued task to another CPU + kick — `migrate_task(handle, to)`
+// Only 3 and 4 cross CPUs, so only they carry a kick; 1 and 2 are local. To
+// decide 3/4 the policy needs cross-CPU load, which it reads via `peer_loads`.
+//
+// `migrate_task` only RECORDS the request (it runs in the tick ISR, IF=0, so it
+// must not mutate a run queue): the core dequeues the named slot and moves it on
+// CPU C's next executor round via `run_pending_migration` -> `enqueue_on(to,
+// Migrated)`, whose remote path stages onto the target's wake list and kicks it
+// (the IPI fires iff the target is idle-halted). One migration request per CPU
+// is held at a time — the balance pass sheds at most one task per tick.
+
+/// This CPU has a pending `migrate_task` request. Cheap relaxed-read gate so the
+/// executor round pays a single load when nothing is pending (the common case).
+static MIGRATE_PENDING: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// The pending request itself: `(task_id, target_cpu)`. Touched from both the
+/// tick ISR (`migrate_task`) and task context (`run_pending_migration`), so it
+/// uses an IRQ-masking lock (the ISR can't be interrupted while the executor
+/// holds it, and vice-versa).
+static PENDING_MIGRATE: [IrqSafeSpinLock<Option<(u64, u32)>>; narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
+
+/// Fill `buf` with a load snapshot of every balance-eligible CPU and return the
+/// filled prefix — NARF's analogue of the per-CPU stats Linux `load_balance`
+/// reads from each `rq`. A policy calls this from `on_tick` to decide whether
+/// (and where) to shed work; size `buf` to the CPU count
+/// ([`narf_lib::percpu::MAX_CPUS`]).
+///
+/// Cheap and ISR-safe: per CPU it takes a single `try_lock` + O(1) `len()` (never
+/// walks a peer's queue), then releases. A CPU whose queue is momentarily
+/// contended (mid-dispatch, a remote wake/steal in flight) is reported BUSY
+/// (`nr_queued = u16::MAX`) rather than empty — matching `select_fork_cpu`'s
+/// contended-is-busy convention, so the balancer never mistakes a busy CPU for a
+/// light target. Only `Active`/`Idle` CPUs are included; a `Draining`/`Starting`
+/// CPU is not a migration target and is skipped. `nr_queued` is the queued length
+/// (an upper bound on runnable work — parked tasks inflate it, which only makes
+/// the balancer more conservative about targeting that CPU).
+pub fn peer_loads(buf: &mut [policy::CpuLoad]) -> &[policy::CpuLoad] {
+    let mut n = 0usize;
+    for c in 0..narf_lib::percpu::MAX_CPUS {
+        if n >= buf.len() {
+            break;
+        }
+        if c != 0 && !narf_lib::smp::is_online(c as u32) {
+            continue;
+        }
+        // Balance-eligible lifecycle only; a Draining/Starting CPU won't drain a
+        // migrated task (it parks on lifecycle state, not a work re-scan).
+        if !matches!(
+            policy::cpu_state(CpuId(c as u32)),
+            policy::CpuState::Active | policy::CpuState::Idle
+        ) {
+            continue;
+        }
+        // O(1) queued length under try_lock; contended => reported busy.
+        let nr = match READY[c].try_lock() {
+            Some(g) => g
+                .as_ref()
+                .map(|d| d.len().min(u16::MAX as usize) as u16)
+                .unwrap_or(0),
+            None => u16::MAX,
+        };
+        buf[n] = policy::CpuLoad {
+            cpu: CpuId(c as u32),
+            nr_queued: nr,
+            idle: CPU_HALTED[c].load(Ordering::SeqCst),
+            vfloor: vfloor(c),
+        };
+        n += 1;
+    }
+    &buf[..n]
+}
+
+/// Request that the task named by `handle` migrate off the current CPU to `to` —
+/// NARF's analogue of Linux moving a task in `load_balance` / active migration. A
+/// side effect a policy issues from [`policy::Scheduler::on_tick`] (actions 3/4;
+/// see the module note above). Records the request only; the current CPU's next
+/// executor round dequeues the slot and performs the move + kick. No-op for a
+/// self-target or an out-of-range CPU. The core re-validates at move time, so a
+/// task that parked, throttled, exited, or lost affinity to `to` in between is
+/// simply not moved.
+pub fn migrate_task(handle: policy::TaskHandle, to: CpuId) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let target = to.0 as usize;
+    if cpu >= narf_lib::percpu::MAX_CPUS || target >= narf_lib::percpu::MAX_CPUS || target == cpu {
+        return;
+    }
+    *PENDING_MIGRATE[cpu].lock() = Some((handle.task_id().raw(), to.0));
+    MIGRATE_PENDING[cpu].store(true, Ordering::Release);
+}
+
+/// Whether `slot` may be pushed off its CPU to `to`: `to` must be in the task's
+/// affinity, a user/address-space task only migrates once user-task SMP is enabled
+/// (mirroring the steal floor), and — like the pull side (`try_steal_from`) — a
+/// just-run, cache-hot task is left in place rather than bounced.
+fn push_migratable(slot: &TaskSlot, to: CpuId, now: u64) -> bool {
+    if slot.addr_space.is_some() && !user_task_smp_enabled() {
+        return false;
+    }
+    if !slot.spec.affinity.allowed.contains(to) {
+        return false;
+    }
+    !task_is_migration_hot(
+        slot.awake.last_run_cycles.load(Ordering::Acquire),
+        now,
+        MIGRATION_COST_NS,
+    )
+}
+
+/// Executor-round handler for a pending [`migrate_task`] on `cpu`: dequeue the
+/// named slot (re-validated) and hand it to `enqueue_on(target, Migrated)`, which
+/// stages it on the target's wake list and kicks it. Runs outside the tick ISR,
+/// so the queue mutation + possible target IPI are legal here. The `READY[cpu]`
+/// lock is dropped before `enqueue_on` (which locks the target's state) to avoid
+/// a `READY[cpu]` -> target inversion.
+fn run_pending_migration(cpu: usize) {
+    let pending = {
+        let mut g = PENDING_MIGRATE[cpu].lock();
+        MIGRATE_PENDING[cpu].store(false, Ordering::Release);
+        g.take()
+    };
+    let Some((task_id, target_raw)) = pending else {
+        return;
+    };
+    let target = target_raw as usize;
+    if target >= narf_lib::percpu::MAX_CPUS
+        || target == cpu
+        || !narf_lib::smp::is_online(target_raw)
+        // Lifecycle re-check (state may have changed since the tick chose it): a
+        // Draining/Starting CPU won't drain a migrated task, so never push there.
+        || !matches!(
+            policy::cpu_state(CpuId(target_raw)),
+            policy::CpuState::Active | policy::CpuState::Idle
+        )
+    {
+        return;
+    }
+    let to = CpuId(target_raw);
+    let now = narf_time::now_cycles();
+    let cpu_id = CpuId(cpu as u32);
+    // Select + remove the slot AND notify the source policy of the dequeue under
+    // the (CPU_SCHEDULERS[cpu] -> READY[cpu]) lock order; `enqueue_on` runs after
+    // both drop. The `Dequeued{Migrated}` event pairs with the target side's
+    // `Enqueued{Migrated}`, so an observing policy's per-task shadow stays balanced.
+    let slot = policy::with_scheduler(cpu_id, |scheduler| {
+        let mut q = READY[cpu].lock();
+        let dq = q.as_mut()?;
+        let pos = dq.iter().position(|s| {
+            s.id.raw() == task_id && slot_is_dispatchable(s, now) && push_migratable(s, to, now)
+        })?;
+        let slot = dq.remove(pos)?;
+        if let Some(scheduler) = scheduler.filter(|p| policy::observes_queue_events(*p)) {
+            scheduler.on_task_queue_event(
+                cpu_id,
+                policy::TaskQueueEvent::Dequeued {
+                    task: policy::TaskMeta::from_slot(&slot),
+                    reason: policy::TaskDequeueReason::Migrated,
+                },
+            );
+        }
+        Some(slot)
+    });
+    if let Some(slot) = slot {
+        enqueue_on(target, slot, policy::TaskEnqueueReason::Migrated);
+    }
+}
+
+/// Run the installed policy's per-tick hook for the running task (Linux
+/// `task_tick`). Called once per timer tick from the preempt path. Reads the
+/// cached `CURRENT_SCHED` snapshot (id-guarded; a stale snapshot → skip) to form
+/// the lean context, then invokes `on_tick` under the same non-blocking
+/// (`try_lock`) discipline as `wake_preempt_policy_check` — best-effort and
+/// IRQ-safe: on policy-slot or run-queue contention the tick is simply skipped.
+/// The policy forces a reschedule, if it wants one, by calling
+/// `resched_current()` inside `on_tick`; this returns nothing.
+pub(crate) fn scheduler_on_tick(current_id: u64, elapsed: u64) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= CURRENT_SCHED.len() {
+        return;
+    }
+    let snap = &CURRENT_SCHED[cpu];
+    if snap.id.load(Ordering::Relaxed) != current_id {
+        return;
+    }
+    let dispatch_vruntime = snap.vruntime.load(Ordering::Relaxed);
+    let ctx = policy::CpuSchedContext {
+        cpu: CpuId(cpu as u32),
+        vfloor: vfloor(cpu),
+        elapsed,
+        quantum_unit: policy::active_quantum_unit(),
+        current: policy::CurrentTask {
+            id: TaskId(current_id),
+            class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
+            vruntime: dispatch_vruntime,
+            vdeadline: dispatch_vruntime.wrapping_add(EEVDF_BASE_SLICE),
+        },
+    };
+    let cpu_id = CpuId(cpu as u32);
+    let _ = policy::try_with_scheduler(cpu_id, |scheduler| {
+        if let Some(s) = scheduler {
+            if let Some(q) = READY[cpu].try_lock() {
+                if let Some(d) = q.as_ref() {
+                    s.on_tick(&ctx, &policy::RunQueue::projected(d));
+                }
+            }
+        }
+    });
 }
 
 // ── Wake→run race instrument (boot flag `wake_race`) ────────────────────
@@ -1699,7 +1966,7 @@ fn resched_remote(target_cpu: u32) {
 /// empty->nonempty edge, not one per wake (`llist_add`'s "first entry" gate).
 /// No-op for self / out-of-range.
 #[inline]
-fn resched_remote_force(target_cpu: u32) {
+pub(crate) fn resched_remote_force(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
     if target_cpu == me || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
         return;
@@ -2129,6 +2396,13 @@ pub fn __reset_queues_for_test() {
     for cell in VFLOOR.iter() {
         cell.0.store(0, Ordering::Release);
     }
+    // Clear pending tick-rebalance migrations + the balancer's per-CPU tick
+    // counter so a request recorded by one smoke can't carry into the next.
+    for (cpu, pending) in PENDING_MIGRATE.iter().enumerate() {
+        *pending.lock() = None;
+        MIGRATE_PENDING[cpu].store(false, Ordering::Release);
+    }
+    policy::__reset_balance_state_for_test();
 }
 
 /// Authoritative affinity for every live scheduler task.
@@ -4548,6 +4822,12 @@ pub fn run_until_empty() {
         // before snapshotting the round so a task a remote CPU pushed onto our
         // wake list dispatches THIS round rather than waiting for the next one.
         drain_wake_list(cpu);
+        // Perform a load-balance migration a policy requested from `on_tick`
+        // (Linux `run_rebalance_domains`). One relaxed load per round when idle;
+        // dequeues + moves the named slot only when a request is pending.
+        if MIGRATE_PENDING[cpu].load(Ordering::Relaxed) {
+            run_pending_migration(cpu);
+        }
         // Snapshot queue length. We'll visit each task at most once per
         // round; spawns during the round land at the back and get
         // visited on the NEXT round.
@@ -4949,6 +5229,12 @@ pub fn run_until_empty() {
         }
         last_pump_cycles = narf_time::now_cycles();
         notify_cpu_idle(cpu);
+        // hrtick: no task is running now, so drop any armed per-task slice timer
+        // rather than let it fire spuriously into the idle CPU (the next dispatch
+        // re-arms). Only matters on the run->idle transition; compiled out
+        // without the `hrtick` feature.
+        #[cfg(feature = "hrtick")]
+        hrtick::disarm(cpu);
 
         {
             // All tasks parked this round. Tick the sleep pumps so the work

@@ -954,9 +954,7 @@ unsafe fn try_direct_handoff(
             .domain_byte
             .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
         target_ref.exec_ctx.store(root_exec, Ordering::Release);
-        target_ref
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(target_ref, cpu);
         // SAFETY: this entire handoff publication runs on `cpu` with
         // interrupts masked, and the inactive gate proves the slot is empty.
         let previous_root_as = unsafe { direct_state.root_as.replace(root_as) };
@@ -1403,6 +1401,50 @@ fn this_cpu() -> usize {
     }
 }
 
+/// Stamp the start of `task`'s slice on `cpu`. Single definition for every
+/// resume/dispatch path (direct handoff, poll_to_yield, preempt-resume, yield-
+/// resume) so the slice window has exactly one origin — the analogue of Linux
+/// resetting the runqueue clock at pick. Under the `hrtick` feature this is also
+/// where the per-task one-shot slice timer is (re)armed, so there is one hook
+/// instead of eight.
+#[inline]
+fn stamp_slice_start(task: &KernelTask, cpu: usize) {
+    let now = narf_time::now_cycles();
+    task.tsc_started.store(now, Ordering::Release);
+    // pmu: in Cycles mode also snapshot APERF, so the slice is measured in actual
+    // (frequency-invariant) work-cycles consumed this slice rather than wall-time.
+    #[cfg(feature = "pmu")]
+    if crate::active_quantum_unit() == crate::QuantumUnit::Cycles {
+        task.work_started
+            .store(crate::pmu::read_work_cycles(), Ordering::Release);
+    }
+    // hrtick (Linux CONFIG_SCHED_HRTICK): (re)arm the per-task one-shot slice
+    // timer so the task is preempted precisely at slice exhaustion instead of at
+    // the next coarse periodic tick. Compiled out (and `cpu` unused) by default.
+    #[cfg(feature = "hrtick")]
+    crate::hrtick::arm(cpu, now, task.slice_cycles.load(Ordering::Acquire));
+    #[cfg(not(feature = "hrtick"))]
+    let _ = cpu;
+}
+
+/// Whether the running task has exhausted its slice, honoring the active
+/// [`crate::QuantumUnit`]. Nanos (default): compare the TSC-elapsed cycles the
+/// caller already computed. Cycles (`pmu`): compare APERF work-cycles consumed
+/// since the slice start against the same numeric `slice` — now a
+/// frequency-invariant WORK budget rather than a wall-time one. Compiled to the
+/// plain `tsc_elapsed >= slice` when `pmu` is off (byte-identical default).
+#[inline]
+fn slice_expired_unit_aware(task: &KernelTask, tsc_elapsed: u64, slice: u64) -> bool {
+    #[cfg(feature = "pmu")]
+    if crate::active_quantum_unit() == crate::QuantumUnit::Cycles {
+        let work_elapsed = crate::pmu::read_work_cycles()
+            .saturating_sub(task.work_started.load(Ordering::Acquire));
+        return work_elapsed >= slice;
+    }
+    let _ = task;
+    tsc_elapsed >= slice
+}
+
 /// A `KernelContext` is only ever switched *into* after a `kernel_switch`
 /// SAVE half populated it (`rip` = a real return-PC, `rsp` = a live kernel
 /// stack) or `KernelContext::fresh` set a trampoline entry + stack top. A
@@ -1544,6 +1586,11 @@ pub struct KernelTask {
     /// whether the task's slice has expired. Updated by
     /// `poll_to_yield` each entry.
     tsc_started: AtomicU64,
+    /// APERF snapshot at slice start, for `QuantumUnit::Cycles` work-cycle
+    /// accounting (frequency-invariant). Stamped alongside `tsc_started` only
+    /// when the active quantum unit is Cycles. Present only under `pmu`.
+    #[cfg(feature = "pmu")]
+    work_started: AtomicU64,
     /// Per-task time slice in TSC cycles. Default
     /// `DEFAULT_SLICE_CYCLES`. Set via `with_slice_cycles` at
     /// spawn time for drivers that need bigger slices.
@@ -1735,6 +1782,8 @@ impl KernelTask {
             exec_ctx: AtomicPtr::new(core::ptr::null_mut()),
             completed: AtomicBool::new(false),
             tsc_started: AtomicU64::new(0),
+            #[cfg(feature = "pmu")]
+            work_started: AtomicU64::new(0),
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
             need_resched: AtomicBool::new(false),
             no_preempt: AtomicBool::new(false),
@@ -1868,8 +1917,7 @@ impl KernelTask {
         // Record when this slice started — the trap-handler
         // preempt hook reads `tsc_started` to decide whether
         // we've used our slice.
-        self.tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(self, this_cpu());
         // CURRENT_STACKFUL_TASK is SET to the running task by task_body_rust
         // (at the top of each poll iter) and CLEARED by it before each yield.
         // The executor side must not *set* it to the task (that would let a
@@ -2127,9 +2175,8 @@ impl KernelTask {
             }
         }
         self.exec_ctx.store(exec_ctx as *mut _, Ordering::Release);
-        self.tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
         let cpu = this_cpu();
+        stamp_slice_start(self, cpu);
         let saved_current = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
         if !saved_current.is_null() {
             // SAFETY: `saved_current` is the synchronously executing outer
@@ -2552,7 +2599,7 @@ fn defer_user_resched_from_tick(task: &KernelTask, now: u64) {
     let slice = task.slice_cycles.load(Ordering::Acquire);
     let elapsed = now.saturating_sub(started);
     let current = crate::current_task_id().raw();
-    let slice_expired = elapsed >= slice;
+    let slice_expired = slice_expired_unit_aware(task, elapsed, slice);
     let tick_required = crate::tick_preemption_required(current, now, slice_expired);
     // `tick_preemption_required` already probes runnable work for an expired
     // ordinary slice. Probe separately only for the earlier fair quantum.
@@ -2626,26 +2673,46 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // `poll_to_yield` whose caller still holds the Box alive; the
     // pointer remains valid until poll_to_yield clears it.
     // SAFETY: Valid memory or trusted environment
+    // Read the slice window early (cheap) so the policy's tick hook can run
+    // BEFORE the preemptibility check — Linux `task_tick` accounts regardless of
+    // whether the switch can happen right now.
+    // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
+    // non-null; per the invariant noted there, the Box it points at is kept
+    // alive by the in-progress poll_to_yield, so the atomic reads below
+    // dereference a live `KernelTask`.
+    // SAFETY: Valid memory or trusted environment
+    let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    let now = narf_time::now_cycles();
+    let elapsed = now.saturating_sub(started);
+    let current_id = crate::current_task_id().raw();
+    // Linux `task_tick`: the policy's per-tick hook for the running task — only
+    // for policies that use it (one bool load skips it for the in-tree ZSTs; the
+    // gate covers the DECISION hook only, never the resched STATE below). It may
+    // advance eligibility and call `resched_current()` to request a yield.
+    if crate::policy_wants_tick() {
+        crate::scheduler_on_tick(current_id, elapsed);
+    }
+    // SAFETY: Same live-`KernelTask` invariant as above.
     let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
     if no_preempt {
         // A user task's syscall continuation is deliberately non-preemptible.
         // Make the timer decision now and defer only the context switch, just
-        // as Linux sets TIF_NEED_RESCHED for its exit-to-user loop.
+        // as Linux sets TIF_NEED_RESCHED for its exit-to-user loop. A resched
+        // the hook requested above persists in NEED_RESCHED and is honored there.
         // SAFETY: task_ptr is the live current task established above.
-        defer_user_resched_from_tick(unsafe { &*task_ptr }, narf_time::now_cycles());
+        defer_user_resched_from_tick(unsafe { &*task_ptr }, now);
         return false;
     }
-    // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
-    // non-null; per the invariant noted there, the Box it points at is kept
-    // alive by the in-progress poll_to_yield, so the atomic field reads below
-    // dereference a live `KernelTask`.
-    // SAFETY: Valid memory or trusted environment
-    let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
     // SAFETY: Same live-`KernelTask` invariant as above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
-    let now = narf_time::now_cycles();
-    let slice_expired = now.saturating_sub(started) >= slice;
-    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+    // SAFETY: task_ptr is the live current task established above.
+    let slice_expired = slice_expired_unit_aware(unsafe { &*task_ptr }, elapsed, slice);
+    // Honor a policy/waker reschedule request (Linux TIF_NEED_RESCHED) alongside
+    // slice expiry. Peek here; if we commit to the switch below we consume it via
+    // `clear_need_resched` (Linux clear_tsk_need_resched). If we DON'T preempt
+    // (nothing else runnable) it stays set for the next check.
+    let need_resched = crate::need_resched_pending(cpu);
+    if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
     // SAFETY: Same live-`KernelTask` invariant as above.
@@ -2653,6 +2720,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if exec_ctx.is_null() {
         return false; // no executor to switch to
     }
+    // Committed to switch: consume NEED_RESCHED so a stale flag (set by a remote
+    // wake to this running CPU, IPI skipped) does not re-fire the preempt on
+    // every subsequent tick until we idle.
+    crate::clear_need_resched(cpu);
 
     // Own-stack invariant tripwire. A CPL0 timer tick that preempts THIS task
     // must have landed on the task's OWN kernel stack: `poll_to_yield`
@@ -2768,9 +2839,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: Valid memory or trusted environment
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
-        (*task_ptr)
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*task_ptr, cpu);
     }
     if kernel_span_paused {
         resume_user_kernel_span();
@@ -2835,14 +2904,27 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     }
     let now = narf_time::now_cycles();
     let started = task.tsc_started.load(Ordering::Acquire);
-    let slice_expired = now.saturating_sub(started) >= task.slice_cycles.load(Ordering::Acquire);
-    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+    let elapsed = now.saturating_sub(started);
+    let current_id = crate::current_task_id().raw();
+    // Linux `task_tick`: per-tick policy hook, gated to the policies that use it
+    // (the DECISION hook only — the resched STATE below is honored regardless).
+    if crate::policy_wants_tick() {
+        crate::scheduler_on_tick(current_id, elapsed);
+    }
+    let slice = task.slice_cycles.load(Ordering::Acquire);
+    let slice_expired = slice_expired_unit_aware(task, elapsed, slice);
+    // Honor a policy/waker reschedule request alongside slice expiry (peek;
+    // consumed at the commit below).
+    let need_resched = crate::need_resched_pending(cpu);
+    if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
     let exec_ctx = task.exec_ctx.load(Ordering::Acquire);
     if exec_ctx.is_null() {
         return false;
     }
+    // Committed to switch: consume NEED_RESCHED (see try_preempt).
+    crate::clear_need_resched(cpu);
     let frame_addr = frame as *const Aarch64TrapFrame as usize;
     let stack_base = task.stack.as_ptr() as usize;
     let stack_top = stack_base + task.stack.len();
@@ -2885,9 +2967,7 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(task_ptr, Ordering::Release);
     // SAFETY: the task is still owned by the in-flight poll_to_yield.
     unsafe {
-        (*task_ptr)
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*task_ptr, cpu);
     }
     if kernel_span_paused {
         resume_user_kernel_span();
@@ -2941,11 +3021,22 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     }
     // SAFETY: live `task_ptr` as established above.
     let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    let now = narf_time::now_cycles();
+    let elapsed = now.saturating_sub(started);
+    let current_id = crate::current_task_id().raw();
+    // Linux `task_tick`: per-tick policy hook, gated to the policies that use it
+    // (the DECISION hook only — the resched STATE below is honored regardless).
+    if crate::policy_wants_tick() {
+        crate::scheduler_on_tick(current_id, elapsed);
+    }
     // SAFETY: live `task_ptr` as established above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
-    let now = narf_time::now_cycles();
-    let slice_expired = now.saturating_sub(started) >= slice;
-    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+    // SAFETY: task_ptr is the live current task established above.
+    let slice_expired = slice_expired_unit_aware(unsafe { &*task_ptr }, elapsed, slice);
+    // Honor a policy/waker reschedule request alongside slice expiry (peek;
+    // consumed at the commit below).
+    let need_resched = crate::need_resched_pending(cpu);
+    if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
     // SAFETY: live `task_ptr` as established above.
@@ -2953,6 +3044,8 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     if exec_ctx.is_null() {
         return false;
     }
+    // Committed to switch: consume NEED_RESCHED (see try_preempt).
+    crate::clear_need_resched(cpu);
     // Own-stack invariant tripwire (CPL3 side). The user task ran on its OWN
     // kernel stack via TSS.rsp0 (poll_to_yield retargets it), so a CPL3→CPL0
     // timer trap lands its frame at rsp0 = this task's stack top. If `frame`
@@ -3012,9 +3105,7 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     // SAFETY: still our live task (poll_to_yield has not returned).
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
-        (*task_ptr)
-            .tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*task_ptr, cpu);
     }
     user_fpu_restore();
     let _ = frame;
@@ -3223,8 +3314,7 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
     // SAFETY: still our live task.
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(p, Ordering::Release);
-        (*p).tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&*p, cpu);
         if masked_trap_park {
             (*p).resume_irqs_masked.store(false, Ordering::Release);
         }
@@ -4388,8 +4478,7 @@ pub mod tests {
         }
         let task = KernelTask::new(Forever);
         let task_ptr = &*task as *const KernelTask as *mut KernelTask;
-        task.tsc_started
-            .store(narf_time::now_cycles(), Ordering::Release);
+        stamp_slice_start(&task, this_cpu());
         task.slice_cycles.store(u64::MAX / 2, Ordering::Release);
         let cpu = this_cpu();
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);

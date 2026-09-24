@@ -3097,11 +3097,20 @@ pub(crate) fn current_mount_arc_with_flags(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
-    if let Some(ns) = current_mount_namespace() {
+    let r = if let Some(ns) = current_mount_namespace() {
         ns.mount_arc_with_flags(authority, path, fs, flags)
     } else {
         narf_filesystem::registry().mount_arc_with_flags(authority, path, fs, flags)
+    };
+    // Mount propagation: a filesystem mount attached under a shared mount is
+    // mirrored into every peer namespace (Linux `propagate_mnt`). No-op unless
+    // the parent mount is shared. Propagated copies are attached through the raw
+    // namespace/registry methods (this wrapper's callees), never back through
+    // this wrapper, so there is no re-entrancy.
+    if r.is_ok() {
+        propagate_new_mount(path);
     }
+    r
 }
 
 /// `fs/namespace.c::path_mount` — the `MS_*` bits a caller passes to
@@ -3177,6 +3186,139 @@ pub(crate) fn current_set_mount_flags(path: &str, flags: u64) -> bool {
     }
 }
 
+/// `do_change_type` in the caller's mount namespace (its private table when it
+/// unshared CLONE_NEWNS, else the global registry). Returns false = no mount at
+/// `path` (ENOENT).
+pub(crate) fn current_change_propagation(
+    path: &str,
+    prop: narf_filesystem::MntPropagation,
+    recursive: bool,
+) -> bool {
+    if let Some(ns) = current_mount_namespace() {
+        ns.change_propagation_at(path, prop, recursive)
+    } else {
+        narf_filesystem::registry().change_propagation_at(path, prop, recursive)
+    }
+}
+
+/// `(path, group_id)` of the mount covering `abs` in the caller's namespace.
+fn current_covering_mount_info(abs: &str) -> Option<(alloc::string::String, u64)> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.covering_mount_info(abs)
+    } else {
+        narf_filesystem::registry().covering_mount_info(abs)
+    }
+}
+
+/// Every DISTINCT private mount namespace currently installed, deduplicated by
+/// `Arc` pointer identity (tasks that share a namespace via fork/plain-clone map
+/// to the same Arc). Keyed on the pointer, NOT `ns.id()`: the id allocator
+/// returns 0 until the ns-id hook is installed (e.g. in kernel tests), so ids
+/// are not unique keys. The global registry (the initial namespace) is visited
+/// separately by callers through `narf_filesystem::registry()`.
+fn unique_private_mount_namespaces(
+) -> alloc::vec::Vec<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
+    if TASK_MOUNT_NS_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return alloc::vec::Vec::new();
+    }
+    let g = TASK_MOUNT_NS.lock();
+    let mut by_ptr: alloc::collections::BTreeMap<
+        usize,
+        alloc::sync::Arc<narf_filesystem::MountNamespace>,
+    > = alloc::collections::BTreeMap::new();
+    if let Some(map) = g.as_ref() {
+        for ns in map.values() {
+            let key = alloc::sync::Arc::as_ptr(ns) as *const () as usize;
+            by_ptr.entry(key).or_insert_with(|| ns.clone());
+        }
+    }
+    drop(g);
+    by_ptr.into_values().collect()
+}
+
+/// `fs/pnode.c::propagate_mnt` (peer-only first cut). After a mount is attached
+/// at `new_path` in the caller's current namespace, if the mount it was attached
+/// UNDER is shared (peer-group id != 0), replicate the new mount into every peer
+/// namespace at the corresponding path so the sub-mount is visible there too.
+///
+/// The copy SHARES the new mount's `Arc<dyn FsInstance>`, so every peer's copy
+/// points at the same underlying directory/superblock — this is what makes a
+/// file written through one peer's `/run/systemd/seats` visible through every
+/// other peer's, which is the whole point for logind's seat/session state.
+///
+/// Copies are attached through the RAW namespace/registry methods (not the
+/// `current_*` wrappers), so a propagated copy never re-propagates and this does
+/// not recurse. LINUX-GAP: copies are left private (group 0), so a further mount
+/// UNDER a propagated mount does not propagate on again, and one-way slave
+/// propagation is not modelled — sufficient for the shared-/run runtime state.
+fn propagate_new_mount(new_path: &str) {
+    // The parent mount is the mount covering the new mount's PARENT directory.
+    let parent_dir = match new_path.rfind('/') {
+        None => return,
+        Some(0) => "/",
+        Some(i) => &new_path[..i],
+    };
+    let Some((parent_path, parent_gid)) = current_covering_mount_info(parent_dir) else {
+        return;
+    };
+    if parent_gid == 0 {
+        // Parent is private — nothing propagates. This is the overwhelmingly
+        // common case, so it stays a single covering-mount lookup.
+        return;
+    }
+    // Relative path of the new mount beneath its parent mount, normalised to
+    // start with '/' for both the root-mount ("/") and nested-mount cases.
+    let parent_trim = if parent_path == "/" {
+        ""
+    } else {
+        parent_path.trim_end_matches('/')
+    };
+    if !new_path.starts_with(parent_trim) {
+        return;
+    }
+    let rel = &new_path[parent_trim.len()..];
+    if rel.is_empty() {
+        return;
+    }
+    // The just-attached mount's fs (shared into peers) and its per-mount flags.
+    let Some(fs) = current_fs_arc_at(new_path) else {
+        return;
+    };
+    let flags = current_mount_flags_at(new_path);
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    // The origin namespace as an Arc (None = caller is in the global registry).
+    // Compared by pointer identity below, since ns ids are not reliably unique.
+    let origin_ns = current_mount_namespace();
+
+    let join = |peer: &str| -> alloc::string::String {
+        let peer_trim = if peer == "/" { "" } else { peer.trim_end_matches('/') };
+        alloc::format!("{peer_trim}{rel}")
+    };
+
+    // Peers in the global registry (the initial namespace). The origin is the
+    // global registry exactly when the caller has no private namespace.
+    for peer_path in narf_filesystem::registry().mount_paths_with_group(parent_gid) {
+        if origin_ns.is_none() && peer_path == parent_path {
+            continue;
+        }
+        let child = join(&peer_path);
+        let _ = narf_filesystem::registry().mount_arc_with_flags(&auth, &child, fs.clone(), flags);
+    }
+    // Peers in every distinct private namespace.
+    for ns in unique_private_mount_namespaces() {
+        let same_ns = origin_ns
+            .as_ref()
+            .is_some_and(|o| alloc::sync::Arc::ptr_eq(o, &ns));
+        for peer_path in ns.mount_paths_with_group(parent_gid) {
+            if same_ns && peer_path == parent_path {
+                continue;
+            }
+            let child = join(&peer_path);
+            let _ = ns.mount_arc_with_flags(&auth, &child, fs.clone(), flags);
+        }
+    }
+}
+
 fn current_bind_mount(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     source: &str,
@@ -3185,11 +3327,18 @@ fn current_bind_mount(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
-    if let Some(ns) = current_mount_namespace() {
+    let r = if let Some(ns) = current_mount_namespace() {
         ns.bind_mount(authority, source, target)
     } else {
         narf_filesystem::registry().bind_mount(authority, source, target)
+    };
+    // Mount propagation: a bind attached under a shared mount is mirrored into
+    // every peer namespace (Linux `propagate_mnt`). Only fires when the parent
+    // mount is shared, so a private-parent bind pays a single lookup.
+    if r.is_ok() {
+        propagate_new_mount(target);
     }
+    r
 }
 
 fn current_move_mount(

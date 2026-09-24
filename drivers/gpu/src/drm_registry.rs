@@ -88,11 +88,21 @@ pub struct DrmCardEntry {
 }
 
 /// Mutable devfs policy applied by udev to one DRM node.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Copy`: `access_acl` holds the raw `system.posix_acl_access` blob that
+/// logind's udev `uaccess` builtin writes via `setxattr("/dev/dri/card<N>", …)`
+/// to grant the active session's user rw. It must live on the PER-DEVICE
+/// metadata (shared across opens) rather than the per-open `DriCardFile`, so the
+/// ACL the worker sets on its O_PATH fd is the same one a later `open()` +
+/// permission check reads back. Without a node-owned store the setxattr would
+/// land in the generic path-keyed xattr table while `acl_of_file` reads the
+/// node's own (empty) xattrs — and card0 would stay EACCES for the greeter.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DrmNodeMetadata {
     pub uid: u32,
     pub gid: u32,
     pub perms: u16,
+    pub access_acl: Option<alloc::vec::Vec<u8>>,
 }
 
 fn default_primary_metadata() -> Arc<IrqSafeSpinLock<DrmNodeMetadata>> {
@@ -100,6 +110,7 @@ fn default_primary_metadata() -> Arc<IrqSafeSpinLock<DrmNodeMetadata>> {
         uid: 0,
         gid: 0,
         perms: 0o600,
+        access_acl: None,
     }))
 }
 
@@ -108,6 +119,7 @@ fn default_render_metadata() -> Arc<IrqSafeSpinLock<DrmNodeMetadata>> {
         uid: 0,
         gid: 0,
         perms: 0o600,
+        access_acl: None,
     }))
 }
 

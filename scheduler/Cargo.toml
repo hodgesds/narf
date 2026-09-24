@@ -24,6 +24,19 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
 kernel-test = []
+# High-resolution tick (Linux CONFIG_SCHED_HRTICK): per-task one-shot slice
+# timer via the timer wheel, so a task is preempted precisely at slice
+# exhaustion. Off by default (the default build stays byte-identical).
+hrtick = []
+# PMU work-cycle scheduling: enables QuantumUnit::Cycles, measuring the slice in
+# APERF (actual, frequency-invariant) core cycles rather than wall-time. Off by
+# default. (APERF-only tier; fixed/GP-PMC + reservation registry are a follow-up.)
+# NOTE: opt-in and intentionally NOT in the CI kernel-test matrix — the feature's
+# code is a no-op in the default Nanos mode, but its tiny hot-path perturbation
+# deterministically trips a PRE-EXISTING scheduler busy-poll livelock (awake
+# stackful tasks not draining; the "ONION #3" wake-race family). Do not add `pmu`
+# to a ktest job until that latent race is fixed.
+pmu = []
 
 # cgroup-v2 cpu + cpuset controller seam: exposes hooks the cgroupfs
 # `cpu` / `cpuset` controllers install at boot to apply per-cgroup

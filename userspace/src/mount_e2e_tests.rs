@@ -2853,6 +2853,346 @@ fn unmount_for_test(path: &str) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+// ── Smoke: MS_SHARED / MS_PRIVATE change_type (do_change_type) ──────
+// mount(NULL, target, NULL, MS_SHARED) marks the mount at `target` shared —
+// gives it a non-zero peer-group id; MS_PRIVATE clears it back to 0. This is
+// the make-{shared,private} half of mount propagation (fs/namespace.c:
+// do_change_type). Linux mints a distinct group id per make-shared'd mount.
+fn smoke_mount_make_shared_then_private() -> TestResult {
+    const MS_SHARED: u64 = 1 << 20;
+    const MS_PRIVATE: u64 = 1 << 18;
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_20);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    const TARGET: &str = "/prop_shared";
+    let _ = unmount_for_test(TARGET);
+
+    // A fresh tmpfs mount starts PRIVATE (group id 0).
+    let mut m = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/prop_shared\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m);
+    if !matches!(m.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount tmpfs /prop_shared failed");
+    }
+    if narf_filesystem::registry().group_id_at(TARGET) != Some(0) {
+        let _ = unmount_for_test(TARGET);
+        return TestResult::Fail("fresh mount was not private (group id != 0)");
+    }
+
+    // make-shared: mount(NULL, target, NULL, MS_SHARED) → non-zero group id.
+    let mut sh = StubCtx {
+        args: mount_args(b"\0", b"/prop_shared\0", b"\0", MS_SHARED),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut sh);
+    if !matches!(sh.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test(TARGET);
+        return TestResult::Fail("mount --make-shared returned error");
+    }
+    let shared_gid = narf_filesystem::registry().group_id_at(TARGET);
+    if shared_gid == Some(0) || shared_gid.is_none() {
+        let _ = unmount_for_test(TARGET);
+        return TestResult::Fail("make-shared did not assign a non-zero peer-group id");
+    }
+
+    // make-private: mount(NULL, target, NULL, MS_PRIVATE) → group id back to 0.
+    let mut pv = StubCtx {
+        args: mount_args(b"\0", b"/prop_shared\0", b"\0", MS_PRIVATE),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut pv);
+    if !matches!(pv.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test(TARGET);
+        return TestResult::Fail("mount --make-private returned error");
+    }
+    let private_gid = narf_filesystem::registry().group_id_at(TARGET);
+    let _ = unmount_for_test(TARGET);
+    if private_gid != Some(0) {
+        return TestResult::Fail("make-private did not clear the peer-group id");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/mount", smoke_mount_make_shared_then_private);
+
+// NEGATIVE: do_change_type requires EXACTLY one propagation bit. More than one
+// (here MS_SHARED|MS_PRIVATE) is -EINVAL, matching flags_to_propagation_type's
+// is_power_of_2 check (fs/namespace.c).
+fn smoke_mount_change_type_rejects_multiple_bits() -> TestResult {
+    const MS_SHARED: u64 = 1 << 20;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const EINVAL: u64 = 22;
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_21);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    const TARGET: &str = "/prop_badbits";
+    let _ = unmount_for_test(TARGET);
+    let mut m = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/prop_badbits\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m);
+    if !matches!(m.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount tmpfs /prop_badbits failed");
+    }
+    let mut bad = StubCtx {
+        args: mount_args(b"\0", b"/prop_badbits\0", b"\0", MS_SHARED | MS_PRIVATE),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut bad);
+    let got = bad.ret.map(|r| r.value);
+    // Must NOT have changed propagation.
+    let still_private = narf_filesystem::registry().group_id_at(TARGET) == Some(0);
+    let _ = unmount_for_test(TARGET);
+    match got {
+        Some(v) if v == (-(EINVAL as i64)) as u64 && still_private => TestResult::Pass,
+        _ => {
+            TestResult::Fail("change_type with two propagation bits must return -EINVAL and no-op")
+        }
+    }
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_change_type_rejects_multiple_bits
+);
+
+// The peer-inheritance crux: after make-shared, unshare(CLONE_NEWNS) copies the
+// mount into the new namespace with the SAME peer-group id — so the two mounts
+// are genuine PEERS across namespaces (Linux clone_mnt inherits mnt_group_id for
+// a same-user_ns clone). This is what makes a service sandbox's /run a peer of
+// the host /run so mounts under it can propagate.
+fn smoke_mount_ns_clone_inherits_peer_group() -> TestResult {
+    const MS_SHARED: u64 = 1 << 20;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = 0x71_22;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    const TARGET: &str = "/peer_run";
+    let _ = unmount_for_test(TARGET);
+
+    // Global shared mount before unshare.
+    let mut m = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/peer_run\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m);
+    let mut sh = StubCtx {
+        args: mount_args(b"\0", b"/peer_run\0", b"\0", MS_SHARED),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut sh);
+    let host_gid = narf_filesystem::registry().group_id_at(TARGET);
+    if host_gid == Some(0) || host_gid.is_none() {
+        let _ = unmount_for_test(TARGET);
+        return TestResult::Fail("precondition: /peer_run not shared before unshare");
+    }
+
+    // unshare(CLONE_NEWNS): the private snapshot must carry the SAME group id.
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test(TARGET);
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+    let clone_gid =
+        crate::handlers::current_mount_namespace().and_then(|ns| ns.group_id_at(TARGET));
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test(TARGET);
+
+    match (host_gid, clone_gid) {
+        (Some(h), Some(c)) if h == c && c != 0 => TestResult::Pass,
+        _ => TestResult::Fail("ns clone did not inherit the peer-group id (not a peer)"),
+    }
+}
+kernel_test_in!("userspace/mount", smoke_mount_ns_clone_inherits_peer_group);
+
+// ── Smoke: mount propagation across peer namespaces (propagate_mnt) ─
+// The seat0 mechanism, at the mount level: /shared_run is made shared in the
+// global registry; two tasks (A and B) unshare CLONE_NEWNS so each holds a peer
+// of it. When A mounts a tmpfs UNDER /shared_run, that mount must PROPAGATE into
+// every peer — B's private namespace and the global registry — because the
+// parent mount is shared. Without propagation A's sub-mount would be invisible
+// to B and the host, which is exactly why logind's /run/systemd/seats never
+// reached the udev worker.
+fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
+    const MS_SHARED: u64 = 1 << 20;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task_a: u64 = 0x7123a;
+    let task_b: u64 = 0x7123b;
+    const BASE: &str = "/shared_run";
+    const SUB: &str = "/shared_run/sub";
+
+    // Clean slate for both tasks.
+    set_task(task_a);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_b);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_a);
+    let _ = unmount_for_test(SUB);
+    let _ = unmount_for_test(BASE);
+
+    // Global shared base mount (the "host /run").
+    let mut mb = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/shared_run\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mb);
+    let mut sh = StubCtx {
+        args: mount_args(b"\0", b"/shared_run\0", b"\0", MS_SHARED),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut sh);
+    if narf_filesystem::registry().group_id_at(BASE).unwrap_or(0) == 0 {
+        let _ = unmount_for_test(BASE);
+        return TestResult::Fail("precondition: /shared_run not shared");
+    }
+
+    // Task B unshares first — an EXISTING peer of the global /shared_run.
+    set_task(task_b);
+    let mut ub = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut ub);
+    // Task A unshares — another peer — and mounts UNDER the shared base.
+    set_task(task_a);
+    let mut ua = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut ua);
+    let mut msub = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/shared_run/sub\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut msub);
+    if !matches!(msub.ret, Some(r) if r.value == 0) {
+        set_task(task_a);
+        crate::handlers::clear_current_mount_namespace_for_test();
+        set_task(task_b);
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test(SUB);
+        let _ = unmount_for_test(BASE);
+        return TestResult::Fail("mount /shared_run/sub in task A failed");
+    }
+
+    // A's own namespace has the original.
+    let a_has = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == SUB))
+        .unwrap_or(false);
+    // It PROPAGATED into the global registry (the host peer)…
+    let global_has = narf_filesystem::registry().list().iter().any(|p| p == SUB);
+    // …and into task B's private namespace (the other peer).
+    set_task(task_b);
+    let b_has = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == SUB))
+        .unwrap_or(false);
+
+    // Cleanup.
+    set_task(task_a);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_b);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_a);
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test(SUB);
+    let _ = unmount_for_test(BASE);
+
+    if !a_has {
+        return TestResult::Fail("sub-mount missing from origin namespace");
+    }
+    if !global_has {
+        return TestResult::Fail("sub-mount did not propagate to the global (host) peer");
+    }
+    if !b_has {
+        return TestResult::Fail("sub-mount did not propagate to peer namespace B");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_propagates_under_shared_to_peers
+);
+
+// NEGATIVE: a mount under a PRIVATE (non-shared) parent must NOT propagate.
+fn smoke_mount_under_private_does_not_propagate() -> TestResult {
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task_a: u64 = 0x7124a;
+    let task_b: u64 = 0x7124b;
+    const BASE: &str = "/priv_base";
+    const SUB: &str = "/priv_base/sub";
+    set_task(task_a);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_b);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_a);
+    let _ = unmount_for_test(SUB);
+    let _ = unmount_for_test(BASE);
+
+    // Global base mount, left PRIVATE (no make-shared).
+    let mut mb = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/priv_base\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mb);
+
+    set_task(task_b);
+    let mut ub = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut ub);
+    set_task(task_a);
+    let mut ua = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut ua);
+    let mut msub = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/priv_base/sub\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut msub);
+
+    set_task(task_b);
+    let b_has = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == SUB))
+        .unwrap_or(false);
+
+    set_task(task_a);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_b);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(task_a);
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test(SUB);
+    let _ = unmount_for_test(BASE);
+
+    if b_has {
+        return TestResult::Fail("sub-mount under a PRIVATE parent leaked into a peer namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_under_private_does_not_propagate
+);
+
 // Silence unused-warning fence for the Vec import (used in the
 // resolve smoke if it grows later; harmless today).
 #[allow(dead_code)]

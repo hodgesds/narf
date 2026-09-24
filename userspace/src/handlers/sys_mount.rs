@@ -299,17 +299,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     }
 
     // Propagation-only change (MS_SLAVE/MS_SHARED/MS_PRIVATE/MS_UNBINDABLE,
-    // optionally |MS_REC): change the propagation type of the mount at
-    // `target` and nothing else. NARF has no propagation model, so this is a
-    // no-op success. Gated to "a propagation bit is set and no fstype / bind /
-    // move / remount work is requested" so a legitimate mount that also passes
-    // a propagation bit still falls through to the real dispatch below. Handled
-    // BEFORE bind/tmpfs/API dispatch because these calls carry a NULL source
-    // and NULL fstype (see the MS_PROPAGATION comment).
-    if (flags & MS_PROPAGATION) != 0 && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
+    // optionally |MS_REC) is dispatched AFTER target resolution below (it needs
+    // the resolved, chroot-applied target path). It is gated on "a propagation
+    // bit is set and no fstype / bind / move / remount work is requested" so a
+    // legitimate mount that also carries a propagation bit still falls through
+    // to the real dispatch. These calls carry a NULL source and NULL fstype.
 
     // systemd performs namespace assembly through O_PATH directory handles and
     // passes `/proc/self/fd/N` to mount(2). Linux follows that procfs magic
@@ -341,12 +335,53 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             resolve_vfs_symlink_path(source_resolved.as_str(), true).unwrap_or(source_resolved)
         };
     // `path_mount` translates the restriction flags into the `MNT_*` set
-    // the mount carries, which the VFS then enforces per mount. MS_REC and
-    // MS_RELATIME have no NARF counterpart — there is no propagation to
-    // recurse over and no atime policy to relax — so those two alone are
-    // still accepted and dropped.
+    // the mount carries, which the VFS then enforces per mount. MS_REC is
+    // honoured for bind mounts (the bind branch replicates the source's
+    // submounts) and for change_type (below); MS_RELATIME has no NARF
+    // counterpart (no atime policy to relax) so it alone is accepted and dropped.
     let mnt_flags = mnt_flags_from_ms(flags);
-    let _ = flags & (MS_REMOUNT | MS_REC | MS_RELATIME);
+    let _ = flags & (MS_REMOUNT | MS_RELATIME);
+
+    // `fs/namespace.c::do_change_type` — `mount --make-{shared,private,slave,
+    // unbindable}[,rshared,...]`. Reached when a propagation bit is set and no
+    // bind/move/remount work is requested (those carry a real source/fstype;
+    // a change_type call has NULL source and NULL fstype and only re-types the
+    // mount already at `target`). systemd runs `mount(NULL,"/",NULL,MS_REC|
+    // MS_SHARED,NULL)` (make-rshared) at early boot, and per-service make-shared
+    // during sandbox assembly — the peer groups this establishes are what let a
+    // mount created under a shared /run propagate to every namespace sharing it.
+    if (flags & MS_PROPAGATION) != 0 && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0 {
+        // `flags_to_propagation_type`: EXACTLY one of the four propagation bits,
+        // else -EINVAL. (`is_power_of_2` of the propagation subset.)
+        let prop_bits = flags & MS_PROPAGATION;
+        let prop = if prop_bits == MS_SHARED {
+            narf_filesystem::MntPropagation::Shared
+        } else if prop_bits == MS_PRIVATE {
+            narf_filesystem::MntPropagation::Private
+        } else if prop_bits == MS_SLAVE {
+            narf_filesystem::MntPropagation::Slave
+        } else if prop_bits == MS_UNBINDABLE {
+            narf_filesystem::MntPropagation::Unbindable
+        } else {
+            // Zero or more-than-one propagation bit set.
+            ctx.set_return(einval);
+            return;
+        };
+        let recursive = (flags & MS_REC) != 0;
+        // `change_propagation_at` re-types the mount at `target` and returns
+        // whether it found one. LINUX-GAP: `do_change_type` answers -EINVAL when
+        // the path is not a mountpoint, but NARF's flat, string-prefix mount
+        // table registers a mount only where one was explicitly attached (see
+        // the target-existence LINUX-GAP in this handler's doc), so a make-shared
+        // on a path with no registered mount has no propagation state to change.
+        // Reporting EINVAL there would break systemd's `make-rshared /` and
+        // per-service `make-*` on the many paths NARF does not track as mounts;
+        // a path with nothing to re-type is a no-op success, which is also the
+        // behaviour this branch had before propagation existed.
+        let _ = current_change_propagation(target.as_str(), prop, recursive);
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
 
     // A bind remount changes flags on an existing mount; `source` and
     // `filesystemtype` are conventionally NULL and must not be interpreted as

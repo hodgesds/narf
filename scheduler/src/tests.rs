@@ -2907,6 +2907,121 @@ fn smoke_scheduler_strict_class_order() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_strict_class_order);
 
+// ── Tick-driven load balancing: peer_loads + migrate_task ──────────────────
+// The plumbing a policy uses from `on_tick` to decide + drive a rebalance. The
+// hooks are dormant (no in-tree policy calls them), so these exercise the core
+// primitives directly.
+
+/// `peer_loads` returns a snapshot of every online CPU, including the boot CPU,
+/// filling the caller's buffer.
+fn smoke_peer_loads_snapshot() -> TestResult {
+    use crate::{peer_loads, CpuId, CpuLoad};
+    let mut buf = [CpuLoad {
+        cpu: CpuId(0),
+        nr_queued: 0,
+        idle: false,
+        vfloor: 0,
+    }; narf_lib::percpu::MAX_CPUS];
+    let loads = peer_loads(&mut buf);
+    if loads.is_empty() {
+        return TestResult::Fail("peer_loads returned no online CPUs");
+    }
+    if !loads.iter().any(|l| l.cpu == CpuId(0)) {
+        return TestResult::Fail("peer_loads snapshot missing the boot CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_peer_loads_snapshot);
+
+/// A self-targeted `migrate_task` is guarded to a no-op: nothing is recorded, so
+/// the running executor round leaves the task on its own queue. Uses THIS CPU
+/// throughout (`migrate_task` keys the request by `current_cpu`), so it is valid
+/// no matter which CPU the harness runs on.
+fn smoke_migrate_task_self_is_noop() -> TestResult {
+    use crate::affinity::{Affinity, CpuId};
+    use crate::{
+        dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
+    };
+    let me = narf_lib::percpu::current_cpu();
+    crate::__reset_queues_for_test();
+    let mut spec = TaskSpec::unthrottled();
+    spec.affinity = Affinity::pinned(CpuId(me as u32)); // admit on THIS cpu
+    let id = spawn_with_spec(async {}, spec);
+    if !dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw()) {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task was not admitted on the running CPU");
+    }
+    migrate_task(TaskHandle::from_id(id), CpuId(me as u32)); // self target -> guarded no-op
+    run_pending_migration(me);
+    let still = dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw());
+    crate::__reset_queues_for_test();
+    if !still {
+        return TestResult::Fail("self-target migrate wrongly dequeued the task");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_migrate_task_self_is_noop);
+
+/// `migrate_task` is re-validated at move time: a task whose affinity forbids the
+/// requested target (or whose target isn't online) is never dequeued. Exercises
+/// the negative re-validation branch the dequeue test skips.
+fn smoke_migrate_task_respects_affinity() -> TestResult {
+    use crate::affinity::{Affinity, CpuId};
+    use crate::{
+        dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let other = if me == 0 { 1u32 } else { 0u32 };
+    crate::__reset_queues_for_test();
+    let mut spec = TaskSpec::unthrottled();
+    spec.affinity = Affinity::pinned(CpuId(me as u32)); // pinned to THIS cpu only
+    let id = spawn_with_spec(async {}, spec);
+    if !dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw()) {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task was not admitted on the running CPU");
+    }
+    // Request a move to a CPU the task may not run on; the core must refuse it.
+    migrate_task(TaskHandle::from_id(id), CpuId(other));
+    run_pending_migration(me);
+    let still = dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw());
+    crate::__reset_queues_for_test();
+    if !still {
+        return TestResult::Fail("a task that may not run on the target was wrongly migrated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_migrate_task_respects_affinity);
+
+/// A real `migrate_task` to an online peer dequeues the slot from the source
+/// CPU's run queue (the core's push half). Skipped on a single-CPU boot.
+fn smoke_migrate_task_dequeues_for_peer() -> TestResult {
+    use crate::affinity::{Affinity, CpuId};
+    use crate::{
+        dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
+    };
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs a second online CPU");
+    }
+    crate::__reset_queues_for_test();
+    let mut spec = TaskSpec::unthrottled();
+    spec.affinity = Affinity::any(); // allow every CPU so the peer is a legal target
+    spec.affinity.preferred = Some(CpuId(0)); // ...but admit on the boot CPU
+    let id = spawn_with_spec(async {}, spec);
+    if !dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw()) {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task was not admitted on the boot CPU");
+    }
+    migrate_task(TaskHandle::from_id(id), CpuId(1));
+    run_pending_migration(0);
+    let still_here = dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw());
+    crate::__reset_queues_for_test();
+    if still_here {
+        return TestResult::Fail("migrate_task did not dequeue the slot from the source CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_migrate_task_dequeues_for_peer);
+
 fn smoke_scheduler_faulty_policy_cannot_strand_work() -> TestResult {
     use crate::{
         install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
@@ -2947,6 +3062,306 @@ kernel_test_in!(
     "scheduler",
     smoke_scheduler_faulty_policy_cannot_strand_work
 );
+
+// The in-tree policies all declare the default `QuantumUnit::Nanos`, so the
+// resolved active unit — and both reporters — must read Nanos after install.
+fn smoke_scheduler_quantum_unit_default_nanos() -> TestResult {
+    use crate::{
+        active_quantum_unit, current_scheduler_quantum_unit, install_scheduler, ClassScheduler,
+        QuantumUnit, SchedPolicy,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Class) failed");
+    }
+    if active_quantum_unit() != QuantumUnit::Nanos {
+        return TestResult::Fail("active_quantum_unit not Nanos after Nanos-policy install");
+    }
+    if current_scheduler_quantum_unit() != QuantumUnit::Nanos {
+        return TestResult::Fail("current_scheduler_quantum_unit reporter not Nanos");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_quantum_unit_default_nanos);
+
+// A policy declaring `QuantumUnit::Cycles` must be REFUSED at install while PMU
+// cycle scheduling has no backend (no `pmu` feature) — a truthful contract, not
+// a silent downgrade — and the refusal must leave the active unit AND the live
+// policy untouched (the refuse happens before publication).
+fn smoke_scheduler_cycles_unit_refused_without_pmu() -> TestResult {
+    use crate::{
+        active_quantum_unit, current_scheduler_name, install_scheduler, ClassScheduler, CpuId,
+        QuantumUnit, RunQueue, SchedPolicy, Scheduler, SchedulerError, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct WantsCycles;
+    impl Scheduler for WantsCycles {
+        fn name(&self) -> &'static str {
+            "wants-cycles"
+        }
+        fn quantum_unit(&self) -> QuantumUnit {
+            QuantumUnit::Cycles
+        }
+        fn pick_next(&self, _cpu: CpuId, _queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            None
+        }
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    // Land on a known-good Nanos policy first.
+    let _ = install_scheduler(&cap, ClassScheduler);
+    let before = active_quantum_unit();
+
+    match install_scheduler(&cap, WantsCycles) {
+        Err(SchedulerError::CycleModeUnavailable) => {}
+        Err(_) => return TestResult::Fail("Cycles install failed with the wrong error"),
+        Ok(()) => {
+            let _ = install_scheduler(&cap, ClassScheduler);
+            return TestResult::Fail("Cycles policy installed despite no PMU backend");
+        }
+    }
+
+    if active_quantum_unit() != before || active_quantum_unit() != QuantumUnit::Nanos {
+        return TestResult::Fail("refused Cycles install perturbed the active unit");
+    }
+    if current_scheduler_name() == Some("wants-cycles") {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("refused Cycles policy became the live scheduler");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cycles_unit_refused_without_pmu);
+
+// `resched_current()` (NARF's `resched_curr`) sets THIS CPU's NEED_RESCHED —
+// the state the preempt path folds into its decision. It must NOT touch the
+// slice quantum (the quantum refills at the next dispatch); here we assert only
+// the flag, which is the observable contract of the primitive.
+fn smoke_scheduler_resched_current_sets_need_resched() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::__test_clear_need_resched(cpu);
+    if crate::__test_need_resched(cpu) {
+        return TestResult::Fail("NEED_RESCHED not clear at start");
+    }
+    crate::resched_current();
+    if !crate::__test_need_resched(cpu) {
+        crate::__test_clear_need_resched(cpu);
+        return TestResult::Fail("resched_current() did not set NEED_RESCHED");
+    }
+    crate::__test_clear_need_resched(cpu);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_resched_current_sets_need_resched
+);
+
+// HIGH-1 regression: the preempt path consumes NEED_RESCHED when it commits to a
+// switch (Linux clear_tsk_need_resched), so a STALE flag — set by every
+// resched_remote to a running CPU, IPI skipped — cannot re-fire the tick-rate
+// preempt on every subsequent tick and collapse the quantum. This asserts the
+// primitive each try_preempt* now calls on commit clears the flag; the
+// preempt-commit integration itself is boot-covered.
+fn smoke_scheduler_clear_need_resched_consumes_flag() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::__test_clear_need_resched(cpu);
+    crate::resched_current(); // stand in for a remote wake's NEED_RESCHED publish
+    if !crate::__test_need_resched(cpu) {
+        return TestResult::Fail("precondition: NEED_RESCHED not set");
+    }
+    crate::clear_need_resched(cpu); // what each try_preempt* runs at the switch commit
+    let cleared = !crate::__test_need_resched(cpu);
+    crate::__test_clear_need_resched(cpu);
+    if !cleared {
+        return TestResult::Fail("clear_need_resched did not consume the stale flag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_clear_need_resched_consumes_flag
+);
+
+// The `on_tick` hook is an OVERHEAD-gated DECISION: `policy_wants_tick()` is
+// false for the plain in-tree ZST policies (Fifo/Priority/Eevdf ride the core
+// slice mechanism, so the tick path skips the whole hook) and true for a policy
+// that overrides it — including the default `ClassScheduler`, which now takes the
+// tick to run the periodic load balancer. The gate only skips the hook — it
+// never gates the resched STATE.
+fn smoke_scheduler_policy_wants_tick_reflects_policy() -> TestResult {
+    use crate::{
+        install_scheduler, ClassScheduler, CpuId, CpuSchedContext, FifoScheduler, RunQueue,
+        SchedPolicy, Scheduler, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct TicksAndReschedules;
+    impl Scheduler for TicksAndReschedules {
+        fn name(&self) -> &'static str {
+            "ticks-and-reschedules"
+        }
+        fn pick_next(&self, _cpu: CpuId, _queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            None
+        }
+        fn on_tick(&self, _ctx: &CpuSchedContext, _queue: &RunQueue<'_>) {
+            crate::resched_current();
+        }
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    // A plain in-tree ZST policy (Fifo) rides the core slice mechanism → the
+    // no-op tick hook is skipped.
+    if install_scheduler(&cap, FifoScheduler).is_err() {
+        return TestResult::Fail("install(Fifo) failed");
+    }
+    if crate::policy_wants_tick() {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("in-tree FifoScheduler should not want the tick hook");
+    }
+    // ClassScheduler overrides on_tick (periodic load balance) → the hook runs.
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install(Class) failed");
+    }
+    if !crate::policy_wants_tick() {
+        return TestResult::Fail("ClassScheduler balances on tick and should want the hook");
+    }
+    // A custom policy that overrides on_tick → the hook runs for it too.
+    if install_scheduler(&cap, TicksAndReschedules).is_err() {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("install(TicksAndReschedules) failed");
+    }
+    if !crate::policy_wants_tick() {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("overriding policy should want the tick hook");
+    }
+    // Restore the default so later smokes see the expected policy.
+    let _ = install_scheduler(&cap, ClassScheduler);
+    if !crate::policy_wants_tick() {
+        return TestResult::Fail("default ClassScheduler should want the tick hook");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_policy_wants_tick_reflects_policy
+);
+
+// hrtick: a finite slice arms a one-shot wheel entry, and draining the wheel
+// past its deadline fires the static waker → reschedules the entry's CPU. A long
+// slice is used so the real LAPIC does not fire it before the assertion window.
+#[cfg(feature = "hrtick")]
+fn smoke_hrtick_finite_slice_arms_and_fires() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::__test_clear_need_resched(cpu);
+    let now = narf_time::now_cycles();
+    crate::hrtick::arm(cpu, now, 10_000_000);
+    if !crate::hrtick::is_armed(cpu) {
+        return TestResult::Fail("finite-slice hrtick did not register a slice timer");
+    }
+    let _ = narf_time::timer_wheel::fire_due(now.saturating_add(20_000_000));
+    let fired = crate::__test_need_resched(cpu);
+    crate::hrtick::disarm(cpu);
+    crate::__test_clear_need_resched(cpu);
+    if !fired {
+        return TestResult::Fail("hrtick slice-timer fire did not set NEED_RESCHED");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "hrtick")]
+kernel_test_in!("scheduler", smoke_hrtick_finite_slice_arms_and_fires);
+
+// hrtick: an "infinite" (non-preemptible) slice must NOT arm a timer. Checked
+// via the armed state directly, so it is deterministic (no reliance on firing).
+#[cfg(feature = "hrtick")]
+fn smoke_hrtick_infinite_slice_not_armed() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    let now = narf_time::now_cycles();
+    crate::hrtick::arm(cpu, now, u64::MAX / 2);
+    let armed = crate::hrtick::is_armed(cpu);
+    crate::hrtick::disarm(cpu);
+    if armed {
+        return TestResult::Fail("infinite-slice hrtick armed a slice timer");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "hrtick")]
+kernel_test_in!("scheduler", smoke_hrtick_infinite_slice_not_armed);
+
+// pmu: installing a QuantumUnit::Cycles policy must exactly track APERF
+// availability — Ok + active unit Cycles when a work-cycle source exists, else
+// refused with CycleModeUnavailable (no silent downgrade). Adapts to the test
+// host (a VM may or may not expose APERF).
+#[cfg(feature = "pmu")]
+fn smoke_pmu_cycles_install_matches_availability() -> TestResult {
+    use crate::{
+        active_quantum_unit, install_scheduler, ClassScheduler, CpuId, QuantumUnit, RunQueue,
+        SchedPolicy, Scheduler, SchedulerError, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct CyclesPolicy;
+    impl Scheduler for CyclesPolicy {
+        fn name(&self) -> &'static str {
+            "cycles-policy"
+        }
+        fn quantum_unit(&self) -> QuantumUnit {
+            QuantumUnit::Cycles
+        }
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            // Sane default so we never strand work while briefly installed.
+            queue.iter_meta().find_map(|(h, m)| m.runnable.then_some(h))
+        }
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    let _ = install_scheduler(&cap, ClassScheduler);
+    let avail = crate::pmu::available();
+    let res = install_scheduler(&cap, CyclesPolicy);
+    let verdict = if avail {
+        match res {
+            Ok(()) if active_quantum_unit() == QuantumUnit::Cycles => TestResult::Pass,
+            Ok(()) => TestResult::Fail("Cycles installed but active_quantum_unit != Cycles"),
+            Err(_) => TestResult::Fail("Cycles refused despite APERF available"),
+        }
+    } else {
+        match res {
+            Err(SchedulerError::CycleModeUnavailable) => TestResult::Pass,
+            Ok(()) => TestResult::Fail("Cycles installed despite no APERF source"),
+            Err(_) => TestResult::Fail("Cycles refused with the wrong error"),
+        }
+    };
+    let _ = install_scheduler(&cap, ClassScheduler);
+    verdict
+}
+#[cfg(feature = "pmu")]
+kernel_test_in!("scheduler", smoke_pmu_cycles_install_matches_availability);
+
+// pmu: when a work-cycle source exists, APERF advances as work is done. Skipped
+// (not silently passed) on a host without APERF.
+#[cfg(feature = "pmu")]
+fn smoke_pmu_work_cycles_advance() -> TestResult {
+    if !crate::pmu::available() {
+        return TestResult::Skip("no APERF work-cycle source on this host");
+    }
+    let before = crate::pmu::read_work_cycles();
+    let mut acc = 0u64;
+    for i in 0..200_000u64 {
+        acc = acc.wrapping_add(i);
+    }
+    core::hint::black_box(acc);
+    let after = crate::pmu::read_work_cycles();
+    if after <= before {
+        return TestResult::Fail("APERF work-cycle counter did not advance across work");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "pmu")]
+kernel_test_in!("scheduler", smoke_pmu_work_cycles_advance);
 
 /// EEVDF-lite accounting (Phase 1): a task's `vruntime` is projected into
 /// `TaskMeta`, starts at the CPU's virtual-time floor on admission, and grows

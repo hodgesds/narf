@@ -100,7 +100,7 @@ fn smoke_debugfs_wake_next_toggle() -> TestResult {
 kernel_test_in!("filesystem/debugfs", smoke_debugfs_wake_next_toggle);
 
 fn smoke_debugfs_reflectors_are_read_only() -> TestResult {
-    for name in ["policy", "steal_strategy"] {
+    for name in ["policy", "quantum_unit", "steal_strategy"] {
         let file = match sched_knob(name) {
             Some(f) => f,
             None => return TestResult::Fail("reflector knob missing"),
@@ -119,3 +119,19 @@ fn smoke_debugfs_reflectors_are_read_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/debugfs", smoke_debugfs_reflectors_are_read_only);
+
+// The `quantum_unit` reflector renders the installed policy's scheduling unit.
+// The in-tree defaults are all `QuantumUnit::Nanos`, and `ACTIVE_QUANTUM_UNIT`
+// defaults to Nanos even before any install, so it reads "nanos".
+fn smoke_debugfs_quantum_unit_reads_nanos() -> TestResult {
+    let file = match sched_knob("quantum_unit") {
+        Some(f) => f,
+        None => return TestResult::Fail("sched/quantum_unit knob missing"),
+    };
+    let value = read_str(&file);
+    if value != "nanos\n" {
+        return TestResult::Fail("quantum_unit reflector did not read \"nanos\\n\"");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/debugfs", smoke_debugfs_quantum_unit_reads_nanos);
