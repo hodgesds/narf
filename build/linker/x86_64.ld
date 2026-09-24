@@ -91,6 +91,10 @@ SECTIONS
      * link-time constant. */
     __kaslr_relocs_phys = __kaslr_relocs_start - KERNEL_VIRT_BASE;
 
+    /* Physical alias of `kaslr::KERNEL_SLIDE`, so the 32-bit pass can record
+     * the slide it applied for the Rust conversions to read later. */
+    __kernel_slide_phys = KERNEL_SLIDE - KERNEL_VIRT_BASE;
+
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;
         *(.rodata .rodata.*)

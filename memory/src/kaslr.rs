@@ -49,6 +49,46 @@ pub const USER_MMAP_RANDOM_BITS: u32 = 24;
 /// x86_64's narrow kernel slot — same shape as Linux's KASLR.
 pub const KERNEL_RANDOM_BITS: u32 = 30;
 
+/// Slide applied to the kernel image's virtual base, in bytes.
+///
+/// Written by the relocation pass in `boot.S` before paging, through the
+/// `__kernel_slide_phys` alias the linker script provides, and read by every
+/// conversion that turns an in-image virtual address into a physical one.
+///
+/// It exists because relocations cannot fix arithmetic. The apply pass patches
+/// symbol REFERENCES, so `&some_static` carries the slide automatically — but
+/// an integer literal spelled `0xFFFF_FFFF_8000_0000` in a subtraction has no
+/// relocation record and keeps its link-time value. Subtracting the unslid
+/// constant from a slid address yields `phys + slide`, not `phys`. Linux has
+/// the same problem and the same answer: a runtime `phys_base` the boot path
+/// sets, which every conversion goes through.
+///
+/// Zero until the slide is turned on, so reading it is correct in either case.
+#[no_mangle]
+pub static KERNEL_SLIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Base the kernel image is linked at, before any slide.
+pub const KERNEL_LINK_BASE: u64 = if cfg!(target_arch = "aarch64") {
+    0xFFFF_FF80_0000_0000
+} else {
+    0xFFFF_FFFF_8000_0000
+};
+
+/// The kernel image's live virtual base — link base plus the applied slide.
+#[inline]
+pub fn kernel_virt_base() -> u64 {
+    KERNEL_LINK_BASE + KERNEL_SLIDE.load(Ordering::Relaxed)
+}
+
+/// Physical address of an in-image kernel-virtual address.
+///
+/// Use this instead of subtracting a hardcoded base: the constant is right
+/// only while the slide is zero, and wrong by exactly the slide otherwise.
+#[inline]
+pub fn image_virt_to_phys(virt: u64) -> u64 {
+    virt.wrapping_sub(kernel_virt_base())
+}
+
 /// Pull one 64-bit value of randomness using the best available source.
 ///
 /// Returns the value plus a tag identifying the source so observability
