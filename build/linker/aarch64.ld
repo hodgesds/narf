@@ -7,6 +7,17 @@ ENTRY(_start)
 KERNEL_LOAD_BASE = 0x40080000;
 KERNEL_VIRT_BASE = 0xFFFFFF8000000000;
 
+/* Bytes reserved in-image for the KASLR relocation table. `xtask` fills it
+ * after the link; the header magic is what the apply pass keys on, so an
+ * unfilled reserve is a skipped slide rather than a slide by garbage.
+ *
+ * aarch64 needs far less than x86_64's 4M: under `code-model=small` the only
+ * class a slide touches is R_AARCH64_ABS64 (~86k sites, 4 bytes each), because
+ * every other absolute reference is a PC-relative ADRP+ADD pair. x86_64 must
+ * additionally carry ~150k R_X86_64_32S sites. 1M leaves better than 2x
+ * headroom; `xtask` fails the build if the table outgrows it. */
+KASLR_RELOC_RESERVE = 1M;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -40,6 +51,35 @@ SECTIONS
         *(.text .text.*)
         __text_end = .;
     } :text
+
+    /* KASLR relocation table. Reserved here at link time and filled by
+     * `xtask` after the link, because the site list is only knowable once
+     * addresses are final.
+     *
+     * In-image and PROGBITS on purpose: `.bss` has no file bytes for `xtask`
+     * to write into, and anything outside a PT_LOAD segment never reaches
+     * memory. The leading QUAD(0) is the header magic slot — `boot.S` checks
+     * it and skips the slide entirely if the table was never filled, so a
+     * forgotten patch step disables KASLR instead of sliding by garbage.
+     *
+     * Linux arm64 does not need an equivalent: it links `-shared -Bsymbolic`
+     * and consumes the `.rela.dyn` R_AARCH64_RELATIVE entries directly
+     * (arch/arm64/kernel/pi/relocate.c). NARF reuses its own table format on
+     * both arches so there is one encoder and one apply pass to reason about. */
+    .kaslr_relocs : AT(ADDR(.kaslr_relocs) - KERNEL_VIRT_BASE) ALIGN(4K) {
+        __kaslr_relocs_start = .;
+        QUAD(0);
+        . = __kaslr_relocs_start + KASLR_RELOC_RESERVE;
+        __kaslr_relocs_end = .;
+    } :rodata
+
+    /* Physical aliases for the apply pass. It runs in `.boot`, before the MMU,
+     * where there is no kernel-half addressing at all. */
+    __kaslr_relocs_phys = __kaslr_relocs_start - KERNEL_VIRT_BASE;
+
+    /* Physical alias of `kaslr::KERNEL_SLIDE`, so the pass can record the
+     * slide it applied for the Rust conversions to read later. */
+    __kernel_slide_phys = KERNEL_SLIDE - KERNEL_VIRT_BASE;
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;
