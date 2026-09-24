@@ -26,7 +26,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::{Any, TypeId};
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -165,6 +165,22 @@ impl TaskMeta {
             vruntime: slot.vruntime,
         }
     }
+}
+
+/// Per-CPU load snapshot for tick-driven load balancing. A policy gathers these
+/// for every online CPU via [`crate::peer_loads`] inside `on_tick`, then decides
+/// whether to shed work (calling [`crate::migrate_task`]). Carries exactly what a
+/// balance decision needs and the core can read cheaply: the count of
+/// dispatchable (awake, un-throttled) queued tasks, whether the CPU is
+/// idle-halted, and its EEVDF virtual-time floor (so a vruntime-ordered policy
+/// can compare virtual time across CPUs). The running task is off-queue during
+/// its poll, so `nr_dispatchable` counts only *queued* runnable work.
+#[derive(Copy, Clone, Debug)]
+pub struct CpuLoad {
+    pub cpu: CpuId,
+    pub nr_dispatchable: u16,
+    pub idle: bool,
+    pub vfloor: u64,
 }
 
 /// Snapshot of the task currently running on a CPU, published by the core at
@@ -434,11 +450,23 @@ pub trait Scheduler: Any + Send + Sync + 'static {
 
     /// Per-timer-tick hook for the task currently running on `ctx.cpu` — NARF's
     /// analogue of Linux `task_tick`/`entity_tick`. Advance this policy's
-    /// per-task accounting (eligibility / virtual runtime) here, and call
-    /// [`crate::resched_current`] to force the runner to yield (Linux
-    /// `resched_curr`). The slice quantum is untouched and refills at the next
-    /// dispatch, so a forced yield never starves the task. Returns nothing — the
-    /// reschedule is a side effect, exactly as in `task_tick`.
+    /// per-task accounting (eligibility / virtual runtime) here, then drive at
+    /// most one of the tick's four actions for the running task T, all as side
+    /// effects (the hook returns nothing):
+    ///   1. let T keep running — call nothing.
+    ///   2. preempt T with a queued task on `ctx.cpu` (LOCAL) —
+    ///      [`crate::resched_current`] (Linux `resched_curr`); the slice quantum
+    ///      is untouched and refills next dispatch, so a forced yield never
+    ///      starves T.
+    ///   3. migrate the running task to another CPU (rare) —
+    ///      [`crate::migrate_task`]`(T's handle, to)`.
+    ///   4. migrate a queued task to a less-loaded/idle CPU —
+    ///      [`crate::migrate_task`]`(handle, to)`.
+    ///
+    /// Only 3 and 4 cross CPUs; the core issues the kick (a reschedule IPI, fired
+    /// only if the target is idle) and does the dequeue/move on `ctx.cpu`'s next
+    /// executor round. To decide 3/4, read cross-CPU load — dispatchable counts,
+    /// idle state, and per-CPU virtual-time floors — via [`crate::peer_loads`].
     ///
     /// Runs in timer-IRQ / slice-ISR context (IF=0): must be allocation-free and
     /// must not block or re-enter scheduler installation. Best-effort — the core
@@ -654,6 +682,73 @@ impl Scheduler for ClassScheduler {
             }
         }
         best.map(|(handle, _)| handle)
+    }
+
+    /// Periodic load balance (Linux `scheduler_tick` -> `load_balance`). Every
+    /// `CLASS_BALANCE_INTERVAL` ticks, if this CPU carries dispatchable surplus
+    /// and a peer is clearly lighter, shed one migratable task to it via
+    /// [`crate::migrate_task`] (push; the core kicks the target). Affinity-pinned
+    /// and address-space (user) tasks are never moved. The actual buffer +
+    /// snapshot live in the `#[inline(never)]` helper so a non-balance tick pays
+    /// only the counter bump, not the peer-load stack frame.
+    fn on_tick(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) {
+        let cpu = ctx.cpu.0 as usize;
+        if cpu >= narf_lib::percpu::MAX_CPUS {
+            return;
+        }
+        let n = CLASS_BALANCE_TICKS[cpu]
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if n % CLASS_BALANCE_INTERVAL == 0 {
+            class_balance_pass(ctx.cpu, queue);
+        }
+    }
+}
+
+/// Per-CPU counter gating [`ClassScheduler`]'s balance pass (keeps per-tick cost
+/// to a single relaxed bump and migrations gentle).
+static CLASS_BALANCE_TICKS: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Run the balance pass at most once per this many ticks per CPU.
+const CLASS_BALANCE_INTERVAL: u32 = 8;
+
+/// One `ClassScheduler` balance pass for `cpu`. `queue` is this CPU's already
+/// locked run queue (so the local dispatchable count comes from it, not from
+/// `peer_loads`, whose own-CPU entry would read 0 under the held lock). Picks the
+/// least-loaded peer (idle preferred) and, only on a clear imbalance, sheds one
+/// runnable, un-pinned, non-user task whose affinity permits that peer.
+/// `#[inline(never)]` keeps the `MAX_CPUS`-wide `CpuLoad` buffer off the
+/// common-tick stack frame.
+#[inline(never)]
+fn class_balance_pass(cpu: CpuId, queue: &RunQueue<'_>) {
+    let my = queue.iter_meta().filter(|(_, m)| m.runnable).count();
+    if my < 2 {
+        return; // keep at least one runnable task local before shedding
+    }
+    let mut buf = [CpuLoad {
+        cpu: CpuId(0),
+        nr_dispatchable: 0,
+        idle: false,
+        vfloor: 0,
+    }; narf_lib::percpu::MAX_CPUS];
+    let loads = crate::peer_loads(&mut buf);
+    let Some(target) = loads
+        .iter()
+        .filter(|l| l.cpu != cpu)
+        .min_by_key(|l| (l.nr_dispatchable, !l.idle))
+    else {
+        return;
+    };
+    // Shed only on a clear imbalance (peer at least two lighter than us).
+    if (my as u16) <= target.nr_dispatchable.saturating_add(1) {
+        return;
+    }
+    for (handle, meta) in queue.iter_meta() {
+        if meta.runnable && !meta.addr_space && meta.affinity.allowed.contains(target.cpu) {
+            crate::migrate_task(handle, target.cpu);
+            return;
+        }
     }
 }
 
@@ -901,17 +996,18 @@ fn resolve_quantum_unit(base: QuantumUnit) -> Result<QuantumUnit, SchedulerError
 /// so no reschedule can be dropped by it. `false` == skip the no-op hook.
 static POLICY_WANTS_TICK: AtomicBool = AtomicBool::new(false);
 
-/// The in-tree ZST policies never override `on_tick` (they ride the core's slice
-/// mechanism), so exclude them by type — the tick path then skips a guaranteed
-/// no-op. Mirrors [`observes_queue_events`]. Unknown/external policies default
-/// to `true` (safe: they may override `on_tick`), so the gate never silently
-/// drops a real decision. When a built-in later opts into `on_tick`, drop it
-/// from this exclusion list.
+/// These in-tree ZST policies never override `on_tick` (they ride the core's
+/// slice mechanism), so exclude them by type — the tick path then skips a
+/// guaranteed no-op. Mirrors [`observes_queue_events`]. `ClassScheduler` is NOT
+/// excluded: it overrides `on_tick` to run the periodic load balancer (Linux
+/// `scheduler_tick` -> `load_balance`), so the default scheduler takes the tick.
+/// Unknown/external policies default to `true` (safe: they may override
+/// `on_tick`), so the gate never silently drops a real decision. When a built-in
+/// later opts into `on_tick`, drop it from this exclusion list.
 fn policy_uses_tick(scheduler: &dyn Scheduler) -> bool {
     let kind = scheduler.type_id();
     kind != TypeId::of::<FifoScheduler>()
         && kind != TypeId::of::<PriorityScheduler>()
-        && kind != TypeId::of::<ClassScheduler>()
         && kind != TypeId::of::<crate::eevdf::EevdfScheduler>()
 }
 

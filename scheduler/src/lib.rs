@@ -116,8 +116,8 @@ pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed
 pub(crate) use policy::policy_wants_tick;
 pub use policy::{
     active_quantum_unit, cpu_state, current_scheduler_name, current_scheduler_quantum_unit,
-    install_scheduler, set_default_policy, ClassScheduler, CpuIdleMeta, CpuSchedContext, CpuState,
-    CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, QuantumUnit, RunQueue,
+    install_scheduler, set_default_policy, ClassScheduler, CpuIdleMeta, CpuLoad, CpuSchedContext,
+    CpuState, CpuStateChange, CurrentTask, FifoScheduler, PriorityScheduler, QuantumUnit, RunQueue,
     SchedPolicy, SchedRow, Scheduler, SchedulerError, TaskDequeueReason, TaskEnqueueReason,
     TaskHandle, TaskMeta, TaskQueueEvent,
 };
@@ -1342,6 +1342,139 @@ pub fn resched_current() {
 #[inline]
 pub(crate) fn need_resched_pending(cpu: usize) -> bool {
     cpu < NEED_RESCHED.len() && NEED_RESCHED[cpu].load(Ordering::Acquire)
+}
+
+// ── Tick-driven load balancing (Linux `scheduler_tick` -> load_balance) ──────
+//
+// From a tick, a policy's `on_tick` can drive one of four actions for the
+// running task T on CPU C:
+//   1. let T keep running        — call nothing
+//   2. preempt T with a queued task on C (LOCAL) — `resched_current()`
+//   3. migrate the running task elsewhere (rare) — `migrate_task(T, to)`
+//   4. migrate a queued task to another CPU + kick — `migrate_task(handle, to)`
+// Only 3 and 4 cross CPUs, so only they carry a kick; 1 and 2 are local. To
+// decide 3/4 the policy needs cross-CPU load, which it reads via `peer_loads`.
+//
+// `migrate_task` only RECORDS the request (it runs in the tick ISR, IF=0, so it
+// must not mutate a run queue): the core dequeues the named slot and moves it on
+// CPU C's next executor round via `run_pending_migration` -> `enqueue_on(to,
+// Migrated)`, whose remote path stages onto the target's wake list and kicks it
+// (the IPI fires iff the target is idle-halted). One migration request per CPU
+// is held at a time — the balance pass sheds at most one task per tick.
+
+/// This CPU has a pending `migrate_task` request. Cheap relaxed-read gate so the
+/// executor round pays a single load when nothing is pending (the common case).
+static MIGRATE_PENDING: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// The pending request itself: `(task_id, target_cpu)`. Touched from both the
+/// tick ISR (`migrate_task`) and task context (`run_pending_migration`), so it
+/// uses an IRQ-masking lock (the ISR can't be interrupted while the executor
+/// holds it, and vice-versa).
+static PENDING_MIGRATE: [IrqSafeSpinLock<Option<(u64, u32)>>; narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
+
+/// Fill `buf` with a load snapshot of every online CPU and return the filled
+/// prefix — NARF's analogue of the per-CPU stats Linux `load_balance` reads from
+/// each `rq`. A policy calls this from `on_tick` to decide whether (and where) to
+/// shed work. Allocation-free and non-blocking (`try_lock` per queue, skipped on
+/// contention), so it is safe to call from the tick ISR; size `buf` to the CPU
+/// count ([`narf_lib::percpu::MAX_CPUS`]).
+pub fn peer_loads(buf: &mut [policy::CpuLoad]) -> &[policy::CpuLoad] {
+    let now = narf_time::now_cycles();
+    let mut n = 0usize;
+    for c in 0..narf_lib::percpu::MAX_CPUS {
+        if n >= buf.len() {
+            break;
+        }
+        if c != 0 && !narf_lib::smp::is_online(c as u32) {
+            continue;
+        }
+        let nr = READY[c]
+            .try_lock()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|d| d.iter().filter(|s| slot_is_dispatchable(s, now)).count())
+            })
+            .unwrap_or(0);
+        buf[n] = policy::CpuLoad {
+            cpu: CpuId(c as u32),
+            nr_dispatchable: nr.min(u16::MAX as usize) as u16,
+            idle: CPU_HALTED[c].load(Ordering::SeqCst),
+            vfloor: vfloor(c),
+        };
+        n += 1;
+    }
+    &buf[..n]
+}
+
+/// Request that the task named by `handle` migrate off the current CPU to `to` —
+/// NARF's analogue of Linux moving a task in `load_balance` / active migration. A
+/// side effect a policy issues from [`policy::Scheduler::on_tick`] (actions 3/4;
+/// see the module note above). Records the request only; the current CPU's next
+/// executor round dequeues the slot and performs the move + kick. No-op for a
+/// self-target or an out-of-range CPU. The core re-validates at move time, so a
+/// task that parked, throttled, exited, or lost affinity to `to` in between is
+/// simply not moved.
+pub fn migrate_task(handle: policy::TaskHandle, to: CpuId) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let target = to.0 as usize;
+    if cpu >= narf_lib::percpu::MAX_CPUS || target >= narf_lib::percpu::MAX_CPUS || target == cpu {
+        return;
+    }
+    *PENDING_MIGRATE[cpu].lock() = Some((handle.task_id().raw(), to.0));
+    MIGRATE_PENDING[cpu].store(true, Ordering::Release);
+}
+
+/// Whether `slot` may be pushed off `from_cpu` to `to`: `to` must be in the
+/// task's affinity, and (mirroring the steal floor) a user/address-space task
+/// only migrates once user-task SMP is enabled.
+fn push_migratable(slot: &TaskSlot, to: CpuId) -> bool {
+    if slot.addr_space.is_some() && !user_task_smp_enabled() {
+        return false;
+    }
+    slot.spec.affinity.allowed.contains(to)
+}
+
+/// Executor-round handler for a pending [`migrate_task`] on `cpu`: dequeue the
+/// named slot (re-validated) and hand it to `enqueue_on(target, Migrated)`, which
+/// stages it on the target's wake list and kicks it. Runs outside the tick ISR,
+/// so the queue mutation + possible target IPI are legal here. The `READY[cpu]`
+/// lock is dropped before `enqueue_on` (which locks the target's state) to avoid
+/// a `READY[cpu]` -> target inversion.
+fn run_pending_migration(cpu: usize) {
+    let pending = {
+        let mut g = PENDING_MIGRATE[cpu].lock();
+        MIGRATE_PENDING[cpu].store(false, Ordering::Release);
+        g.take()
+    };
+    let Some((task_id, target_raw)) = pending else {
+        return;
+    };
+    let target = target_raw as usize;
+    if target >= narf_lib::percpu::MAX_CPUS
+        || target == cpu
+        || !narf_lib::smp::is_online(target_raw)
+    {
+        return;
+    }
+    let to = CpuId(target_raw);
+    let now = narf_time::now_cycles();
+    let slot = {
+        let mut q = READY[cpu].lock();
+        let Some(dq) = q.as_mut() else {
+            return;
+        };
+        let Some(pos) = dq.iter().position(|s| {
+            s.id.raw() == task_id && slot_is_dispatchable(s, now) && push_migratable(s, to)
+        }) else {
+            return;
+        };
+        dq.remove(pos)
+    };
+    if let Some(slot) = slot {
+        enqueue_on(target, slot, policy::TaskEnqueueReason::Migrated);
+    }
 }
 
 /// Run the installed policy's per-tick hook for the running task (Linux
@@ -4622,6 +4755,12 @@ pub fn run_until_empty() {
         // before snapshotting the round so a task a remote CPU pushed onto our
         // wake list dispatches THIS round rather than waiting for the next one.
         drain_wake_list(cpu);
+        // Perform a load-balance migration a policy requested from `on_tick`
+        // (Linux `run_rebalance_domains`). One relaxed load per round when idle;
+        // dequeues + moves the named slot only when a request is pending.
+        if MIGRATE_PENDING[cpu].load(Ordering::Relaxed) {
+            run_pending_migration(cpu);
+        }
         // Snapshot queue length. We'll visit each task at most once per
         // round; spawns during the round land at the back and get
         // visited on the NEXT round.

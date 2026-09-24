@@ -2907,6 +2907,86 @@ fn smoke_scheduler_strict_class_order() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_strict_class_order);
 
+// ── Tick-driven load balancing: peer_loads + migrate_task ──────────────────
+// The plumbing a policy uses from `on_tick` to decide + drive a rebalance. The
+// hooks are dormant (no in-tree policy calls them), so these exercise the core
+// primitives directly.
+
+/// `peer_loads` returns a snapshot of every online CPU, including the boot CPU,
+/// filling the caller's buffer.
+fn smoke_peer_loads_snapshot() -> TestResult {
+    use crate::{peer_loads, CpuId, CpuLoad};
+    let mut buf = [CpuLoad {
+        cpu: CpuId(0),
+        nr_dispatchable: 0,
+        idle: false,
+        vfloor: 0,
+    }; narf_lib::percpu::MAX_CPUS];
+    let loads = peer_loads(&mut buf);
+    if loads.is_empty() {
+        return TestResult::Fail("peer_loads returned no online CPUs");
+    }
+    if !loads.iter().any(|l| l.cpu == CpuId(0)) {
+        return TestResult::Fail("peer_loads snapshot missing the boot CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_peer_loads_snapshot);
+
+/// A self-targeted `migrate_task` is guarded to a no-op: nothing is recorded, so
+/// the running executor round leaves the task on its own queue.
+fn smoke_migrate_task_self_is_noop() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::{
+        dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
+    };
+    crate::__reset_queues_for_test();
+    let id = spawn_with_spec(async {}, TaskSpec::unthrottled());
+    if !dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw()) {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task was not admitted on the boot CPU");
+    }
+    migrate_task(TaskHandle::from_id(id), CpuId(0)); // self target -> guarded no-op
+    run_pending_migration(0);
+    let still = dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw());
+    crate::__reset_queues_for_test();
+    if !still {
+        return TestResult::Fail("self-target migrate wrongly dequeued the task");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_migrate_task_self_is_noop);
+
+/// A real `migrate_task` to an online peer dequeues the slot from the source
+/// CPU's run queue (the core's push half). Skipped on a single-CPU boot.
+fn smoke_migrate_task_dequeues_for_peer() -> TestResult {
+    use crate::affinity::{Affinity, CpuId};
+    use crate::{
+        dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
+    };
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs a second online CPU");
+    }
+    crate::__reset_queues_for_test();
+    let mut spec = TaskSpec::unthrottled();
+    spec.affinity = Affinity::any(); // allow every CPU so the peer is a legal target
+    spec.affinity.preferred = Some(CpuId(0)); // ...but admit on the boot CPU
+    let id = spawn_with_spec(async {}, spec);
+    if !dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw()) {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task was not admitted on the boot CPU");
+    }
+    migrate_task(TaskHandle::from_id(id), CpuId(1));
+    run_pending_migration(0);
+    let still_here = dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw());
+    crate::__reset_queues_for_test();
+    if still_here {
+        return TestResult::Fail("migrate_task did not dequeue the slot from the source CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_migrate_task_dequeues_for_peer);
+
 fn smoke_scheduler_faulty_policy_cannot_strand_work() -> TestResult {
     use crate::{
         install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
@@ -3045,13 +3125,15 @@ kernel_test_in!(
 );
 
 // The `on_tick` hook is an OVERHEAD-gated DECISION: `policy_wants_tick()` is
-// false for the in-tree ZST policies (their `on_tick` is a no-op, so the tick
-// path skips the whole hook) and true for a policy that overrides it. The gate
-// only skips the hook — it never gates the resched STATE.
+// false for the plain in-tree ZST policies (Fifo/Priority/Eevdf ride the core
+// slice mechanism, so the tick path skips the whole hook) and true for a policy
+// that overrides it — including the default `ClassScheduler`, which now takes the
+// tick to run the periodic load balancer. The gate only skips the hook — it
+// never gates the resched STATE.
 fn smoke_scheduler_policy_wants_tick_reflects_policy() -> TestResult {
     use crate::{
-        install_scheduler, ClassScheduler, CpuId, CpuSchedContext, RunQueue, SchedPolicy,
-        Scheduler, TaskHandle,
+        install_scheduler, ClassScheduler, CpuId, CpuSchedContext, FifoScheduler, RunQueue,
+        SchedPolicy, Scheduler, TaskHandle,
     };
     use narf_capabilities::{Cap, Grant};
 
@@ -3070,15 +3152,25 @@ fn smoke_scheduler_policy_wants_tick_reflects_policy() -> TestResult {
     }
 
     let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
-    // In-tree ZST policy → the no-op tick hook is skipped.
+    // A plain in-tree ZST policy (Fifo) rides the core slice mechanism → the
+    // no-op tick hook is skipped.
+    if install_scheduler(&cap, FifoScheduler).is_err() {
+        return TestResult::Fail("install(Fifo) failed");
+    }
+    if crate::policy_wants_tick() {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("in-tree FifoScheduler should not want the tick hook");
+    }
+    // ClassScheduler overrides on_tick (periodic load balance) → the hook runs.
     if install_scheduler(&cap, ClassScheduler).is_err() {
         return TestResult::Fail("install(Class) failed");
     }
-    if crate::policy_wants_tick() {
-        return TestResult::Fail("in-tree ClassScheduler should not want the tick hook");
+    if !crate::policy_wants_tick() {
+        return TestResult::Fail("ClassScheduler balances on tick and should want the hook");
     }
-    // A policy that overrides on_tick → the hook runs for it.
+    // A custom policy that overrides on_tick → the hook runs for it too.
     if install_scheduler(&cap, TicksAndReschedules).is_err() {
+        let _ = install_scheduler(&cap, ClassScheduler);
         return TestResult::Fail("install(TicksAndReschedules) failed");
     }
     if !crate::policy_wants_tick() {
@@ -3087,8 +3179,8 @@ fn smoke_scheduler_policy_wants_tick_reflects_policy() -> TestResult {
     }
     // Restore the default so later smokes see the expected policy.
     let _ = install_scheduler(&cap, ClassScheduler);
-    if crate::policy_wants_tick() {
-        return TestResult::Fail("wants_tick not cleared after reinstalling Class");
+    if !crate::policy_wants_tick() {
+        return TestResult::Fail("default ClassScheduler should want the tick hook");
     }
     TestResult::Pass
 }
