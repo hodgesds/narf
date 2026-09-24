@@ -23,18 +23,27 @@ int main(void) {
     static unsigned char arena[1024];
     struct utsname *u = (struct utsname *)(void *)(arena + 512);
     unsigned long flags;
-    register long nr __asm__("rax") = 63; // x86_64 Linux uname
-    register void *arg __asm__("rdi") = u;
+    long nr;
 
     memset(arena, 0xA5, sizeof(arena));
+    // Pin the syscall number (63 = x86_64 uname) into rax and the buffer into
+    // rdi via INPUT operand constraints, not `register long __asm__("rax")`
+    // locals. A local register variable is only guaranteed live in its register
+    // across an asm if NOTHING clobbers it in between — and GCC's manual warns
+    // specifically that an intervening FUNCTION CALL (here `memset`) may clobber
+    // it with no reload. Older musl-gcc happened to reload rax after the memset;
+    // newer ones do not, so the trap ran with a garbage syscall number and uname
+    // spuriously "failed". Input constraints ("0" ties 63 to the rax output, "D"
+    // forces rdi) make the compiler materialise both registers immediately before
+    // the trap, regardless of surrounding calls.
     __asm__ volatile(
         "std\n\t"
         "int $0x80\n\t"
         "pushfq\n\t"
         "popq %[flags]\n\t"
         "cld"
-        : "+a"(nr), "+D"(arg), [flags] "=r"(flags)
-        :
+        : "=a"(nr), [flags] "=r"(flags)
+        : "0"(63L), "D"(u)
         : "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11", "memory", "cc");
 
     if (nr != 0) {
