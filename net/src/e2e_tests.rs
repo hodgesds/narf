@@ -92,6 +92,10 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     arp_cache::__reset_for_test();
     crate::ifaddr::__reset_for_test();
     crate::bypass::__reset_for_test();
+    // The ICMP Redirect budget is global and survives every other reset, so
+    // a test that exhausts it silences every later test using the same
+    // sender. Clear it here with the rest of the per-test state.
+    crate::ip_forward::__reset_for_test();
     TX_CAPTURE.lock().clear();
 
     // Register the synthetic NIC — `SendFn` captures frames.
