@@ -189,6 +189,18 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "test rax, rax",
         "jz 9f",
         "mov rcx, cr3",
+        // Domain PCIDs are 1..=16 (domain + 1). A larger tag means CR3 holds
+        // the calling task's user root, the only root carrying its user half.
+        // A syscall ALWAYS arrives that way, so swapping to the FRAME PML4
+        // here strips the very mappings the handler is about to read
+        // (argument buffers, TLS), and the resulting #PF re-enters the trap
+        // prefix and strips them again — an unbreakable loop. The PKS sibling
+        // neutralises by relaxing IA32_PKRS, not by changing the address
+        // space; match it. Kind stays 0, so the exit path restores nothing.
+        "mov rdx, rcx",
+        "and rdx, 0xFFF",
+        "cmp rdx, 16",
+        "ja 9f",
         "mov [rsp + 152], rcx",
         "mov qword ptr [rsp + 160], 2",
         "or rax, 1",
