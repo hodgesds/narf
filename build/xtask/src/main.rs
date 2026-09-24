@@ -6836,23 +6836,34 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     let mut log_ratio_sum = 0f64;
     let mut ratio_count = 0usize;
     for m in &narf {
-        let lrate = linux
+        let lm = linux
             .as_ref()
-            .and_then(|l| l.iter().find(|x| x.name == m.name))
-            .map(|x| x.rate_real);
-        match lrate {
-            Some(lr) if lr > 0.0 && m.rate_real > 0.0 => {
-                let ratio = m.rate_real / lr;
+            .and_then(|l| l.iter().find(|x| x.name == m.name));
+        match lm {
+            Some(l) if l.rate_real > 0.0 && m.rate_real > 0.0 => {
+                // A stressor that exited almost immediately (musl's sbrk
+                // stub makes stress-ng --brk do 33 ops and quit on EVERY
+                // kernel) divides a tiny op count by a near-zero wall
+                // time: the "rate" is noise. Flag it and keep it out of
+                // the geometric mean instead of reporting it as a result.
+                if m.real_secs < 1.0 || l.real_secs < 1.0 {
+                    println!(
+                        "│ {:<12} {:>16.1} {:>17.1} {:>12}  (short run: {:.2}s/{:.2}s — rate untrustworthy)",
+                        m.name, m.rate_real, l.rate_real, "n/a", m.real_secs, l.real_secs
+                    );
+                    continue;
+                }
+                let ratio = m.rate_real / l.rate_real;
                 log_ratio_sum += ratio.ln();
                 ratio_count += 1;
                 println!(
                     "│ {:<12} {:>16.1} {:>17.1} {:>11.2}x",
-                    m.name, m.rate_real, lr, ratio
+                    m.name, m.rate_real, l.rate_real, ratio
                 );
             }
-            Some(lr) => println!(
+            Some(l) => println!(
                 "│ {:<12} {:>16.1} {:>17.1} {:>12}",
-                m.name, m.rate_real, lr, "n/a"
+                m.name, m.rate_real, l.rate_real, "n/a"
             ),
             None => println!(
                 "│ {:<12} {:>16.1} {:>17} {:>12}",
