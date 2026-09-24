@@ -89,6 +89,63 @@ pub fn image_virt_to_phys(virt: u64) -> u64 {
     virt.wrapping_sub(kernel_virt_base())
 }
 
+#[cfg(feature = "kernel-test")]
+mod kaslr_slide_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// The kernel image really is slid, and the recorded slide agrees with
+    /// where the image actually sits.
+    ///
+    /// This is the guard against the whole mechanism silently reverting to a
+    /// no-op. Every piece of it fails soft: the apply pass skips when the
+    /// table's magic is missing, `KERNEL_SLIDE` reads zero when nothing wrote
+    /// it, and a zero slide maps and boots exactly like an unslid kernel. A
+    /// clean boot is therefore not evidence that any of it ran.
+    fn smoke_kaslr_kernel_image_is_slid() -> TestResult {
+        let slide = KERNEL_SLIDE.load(Ordering::Relaxed);
+        if slide == 0 {
+            // `KASLR_SLIDE_MASK` is 0 in the linker script, so the machinery
+            // is built and exercised but deliberately inert.
+            //
+            // Enabling it boots and runs most of the suite, but regresses
+            // `drivers/storage/nvme-e2e`, so the mask stays at 0 until that is
+            // understood. A Skip rather than a Pass on purpose: an inert KASLR
+            // must not read as a working one.
+            return TestResult::Skip("KASLR_SLIDE_MASK is 0 — the image is not slid");
+        }
+        // 2 MiB pages back the window, so anything finer cannot be mapped.
+        if slide & 0x1F_FFFF != 0 {
+            return TestResult::Fail("the slide is not 2 MiB aligned");
+        }
+        // Must stay clear of the module text window one GiB above the link
+        // base, or the image lands on top of it.
+        if slide >= (1 << 30) {
+            return TestResult::Fail("the slide reaches the module text window");
+        }
+
+        // The live base has to match where code actually is. Taking the
+        // address of a function goes through a relocation, so this compares
+        // the patched world against the recorded slide.
+        let here = smoke_kaslr_kernel_image_is_slid as usize as u64;
+        if here < kernel_virt_base() {
+            return TestResult::Fail("kernel code sits below the slid base");
+        }
+        if here < KERNEL_LINK_BASE + slide {
+            return TestResult::Fail("code address disagrees with the recorded slide");
+        }
+        // And the conversion has to undo it: a text address minus the live
+        // base is a physical address inside the 1 GiB window.
+        if image_virt_to_phys(here) >= (1 << 30) {
+            return TestResult::Fail(
+                "image_virt_to_phys produced an out-of-window physical address",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/kaslr", smoke_kaslr_kernel_image_is_slid);
+}
+
 /// Pull one 64-bit value of randomness using the best available source.
 ///
 /// Returns the value plus a tag identifying the source so observability

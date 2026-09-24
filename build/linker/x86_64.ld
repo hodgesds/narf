@@ -21,6 +21,23 @@ KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
  * table does not fit rather than writing a short one. */
 KASLR_RELOC_RESERVE = 4M;
 
+/* Largest slide the kernel window may take, as a mask of the low bits.
+ *
+ * The module text window begins 1 GiB above the link base, so the image plus
+ * its slide has to stay below that. 256 MiB leaves the ~78 MiB image well
+ * clear of it with room to grow, and is a single mask the 32-bit entry can
+ * apply with one AND. `KERNEL_RANDOM_BITS = 30` in kaslr.rs describes the
+ * 1 GiB kernel slot, NOT how far the image may move inside it. */
+/* Currently 0: the slide is implemented end to end and boots, but enabling it
+ * regresses `drivers/storage/nvme-e2e`, so it stays off until that is
+ * diagnosed. Set to 0x0FE00000 (254 MiB, already 2 MiB aligned) to enable.
+ *
+ * That value is a hand-picked bound, not a derived one. The real constraint is
+ * that the image plus its slide must stay clear of the module text window one
+ * GiB above the link base; deriving it from `__kernel_end` would keep it
+ * honest as the image grows. */
+KASLR_SLIDE_MASK = 0x00000000;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -147,10 +164,23 @@ SECTIONS
      * jumps to 0x0 — the weston/SMP #UD heisenbug (rip=0x3, etc.).
      */
     .got : AT(ADDR(.got) - KERNEL_VIRT_BASE) ALIGN(8) {
+        __got_start = .;
         *(.got)
         *(.got.plt)
         *(.data.rel.ro .data.rel.ro.*)
+        __got_end = .;
     } :data
+
+    /* Physical aliases of the GOT, for the 32-bit slide pass.
+     *
+     * The GOT needs fixing up and carries NO relocation records: LLD resolves
+     * each slot at link time to an absolute kernel-half address, so
+     * `--emit-relocs` has nothing to report and the table cannot see them. An
+     * unslid GOT is an immediate instruction-fetch fault on the first indirect
+     * call through it. Linux fixes its own GOT explicitly in head_64.S for the
+     * same reason. */
+    __got_phys_start = __got_start - KERNEL_VIRT_BASE;
+    __got_phys_end   = __got_end   - KERNEL_VIRT_BASE;
 
     . = ALIGN(4K);
     __kernel_end = . - KERNEL_VIRT_BASE;

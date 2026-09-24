@@ -267,7 +267,10 @@ fn alias_vas(phys: u64) -> ([u64; 2], usize) {
     const KERNEL_WINDOW_SPAN: u64 = 1 << 30;
     let mut out = [0u64; 2];
     let mut n = 0;
-    if phys < KERNEL_WINDOW_SPAN {
+    // The slid window covers phys [0, span - slide): its tail was given up to
+    // keep it clear of the module text window at PDPT[511].
+    let slide = crate::kaslr::KERNEL_SLIDE.load(core::sync::atomic::Ordering::Relaxed);
+    if phys + slide < KERNEL_WINDOW_SPAN {
         // The window follows the image: a KASLR slide moves it, and a
         // hardcoded base would hand `set_range_writable` a VA with no present
         // leaf — exactly the failure this function's own docs warn about.

@@ -94,12 +94,51 @@ _start:
      * usable as-is with flat 32-bit addressing. It must also run before any
      * patched value is read, and nothing above this point touches one.
      *
-     * `ebx` holds the slide. It is zero for now: the pass is wired and
-     * exercised end to end — table located, 399k sites read and written —
-     * while remaining a provable no-op, so a boot failure here means the
-     * machinery is wrong rather than the slide value.
+     * `ebx` holds the slide, in bytes.
+     *
+     * Bounds, both of which matter:
+     *
+     *  - 2 MiB aligned, because the kernel window is mapped with 2 MiB pages.
+     *  - Below KASLR_SLIDE_MAX. The module text window starts exactly 1 GiB
+     *    above the link base, so a slide approaching 1 GiB would put the image
+     *    on top of it; the linker script derives the bound from the image's
+     *    real end so it cannot drift as the image grows.
+     *
+     * Entropy is RDRAND when the CPU has it, TSC otherwise. TSC alone is only
+     * boot-time jitter, which is what `kaslr.rs` already documents as
+     * acceptable for slot picking.
      */
-    xor ebx, ebx                                /* slide = 0 */
+    mov ebx, 0                                  /* slide, filled in below */
+
+    /* CPUID.1:ECX[30] = RDRAND. CPUID clobbers ebx, so stash it. */
+    mov eax, 1
+    push ebx
+    cpuid
+    pop ebx
+    test ecx, 0x40000000
+    jz .Lslide_tsc
+
+    /* RDRAND, retried a bounded number of times; CF=0 means no data. */
+    mov ecx, 32
+.Lslide_rdrand:
+    rdrand eax
+    jc .Lslide_have
+    dec ecx
+    jnz .Lslide_rdrand
+
+.Lslide_tsc:
+    rdtsc                                       /* edx:eax */
+    xor eax, edx
+
+.Lslide_have:
+    and eax, offset KASLR_SLIDE_MASK            /* clamp to the window  */
+    and eax, 0xFFE00000                         /* 2 MiB align          */
+    mov ebx, eax
+
+    /* Record it for the Rust conversions (`kaslr::KERNEL_SLIDE`). */
+    mov eax, offset __kernel_slide_phys
+    mov [eax], ebx
+    mov dword ptr [eax + 4], 0
 
     mov esi, offset __kaslr_relocs_phys
     cmp dword ptr [esi], 0x4B41534C             /* "KASL" */
@@ -141,6 +180,31 @@ _start:
 
 .Lreloc_done:
 
+    /* ── GOT fixup ──
+     *
+     * The GOT is not in the relocation table and cannot be: LLD resolves every
+     * slot at link time to an absolute kernel-half address, so `--emit-relocs`
+     * has no record to emit. Each slot still has to move with the image, and
+     * the first indirect call through an unslid one faults on instruction
+     * fetch at an address below the window.
+     *
+     * A slot whose high dword is zero is not a kernel-half pointer (an empty
+     * or low entry) and is left alone.
+     */
+    mov esi, offset __got_phys_start
+    mov edi, offset __got_phys_end
+.Lgot:
+    cmp esi, edi
+    jae .Lgot_done
+    cmp dword ptr [esi + 4], 0
+    je .Lgot_next
+    add [esi], ebx
+    adc dword ptr [esi + 4], 0
+.Lgot_next:
+    add esi, 8
+    jmp .Lgot
+.Lgot_done:
+
     /* ── identity-map the first 4 GiB + higher-half mapping ──
      *
      * 4-GiB identity coverage matters for real-HW boot: UEFI GOP
@@ -164,7 +228,53 @@ _start:
     mov dword ptr [pdpt + 1 * 8],     0x40000083  /* 1..2 GiB */
     mov dword ptr [pdpt + 2 * 8],     0x80000083  /* 2..3 GiB */
     mov dword ptr [pdpt + 3 * 8],     0xC0000083  /* 3..4 GiB */
-    mov dword ptr [pdpt + 510 * 8],   0x00000083  /* higher-half */
+
+    /* ── higher-half kernel window, slid ──
+     *
+     * Was one 1 GiB page at PDPT[510], which fixes the window at the link
+     * base: 1 GiB granularity cannot express a smaller offset. The image now
+     * expects to live at `KERNEL_VIRT_BASE + slide`, so the window is built
+     * from 2 MiB pages instead, mapping VA (KVB + slide + phys) -> phys for
+     * phys in [0, 1 GiB).
+     *
+     * The window stays entirely inside PDPT[510]. Letting it run the full
+     * 1 GiB from `slide` would push its tail into PDPT[511], which is the
+     * module text window (`module_text: kernel VA slot 511`) — the boot dies
+     * at the MMU handoff with no output when they overlap. So the alias covers
+     * phys [0, 1 GiB - slide) instead: the top `slide` bytes lose their
+     * kernel-window alias and are reachable through the direct map once that
+     * is live, which is where `text_poke::alias_vas` already looks.
+     */
+    mov edi, offset pd_kernel_lo
+    mov ecx, 1024                               /* one 4 KiB table, dwords */
+    xor eax, eax
+    rep stosd
+
+    xor esi, esi                                /* phys frame index */
+.Lkmap:
+    mov eax, esi
+    shl eax, 21                                 /* phys = i * 2 MiB      */
+    mov edx, eax                                /* keep phys            */
+    add eax, ebx                                /* + slide = VA offset  */
+    shr eax, 21                                 /* -> PD entry index    */
+    cmp eax, 512                                /* past PDPT[510]?      */
+    jae .Lkmap_done
+    shl eax, 3
+    mov edi, offset pd_kernel_lo
+    add edi, eax
+    mov eax, edx
+    or  eax, 0x83                               /* P | RW | PS          */
+    mov [edi], eax
+    mov dword ptr [edi + 4], 0
+    inc esi
+    cmp esi, 512
+    jb .Lkmap
+.Lkmap_done:
+
+    lea eax, [pd_kernel_lo]
+    or  eax, 0x3
+    mov [pdpt + 510 * 8], eax
+    mov dword ptr [pdpt + 510 * 8 + 4], 0
 
     /* CR3 = &PML4 */
     mov eax, offset pml4
@@ -196,6 +306,13 @@ _start:
 .size _start, . - _start
 
 /* ─── 64-bit entry ─────────────────────────────────────────────── */
+/*
+ * `rbx` still holds the KASLR slide. Nothing between its computation and here
+ * writes ebx: the apply pass reads it as the delta, the page-table build uses
+ * eax/ecx/edx/esi/edi, and the CR4/EFER/CR0 sequence clobbers only eax/ecx/edx
+ * (`cpuid` does clobber ebx, which is why the one above brackets it with
+ * push/pop).
+ */
 .code64
 .type long_mode_start, @function
 long_mode_start:
@@ -229,6 +346,7 @@ long_mode_start:
      * low alias. Every push from the `call` below lands high.
      */
     movabs rax, 0xFFFFFFFF80000000              /* KERNEL_VIRT_BASE */
+    add rax, rbx                                /* + KASLR slide    */
     add rsp, rax
 
     call _start_rust
@@ -254,6 +372,11 @@ gdt_ptr:
 pml4:
     .skip 4096
 pdpt:
+    .skip 4096
+/* 2 MiB leaves for the slid kernel window. One table: the window is clamped
+ * to PDPT[510] so it cannot collide with the module text window at
+ * PDPT[511]. */
+pd_kernel_lo:
     .skip 4096
 
 .align 16

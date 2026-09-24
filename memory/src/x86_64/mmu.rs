@@ -560,6 +560,16 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // text through this window. Making kernel text read-only is a
         // separate, larger change (it needs a text-poke path of its own) and
         // is *not* claimed by this work.
+        // The window is placed at `base + slide`, matching what `boot.S` built
+        // and what every relocated address in the image now expects.
+        //
+        // It is CLAMPED to PDPT[510]. Running the full 1 GiB from `slide`
+        // would extend into PDPT[511], which is the module text window — and
+        // an overlap there kills the boot at this exact CR3 load with no
+        // output, because the fault handler disappears along with everything
+        // else. The alias therefore covers phys [0, 1 GiB - slide); the top
+        // `slide` bytes are reachable through the direct map instead.
+        let slide = crate::kaslr::KERNEL_SLIDE.load(core::sync::atomic::Ordering::Relaxed);
         write_identity::<PageTableEntry>(
             PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8),
             PageTableEntry::new(pd_hi_kernel_addr, flags_ptr),
@@ -570,7 +580,14 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             if !kernel_window_leaf_needs_exec(phys, 1 << 21) {
                 flags |= PtFlags::NO_EXEC;
             }
-            let slot = PhysAddr::new(pd_hi_kernel_addr.raw() + two_mb * 8);
+            // Index by the VIRTUAL offset from the window's base, which the
+            // slide shifts, not by the physical frame number. Anything past
+            // the end of this PD would land in the module window, so stop.
+            let pd_index = (slide + phys) >> 21;
+            if pd_index >= 512 {
+                break;
+            }
+            let slot = PhysAddr::new(pd_hi_kernel_addr.raw() + pd_index * 8);
             write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
         }
     }
