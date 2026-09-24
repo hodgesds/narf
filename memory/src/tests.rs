@@ -15888,83 +15888,6 @@ kernel_test_in!("memory", smoke_memory_brk_growth_rejects_foreign_root);
 // kernel write could reach. These tests are the reason that claim can now be
 // made, and the reason it will fail loudly if a future edit takes it back.
 
-/// Jump to `alias` under an armed recoverable probe and report what the CPU
-/// did.
-///
-/// The first 14 bytes of `alias` are overwritten with an absolute indirect
-/// jump back to the probe's own recovery label, so the "it was executable
-/// after all" branch lands somewhere safe instead of running whatever
-/// happened to be in the page. A test whose failure mode is an unrecoverable
-/// kernel crash tells you nothing.
-///
-/// # Safety
-/// `alias` must be a writable kernel mapping of a frame the caller owns, at
-/// least 14 bytes long.
-#[cfg(target_arch = "x86_64")]
-unsafe fn probe_fetch_at(alias: u64) -> narf_arch::x86_64::probe::Caught {
-    use core::arch::asm;
-    use narf_arch::x86_64::probe;
-
-    let recovery: u64;
-    // SAFETY: LEA of a local label is always safe.
-    unsafe {
-        asm!(
-            "lea {r}, [66f + rip]",
-            r = out(reg) recovery,
-            options(nostack, preserves_flags),
-        );
-    }
-
-    // `FF 25 00 00 00 00` = `jmp qword ptr [rip + 0]`, followed by the
-    // 8-byte absolute target. Position-independent, so it works for any
-    // distance between the alias and the kernel image — a `jmp rel32` does
-    // not: the identity alias of a buddy frame and a `-2 GiB` kernel label
-    // are almost exactly 2 GiB apart, right on the `i32` boundary.
-    const JMP_INDIRECT: [u8; 6] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
-    // SAFETY: per the fn contract, `alias` is a writable mapping of a frame
-    // the caller owns and 14 bytes fit inside it.
-    unsafe {
-        let p = alias as *mut u8;
-        for (i, b) in JMP_INDIRECT.iter().enumerate() {
-            p.add(i).write_volatile(*b);
-        }
-        for (i, b) in recovery.to_le_bytes().iter().enumerate() {
-            p.add(6 + i).write_volatile(*b);
-        }
-    }
-
-    probe::arm(recovery);
-    // SAFETY: either the fetch faults (the probe redirects RIP to `66:`) or
-    // the stub we just wrote jumps to the same label. Both paths converge
-    // with the stack untouched.
-    unsafe {
-        asm!(
-            "jmp {p}",
-            "66:",
-            p = in(reg) alias,
-            options(nostack),
-        );
-    }
-    probe::disarm()
-}
-
-/// Classify what [`probe_fetch_at`] caught, so the three tests below agree on
-/// what "the alias is not executable" means.
-#[cfg(target_arch = "x86_64")]
-fn expect_nx_fault(caught: narf_arch::x86_64::probe::Caught, what: &'static str) -> TestResult {
-    match caught.vector {
-        None => TestResult::Fail(what),
-        Some(14) => {
-            if caught.error_code & (1 << 4) == 0 {
-                TestResult::Fail("faulted, but not on instruction fetch — not NX")
-            } else {
-                TestResult::Pass
-            }
-        }
-        Some(_) => TestResult::Fail("wrong vector caught (not #PF)"),
-    }
-}
-
 /// The load-bearing negative test: a frame the buddy handed out is writable
 /// at its identity alias and **not executable there**.
 ///
@@ -16014,11 +15937,19 @@ kernel_test_in!(
 /// `PML4[511]/PDPT[510]` used to be one 1 GiB RWX huge page over physical
 /// 0..1 GiB — precisely where a small machine's buddy allocates — so NXing
 /// only the identity map would have left a complete, equally reachable
-/// replacement alias at `KERNEL_VIRT_BASE + phys`.
+/// replacement alias at `KERNEL_VIRT_BASE + phys`. Demoting it to 2 MiB leaves
+/// and NXing everything outside kernel text was the first answer, and this
+/// case used to assert exactly that: probe the alias, expect an NX fault.
+///
+/// The window now maps only the kernel image, so a buddy frame has no
+/// higher-half alias at all. That is strictly stronger than an NX one — there
+/// is nothing to mark non-executable — and it is what this asserts instead.
+/// Keeping the old probe would test nothing: it would fault not-present rather
+/// than NX, for a reason unrelated to executability.
 #[cfg(target_arch = "x86_64")]
-fn smoke_kernel_window_alias_of_buddy_frame_is_nx() -> TestResult {
-    use crate::{alloc_frame, free_frame, FrameAllocError};
-    const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+fn smoke_kernel_window_does_not_alias_buddy_frames() -> TestResult {
+    use crate::paging::{leaf_flags_at, read_cr3};
+    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
 
     let frame = match alloc_frame() {
         Ok(f) => f,
@@ -16028,21 +15959,33 @@ fn smoke_kernel_window_alias_of_buddy_frame_is_nx() -> TestResult {
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     let phys = frame.start_address().raw();
+    // Past the window's own 1 GiB PD no alias can exist by construction, and
+    // the VA would run off the top of the address space.
     if phys >= (1u64 << 30) {
         free_frame(frame);
-        return TestResult::Skip("frame is outside the higher-half kernel window");
+        return TestResult::Pass;
     }
 
-    // SAFETY: the kernel window aliases this frame writably and we own it.
-    let caught = unsafe { probe_fetch_at(KERNEL_VIRT_BASE + phys) };
+    // Walk the live tables rather than asking `kernel_window_covers`: that is
+    // the predicate the mapping code itself uses, so a test built on it would
+    // agree with `init_mmu` even if both were wrong. The window maps
+    // `kernel_virt_base() + phys`, slide included.
+    let va = crate::kaslr::kernel_virt_base().wrapping_add(phys);
+    // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
+    let cr3 = unsafe { read_cr3() };
+    // SAFETY: the live PML4 is reachable through the direct map.
+    let flags = unsafe { leaf_flags_at(cr3, VirtAddr::new(va)) };
     free_frame(frame);
-    expect_nx_fault(
-        caught,
-        "kernel-window alias of a buddy frame was executable",
-    )
+    match flags {
+        None => TestResult::Pass,
+        // A present leaf here means the buddy handed out a frame the image
+        // window maps — either the window is oversized again, or the frame
+        // allocator is handing out kernel image memory.
+        Some(_) => TestResult::Fail("buddy frame still has a higher-half kernel-window alias"),
+    }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_kernel_window_alias_of_buddy_frame_is_nx);
+kernel_test_in!("memory", smoke_kernel_window_does_not_alias_buddy_frames);
 
 /// Positive control for the demotion: the AP trampoline window is still
 /// executable, at 4 KiB granularity, and the page just past it is not.

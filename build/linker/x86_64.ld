@@ -36,6 +36,12 @@ KASLR_RELOC_RESERVE = 4M;
  * that the image plus its slide must stay clear of the module text window one
  * GiB above the link base; deriving it from `__kernel_end` would keep it
  * honest as the image grows. */
+/* Still 0. The kernel-window shrink in `init_mmu` removed the image-vs-alias
+ * conflict that defeated the first two attempts, and with the slide on the
+ * kernel now boots and runs hundreds of tests — but `drivers/storage/nvme-e2e`
+ * still fails, for a reason that is NOT the window shape: it fails identically
+ * with the old 1 GiB window, the clamped window and the shrunk one.
+ * Set to 0x0FE00000 to enable. */
 KASLR_SLIDE_MASK = 0x00000000;
 
 PHDRS

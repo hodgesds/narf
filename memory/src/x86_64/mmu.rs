@@ -162,6 +162,9 @@ unsafe extern "C" {
     static __kernel_start: u8;
     /// End of `.text`, as a *kernel-virtual* address.
     static __text_end: u8;
+    /// End of the whole image, as a *physical* address: the linker script
+    /// subtracts `KERNEL_VIRT_BASE` when defining it.
+    static __kernel_end: u8;
 }
 
 /// The one physical range that must remain executable through *both* the low
@@ -196,6 +199,25 @@ fn kernel_exec_phys_range() -> (u64, u64) {
 #[inline]
 const fn overlaps(base: u64, len: u64, lo: u64, hi: u64) -> bool {
     base < hi && lo < base + len
+}
+
+/// How many 2 MiB leaves the kernel window covers: the image, rounded up.
+///
+/// Clamped to a full PD so a pathologically large image cannot run past the
+/// slot and into the module text window above it.
+pub fn kernel_window_leaves() -> u64 {
+    let end = core::ptr::addr_of!(__kernel_end) as u64;
+    (end.next_multiple_of(1 << 21) >> 21).min(512)
+}
+
+/// Whether the kernel window maps `phys`.
+///
+/// `text_poke` asks before offering the window as an alias: naming a VA the
+/// window no longer covers hands `set_range_writable` an address with no
+/// present leaf, which fails the seal — and a failed seal is reported as
+/// "the image could not be mapped".
+pub fn kernel_window_covers(phys: u64) -> bool {
+    phys < (kernel_window_leaves() << 21)
 }
 
 /// True if a leaf covering `[phys, phys + len)` must be executable through the
@@ -574,17 +596,42 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8),
             PageTableEntry::new(pd_hi_kernel_addr, flags_ptr),
         );
-        for two_mb in 0u64..512 {
+        // Only the IMAGE is mapped here, not all of phys 0..1 GiB.
+        //
+        // The window used to alias the whole first GiB, so every frame a
+        // small-RAM boot allocated — heap, BPF packs, page tables — sat behind
+        // a writable kernel alias that `text_poke` then had to seal one pack at
+        // a time. Nothing needs that alias: `PhysAddr::kernel_mut_ptr` routes
+        // kernel physical access through the direct map (identity before
+        // `init_mmu` installs it), and `set_range_writable` splits the direct
+        // map's 1 GiB leaves when a seal needs finer granularity.
+        //
+        // Linux's kernel text mapping covers `KERNEL_IMAGE_SIZE` and nothing
+        // else, with the direct map in its own PML4 range. Matching that is
+        // also what frees room inside this one PDPT slot for a KASLR slide:
+        // the window no longer has to be both the image's home and a fixed
+        // alias of the first GiB, which is a pair of requirements no single
+        // 1 GiB PD can satisfy at once.
+        for two_mb in 0u64..kernel_window_leaves() {
             let phys = two_mb << 21;
             let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
             if !kernel_window_leaf_needs_exec(phys, 1 << 21) {
                 flags |= PtFlags::NO_EXEC;
             }
             // Index by the VIRTUAL offset from the window's base, which the
-            // slide shifts, not by the physical frame number. Anything past
-            // the end of this PD would land in the module window, so stop.
+            // slide shifts, not by the physical frame number.
+            //
+            // Now that the window covers only the image there is room for the
+            // slide inside this one PD, so nothing has to be clamped or
+            // wrapped. Both of those were tried while the window still spanned
+            // the whole first GiB: clamping dropped aliases the seal path
+            // needed, and wrapping broke the contiguity that range mapping
+            // assumes. Shrinking the window is what removes the conflict
+            // rather than trading one half of it away.
             let pd_index = (slide + phys) >> 21;
             if pd_index >= 512 {
+                // Only reachable if the image plus the slide outgrew the slot,
+                // which `KASLR_SLIDE_MASK` is chosen to prevent.
                 break;
             }
             let slot = PhysAddr::new(pd_hi_kernel_addr.raw() + pd_index * 8);
