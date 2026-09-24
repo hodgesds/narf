@@ -41,13 +41,6 @@ KASLR_RELOC_RESERVE = 4M;
  * clear of it with room to grow, and is a single mask the 32-bit entry can
  * apply with one AND. `KERNEL_RANDOM_BITS = 30` in kaslr.rs describes the
  * 1 GiB kernel slot, NOT how far the image may move inside it. */
-/* Enabled. A nonzero slide used to fail in one of two ways, both traced to
- * one defect in the relocation-table builder: it slid every absolute field in
- * a kernel-half section, including the few encoding `__kernel_start` /
- * `__kernel_end`, which are PHYSICAL. See `relocs.rs` and
- * `smoke_kaslr_image_bounds_stay_physical`. Verified at slides of 2, 8, 32,
- * 128 and 254 MiB and on the random path. */
-KASLR_SLIDE_MASK = 0x0FE00000;
 
 /* Debug: pin the slide to a fixed value instead of drawing entropy, so a
  * slide-dependent failure is reproducible and bisectable. The random path
@@ -212,6 +205,40 @@ SECTIONS
         *(.gcc_except_table*)
     }
 }
+
+/* ── KASLR slide bound ────────────────────────────────────────────────────
+ *
+ * Derived from the image, not hand-picked. This was 0x0FE00000 (254 MiB) with
+ * a comment admitting it was a guess that had to be revisited as the image
+ * grew; the real constraint is that the image plus its slide stays below the
+ * module text window at `KERNEL_IMAGE_SIZE`.
+ *
+ * Masks are contiguous and 2 MiB aligned, `m(k) = 2^k - 2 MiB`, because the
+ * slide is chosen with a single AND: `entropy & MASK`. That yields a submask
+ * of MASK, so a NON-contiguous mask would silently cost entropy — the gaps
+ * are bits the slide can never set. Deriving `align_down(slack, 2 MiB)`
+ * directly is the obvious approach and is exactly that mistake: for today's
+ * image it gives 0x3A000000, whose four set bits allow 16 positions where a
+ * contiguous mask allows 256.
+ *
+ * Picking the largest `m(k) <= slack` needs no log2 and no ternary (LLD has
+ * neither): since `m(k) - m(k-1) == 2^(k-1)`, summing `2^(k-1)` over every
+ * `m(k)` that fits telescopes to the largest one that does.
+ *
+ * `KASLR_ENABLE = 0` turns the slide off wholesale — the mask reaching 0 is
+ * how `smoke_kaslr_kernel_image_is_slid` decides to Skip rather than Pass. */
+KASLR_ENABLE = 1;
+KASLR_SLIDE_SLACK = KERNEL_IMAGE_SIZE - __kernel_end;
+KASLR_SLIDE_MASK = KASLR_ENABLE * (
+      (KASLR_SLIDE_SLACK >= 0x3FE00000) * 0x20000000
+    + (KASLR_SLIDE_SLACK >= 0x1FE00000) * 0x10000000
+    + (KASLR_SLIDE_SLACK >= 0x0FE00000) * 0x08000000
+    + (KASLR_SLIDE_SLACK >= 0x07E00000) * 0x04000000
+    + (KASLR_SLIDE_SLACK >= 0x03E00000) * 0x02000000
+    + (KASLR_SLIDE_SLACK >= 0x01E00000) * 0x01000000
+    + (KASLR_SLIDE_SLACK >= 0x00E00000) * 0x00800000
+    + (KASLR_SLIDE_SLACK >= 0x00600000) * 0x00400000
+    + (KASLR_SLIDE_SLACK >= 0x00200000) * 0x00200000);
 
 ASSERT(__boot_end <= __text_start - KERNEL_VIRT_BASE,
        "linker: .boot section must come before .text — see build/ §4")
