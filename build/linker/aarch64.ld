@@ -18,6 +18,23 @@ KERNEL_VIRT_BASE = 0xFFFFFF8000000000;
  * headroom; `xtask` fails the build if the table outgrows it. */
 KASLR_RELOC_RESERVE = 1M;
 
+/* KASLR slide bound. Still 0: the table is built and the apply pass in
+ * `boot.S` is wired, but the image and the RAM linear map share
+ * `hi_L1[1]` — image VA is `KERNEL_VIRT_BASE + phys`, which is also what
+ * `PhysAddr::kernel_ptr` resolves to — so sliding the image inside that slot
+ * would overwrite linear entries for unrelated physical addresses. The image
+ * needs its own VA region first (Linux: `KIMAGE_VADDR` separate from
+ * `PAGE_OFFSET`, with `kimage_voffset` between them).
+ *
+ * Derived from the image the way x86_64's is once that lands. */
+KASLR_ENABLE = 0;
+KASLR_SLIDE_MASK = 0x00000000;
+
+/* Debug: pin the slide instead of drawing entropy, so a slide-dependent
+ * failure is reproducible. Masked and aligned by the same code as a drawn
+ * value, so it cannot widen the window. 0 = draw entropy. */
+KASLR_SLIDE_FIXED = 0x00000000;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */

@@ -57,6 +57,97 @@ _start:
     add  x0, x0, #:lo12:stack_top
     mov  sp, x0
 
+    /* ── KASLR: pick a slide and apply the relocation table ─────────────
+     *
+     * Runs here, with the MMU off and `.boot` executing at its load address,
+     * because every site the table names is a PHYSICAL address and every
+     * value it patches is a kernel-half VA that nothing may dereference until
+     * it has been fixed up.
+     *
+     * x20 holds the slide from here to the page-table build. x19 already holds
+     * the DTB pointer and must survive.
+     *
+     * Entropy: RNDR (FEAT_RNG, CPUID ID_AA64ISAR0_EL1.RNDR != 0) when the CPU
+     * has it, the virtual counter otherwise. CNTVCT alone is boot-time jitter,
+     * which `kaslr.rs` already documents as acceptable for slot picking and is
+     * what the x86_64 stub falls back to as well.
+     */
+    mov  x20, #0                        /* slide, filled in below */
+
+    ldr  x0, =KASLR_SLIDE_MASK
+    cbz  x0, .Lkaslr_done               /* mask 0 -> KASLR disabled */
+
+    /* A pinned slide skips entropy entirely; it still passes through the mask
+     * and alignment below, so it cannot escape the window. */
+    ldr  x1, =KASLR_SLIDE_FIXED
+    cbnz x1, .Lkaslr_have
+
+    /* ID_AA64ISAR0_EL1.RNDR is bits [63:60]. */
+    mrs  x1, id_aa64isar0_el1
+    lsr  x1, x1, #60
+    cbz  x1, .Lkaslr_tsc
+    mrs  x1, s3_3_c2_c4_0               /* RNDR */
+    cbnz x1, .Lkaslr_have               /* RNDR reads 0 on failure */
+.Lkaslr_tsc:
+    mrs  x1, cntvct_el0
+
+.Lkaslr_have:
+    and  x1, x1, x0                     /* clamp to the window  */
+    and  x1, x1, #0xFFFFFFFFFFE00000    /* 2 MiB align          */
+    mov  x20, x1
+    cbz  x20, .Lkaslr_done              /* drew zero: nothing to apply */
+
+    /* Record it for the Rust conversions (`kaslr::KERNEL_SLIDE`). */
+    ldr  x0, =__kernel_slide_phys
+    str  x20, [x0]
+
+    /* Apply the table. Header: magic, n_abs64, n_abs32s, n_pcrel32,
+     * n_abs64_low, then the site lists as u32 offsets.
+     *
+     * Both aarch64 lists are 64-bit absolute fields and both resolve to
+     * PHYSICAL addresses: image `phys == VA - KERNEL_VIRT_BASE`, so a
+     * kernel-half site stored relative to the base IS its physical address,
+     * and a low-half site is physical already. One loop covers both.
+     * `abs32s` and `pcrel32` are x86_64 classes and are always 0 here.
+     */
+    ldr  x0, =__kaslr_relocs_phys
+    ldr  w1, [x0]
+    mov  w2, #0x534C                    /* "KASL" = 0x4B41534C */
+    movk w2, #0x4B41, lsl #16
+    cmp  w1, w2
+    b.ne .Lkaslr_done                   /* never patched — skip the slide */
+
+    ldr  w3, [x0, #4]                   /* n_abs64                     */
+    ldr  w4, [x0, #16]                  /* n_abs64_low                 */
+    add  x3, x3, x4                     /* both lists, one loop        */
+    add  x5, x0, #20                    /* -> first site offset        */
+
+    /* The abs32s/pcrel32 lists sit between abs64 and abs64_low in the
+     * encoding, and are empty on aarch64 — asserted rather than assumed,
+     * because a nonzero count would make the second list start elsewhere. */
+    ldr  w6, [x0, #8]
+    ldr  w7, [x0, #12]
+    orr  w6, w6, w7
+    cbnz w6, .Lkaslr_bad
+
+.Lkaslr_apply:
+    cbz  x3, .Lkaslr_done
+    ldr  w6, [x5], #4                   /* site offset == physical addr */
+    ldr  x7, [x6]
+    add  x7, x7, x20
+    str  x7, [x6]
+    sub  x3, x3, #1
+    b    .Lkaslr_apply
+
+.Lkaslr_bad:
+    /* An x86_64-only list is populated: the encoding is not what this pass
+     * expects and the site offsets cannot be trusted. Hang rather than patch
+     * the wrong words -- there is no console this early. */
+    wfi
+    b    .Lkaslr_bad
+
+.Lkaslr_done:
+
     /* --- Build temporary 4-level page tables ---
      * lo_L0 -> lo_L1 -> Blocks
      * hi_L0 -> hi_L1 -> Blocks
