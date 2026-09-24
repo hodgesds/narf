@@ -370,6 +370,27 @@ static REDIRECT_LOG: IrqSafeSpinLock<[RedirectPeer; REDIRECT_PEERS]> = IrqSafeSp
     }; REDIRECT_PEERS],
 );
 
+/// Clear the redirect budget.
+///
+/// The budget is global and deliberately survives everything else a test
+/// resets, because Linux's `inet_peer` entries do too. That makes two tests
+/// sharing a source address order-dependent: one that deliberately exhausts
+/// the budget (proving the rate limit works) silences any later test that
+/// expects a redirect from the same sender. Test order is linker-section
+/// order and differs per arch, so the pair passed on x86_64 and failed on
+/// aarch64.
+#[doc(hidden)]
+pub fn __reset_for_test() {
+    let mut g = REDIRECT_LOG.lock();
+    for p in g.iter_mut() {
+        *p = RedirectPeer {
+            addr: [0, 0, 0, 0],
+            count: 0,
+            last_ns: 0,
+        };
+    }
+}
+
 /// Claim a redirect for `dst`, or refuse because it has had enough.
 fn redirect_budget(dst: [u8; 4]) -> bool {
     let now = narf_time::monotonic_ns();

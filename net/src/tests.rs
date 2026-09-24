@@ -8151,21 +8151,33 @@ fn smoke_net_gateway_config_installs_default_route() -> TestResult {
     crate::iface::register(GWIF, [0x02, 0, 0, 0, 0, 0x99], |_| Ok(()));
     crate::iface::set_iface_ipv4(GWIF, [198, 51, 100, 2], GW);
 
-    let looked_up = crate::route::route_lookup(Ipv4Addr([203, 0, 113, 7]));
-
+    // Look for OUR default route in the FIB rather than asking
+    // `route_lookup` what it would pick. Another test's interface may already
+    // hold a default route — `e2e_tests.rs` installs one with `gateway ==
+    // its own IP` — and `Route::metric` only breaks ties between equal prefix
+    // lengths, so with both at the default metric the lookup may legitimately
+    // return theirs. That makes the assertion depend on test order, which is
+    // linker-section order and differs per arch: this passed on x86_64 and
+    // failed on every aarch64 boot.
     let default_net = Ipv4Net {
         addr: Ipv4Addr([0, 0, 0, 0]),
         prefix_len: 0,
     };
+    let installed = crate::route::route_list()
+        .into_iter()
+        .find(|r| r.iface == GWIF && r.dst == default_net);
+
     crate::route::route_delete(default_net, GWIF, TABLE_MAIN);
 
-    let r = match looked_up {
+    let r = match installed {
         Some(r) => r,
         None => {
-            return TestResult::Fail("no route for an off-link address — no default route in FIB");
+            return TestResult::Fail(
+                "configuring a gateway installed no default route for the interface",
+            );
         }
     };
-    if r.nexthop != Ipv4Addr(GW) {
+    if r.gateway != Some(Ipv4Addr(GW)) {
         return TestResult::Fail("default route did not carry the configured gateway as nexthop");
     }
     TestResult::Pass

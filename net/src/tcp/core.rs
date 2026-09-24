@@ -871,7 +871,24 @@ pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
 
 pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
     let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(())?;
-    let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, iface.gateway, 1000)?;
+    // Resolve the ROUTE's next hop, not the interface's `gateway` field.
+    //
+    // Linux picks it in `ip_neigh_for_gw` (include/net/route.h): the route's
+    // gateway when it has one, otherwise the destination itself —
+    // `rt_nexthop()` is the same rule. `RouteResult::nexthop` already encodes
+    // it, and `ip_forward.rs` already uses it.
+    //
+    // Resolving `iface.gateway` was wrong in both directions. An on-link peer
+    // must be ARPed directly, so a directly reachable destination became
+    // unreachable whenever the interface's gateway was unset or unresolvable;
+    // and a per-route gateway was ignored in favour of a per-interface field
+    // that no route need agree with. Because the failure returns before the
+    // SYN is built, it presents as "no SYN emitted" with the routing table
+    // and the peer's ARP entry both perfectly correct.
+    let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
+        .map(|r| r.nexthop.0)
+        .unwrap_or(remote_addr);
+    let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, 1000)?;
     let local_port = fresh_local_port();
     let id = fresh_tcb_id();
     let iss = compute_isn();
