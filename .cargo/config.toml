@@ -71,7 +71,7 @@ rustflags = [
     # (arch/arm64/kernel/pi/relocate.c); NARF reuses its own `--emit-relocs`
     # pipeline on both arches so there is one table format and one apply pass.
     "-C", "link-arg=--emit-relocs",
-    "-C", "code-model=large",
+    "-C", "code-model=small",
     "-C", "target-feature=+lse",
     "-C", "link-arg=-Tbuild/linker/aarch64.ld",
     "-C", "link-arg=--gc-sections",

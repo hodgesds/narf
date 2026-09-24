@@ -175,12 +175,20 @@ pub fn enter(domain: DomainId) -> DomainScope {
         use narf_arch::aarch64::{mte, Mte};
         use narf_arch::DomainPrimitive;
         if mte::supported() {
-            // The image's pages are `ATTR_TAGGED` with the domain's tag in
-            // every granule (`memory::module_text`), and the loader relocated
-            // against `tagged_base()`, so the module's own accesses carry that
-            // tag. Flipping TCF to Sync therefore makes a pointer into this
-            // image derived from another domain fault -- the aarch64
+            // What TCF=Sync protects here is the domain's DATA: `domain_heap`
+            // tags its allocations with `domain_tag_of(domain)`, and those
+            // pointers come from the allocator carrying the tag, so a pointer
+            // to another domain's buffer faults. That is the aarch64
             // equivalent of narrowing IA32_PKRS.
+            //
+            // It does NOT cover the module image. Image pages are plain
+            // `ATTR_NORMAL`: a module derives pointers to its own text and
+            // rodata from the PC, and a branch does not carry an MTE tag into
+            // the PC, so a tagged image faults on its own rodata as soon as
+            // the compiler emits ADRP instead of MOVZ/MOVK. See
+            // `module_text::Prot::leaf_flags` for the full account. The image
+            // is isolated by its sealing (RX/RO, UXN, PXN off text only) and
+            // its private window instead.
             //
             // Safe for everything else it touches: checks apply only to
             // `ATTR_TAGGED` pages, and the heap from `narf_kmalloc`, the
