@@ -108,9 +108,19 @@ use crate::{PhysAddr, PhysFrame, VirtAddr};
 
 // ── Window ─────────────────────────────────────────────────────────────
 
-/// Base kernel VA of the module image window.
+/// Base kernel VA of the module image window: immediately above the VA span
+/// reserved for the kernel image.
+///
+/// Derived, not written out, so it tracks `KERNEL_IMAGE_SIZE` instead of
+/// having to be edited in step with it. Linux places its own the same way:
+/// `MODULES_VADDR = __START_KERNEL_map + KERNEL_IMAGE_SIZE`
+/// (arch/x86/include/asm/pgtable_64_types.h).
+///
+/// This is also what a KASLR slide must not reach. The slide moves the image
+/// *up*, toward this window, and `build/linker/x86_64.ld` asserts at link time
+/// that the image plus the widest slide the mask permits still fits below it.
 #[cfg(target_arch = "x86_64")]
-pub const MODULE_VA_BASE: u64 = 0xFFFF_FFFF_C000_0000;
+pub const MODULE_VA_BASE: u64 = crate::kaslr::KERNEL_LINK_BASE + crate::kaslr::KERNEL_IMAGE_SIZE;
 /// Base kernel VA of the module image window: the top 128 MiB of the L0 slot
 /// **below** `KERNEL_VIRT_BASE`, ending exactly where it begins.
 ///
@@ -897,8 +907,12 @@ fn smoke_module_text_window_placement() -> TestResult {
         }
         // The kernel image is linked at -2 GiB. Both ends of the module window
         // must sit within i32 range of it in both directions.
-        const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
-        let far = (MODULE_VA_BASE + MODULE_VA_USABLE) as i64 - KERNEL_VIRT_BASE as i64;
+        //
+        // The shared constant, not a local copy: a file-local const with the
+        // right name and a stale value agrees with itself and with the test,
+        // which is how this class of bug survives review.
+        let far =
+            (MODULE_VA_BASE + MODULE_VA_USABLE) as i64 - crate::kaslr::KERNEL_LINK_BASE as i64;
         if far > i32::MAX as i64 {
             return TestResult::Fail("module window top is out of PC32 range of kernel text");
         }
