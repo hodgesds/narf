@@ -1617,6 +1617,17 @@ pub struct AddressSpace {
     /// Initial value 0x4080_0000_0000 matches the prior global —
     /// well above the ELF + brk regions and below the user stack.
     mmap_cursor: core::sync::atomic::AtomicU64,
+    /// Per-address-space floor of the mmap arena — Linux's `mm->mmap_base`.
+    ///
+    /// Randomized once per fresh address space and inherited across fork, so
+    /// the gap search in `find_unmapped_area` starts somewhere different in
+    /// each process. Searching from the CONSTANT floor is what kept
+    /// `mmap(NULL, ...)` landing at one fixed address everywhere even after
+    /// the cursor itself was randomized.
+    ///
+    /// Linux ref: `arch_get_unmapped_area` searches from `mm->mmap_base`,
+    /// which `arch_pick_mmap_base` randomizes at exec.
+    mmap_floor: core::sync::atomic::AtomicU64,
     /// Program break (top of the `brk(2)` heap), owned by the ADDRESS SPACE —
     /// not per-task. The heap is AS state: every `CLONE_VM` thread shares it and
     /// a real fork inherits it (see `clone_for_fork`). Keying it per-task let a
@@ -1664,9 +1675,34 @@ const fn ordinary_mutation_needs_remote_tlb(tag: u16, vm_shared: bool) -> bool {
 }
 
 impl AddressSpace {
-    /// Default base for the per-AS mmap cursor. Matches the prior
-    /// global MMAP_CURSOR so existing user binaries continue to see
-    /// mmap returning addresses in the same broad range.
+    /// This address space's randomized mmap floor — Linux's `mm->mmap_base`.
+    /// Test-only: a case that builds its own layout in the mmap arena has to
+    /// start from this, not from `MMAP_CURSOR_BASE`, or the gap scanner will
+    /// place relocations somewhere the case did not predict.
+    pub fn __test_mmap_floor(&self) -> u64 {
+        self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The live mmap cursor. Test-only: lets a case observe that fresh
+    /// address spaces are randomized rather than all starting at the floor.
+    pub fn __test_mmap_cursor(&self) -> u64 {
+        self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Floor of the per-AS mmap arena. Every fresh address space starts its
+    /// cursor at a randomized offset above this, via
+    /// [`crate::kaslr::user_mmap_slot`] — so this is the bottom of the window,
+    /// not the first address handed out.
+    ///
+    /// It used to BE the first address handed out, identically in every
+    /// process: `user_mmap_slot` existed, was tested, and had no caller, so
+    /// `kaslr.rs` described "kernel + userspace ASLR" while user mappings
+    /// landed at a fixed address in every address space.
+    ///
+    /// Randomization happens in the fresh-AS constructors only.
+    /// `clone_for_fork` inherits the parent's cursor, which is what Linux
+    /// does: `arch_pick_mmap_base` runs at exec, and fork keeps the layout it
+    /// was given.
     pub const MMAP_CURSOR_BASE: u64 = 0x0000_4080_0000_0000;
 
     /// Ceiling of the no-hint mmap window. The user stack lives at the
@@ -1712,6 +1748,7 @@ impl AddressSpace {
     /// Fresh address space with no regions. Stage-4 arch backend
     /// must assign `root` to a freshly-allocated page-table frame.
     pub fn empty() -> Self {
+        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         Self {
             root: PhysAddr::new(0),
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -1720,7 +1757,8 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
-            mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
+            mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
+            mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
@@ -2180,7 +2218,8 @@ impl AddressSpace {
         }
         let huge = self.huge_regions.lock();
         let regions = self.regions.lock();
-        Self::find_unmapped_area_locked(&regions, &huge, 0, len, align).map(VirtAddr::new)
+        let floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
+        Self::find_unmapped_area_locked(&regions, &huge, floor, 0, len, align).map(VirtAddr::new)
     }
 
     /// Reserve an mmap window with an aligned base. Any alignment padding is
@@ -2566,6 +2605,7 @@ impl AddressSpace {
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
+        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -2573,7 +2613,8 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(regions),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
-            mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
+            mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
+            mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
@@ -2598,6 +2639,7 @@ impl AddressSpace {
         // SAFETY: Valid memory or trusted environment
         let phys = unsafe { crate::aarch64::paging::new_user_ttbr0() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
+        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -2605,7 +2647,8 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(regions),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
-            mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
+            mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
+            mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
@@ -2801,11 +2844,19 @@ impl AddressSpace {
                 // Preserve the first-fit/reuse shape for an otherwise empty
                 // address space. Real processes retain image/stack VMAs and
                 // take the high-water fast path below.
-                Self::MMAP_CURSOR_BASE
+                self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed)
             } else {
                 self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed)
             };
-            Self::find_unmapped_area_locked(&regions, &huge, placement_hint, region.len, align)?
+            let floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
+            Self::find_unmapped_area_locked(
+                &regions,
+                &huge,
+                floor,
+                placement_hint,
+                region.len,
+                align,
+            )?
         };
         region.base = VirtAddr::new(selected);
         let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
@@ -2830,6 +2881,7 @@ impl AddressSpace {
     fn find_unmapped_area_locked(
         regions: &RegionTable,
         huge: &[HugeRegion],
+        floor: u64,
         hint: u64,
         len: u64,
         align: u64,
@@ -2893,7 +2945,12 @@ impl AddressSpace {
             }
         }
 
-        let mut candidate = Self::MMAP_CURSOR_BASE;
+        // Search from THIS address space's floor, not the shared constant.
+        // Starting at the constant is what kept `mmap(NULL, ...)` returning
+        // one fixed address in every process: randomizing the cursor alone
+        // does not move this scan, and this scan is what anonymous placement
+        // uses. Linux searches from `mm->mmap_base` for the same reason.
+        let mut candidate = floor;
         loop {
             candidate = align_up(candidate).ok_or(AddressSpaceError::MappingLimit)?;
             let end = candidate
@@ -10474,6 +10531,15 @@ impl AddressSpace {
         child
             .mmap_cursor
             .store(parent_cursor, core::sync::atomic::Ordering::Relaxed);
+        // The floor travels with the cursor. `new_for_user` gave the child a
+        // fresh random floor, but its regions are the parent's clones, so a
+        // different floor would make the child's gap search disagree with the
+        // layout it inherited. Linux's `dup_mm` copies `mmap_base` for the
+        // same reason; re-randomizing belongs at exec, not fork.
+        let parent_floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
+        child
+            .mmap_floor
+            .store(parent_floor, core::sync::atomic::Ordering::Relaxed);
         // A real fork inherits the parent's program break: the child clones the
         // heap regions, so its break must start where the parent's is (a fresh
         // `0` would let the first child brk mass-unmap the cloned heap on the
