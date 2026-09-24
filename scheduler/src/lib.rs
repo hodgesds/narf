@@ -1461,14 +1461,22 @@ pub fn migrate_task(handle: policy::TaskHandle, to: CpuId) {
     MIGRATE_PENDING[cpu].store(true, Ordering::Release);
 }
 
-/// Whether `slot` may be pushed off `from_cpu` to `to`: `to` must be in the
-/// task's affinity, and (mirroring the steal floor) a user/address-space task
-/// only migrates once user-task SMP is enabled.
-fn push_migratable(slot: &TaskSlot, to: CpuId) -> bool {
+/// Whether `slot` may be pushed off its CPU to `to`: `to` must be in the task's
+/// affinity, a user/address-space task only migrates once user-task SMP is enabled
+/// (mirroring the steal floor), and — like the pull side (`try_steal_from`) — a
+/// just-run, cache-hot task is left in place rather than bounced.
+fn push_migratable(slot: &TaskSlot, to: CpuId, now: u64) -> bool {
     if slot.addr_space.is_some() && !user_task_smp_enabled() {
         return false;
     }
-    slot.spec.affinity.allowed.contains(to)
+    if !slot.spec.affinity.allowed.contains(to) {
+        return false;
+    }
+    !task_is_migration_hot(
+        slot.awake.last_run_cycles.load(Ordering::Acquire),
+        now,
+        MIGRATION_COST_NS,
+    )
 }
 
 /// Executor-round handler for a pending [`migrate_task`] on `cpu`: dequeue the
@@ -1501,18 +1509,29 @@ fn run_pending_migration(cpu: usize) {
     }
     let to = CpuId(target_raw);
     let now = narf_time::now_cycles();
-    let slot = {
+    let cpu_id = CpuId(cpu as u32);
+    // Select + remove the slot AND notify the source policy of the dequeue under
+    // the (CPU_SCHEDULERS[cpu] -> READY[cpu]) lock order; `enqueue_on` runs after
+    // both drop. The `Dequeued{Migrated}` event pairs with the target side's
+    // `Enqueued{Migrated}`, so an observing policy's per-task shadow stays balanced.
+    let slot = policy::with_scheduler(cpu_id, |scheduler| {
         let mut q = READY[cpu].lock();
-        let Some(dq) = q.as_mut() else {
-            return;
-        };
-        let Some(pos) = dq.iter().position(|s| {
-            s.id.raw() == task_id && slot_is_dispatchable(s, now) && push_migratable(s, to)
-        }) else {
-            return;
-        };
-        dq.remove(pos)
-    };
+        let dq = q.as_mut()?;
+        let pos = dq.iter().position(|s| {
+            s.id.raw() == task_id && slot_is_dispatchable(s, now) && push_migratable(s, to, now)
+        })?;
+        let slot = dq.remove(pos)?;
+        if let Some(scheduler) = scheduler.filter(|p| policy::observes_queue_events(*p)) {
+            scheduler.on_task_queue_event(
+                cpu_id,
+                policy::TaskQueueEvent::Dequeued {
+                    task: policy::TaskMeta::from_slot(&slot),
+                    reason: policy::TaskDequeueReason::Migrated,
+                },
+            );
+        }
+        Some(slot)
+    });
     if let Some(slot) = slot {
         enqueue_on(target, slot, policy::TaskEnqueueReason::Migrated);
     }
@@ -2377,6 +2396,13 @@ pub fn __reset_queues_for_test() {
     for cell in VFLOOR.iter() {
         cell.0.store(0, Ordering::Release);
     }
+    // Clear pending tick-rebalance migrations + the balancer's per-CPU tick
+    // counter so a request recorded by one smoke can't carry into the next.
+    for (cpu, pending) in PENDING_MIGRATE.iter().enumerate() {
+        *pending.lock() = None;
+        MIGRATE_PENDING[cpu].store(false, Ordering::Release);
+    }
+    policy::__reset_balance_state_for_test();
 }
 
 /// Authoritative affinity for every live scheduler task.
@@ -5203,6 +5229,12 @@ pub fn run_until_empty() {
         }
         last_pump_cycles = narf_time::now_cycles();
         notify_cpu_idle(cpu);
+        // hrtick: no task is running now, so drop any armed per-task slice timer
+        // rather than let it fire spuriously into the idle CPU (the next dispatch
+        // re-arms). Only matters on the run->idle transition; compiled out
+        // without the `hrtick` feature.
+        #[cfg(feature = "hrtick")]
+        hrtick::disarm(cpu);
 
         {
             // All tasks parked this round. Tick the sleep pumps so the work

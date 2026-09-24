@@ -2934,21 +2934,26 @@ fn smoke_peer_loads_snapshot() -> TestResult {
 kernel_test_in!("scheduler", smoke_peer_loads_snapshot);
 
 /// A self-targeted `migrate_task` is guarded to a no-op: nothing is recorded, so
-/// the running executor round leaves the task on its own queue.
+/// the running executor round leaves the task on its own queue. Uses THIS CPU
+/// throughout (`migrate_task` keys the request by `current_cpu`), so it is valid
+/// no matter which CPU the harness runs on.
 fn smoke_migrate_task_self_is_noop() -> TestResult {
-    use crate::affinity::CpuId;
+    use crate::affinity::{Affinity, CpuId};
     use crate::{
         dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
     };
+    let me = narf_lib::percpu::current_cpu();
     crate::__reset_queues_for_test();
-    let id = spawn_with_spec(async {}, TaskSpec::unthrottled());
-    if !dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw()) {
+    let mut spec = TaskSpec::unthrottled();
+    spec.affinity = Affinity::pinned(CpuId(me as u32)); // admit on THIS cpu
+    let id = spawn_with_spec(async {}, spec);
+    if !dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw()) {
         crate::__reset_queues_for_test();
-        return TestResult::Fail("task was not admitted on the boot CPU");
+        return TestResult::Fail("task was not admitted on the running CPU");
     }
-    migrate_task(TaskHandle::from_id(id), CpuId(0)); // self target -> guarded no-op
-    run_pending_migration(0);
-    let still = dbg_ready_slots(0).iter().any(|(tid, ..)| *tid == id.raw());
+    migrate_task(TaskHandle::from_id(id), CpuId(me as u32)); // self target -> guarded no-op
+    run_pending_migration(me);
+    let still = dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw());
     crate::__reset_queues_for_test();
     if !still {
         return TestResult::Fail("self-target migrate wrongly dequeued the task");
@@ -2956,6 +2961,36 @@ fn smoke_migrate_task_self_is_noop() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_migrate_task_self_is_noop);
+
+/// `migrate_task` is re-validated at move time: a task whose affinity forbids the
+/// requested target (or whose target isn't online) is never dequeued. Exercises
+/// the negative re-validation branch the dequeue test skips.
+fn smoke_migrate_task_respects_affinity() -> TestResult {
+    use crate::affinity::{Affinity, CpuId};
+    use crate::{
+        dbg_ready_slots, migrate_task, run_pending_migration, spawn_with_spec, TaskHandle, TaskSpec,
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let other = if me == 0 { 1u32 } else { 0u32 };
+    crate::__reset_queues_for_test();
+    let mut spec = TaskSpec::unthrottled();
+    spec.affinity = Affinity::pinned(CpuId(me as u32)); // pinned to THIS cpu only
+    let id = spawn_with_spec(async {}, spec);
+    if !dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw()) {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task was not admitted on the running CPU");
+    }
+    // Request a move to a CPU the task may not run on; the core must refuse it.
+    migrate_task(TaskHandle::from_id(id), CpuId(other));
+    run_pending_migration(me);
+    let still = dbg_ready_slots(me).iter().any(|(tid, ..)| *tid == id.raw());
+    crate::__reset_queues_for_test();
+    if !still {
+        return TestResult::Fail("a task that may not run on the target was wrongly migrated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_migrate_task_respects_affinity);
 
 /// A real `migrate_task` to an online peer dequeues the slot from the source
 /// CPU's run queue (the core's push half). Skipped on a single-CPU boot.
@@ -3124,6 +3159,32 @@ kernel_test_in!(
     smoke_scheduler_resched_current_sets_need_resched
 );
 
+// HIGH-1 regression: the preempt path consumes NEED_RESCHED when it commits to a
+// switch (Linux clear_tsk_need_resched), so a STALE flag — set by every
+// resched_remote to a running CPU, IPI skipped — cannot re-fire the tick-rate
+// preempt on every subsequent tick and collapse the quantum. This asserts the
+// primitive each try_preempt* now calls on commit clears the flag; the
+// preempt-commit integration itself is boot-covered.
+fn smoke_scheduler_clear_need_resched_consumes_flag() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::__test_clear_need_resched(cpu);
+    crate::resched_current(); // stand in for a remote wake's NEED_RESCHED publish
+    if !crate::__test_need_resched(cpu) {
+        return TestResult::Fail("precondition: NEED_RESCHED not set");
+    }
+    crate::clear_need_resched(cpu); // what each try_preempt* runs at the switch commit
+    let cleared = !crate::__test_need_resched(cpu);
+    crate::__test_clear_need_resched(cpu);
+    if !cleared {
+        return TestResult::Fail("clear_need_resched did not consume the stale flag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_clear_need_resched_consumes_flag
+);
+
 // The `on_tick` hook is an OVERHEAD-gated DECISION: `policy_wants_tick()` is
 // false for the plain in-tree ZST policies (Fifo/Priority/Eevdf ride the core
 // slice mechanism, so the tick path skips the whole hook) and true for a policy
@@ -3281,11 +3342,11 @@ fn smoke_pmu_cycles_install_matches_availability() -> TestResult {
 kernel_test_in!("scheduler", smoke_pmu_cycles_install_matches_availability);
 
 // pmu: when a work-cycle source exists, APERF advances as work is done. Skipped
-// (trivially passes) on a host without APERF.
+// (not silently passed) on a host without APERF.
 #[cfg(feature = "pmu")]
 fn smoke_pmu_work_cycles_advance() -> TestResult {
     if !crate::pmu::available() {
-        return TestResult::Pass;
+        return TestResult::Skip("no APERF work-cycle source on this host");
     }
     let before = crate::pmu::read_work_cycles();
     let mut acc = 0u64;

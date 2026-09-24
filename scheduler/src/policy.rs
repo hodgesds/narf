@@ -218,16 +218,19 @@ pub struct CpuSchedContext {
     pub vfloor: u64,
     /// Snapshot of the task currently running on `cpu`.
     pub current: CurrentTask,
-    /// Cycles the running task has executed since its current dispatch. Lets a
-    /// policy apply RUN_TO_PARITY slice protection (don't preempt the runner
+    /// TSC cycles the running task has executed since its current dispatch. Lets
+    /// a policy apply RUN_TO_PARITY slice protection (don't preempt the runner
     /// until it has consumed a base slice) — the batching guard that keeps a
     /// cooperative producer/consumer from context-switching on every wake.
     pub elapsed: u64,
-    /// The resolved [`QuantumUnit`] the core is enforcing — the unit of
-    /// `current.vruntime`, `vfloor`, and `elapsed`. A policy reads this to keep
-    /// its comparisons and slice magnitudes in the right unit (0.75 ms is a very
-    /// different integer in ns vs PMU-cycles). Equals the installed policy's
-    /// `quantum_unit()` by the install-time validation.
+    /// The resolved [`QuantumUnit`] the core enforces the per-task SLICE in:
+    /// `Nanos` compares TSC-elapsed against the slice, `Cycles` compares APERF
+    /// work-cycles. It is the unit a policy should size its per-task slice
+    /// magnitudes in (0.75 ms is a very different integer in ns vs PMU-cycles).
+    /// NOTE: only slice expiry is unit-aware — `elapsed`, `vfloor`, and
+    /// `current.vruntime`/`vdeadline` are always TSC cycles (the EEVDF virtual
+    /// clock is TSC-based regardless of the quantum unit). Equals the installed
+    /// policy's `quantum_unit()` by the install-time validation.
     pub quantum_unit: QuantumUnit,
 }
 
@@ -709,12 +712,35 @@ impl Scheduler for ClassScheduler {
 }
 
 /// Per-CPU counter gating [`ClassScheduler`]'s balance pass (keeps per-tick cost
-/// to a single relaxed bump and migrations gentle).
-static CLASS_BALANCE_TICKS: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+/// to a single relaxed bump and migrations gentle). Padded to its own cache line:
+/// every CPU bumps its own counter every tick, so an unpadded `[AtomicU32; N]`
+/// (16 per line) would false-share, matching the padding on every other per-CPU
+/// counter in the crate ([`crate::VFloorCell`] / the handoff flags).
+#[repr(align(64))]
+struct BalanceTickCell(AtomicU32);
+
+impl core::ops::Deref for BalanceTickCell {
+    type Target = AtomicU32;
+    fn deref(&self) -> &AtomicU32 {
+        &self.0
+    }
+}
+
+static CLASS_BALANCE_TICKS: [BalanceTickCell; narf_lib::percpu::MAX_CPUS] =
+    [const { BalanceTickCell(AtomicU32::new(0)) }; narf_lib::percpu::MAX_CPUS];
 
 /// Run the balance pass at most once per this many ticks per CPU.
 const CLASS_BALANCE_INTERVAL: u32 = 8;
+
+/// Test-only: clear the balancer's per-CPU tick counters so a request cadence
+/// from one smoke does not carry into the next. Called by
+/// [`crate::__reset_queues_for_test`].
+#[doc(hidden)]
+pub(crate) fn __reset_balance_state_for_test() {
+    for cell in CLASS_BALANCE_TICKS.iter() {
+        cell.store(0, Ordering::Relaxed);
+    }
+}
 
 /// One `ClassScheduler` balance pass for `cpu`. Picks the least-loaded peer (idle
 /// preferred) and, only on a clear imbalance, sheds one runnable, un-pinned,
