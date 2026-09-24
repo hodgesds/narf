@@ -15850,30 +15850,61 @@ kernel_test_in!(
 fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // brk growth publishes `[grow_lo, grow_hi)` as heap and must refuse to annex
+    // a foreign VMA that already occupies `grow_lo`: extending brk over a foreign
+    // `MAP_FIXED` would silently pull it into brk ownership, and a later
+    // brk-shrink could then free pages the program never handed to brk. It does
+    // NOT require the heap to stay rooted at `heap_base` with `BRK_HEAP` perms —
+    // musl's mallocng punches the heap base with a `MAP_FIXED PROT_NONE` guard,
+    // and that older rooting gate wedged every later grow (see
+    // `brk_extend_region_limited_locked`). So the invariant is precisely: nothing
+    // may be based at `grow_lo`, but growth into free space adjacent to a foreign
+    // VMA is allowed and publishes a SEPARATE heap tail.
     let a = AddressSpace::empty();
-    let base = VirtAddr::new(0x0000_0000_7000_0000);
-    if a.map_region(Region {
-        base,
-        len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
-    })
-    .is_err()
+    let foreign = VirtAddr::new(0x0000_0000_7000_0000);
+    if a
+        .map_region(Region {
+            base: foreign,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
     {
         return TestResult::Fail("foreign brk-root setup failed");
     }
-    if a.brk_extend_region(base, base.as_u64() + 0x1000, 1) != Err(AddressSpaceError::Overlap) {
-        return TestResult::Fail("brk annexed a root without BRK_HEAP provenance");
+
+    // Growing brk INTO the foreign region (something is based at grow_lo) is
+    // rejected, and the foreign VMA is left byte-for-byte untouched.
+    if a.brk_extend_region(foreign, foreign.as_u64(), 1) != Err(AddressSpaceError::Overlap) {
+        return TestResult::Fail("brk annexed a foreign root at grow_lo");
     }
-    let unchanged = a.lookup(base).is_some_and(|region| {
+    let untouched = a.lookup(foreign).is_some_and(|region| {
         region.len == 0x1000
             && !region.perms.contains(RegionPerms::BRK_HEAP)
             && region.phys == alloc::vec![PhysAddr::new(0)]
-    }) && a.lookup(VirtAddr::new(base.as_u64() + 0x1000)).is_none();
-    if unchanged {
+    });
+    if !untouched {
+        return TestResult::Fail("rejected brk growth mutated the foreign root");
+    }
+
+    // Growth into the FREE page immediately after the foreign region succeeds and
+    // publishes a distinct BRK_HEAP tail — the musl-compat behaviour the removed
+    // rooting gate used to forbid — without disturbing the foreign neighbour.
+    let free = foreign.as_u64() + 0x1000;
+    if a.brk_extend_region(foreign, free, 1).is_err() {
+        return TestResult::Fail("brk growth into free space after a foreign VMA must succeed");
+    }
+    let heap_ok = a.lookup(VirtAddr::new(free)).is_some_and(|region| {
+        region.base.as_u64() == free && region.perms.contains(RegionPerms::BRK_HEAP)
+    });
+    let foreign_ok = a
+        .lookup(foreign)
+        .is_some_and(|region| region.len == 0x1000 && !region.perms.contains(RegionPerms::BRK_HEAP));
+    if heap_ok && foreign_ok {
         TestResult::Pass
     } else {
-        TestResult::Fail("rejected brk growth mutated the foreign root")
+        TestResult::Fail("brk growth after a foreign VMA did not publish a separate heap tail")
     }
 }
 kernel_test_in!("memory", smoke_memory_brk_growth_rejects_foreign_root);
