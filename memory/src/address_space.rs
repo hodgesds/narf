@@ -2515,73 +2515,55 @@ impl AddressSpace {
             return Err(AddressSpaceError::Overlap);
         }
 
-        if grow_lo == heap_base.as_u64() {
-            // First grow. A mapping already rooted at the conventional brk
-            // base is not implicitly the heap: it may be a user MAP_FIXED
-            // mapping. The old per-grow `map_region` path rejected that
-            // collision; extending the foreign VMA would silently annex it
-            // into brk ownership and later brk-shrink could free its pages.
-            if regions.get(heap_base.as_u64()).is_some() {
+        // Linux vm_brk shape: growth publishes `[grow_lo, grow_hi)` as heap
+        // and is indifferent to what earlier heap pages have since become —
+        // userspace may punch or replace them wholesale. musl's mallocng does
+        // exactly that on its first metadata allocation (a `MAP_FIXED`
+        // `PROT_NONE` guard page over the heap base), and the old "heap must
+        // still be rooted at `heap_base` with `BRK_HEAP` perms" gate then
+        // permanently wedged every later brk grow in every dynamically linked
+        // musl process. Only the target interval itself must be free: nothing
+        // may be based at `grow_lo` (extending over a foreign `MAP_FIXED`
+        // would silently annex it into brk ownership, and a later brk-shrink
+        // could free its pages) and no predecessor may span past it; the
+        // successor bound was checked above.
+        let _ = heap_base;
+        if regions.get(grow_lo).is_some() {
+            return Err(AddressSpaceError::Overlap);
+        }
+        let predecessor_base = regions.by_base.predecessor(grow_lo).map(|(base, _)| base);
+        let extend_in_place = match predecessor_base.and_then(|base| regions.get(base)) {
+            Some(p) if p.base.as_u64().saturating_add(p.len) > grow_lo => {
                 return Err(AddressSpaceError::Overlap);
             }
-            if regions
-                .predecessor(grow_lo)
-                .is_some_and(|p| p.base.as_u64().saturating_add(p.len) > grow_lo)
-            {
-                return Err(AddressSpaceError::Overlap);
-            }
-            // Demand-paged: grow the length only, with an EMPTY phys list. Each
-            // page materializes its slot on first fault (finish_demand_page), so
-            // the grow is O(1) instead of O(pages) (no per-page zero-fill up
-            // front), and pages the program never touches cost nothing.
+            // In-place O(1) extension only for an exactly-adjacent heap tail
+            // with identical perms (`tail_perms` includes `BRK_HEAP`, so a
+            // foreign anonymous neighbour never matches). A perms mismatch —
+            // e.g. `mlockall(MCL_FUTURE)` changed the future-lock bits —
+            // gets a distinct tail VMA instead, so earlier heap pages never
+            // change status retroactively.
+            Some(p) => p.base.as_u64().saturating_add(p.len) == grow_lo && p.perms == tail_perms,
+            None => false,
+        };
+        if extend_in_place {
+            let base = predecessor_base.expect("in-place extension has a predecessor");
+            let heap_tail = regions.get_mut(base).ok_or(AddressSpaceError::Overlap)?;
+            // Extend the length only; phys stays at its faulted prefix and
+            // grows lazily on fault (see the demand-paged insert below).
+            heap_tail.len += add_len;
+        } else {
+            // Demand-paged: publish the tail with an EMPTY phys list. Each
+            // page materializes its slot on first fault (finish_demand_page),
+            // so the grow is O(1) instead of O(pages) (no per-page zero-fill
+            // up front), and pages the program never touches cost nothing.
             assert!(regions
                 .insert(Region {
-                    base: heap_base,
+                    base: VirtAddr::new(grow_lo),
                     len: add_len,
                     perms: tail_perms,
                     phys: Vec::new(),
                 })?
                 .is_none());
-        } else {
-            // A later append is valid only when the heap still starts at its
-            // owned base and its last fragment ends exactly at the append
-            // site. This rejects a detached hole or foreign MAP_FIXED VMA.
-            if !regions
-                .get(heap_base.as_u64())
-                .is_some_and(|root| root.perms.contains(RegionPerms::BRK_HEAP))
-            {
-                return Err(AddressSpaceError::Overlap);
-            }
-            let predecessor_base = regions
-                .by_base
-                .predecessor(grow_lo)
-                .map(|(base, _)| base)
-                .ok_or(AddressSpaceError::Overlap)?;
-            let predecessor = regions
-                .get(predecessor_base)
-                .ok_or(AddressSpaceError::Overlap)?;
-            if predecessor.base.as_u64().saturating_add(predecessor.len) != grow_lo
-                || !predecessor.perms.contains(RegionPerms::BRK_HEAP)
-            {
-                return Err(AddressSpaceError::Overlap);
-            }
-            if predecessor.perms == tail_perms {
-                let heap_tail = regions
-                    .get_mut(predecessor_base)
-                    .ok_or(AddressSpaceError::Overlap)?;
-                // O(1) grow: extend the length only; phys stays at its faulted
-                // prefix and grows lazily on fault (see the first-grow comment).
-                heap_tail.len += add_len;
-            } else {
-                assert!(regions
-                    .insert(Region {
-                        base: VirtAddr::new(grow_lo),
-                        len: add_len,
-                        perms: tail_perms,
-                        phys: Vec::new(),
-                    })?
-                    .is_none());
-            }
         }
         drop(regions);
         Ok((grow_hi, tail_perms))
