@@ -92,6 +92,21 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     arp_cache::__reset_for_test();
     crate::ifaddr::__reset_for_test();
     crate::bypass::__reset_for_test();
+    // netfilter and the ipv4 sysctls are process-global too, and `full_reset`
+    // used to leave them alone — so a prior case's leaked OUTPUT drop rule or a
+    // cleared `send_redirects` silently reached across test boundaries. That is
+    // invisible on x86_64 (the test order happens to leave them at defaults) but
+    // deterministic on aarch64, whose much smaller test set reorders neighbours:
+    // it starved `tcp_syn` of its SYN (dropped by a stale rule) and `ipv4_redirect`
+    // of its ICMP advice (redirects still disabled from an earlier case). Reset
+    // them here so a full_reset is a genuine clean slate.
+    crate::netfilter::__reset_all_for_test();
+    narf_lib::sysctl::ipv4::__reset_for_test();
+    // The ICMP-redirect budget is a process-global with a 20 s silence window,
+    // keyed by sender; clear it so a prior case's exhausted count can't
+    // rate-limit this test's first redirect (the aarch64-only
+    // `smoke_ipv4_forward_sends_redirect_and_still_forwards` failure).
+    crate::ip_forward::__reset_redirect_log_for_test();
     TX_CAPTURE.lock().clear();
 
     // Register the synthetic NIC — `SendFn` captures frames.
@@ -100,7 +115,18 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
         [0x02, 0x00, 0x00, 0x00, 0x00, 0x05],
         capture_send,
     );
-    iface::set_default_ipv4(local_ip, gateway);
+    // Configure THIS iface by name, not `set_default_ipv4`, which stamps
+    // whatever is FIRST in the (process-global, never-cleared) registry. With
+    // other tests' ifaces ahead of ours, `set_default_ipv4` left this NIC on its
+    // register defaults (10.0.2.15 / gw 10.0.2.2) instead of the caller's
+    // local_ip/gateway — so `connect` sourced the wrong IP and arp-resolved the
+    // wrong gateway (unseeded → no SYN emitted). Deterministic on aarch64, where
+    // the smaller test set puts these cases first, before anything seeds the
+    // default gateway's MAC. `set_iface_ipv4_fields` stamps the named entry
+    // WITHOUT publishing a 0.0.0.0/0 route — `add_addr` supplies the connected
+    // route, and a synthetic default route would mask the no-route/unreachable
+    // cases (`smoke_ipv4_forward_no_route_sends_net_unreachable`).
+    iface::set_iface_ipv4_fields(iface_name, local_ip, gateway);
     iface::add_addr(iface_name, local_ip, 24);
 
     // Pre-seed the ARP cache so `arp_resolve` in `connect` / `listen`

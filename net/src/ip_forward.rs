@@ -370,6 +370,22 @@ static REDIRECT_LOG: IrqSafeSpinLock<[RedirectPeer; REDIRECT_PEERS]> = IrqSafeSp
     }; REDIRECT_PEERS],
 );
 
+/// Test helper: clear the per-sender redirect budget. The budget is a
+/// process-global with a 20 s silence window, and `full_reset` never cleared it,
+/// so an earlier case that provoked redirects from the same sender left its count
+/// at the ceiling — the next test's first redirect was then rate-limited away.
+/// Masked on x86_64 (enough wall-clock elapses between cases to clear the
+/// window); deterministic on aarch64, whose smaller test set runs a redirect
+/// case first, inside the window of whatever ran before it.
+#[doc(hidden)]
+pub fn __reset_redirect_log_for_test() {
+    *REDIRECT_LOG.lock() = [RedirectPeer {
+        addr: [0, 0, 0, 0],
+        count: 0,
+        last_ns: 0,
+    }; REDIRECT_PEERS];
+}
+
 /// Claim a redirect for `dst`, or refuse because it has had enough.
 fn redirect_budget(dst: [u8; 4]) -> bool {
     let now = narf_time::monotonic_ns();

@@ -548,6 +548,23 @@ pub fn set_default_ipv4(ipv4: [u8; 4], gateway: [u8; 4]) {
     // `set_gateway` themselves.
 }
 
+/// Stamp a named iface's IPv4 / gateway FIELDS ONLY — like
+/// [`set_default_ipv4`] (no `0.0.0.0/0` route published), but targeting the
+/// entry by name instead of whatever is first in the registry. `for_dst` reads
+/// `ipv4` for the src-IP and `connect` reads `gateway` for the next-hop ARP, so
+/// a test harness needs these correct on ITS interface — while relying on the
+/// connected route from `add_addr` (and any explicit `set_gateway`) for routing,
+/// so a synthetic default route does not mask "no route" behaviour.
+pub fn set_iface_ipv4_fields(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
+    let mut g = IFACES.lock();
+    if let Some(v) = g.as_mut() {
+        if let Some(e) = v.iter_mut().find(|e| e.name == name) {
+            e.ipv4 = ipv4;
+            e.gateway = gateway;
+        }
+    }
+}
+
 /// Replace the IPv4 / gateway pair on a named iface. Wave-47: the
 /// per-flow `for_dst` path stamps src-IP from `NetIfaceSnapshot::ipv4`,
 /// so multi-iface tests (and any future multi-NIC bring-up) need a
