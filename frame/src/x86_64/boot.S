@@ -110,6 +110,13 @@ _start:
      */
     mov ebx, 0                                  /* slide, filled in below */
 
+    /* A pinned slide (KASLR_SLIDE_FIXED != 0) skips entropy entirely. It
+     * still falls through the mask + align below, so it cannot escape the
+     * window. See the linker script for why this exists. */
+    mov eax, offset KASLR_SLIDE_FIXED
+    test eax, eax
+    jnz .Lslide_have
+
     /* CPUID.1:ECX[30] = RDRAND. CPUID clobbers ebx, so stash it. */
     mov eax, 1
     push ebx
