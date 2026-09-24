@@ -74,6 +74,23 @@ pub const KERNEL_LINK_BASE: u64 = if cfg!(target_arch = "aarch64") {
     0xFFFF_FFFF_8000_0000
 };
 
+/// VA span reserved for the kernel image, and the offset at which the module
+/// text window begins.
+///
+/// Linux spells the same relationship
+/// `MODULES_VADDR = __START_KERNEL_map + KERNEL_IMAGE_SIZE`
+/// (arch/x86/include/asm/pgtable_64_types.h), and bounds its own slide by it.
+/// `module_text::MODULE_VA_BASE` is derived from this rather than written out
+/// as an address, and `build/linker/x86_64.ld` asserts at link time that
+/// `__kernel_end + KASLR_SLIDE_MASK` fits inside it — the image plus its
+/// widest slide must not reach the module window.
+///
+/// x86_64 only: on aarch64 the module window sits *below* the kernel base
+/// rather than above the image, so no such span exists. See the placement
+/// rationale on `MODULE_VA_BASE`.
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_IMAGE_SIZE: u64 = 1 << 30;
+
 /// The kernel image's live virtual base — link base plus the applied slide.
 #[inline]
 pub fn kernel_virt_base() -> u64 {
@@ -191,6 +208,37 @@ mod kaslr_slide_tests {
         TestResult::Pass
     }
     kernel_test_in!("memory/kaslr", smoke_kaslr_image_bounds_stay_physical);
+
+    /// The slid image must stay clear of the module text window.
+    ///
+    /// The slide moves the image *up*, toward `MODULE_VA_BASE`, so the window
+    /// is what bounds it. `build/linker/x86_64.ld` asserts the same thing at
+    /// link time against `KASLR_SLIDE_MASK`, which is the stronger check
+    /// because it covers every slide the mask can produce rather than the one
+    /// this boot drew. This case covers what that cannot: that the slide
+    /// actually applied is inside the mask, i.e. that `boot.S` masked it.
+    ///
+    /// Overlap here would not fault. The image would quietly share addresses
+    /// with module text, and the first module load would corrupt the kernel.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_kaslr_slid_image_clears_module_window() -> TestResult {
+        unsafe extern "C" {
+            static __kernel_end: u8;
+        }
+        // Physical, and deliberately not converted — see
+        // `smoke_kaslr_image_bounds_stay_physical`.
+        let image_end_phys = core::ptr::addr_of!(__kernel_end) as u64;
+        let top = kernel_virt_base().wrapping_add(image_end_phys);
+        if top > crate::module_text::MODULE_VA_BASE {
+            return TestResult::Fail("the slid kernel image reaches the module text window");
+        }
+        if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end_phys > KERNEL_IMAGE_SIZE {
+            return TestResult::Fail("slide + image exceeds KERNEL_IMAGE_SIZE");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/kaslr", smoke_kaslr_slid_image_clears_module_window);
 }
 
 /// Pull one 64-bit value of randomness using the best available source.

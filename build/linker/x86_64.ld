@@ -15,6 +15,19 @@ ENTRY(_start)
 KERNEL_LOAD_BASE = 0x1000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
+/* VA span reserved for the kernel image. The module text window begins
+ * exactly where this ends, which is how Linux places its own:
+ * `MODULES_VADDR = __START_KERNEL_map + KERNEL_IMAGE_SIZE`
+ * (arch/x86/include/asm/pgtable_64_types.h). `module_text.rs` derives
+ * `MODULE_VA_BASE` from the same relationship rather than repeating the
+ * address, so the two cannot drift.
+ *
+ * Also the bound on how far the image may slide: the ASSERT at the end of
+ * this file ties `KASLR_SLIDE_MASK` to it and to `__kernel_end`, so a mask
+ * that would push the image into the module window fails the build instead
+ * of corrupting module text at run time. */
+KERNEL_IMAGE_SIZE = 0x40000000;   /* 1 GiB. LLD takes K/M, not G. */
+
 /* Space reserved for the KASLR relocation table. A debug build currently
  * needs ~1.6 MiB (399k sites x 4 bytes + header); 4 MiB leaves room to grow
  * before the reservation has to be revisited. `xtask relocs` errors out if a
@@ -28,14 +41,6 @@ KASLR_RELOC_RESERVE = 4M;
  * clear of it with room to grow, and is a single mask the 32-bit entry can
  * apply with one AND. `KERNEL_RANDOM_BITS = 30` in kaslr.rs describes the
  * 1 GiB kernel slot, NOT how far the image may move inside it. */
-/* Currently 0: the slide is implemented end to end and boots, but enabling it
- * regresses `drivers/storage/nvme-e2e`, so it stays off until that is
- * diagnosed. Set to 0x0FE00000 (254 MiB, already 2 MiB aligned) to enable.
- *
- * That value is a hand-picked bound, not a derived one. The real constraint is
- * that the image plus its slide must stay clear of the module text window one
- * GiB above the link base; deriving it from `__kernel_end` would keep it
- * honest as the image grows. */
 /* Enabled. A nonzero slide used to fail in one of two ways, both traced to
  * one defect in the relocation-table builder: it slid every absolute field in
  * a kernel-half section, including the few encoding `__kernel_start` /
@@ -210,3 +215,11 @@ SECTIONS
 
 ASSERT(__boot_end <= __text_start - KERNEL_VIRT_BASE,
        "linker: .boot section must come before .text — see build/ §4")
+
+/* The image plus the widest slide the mask allows must stay clear of the
+ * module text window. `__kernel_end` is the image's physical end, and the
+ * image occupies VA [KERNEL_VIRT_BASE + slide, + __kernel_end), so this is
+ * the real constraint that 0x0FE00000 was hand-picked to satisfy. Deriving
+ * it keeps the bound honest as the image grows. */
+ASSERT(__kernel_end + KASLR_SLIDE_MASK <= KERNEL_IMAGE_SIZE,
+       "linker: image + KASLR_SLIDE_MASK reaches the module text window — lower KASLR_SLIDE_MASK or raise KERNEL_IMAGE_SIZE (and MODULE_VA_BASE with it)")
