@@ -156,9 +156,6 @@ pub const AP_TRAMPOLINE_EXEC_BASE: u64 = 0x8000;
 /// loudly at boot instead of as an AP that never checks in.
 pub const AP_TRAMPOLINE_EXEC_LEN: u64 = 0x2000;
 
-/// Higher-half base the kernel image is linked at.
-const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
-
 unsafe extern "C" {
     /// First byte of the kernel image, as a *physical* address: the linker
     /// script declares it before `. += KERNEL_VIRT_BASE`.
@@ -183,7 +180,7 @@ unsafe extern "C" {
 /// outside this range and is therefore NX in every kernel mapping.
 fn kernel_exec_phys_range() -> (u64, u64) {
     let start = core::ptr::addr_of!(__kernel_start) as u64;
-    let end = (core::ptr::addr_of!(__text_end) as u64).wrapping_sub(KERNEL_VIRT_BASE);
+    let end = crate::kaslr::image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
     // Defensive: a linker-script edit that inverted these, or moved the image
     // out of the first GiB, would otherwise silently produce an unbootable
     // (or silently over-permissive) map. Clamp to "whole first GiB
@@ -388,16 +385,16 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     let pt_lo_0_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pt_lo_0) } as u64;
     // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
     let pd_hi_kernel_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pd_hi_kernel) } as u64;
-    let pml4_addr = PhysAddr::new(pml4_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    let pdpt_lo_addr = PhysAddr::new(pdpt_lo_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    let pdpt_hi_mmio_addr = PhysAddr::new(pdpt_hi_mmio_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    let pdpt_hi_addr = PhysAddr::new(pdpt_hi_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    let pd_lo_0_addr = PhysAddr::new(pd_lo_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    let pt_lo_0_addr = PhysAddr::new(pt_lo_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    let pd_hi_kernel_addr = PhysAddr::new(pd_hi_kernel_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pml4_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pml4_virt));
+    let pdpt_lo_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_lo_virt));
+    let pdpt_hi_mmio_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_hi_mmio_virt));
+    let pdpt_hi_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_hi_virt));
+    let pd_lo_0_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pd_lo_0_virt));
+    let pt_lo_0_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pt_lo_0_virt));
+    let pd_hi_kernel_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pd_hi_kernel_virt));
     // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
     let pdpt_direct_0_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_direct_0) } as u64;
-    let pdpt_direct_0_addr = PhysAddr::new(pdpt_direct_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pdpt_direct_0_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_direct_0_virt));
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
@@ -563,6 +560,16 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // text through this window. Making kernel text read-only is a
         // separate, larger change (it needs a text-poke path of its own) and
         // is *not* claimed by this work.
+        // The window is placed at `base + slide`, matching what `boot.S` built
+        // and what every relocated address in the image now expects.
+        //
+        // It is CLAMPED to PDPT[510]. Running the full 1 GiB from `slide`
+        // would extend into PDPT[511], which is the module text window — and
+        // an overlap there kills the boot at this exact CR3 load with no
+        // output, because the fault handler disappears along with everything
+        // else. The alias therefore covers phys [0, 1 GiB - slide); the top
+        // `slide` bytes are reachable through the direct map instead.
+        let slide = crate::kaslr::KERNEL_SLIDE.load(core::sync::atomic::Ordering::Relaxed);
         write_identity::<PageTableEntry>(
             PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8),
             PageTableEntry::new(pd_hi_kernel_addr, flags_ptr),
@@ -573,7 +580,14 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             if !kernel_window_leaf_needs_exec(phys, 1 << 21) {
                 flags |= PtFlags::NO_EXEC;
             }
-            let slot = PhysAddr::new(pd_hi_kernel_addr.raw() + two_mb * 8);
+            // Index by the VIRTUAL offset from the window's base, which the
+            // slide shifts, not by the physical frame number. Anything past
+            // the end of this PD would land in the module window, so stop.
+            let pd_index = (slide + phys) >> 21;
+            if pd_index >= 512 {
+                break;
+            }
+            let slot = PhysAddr::new(pd_hi_kernel_addr.raw() + pd_index * 8);
             write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
         }
     }

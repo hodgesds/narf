@@ -15,6 +15,29 @@ ENTRY(_start)
 KERNEL_LOAD_BASE = 0x1000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
+/* Space reserved for the KASLR relocation table. A debug build currently
+ * needs ~1.6 MiB (399k sites x 4 bytes + header); 4 MiB leaves room to grow
+ * before the reservation has to be revisited. `xtask relocs` errors out if a
+ * table does not fit rather than writing a short one. */
+KASLR_RELOC_RESERVE = 4M;
+
+/* Largest slide the kernel window may take, as a mask of the low bits.
+ *
+ * The module text window begins 1 GiB above the link base, so the image plus
+ * its slide has to stay below that. 256 MiB leaves the ~78 MiB image well
+ * clear of it with room to grow, and is a single mask the 32-bit entry can
+ * apply with one AND. `KERNEL_RANDOM_BITS = 30` in kaslr.rs describes the
+ * 1 GiB kernel slot, NOT how far the image may move inside it. */
+/* Currently 0: the slide is implemented end to end and boots, but enabling it
+ * regresses `drivers/storage/nvme-e2e`, so it stays off until that is
+ * diagnosed. Set to 0x0FE00000 (254 MiB, already 2 MiB aligned) to enable.
+ *
+ * That value is a hand-picked bound, not a derived one. The real constraint is
+ * that the image plus its slide must stay clear of the module text window one
+ * GiB above the link base; deriving it from `__kernel_end` would keep it
+ * honest as the image grows. */
+KASLR_SLIDE_MASK = 0x00000000;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -57,6 +80,37 @@ SECTIONS
         *(.text .text.*)
         __text_end = .;
     } :text
+
+    /* KASLR relocation table.
+     *
+     * Reserved here, filled after linking by `xtask relocs --patch`: the
+     * table's contents are computed FROM the linked image, so its size has to
+     * be fixed before the link or every address it records would move. The
+     * build fails rather than truncating if the table outgrows the window.
+     *
+     * It lives in the kernel half so the boot-time apply pass can find it by
+     * the same slid addressing it is patching, and it is PROGBITS (not .bss)
+     * because a NOBITS section has no file bytes to write into.
+     *
+     * Linux keeps its table appended after the compressed payload instead;
+     * that is not available here because the multiboot2/PVH loader maps only
+     * PT_LOAD segments, so anything outside one never reaches memory. */
+    .kaslr_relocs : AT(ADDR(.kaslr_relocs) - KERNEL_VIRT_BASE) ALIGN(4K) {
+        __kaslr_relocs_start = .;
+        QUAD(0);
+        . = __kaslr_relocs_start + KASLR_RELOC_RESERVE;
+        __kaslr_relocs_end = .;
+    } :rodata
+
+    /* Physical alias of the table, for the 32-bit apply pass in boot.S.
+     * Before paging there is no kernel-half addressing, and a 32-bit absolute
+     * cannot hold the high VA, so the pass needs the low address as a
+     * link-time constant. */
+    __kaslr_relocs_phys = __kaslr_relocs_start - KERNEL_VIRT_BASE;
+
+    /* Physical alias of `kaslr::KERNEL_SLIDE`, so the 32-bit pass can record
+     * the slide it applied for the Rust conversions to read later. */
+    __kernel_slide_phys = KERNEL_SLIDE - KERNEL_VIRT_BASE;
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;
@@ -110,10 +164,23 @@ SECTIONS
      * jumps to 0x0 — the weston/SMP #UD heisenbug (rip=0x3, etc.).
      */
     .got : AT(ADDR(.got) - KERNEL_VIRT_BASE) ALIGN(8) {
+        __got_start = .;
         *(.got)
         *(.got.plt)
         *(.data.rel.ro .data.rel.ro.*)
+        __got_end = .;
     } :data
+
+    /* Physical aliases of the GOT, for the 32-bit slide pass.
+     *
+     * The GOT needs fixing up and carries NO relocation records: LLD resolves
+     * each slot at link time to an absolute kernel-half address, so
+     * `--emit-relocs` has nothing to report and the table cannot see them. An
+     * unslid GOT is an immediate instruction-fetch fault on the first indirect
+     * call through it. Linux fixes its own GOT explicitly in head_64.S for the
+     * same reason. */
+    __got_phys_start = __got_start - KERNEL_VIRT_BASE;
+    __got_phys_end   = __got_end   - KERNEL_VIRT_BASE;
 
     . = ALIGN(4K);
     __kernel_end = . - KERNEL_VIRT_BASE;
