@@ -16538,6 +16538,17 @@ mod child_reap_signalfd_tests {
     /// `watch_mask` (sig_bit convention), armed epoll-style. Returns
     /// `(waker_fire_count, reports_poll_in)`.
     fn run_exit(parent: u64, child: u64, watch_mask: u64) -> (u32, bool) {
+        // A real parent's signal state is created at task creation
+        // (init_per_task_state → signal_init), which allocates its SIGNAL_PENDING
+        // bucket. This synthetic parent never went through that: on a boot where
+        // no earlier test happened to run signal_init, the bucket is None, so
+        // on_child_exit's `pending_signal_bits_update(parent)` returns None and
+        // takes the legacy `wake_signal`-only fallback that never fires the
+        // signalfd cell — the waker count stays 0. x86_64 masks it (a prior test
+        // seeded the bucket); aarch64's smaller, reordered set runs this case
+        // first and exposes it. Establish the initialised signal state a real
+        // parent has (and clear any prior case's leaked bits) up front.
+        super::signal_init();
         // What fork/exit set up before on_child_exit: the natural-parent link
         // with a SIGCHLD exit-signal, and the staged wstatus.
         super::parent_of_set_with_signal(child, parent, 17); // SIGCHLD
