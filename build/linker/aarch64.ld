@@ -106,6 +106,26 @@ SECTIONS
         QUAD(__kernel_end);
     } :data
 
+    /* Physical addresses of the AP trampoline entry and its stack table.
+     *
+     * Both live in `.boot` / `.boot.data`, which is linked low so an AP can
+     * execute it before the MMU is on. `smp.rs` needs the entry address to
+     * hand to PSCI CPU_ON and needs to write the stack table, and it runs in
+     * the kernel half — so it faces the same +/-4 GiB ADRP limit as the image
+     * bounds above and gets the same treatment: read the VALUE here rather
+     * than take the address of a low symbol.
+     *
+     * Linux does the same thing at the same place: `psci.c` boots a secondary
+     * with `__pa_symbol(secondary_entry)` rather than referencing a physical
+     * symbol. The low identity map is still live during bring-up, so the
+     * address is directly usable as a pointer.
+     */
+    .ap_boot_syms : AT(ADDR(.ap_boot_syms) - KERNEL_VIRT_BASE) ALIGN(8) {
+        __ap_boot_syms = .;
+        QUAD(_ap_start);
+        QUAD(AP_STACKS);
+    } :data
+
 
     __kernel_end = . - KERNEL_VIRT_BASE;
 

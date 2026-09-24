@@ -33,11 +33,34 @@ const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 const AP_STACK_ORDER: u8 = 4;
 const AP_STACK_PAGES: u64 = 1 << AP_STACK_ORDER;
 
-// AP entry symbol (defined in `smp_entry.S`).
-extern "C" {
-    fn _ap_start();
-    /// Per-CPU stack-top table — [u64; MAX_CPUS] in `.boot.data`.
-    static mut AP_STACKS: [u64; 64];
+// Physical addresses of the AP trampoline entry and its stack table.
+//
+// `_ap_start` and `AP_STACKS` live in `.boot` / `.boot.data`, linked low so an
+// AP can run them with the MMU off. Referencing them from here — kernel-half
+// code — would emit a PC-relative page reference across ~512 GiB, which
+// aarch64 ADRP cannot make; that is what pins this target to
+// `code-model=large`. The linker puts the two VALUES in a kernel-half word
+// instead, exactly as it does for the image bounds. Linux takes the same route
+// in `psci.c`: `__pa_symbol(secondary_entry)`, never a physical symbol.
+//
+// See `.ap_boot_syms` in `build/linker/aarch64.ld`.
+unsafe extern "C" {
+    static __ap_boot_syms: [u64; 2];
+}
+
+/// Physical address of the AP trampoline entry (`_ap_start`).
+#[inline]
+fn ap_entry_phys() -> u64 {
+    // SAFETY: a linker-populated word inside the image, read-only.
+    unsafe { core::ptr::addr_of!(__ap_boot_syms).read()[0] }
+}
+
+/// Physical address of the per-CPU stack-top table (`AP_STACKS`,
+/// `[u64; MAX_CPUS]` in `.boot.data`).
+#[inline]
+fn ap_stacks_phys() -> u64 {
+    // SAFETY: a linker-populated word inside the image, read-only.
+    unsafe { core::ptr::addr_of!(__ap_boot_syms).read()[1] }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -132,11 +155,13 @@ pub unsafe fn start_aps() -> u32 {
             }
         };
 
-        // SAFETY: AP_STACKS is in .boot.data, the only writer is
-        // the BSP during this start_aps call.
-        // SAFETY: Valid memory or trusted environment
+        // SAFETY: the table is `[u64; MAX_CPUS]` in `.boot.data`, still
+        // identity-mapped at this point in bring-up, `logical < total <=
+        // MAX_CPUS`, and the BSP inside this call is its only writer.
         unsafe {
-            (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
+            (ap_stacks_phys() as *mut u64)
+                .add(logical as usize)
+                .write(stack_top);
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -148,7 +173,7 @@ pub unsafe fn start_aps() -> u32 {
 
         // Entry address: physical pointer to _ap_start (which lives
         // in .text, identity-mapped at low PA).
-        let entry = (_ap_start as usize) as u64;
+        let entry = ap_entry_phys();
 
         // Map this AP's GIC redistributor from the BSP, before the AP runs.
         // The AP would otherwise have to `ioremap` its own frame inside
