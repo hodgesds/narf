@@ -4031,7 +4031,11 @@ fn smoke_memory_mmap_arena_fails_closed_at_ceiling() -> TestResult {
     }
     // Consume almost the entire window in one shot, parking the cursor a
     // hair below the ceiling.
-    let window = AddressSpace::MMAP_WINDOW_TOP - AddressSpace::MMAP_CURSOR_BASE;
+    // Measure from the LIVE cursor, not the floor: a fresh address space now
+    // starts at a randomized offset above `MMAP_CURSOR_BASE`, so the span
+    // still available is smaller than the nominal window. Linux's
+    // `arch_pick_mmap_base` costs it the same way.
+    let window = AddressSpace::MMAP_WINDOW_TOP - a.__test_mmap_cursor();
     let near = a.reserve_mmap_va(window - 0x4000);
     if near == 0 {
         return TestResult::Fail("large in-window reservation wrongly failed");
@@ -4060,6 +4064,7 @@ fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
 
     const LEN: u64 = 4 * 4096;
     let aspace = AddressSpace::empty();
+    let cursor_at_start = aspace.__test_mmap_cursor();
     let lazy_region = || Region {
         base: VirtAddr::new(0),
         len: LEN,
@@ -4077,7 +4082,10 @@ fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
         Ok(base) => base,
         Err(_) => return TestResult::Fail("initial anonymous placement failed"),
     };
-    if first.as_u64() != AddressSpace::MMAP_CURSOR_BASE {
+    // The first gap is at the address space's randomized cursor, which is at
+    // or above `MMAP_CURSOR_BASE` — it used to BE that constant, because
+    // nothing applied `user_mmap_slot`.
+    if first.as_u64() != cursor_at_start {
         return TestResult::Fail("initial anonymous placement missed the first mmap gap");
     }
     if aspace.unmap_region(first).is_err() {
@@ -16302,3 +16310,116 @@ fn smoke_slab_growth_consumes_buddy_frames() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_growth_consumes_buddy_frames);
+
+// ── userspace mmap ASLR is actually applied ──────────────────────────────
+//
+// `kaslr::user_mmap_slot` existed, had a test of its own, and had no
+// production caller: every fresh address space started its mmap cursor at the
+// bare `MMAP_CURSOR_BASE`, so user mappings landed at the same address in
+// every process while `kaslr.rs` described "kernel + userspace ASLR".
+//
+// Linux ref: `arch/x86/mm/mmap.c::arch_pick_mmap_base`, which randomizes at
+// exec; fork inherits the layout, which `clone_for_fork` already did.
+fn smoke_kaslr_fresh_address_spaces_get_distinct_mmap_bases() -> TestResult {
+    use crate::address_space::AddressSpace;
+    use crate::kaslr::USER_MMAP_RANDOM_BITS;
+
+    let span = 1u64 << USER_MMAP_RANDOM_BITS;
+    let lo = AddressSpace::MMAP_CURSOR_BASE;
+    let hi = lo + span;
+
+    // Sample several fresh spaces. Each must sit inside the window...
+    let mut seen = alloc::vec::Vec::new();
+    for _ in 0..8 {
+        let space = AddressSpace::empty();
+        let base = space.__test_mmap_cursor();
+        if !(lo..hi).contains(&base) {
+            return TestResult::Fail("a fresh mmap cursor landed outside the ASLR window");
+        }
+        if base & 0xFFF != 0 {
+            return TestResult::Fail("a randomized mmap cursor is not page aligned");
+        }
+        seen.push(base);
+    }
+
+    // ...and they must not all be the same value, which is precisely what an
+    // unwired `user_mmap_slot` produced.
+    if seen.iter().all(|b| *b == seen[0]) {
+        return TestResult::Fail(
+            "every fresh address space got the same mmap base — ASLR is not wired",
+        );
+    }
+
+    // The cursor is only half of it. Anonymous placement goes through the gap
+    // scanner, which searched from the shared constant and so chose one fixed
+    // address in every process even once the cursor was randomized. Assert the
+    // user-visible property directly: automatic placement differs between
+    // address spaces.
+    let mut placed = alloc::vec::Vec::new();
+    for _ in 0..8 {
+        let space = AddressSpace::empty();
+        // SAFETY: a freshly constructed address space with no regions mapped;
+        // the candidate is observed, not installed.
+        let candidate = unsafe { space.mmap_unmapped_candidate_locked(0x1000, 0x1000) };
+        match candidate {
+            Ok(addr) => {
+                let raw = addr.as_u64();
+                if !(lo..hi).contains(&raw) {
+                    return TestResult::Fail("an anonymous placement landed outside the window");
+                }
+                placed.push(raw);
+            }
+            Err(_) => {
+                return TestResult::Fail("anonymous placement failed in a fresh address space")
+            }
+        }
+    }
+    if placed.iter().all(|a| *a == placed[0]) {
+        return TestResult::Fail(
+            "automatic placement returned one address in every address space — the gap scanner is not searching the per-AS floor",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/kaslr",
+    smoke_kaslr_fresh_address_spaces_get_distinct_mmap_bases
+);
+
+// fork carries the mmap floor to the child, as `dup_mm` copies `mmap_base`.
+//
+// The child's regions are clones of the parent's, so a child searching from a
+// DIFFERENT randomized floor would place its mappings by a policy its
+// inherited layout was not built under. Linux randomizes at exec, in
+// `arch_pick_mmap_base`, and fork keeps whatever it was given.
+//
+// This exists because the inheritance was unverified: removing the floor copy
+// from `clone_for_fork` failed nothing in the whole suite, while the
+// neighbouring cursor copy has been load-bearing since Wave-49fu.
+fn smoke_memory_fork_inherits_mmap_floor() -> TestResult {
+    use crate::address_space::AddressSpace;
+
+    // SAFETY: freshly created, exclusively owned, never activated.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(space) => space,
+        Err(_) => return TestResult::Fail("fork-floor parent creation failed"),
+    };
+    let parent_floor = parent.__test_mmap_floor();
+
+    // SAFETY: the inactive parent is exclusively owned and paging is live.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("fork-floor clone failed"),
+    };
+
+    if child.__test_mmap_floor() != parent_floor {
+        return TestResult::Fail("fork did not inherit the parent's mmap floor");
+    }
+    // The cursor travels with it; a floor above the cursor would let the child
+    // hand out an address inside a region it just cloned.
+    if child.__test_mmap_cursor() < child.__test_mmap_floor() {
+        return TestResult::Fail("inherited cursor sits below the inherited floor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_fork_inherits_mmap_floor);

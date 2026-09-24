@@ -1043,26 +1043,30 @@ mod tests {
     );
 
     fn smoke_mremap_maymove_preserves_backing_and_grows_lazily() -> TestResult {
-        const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE;
         let aspace = AddressSpace::empty();
-        let source = lazy_region(BASE, 2);
+        // Build the layout at THIS address space's randomized mmap floor. The
+        // relocation below is chosen by the gap scanner, which searches from
+        // that floor, so a layout pinned to `MMAP_CURSOR_base` would sit below
+        // where the scanner looks and the move would land elsewhere.
+        let base = aspace.__test_mmap_floor();
+        let source = lazy_region(base, 2);
         let expected = source.phys.clone();
         if aspace.map_region(source).is_err()
-            || aspace.map_region(lazy_region(BASE + 2 * 4096, 2)).is_err()
+            || aspace.map_region(lazy_region(base + 2 * 4096, 2)).is_err()
         {
             return TestResult::Fail("could not create grow collision");
         }
-        if mremap_core(&aspace, BASE, 2 * 4096, 4 * 4096, 0, 0) != Err(ENOMEM) {
+        if mremap_core(&aspace, base, 2 * 4096, 4 * 4096, 0, 0) != Err(ENOMEM) {
             return TestResult::Fail("colliding grow without MAYMOVE did not fail");
         }
-        let moved = match mremap_core(&aspace, BASE, 2 * 4096, 4 * 4096, MREMAP_MAYMOVE, 0) {
-            Ok(address) if address == BASE + 4 * 4096 => address,
+        let moved = match mremap_core(&aspace, base, 2 * 4096, 4 * 4096, MREMAP_MAYMOVE, 0) {
+            Ok(address) if address == base + 4 * 4096 => address,
             _ => return TestResult::Fail("MAYMOVE did not relocate"),
         };
         let Some(region) = aspace.lookup(VirtAddr::new(moved)) else {
             return TestResult::Fail("moved region missing");
         };
-        if aspace.lookup(VirtAddr::new(BASE)).is_some()
+        if aspace.lookup(VirtAddr::new(base)).is_some()
             || region.len != 4 * 4096
             || region.phys[..2] != expected
             || region.phys[2..].iter().any(|phys| phys.raw() != 0)
@@ -1313,6 +1317,11 @@ mod tests {
         if aspace.map_region(lazy_region(SOURCE, 1)).is_err() {
             return TestResult::Fail("DONTUNMAP cursor setup failed");
         }
+        // Where this address space's mmap arena actually starts. A fresh AS
+        // randomizes its cursor above `MMAP_CURSOR_BASE`, so the retry lands
+        // at the live cursor rather than at the constant; comparing against
+        // the constant only worked while `user_mmap_slot` had no caller.
+        let arena_start = aspace.__test_mmap_cursor();
         let constrained = narf_memory::MremapLimits {
             memlock_bytes: u64::MAX,
             address_space_bytes: 0x1000,
@@ -1340,7 +1349,7 @@ mod tests {
             MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
             0,
         );
-        if retry == Ok(AddressSpace::MMAP_CURSOR_BASE) {
+        if retry == Ok(arena_start) {
             TestResult::Pass
         } else {
             TestResult::Fail("failed DONTUNMAP consumed mmap cursor space")
