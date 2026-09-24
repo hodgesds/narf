@@ -52,7 +52,13 @@ impl ProcessOomKiller {
             let Some(address_space) = narf_scheduler::address_space_of(TaskId(tid)) else {
                 continue;
             };
-            let rss_pages = (address_space.mapped_bytes() / 4096) as usize;
+            // Badness must rank RESIDENT memory, not virtual reservations:
+            // `mapped_bytes` counts region lengths, so a sparse-VA process
+            // (musl mallocng keeps tens of GB of lazy anonymous mappings for
+            // a few MB of touched pages) dwarfed every genuine hog and the
+            // same worker was killed on every pass. Linux's badness is
+            // `get_mm_rss()` — resident pages — plus the adj bias.
+            let rss_pages = address_space.memory_stats().resident_pages as usize;
             if rss_pages == 0 {
                 continue;
             }
