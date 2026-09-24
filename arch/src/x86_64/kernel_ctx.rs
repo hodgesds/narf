@@ -205,11 +205,19 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "jz 5f",
         "mov r9, cr3",
         "or r8, 1",
-        // Syscall/trap entry normally put the continuation in this exact
-        // FRAME root+PCID before it can yield. Canonicalise that already-neutral
-        // state as kind 0 instead of issuing a serialising same-value CR3 write.
+        // Syscall/trap entry leaves an already-neutral FRAME root+PCID here
+        // when it entered from kernel context. Canonicalise that as kind 0
+        // instead of issuing a serialising same-value CR3 write.
         "cmp r9, r8",
         "je 5f",
+        // Entry no longer displaces a live user root (domain PCIDs are
+        // 1..=16; a larger tag is a process tag), because doing so strips the
+        // user half that the handler still needs. Preserve that root across
+        // the context save for the same reason: kind 0, no restore, no swap.
+        "mov r10, r9",
+        "and r10, 0xFFF",
+        "cmp r10, 16",
+        "ja 5f",
         "bts r8, 63",
         "mov cr3, r8",
         "mov [rdi + 72], r9",

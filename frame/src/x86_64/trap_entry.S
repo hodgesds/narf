@@ -176,6 +176,20 @@ common_trap:
     test rax, rax                      /* PCID enforcer not initialised yet */
     jz .Ldomain_enter_done
     mov rcx, cr3
+    /* Keep a live user address space installed. Domain PCIDs are 1..=16
+     * (domain + 1); a process tag above that range means CR3 currently holds
+     * the user root of the task that trapped, and that root is the ONLY one
+     * carrying its user half. Swapping to the FRAME PML4 would strip those
+     * mappings, so the handler's first user access (syscall argument copy,
+     * TLS, signal frame) #PFs — and the #PF re-enters this same prefix and
+     * strips them again, an unbreakable fault loop that hangs the CPU at
+     * 100%. The PKS sibling below neutralises by RELAXING IA32_PKRS to
+     * all-allow, never by changing the address space; match that here and
+     * leave the root alone. Kind stays 0, so the exit path restores nothing. */
+    mov rdx, rcx
+    and rdx, 0xFFF
+    cmp rdx, 16
+    ja .Ldomain_enter_done
     mov qword ptr [rsp], rcx
     mov qword ptr [rsp + 8], 2
     or rax, 1                          /* FRAME uses PCID 1 */
