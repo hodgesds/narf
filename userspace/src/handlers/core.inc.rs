@@ -4523,6 +4523,11 @@ pub(crate) const CAP_SETUID: u32 = 7;
 /// `CAP_NET_RAW` (`include/uapi/linux/capability.h`) — raw sockets, and
 /// re-binding a socket that is already pinned to an interface.
 pub(crate) const CAP_NET_RAW: u32 = 13;
+/// `CAP_IPC_LOCK` (`include/uapi/linux/capability.h`: 14) — lock memory
+/// (`mlock`/`mlockall`/`mmap MAP_LOCKED`/`shmctl SHM_LOCK`) and bypass
+/// `RLIMIT_MEMLOCK`. Linux `mm/mlock.c::can_do_mlock` and the mlock accounting
+/// consult it host-scoped (`capable`, not `ns_capable`).
+pub(crate) const CAP_IPC_LOCK: u32 = 14;
 pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
@@ -14426,13 +14431,19 @@ fn current_mlock_authority() -> MlockAuthority {
     let limit_bytes = read_rlimit(task, RLIMIT_MEMLOCK)
         .map(|limit| limit.cur)
         .unwrap_or(0);
-    // CAP_TABLE is currently an ABI round-trip store, not trusted capability
-    // authority: capset may synthesize bits. Do not turn those emulated bits
-    // into a memory-limit bypass. Once capability-core supplies authenticated
-    // credentials this becomes its effective CAP_IPC_LOCK query.
+    // `capable(CAP_IPC_LOCK)` is exactly Linux `mm/mlock.c::can_do_mlock`'s
+    // authority test and the bypass that lets a privileged task lock past
+    // `RLIMIT_MEMLOCK`. The cap table is now trustworthy for this: `cap_capset`
+    // enforces the `security/commoncap.c::cap_capset` bounding rules, so a task
+    // can no longer synthesize a bit it was not granted (the earlier worry that
+    // kept this hardcoded `false`). Host-scoped `capable`, not `ns_capable`,
+    // matches Linux — a user-namespace-only CAP_IPC_LOCK does not bypass the
+    // host memlock limit. Without this, a root process whose current VMAs
+    // exceed the 8 MiB default limit got EPERM/ENOMEM from `mlockall(MCL_CURRENT)`
+    // where Linux root succeeds.
     MlockAuthority {
         limit_bytes,
-        bypass_limit: false,
+        bypass_limit: capable(CAP_IPC_LOCK),
     }
 }
 
