@@ -159,12 +159,8 @@ pub const AP_TRAMPOLINE_EXEC_LEN: u64 = 0x2000;
 unsafe extern "C" {
     /// First byte of the kernel image, as a *physical* address: the linker
     /// script declares it before `. += KERNEL_VIRT_BASE`.
-    static __kernel_start: u8;
     /// End of `.text`, as a *kernel-virtual* address.
     static __text_end: u8;
-    /// End of the whole image, as a *physical* address: the linker script
-    /// subtracts `KERNEL_VIRT_BASE` when defining it.
-    static __kernel_end: u8;
 }
 
 /// The one physical range that must remain executable through *both* the low
@@ -182,7 +178,7 @@ unsafe extern "C" {
 /// bootstrap heap arena), `.got` — and every frame the buddy ever hands out is
 /// outside this range and is therefore NX in every kernel mapping.
 fn kernel_exec_phys_range() -> (u64, u64) {
-    let start = core::ptr::addr_of!(__kernel_start) as u64;
+    let start = crate::kaslr::image_phys_bounds().0;
     let end = crate::kaslr::image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
     // Defensive: a linker-script edit that inverted these, or moved the image
     // out of the first GiB, would otherwise silently produce an unbootable
@@ -206,7 +202,7 @@ const fn overlaps(base: u64, len: u64, lo: u64, hi: u64) -> bool {
 /// Clamped to a full PD so a pathologically large image cannot run past the
 /// slot and into the module text window above it.
 pub fn kernel_window_leaves() -> u64 {
-    let end = core::ptr::addr_of!(__kernel_end) as u64;
+    let end = crate::kaslr::image_phys_bounds().1;
     (end.next_multiple_of(1 << 21) >> 21).min(512)
 }
 

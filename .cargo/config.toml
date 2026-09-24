@@ -65,6 +65,12 @@ rustflags = [
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
+    # KASLR: keep the relocation records so a boot-time pass can slide the
+    # image, same as the x86_64 target above. Linux arm64 instead links
+    # `-shared -Bsymbolic` and consumes `.rela.dyn` R_AARCH64_RELATIVE entries
+    # (arch/arm64/kernel/pi/relocate.c); NARF reuses its own `--emit-relocs`
+    # pipeline on both arches so there is one table format and one apply pass.
+    "-C", "link-arg=--emit-relocs",
     "-C", "code-model=large",
     "-C", "target-feature=+lse",
     "-C", "link-arg=-Tbuild/linker/aarch64.ld",
