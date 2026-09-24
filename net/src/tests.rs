@@ -8148,6 +8148,13 @@ fn smoke_net_gateway_config_installs_default_route() -> TestResult {
     // of this test did exactly that and broke an unrelated ARP/routing e2e
     // by sending 8.8.8.8 to loopback. Use a dedicated interface and remove
     // the route before returning, on every path.
+    //
+    // Symmetrically, this test must not INHERIT a leaked default route either:
+    // it never called `route::__reset_for_test`, so a prior case's stray
+    // 0.0.0.0/0 shadowed the one installed here and `route_lookup` returned the
+    // wrong next hop. Invisible on x86_64, deterministic on aarch64 (smaller test
+    // set → different neighbours). Start from a clean FIB.
+    crate::route::__reset_for_test();
     crate::iface::register(GWIF, [0x02, 0, 0, 0, 0, 0x99], |_| Ok(()));
     crate::iface::set_iface_ipv4(GWIF, [198, 51, 100, 2], GW);
 
