@@ -4161,6 +4161,14 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
         }
         let task = crate::handlers::current_task_id();
         crate::handlers::__test_set_fsids(task, 1000, 1000);
+        // Model an unprivileged owner: drop caps so CAP_IPC_LOCK does not bypass
+        // RLIMIT_MEMLOCK on SHM_LOCK. `__test_set_fsids` sets fsuid directly and
+        // does NOT run the setfsuid cap fixup, so the task would otherwise still
+        // hold CAP_IPC_LOCK and shmctl's `can_do_mlock` would let the zero-limit
+        // lock through. Linux gates SHM_LOCK on `ns_capable(CAP_IPC_LOCK)` and
+        // then RLIMIT_MEMLOCK, so a non-cap owner over a zero limit gets EPERM.
+        // setup() restores full caps for the next test.
+        crate::handlers::__test_set_caps(task, 0, 0);
         let mut limit = [0u8; 16];
         limit[8..].copy_from_slice(&(8u64 * 1024 * 1024).to_ne_bytes());
         if call(Syscall::Setrlimit.raw(), a1(8, limit.as_ptr() as u64)) != Some(0)

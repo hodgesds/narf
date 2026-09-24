@@ -181,6 +181,13 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mmap_no_as_neg);
 fn smoke_abi_mem_map_locked_linux_errno_ordering() -> TestResult {
     with_setup(|| {
         with_mem_test_as(|as_ref| {
+            // Model the "unprivileged caller" this test describes: drop caps so
+            // the task lacks CAP_IPC_LOCK. mlock authority is
+            // `capable(CAP_IPC_LOCK) || RLIMIT_MEMLOCK != 0` (Linux
+            // `mm/mlock.c::can_do_mlock`); the harness task starts with the full
+            // set, which would grant the CAP_IPC_LOCK bypass and mask the EPERM
+            // path. setup() restores full caps for the next test.
+            crate::handlers::__test_set_caps(crate::handlers::current_task_id(), 0, 0);
             // RLIMIT_MEMLOCK == 0 makes mlock unavailable to an unprivileged
             // caller. Linux resolves a non-anonymous mapping's file descriptor
             // before do_mmap checks MAP_LOCKED authority, so an invalid fd wins.
@@ -227,6 +234,11 @@ fn smoke_abi_mem_future_locked_map_fixed_limit_preserves_old_mapping() -> TestRe
             const MAP_FIXED: u64 = 0x10;
             const MAP_ANONYMOUS: u64 = 0x20;
 
+            // Unprivileged caller: drop caps so CAP_IPC_LOCK does not bypass the
+            // one-page RLIMIT_MEMLOCK below (see the map_locked test for why).
+            // The nonzero limit still lets MCL_FUTURE install; only the
+            // over-limit charge must fail with EAGAIN. setup() restores caps.
+            crate::handlers::__test_set_caps(crate::handlers::current_task_id(), 0, 0);
             let one_page_limit = [0x1000u64, 0x1000u64];
             if call(
                 Syscall::Setrlimit.raw(),
@@ -351,6 +363,10 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mlock_no_as_neg);
 
 fn smoke_abi_mem_mlock_permission_precedes_range_validation() -> TestResult {
     with_setup(|| {
+        // Unprivileged caller: drop caps so CAP_IPC_LOCK does not grant mlock
+        // authority (which would let the range check run and change the errno).
+        // setup() restores full caps for the next test.
+        crate::handlers::__test_set_caps(crate::handlers::current_task_id(), 0, 0);
         let zero_limit = [0u64, 0u64];
         if call(Syscall::Setrlimit.raw(), a1(8, zero_limit.as_ptr() as u64)) != Some(0) {
             return Err("failed to set zero RLIMIT_MEMLOCK");
