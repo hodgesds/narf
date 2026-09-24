@@ -1073,6 +1073,32 @@ impl RegionTable {
             return;
         }
 
+        // Merge only fully-materialized neighbours. A sparse region's `phys`
+        // is a materialized prefix shorter than its page count, and absorbing
+        // one into a longer run makes every later operation in the combined
+        // region pay for the merged span: a fault zero-fills `phys` up to the
+        // faulting page's offset, and a mid-region punch copies both split
+        // halves of the prefix. With the monotonic mmap cursor placing
+        // adjacent demand-paged mappings back to back (musl mallocng backs
+        // every large allocation with its own mmap), those merges compounded
+        // into ever-longer runs whose per-op cost grew with the number of
+        // live mappings — stress-ng malloc fell from 133k to 49k ops/s
+        // between 256 and 16384 live slots while Linux stayed flat. Keeping
+        // demand-paged mappings as separate regions is Linux's
+        // VMA-per-mapping shape; dense (fully touched) neighbours still
+        // merge and keep the low-region-count win.
+        let sparse = |region: &Region| region.phys.len() != (region.len >> 12) as usize;
+        if sparse(current)
+            || predecessor_base
+                .and_then(|predecessor_base| self.get(predecessor_base))
+                .is_some_and(sparse)
+            || successor_base
+                .and_then(|successor_base| self.get(successor_base))
+                .is_some_and(sparse)
+        {
+            return;
+        }
+
         // `Region::phys` is a materialized prefix: entries past `phys.len()`
         // and explicit `PhysAddr::new(0)` slots both mean demand-zero.
         // Appending a source's prefix directly after a destination whose own
