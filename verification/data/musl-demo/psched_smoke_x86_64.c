@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
 
@@ -60,7 +61,14 @@ int main(void) {
         w("psched-fail: fchmodat2\n"); return 1;
     }
 
-    // ── rseq: register a restartable-sequence area ──
+    // ── rseq: must be REFUSED with ENOSYS ──
+    // NARF deliberately does not implement restartable sequences under
+    // preemptive SMP: faking registration success makes glibc trust an rseq ABI
+    // area whose cpu_id never advances and run critical sections un-restarted
+    // across a real CPU migration, silently corrupting per-CPU state (it matched
+    // the KDE greeter's heap abort()). So rseq(2) answers -ENOSYS, exactly like a
+    // kernel without rseq, and glibc falls back to getcpu(2). See
+    // userspace/src/handlers/sys_rseq.rs.
     struct rseq_area {
         uint32_t cpu_id_start;
         uint32_t cpu_id;
@@ -68,9 +76,9 @@ int main(void) {
         uint32_t flags;
     } __attribute__((aligned(32)));
     static struct rseq_area area;
-    if (syscall(SYS_rseq, &area, (long)sizeof area, 0L, 0x53053053L) != 0) {
-        w("psched-fail: rseq\n"); return 1;
-    }
+    errno = 0;
+    long rq = syscall(SYS_rseq, &area, (long)sizeof area, 0L, 0x53053053L);
+    if (rq != -1 || errno != ENOSYS) { w("psched-fail: rseq\n"); return 1; }
 
     w("psched-ok\n");
     return 0;
