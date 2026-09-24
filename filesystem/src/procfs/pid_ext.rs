@@ -265,6 +265,14 @@ impl FileOps for PidExtFile {
             mtime_cycles: 0,
         }
     }
+
+    /// Per-pid files belong to the task, as Linux's `task_dump_owner` stamps
+    /// them from its effective credentials. Without this the 0644 that
+    /// `Mode::FILE_RW` now means would leave these root-owned, so a task
+    /// could not write its own `oom_score_adj` or `loginuid`.
+    fn owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
 }
 
 /// Look up an extended per-pid file by `name` for `pid`.  Returns

@@ -667,7 +667,29 @@ impl Mode {
         file_type: FileType::File,
         perms: 0o444,
     };
+    /// A writable file: readable by all, writable by its owner.
+    ///
+    /// This is the DEFAULT any writable node should reach for, and it is
+    /// 0644 rather than 0666 on purpose. Virtual files are reported
+    /// root-owned unless their `FileOps` overrides `owners()`, so a 0666
+    /// mode hands the `other` write bit to every task on the system --- and
+    /// for anything reachable by path that IS the access decision. Two live
+    /// bugs came from this constant being 0666: every writable `/proc/sys`
+    /// key, and `/proc/<pid>/comm`, were world-writable.
+    ///
+    /// Use [`Mode::FILE_RW_ALL`] only where Linux genuinely publishes a
+    /// world-writable file.
     pub const FILE_RW: Mode = Mode {
+        file_type: FileType::File,
+        perms: 0o644,
+    };
+    /// A genuinely world-writable file, 0666.
+    ///
+    /// Rare, and it should be justified against Linux at each use. The one
+    /// case in NARF is `/proc/<pid>/attr/*`, which Linux declares
+    /// `ATTR(LSM, name, 0666)` because the LSM, not the mode, decides who
+    /// may write a security label.
+    pub const FILE_RW_ALL: Mode = Mode {
         file_type: FileType::File,
         perms: 0o666,
     };
