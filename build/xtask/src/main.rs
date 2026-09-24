@@ -6620,9 +6620,8 @@ fn boot_linux_stress(
     // Mirror `Arch::X86_64::qemu_args` piece by piece so the only
     // variable is the kernel: same -cpu string (clamped), same -smp and
     // NUMA/HMAT layout, same RAM split, same accelerator policy.
-    let cpu = Arch::clamp_cpu_phys_bits(
-        std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into()),
-    );
+    let cpu =
+        Arch::clamp_cpu_phys_bits(std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into()));
     let smp = std::env::var("NARF_QEMU_SMP").ok();
     let mem_mb: u64 = std::env::var("NARF_QEMU_MEM_MB")
         .ok()
@@ -6718,9 +6717,7 @@ fn boot_linux_stress(
     let mut done = false;
     while start.elapsed() < Duration::from_secs(timeout_secs) {
         if let Ok(g) = captured.lock() {
-            if g.windows(b"SWEEP-DONE".len())
-                .any(|w| w == b"SWEEP-DONE")
-            {
+            if g.windows(b"SWEEP-DONE".len()).any(|w| w == b"SWEEP-DONE") {
                 done = true;
             }
         }
@@ -6750,9 +6747,7 @@ fn boot_linux_stress(
             .chars()
             .rev()
             .collect();
-        bail!(
-            "Linux baseline: no SWEEP-DONE within {timeout_secs}s. Serial tail:\n{tail}"
-        );
+        bail!("Linux baseline: no SWEEP-DONE within {timeout_secs}s. Serial tail:\n{tail}");
     }
     Ok(transcript)
 }
@@ -6932,7 +6927,10 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     // in a 0.0 row.
     for m in &narf {
         if m.bogo_ops == 0.0 && m.real_secs > 0.0 {
-            println!("  note: NARF `{}` completed 0 bogo-ops — worker likely failed", m.name);
+            println!(
+                "  note: NARF `{}` completed 0 bogo-ops — worker likely failed",
+                m.name
+            );
         }
     }
     println!("\nxtask stress-bench: ok");
