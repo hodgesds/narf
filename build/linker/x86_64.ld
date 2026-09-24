@@ -15,6 +15,12 @@ ENTRY(_start)
 KERNEL_LOAD_BASE = 0x1000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
+/* Space reserved for the KASLR relocation table. A debug build currently
+ * needs ~1.6 MiB (399k sites x 4 bytes + header); 4 MiB leaves room to grow
+ * before the reservation has to be revisited. `xtask relocs` errors out if a
+ * table does not fit rather than writing a short one. */
+KASLR_RELOC_RESERVE = 4M;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -57,6 +63,33 @@ SECTIONS
         *(.text .text.*)
         __text_end = .;
     } :text
+
+    /* KASLR relocation table.
+     *
+     * Reserved here, filled after linking by `xtask relocs --patch`: the
+     * table's contents are computed FROM the linked image, so its size has to
+     * be fixed before the link or every address it records would move. The
+     * build fails rather than truncating if the table outgrows the window.
+     *
+     * It lives in the kernel half so the boot-time apply pass can find it by
+     * the same slid addressing it is patching, and it is PROGBITS (not .bss)
+     * because a NOBITS section has no file bytes to write into.
+     *
+     * Linux keeps its table appended after the compressed payload instead;
+     * that is not available here because the multiboot2/PVH loader maps only
+     * PT_LOAD segments, so anything outside one never reaches memory. */
+    .kaslr_relocs : AT(ADDR(.kaslr_relocs) - KERNEL_VIRT_BASE) ALIGN(4K) {
+        __kaslr_relocs_start = .;
+        QUAD(0);
+        . = __kaslr_relocs_start + KASLR_RELOC_RESERVE;
+        __kaslr_relocs_end = .;
+    } :rodata
+
+    /* Physical alias of the table, for the 32-bit apply pass in boot.S.
+     * Before paging there is no kernel-half addressing, and a 32-bit absolute
+     * cannot hold the high VA, so the pass needs the low address as a
+     * link-time constant. */
+    __kaslr_relocs_phys = __kaslr_relocs_start - KERNEL_VIRT_BASE;
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;

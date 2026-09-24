@@ -21,8 +21,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// The `affected` subcommand: crate reverse-dependency closure → the set
-/// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod affected;
 /// `verification/specification/spec.md` §8's statistics, split out because
 /// they are the only part of xtask with unit tests — a wrong t-distribution
@@ -30,12 +28,27 @@ mod affected;
 mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
+/// The `affected` subcommand: crate reverse-dependency closure → the set
+/// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
+mod relocs;
 
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(clap::Args)]
+struct RelocsArgs {
+    /// Linked kernel ELF to read.
+    elf: std::path::PathBuf,
+    /// Write the encoded table here instead of only reporting counts.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Patch the table into the image's reserved `.kaslr_relocs` section.
+    #[arg(long)]
+    patch: bool,
 }
 
 #[derive(Subcommand)]
@@ -52,6 +65,10 @@ enum Cmd {
     /// outputs (`--github`). Hub-crate / build-infra / unknown-path
     /// changes and push-to-main / nightly events force a full run.
     Affected(affected::AffectedArgs),
+    /// Extract the kernel's relocation table for KASLR and report what a
+    /// boot-time slide would have to patch. Requires a kernel linked with
+    /// `--emit-relocs`.
+    Relocs(RelocsArgs),
     /// Cross-compile the kernel.
     Build(BuildArgs),
     /// Cross-compile and boot under QEMU.
@@ -2556,6 +2573,28 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
 
     let profile = if args.debug { "debug" } else { "release" };
     let out = root.join("target").join(args.arch.triple()).join(profile);
+
+    // KASLR: fill the relocation table reserved by the linker script.
+    //
+    // This has to happen on every kernel link, not as a separate step someone
+    // remembers to run: the apply pass in `boot.S` keys on the table's magic
+    // and silently skips a slide when it is absent, so a forgotten patch would
+    // not fail the build or the boot — it would just quietly disable KASLR.
+    // Only x86_64 carries the table today.
+    if matches!(args.arch, Arch::X86_64) {
+        let elf = out.join(&args.package);
+        if elf.is_file() {
+            let table = relocs::patch(&elf).with_context(|| {
+                format!("patching the KASLR relocation table into {}", elf.display())
+            })?;
+            println!(
+                "xtask: KASLR relocation table -> {} sites ({} bytes)",
+                table.total(),
+                table.encoded_len()
+            );
+        }
+    }
+
     Ok(out)
 }
 
@@ -8813,6 +8852,28 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
+        Cmd::Relocs(args) => {
+            let table = if args.patch {
+                let t = relocs::patch(&args.elf)?;
+                println!(
+                    "xtask relocs: patched {} sites into {}",
+                    t.total(),
+                    args.elf.display()
+                );
+                t
+            } else {
+                relocs::extract(&args.elf)?
+            };
+            if let Some(out) = args.out.as_ref() {
+                std::fs::write(out, table.encode())?;
+                println!(
+                    "xtask relocs: wrote {} bytes to {}",
+                    table.encoded_len(),
+                    out.display()
+                );
+            }
+            Ok(())
+        }
         Cmd::Affected(args) => {
             let root = workspace_root()?;
             affected::affected_cmd(&args, &root)

@@ -81,6 +81,66 @@ _start:
     push 0
     push eax
 
+    /* ── KASLR: apply the relocation table ──
+     *
+     * The kernel is linked at a fixed address with `relocation-model=static`,
+     * so sliding it means patching every absolute field. `xtask relocs` has
+     * already recorded them into `.kaslr_relocs`; this walks that table and
+     * adds the slide to each site.
+     *
+     * Runs HERE, in 32-bit mode before paging, because the recorded offsets
+     * are physical: the linker's `AT(ADDR(x) - KERNEL_VIRT_BASE)` makes
+     * `virt - KERNEL_VIRT_BASE` exactly the load address, so a table entry is
+     * usable as-is with flat 32-bit addressing. It must also run before any
+     * patched value is read, and nothing above this point touches one.
+     *
+     * `ebx` holds the slide. It is zero for now: the pass is wired and
+     * exercised end to end — table located, 399k sites read and written —
+     * while remaining a provable no-op, so a boot failure here means the
+     * machinery is wrong rather than the slide value.
+     */
+    xor ebx, ebx                                /* slide = 0 */
+
+    mov esi, offset __kaslr_relocs_phys
+    cmp dword ptr [esi], 0x4B41534C             /* "KASL" */
+    jne .Lreloc_done                            /* never patched — skip */
+    mov ecx, [esi + 4]                          /* abs64 count   */
+    mov edx, [esi + 8]                          /* abs32s count  */
+    mov edi, [esi + 12]                         /* pcrel count   */
+    add esi, 20                                 /* first entry   */
+
+.Lreloc_64:
+    test ecx, ecx
+    jz .Lreloc_32s
+    mov eax, [esi]
+    add [eax], ebx                              /* low half      */
+    adc dword ptr [eax + 4], 0                  /* carry, hi = 0 */
+    add esi, 4
+    dec ecx
+    jmp .Lreloc_64
+
+.Lreloc_32s:
+    test edx, edx
+    jz .Lreloc_pc
+    mov eax, [esi]
+    add [eax], ebx
+    add esi, 4
+    dec edx
+    jmp .Lreloc_32s
+
+    /* Boot-stub references INTO the kernel half: PC-relative, but only the
+     * target moves, so the displacement grows by the same slide. */
+.Lreloc_pc:
+    test edi, edi
+    jz .Lreloc_done
+    mov eax, [esi]
+    add [eax], ebx
+    add esi, 4
+    dec edi
+    jmp .Lreloc_pc
+
+.Lreloc_done:
+
     /* ── identity-map the first 4 GiB + higher-half mapping ──
      *
      * 4-GiB identity coverage matters for real-HW boot: UEFI GOP

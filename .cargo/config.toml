@@ -35,6 +35,11 @@ rustflags = [
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
+    # KASLR: keep the relocation records in the linked image so a boot-time
+    # pass can slide it. Linux does the same -- `--emit-relocs` with
+    # `-mcmodel=kernel`, NOT a PIC build; the 32-bit entry in boot.S needs
+    # absolute R_X86_64_32 relocations that PIC rejects outright.
+    "-C", "link-arg=--emit-relocs",
     "-C", "code-model=kernel",
     "-C", "link-arg=-Tbuild/linker/x86_64.ld",
     "-C", "link-arg=--gc-sections",
