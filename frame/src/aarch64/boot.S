@@ -260,7 +260,25 @@ _start_rust_entry:
     mov x0, #0xfeed
     movk x0, #0xd00d, lsl #16
     mov x1, x19
-    bl  _start_rust
+    /* Indirect through a literal, not `bl _start_rust`.
+     *
+     * `.boot` is linked low (KERNEL_LOAD_BASE) and `_start_rust` is in the
+     * kernel half, so a direct `bl` is ~512 GiB out of CALL26's +/-128 MiB
+     * range and LLD silently inserts a range-extension thunk:
+     *
+     *     ldr x16, [pc+8] ; br x16 ; .quad _start_rust
+     *
+     * That `.quad` holds a kernel-half address and carries NO relocation
+     * record -- LLD resolves it at link time, so `--emit-relocs` reports
+     * nothing and a KASLR slide cannot see it. The x86_64 GOT is invisible
+     * for exactly this reason and needs its own fixup pass; here the whole
+     * problem is avoidable. A literal loaded with `ldr =` gets a real
+     * R_AARCH64_ABS64 record, which the relocation table already carries.
+     *
+     * x16 is IP0, the register a veneer is allowed to clobber, and x0/x1 hold
+     * the arguments. */
+    ldr x16, =_start_rust
+    blr x16
 
 1:  wfi
     b 1b
