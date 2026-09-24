@@ -3473,7 +3473,9 @@ fn smoke_abi_pathx_newfstatat_proc_self_fd_magic_symlink() -> TestResult {
         ) {
             Some(0) => {}
             Some(v) if v == ENOENT_E => {
-                return Err("newfstatat(/proc/self/fd/N) returned -ENOENT — magic symlink not followed")
+                return Err(
+                    "newfstatat(/proc/self/fd/N) returned -ENOENT — magic symlink not followed",
+                )
             }
             _ => return Err("newfstatat(/proc/self/fd/N) should return 0"),
         }

@@ -2949,10 +2949,15 @@ fn smoke_mount_change_type_rejects_multiple_bits() -> TestResult {
     let _ = unmount_for_test(TARGET);
     match got {
         Some(v) if v == (-(EINVAL as i64)) as u64 && still_private => TestResult::Pass,
-        _ => TestResult::Fail("change_type with two propagation bits must return -EINVAL and no-op"),
+        _ => {
+            TestResult::Fail("change_type with two propagation bits must return -EINVAL and no-op")
+        }
     }
 }
-kernel_test_in!("userspace/mount", smoke_mount_change_type_rejects_multiple_bits);
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_change_type_rejects_multiple_bits
+);
 
 // The peer-inheritance crux: after make-shared, unshare(CLONE_NEWNS) copies the
 // mount into the new namespace with the SAME peer-group id — so the two mounts
@@ -2998,7 +3003,8 @@ fn smoke_mount_ns_clone_inherits_peer_group() -> TestResult {
         let _ = unmount_for_test(TARGET);
         return TestResult::Fail("unshare(CLONE_NEWNS) failed");
     }
-    let clone_gid = crate::handlers::current_mount_namespace().and_then(|ns| ns.group_id_at(TARGET));
+    let clone_gid =
+        crate::handlers::current_mount_namespace().and_then(|ns| ns.group_id_at(TARGET));
 
     crate::handlers::clear_current_mount_namespace_for_test();
     crate::handlers::__test_root_dir_reset();
@@ -3116,7 +3122,10 @@ fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace/mount", smoke_mount_propagates_under_shared_to_peers);
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_propagates_under_shared_to_peers
+);
 
 // NEGATIVE: a mount under a PRIVATE (non-shared) parent must NOT propagate.
 fn smoke_mount_under_private_does_not_propagate() -> TestResult {
@@ -3179,7 +3188,10 @@ fn smoke_mount_under_private_does_not_propagate() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace/mount", smoke_mount_under_private_does_not_propagate);
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_under_private_does_not_propagate
+);
 
 // Silence unused-warning fence for the Vec import (used in the
 // resolve smoke if it grows later; harmless today).

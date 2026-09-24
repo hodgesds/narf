@@ -3750,12 +3750,7 @@ impl MountNamespace {
     /// [`VfsRegistry::change_propagation_at`]. Operates on this namespace's own
     /// table (its private mounts), which is where a service that unshared
     /// CLONE_NEWNS issues `mount --make-shared`.
-    pub fn change_propagation_at(
-        &self,
-        path: &str,
-        prop: MntPropagation,
-        recursive: bool,
-    ) -> bool {
+    pub fn change_propagation_at(&self, path: &str, prop: MntPropagation, recursive: bool) -> bool {
         self.store().change_propagation_at(path, prop, recursive)
     }
 
@@ -4403,12 +4398,7 @@ impl VfsRegistry {
     /// per mount so each mountpoint propagates independently). The other types
     /// drop the mount out of its peer group — full one-way slave and unbindable
     /// semantics are the LINUX-GAP noted on [`MntPropagation`].
-    pub fn change_propagation_at(
-        &self,
-        path: &str,
-        prop: MntPropagation,
-        recursive: bool,
-    ) -> bool {
+    pub fn change_propagation_at(&self, path: &str, prop: MntPropagation, recursive: bool) -> bool {
         let q = self.inner.lock();
         let mut found = false;
         for m in q.iter() {
@@ -4424,9 +4414,9 @@ impl VfsRegistry {
                         m.set_group_id(alloc_mount_group_id());
                     }
                 }
-                MntPropagation::Private
-                | MntPropagation::Slave
-                | MntPropagation::Unbindable => m.set_group_id(0),
+                MntPropagation::Private | MntPropagation::Slave | MntPropagation::Unbindable => {
+                    m.set_group_id(0)
+                }
             }
         }
         drop(q);
