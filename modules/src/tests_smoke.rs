@@ -521,13 +521,20 @@ kernel_test_in!(
     smoke_reloc_displacements_ignore_the_place_tag
 );
 
-/// The enforcement: inside a module's domain scope, a pointer into its image
-/// that does not carry the domain's tag faults; one that does, works.
+/// The enforcement: inside a module's domain scope, a pointer to that domain's
+/// heap memory that does not carry its tag faults; one that does, works.
 ///
-/// This is what "driver domains are isolated on aarch64" has to mean, and the
-/// assertion the whole of step 6 exists to make true. Without the in-scope
-/// fault the tagging is bookkeeping — pages marked Tagged Normal, granules
-/// carrying a tag, and nothing ever checking either.
+/// This is what "driver domains are isolated on aarch64" has to mean. Without
+/// the in-scope fault the tagging is bookkeeping — pages marked Tagged Normal,
+/// granules carrying a tag, and nothing ever checking either.
+///
+/// It used to make this assertion against the module IMAGE, which was tagged
+/// too. That could not survive PC-relative code generation: a module derives
+/// pointers to its own text and rodata from the PC, a branch does not carry an
+/// MTE tag into the PC, so the module faulted on its own rodata. Image pages
+/// are plain Normal now and the domain's *data* carries the tag, which is
+/// where a pointer comes from an allocator that can apply one. Linux draws the
+/// line in the same place: `KASAN_HW_TAGS` tags allocations, not module text.
 ///
 /// The out-of-scope half matters as much: it shows the enforcement is
 /// *scoped*. A test that only proved the fault would pass equally on a system
@@ -535,24 +542,35 @@ kernel_test_in!(
 /// dangerous machine than the one being built.
 #[cfg(target_arch = "aarch64")]
 fn smoke_module_domain_untagged_access_faults_in_scope() -> TestResult {
+    use core::alloc::Layout;
     use core::arch::asm;
     use narf_arch::aarch64::{mte, probe};
     use narf_lib::id::DomainId;
-    use narf_memory::module_text::{alloc, free};
+    use narf_memory::domain_heap;
 
     if !mte::supported() {
         return TestResult::Skip("no MTE on this CPU");
     }
-    let img = match alloc(1, DomainId::SCRATCH) {
-        Ok(i) => i,
-        Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
+    // A domain-heap allocation, not a module image. Image pages are no longer
+    // MTE-tagged — a module derives pointers to its own text and rodata from
+    // the PC, and a branch does not carry a tag into the PC, so a tagged image
+    // faulted on its own rodata under PC-relative codegen. The enforcement
+    // this case exists for is intact, on the memory where pointers do carry
+    // the tag: the allocator hands them out.
+    let layout = match Layout::from_size_align(64, 16) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("bad layout"),
     };
-    let plain = img.base;
-    let tagged = img.tagged_base();
+    let p = match domain_heap::alloc(layout, DomainId::SCRATCH) {
+        Some(p) => p,
+        None => return TestResult::Skip("the domain heap declined a SCRATCH allocation"),
+    };
+    let tagged = p as u64;
+    let plain = mte::with_tag(tagged, mte::UNTAGGED_KERNEL_TAG);
     if tagged == plain {
-        // SAFETY: nothing was executed from this image.
-        unsafe { free(img) };
-        return TestResult::Fail("SCRATCH's image is untagged, so nothing could fault");
+        // SAFETY: from `domain_heap::alloc` with this layout.
+        unsafe { domain_heap::free(p, layout) };
+        return TestResult::Skip("the domain heap returned an untagged pointer");
     }
 
     // Control: the untagged pointer works with TCF at Ignore. If it faults
@@ -604,14 +622,14 @@ fn smoke_module_domain_untagged_access_faults_in_scope() -> TestResult {
     // SAFETY: MRS SCTLR_EL1.
     let tcf_after = unsafe { mte::tcf_mode() };
 
-    // SAFETY: nothing was ever executed from this image.
-    unsafe { free(img) };
+    // SAFETY: from `domain_heap::alloc` with this layout, and no longer read.
+    unsafe { domain_heap::free(p, layout) };
 
     if inside_tagged != before {
         return TestResult::Fail("the tagged pointer read a different value inside the scope");
     }
     if !caught.fired {
-        return TestResult::Fail("untagged access inside a module domain scope did not fault");
+        return TestResult::Fail("untagged access to domain memory inside the scope did not fault");
     }
     // DFSC 0b010001 is a Synchronous Tag Check Fault specifically. A
     // translation or permission fault here would mean the mapping is wrong,

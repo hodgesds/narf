@@ -482,7 +482,7 @@ fn build_image(
         // fault once TCF is Sync. Safe for relocation arithmetic because
         // `apply_aarch64` untags both operands of every displacement form.
         // No-op off aarch64 / without MTE.
-        let va = mem.tagged_base() + off;
+        let va = mem.entry_base() + off;
         // SAFETY: `plan_layout` sized the image to cover `[off, off + size)`,
         // and every page is still `Rw` — nothing has been sealed yet.
         let dst = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, size) };
@@ -509,7 +509,7 @@ fn build_image(
 
     let symbols = SymbolTable::new(bytes, symtab_pair.0, symtab_pair.1);
     let mut plt = (layout.plt_slots > 0)
-        .then(|| Plt::new(mem.tagged_base() + layout.plt_offset, layout.plt_slots));
+        .then(|| Plt::new(mem.entry_base() + layout.plt_offset, layout.plt_slots));
     let mut ctx = RelocContext {
         manifest,
         plt: plt.as_mut(),
