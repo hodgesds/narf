@@ -192,7 +192,11 @@ mod kaslr_slide_tests {
         let tstart = image_virt_to_phys(core::ptr::addr_of!(__text_start) as u64);
         let tend = image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
 
-        if kend <= kstart || kend >= (1 << 30) {
+        // A size bound, not an address bound. `KERNEL_LOAD_BASE` is 16 MiB on
+        // x86_64 but 0x40080000 on aarch64, where RAM starts at 1 GiB, so
+        // "under 1 GiB" is an x86 assumption and not an invariant. The size is
+        // one on both.
+        if kend <= kstart || kend - kstart > (1 << 30) {
             return TestResult::Fail("image bounds are not a sane physical range");
         }
         if tstart < kstart {
