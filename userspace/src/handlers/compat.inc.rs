@@ -5283,6 +5283,19 @@ pub fn signal_pending_of(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_PENDING, task)
 }
 
+/// Linux `fatal_signal_pending()` for the CURRENT task: an uncatchable
+/// SIGKILL is queued. The page-fault path uses this to stop servicing
+/// demand faults for a task that is already condemned — after the OOM
+/// killer queues SIGKILL and reaps the victim's anonymous frames, the
+/// victim's next touch faults; servicing that fault hands it a fresh
+/// zero page and lets it keep executing on wiped state until it dies of
+/// a #GP (stress-ng then reports "unexpected SIGSEGV" instead of the
+/// OOM kill). Dying AT the fault is Linux's `VM_FAULT_SIGKILL` shape.
+pub fn current_task_fatal_signal_pending() -> bool {
+    // Bit N == signal N in the pending mask (see SIGNAL_PENDING).
+    signal_pending_of(current_task_id()) & (1 << 9) != 0
+}
+
 /// Test hook for the exact empty/non-empty task count that gates syscall-return
 /// signal delivery.
 #[doc(hidden)]
