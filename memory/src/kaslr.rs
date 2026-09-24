@@ -108,10 +108,8 @@ mod kaslr_slide_tests {
             // `KASLR_SLIDE_MASK` is 0 in the linker script, so the machinery
             // is built and exercised but deliberately inert.
             //
-            // Enabling it boots and runs most of the suite, but regresses
-            // `drivers/storage/nvme-e2e`, so the mask stays at 0 until that is
-            // understood. A Skip rather than a Pass on purpose: an inert KASLR
-            // must not read as a working one.
+            // A Skip rather than a Pass on purpose: an inert KASLR must not
+            // read as a working one.
             return TestResult::Skip("KASLR_SLIDE_MASK is 0 — the image is not slid");
         }
         // 2 MiB pages back the window, so anything finer cannot be mapped.
@@ -144,6 +142,55 @@ mod kaslr_slide_tests {
         TestResult::Pass
     }
     kernel_test_in!("memory/kaslr", smoke_kaslr_kernel_image_is_slid);
+
+    /// The image-bounding linker symbols are PHYSICAL and must not be slid.
+    ///
+    /// `__kernel_start` and `__kernel_end` are defined outside the virtual
+    /// window (before `. += KERNEL_VIRT_BASE`, and as `. - KERNEL_VIRT_BASE`
+    /// respectively), so they already hold physical addresses. The linker
+    /// nonetheless emits them with a real section index rather than
+    /// `SHN_ABS`, which makes them indistinguishable from ordinary pointers
+    /// to a relocation-table builder that keys only on the field's location.
+    ///
+    /// Adding the slide to them is silent and catastrophic. It moved the
+    /// frame allocator's reserved range to `[start + slide, end + slide)`,
+    /// leaving the image's first `slide` bytes free for the buddy to hand
+    /// out — the kernel allocating its own code as scratch — and it pushed
+    /// `kernel_exec_phys_range`'s start past the real start of text, mapping
+    /// that text NX so instruction fetch faulted inside the fault handler.
+    ///
+    /// Neither shows up as a wrong slide, so the sibling test above passes
+    /// throughout. The invariant that does catch it is containment: text lies
+    /// inside the image, in physical terms, at every slide.
+    fn smoke_kaslr_image_bounds_stay_physical() -> TestResult {
+        unsafe extern "C" {
+            static __kernel_start: u8;
+            static __kernel_end: u8;
+            static __text_start: u8;
+            static __text_end: u8;
+        }
+        let kstart = core::ptr::addr_of!(__kernel_start) as u64;
+        let kend = core::ptr::addr_of!(__kernel_end) as u64;
+        // These two are virtual and SHOULD move, so convert them.
+        let tstart = image_virt_to_phys(core::ptr::addr_of!(__text_start) as u64);
+        let tend = image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
+
+        if kend <= kstart || kend >= (1 << 30) {
+            return TestResult::Fail("image bounds are not a sane physical range");
+        }
+        if tstart < kstart {
+            return TestResult::Fail(
+                "kernel text starts below __kernel_start — a physical linker symbol was slid",
+            );
+        }
+        if tend > kend {
+            return TestResult::Fail(
+                "kernel text ends above __kernel_end — a physical linker symbol was slid",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/kaslr", smoke_kaslr_image_bounds_stay_physical);
 }
 
 /// Pull one 64-bit value of randomness using the best available source.
@@ -182,8 +229,16 @@ pub fn user_mmap_slot(base: u64) -> u64 {
     base + (r & mask)
 }
 
-/// Pick a kernel-image slide. Caller adds this to the fixed kernel-half
-/// base before installing the page tables.
+/// Pick a *candidate* kernel-image slide by drawing fresh entropy.
+///
+/// NOT an accessor for the slide in force — read [`KERNEL_SLIDE`] for that.
+/// Every call returns a different number, so using this where the applied
+/// slide was meant yields a plausible-looking wrong answer rather than an
+/// error; it has already done so once, in the boot log.
+///
+/// `boot.S` picks the live slide itself, long before Rust runs, because the
+/// relocations must be applied before any slid address is dereferenced. That
+/// leaves this function with no caller on the boot path.
 #[inline]
 pub fn kernel_slide() -> u64 {
     let (r, _) = random_u64();

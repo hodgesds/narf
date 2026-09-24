@@ -152,6 +152,11 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
 
     let mut table = RelocTable::default();
     let mut skipped_low = 0usize;
+    // Kernel-half absolute fields deliberately left unpatched because the
+    // value they encode does not move (a physical address or a constant).
+    // Counted separately: a site that is neither patched nor reported is
+    // indistinguishable from one the parser never saw.
+    let mut skipped_static = 0usize;
 
     for &(sh_type, _, _, sh_offset, sh_size, sh_link, sh_info, sh_entsize) in &sections {
         if sh_type != SHT_RELA {
@@ -194,8 +199,21 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
             match (r_type, field_moves, value_moves) {
                 // Absolute fields in the kernel half encoding a kernel-half
                 // value: the ordinary case.
-                (R_X86_64_64, true, _) => table.abs64.push(r_offset),
-                (R_X86_64_32S, true, _) => table.abs32s.push(r_offset),
+                //
+                // `value_moves` is load-bearing, not decoration. A kernel-half
+                // field can encode a value that does NOT move, and sliding it
+                // corrupts it. The linker script defines `__kernel_start` and
+                // `__kernel_end` as PHYSICAL addresses (before/minus
+                // `KERNEL_VIRT_BASE`), yet emits them with a real section
+                // index rather than SHN_ABS — so they look like any other
+                // symbol here. Adding the slide to them made the frame
+                // allocator reserve `[start + slide, end + slide)`, leaving the
+                // image's first `slide` bytes free for the buddy to hand out,
+                // and made `kernel_exec_phys_range` mark the corresponding
+                // kernel text NX. Matching on the value, not just the field,
+                // is what distinguishes a pointer from a physical constant.
+                (R_X86_64_64, true, true) => table.abs64.push(r_offset),
+                (R_X86_64_32S, true, true) => table.abs32s.push(r_offset),
                 // A plain 32-bit absolute encoding a kernel-half value cannot
                 // survive a slide; `code-model=kernel` does not emit these, so
                 // refuse rather than silently truncate.
@@ -210,6 +228,7 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
                 }
                 // Absolute field in the boot stub encoding a low value, or
                 // PC-relative within one half: nothing to do.
+                (R_X86_64_64 | R_X86_64_32S, true, false) => skipped_static += 1,
                 _ => {
                     if !field_moves {
                         skipped_low += 1;
@@ -224,7 +243,7 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
     }
     eprintln!(
         "xtask relocs: {} abs64 + {} abs32s + {} cross-half pcrel = {} sites \
-         ({} bytes), {skipped_low} left alone",
+         ({} bytes), {skipped_low} low + {skipped_static} non-moving left alone",
         table.abs64.len(),
         table.abs32s.len(),
         table.pcrel32_into_kernel.len(),

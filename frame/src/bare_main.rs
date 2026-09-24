@@ -1585,6 +1585,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             narf_memory::direct_map_base() >> 39 & 0x1FF,
                             narf_memory::direct_map_base()
                         );
+                        // Same reasoning for the image itself: a zero slide
+                        // and a slide that was computed but never applied
+                        // look identical in a boot log, and a slide-dependent
+                        // bug is unbisectable without knowing the value.
+                        let _ = writeln!(
+                            console::Writer,
+                            "  mmu: kernel image slide {:#x}, base {:#018x}",
+                            narf_memory::kaslr::KERNEL_SLIDE
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                            narf_memory::kaslr::kernel_virt_base()
+                        );
                         // Supervisor stores ignore the read-only bit unless
                         // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S
                         // only ever set CR0.PG — measured CR0 at this point

@@ -36,13 +36,21 @@ KASLR_RELOC_RESERVE = 4M;
  * that the image plus its slide must stay clear of the module text window one
  * GiB above the link base; deriving it from `__kernel_end` would keep it
  * honest as the image grows. */
-/* Still 0. The kernel-window shrink in `init_mmu` removed the image-vs-alias
- * conflict that defeated the first two attempts, and with the slide on the
- * kernel now boots and runs hundreds of tests — but `drivers/storage/nvme-e2e`
- * still fails, for a reason that is NOT the window shape: it fails identically
- * with the old 1 GiB window, the clamped window and the shrunk one.
- * Set to 0x0FE00000 to enable. */
-KASLR_SLIDE_MASK = 0x00000000;
+/* Enabled. A nonzero slide used to fail in one of two ways, both traced to
+ * one defect in the relocation-table builder: it slid every absolute field in
+ * a kernel-half section, including the few encoding `__kernel_start` /
+ * `__kernel_end`, which are PHYSICAL. See `relocs.rs` and
+ * `smoke_kaslr_image_bounds_stay_physical`. Verified at slides of 2, 8, 32,
+ * 128 and 254 MiB and on the random path. */
+KASLR_SLIDE_MASK = 0x0FE00000;
+
+/* Debug: pin the slide to a fixed value instead of drawing entropy, so a
+ * slide-dependent failure is reproducible and bisectable. The random path
+ * gives every boot a different slide, which makes a failure look like it
+ * moves between unrelated tests. Still masked and 2 MiB aligned by the same
+ * code as the random value, so an out-of-range value here cannot widen the
+ * window. 0 = draw entropy as normal. */
+KASLR_SLIDE_FIXED = 0x00000000;
 
 PHDRS
 {
