@@ -1336,12 +1336,30 @@ pub fn resched_current() {
 }
 
 /// Peek this CPU's pending reschedule request without consuming it. The preempt
-/// path reads this to fold a `resched_current()`/waker request into its slice
-/// decision; the executor's dispatch loop is the authoritative consumer (it
-/// clears the flag once we actually switch), so a peek here never steals it.
+/// path folds a `resched_current()`/waker request into its slice decision and,
+/// when it actually commits the switch, consumes it via [`clear_need_resched`]
+/// (Linux `clear_tsk_need_resched` in `__schedule`). A peek that does NOT lead to
+/// a preempt (nothing else runnable) leaves the flag set for the next check; the
+/// halt-commit `swap(false)` is the backstop that clears it when the CPU idles.
 #[inline]
 pub(crate) fn need_resched_pending(cpu: usize) -> bool {
     cpu < NEED_RESCHED.len() && NEED_RESCHED[cpu].load(Ordering::Acquire)
+}
+
+/// Consume this CPU's reschedule request at the point a preempt actually commits
+/// to switching to the executor (Linux `clear_tsk_need_resched`). Without this a
+/// stale `NEED_RESCHED` — set by every `resched_remote` to a *running* CPU, IPI
+/// skipped — would re-fire the tick-rate preempt on every subsequent tick until
+/// the CPU next idled, collapsing the effective quantum. Safe against a racing
+/// waker: the wake published its slot to READY/the wake-list BEFORE storing
+/// `NEED_RESCHED`, so the executor's next round dispatches it regardless, and a
+/// wake that arrives after this clear re-sets the flag and is caught by the
+/// halt-commit backstop.
+#[inline]
+pub(crate) fn clear_need_resched(cpu: usize) {
+    if cpu < NEED_RESCHED.len() {
+        NEED_RESCHED[cpu].store(false, Ordering::SeqCst);
+    }
 }
 
 // ── Tick-driven load balancing (Linux `scheduler_tick` -> load_balance) ──────
@@ -1374,14 +1392,22 @@ static MIGRATE_PENDING: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
 static PENDING_MIGRATE: [IrqSafeSpinLock<Option<(u64, u32)>>; narf_lib::percpu::MAX_CPUS] =
     [const { IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
 
-/// Fill `buf` with a load snapshot of every online CPU and return the filled
-/// prefix — NARF's analogue of the per-CPU stats Linux `load_balance` reads from
-/// each `rq`. A policy calls this from `on_tick` to decide whether (and where) to
-/// shed work. Allocation-free and non-blocking (`try_lock` per queue, skipped on
-/// contention), so it is safe to call from the tick ISR; size `buf` to the CPU
-/// count ([`narf_lib::percpu::MAX_CPUS`]).
+/// Fill `buf` with a load snapshot of every balance-eligible CPU and return the
+/// filled prefix — NARF's analogue of the per-CPU stats Linux `load_balance`
+/// reads from each `rq`. A policy calls this from `on_tick` to decide whether
+/// (and where) to shed work; size `buf` to the CPU count
+/// ([`narf_lib::percpu::MAX_CPUS`]).
+///
+/// Cheap and ISR-safe: per CPU it takes a single `try_lock` + O(1) `len()` (never
+/// walks a peer's queue), then releases. A CPU whose queue is momentarily
+/// contended (mid-dispatch, a remote wake/steal in flight) is reported BUSY
+/// (`nr_queued = u16::MAX`) rather than empty — matching `select_fork_cpu`'s
+/// contended-is-busy convention, so the balancer never mistakes a busy CPU for a
+/// light target. Only `Active`/`Idle` CPUs are included; a `Draining`/`Starting`
+/// CPU is not a migration target and is skipped. `nr_queued` is the queued length
+/// (an upper bound on runnable work — parked tasks inflate it, which only makes
+/// the balancer more conservative about targeting that CPU).
 pub fn peer_loads(buf: &mut [policy::CpuLoad]) -> &[policy::CpuLoad] {
-    let now = narf_time::now_cycles();
     let mut n = 0usize;
     for c in 0..narf_lib::percpu::MAX_CPUS {
         if n >= buf.len() {
@@ -1390,16 +1416,25 @@ pub fn peer_loads(buf: &mut [policy::CpuLoad]) -> &[policy::CpuLoad] {
         if c != 0 && !narf_lib::smp::is_online(c as u32) {
             continue;
         }
-        let nr = READY[c]
-            .try_lock()
-            .and_then(|g| {
-                g.as_ref()
-                    .map(|d| d.iter().filter(|s| slot_is_dispatchable(s, now)).count())
-            })
-            .unwrap_or(0);
+        // Balance-eligible lifecycle only; a Draining/Starting CPU won't drain a
+        // migrated task (it parks on lifecycle state, not a work re-scan).
+        if !matches!(
+            policy::cpu_state(CpuId(c as u32)),
+            policy::CpuState::Active | policy::CpuState::Idle
+        ) {
+            continue;
+        }
+        // O(1) queued length under try_lock; contended => reported busy.
+        let nr = match READY[c].try_lock() {
+            Some(g) => g
+                .as_ref()
+                .map(|d| d.len().min(u16::MAX as usize) as u16)
+                .unwrap_or(0),
+            None => u16::MAX,
+        };
         buf[n] = policy::CpuLoad {
             cpu: CpuId(c as u32),
-            nr_dispatchable: nr.min(u16::MAX as usize) as u16,
+            nr_queued: nr,
             idle: CPU_HALTED[c].load(Ordering::SeqCst),
             vfloor: vfloor(c),
         };
@@ -1455,6 +1490,12 @@ fn run_pending_migration(cpu: usize) {
     if target >= narf_lib::percpu::MAX_CPUS
         || target == cpu
         || !narf_lib::smp::is_online(target_raw)
+        // Lifecycle re-check (state may have changed since the tick chose it): a
+        // Draining/Starting CPU won't drain a migrated task, so never push there.
+        || !matches!(
+            policy::cpu_state(CpuId(target_raw)),
+            policy::CpuState::Active | policy::CpuState::Idle
+        )
     {
         return;
     }

@@ -2708,9 +2708,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: task_ptr is the live current task established above.
     let slice_expired = slice_expired_unit_aware(unsafe { &*task_ptr }, elapsed, slice);
     // Honor a policy/waker reschedule request (Linux TIF_NEED_RESCHED) alongside
-    // slice expiry. Peek, don't consume: the executor's dispatch loop clears it
-    // once we switch, and if we don't preempt (nothing else runnable) it remains
-    // set harmlessly for the next check.
+    // slice expiry. Peek here; if we commit to the switch below we consume it via
+    // `clear_need_resched` (Linux clear_tsk_need_resched). If we DON'T preempt
+    // (nothing else runnable) it stays set for the next check.
     let need_resched = crate::need_resched_pending(cpu);
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
@@ -2720,6 +2720,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if exec_ctx.is_null() {
         return false; // no executor to switch to
     }
+    // Committed to switch: consume NEED_RESCHED so a stale flag (set by a remote
+    // wake to this running CPU, IPI skipped) does not re-fire the preempt on
+    // every subsequent tick until we idle.
+    crate::clear_need_resched(cpu);
 
     // Own-stack invariant tripwire. A CPL0 timer tick that preempts THIS task
     // must have landed on the task's OWN kernel stack: `poll_to_yield`
@@ -2909,7 +2913,8 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     }
     let slice = task.slice_cycles.load(Ordering::Acquire);
     let slice_expired = slice_expired_unit_aware(task, elapsed, slice);
-    // Honor a policy/waker reschedule request alongside slice expiry (peek).
+    // Honor a policy/waker reschedule request alongside slice expiry (peek;
+    // consumed at the commit below).
     let need_resched = crate::need_resched_pending(cpu);
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
@@ -2918,6 +2923,8 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     if exec_ctx.is_null() {
         return false;
     }
+    // Committed to switch: consume NEED_RESCHED (see try_preempt).
+    crate::clear_need_resched(cpu);
     let frame_addr = frame as *const Aarch64TrapFrame as usize;
     let stack_base = task.stack.as_ptr() as usize;
     let stack_top = stack_base + task.stack.len();
@@ -3026,7 +3033,8 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
     // SAFETY: task_ptr is the live current task established above.
     let slice_expired = slice_expired_unit_aware(unsafe { &*task_ptr }, elapsed, slice);
-    // Honor a policy/waker reschedule request alongside slice expiry (peek).
+    // Honor a policy/waker reschedule request alongside slice expiry (peek;
+    // consumed at the commit below).
     let need_resched = crate::need_resched_pending(cpu);
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
@@ -3036,6 +3044,8 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     if exec_ctx.is_null() {
         return false;
     }
+    // Committed to switch: consume NEED_RESCHED (see try_preempt).
+    crate::clear_need_resched(cpu);
     // Own-stack invariant tripwire (CPL3 side). The user task ran on its OWN
     // kernel stack via TSS.rsp0 (poll_to_yield retargets it), so a CPL3→CPL0
     // timer trap lands its frame at rsp0 = this task's stack top. If `frame`

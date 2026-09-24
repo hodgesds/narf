@@ -2918,7 +2918,7 @@ fn smoke_peer_loads_snapshot() -> TestResult {
     use crate::{peer_loads, CpuId, CpuLoad};
     let mut buf = [CpuLoad {
         cpu: CpuId(0),
-        nr_dispatchable: 0,
+        nr_queued: 0,
         idle: false,
         vfloor: 0,
     }; narf_lib::percpu::MAX_CPUS];

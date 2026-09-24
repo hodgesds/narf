@@ -168,17 +168,20 @@ impl TaskMeta {
 }
 
 /// Per-CPU load snapshot for tick-driven load balancing. A policy gathers these
-/// for every online CPU via [`crate::peer_loads`] inside `on_tick`, then decides
-/// whether to shed work (calling [`crate::migrate_task`]). Carries exactly what a
-/// balance decision needs and the core can read cheaply: the count of
-/// dispatchable (awake, un-throttled) queued tasks, whether the CPU is
-/// idle-halted, and its EEVDF virtual-time floor (so a vruntime-ordered policy
-/// can compare virtual time across CPUs). The running task is off-queue during
-/// its poll, so `nr_dispatchable` counts only *queued* runnable work.
+/// for every balance-eligible CPU via [`crate::peer_loads`] inside `on_tick`,
+/// then decides whether to shed work (calling [`crate::migrate_task`]). Carries
+/// exactly what a balance decision needs and the core can read cheaply (O(1) per
+/// CPU): the queued length, whether the CPU is idle-halted, and its EEVDF
+/// virtual-time floor (so a vruntime-ordered policy can compare virtual time
+/// across CPUs). `nr_queued` is the run-queue length — an upper bound on runnable
+/// work (parked tasks inflate it) and `u16::MAX` for a CPU whose queue was
+/// momentarily lock-contended (reported busy so it is never mistaken for a light
+/// target). The running task is off-queue during its poll, so `nr_queued` counts
+/// only *queued* tasks.
 #[derive(Copy, Clone, Debug)]
 pub struct CpuLoad {
     pub cpu: CpuId,
-    pub nr_dispatchable: u16,
+    pub nr_queued: u16,
     pub idle: bool,
     pub vfloor: u64,
 }
@@ -713,42 +716,55 @@ static CLASS_BALANCE_TICKS: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
 /// Run the balance pass at most once per this many ticks per CPU.
 const CLASS_BALANCE_INTERVAL: u32 = 8;
 
-/// One `ClassScheduler` balance pass for `cpu`. `queue` is this CPU's already
-/// locked run queue (so the local dispatchable count comes from it, not from
-/// `peer_loads`, whose own-CPU entry would read 0 under the held lock). Picks the
-/// least-loaded peer (idle preferred) and, only on a clear imbalance, sheds one
-/// runnable, un-pinned, non-user task whose affinity permits that peer.
-/// `#[inline(never)]` keeps the `MAX_CPUS`-wide `CpuLoad` buffer off the
-/// common-tick stack frame.
+/// One `ClassScheduler` balance pass for `cpu`. Picks the least-loaded peer (idle
+/// preferred) and, only on a clear imbalance, sheds one runnable, un-pinned,
+/// non-user task whose affinity permits that peer. Kept cheap for the tick path:
+/// an O(1) `len()` early-out, one O(1)-per-peer `peer_loads` snapshot, then a
+/// SINGLE local-queue scan that both counts runnable work and finds the shed
+/// candidate for the chosen target. `#[inline(never)]` keeps the `MAX_CPUS`-wide
+/// `CpuLoad` buffer off the common-tick stack frame.
 #[inline(never)]
 fn class_balance_pass(cpu: CpuId, queue: &RunQueue<'_>) {
-    let my = queue.iter_meta().filter(|(_, m)| m.runnable).count();
-    if my < 2 {
-        return; // keep at least one runnable task local before shedding
+    // Cheap gate: fewer than two queued tasks can never leave a runnable task
+    // local AND shed one, so skip the peer snapshot entirely.
+    if queue.len() < 2 {
+        return;
     }
     let mut buf = [CpuLoad {
         cpu: CpuId(0),
-        nr_dispatchable: 0,
+        nr_queued: 0,
         idle: false,
         vfloor: 0,
     }; narf_lib::percpu::MAX_CPUS];
     let loads = crate::peer_loads(&mut buf);
+    // `peer_loads` already excludes this CPU's own (lock-contended) entry as busy
+    // and reports only Active/Idle peers; pick the lightest, idle preferred.
     let Some(target) = loads
         .iter()
         .filter(|l| l.cpu != cpu)
-        .min_by_key(|l| (l.nr_dispatchable, !l.idle))
+        .min_by_key(|l| (l.nr_queued, !l.idle))
     else {
         return;
     };
-    // Shed only on a clear imbalance (peer at least two lighter than us).
-    if (my as u16) <= target.nr_dispatchable.saturating_add(1) {
+    // Single local scan: count runnable work AND remember the first task that
+    // could move to `target` (runnable, un-pinned, non-user, affinity permits it).
+    let mut my = 0u32;
+    let mut shed: Option<TaskHandle> = None;
+    for (handle, meta) in queue.iter_meta() {
+        if !meta.runnable {
+            continue;
+        }
+        my += 1;
+        if shed.is_none() && !meta.addr_space && meta.affinity.allowed.contains(target.cpu) {
+            shed = Some(handle);
+        }
+    }
+    // Keep at least one runnable task local, and shed only on a clear imbalance.
+    if my < 2 || (my as u16) <= target.nr_queued.saturating_add(1) {
         return;
     }
-    for (handle, meta) in queue.iter_meta() {
-        if meta.runnable && !meta.addr_space && meta.affinity.allowed.contains(target.cpu) {
-            crate::migrate_task(handle, target.cpu);
-            return;
-        }
+    if let Some(handle) = shed {
+        crate::migrate_task(handle, target.cpu);
     }
 }
 
@@ -906,18 +922,25 @@ pub fn install_scheduler<S: Scheduler>(
     // is no partial install. Publishing the base right before the policy goes
     // live keeps dispatch's (policy, base) pair consistent.
     let base = resolve_quantum_unit(s.quantum_unit())?;
+    // Compute the tick gate before `s` is moved into the published instance.
+    let wants_tick = policy_uses_tick(&s);
     let replacement = Arc::new(PolicyInstance {
         policy: Box::new(s),
     });
     replacement.policy.on_install();
-    store_active_quantum_unit(base);
-    store_policy_wants_tick(replacement.policy.as_ref());
     let generation = publish_policy(replacement, false);
     // This acquire load is the install operation's linearization point. If no
     // newer ticket exists, our completed walk necessarily published this
     // generation to every CPU. A ticket issued after the load is a later
     // install; a ticket issued before it makes this caller the explicit loser.
     if NEXT_SCHEDULER_GENERATION.load(Ordering::Acquire) == generation.wrapping_add(1) {
+        // Won the linearization: publish the resolved base + tick gate NOW, on the
+        // winning path only. Storing them before the generation check (as before)
+        // let a superseded install leave the live winner with the LOSER's base /
+        // tick flags — e.g. the balancer silently off, or a `Cycles` policy run
+        // under Nanos enforcement (the silent downgrade the design refuses).
+        store_active_quantum_unit(base);
+        POLICY_WANTS_TICK.store(wants_tick, Ordering::Release);
         Ok(())
     } else {
         Err(SchedulerError::Superseded)
