@@ -173,7 +173,13 @@ pub fn icmp_echo_send(
     let dst_mac = if target == [255, 255, 255, 255] {
         [0xFF; 6]
     } else {
-        arp_resolve_in(sock.net_ns_id, target, 1000).map_err(|_| IcmpError2::NetworkUnreachable)?
+        // The route's next hop, not the target — see `udp_sock.rs` and
+        // Linux's `ip_neigh_for_gw()`. Pinging anything off-link ARPed the
+        // remote address on the local link and failed.
+        let nexthop = crate::route::route_lookup_in(sock.net_ns_id, crate::ipv4::Ipv4Addr(target))
+            .map(|r| r.nexthop.0)
+            .unwrap_or(target);
+        arp_resolve_in(sock.net_ns_id, nexthop, 1000).map_err(|_| IcmpError2::NetworkUnreachable)?
     };
 
     // Build: Eth + IPv4 + ICMP echo request.
