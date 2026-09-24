@@ -1674,6 +1674,79 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     true
 }
 
+/// Detach (but do NOT free) the level-1 PT covering `virt` when it holds no
+/// present leaves: clear its PD entry, unregister it, and push its frame —
+/// plus the PD's, when the detach empties the PD too — onto `out`. Returns
+/// true when a PT was detached.
+///
+/// The USER munmap paths need this mmu_gather split of [`free_empty_pt`]: a
+/// peer CPU running the same address space may have re-cached the PD entry in
+/// its paging-structure caches between the caller's leaf flush and this
+/// detach (user code can touch the unmapped range at any time and fault). A
+/// detached frame may therefore only return to the allocator after one more
+/// cross-CPU invalidation of the covered range; freeing immediately would let
+/// that CPU's next hardware walk descend into a reused frame and write A/D
+/// bits into it. `free_empty_pt` keeps the immediate-free contract for kernel
+/// vmalloc, whose VAs are never touched after unmap.
+///
+/// Only AS-private, registry-known tables are detached; a kernel-shared table
+/// is never registered and is skipped (same guard as AS teardown).
+///
+/// # Safety
+/// Same walk contract as [`free_empty_pt`]: `root` must be identity-reachable
+/// and every present leaf in this PT must already be unmapped with a
+/// cross-CPU invalidation of the covered range issued.
+pub(crate) unsafe fn detach_empty_pt(
+    root: PhysAddr,
+    virt: VirtAddr,
+    out: &mut alloc::vec::Vec<crate::frame::PhysFrame>,
+) -> bool {
+    let _guard = pt_lock_for(root).lock();
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: root is identity-reachable and the mutation lock is held.
+    let pml4 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    let pml4e = pml4.entries[idx.pml4];
+    if !pml4e.is_present() {
+        return false;
+    }
+    // SAFETY: a present PML4 entry names an identity-reachable PDPT.
+    let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
+    let pdpte = pdpt.entries[idx.pdpt];
+    if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+        return false;
+    }
+    // SAFETY: a present, non-huge PDPT entry names an identity-reachable PD.
+    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
+    let pde = pd.entries[idx.pd];
+    if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+        return false;
+    }
+    let pt_phys = pde.addr();
+    if !crate::frame::__pagetable_is_registered(pt_phys.raw()) {
+        return false;
+    }
+    // SAFETY: a present, non-huge PD entry names an identity-reachable PT.
+    let pt = unsafe { &*pt_phys.kernel_ptr::<PageTable>() };
+    if pt.entries.iter().any(|e| e.is_present()) {
+        return false;
+    }
+    pd.entries[idx.pd] = PageTableEntry::EMPTY;
+    crate::frame::__pagetable_unregister(pt_phys.raw());
+    out.push(crate::frame::PhysFrame::new(pt_phys));
+    // Cascade: if that emptied the PD too, detach it from the PDPT as well.
+    // Stop at the PDPT (one per 512 GiB of VA — retaining it is negligible
+    // and AS teardown reclaims it).
+    if !pd.entries.iter().any(|e| e.is_present()) {
+        let pd_phys = pdpte.addr();
+        if crate::frame::__pagetable_is_registered(pd_phys.raw()) {
+            pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
+            crate::frame::__pagetable_unregister(pd_phys.raw());
+            out.push(crate::frame::PhysFrame::new(pd_phys));
+        }
+    }
+    true
+}
+
 /// [`unmap_4kb`] WITHOUT the cross-CPU shootdown broadcast — the leaf PTE is
 /// cleared and INVLPG'd **locally only**. For batched whole-AS operations
 /// (fork's parent `rematerialize`, exit-path region teardown) that issue ONE

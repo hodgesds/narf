@@ -123,6 +123,30 @@ echo "STRESS-DONE"
 PROBE
 chmod +x "$RD/probe.sh"
 
+# The pure-performance sweep `cargo xtask stress-bench` drives — on NARF via
+# `chroot_run /bin/busybox sh /sweep.sh <dur> <workers> [list]`, and on a stock
+# Linux kernel booted against this SAME image, so the per-stressor bogo-ops/s
+# comparison uses identical userspace bits. Unlike /probe.sh this is a
+# measurement, not a gate: no --verify (its checksum passes distort throughput),
+# no --abort (one failed stressor must not hide the others' numbers). The
+# byte caps match /probe.sh so the two workloads stay comparable.
+cat > "$RD/sweep.sh" <<'SWEEP'
+echo "SWEEP-START pid=$$"
+cd /tmp 2>/dev/null
+DUR="${1:-10s}"
+WORKERS="${2:-2}"
+LIST="${3:-fork,malloc,vm,mmap,brk,stack,vma,mlock,madvise,fault,shm,pthread,pipe,sock,switch,clone,sigrt,cpu}"
+echo "SWEEP-CONFIG dur=$DUR workers=$WORKERS list=$LIST"
+/usr/bin/stress-ng --temp-path /tmp --sequential "$WORKERS" \
+    --with "$LIST" \
+    --malloc-bytes 32M --vm-bytes 32M --mmap-bytes 32M \
+    --shm-bytes 16M \
+    --timeout "$DUR" --stressor-time --metrics-brief 2>&1
+echo "SWEEP-RC=$?"
+echo "SWEEP-DONE"
+SWEEP
+chmod +x "$RD/sweep.sh"
+
 # Pack into an ext2 image (256 MiB, 1 KiB blocks).
 mke2fs -q -F -t ext2 -d "$RD" -b 1024 "$OUT" 262144
 echo "built $OUT ($(du -h "$OUT" | cut -f1)); stress-ng+perf present"

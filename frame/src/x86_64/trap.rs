@@ -1468,6 +1468,25 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             }
         }
 
+        // Linux `fatal_signal_pending()` at fault entry: a task that
+        // already has SIGKILL queued (the OOM killer, or a plain
+        // kill(2), followed by async reaping of its anonymous frames)
+        // gets no further fault service. Servicing would hand the
+        // condemned task fresh zero pages over its reaped state and let
+        // it keep executing on wiped data until it dies of a #GP —
+        // which stress-ng then misreports as an "unexpected SIGSEGV"
+        // worker failure instead of a tolerated OOM kill. Delivering
+        // the fatal signal here is Linux's `VM_FAULT_SIGKILL`: the
+        // default action terminates via the executor longjmp and never
+        // returns. If an exotic hook state does return, fall through to
+        // normal fault service so the task cannot spin undeliverable.
+        if from_user && narf_userspace::handlers::current_task_fatal_signal_pending() {
+            let mut ctx = X86TrapContext::from_int80(frame);
+            if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+            }
+        }
+
         // Demand paging: P=0 means the page wasn't mapped at fault
         // time. Two cases get serviced through the active user AS's
         // lazy region table:

@@ -2515,73 +2515,55 @@ impl AddressSpace {
             return Err(AddressSpaceError::Overlap);
         }
 
-        if grow_lo == heap_base.as_u64() {
-            // First grow. A mapping already rooted at the conventional brk
-            // base is not implicitly the heap: it may be a user MAP_FIXED
-            // mapping. The old per-grow `map_region` path rejected that
-            // collision; extending the foreign VMA would silently annex it
-            // into brk ownership and later brk-shrink could free its pages.
-            if regions.get(heap_base.as_u64()).is_some() {
+        // Linux vm_brk shape: growth publishes `[grow_lo, grow_hi)` as heap
+        // and is indifferent to what earlier heap pages have since become —
+        // userspace may punch or replace them wholesale. musl's mallocng does
+        // exactly that on its first metadata allocation (a `MAP_FIXED`
+        // `PROT_NONE` guard page over the heap base), and the old "heap must
+        // still be rooted at `heap_base` with `BRK_HEAP` perms" gate then
+        // permanently wedged every later brk grow in every dynamically linked
+        // musl process. Only the target interval itself must be free: nothing
+        // may be based at `grow_lo` (extending over a foreign `MAP_FIXED`
+        // would silently annex it into brk ownership, and a later brk-shrink
+        // could free its pages) and no predecessor may span past it; the
+        // successor bound was checked above.
+        let _ = heap_base;
+        if regions.get(grow_lo).is_some() {
+            return Err(AddressSpaceError::Overlap);
+        }
+        let predecessor_base = regions.by_base.predecessor(grow_lo).map(|(base, _)| base);
+        let extend_in_place = match predecessor_base.and_then(|base| regions.get(base)) {
+            Some(p) if p.base.as_u64().saturating_add(p.len) > grow_lo => {
                 return Err(AddressSpaceError::Overlap);
             }
-            if regions
-                .predecessor(grow_lo)
-                .is_some_and(|p| p.base.as_u64().saturating_add(p.len) > grow_lo)
-            {
-                return Err(AddressSpaceError::Overlap);
-            }
-            // Demand-paged: grow the length only, with an EMPTY phys list. Each
-            // page materializes its slot on first fault (finish_demand_page), so
-            // the grow is O(1) instead of O(pages) (no per-page zero-fill up
-            // front), and pages the program never touches cost nothing.
+            // In-place O(1) extension only for an exactly-adjacent heap tail
+            // with identical perms (`tail_perms` includes `BRK_HEAP`, so a
+            // foreign anonymous neighbour never matches). A perms mismatch —
+            // e.g. `mlockall(MCL_FUTURE)` changed the future-lock bits —
+            // gets a distinct tail VMA instead, so earlier heap pages never
+            // change status retroactively.
+            Some(p) => p.base.as_u64().saturating_add(p.len) == grow_lo && p.perms == tail_perms,
+            None => false,
+        };
+        if extend_in_place {
+            let base = predecessor_base.expect("in-place extension has a predecessor");
+            let heap_tail = regions.get_mut(base).ok_or(AddressSpaceError::Overlap)?;
+            // Extend the length only; phys stays at its faulted prefix and
+            // grows lazily on fault (see the demand-paged insert below).
+            heap_tail.len += add_len;
+        } else {
+            // Demand-paged: publish the tail with an EMPTY phys list. Each
+            // page materializes its slot on first fault (finish_demand_page),
+            // so the grow is O(1) instead of O(pages) (no per-page zero-fill
+            // up front), and pages the program never touches cost nothing.
             assert!(regions
                 .insert(Region {
-                    base: heap_base,
+                    base: VirtAddr::new(grow_lo),
                     len: add_len,
                     perms: tail_perms,
                     phys: Vec::new(),
                 })?
                 .is_none());
-        } else {
-            // A later append is valid only when the heap still starts at its
-            // owned base and its last fragment ends exactly at the append
-            // site. This rejects a detached hole or foreign MAP_FIXED VMA.
-            if !regions
-                .get(heap_base.as_u64())
-                .is_some_and(|root| root.perms.contains(RegionPerms::BRK_HEAP))
-            {
-                return Err(AddressSpaceError::Overlap);
-            }
-            let predecessor_base = regions
-                .by_base
-                .predecessor(grow_lo)
-                .map(|(base, _)| base)
-                .ok_or(AddressSpaceError::Overlap)?;
-            let predecessor = regions
-                .get(predecessor_base)
-                .ok_or(AddressSpaceError::Overlap)?;
-            if predecessor.base.as_u64().saturating_add(predecessor.len) != grow_lo
-                || !predecessor.perms.contains(RegionPerms::BRK_HEAP)
-            {
-                return Err(AddressSpaceError::Overlap);
-            }
-            if predecessor.perms == tail_perms {
-                let heap_tail = regions
-                    .get_mut(predecessor_base)
-                    .ok_or(AddressSpaceError::Overlap)?;
-                // O(1) grow: extend the length only; phys stays at its faulted
-                // prefix and grows lazily on fault (see the first-grow comment).
-                heap_tail.len += add_len;
-            } else {
-                assert!(regions
-                    .insert(Region {
-                        base: VirtAddr::new(grow_lo),
-                        len: add_len,
-                        perms: tail_perms,
-                        phys: Vec::new(),
-                    })?
-                    .is_none());
-            }
         }
         drop(regions);
         Ok((grow_hi, tail_perms))
@@ -6112,13 +6094,26 @@ impl AddressSpace {
             region
         };
         drop(regions);
+        // Detach emptied page tables now so the single broadcast below also
+        // retires their cached walks (mmu_gather: detach → flush → free).
+        let reclaimed = self.detach_empty_page_tables(region.base, region.pte_span_pages());
         // ONE cross-CPU invalidation BEFORE any frame is freed for reuse
         // (no-op unless the AS is CLONE_VM-shared — see vm_shared docs).
-        self.flush_region_broadcast(region.base, region.pte_span_pages());
+        // Detached page tables widen it to whole PT granules.
+        match &reclaimed {
+            Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
+            None => self.flush_region_broadcast(region.base, region.pte_span_pages()),
+        }
         #[cfg(target_arch = "x86_64")]
         crate::swap::swap_discard_batch(&swapped_entries);
         if self.root.as_u64() != 0 {
             self.free_region_frames(&region);
+        }
+        if let Some((frames, _, _)) = reclaimed {
+            // SAFETY: every detached table was unhooked from this root and
+            // unregistered, and the broadcast above retired stale walks.
+            // Page tables are never COW-shared.
+            unsafe { crate::frame::free_unique_frame_batch(&frames) };
         }
         Ok(region)
     }
@@ -6265,9 +6260,18 @@ impl AddressSpace {
             }
             drop(regions);
             drop(huge);
-            self.flush_region_broadcast(region.base, region.len >> 12);
+            let reclaimed = self.detach_empty_page_tables(region.base, region.len >> 12);
+            match &reclaimed {
+                Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
+                None => self.flush_region_broadcast(region.base, region.len >> 12),
+            }
             if self.root.as_u64() != 0 {
                 self.free_region_frames(&region);
+            }
+            if let Some((frames, _, _)) = reclaimed {
+                // SAFETY: detached from this root + unregistered above; the
+                // broadcast retired stale walks; tables are never COW-shared.
+                unsafe { crate::frame::free_unique_frame_batch(&frames) };
             }
             return Ok(());
         }
@@ -6550,8 +6554,16 @@ impl AddressSpace {
         // `unmap_region` path). This also replaces the previous PER-PAGE
         // broadcast+ack-wait (`unmap_4kb`) a CLONE_VM AS paid here — an IPI
         // round-trip per punched page under MAP_FIXED churn.
+        let reclaimed = if punched_pages > 0 {
+            self.detach_empty_page_tables(base, (hi - lo) >> 12)
+        } else {
+            None
+        };
         if punched_pages > 0 {
-            self.flush_region_broadcast(base, (hi - lo) >> 12);
+            match &reclaimed {
+                Some((_, rlo, span)) => self.flush_region_broadcast(*rlo, *span),
+                None => self.flush_region_broadcast(base, (hi - lo) >> 12),
+            }
         }
         // Shared owners may return their last frame to an external cache, so
         // release them only after the same remote invalidation that protects
@@ -6565,7 +6577,87 @@ impl AddressSpace {
             // before this batched owner drop.
             crate::frame::free_frame_batch(&to_free);
         }
+        if let Some((frames, _, _)) = reclaimed {
+            // SAFETY: detached from this root + unregistered above; the
+            // broadcast retired stale walks; tables are never COW-shared.
+            unsafe { crate::frame::free_unique_frame_batch(&frames) };
+        }
         Ok(())
+    }
+
+    /// Detach emptied page-table pages covering the just-unmapped
+    /// `[base, base + pages * 4096)` — Linux's `free_pgtables` step at
+    /// munmap. Without this, mmap/munmap churn accumulated page-table pages
+    /// in a live address space without bound (one PT page per 2 MiB of
+    /// churned VA, at a monotonically advancing mmap cursor): invisible to
+    /// resident-page accounting and unreachable by the OOM reaper, a single
+    /// stress-ng malloc pass turned hundreds of MB of RAM into orphaned page
+    /// tables until process exit.
+    ///
+    /// mmu_gather split, sharing the caller's ONE cross-CPU invalidation:
+    /// call after the range's leaves are torn down LOCALLY but BEFORE the
+    /// batched broadcast. Empty PTs (and PDs they empty) are detached under
+    /// the page-table lock; `Some((frames, lo, span))` hands back the
+    /// detached frames plus the PT-granule-rounded window the caller's
+    /// broadcast must cover INSTEAD of the bare region span — a peer CPU
+    /// walking any VA in a detached granule (even an unmapped neighbour of
+    /// the region) may have cached the PD entry, so the invalidation has to
+    /// span whole granules. Only after that broadcast may the caller free
+    /// the frames (`free_unique_frame_batch`); freeing earlier would let a
+    /// stale cached walk descend into a reused frame and write A/D bits into
+    /// it (see `detach_empty_pt`).
+    ///
+    /// Returns `None` (caller broadcasts its own span, nothing to free) when
+    /// nothing was detached or the scratch allocation failed — the tables
+    /// then persist until AS teardown, the old behaviour, which is safe.
+    #[must_use]
+    fn detach_empty_page_tables(
+        &self,
+        base: VirtAddr,
+        pages: u64,
+    ) -> Option<(Vec<crate::frame::PhysFrame>, VirtAddr, u64)> {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (base, pages);
+            None
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.root.as_u64() == 0 || pages == 0 {
+                return None;
+            }
+            const PT_SPAN: u64 = 2 * 1024 * 1024;
+            let lo = base.as_u64() & !(PT_SPAN - 1);
+            let end = base
+                .as_u64()
+                .checked_add(pages << 12)?
+                .checked_next_multiple_of(PT_SPAN)?;
+            let granules = end.saturating_sub(lo).div_ceil(PT_SPAN) as usize;
+            let mut detached: Vec<crate::frame::PhysFrame> = Vec::new();
+            // One slot per candidate PT plus headroom for cascaded PDs.
+            if detached.try_reserve(granules + granules / 512 + 1).is_err() {
+                return None;
+            }
+            let mut granule = lo;
+            while granule < end {
+                // SAFETY: the caller has already torn down every leaf in the
+                // range locally; detach_empty_pt re-validates emptiness under
+                // the per-root page-table lock, so a granule shared with live
+                // neighbouring mappings is left untouched.
+                unsafe {
+                    crate::x86_64::paging::detach_empty_pt(
+                        self.root,
+                        VirtAddr::new(granule),
+                        &mut detached,
+                    );
+                }
+                granule = granule.saturating_add(PT_SPAN);
+            }
+            if detached.is_empty() {
+                return None;
+            }
+            Some((detached, VirtAddr::new(lo), (end - lo) >> 12))
+        }
     }
 
     /// One batched cross-CPU TLB invalidation for `pages` pages starting at
