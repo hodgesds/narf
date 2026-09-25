@@ -646,7 +646,65 @@ impl Scheduler for PriorityScheduler {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ClassScheduler;
 
+/// Shared wake-time idle-sibling selection — Linux `select_idle_sibling`
+/// intersected with the wakee's affinity, policy-agnostic. Wake-affine
+/// first (waker's CPU when idle and node-local: the producer→consumer IPC
+/// shape), then the nearest node-local idle CPU scanning outward from
+/// `prev_cpu`, then any idle CPU. `None` keeps the wakee on `prev_cpu`
+/// rather than stacking it onto another BUSY CPU.
+///
+/// Both the EEVDF and Class policies use this. The Class policy — the boot
+/// DEFAULT — previously inherited the trait's `None` stub, so a wake NEVER
+/// migrated: a wake-all storm enqueued every wakee on its (shared) home CPU
+/// and a 1000-thread exit storm ran at measured concurrency 1.02 on 16
+/// vCPUs, its wall time exactly the serial sum of per-exit costs.
+pub(crate) fn select_idle_sibling(
+    prev_cpu: CpuId,
+    waker_cpu: CpuId,
+    is_online: &dyn Fn(CpuId) -> bool,
+    is_idle: &dyn Fn(CpuId) -> bool,
+    allowed: &dyn Fn(CpuId) -> bool,
+) -> Option<CpuId> {
+    let node = narf_acpi::cpu_node(prev_cpu.0);
+    let same_node = |c: CpuId| node.is_none() || narf_acpi::cpu_node(c.0) == node;
+    if waker_cpu != prev_cpu
+        && is_online(waker_cpu)
+        && is_idle(waker_cpu)
+        && same_node(waker_cpu)
+        && allowed(waker_cpu)
+    {
+        return Some(waker_cpu);
+    }
+    let max = narf_lib::percpu::MAX_CPUS as u32;
+    if node.is_some() {
+        for i in 1..max {
+            let cpu = CpuId((prev_cpu.0 + i) % max);
+            if is_online(cpu) && is_idle(cpu) && same_node(cpu) && allowed(cpu) {
+                return Some(cpu);
+            }
+        }
+    }
+    for i in 1..max {
+        let cpu = CpuId((prev_cpu.0 + i) % max);
+        if is_online(cpu) && is_idle(cpu) && allowed(cpu) {
+            return Some(cpu);
+        }
+    }
+    None
+}
+
 impl Scheduler for ClassScheduler {
+    fn select_task_rq(
+        &self,
+        prev_cpu: CpuId,
+        waker_cpu: CpuId,
+        is_online: &dyn Fn(CpuId) -> bool,
+        is_idle: &dyn Fn(CpuId) -> bool,
+        allowed: &dyn Fn(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        select_idle_sibling(prev_cpu, waker_cpu, is_online, is_idle, allowed)
+    }
+
     fn name(&self) -> &'static str {
         "class"
     }

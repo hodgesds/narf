@@ -24,6 +24,22 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
     // Robust-futex owner-died walk — in-task context, before teardown
     // (see terminate_current_task).
     robust_list_exit_walk(tid);
+    // Clear child_tid + wake NOW — Linux `mm_release` order (kernel/fork.c:
+    // futex_exit_release, then clear_child_tid, BEFORE exit_files/exit_notify
+    // and all other teardown). This is load-bearing for throughput, not just
+    // parity: musl's pthread_exit holds the GLOBAL `__thread_list_lock` from
+    // userspace until this wake releases it, so everything between syscall
+    // entry and this point is a process-wide exit critical section. Firing
+    // it from the exit-observer fan-out (after rusage, zombie flip, and the
+    // observers registered ahead of it) serialized a 1000-thread exit storm
+    // at measured concurrency 1.0 across 16 CPUs. The observer still runs
+    // later and no-ops (`take_clear_child_tid` empties the entry).
+    // Only on the diverging path: the legacy redirect below can RETURN to
+    // user code, which must not keep running on a stack the (now-woken)
+    // joiner is free to munmap.
+    if crate::user_task::current_user_task().is_some() && crate::user_task::exit_hook().is_some() {
+        fire_clear_child_tid_on_exit(pid, tid);
+    }
     // wait4 rusage snapshot — must run here, while OUR address space is
     // still the active one (see EXIT_RUSAGE).
     record_exit_rusage(tid, pid);

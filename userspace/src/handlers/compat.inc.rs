@@ -4618,10 +4618,32 @@ pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
     let cpu = cpu_time_ns_of(tid)
         .saturating_add(child_cpu_time_ns_of(tid))
         .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
+    // CPU time only — NO vm snapshot here. `task_vm_bytes` walks every
+    // region (and every page slot) of the address space under the regions
+    // lock; for a CLONE_THREAD sibling that walk is pure waste (the entry
+    // is keyed by the SHARED pid and each sibling overwrites it — wait4
+    // only reads it at process reap) and it was measured as 99% of the
+    // per-exit cost in a 1000-thread exit storm (~600k cycles/exit: 14
+    // concurrent exiters convoying on one shared-AS regions lock, each
+    // holder walking ~1000 thread-stack regions). The vm half is filled
+    // in ONCE, at the group-dead transition, by `finalize_exit_rusage_vm`
+    // — still in the last thread's context, AS still alive.
+    let mut g = EXIT_RUSAGE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let vm_kb = m.get(&pid).map_or(0, |&(_, vm)| vm);
+    m.insert(pid, (cpu, vm_kb));
+}
+
+/// Fill in the vm_kb half of the exit-rusage snapshot for `pid` — called
+/// exactly once per process, on the group-dead transition inside
+/// `notify_task_exited`, while the last thread's address space is still
+/// resolvable. Keeps the (already recorded) cpu time.
+pub(crate) fn finalize_exit_rusage_vm(pid: u64, tid: u64) {
     let vm_kb = task_vm_bytes(tid) / 1024;
     let mut g = EXIT_RUSAGE.lock();
-    g.get_or_insert_with(BTreeMap::new)
-        .insert(pid, (cpu, vm_kb));
+    if let Some(e) = g.get_or_insert_with(BTreeMap::new).get_mut(&pid) {
+        e.1 = vm_kb;
+    }
 }
 
 fn take_exit_rusage(tid: u64) -> Option<(u64, u64)> {
@@ -7680,10 +7702,47 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
         out
     };
     let count = drained.len();
+    // Multi-wake (wake-all / broadcast): NON-urgent wakes. The urgent path
+    // feeds the direct-handoff machinery, which chains wakees into
+    // SEQUENTIAL task→task switches on the waker's CPU — correct for the
+    // 1-waiter mutex/condvar handoff above, but a 1000-waiter FUTEX_WAKE
+    // built a 1000-long serial chain instead of fanning out across idle
+    // CPUs (a 1000-thread exit storm ran at measured concurrency 1.02 on
+    // 16 vCPUs). Plain wakes enqueue each wakee on its own home CPU and
+    // kick it, the Linux wake-all shape.
     for (tid, w) in drained {
-        wake_one_urgent(tid, w);
+        wake_one(tid, w);
     }
     count
+}
+
+/// Wake ONE waiter on `key` with a NON-urgent (spread) wake. The urgent
+/// single-wake above direct-handoffs the wakee onto the CALLER's CPU — right
+/// for a mutex/condvar handoff where the waker is about to block, wrong for
+/// the exit-path clear_child_tid wake: there the wakee is the NEXT exiting
+/// thread (musl parks every exiter on the global `__thread_list_lock`), and
+/// a direct handoff makes it wait behind THIS task's remaining teardown
+/// (rusage, zombie flip, observers, stack/slot release) — serializing a
+/// 1000-thread exit storm at concurrency 1.0 across 16 CPUs. A plain wake
+/// places the wakee on another CPU so its exit critical section overlaps
+/// our post-wake teardown, the Linux `mm_release` shape.
+pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
+    let waiter = {
+        let mut values = futex_wait_bucket(key).values.lock();
+        let waiter = values.get_mut(&key).and_then(|set| {
+            let tid = set.keys().next().copied()?;
+            set.remove(&tid).map(|waker| (tid, waker))
+        });
+        if values.get(&key).is_some_and(|set| set.is_empty()) {
+            values.remove(&key);
+        }
+        waiter
+    };
+    if let Some((tid, waker)) = waiter {
+        wake_one(tid, waker);
+        return 1;
+    }
+    0
 }
 
 /// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` core: wake up to `n_wake` waiters on
