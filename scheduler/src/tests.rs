@@ -3783,7 +3783,21 @@ fn smoke_scheduler_urgent_next_respects_period_throttle() -> TestResult {
     crate::__reset_queues_for_test();
     crate::disable_wake_next();
     let mut spec = TaskSpec::unthrottled();
-    spec.budget = ResourceBudget::unthrottled().with_period(PeriodBudget::strict(1, 1_000_000));
+    // The period is the THROTTLE HORIZON, and it has to outlast the rest of
+    // this test. `charge_period` below spends the whole 1-cycle allowance, which
+    // leaves the task `Throttled` only while `now < replenish_at_cycles`; once
+    // `view()` sees `now` past that, it replenishes and the task reads
+    // `Eligible` again. With the old 1_000_000-cycle period that is a ~0.3 ms
+    // deadline on the code between the charge and `pick_next_slot`. `now_cycles`
+    // tracks wall-clock, so under TCG — where the interpreter runs roughly an
+    // order of magnitude slower than native — those few statements routinely
+    // took longer than the window, the slot replenished to `Eligible`, tied the
+    // peer's top tier, and won the next-buddy shortcut it was supposed to be
+    // barred from. The test then reported the throttle as bypassed when nothing
+    // had bypassed it. A horizon of 2^40 cycles (~5 min at 3 GHz) cannot be
+    // crossed by this test under any accel, so the throttle it asserts is the
+    // state the scheduler actually sees.
+    spec.budget = ResourceBudget::unthrottled().with_period(PeriodBudget::strict(1, 1 << 40));
     let urgent = spawn_with_spec(async {}, spec);
     let peer = spawn(async {});
 
