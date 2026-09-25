@@ -522,7 +522,10 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // CPU-mmap the kwin QPainter swapchain buffer — without it kwin logged
     // "drmPrimeHandleToFD() failed: Not a tty" and could not render.
     if (cmd & 0xFF) == 0x2d && ((cmd >> 8) & 0xFF) == 0x64 {
-        if let Some(card_idx) = ops.as_drm_card_index() {
+        // Export works from a card node OR a render node (a render node reports
+        // the card index it renders for); `drm_prime_export` keys on that index
+        // either way. Mesa may export from either fd it holds.
+        if let Some(card_idx) = ops.as_drm_card_index().or_else(|| ops.as_drm_render_index()) {
             // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
             let handle = read_user_u32(arg as u64);
             let dmabuf = match narf_filesystem::drm_prime_export(card_idx, handle) {
@@ -556,7 +559,21 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // imports it to build a scannable KMS framebuffer. Without it kwin logged
     // "drmPrimeFDToHandle() failed" → "Failed to create dumb framebuffer" →
     // "Applying output config failed!".
-    if (cmd & 0xFF) == 0x2e && ((cmd >> 8) & 0xFF) == 0x64 && ops.as_drm_card_index().is_some() {
+    //
+    // The gate accepts EITHER a card node OR a render node: Mesa opens the
+    // RENDER node (renderD128) for its GBM/EGL context and imports the
+    // compositor's scanout dma-buf THERE, not on the card node. Gating this on
+    // `as_drm_card_index()` alone (a card-only check) made the render-node
+    // import fall through to the driver dispatch → -EOPNOTSUPP →
+    // `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` = EGL_BAD_ALLOC → kwin never
+    // reached OpenGL compositing / modeset (the CachyOS greeter stayed black).
+    // The import body itself is node-independent — it only resolves the
+    // dma-buf's `as_prime_gem_handle`, never the DRM index — so accepting the
+    // render node here is sufficient.
+    if (cmd & 0xFF) == 0x2e
+        && ((cmd >> 8) & 0xFF) == 0x64
+        && (ops.as_drm_card_index().is_some() || ops.as_drm_render_index().is_some())
+    {
         // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
         let dmabuf_fd = read_user_u32(arg as u64 + 8);
         let buf_ops = fd::with_table(task, |t| t.get(dmabuf_fd).map(|e| e.ops.clone())).flatten();
