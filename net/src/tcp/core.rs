@@ -44,6 +44,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_capabilities::{Cap, Grant};
+use narf_lib::errno;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::iface;
@@ -291,6 +292,17 @@ pub struct Tcb {
     pub drop_cause: Option<DropCause>,
     /// Last error from a setsockopt / get path.
     pub last_error: i32,
+    /// Linux `sk->sk_err`: the hard error that ended the connection, as a
+    /// positive errno (0 = none). Reported once, then cleared, by the next
+    /// `recv_errno` / `send_errno` / `take_sock_error` (Linux `sock_error`).
+    pub sk_err: i32,
+    /// Linux `sk->sk_err_soft`: the last non-fatal (ICMP) error on an
+    /// established connection. Surfaces only via `SO_ERROR`, or as the
+    /// errno of a later timeout (`tcp_write_err`).
+    pub sk_err_soft: i32,
+    /// Linux `RCV_SHUTDOWN`: the user shut down the read side. Queued data
+    /// stays readable; once it is drained, reads return 0.
+    pub rcv_shutdown: bool,
 
     /// Memoized egress interface (NIC source MAC + frame-emit fn) for this
     /// connection. The egress is a pure function of the immutable
@@ -411,6 +423,9 @@ impl Tcb {
             backlog: 0,
             drop_cause: None,
             last_error: 0,
+            sk_err: 0,
+            sk_err_soft: 0,
+            rcv_shutdown: false,
             egress: None,
         }
     }
@@ -439,8 +454,16 @@ impl Tcb {
     /// `true` once we transition into a state where the user
     /// can read inbound data.
     pub fn user_can_read(&self) -> bool {
+        // Exactly when `recv_errno` would not return EAGAIN (Linux
+        // `tcp_poll`: EPOLLIN on data, RCV_SHUTDOWN, or a pending error).
         self.recv_buf.has_data()
-            || matches!(self.state, TcpState::CloseWait | TcpState::Closed)
+            || self.fin_received
+            || self.rcv_shutdown
+            || self.sk_err != 0
+            || matches!(
+                self.state,
+                TcpState::CloseWait | TcpState::Closed | TcpState::TimeWait
+            )
             || self.drop_cause.is_some()
     }
 
@@ -719,9 +742,76 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
     }
 }
 
+// ── Dead-connection tombstones ──────────────────────────────────────
+//
+// Linux keeps `struct sock` — with its `sk_err` and `SOCK_DONE` — alive
+// until the owning fd is closed, so a read or write after a reset or a
+// timeout still reports why the connection died. NARF frees the TCB at
+// teardown, so the two facts the socket API still needs are parked here,
+// keyed by TCB id, until the socket is closed (`close` / `release`).
+// Bounded: a connection nobody ever accepts or closes cannot grow it
+// without limit (the oldest entry is evicted).
+
+#[derive(Clone, Copy, Debug)]
+struct Tombstone {
+    /// Pending `sk_err` (positive errno; 0 once reported).
+    err: i32,
+    /// Linux `SOCK_DONE`: the peer's FIN had been received.
+    done: bool,
+}
+
+const MAX_TOMBSTONES: usize = 4096;
+
+static TOMBSTONES: IrqSafeSpinLock<Option<BTreeMap<u32, Tombstone>>> = IrqSafeSpinLock::new(None);
+
+/// Linux `tcp_done_with_error`: record `err` as the socket error, move to
+/// CLOSED, and free the TCB. `err` is a positive errno from
+/// `narf_lib::errno`.
+fn abort_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>, err: i32, cause: DropCause) {
+    let (id, done) = {
+        let mut t = arc.lock();
+        t.sk_err = err;
+        t.drop_cause = Some(cause);
+        t.state = TcpState::Closed;
+        (t.id, t.fin_received)
+    };
+    if err != 0 {
+        let mut g = TOMBSTONES.lock();
+        let m = g.get_or_insert_with(BTreeMap::new);
+        if m.len() >= MAX_TOMBSTONES {
+            m.pop_first();
+        }
+        m.insert(id, Tombstone { err, done });
+    }
+    remove_tcb(id);
+    // A reader or writer parked on this socket must wake to see the error.
+    crate::readiness::notify(id as u64);
+}
+
+/// Take a dead connection's pending error (Linux `sock_error`: report
+/// once, then clear). `None` if the id has no tombstone.
+fn take_tombstone(id: u32) -> Option<Tombstone> {
+    let mut g = TOMBSTONES.lock();
+    let m = g.as_mut()?;
+    let ts = m.get_mut(&id)?;
+    let out = *ts;
+    ts.err = 0;
+    Some(out)
+}
+
+/// Forget everything about `id`. Called when the owning socket closes.
+pub fn release(id: u32) {
+    if let Some(m) = TOMBSTONES.lock().as_mut() {
+        m.remove(&id);
+    }
+}
+
 /// Test-only: drop every TCB.
 #[doc(hidden)]
 pub fn __reset_for_test() {
+    if let Some(m) = TOMBSTONES.lock().as_mut() {
+        m.clear();
+    }
     for shard in TCB_TABLE.iter() {
         let mut g = shard.lock();
         if let Some(m) = g.as_mut() {
@@ -870,7 +960,27 @@ pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
 }
 
 pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
-    let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(())?;
+    connect_errno_in(net_ns_id, remote_addr, remote_port).map_err(|_| ())
+}
+
+/// Active open. On failure returns the errno Linux's `connect(2)` reports
+/// for the same cause:
+///
+/// - `ENETUNREACH` — no route (`fib_lookup` → `-ENETUNREACH`,
+///   include/net/ip_fib.h; returned by `ip_route_connect` in
+///   `tcp_v4_connect`).
+/// - `EHOSTUNREACH` — the next hop's link-layer address cannot be
+///   resolved (`ipv4_link_failure` sends ICMP_HOST_UNREACH, which
+///   `tcp_v4_err` maps via `icmp_err_convert` and applies in SYN-SENT).
+/// - `ECONNREFUSED` — RST in reply to the SYN (`tcp_reset`, SYN-SENT).
+/// - the ICMP-derived errno for an ICMP error in SYN-SENT (`tcp_v4_err`).
+/// - `ETIMEDOUT` — no answer (`tcp_write_err`, or the soft ICMP error).
+pub fn connect_errno_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+) -> Result<u32, i32> {
+    let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(errno::ENETUNREACH as i32)?;
     // Resolve the ROUTE's next hop, not the interface's `gateway` field.
     //
     // Linux picks it in `ip_neigh_for_gw` (include/net/route.h): the route's
@@ -889,7 +999,8 @@ pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Res
     let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
         .map(|r| r.nexthop.0)
         .unwrap_or(remote_addr);
-    let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, 1000)?;
+    let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, 1000)
+        .map_err(|()| errno::EHOSTUNREACH as i32)?;
     let local_port = fresh_local_port();
     let id = fresh_tcb_id();
     let iss = compute_isn();
@@ -923,12 +1034,23 @@ pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Res
         },
         deadline,
     );
-    let st = arc.lock().state;
+    let (st, sk_err, soft) = {
+        let t = arc.lock();
+        (t.state, t.sk_err, t.sk_err_soft)
+    };
     match st {
         TcpState::Established => Ok(id),
         _ => {
             remove_tcb(id);
-            Err(())
+            release(id);
+            // An abort recorded its errno; otherwise we gave up waiting.
+            Err(if sk_err != 0 {
+                sk_err
+            } else if soft != 0 {
+                soft
+            } else {
+                errno::ETIMEDOUT as i32
+            })
         }
     }
 }
@@ -975,6 +1097,152 @@ pub fn readable(id: u32) -> bool {
         Some(arc) => arc.lock().user_can_read(),
         None => true,
     }
+}
+
+// ── Public API: errno-returning socket calls ─────────────────────────
+//
+// These mirror what Linux's TCP returns to `send(2)` / `recv(2)` /
+// `shutdown(2)` / `getsockopt(SO_ERROR)` for the same state, errors being
+// positive errnos from `narf_lib::errno`. Non-blocking: where Linux would
+// sleep, these return `EAGAIN` and the socket layer parks and retries.
+
+/// Linux `tcp_sendmsg_locked` (net/ipv4/tcp.c) + `sk_stream_error`
+/// (net/core/stream.c):
+/// - not ESTABLISHED / CLOSE-WAIT: `sk_stream_wait_connect` — the pending
+///   error, else `EPIPE` (or `EAGAIN` while the handshake is in progress);
+/// - `sk_err` set or `SEND_SHUTDOWN`: `EPIPE`, which `sk_stream_error`
+///   replaces with the pending error if there is one;
+/// - send buffer full: `EAGAIN` (`sk_stream_wait_memory`, non-blocking).
+///
+/// The caller raises `SIGPIPE` for `EPIPE` (unless `MSG_NOSIGNAL`).
+pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32> {
+    let epipe = errno::EPIPE as i32;
+    let Some(arc) = lookup_tcb(id) else {
+        // TCP_CLOSE: `sk_stream_wait_connect` → `sock_error` ?: -EPIPE.
+        return Err(take_tombstone(id)
+            .map(|t| t.err)
+            .filter(|&e| e != 0)
+            .unwrap_or(epipe));
+    };
+    let n = {
+        let mut t = arc.lock();
+        match t.state {
+            TcpState::Established | TcpState::CloseWait => {}
+            TcpState::SynSent | TcpState::SynReceived => {
+                return Err(take_sk_err(&mut t).unwrap_or(errno::EAGAIN as i32));
+            }
+            _ => return Err(take_sk_err(&mut t).unwrap_or(epipe)),
+        }
+        if t.sk_err != 0 || t.fin_sent {
+            return Err(take_sk_err(&mut t).unwrap_or(epipe));
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        t.send_buf.write(buf)
+    };
+    if n == 0 {
+        return Err(errno::EAGAIN as i32);
+    }
+    pump_send(&arc);
+    Ok(n)
+}
+
+/// Linux `tcp_recvmsg_locked` (net/ipv4/tcp.c). Queued data is returned
+/// first, whatever the state. With nothing queued, in Linux's order:
+/// `SOCK_DONE` (peer FIN received) → 0; pending `sk_err` → that errno
+/// (once); `RCV_SHUTDOWN` → 0; CLOSED → `ENOTCONN`; otherwise `EAGAIN`.
+/// A connection torn down by `tcp_done` has `RCV_SHUTDOWN` set, so after
+/// its error has been reported, reads return 0.
+pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32> {
+    let Some(arc) = lookup_tcb(id) else {
+        // `tcp_done` set RCV_SHUTDOWN. SOCK_DONE is checked before
+        // `sk_err`, so after a FIN the error stays pending (for a send).
+        let pending = TOMBSTONES
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&id).copied())
+            .is_some_and(|t| !t.done && t.err != 0);
+        return match pending {
+            true => Err(take_tombstone(id).map_or(0, |t| t.err)),
+            false => Ok(0),
+        };
+    };
+    let mut t = arc.lock();
+    if t.state == TcpState::Listen {
+        return Err(errno::ENOTCONN as i32);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let n = t.recv_buf.read(buf);
+    if n > 0 {
+        return Ok(n);
+    }
+    if t.fin_received {
+        return Ok(0);
+    }
+    if let Some(e) = take_sk_err(&mut t) {
+        return Err(e);
+    }
+    if t.rcv_shutdown || t.state == TcpState::TimeWait {
+        return Ok(0);
+    }
+    if t.state == TcpState::Closed {
+        return Err(errno::ENOTCONN as i32);
+    }
+    Err(errno::EAGAIN as i32)
+}
+
+/// Linux `inet_shutdown` (net/ipv4/af_inet.c) + `tcp_shutdown`: a socket
+/// whose connection is gone (TCP_CLOSE — including one in TIME-WAIT, whose
+/// user socket `tcp_time_wait` has already closed) reports `ENOTCONN`;
+/// otherwise the shutdown bits are applied and a FIN is queued for
+/// `SHUT_WR` / `SHUT_RDWR`. `how` validation (`EINVAL`) is the caller's.
+pub fn shutdown_errno(id: u32, how: Shutdown) -> Result<(), i32> {
+    let enotconn = errno::ENOTCONN as i32;
+    let Some(arc) = lookup_tcb(id) else {
+        return Err(enotconn);
+    };
+    let state = {
+        let mut t = arc.lock();
+        if matches!(t.state, TcpState::Closed | TcpState::TimeWait) {
+            return Err(enotconn);
+        }
+        if matches!(how, Shutdown::Read | Shutdown::Both) {
+            t.rcv_shutdown = true;
+        }
+        if matches!(how, Shutdown::Write | Shutdown::Both) {
+            do_shutdown(&mut t, Shutdown::Write);
+        }
+        t.state
+    };
+    if matches!(state, TcpState::FinWait1 | TcpState::LastAck) {
+        pump_send(&arc);
+    }
+    crate::readiness::notify(id as u64);
+    Ok(())
+}
+
+/// `getsockopt(SO_ERROR)` (Linux `sk_getsockopt`, net/core/sock.c):
+/// `sock_error()`, else the soft error, each cleared once read. 0 if none.
+pub fn take_sock_error(id: u32) -> i32 {
+    match lookup_tcb(id) {
+        Some(arc) => {
+            let mut t = arc.lock();
+            if let Some(e) = take_sk_err(&mut t) {
+                return e;
+            }
+            core::mem::take(&mut t.sk_err_soft)
+        }
+        None => take_tombstone(id).map_or(0, |t| t.err),
+    }
+}
+
+/// Linux `sock_error`: the pending hard error, cleared on read.
+fn take_sk_err(t: &mut Tcb) -> Option<i32> {
+    let e = core::mem::take(&mut t.sk_err);
+    (e != 0).then_some(e)
 }
 
 // ── Public API: shutdown / close ────────────────────────────────────
@@ -1026,6 +1294,7 @@ fn do_shutdown(t: &mut Tcb, how: Shutdown) {
 }
 
 pub fn close(id: u32) -> Result<(), ()> {
+    release(id);
     let arc = lookup_tcb(id).ok_or(())?;
     {
         let mut t = arc.lock();
@@ -1547,6 +1816,16 @@ fn arm_retransmit_timer(t: &mut Tcb) {
     t.retx_deadline_cycles = now.wrapping_add(narf_scheduler::narf_time::ns_to_cycles(rto));
 }
 
+/// Linux `tcp_write_err` (net/ipv4/tcp_timer.c): a timed-out connection
+/// reports `sk_err_soft ?: ETIMEDOUT`.
+fn write_err(t: &Tcb) -> i32 {
+    if t.sk_err_soft != 0 {
+        t.sk_err_soft
+    } else {
+        errno::ETIMEDOUT as i32
+    }
+}
+
 /// Fire the RTO if the deadline has passed. Resends the oldest
 /// unacked segment and applies the exponential back-off.
 pub fn tick_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -1600,16 +1879,14 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // Reset the sender to retransmit from snd_una.
             t.send_buf.rewind_for_retransmit();
             t.snd_nxt = t.snd_una;
-        } else {
-            t.drop_cause = Some(DropCause::RetransmitGiveUp);
-            t.state = TcpState::Closed;
         }
         ok
     };
     if !backoff_ok {
-        // Tear down the connection.
-        let id = arc.lock().id;
-        remove_tcb(id);
+        // Linux `tcp_write_err`: the soft (ICMP) error if one was seen,
+        // else ETIMEDOUT.
+        let err = write_err(&arc.lock());
+        abort_tcb(arc, err, DropCause::RetransmitGiveUp);
         return;
     }
     // Rebuild & send the oldest segment.
@@ -1807,13 +2084,10 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         return;
     }
     if probes >= cnt {
-        // Exhausted — drop the connection.
-        let mut t = arc.lock();
-        t.drop_cause = Some(DropCause::KeepaliveDead);
-        t.state = TcpState::Closed;
-        let id = t.id;
-        drop(t);
-        remove_tcb(id);
+        // Exhausted — drop the connection with `tcp_write_err`'s errno
+        // (Linux `tcp_keepalive_timer`).
+        let err = write_err(&arc.lock());
+        abort_tcb(arc, err, DropCause::KeepaliveDead);
         return;
     }
     // Send empty segment with seq = snd_una - 1 (RFC 9293 §3.8.4).
@@ -2215,7 +2489,7 @@ fn process_in_state(
 }
 
 fn handle_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
-    let mut t = arc.lock();
+    let t = arc.lock();
     // RFC 9293 §3.10.7.3 — synchronised states accept RST if
     // SEG.SEQ is in the window.
     if t.state.is_synchronised() {
@@ -2229,11 +2503,17 @@ fn handle_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
             return;
         }
     }
-    t.drop_cause = Some(DropCause::PeerReset);
-    t.state = TcpState::Closed;
-    let id = t.id;
+    // Linux `tcp_reset` (net/ipv4/tcp_input.c): "the right error as BSD
+    // sees it" — SYN-SENT → ECONNREFUSED, CLOSE-WAIT → EPIPE, CLOSED →
+    // ignore, anything else → ECONNRESET.
+    let err = match t.state {
+        TcpState::SynSent => errno::ECONNREFUSED,
+        TcpState::CloseWait => errno::EPIPE,
+        TcpState::Closed => return,
+        _ => errno::ECONNRESET,
+    } as i32;
     drop(t);
-    remove_tcb(id);
+    abort_tcb(arc, err, DropCause::PeerReset);
 }
 
 fn handle_in_syn_sent(
@@ -2990,33 +3270,124 @@ pub fn tick_all() {
     }
 }
 
-/// Convert an ICMP destination-unreachable into a connection drop.
-/// Mirrors `tcp_v4_err` (`net/ipv4/tcp_ipv4.c`); we don't currently
-/// distinguish hard vs. soft errors and just close the TCB.
-pub fn signal_icmp_error(remote_ip: [u8; 4], remote_port: u16, local_ip: [u8; 4], local_port: u16) {
-    signal_icmp_error_in(0, remote_ip, remote_port, local_ip, local_port);
+/// ICMP message types TCP reacts to (include/uapi/linux/icmp.h).
+const ICMP_DEST_UNREACH: u8 = 3;
+const ICMP_SOURCE_QUENCH: u8 = 4;
+const ICMP_REDIRECT: u8 = 5;
+const ICMP_TIME_EXCEEDED: u8 = 11;
+const ICMP_PARAMETERPROB: u8 = 12;
+/// Destination-unreachable code: fragmentation needed and DF set.
+const ICMP_FRAG_NEEDED: u8 = 4;
+/// Highest destination-unreachable code (`NR_ICMP_UNREACH`).
+const NR_ICMP_UNREACH: u8 = 15;
+
+/// Linux `icmp_err_convert[code].errno` (net/ipv4/icmp.c), indexed by the
+/// destination-unreachable code 0..=NR_ICMP_UNREACH.
+const ICMP_UNREACH_ERRNO: [i64; 16] = [
+    errno::ENETUNREACH,  // ICMP_NET_UNREACH
+    errno::EHOSTUNREACH, // ICMP_HOST_UNREACH
+    errno::ENOPROTOOPT,  // ICMP_PROT_UNREACH
+    errno::ECONNREFUSED, // ICMP_PORT_UNREACH
+    errno::EMSGSIZE,     // ICMP_FRAG_NEEDED (handled as PMTU, never used)
+    errno::EOPNOTSUPP,   // ICMP_SR_FAILED
+    errno::ENETUNREACH,  // ICMP_NET_UNKNOWN
+    errno::EHOSTDOWN,    // ICMP_HOST_UNKNOWN
+    errno::ENONET,       // ICMP_HOST_ISOLATED
+    errno::ENETUNREACH,  // ICMP_NET_ANO
+    errno::EHOSTUNREACH, // ICMP_HOST_ANO
+    errno::ENETUNREACH,  // ICMP_NET_UNR_TOS
+    errno::EHOSTUNREACH, // ICMP_HOST_UNR_TOS
+    errno::EHOSTUNREACH, // ICMP_PKT_FILTERED
+    errno::EHOSTUNREACH, // ICMP_PREC_VIOLATION
+    errno::EHOSTUNREACH, // ICMP_PREC_CUTOFF
+];
+
+/// Apply an ICMP error about one of our segments to its connection.
+/// `seq` is the sequence number of the quoted (offending) TCP header.
+///
+/// Mirrors Linux `tcp_v4_err` (net/ipv4/tcp_ipv4.c):
+/// - ignored unless `snd_una <= seq <= snd_nxt` (stale / forged ICMP);
+/// - REDIRECT and SOURCE_QUENCH are ignored here; FRAG_NEEDED is PMTU
+///   discovery, not an error (NARF does not implement PMTU reduction, so it
+///   is ignored rather than killing the connection);
+/// - PARAMETERPROB → EPROTO; DEST_UNREACH → `icmp_err_convert[code]`;
+///   TIME_EXCEEDED → EHOSTUNREACH; anything else is ignored;
+/// - SYN-SENT / SYN-RECEIVED: fatal — the connection is aborted with that
+///   errno (`tcp_done_with_error`), which is what `connect` reports;
+/// - otherwise it is only a soft error (`sk_err_soft`, RFC 1122 §4.2.3.9):
+///   the connection keeps retrying, and the error surfaces via SO_ERROR or
+///   as the errno if it later times out. (NARF has no IP_RECVERR.)
+pub fn signal_icmp_error(
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    local_ip: [u8; 4],
+    local_port: u16,
+    icmp_type: u8,
+    icmp_code: u8,
+    seq: u32,
+) {
+    signal_icmp_error_in(
+        0,
+        remote_ip,
+        remote_port,
+        local_ip,
+        local_port,
+        icmp_type,
+        icmp_code,
+        seq,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn signal_icmp_error_in(
     net_ns_id: u64,
     remote_ip: [u8; 4],
     remote_port: u16,
     local_ip: [u8; 4],
     local_port: u16,
+    icmp_type: u8,
+    icmp_code: u8,
+    seq: u32,
 ) {
-    let arc = conn_index_lookup(conn_key(
+    let Some(arc) = conn_index_lookup(conn_key(
         net_ns_id,
         remote_ip,
         remote_port,
         local_ip,
         local_port,
-    ));
-    if let Some(arc) = arc {
+    )) else {
+        return;
+    };
+    let err = match icmp_type {
+        ICMP_REDIRECT | ICMP_SOURCE_QUENCH => return,
+        ICMP_PARAMETERPROB => errno::EPROTO,
+        ICMP_DEST_UNREACH => {
+            if icmp_code > NR_ICMP_UNREACH || icmp_code == ICMP_FRAG_NEEDED {
+                return;
+            }
+            ICMP_UNREACH_ERRNO[icmp_code as usize]
+        }
+        ICMP_TIME_EXCEEDED => errno::EHOSTUNREACH,
+        _ => return,
+    } as i32;
+    let fatal = {
         let mut t = arc.lock();
-        t.drop_cause = Some(DropCause::PeerReset);
-        t.state = TcpState::Closed;
-        let id = t.id;
-        drop(t);
-        remove_tcb(id);
+        if t.state == TcpState::Closed {
+            return;
+        }
+        // `between(seq, snd_una, snd_nxt)`, inclusive at both ends.
+        if !(seq_geq(seq, t.snd_una) && seq_leq(seq, t.snd_nxt)) {
+            return;
+        }
+        match t.state {
+            TcpState::SynSent | TcpState::SynReceived => true,
+            _ => {
+                t.sk_err_soft = err;
+                false
+            }
+        }
+    };
+    if fatal {
+        abort_tcb(&arc, err, DropCause::IcmpError);
     }
 }

@@ -38,11 +38,11 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, connect_in, getsockopt_cong, getsockopt_int, listen,
-    listen_has_pending, listen_in, lookup_tcb, readable, recv, remove_tcb, send, setsockopt_int,
-    setsockopt_str, shutdown, tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE,
-    TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK,
-    TCP_USER_TIMEOUT,
+    accept, close, connect, connect_errno_in, connect_in, getsockopt_cong, getsockopt_int, listen,
+    listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, release, remove_tcb,
+    send, send_errno, setsockopt_int, setsockopt_str, shutdown, shutdown_errno, take_sock_error,
+    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
+    TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 
@@ -474,26 +474,40 @@ fn handle_udp(
 // ── ICMP error signalling (called by icmp_sock) ─────────────────
 
 /// Notify the TCP connection identified by
-/// `(local_addr, local_port, remote_addr, remote_port)` that an
-/// ICMP error was received. Per RFC 1122 §4.2.3.9 this is a soft
-/// signal — we route it as `DropCause::PeerReset` to mirror Linux's
-/// `tcp_v4_err` (`net/ipv4/tcp_ipv4.c:tcp_v4_err`) behaviour on
-/// hard errors.
+/// `(local_addr, local_port, remote_addr, remote_port)` of an ICMP error
+/// about the segment with sequence number `seq`. Linux `tcp_v4_err`
+/// semantics — see `tcp::core::signal_icmp_error_in`: fatal (abort with the
+/// ICMP-derived errno) only during the handshake, a soft error otherwise.
 pub fn signal_icmp_error(
     local_addr: [u8; 4],
     local_port: u16,
     remote_addr: [u8; 4],
     remote_port: u16,
+    icmp_type: u8,
+    icmp_code: u8,
+    seq: u32,
 ) {
-    crate::tcp::core::signal_icmp_error(remote_addr, remote_port, local_addr, local_port);
+    crate::tcp::core::signal_icmp_error(
+        remote_addr,
+        remote_port,
+        local_addr,
+        local_port,
+        icmp_type,
+        icmp_code,
+        seq,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn signal_icmp_error_in(
     net_ns_id: u64,
     local_addr: [u8; 4],
     local_port: u16,
     remote_addr: [u8; 4],
     remote_port: u16,
+    icmp_type: u8,
+    icmp_code: u8,
+    seq: u32,
 ) {
     crate::tcp::core::signal_icmp_error_in(
         net_ns_id,
@@ -501,6 +515,9 @@ pub fn signal_icmp_error_in(
         remote_port,
         local_addr,
         local_port,
+        icmp_type,
+        icmp_code,
+        seq,
     );
 }
 

@@ -73,6 +73,8 @@ const SERVER_IP: [u8; 4] = [10, 0, 77, 2];
 const SERVER_PORT: u16 = 18_080;
 /// A port nothing listens on — the refused-connect target.
 const CLOSED_PORT: u16 = 18_081;
+/// An on-link router that originates ICMP errors.
+const ROUTER_IP: [u8; 4] = [10, 0, 77, 254];
 
 /// Upper bound on TCB ids scanned by the virtual clock. `__reset_for_test`
 /// restarts ids at 1 and no smoke here creates more than a few dozen.
@@ -176,6 +178,10 @@ enum Fault {
     /// Drop each segment (any kind, either direction) with probability
     /// `per_mille / 1000`, from a deterministic xorshift stream.
     RandomLoss { per_mille: u32 },
+    /// Answer the next `count` bare SYNs with an ICMP destination-unreachable
+    /// of `code` (from `ROUTER_IP`) instead of delivering them — a router
+    /// refusing the path.
+    IcmpOnSyn { code: u8, count: u32 },
 }
 
 struct Wire {
@@ -260,6 +266,17 @@ fn wire_send(frame: &[u8]) -> Result<(), ()> {
         Fault::RandomLoss { per_mille } => {
             drop_it = w.next_rand() % 1000 < per_mille;
         }
+        Fault::IcmpOnSyn { code, count } => {
+            if count > 0 && seg.has(FLAG_SYN) && !seg.has(FLAG_ACK) {
+                drop_it = true;
+                w.fault = Fault::IcmpOnSyn {
+                    code,
+                    count: count - 1,
+                };
+                let icmp = icmp_error_frame(ROUTER_IP, 3, code, &frame[ETH_HDR_LEN..]);
+                w.queue.push_back(icmp);
+            }
+        }
     }
 
     seg.dropped = drop_it;
@@ -283,6 +300,43 @@ fn wire_send(frame: &[u8]) -> Result<(), ()> {
     }
     w.queue.push_back(frame);
     Ok(())
+}
+
+/// Ethernet + IPv4 + ICMP error frame from `from` about `offending`
+/// (an IPv4 packet we sent): type/code, then the quoted IPv4 header and the
+/// first 8 bytes of its payload (RFC 792), addressed back to its source.
+fn icmp_error_frame(from: [u8; 4], icmp_type: u8, code: u8, offending: &[u8]) -> Vec<u8> {
+    use crate::pkt::{
+        ip_checksum, set_ipv4_checksum, write_eth_header, write_ipv4_header, IPV4_HDR_LEN,
+        IP_PROTO_ICMP,
+    };
+    let ihl = ((offending[0] & 0x0f) as usize) * 4;
+    let quoted = &offending[..(ihl + 8).min(offending.len())];
+    let dst: [u8; 4] = [offending[12], offending[13], offending[14], offending[15]];
+    let mut icmp = vec![0u8; 8 + quoted.len()];
+    icmp[0] = icmp_type;
+    icmp[1] = code;
+    icmp[8..].copy_from_slice(quoted);
+    let cs = ip_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&cs.to_be_bytes());
+    let ip_total = IPV4_HDR_LEN + icmp.len();
+    let mut frame = vec![0u8; ETH_HDR_LEN + ip_total];
+    write_eth_header(
+        &mut frame,
+        IFACE_MAC,
+        [0x02, 0, 0, 0, 0x77, 0xfe],
+        ETHERTYPE_IPV4,
+    );
+    write_ipv4_header(
+        &mut frame[ETH_HDR_LEN..],
+        ip_total as u16,
+        IP_PROTO_ICMP,
+        from,
+        dst,
+    );
+    set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
+    frame[ETH_HDR_LEN + IPV4_HDR_LEN..].copy_from_slice(&icmp);
+    frame
 }
 
 /// Deliver one queued frame through the full RX path. Returns `false` when
@@ -615,7 +669,7 @@ fn transfer(from: u32, to: u32, data: &[u8], budget: u32) -> Result<(), &'static
 /// Sender side fully drained and acknowledged: nothing unsent, nothing in
 /// flight, no retransmit timer armed.
 fn sender_quiescent(id: u32) -> Result<(), &'static str> {
-    let r = __with_tcb(id, |t| {
+    __with_tcb(id, |t| {
         if t.snd_una != t.snd_nxt || !t.retx_queue.is_empty() || !t.send_buf.is_empty() {
             Err("sender not quiescent: unacked or queued data left")
         } else if t.retx_deadline_cycles != 0 {
@@ -626,8 +680,7 @@ fn sender_quiescent(id: u32) -> Result<(), &'static str> {
             Ok(())
         }
     })
-    .ok_or("sender TCB vanished")?;
-    r
+    .ok_or("sender TCB vanished")?
 }
 
 /// Count data segments that re-sent a sequence number already sent in the
@@ -1533,3 +1586,439 @@ fn smoke_tcp_e2e_zero_window() -> TestResult {
     finish(tcp_e2e_zero_window())
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_zero_window);
+
+// ── errno contract ──────────────────────────────────────────────────────────
+//
+// What `send` / `recv` / `shutdown` / `connect` / `SO_ERROR` report, pinned
+// to the Linux source that decides it for the same condition:
+//
+// - `tcp_recvmsg_locked` (net/ipv4/tcp.c): queued data first; then
+//   SOCK_DONE → 0, `sock_error` (once) → errno, RCV_SHUTDOWN → 0,
+//   TCP_CLOSE → ENOTCONN, else EAGAIN.
+// - `tcp_sendmsg_locked` + `sk_stream_error` (net/core/stream.c): pending
+//   error once, then EPIPE; EAGAIN when the send buffer is full.
+// - `tcp_reset` (net/ipv4/tcp_input.c): SYN-SENT → ECONNREFUSED,
+//   CLOSE-WAIT → EPIPE, else ECONNRESET.
+// - `tcp_write_err` (net/ipv4/tcp_timer.c): `sk_err_soft ?: ETIMEDOUT`.
+// - `tcp_v4_err` (net/ipv4/tcp_ipv4.c) + `icmp_err_convert`
+//   (net/ipv4/icmp.c): fatal in SYN-SENT, soft once established.
+// - `inet_shutdown` (net/ipv4/af_inet.c): TCP_CLOSE → ENOTCONN.
+// - `sk_getsockopt(SO_ERROR)` (net/core/sock.c): `sock_error`, else the
+//   soft error, each cleared by the read.
+
+use narf_lib::errno;
+
+use crate::tcp::core::{connect_errno_in, recv_errno, send_errno, shutdown_errno, take_sock_error};
+
+const EAGAIN: i32 = errno::EAGAIN as i32;
+const EPIPE: i32 = errno::EPIPE as i32;
+const ENOTCONN: i32 = errno::ENOTCONN as i32;
+const ECONNRESET: i32 = errno::ECONNRESET as i32;
+const ECONNREFUSED: i32 = errno::ECONNREFUSED as i32;
+const ETIMEDOUT: i32 = errno::ETIMEDOUT as i32;
+const EHOSTUNREACH: i32 = errno::EHOSTUNREACH as i32;
+const ENETUNREACH: i32 = errno::ENETUNREACH as i32;
+const EHOSTDOWN: i32 = errno::EHOSTDOWN as i32;
+
+fn expect(
+    got: Result<usize, i32>,
+    want: Result<usize, i32>,
+    msg: &'static str,
+) -> Result<(), &'static str> {
+    if got == want {
+        Ok(())
+    } else {
+        narf_console::klog!("tcp_e2e errno: got {:?}, want {:?}", got, want);
+        Err(msg)
+    }
+}
+
+// Orderly shutdown: EAGAIN while live, 0 at EOF, EPIPE after SHUT_WR, and
+// ENOTCONN / EPIPE / 0 once the connection is gone.
+fn tcp_e2e_errno_orderly_shutdown() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    settle();
+    let mut b = [0u8; 16];
+    expect(
+        recv_errno(c.server, &mut b),
+        Err(EAGAIN),
+        "live, empty: recv must be EAGAIN",
+    )?;
+    if tcp_core::readable(c.server) {
+        return Err("live, empty socket must not poll readable");
+    }
+    shutdown_errno(c.client, Shutdown::Write).map_err(|_| "shutdown(SHUT_WR) failed")?;
+    expect(
+        send_errno(c.client, b"x"),
+        Err(EPIPE),
+        "send after SHUT_WR must be EPIPE",
+    )?;
+    settle();
+    expect(
+        recv_errno(c.server, &mut b),
+        Ok(0),
+        "peer FIN: recv must be 0 (EOF)",
+    )?;
+    expect(recv_errno(c.server, &mut b), Ok(0), "EOF must be sticky")?;
+    if !tcp_core::readable(c.server) {
+        return Err("EOF must poll readable");
+    }
+    // The half-closed client still reads: nothing yet → EAGAIN.
+    expect(
+        recv_errno(c.client, &mut b),
+        Err(EAGAIN),
+        "FIN-WAIT-2, empty: recv must be EAGAIN",
+    )?;
+    expect(
+        send_errno(c.server, b"late"),
+        Ok(4),
+        "CLOSE-WAIT may still send",
+    )?;
+    settle();
+    expect(
+        recv_errno(c.client, &mut b),
+        Ok(4),
+        "half-closed side must receive",
+    )?;
+    shutdown_errno(c.server, Shutdown::Write).map_err(|_| "server SHUT_WR failed")?;
+    settle();
+    expect(
+        recv_errno(c.client, &mut b),
+        Ok(0),
+        "EOF after the server's FIN",
+    )?;
+    if !tcp_core::readable(c.client) {
+        return Err("TIME-WAIT socket at EOF must poll readable");
+    }
+    // Client in TIME-WAIT — its user socket is closed (`tcp_time_wait`).
+    if shutdown_errno(c.client, Shutdown::Write) != Err(ENOTCONN) {
+        return Err("shutdown in TIME-WAIT must be ENOTCONN");
+    }
+    expire_time_wait();
+    expect(
+        recv_errno(c.client, &mut b),
+        Ok(0),
+        "closed connection: recv must be 0",
+    )?;
+    expect(
+        send_errno(c.client, b"x"),
+        Err(EPIPE),
+        "closed connection: send must be EPIPE",
+    )?;
+    if shutdown_errno(c.client, Shutdown::Both) != Err(ENOTCONN) {
+        return Err("shutdown on a closed connection must be ENOTCONN");
+    }
+    if take_sock_error(c.client) != 0 {
+        return Err("orderly close must leave no SO_ERROR");
+    }
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_orderly_shutdown() -> TestResult {
+    finish(tcp_e2e_errno_orderly_shutdown())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_orderly_shutdown);
+
+// A full send buffer is EAGAIN, never a silent 0.
+fn tcp_e2e_errno_send_buffer_full() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    settle();
+    let chunk = pattern(64 * 1024, 7);
+    // Nothing is delivered (the wire is not run), so the buffer fills.
+    for _ in 0..64 {
+        match send_errno(c.client, &chunk) {
+            Ok(n) if n > 0 => continue,
+            Ok(_) => return Err("full send buffer returned Ok(0) instead of EAGAIN"),
+            Err(e) if e == EAGAIN => return Ok(()),
+            Err(_) => return Err("full send buffer returned an errno other than EAGAIN"),
+        }
+    }
+    Err("send buffer never filled")
+}
+
+fn smoke_tcp_e2e_errno_send_buffer_full() -> TestResult {
+    finish(tcp_e2e_errno_send_buffer_full())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_send_buffer_full);
+
+/// Establish, then make the server vanish without a FIN (crash / reboot)
+/// and have the client send, drawing an RST. Returns the client id.
+fn reset_client_by_peer(listener: u32) -> Result<u32, &'static str> {
+    let client = connect(SERVER_IP, SERVER_PORT).map_err(|_| "connect failed")?;
+    let server = accept_one(listener)?;
+    settle();
+    tcp_core::remove_tcb(server);
+    expect(
+        send_errno(client, b"hello?"),
+        Ok(6),
+        "send before the RST must succeed",
+    )?;
+    if !run_until(BUDGET_SMALL, || lookup_tcb(client).is_none()) {
+        return Err("client not torn down by the RST");
+    }
+    Ok(client)
+}
+
+// RST in ESTABLISHED: ECONNRESET exactly once (whichever call sees it),
+// then recv → 0 and send → EPIPE.
+fn tcp_e2e_errno_reset_established() -> Result<(), &'static str> {
+    reset();
+    let mut b = [0u8; 8];
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    let id = reset_client_by_peer(listener)?;
+    if !tcp_core::readable(id) {
+        return Err("reset socket must poll readable");
+    }
+    expect(
+        recv_errno(id, &mut b),
+        Err(ECONNRESET),
+        "first recv after RST must be ECONNRESET",
+    )?;
+    expect(
+        recv_errno(id, &mut b),
+        Ok(0),
+        "ECONNRESET is reported once; then EOF",
+    )?;
+    expect(
+        send_errno(id, b"x"),
+        Err(EPIPE),
+        "send after the reported reset must be EPIPE",
+    )?;
+
+    // Same again, but the first call is a send.
+    let id = reset_client_by_peer(listener)?;
+    expect(
+        send_errno(id, b"x"),
+        Err(ECONNRESET),
+        "first send after RST must be ECONNRESET",
+    )?;
+    expect(send_errno(id, b"x"), Err(EPIPE), "then EPIPE")?;
+    expect(recv_errno(id, &mut b), Ok(0), "then recv is EOF")?;
+
+    // And via SO_ERROR.
+    let id = reset_client_by_peer(listener)?;
+    if take_sock_error(id) != ECONNRESET {
+        return Err("SO_ERROR after RST must be ECONNRESET");
+    }
+    if take_sock_error(id) != 0 {
+        return Err("SO_ERROR must clear once read");
+    }
+    tcp_core::release(id);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_reset_established() -> TestResult {
+    finish(tcp_e2e_errno_reset_established())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_established);
+
+// RST in CLOSE-WAIT is EPIPE (tcp_reset), and since the peer's FIN was
+// received (SOCK_DONE), recv still reports EOF rather than the error.
+fn tcp_e2e_errno_reset_close_wait() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    shutdown_errno(c.client, Shutdown::Write).map_err(|_| "client SHUT_WR failed")?;
+    settle();
+    if state_of(c.server) != Some(TcpState::CloseWait) {
+        return Err("server not in CLOSE-WAIT");
+    }
+    tcp_core::remove_tcb(c.client);
+    expect(
+        send_errno(c.server, b"data"),
+        Ok(4),
+        "CLOSE-WAIT send must succeed",
+    )?;
+    if !run_until(BUDGET_SMALL, || lookup_tcb(c.server).is_none()) {
+        return Err("server not torn down by the RST");
+    }
+    let mut b = [0u8; 8];
+    expect(
+        recv_errno(c.server, &mut b),
+        Ok(0),
+        "SOCK_DONE precedes sk_err: recv must be 0",
+    )?;
+    if take_sock_error(c.server) != EPIPE {
+        return Err("RST in CLOSE-WAIT must report EPIPE");
+    }
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_reset_close_wait() -> TestResult {
+    finish(tcp_e2e_errno_reset_close_wait())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_close_wait);
+
+// connect(): RST → ECONNREFUSED; silence → ETIMEDOUT; unresolvable next
+// hop → EHOSTUNREACH; no interface → ENETUNREACH.
+fn tcp_e2e_errno_connect_failures() -> Result<(), &'static str> {
+    reset();
+    if connect_errno_in(0, SERVER_IP, CLOSED_PORT) != Err(ECONNREFUSED) {
+        return Err("RST to SYN must fail connect with ECONNREFUSED");
+    }
+    set_fault(Fault::DropControl {
+        dir: Dir::ToServer,
+        flags: FLAG_SYN,
+        count: u32::MAX,
+    });
+    let _ = listen(SERVER_IP, SERVER_PORT, 4).map_err(|_| "listen failed")?;
+    if connect_errno_in(0, SERVER_IP, SERVER_PORT) != Err(ETIMEDOUT) {
+        return Err("unanswered SYNs must fail connect with ETIMEDOUT");
+    }
+    set_fault(Fault::None);
+    // On-link, but nothing answers ARP.
+    if connect_errno_in(0, [10, 0, 77, 99], SERVER_PORT) != Err(EHOSTUNREACH) {
+        return Err("unresolvable next hop must fail connect with EHOSTUNREACH");
+    }
+    if live_ids().len() != 1 {
+        return Err("failed connects leaked TCBs");
+    }
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_connect_failures() -> TestResult {
+    finish(tcp_e2e_errno_connect_failures())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_connect_failures);
+
+// ICMP destination-unreachable in SYN-SENT is fatal, with the errno from
+// `icmp_err_convert[code]`. FRAG_NEEDED is PMTU, not an error.
+fn tcp_e2e_errno_connect_icmp() -> Result<(), &'static str> {
+    const CASES: [(u8, i32); 4] = [
+        (0, ENETUNREACH),  // ICMP_NET_UNREACH
+        (1, EHOSTUNREACH), // ICMP_HOST_UNREACH
+        (3, ECONNREFUSED), // ICMP_PORT_UNREACH
+        (7, EHOSTDOWN),    // ICMP_HOST_UNKNOWN
+    ];
+    reset();
+    for_each_icmp_case(&CASES)?;
+    // FRAG_NEEDED on the first SYN: not an error; the retransmitted SYN
+    // gets through and connect succeeds.
+    reset();
+    let _ = listen(SERVER_IP, SERVER_PORT, 4).map_err(|_| "listen failed")?;
+    set_fault(Fault::IcmpOnSyn { code: 4, count: 1 });
+    if connect_errno_in(0, SERVER_IP, SERVER_PORT).is_err() {
+        return Err("ICMP FRAG_NEEDED must not abort the connect");
+    }
+    Ok(())
+}
+
+fn for_each_icmp_case(cases: &[(u8, i32)]) -> Result<(), &'static str> {
+    for &(code, want) in cases {
+        set_fault(Fault::IcmpOnSyn { code, count: 1 });
+        let got = connect_errno_in(0, SERVER_IP, SERVER_PORT);
+        if got != Err(want) {
+            narf_console::klog!(
+                "tcp_e2e errno: ICMP code {} → {:?}, want {}",
+                code,
+                got,
+                want
+            );
+            return Err("ICMP error in SYN-SENT did not map per icmp_err_convert");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_connect_icmp() -> TestResult {
+    finish(tcp_e2e_errno_connect_icmp())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_connect_icmp);
+
+/// An ICMP error from `ROUTER_IP` about a client→server segment with
+/// sequence number `seq`, delivered through the full RX path.
+fn inject_icmp_about_client_segment(client_port: u16, seq: u32, code: u8) {
+    use crate::pkt::{set_ipv4_checksum, write_ipv4_header, IPV4_HDR_LEN};
+    let mut quoted = vec![0u8; IPV4_HDR_LEN + 8];
+    write_ipv4_header(
+        &mut quoted,
+        (IPV4_HDR_LEN + 20) as u16,
+        IP_PROTO_TCP,
+        CLIENT_IP,
+        SERVER_IP,
+    );
+    set_ipv4_checksum(&mut quoted);
+    quoted[IPV4_HDR_LEN..IPV4_HDR_LEN + 2].copy_from_slice(&client_port.to_be_bytes());
+    quoted[IPV4_HDR_LEN + 2..IPV4_HDR_LEN + 4].copy_from_slice(&SERVER_PORT.to_be_bytes());
+    quoted[IPV4_HDR_LEN + 4..IPV4_HDR_LEN + 8].copy_from_slice(&seq.to_be_bytes());
+    let mut frame = icmp_error_frame(ROUTER_IP, 3, code, &quoted);
+    crate::tcp_stack::rx_handler(IFACE, &mut frame);
+}
+
+// Once established, ICMP errors are soft (RFC 1122 §4.2.3.9): the
+// connection survives, SO_ERROR reports the soft error once, a quoted
+// sequence number outside [snd_una, snd_nxt] is ignored, and a later
+// timeout reports the soft error instead of ETIMEDOUT.
+fn tcp_e2e_errno_icmp_soft_established() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    settle();
+    let (port, una) = __with_tcb(c.client, |t| (t.local_port, t.snd_una)).ok_or("client gone")?;
+
+    inject_icmp_about_client_segment(port, una.wrapping_add(100_000), 1);
+    if take_sock_error(c.client) != 0 {
+        return Err("ICMP quoting an out-of-window sequence number must be ignored");
+    }
+    inject_icmp_about_client_segment(port, una, 1);
+    if state_of(c.client) != Some(TcpState::Established) {
+        return Err("ICMP error must not abort an established connection");
+    }
+    if take_sock_error(c.client) != EHOSTUNREACH || take_sock_error(c.client) != 0 {
+        return Err("SO_ERROR must report the soft ICMP error exactly once");
+    }
+    transfer(c.client, c.server, b"still-alive", BUDGET_SMALL)?;
+
+    // Soft error, then the path goes dark until the retransmit give-up.
+    let una = __with_tcb(c.client, |t| t.snd_una).ok_or("client gone")?;
+    inject_icmp_about_client_segment(port, una, 1);
+    set_fault(Fault::RandomLoss { per_mille: 1000 });
+    expect(
+        send_errno(c.client, b"into the void"),
+        Ok(13),
+        "send must queue",
+    )?;
+    if !run_until(BUDGET_BULK, || lookup_tcb(c.client).is_none()) {
+        return Err("connection never timed out on a dead path");
+    }
+    expect(
+        send_errno(c.client, b"x"),
+        Err(EHOSTUNREACH),
+        "timeout after a soft ICMP error must report it (sk_err_soft ?: ETIMEDOUT)",
+    )?;
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_icmp_soft_established() -> TestResult {
+    finish(tcp_e2e_errno_icmp_soft_established())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_icmp_soft_established);
+
+// A plain retransmit give-up with no ICMP history is ETIMEDOUT.
+fn tcp_e2e_errno_retransmit_timeout() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    settle();
+    set_fault(Fault::RandomLoss { per_mille: 1000 });
+    expect(send_errno(c.client, b"lost"), Ok(4), "send must queue")?;
+    if !run_until(BUDGET_BULK, || lookup_tcb(c.client).is_none()) {
+        return Err("connection never timed out on a dead path");
+    }
+    let mut b = [0u8; 4];
+    expect(
+        recv_errno(c.client, &mut b),
+        Err(ETIMEDOUT),
+        "retransmit give-up must be ETIMEDOUT",
+    )?;
+    expect(
+        recv_errno(c.client, &mut b),
+        Ok(0),
+        "reported once; then EOF",
+    )?;
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_retransmit_timeout() -> TestResult {
+    finish(tcp_e2e_errno_retransmit_timeout())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_retransmit_timeout);

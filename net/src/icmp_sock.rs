@@ -37,9 +37,9 @@ use narf_lib::sysctl::ipv4 as sysctl;
 
 use crate::iface;
 use crate::pkt::{
-    ip_checksum, parse_ipv4, set_ipv4_checksum, write_eth_header, write_ipv4_header,
-    ETHERTYPE_IPV4, ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_ICMP,
-    IP_PROTO_TCP, IP_PROTO_UDP,
+    ip_checksum, set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4,
+    ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP,
+    IP_PROTO_UDP,
 };
 use crate::pkt_icmp_extra::{ICMP_DEST_UNREACHABLE, ICMP_TIME_EXCEEDED};
 use crate::tcp_stack::{arp_resolve_in, nf_tx_filter_in};
@@ -451,14 +451,35 @@ pub fn deliver_error_in(
     if icmp_body.len() < 8 + IPV4_HDR_LEN + 8 {
         return;
     }
+    // The quoted header is parsed leniently, as Linux does: `icmp_unreach`
+    // requires only `ihl >= 5` and `icmp_socket_deliver` only
+    // `ihl * 4 + 8` quoted bytes (net/ipv4/icmp.c). Its `total_length`
+    // describes the ORIGINAL datagram, of which RFC 792 guarantees just the
+    // IP header + 8 bytes, so `parse_ipv4` (which requires the whole
+    // datagram) rejected every error quoting the minimum for a datagram
+    // over 28 bytes — the error never reached the socket.
     let orig_ip_body = &icmp_body[8..];
-    let (orig_ip, orig_l4) = match parse_ipv4(orig_ip_body) {
-        Some(p) => p,
-        None => return,
-    };
-    if orig_l4.len() < 8 {
+    if orig_ip_body[0] >> 4 != 4 {
         return;
     }
+    let ihl = ((orig_ip_body[0] & 0x0f) as usize) * 4;
+    if ihl < IPV4_HDR_LEN || orig_ip_body.len() < ihl + 8 {
+        return;
+    }
+    let orig_protocol = orig_ip_body[9];
+    let orig_src_ip = [
+        orig_ip_body[12],
+        orig_ip_body[13],
+        orig_ip_body[14],
+        orig_ip_body[15],
+    ];
+    let orig_dst_ip = [
+        orig_ip_body[16],
+        orig_ip_body[17],
+        orig_ip_body[18],
+        orig_ip_body[19],
+    ];
+    let orig_l4 = &orig_ip_body[ihl..];
     let orig_src_port = u16::from_be_bytes([orig_l4[0], orig_l4[1]]);
 
     let err = SockError {
@@ -467,19 +488,24 @@ pub fn deliver_error_in(
         from_ip,
     };
 
-    match orig_ip.protocol {
+    match orig_protocol {
         IP_PROTO_UDP => {
             // Deliver to the UDP socket that sent the triggering datagram.
-            deliver_icmp_error_in(net_ns_id, orig_ip.src_ip, orig_src_port, err);
+            deliver_icmp_error_in(net_ns_id, orig_src_ip, orig_src_port, err);
         }
         IP_PROTO_TCP => {
             // Signal the TCP connection.
+            // Bytes 4..8 of the quoted TCP header: the offending segment's
+            // sequence number, which `tcp_v4_err` checks against the window.
             crate::tcp_stack::signal_icmp_error_in(
                 net_ns_id,
-                orig_ip.src_ip,
+                orig_src_ip,
                 orig_src_port,
-                orig_ip.dst_ip,
+                orig_dst_ip,
                 u16::from_be_bytes([orig_l4[2], orig_l4[3]]),
+                icmp_type,
+                icmp_code,
+                u32::from_be_bytes([orig_l4[4], orig_l4[5], orig_l4[6], orig_l4[7]]),
             );
         }
         _ => {}
