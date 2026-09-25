@@ -463,13 +463,52 @@ const ELF64_SYM_SIZE: u64 = 24;
 /// purely-external symbol; non-zero `st_shndx` means defined-in-image.
 const SHN_UNDEF: u16 = 0;
 
-// x86_64 relocation type codes (low 32 bits of `r_info`).
-// AMD64 SysV ABI psABI v1.0 §4.4.1 "Relocation Types".
-const R_X86_64_NONE: u32 = 0;
-const R_X86_64_64: u32 = 1;
-const R_X86_64_GLOB_DAT: u32 = 6;
-const R_X86_64_JUMP_SLOT: u32 = 7;
-const R_X86_64_RELATIVE: u32 = 8;
+// Relocation type codes (low 32 bits of `r_info`), named by what they MEAN
+// rather than by one arch's spelling, because the numbers are per-arch while
+// the arithmetic below is not:
+//
+//   meaning                       x86_64  aarch64
+//   ------------------------------ ------  -------
+//   no-op                              0        0   NONE
+//   S + A (absolute, 64-bit)           1      257   _64 / ABS64
+//   S (GOT slot)                       6     1025   GLOB_DAT
+//   S (PLT slot)                       7     1026   JUMP_SLOT
+//   B + A (load-bias only)             8     1027   RELATIVE
+//   resolver-produced address         37     1032   IRELATIVE
+//
+// References: AMD64 psABI v1.0 §4.4.1; "ELF for the Arm 64-bit Architecture"
+// §5.7.4 "Relocation codes". Only the running arch's set is compiled, so the
+// match below has no overlapping patterns.
+//
+// This used to be the x86_64 numbers only, which meant a genuine aarch64
+// ET_DYN — whose RELATIVE entries are type 1027, not 8 — fell through to the
+// catch-all and failed the whole load with `UnsupportedRelocation`.
+#[cfg(target_arch = "x86_64")]
+const R_NONE: u32 = 0;
+#[cfg(target_arch = "x86_64")]
+const R_ABS64: u32 = 1;
+#[cfg(target_arch = "x86_64")]
+const R_GLOB_DAT: u32 = 6;
+#[cfg(target_arch = "x86_64")]
+const R_JUMP_SLOT: u32 = 7;
+#[cfg(target_arch = "x86_64")]
+const R_RELATIVE: u32 = 8;
+#[cfg(target_arch = "x86_64")]
+const R_IRELATIVE: u32 = 37;
+
+#[cfg(target_arch = "aarch64")]
+const R_NONE: u32 = 0;
+#[cfg(target_arch = "aarch64")]
+const R_ABS64: u32 = 257;
+#[cfg(target_arch = "aarch64")]
+const R_GLOB_DAT: u32 = 1025;
+#[cfg(target_arch = "aarch64")]
+const R_JUMP_SLOT: u32 = 1026;
+#[cfg(target_arch = "aarch64")]
+const R_RELATIVE: u32 = 1027;
+#[cfg(target_arch = "aarch64")]
+const R_IRELATIVE: u32 = 1032;
+
 // TLS relocations. ld-musl uses these to relocate the program's
 // PT_TLS template at interpreter startup.
 //   DTPMOD64 — module ID for general-dynamic / local-dynamic TLS.
@@ -481,10 +520,22 @@ const R_X86_64_RELATIVE: u32 = 8;
 //     `mov rax, fs:[offset]` reaches the variable's storage at
 //     NEGATIVE offsets from FS_BASE (matches `tls.rs::stage_tls`'s
 //     `[ TLS image | TCB ]` layout with `fs_base = image_end`).
-const R_X86_64_DTPMOD64: u32 = 16;
-const R_X86_64_DTPOFF64: u32 = 17;
-const R_X86_64_TPOFF64: u32 = 18;
-const R_X86_64_IRELATIV: u32 = 37;
+//
+// x86_64 only, deliberately. The aarch64 numbers exist (TLS_DTPMOD 1028,
+// TLS_DTPREL 1029, TLS_TPREL 1030) but the TPOFF arithmetic above is
+// variant-II: the TLS block sits BELOW the thread pointer, so offsets are
+// negative. aarch64 is variant-I — the block sits above TPIDR_EL0 past a
+// two-word TCB — so the same formula would be wrong by the whole block size
+// plus the TCB, and NARF does not stage an aarch64 thread pointer at all yet
+// (`process.rs` leaves `fs_base` None off x86_64). Emitting a plausible wrong
+// offset is worse than refusing, so these fall to the catch-all on aarch64
+// and report `UnsupportedRelocation` by type number.
+#[cfg(target_arch = "x86_64")]
+const R_DTPMOD64: u32 = 16;
+#[cfg(target_arch = "x86_64")]
+const R_DTPOFF64: u32 = 17;
+#[cfg(target_arch = "x86_64")]
+const R_TPOFF64: u32 = 18;
 
 /// Lookup helper — return the value paired with the *first*
 /// occurrence of `tag` in `dynamic`. PT_DYNAMIC duplicates would
@@ -719,6 +770,9 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
 /// gating. An undefined symbol returns 0 (the conventional template
 /// base), matching how ld-musl emits TPOFF64 with `sym_ix == 0` for
 /// the program's own TLS template.
+// Only the variant-II TLS arms call this, and those are x86_64-only
+// (see the TLS relocation constants above).
+#[cfg(target_arch = "x86_64")]
 fn resolve_tls_symbol_offset(
     bytes: &[u8],
     image: &ExecImage,
@@ -744,6 +798,8 @@ fn resolve_tls_symbol_offset(
 /// arithmetic agrees with where the kernel actually places the image.
 /// Returns 0 when the image has no PT_TLS — TPOFF64 against a binary
 /// without TLS is degenerate but should not abort relocation.
+// As above: variant-II TLS math, x86_64-only.
+#[cfg(target_arch = "x86_64")]
 fn tls_block_size(image: &ExecImage) -> u64 {
     match &image.tls {
         Some(t) => {
@@ -978,28 +1034,30 @@ unsafe fn process_rela_array(
 
         // Compute the value we'll write.
         let value: u64 = match rtype {
-            R_X86_64_RELATIVE => {
+            R_RELATIVE => {
                 // S = 0 (no symbol). Result = B + A, where B is the
                 // load bias we're applying and A is r_addend.
                 vaddr_bias.wrapping_add(r_addend as u64)
             }
-            R_X86_64_64 => {
+            R_ABS64 => {
                 // S + A — symbol address (biased) plus addend.
                 let s = resolve_symbol(bytes, image, sym_ix, vaddr_bias)?;
                 s.wrapping_add(r_addend as u64)
             }
-            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+            R_GLOB_DAT | R_JUMP_SLOT => {
                 // S — bare symbol address. The addend slot is reserved
                 // by the ABI for these two types; ignore it.
                 resolve_symbol(bytes, image, sym_ix, vaddr_bias)?
             }
-            R_X86_64_DTPMOD64 => {
+            #[cfg(target_arch = "x86_64")]
+            R_DTPMOD64 => {
                 // Module ID. The static-tls model has exactly one TLS
                 // module (the program's PT_TLS template), so the value
                 // is always 1 regardless of sym_ix. Addend is reserved.
                 1
             }
-            R_X86_64_DTPOFF64 => {
+            #[cfg(target_arch = "x86_64")]
+            R_DTPOFF64 => {
                 // Offset of `sym` within its TLS template image, plus
                 // addend. sym_ix == 0 is the common "anonymous" form
                 // emitted for the TLS template itself; we treat that
@@ -1011,7 +1069,8 @@ unsafe fn process_rela_array(
                 };
                 s.wrapping_add(r_addend as u64)
             }
-            R_X86_64_TPOFF64 => {
+            #[cfg(target_arch = "x86_64")]
+            R_TPOFF64 => {
                 // Initial-exec TLS offset from `fs_base`. The NARF TLS
                 // layout (tls.rs::stage_tls) places the TLS image
                 // immediately below the TCB and points fs_base at the
@@ -1029,7 +1088,7 @@ unsafe fn process_rela_array(
                     .wrapping_sub(tls_size as i64)
                     .wrapping_add(r_addend) as u64
             }
-            R_X86_64_IRELATIV | R_X86_64_NONE => {
+            R_IRELATIVE | R_NONE => {
                 // Cannot resolve IRELATIV in kernel space. Skip it.
                 // Musl static-pie binaries have an internal __reloc_self
                 // routine that runs in userspace before main() and will

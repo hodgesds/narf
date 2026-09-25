@@ -2748,6 +2748,152 @@ fn smoke_userspace_at_random_block_is_written() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("userspace", smoke_userspace_at_random_block_is_written);
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_relative_reloc_uses_native_type_code() -> TestResult {
+    // Relocation TYPE NUMBERING is per-arch while the arithmetic is not.
+    // `R_X86_64_RELATIVE` is 8; `R_AARCH64_RELATIVE` is 1027. The loader
+    // carried only the x86_64 numbers, so a genuine aarch64 ET_DYN — whose
+    // RELATIVE entries are 1027 — hit the catch-all and failed the whole load
+    // with `UnsupportedRelocation`.
+    //
+    // Not arch-gated, and it asserts both directions:
+    //   * the NATIVE code relocates (B + A written into the slot), and
+    //   * the OTHER arch's code is REJECTED rather than silently accepted.
+    // The second half is what pins the numbering: a loader using 8 on aarch64
+    // fails the first, and one accepting both fails the second. The numbers
+    // are written out from the psABIs (AMD64 psABI §4.4.1; "ELF for the Arm
+    // 64-bit Architecture" §5.7.4) rather than read back from the loader's own
+    // constants, so a typo there is caught.
+    use crate::load_user_process_with;
+
+    const R_RELATIVE_X86_64: u32 = 8;
+    const R_RELATIVE_AARCH64: u32 = 1027;
+    let (native, foreign) = if cfg!(target_arch = "x86_64") {
+        (R_RELATIVE_X86_64, R_RELATIVE_AARCH64)
+    } else {
+        (R_RELATIVE_AARCH64, R_RELATIVE_X86_64)
+    };
+
+    // Link-time layout, all inside one R|W PT_LOAD mapped from file page
+    // 0x1000. ET_DYN with a 0-based segment, so the loader picks the base and
+    // no arch-specific load address is baked in.
+    const SEG_VA: u64 = 0x1000;
+    const SEG_FOFF: u64 = 0x1000;
+    const RELOC_OFF_IN_SEG: u64 = 0x80;
+    const RELA_OFF_IN_SEG: u64 = 0x100;
+    const DYN_OFF_IN_SEG: u64 = 0x200;
+    const ADDEND: u64 = 0x1234_5678;
+
+    let build = |rtype: u32| -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; 0x2000];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes()); // e_entry
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // PT_LOAD + PT_DYNAMIC
+
+        // Phdr 0 — PT_LOAD (R|W) mapping file page 0x1000 at SEG_VA.
+        let mut ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // Phdr 1 — PT_DYNAMIC over the 4-entry dynamic array.
+        ph = 64 + 56;
+        let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
+        let dyn_va = SEG_VA + DYN_OFF_IN_SEG;
+        b[ph..ph + 0x04].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&(4u64 * 16).to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&(4u64 * 16).to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+
+        // One Elf64_Rela { r_offset, r_info, r_addend } at RELA_OFF_IN_SEG.
+        let rela = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
+        b[rela..rela + 8].copy_from_slice(&(SEG_VA + RELOC_OFF_IN_SEG).to_le_bytes());
+        // r_info = sym index (high 32) | type (low 32); sym 0 for RELATIVE.
+        b[rela + 8..rela + 16].copy_from_slice(&u64::from(rtype).to_le_bytes());
+        b[rela + 16..rela + 24].copy_from_slice(&ADDEND.to_le_bytes());
+
+        // DT_RELA / DT_RELASZ / DT_RELAENT / DT_NULL.
+        let dyn_at = dyn_foff as usize;
+        for (i, (tag, val)) in [(7i64, SEG_VA + RELA_OFF_IN_SEG), (8, 24), (9, 24), (0, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let o = dyn_at + i * 16;
+            b[o..o + 8].copy_from_slice(&tag.to_le_bytes());
+            b[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        }
+        b
+    };
+
+    // Load an image carrying `rtype`, run the relocation pass, and report
+    // either the (bias, slot value) pair or that the pass refused the type.
+    enum Outcome {
+        Applied { bias: u64, slot: u64 },
+        Refused,
+    }
+    let run = |rtype: u32| -> Result<Outcome, &'static str> {
+        let bytes = build(rtype);
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised — the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return Err("load_user_process_with failed"),
+        };
+        let image = crate::parse_elf(&bytes).map_err(|_| "parse_elf failed")?;
+        let bias = proc.program_bias;
+        // SAFETY: `proc`'s segments were just mapped and materialised from
+        // these same bytes at `bias`, which is what the relocation pass needs.
+        if unsafe {
+            crate::loader::apply_relocations(&bytes, &image, &proc.address_space, bias, false)
+        }
+        .is_err()
+        {
+            return Ok(Outcome::Refused);
+        }
+        let va = SEG_VA + RELOC_OFF_IN_SEG + bias;
+        let phys = user_phys_of(proc.address_space.root, va).ok_or("reloc slot not mapped")?;
+        // SAFETY: `phys` is the frame backing the 8-byte-aligned slot.
+        let slot = unsafe { *narf_memory::PhysAddr::new(phys).kernel_ptr::<u64>() };
+        Ok(Outcome::Applied { bias, slot })
+    };
+
+    match run(native) {
+        Err(e) => return TestResult::Fail(e),
+        Ok(Outcome::Refused) => return TestResult::Fail("native RELATIVE type was rejected"),
+        // RELATIVE is B + A: the load bias plus the addend, applied once.
+        Ok(Outcome::Applied { bias, slot }) if slot != bias.wrapping_add(ADDEND) => {
+            return TestResult::Fail("RELATIVE slot is not bias + addend");
+        }
+        Ok(Outcome::Applied { .. }) => {}
+    }
+
+    match run(foreign) {
+        Err(e) => TestResult::Fail(e),
+        Ok(Outcome::Refused) => TestResult::Pass,
+        Ok(Outcome::Applied { .. }) => TestResult::Fail("foreign-arch RELATIVE type was accepted"),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_relative_reloc_uses_native_type_code
+);
+
 // ── execve smokes ───────────────────────────────────────────────
 //
 // `sys_execve` (Syscall::Execve = 179) replaces the current process
