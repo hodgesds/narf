@@ -289,6 +289,62 @@ When a receive buffer is short, only its capacity is copied. `MSG_TRUNC`
 returns the complete datagram length; `recvmsg` also sets its output
 `msg_flags` to `MSG_TRUNC`.
 
+### 3.7 In-kernel TCP socket calls and errno (`tcp_stack`)
+
+The kernel-TCP socket path (`SocketState::InetWired`) calls the
+errno-returning entry points below. Errors are positive Linux errnos from
+`narf_lib::errno`; each call returns what Linux returns for the same state.
+All are non-blocking: where Linux would sleep, they return `EAGAIN` and the
+socket layer parks the task.
+
+```rust
+pub fn connect_errno_in(ns: u64, addr: [u8; 4], port: u16) -> Result<u32, i32>;
+pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32>;
+pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>; // Ok(0) = EOF
+pub fn shutdown_errno(id: u32, how: Shutdown) -> Result<(), i32>;
+pub fn take_sock_error(id: u32) -> i32;  // getsockopt(SO_ERROR); 0 = none
+pub fn release(id: u32);                 // socket closed: forget the TCB id
+pub fn signal_icmp_error_in(ns, local, lport, remote, rport,
+                            icmp_type: u8, icmp_code: u8, seq: u32);
+```
+
+The legacy `connect_in` / `send` / `recv` / `shutdown` (`Result<_, ()>`)
+remain for in-kernel callers that do not report errors.
+
+| Condition | Result | Linux source |
+| --- | --- | --- |
+| `connect`: no interface | `ENETUNREACH` | `fib_lookup` (include/net/ip_fib.h) |
+| `connect`: next hop unresolvable | `EHOSTUNREACH` | `ipv4_link_failure` → `tcp_v4_err` |
+| `connect`: RST to the SYN | `ECONNREFUSED` | `tcp_reset` |
+| `connect`: ICMP error in SYN-SENT | `icmp_err_convert[code]`; TIME_EXCEEDED `EHOSTUNREACH`; PARAMETERPROB `EPROTO` | `tcp_v4_err`, net/ipv4/icmp.c |
+| `connect`: no answer | `ETIMEDOUT` (or the soft ICMP error) | `tcp_write_err` |
+| RST in ESTABLISHED / FIN-WAIT / CLOSING / LAST-ACK | `ECONNRESET` | `tcp_reset` |
+| RST in CLOSE-WAIT | `EPIPE` | `tcp_reset` |
+| retransmit or keepalive give-up | `sk_err_soft` if set, else `ETIMEDOUT` | `tcp_write_err` |
+| ICMP error once established | soft only: `SO_ERROR`, or the errno of a later timeout; never aborts | `tcp_v4_err` (RFC 1122 §4.2.3.9) |
+| ICMP FRAG_NEEDED / REDIRECT / SOURCE_QUENCH; quoted seq outside `[snd_una, snd_nxt]` | ignored | `tcp_v4_err` |
+| `recv`: data queued | the data, whatever the state | `tcp_recvmsg_locked` |
+| `recv`: peer FIN received (`SOCK_DONE`) | `0` | `tcp_recvmsg_locked` |
+| `recv`: pending error | that errno, once; then `0` | `sock_error`, `tcp_done` |
+| `recv`: after `SHUT_RD` / connection closed | `0` | `RCV_SHUTDOWN` |
+| `recv`: live, nothing queued | `EAGAIN` | `tcp_recvmsg_locked` |
+| `send`: pending error | that errno, once; then `EPIPE` | `sk_stream_error` |
+| `send`: after `SHUT_WR` / connection closed | `EPIPE` (caller raises `SIGPIPE` unless `MSG_NOSIGNAL`) | `tcp_sendmsg_locked` |
+| `send`: send buffer full | `EAGAIN` | `sk_stream_wait_memory` |
+| `shutdown`: connection closed (incl. TIME-WAIT) | `ENOTCONN` | `inet_shutdown` |
+| `shutdown`: `how > SHUT_RDWR` | `EINVAL` | `inet_shutdown` |
+| `SO_ERROR` | pending error, else the soft error; each cleared by the read | `sk_getsockopt` |
+| `setsockopt` SO_TYPE / SO_PROTOCOL / SO_DOMAIN / SO_ERROR | `ENOPROTOOPT` | `sk_setsockopt` |
+
+A connection's TCB is freed when it ends, while Linux keeps `struct sock`
+until the fd closes. So the pending error and `SOCK_DONE` of a connection
+that ended in error are kept by TCB id until `close` / `release` (bounded:
+the oldest entry is evicted past 4096).
+
+Deviation: `iface::for_dst` falls back to the primary interface when no
+route matches, so `ENETUNREACH` is reported only when no interface exists,
+not for every destination without a route.
+
 ## 4. Invariants & safety properties
 
 - A frame buffer is owned by exactly one holder at a time — either

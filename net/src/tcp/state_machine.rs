@@ -136,6 +136,8 @@ pub enum DropCause {
     RetransmitGiveUp,
     /// Keepalive ran out of probes (RFC 9293 §3.8.4).
     KeepaliveDead,
+    /// A hard ICMP error during the handshake (Linux `tcp_v4_err`).
+    IcmpError,
 }
 
 /// Direction-of-events log entry. Stored in the TCB ring buffer
