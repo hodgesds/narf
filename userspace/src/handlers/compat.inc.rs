@@ -7674,10 +7674,47 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
         out
     };
     let count = drained.len();
+    // Multi-wake (wake-all / broadcast): NON-urgent wakes. The urgent path
+    // feeds the direct-handoff machinery, which chains wakees into
+    // SEQUENTIAL task→task switches on the waker's CPU — correct for the
+    // 1-waiter mutex/condvar handoff above, but a 1000-waiter FUTEX_WAKE
+    // built a 1000-long serial chain instead of fanning out across idle
+    // CPUs (a 1000-thread exit storm ran at measured concurrency 1.02 on
+    // 16 vCPUs). Plain wakes enqueue each wakee on its own home CPU and
+    // kick it, the Linux wake-all shape.
     for (tid, w) in drained {
-        wake_one_urgent(tid, w);
+        wake_one(tid, w);
     }
     count
+}
+
+/// Wake ONE waiter on `key` with a NON-urgent (spread) wake. The urgent
+/// single-wake above direct-handoffs the wakee onto the CALLER's CPU — right
+/// for a mutex/condvar handoff where the waker is about to block, wrong for
+/// the exit-path clear_child_tid wake: there the wakee is the NEXT exiting
+/// thread (musl parks every exiter on the global `__thread_list_lock`), and
+/// a direct handoff makes it wait behind THIS task's remaining teardown
+/// (rusage, zombie flip, observers, stack/slot release) — serializing a
+/// 1000-thread exit storm at concurrency 1.0 across 16 CPUs. A plain wake
+/// places the wakee on another CPU so its exit critical section overlaps
+/// our post-wake teardown, the Linux `mm_release` shape.
+pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
+    let waiter = {
+        let mut values = futex_wait_bucket(key).values.lock();
+        let waiter = values.get_mut(&key).and_then(|set| {
+            let tid = set.keys().next().copied()?;
+            set.remove(&tid).map(|waker| (tid, waker))
+        });
+        if values.get(&key).is_some_and(|set| set.is_empty()) {
+            values.remove(&key);
+        }
+        waiter
+    };
+    if let Some((tid, waker)) = waiter {
+        wake_one(tid, waker);
+        return 1;
+    }
+    0
 }
 
 /// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` core: wake up to `n_wake` waiters on

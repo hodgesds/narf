@@ -9262,11 +9262,14 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // here woke every parked sibling per exit (measured ~69/exit in a
     // 1000-thread exit storm); one won the lock and the rest re-parked —
     // an O(n²) thundering herd that was ~70% of NARF's per-exit cost.
-    let _ = futex_wake_waiters_key(key, 1);
+    // SPREAD (non-urgent) wake: the wakee is usually the NEXT exiting
+    // thread; see `futex_wake_one_key_spread` for why a direct handoff
+    // here re-serializes the whole exit storm.
+    let _ = futex_wake_one_key_spread(key);
     if entry.futex_namespace != 0 {
         let shared_key = futex_key(0, uaddr);
         futex_bump_counter_key(shared_key);
-        let _ = futex_wake_waiters_key(shared_key, 1);
+        let _ = futex_wake_one_key_spread(shared_key);
     }
 }
 
