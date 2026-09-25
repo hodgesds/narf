@@ -2917,19 +2917,20 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 /// Mirrors the `AT_EMPTY_PATH` branch of `sys_newfstatat`.
 fn stat_linux_fd(ctx: &mut dyn TrapContext, n: u32, out_ptr: *mut linux_compat::Stat) {
     let task = current_task_id();
-    let stat = fd::with_table(task, |t| {
-        t.get(n).map(|e| {
-            (
-                e.ops.stat(),
-                e.ops.owners(),
-                e.ops.rdev(),
-                e.ops.ino(),
-                e.ops.inode_attrs(),
-            )
-        })
-    });
-    let (s, (uid, gid), rdev, ino, attrs) = match stat {
-        Some(Some(tuple)) => tuple,
+    // Clone the FileOps out from under the fd-table lock before querying:
+    // `owners()` on a procfs node reaches `proc_task_info` →
+    // `with_table(same task)` (a non-reentrant IrqSafeSpinLock), so querying
+    // inside the closure self-deadlocks when `/proc/self/fd/N` names a procfs
+    // node. See sys_fstat_linux.
+    let ops = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone()));
+    let (s, (uid, gid), rdev, ino, attrs) = match ops {
+        Some(Some(ops)) => (
+            ops.stat(),
+            ops.owners(),
+            ops.rdev(),
+            ops.ino(),
+            ops.inode_attrs(),
+        ),
         _ => {
             ctx.set_return(errno_ret(EBADF));
             return;

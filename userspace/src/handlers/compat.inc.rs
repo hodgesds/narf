@@ -6112,7 +6112,16 @@ pub fn proc_task_info(
         tracer_pid: crate::ptrace::get_task_tracer(pid)
             .map(|tracer| report_pid_to(tid, tracer))
             .unwrap_or(0),
-        fd_table_size: fd::with_table(tid, |t| t.fd_table_size())
+        // `try_with_table`, never `with_table`: a stat-family syscall on a
+        // `/proc/self` fd reaches here (owners → task_info) while ALREADY
+        // holding this task's fd-table lock, and that lock is a non-reentrant
+        // IrqSafeSpinLock — a blocking re-acquire self-deadlocks with IF=0.
+        // The non-blocking read falls back to the floor on contention, which
+        // mirrors Linux reading `fdtable::max_fds` locklessly under RCU. The
+        // stat-path callers also clone their FileOps out of the lock first, so
+        // this guard is defence-in-depth (it also protects the fatal-fault
+        // VMA dump, which calls proc_task_info from any faulting context).
+        fd_table_size: fd::try_with_table(tid, |t| t.fd_table_size())
             // Linux's table starts at NR_OPEN_DEFAULT and never shrinks
             // below it, so neither does this. The value must never
             // UNDERSTATE the highest open descriptor: a consumer scanning

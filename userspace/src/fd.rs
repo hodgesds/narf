@@ -1097,13 +1097,22 @@ fn nofile_limit_for(task_id: u64) -> u64 {
     }
 }
 
-/// `with_table` for callers running in the timer trap, which can interrupt
-/// a CPU already holding either the shard lock or the table lock — blocking
-/// on those deadlocks the machine under observation. `None` on contention.
+/// Non-blocking [`with_table`]: takes the shard + table locks with `try_lock`
+/// and returns `None` the instant either is contended, instead of spinning.
 ///
-/// Also, unlike [`with_table`], this NEVER creates a table: a diagnostic
-/// probe that materialises the thing it is inspecting is not a probe.
-#[cfg(feature = "unix-latency-trace")]
+/// Two callers need this rather than [`with_table`]:
+///   1. Code running in the timer trap, which can interrupt a CPU already
+///      holding either lock — blocking there deadlocks the machine under
+///      observation.
+///   2. `/proc` introspection of a task's own fd table. `proc_task_info`
+///      (via `/proc/<pid>/{stat,status,…}` `owners()`/`task_info`) reads the
+///      table's size, but a stat-family syscall may already hold that exact
+///      per-task lock (threads share one table `Arc`); a blocking re-acquire
+///      self-deadlocks with IF=0. A `try_lock` that falls back on contention
+///      mirrors Linux reading `fdtable::max_fds` locklessly under RCU.
+///
+/// Also, unlike [`with_table`], this NEVER creates a table: a reader that
+/// materialises the thing it is inspecting is not a reader.
 pub fn try_with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
     let arc = {
         let map = TABLES[table_shard(task_id)].tables.try_lock()?;

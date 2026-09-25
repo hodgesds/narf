@@ -101,20 +101,25 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // branch has no pathname and never reaches that arm.
     let (fs_stat, mnt_id, is_mount_root, walked_path) = if empty && dirfd >= 0 {
         let task = current_task_id();
-        let st = fd::with_table(task, |t| {
-            t.get(dirfd as u32).map(|e| {
-                let (uid, gid) = e.ops.owners();
-                (
-                    e.ops.stat(),
-                    e.ops.ino(),
-                    e.ops.rdev(),
-                    uid,
-                    gid,
-                    e.ops.inode_attrs(),
-                )
-            })
-        })
-        .flatten();
+        // Clone the FileOps out from under the fd-table lock before querying.
+        // `owners()` on a procfs node reaches `proc_task_info` →
+        // `with_table(same task)`, and this table lock is a non-reentrant
+        // IrqSafeSpinLock, so querying inside the closure self-deadlocks (IF=0)
+        // on `statx(AT_EMPTY_PATH)` of a `/proc/self` fd. Cloning the Arc also
+        // shortens the critical section to a single refcount bump — the 5
+        // read-only FileOps queries no longer run under the lock.
+        let ops = fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.clone())).flatten();
+        let st = ops.map(|ops| {
+            let (uid, gid) = ops.owners();
+            (
+                ops.stat(),
+                ops.ino(),
+                ops.rdev(),
+                uid,
+                gid,
+                ops.inode_attrs(),
+            )
+        });
         let Some(st) = st else {
             // vfs_statx_fd's `fd_empty(f)` arm. A closed descriptor is EBADF,
             // never ENOENT: the caller asked about an fd, not a name.

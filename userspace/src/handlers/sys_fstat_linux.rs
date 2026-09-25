@@ -25,20 +25,21 @@ pub(crate) fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     let fd = args.arg0 as u32;
     let out_ptr = args.arg1 as *mut linux_compat::Stat;
     let task = current_task_id();
-    let stat = fd::with_table(task, |t| {
-        t.get(fd)
-            .map(|e| {
-                (
-                    e.ops.stat(),
-                    e.ops.owners(),
-                    e.ops.rdev(),
-                    e.ops.ino(),
-                    e.ops.inode_attrs(),
-                )
-            })
-    });
-    let (s, (uid, gid), rdev, ino, attrs) = match stat {
-        Some(Some(tuple)) => tuple,
+    // Clone the FileOps out from under the fd-table lock BEFORE querying it.
+    // `owners()` on a procfs node reaches `task_info` → `proc_task_info` →
+    // `with_table(same task)`, and this table lock is a non-reentrant
+    // IrqSafeSpinLock — calling it inside the closure self-deadlocks (with
+    // IF=0) on any `fstat` of a `/proc/self` fd. The read-only queries below
+    // do not need the table lock; the cloned Arc keeps the node alive.
+    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
+    let (s, (uid, gid), rdev, ino, attrs) = match ops {
+        Some(Some(ops)) => (
+            ops.stat(),
+            ops.owners(),
+            ops.rdev(),
+            ops.ino(),
+            ops.inode_attrs(),
+        ),
         _ => {
             ctx.set_return(errno_ret(EBADF));
             return;
