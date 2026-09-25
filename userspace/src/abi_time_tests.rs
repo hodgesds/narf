@@ -1771,11 +1771,19 @@ kernel_test_in!("syscall_abi", smoke_abi_time_time_null);
 
 fn smoke_abi_time_ioprio_roundtrip() -> TestResult {
     with_setup(|| {
-        // ioprio_set(1, 0, 0x1234) → stores 0x1234
-        call(Syscall::IoprioSet.raw(), a2(1, 0, 0x1234)).ok_or("ioprio_set failed")?;
-        // ioprio_get(1, 0) → returns 0x1234
+        // 0x1234 is IOPRIO_CLASS_NONE (0x1234 >> 13 == 0) with level 4:
+        // `case IOPRIO_CLASS_NONE: if (level) return -EINVAL;`. This case
+        // used to store it and read it back.
+        if call(Syscall::IoprioSet.raw(), a2(1, 0, 0x1234)) != Some(-22) {
+            return Err("ioprio_set(IOPRIO_CLASS_NONE, level 4) must be -EINVAL");
+        }
+        // IOPRIO_CLASS_BE (2) level 3 → 0x4003, a value Linux accepts.
+        const BE_3: u64 = (2 << 13) | 3;
+        if call(Syscall::IoprioSet.raw(), a2(1, 0, BE_3)) != Some(0) {
+            return Err("ioprio_set(BE, 3) failed");
+        }
         let val = call(Syscall::IoprioGet.raw(), a1(1, 0)).ok_or("ioprio_get failed")?;
-        if val != 0x1234 {
+        if val != BE_3 as i64 {
             return Err("ioprio_get should return the set value");
         }
         Ok(())

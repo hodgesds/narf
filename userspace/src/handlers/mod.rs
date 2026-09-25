@@ -44,3 +44,4 @@ pub(crate) use crate::errno::*;
 // fragments into child modules would widen that internal visibility.
 include!("core.inc.rs");
 include!("compat.inc.rs");
+include!("sched_policy.inc.rs");

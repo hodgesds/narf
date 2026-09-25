@@ -16,7 +16,10 @@ const BAD_PTR: u64 = 0x0001_0000_0000_0000;
 
 // Linux sched policy numbers.
 const SCHED_OTHER: u64 = 0;
+const SCHED_FIFO: u64 = 1;
 const SCHED_RR: u64 = 2;
+const SCHED_IDLE: u64 = 5;
+const SCHED_DEADLINE: u64 = 6;
 
 // ── getcpu(cpu*, node*, tcache) ─────────────────────────────────────
 // Reports the live logical CPU and its SRAT NUMA node. The ABI harness runs
@@ -763,11 +766,10 @@ fn smoke_abi_sched_setparam_null_buf_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_null_buf_neg);
 
 // ── sched_getscheduler(pid) ─────────────────────────────────────────
-// Cooperative single policy: always SCHED_OTHER (0). No reachable error.
 
 fn smoke_abi_sched_getscheduler_pos() -> TestResult {
     with_setup(|| {
-        // Always reports SCHED_OTHER (0) regardless of pid.
+        // A fresh task is SCHED_OTHER (0).
         match call(Syscall::SchedGetScheduler.raw(), a0(0)) {
             Some(0) => Ok(()),
             _ => Err("sched_getscheduler should report SCHED_OTHER (0)"),
@@ -780,10 +782,20 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getscheduler_pos);
 
 fn smoke_abi_sched_setscheduler_pos() -> TestResult {
     with_setup(|| {
-        // SCHED_RR (policy 2) is a recognised policy ⇒ ok(0).
-        match call(Syscall::SchedSetScheduler.raw(), a3(0, SCHED_RR, 0, 0)) {
-            Some(0) => Ok(()),
-            _ => Err("sched_setscheduler(SCHED_RR) should return 0"),
+        // SCHED_RR at priority 1 (the harness task holds CAP_SYS_NICE),
+        // then read it back — the policy is no longer hard-coded.
+        let one = 1i32.to_ne_bytes();
+        match call(
+            Syscall::SchedSetScheduler.raw(),
+            a3(0, SCHED_RR, one.as_ptr() as u64, 0),
+        ) {
+            Some(0) => {}
+            _ => return Err("sched_setscheduler(SCHED_RR, 1) should return 0"),
+        }
+        match call(Syscall::SchedGetScheduler.raw(), a0(0)) {
+            Some(v) if v == SCHED_RR as i64 => Ok(()),
+            Some(0) => Err("sched_getscheduler still reports SCHED_OTHER after SCHED_RR"),
+            _ => Err("sched_getscheduler should report SCHED_RR"),
         }
     })
 }
@@ -792,12 +804,23 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setscheduler_pos);
 fn smoke_abi_sched_setscheduler_reset_on_fork_pos() -> TestResult {
     with_setup(|| {
         const SCHED_RESET_ON_FORK: u64 = 0x4000_0000;
+        let zero = 0i32.to_ne_bytes();
         match call(
             Syscall::SchedSetScheduler.raw(),
-            a3(0, SCHED_OTHER | SCHED_RESET_ON_FORK, 0, 0),
+            a3(
+                0,
+                SCHED_OTHER | SCHED_RESET_ON_FORK,
+                zero.as_ptr() as u64,
+                0,
+            ),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("sched_setscheduler must accept SCHED_RESET_ON_FORK"),
+            Some(0) => {}
+            _ => return Err("sched_setscheduler must accept SCHED_RESET_ON_FORK"),
+        }
+        // `if (p->sched_reset_on_fork) retval |= SCHED_RESET_ON_FORK;`
+        match call(Syscall::SchedGetScheduler.raw(), a0(0)) {
+            Some(v) if v as u64 == SCHED_OTHER | SCHED_RESET_ON_FORK => Ok(()),
+            _ => Err("sched_getscheduler must OR SCHED_RESET_ON_FORK back in"),
         }
     })
 }
@@ -808,8 +831,13 @@ kernel_test_in!(
 
 fn smoke_abi_sched_setscheduler_bad_policy_neg() -> TestResult {
     with_setup(|| {
-        // Policy 42 is unknown ⇒ EINVAL.
-        match call(Syscall::SchedSetScheduler.raw(), a3(0, 42, 0, 0)) {
+        // Policy 42 is unknown ⇒ EINVAL — with a VALID param, so the
+        // answer is about the policy and not the NULL-param guard.
+        let zero = 0i32.to_ne_bytes();
+        match call(
+            Syscall::SchedSetScheduler.raw(),
+            a3(0, 42, zero.as_ptr() as u64, 0),
+        ) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("sched_setscheduler bad policy should return -EINVAL"),
         }
@@ -818,7 +846,7 @@ fn smoke_abi_sched_setscheduler_bad_policy_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_setscheduler_bad_policy_neg);
 
 // ── sched_rr_get_interval(pid, timespec*) ───────────────────────────
-// Cooperative policy has no quantum ⇒ writes {0, 0} and returns ok(0).
+// A SCHED_OTHER task's default slice is under one jiffy ⇒ {0, 0}.
 
 fn smoke_abi_sched_rr_get_interval_pos() -> TestResult {
     with_setup(|| {
@@ -1686,3 +1714,1102 @@ fn smoke_abi_sched_setparam_arg_errors() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_arg_errors);
+
+// ─────────────────────────────────────────────────────────────────────
+// Scheduling-policy parity (`kernel/sched/syscalls.c`)
+//
+// Every setter funnels into `__sched_setscheduler`, and every case below
+// is one of its arms, taken in Linux's order. Before this block
+// `sched_getscheduler` hard-coded SCHED_OTHER, `sched_setscheduler`
+// accepted a NULL param and never read a priority, and `sched_getattr`
+// replayed stored bytes — so none of these answers were reachable.
+// ─────────────────────────────────────────────────────────────────────
+
+const SCHED_RESET_ON_FORK_W: u64 = 0x4000_0000;
+const SCHED_FLAG_RESET_ON_FORK_W: u64 = 0x01;
+const SCHED_FLAG_KEEP_POLICY_W: u64 = 0x08;
+const SCHED_FLAG_KEEP_PARAMS_W: u64 = 0x10;
+const SCHED_FLAG_UTIL_CLAMP_MIN_W: u64 = 0x20;
+const SCHED_FLAG_SUGOV_W: u64 = 0x1000_0000;
+const RLIMIT_RTPRIO_W: u64 = 14;
+
+/// A VER0 `struct sched_attr`.
+#[allow(clippy::too_many_arguments)]
+fn sched_attr(
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+) -> [u8; 48] {
+    let mut b = [0u8; 48];
+    b[0..4].copy_from_slice(&48u32.to_ne_bytes());
+    b[4..8].copy_from_slice(&policy.to_ne_bytes());
+    b[8..16].copy_from_slice(&flags.to_ne_bytes());
+    b[16..20].copy_from_slice(&nice.to_ne_bytes());
+    b[20..24].copy_from_slice(&priority.to_ne_bytes());
+    b[24..32].copy_from_slice(&runtime.to_ne_bytes());
+    b[32..40].copy_from_slice(&deadline.to_ne_bytes());
+    b[40..48].copy_from_slice(&period.to_ne_bytes());
+    b
+}
+
+fn setattr(pid: u64, attr: &[u8]) -> Option<i64> {
+    call(
+        Syscall::SchedSetattr.raw(),
+        a3(pid, attr.as_ptr() as u64, 0, 0),
+    )
+}
+
+fn getattr(pid: u64) -> Result<[u8; 48], &'static str> {
+    let mut out = [0xAAu8; 48];
+    match call(
+        Syscall::SchedGetattr.raw(),
+        a3(pid, out.as_mut_ptr() as u64, 48, 0),
+    ) {
+        Some(0) => Ok(out),
+        _ => Err("sched_getattr should succeed"),
+    }
+}
+
+fn attr_u32(b: &[u8; 48], off: usize) -> u32 {
+    u32::from_ne_bytes(b[off..off + 4].try_into().unwrap())
+}
+
+fn attr_u64(b: &[u8; 48], off: usize) -> u64 {
+    u64::from_ne_bytes(b[off..off + 8].try_into().unwrap())
+}
+
+fn setscheduler(pid: u64, policy: u64, prio: i32) -> Option<i64> {
+    let p = prio.to_ne_bytes();
+    call(
+        Syscall::SchedSetScheduler.raw(),
+        a3(pid, policy, p.as_ptr() as u64, 0),
+    )
+}
+
+fn getscheduler(pid: u64) -> Option<i64> {
+    call(Syscall::SchedGetScheduler.raw(), a0(pid))
+}
+
+fn getparam(pid: u64) -> Option<i32> {
+    let mut out = [0xFFu8; 4];
+    match call(
+        Syscall::SchedGetparam.raw(),
+        a1(pid, out.as_mut_ptr() as u64),
+    ) {
+        Some(0) => Some(i32::from_ne_bytes(out)),
+        _ => None,
+    }
+}
+
+fn rr_interval_ns(pid: u64) -> Option<u64> {
+    let mut ts = [0xFFu8; 16];
+    match call(
+        Syscall::SchedRrGetInterval.raw(),
+        a1(pid, ts.as_mut_ptr() as u64),
+    ) {
+        Some(0) => {
+            let sec = u64::from_ne_bytes(ts[..8].try_into().unwrap());
+            let nsec = u64::from_ne_bytes(ts[8..].try_into().unwrap());
+            Some(sec * 1_000_000_000 + nsec)
+        }
+        _ => None,
+    }
+}
+
+fn set_rlimit(resource: u64, cur: u64, max: u64) -> Option<i64> {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&cur.to_ne_bytes());
+    buf[8..].copy_from_slice(&max.to_ne_bytes());
+    call(Syscall::Setrlimit.raw(), a1(resource, buf.as_ptr() as u64))
+}
+
+/// Register a live task owned by root (uid 0) — a "someone else's process"
+/// once the harness task drops to an unprivileged uid.
+fn register_foreign(task: u64) {
+    crate::task::release_task(task);
+    let _ = crate::task::Task::new_registered(task, task);
+    crate::handlers::register_task_to_pid(task, task);
+    crate::handlers::register_pid_task_mapping(task, task);
+}
+
+fn online_cpus() -> u32 {
+    narf_scheduler::online_cpu_set().bits().count_ones().max(1)
+}
+
+// ── sched_setscheduler / sched_setparam argument guards ─────────────
+
+fn smoke_abi_sched_setscheduler_arg_errors_in_linux_order() -> TestResult {
+    with_setup(|| {
+        let zero = 0i32.to_ne_bytes();
+        let p = zero.as_ptr() as u64;
+        let ss = |pid: u64, policy: u64, param: u64| {
+            call(Syscall::SchedSetScheduler.raw(), a3(pid, policy, param, 0))
+        };
+        // `if (policy < 0) return -EINVAL;` — before the param is looked at.
+        if ss(0, (-1i64) as u64, 0) != Some(EINVAL) {
+            return Err("a negative policy must be -EINVAL");
+        }
+        // `if (!param || pid < 0) return -EINVAL;` — the case that used to
+        // return 0 without reading anything.
+        if ss(0, SCHED_OTHER, 0) != Some(EINVAL) {
+            return Err("a NULL param must be -EINVAL, not success");
+        }
+        if ss((-1i64) as u64, SCHED_OTHER, p) != Some(EINVAL) {
+            return Err("a negative pid must be -EINVAL");
+        }
+        // Then the copy: -EFAULT outranks a pid that names nothing.
+        if ss(123456, SCHED_OTHER, BAD_PTR) != Some(EFAULT) {
+            return Err("an unmapped param must be -EFAULT before the pid lookup");
+        }
+        if ss(123456, SCHED_OTHER, p) != Some(ESRCH) {
+            return Err("a pid that names no task must be -ESRCH");
+        }
+        // `pid_t` / `int` are the low 32 bits of each register.
+        if ss(
+            0xFFFF_FFFF_0000_0000,
+            0xdead_0000_0000_0000 | SCHED_OTHER,
+            p,
+        ) != Some(0)
+        {
+            return Err("sched_setscheduler must read pid/policy as 32-bit ints");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setscheduler_arg_errors_in_linux_order
+);
+
+fn smoke_abi_sched_setscheduler_policy_priority_agreement() -> TestResult {
+    with_setup(|| {
+        // "Valid priorities for SCHED_FIFO and SCHED_RR are 1..MAX_RT_PRIO-1,
+        // valid priority for SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE is 0."
+        let cases: [(u64, i32, &str); 7] = [
+            (SCHED_FIFO, 0, "SCHED_FIFO at priority 0 must be -EINVAL"),
+            (SCHED_RR, 0, "SCHED_RR at priority 0 must be -EINVAL"),
+            (SCHED_FIFO, 100, "an RT priority above 99 must be -EINVAL"),
+            (SCHED_FIFO, -1, "a negative priority must be -EINVAL"),
+            (
+                SCHED_OTHER,
+                1,
+                "SCHED_OTHER with a non-zero priority must be -EINVAL",
+            ),
+            (
+                SCHED_IDLE,
+                5,
+                "SCHED_IDLE with a non-zero priority must be -EINVAL",
+            ),
+            // A `sched_param` cannot carry runtime/deadline/period, so
+            // SCHED_DEADLINE always fails `__checkparam_dl` here.
+            (
+                SCHED_DEADLINE,
+                0,
+                "SCHED_DEADLINE via sched_setscheduler must be -EINVAL",
+            ),
+        ];
+        for (policy, prio, why) in cases {
+            if setscheduler(0, policy, prio) != Some(EINVAL) {
+                return Err(why);
+            }
+        }
+        // Policies no kernel defines, and SCHED_EXT without
+        // CONFIG_SCHED_CLASS_EXT — even though get_priority_max knows it.
+        for policy in [4u64, 7, 8, 42] {
+            if setscheduler(0, policy, 0) != Some(EINVAL) {
+                return Err("an unsettable policy number must be -EINVAL");
+            }
+        }
+        // None of the refusals changed anything.
+        if getscheduler(0) != Some(0) {
+            return Err("a refused sched_setscheduler changed the policy");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setscheduler_policy_priority_agreement
+);
+
+fn smoke_abi_sched_policy_round_trip_through_every_reader() -> TestResult {
+    with_setup(|| {
+        // SCHED_FIFO 10: every reader must agree.
+        if setscheduler(0, SCHED_FIFO, 10) != Some(0) {
+            return Err("privileged sched_setscheduler(SCHED_FIFO, 10) should succeed");
+        }
+        if getscheduler(0) != Some(SCHED_FIFO as i64) {
+            return Err("sched_getscheduler did not report SCHED_FIFO");
+        }
+        if getparam(0) != Some(10) {
+            return Err("sched_getparam did not report the RT priority");
+        }
+        let a = getattr(0)?;
+        if attr_u32(&a, 4) != SCHED_FIFO as u32 || attr_u32(&a, 20) != 10 {
+            return Err("sched_getattr did not report SCHED_FIFO / 10");
+        }
+        // `get_rr_interval_rt`: 0 for FIFO.
+        if rr_interval_ns(0) != Some(0) {
+            return Err("SCHED_FIFO has no round-robin quantum");
+        }
+        // sched_setparam now judges against FIFO: 0 is refused, 1..99 not.
+        let zero = 0i32.to_ne_bytes();
+        if call(Syscall::SchedSetparam.raw(), a1(0, zero.as_ptr() as u64)) != Some(EINVAL) {
+            return Err("sched_setparam(0) on a SCHED_FIFO task must be -EINVAL");
+        }
+        let fifty = 50i32.to_ne_bytes();
+        if call(Syscall::SchedSetparam.raw(), a1(0, fifty.as_ptr() as u64)) != Some(0) {
+            return Err("sched_setparam(50) on a SCHED_FIFO task should succeed");
+        }
+        if getparam(0) != Some(50) || getscheduler(0) != Some(SCHED_FIFO as i64) {
+            return Err("sched_setparam must keep the policy and set the priority");
+        }
+        // SCHED_RR: `sched_rr_timeslice` = RR_TIMESLICE = 100 ms.
+        if setscheduler(0, SCHED_RR, 5) != Some(0) {
+            return Err("sched_setscheduler(SCHED_RR, 5) should succeed");
+        }
+        if rr_interval_ns(0) != Some(100_000_000) {
+            return Err("SCHED_RR must report the 100 ms round-robin timeslice");
+        }
+        // Back to SCHED_OTHER: priority reads 0 again (the RT value is not
+        // reported for a non-RT task).
+        if setscheduler(0, SCHED_OTHER, 0) != Some(0) {
+            return Err("returning to SCHED_OTHER should succeed");
+        }
+        if getparam(0) != Some(0) || getscheduler(0) != Some(0) {
+            return Err("SCHED_OTHER must report policy 0 / priority 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_policy_round_trip_through_every_reader
+);
+
+fn smoke_abi_sched_getscheduler_arg_errors() -> TestResult {
+    with_setup(|| {
+        // `if (pid < 0) return -EINVAL;` then `if (!p) return -ESRCH;`.
+        if getscheduler((-1i64) as u64) != Some(EINVAL) {
+            return Err("sched_getscheduler(-1) must be -EINVAL");
+        }
+        if getscheduler(123456) != Some(ESRCH) {
+            return Err("sched_getscheduler on a pid naming no task must be -ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getscheduler_arg_errors);
+
+// ── user_check_sched_setscheduler: the -EPERM arms ──────────────────
+
+fn smoke_abi_sched_unprivileged_rt_needs_rlimit_rtprio() -> TestResult {
+    with_setup(|| {
+        // RLIMIT_RTPRIO defaults to 0 (INIT_RLIMITS), so an unprivileged
+        // task may not enter an RT policy at all.
+        let mut buf = [0u8; 16];
+        if call(
+            Syscall::Getrlimit.raw(),
+            a1(RLIMIT_RTPRIO_W, buf.as_mut_ptr() as u64),
+        ) != Some(0)
+            || buf != [0u8; 16]
+        {
+            return Err("RLIMIT_RTPRIO must default to {0, 0} like Linux");
+        }
+        drop_to_unprivileged_uid()?;
+        if setscheduler(0, SCHED_FIFO, 1) != Some(EPERM) {
+            return Err("an unprivileged task entered SCHED_FIFO with RLIMIT_RTPRIO 0");
+        }
+        if getscheduler(0) != Some(0) {
+            return Err("the refused call changed the policy anyway");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_unprivileged_rt_needs_rlimit_rtprio
+);
+
+fn smoke_abi_sched_rlimit_rtprio_is_the_unprivileged_ceiling() -> TestResult {
+    with_setup(|| {
+        // Grant headroom while still privileged, then drop.
+        if set_rlimit(RLIMIT_RTPRIO_W, 20, 20) != Some(0) {
+            return Err("setrlimit(RLIMIT_RTPRIO, 20) should succeed while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+        if setscheduler(0, SCHED_FIFO, 10) != Some(0) {
+            return Err("SCHED_FIFO 10 is within RLIMIT_RTPRIO 20 and must succeed");
+        }
+        // "Can't increase priority" past the rlimit.
+        if setscheduler(0, SCHED_FIFO, 30) != Some(EPERM) {
+            return Err("raising an RT priority past RLIMIT_RTPRIO must be -EPERM");
+        }
+        // Lowering is always allowed; raising back within the limit too.
+        let five = 5i32.to_ne_bytes();
+        if call(Syscall::SchedSetparam.raw(), a1(0, five.as_ptr() as u64)) != Some(0) {
+            return Err("lowering an RT priority must not need privilege");
+        }
+        let fifteen = 15i32.to_ne_bytes();
+        if call(Syscall::SchedSetparam.raw(), a1(0, fifteen.as_ptr() as u64)) != Some(0) {
+            return Err("raising an RT priority within RLIMIT_RTPRIO must succeed");
+        }
+        if getparam(0) != Some(15) {
+            return Err("the RT priority did not follow the permitted changes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_rlimit_rtprio_is_the_unprivileged_ceiling
+);
+
+fn smoke_abi_sched_reset_on_fork_cannot_be_cleared_unprivileged() -> TestResult {
+    with_setup(|| {
+        if setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK_W, 0) != Some(0) {
+            return Err("setting SCHED_RESET_ON_FORK should succeed");
+        }
+        drop_to_unprivileged_uid()?;
+        // "Normal users shall not reset the sched_reset_on_fork flag".
+        if setscheduler(0, SCHED_OTHER, 0) != Some(EPERM) {
+            return Err("clearing reset_on_fork without CAP_SYS_NICE must be -EPERM");
+        }
+        // Keeping it is fine, and sched_setparam (SETPARAM_POLICY) keeps it
+        // implicitly.
+        if setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK_W, 0) != Some(0) {
+            return Err("re-asserting reset_on_fork must succeed");
+        }
+        let zero = 0i32.to_ne_bytes();
+        if call(Syscall::SchedSetparam.raw(), a1(0, zero.as_ptr() as u64)) != Some(0) {
+            return Err("sched_setparam keeps reset_on_fork and must succeed");
+        }
+        if getscheduler(0) != Some((SCHED_OTHER | SCHED_RESET_ON_FORK_W) as i64) {
+            return Err("reset_on_fork did not survive");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_reset_on_fork_cannot_be_cleared_unprivileged
+);
+
+fn smoke_abi_sched_leaving_sched_idle_needs_rlimit_nice() -> TestResult {
+    with_setup(|| {
+        drop_to_unprivileged_uid()?;
+        // Entering SCHED_IDLE is never privileged...
+        if setscheduler(0, SCHED_IDLE, 0) != Some(0) {
+            return Err("an unprivileged task may always enter SCHED_IDLE");
+        }
+        // ...but "Treat SCHED_IDLE as nice 20": leaving it is a nice
+        // reduction to the task's nice (0), which RLIMIT_NICE 0 forbids.
+        if setscheduler(0, SCHED_OTHER, 0) != Some(EPERM) {
+            return Err("leaving SCHED_IDLE without RLIMIT_NICE headroom must be -EPERM");
+        }
+        if getscheduler(0) != Some(SCHED_IDLE as i64) {
+            return Err("the refused call left SCHED_IDLE anyway");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_leaving_sched_idle_needs_rlimit_nice
+);
+
+fn smoke_abi_sched_setters_refuse_another_users_task() -> TestResult {
+    with_setup(|| {
+        const OTHER: u64 = 0x5C_4ED0;
+        register_foreign(OTHER);
+        let result = (|| {
+            drop_to_unprivileged_uid()?;
+            // `check_same_owner` fails ⇒ req_priv ⇒ -EPERM, for every setter.
+            if setscheduler(OTHER, SCHED_OTHER, 0) != Some(EPERM) {
+                return Err("sched_setscheduler on another user's task must be -EPERM");
+            }
+            let zero = 0i32.to_ne_bytes();
+            if call(
+                Syscall::SchedSetparam.raw(),
+                a1(OTHER, zero.as_ptr() as u64),
+            ) != Some(EPERM)
+            {
+                return Err("sched_setparam on another user's task must be -EPERM");
+            }
+            let attr = sched_attr(0, 0, 0, 0, 0, 0, 0);
+            if setattr(OTHER, &attr) != Some(EPERM) {
+                return Err("sched_setattr on another user's task must be -EPERM");
+            }
+            // Reading is not privileged.
+            if getscheduler(OTHER) != Some(0) || getparam(OTHER) != Some(0) {
+                return Err("reading another task's policy must succeed");
+            }
+            Ok(())
+        })();
+        crate::task::release_task(OTHER);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setters_refuse_another_users_task
+);
+
+// ── sched_setattr ───────────────────────────────────────────────────
+
+fn smoke_abi_sched_setattr_error_order() -> TestResult {
+    with_setup(|| {
+        // The flag mask is checked in `__sched_setscheduler`, i.e. AFTER the
+        // task lookup: an unknown flag against a pid naming nothing is
+        // -ESRCH, not -EINVAL.
+        let bad_flag = sched_attr(0, 0x8000, 0, 0, 0, 0, 0);
+        if setattr(0x7f00_0001, &bad_flag) != Some(ESRCH) {
+            return Err("sched_setattr must look the task up before checking flags");
+        }
+        if setattr(0, &bad_flag) != Some(EINVAL) {
+            return Err("an undefined sched_flag must be -EINVAL");
+        }
+        // SCHED_FLAG_SUGOV is kernel-internal: past the mask, refused after
+        // the permission check.
+        let sugov = sched_attr(0, SCHED_FLAG_SUGOV_W, 0, 0, 0, 0, 0);
+        if setattr(0, &sugov) != Some(EINVAL) {
+            return Err("SCHED_FLAG_SUGOV from userspace must be -EINVAL");
+        }
+        // Util clamping with a VER1-sized struct: the size is fine, but
+        // without CONFIG_UCLAMP_TASK `uclamp_validate` is -EOPNOTSUPP.
+        let mut v1 = [0u8; 56];
+        v1[..48].copy_from_slice(&sched_attr(0, SCHED_FLAG_UTIL_CLAMP_MIN_W, 0, 0, 0, 0, 0));
+        v1[..4].copy_from_slice(&56u32.to_ne_bytes());
+        if setattr(0, &v1) != Some(EOPNOTSUPP) {
+            return Err("util clamping without uclamp support must be -EOPNOTSUPP");
+        }
+        // `unsigned int flags` — upper register bits are not the argument.
+        let ok = sched_attr(0, 0, 0, 0, 0, 0, 0);
+        if call(
+            Syscall::SchedSetattr.raw(),
+            a3(0, ok.as_ptr() as u64, 1u64 << 32, 0),
+        ) != Some(0)
+        {
+            return Err("sched_setattr must read its flags argument as 32 bits");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_error_order);
+
+fn smoke_abi_sched_setattr_nice_reaches_getpriority() -> TestResult {
+    with_setup(|| {
+        // `__setscheduler_params` writes `static_prio` for a fair policy:
+        // the nice asked for is THE nice, visible to getpriority.
+        if setattr(0, &sched_attr(0, 0, 5, 0, 0, 0, 0)) != Some(0) {
+            return Err("sched_setattr(SCHED_OTHER, nice 5) should succeed");
+        }
+        if call(Syscall::Getpriority.raw(), a1(0, 0)) != Some(15) {
+            return Err("the nice set via sched_setattr did not reach getpriority");
+        }
+        // And the reverse: setpriority shows up in sched_getattr.
+        if call(Syscall::Setpriority.raw(), a2(0, 0, 7)) != Some(0) {
+            return Err("setpriority setup failed");
+        }
+        if attr_u32(&getattr(0)?, 16) as i32 != 7 {
+            return Err("sched_getattr did not report the setpriority nice");
+        }
+        // `sched_copy_attr` clamps an out-of-range nice rather than failing.
+        if setattr(0, &sched_attr(0, 0, 100, 0, 0, 0, 0)) != Some(0) {
+            return Err("an out-of-range sched_nice must be clamped, not refused");
+        }
+        if call(Syscall::Getpriority.raw(), a1(0, 0)) != Some(1) {
+            return Err("sched_nice 100 must clamp to 19");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setattr_nice_reaches_getpriority
+);
+
+fn smoke_abi_sched_setattr_nice_reduction_is_eperm() -> TestResult {
+    with_setup(|| {
+        drop_to_unprivileged_uid()?;
+        // Raising nice needs nothing...
+        if setattr(0, &sched_attr(0, 0, 5, 0, 0, 0, 0)) != Some(0) {
+            return Err("raising nice via sched_setattr must not need privilege");
+        }
+        // ...lowering it past RLIMIT_NICE is `goto req_priv` — -EPERM here,
+        // where setpriority's `can_nice` failure is -EACCES.
+        if setattr(0, &sched_attr(0, 0, -5, 0, 0, 0, 0)) != Some(EPERM) {
+            return Err("an unprivileged nice reduction via sched_setattr must be -EPERM");
+        }
+        if call(Syscall::Getpriority.raw(), a1(0, 0)) != Some(15) {
+            return Err("the refused nice reduction changed the nice anyway");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setattr_nice_reduction_is_eperm
+);
+
+fn smoke_abi_sched_setattr_keep_policy_and_params() -> TestResult {
+    with_setup(|| {
+        if setscheduler(0, SCHED_RR, 30) != Some(0) {
+            return Err("setup: SCHED_RR 30");
+        }
+        // KEEP_POLICY: the struct's policy (SCHED_OTHER here) is ignored and
+        // the priority applies to the current RR policy.
+        let keep_policy = sched_attr(0, SCHED_FLAG_KEEP_POLICY_W, 0, 40, 0, 0, 0);
+        if setattr(0, &keep_policy) != Some(0) {
+            return Err("SCHED_FLAG_KEEP_POLICY should keep SCHED_RR");
+        }
+        if getscheduler(0) != Some(SCHED_RR as i64) || getparam(0) != Some(40) {
+            return Err("KEEP_POLICY did not keep the policy / apply the priority");
+        }
+        // KEEP_PARAMS: the struct's priority (0) is replaced by the task's
+        // own, so switching to FIFO keeps 40 instead of failing prio 0.
+        let keep_params = sched_attr(SCHED_FIFO as u32, SCHED_FLAG_KEEP_PARAMS_W, 0, 0, 0, 0, 0);
+        if setattr(0, &keep_params) != Some(0) {
+            return Err("SCHED_FLAG_KEEP_PARAMS should carry the priority over");
+        }
+        if getscheduler(0) != Some(SCHED_FIFO as i64) || getparam(0) != Some(40) {
+            return Err("KEEP_PARAMS did not keep the priority");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setattr_keep_policy_and_params
+);
+
+fn smoke_abi_sched_setattr_fair_slice_round_trips() -> TestResult {
+    with_setup(|| {
+        // Linux ≥ 6.12 reports `se.slice` as a fair task's sched_runtime.
+        // Default: 0.75 ms × (1 + ilog2(min(cpus, 8))).
+        let cpus = online_cpus().min(8);
+        let base = 750_000u64 * (1 + u64::from(cpus.ilog2()));
+        if attr_u64(&getattr(0)?, 24) != base {
+            return Err("a fair task's sched_runtime must be the base slice");
+        }
+        // A custom slice is clamped to [0.1 ms, 100 ms] and reported back,
+        // and `get_rr_interval_fair` rounds it to whole jiffies.
+        if setattr(0, &sched_attr(0, 0, 0, 0, 50_000_000, 0, 0)) != Some(0) {
+            return Err("sched_setattr with a 50 ms custom slice should succeed");
+        }
+        if attr_u64(&getattr(0)?, 24) != 50_000_000 {
+            return Err("the custom slice did not round-trip");
+        }
+        if rr_interval_ns(0) != Some(50_000_000) {
+            return Err("sched_rr_get_interval must report the fair slice in whole jiffies");
+        }
+        if setattr(0, &sched_attr(0, 0, 0, 0, 10, 0, 0)) != Some(0)
+            || attr_u64(&getattr(0)?, 24) != 100_000
+        {
+            return Err("a custom slice below 0.1 ms must clamp up to 0.1 ms");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setattr_fair_slice_round_trips
+);
+
+// ── SCHED_DEADLINE ──────────────────────────────────────────────────
+
+const DL_RUNTIME: u64 = 10_000_000; // 10 ms
+const DL_DEADLINE: u64 = 30_000_000; // 30 ms
+const DL_PERIOD: u64 = 100_000_000; // 100 ms
+
+fn smoke_abi_sched_deadline_checkparam() -> TestResult {
+    with_setup(|| {
+        let dl = SCHED_DEADLINE as u32;
+        // `__checkparam_dl` refusals, each -EINVAL.
+        let bad: [([u8; 48], &str); 7] = [
+            (
+                sched_attr(dl, 0, 0, 0, DL_RUNTIME, 0, DL_PERIOD),
+                "deadline 0",
+            ),
+            (
+                sched_attr(dl, 0, 0, 0, 1000, DL_DEADLINE, DL_PERIOD),
+                "runtime < 1 << DL_SCALE",
+            ),
+            (
+                sched_attr(dl, 0, 0, 0, DL_DEADLINE + 1, DL_DEADLINE, DL_PERIOD),
+                "runtime > deadline",
+            ),
+            (
+                sched_attr(dl, 0, 0, 0, DL_RUNTIME, DL_PERIOD + 1, DL_PERIOD),
+                "deadline > period",
+            ),
+            (
+                sched_attr(dl, 0, 0, 0, 2048, 50_000, 0),
+                "period below 100 us",
+            ),
+            (
+                sched_attr(dl, 0, 0, 0, DL_RUNTIME, DL_DEADLINE, 5_000_000_000),
+                "period above 2^22 us",
+            ),
+            (
+                sched_attr(dl, 0, 0, 1, DL_RUNTIME, DL_DEADLINE, DL_PERIOD),
+                "non-zero sched_priority",
+            ),
+        ];
+        for (attr, _why) in bad.iter() {
+            if setattr(0, attr) != Some(EINVAL) {
+                return Err("a SCHED_DEADLINE triple failing __checkparam_dl must be -EINVAL");
+            }
+        }
+        if getscheduler(0) != Some(0) {
+            return Err("a refused SCHED_DEADLINE request changed the policy");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_deadline_checkparam);
+
+fn smoke_abi_sched_deadline_admitted_and_reported() -> TestResult {
+    with_setup(|| {
+        let attr = sched_attr(
+            SCHED_DEADLINE as u32,
+            0,
+            0,
+            0,
+            DL_RUNTIME,
+            DL_DEADLINE,
+            DL_PERIOD,
+        );
+        if setattr(0, &attr) != Some(0) {
+            return Err("a valid privileged SCHED_DEADLINE request should be admitted");
+        }
+        if getscheduler(0) != Some(SCHED_DEADLINE as i64) {
+            return Err("sched_getscheduler did not report SCHED_DEADLINE");
+        }
+        let a = getattr(0)?;
+        if attr_u32(&a, 4) != SCHED_DEADLINE as u32
+            || attr_u64(&a, 24) != DL_RUNTIME
+            || attr_u64(&a, 32) != DL_DEADLINE
+            || attr_u64(&a, 40) != DL_PERIOD
+        {
+            return Err("sched_getattr did not report the deadline reservation");
+        }
+        // A deadline task has no RT priority and no RR quantum.
+        if getparam(0) != Some(0) || rr_interval_ns(0) != Some(0) {
+            return Err("SCHED_DEADLINE must report priority 0 and a 0 interval");
+        }
+        // sched_fork: `if (dl_prio(p->prio)) return -EAGAIN;`.
+        if !crate::handlers::__test_sched_fork_denied(FAKE_TASK) {
+            return Err("fork of a SCHED_DEADLINE task must be refused");
+        }
+        #[cfg(target_arch = "x86_64")]
+        if call(Syscall::Fork.raw(), a0(0)) != Some(EAGAIN) {
+            return Err("fork(2) from a SCHED_DEADLINE task must be -EAGAIN");
+        }
+        // With reset_on_fork the child restarts as SCHED_NORMAL, so fork is
+        // allowed again.
+        let with_reset = sched_attr(
+            SCHED_DEADLINE as u32,
+            SCHED_FLAG_RESET_ON_FORK_W,
+            0,
+            0,
+            DL_RUNTIME,
+            DL_DEADLINE,
+            DL_PERIOD,
+        );
+        if setattr(0, &with_reset) != Some(0) {
+            return Err("adding reset_on_fork to a DL task should succeed");
+        }
+        if crate::handlers::__test_sched_fork_denied(FAKE_TASK) {
+            return Err("a reset_on_fork DL task must be allowed to fork");
+        }
+        // Leaving SCHED_DEADLINE always succeeds.
+        if setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK_W, 0) != Some(0) {
+            return Err("leaving SCHED_DEADLINE should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_deadline_admitted_and_reported
+);
+
+fn smoke_abi_sched_deadline_is_always_privileged() -> TestResult {
+    with_setup(|| {
+        drop_to_unprivileged_uid()?;
+        // "Can't set/change SCHED_DEADLINE policy at all for now".
+        let attr = sched_attr(
+            SCHED_DEADLINE as u32,
+            0,
+            0,
+            0,
+            DL_RUNTIME,
+            DL_DEADLINE,
+            DL_PERIOD,
+        );
+        if setattr(0, &attr) != Some(EPERM) {
+            return Err("an unprivileged SCHED_DEADLINE request must be -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_deadline_is_always_privileged);
+
+fn smoke_abi_sched_deadline_bandwidth_admission_is_ebusy() -> TestResult {
+    with_setup(|| {
+        // Fill the root domain to 90% per CPU with seeded reservations, then
+        // ask for 99% more: `__dl_overflow` against the default 95% cap.
+        let cpus = u64::from(online_cpus());
+        let dl = SCHED_DEADLINE as u32;
+        const SEED_BASE: u64 = 0xD1_0000;
+        let fill = sched_attr(dl, 0, 0, 0, 90_000_000, 100_000_000, 100_000_000);
+        let mut seeded = alloc::vec::Vec::new();
+        for i in 0..cpus {
+            let t = SEED_BASE + i;
+            register_foreign(t);
+            seeded.push(t);
+            if setattr(t, &fill) != Some(0) {
+                for t in seeded {
+                    crate::task::release_task(t);
+                }
+                return Err("seeding a 90% reservation should be admitted");
+            }
+        }
+        let big = sched_attr(dl, 0, 0, 0, 99_000_000, 100_000_000, 100_000_000);
+        let got = setattr(0, &big);
+        // A small request still fits in the remaining 5% per CPU.
+        let small = sched_attr(dl, 0, 0, 0, 1_000_000, 100_000_000, 100_000_000);
+        let got_small = setattr(0, &small);
+        for t in seeded {
+            crate::task::release_task(t);
+        }
+        if got != Some(EBUSY) {
+            return Err("a reservation past the root domain's bandwidth must be -EBUSY");
+        }
+        if got_small != Some(0) {
+            return Err("a reservation within the remaining bandwidth must be admitted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_deadline_bandwidth_admission_is_ebusy
+);
+
+fn smoke_abi_sched_deadline_pins_affinity() -> TestResult {
+    with_setup(|| {
+        let attr = sched_attr(
+            SCHED_DEADLINE as u32,
+            0,
+            0,
+            0,
+            DL_RUNTIME,
+            DL_DEADLINE,
+            DL_PERIOD,
+        );
+        if setattr(0, &attr) != Some(0) {
+            return Err("setup: SCHED_DEADLINE");
+        }
+        // `dl_task_check_affinity`: a DL task may not narrow below its root
+        // domain — -EBUSY, ahead of the empty-mask -EINVAL.
+        let empty = [0u8; 8];
+        match call(
+            Syscall::SchedSetaffinity.raw(),
+            a2(0, 8, empty.as_ptr() as u64),
+        ) {
+            Some(v) if v == EBUSY => Ok(()),
+            Some(v) if v == EINVAL => {
+                Err("a DL task's affinity check ran after the empty-mask check")
+            }
+            _ => Err("narrowing a SCHED_DEADLINE task's affinity must be -EBUSY"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_deadline_pins_affinity);
+
+// ── fork inheritance (sched_fork) ───────────────────────────────────
+
+fn smoke_abi_sched_fork_inherits_and_resets() -> TestResult {
+    with_setup(|| {
+        const CHILD_A: u64 = 0xF0_4C_01;
+        const CHILD_B: u64 = 0xF0_4C_02;
+        const CHILD_C: u64 = 0xF0_4C_03;
+        // Plain inheritance: policy, priority and nice are copied.
+        if setscheduler(0, SCHED_FIFO, 10) != Some(0)
+            || call(Syscall::Setpriority.raw(), a2(0, 0, 5)) != Some(0)
+        {
+            return Err("setup: SCHED_FIFO 10 / nice 5");
+        }
+        crate::handlers::__test_sched_fork(FAKE_TASK, CHILD_A);
+        if crate::handlers::__test_sched_policy_of(CHILD_A) != SCHED_FIFO as i32 {
+            return Err("a forked child must inherit SCHED_FIFO");
+        }
+        if crate::handlers::nice_of(CHILD_A) != 5 {
+            return Err("a forked child must inherit its parent's nice");
+        }
+        // reset_on_fork on an RT parent: child is SCHED_NORMAL at nice 0,
+        // and the flag is consumed.
+        if setscheduler(0, SCHED_FIFO | SCHED_RESET_ON_FORK_W, 10) != Some(0) {
+            return Err("setup: SCHED_FIFO | RESET_ON_FORK");
+        }
+        crate::handlers::__test_sched_fork(FAKE_TASK, CHILD_B);
+        if crate::handlers::__test_sched_policy_of(CHILD_B) != SCHED_OTHER as i32
+            || crate::handlers::nice_of(CHILD_B) != 0
+        {
+            return Err("reset_on_fork must restart an RT parent's child as SCHED_NORMAL nice 0");
+        }
+        // reset_on_fork on a fair parent keeps a POSITIVE nice (only a
+        // negative one is reset).
+        if setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK_W, 0) != Some(0) {
+            return Err("setup: SCHED_OTHER | RESET_ON_FORK");
+        }
+        crate::handlers::__test_sched_fork(FAKE_TASK, CHILD_C);
+        if crate::handlers::__test_sched_policy_of(CHILD_C) != SCHED_OTHER as i32
+            || crate::handlers::nice_of(CHILD_C) != 5
+        {
+            return Err("reset_on_fork must leave a fair parent's non-negative nice alone");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_fork_inherits_and_resets);
+
+// ── sched_getattr ───────────────────────────────────────────────────
+
+fn smoke_abi_sched_getattr_faults_are_efault() -> TestResult {
+    with_setup(|| {
+        // Both halves of `copy_struct_to_user` report -EFAULT. The tail
+        // half used to return a POSITIVE 14 as though it had succeeded.
+        match call(Syscall::SchedGetattr.raw(), a3(0, BAD_PTR, 64, 0)) {
+            Some(v) if v == EFAULT => {}
+            Some(14) => return Err("sched_getattr reported EFAULT as a positive success value"),
+            _ => return Err("sched_getattr into an unmapped buffer must be -EFAULT"),
+        }
+        match call(Syscall::SchedGetattr.raw(), a3(0, BAD_PTR, 48, 0)) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("sched_getattr into an unmapped buffer must be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getattr_faults_are_efault);
+
+// ── sched_{get,set}affinity ordering ────────────────────────────────
+
+fn smoke_abi_sched_setaffinity_empty_mask_is_checked_last() -> TestResult {
+    with_setup(|| {
+        let mask = [0u8; 8];
+        // `len == 0` is not refused up front: `get_user_cpu_mask` copies
+        // nothing (so even NULL does not fault), and the empty mask is only
+        // -EINVAL after the pid lookup.
+        if call(Syscall::SchedSetaffinity.raw(), a2(123456, 0, 0)) != Some(ESRCH) {
+            return Err("sched_setaffinity(len 0) must look the pid up first (-ESRCH)");
+        }
+        if call(Syscall::SchedSetaffinity.raw(), a2(0, 0, 0)) != Some(EINVAL) {
+            return Err("sched_setaffinity(len 0, NULL) must be -EINVAL, not -EFAULT");
+        }
+        if call(
+            Syscall::SchedSetaffinity.raw(),
+            a2(0, 8, mask.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("an all-zero mask must be -EINVAL");
+        }
+        // pid_t: a negative pid names nothing (-ESRCH, not -EINVAL, here).
+        let one = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        if call(
+            Syscall::SchedSetaffinity.raw(),
+            a2((-1i64) as u64, 8, one.as_ptr() as u64),
+        ) != Some(ESRCH)
+        {
+            return Err("sched_setaffinity(-1) must be -ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setaffinity_empty_mask_is_checked_last
+);
+
+fn smoke_abi_sched_setaffinity_foreign_task_is_eperm() -> TestResult {
+    with_setup(|| {
+        narf_scheduler::__reset_queues_for_test();
+        let spec = narf_scheduler::TaskSpec {
+            affinity: narf_scheduler::Affinity::any(),
+            ..narf_scheduler::TaskSpec::unthrottled()
+        };
+        let target = narf_scheduler::spawn_with_spec(core::future::pending::<()>(), spec);
+        let result = (|| {
+            drop_to_unprivileged_uid()?;
+            let one = [1u8, 0, 0, 0, 0, 0, 0, 0];
+            match call(
+                Syscall::SchedSetaffinity.raw(),
+                a2(target.raw(), 8, one.as_ptr() as u64),
+            ) {
+                Some(v) if v == EPERM => Ok(()),
+                _ => Err("pinning another user's task without CAP_SYS_NICE must be -EPERM"),
+            }
+        })();
+        narf_scheduler::__reset_queues_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setaffinity_foreign_task_is_eperm
+);
+
+fn smoke_abi_sched_getaffinity_len_and_order() -> TestResult {
+    with_setup(|| {
+        let mut mask = [0u8; 8];
+        let p = mask.as_mut_ptr() as u64;
+        // `(len * BITS_PER_BYTE) < nr_cpu_ids` in `unsigned int`: 0, and a
+        // length whose ×8 wraps to 0, are both -EINVAL.
+        for len in [0u64, 0x2000_0000, 12] {
+            if call(Syscall::SchedGetaffinity.raw(), a2(0, len, p)) != Some(EINVAL) {
+                return Err("sched_getaffinity must refuse a short, wrapping or unaligned len");
+            }
+        }
+        // No up-front NULL check: the pid lookup answers first.
+        if call(Syscall::SchedGetaffinity.raw(), a2(123456, 8, 0)) != Some(ESRCH) {
+            return Err("sched_getaffinity(bad pid, NULL) must be -ESRCH, not -EFAULT");
+        }
+        if call(Syscall::SchedGetaffinity.raw(), a2((-1i64) as u64, 8, p)) != Some(ESRCH) {
+            return Err("sched_getaffinity(-1) must be -ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getaffinity_len_and_order);
+
+// ── getcpu ──────────────────────────────────────────────────────────
+
+fn smoke_abi_sched_getcpu_attempts_both_writes() -> TestResult {
+    with_setup(|| {
+        // `err |= put_user(cpu, cpup); err |= put_user(node, nodep);` — a
+        // bad cpup does not stop nodep being written.
+        let mut node = [0xFFu8; 4];
+        match call(
+            Syscall::Getcpu.raw(),
+            a2(BAD_PTR, node.as_mut_ptr() as u64, 0),
+        ) {
+            Some(v) if v == EFAULT => {}
+            _ => return Err("getcpu with a bad cpu pointer must be -EFAULT"),
+        }
+        if u32::from_ne_bytes(node) != 0 {
+            return Err("getcpu skipped the node write after the cpu write faulted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getcpu_attempts_both_writes);
+
+// ── setpriority: error threading across a set ───────────────────────
+
+fn smoke_abi_sched_setpriority_success_never_clears_a_failure() -> TestResult {
+    with_setup(|| {
+        // Group: caller (uid 1000), A (uid 0, not ours), B (uid 1000).
+        // Visited caller → A → B. `if (error == -ESRCH) error = 0;` means
+        // B's success must NOT erase A's -EPERM.
+        const PGRP: u64 = 0x6A_6A00;
+        const A: u64 = 0x6A_6A01;
+        const B: u64 = 0x6A_6A02;
+        register_foreign(A);
+        register_foreign(B);
+        let result = (|| {
+            for t in [FAKE_TASK, A, B] {
+                crate::handlers::__test_set_pgid(t, PGRP);
+            }
+            crate::handlers::__test_set_uidgid_euid(B, 1000);
+            drop_to_unprivileged_uid()?;
+            match call(Syscall::Setpriority.raw(), a2(PRIO_PGRP_W, 0, 5)) {
+                Some(v) if v == EPERM => {}
+                Some(0) => return Err("a later success cleared an earlier -EPERM in the group"),
+                _ => return Err("setpriority over a partly-foreign group must be -EPERM"),
+            }
+            // Every permitted member was still reniced.
+            if crate::handlers::nice_of(B) != 5 {
+                return Err("the permitted member after the refusal was not reniced");
+            }
+            if call(Syscall::Getpriority.raw(), a1(0, 0)) != Some(15) {
+                return Err("the caller was not reniced");
+            }
+            Ok(())
+        })();
+        crate::task::release_task(A);
+        crate::task::release_task(B);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setpriority_success_never_clears_a_failure
+);
+
+// ── ioprio_set: ioprio_check_cap + set_task_ioprio ──────────────────
+
+fn smoke_abi_sched_ioprio_set_class_and_level_checks() -> TestResult {
+    with_setup(|| {
+        // Only IOPRIO_CLASS_NONE/RT/BE/IDLE (0..=3) exist; 4..=7 fall to
+        // `default: return -EINVAL;` (7 is IOPRIO_CLASS_INVALID).
+        for class in 4u64..=7 {
+            if call(
+                Syscall::IoprioSet.raw(),
+                a2(IOPRIO_WHO_PROCESS_W, 0, class << 13),
+            ) != Some(EINVAL)
+            {
+                return Err("an undefined I/O priority class must be -EINVAL");
+            }
+        }
+        // `case IOPRIO_CLASS_NONE: if (level) return -EINVAL;`
+        if call(Syscall::IoprioSet.raw(), a2(IOPRIO_WHO_PROCESS_W, 0, 3)) != Some(EINVAL) {
+            return Err("IOPRIO_CLASS_NONE with a level must be -EINVAL");
+        }
+        if call(Syscall::IoprioSet.raw(), a2(IOPRIO_WHO_PROCESS_W, 0, 0)) != Some(0) {
+            return Err("IOPRIO_CLASS_NONE level 0 must be accepted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_ioprio_set_class_and_level_checks
+);
+
+fn smoke_abi_sched_ioprio_set_foreign_task_is_eperm() -> TestResult {
+    with_setup(|| {
+        const OTHER: u64 = 0x10_F00D;
+        register_foreign(OTHER);
+        let result = (|| {
+            drop_to_unprivileged_uid()?;
+            const BE_3: u64 = (2 << 13) | 3;
+            // `set_task_ioprio`: the target's uid must be the caller's uid
+            // or euid, else CAP_SYS_NICE, else -EPERM. It used to be absent.
+            match call(
+                Syscall::IoprioSet.raw(),
+                a2(IOPRIO_WHO_PROCESS_W, OTHER, BE_3),
+            ) {
+                Some(v) if v == EPERM => {}
+                Some(0) => return Err("an unprivileged task reprioritised another user's I/O"),
+                _ => return Err("ioprio_set on another user's task must be -EPERM"),
+            }
+            // Its own I/O is fine.
+            if call(Syscall::IoprioSet.raw(), a2(IOPRIO_WHO_PROCESS_W, 0, BE_3)) != Some(0) {
+                return Err("ioprio_set on the caller's own task must succeed");
+            }
+            Ok(())
+        })();
+        crate::task::release_task(OTHER);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_ioprio_set_foreign_task_is_eperm
+);
