@@ -2050,8 +2050,10 @@ pub unsafe fn lazyfree_take_clean_4kb_range(
             // Rewritten since MADV_FREE — the page is live again. Clearing
             // LAZYFREE with a plain store is fine: a concurrent D-assist
             // can only re-set a bit we are keeping set.
-            pt.entries[idx.pt] =
-                PageTableEntry::new(leaf.addr(), PtFlags(leaf.flags().bits() & !PtFlags::LAZYFREE.bits()));
+            pt.entries[idx.pt] = PageTableEntry::new(
+                leaf.addr(),
+                PtFlags(leaf.flags().bits() & !PtFlags::LAZYFREE.bits()),
+            );
             continue;
         }
         // SAFETY: a PageTableEntry is a repr-compatible u64 slot; the atomic
