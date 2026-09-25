@@ -7539,11 +7539,30 @@ fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
 }
 
 fn futex_drop_task_waiters(task_id: u64) {
-    for bucket in &FUTEX_WAITERS {
-        bucket.values.lock().retain(|_, waiters| {
-            waiters.remove(&task_id);
-            !waiters.is_empty()
-        });
+    // Targeted: the park loop is the only registrar, it registers exactly
+    // one key (the task's live `futex_uaddr`), and every non-stay exit from
+    // the loop drops that key — including the seqlock retarget path, whose
+    // requeue moves the entry AND the uaddr together. So at drop time every
+    // registration this task can own sits under its CURRENT park key. The
+    // old shape swept all 256 bucket locks per task exit; a 1000-thread
+    // exit storm hammered those global locks from every CPU at once.
+    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
+        let uaddr = uc.futex_uaddr.load(Ordering::Acquire);
+        (uaddr != 0).then(|| futex_key(uc.futex_namespace.load(Ordering::Acquire), uaddr))
+    });
+    match key {
+        Some(Some(key)) => futex_drop_waiter_key(key, task_id),
+        // Not parked: nothing registered, nothing to sweep.
+        Some(None) => {}
+        // Ctx already gone (racing teardown) — conservative full sweep.
+        None => {
+            for bucket in &FUTEX_WAITERS {
+                bucket.values.lock().retain(|_, waiters| {
+                    waiters.remove(&task_id);
+                    !waiters.is_empty()
+                });
+            }
+        }
     }
 }
 
