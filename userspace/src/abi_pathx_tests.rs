@@ -317,12 +317,33 @@ fn smoke_abi_pathx_faccessat2_empty_path_fd() -> TestResult {
         const X_OK: u64 = 1;
         const AT_EMPTY_PATH: u64 = 0x1000;
         let empty = b"\0";
+        // The fd's inode is permission-checked like any other: a seeded
+        // 0666 file has no x bit, so X_OK is -EACCES even for root (Linux
+        // 6.18: CAP_DAC_OVERRIDE grants exec only if some x bit is set).
+        if call(
+            Syscall::Faccessat2.raw(),
+            a3(fd, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
+        ) != Some(EACCES)
+        {
+            return Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) on 0666 must be -EACCES");
+        }
+        if call(Syscall::Fchmod.raw(), a1(fd, 0o755)) != Some(0) {
+            return Err("fchmod 0755 failed");
+        }
         match call(
             Syscall::Faccessat2.raw(),
             a3(fd, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) must return 0"),
+            Some(0) => {}
+            _ => return Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) must return 0"),
+        }
+        // A closed descriptor is -EBADF.
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(7575, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("faccessat2(badfd, \"\", AT_EMPTY_PATH) must be -EBADF"),
         }
     })
 }
@@ -825,8 +846,9 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_exact_errnos);
 
 // ── openat2 (dirfd, NUL-term path, open_how*, size) → fd / -EINVAL ──
 //
-// open_how is { u64 flags; u64 mode; u64 resolve } (24 bytes). how==NULL
-// or size<24 → -EINVAL; otherwise forwards to sys_open with the flags.
+// open_how is { u64 flags; u64 mode; u64 resolve } (24 bytes). size<24 →
+// -EINVAL, size>PAGE_SIZE → -E2BIG, then how==NULL → -EFAULT (the struct
+// copy); otherwise forwards to sys_openat with the flags.
 
 fn smoke_abi_pathx_openat2_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
@@ -1021,17 +1043,181 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_open_tree_path_fd_mkdirat);
 fn smoke_abi_pathx_openat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        // how==NULL → -EINVAL (structural check before any path work).
+        // how==NULL with a valid size is `copy_struct_from_user`'s -EFAULT;
+        // the size checks run first, so a short size is still -EINVAL.
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 8),
+        ) != Some(EINVAL)
+        {
+            return Err("openat2(how=NULL, size=8) was not -EINVAL");
+        }
         match call(
             Syscall::Openat2.raw(),
             a3(AT_FDCWD, path.as_ptr() as u64, 0, 24),
         ) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("openat2(how=NULL) was not -EINVAL"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("openat2(how=NULL) was not -EFAULT"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_neg);
+
+/// `open`/`openat` flag and object-type errnos, each against `fs/open.c` /
+/// `fs/namei.c` (and confirmed on a Linux 6.18 host):
+///
+/// * `build_open_flags` (ahead of `getname`, so ahead of -EFAULT):
+///   O_DIRECTORY|O_CREAT and a bare / read-only O_TMPFILE are -EINVAL.
+/// * `do_open`: O_CREAT|O_EXCL on anything that exists — a dangling
+///   symlink included, O_EXCL implying O_NOFOLLOW — is -EEXIST; O_DIRECTORY
+///   on a non-directory -ENOTDIR; write intent on a directory -EISDIR.
+/// * the walk: a regular file used as a directory is -ENOTDIR, with or
+///   without O_CREAT; a trailing slash with O_CREAT is -EISDIR.
+/// * O_TRUNC actually truncates.
+fn smoke_abi_pathx_open_flag_errnos() -> TestResult {
+    with_memfs("/opf", "opf", &[("f", b"hello")], || {
+        const O_WRONLY: u64 = 0o1;
+        const O_RDWR: u64 = 0o2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_TRUNC: u64 = 0o1000;
+        const O_DIRECTORY: u64 = 0o200000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        const O_TMPFILE: u64 = 0o20000000 | O_DIRECTORY;
+        let open = |path: &[u8], flags: u64| {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, path.as_ptr() as u64, flags, 0o644),
+            )
+        };
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(
+                c"nowhere".as_ptr() as u64,
+                AT_FDCWD,
+                c"/opf/dang".as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("could not create the dangling symlink fixture");
+        }
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, c"/opf/d".as_ptr() as u64, 0o755),
+        ) != Some(0)
+        {
+            return Err("could not create the directory fixture");
+        }
+        let cases: [(&[u8], u64, i64, &str); 13] = [
+            (
+                b"/opf/zz\0",
+                O_DIRECTORY | O_CREAT,
+                EINVAL,
+                "O_DIRECTORY|O_CREAT must be -EINVAL",
+            ),
+            (
+                b"/opf/d\0",
+                O_TMPFILE,
+                EINVAL,
+                "O_TMPFILE|O_RDONLY must be -EINVAL",
+            ),
+            (
+                b"/opf/d\0",
+                0o20000000 | O_RDWR,
+                EINVAL,
+                "__O_TMPFILE without O_DIRECTORY must be -EINVAL",
+            ),
+            (
+                b"/opf/f\0",
+                O_TMPFILE | O_RDWR,
+                ENOTDIR,
+                "O_TMPFILE on a file must be -ENOTDIR",
+            ),
+            (
+                b"/opf/f\0",
+                O_CREAT | O_EXCL | O_RDWR,
+                EEXIST,
+                "O_CREAT|O_EXCL on a file must be -EEXIST",
+            ),
+            (
+                b"/opf/dang\0",
+                O_CREAT | O_EXCL | O_RDWR,
+                EEXIST,
+                "O_CREAT|O_EXCL on a dangling symlink must be -EEXIST",
+            ),
+            (
+                b"/opf/d\0",
+                O_CREAT | O_EXCL,
+                EEXIST,
+                "O_CREAT|O_EXCL on a directory must be -EEXIST",
+            ),
+            (
+                b"/opf/f\0",
+                O_DIRECTORY,
+                ENOTDIR,
+                "O_DIRECTORY on a file must be -ENOTDIR",
+            ),
+            (
+                b"/opf/dang\0",
+                O_DIRECTORY | O_NOFOLLOW,
+                ENOTDIR,
+                "O_DIRECTORY|O_NOFOLLOW on a symlink must be -ENOTDIR",
+            ),
+            (
+                b"/opf/d\0",
+                O_WRONLY,
+                EISDIR,
+                "a write-open of a directory must be -EISDIR",
+            ),
+            (
+                b"/opf/f/x\0",
+                0,
+                ENOTDIR,
+                "a file used as a directory must be -ENOTDIR",
+            ),
+            (
+                b"/opf/f/x\0",
+                O_CREAT | O_RDWR,
+                ENOTDIR,
+                "O_CREAT below a file must be -ENOTDIR",
+            ),
+            (
+                b"/opf/new/\0",
+                O_CREAT | O_RDWR,
+                EISDIR,
+                "O_CREAT with a trailing slash must be -EISDIR",
+            ),
+        ];
+        for (path, flags, want, msg) in cases {
+            if open(path, flags) != Some(want) {
+                return Err(msg);
+            }
+        }
+        if open(b"/opf/missing/x\0", O_CREAT | O_RDWR) != Some(ENOENT) {
+            return Err("O_CREAT below a missing directory must be -ENOENT");
+        }
+        // O_TRUNC empties the file it opens.
+        let fd = match open(b"/opf/f\0", O_WRONLY | O_TRUNC) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_WRONLY|O_TRUNC) of an existing file failed"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let fd = match open(b"/opf/f\0", 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("reopen after O_TRUNC failed"),
+        };
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) != Some(0)
+        {
+            return Err("O_TRUNC did not truncate the file");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_open_flag_errnos);
 
 /// Regression: `openat2` with a real dirfd + a RELATIVE path under
 /// `RESOLVE_IN_ROOT` must resolve ONCE, rooted at the dirfd — not double-root
@@ -2408,7 +2594,9 @@ fn smoke_abi_pathx_renameat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("old", b"x")], || {
         let old = b"/p2/old\0";
         let new = b"/p2/new\0";
-        // RENAME_EXCHANGE (2) is unsupported → -EINVAL.
+        // RENAME_EXCHANGE (2) with a destination that does not exist →
+        // -ENOENT (`do_renameat2`: `if ((flags & RENAME_EXCHANGE) &&
+        // d_is_negative(new_dentry)) goto exit5;`).
         match call_raw(
             Syscall::Renameat2.raw(),
             SyscallArgs {
@@ -2420,14 +2608,14 @@ fn smoke_abi_pathx_renameat2_neg() -> TestResult {
                 arg5: 0,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == EINVAL => Ok(()),
-            _ => Err("renameat2(RENAME_EXCHANGE) was not -EINVAL"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == ENOENT => Ok(()),
+            _ => Err("renameat2(RENAME_EXCHANGE) onto a missing name was not -ENOENT"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_renameat2_neg);
 
-// ── statfs (NARF-native path_ptr, path_len, buf) → 0 / -1 ──────────
+// ── statfs(path, buf) → 0 / -errno ─────────────────────────────────
 //
 // `sys_statfs` takes the Linux shape: (path NUL-term, buf).
 
@@ -2450,10 +2638,28 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_pos);
 fn smoke_abi_pathx_statfs_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        // buf_ptr == 0 → fill_statfs_for_path returns false → -1 sentinel.
+        // `user_statfs`: a resolved path with an unwritable buf is -EFAULT
+        // (was the -1 sentinel → EPERM)...
         match call(Syscall::Statfs.raw(), a1(path.as_ptr() as u64, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("statfs(null buf) was not the -1 sentinel"),
+            Some(-14) => {}
+            _ => return Err("statfs(null buf) was not -EFAULT"),
+        }
+        // ...but the lookup runs first: a missing name is -ENOENT even with
+        // a bad buf (it used to SUCCEED for any path under a mount), and a
+        // file used as a directory is -ENOTDIR.
+        let missing = b"/p2/nope\0";
+        match call(Syscall::Statfs.raw(), a1(missing.as_ptr() as u64, 0)) {
+            Some(-2) => {}
+            _ => return Err("statfs(missing path) was not -ENOENT"),
+        }
+        let through_file = b"/p2/f/x\0";
+        let mut buf = [0u8; 128];
+        match call(
+            Syscall::Statfs.raw(),
+            a1(through_file.as_ptr() as u64, buf.as_mut_ptr() as u64),
+        ) {
+            Some(-20) => Ok(()),
+            _ => Err("statfs through a regular file was not -ENOTDIR"),
         }
     })
 }
@@ -2913,6 +3119,24 @@ fn smoke_abi_pathx_getdents64_errno_order_and_small_buffer() -> TestResult {
         ) != Some(EINVAL)
         {
             return Err("getdents64 count must use the native unsigned-int width");
+        }
+        // `fdget` masks FMODE_PATH: an O_PATH directory fd is -EBADF.
+        const O_PATH: u64 = 0o10000000;
+        let dir = b"/p2\0";
+        let pfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(dir, O_PATH) did not return an fd"),
+        };
+        let mut buf = [0u8; 256];
+        if call(
+            Syscall::Getdents64.raw(),
+            a2(pfd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) != Some(EBADF)
+        {
+            return Err("getdents64 on an O_PATH directory fd must return EBADF");
         }
         Ok(())
     })
@@ -3385,10 +3609,41 @@ fn smoke_abi_pathx_lstat_errnos() -> TestResult {
             Syscall::Lstat.raw(),
             a1(missing.as_ptr() as u64, sb.as_mut_ptr() as u64),
         ) {
-            Some(ENOENT) => Ok(()),
-            Some(EPERM) => Err("lstat(missing) returned EPERM — the bare -1 sentinel"),
-            _ => Err("lstat(missing) must return -ENOENT"),
+            Some(ENOENT) => {}
+            Some(EPERM) => return Err("lstat(missing) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("lstat(missing) must return -ENOENT"),
         }
+        // No LOOKUP_EMPTY: "" is -ENOENT, never a stat of the cwd.
+        let empty = b"\0";
+        if call(
+            Syscall::Lstat.raw(),
+            a1(empty.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("lstat(\"\") must return -ENOENT");
+        }
+        // link_path_walk sees the name as written: a trailing slash, "/."
+        // or "/.." after a regular file is -ENOTDIR (6.18 probe), even
+        // though each normalises to an existing path.
+        for p in [&b"/p2/f/\0"[..], &b"/p2/f/.\0"[..], &b"/p2/f/../f\0"[..]] {
+            if call(
+                Syscall::Lstat.raw(),
+                a1(p.as_ptr() as u64, sb.as_mut_ptr() as u64),
+            ) != Some(ENOTDIR)
+            {
+                return Err("lstat through a regular file must return -ENOTDIR");
+            }
+        }
+        // ...and "/.." after a missing name is -ENOENT.
+        let via_missing = b"/p2/nope/../f\0";
+        if call(
+            Syscall::Lstat.raw(),
+            a1(via_missing.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("lstat(\"missing/../f\") must return -ENOENT");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_lstat_errnos);
@@ -3561,6 +3816,27 @@ fn smoke_abi_pathx_statx_errnos() -> TestResult {
         // cp_statx's arm, last of all.
         if call_statx(AT_FDCWD, present.as_ptr() as u64, 0, 0, 0) != Some(EFAULT) {
             return Err("statx(existing, NULL buffer) must return -EFAULT");
+        }
+        // Trailing slash on a regular file: LOOKUP_DIRECTORY → -ENOTDIR.
+        let slashed = b"/p2/f/\0";
+        if call_statx(AT_FDCWD, slashed.as_ptr() as u64, 0, 0, buf) != Some(ENOTDIR) {
+            return Err("statx(\"file/\") must return -ENOTDIR");
+        }
+        // path_init on a relative name: a closed dirfd is -EBADF and a
+        // regular-file dirfd -ENOTDIR (it used to fall back to the cwd).
+        let rel = b"f\0";
+        if call_statx(9191, rel.as_ptr() as u64, 0, 0, buf) != Some(EBADF) {
+            return Err("statx(closed dirfd, relative) must return -EBADF");
+        }
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, present.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        if call_statx(fd, rel.as_ptr() as u64, 0, 0, buf) != Some(ENOTDIR) {
+            return Err("statx(file dirfd, relative) must return -ENOTDIR");
         }
         Ok(())
     })
@@ -4657,6 +4933,20 @@ fn smoke_abi_pathx_openat2_struct_rules() -> TestResult {
         if openat2_at(AT_FDCWD, path, &openat2_how(0, 0, 1 << 20)) != Some(EINVAL) {
             return Err("an undefined resolve flag must be -EINVAL");
         }
+        // "Scoping flags are mutually exclusive."
+        if openat2_at(
+            AT_FDCWD,
+            path,
+            &openat2_how(0, 0, RESOLVE_BENEATH | RESOLVE_IN_ROOT),
+        ) != Some(EINVAL)
+        {
+            return Err("RESOLVE_BENEATH|RESOLVE_IN_ROOT must be -EINVAL");
+        }
+        // RESOLVE_CACHED refuses create/truncate/tmpfile in build_open_flags.
+        if openat2_at(AT_FDCWD, path, &openat2_how(O_CREAT, 0o644, RESOLVE_CACHED)) != Some(EAGAIN)
+        {
+            return Err("RESOLVE_CACHED with O_CREAT must be -EAGAIN");
+        }
         Ok(())
     })
 }
@@ -4734,6 +5024,25 @@ fn smoke_abi_pathx_openat2_scoped() -> TestResult {
         if openat2_at(dfd, b"/o2b/f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EXDEV) {
             return Err("RESOLVE_BENEATH must refuse an absolute pathname");
         }
+        // `path_init` jumps to the root for an absolute path without looking
+        // at dirfd, so even a closed dirfd is EXDEV there; a relative path
+        // needs the dirfd — closed is EBADF, a non-directory ENOTDIR.
+        if openat2_at(9999, b"/o2b/f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EXDEV) {
+            return Err("RESOLVE_BENEATH with an absolute path must be -EXDEV before dirfd");
+        }
+        if openat2_at(9999, b"f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EBADF) {
+            return Err("RESOLVE_BENEATH with a closed dirfd must be -EBADF");
+        }
+        let ffd = match openat2_at(AT_FDCWD, b"/o2b/f\0", &openat2_how(0, 0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the scope file"),
+        };
+        if openat2_at(ffd, b"../f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(ENOTDIR) {
+            return Err("RESOLVE_BENEATH with a regular-file dirfd must be -ENOTDIR");
+        }
+        if openat2_at(ffd, b"/f\0", &openat2_how(0, 0, RESOLVE_IN_ROOT)) != Some(ENOTDIR) {
+            return Err("RESOLVE_IN_ROOT with a regular-file dirfd must be -ENOTDIR");
+        }
         // IN_ROOT: the same climb lands back at the root rather than
         // escaping, so it resolves instead of failing.
         match openat2_at(dfd, b"/f\0", &openat2_how(0, 0, RESOLVE_IN_ROOT)) {
@@ -4794,7 +5103,7 @@ fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
             _ => return Err("renameat2 with invalid flags must return -EINVAL"),
         }
 
-        // 2. Unsupported RENAME_EXCHANGE (2) -> -EINVAL (-22)
+        // 2. RENAME_EXCHANGE (2) onto a missing name -> -ENOENT (-2)
         match call(
             Syscall::Renameat2.raw(),
             a4(
@@ -4805,8 +5114,8 @@ fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
                 2,
             ),
         ) {
-            Some(EINVAL) => {}
-            _ => return Err("renameat2 with RENAME_EXCHANGE must return -EINVAL"),
+            Some(ENOENT) => {}
+            _ => return Err("renameat2(RENAME_EXCHANGE) onto a missing name must return -ENOENT"),
         }
 
         // 3. Mutually exclusive RENAME_NOREPLACE (1) | RENAME_EXCHANGE (2) -> -EINVAL (-22)
@@ -4864,6 +5173,147 @@ kernel_test_in!(
     smoke_abi_pathx_renameat2_flags_and_empty_paths
 );
 
+/// Namespace-mutation errnos that depend on the RAW last component (a final
+/// `.`/`..`, a trailing slash) or on `fs/namei.c`'s check ORDER — each one
+/// observed on Linux 6.18 tmpfs. NARF normalised the path first, so e.g.
+/// `rmdir("d/.")` removed `d` and `rename("f", "x/")` created `x`.
+fn smoke_abi_pathx_namespace_mutation_linux_errnos() -> TestResult {
+    const AT_REMOVEDIR: u64 = 0x200;
+    const S_IFREG: u64 = 0o100000;
+    const S_IFDIR: u64 = 0o040000;
+    with_memfs("/p2_ns", "p2_ns", &[("f", b"hi")], || {
+        let p = |s: &'static [u8]| s.as_ptr() as u64;
+        let ren = |old: &'static [u8], new: &'static [u8], flags: u64| {
+            call(
+                Syscall::Renameat2.raw(),
+                a4(AT_FDCWD, p(old), AT_FDCWD, p(new), flags),
+            )
+        };
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, p(b"/p2_ns/d\0"), 0o755),
+        ) != Some(0)
+            || call(
+                Syscall::Mkdirat.raw(),
+                a2(AT_FDCWD, p(b"/p2_ns/d/sub\0"), 0o755),
+            ) != Some(0)
+        {
+            return Err("fixture mkdir failed");
+        }
+        // do_rmdir: LAST_DOT -> EINVAL, LAST_DOTDOT -> ENOTEMPTY.
+        let rmdir =
+            |s: &'static [u8]| call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, p(s), AT_REMOVEDIR));
+        if rmdir(b"/p2_ns/d/sub/.\0") != Some(EINVAL) {
+            return Err("rmdir(\"d/.\") must be -EINVAL (and must not remove d)");
+        }
+        if rmdir(b"/p2_ns/d/..\0") != Some(ENOTEMPTY) {
+            return Err("rmdir(\"d/..\") must be -ENOTEMPTY");
+        }
+        // do_unlinkat: a trailing slash on a file is ENOTDIR; `.` is EISDIR.
+        let unlink = |s: &'static [u8]| call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, p(s), 0));
+        if unlink(b"/p2_ns/f/\0") != Some(ENOTDIR) {
+            return Err("unlink(\"f/\") must be -ENOTDIR (and must not remove f)");
+        }
+        if unlink(b"/p2_ns/d/.\0") != Some(EISDIR) {
+            return Err("unlink(\"d/.\") must be -EISDIR");
+        }
+        // unlinkat validates flags before reading the path.
+        if call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, 0, 1)) != Some(EINVAL) {
+            return Err("unlinkat(bad flag, NULL) must be -EINVAL, not -EFAULT");
+        }
+        // A file as a non-final component is ENOTDIR, not ENOENT.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, p(b"/p2_ns/f/x\0"), 0o755),
+        ) != Some(ENOTDIR)
+        {
+            return Err("mkdir(\"f/x\") must be -ENOTDIR");
+        }
+        // mknod: may_mknod before getname; EEXIST before anything else;
+        // a trailing slash on a new name is ENOENT.
+        let mknod =
+            |path: u64, mode: u64| call(Syscall::Mknodat.raw(), a3(AT_FDCWD, path, mode, 0));
+        if mknod(0, S_IFDIR) != Some(EPERM) {
+            return Err("mknodat(NULL, S_IFDIR) must be -EPERM (may_mknod runs first)");
+        }
+        if mknod(p(b"/p2_ns/new/\0"), S_IFREG | 0o644) != Some(ENOENT) {
+            return Err("mknod(\"new/\") must be -ENOENT, not create new");
+        }
+        if mknod(p(b"/p2_ns/f\0"), S_IFREG | 0o644) != Some(EEXIST) {
+            return Err("mknod on an existing name must be -EEXIST");
+        }
+        // symlink: an empty TARGET is -ENOENT; trailing slash; EEXIST.
+        let symlink = |t: &'static [u8], l: &'static [u8]| {
+            call(Syscall::Symlinkat.raw(), a2(p(t), AT_FDCWD, p(l)))
+        };
+        if symlink(b"\0", b"/p2_ns/l\0") != Some(ENOENT) {
+            return Err("symlink(\"\", l) must be -ENOENT");
+        }
+        if symlink(b"t\0", b"/p2_ns/l/\0") != Some(ENOENT) {
+            return Err("symlink(t, \"l/\") must be -ENOENT");
+        }
+        if symlink(b"t\0", b"/p2_ns/f\0") != Some(EEXIST) {
+            return Err("symlink onto an existing name must be -EEXIST");
+        }
+        // link: a directory source is EPERM (was EXDEV across directories);
+        // a missing source is ENOENT even when the new name exists.
+        let link = |o: &'static [u8], n: &'static [u8]| {
+            call(Syscall::Linkat.raw(), a4(AT_FDCWD, p(o), AT_FDCWD, p(n), 0))
+        };
+        if link(b"/p2_ns/d\0", b"/p2_ns/d/sub/d2\0") != Some(EPERM) {
+            return Err("link(dir, new) must be -EPERM");
+        }
+        if link(b"/p2_ns/nx\0", b"/p2_ns/f\0") != Some(ENOENT) {
+            return Err("link(missing, existing) must be -ENOENT (old name is looked up first)");
+        }
+        if link(b"/p2_ns/f/\0", b"/p2_ns/g\0") != Some(ENOTDIR) {
+            return Err("link(\"f/\", g) must be -ENOTDIR");
+        }
+        // rename: do_renameat2 / vfs_rename order.
+        if ren(b"/p2_ns/d\0", b"/p2_ns/d/sub/x\0", 0) != Some(EINVAL) {
+            return Err("rename(d, d/sub/x) must be -EINVAL");
+        }
+        if ren(b"/p2_ns/d/sub\0", b"/p2_ns/d\0", 0) != Some(ENOTEMPTY) {
+            return Err("rename(d/sub, d) must be -ENOTEMPTY");
+        }
+        if ren(b"/p2_ns/f\0", b"/p2_ns/x/\0", 0) != Some(ENOTDIR) {
+            return Err("rename(f, \"x/\") must be -ENOTDIR");
+        }
+        if ren(b"/p2_ns/d/.\0", b"/p2_ns/y\0", 0) != Some(EBUSY) {
+            return Err("rename(\"d/.\", y) must be -EBUSY");
+        }
+        if ren(b"/p2_ns/f\0", b"/p2_ns/d\0", 0) != Some(EISDIR) {
+            return Err("rename(file, dir) must be -EISDIR");
+        }
+        if ren(b"/p2_ns/d\0", b"/p2_ns/f\0", 0) != Some(ENOTDIR) {
+            return Err("rename(dir, file) must be -ENOTDIR");
+        }
+        if ren(b"/p2_ns/nx\0", b"/p2_ns/f\0", 1) != Some(ENOENT) {
+            return Err("renameat2(missing, existing, NOREPLACE) must be -ENOENT");
+        }
+        if ren(b"/p2_ns/f\0", b"/p2_ns/nx/y\0", 0) != Some(ENOENT) {
+            return Err("rename into a missing directory must be -ENOENT, not -EXDEV");
+        }
+        if call(Syscall::Renameat2.raw(), a4(AT_FDCWD, 0, AT_FDCWD, 0, 8)) != Some(EINVAL) {
+            return Err("renameat2(NULL, NULL, bad flag) must be -EINVAL, not -EFAULT");
+        }
+        // Nothing above may have mutated the tree.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, p(b"/p2_ns/d/sub\0"), 0o755),
+        ) != Some(EEXIST)
+            || mknod(p(b"/p2_ns/f\0"), S_IFREG | 0o644) != Some(EEXIST)
+        {
+            return Err("a refused call removed or moved a fixture");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_namespace_mutation_linux_errnos
+);
+
 fn smoke_abi_pathx_readlinkat_bufsiz_and_empty_path() -> TestResult {
     with_memfs("/p2_rl", "p2_rl", &[("f", b"hi")], || {
         let empty = b"\0";
@@ -4885,6 +5335,31 @@ fn smoke_abi_pathx_readlinkat_bufsiz_and_empty_path() -> TestResult {
         ) {
             Some(ENOENT) => {}
             _ => return Err("readlinkat with empty path must return -ENOENT"),
+        }
+
+        // 3. do_readlinkat always passes LOOKUP_EMPTY, so "" names the
+        //    dirfd: a closed one is -EBADF, a non-symlink one -ENOENT.
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(9393, empty.as_ptr() as u64, buf.as_mut_ptr() as u64, 64),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("readlinkat(closed fd, \"\") must return -EBADF"),
+        }
+        let file = b"/p2_rl/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(fd, empty.as_ptr() as u64, buf.as_mut_ptr() as u64, 64),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("readlinkat(file fd, \"\") must return -ENOENT"),
         }
 
         Ok(())

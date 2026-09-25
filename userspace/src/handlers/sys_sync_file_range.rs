@@ -34,6 +34,7 @@ pub(crate) fn sys_sync_file_range(ctx: &mut dyn TrapContext) {
         SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
     let task = current_task_id();
 
+    // `fdget`: an O_PATH descriptor is -EBADF, like an unopened slot.
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;

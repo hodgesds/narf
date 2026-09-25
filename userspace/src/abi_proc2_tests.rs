@@ -2543,6 +2543,12 @@ fn smoke_abi_proc2_exec_resets_dumpable() -> TestResult {
 
         // A SET-USER-ID image owned by someone else: euid moves away from
         // uid, so the exec must clear dumpability.
+        //
+        // Restage as root first: the exec above left the task as CALLER
+        // with its effective capabilities cleared, and chown/chmod of a
+        // file the caller does not own is EPERM (`setattr_prepare`).
+        crate::handlers::__test_uidgid_reset();
+        crate::handlers::__test_caps_reset();
         if call(
             Syscall::Chown.raw(),
             a2(cpath.as_ptr() as u64, OWNER as u64, OWNER as u64),

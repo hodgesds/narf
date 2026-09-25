@@ -51,6 +51,16 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     } else {
         None
     };
+    // rw_verify_area(WRITE, file, &f_pos, count) runs in vfs_write before
+    // the filesystem sees the write: f_pos + count past LLONG_MAX is -EINVAL.
+    // It tests f_pos even for O_APPEND (i_size is only substituted later, in
+    // generic_write_checks); streams pass ppos == NULL.
+    if !endpoint.ops.is_stream() {
+        if let Err(errno) = rw_verify_area_pos(endpoint.description.offset(), requested) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
 
     // `inode_permission`'s "Nobody gets write access to an immutable
     // file", and the append-only half: the data may grow but never be

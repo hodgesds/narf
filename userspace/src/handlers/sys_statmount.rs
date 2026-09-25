@@ -58,9 +58,22 @@ const STATMOUNT_SUPPORTED: u64 = STATMOUNT_SB_BASIC
 
 /// The `[str]` bits: requesting any of these needs room past the fixed
 /// struct, which is what makes `bufsize == sizeof(statmount)` -EOVERFLOW.
-const STATMOUNT_STRING_REQ: u64 =
-    STATMOUNT_MNT_ROOT | STATMOUNT_MNT_POINT | STATMOUNT_FS_TYPE | STATMOUNT_MNT_OPTS
-        | STATMOUNT_SB_SOURCE;
+///
+/// This is Linux's `STATMOUNT_STRING_REQ`, including the string fields NARF
+/// cannot fill (FS_SUBTYPE, OPT_ARRAY, OPT_SEC_ARRAY, MNT_UIDMAP,
+/// MNT_GIDMAP): `prepare_kstatmount` tests the REQUESTED mask, so asking for
+/// only FS_SUBTYPE with a 512-byte buffer is -EOVERFLOW even though nothing
+/// would be written (probed on 6.18).
+const STATMOUNT_STRING_REQ: u64 = STATMOUNT_MNT_ROOT
+    | STATMOUNT_MNT_POINT
+    | STATMOUNT_FS_TYPE
+    | STATMOUNT_MNT_OPTS
+    | 0x0000_0100 // STATMOUNT_FS_SUBTYPE
+    | STATMOUNT_SB_SOURCE
+    | 0x0000_0400 // STATMOUNT_OPT_ARRAY
+    | 0x0000_0800 // STATMOUNT_OPT_SEC_ARRAY
+    | 0x0000_2000 // STATMOUNT_MNT_UIDMAP
+    | 0x0000_4000; // STATMOUNT_MNT_GIDMAP
 
 /// `struct statmount` (`include/uapi/linux/mount.h`), field for field.
 ///
@@ -283,6 +296,15 @@ pub(crate) fn sys_listmount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `param` is a unique mount id cursor, held to the same floor as
+    // `mnt_id`: "The first valid unique mount id is MNT_UNIQUE_ID_OFFSET +
+    // 1." — `if (last_mnt_id != 0 && last_mnt_id <= MNT_UNIQUE_ID_OFFSET)
+    // return -EINVAL;`. A mountinfo-style id passed as the cursor would
+    // otherwise silently restart the walk from the top.
+    if last_mnt_id != 0 && last_mnt_id <= MNT_UNIQUE_ID_OFFSET {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
     let reverse = flags & LISTMOUNT_REVERSE != 0;
     let mounts = visible_mounts();
     let base = if mnt_id == LSMT_ROOT {
@@ -344,10 +366,9 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
-    if validate_user_range(buf, bufsize as usize).is_err() {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    }
+    // `copy_mnt_id_req` runs BEFORE `prepare_kstatmount`'s `access_ok(buf)`,
+    // so a malformed request outranks an unwritable buffer (probed on 6.18:
+    // bad size + bad buffer is EINVAL). `listmount` is the other way round.
     let (_, mnt_id, mask, _) = match mnt_id_req_from_user(req, false) {
         Ok(v) => v,
         Err(errno) => {
@@ -355,6 +376,10 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if validate_user_range(buf, bufsize as usize).is_err() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
     // `prepare_kstatmount`: asking for a string with no room past the fixed
     // struct is -EOVERFLOW, decided before the mount is even looked up.
     if mask & STATMOUNT_STRING_REQ != 0 && bufsize as usize == STATMOUNT_SIZE {
@@ -458,7 +483,11 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
     let copysize = core::cmp::min(bufsize as usize, STATMOUNT_SIZE);
     sm.size = (copysize + strs.len()) as u32;
     if !strs.is_empty() {
-        if (bufsize as usize) < STATMOUNT_SIZE + strs.len() {
+        // `statmount_string`: `if (kbufsize >= s->bufsize) return
+        // -EOVERFLOW;` — the buffer must be strictly larger than the struct
+        // plus the NUL-terminated strings (probed on 6.18: "/tmp/qn" fails at
+        // 512 + 8 and succeeds at 512 + 9).
+        if (bufsize as usize) <= STATMOUNT_SIZE + strs.len() {
             ctx.set_return(errno_ret(EOVERFLOW));
             return;
         }

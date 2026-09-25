@@ -43,12 +43,24 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // an exactly-8-byte handle: the fd's inode if the backing FS exposes one,
     // else a stable hash of the fd's path.
     if raw.is_empty() {
+        // `user_path_at` without LOOKUP_EMPTY: `getname` refuses an empty
+        // name with -ENOENT, the same as every other path syscall. (-EINVAL
+        // here claimed the flags were wrong.)
         if a.arg4 & AT_EMPTY_PATH == 0 {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
             return;
         }
         let task = current_task_id();
         let dirfd = a.arg0 as u32;
+        // AT_EMPTY_PATH names the dirfd itself; a descriptor that is not
+        // open is `path_init`'s -EBADF, not a missing object.
+        const AT_FDCWD: i32 = -100;
+        if dirfd as i32 != AT_FDCWD
+            && !fd::with_table(task, |t| t.get(dirfd).is_some()).unwrap_or(false)
+        {
+            ctx.set_return(SyscallReturn::ok((-EBADF) as u64));
+            return;
+        }
         // An ns-fd encodes to an nsfs handle, not to the generic inode one.
         // `nsfs_encode_fh` carries id, type AND inode: the id alone would
         // locate the namespace, and the other two are what let the decoder
@@ -181,10 +193,14 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // `lookup_dir` targets — has no FileOps shape, so a file-shape
     // resolve alone reports ENOENT for exactly the paths systemd's
     // cg_path_get_cgroupid asks about (/sys/fs/cgroup/.../<svc>.service).
-    let path_ino = match stat_ino_path_dir_aware(&path) {
+    // `lookup_flags = (flag & AT_SYMLINK_FOLLOW) ? LOOKUP_FOLLOW : 0;` — a
+    // final symlink is encoded as itself unless the caller asks otherwise.
+    // A failed walk reports why (ENOTDIR for a file prefix, ELOOP, EACCES),
+    // as `user_path_at` does, rather than a flat ENOENT.
+    let path_ino = match stat_ino_path_dir_aware_ext(&path, flags & AT_SYMLINK_FOLLOW != 0) {
         Some((_, ino, ..)) => ino,
         None => {
-            ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(&path)) as u64));
             return;
         }
     };

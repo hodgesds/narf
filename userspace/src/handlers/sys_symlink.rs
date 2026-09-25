@@ -19,6 +19,14 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `do_symlinkat` reports the TARGET name's `getname()` failure first,
+    // and that includes the empty string: `getname()` without LOOKUP_EMPTY
+    // rejects "" with -ENOENT. An empty target used to be accepted and a
+    // symlink to nothing created.
+    if target_str.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     let link_path = match copy_user_cstr_checked(link_ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
@@ -32,8 +40,9 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
     }
     // Resolve the link location against the cwd (the symlink *target*
     // stays verbatim — symlink targets may legitimately be relative).
+    let last = LastComponent::of(&link_path);
     let link_path = resolve_cwd_path(current_task_id(), &link_path);
-    symlink_absolute(ctx, &target_str, &link_path);
+    symlink_absolute(ctx, &target_str, &link_path, last);
 }
 
 /// Create a symlink whose LINK PATH is already absolute.
@@ -41,7 +50,21 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
 /// Split out so `sys_symlinkat` can join its relative linkpath against
 /// `newdirfd` and share this body. The target string stays verbatim —
 /// symlink targets may legitimately be relative and must not be rewritten.
-pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link_path: &str) {
+pub(crate) fn symlink_absolute(
+    ctx: &mut dyn TrapContext,
+    target_str: &str,
+    link_path: &str,
+    last: LastComponent,
+) {
+    // `filename_create`: the walk's errno, then EEXIST for an existing name
+    // (or `.`/`..`/`/`), then ENOENT for a trailing slash — all ahead of the
+    // read-only and permission checks below. systemd-tmpfiles treats EEXIST
+    // as "already present", so an EROFS/EACCES in its place on an existing
+    // link is a spurious failure.
+    if let Err(errno) = filename_create_check(link_path, last) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // `do_symlinkat` -> `filename_create` -> `may_create`: write+exec on
     // the directory the link is being added to, checked inside the
     // resolution this already performs.
@@ -80,7 +103,20 @@ pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link
         Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
             ctx.set_return(errno_ret(EDQUOT))
         }
-        // Parent path/filesystem didn't resolve → a component is missing.
-        _ => ctx.set_return(errno_ret(ENOENT)),
+        // The backend's own failure (`vfs_symlink` -> `->symlink`): a full
+        // disk, a failing device or an unwritable directory is not "no such
+        // file", which is what every one of them used to read as.
+        Some(Some(Err(narf_filesystem::FsError::NoSpace))) => {
+            ctx.set_return(errno_ret(ENOSPC))
+        }
+        Some(Some(Err(narf_filesystem::FsError::Io(_)))) => ctx.set_return(errno_ret(EIO)),
+        Some(Some(Err(narf_filesystem::FsError::PermissionDenied))) => {
+            ctx.set_return(errno_ret(EACCES))
+        }
+        Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
+            ctx.set_return(errno_ret(EPERM)) // `if (!dir->i_op->symlink)`
+        }
+        // Parent path/filesystem didn't resolve → the walk's errno.
+        _ => ctx.set_return(errno_ret(path_lookup_errno(link_path))),
     }
 }

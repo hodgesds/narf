@@ -13,6 +13,12 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let path_uptr = args.arg1;
     let flags = args.arg2;
     let mode = args.arg3 as u32;
+    // `do_sys_openat2` runs `build_open_flags` before `getname`: an invalid
+    // flag combination is -EINVAL even with an unreadable pathname.
+    if let Err(errno) = open_build_flags(flags) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
@@ -74,6 +80,12 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let effective = match resolve_at_path(task, dirfd, &path_str) {
         Ok(path) => path,
         Err(errno) => {
+            // `FD_ADD` reserves the descriptor before `path_init` looks at
+            // `dirfd`, so a full table is -EMFILE ahead of -EBADF/-ENOTDIR.
+            if !fd::has_free_descriptor(task) {
+                ctx.set_return(errno_ret(EMFILE));
+                return;
+            }
             ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }

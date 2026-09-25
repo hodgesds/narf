@@ -55,27 +55,20 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
         finish_sendfile(ctx, offset_ptr, initial_offset, -ESPIPE);
         return;
     }
-    if offset_ptr == 0 && input.ops.is_stream() {
-        // NARF streams do not provide Linux's splice_read/mmap source op.
-        // Fail closed so an empty live pipe can never masquerade as EOF.
-        finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
+
+    // rw_verify_area(READ, in, &pos, count) runs on the explicit offset or,
+    // without one, on `in->f_pos` — so `sendfile(out, in, NULL, SIZE_MAX)`
+    // is -EINVAL (ssize_t count < 0), still ahead of any output-fd check.
+    let verify_in = if offset_ptr != 0 {
+        initial_offset
+    } else {
+        input.description.offset()
+    };
+    if let Err(errno) = rw_verify_area_pos(verify_in, requested) {
+        finish_sendfile(ctx, offset_ptr, initial_offset, -errno);
         return;
     }
-
-    let transfer_offset = if offset_ptr != 0 {
-        if (initial_offset as i64) < 0
-            || requested > isize::MAX as usize
-            || initial_offset
-                .checked_add(requested as u64)
-                .is_none_or(|end| end > i64::MAX as u64)
-        {
-            finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
-            return;
-        }
-        Some(initial_offset)
-    } else {
-        None
-    };
+    let transfer_offset = (offset_ptr != 0).then_some(initial_offset);
 
     // Linux checks output only after the input fd/mode/range is valid.
     let Some(output) = copy_fd_endpoint(task, out_fd) else {
@@ -86,12 +79,19 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
         finish_sendfile(ctx, offset_ptr, initial_offset, -EBADF);
         return;
     }
+    let count = core::cmp::min(requested, MAX_RW_COUNT);
+    // A non-pipe output goes through do_splice_direct: rw_verify_area(WRITE,
+    // out, &out->f_pos, count), then O_APPEND -> -EINVAL.
+    if !output.is_pipe() {
+        if let Err(errno) = rw_verify_area_pos(output.description.offset(), count) {
+            finish_sendfile(ctx, offset_ptr, initial_offset, -errno);
+            return;
+        }
+    }
     if output.append() {
         finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
         return;
     }
-
-    let count = core::cmp::min(requested, MAX_RW_COUNT);
     if count != 0
         && output.is_pipe()
         && output.ops.poll_readiness() & narf_filesystem::POLL_OUT == 0
@@ -109,6 +109,15 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
             return;
         }
         finish_sendfile(ctx, offset_ptr, initial_offset, 0);
+        return;
+    }
+    if offset_ptr == 0 && input.ops.is_stream() {
+        // NARF streams do not provide Linux's splice_read/mmap source op.
+        // Fail closed so an empty live pipe can never masquerade as EOF.
+        // Linux 6.x also answers -EINVAL for a pipe source, but only after the
+        // output fd is resolved (splice_direct_to_actor's S_ISREG test /
+        // do_splice_read's missing ->splice_read): a bad out_fd is -EBADF.
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
         return;
     }
     let (result, advanced) =

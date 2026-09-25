@@ -1157,6 +1157,49 @@ fn proc_namespace_fd_from_path(
     namespace_fd_for_task(target_task, flavour)
 }
 
+/// `fs/open.c::build_open_how` + the flag half of `build_open_flags`, as the
+/// legacy `open`/`openat`/`creat` entries apply them. Runs before `getname`
+/// in `do_sys_openat2`, so its -EINVAL outranks -EFAULT on the pathname and
+/// -EMFILE; callers invoke it before copying the path. Returns the effective
+/// flags (O_PATH strips every flag outside `O_PATH_FLAGS`) or a positive
+/// errno.
+///
+/// ```text
+///   if (how.flags & O_PATH) how.flags &= O_PATH_FLAGS;          /* build_open_how */
+///   if ((flags & (O_DIRECTORY | O_CREAT)) == (O_DIRECTORY | O_CREAT)) return -EINVAL;
+///   if (flags & __O_TMPFILE) {
+///           if ((flags & O_TMPFILE_MASK) != O_TMPFILE) return -EINVAL;
+///           if (!(acc_mode & MAY_WRITE)) return -EINVAL;
+///   }
+/// ```
+fn open_build_flags(flags: u64) -> Result<u64, i64> {
+    const O_DIRECTORY: u64 = 0o200000;
+    const O_NOFOLLOW: u64 = 0o400000;
+    const O_CLOEXEC: u64 = 0o2000000;
+    const O_PATH: u64 = 0o10000000;
+    const O_TMPFILE_BIT: u64 = 0o20000000;
+    let mut flags = flags;
+    if flags & O_PATH != 0 {
+        flags &= O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
+    }
+    if flags & (O_DIRECTORY | O_CREAT) == (O_DIRECTORY | O_CREAT) {
+        return Err(EINVAL);
+    }
+    if flags & O_TMPFILE_BIT != 0 {
+        // O_TMPFILE_MASK = __O_TMPFILE | O_DIRECTORY | O_CREAT; O_CREAT
+        // with O_DIRECTORY was refused just above.
+        if flags & O_DIRECTORY == 0 {
+            return Err(EINVAL);
+        }
+        // ACC_MODE: O_RDONLY is the only access mode without MAY_WRITE
+        // (the "3" ioctl-only mode maps to MAY_READ | MAY_WRITE).
+        if flags & 0o3 == 0 {
+            return Err(EINVAL);
+        }
+    }
+    Ok(flags)
+}
+
 fn open_impl(
     ctx: &mut dyn TrapContext,
     path_owned_raw: alloc::string::String,
@@ -1182,6 +1225,32 @@ fn open_impl(
             return;
         }
     }
+    // `build_open_flags` runs first of all (see `open_build_flags`); the
+    // entry points already ran it ahead of their pathname copy, so this only
+    // yields the effective (O_PATH-stripped) flags for them.
+    let flags = match open_build_flags(flags) {
+        Ok(flags) => flags,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
+    // Linux open/openat reject an empty pathname with ENOENT. Do this before
+    // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
+    // the cwd itself and accidentally opens a directory. dbus-broker probes an
+    // optional empty path this way; opening cwd produced a regular fd that it
+    // added to epoll, yielding an infinite readable-at-EOF loop. It is
+    // `getname`'s answer, so it also precedes the descriptor reservation
+    // below: `open("", …)` with a full table is ENOENT, not EMFILE.
+    if path_owned_raw.is_empty() {
+        ctx.set_return(errno_ret(ENOENT)); // -ENOENT
+        return;
+    }
+    // A trailing slash makes the final component a directory lookup
+    // (`open_last_lookups`: `if (nd->last.name[nd->last.len]) nd->flags |=
+    // LOOKUP_FOLLOW | LOOKUP_DIRECTORY;`), and on the create side it is
+    // -EISDIR outright. Captured before normalization strips it.
+    let trailing_slash = mnt_len == 0 && path_owned_raw.len() > 1 && path_owned_raw.ends_with('/');
     // Linux's `FD_ADD(flags, do_file_open(...))` reserves the lowest-free fd
     // before evaluating path lookup or O_CREAT. Apart from preserving exact
     // EMFILE precedence, that ordering is transactional: descriptor exhaustion
@@ -1208,15 +1277,15 @@ fn open_impl(
     let want_r = access_mode == 0 || access_mode == 2;
     let want_w = access_mode == 1 || access_mode == 2;
     let task = current_task_id();
-    // Linux open/openat reject an empty pathname with ENOENT. Do this before
-    // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
-    // the cwd itself and accidentally opens a directory. dbus-broker probes an
-    // optional empty path this way; opening cwd produced a regular fd that it
-    // added to epoll, yielding an infinite readable-at-EOF loop.
-    if path_owned_raw.is_empty() {
-        ctx.set_return(errno_ret(ENOENT)); // -ENOENT
-        return;
-    }
+    // `build_open_flags`: `if (flags & O_EXCL) { ... flags |= O_NOFOLLOW; }`
+    // under O_CREAT — an exclusive create never follows a final symlink, so a
+    // dangling link is EEXIST rather than a file created at its target.
+    const O_EXCL: u64 = 0o200;
+    let excl_create = flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL);
+    // O_DIRECTORY or a trailing slash: the final object must be a directory
+    // (`do_open`: `if ((nd->flags & LOOKUP_DIRECTORY) && !d_can_lookup(...))
+    // return -ENOTDIR;`).
+    let want_dir = flags & 0o200000 != 0 || trailing_slash;
     // Resolve relative paths against the task's cwd and collapse
     // `.`/`..` (absolute-mount form only; the explicit-mount form below
     // keeps its already-relative-to-the-mount path). This is what makes
@@ -1263,7 +1332,10 @@ fn open_impl(
         // path it asked the kernel to refuse. Outside one, an unresolvable
         // path keeps the long-standing "use it as written and let the
         // lookup fail" behaviour, which is what the other callers rely on.
-        match resolve_vfs_symlink_path_scoped(&path_owned, flags & 0o400000 == 0) {
+        match resolve_vfs_symlink_path_scoped(
+            &path_owned,
+            flags & 0o400000 == 0 && !excl_create,
+        ) {
             Ok(resolved) => resolved,
             Err(errno) if current_resolve_scope().is_some() => {
                 ctx.set_return(SyscallReturn::ok(errno as u64));
@@ -1275,6 +1347,26 @@ fn open_impl(
         path_owned
     };
     let path: &str = &path_owned;
+
+    // `open_last_lookups`, create side: once the parent has been walked,
+    // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR);`
+    // — `open("x/", O_CREAT)` is EISDIR whether `x` is missing, a file or a
+    // directory. A parent that does not resolve fails its walk first
+    // (ENOENT / ENOTDIR). Checked before anything below can create `x`.
+    if trailing_slash && flags & O_CREAT != 0 {
+        let parent = match path.rsplit_once('/') {
+            Some(("", _)) => "/",
+            Some((parent, _)) => parent,
+            None => "/",
+        };
+        let errno = if resolve_dir_absolute(parent).is_some() {
+            EISDIR
+        } else {
+            path_lookup_errno(path)
+        };
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
 
     // RLIMIT_NOFILE is enforced by the fd table itself now, so every
     // allocation site reports -EMFILE the same way. The pre-check that used
@@ -1366,12 +1458,55 @@ fn open_impl(
                     None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
                 }
             }
-            // Directory resolves but its FS can't hold an anonymous inode,
-            // or the path doesn't name a directory at all: EOPNOTSUPP so
-            // the caller falls back rather than treating it as fatal.
-            _ => ctx.set_return(errno_ret(EOPNOTSUPP)), // -EOPNOTSUPP
+            // Directory resolves but its FS can't hold an anonymous inode:
+            // EOPNOTSUPP so the caller falls back rather than treating it as
+            // fatal.
+            Some(_) => ctx.set_return(errno_ret(EOPNOTSUPP)), // -EOPNOTSUPP
+            // No directory there. `do_tmpfile` walks the path with
+            // LOOKUP_DIRECTORY first, so this is the walk's own answer — a
+            // non-directory is -ENOTDIR and a missing one -ENOENT — not a
+            // capability of the filesystem (EOPNOTSUPP would send the caller
+            // to its named-temp fallback in a directory that isn't there).
+            None => {
+                let errno = if stat_path_dir_aware(path).is_some() {
+                    ENOTDIR
+                } else {
+                    path_lookup_errno(path)
+                };
+                ctx.set_return(errno_ret(errno));
+            }
         }
         return;
+    }
+
+    // `do_open`: `if ((open_flag & O_EXCL) && !(file->f_mode & FMODE_CREATED))
+    // return -EEXIST;` — any existing object at the final component, a
+    // directory or a (possibly dangling) symlink included, since O_EXCL made
+    // the final lookup non-following. This open path never checked O_EXCL,
+    // so `O_CREAT|O_EXCL` on an existing file silently opened it: lock-file
+    // and mkstemp-style callers all believed they had created a fresh file.
+    if excl_create && mnt_len == 0 {
+        let exists = match fast_create.as_ref() {
+            Some(FastCreateResolution::Existing { .. }) => true,
+            Some(FastCreateResolution::Missing { .. }) => false,
+            None => {
+                current_resolve_absolute(path, |fs, rel| {
+                    if rel.is_empty() {
+                        fs.root_file()
+                    } else {
+                        poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                            .and_then(|r| r.ok())
+                    }
+                })
+                .flatten()
+                .is_some()
+                    || resolve_dir_absolute(path).is_some()
+            }
+        };
+        if exists {
+            ctx.set_return(errno_ret(EEXIST)); // -EEXIST
+            return;
+        }
     }
 
     // O_NOFOLLOW: don't follow a final-component symlink. With O_PATH this
@@ -1402,6 +1537,14 @@ fn open_impl(
         .flatten();
         if let Some(lops) = leaf {
             if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
+                // An unfollowed symlink is not a directory: O_DIRECTORY
+                // reports that (-ENOTDIR, `complete_walk`'s LOOKUP_DIRECTORY
+                // check) before `may_open` can reach its S_IFLNK -ELOOP, and
+                // for O_PATH as well as a real open.
+                if want_dir {
+                    ctx.set_return(errno_ret(ENOTDIR)); // -ENOTDIR
+                    return;
+                }
                 if flags & O_PATH == 0 {
                     ctx.set_return(errno_ret(ELOOP)); // -ELOOP
                     return;
@@ -1479,8 +1622,18 @@ fn open_impl(
         .as_ref()
         .map(|o| o.stat().mode.file_type == narf_filesystem::FileType::Dir)
         .unwrap_or(false);
+    // A directory cannot be opened for writing: `do_open`'s
+    // `if (open_flag & O_CREAT) { ... if (d_is_dir(...)) return -EISDIR; }`
+    // and `may_open`'s `case S_IFDIR: if (acc_mode & MAY_WRITE) return
+    // -EISDIR;`, where O_TRUNC adds MAY_WRITE and the ioctl-only access mode
+    // 3 carries it too. O_PATH reaches here with every such flag stripped.
+    let dir_write_intent = flags & (O_CREAT | 0o1000) != 0 || access_mode != 0;
     if fast_create.is_none() && (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
+            if dir_write_intent {
+                ctx.set_return(errno_ret(EISDIR)); // -EISDIR
+                return;
+            }
             let new_fd = reservation.install(crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
@@ -1615,9 +1768,15 @@ fn open_impl(
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
                         narf_filesystem::FsError::SymlinkLoop => 40,   // ELOOP
                         narf_filesystem::FsError::CrossDevice => 18,      // EXDEV
-                        narf_filesystem::FsError::Busy => 16,             // EBUSY
+                        // The name is taken — the backends' "exists"
+                        // (`memfs::create_with_attrs`), which linkat/rename
+                        // already read as EEXIST.
+                        narf_filesystem::FsError::Busy => 17,             // EEXIST
                         narf_filesystem::FsError::ReadOnly => 30,         // EROFS
-                        narf_filesystem::FsError::Unsupported => 95,      // EOPNOTSUPP
+                        // The directory has no create op (the trait default):
+                        // `lookup_open`'s `if (!dir_inode->i_op->create)
+                        // { error = -EACCES; ... }` — sysfs answers EACCES.
+                        narf_filesystem::FsError::Unsupported => 13,      // EACCES
                         narf_filesystem::FsError::BrokenPipe => 32,       // EPIPE
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
@@ -1632,22 +1791,52 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
                     return;
                 }
-                None | Some(None) => {
+                // The parent did not resolve: that is the walk's failure
+                // (`link_path_walk`), -ENOENT for a missing component or
+                // -ENOTDIR for a non-directory one — `open("file/x",
+                // O_CREAT)` is ENOTDIR. It used to be -EIO, which reads as
+                // a device error for a caller that merely named a missing
+                // directory.
+                None => {
+                    ctx.set_return(errno_ret(path_lookup_errno(path)));
+                    return;
+                }
+                Some(None) => {
                     ctx.set_return(errno_ret(EIO)); // -EIO
                     return;
                 }
             }
         }
         None => {
-            // Missing file (no O_CREAT): report -ENOENT, not the generic
-            // -1 sentinel. musl maps the raw return to -errno, so a
+            // Missing file (no O_CREAT): report the lookup's errno, not the
+            // generic -1 sentinel. musl maps the raw return to -errno, so a
             // daemon that opens an optional file (e.g. redis probing for
             // dump.rdb) sees ENOENT and continues instead of treating it
-            // as a fatal EPERM. Native callers detect the negative range.
-            ctx.set_return(errno_ret(ENOENT)); // -ENOENT
+            // as a fatal EPERM. A non-directory prefix component is
+            // -ENOTDIR (`open("/etc/passwd/x")`), as for stat — see
+            // `path_lookup_errno`.
+            ctx.set_return(errno_ret(path_lookup_errno(path)));
             return;
         }
     };
+
+    // `do_open`, on the object the walk found: O_DIRECTORY (or a trailing
+    // slash) on a non-directory is -ENOTDIR — for O_PATH too, whose
+    // `path_lookupat` applies the same LOOKUP_DIRECTORY check — and a
+    // directory reached with write intent is -EISDIR (see
+    // `dir_write_intent`). The directory branch above covers directories
+    // that resolve as `DirOps`; this covers directory-typed file nodes.
+    {
+        let is_dir = ops.stat().mode.file_type == narf_filesystem::FileType::Dir;
+        if want_dir && !is_dir {
+            ctx.set_return(errno_ret(ENOTDIR)); // -ENOTDIR
+            return;
+        }
+        if is_dir && dir_write_intent && !created {
+            ctx.set_return(errno_ret(EISDIR)); // -EISDIR
+            return;
+        }
+    }
 
     // O_PATH: install a bare path-reference fd. Per Linux `do_dentry_open`,
     // an O_PATH open resolves the node but invokes NO file operation — no
@@ -1659,7 +1848,8 @@ fn open_impl(
     // this, `systemd-tmpfiles-setup-dev` and sd-device — which scan /dev with
     // `openat(…, O_PATH|O_NOFOLLOW)` purely to stat each node — parked forever
     // the moment they reached a FIFO with no writer. Directories still wrap in
-    // `DirFdFile` so `openat`-relative descent and getdents work.
+    // `DirFdFile` so `openat`-relative descent works (getdents on it is
+    // still -EBADF, as `fdget` masks FMODE_PATH — see sys_getdents_common).
     if flags & O_PATH != 0 {
         let ops = if let Some(dirops) = ops.as_dir() {
             alloc::sync::Arc::new(DirFdFile { dir: dirops }) as Arc<dyn narf_filesystem::FileOps>
@@ -1716,6 +1906,11 @@ fn open_impl(
     // FSes report (uid=0, gid=0, perms=0o666) so non-root tasks see
     // the "other" triplet's rw bits and pass; the gate is structural
     // until ext2/minix start surfacing real owners.
+    // `build_open_flags`: `if (flags & O_TRUNC) acc_mode |= MAY_WRITE;` —
+    // truncating is writing, so O_RDONLY|O_TRUNC still needs write
+    // permission, a writable mount and a mutable inode. `do_open` drops
+    // O_TRUNC (and the whole acc_mode) for a file it just created.
+    let may_write = want_w || (flags & 0o1000 != 0 && !created);
     let (stat, file_uid, file_gid) = if created {
         // Linux's may_open() permission check applies to an existing inode.
         // A newly created file is already open under the creation intent;
@@ -1728,7 +1923,7 @@ fn open_impl(
         (Some(stat), file_uid, file_gid)
     };
     if let Some(stat) = stat {
-        let wanted = u16::from(want_r) * 0o4 + u16::from(want_w) * 0o2;
+        let wanted = u16::from(want_r) * 0o4 + u16::from(may_write) * 0o2;
         let owner = current_host_fsuid(task) == file_uid;
         // Linux tests inode ownership before `check_acl`: ACL_USER_OBJ is
         // already mirrored into the mode's owner triplet, and no named ACL
@@ -1800,7 +1995,7 @@ fn open_impl(
     // inside it still cannot reach a device.
     if narf_filesystem::any_restricted_mounts() {
         let mnt = current_mount_flags_at(path);
-        if want_w && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
+        if may_write && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
             ctx.set_return(errno_ret(EROFS)); // -EROFS
             return;
         }
@@ -1830,7 +2025,7 @@ fn open_impl(
         const O_APPEND: u64 = 0o2000;
         const O_TRUNC: u64 = 0o1000;
         let iflags = ops.inode_flags();
-        if want_w && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        if may_write && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
             ctx.set_return(errno_ret(EPERM)); // -EPERM
             return;
         }
@@ -1848,6 +2043,32 @@ fn open_impl(
         if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
             ctx.set_return(denied);
             return;
+        }
+    }
+
+    // O_TRUNC: `do_open` -> `handle_truncate` -> `do_truncate(..., 0, ...)`
+    // for an existing regular file, whatever the access mode (Linux
+    // truncates on O_RDONLY|O_TRUNC too). This open path accepted O_TRUNC
+    // but never truncated, so `creat()` / `open(O_WRONLY|O_CREAT|O_TRUNC)`
+    // over a longer file left its old tail behind the new contents. Like
+    // `truncate(2)`, the size change also clears set-user/group-ID. A
+    // backend without a size op (`Unsupported` — synthetic attribute files
+    // written with `echo > …`) keeps opening as before.
+    if flags & 0o1000 != 0
+        && !created
+        && ops.stat().mode.file_type == narf_filesystem::FileType::File
+        && ops.stat().size != 0
+    {
+        match poll_blocking(ops.truncate(0)) {
+            Some(Ok(())) => {
+                file_remove_privs(ops.as_ref(), task);
+                crate::mqueue::notify_modify_path(path);
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(error)) => {
+                ctx.set_return(errno_ret(copy_fs_errno(error)));
+                return;
+            }
         }
     }
 
@@ -2472,32 +2693,8 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     const S_IFCHR: u64 = 0o020000;
     const S_IFBLK: u64 = 0o060000;
     const S_IFIFO: u64 = 0o010000;
-    // `fs/namei.c::may_mknod` screens the node type BEFORE `filename_create`
-    // looks the path up, so a mode mknod cannot create outranks a bad path:
-    //
-    //     case S_IFREG: case S_IFCHR: case S_IFBLK:
-    //     case S_IFIFO: case S_IFSOCK: case 0:  return 0;
-    //     case S_IFDIR:                         return -EPERM;
-    //     default:                              return -EINVAL;
-    //
-    // A directory is EPERM — mkdir(2) is the only way to make one, and glibc
-    // relies on that to decide whether to fall back. NARF used to accept
-    // S_IFDIR here and create the directory, which is a NARF-only extension
-    // no portable caller can use, and reported every other malformed mode as
-    // the `-1` sentinel (EPERM) — colliding with the one mode that really is
-    // EPERM and hiding the EINVAL that says "this node type does not exist".
-    {
-        const S_IFREG: u64 = 0o100000;
-        const S_IFCHR_M: u64 = 0o020000;
-        const S_IFBLK_M: u64 = 0o060000;
-        const S_IFIFO_M: u64 = 0o010000;
-        const S_IFSOCK: u64 = 0o140000;
-        const S_IFDIR_M: u64 = 0o040000;
-        match mode & S_IFMT {
-            0 | S_IFREG | S_IFCHR_M | S_IFBLK_M | S_IFIFO_M | S_IFSOCK => {}
-            S_IFDIR_M => return errno_ret(EPERM), // -EPERM
-            _ => return errno_ret(EINVAL),        // -EINVAL
-        }
+    if let Err(errno) = may_mknod(mode) {
+        return SyscallReturn::ok(errno as u64);
     }
     if raw_path.is_empty() {
         return errno_ret(ENOENT); // -ENOENT
@@ -2506,33 +2703,46 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     // applied its dirfd so a relative path is resolved against the dirfd's
     // directory, not the cwd. `resolve_cwd_path` then only normalises a
     // cwd-relative `mknod(2)` path (absolute inputs pass through unchanged).
+    // The last-component shape is read off the RAW string first, since
+    // normalising erases a trailing slash and a final `.`.
+    let last = LastComponent::of(raw_path);
     let path = resolve_cwd_path(current_task_id(), raw_path);
-    let path_ref = {
-        let t = path.trim_end_matches('/');
-        if t.is_empty() {
-            // No LOOKUP_EMPTY on this path, so `getname()` rejects "" with
-            // -ENOENT rather than the sentinel's EPERM.
-            return errno_ret(ENOENT);
-        }
-        t
-    };
+    let fmt = mode & S_IFMT;
+    // `filename_create`: walk errors, then EEXIST for an existing name (or
+    // `.`/`..`/`/`), then ENOENT for a trailing slash — all BEFORE the
+    // read-only, permission and CAP_MKNOD checks below. The one NARF-local
+    // exception is the empty regular-file placeholder a FIFO/device node
+    // may replace (see the unlink further down).
+    match filename_create_check(&path, last) {
+        Ok(()) => {}
+        Err(errno)
+            if errno == -EEXIST
+                && last == LastComponent::Norm
+                && (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
+                && resolve_parent_dir_async(&path)
+                    .and_then(|(parent, leaf)| poll_blocking(parent.lookup_async(&leaf)))
+                    .and_then(Result::ok)
+                    .is_some_and(|entry| {
+                        entry.stat().mode.file_type == narf_filesystem::FileType::File
+                            && entry.stat().size == 0
+                    }) => {}
+        Err(errno) => return SyscallReturn::ok(errno as u64),
+    }
+    let path_ref = path.as_str();
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            return errno_ret(ENOENT); // -ENOENT
+            return SyscallReturn::ok((-path_lookup_errno(path_ref)) as u64);
         }
     };
     if let Err(errno) = mnt_want_write(path_ref) {
         return SyscallReturn::ok(errno as u64);
     }
     // `do_mknodat` -> `filename_create` -> `may_create(dir, ..)`: write+exec
-    // on the directory gaining the node. CAP_MKNOD for a device node is a
-    // separate gate (`may_mknod` above screened the TYPE, not the
-    // privilege) and is not modelled here.
+    // on the directory gaining the node.
     if let Err(errno) = may_create_in(&*parent, current_task_id()) {
         return SyscallReturn::ok(errno as u64);
     }
-    let fmt = mode & S_IFMT;
     // `vfs_mknod`:
     //
     //     if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout &&
@@ -2548,6 +2758,54 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     if (fmt == S_IFCHR || fmt == S_IFBLK) && !capable(CAP_MKNOD) {
         return errno_ret(EPERM); // -EPERM
     }
+    mknod_create(&*parent, &leaf, mode, fmt, dev)
+}
+
+/// `fs/namei.c::may_mknod` — the node-type screen `do_mknodat` runs before
+/// it even reads the pathname, so a bad mode outranks -EFAULT for a bad
+/// path pointer and every path-walk error.
+fn may_mknod(mode: u64) -> Result<(), i64> {
+    const S_IFMT: u64 = 0o170000;
+    // `fs/namei.c::may_mknod` screens the node type BEFORE `filename_create`
+    // looks the path up, so a mode mknod cannot create outranks a bad path:
+    //
+    //     case S_IFREG: case S_IFCHR: case S_IFBLK:
+    //     case S_IFIFO: case S_IFSOCK: case 0:  return 0;
+    //     case S_IFDIR:                         return -EPERM;
+    //     default:                              return -EINVAL;
+    //
+    // A directory is EPERM — mkdir(2) is the only way to make one, and glibc
+    // relies on that to decide whether to fall back. NARF used to accept
+    // S_IFDIR here and create the directory, which is a NARF-only extension
+    // no portable caller can use, and reported every other malformed mode as
+    // the `-1` sentinel (EPERM) — colliding with the one mode that really is
+    // EPERM and hiding the EINVAL that says "this node type does not exist".
+    const S_IFREG: u64 = 0o100000;
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFBLK: u64 = 0o060000;
+    const S_IFIFO: u64 = 0o010000;
+    const S_IFSOCK: u64 = 0o140000;
+    const S_IFDIR: u64 = 0o040000;
+    match mode & S_IFMT {
+        0 | S_IFREG | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK => Ok(()),
+        S_IFDIR => Err(-EPERM),
+        _ => Err(-EINVAL),
+    }
+}
+
+/// The node-creating tail of [`mknod_common`], once every `filename_create`
+/// / `vfs_mknod` check has passed.
+fn mknod_create(
+    parent: &dyn narf_filesystem::DirOps,
+    leaf: &str,
+    mode: u64,
+    fmt: u64,
+    dev: u64,
+) -> SyscallReturn {
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFBLK: u64 = 0o060000;
+    const S_IFIFO: u64 = 0o010000;
+    let leaf = alloc::string::String::from(leaf);
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
         if (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
@@ -2604,7 +2862,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             // setgid parent hands down its group. A device node or FIFO in
             // a shared group directory has to land in that group like
             // anything else.
-            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o7777) as u16, false);
+            let inherited = inherit_acls_from_parent(parent, (mode & 0o7777) as u16, false);
             let _ = poll_blocking(n.set_owners(inherited.uid, inherited.gid));
             let _ = poll_blocking(n.set_perms(inherited.mode));
             if let Some(blob) = inherited.access.as_ref() {
@@ -2906,6 +3164,12 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
             return;
         }
     };
+    // stat/lstat pass no LOOKUP_EMPTY, so `getname()` rejects "" with
+    // -ENOENT. Joined onto the cwd it used to stat the cwd and succeed.
+    if raw.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     stat_linux_path(ctx, &raw, out_arg, follow_final);
 }
 
@@ -2991,12 +3255,23 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     } else {
         raw
     };
+    // `link_path_walk` sees the name as written: `file/`, `file/.` and
+    // `file/../x` are -ENOTDIR, which the normalised path below cannot
+    // tell. A name ending in a slash is also followed even for lstat, so the
+    // proven directory (link-expanded) is what gets described.
+    let dir_named = match literal_walk_check(task, raw) {
+        Ok(dir) => dir,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
     // caller's cwd before chroot, so the stat family works from any
     // working directory — not just absolute paths.
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
-    let path_owned = resolve_cwd_path(task, raw);
+    let path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, raw));
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     // `resolve_absolute` splits an absolute path into (mount, rel).
@@ -3237,7 +3512,7 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
 }
 
 /// Map an `FsError` from `DirOps::rename` to the Linux errno userspace
-/// expects. `NotFound` → ENOENT (source is gone), `Busy` → EEXIST,
+/// expects. `NotFound` → ENOENT (source is gone), `Busy` → ENOTEMPTY,
 /// `InvalidPath` → EINVAL, `CrossDevice` → EXDEV, `ReadOnly` → EROFS,
 /// everything else → EPERM.
 /// Never a bare -1 → systemd renames propagation dirs during mount
@@ -3246,7 +3521,12 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
         FsError::NotFound => -ENOENT,
-        FsError::Busy => -EEXIST,
+        // The backends (memfs `validate_replacement`, ext2's empty check)
+        // report a non-empty destination DIRECTORY as `Busy`; `->rename`
+        // answers that with -ENOTEMPTY. It used to read EEXIST, an errno
+        // plain rename(2) never returns (RENAME_NOREPLACE's EEXIST is decided
+        // by `rename_impl` before the backend is reached).
+        FsError::Busy => -ENOTEMPTY,
         FsError::InvalidPath => -EINVAL,
         FsError::CrossDevice => -EXDEV,
         FsError::ReadOnly => -EROFS,  // inode_permission
@@ -3263,6 +3543,123 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         _ => -EPERM,
     };
     code as u64
+}
+
+/// `nd->last_type` plus "did the last component carry trailing slashes"
+/// (`last.name[last.len] != 0`) for a caller's RAW pathname.
+///
+/// NARF normalises a path lexically (`resolve_cwd_path`) before resolving
+/// it, which erases exactly the two facts `fs/namei.c` bases several
+/// namespace-mutation errnos on: `rmdir("d/.")` is -EINVAL and
+/// `rename("d/.", x)` -EBUSY (LAST_DOT), `unlink("f/")` is -ENOTDIR and
+/// `mknod("new/")` -ENOENT (trailing slash). Classify BEFORE normalising.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LastComponent {
+    /// `LAST_NORM`, no trailing slash.
+    Norm,
+    /// `LAST_NORM` followed by one or more `/`.
+    NormSlash,
+    /// `LAST_DOT` — the path ends in `.`.
+    Dot,
+    /// `LAST_DOTDOT` — the path ends in `..`.
+    DotDot,
+    /// `LAST_ROOT` — the path is only slashes.
+    Root,
+}
+
+impl LastComponent {
+    pub(crate) fn of(raw: &str) -> Self {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return if raw.is_empty() { Self::Norm } else { Self::Root };
+        }
+        match trimmed.rsplit('/').next().unwrap_or(trimmed) {
+            "." => Self::Dot,
+            ".." => Self::DotDot,
+            _ if trimmed.len() != raw.len() => Self::NormSlash,
+            _ => Self::Norm,
+        }
+    }
+
+    pub(crate) fn is_norm(self) -> bool {
+        matches!(self, Self::Norm | Self::NormSlash)
+    }
+}
+
+/// The parent directory of a normalised absolute path (`"/"` for `"/x"`).
+fn parent_of_abs(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
+}
+
+/// Is `path` a strict descendant of `ancestor` (both normalised absolute)?
+fn path_is_strictly_under(path: &str, ancestor: &str) -> bool {
+    if ancestor == "/" {
+        return path != "/";
+    }
+    path.len() > ancestor.len()
+        && path.starts_with(ancestor)
+        && path.as_bytes()[ancestor.len()] == b'/'
+}
+
+/// What `lookup_one_qstr_excl` finds at a normalised absolute path, without
+/// following a final symlink: `None` = negative dentry, `Some(is_dir)`.
+fn namespace_node_kind(path: &str) -> Option<bool> {
+    stat_ino_path_dir_aware_ext(path, false)
+        .map(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+}
+
+/// `filename_parentat`: walk to the directory the last component lives in.
+/// Returns that directory's path, or the negative errno the walk fails with
+/// (-ENOENT / -ENOTDIR / -EACCES / -ELOOP, via `path_lookup_errno`). For a
+/// `.`/`..` last component the walk goes THROUGH the named directory, so
+/// the normalised path itself must resolve.
+fn parentat_dir(path: &str, last: LastComponent) -> Result<alloc::string::String, i64> {
+    let dir = match last {
+        LastComponent::Root => return Ok(alloc::string::String::from("/")),
+        LastComponent::Dot | LastComponent::DotDot => path,
+        _ => parent_of_abs(path),
+    };
+    // The dir-aware stat covers real directories, mount roots, synthetic
+    // mount ancestors and — since intermediate components are followed —
+    // a symlink to a directory (`/proc/self/…`).
+    if stat_ino_path_dir_aware(dir)
+        .is_some_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+    {
+        return Ok(alloc::string::String::from(dir));
+    }
+    // `path_lookup_errno` classifies every component BEFORE the leaf, so
+    // hand it a path whose parent is `dir`.
+    Err(-path_lookup_errno(&alloc::format!("{dir}/.")))
+}
+
+/// `fs/namei.c::filename_create` up to (not including) `mnt_want_write`,
+/// for a non-directory create (`mknod`, `symlink`, `link`'s new name):
+///
+/// ```text
+/// error = filename_parentat(..);             /* walk errors */
+/// if (unlikely(type != LAST_NORM)) -EEXIST;  /* ".", "..", "/" */
+/// dentry = lookup_one_qstr_excl(.., LOOKUP_CREATE | LOOKUP_EXCL);
+///                                            /* positive -> -EEXIST */
+/// if (unlikely(!create_flags) && last.name[last.len]) -ENOENT;
+/// if (unlikely(err2 /* mnt_want_write */)) -EROFS;
+/// ```
+///
+/// So an existing name is EEXIST whatever else is wrong with the request —
+/// a read-only mount or an unwritable directory included — and a trailing
+/// slash on a name that does not exist is ENOENT, not a silently created
+/// node.
+fn filename_create_check(path: &str, last: LastComponent) -> Result<(), i64> {
+    parentat_dir(path, last)?;
+    if !last.is_norm() || namespace_node_kind(path).is_some() {
+        return Err(-EEXIST);
+    }
+    if last == LastComponent::NormSlash {
+        return Err(-ENOENT);
+    }
+    Ok(())
 }
 
 // ── Mkdir / Rmdir / Rename — Tier-3b directory mutation ────────────
@@ -3607,12 +4004,51 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         return;
     }
     let task = current_task_id();
+    let old_last = LastComponent::of(old_raw);
+    let new_last = LastComponent::of(new_raw);
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);
+    // `do_linkat` resolves the OLD name first (`filename_lookup`, no
+    // LOOKUP_FOLLOW), so a missing source is -ENOENT (or the walk's
+    // -ENOTDIR) whatever is wrong with the new name. A trailing slash makes
+    // the lookup demand a directory: `link("file/", x)` is -ENOTDIR.
+    let old_is_dir = match namespace_node_kind(&old_path) {
+        Some(is_dir) => is_dir,
+        None => {
+            ctx.set_return(errno_ret(path_lookup_errno(&old_path)));
+            return;
+        }
+    };
+    if !old_is_dir && old_last == LastComponent::NormSlash {
+        ctx.set_return(errno_ret(ENOTDIR));
+        return;
+    }
+    // Then `filename_create(newdfd, new, ..)`: walk errors, EEXIST for an
+    // existing name — the backend used to decide that AFTER the read-only
+    // and permission checks, and before noticing a missing source — and
+    // ENOENT for a trailing slash on a new name.
+    if let Err(errno) = filename_create_check(&new_path, new_last) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // Only the directory GAINING a name is written, so only that mount
     // needs to be writable — a hard link from a read-only mount into a
     // writable one is legal.
     if let Err(errno) = mnt_want_write(&new_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `do_linkat`: `if (old_path.mnt != new_path.mnt) goto out (-EXDEV)` —
+    // before `vfs_link` runs `may_create`, so a cross-mount link is EXDEV
+    // even into a directory the caller could not write.
+    if current_mount_id_at(&old_path) != current_mount_id_at(parent_of_abs(&new_path)) {
+        ctx.set_return(errno_ret(EXDEV));
+        return;
+    }
+    // `vfs_link` -> `may_create(new_dir, ..)`. The OLD name is only read, so
+    // it needs no directory write permission — only the directory gaining a
+    // name does.
+    if let Err(errno) = check_may_create(&new_path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
@@ -3622,11 +4058,11 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         ctx.set_return(errno_ret(EPERM)); // -EPERM
         return;
     }
-    // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
-    // OLD name is only read, so it needs no directory write permission —
-    // only the directory gaining a name does.
-    if let Err(errno) = check_may_create(&new_path) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+    // `vfs_link`: `if (S_ISDIR(inode->i_mode)) return -EPERM;`. The backends
+    // refuse a directory as `InvalidPath`, which the cross-directory branch
+    // below reported as EXDEV.
+    if old_is_dir {
+        ctx.set_return(errno_ret(EPERM)); // -EPERM
         return;
     }
     let (Some(old_split), Some(new_split)) = (old_path.rfind('/'), new_path.rfind('/')) else {
@@ -3709,11 +4145,15 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
     };
     let new_leaf = alloc::string::String::from(&new_path[split + 1..]);
     if new_leaf.is_empty() {
-        return -22; // -EINVAL
+        // Only `/` normalises to an empty leaf: `filename_create` answers
+        // LAST_ROOT with -EEXIST.
+        return -EEXIST;
     }
     let dir_path = if split == 0 { "/" } else { &new_path[..split] };
     let Some(dir) = resolve_dir_absolute(dir_path) else {
-        return -2; // -ENOENT: target directory doesn't exist
+        // The walk to the target directory failed; say why (ENOENT, or
+        // ENOTDIR for a file component) as `link_path_walk` does.
+        return -path_lookup_errno(new_path);
     };
     match poll_blocking(dir.link_node(&new_leaf, node)) {
         Some(Ok(())) => {
@@ -3778,6 +4218,21 @@ fn readlink_impl(
         return;
     }
     let buf_len = buf_len as usize;
+    // `link_path_walk` sees the name as written: `file/`, `file/.` and
+    // `file/../x` are -ENOTDIR. A name ending in `/`, `/.` or `/..` is
+    // resolved FOLLOWING its final link, so what it names is a directory
+    // and never a symlink: -EINVAL (`readlink("dirlink/")` on 6.18).
+    match literal_walk_check(current_task_id(), &raw) {
+        Ok(None) => {}
+        Ok(Some(_dir)) => {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        }
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
     let path = resolve_cwd_path(current_task_id(), &raw);
@@ -3816,25 +4271,36 @@ fn readlink_impl(
     // therefore report EINVAL (not the generic -1 → EPERM, which aborted
     // realpath at the first directory component); a path that names nothing
     // reports ENOENT.
-    let einval = errno_ret(EINVAL); // -EINVAL: exists, not a symlink
-    let enoent = errno_ret(ENOENT); // -ENOENT: nothing here
     let file = match file {
         Some(f) => f,
         None => {
             // Not a file. Directories and mount roots exist but aren't
-            // symlinks → EINVAL; a truly absent path → ENOENT.
+            // symlinks → EINVAL; a path that does not resolve reports the
+            // walk's own errno — -ENOENT, or -ENOTDIR for a non-directory
+            // ancestor (`readlink("file/x")`), -ELOOP, -EACCES, -ENAMETOOLONG.
             if stat_path_dir_aware(&path).is_some() {
-                ctx.set_return(einval);
+                ctx.set_return(errno_ret(EINVAL));
             } else {
-                ctx.set_return(enoent);
+                ctx.set_return(errno_ret(path_lookup_errno(&path)));
             }
             return;
         }
     };
+    readlink_node(ctx, &file, buf_ptr, buf_len);
+}
+
+/// `vfs_readlink` on a node already looked up: -EINVAL unless it is a
+/// symlink, then the target copied out (EFAULT only at the copy).
+fn readlink_node(
+    ctx: &mut dyn TrapContext,
+    file: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    buf_ptr: *mut u8,
+    buf_len: usize,
+) {
     // Refuse non-symlinks — POSIX readlink returns EINVAL for those.
     let st = file.stat();
     if st.mode.file_type != narf_filesystem::FileType::Symlink {
-        ctx.set_return(einval);
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `st_size` is only a hint for symlinks and is deliberately zero for
@@ -4093,6 +4559,27 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     Ok(())
 }
 
+/// `fs/read_write.c::rw_verify_area` position/length half, for a file whose
+/// position is meaningful (Linux passes `ppos == NULL` for FMODE_STREAM, so
+/// callers skip streams unless Linux uses `f_pos` unconditionally):
+///
+/// ```text
+///   if (unlikely((ssize_t) count < 0)) return -EINVAL;
+///   if (pos < 0) return -EINVAL;                     /* !unsigned_offsets */
+///   else if ((loff_t) (pos + count) < 0) return -EINVAL;
+/// ```
+///
+/// So `pread(fd, buf, 10, INT64_MAX - 5)` is -EINVAL, not a 0-byte EOF.
+fn rw_verify_area_pos(pos: u64, count: usize) -> Result<(), i64> {
+    if count > isize::MAX as usize
+        || (pos as i64) < 0
+        || (pos as i64).checked_add(count as i64).is_none()
+    {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone)]
 struct ImportedRwIovec {
     base: u64,
@@ -4108,12 +4595,29 @@ fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<Impor
     }
     // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
     let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
+    // `lib/iov_iter.c::copy_iovec_from_user` rejects an iov_len with the
+    // ssize_t sign bit set (-EINVAL) while copying the array — before
+    // `__import_iovec` runs a single access_ok, so a negative length outranks
+    // a bad base in an earlier element.
+    if raw
+        .chunks_exact(16)
+        .any(|slot| (u64::from_ne_bytes(slot[8..].try_into().unwrap()) as i64) < 0)
+    {
+        return Err(EINVAL as u64);
+    }
     let mut out = alloc::vec::Vec::with_capacity(iovcnt);
     let mut remaining = LINUX_MAX_RW_COUNT;
     for slot in raw.chunks_exact(16) {
         let base = u64::from_ne_bytes(slot[..8].try_into().unwrap());
         let requested = u64::from_ne_bytes(slot[8..].try_into().unwrap()) as usize;
-        validate_rw_user_range(base, requested)?;
+        // A one-element vector takes `__import_iovec_ubuf` -> `import_ubuf`,
+        // which clamps to MAX_RW_COUNT BEFORE access_ok; the multi-element
+        // loop checks the full length first.
+        if iovcnt == 1 {
+            validate_rw_user_range(base, core::cmp::min(requested, remaining))?;
+        } else {
+            validate_rw_user_range(base, requested)?;
+        }
         let len = core::cmp::min(requested, remaining);
         remaining -= len;
         out.push(ImportedRwIovec { base, len });
@@ -4133,10 +4637,19 @@ fn copy_fd_endpoint_from_table(
     fd_num: u32,
 ) -> Option<CopyFdEndpoint> {
     let entry = table.get(fd_num)?;
+    let status_flags = table.status_flags(fd_num)?;
+    // `fdget()` is `__fget_light(fd, FMODE_PATH)`: an O_PATH file is
+    // invisible to every fdget() user, so it is -EBADF at lookup time — before
+    // ESPIPE (pread/preadv), EFAULT (splice offsets), or the -EINVAL that
+    // ftruncate/fallocate give a non-writable file. Only fdget_raw() callers
+    // (fstat, fchdir, *at dirfds…) may see O_PATH, and none of them use this.
+    if status_flags & crate::fd::O_PATH != 0 {
+        return None;
+    }
     Some(CopyFdEndpoint {
         ops: entry.ops.clone(),
         description: table.description(fd_num)?,
-        status_flags: table.status_flags(fd_num)?,
+        status_flags,
     })
 }
 
@@ -6078,68 +6591,120 @@ const XATTR_AT_FDCWD: i64 = -100;
 ///
 /// `filename_maybe_null` is what makes a NULL pathname legal, and only with
 /// AT_EMPTY_PATH; the `dfd >= 0` guard is why `AT_FDCWD` with a NULL path
-/// still takes the path branch (and fails there) rather than silently
-/// operating on the cwd.
+/// still takes the path branch — where the empty lookup names the cwd. The
+/// list/remove bodies lack that guard (see `cwd_ok` below).
 ///
 /// Returns the resolved absolute path (or the `f*xattr` fd key) together
 /// with the `follow_final` the caller must hand to the core.
-fn xattr_at_path(dfd: i64, path_ptr: u64, at_flags: u32) -> Result<(alloc::string::String, bool), i64> {
-    if at_flags & !(XATTR_AT_SYMLINK_NOFOLLOW | XATTR_AT_EMPTY_PATH) != 0 {
-        return Err(XE_INVAL);
-    }
+fn xattr_at_path(
+    dfd: i64,
+    path_ptr: u64,
+    at_flags: u32,
+    cwd_ok: bool,
+) -> Result<(alloc::string::String, bool), i64> {
+    // The caller (`xattr_*_at`) has already run the `at_flags` check and
+    // imported the name/value: `path_*xattrat` does both BEFORE it touches
+    // the pathname, so a bad name is -ERANGE even when the path or the
+    // descriptor is also bad.
     let follow = at_flags & XATTR_AT_SYMLINK_NOFOLLOW == 0;
+    let task = current_task_id();
+    // `int dfd`: only the low 32 bits of the register are the argument.
+    let dfd = dfd as i32 as i64;
     // A NULL pathname is `filename_maybe_null` returning NULL, which is only
     // legal with AT_EMPTY_PATH; an empty STRING reaches the same arm because
     // `getname_flags` maps "" + AT_EMPTY_PATH to it too.
-    let empty = if path_ptr == 0 {
+    let raw = if path_ptr == 0 {
         if at_flags & XATTR_AT_EMPTY_PATH == 0 {
             // `getname` on a NULL pointer is -EFAULT.
             return Err(XE_FAULT);
         }
-        true
+        alloc::string::String::new()
     } else {
         let raw = copy_user_cstr(path_ptr, 4096).ok_or(XE_FAULT)?;
-        if raw.is_empty() {
-            if at_flags & XATTR_AT_EMPTY_PATH == 0 {
-                // `getname` rejects "" without AT_EMPTY_PATH: -ENOENT.
-                return Err(-ENOENT);
-            }
-            true
-        } else {
-            let task = current_task_id();
-            let anchored = apply_chroot(&resolve_at_path(task, dfd, &raw)?);
-            // The VFS-level symlink walk, exactly as `open` runs it:
-            //
-            //   resolve_vfs_symlink_path(&path_owned, flags & O_NOFOLLOW == 0)
-            //
-            // This is where LOOKUP_FOLLOW actually lives. It has the mount
-            // table, so it can follow an ABSOLUTE symlink target out of the
-            // filesystem the link sits on — which the in-filesystem resolver
-            // cannot, since it restarts such a target at its own mount root.
-            // Every absolute target (`/usr/bin/awk` -> `/etc/alternatives/awk`,
-            // and every `/lib` -> `/usr/lib` merge) depends on that.
-            //
-            // `unwrap_or` keeps a path the walk could not resolve: the xattr
-            // core reports the real errno for a missing name, and swallowing
-            // it here would turn every ENOENT into a resolution failure.
-            let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
-            return Ok((resolved, follow));
+        if raw.is_empty() && at_flags & XATTR_AT_EMPTY_PATH == 0 {
+            // `getname` rejects "" without AT_EMPTY_PATH: -ENOENT.
+            return Err(-ENOENT);
         }
+        raw
     };
-    debug_assert!(empty);
-    // The fd branch. `dfd >= 0` is Linux's guard: AT_FDCWD here is not a
-    // descriptor, so it cannot name a file and falls through to the path
-    // branch, which has no path — -EBADF.
-    if dfd < 0 || dfd == XATTR_AT_FDCWD {
-        return Err(XE_BADF);
+    if raw.is_empty() {
+        // `path_setxattrat` / `path_getxattrat` test
+        // `if (!filename && dfd >= 0)`: only a real descriptor takes the fd
+        // branch, and AT_FDCWD falls through to `filename_*xattr(AT_FDCWD,
+        // NULL, ...)`, whose empty lookup lands on the cwd itself. The list
+        // and remove bodies test plain `if (!filename)`, so there AT_FDCWD
+        // reaches `fdget` and is -EBADF. Probed on Linux 6.18:
+        // `fgetxattr(AT_FDCWD, ...)` / `fsetxattr` act on the cwd, while
+        // `fremovexattr` / `flistxattr` / `listxattrat(AT_FDCWD, "",
+        // AT_EMPTY_PATH)` are EBADF. `cwd_ok` selects the former.
+        if cwd_ok && dfd == XATTR_AT_FDCWD {
+            return xattr_lookup(task, dfd, ".", follow);
+        }
+        if dfd < 0 {
+            return Err(XE_BADF);
+        }
+        // `CLASS(fd, f)(dfd)` is `fdget`, which does not hand out O_PATH
+        // files: `fgetxattr(open(p, O_PATH), ...)` is -EBADF.
+        let status = fd::with_table(task, |t| t.status_flags(dfd as u32)).flatten();
+        if status.is_some_and(|flags| flags & crate::fd::O_PATH != 0) {
+            return Err(XE_BADF);
+        }
+        // Same side-table key the `f*xattr` family uses, so an AT_EMPTY_PATH
+        // call and an `f*xattr` call on the same descriptor address the same
+        // attributes. (Both are separate from the path-keyed family — see
+        // `xattr_fd_key`.)
+        return xattr_fd_key(dfd as u32)
+            .map(|key| (key, follow))
+            .ok_or(XE_BADF);
     }
-    // Same side-table key the `f*xattr` family uses, so an AT_EMPTY_PATH
-    // call and an `f*xattr` call on the same descriptor address the same
-    // attributes. (Both are separate from the path-keyed family — see
-    // `xattr_fd_key`.)
-    xattr_fd_key(dfd as u32)
-        .map(|key| (key, follow))
-        .ok_or(XE_BADF)
+    xattr_lookup(task, dfd, &raw, follow)
+}
+
+/// The `filename_lookup` half of [`xattr_at_path`].
+fn xattr_lookup(
+    task: u64,
+    dfd: i64,
+    raw: &str,
+    follow: bool,
+) -> Result<(alloc::string::String, bool), i64> {
+    // `resolve_cwd_path`, not a bare `apply_chroot`: a RELATIVE name has to
+    // be joined onto the cwd before anything can resolve it (`apply_chroot`
+    // passes relative paths through untouched).
+    let anchored = resolve_cwd_path(task, &resolve_at_path(task, dfd, raw)?);
+    // The VFS-level symlink walk, exactly as `open` runs it:
+    //
+    //   resolve_vfs_symlink_path(&path_owned, flags & O_NOFOLLOW == 0)
+    //
+    // This is where LOOKUP_FOLLOW actually lives. It has the mount
+    // table, so it can follow an ABSOLUTE symlink target out of the
+    // filesystem the link sits on — which the in-filesystem resolver
+    // cannot, since it restarts such a target at its own mount root.
+    // Every absolute target (`/usr/bin/awk` -> `/etc/alternatives/awk`,
+    // and every `/lib` -> `/usr/lib` merge) depends on that.
+    //
+    // `unwrap_or` keeps a path the walk could not resolve, so the check
+    // below can classify WHY it did not resolve.
+    let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
+    // `filename_lookup` fails before any xattr code runs: a name that is
+    // not there is -ENOENT (-ENOTDIR / -ELOOP / -EACCES from the walk),
+    // never a silent store into the path-keyed side table. A node the
+    // xattr resolver cannot reach but `stat` can (a synthetic filesystem
+    // with no xattr store) still exists, and keeps the side table.
+    // With LOOKUP_FOLLOW a dangling final symlink is -ENOENT too: the walk
+    // above left it unexpanded, and the xattr resolver (which never follows)
+    // would otherwise find the link itself.
+    let exists = stat_ino_path_dir_aware_ext(&resolved, follow).is_some()
+        || match xattr_target(&resolved) {
+            Some(XattrTarget::File(file)) => {
+                !follow || file.stat().mode.file_type != narf_filesystem::FileType::Symlink
+            }
+            Some(XattrTarget::Dir(_)) => true,
+            None => false,
+        };
+    if !exists {
+        return Err(-path_lookup_errno(&resolved));
+    }
+    Ok((resolved, follow))
 }
 
 /// `struct xattr_args` (`include/uapi/linux/xattr.h`), read with
@@ -6236,22 +6801,20 @@ fn xattr_import_name(ptr: u64) -> Result<alloc::string::String, i64> {
     }
 }
 
-/// `fs/xattr.c::xattr_resolve_name` + `xattr_permission`, for the handler
-/// set every NARF filesystem with xattrs presents (`security`, `trusted`,
-/// `user`, and `system` for the two POSIX ACL names).
+/// `fs/xattr.c::xattr_resolve_name`, for the handler set every NARF
+/// filesystem with xattrs presents (`security`, `trusted`, `user`, and
+/// `system` for the two POSIX ACL names).
 ///
-/// `write` selects Linux's asymmetry: a namespace the caller may not touch
-/// answers `-EPERM` to a set/remove and `-ENODATA` to a get, so a
-/// `getxattr` can never be used to probe for the existence of an attribute
-/// the caller is not allowed to read.
-fn xattr_namespace_ok(name: &str, write: bool) -> Result<(), i64> {
-    if name.starts_with("security.") {
-        return Ok(());
-    }
-    // `xattr_permission` waves `system.*` through to the filesystem, but on
-    // every filesystem NARF has the only `system.*` handlers are the two
-    // POSIX ACL names; anything else fails to resolve to a handler, which
-    // is `xattr_resolve_name`'s -EOPNOTSUPP.
+/// This runs LAST among the VFS checks — after the lookup,
+/// `mnt_want_write` and `xattr_permission` — because Linux only resolves
+/// the handler inside `__vfs_setxattr` / `__vfs_getxattr` /
+/// `__vfs_removexattr`. So `setxattr("/nonexistent", "foo.bar")` is ENOENT,
+/// a read-only mount is EROFS, and an unwritable file is EACCES, all ahead
+/// of the EOPNOTSUPP an unknown prefix earns (probed on Linux 6.18). The
+/// `trusted.*` privilege rule is `xattr_permission`'s, not this one's.
+fn xattr_resolve_name(name: &str) -> Result<(), i64> {
+    // On every filesystem NARF has, the only `system.*` handlers are the
+    // two POSIX ACL names; anything else fails to resolve to a handler.
     if name.starts_with("system.") {
         return if is_acl_xattr(name) {
             Ok(())
@@ -6259,15 +6822,7 @@ fn xattr_namespace_ok(name: &str, write: bool) -> Result<(), i64> {
             Err(XE_OPNOTSUPP)
         };
     }
-    if name.starts_with("trusted.") {
-        // "The trusted.* namespace can only be accessed by privileged
-        // users."
-        if !capable(CAP_SYS_ADMIN) {
-            return Err(if write { XE_PERM } else { XE_NODATA });
-        }
-        return Ok(());
-    }
-    if name.starts_with("user.") {
+    if name.starts_with("security.") || name.starts_with("trusted.") || name.starts_with("user.") {
         return Ok(());
     }
     // No handler for this prefix: `xattr_resolve_name` returns -EOPNOTSUPP.
@@ -6290,6 +6845,7 @@ const XE_NOSPC: i64 = -28;
 const XE_DQUOT: i64 = -122;
 const XE_IO: i64 = -5;
 const XE_BADF: i64 = -9;
+const XE_ROFS: i64 = -30;
 
 /// Map an `FsError` from an xattr operation onto Linux's errno.
 ///
@@ -6311,6 +6867,7 @@ fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
         FsError::NoSpace => XE_NOSPC,
         FsError::QuotaExceeded => XE_DQUOT,
         FsError::InvalidData => XE_INVAL,
+        FsError::ReadOnly => XE_ROFS,
         _ => XE_IO,
     })
 }
@@ -6337,6 +6894,81 @@ fn inode_owner_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
     capable_wrt_inode(task, file_uid, file_gid, CAP_FOWNER)
 }
 
+/// `fs/attr.c::notify_change` + `setattr_prepare` for an `ATTR_MODE`
+/// change (chmod / fchmod / fchmodat / fchmodat2), in their order:
+///
+/// ```text
+/// may_setattr:     if (IS_IMMUTABLE(inode) || IS_APPEND(inode)) return -EPERM;
+/// notify_change:   if (S_ISLNK(inode->i_mode)) return -EOPNOTSUPP;
+/// setattr_prepare: if (!inode_owner_or_capable(idmap, inode)) return -EPERM;
+/// ```
+///
+/// Returns a positive errno. Without the owner test any task that could
+/// name a file could re-permission it (Linux: EPERM for a non-owner).
+fn chmod_setattr_check(
+    task: u64,
+    iflags: u32,
+    is_symlink: bool,
+    uid: u32,
+    gid: u32,
+) -> Result<(), i64> {
+    if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        return Err(EPERM);
+    }
+    if is_symlink {
+        return Err(EOPNOTSUPP);
+    }
+    if !inode_owner_or_capable(task, uid, gid) {
+        return Err(EPERM);
+    }
+    Ok(())
+}
+
+/// `fs/attr.c::notify_change` + `setattr_prepare` for a chown. `new_uid` /
+/// `new_gid` are `u32::MAX` for "leave unchanged", which sets neither
+/// ATTR_UID nor ATTR_GID — so `chown(p, -1, -1)` succeeds for anyone, even
+/// on an immutable inode (probed on Linux 6.18). Otherwise:
+///
+/// ```text
+/// chown_ok: (owner && uid unchanged) || capable_wrt_inode_uidgid(CAP_CHOWN)
+/// chgrp_ok: (owner && (gid unchanged || in_group_p(gid))) || capable_wrt_inode_uidgid(CAP_CHOWN)
+/// ```
+///
+/// both -EPERM. Returns a positive errno.
+fn chown_setattr_check(
+    task: u64,
+    iflags: u32,
+    file_uid: u32,
+    file_gid: u32,
+    new_uid: u32,
+    new_gid: u32,
+) -> Result<(), i64> {
+    let set_uid = new_uid != u32::MAX;
+    let set_gid = new_gid != u32::MAX;
+    if !set_uid && !set_gid {
+        return Ok(());
+    }
+    // `may_setattr`: ATTR_UID / ATTR_GID on an immutable or append-only inode.
+    if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        return Err(EPERM);
+    }
+    if capable_wrt_inode(task, file_uid, file_gid, CAP_CHOWN) {
+        return Ok(());
+    }
+    let owner = current_host_fsuid(task) == file_uid;
+    if set_uid && !(owner && new_uid == file_uid) {
+        return Err(EPERM);
+    }
+    if set_gid {
+        let ids = read_uidgid(task);
+        let in_group = ids.fsgid == new_gid || read_groups(task).contains(&new_gid);
+        if !(owner && (new_gid == file_gid || in_group)) {
+            return Err(EPERM);
+        }
+    }
+    Ok(())
+}
+
 /// The inode an xattr call names. A directory is an inode with extended
 /// attributes, but path resolution hands back `DirOps` for one, so the
 /// `FileOps` form alone can never see it.
@@ -6351,12 +6983,27 @@ impl XattrTarget {
         match self {
             Self::File(file) => {
                 let (uid, gid) = file.owners();
-                (uid, gid, file.stat().mode.perms, false)
+                let mode = file.stat().mode;
+                // Ext2 hands directories out through `FileOps` too.
+                let is_dir = mode.file_type == narf_filesystem::FileType::Dir;
+                (uid, gid, mode.perms, is_dir)
             }
             Self::Dir(dir) => {
                 let (uid, gid) = dir.dir_owners();
                 (uid, gid, dir.dir_mode(), true)
             }
+        }
+    }
+
+    /// `S_ISREG(mode) || S_ISDIR(mode)` — the only inodes `xattr_permission`
+    /// lets carry `user.*` attributes.
+    fn user_xattr_capable(&self) -> bool {
+        match self {
+            Self::File(file) => matches!(
+                file.stat().mode.file_type,
+                narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+            ),
+            Self::Dir(_) => true,
         }
     }
 
@@ -6384,7 +7031,55 @@ fn xattr_target(path: &str) -> Option<XattrTarget> {
     resolve_dir_absolute(path).map(XattrTarget::Dir)
 }
 
-/// The permission gate for one xattr operation on one inode.
+/// `XATTR_NAME_CAPS`.
+const XATTR_NAME_CAPS: &str = "security.capability";
+/// Linux `CAP_SETFCAP` — "set arbitrary capabilities on a file".
+const CAP_SETFCAP: u32 = 31;
+
+/// `security/commoncap.c::cap_convert_nscap`'s validation of a
+/// `security.capability` value, which `vfs_setxattr` runs (for a non-empty
+/// value) after `mnt_want_write` and before `xattr_permission`:
+///
+/// ```text
+/// if (!validheader(size, cap)) return -EINVAL;
+/// if (!capable_wrt_inode_uidgid(idmap, inode, CAP_SETFCAP)) return -EPERM;
+/// ```
+///
+/// `validheader` accepts exactly a v2 header in `XATTR_CAPS_SZ_2` (20)
+/// bytes or a v3 header in `XATTR_CAPS_SZ_3` (24); a v1 blob, a wrong
+/// revision or a wrong size is EINVAL (probed on Linux 6.18).
+fn xattr_caps_check(value: &[u8], target: Option<&XattrTarget>, task: u64) -> Result<(), i64> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
+    let rev = value
+        .get(0..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & VFS_CAP_REVISION_MASK);
+    let valid = matches!(
+        (value.len(), rev),
+        (20, Some(0x0200_0000)) | (24, Some(0x0300_0000))
+    );
+    if !valid {
+        return Err(XE_INVAL);
+    }
+    let permitted = match target {
+        Some(t) => {
+            let (uid, gid, ..) = t.meta();
+            capable_wrt_inode(task, uid, gid, CAP_SETFCAP)
+        }
+        None => capable(CAP_SETFCAP),
+    };
+    if permitted {
+        Ok(())
+    } else {
+        Err(XE_PERM)
+    }
+}
+
+/// The permission gate for one xattr operation on one inode, in Linux's
+/// order: `may_write_xattr`, then `xattr_permission`, then the LSM hook
+/// (`security_inode_setxattr` / `_removexattr`, i.e. commoncap).
 ///
 /// The two name classes take different routes in Linux, and conflating
 /// them gets the answer wrong in both directions. `do_setxattr` sends the
@@ -6392,12 +7087,16 @@ fn xattr_target(path: &str) -> Option<XattrTarget> {
 /// whose only check is `inode_owner_or_capable` (EPERM) — write permission
 /// on the inode is neither required nor sufficient. Everything else goes
 /// through `vfs_setxattr` -> `xattr_permission`, which ends at
-/// `inode_permission(idmap, inode, mask)`.
+/// `inode_permission(idmap, inode, mask)` — except for `security.*` and
+/// `system.*`, which it waves through to the LSM / filesystem.
 ///
 /// Reading an ACL has no check at all (`vfs_get_acl` performs none), which
 /// matches the mode bits being world-readable through `stat`.
+///
+/// `target` is `None` for a node NARF can only reach through the
+/// side table; the name-only rules still apply to it.
 fn xattr_permission_check(
-    target: &XattrTarget,
+    target: Option<&XattrTarget>,
     name: &str,
     write: bool,
     task: u64,
@@ -6408,64 +7107,111 @@ fn xattr_permission_check(
     // append-only inode".
     if write {
         let iflags = match target {
-            XattrTarget::File(file) => file.inode_flags(),
-            XattrTarget::Dir(_) => 0,
+            Some(XattrTarget::File(file)) => file.inode_flags(),
+            _ => 0,
         };
         if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
             return Err(XE_PERM);
         }
     }
-    let (uid, gid, perms, is_dir) = target.meta();
     if is_acl_xattr(name) {
+        let Some(target) = target else {
+            return Ok(());
+        };
         if !write {
             return Ok(());
         }
+        let (uid, gid, _, is_dir) = target.meta();
         // `set_posix_acl` tests the DEFAULT-on-a-non-directory case FIRST
         // and answers `acl ? -EACCES : 0` without ever consulting the
         // owner. Leaving that arm to the filesystem keeps Linux's
         // precedence, which putting EPERM in front of it would invert.
-        let default_on_file =
-            !is_dir && name == narf_filesystem::AclType::Default.xattr_name();
+        let default_on_file = !is_dir && name == narf_filesystem::AclType::Default.xattr_name();
         if !default_on_file && !inode_owner_or_capable(task, uid, gid) {
             return Err(XE_PERM);
         }
         return Ok(());
     }
-    // The rest of `xattr_permission`. The sticky-directory rule first: on
-    // a directory with S_ISVTX, `user.*` may only be WRITTEN by someone who
-    // passes `inode_owner_or_capable`, so a shared `/tmp` cannot have its
-    // entries relabelled by passers-by.
-    if write
-        && is_dir
-        && perms & 0o1000 != 0
-        && name.starts_with("user.")
-        && !inode_owner_or_capable(task, uid, gid)
+    // "No restriction for security.* and system.* from the VFS. Decision
+    // on these is left to the underlying filesystem / security module."
+    // Applying `inode_permission` to them answered EACCES where Linux
+    // answers EPERM (a `security.*` write) or ENODATA (a read).
+    let vfs_exempt = name.starts_with("security.") || name.starts_with("system.");
+    if !vfs_exempt {
+        if name.starts_with("trusted.") {
+            // "The trusted.* namespace can only be accessed by privileged
+            // users." A read answers ENODATA, so a getxattr can never be
+            // used to probe for an attribute the caller may not see.
+            if !capable(CAP_SYS_ADMIN) {
+                return Err(if write { XE_PERM } else { XE_NODATA });
+            }
+        } else if let Some(target) = target {
+            let (uid, gid, perms, is_dir) = target.meta();
+            if name.starts_with("user.") {
+                // "In the user.* namespace, only regular files and
+                // directories can have extended attributes."
+                if !target.user_xattr_capable() {
+                    return Err(if write { XE_PERM } else { XE_NODATA });
+                }
+                // "For sticky directories, only the owner and privileged
+                // users can write attributes" — so a shared `/tmp` cannot
+                // have its entries relabelled by passers-by.
+                if write && is_dir && perms & 0o1000 != 0 && !inode_owner_or_capable(task, uid, gid)
+                {
+                    return Err(XE_PERM);
+                }
+            }
+            // ...ending at `inode_permission(idmap, inode, mask)`: setting
+            // an attribute needs WRITE on the inode, reading one needs READ.
+            let permitted = narf_filesystem::posix_access_ok_with_acl(
+                narf_filesystem::FileOwner {
+                    uid,
+                    gid,
+                    perms,
+                    is_dir,
+                },
+                &accessor_for_inode(task, uid, gid),
+                narf_filesystem::AccessRequest {
+                    read: !write,
+                    write,
+                    exec: false,
+                },
+                target.access_acl().as_ref(),
+            );
+            if !permitted {
+                return Err(XE_ACCES);
+            }
+        }
+    }
+    // The LSM hook. With no LSM claiming the name, commoncap decides:
+    // `cap_inode_setxattr` / `cap_inode_removexattr` require CAP_SYS_ADMIN
+    // to write any `security.*` name other than `security.capability`,
+    // which has its own rules ([`xattr_caps_check`] for a set,
+    // [`xattr_caps_remove_check`] for a removal). Reads are unrestricted.
+    if write && name.starts_with("security.") && name != XATTR_NAME_CAPS && !capable(CAP_SYS_ADMIN)
     {
         return Err(XE_PERM);
     }
-    // ...ending at `inode_permission(idmap, inode, mask)`: setting an
-    // attribute needs WRITE on the inode, reading one needs READ. Nothing
-    // enforced that, so a file's `security.*` label could be rewritten by
-    // anyone who could name it.
-    let permitted = narf_filesystem::posix_access_ok_with_acl(
-        narf_filesystem::FileOwner {
-            uid,
-            gid,
-            perms,
-            is_dir,
-        },
-        &accessor_for_inode(task, uid, gid),
-        narf_filesystem::AccessRequest {
-            read: !write,
-            write,
-            exec: false,
-        },
-        target.access_acl().as_ref(),
-    );
+    Ok(())
+}
+
+/// `cap_inode_removexattr` for `security.capability`:
+/// `if (!capable_wrt_inode_uidgid(idmap, inode, CAP_SETFCAP)) return -EPERM;`
+fn xattr_caps_remove_check(name: &str, target: Option<&XattrTarget>, task: u64) -> Result<(), i64> {
+    if name != XATTR_NAME_CAPS {
+        return Ok(());
+    }
+    let permitted = match target {
+        Some(t) => {
+            let (uid, gid, ..) = t.meta();
+            capable_wrt_inode(task, uid, gid, CAP_SETFCAP)
+        }
+        None => capable(CAP_SETFCAP),
+    };
     if permitted {
         Ok(())
     } else {
-        Err(XE_ACCES)
+        Err(XE_PERM)
     }
 }
 
@@ -6510,7 +7256,21 @@ fn is_acl_xattr(name: &str) -> bool {
         || name == narf_filesystem::AclType::Default.xattr_name()
 }
 
-fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
+/// What `setxattr_copy` produced: the imported name, the copied value and
+/// the validated flags.
+pub(crate) struct XattrSetArgs {
+    name: alloc::string::String,
+    value: alloc::vec::Vec<u8>,
+    flags: u64,
+}
+
+/// `fs/xattr.c::setxattr_copy` (name/value/size/flags at arg1..arg4).
+///
+/// `path_setxattrat` runs this BEFORE it looks at the pathname or the
+/// descriptor, so `fsetxattr(bad_fd, "", ...)` is ERANGE and
+/// `setxattr(bad_ptr, "user.a", v, 70000, 0)` is E2BIG (probed on Linux
+/// 6.18) — the lookup's EFAULT / ENOENT / EBADF never get a say.
+fn xattr_set_copy(ctx: &mut dyn TrapContext) -> Result<XattrSetArgs, i64> {
     let a = *ctx.args();
     let size = a.arg3 as usize;
     let flags = a.arg4;
@@ -6519,49 +7279,44 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     // TOGETHER is not rejected here — `simple_xattr_set` fails it with
     // EEXIST or ENODATA depending on whether the attribute exists.
     if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
-        ctx.set_return(SyscallReturn::ok(XE_INVAL as u64));
-        return;
+        return Err(XE_INVAL);
     }
-    let name = match xattr_import_name(a.arg1) {
-        Ok(name) => name,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    };
+    let name = xattr_import_name(a.arg1)?;
     if size > XATTR_SIZE_MAX {
-        ctx.set_return(SyscallReturn::ok(XE_2BIG as u64));
-        return;
-    }
-    if let Err(errno) = xattr_namespace_ok(&name, true) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
+        return Err(XE_2BIG);
     }
     let value = if size == 0 {
         alloc::vec::Vec::new()
     } else {
         // SAFETY: size != 0; copy_from_user_vec range-validates a.arg2.
-        match unsafe { copy_from_user_vec(a.arg2, size) } {
-            Ok(v) => v,
-            Err(_) => {
-                ctx.set_return(SyscallReturn::ok(XE_FAULT as u64));
-                return;
-            }
-        }
+        unsafe { copy_from_user_vec(a.arg2, size) }.map_err(|_| XE_FAULT)?
     };
-    // `setxattr` -> `mnt_want_write` before anything else touches the
-    // inode: an attribute is state on the filesystem like any other.
+    Ok(XattrSetArgs { name, value, flags })
+}
+
+fn xattr_set_core(path: alloc::string::String, args: XattrSetArgs, ctx: &mut dyn TrapContext) {
+    let XattrSetArgs { name, value, flags } = args;
+    let task = current_task_id();
+    // `filename_setxattr` -> `mnt_want_write` before anything else touches
+    // the inode: an attribute is state on the filesystem like any other.
     if let Err(errno) = mnt_want_write(&path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
     // A path can name a file or a directory; both are inodes with xattrs.
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
+    // `vfs_setxattr`: `cap_convert_nscap` for `security.capability`, then
+    // `xattr_permission` + the LSM hook, then `xattr_resolve_name`.
+    let checked = (if name == XATTR_NAME_CAPS {
+        xattr_caps_check(&value, target.as_ref(), task)
+    } else {
+        Ok(())
+    })
+    .and_then(|()| xattr_permission_check(target.as_ref(), &name, true, task))
+    .and_then(|()| xattr_resolve_name(&name));
+    if let Err(errno) = checked {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
     }
     let stored = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
@@ -6611,26 +7366,20 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
 
 /// `getxattr` / `lgetxattr` / `fgetxattr` core (name at arg1, value at
 /// arg2, size at arg3).
-fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
+fn xattr_get_core(
+    path: alloc::string::String,
+    name: alloc::string::String,
+    ctx: &mut dyn TrapContext,
+) {
     let a = *ctx.args();
-    let name = match xattr_import_name(a.arg1) {
-        Ok(name) => name,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    };
-    if let Err(errno) = xattr_namespace_ok(&name, false) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
-    }
     let size = a.arg3 as usize;
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        if let Err(errno) = xattr_permission_check(target, &name, false, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
+    // `vfs_getxattr`: `xattr_permission(MAY_READ)`, then the handler lookup.
+    if let Err(errno) = xattr_permission_check(target.as_ref(), &name, false, current_task_id())
+        .and_then(|()| xattr_resolve_name(&name))
+    {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
     }
     let fetched = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.get_xattr(&name)),
@@ -6680,16 +7429,11 @@ fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
+    // `vfs_listxattr` makes no permission check at all: only
+    // `security_inode_listxattr`, which commoncap does not implement. A
+    // mode-000 file owned by someone else still lists (probed on Linux
+    // 6.18), so demanding READ here answered EACCES where Linux succeeds.
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        // `listxattr` needs READ on the inode, like any other read of its
-        // metadata. The empty name is the whole-inode form, so there is no
-        // namespace to resolve.
-        if let Err(errno) = xattr_permission_check(target, "", false, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    }
     let listed = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.list_xattr()),
         Some(XattrTarget::Dir(dir)) => poll_blocking(dir.list_xattr()),
@@ -6736,29 +7480,25 @@ fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
 }
 
 /// `removexattr` / `lremovexattr` / `fremovexattr` core (name at arg1).
-fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let name = match xattr_import_name(a.arg1) {
-        Ok(name) => name,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    };
-    if let Err(errno) = xattr_namespace_ok(&name, true) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
-    }
+fn xattr_remove_core(
+    path: alloc::string::String,
+    name: alloc::string::String,
+    ctx: &mut dyn TrapContext,
+) {
+    let task = current_task_id();
     if let Err(errno) = mnt_want_write(&path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
+    // `vfs_removexattr`: `xattr_permission(MAY_WRITE)`, the LSM hook, then
+    // the handler lookup in `__vfs_removexattr`.
+    if let Err(errno) = xattr_permission_check(target.as_ref(), &name, true, task)
+        .and_then(|()| xattr_caps_remove_check(&name, target.as_ref(), task))
+        .and_then(|()| xattr_resolve_name(&name))
+    {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
     }
     let removed = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.remove_xattr(&name)),
@@ -6804,61 +7544,302 @@ fn wall_now_ns() -> u64 {
     (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64
 }
 
-/// Apply `set_times` to an absolute (already cwd/chroot-resolved) path.
-/// Returns the Linux result: 0, -ENOENT, or 0 for a resolvable node
-/// whose FS doesn't track times (lenient legacy behavior, incl. dirs —
-/// resolve_async only yields files, so directories take the
-/// stat-dir-aware fallback).
-fn set_path_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> i64 {
-    // `do_utimes` -> `mnt_want_write`: stamping a timestamp is a write.
-    if let Err(errno) = mnt_want_write(path) {
-        return errno;
+/// A `timespec[2]` exactly as the caller supplied it — raw `(tv_sec,
+/// tv_nsec)` pairs — or `None` for a NULL `times`. Validation is deferred
+/// to [`utimes_request`] because Linux validates `tv_nsec` in `vfs_utimes`,
+/// AFTER the lookup (probed on Linux 6.18: a bad `tv_nsec` on a missing path
+/// is ENOENT, and on a bad descriptor EBADF).
+pub(crate) type UtimesSpec = Option<[(i64, i64); 2]>;
+
+pub(crate) const UTIME_NOW: i64 = 0x3FFF_FFFF;
+pub(crate) const UTIME_OMIT: i64 = 0x3FFF_FFFE;
+
+/// `fs/utimes.c::vfs_utimes`' reading of the times: `(atime, mtime,
+/// touch)`, with `None` for an omitted slot. `touch` is Linux's ATTR_TOUCH
+/// — times NULL, or both UTIME_NOW — which is the only form a non-owner
+/// with write permission may use. Returns a negative errno.
+fn utimes_request(times: UtimesSpec) -> Result<(Option<u64>, Option<u64>, bool), i64> {
+    let now = wall_now_ns();
+    let Some(t) = times else {
+        return Ok((Some(now), Some(now), true));
+    };
+    // `nsec_valid`: UTIME_NOW / UTIME_OMIT, or 0..=999_999_999.
+    let nsec_valid = |n: i64| n == UTIME_NOW || n == UTIME_OMIT || (0..1_000_000_000).contains(&n);
+    if !nsec_valid(t[0].1) || !nsec_valid(t[1].1) {
+        return Err(-EINVAL);
     }
-    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
-    });
-    match ops {
-        Some(Some(Ok(o))) => {
-            // Unsupported → lenient 0 (see module comment above).
-            let _ = o.set_times(atime_ns, mtime_ns);
-            0
+    // "if (times && times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec ==
+    // UTIME_NOW) times = NULL;"
+    if t[0].1 == UTIME_NOW && t[1].1 == UTIME_NOW {
+        return Ok((Some(now), Some(now), true));
+    }
+    let slot = |(sec, nsec): (i64, i64)| match nsec {
+        UTIME_OMIT => None,
+        UTIME_NOW => Some(now),
+        n => Some((sec.max(0) as u64).saturating_mul(1_000_000_000) + n as u64),
+    };
+    Ok((slot(t[0]), slot(t[1]), false))
+}
+
+/// `fs/attr.c::may_setattr` + `setattr_prepare` for a timestamp change.
+///
+/// ```text
+/// ATTR_TIMES_SET: IS_IMMUTABLE || IS_APPEND -> -EPERM;
+///                 !inode_owner_or_capable   -> -EPERM
+/// ATTR_TOUCH:     IS_IMMUTABLE              -> -EPERM;
+///                 !inode_owner_or_capable && inode_permission(MAY_WRITE) fails -> -EACCES
+/// ```
+///
+/// So a stranger who can write the file may `touch` it but not set an
+/// explicit time (probed on Linux 6.18). NARF checked neither, so any task
+/// could back-date any file it could name. Returns a negative errno.
+fn utimes_permission(target: &XattrTarget, touch: bool, task: u64) -> Result<(), i64> {
+    let iflags = match target {
+        XattrTarget::File(file) => file.inode_flags(),
+        XattrTarget::Dir(_) => 0,
+    };
+    let (uid, gid, perms, is_dir) = target.meta();
+    if !touch {
+        if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+            return Err(-EPERM);
         }
-        _ => {
-            // Not a plain file — a directory still validates (0), a
-            // missing path is -ENOENT, matching the old stubs.
-            if stat_path_dir_aware(path).is_some() {
-                0
-            } else {
-                -2
-            }
-        }
+        return if inode_owner_or_capable(task, uid, gid) {
+            Ok(())
+        } else {
+            Err(-EPERM)
+        };
+    }
+    if iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        return Err(-EPERM);
+    }
+    if inode_owner_or_capable(task, uid, gid) {
+        return Ok(());
+    }
+    let writable = narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: true,
+            exec: false,
+        },
+        target.access_acl().as_ref(),
+    );
+    if writable {
+        Ok(())
+    } else {
+        Err(-EACCES)
     }
 }
 
-/// Shared utimes body: `timeval[2]` (sec + USEC) at `tv_ptr`, NULL =
-/// both now. Used by utimes(235) and futimesat(261).
-fn utimes_common(ctx: &mut dyn TrapContext, raw_path: &str, tv_ptr: u64) {
-    let (at, mt) = if tv_ptr == 0 {
-        let now = wall_now_ns();
-        (now, now)
-    } else {
-        let mut buf = [0u8; 32];
-        // SAFETY: non-zero user timeval[2] pointer; copy_from_user
-        // range-validates and SMAP-brackets the 32-byte read.
-        if unsafe { copy_from_user(&mut buf, tv_ptr) }.is_err() {
-            ctx.set_return(errno_ret(EFAULT));
+/// `fs/utimes.c::do_utimes` — the body behind utime / utimes / futimesat /
+/// utimensat, with Linux's split:
+///
+/// ```text
+/// if (filename == NULL && dfd != AT_FDCWD) return do_utimes_fd(dfd, times, flags);
+/// return do_utimes_path(dfd, filename, times, flags);
+/// ```
+///
+/// `do_utimes_fd`: `flags` must be 0 (EINVAL), then `fdget` (EBADF, and
+/// O_PATH descriptors are not handed out), then `vfs_utimes`.
+/// `do_utimes_path`: flags check (EINVAL), `user_path_at` (EFAULT / ENOENT
+/// / ENOTDIR / EBADF), then `vfs_utimes`: tv_nsec (EINVAL), `mnt_want_write`
+/// (EROFS), `notify_change` (EPERM / EACCES).
+pub(crate) fn do_utimes(
+    ctx: &mut dyn TrapContext,
+    dfd: i64,
+    path_ptr: u64,
+    times: UtimesSpec,
+    flags: u64,
+) {
+    const AT_FDCWD: i64 = -100;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let task = current_task_id();
+    let dfd = dfd as i32 as i64;
+
+    if path_ptr == 0 && dfd != AT_FDCWD {
+        if flags != 0 {
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
-        let tv = |o: usize| -> u64 {
-            let sec = i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
-            let usec = i64::from_ne_bytes(buf[o + 8..o + 16].try_into().unwrap());
-            (sec.max(0) as u64).saturating_mul(1_000_000_000) + (usec.max(0) as u64) * 1_000
+        let ops = if dfd < 0 {
+            None
+        } else {
+            fd::with_table(task, |t| {
+                let entry = t.get(dfd as u32)?;
+                if t.status_flags(dfd as u32).unwrap_or(0) & crate::fd::O_PATH != 0 {
+                    return None;
+                }
+                Some(entry.ops.clone())
+            })
+            .flatten()
         };
-        (tv(0), tv(16))
+        match ops {
+            Some(ops) => utimes_fd(ctx, task, dfd as u32, ops, times),
+            None => ctx.set_return(errno_ret(EBADF)),
+        }
+        return;
+    }
+
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    // A NULL pathname here (AT_FDCWD) is `getname(NULL)`: -EFAULT.
+    let raw = match copy_user_cstr_checked(path_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
     };
-    let path = resolve_cwd_path(current_task_id(), raw_path);
-    let r = set_path_times(&path, Some(at), Some(mt));
-    ctx.set_return(SyscallReturn::ok(r as u64));
+    let raw: &str = if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            ctx.set_return(errno_ret(ENOENT));
+            return;
+        }
+        if dfd == AT_FDCWD {
+            "."
+        } else if dfd >= 0 {
+            // LOOKUP_EMPTY names the descriptor itself; unlike `fdget`, a
+            // path lookup accepts an O_PATH descriptor.
+            let ops = fd::with_table(task, |t| t.get(dfd as u32).map(|e| e.ops.clone())).flatten();
+            match ops {
+                Some(ops) => utimes_fd(ctx, task, dfd as u32, ops, times),
+                None => ctx.set_return(errno_ret(EBADF)),
+            }
+            return;
+        } else {
+            ctx.set_return(errno_ret(EBADF));
+            return;
+        }
+    } else {
+        &raw
+    };
+    let effective = match resolve_at_path(task, dfd, raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    let path = resolve_cwd_path(task, &effective);
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let target = resolve_file_absolute_ext(&path, follow)
+        .map(XattrTarget::File)
+        .or_else(|| resolve_dir_absolute(&path).map(XattrTarget::Dir));
+    // A node only `stat` can see (a synthetic filesystem) still exists; it
+    // keeps the old lenient accept, since there is nothing to stamp.
+    if target.is_none() && stat_ino_path_dir_aware_ext(&path, follow).is_none() {
+        ctx.set_return(errno_ret(path_lookup_errno(&path)));
+        return;
+    }
+    let (atime, mtime, touch) = match utimes_request(times) {
+        Ok(req) => req,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    // `vfs_utimes` -> `mnt_want_write`: stamping a timestamp is a write.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    let mut is_dir = false;
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = utimes_permission(target, touch, task) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+        match target {
+            // Filesystems without `set_times` keep the lenient accept: the
+            // path was validated, and there is no store to update.
+            XattrTarget::File(file) => {
+                let _ = file.set_times(atime, mtime);
+                is_dir = file.as_dir().is_some();
+            }
+            XattrTarget::Dir(_) => is_dir = true,
+        }
+    }
+    // inotify: a successful timestamp change is IN_ATTRIB on the path.
+    crate::mqueue::notify_attrib(&path, is_dir);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `vfs_utimes` on the file behind a descriptor.
+fn utimes_fd(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    fd: u32,
+    ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    times: UtimesSpec,
+) {
+    let (atime, mtime, touch) = match utimes_request(times) {
+        Ok(req) => req,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    // Only inodes whose ownership NARF models faithfully are gated: an
+    // anonymous object (pipe, socket, eventfd) reports the default (0, 0)
+    // owner, which would wrongly refuse its own creator.
+    let modelled = matches!(
+        ops.stat().mode.file_type,
+        narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+    );
+    let target = XattrTarget::File(ops);
+    if modelled {
+        if let Err(errno) = utimes_permission(&target, touch, task) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    if let XattrTarget::File(ops) = target {
+        // set_times is lenient — unsupported FileOps → 0.
+        let _ = ops.set_times(atime, mtime);
+    }
+    // inotify: a timestamp change is IN_ATTRIB on the fd's file.
+    crate::mqueue::notify_attrib_fd(task, fd);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// The `timeval[2]` shared by utimes(235) and futimesat(261), read and
+/// checked the way `do_futimesat` does it — BEFORE the pathname is looked
+/// at (probed on Linux 6.18: `utimes(bad_ptr, {usec = 1000000})` is
+/// EINVAL):
+///
+/// ```text
+/// if (copy_from_user(&times, utimes, sizeof(times))) return -EFAULT;
+/// if (times[0].tv_usec >= 1000000 || times[0].tv_usec < 0 ||
+///     times[1].tv_usec >= 1000000 || times[1].tv_usec < 0) return -EINVAL;
+/// ```
+///
+/// The usec check also catches UTIME_NOW / UTIME_OMIT, which only
+/// utimensat may use. Returns a positive errno.
+pub(crate) fn utimes_read_timeval(tv_ptr: u64) -> Result<UtimesSpec, i64> {
+    if tv_ptr == 0 {
+        return Ok(None);
+    }
+    let mut buf = [0u8; 32];
+    // SAFETY: non-zero user timeval[2] pointer; copy_from_user
+    // range-validates and SMAP-brackets the 32-byte read.
+    if unsafe { copy_from_user(&mut buf, tv_ptr) }.is_err() {
+        return Err(EFAULT);
+    }
+    let word = |o: usize| i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+    let (s0, u0, s1, u1) = (word(0), word(8), word(16), word(24));
+    if !(0..1_000_000).contains(&u0) || !(0..1_000_000).contains(&u1) {
+        return Err(EINVAL);
+    }
+    Ok(Some([(s0, u0 * 1_000), (s1, u1 * 1_000)]))
 }
 
 // ── pkey_alloc / pkey_free / pkey_mprotect ───────────────────────────
@@ -8055,6 +9036,21 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         return;
     }
 
+    // vfs_readv/vfs_writev: rw_verify_area(pos, tot_len) sits between the
+    // `!tot_len` short-circuit and the flag word. The `pos == -1` form checks
+    // the shared f_pos (NULL, i.e. skipped, for a stream).
+    let verify_pos = if use_current_pos {
+        (!endpoint.ops.is_stream()).then(|| endpoint.description.offset())
+    } else {
+        Some(pos)
+    };
+    if let Some(verify_pos) = verify_pos {
+        if let Err(errno) = rw_verify_area_pos(verify_pos, count) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
+
     // Only now does the flag word matter. `vfs_readv`/`vfs_writev` reach
     // `kiocb_set_rw_flags` (via do_iter_readv_writev) AFTER the FMODE check,
     // after `import_iovec`, and after the `if (!tot_len) goto out;`
@@ -8134,6 +9130,13 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             // in-memory coherent filesystem already satisfies, and RWF_HIPRI
             // is a scheduling hint.
         }
+    }
+
+    // A directory has no read_iter: do_loop_readv_writev reaches
+    // generic_read_dir -> -EISDIR once the flag word has been accepted.
+    if !is_write && endpoint.ops.as_dir().is_some() {
+        ctx.set_return(errno_ret(EISDIR));
+        return;
     }
 
     if use_current_pos {
@@ -13891,6 +14894,72 @@ fn dir_search_permitted(path: &str, task: u64) -> bool {
             exec: true,
         },
     )
+}
+
+/// `link_path_walk`'s `may_lookup` (MAY_EXEC) on every directory a walk to
+/// `path` traverses, for a path that DID resolve. [`path_lookup_errno`] only
+/// classifies failed walks, so without this a file inside a 0700 directory
+/// was reachable by anyone who could name it. The root itself is not
+/// checked, matching the `path_lookup_errno` walk.
+fn path_ancestors_searchable(path: &str, task: u64) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
+        return true;
+    };
+    let mut prefix = alloc::string::String::new();
+    for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(comp);
+        if !dir_search_permitted(&prefix, task) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `inode_permission(idmap, inode, mask)` for a node already looked up by
+/// path: mode bits plus, for a file-shaped node, its ACCESS ACL (the same
+/// `check_acl` step `open` and `access` take). A directory has no xattr
+/// surface here, so it is decided on its mode alone, as in `access_path`.
+/// Errors are positive errnos: -EACCES on refusal, and an ACL that does not
+/// decode is passed through as `check_acl` does rather than falling back to
+/// the mode bits.
+fn node_permission(
+    task: u64,
+    file: Option<&dyn narf_filesystem::FileOps>,
+    perms: u16,
+    uid: u32,
+    gid: u32,
+    is_dir: bool,
+    request: narf_filesystem::AccessRequest,
+) -> Result<(), i64> {
+    let acl = match file {
+        Some(file) if !is_dir => match poll_blocking(narf_filesystem::acl_of_file(
+            file,
+            narf_filesystem::AclType::Access,
+        )) {
+            Some(Ok(acl)) => acl,
+            Some(Err(narf_filesystem::FsError::Unsupported)) => return Err(EOPNOTSUPP),
+            Some(Err(_)) => return Err(EINVAL),
+            None => None,
+        },
+        _ => None,
+    };
+    if narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(task, uid, gid),
+        request,
+        acl.as_ref(),
+    ) {
+        Ok(())
+    } else {
+        Err(EACCES)
+    }
 }
 
 pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {

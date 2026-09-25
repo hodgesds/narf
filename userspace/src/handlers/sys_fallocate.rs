@@ -8,7 +8,14 @@ use super::*;
 ///
 /// ```text
 ///   if (offset < 0 || len <= 0) return -EINVAL;
-///   ...mode validation...                     /* -EOPNOTSUPP */
+///   if (mode & ~(FALLOC_FL_MODE_MASK | FALLOC_FL_KEEP_SIZE)) return -EOPNOTSUPP;
+///   switch (mode & FALLOC_FL_MODE_MASK) {     /* modes are exclusive */
+///   case ALLOCATE_RANGE: case UNSHARE_RANGE: case ZERO_RANGE: break;
+///   case PUNCH_HOLE: if (!(mode & KEEP_SIZE)) return -EOPNOTSUPP; break;
+///   case COLLAPSE_RANGE: case INSERT_RANGE: case WRITE_ZEROES:
+///           if (mode & KEEP_SIZE) return -EOPNOTSUPP; break;
+///   default: return -EOPNOTSUPP;
+///   }
 ///   if (!(file->f_mode & FMODE_WRITE)) return -EBADF;
 ///   if (S_ISFIFO(...)) return -ESPIPE;
 ///   if (S_ISDIR(...)) return -EISDIR;
@@ -27,9 +34,16 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     let len = args.arg3;
     const KEEP_SIZE: u64 = 0x01;
     const PUNCH_HOLE: u64 = 0x02;
+    const COLLAPSE_RANGE: u64 = 0x08;
     const ZERO_RANGE: u64 = 0x10;
+    const INSERT_RANGE: u64 = 0x20;
+    const UNSHARE_RANGE: u64 = 0x40;
+    const WRITE_ZEROES: u64 = 0x80;
+    const MODE_MASK: u64 =
+        PUNCH_HOLE | COLLAPSE_RANGE | ZERO_RANGE | INSERT_RANGE | UNSHARE_RANGE | WRITE_ZEROES;
     let task = current_task_id();
 
+    // `fdget`: an O_PATH descriptor is -EBADF before any argument check.
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;
@@ -42,9 +56,19 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    if mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0
-        || mode & PUNCH_HOLE != 0 && mode != PUNCH_HOLE | KEEP_SIZE
-    {
+    // VFS-level mode validation only. COLLAPSE/INSERT/UNSHARE/WRITE_ZEROES
+    // are VALID here — a filesystem that cannot do them answers -EOPNOTSUPP
+    // from `f_op->fallocate`, i.e. only after the fd-mode and file-type
+    // checks below. Rejecting them up front reported EOPNOTSUPP where Linux
+    // reports EBADF (read-only fd) or ESPIPE (pipe).
+    let mode_ok = mode & !(MODE_MASK | KEEP_SIZE) == 0
+        && match mode & MODE_MASK {
+            0 | UNSHARE_RANGE | ZERO_RANGE => true,
+            PUNCH_HOLE => mode & KEEP_SIZE != 0,
+            COLLAPSE_RANGE | INSERT_RANGE | WRITE_ZEROES => mode & KEEP_SIZE == 0,
+            _ => false,
+        };
+    if !mode_ok {
         ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }

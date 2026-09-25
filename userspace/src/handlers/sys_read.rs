@@ -103,6 +103,13 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(errno as i64));
         return;
     }
+    // `vfs_read` has no zero-count shortcut: after access_ok and
+    // rw_verify_area it calls `f_op->read`, which for a directory is
+    // `generic_read_dir` -> -EISDIR even for `read(dirfd, NULL, 0)`.
+    if endpoint.ops.as_dir().is_some() {
+        ctx.set_return(errno_ret(EISDIR));
+        return;
+    }
     let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
     if count == 0 {
         ctx.set_return(SyscallReturn::ok(0));
@@ -152,6 +159,14 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
     let mut offset = endpoint.description.offset();
+    // rw_verify_area(READ, file, &f_pos, count): f_pos + count past
+    // LLONG_MAX is -EINVAL (streams pass ppos == NULL and skip this).
+    if !endpoint.ops.is_stream() {
+        if let Err(errno) = rw_verify_area_pos(offset, requested) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
         let transactional = if let Some(pipe) = endpoint

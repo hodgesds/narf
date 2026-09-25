@@ -17,30 +17,52 @@ pub(crate) const AT_EMPTY_PATH_ARG: u32 = 0x1000;
 // then cannot drift between forms, which is how `setxattr` came to behave
 // like `lsetxattr` here in the first place.
 
+/// `path_*xattrat`'s first check, ahead of everything else.
+fn xattr_at_flags_ok(at_flags: u32) -> Result<(), i64> {
+    if at_flags & !(AT_SYMLINK_NOFOLLOW_ARG | AT_EMPTY_PATH_ARG) != 0 {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
+// Each body runs Linux's three phases in Linux's order: the `at_flags`
+// check, then the argument import (`setxattr_copy` / `import_xattr_name`),
+// then the lookup. The import coming before the lookup is observable:
+// `fgetxattr(bad_fd, "")` is ERANGE, not EBADF.
+
 pub(crate) fn xattr_set_at(dfd: i64, path_ptr: u64, at_flags: u32, ctx: &mut dyn TrapContext) {
-    match xattr_at_path(dfd, path_ptr, at_flags) {
-        Ok((path, _follow)) => xattr_set_core(path, ctx),
+    let result = xattr_at_flags_ok(at_flags)
+        .and_then(|()| xattr_set_copy(ctx))
+        .and_then(|args| Ok((args, xattr_at_path(dfd, path_ptr, at_flags, true)?)));
+    match result {
+        Ok((args, (path, _follow))) => xattr_set_core(path, args, ctx),
         Err(errno) => ctx.set_return(SyscallReturn::ok(errno as u64)),
     }
 }
 
 pub(crate) fn xattr_get_at(dfd: i64, path_ptr: u64, at_flags: u32, ctx: &mut dyn TrapContext) {
-    match xattr_at_path(dfd, path_ptr, at_flags) {
-        Ok((path, _follow)) => xattr_get_core(path, ctx),
+    let result = xattr_at_flags_ok(at_flags)
+        .and_then(|()| xattr_import_name(ctx.args().arg1))
+        .and_then(|name| Ok((name, xattr_at_path(dfd, path_ptr, at_flags, true)?)));
+    match result {
+        Ok((name, (path, _follow))) => xattr_get_core(path, name, ctx),
         Err(errno) => ctx.set_return(SyscallReturn::ok(errno as u64)),
     }
 }
 
 pub(crate) fn xattr_list_at(dfd: i64, path_ptr: u64, at_flags: u32, ctx: &mut dyn TrapContext) {
-    match xattr_at_path(dfd, path_ptr, at_flags) {
+    match xattr_at_flags_ok(at_flags).and_then(|()| xattr_at_path(dfd, path_ptr, at_flags, false)) {
         Ok((path, _follow)) => xattr_list_core(path, ctx),
         Err(errno) => ctx.set_return(SyscallReturn::ok(errno as u64)),
     }
 }
 
 pub(crate) fn xattr_remove_at(dfd: i64, path_ptr: u64, at_flags: u32, ctx: &mut dyn TrapContext) {
-    match xattr_at_path(dfd, path_ptr, at_flags) {
-        Ok((path, _follow)) => xattr_remove_core(path, ctx),
+    let result = xattr_at_flags_ok(at_flags)
+        .and_then(|()| xattr_import_name(ctx.args().arg1))
+        .and_then(|name| Ok((name, xattr_at_path(dfd, path_ptr, at_flags, false)?)));
+    match result {
+        Ok((name, (path, _follow))) => xattr_remove_core(path, name, ctx),
         Err(errno) => ctx.set_return(SyscallReturn::ok(errno as u64)),
     }
 }

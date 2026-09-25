@@ -128,6 +128,87 @@ fn smoke_abi_ioerrno_pread64_pipe_espipe() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_pread64_pipe_espipe);
 
+fn smoke_abi_ioerrno_pread64_pos_plus_count_overflow() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let mut buf = [0u8; 16];
+        // rw_verify_area: `(loff_t)(pos + count) < 0` -> -EINVAL, rather than
+        // a 0-byte "EOF" read at an absurd offset.
+        expect(
+            call(
+                Syscall::Pread64.raw(),
+                a3(
+                    fd as u64,
+                    buf.as_mut_ptr() as u64,
+                    10,
+                    (i64::MAX - 5) as u64,
+                ),
+            ),
+            EINVAL,
+            "pread64 with offset + count past LLONG_MAX must be -EINVAL",
+        )?;
+        expect(
+            call(
+                Syscall::Pwrite64.raw(),
+                a3(fd as u64, buf.as_ptr() as u64, 1, i64::MAX as u64),
+            ),
+            EINVAL,
+            "pwrite64 with offset + count past LLONG_MAX must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pread64_pos_plus_count_overflow
+);
+
+fn smoke_abi_ioerrno_read_directory_eisdir() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        const O_DIRECTORY: u64 = 0o200000;
+        let dir = open_fd_flags(b"/abi\0", O_DIRECTORY)?;
+        let mut buf = [0u8; 16];
+        // vfs_read has no count==0 shortcut: `generic_read_dir` answers
+        // -EISDIR even for a zero-length read.
+        expect(
+            call(
+                Syscall::Read.raw(),
+                a2(dir as u64, buf.as_mut_ptr() as u64, 0),
+            ),
+            EISDIR,
+            "zero-length read on a directory fd must be -EISDIR",
+        )?;
+        expect(
+            call(
+                Syscall::Pread64.raw(),
+                a3(dir as u64, buf.as_mut_ptr() as u64, 16, 0),
+            ),
+            EISDIR,
+            "pread64 on a directory fd must be -EISDIR",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_read_directory_eisdir);
+
+fn smoke_abi_ioerrno_opath_fd_is_ebadf() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        const O_PATH: u64 = 0o10000000;
+        let fd = open_fd_flags(b"/abi/f\0", O_PATH)?;
+        // fdget()/fdget_pos() never return an O_PATH file, so these are
+        // -EBADF at lookup — not ftruncate's -EINVAL for a read-only fd.
+        expect(
+            call(Syscall::Lseek.raw(), a2(fd as u64, 0, 0)),
+            EBADF,
+            "lseek on an O_PATH fd must be -EBADF",
+        )?;
+        expect(
+            call(Syscall::Ftruncate.raw(), a1(fd as u64, 0)),
+            EBADF,
+            "ftruncate on an O_PATH fd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_opath_fd_is_ebadf);
+
 fn smoke_abi_ioerrno_pread64_efault() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
         let fd = open_rw(b"/abi/f\0")?;
@@ -2776,7 +2857,9 @@ kernel_test_in!(
 fn smoke_abi_ioerrno_linkat_across_filesystems_is_exdev() -> TestResult {
     const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
     const AT_EMPTY_PATH: u64 = 0x1000;
-    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    // The full O_TMPFILE value: `__O_TMPFILE | O_DIRECTORY`. `build_open_flags`
+    // refuses the bare `__O_TMPFILE` bit with -EINVAL.
+    const O_TMPFILE_BIT: u64 = 0o20_000_000 | 0o200_000;
     const O_RDWR: u64 = 2;
 
     // Filesystem A is the harness's mount; B is a SECOND, independent MemFs
@@ -2879,7 +2962,9 @@ kernel_test_in!(
 fn smoke_abi_o_tmpfile_owned_by_creator_is_reopenable() -> TestResult {
     const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
     const AT_EMPTY_PATH: u64 = 0x1000;
-    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    // The full O_TMPFILE value: `__O_TMPFILE | O_DIRECTORY`. `build_open_flags`
+    // refuses the bare `__O_TMPFILE` bit with -EINVAL.
+    const O_TMPFILE_BIT: u64 = 0o20_000_000 | 0o200_000;
     const O_RDWR: u64 = 2;
     const O_RDONLY: u64 = 0;
     const EACCES: i64 = -13;

@@ -76,6 +76,12 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+    // Past `if (!tot_len) goto out;`, a directory reaches
+    // do_loop_readv_writev -> generic_read_dir: -EISDIR.
+    if endpoint.ops.as_dir().is_some() {
+        ctx.set_return(errno_ret(EISDIR));
+        return;
+    }
 
     if let Some(ret) = tty_background_access(task, endpoint.ops.as_ref(), false) {
         ctx.set_return(SyscallReturn::ok(ret as u64));
@@ -147,6 +153,14 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
     let mut offset = endpoint.description.offset();
+    // vfs_readv: rw_verify_area(READ, file, &f_pos, tot_len) -> -EINVAL when
+    // the position plus the vector length passes LLONG_MAX.
+    if !endpoint.ops.is_stream() {
+        if let Err(errno) = rw_verify_area_pos(offset, count) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
     let mut iov_index = 0usize;
     let mut iov_offset = 0usize;
     while total < count {

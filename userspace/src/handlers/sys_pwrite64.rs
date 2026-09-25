@@ -39,6 +39,12 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(errno as i64));
         return;
     }
+    // vfs_write -> rw_verify_area: offset + count past LLONG_MAX is -EINVAL
+    // (`pwrite(fd, buf, 1, INT64_MAX)`), checked on the uncapped count.
+    if let Err(errno) = rw_verify_area_pos(offset, requested) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
     if count == 0 {
         ctx.set_return(SyscallReturn::ok(0));

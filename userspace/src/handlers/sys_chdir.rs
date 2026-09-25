@@ -47,6 +47,12 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    // The walk is literal: `chdir("file/..")` is -ENOTDIR and
+    // `chdir("missing/..")` -ENOENT, though both normalise to a valid dir.
+    if let Err(errno) = literal_walk_check(task, &path) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     // Validate against the chroot-resolved path, but STORE the user
     // view — chroot is applied exactly once, at resolution time (see
     // resolve_cwd_path_user).

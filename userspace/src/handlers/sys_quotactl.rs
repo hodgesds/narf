@@ -51,7 +51,7 @@ const _: () = assert!(EBADF == -9 && EPERM == -1 && EDQUOT == -122);
 // conventions returned +9, which userspace reads as a successful
 // `quotactl_fd` that wrote nothing.
 use crate::errno::wire::{
-    EBADF, EDQUOT, EFAULT, EINVAL, EIO, ENOENT, ENOSPC, EPERM, ESRCH,
+    EBADF, EDQUOT, EFAULT, EINVAL, EIO, ENODEV, ENOENT, ENOSPC, EPERM, ESRCH,
 };
 
 /// Map a filesystem error to the `quotactl(2)` errno. The quota fs methods only
@@ -122,7 +122,11 @@ fn quota_kind(type_: u32) -> Option<QuotaKind> {
 fn fs_for_special(
     special_ptr: u64,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, i64> {
-    let raw = copy_user_cstr_checked(special_ptr, 4096)?;
+    // `copy_user_cstr_checked` reports a POSITIVE errno, while every errno
+    // in this file is the pre-negated `wire::` form. Passing it through with
+    // `?` returned +EFAULT (14) for a faulting `special` — a "successful"
+    // quotactl as far as userspace could tell.
+    let raw = copy_user_cstr_checked(special_ptr, 4096).map_err(|e| -e)?;
     let path = resolve_cwd_path(current_task_id(), &raw);
     current_fs_arc_at(&path).ok_or(ENOENT)
 }
@@ -141,20 +145,90 @@ pub(crate) fn sys_quotactl(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ret as u64));
 }
 
+/// `MAXQUOTAS` (`include/linux/quota.h`): USRQUOTA, GRPQUOTA, PRJQUOTA.
+const MAXQUOTAS: u32 = 3;
+
+/// `fs/quota/quota.c::SYSCALL_DEFINE4(quotactl)`:
+///
+/// ```text
+/// if (type >= MAXQUOTAS) return -EINVAL;
+/// if (!special) {
+///         if (cmds == Q_SYNC) return quota_sync_all(type);
+///         return -ENODEV;
+/// }
+/// sb = quotactl_block(special, cmds);          /* -EFAULT / -ENOENT / ... */
+/// ret = do_quotactl(sb, type, cmds, id, addr, pathp);
+/// ```
+///
+/// The type bound is checked before the NULL-special Q_SYNC shortcut, so
+/// `Q_SYNC` of type 5 is -EINVAL; and a NULL special for any other command
+/// is -ENODEV, not the -EFAULT reading it as a path gave (probed on 6.18).
 fn quotactl_dispatch(subcmd: u32, type_: u32, special: u64, id: u32, addr: u64) -> i64 {
-    // Q_SYNC with a NULL special syncs every mount; for RAM-backed tmpfs that
-    // is a no-op that always succeeds.
-    if subcmd == Q_SYNC && special == 0 {
-        return 0;
+    if type_ >= MAXQUOTAS {
+        return EINVAL;
     }
-    let Some(kind) = quota_kind(type_) else {
-        return EINVAL; // unknown/unsupported quota type
-    };
+    if special == 0 {
+        // Q_SYNC with a NULL special syncs every mount; for RAM-backed tmpfs
+        // that is a no-op that always succeeds.
+        return if subcmd == Q_SYNC { 0 } else { ENODEV };
+    }
     let fs = match fs_for_special(special) {
         Ok(fs) => fs,
         Err(e) => return e,
     };
+    // `do_quotactl`: `if (!(sb->s_quota_types & (1 << type))) return
+    // -EINVAL;` — PRJQUOTA reaches here and tmpfs does not carry it.
+    let Some(kind) = quota_kind(type_) else {
+        return EINVAL;
+    };
+    if let Err(e) = check_quotactl_permission(subcmd, kind, id) {
+        return e;
+    }
     quotactl_on_fs(subcmd, kind, fs, id, addr)
+}
+
+/// `fs/quota/quota.c::check_quotactl_permission`, which `do_quotactl` runs
+/// before dispatching any command:
+///
+/// ```text
+/// switch (cmd) {
+/// case Q_GETFMT: case Q_SYNC: case Q_GETINFO: ...  break;
+/// case Q_GETQUOTA: ...
+///         if ((type == USRQUOTA && uid_eq(current_euid(), id)) ||
+///             (type == GRPQUOTA && in_egroup_p(id)))
+///                 break;
+///         fallthrough;
+/// default:
+///         if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN)) return -EPERM;
+/// }
+/// ```
+///
+/// Neither `quotactl` form checked privilege at all, so any task could set
+/// any user's limits. Note the `default` arm covers unknown commands too:
+/// an unprivileged unknown subcommand is -EPERM, a privileged one -EINVAL
+/// (probed on 6.18). `sb->s_user_ns` is approximated by the mount
+/// namespace's owner, as `mount_admin` does for `may_mount`.
+fn check_quotactl_permission(subcmd: u32, kind: QuotaKind, id: u32) -> Result<(), i64> {
+    let task = current_task_id();
+    match subcmd {
+        Q_GETFMT | Q_SYNC | Q_GETINFO => return Ok(()),
+        Q_GETQUOTA => {
+            let ids = read_uidgid(task);
+            let own = match kind {
+                QuotaKind::User => ids.euid == id,
+                QuotaKind::Group => ids.egid == id || read_groups(task).contains(&id),
+            };
+            if own {
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+    if mount_admin(task) {
+        Ok(())
+    } else {
+        Err(EPERM)
+    }
 }
 
 /// Everything past "which filesystem" — shared by `quotactl` and
@@ -288,12 +362,9 @@ pub(crate) fn sys_quotactl_fd(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(EBADF as u64));
         return;
     }
-    let Some(kind) = quota_kind(type_) else {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
-        return;
-    };
-    // `Q_QUOTAON` has no quota-file path in this form.
-    if subcmd == Q_QUOTAON {
+    // `if (type >= MAXQUOTAS) return -EINVAL;` — the bound only; PRJQUOTA
+    // passes here and is refused by `do_quotactl` after the write check.
+    if type_ >= MAXQUOTAS {
         ctx.set_return(SyscallReturn::ok(EINVAL as u64));
         return;
     }
@@ -305,14 +376,31 @@ pub(crate) fn sys_quotactl_fd(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(EBADF as u64));
         return;
     };
-    // `quotactl_cmd_write(cmds)` -> `mnt_want_write`: changing a quota is a
-    // write to the filesystem like any other, so a read-only mount refuses it
-    // before the quota layer is reached.
-    if matches!(subcmd, Q_SETQUOTA | Q_SETINFO | Q_QUOTAOFF) {
+    // `quotactl_cmd_write(cmds)` -> `mnt_want_write`, before `do_quotactl`
+    // looks at anything. The kernel's list is of the commands that do NOT
+    // write — Q_GETFMT, Q_GETINFO, Q_SYNC (and the XFS getters) — so
+    // Q_GETQUOTA, Q_GETNEXTQUOTA and Q_QUOTAON count as writes too: on a
+    // read-only mount all three are -EROFS (probed on 6.18), where this
+    // handler checked only SETQUOTA/SETINFO/QUOTAOFF and answered Q_QUOTAON
+    // with -EINVAL ahead of the -EROFS.
+    if !matches!(subcmd, Q_GETFMT | Q_GETINFO | Q_SYNC) {
         if let Err(errno) = mnt_want_write(&path) {
             ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
+    }
+    let Some(kind) = quota_kind(type_) else {
+        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        return;
+    };
+    if let Err(errno) = check_quotactl_permission(subcmd, kind, id) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `Q_QUOTAON` has no quota-file path in this form.
+    if subcmd == Q_QUOTAON {
+        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        return;
     }
     let ret = quotactl_on_fs(subcmd, kind, fs, id, addr);
     ctx.set_return(SyscallReturn::ok(ret as u64));

@@ -2790,13 +2790,18 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
         fn set_rip(&mut self, _rip: u64) {}
     }
 
+    // The name and seal words are kernel buffers standing in for user ones;
+    // memfd_create reads the name (`alloc_name`), so it needs the opt-in.
+    // See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     __test_clear_global();
     crate::fd::__test_reset();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
-    let name = "lockdown";
+    // NUL-terminated: memfd_create reads the name like `alloc_name` does.
+    let name = b"lockdown\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: name.as_ptr() as u64,
@@ -2809,7 +2814,7 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
     };
     kernel_syscall_entry(Syscall::MemfdCreate.raw(), &mut ctx);
     let fd = match ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) >= 0 => r.value as u32,
         _ => return TestResult::Fail("memfd_create failed"),
     };
 

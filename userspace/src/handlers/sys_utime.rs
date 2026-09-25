@@ -3,18 +3,19 @@ use super::*;
 
 /// `utime(path, utimbuf*)` — x86_64 132. `utimbuf { actime, modtime }`
 /// in SECONDS; NULL times = both now.
+///
+/// ```text
+/// if (times) { if (get_user(tv[0].tv_sec, &times->actime) ||
+///                  get_user(tv[1].tv_sec, &times->modtime)) return -EFAULT; ... }
+/// return do_utimes(AT_FDCWD, filename, times ? tv : NULL, 0);
+/// ```
+///
+/// The buffer is read BEFORE the path, so a bad `utimbuf` is EFAULT even
+/// when the path is also bad.
 pub(crate) fn sys_utime(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let raw = match copy_user_cstr_checked(a.arg0, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(errno_ret(errno)); // -EFAULT
-            return;
-            }
-        };
-    let (at, mt) = if a.arg1 == 0 {
-        let now = wall_now_ns();
-        (now, now)
+    let times = if a.arg1 == 0 {
+        None
     } else {
         let mut buf = [0u8; 16];
         // SAFETY: non-zero user utimbuf pointer; copy_from_user
@@ -25,12 +26,7 @@ pub(crate) fn sys_utime(ctx: &mut dyn TrapContext) {
         }
         let actime = i64::from_ne_bytes(buf[..8].try_into().unwrap());
         let modtime = i64::from_ne_bytes(buf[8..].try_into().unwrap());
-        (
-            (actime.max(0) as u64).saturating_mul(1_000_000_000),
-            (modtime.max(0) as u64).saturating_mul(1_000_000_000),
-        )
+        Some([(actime, 0), (modtime, 0)])
     };
-    let path = resolve_cwd_path(current_task_id(), &raw);
-    let r = set_path_times(&path, Some(at), Some(mt));
-    ctx.set_return(SyscallReturn::ok(r as u64));
+    do_utimes(ctx, -100, a.arg0, times, 0);
 }

@@ -25,8 +25,8 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let off_in_ptr = args.arg1;
     let fd_out = args.arg2 as u32;
     let off_out_ptr = args.arg3;
-    let len = core::cmp::min(args.arg4 as usize, LINUX_MAX_RW_COUNT);
-    let flags = args.arg5;
+    // `unsigned int flags`: the syscall ABI drops the upper register half.
+    let flags = args.arg5 as u32 as u64;
 
     // Linux fdget()s both descriptors before touching offset words or flags.
     let task = current_task_id();
@@ -75,14 +75,8 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EBADF));
         return;
     }
-    if explicit_in.is_some_and(|offset| (offset as i64) < 0)
-        || explicit_out.is_some_and(|offset| (offset as i64) < 0)
-    {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
 
-    // Linux generic_copy_file_checks (fs/read_write.c:1518):
+    // Linux generic_copy_file_checks (fs/read_write.c):
     // Immutable output file -> -EPERM.
     if output.ops.inode_flags() & narf_filesystem::FS_IMMUTABLE_FL != 0 {
         ctx.set_return(errno_ret(EPERM));
@@ -92,34 +86,78 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let start_in = explicit_in.unwrap_or_else(|| input.description.offset());
     let start_out = explicit_out.unwrap_or_else(|| output.description.offset());
 
-    // Linux generic_copy_file_checks (fs/read_write.c:1525):
-    // Offsets wrapping or overflowing loff_t -> -EOVERFLOW.
-    if (start_in as i64).checked_add(len as i64).is_none()
-        || (start_out as i64).checked_add(len as i64).is_none()
-    {
+    // generic_copy_file_checks, in order. Every test below uses Linux's
+    // mixed loff_t/uint64_t arithmetic, i.e. u64 wrap-around, and runs on the
+    // caller's RAW len — not the MAX_RW_COUNT-clamped one:
+    //
+    //   if (pos_in + count < pos_in || pos_out + count < pos_out)
+    //           return -EOVERFLOW;
+    //
+    // So `*off_in = 1, len = SIZE_MAX` and `*off_in = -1, len = 10` are both
+    // -EOVERFLOW; a negative offset that does not wrap falls through to
+    // rw_verify_area's -EINVAL below.
+    let raw_len = args.arg4;
+    if start_in.checked_add(raw_len).is_none() || start_out.checked_add(raw_len).is_none() {
         ctx.set_return(errno_ret(EOVERFLOW));
         return;
     }
+    // "Shorten the copy to EOF": pos_in >= i_size -> count = 0, else
+    // count = min(count, size_in - (u64)pos_in).
+    let size_in = input.ops.stat().size;
+    let mut count = if (start_in as i64) >= (size_in as i64) {
+        0
+    } else {
+        raw_len.min(size_in.wrapping_sub(start_in))
+    };
+    // generic_write_check_limits(file_out, pos_out, &count): RLIMIT_FSIZE
+    // (SIGXFSZ + -EFBIG at or past the limit, else clamp), then
+    // s_maxbytes — MAX_LFS_FILESIZE (LLONG_MAX) for NARF's filesystems, so
+    // `*off_out = INT64_MAX` is -EFBIG. Both apply even when count == 0.
+    // A negative pos_out is below both limits and is left to rw_verify_area.
+    if (start_out as i64) >= 0 {
+        match fsize_check_write(task, start_out, count as usize, || true) {
+            Ok(limited) => count = count.min(limited as u64),
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
+                return;
+            }
+        }
+        if start_out >= i64::MAX as u64 {
+            ctx.set_return(errno_ret(EFBIG));
+            return;
+        }
+        count = count.min(i64::MAX as u64 - start_out);
+    }
 
-    // Linux generic_copy_file_checks (fs/read_write.c:1540):
-    // Don't allow overlapped copying within the same file -> -EINVAL.
+    // Don't allow overlapped copying within the same file -> -EINVAL. This
+    // uses the EOF-shortened count: copying [0, 1000) of a 15-byte file to
+    // offset 200 does not overlap.
     let same_file = Arc::ptr_eq(&input.ops, &output.ops)
         || (input.ops.ino() != 0
             && input.ops.ino() == output.ops.ino()
             && input.ops.inode_attrs().dev == output.ops.inode_attrs().dev);
     if same_file
-        && len > 0
-        && start_out + (len as u64) > start_in
-        && start_out < start_in + (len as u64)
+        && start_out.wrapping_add(count) > start_in
+        && start_out < start_in.wrapping_add(count)
     {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
-    if len == 0 {
+    // vfs_copy_file_range: rw_verify_area(READ, in, &pos_in, len) and
+    // rw_verify_area(WRITE, out, &pos_out, len) — negative offsets land here.
+    if rw_verify_area_pos(start_in, count as usize).is_err()
+        || rw_verify_area_pos(start_out, count as usize).is_err()
+    {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+
+    if count == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+    let len = core::cmp::min(count as usize, LINUX_MAX_RW_COUNT);
 
     let implicit_in = explicit_in.is_none();
     let implicit_out = explicit_out.is_none();

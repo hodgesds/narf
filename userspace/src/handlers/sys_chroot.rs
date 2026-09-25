@@ -46,6 +46,12 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    // The walk is literal: `chroot("file/..")` is -ENOTDIR and
+    // `chroot("missing/..")` -ENOENT, though both normalise to a valid dir.
+    if let Err(errno) = literal_walk_check(task, &raw) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     // AT_FDCWD anchoring: join a relative target to the cwd. resolve_cwd_path
     // ALSO composes any existing chroot (a nested chroot resolves under the
     // current root before installation), so apply_chroot must not run again

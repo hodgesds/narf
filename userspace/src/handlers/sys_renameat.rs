@@ -34,6 +34,12 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // The old name is walked before the new name's `getname()` error is
+    // examined: an empty old name (-ENOENT) outranks an unreadable new one.
+    if old_str.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     let new_str = match copy_user_cstr_checked(new_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
@@ -41,7 +47,7 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    if old_str.is_empty() || new_str.is_empty() {
+    if new_str.is_empty() {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }
@@ -66,5 +72,12 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
     // form, so a chrooted process renames inside its own namespace.
     let old_path = resolve_cwd_path(task, &old_path);
     let new_path = resolve_cwd_path(task, &new_path);
-    rename_absolute(ctx, &old_path, &new_path);
+    rename_absolute(
+        ctx,
+        &old_path,
+        &new_path,
+        LastComponent::of(&old_str),
+        LastComponent::of(&new_str),
+        0,
+    );
 }

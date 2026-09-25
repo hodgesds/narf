@@ -948,7 +948,7 @@ fn resolve_file_absolute_ext(
 /// Apply Linux `*at` anchoring before the ordinary cwd/chroot rewrite.
 /// Absolute paths ignore `dirfd`; relative paths require `AT_FDCWD` or an
 /// open directory fd. Errors are negative Linux errno values.
-fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
+pub(crate) fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
     const AT_FDCWD: i64 = -100;
     let dirfd = dirfd as i32 as i64;
     if raw.starts_with('/') || dirfd == AT_FDCWD {
@@ -975,7 +975,7 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
 /// Files come from the FileOps `stat()`; directories (mount roots and
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
-fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
+pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
     stat_ino_path_dir_aware(path).map(|(s, ..)| s)
 }
 
@@ -1015,12 +1015,19 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 fn path_lookup_errno(path: &str) -> i64 {
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
-    let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
+    let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
         return ENOENT;
     };
     let task = current_task_id();
     let mut prefix = alloc::string::String::new();
     for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        // A component longer than NAME_MAX cannot exist, and the lookup of
+        // it in the (already searchable) directory walked so far fails —
+        // see `name_too_long_in`. It is decided before this component's
+        // own type/search checks, exactly where `walk_component` runs.
+        if name_too_long_in(&prefix, comp) {
+            return ENAMETOOLONG;
+        }
         prefix.push('/');
         prefix.push_str(comp);
         // Non-final components are always followed, as in a real walk.
@@ -1048,11 +1055,205 @@ fn path_lookup_errno(path: &str) -> i64 {
             None => return ENOENT,
         }
     }
+    // Every ancestor resolved. An over-long leaf can be neither a file nor
+    // a link, so it is decided ahead of the cycle probe.
+    if name_too_long_in(&prefix, leaf) {
+        return ENAMETOOLONG;
+    }
     // Every ancestor resolved, so any cycle is in the final component.
     if path_symlink_loop(path) {
         return ELOOP;
     }
     ENOENT
+}
+
+/// A node found by [`user_path_lookup`].
+pub(crate) struct LookedUpPath {
+    /// Host-view absolute path (chroot applied), for resolver calls.
+    pub(crate) path: alloc::string::String,
+    /// Caller-view absolute path (no chroot prefix), for keys the caller's
+    /// later syscalls will name again.
+    pub(crate) user_path: alloc::string::String,
+    pub(crate) stat: narf_filesystem::Stat,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+/// `fs/namei.c::user_path_at(dfd, name, flags, &path)` errno shape for the
+/// syscalls that only need "find the node, or say why not":
+///
+/// ```text
+///   getname():          ""                    -> -ENOENT (no LOOKUP_EMPTY)
+///   link_path_walk():   non-dir component     -> -ENOTDIR
+///                       unsearchable dir      -> -EACCES
+///                       symlink cycle         -> -ELOOP
+///   LOOKUP_DIRECTORY or a trailing '/' on a non-directory -> -ENOTDIR
+/// ```
+///
+/// `dirfd` follows [`resolve_at_path`] (-EBADF / -ENOTDIR). Errors are
+/// POSITIVE errnos. `follow` is `LOOKUP_FOLLOW` for the final component.
+pub(crate) fn user_path_lookup(
+    task: u64,
+    dirfd: i64,
+    raw: &str,
+    follow: bool,
+    directory: bool,
+) -> Result<LookedUpPath, i64> {
+    if raw.is_empty() {
+        return Err(ENOENT);
+    }
+    let anchored = resolve_at_path(task, dirfd, raw).map_err(|e| -e)?;
+    let user_path = resolve_cwd_path_user(task, &anchored);
+    let path = resolve_cwd_path(task, &anchored);
+    // A trailing slash forces the final component to be followed and to be
+    // a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY` in `path_lookupat`).
+    let trailing_slash = raw.len() > 1 && raw.ends_with('/');
+    let Some((stat, _ino, _rdev, uid, gid, _attrs)) =
+        stat_ino_path_dir_aware_ext(&path, follow || trailing_slash)
+    else {
+        return Err(path_lookup_errno(&path));
+    };
+    if !path_ancestors_searchable(&path, task) {
+        return Err(EACCES);
+    }
+    if (directory || trailing_slash) && stat.mode.file_type != narf_filesystem::FileType::Dir {
+        return Err(ENOTDIR);
+    }
+    Ok(LookedUpPath {
+        path,
+        user_path,
+        stat,
+        uid,
+        gid,
+    })
+}
+
+/// `path_permission(&path, mask)` on a node [`user_path_lookup`] found:
+/// mode bits plus the file's ACCESS ACL. Errors are POSITIVE errnos.
+pub(crate) fn looked_up_permission(
+    task: u64,
+    found: &LookedUpPath,
+    follow: bool,
+    request: narf_filesystem::AccessRequest,
+) -> Result<(), i64> {
+    let is_dir = found.stat.mode.file_type == narf_filesystem::FileType::Dir;
+    let file = if is_dir {
+        None
+    } else {
+        resolve_file_absolute_ext(&found.path, follow)
+    };
+    node_permission(
+        task,
+        file.as_deref(),
+        found.stat.mode.perms,
+        found.uid,
+        found.gid,
+        is_dir,
+        request,
+    )
+}
+
+/// Linux's `NAME_MAX` — the longest single pathname component.
+const NAME_MAX: usize = 255;
+
+/// Would looking `comp` up in the directory `dir` (a host-view absolute
+/// path; "" is the root) fail with -ENAMETOOLONG?
+///
+/// There is no generic NAME_MAX test in `link_path_walk`; the errno comes
+/// from the filesystem's `->lookup`: `simple_lookup` (tmpfs, devtmpfs,
+/// debugfs), ext4, btrfs, xfs, kernfs (cgroup2) all open with
+///
+/// ```text
+///     if (dentry->d_name.len > NAME_MAX) return ERR_PTR(-ENAMETOOLONG);
+/// ```
+///
+/// while procfs and sysfs just miss, which is -ENOENT (observed on 6.18:
+/// `stat /tmp/<300 x 'a'>` is ENAMETOOLONG, `stat /proc/<same>` and
+/// `stat /sys/<same>` are ENOENT). Only called on the failure path.
+fn name_too_long_in(dir: &str, comp: &str) -> bool {
+    if comp.len() <= NAME_MAX {
+        return false;
+    }
+    let dir = if dir.is_empty() { "/" } else { dir };
+    !current_resolve_absolute(dir, |fs, _rel| matches!(fs.name(), "proc" | "sysfs"))
+        .unwrap_or(false)
+}
+
+/// `fs/namei.c::link_path_walk` walks the pathname AS WRITTEN, while NARF's
+/// resolvers see it only after [`normalize_abs`] has collapsed `.`/`..` and
+/// dropped a trailing slash. That loses three Linux errnos:
+///
+/// ```text
+///     stat("file/")      -> ENOTDIR   (trailing slash = LOOKUP_DIRECTORY)
+///     stat("file/.")     -> ENOTDIR   (a component follows a non-dir)
+///     stat("file/../x")  -> ENOTDIR   (the ".." is walked FROM the file)
+///     stat("nope/../x")  -> ENOENT    (…and from a name that is absent)
+/// ```
+///
+/// Normalisation turned all four into questions about some other path, and
+/// usually into success. This re-checks, in walk order, every prefix that a
+/// `.`/`..` component or a trailing slash is applied to: each must resolve
+/// (following links, as a non-final component always is) to a directory.
+/// Components that survive normalisation are checked by the caller's own
+/// resolution; the ones a `..` erases are covered here, because the prefix
+/// checked before that `..` contains them.
+///
+/// `raw` is the caller's pathname before [`resolve_cwd_path`] (relative to
+/// the cwd, or absolute — including a dirfd base already joined on). Returns
+/// `Ok(Some(dir))` when the name ends in `/`, `/.` or `/..`: the final object
+/// was then proved to be a directory reached by FOLLOWING any final symlink
+/// (which is how Linux treats such a name even under `AT_SYMLINK_NOFOLLOW`),
+/// and `dir` is its link-expanded host path for the caller to use instead.
+/// A plain name costs nothing: only a `.`/`..` after a real component, or a
+/// trailing slash, triggers a lookup.
+pub(crate) fn literal_walk_check(
+    task: u64,
+    raw: &str,
+) -> Result<Option<alloc::string::String>, i64> {
+    let bytes = raw.as_bytes();
+    let mut seen_named = false;
+    let mut last_is_dot = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'/' {
+            i += 1;
+        }
+        let comp = &raw[start..i];
+        last_is_dot = comp == "." || comp == "..";
+        if last_is_dot {
+            // The cwd / root anchor is a directory by construction; only a
+            // prefix that names something needs looking at.
+            if seen_named {
+                literal_prefix_is_dir(task, &raw[..start])?;
+            }
+        } else {
+            seen_named = true;
+        }
+    }
+    if seen_named && (last_is_dot || raw.ends_with('/')) {
+        return literal_prefix_is_dir(task, raw).map(Some);
+    }
+    Ok(None)
+}
+
+fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::String, i64> {
+    let host = resolve_cwd_path(task, prefix);
+    // Expand links first, as chdir does: a symlink-to-directory is a valid
+    // non-final component, and the per-fs file lookup does not always hand
+    // a directory back as a node.
+    let Some(resolved) = resolve_vfs_symlink_path(&host, true) else {
+        return Err(ELOOP);
+    };
+    match stat_ino_path_dir_aware_ext(&resolved, true) {
+        Some((st, ..)) if st.mode.file_type == narf_filesystem::FileType::Dir => Ok(resolved),
+        Some(_) => Err(ENOTDIR),
+        None => Err(path_lookup_errno(&resolved)),
+    }
 }
 
 /// Did resolving `path` fail specifically because of a symlink cycle?
@@ -2037,33 +2238,6 @@ fn do_execve_resolved(
     ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
 }
 
-/// A `TrapContext` proxy that overrides the syscall args while forwarding
-/// the return + control-flow hooks to the wrapped context. Used by the
-/// `*at`/`*at2` reshapers to call an existing handler with a different
-/// argument layout.
-struct ArgReshape<'a> {
-    inner: &'a mut dyn TrapContext,
-    args: SyscallArgs,
-}
-impl<'a> TrapContext for ArgReshape<'a> {
-    fn args(&self) -> &SyscallArgs {
-        &self.args
-    }
-    fn set_return(&mut self, ret: SyscallReturn) {
-        self.inner.set_return(ret);
-    }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
-    }
-    fn rip(&self) -> u64 {
-        0
-    }
-    fn set_rip(&mut self, _rip: u64) {}
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
-}
-
 /// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
 /// These are the magic symlinks glibc's fexecve / systemd's spawn execve.
 pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
@@ -2799,10 +2973,10 @@ const TMPFS_MAGIC: u64 = 0x0102_1994;
 const RAMFS_MAGIC: u64 = 0x8584_58f6;
 const EXT2_SUPER_MAGIC: u64 = 0xEF53;
 
-fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
-    if buf_ptr == 0 {
-        return false;
-    }
+/// Errors are POSITIVE errnos. The destination is only touched after the
+/// filesystem answered — `user_statfs`/`fd_statfs` run `vfs_statfs` first and
+/// `copy_to_user` last — so a bad `buf` never hides a lookup error.
+fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> Result<(), i64> {
     // Both statfs(path) and fstatfs(fd) hand us a path in the caller's
     // namespace: fds deliberately retain a chroot-relative path so
     // /proc/self/fd can expose a reopenable link. Re-root it before finding
@@ -2813,7 +2987,7 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
     let fs = match current_fs_arc_at(&path) {
         Some(fs) => fs,
-        None => return false,
+        None => return Err(ENOENT),
     };
     let f_type = match fs.name() {
         "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
@@ -2826,7 +3000,8 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     };
     let fs_stat = match poll_blocking(fs.statfs()) {
         Some(Ok(stat)) => stat,
-        _ => return false,
+        Some(Err(error)) => return Err(copy_fs_errno(error)),
+        None => return Err(EIO),
     };
     let stat = StatfsBuf {
         f_type,
@@ -2844,9 +3019,13 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // SAFETY: StatfsBuf is repr(C) of fifteen u64s with no padding; transmuting
     // it to a `[u8; size_of::<StatfsBuf>()]` reinterprets its bytes 1:1.
     let bytes: [u8; core::mem::size_of::<StatfsBuf>()] = unsafe { core::mem::transmute(stat) };
+    // A NULL destination is -EFAULT like any other unwritable one.
+    if buf_ptr == 0 {
+        return Err(EFAULT);
+    }
     // SAFETY: `buf_ptr` is the user statfs buffer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
+    unsafe { copy_to_user(buf_ptr, &bytes) }.map_err(|_| EFAULT)
 }
 
 // Per-task mount namespace table. Entries appear when a task calls
@@ -2994,7 +3173,7 @@ pub(crate) fn current_fs_arc_at(
     }
 }
 
-fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
+pub(crate) fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
     current_mount_namespace()
         .map(|ns| ns.list())
         .unwrap_or_else(|| narf_filesystem::registry().list())
@@ -3341,7 +3520,7 @@ fn current_bind_mount(
     r
 }
 
-fn current_move_mount(
+pub(crate) fn current_move_mount(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     source: &str,
     target: &str,
@@ -12620,8 +12799,6 @@ mod handler_sys_name_to_handle_at;
 mod handler_sys_newfstatat_linux;
 #[path = "sys_noop_ok.rs"]
 mod handler_sys_noop_ok;
-#[path = "sys_open.rs"]
-mod handler_sys_open;
 #[path = "sys_open_by_handle_at.rs"]
 mod handler_sys_open_by_handle_at;
 #[path = "sys_open_linux.rs"]
@@ -13055,7 +13232,7 @@ pub(crate) use {
     handler_sys_fb_info::sys_fb_info,
     handler_sys_fb_ring_map::sys_fb_ring_map,
     handler_sys_fchdir::sys_fchdir,
-    handler_sys_fchmod_or_fchown::{sys_fchmod, sys_fchown},
+    handler_sys_fchmod_or_fchown::{fchmod_fd, fchown_fd, sys_fchmod, sys_fchown},
     handler_sys_fchmodat::{sys_fchmodat, sys_fchmodat2},
     handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat,
     handler_sys_fcntl::sys_fcntl,
@@ -13136,7 +13313,6 @@ pub(crate) use {
     handler_sys_munlockall::sys_munlockall,
     handler_sys_munmap::sys_munmap,
     handler_sys_noop_ok::sys_noop_ok,
-    handler_sys_open::sys_open,
     handler_sys_open_linux::sys_open_linux,
     handler_sys_openat::sys_openat,
     handler_sys_openat2::sys_openat2,

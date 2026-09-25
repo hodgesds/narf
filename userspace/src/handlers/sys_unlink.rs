@@ -20,8 +20,9 @@ pub(crate) fn sys_unlink(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }
+    let last = LastComponent::of(&path);
     let path = resolve_cwd_path(current_task_id(), &path);
-    unlink_absolute(ctx, &path);
+    unlink_absolute(ctx, &path, last);
 }
 
 /// Unlink a path that is ALREADY resolved to absolute.
@@ -30,7 +31,18 @@ pub(crate) fn sys_unlink(ctx: &mut dyn TrapContext) {
 /// and share this body. It previously proxied here with the raw user
 /// pointer, which forced the path through `resolve_cwd_path` and discarded
 /// the dirfd entirely.
-pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
+///
+/// `last` is the shape of the caller's RAW last component, which the
+/// normalised `path` no longer shows.
+pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastComponent) {
+    // `do_unlinkat`: `if (type != LAST_NORM) { error = -EISDIR; goto exit; }`
+    // — before `mnt_want_write`. `.`, `..` and `/` always name a directory.
+    // Normalising `unlink("d/.")` into `unlink("d")` reached the backend and
+    // came back with whatever it reports for a directory victim.
+    if !last.is_norm() {
+        ctx.set_return(errno_ret(EISDIR));
+        return;
+    }
     // If this path is a live bound AF_UNIX socket, release its address so it
     // can be re-bound (Linux frees the address when the socket inode is
     // unlinked — dbus/wayland unlink a stale socket before re-binding).
@@ -48,6 +60,27 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     // before any permission question is asked.
     if let Err(errno) = mnt_want_write(path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `do_unlinkat`, right after the lookup and before `vfs_unlink` asks
+    // any permission question:
+    //
+    //     if (last.name[last.len]) goto slashes;
+    //     ...
+    //  slashes:
+    //     if (d_is_negative(dentry))  error = -ENOENT;
+    //     else if (d_is_dir(dentry))  error = -EISDIR;
+    //     else                        error = -ENOTDIR;
+    //
+    // A trailing slash was normalised away, so `unlink("file/")` used to
+    // remove the file.
+    if last == LastComponent::NormSlash {
+        let errno = match namespace_node_kind(path) {
+            None => path_lookup_errno(path),
+            Some(true) => EISDIR,
+            Some(false) => ENOTDIR,
+        };
+        ctx.set_return(errno_ret(errno));
         return;
     }
     // `may_delete`: `if (check_sticky(..) || IS_APPEND(inode) ||
@@ -100,7 +133,8 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         // The parent path/filesystem didn't resolve at all → the target
-        // can't exist. Linux returns ENOENT when a path component is absent.
-        _ => ctx.set_return(errno_ret(ENOENT)),
+        // can't exist. `link_path_walk` says why: ENOENT for an absent
+        // component, ENOTDIR when one is a file (`unlink("f/x")`).
+        _ => ctx.set_return(errno_ret(path_lookup_errno(path))),
     }
 }

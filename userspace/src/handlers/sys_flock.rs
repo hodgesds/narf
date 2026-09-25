@@ -35,7 +35,14 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+    // `CLASS(fd, f)(fd)` is `fdget`, which does not see O_PATH descriptors:
+    // an O_PATH fd is -EBADF here, as for read/write.
+    let arc_ops = fd::with_table(task, |t| {
+        t.get(fd)
+            .filter(|_| t.status_flags(fd).is_some_and(|f| f & crate::fd::O_PATH == 0))
+            .map(|e| e.ops.clone())
+    })
+    .flatten();
     let arc_ops = match arc_ops {
         Some(a) => a,
         None => {

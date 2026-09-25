@@ -30,6 +30,9 @@ const XATTR_REPLACE: u64 = 2;
 // new-mount-API fsconfig commands.
 const FSCONFIG_SET_STRING: u64 = 1;
 const FSCONFIG_CMD_CREATE: u64 = 6;
+/// move_mount(2): the source is `from_dfd` itself (an fsmount/open_tree fd);
+/// without it an empty or NULL `from_path` is -ENOENT / -EFAULT.
+const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x0000_0004;
 
 // Open a MemFs-backed file via the (linux-compat) open syscall.
 fn open_memfs_fd(path: &[u8]) -> Result<u32, &'static str> {
@@ -391,7 +394,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_efault_neg);
 // runs; a bogus value pointer fails → ok(-EFAULT).
 
 fn smoke_abi_fsx2_setxattr_value_efault_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("vf", b"hi")], || {
         let path = b"/abi/vf\0";
         let name = b"user.vf\0";
         let args = SyscallArgs {
@@ -415,7 +420,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_value_efault_neg);
 // xattr_set_core flag branch: flags & XATTR_REPLACE && !exists → ok(-ENODATA).
 
 fn smoke_abi_fsx2_setxattr_replace_missing_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("repl", b"hi")], || {
         let path = b"/abi/repl\0";
         let name = b"user.repl\0";
         let val = b"v";
@@ -441,7 +448,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_replace_missing_neg);
 // → ok(-EEXIST). This is the positive-feature path for the create flag.
 
 fn smoke_abi_fsx2_setxattr_create_exists_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("cre", b"hi")], || {
         let path = b"/abi/cre\0";
         let name = b"user.cre\0";
         let val = b"v";
@@ -479,7 +488,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_create_exists_pos);
 // (ENODATA) case; ERANGE on the *value* buffer is unhit there.
 
 fn smoke_abi_fsx2_getxattr_erange_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("ge", b"hi")], || {
         let path = b"/abi/ge\0";
         let name = b"user.ge\0";
         let val = b"abcdefgh"; // 8 bytes
@@ -516,7 +527,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_erange_neg);
 // length. The first file only exercises getxattr(size=0) (length probe).
 
 fn smoke_abi_fsx2_getxattr_copyout_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("gc", b"hi")], || {
         let path = b"/abi/gc\0";
         let name = b"user.gc\0";
         let val = b"wxyz"; // 4 bytes
@@ -556,7 +569,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_copyout_pos);
 // `if (error == 0 || error == sizeof(kname->name)) return -ERANGE;`.
 
 fn smoke_abi_fsx2_getxattr_emptyname_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("gn", b"hi")], || {
         let path = b"/abi/gn\0";
         let name = b"\0"; // empty → ERANGE
         let gargs = SyscallArgs {
@@ -581,7 +596,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_emptyname_neg);
 // pins listxattr(size=0) and the ERANGE case.
 
 fn smoke_abi_fsx2_listxattr_copyout_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lc", b"hi")], || {
         let path = b"/abi/lc\0";
         let name = b"user.lc\0"; // "user.lc\0" = 8 bytes
         let val = b"v";
@@ -612,7 +629,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattr_copyout_pos);
 // 0 (not an error). Pins the "names empty, size 0" exit.
 
 fn smoke_abi_fsx2_listxattr_empty_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("empty-list", b"hi")], || {
         let path = b"/abi/empty-list\0";
         let largs = a2(path.as_ptr() as u64, 0, 0);
         match call(Syscall::Listxattr.raw(), largs) {
@@ -632,7 +651,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattr_empty_pos);
 // `if (error == 0 || error == sizeof(kname->name)) return -ERANGE;`.
 
 fn smoke_abi_fsx2_removexattr_emptyname_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("rn", b"hi")], || {
         let path = b"/abi/rn\0";
         let name = b"\0"; // empty → ERANGE
         let rargs = a1(path.as_ptr() as u64, name.as_ptr() as u64);
@@ -681,20 +702,34 @@ fn smoke_abi_fsx2_fgetxattr_erange_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fgetxattr_erange_neg);
 
-// ── name_to_handle_at: EINVAL on an empty path ────────────────────────
+// ── name_to_handle_at: an empty path ─────────────────────────────────
 //
-// sys_name_to_handle_at rejects an empty path BEFORE the existence check.
-// The first file pins ENOENT (missing path) and 0 (success), not EINVAL.
+// Without AT_EMPTY_PATH, `user_path_at` -> `getname` refuses "" with
+// -ENOENT, as for every path syscall (NARF used to answer -EINVAL, which
+// blames the flags). With AT_EMPTY_PATH the dirfd itself is encoded, so a
+// closed dirfd is -EBADF. The smoke keeps its historical name.
 
 fn smoke_abi_fsx2_name_to_handle_at_einval_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
-        let path = b"\0"; // empty → EINVAL
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let path = b"\0"; // empty
         let mut hbuf = [0u8; 64];
         hbuf[0..4].copy_from_slice(&32u32.to_ne_bytes());
         let args = a3(0, path.as_ptr() as u64, hbuf.as_mut_ptr() as u64, 0);
         match call(Syscall::NameToHandleAt.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("name_to_handle_at with an empty path must return -EINVAL"),
+            Some(v) if v == ENOENT => {}
+            _ => return Err("name_to_handle_at with an empty path must return -ENOENT"),
+        }
+        let args = a4(
+            9999,
+            path.as_ptr() as u64,
+            hbuf.as_mut_ptr() as u64,
+            0,
+            AT_EMPTY_PATH,
+        );
+        match call(Syscall::NameToHandleAt.raw(), args) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("name_to_handle_at(closed fd, \"\", AT_EMPTY_PATH) must return -EBADF"),
         }
     })
 }
@@ -1356,27 +1391,39 @@ fn smoke_abi_fsx2_mount_badtarget_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_badtarget_neg);
 
-// ── fsconfig: ENODEV on an un-buildable fsname ────────────────────────
+// ── fsopen: ENODEV on an un-buildable fsname ──────────────────────────
 //
-// fsopen accepts any non-empty fsname; fsconfig(CMD_CREATE) then calls
-// build_fs, which returns None for an unknown fs → ENODEV. The first file
-// only pins the tmpfs CMD_CREATE success and the EBADF (unknown fd) case.
+// `fsopen` itself runs `get_fs_type` and refuses an unknown name with
+// -ENODEV (Linux 6.18); it does not hand back a context that only fails at
+// CMD_CREATE. The fsconfig checks that follow are the ones `fs/fsopen.c`
+// makes before it even looks up the descriptor.
 
 fn smoke_abi_fsx2_fsconfig_enodev_neg() -> TestResult {
     with_setup(|| {
         let fsname = b"nosuchfs\0";
-        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
-            Some(v) if v >= 0 => v as u64,
-            _ => return Err("fsopen of an arbitrary fsname should still open a context"),
-        };
-        let args = SyscallArgs {
-            arg0: fd,
-            arg1: FSCONFIG_CMD_CREATE,
+        if call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) != Some(ENODEV) {
+            return Err("fsopen of an unknown fsname must return -ENODEV");
+        }
+        // An unknown fsconfig command is -EOPNOTSUPP even on a closed fd.
+        let unknown_cmd = SyscallArgs {
+            arg0: 999,
+            arg1: 99,
             ..Default::default()
         };
-        match call(Syscall::Fsconfig.raw(), args) {
-            Some(v) if v == ENODEV => Ok(()),
-            _ => Err("fsconfig(CMD_CREATE) on an un-buildable fsname must return -ENODEV"),
+        if call(Syscall::Fsconfig.raw(), unknown_cmd) != Some(EOPNOTSUPP) {
+            return Err("fsconfig with an unknown command must return -EOPNOTSUPP first");
+        }
+        // CMD_CREATE with a key is a shape error, also before the fd lookup.
+        let key = b"size\0";
+        let create_with_key = SyscallArgs {
+            arg0: 999,
+            arg1: FSCONFIG_CMD_CREATE,
+            arg2: key.as_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Fsconfig.raw(), create_with_key) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("fsconfig(CMD_CREATE, key) must return -EINVAL before -EBADF"),
         }
     })
 }
@@ -1504,11 +1551,12 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_tmpfs_option_rejected);
 
-// ── move_mount: EINVAL on a relative target (valid from_dfd) ──────────
+// ── move_mount: a relative target resolves against to_dfd ─────────────
 //
-// Build a real detached-mount fd, then pass a relative to_path. mount_of
-// succeeds, but the to_path branch rejects a non-'/' target → EINVAL. The
-// first file's negative pins EBADF (unknown from_dfd) — a different branch.
+// Build a real detached-mount fd, then pass a relative to_path with a
+// to_dfd that is not open. Like any *at call, the relative name resolves
+// against to_dfd, so the answer is -EBADF — not a blanket -EINVAL for "not
+// absolute" (Linux 6.18 attaches `move_mount(mfd, "", dirfd, "t", ...)`).
 
 fn smoke_abi_fsx2_move_mount_relpath_neg() -> TestResult {
     with_setup(|| {
@@ -1529,18 +1577,18 @@ fn smoke_abi_fsx2_move_mount_relpath_neg() -> TestResult {
             Some(v) if v >= 0 => v as u64,
             _ => return Err("fsmount setup failed"),
         };
-        let to = b"relative-target\0"; // not absolute → EINVAL
+        let to = b"relative-target\0"; // resolved against to_dfd 999 → EBADF
         let args = SyscallArgs {
             arg0: mfd,
             arg1: 0,
-            arg2: 0,
+            arg2: 999,
             arg3: to.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         match call(Syscall::MoveMount.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("move_mount with a relative to_path must return -EINVAL"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("move_mount with a relative to_path and a closed to_dfd must return -EBADF"),
         }
     })
 }
@@ -1576,6 +1624,7 @@ fn smoke_abi_fsx2_move_mount_private_namespace_pos() -> TestResult {
                 arg1: 0,
                 arg2: (-100i64) as u64,
                 arg3: target.as_ptr() as u64,
+                arg4: MOVE_MOUNT_F_EMPTY_PATH,
                 ..Default::default()
             };
             if call(Syscall::MoveMount.raw(), attach) != Some(0) {
@@ -1985,6 +2034,7 @@ fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
                 arg1: 0,
                 arg2: (-100i64) as u64,
                 arg3: target.as_ptr() as u64,
+                arg4: MOVE_MOUNT_F_EMPTY_PATH,
                 ..Default::default()
             };
             if call(Syscall::MoveMount.raw(), attach) != Some(0) {
@@ -2096,17 +2146,23 @@ fn smoke_abi_fsx2_open_tree_enoent_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_open_tree_enoent_neg);
 
-// ── fspick: EINVAL on a relative path ─────────────────────────────────
+// ── fspick: EINVAL on a path that is not a mount root ─────────────────
 //
-// The first file's fspick negative is lenient (accepts anything); pin the
-// concrete EINVAL relative-path guard branch here.
+// `fspick` requires `target.mnt->mnt_root == target.dentry`: a path that
+// exists but is not the root of a mount is -EINVAL (Linux 6.18), where a
+// relative path merely resolves against dfd like any *at call. Unknown flag
+// bits are -EINVAL before the path is looked at.
 
 fn smoke_abi_fsx2_fspick_relpath_neg() -> TestResult {
-    with_setup(|| {
-        let path = b"relative\0";
-        match call(Syscall::Fspick.raw(), a2(0, path.as_ptr() as u64, 0)) {
+    with_memfs("/abi-fspick", "abi-fspick", &[("f", b"hi")], || {
+        let below = b"/abi-fspick/f\0";
+        if call(Syscall::Fspick.raw(), a2(0, below.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("fspick of an existing non-mountpoint must return -EINVAL");
+        }
+        let root = b"/abi-fspick\0";
+        match call(Syscall::Fspick.raw(), a2(0, root.as_ptr() as u64, 0x10)) {
             Some(v) if v == EINVAL => Ok(()),
-            _ => Err("fspick with a relative path must return -EINVAL"),
+            _ => Err("fspick with an unknown flag must return -EINVAL"),
         }
     })
 }
@@ -2261,7 +2317,7 @@ fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
             Some(v) if v >= 0 => v as u64,
             _ => return Err("fsmount on a created context should return a mount fd"),
         };
-        // move_mount(mfd, "", AT_FDCWD, dest, 0).
+        // move_mount(mfd, "", AT_FDCWD, dest, MOVE_MOUNT_F_EMPTY_PATH).
         let empty = b"\0";
         let mut dest_c = [0u8; 32];
         dest_c[..dest.len()].copy_from_slice(dest.as_bytes());
@@ -2270,7 +2326,7 @@ fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
             arg1: empty.as_ptr() as u64,
             arg2: 0xffffffffffffff9c, // AT_FDCWD
             arg3: dest_c.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         if call(Syscall::MoveMount.raw(), mvargs) != Some(0) {
@@ -2335,7 +2391,7 @@ fn smoke_abi_fsx2_new_mount_api_procfd_target_pos() -> TestResult {
             arg1: empty.as_ptr() as u64,
             arg2: (-100i64) as u64, // AT_FDCWD
             arg3: procfd_target_c.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         let moved = call(Syscall::MoveMount.raw(), move_args) == Some(0);
@@ -3667,7 +3723,7 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_attr_size_and_flag_rules);
 ///
 /// `if (!name && dfd >= 0) { filepath = fd_file(f)->f_path; }` — and
 /// AT_FDCWD is NOT a descriptor, so it falls through to the path branch,
-/// which has no path: -EBADF.
+/// where the empty lookup names the cwd.
 fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
     const AT_FDCWD: u64 = (-100i64) as u64;
     const AT_EMPTY_PATH: u64 = 0x1000;
@@ -3701,7 +3757,14 @@ fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
         if call(Syscall::FileGetattr.raw(), bad) != Some(EBADF) {
             return Err("AT_EMPTY_PATH on a closed descriptor must be -EBADF");
         }
-        // AT_FDCWD is not a descriptor, so it cannot name a file.
+        // AT_FDCWD is not a descriptor, so it falls through to
+        // `filename_lookup(AT_FDCWD, NULL, ...)` — whose empty walk names
+        // the cwd, a directory, which has (empty) flags. Linux 6.18 answers
+        // 0 here, not EBADF.
+        let dir = c"/fattr3";
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("chdir to the test mount should succeed");
+        }
         let cwd = SyscallArgs {
             arg0: AT_FDCWD,
             arg1: 0,
@@ -3710,8 +3773,38 @@ fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
             arg4: AT_EMPTY_PATH,
             ..Default::default()
         };
-        if call(Syscall::FileGetattr.raw(), cwd) != Some(EBADF) {
-            return Err("AT_FDCWD with a NULL path must be -EBADF");
+        if call(Syscall::FileGetattr.raw(), cwd) != Some(0) {
+            return Err("AT_FDCWD with a NULL path + AT_EMPTY_PATH must name the cwd");
+        }
+        // An O_PATH descriptor is not handed out by `fdget`: -EBADF.
+        const O_PATH: u64 = 0o10000000;
+        let opath = match call_open(path.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_PATH) should succeed"),
+        };
+        let via_opath = SyscallArgs {
+            arg0: opath,
+            arg1: 0,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), via_opath) != Some(EBADF) {
+            return Err("file_getattr on an O_PATH descriptor must be -EBADF");
+        }
+        let _ = call(Syscall::Close.raw(), a0(opath));
+        // `at_flags` is checked before `usize`: EINVAL, not E2BIG.
+        let both_bad = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: 8000,
+            arg4: 0x8000,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), both_bad) != Some(EINVAL) {
+            return Err("a bad at_flags must be -EINVAL ahead of an oversized usize");
         }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())

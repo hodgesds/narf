@@ -75,6 +75,12 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
             return;
             }
         };
+    // `getname("")` without LOOKUP_EMPTY is -ENOENT; resolving the empty
+    // string would name the cwd and unmount whatever covers it.
+    if target_raw.is_empty() {
+        ctx.set_return(fail(ENOENT));
+        return;
+    }
     // Resolve against the caller's cwd (and re-root under any chroot), like
     // sys_pivot_root / sys_mount. systemd's switch-root does
     // `fchdir(new_root_fd); pivot_root(".", "."); umount2(".", MNT_DETACH)` —
@@ -99,6 +105,21 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // is unconditional. The flag word is recorded for diagnostic symmetry
     // only. (MNT_EXPIRE's conflict check is enforced below.)
     let _ = flags & (MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW);
+
+    // `user_path_at` runs first (-ENOENT), then `can_umount`'s `may_mount()`
+    // (-EPERM), then its `path_mounted()` (-EINVAL, below). Probed on Linux
+    // 6.18: an unprivileged umount2 of a missing path is ENOENT, of an
+    // existing non-mountpoint EPERM. This handler had no privilege check at
+    // all, so any task could unmount anything.
+    let mounted = current_mount_list().iter().any(|m| m == &target);
+    if !mounted && stat_path_dir_aware(target.as_str()).is_none() {
+        ctx.set_return(fail(ENOENT));
+        return;
+    }
+    if !mount_admin(current_task_id()) {
+        ctx.set_return(fail(EPERM));
+        return;
+    }
 
     // Protect the core API pseudo-filesystems from destructive unmount ONLY in
     // the GLOBAL registry. NARF has no mount stacking: the global /proc, /sys,
@@ -133,15 +154,11 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
 
     // `can_umount`'s `path_mounted()` test, split out ahead of the pop so the
     // two halves of the registry's single `NotFound` can be told apart the way
-    // Linux tells them apart: the path lookup fails first (-ENOENT), and only
-    // a path that DOES resolve reaches the "not a mount point" -EINVAL.
-    if !current_mount_list().iter().any(|m| m == &target) {
-        let errno = if stat_path_dir_aware(target.as_str()).is_some() {
-            EINVAL
-        } else {
-            ENOENT
-        };
-        ctx.set_return(fail(errno));
+    // Linux tells them apart: the path lookup failed first (-ENOENT, above),
+    // and only a path that DOES resolve reaches the "not a mount point"
+    // -EINVAL.
+    if !mounted {
+        ctx.set_return(fail(EINVAL));
         return;
     }
 

@@ -25,64 +25,125 @@ const FS_XFLAG_RDONLY_MASK: u64 = 0x8002_0002;
 const FS_XFLAG_IMMUTABLE: u64 = 0x0000_0008;
 const FS_XFLAG_APPEND: u64 = 0x0000_0010;
 
-/// The `(dfd, filename, at_flags)` prologue these two share.
+/// Both syscalls open with this, BEFORE the `usize` checks:
 ///
 /// ```text
 /// if ((at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) return -EINVAL;
 /// if (!(at_flags & AT_SYMLINK_NOFOLLOW)) lookup_flags |= LOOKUP_FOLLOW;
+/// if (usize > PAGE_SIZE) return -E2BIG;
+/// ```
+///
+/// so a bad `at_flags` with an oversized `usize` is EINVAL, not E2BIG
+/// (probed on Linux 6.18).
+fn file_attr_at_flags_ok(at_flags: u32) -> Result<(), i64> {
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
+/// The `(dfd, filename, at_flags)` lookup these two share (the `at_flags`
+/// check has already run).
+///
+/// ```text
 /// CLASS(filename_maybe_null, name)(filename, at_flags);
 /// if (!name && dfd >= 0) { CLASS(fd, f)(dfd); if (fd_empty(f)) return -EBADF;
 ///                          filepath = fd_file(f)->f_path; }
 /// else                   { filename_lookup(dfd, name, lookup_flags, &filepath, NULL); }
 /// ```
 ///
-/// Unlike the xattr `*at` family, the AT_EMPTY_PATH arm needs the FILE
-/// behind the descriptor rather than a side-table key, because inode flags
-/// live on the inode itself.
+/// `CLASS(fd, ...)` is `fdget`, which does not hand out O_PATH files, and an
+/// AT_FDCWD with an empty name reaches `filename_lookup`, whose empty walk is
+/// the cwd (both probed on Linux 6.18). A directory is an inode with flags
+/// too, but path resolution hands back `DirOps` for one, hence
+/// [`XattrTarget`] rather than a bare `FileOps`.
+///
+/// Returns the target and, for the path form, the path (`mnt_want_write`
+/// needs it).
 fn file_attr_target(
     dfd: i64,
     path_ptr: u64,
     at_flags: u32,
-) -> Result<alloc::sync::Arc<dyn narf_filesystem::FileOps>, i64> {
+) -> Result<(XattrTarget, Option<alloc::string::String>), i64> {
     const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
     const AT_EMPTY_PATH: u32 = 0x1000;
     const AT_FDCWD: i64 = -100;
-    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        return Err(-EINVAL);
-    }
     let follow = at_flags & AT_SYMLINK_NOFOLLOW == 0;
     let task = current_task_id();
+    let dfd = dfd as i32 as i64;
 
-    let empty = if path_ptr == 0 {
+    let raw = if path_ptr == 0 {
         if at_flags & AT_EMPTY_PATH == 0 {
             return Err(-EFAULT); // getname on a NULL pointer
         }
-        true
+        alloc::string::String::new()
     } else {
         let raw = copy_user_cstr_checked(path_ptr, 4096).map_err(|e| -e)?;
-        if raw.is_empty() {
-            if at_flags & AT_EMPTY_PATH == 0 {
-                return Err(-ENOENT); // "" without AT_EMPTY_PATH
-            }
-            true
-        } else {
-            let anchored = apply_chroot(&resolve_at_path(task, dfd, &raw)?);
-            // The VFS-level symlink walk, as `open` runs it — only this can
-            // follow an ABSOLUTE target out of the filesystem the link lives
-            // on, which the in-filesystem resolver cannot.
-            let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
-            return resolve_file_absolute_ext(&resolved, false).ok_or(-ENOENT);
+        if raw.is_empty() && at_flags & AT_EMPTY_PATH == 0 {
+            return Err(-ENOENT); // "" without AT_EMPTY_PATH
         }
+        raw
     };
-    debug_assert!(empty);
-    // `if (!name && dfd >= 0)`: AT_FDCWD is not a descriptor, so it cannot
-    // name a file and falls through to the path branch, which has no path.
-    if dfd < 0 || dfd == AT_FDCWD {
-        return Err(-EBADF);
+    let raw: &str = if raw.is_empty() {
+        if dfd == AT_FDCWD {
+            "."
+        } else if dfd < 0 {
+            return Err(-EBADF);
+        } else {
+            let ops = crate::fd::with_table(task, |t| {
+                let entry = t.get(dfd as u32)?;
+                if t.status_flags(dfd as u32).unwrap_or(0) & crate::fd::O_PATH != 0 {
+                    return None;
+                }
+                Some(entry.ops.clone())
+            })
+            .flatten()
+            .ok_or(-EBADF)?;
+            return Ok((XattrTarget::File(ops), None));
+        }
+    } else {
+        &raw
+    };
+    // `resolve_cwd_path`, not a bare `apply_chroot`: a RELATIVE name must be
+    // joined onto the cwd before anything can resolve it.
+    let anchored = resolve_cwd_path(task, &resolve_at_path(task, dfd, raw)?);
+    // The VFS-level symlink walk, as `open` runs it — only this can follow
+    // an ABSOLUTE target out of the filesystem the link lives on, which the
+    // in-filesystem resolver cannot.
+    let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
+    let target = resolve_file_absolute_ext(&resolved, follow)
+        .map(XattrTarget::File)
+        .or_else(|| resolve_dir_absolute(&resolved).map(XattrTarget::Dir));
+    match target {
+        Some(target) => Ok((target, Some(resolved))),
+        // `filename_lookup`'s own errno: ENOENT, ENOTDIR, ELOOP, EACCES.
+        None => Err(-path_lookup_errno(&resolved)),
     }
-    crate::fd::with_table(task, |t| t.get(dfd as u32).map(|e| e.ops.clone()))
-        .flatten()
-        .ok_or(-EBADF)
+}
+
+/// `vfs_fileattr_get` / `_set` begin with `if (!inode->i_op->fileattr_get)
+/// return -ENOIOCTLCMD;`, which these syscalls report as -EOPNOTSUPP. Only
+/// regular files and directories carry the operation; a symlink (reached
+/// with AT_SYMLINK_NOFOLLOW), a FIFO or a device node does not (probed on
+/// Linux 6.18).
+fn file_attr_supported(target: &XattrTarget) -> bool {
+    match target {
+        XattrTarget::File(file) => matches!(
+            file.stat().mode.file_type,
+            narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+        ),
+        XattrTarget::Dir(_) => true,
+    }
+}
+
+/// The inode's `FS_*_FL` word. A `DirOps` directory models none.
+fn file_attr_flags(target: &XattrTarget) -> u32 {
+    match target {
+        XattrTarget::File(file) => file.inode_flags(),
+        XattrTarget::Dir(_) => 0,
+    }
 }
 
 /// `usize` handling, shared by both. Note the ORDER — E2BIG before EINVAL,
@@ -109,20 +170,26 @@ pub(crate) fn sys_file_getattr(ctx: &mut dyn TrapContext) {
     let (dfd, path_ptr, ufattr, usize_bytes, at_flags) =
         (a.arg0 as i64, a.arg1, a.arg2, a.arg3, a.arg4 as u32);
 
-    if let Err(errno) = file_attr_usize_ok(usize_bytes) {
+    if let Err(errno) =
+        file_attr_at_flags_ok(at_flags).and_then(|()| file_attr_usize_ok(usize_bytes))
+    {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
-    let ops = match file_attr_target(dfd, path_ptr, at_flags) {
-        Ok(ops) => ops,
+    let target = match file_attr_target(dfd, path_ptr, at_flags) {
+        Ok((target, _)) => target,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
     };
+    if !file_attr_supported(&target) {
+        ctx.set_return(errno_ret(EOPNOTSUPP));
+        return;
+    }
     // `fileattr_to_file_attr`: the inode's FS_*_FL word, reported as the
     // xfs-style xflags this ABI uses. NARF models the two the VFS enforces.
-    let flags = ops.inode_flags();
+    let flags = file_attr_flags(&target);
     let mut xflags = 0u64;
     if u64::from(flags) & u64::from(narf_filesystem::FS_IMMUTABLE_FL) != 0 {
         xflags |= FS_XFLAG_IMMUTABLE;
@@ -130,19 +197,18 @@ pub(crate) fn sys_file_getattr(ctx: &mut dyn TrapContext) {
     if u64::from(flags) & u64::from(narf_filesystem::FS_APPEND_FL) != 0 {
         xflags |= FS_XFLAG_APPEND;
     }
-    let mut fattr = [0u8; FILE_ATTR_SIZE_VER0 as usize];
-    fattr[0..8].copy_from_slice(&xflags.to_ne_bytes());
     // fa_extsize / fa_nextents / fa_projid / fa_cowextsize stay 0: NARF has
     // no extent allocator and no project quotas, so there is no value to
     // report and 0 is what a filesystem without them reports.
     //
-    // `copy_struct_to_user` writes min(usize, sizeof) and zero-fills the
-    // rest; a caller declaring a SMALLER struct than this kernel's gets the
-    // prefix it asked for.
-    let n = core::cmp::min(usize_bytes as usize, fattr.len());
+    // `copy_struct_to_user` writes min(usize, sizeof) and ZERO-FILLS the
+    // rest of a larger caller struct (`clear_user`), so a newer caller never
+    // reads stale bytes as fields this kernel does not know.
+    let mut fattr = alloc::vec![0u8; usize_bytes as usize];
+    fattr[0..8].copy_from_slice(&xflags.to_ne_bytes());
     // SAFETY: `ufattr` is the user `struct file_attr`; copy_to_user
-    // range-validates it and brackets the write of `n` bytes.
-    if unsafe { copy_to_user(ufattr, &fattr[..n]) }.is_err() {
+    // range-validates it and brackets the write of `usize` bytes.
+    if unsafe { copy_to_user(ufattr, &fattr) }.is_err() {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
@@ -162,7 +228,9 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
     let (dfd, path_ptr, ufattr, usize_bytes, at_flags) =
         (a.arg0 as i64, a.arg1, a.arg2, a.arg3, a.arg4 as u32);
 
-    if let Err(errno) = file_attr_usize_ok(usize_bytes) {
+    if let Err(errno) =
+        file_attr_at_flags_ok(at_flags).and_then(|()| file_attr_usize_ok(usize_bytes))
+    {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
@@ -210,15 +278,35 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
         requested |= narf_filesystem::FS_APPEND_FL;
     }
 
-    let ops = match file_attr_target(dfd, path_ptr, at_flags) {
-        Ok(ops) => ops,
+    let (target, path) = match file_attr_target(dfd, path_ptr, at_flags) {
+        Ok(found) => found,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
     };
+    // `mnt_want_write(filepath.mnt)` before `vfs_fileattr_set`: a read-only
+    // mount is EROFS (probed on Linux 6.18).
+    if let Some(path) = path.as_deref() {
+        if let Err(errno) = mnt_want_write(path) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    // `vfs_fileattr_set`: no `fileattr_set` op is -EOPNOTSUPP, ahead of the
+    // ownership test.
+    if !file_attr_supported(&target) {
+        ctx.set_return(errno_ret(EOPNOTSUPP));
+        return;
+    }
     let task = current_task_id();
-    let current = ops.inode_flags();
+    // `may_fileattr_set`: "Verify that we are the owner or have CAP_FOWNER".
+    let (uid, gid, ..) = target.meta();
+    if !inode_owner_or_capable(task, uid, gid) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
+    let current = file_attr_flags(&target);
     // `fileattr_set_prepare`: it is the CHANGE to IMMUTABLE/APPEND that is
     // privileged, not the value.
     if (requested ^ current) & narf_filesystem::FS_PRIVILEGED_FL != 0
@@ -227,20 +315,19 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EPERM));
         return;
     }
-    // `vfs_fileattr_set` -> `may_fileattr_set`: "Verify that we are the
-    // owner or have CAP_FOWNER".
-    let (uid, gid) = ops.owners();
-    if !inode_owner_or_capable(task, uid, gid) {
-        ctx.set_return(errno_ret(EPERM));
-        return;
-    }
-    let result = match ops.set_inode_flags(requested) {
-        Ok(()) => 0,
-        // A filesystem that cannot store them must not pretend it did:
-        // userspace would believe a file is immutable while nothing
-        // enforces it. `file_getattr`/`file_setattr` map the ioctl's
-        // ENOTTY to -EOPNOTSUPP, which is the answer this surface uses.
-        Err(_) => -EOPNOTSUPP,
+    let result = match &target {
+        XattrTarget::File(ops) => match ops.set_inode_flags(requested) {
+            Ok(()) => 0,
+            // A filesystem that cannot store them must not pretend it did:
+            // userspace would believe a file is immutable while nothing
+            // enforces it. `file_getattr`/`file_setattr` map the ioctl's
+            // ENOTTY to -EOPNOTSUPP, which is the answer this surface uses.
+            Err(_) => -EOPNOTSUPP,
+        },
+        // A `DirOps` directory has no flag store: rewriting the (empty) word
+        // unchanged is a no-op, anything else cannot be honoured.
+        XattrTarget::Dir(_) if requested == current => 0,
+        XattrTarget::Dir(_) => -EOPNOTSUPP,
     };
     ctx.set_return(SyscallReturn::ok(result as u64));
 }

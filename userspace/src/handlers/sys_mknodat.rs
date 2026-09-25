@@ -31,6 +31,12 @@ use super::*;
 pub(crate) fn sys_mknodat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // mknodat(dirfd, path, mode, dev): dirfd=arg0, path=arg1, mode=arg2, dev=arg3.
+    // `do_mknodat` runs `may_mknod(mode)` first: EINVAL / EPERM (S_IFDIR)
+    // outrank -EFAULT for the path and -EBADF for the dirfd.
+    if let Err(errno) = may_mknod(args.arg2) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let raw = match copy_user_cstr_checked(args.arg1, 4096) {
         Ok(s) => s,
         Err(errno) => {
