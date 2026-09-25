@@ -1179,11 +1179,6 @@ pub fn release_task(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().remove(&tid)
 }
 
-/// Number of registered (live + zombie) tasks. Diagnostics only.
-pub fn task_count() -> usize {
-    TASKS.lock().len()
-}
-
 /// Snapshot every registered task's `(tid, pid)`. The OOM killer scans this
 /// to score candidates without holding the registry lock across address-space
 /// resolution (which locks the scheduler ready queues) — that nesting is the
