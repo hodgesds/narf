@@ -342,15 +342,19 @@ mod kaslr_slide_tests {
     /// Overlap here would not fault. The image would quietly share addresses
     /// with module text, and the first module load would corrupt the kernel.
     fn smoke_kaslr_slid_image_clears_module_window() -> TestResult {
-        // Physical, and deliberately not converted — see
-        // `smoke_kaslr_image_bounds_stay_physical`.
-        let image_end_phys = image_phys_bounds().1;
-        let top = kernel_virt_base().wrapping_add(image_end_phys);
+        // The image's VIRTUAL extent, NOT `image_phys_bounds().1`. Both name the
+        // image's end and they differ by the physical relocation delta, which
+        // has nothing to do with where the image APPEARS — so folding it into a
+        // VA inflates the answer by the delta and fails this check for any
+        // slide + delta over about 926 MiB. That made the test fail for roughly
+        // one boot in three once the delta became random.
+        let image_end = image_virt_extent();
+        let top = kernel_virt_base().wrapping_add(image_end);
         if top > crate::module_text::MODULE_VA_BASE {
             return TestResult::Fail("the slid kernel image reaches the module text window");
         }
         #[cfg(target_arch = "x86_64")]
-        if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end_phys > KERNEL_IMAGE_SIZE {
+        if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end > KERNEL_IMAGE_SIZE {
             return TestResult::Fail("slide + image exceeds KERNEL_IMAGE_SIZE");
         }
         TestResult::Pass
