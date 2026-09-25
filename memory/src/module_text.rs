@@ -958,8 +958,15 @@ fn smoke_module_text_window_placement() -> TestResult {
     // address the veneers and the page-table walk actually use. Asserting the
     // region base would pass while the chosen window sat somewhere illegal.
     let win_base = module_va_base();
-    if win_base < MODULE_VA_BASE || win_base + MODULE_VA_USABLE > MODULE_VA_BASE + MODULE_VA_REGION
-    {
+    // Compared as an OFFSET, never by adding to the base.
+    //
+    // `MODULE_VA_BASE + MODULE_VA_REGION` overflows u64 on x86_64: the region
+    // is all of PML4[511]/PDPT[511], whose last byte IS the last byte of the
+    // address space, so the exclusive end is 2^64. In a debug build that is a
+    // runtime add and `cargo check` says nothing; in release, const-propagation
+    // turns it into `deny(arithmetic_overflow)` and the kernel does not build.
+    let max_off = MODULE_VA_REGION - MODULE_VA_USABLE;
+    if win_base < MODULE_VA_BASE || win_base - MODULE_VA_BASE > max_off {
         return TestResult::Fail("module window is outside its reserved region");
     }
     if win_base & ((2 << 20) - 1) != 0 {
