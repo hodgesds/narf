@@ -29,11 +29,38 @@ pub(crate) fn sys_readlinkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let task = current_task_id();
+    // `do_readlinkat` always looks up with LOOKUP_EMPTY, so "" names the
+    // dirfd itself — no AT_EMPTY_PATH flag needed:
+    //
+    //     if (d_is_symlink(path.dentry) || inode->i_op->readlink) ...
+    //     else error = (name->name[0] == '\0') ? -ENOENT : -EINVAL;
+    //
+    // A bad anchor is therefore -EBADF (path_init's fdget), an
+    // `O_PATH|O_NOFOLLOW` descriptor on a symlink reads that link, and any
+    // other descriptor (or the cwd) is -ENOENT. This used to answer -ENOENT
+    // for all of them.
     if path_str.is_empty() {
-        ctx.set_return(errno_ret(ENOENT));
+        const AT_FDCWD: i64 = -100;
+        let dirfd = dirfd as i32 as i64;
+        if dirfd == AT_FDCWD {
+            ctx.set_return(errno_ret(ENOENT));
+            return;
+        }
+        let ops = if dirfd < 0 {
+            None
+        } else {
+            fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.clone())).flatten()
+        };
+        match ops {
+            None => ctx.set_return(errno_ret(EBADF)),
+            Some(file) if file.stat().mode.file_type == narf_filesystem::FileType::Symlink => {
+                readlink_node(ctx, &file, buf_ptr, buf_len as usize);
+            }
+            Some(_) => ctx.set_return(errno_ret(ENOENT)),
+        }
         return;
     }
-    let task = current_task_id();
     let effective = match resolve_at_path(task, dirfd, &path_str) {
         Ok(p) => p,
         Err(errno) => {

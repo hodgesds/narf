@@ -181,25 +181,34 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // STATX_TYPE); without this branch every such lookup resolved
         // against the CWD instead and ENOENT'd (exec_setup_credentials'
         // mount-ns child → journald 243/EXIT_CREDENTIALS).
-        let relative = !raw.starts_with('/');
-        if relative && dirfd < 0 && dirfd != AT_FDCWD_I32 {
-            // path_init's `fdget(nd->dfd)` on a bogus anchor.
-            ctx.set_return(errno_ret(EBADF));
-            return;
-        }
-        let effective = if !relative || dirfd == AT_FDCWD_I32 {
-            raw
-        } else {
-            match fd_path_for_task(current_task_id(), dirfd as u32) {
-                Some(dir) if dir.starts_with('/') => {
-                    alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-                }
-                _ => raw,
+        //
+        // `path_init` on a relative name: `fdget(nd->dfd)` failing is
+        // -EBADF, and an anchor that is not a directory is -ENOTDIR — both
+        // before any component is looked up. This used to fall back to a
+        // CWD-relative lookup whenever the descriptor had no directory path,
+        // so a closed or regular-file dirfd silently statted some other file.
+        let task = current_task_id();
+        let effective = match resolve_at_path(task, dirfd as i64, &raw) {
+            Ok(path) => path,
+            Err(errno) => {
+                // resolve_at_path reports a negative errno.
+                ctx.set_return(errno_ret(-errno));
+                return;
+            }
+        };
+        // `link_path_walk` sees `file/`, `file/.` and `file/../x` as written
+        // (-ENOTDIR); a trailing slash also forces the final link to be
+        // followed, so the proven directory is what gets described.
+        let dir_named = match literal_walk_check(task, &effective) {
+            Ok(dir) => dir,
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
+                return;
             }
         };
         // resolve_cwd_path resolves against the cwd AND re-roots under
         // the task's chroot — applying apply_chroot again double-composes.
-        let path_owned = resolve_cwd_path(current_task_id(), &effective);
+        let path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, &effective));
         // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
         // not its target; otherwise follow like plain stat.
         let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;

@@ -1015,12 +1015,19 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 fn path_lookup_errno(path: &str) -> i64 {
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
-    let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
+    let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
         return ENOENT;
     };
     let task = current_task_id();
     let mut prefix = alloc::string::String::new();
     for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        // A component longer than NAME_MAX cannot exist, and the lookup of
+        // it in the (already searchable) directory walked so far fails —
+        // see `name_too_long_in`. It is decided before this component's
+        // own type/search checks, exactly where `walk_component` runs.
+        if name_too_long_in(&prefix, comp) {
+            return ENAMETOOLONG;
+        }
         prefix.push('/');
         prefix.push_str(comp);
         // Non-final components are always followed, as in a real walk.
@@ -1047,6 +1054,11 @@ fn path_lookup_errno(path: &str) -> i64 {
             None if path_symlink_loop(&prefix) => return ELOOP,
             None => return ENOENT,
         }
+    }
+    // Every ancestor resolved. An over-long leaf can be neither a file nor
+    // a link, so it is decided ahead of the cycle probe.
+    if name_too_long_in(&prefix, leaf) {
+        return ENAMETOOLONG;
     }
     // Every ancestor resolved, so any cycle is in the final component.
     if path_symlink_loop(path) {
@@ -1139,6 +1151,109 @@ pub(crate) fn looked_up_permission(
         is_dir,
         request,
     )
+}
+
+/// Linux's `NAME_MAX` — the longest single pathname component.
+const NAME_MAX: usize = 255;
+
+/// Would looking `comp` up in the directory `dir` (a host-view absolute
+/// path; "" is the root) fail with -ENAMETOOLONG?
+///
+/// There is no generic NAME_MAX test in `link_path_walk`; the errno comes
+/// from the filesystem's `->lookup`: `simple_lookup` (tmpfs, devtmpfs,
+/// debugfs), ext4, btrfs, xfs, kernfs (cgroup2) all open with
+///
+/// ```text
+///     if (dentry->d_name.len > NAME_MAX) return ERR_PTR(-ENAMETOOLONG);
+/// ```
+///
+/// while procfs and sysfs just miss, which is -ENOENT (observed on 6.18:
+/// `stat /tmp/<300 x 'a'>` is ENAMETOOLONG, `stat /proc/<same>` and
+/// `stat /sys/<same>` are ENOENT). Only called on the failure path.
+fn name_too_long_in(dir: &str, comp: &str) -> bool {
+    if comp.len() <= NAME_MAX {
+        return false;
+    }
+    let dir = if dir.is_empty() { "/" } else { dir };
+    !current_resolve_absolute(dir, |fs, _rel| matches!(fs.name(), "proc" | "sysfs"))
+        .unwrap_or(false)
+}
+
+/// `fs/namei.c::link_path_walk` walks the pathname AS WRITTEN, while NARF's
+/// resolvers see it only after [`normalize_abs`] has collapsed `.`/`..` and
+/// dropped a trailing slash. That loses three Linux errnos:
+///
+/// ```text
+///     stat("file/")      -> ENOTDIR   (trailing slash = LOOKUP_DIRECTORY)
+///     stat("file/.")     -> ENOTDIR   (a component follows a non-dir)
+///     stat("file/../x")  -> ENOTDIR   (the ".." is walked FROM the file)
+///     stat("nope/../x")  -> ENOENT    (…and from a name that is absent)
+/// ```
+///
+/// Normalisation turned all four into questions about some other path, and
+/// usually into success. This re-checks, in walk order, every prefix that a
+/// `.`/`..` component or a trailing slash is applied to: each must resolve
+/// (following links, as a non-final component always is) to a directory.
+/// Components that survive normalisation are checked by the caller's own
+/// resolution; the ones a `..` erases are covered here, because the prefix
+/// checked before that `..` contains them.
+///
+/// `raw` is the caller's pathname before [`resolve_cwd_path`] (relative to
+/// the cwd, or absolute — including a dirfd base already joined on). Returns
+/// `Ok(Some(dir))` when the name ends in `/`, `/.` or `/..`: the final object
+/// was then proved to be a directory reached by FOLLOWING any final symlink
+/// (which is how Linux treats such a name even under `AT_SYMLINK_NOFOLLOW`),
+/// and `dir` is its link-expanded host path for the caller to use instead.
+/// A plain name costs nothing: only a `.`/`..` after a real component, or a
+/// trailing slash, triggers a lookup.
+pub(crate) fn literal_walk_check(
+    task: u64,
+    raw: &str,
+) -> Result<Option<alloc::string::String>, i64> {
+    let bytes = raw.as_bytes();
+    let mut seen_named = false;
+    let mut last_is_dot = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'/' {
+            i += 1;
+        }
+        let comp = &raw[start..i];
+        last_is_dot = comp == "." || comp == "..";
+        if last_is_dot {
+            // The cwd / root anchor is a directory by construction; only a
+            // prefix that names something needs looking at.
+            if seen_named {
+                literal_prefix_is_dir(task, &raw[..start])?;
+            }
+        } else {
+            seen_named = true;
+        }
+    }
+    if seen_named && (last_is_dot || raw.ends_with('/')) {
+        return literal_prefix_is_dir(task, raw).map(Some);
+    }
+    Ok(None)
+}
+
+fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::String, i64> {
+    let host = resolve_cwd_path(task, prefix);
+    // Expand links first, as chdir does: a symlink-to-directory is a valid
+    // non-final component, and the per-fs file lookup does not always hand
+    // a directory back as a node.
+    let Some(resolved) = resolve_vfs_symlink_path(&host, true) else {
+        return Err(ELOOP);
+    };
+    match stat_ino_path_dir_aware_ext(&resolved, true) {
+        Some((st, ..)) if st.mode.file_type == narf_filesystem::FileType::Dir => Ok(resolved),
+        Some(_) => Err(ENOTDIR),
+        None => Err(path_lookup_errno(&resolved)),
+    }
 }
 
 /// Did resolving `path` fail specifically because of a symlink cycle?

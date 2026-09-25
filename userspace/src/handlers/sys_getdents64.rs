@@ -57,8 +57,19 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
     let out_len = args.arg2 as u32 as usize;
     let task = current_task_id();
 
+    // `CLASS(fd_pos, f)(fd)` is `fdget`, which masks out FMODE_PATH: an
+    // O_PATH descriptor is "not open" here and is -EBADF, even on a
+    // directory (6.18: getdents64 on `open(dir, O_PATH)` → EBADF). NARF
+    // wraps an O_PATH directory in `DirFdFile` for *at anchoring, so the
+    // status flag has to be consulted explicitly or it enumerated.
     let entry = fd::with_table(task, |table| {
         let entry = table.get(fd)?;
+        if table
+            .status_flags(fd)
+            .is_some_and(|status| status & crate::fd::O_PATH != 0)
+        {
+            return None;
+        }
         Some((entry.ops.clone(), table.offset(fd)?))
     })
     .flatten();

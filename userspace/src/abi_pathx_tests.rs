@@ -317,12 +317,33 @@ fn smoke_abi_pathx_faccessat2_empty_path_fd() -> TestResult {
         const X_OK: u64 = 1;
         const AT_EMPTY_PATH: u64 = 0x1000;
         let empty = b"\0";
+        // The fd's inode is permission-checked like any other: a seeded
+        // 0666 file has no x bit, so X_OK is -EACCES even for root (Linux
+        // 6.18: CAP_DAC_OVERRIDE grants exec only if some x bit is set).
+        if call(
+            Syscall::Faccessat2.raw(),
+            a3(fd, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
+        ) != Some(EACCES)
+        {
+            return Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) on 0666 must be -EACCES");
+        }
+        if call(Syscall::Fchmod.raw(), a1(fd, 0o755)) != Some(0) {
+            return Err("fchmod 0755 failed");
+        }
         match call(
             Syscall::Faccessat2.raw(),
             a3(fd, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) must return 0"),
+            Some(0) => {}
+            _ => return Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) must return 0"),
+        }
+        // A closed descriptor is -EBADF.
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(7575, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("faccessat2(badfd, \"\", AT_EMPTY_PATH) must be -EBADF"),
         }
     })
 }
@@ -2934,6 +2955,24 @@ fn smoke_abi_pathx_getdents64_errno_order_and_small_buffer() -> TestResult {
         {
             return Err("getdents64 count must use the native unsigned-int width");
         }
+        // `fdget` masks FMODE_PATH: an O_PATH directory fd is -EBADF.
+        const O_PATH: u64 = 0o10000000;
+        let dir = b"/p2\0";
+        let pfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(dir, O_PATH) did not return an fd"),
+        };
+        let mut buf = [0u8; 256];
+        if call(
+            Syscall::Getdents64.raw(),
+            a2(pfd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) != Some(EBADF)
+        {
+            return Err("getdents64 on an O_PATH directory fd must return EBADF");
+        }
         Ok(())
     })
 }
@@ -3405,10 +3444,41 @@ fn smoke_abi_pathx_lstat_errnos() -> TestResult {
             Syscall::Lstat.raw(),
             a1(missing.as_ptr() as u64, sb.as_mut_ptr() as u64),
         ) {
-            Some(ENOENT) => Ok(()),
-            Some(EPERM) => Err("lstat(missing) returned EPERM — the bare -1 sentinel"),
-            _ => Err("lstat(missing) must return -ENOENT"),
+            Some(ENOENT) => {}
+            Some(EPERM) => return Err("lstat(missing) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("lstat(missing) must return -ENOENT"),
         }
+        // No LOOKUP_EMPTY: "" is -ENOENT, never a stat of the cwd.
+        let empty = b"\0";
+        if call(
+            Syscall::Lstat.raw(),
+            a1(empty.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("lstat(\"\") must return -ENOENT");
+        }
+        // link_path_walk sees the name as written: a trailing slash, "/."
+        // or "/.." after a regular file is -ENOTDIR (6.18 probe), even
+        // though each normalises to an existing path.
+        for p in [&b"/p2/f/\0"[..], &b"/p2/f/.\0"[..], &b"/p2/f/../f\0"[..]] {
+            if call(
+                Syscall::Lstat.raw(),
+                a1(p.as_ptr() as u64, sb.as_mut_ptr() as u64),
+            ) != Some(ENOTDIR)
+            {
+                return Err("lstat through a regular file must return -ENOTDIR");
+            }
+        }
+        // ...and "/.." after a missing name is -ENOENT.
+        let via_missing = b"/p2/nope/../f\0";
+        if call(
+            Syscall::Lstat.raw(),
+            a1(via_missing.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("lstat(\"missing/../f\") must return -ENOENT");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_lstat_errnos);
@@ -3581,6 +3651,27 @@ fn smoke_abi_pathx_statx_errnos() -> TestResult {
         // cp_statx's arm, last of all.
         if call_statx(AT_FDCWD, present.as_ptr() as u64, 0, 0, 0) != Some(EFAULT) {
             return Err("statx(existing, NULL buffer) must return -EFAULT");
+        }
+        // Trailing slash on a regular file: LOOKUP_DIRECTORY → -ENOTDIR.
+        let slashed = b"/p2/f/\0";
+        if call_statx(AT_FDCWD, slashed.as_ptr() as u64, 0, 0, buf) != Some(ENOTDIR) {
+            return Err("statx(\"file/\") must return -ENOTDIR");
+        }
+        // path_init on a relative name: a closed dirfd is -EBADF and a
+        // regular-file dirfd -ENOTDIR (it used to fall back to the cwd).
+        let rel = b"f\0";
+        if call_statx(9191, rel.as_ptr() as u64, 0, 0, buf) != Some(EBADF) {
+            return Err("statx(closed dirfd, relative) must return -EBADF");
+        }
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, present.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        if call_statx(fd, rel.as_ptr() as u64, 0, 0, buf) != Some(ENOTDIR) {
+            return Err("statx(file dirfd, relative) must return -ENOTDIR");
         }
         Ok(())
     })
@@ -5046,6 +5137,31 @@ fn smoke_abi_pathx_readlinkat_bufsiz_and_empty_path() -> TestResult {
         ) {
             Some(ENOENT) => {}
             _ => return Err("readlinkat with empty path must return -ENOENT"),
+        }
+
+        // 3. do_readlinkat always passes LOOKUP_EMPTY, so "" names the
+        //    dirfd: a closed one is -EBADF, a non-symlink one -ENOENT.
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(9393, empty.as_ptr() as u64, buf.as_mut_ptr() as u64, 64),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("readlinkat(closed fd, \"\") must return -EBADF"),
+        }
+        let file = b"/p2_rl/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(fd, empty.as_ptr() as u64, buf.as_mut_ptr() as u64, 64),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("readlinkat(file fd, \"\") must return -ENOENT"),
         }
 
         Ok(())

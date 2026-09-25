@@ -1659,7 +1659,8 @@ fn open_impl(
     // this, `systemd-tmpfiles-setup-dev` and sd-device — which scan /dev with
     // `openat(…, O_PATH|O_NOFOLLOW)` purely to stat each node — parked forever
     // the moment they reached a FIFO with no writer. Directories still wrap in
-    // `DirFdFile` so `openat`-relative descent and getdents work.
+    // `DirFdFile` so `openat`-relative descent works (getdents on it is
+    // still -EBADF, as `fdget` masks FMODE_PATH — see sys_getdents_common).
     if flags & O_PATH != 0 {
         let ops = if let Some(dirops) = ops.as_dir() {
             alloc::sync::Arc::new(DirFdFile { dir: dirops }) as Arc<dyn narf_filesystem::FileOps>
@@ -2943,6 +2944,12 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
             return;
         }
     };
+    // stat/lstat pass no LOOKUP_EMPTY, so `getname()` rejects "" with
+    // -ENOENT. Joined onto the cwd it used to stat the cwd and succeed.
+    if raw.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     stat_linux_path(ctx, &raw, out_arg, follow_final);
 }
 
@@ -3028,12 +3035,23 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     } else {
         raw
     };
+    // `link_path_walk` sees the name as written: `file/`, `file/.` and
+    // `file/../x` are -ENOTDIR, which the normalised path below cannot
+    // tell. A name ending in a slash is also followed even for lstat, so the
+    // proven directory (link-expanded) is what gets described.
+    let dir_named = match literal_walk_check(task, raw) {
+        Ok(dir) => dir,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
     // caller's cwd before chroot, so the stat family works from any
     // working directory — not just absolute paths.
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
-    let path_owned = resolve_cwd_path(task, raw);
+    let path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, raw));
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     // `resolve_absolute` splits an absolute path into (mount, rel).
@@ -3980,6 +3998,21 @@ fn readlink_impl(
         return;
     }
     let buf_len = buf_len as usize;
+    // `link_path_walk` sees the name as written: `file/`, `file/.` and
+    // `file/../x` are -ENOTDIR. A name ending in `/`, `/.` or `/..` is
+    // resolved FOLLOWING its final link, so what it names is a directory
+    // and never a symlink: -EINVAL (`readlink("dirlink/")` on 6.18).
+    match literal_walk_check(current_task_id(), &raw) {
+        Ok(None) => {}
+        Ok(Some(_dir)) => {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        }
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
     let path = resolve_cwd_path(current_task_id(), &raw);
@@ -4018,25 +4051,36 @@ fn readlink_impl(
     // therefore report EINVAL (not the generic -1 → EPERM, which aborted
     // realpath at the first directory component); a path that names nothing
     // reports ENOENT.
-    let einval = errno_ret(EINVAL); // -EINVAL: exists, not a symlink
-    let enoent = errno_ret(ENOENT); // -ENOENT: nothing here
     let file = match file {
         Some(f) => f,
         None => {
             // Not a file. Directories and mount roots exist but aren't
-            // symlinks → EINVAL; a truly absent path → ENOENT.
+            // symlinks → EINVAL; a path that does not resolve reports the
+            // walk's own errno — -ENOENT, or -ENOTDIR for a non-directory
+            // ancestor (`readlink("file/x")`), -ELOOP, -EACCES, -ENAMETOOLONG.
             if stat_path_dir_aware(&path).is_some() {
-                ctx.set_return(einval);
+                ctx.set_return(errno_ret(EINVAL));
             } else {
-                ctx.set_return(enoent);
+                ctx.set_return(errno_ret(path_lookup_errno(&path)));
             }
             return;
         }
     };
+    readlink_node(ctx, &file, buf_ptr, buf_len);
+}
+
+/// `vfs_readlink` on a node already looked up: -EINVAL unless it is a
+/// symlink, then the target copied out (EFAULT only at the copy).
+fn readlink_node(
+    ctx: &mut dyn TrapContext,
+    file: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    buf_ptr: *mut u8,
+    buf_len: usize,
+) {
     // Refuse non-symlinks — POSIX readlink returns EINVAL for those.
     let st = file.stat();
     if st.mode.file_type != narf_filesystem::FileType::Symlink {
-        ctx.set_return(einval);
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `st_size` is only a hint for symlinks and is deliberately zero for
