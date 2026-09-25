@@ -28,10 +28,13 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
+
+mod inet_dgram;
+pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 
 // ── POSIX-numbered constants ────────────────────────────────────
 
@@ -595,6 +598,18 @@ pub enum SockError {
     /// libudev learns to re-enumerate /sys instead of trusting its event
     /// stream, so it must be distinguishable from "no events".
     NoBufs,
+    /// `EDESTADDRREQ` — an unconnected datagram send with no destination
+    /// (`udp_sendmsg`, `net/ipv4/udp.c:1128`).
+    DestAddrReq,
+    /// `EACCES` — a broadcast send or connect without `SO_BROADCAST`
+    /// (`net/ipv4/udp.c:1247`, `net/ipv4/datagram.c:61`).
+    Access,
+    /// `EAFNOSUPPORT` — an AF_INET operation given another address family
+    /// (`net/ipv4/af_inet.c:483`, `net/ipv4/datagram.c:34`,
+    /// `net/ipv4/udp.c:1119`).
+    AfNoSupport,
+    /// `ENETUNREACH` — no route to the destination.
+    NetUnreach,
 }
 
 impl SockError {
@@ -620,6 +635,10 @@ impl SockError {
             Self::MsgSize => errno::EMSGSIZE as i32,
             Self::ProtoType => errno::EPROTOTYPE as i32,
             Self::NoBufs => errno::ENOBUFS as i32,
+            Self::DestAddrReq => errno::EDESTADDRREQ as i32,
+            Self::Access => errno::EACCES as i32,
+            Self::AfNoSupport => errno::EAFNOSUPPORT as i32,
+            Self::NetUnreach => errno::ENETUNREACH as i32,
         }
     }
 }
@@ -643,6 +662,9 @@ pub struct SocketFile {
     /// Pending async error. connect/send/recv set on failure;
     /// getsockopt(SO_ERROR) consumes (returns + clears) it.
     pending_error: IrqSafeSpinLock<Option<SockError>>,
+    /// `sk_shutdown`: `RCV_SHUTDOWN` / `SEND_SHUTDOWN` bits set by
+    /// shutdown(2). Read by the AF_INET datagram path.
+    sk_shutdown: AtomicU8,
     /// Network-namespace id this socket belongs to (0 = host/default
     /// netns). Stamped by `sys_socket` from the creator's net-ns at
     /// socket() time. Keys AF_INET bind tables and selects namespace-scoped
@@ -945,6 +967,15 @@ enum SocketState {
         /// Optional connect()'d peer — when set, send() goes there
         /// without an explicit destination addr.
         peer: Option<(u32, u16)>,
+        /// `SOCK_BINDADDR_LOCK`: bind() named a specific address, so a
+        /// disconnect keeps it.
+        addr_locked: bool,
+        /// `SOCK_BINDPORT_LOCK`: bind() named a port, so a disconnect keeps
+        /// it; an autobound port is released instead.
+        port_locked: bool,
+        /// Bytes charged against `SO_RCVBUF` by the queued datagrams
+        /// (`sk_rmem_alloc`).
+        rmem: usize,
     },
     /// AF_UNIX SOCK_DGRAM endpoint. Same shape as InetDgram but keyed by
     /// a unix address (pathname or abstract name).
@@ -1022,8 +1053,9 @@ enum SocketState {
 /// and this is the fallback, so a port claimed by an in-kernel consumer
 /// (DHCP, DNS) keeps it.
 ///
-/// Wildcard matching mirrors the loopback path and Linux's `compute_score`:
-/// an exact local address wins, INADDR_ANY also matches.
+/// Socket selection is the loopback path's: Linux's `__udp4_lib_lookup` /
+/// `compute_score`, including connected-peer filtering and SO_BINDTODEVICE
+/// against `in_ifindex` (0 = unknown, which matches any binding).
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_wire_datagram(
     net_ns_id: u64,
@@ -1034,53 +1066,9 @@ pub fn deliver_wire_datagram(
     payload: &[u8],
     in_ifindex: u32,
 ) -> bool {
-    let dst = u32::from_be_bytes(dst_ip);
-    let sock = {
-        let bound = INET_DGRAM_BOUND.lock();
-        bound.as_ref().and_then(|m| {
-            m.get(&(net_ns_id, dst, dst_port))
-                .or_else(|| m.get(&(net_ns_id, 0, dst_port)))
-                .cloned()
-        })
-    };
-    let Some(sock) = sock else {
-        return false;
-    };
-
-    // SO_BINDTODEVICE, the receive half. `compute_score`
-    // (`net/ipv4/udp.c:400`) drops a socket from consideration entirely
-    // when it is bound to a different interface, so a socket pinned to one
-    // NIC never sees traffic that arrived on another. An arrival interface
-    // of 0 is "unknown" and cannot contradict a binding.
-    let bound = sock.options.lock().bindtodevice_index;
-    if bound != 0 && in_ifindex != 0 && bound != in_ifindex {
-        return false;
-    }
-    let pkt = DgramPacket {
-        peer_unix: None,
-        sender_cred: Ucred::default(),
-        peer_addr: u32::from_be_bytes(src_ip),
-        peer_port: src_port,
-        payload: payload.to_vec(),
-        fds: Vec::new(),
-    };
-    let mut st = sock.state.lock();
-    let delivered = if let SocketState::InetDgram { inbox, .. } = &mut *st {
-        inbox.push_back(pkt);
-        true
-    } else {
-        false
-    };
-    drop(st);
-    if delivered {
-        // Same wake sequence the loopback path uses: the targeted per-fd
-        // cell first, then the global readiness bump, or a reader parked in
-        // epoll_wait(-1) never learns the datagram arrived.
-        sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
-        sock.dgram_readiness.notify(narf_filesystem::POLL_IN);
-        narf_net::readiness::notify(0);
-    }
-    delivered
+    inet_dgram::deliver_wire(
+        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
+    )
 }
 
 /// Open-file state transported by `SCM_RIGHTS`.
@@ -1151,6 +1139,14 @@ impl SocketFile {
     /// IPPROTO_*, and so SO_PROTOCOL round-trips. Also seeds the
     /// state with InetRaw for AF_INET/SOCK_RAW.
     pub fn with_protocol(domain: u16, kind: u32, protocol: u32) -> Arc<Self> {
+        // `inet_create` resolves protocol 0 to the type's default
+        // (`net/ipv4/af_inet.c:281-283`), so SO_PROTOCOL on a
+        // socket(AF_INET, SOCK_DGRAM, 0) reports IPPROTO_UDP.
+        let protocol = if domain == AF_INET && kind == SOCK_DGRAM && protocol == 0 {
+            IPPROTO_UDP
+        } else {
+            protocol
+        };
         let state = if domain == AF_INET && kind == SOCK_RAW {
             SocketState::InetRaw {
                 protocol,
@@ -1250,6 +1246,7 @@ impl SocketFile {
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
+            sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
             bound_unix_path: IrqSafeSpinLock::new(None),
             connected_unix_path: IrqSafeSpinLock::new(None),
@@ -1892,6 +1889,11 @@ impl SocketFile {
         self.nonblock.store(on, Ordering::Release);
     }
 
+    /// An AF_INET `SOCK_DGRAM` (UDP) socket.
+    pub fn is_inet_dgram(&self) -> bool {
+        self.domain == AF_INET && self.kind == SOCK_DGRAM
+    }
+
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Acquire)
     }
@@ -1912,6 +1914,11 @@ impl SocketFile {
     pub fn local_addr(&self) -> Option<SockAddr> {
         let state = self.state.lock();
         match &*state {
+            // An unbound AF_INET datagram socket reports 0.0.0.0:0
+            // (`inet_getname`, `net/ipv4/af_inet.c:819-823`), not ENOTCONN.
+            SocketState::Fresh if self.domain == AF_INET && self.kind == SOCK_DGRAM => {
+                Some(make_sockaddr_in(0, 0))
+            }
             SocketState::InetListener { addr, port, .. } => Some(make_sockaddr_in(*addr, *port)),
             SocketState::InetConnected {
                 peer_addr,
@@ -2041,7 +2048,7 @@ impl SocketFile {
             Inet6([u8; 16], u16),
             UnixDgram(UnixPathKey),
             AbstractDgram((u64, Vec<u8>)),
-            InetDgram(u32, u16),
+            InetDgram(u16, bool),
             Tcb(u32),
             None,
         }
@@ -2089,10 +2096,10 @@ impl SocketFile {
                     UnixAddr::Unnamed => Reg::None,
                 },
                 SocketState::InetDgram {
-                    local_addr,
                     local_port,
+                    port_locked,
                     ..
-                } => Reg::InetDgram(*local_addr, *local_port),
+                } => Reg::InetDgram(*local_port, *port_locked),
                 SocketState::InetWired { tcb_id, .. } => Reg::Tcb(*tcb_id),
                 _ => Reg::None,
             }
@@ -2128,29 +2135,8 @@ impl SocketFile {
                     map.remove(&p);
                 }
             }
-            Reg::InetDgram(a, p) => {
-                if let Some(map) = INET_DGRAM_BOUND.lock().as_mut() {
-                    map.remove(&(self.net_ns_id(), a, p));
-                }
-                // Release any ephemeral reservation. clear() on an
-                // unset bit is a no-op, so an explicit bind() to a
-                // port in this range is harmless.
-                if p >= crate::ephemeral_port::EPHEMERAL_MIN {
-                    crate::ephemeral_port::free(
-                        AF_INET,
-                        0,
-                        crate::ephemeral_port::SocketProto::Udp,
-                        p,
-                    );
-                    if a != 0 {
-                        crate::ephemeral_port::free(
-                            AF_INET,
-                            a,
-                            crate::ephemeral_port::SocketProto::Udp,
-                            p,
-                        );
-                    }
-                }
+            Reg::InetDgram(port, port_locked) => {
+                self.inet_dgram_unregister(port, port_locked);
             }
             Reg::Tcb(id) => {
                 let _ = narf_net::tcp_stack::close(id);
@@ -2174,9 +2160,13 @@ impl core::fmt::Debug for SocketFile {
 /// in handlers.rs): family u16 + body[port_be, ip_be...]. `addr`
 /// and `port` are taken in host byte order; the body is encoded BE.
 pub fn make_sockaddr_in(addr: u32, port: u16) -> SockAddr {
-    let mut body = Vec::with_capacity(6);
+    // A full `struct sockaddr_in`: port, address, then the 8-byte `sin_zero`
+    // that `inet_getname` / `udp_recvmsg` zero, so callers see
+    // `addrlen == sizeof(struct sockaddr_in)` (16).
+    let mut body = Vec::with_capacity(SOCKADDR_IN_BODY_LEN);
     body.extend_from_slice(&port.to_be_bytes());
     body.extend_from_slice(&addr.to_be_bytes());
+    body.resize(SOCKADDR_IN_BODY_LEN, 0);
     SockAddr {
         family: AF_INET,
         body,
@@ -2601,6 +2591,11 @@ impl SocketFile {
     /// lock.
     fn readiness_bits_for_state(&self, state: &SocketState) -> u32 {
         match state {
+            // A fresh UDP socket is already writable (`datagram_poll`,
+            // `net/core/datagram.c:919-921`).
+            SocketState::Fresh if self.domain == AF_INET && self.kind == SOCK_DGRAM => {
+                self.inet_dgram_poll_bits(false)
+            }
             SocketState::Fresh | SocketState::UnixBound { .. } => 0,
             // An AF_INET listener is accept-ready (POLL_IN) when its
             // loopback `pending` queue OR — for a wired (off-box) listen
@@ -2664,7 +2659,11 @@ impl SocketFile {
                 bits
             }
             SocketState::InetDgram { inbox, .. } | SocketState::UnixDgram { inbox, .. } => {
-                let mut bits = narf_filesystem::POLL_OUT; // always sendable
+                let mut bits = if self.domain == AF_INET {
+                    self.inet_dgram_poll_bits(!inbox.is_empty())
+                } else {
+                    narf_filesystem::POLL_OUT // always sendable
+                };
                 if !inbox.is_empty() {
                     bits |= narf_filesystem::POLL_IN;
                 }
@@ -4791,242 +4790,20 @@ impl SocketFile {
         }
     }
 
-    /// AF_INET SOCK_DGRAM (UDP). Connectionless: bind sets the
-    /// local addr/port + registers in INET_DGRAM_BOUND;
-    /// sendto/send pushes a DgramPacket into the destination's
-    /// inbox; recvfrom/recv pops from our own inbox.
+    /// AF_INET SOCK_DGRAM (UDP). The per-operation Linux semantics live in
+    /// `socket/inet_dgram.rs`.
     fn dispatch_inet_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
-            SocketOp::Bind { addr } => {
-                if addr.family != AF_INET || addr.body.len() < 6 {
-                    return SocketOpResult::Err(SockError::InvalidArg);
-                }
-                let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let ip =
-                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
-                let mut state = self.state.lock();
-                match &*state {
-                    SocketState::Fresh => {
-                        let ns = self.net_ns_id();
-                        let reuseaddr = self.options.lock().reuseaddr;
-                        let mut bound = INET_DGRAM_BOUND.lock();
-                        let map = bound.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(&(ns, ip, port)) && !reuseaddr {
-                            return SocketOpResult::Err(SockError::AddrInUse);
-                        }
-                        *state = SocketState::InetDgram {
-                            local_addr: ip,
-                            local_port: port,
-                            inbox: VecDeque::new(),
-                            peer: None,
-                        };
-                        map.insert((ns, ip, port), self.clone());
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::InvalidArg),
-                }
-            }
-            SocketOp::Connect { addr } => {
-                if addr.family != AF_INET || addr.body.len() < 6 {
-                    return SocketOpResult::Err(SockError::InvalidArg);
-                }
-                let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let ip =
-                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
-                let mut state = self.state.lock();
-                // If unbound, auto-bind to (0, ephemeral-port).
-                // RFC 6056 §3.2 Algorithm 1, IANA dynamic range.
-                if matches!(&*state, SocketState::Fresh) {
-                    let local_port = match crate::ephemeral_port::alloc(
-                        AF_INET,
-                        0,
-                        crate::ephemeral_port::SocketProto::Udp,
-                    ) {
-                        Some(p) => p,
-                        None => return SocketOpResult::Err(SockError::AddrNotAvail),
-                    };
-                    *state = SocketState::InetDgram {
-                        local_addr: 0,
-                        local_port,
-                        inbox: VecDeque::new(),
-                        peer: Some((ip, port)),
-                    };
-                    return SocketOpResult::Ok(0);
-                }
-                if let SocketState::InetDgram { peer, .. } = &mut *state {
-                    *peer = Some((ip, port));
-                    SocketOpResult::Ok(0)
-                } else {
-                    SocketOpResult::Err(SockError::InvalidArg)
-                }
-            }
-            SocketOp::Send {
-                buf,
-                flags: _,
-                addr,
-            } => {
-                let state = self.state.lock();
-                let (local_addr, local_port, dest) = match &*state {
-                    SocketState::InetDgram {
-                        local_addr,
-                        local_port,
-                        peer,
-                        ..
-                    } => {
-                        let dest = if let Some(a) = addr {
-                            if a.body.len() < 6 {
-                                return SocketOpResult::Err(SockError::InvalidArg);
-                            }
-                            let p = u16::from_be_bytes([a.body[0], a.body[1]]);
-                            let i =
-                                u32::from_be_bytes([a.body[2], a.body[3], a.body[4], a.body[5]]);
-                            (i, p)
-                        } else if let Some(d) = peer {
-                            *d
-                        } else {
-                            return SocketOpResult::Err(SockError::InvalidArg);
-                        };
-                        (*local_addr, *local_port, dest)
-                    }
-                    _ => return SocketOpResult::Err(SockError::NotConnected),
-                };
-                drop(state);
-                // Linux net/ipv4/udp.c udp_sendmsg(): broadcast sends
-                // require SO_BROADCAST. Without it, sendto to
-                // 255.255.255.255 returns EACCES. We model the same.
-                if dest.0 == 0xFFFF_FFFF && !self.options.lock().broadcast {
-                    return SocketOpResult::Err(SockError::InvalidArg);
-                }
-                // Find the destination socket. Loopback + INADDR_ANY both
-                // match, scoped to THIS socket's net-ns (in-process
-                // loopback never crosses a netns boundary).
-                let dest_sock = {
-                    let ns = self.net_ns_id();
-                    let bound = INET_DGRAM_BOUND.lock();
-                    bound.as_ref().and_then(|m| {
-                        m.get(&(ns, dest.0, dest.1))
-                            .or_else(|| m.get(&(ns, 0, dest.1)))
-                            .cloned()
-                    })
-                };
-                let dest_sock = match dest_sock {
-                    Some(s) => s,
-                    None => {
-                        // Nothing bound locally, so this is destined for the
-                        // network. Dropping it here (which is what used to
-                        // happen, with a SUCCESS return) meant a userspace
-                        // program could never send a datagram off-box at
-                        // all — every sendto to a remote address was
-                        // silently discarded while reporting the full byte
-                        // count as written.
-                        let o = self.options.lock();
-                        let udp_opts = narf_net::udp_sock::UdpOptions {
-                            broadcast: o.broadcast,
-                            bind_to_device: o.bindtodevice_index,
-                            ..Default::default()
-                        };
-                        drop(o);
-                        let dst =
-                            narf_net::udp_sock::SocketAddrV4::new(dest.0.to_be_bytes(), dest.1);
-                        return match narf_net::udp_sock::udp_send_from(
-                            self.net_ns_id(),
-                            local_port,
-                            dst,
-                            buf,
-                            &udp_opts,
-                            // Never block a sendto on ARP.
-                            0,
-                        ) {
-                            Ok(n) => SocketOpResult::Ok(n as u64),
-                            // `udp_sendmsg` surfaces a routing failure as
-                            // ENETUNREACH; NARF has no such variant here, and
-                            // the broadcast guard is already applied above,
-                            // so the remaining cases map to EINVAL.
-                            Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {
-                                SocketOpResult::Err(SockError::InvalidArg)
-                            }
-                            // An unresolved neighbour is not an error to
-                            // the caller: Linux queues the datagram and
-                            // returns success, so report the bytes as sent
-                            // rather than surfacing a failure the
-                            // application cannot act on.
-                            Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
-                                SocketOpResult::Ok(buf.len() as u64)
-                            }
-                            Err(_) => SocketOpResult::Err(SockError::InvalidArg),
-                        };
-                    }
-                };
-                let pkt = DgramPacket {
-                    peer_unix: None,
-                    sender_cred: Ucred::default(),
-                    peer_addr: local_addr,
-                    peer_port: local_port,
-                    payload: buf.to_vec(),
-                    fds: Vec::new(),
-                };
-                let mut ds = dest_sock.state.lock();
-                let delivered = if let SocketState::InetDgram { inbox, .. } = &mut *ds {
-                    inbox.push_back(pkt);
-                    true
-                } else {
-                    false // no bound InetDgram at the destination — dropped
-                };
-                drop(ds);
-                if delivered {
-                    // Durable per-fd wake: fire the reader armed on the
-                    // destination's datagram cell directly (targeted), so it
-                    // does not depend on the notify(0) herd + backstop below.
-                    // poll_readiness reconciles the cell on the consume side.
-                    dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
-                    // Linux wait-queue: fire on every event even at the same level.
-                    dest_sock.dgram_readiness.notify(narf_filesystem::POLL_IN);
-                    // Wake a reader parked in poll/epoll on the destination.
-                    // Without this a peer blocked in epoll_wait(-1)/poll(-1) on
-                    // a bound UDP socket never wakes for a loopback datagram —
-                    // an infinite-timeout park breaks only on the readiness
-                    // generation bump, and the ~10 ms backstop re-checks the
-                    // park condition without re-running the readiness scan.
-                    // Mirrors the AF_UNIX dgram send path (dispatch_unix_dgram).
-                    narf_net::readiness::notify(0);
-                }
-                SocketOpResult::Ok(buf.len() as u64)
-            }
-            SocketOp::Recv { buf, flags: _ } => {
-                let mut state = self.state.lock();
-                if let SocketState::InetDgram { inbox, peer, .. } = &mut *state {
-                    let connected_peer = *peer;
-                    // Connected-mode filter: when connect() was
-                    // called, drop any packets from a different
-                    // peer (Linux returns ECONNREFUSED on these in
-                    // a separate code path; we silently skip).
-                    while let Some(pkt) = inbox.pop_front() {
-                        if let Some((paddr, pport)) = connected_peer {
-                            if (paddr, pport) != (pkt.peer_addr, pkt.peer_port) {
-                                continue;
-                            }
-                        }
-                        let n = core::cmp::min(buf.len(), pkt.payload.len());
-                        buf[..n].copy_from_slice(&pkt.payload[..n]);
-                        let mut peer_body = alloc::vec::Vec::with_capacity(6);
-                        peer_body.extend_from_slice(&pkt.peer_port.to_be_bytes());
-                        peer_body.extend_from_slice(&pkt.peer_addr.to_be_bytes());
-                        return SocketOpResult::Received {
-                            n,
-                            peer: Some(SockAddr {
-                                family: AF_INET,
-                                body: peer_body,
-                            }),
-                        };
-                    }
-                    return SocketOpResult::Err(SockError::WouldBlock);
-                }
-                SocketOpResult::Err(SockError::NotConnected)
-            }
+            SocketOp::Bind { addr } => self.inet_dgram_bind(&addr),
+            SocketOp::Connect { addr } => self.inet_dgram_connect(&addr),
+            SocketOp::Send { buf, flags, addr } => self.inet_dgram_send(buf, flags, addr.as_ref()),
+            SocketOp::Recv { buf, flags } => self.inet_dgram_recv(buf, flags),
+            // `inet_dgram_ops` wires listen/accept to `sock_no_listen` /
+            // `sock_no_accept`, both EOPNOTSUPP (`net/core/sock.c:3339-3362`).
             SocketOp::Listen { .. } | SocketOp::Accept => {
                 SocketOpResult::Err(SockError::NotSupported)
             }
-            SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            SocketOp::Shutdown { how } => self.inet_dgram_shutdown(how),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
@@ -6384,10 +6161,6 @@ static INET_LISTENERS: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(
 /// AF_INET6 listener registry keyed by (ipv6, port). Same loopback-
 /// only constraint as INET_LISTENERS.
 static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new(None);
-
-/// AF_INET datagram-bound registry: (ip, port) → socket. Lookup
-/// from sendto's destination + delivery into the dest's inbox.
-static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(None);
 
 /// AF_UNIX datagram-bound registry: path → socket.
 static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =

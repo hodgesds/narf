@@ -841,8 +841,17 @@ kernel_test_in!(
     smoke_kernel_perf_event_paranoid_validation
 );
 
+/// domainname reads back the boot default, "(none)\n".
+///
+/// Reset through the file, as `smoke_kernel_hostname_default` does: with the
+/// UTS hooks installed the key reads the calling task's UTS namespace, which
+/// a `setdomainname` smoke earlier in link order may have changed, so the
+/// `DOMAINNAME` static alone does not restore what the file returns.
 fn smoke_kernel_domainname_default() -> TestResult {
     register_all();
+    if let Some(f) = lookup_sys("kernel/domainname") {
+        let _ = f.write(b"(none)\n");
+    }
     *DOMAINNAME.lock() = String::from("(none)");
     match read_sys("kernel/domainname") {
         Some(s) if s == "(none)\n" => TestResult::Pass,

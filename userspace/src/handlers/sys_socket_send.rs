@@ -66,8 +66,12 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             // unix_stream_sendmsg (net/unix/af_unix.c:2500). SIGPIPE's default
             // action is Terminate, so a client that neither sets MSG_NOSIGNAL nor
             // ignores SIGPIPE dies here exactly as on Linux.
+            // UDP never signals: its EPIPE comes from `sock_alloc_send_pskb`
+            // (net/core/sock.c:2873), and only the stream error path raises
+            // SIGPIPE (net/core/stream.c:191).
             if e == crate::socket::SockError::Pipe
                 && flags & crate::socket::MSG_NOSIGNAL == 0
+                && !sock.is_inet_dgram()
             {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }

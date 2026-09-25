@@ -4447,8 +4447,8 @@ fn smoke_abi_inet_dgram_send_wakes_parked_reader() -> TestResult {
             return Err("idle UDP socket reported epoll-ready before any send");
         }
 
-        // Sender must be bound first: NARF's InetDgram Send has no
-        // Linux-style sendto auto-bind (Fresh state → ENOTCONN).
+        // Bound explicitly so the source port is fixed (sendto would also
+        // autobind an unbound sender, as Linux's `inet_send_prepare` does).
         let tx = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("socket(AF_INET, SOCK_DGRAM) for sender failed"),

@@ -42,6 +42,10 @@ use crate::pkt_udp::{UdpHeader, UDP_HDR_LEN};
 pub const UDP_EPHEMERAL_MIN: u16 = 32768;
 pub const UDP_EPHEMERAL_MAX: u16 = 60999;
 
+/// Largest UDP payload an IPv4 datagram can carry: 65535 - 20 (IPv4 header)
+/// - 8 (UDP header). See the EMSGSIZE check in `udp_send_inner`.
+pub const UDP_MAX_PAYLOAD: usize = 65507;
+
 // ── Socket options ─────────────────────────────────────────────────
 
 /// Subset of socket options relevant to UDP. Modelled on Linux
@@ -52,8 +56,9 @@ pub struct UdpOptions {
     /// SO_BROADCAST: allow sends to 255.255.255.255 / subnet bcast.
     pub broadcast: bool,
     /// SO_RCVBUF: max number of datagrams in the RX queue. When the
-    /// queue is full the *oldest* datagram is dropped to make room
-    /// (matches Linux drop-on-overflow behaviour, udp.c:1666).
+    /// queue is full the *arriving* datagram is dropped and the queued ones
+    /// are kept, as `__udp_enqueue_schedule_skb` (`net/ipv4/udp.c:1527`)
+    /// does: `if (rmem > rcvbuf) goto drop;`.
     pub rcvbuf: usize,
     /// SO_SNDBUF: max single datagram payload in bytes.
     pub sndbuf: usize,
@@ -368,8 +373,22 @@ fn udp_send_inner(
     options: &UdpOptions,
     arp_timeout_ms: u64,
 ) -> Result<usize, UdpError> {
-    // SO_BROADCAST guard (Linux udp.c:1093).
-    if (dst.ip == [255, 255, 255, 255] || dst.ip[3] == 255) && !options.broadcast {
+    // The largest datagram IPv4 can carry: `__ip_append_data`
+    // (`net/ipv4/ip_output.c:992`) refuses `length > IP_MAX_MTU(0xFFFF) -
+    // sizeof(iphdr)` with EMSGSIZE, and `length` includes the 8-byte UDP
+    // header, so the payload limit is 65535 - 20 - 8 = 65507. Checked before
+    // SO_SNDBUF so a raised send buffer can never overflow the 16-bit UDP /
+    // IP length fields below.
+    if payload.len() > UDP_MAX_PAYLOAD {
+        return Err(UdpError::MsgTooLong);
+    }
+
+    // SO_BROADCAST guard. `udp_sendmsg` (`net/ipv4/udp.c:1247`) fails with
+    // EACCES when the route is `RTCF_BROADCAST` and the socket lacks
+    // SOCK_BROADCAST. That flag covers the limited broadcast and a local
+    // subnet's directed broadcast — not every address ending in .255.
+    let is_broadcast = iface::is_broadcast_in(net_ns_id, dst.ip);
+    if is_broadcast && !options.broadcast {
         return Err(UdpError::NoBroadcastPermission);
     }
 
@@ -400,7 +419,7 @@ fn udp_send_inner(
     let dst_port = dst.port;
 
     // Resolve the destination MAC.  For broadcast, use ff:ff:ff:ff:ff:ff.
-    let dst_mac = if dst_ip == [255, 255, 255, 255] {
+    let dst_mac = if is_broadcast {
         [0xFF; 6]
     } else {
         // `arp_timeout_ms == 0` means "do not wait": `ip_finish_output2`
@@ -611,11 +630,13 @@ pub fn deliver_in(
     let src_port = u16::from_be_bytes([datagram[0], datagram[1]]);
     let dst_port = u16::from_be_bytes([datagram[2], datagram[3]]);
     let udp_len = u16::from_be_bytes([datagram[4], datagram[5]]) as usize;
-    let end = udp_len.min(datagram.len());
-    if end < UDP_HDR_LEN {
+    // `__udp4_lib_rcv` (`net/ipv4/udp.c:2412-2418`): a length field larger
+    // than what arrived, or smaller than the header, is a short packet and is
+    // dropped; bytes past the length field (link-layer padding) are trimmed.
+    if udp_len > datagram.len() || udp_len < UDP_HDR_LEN {
         return;
     }
-    let payload = &datagram[UDP_HDR_LEN..end];
+    let payload = &datagram[UDP_HDR_LEN..udp_len];
 
     let src_addr = SocketAddrV4::new(src_ip, src_port);
 
@@ -692,10 +713,12 @@ pub fn deliver_in(
         ttl,
     };
 
-    // Enqueue, dropping oldest if rcvbuf exceeded (Linux udp.c:1666).
+    // A full queue drops the ARRIVING datagram and keeps what is already
+    // queued: `__udp_enqueue_schedule_skb` (`net/ipv4/udp.c:1527`) checks
+    // `if (rmem > rcvbuf) goto drop;` before charging the new skb.
     let mut q = sock.rx_queue.lock();
     if q.len() >= opts.rcvbuf {
-        q.pop_front(); // drop oldest
+        return;
     }
     q.push_back(dg);
 }
@@ -922,7 +945,10 @@ fn smoke_udp_broadcast_guard() -> TestResult {
 }
 kernel_test_in!("net/udp", smoke_udp_broadcast_guard);
 
-fn smoke_udp_rcvbuf_overflow_drops_oldest() -> TestResult {
+/// A full queue drops the ARRIVING datagram and keeps the queued ones:
+/// `__udp_enqueue_schedule_skb` (`net/ipv4/udp.c:1527`) is
+/// `if (rmem > rcvbuf) goto drop;` before charging the new skb.
+fn smoke_udp_rcvbuf_full_drops_newest() -> TestResult {
     let port = 59013u16;
     let opts = UdpOptions {
         rcvbuf: 2, // keep only 2 datagrams
@@ -932,48 +958,22 @@ fn smoke_udp_rcvbuf_overflow_drops_oldest() -> TestResult {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("bind failed"),
     };
-    // Inject 3 datagrams: A, B, C.  A should be dropped when C arrives.
+    // Inject 3 datagrams: A, B, C. C arrives at a full queue and is dropped.
     for b in [b'A', b'B', b'C'] {
-        let mut seg = [0u8; 9];
-        seg[0..2].copy_from_slice(&9001u16.to_be_bytes());
-        seg[2..4].copy_from_slice(&port.to_be_bytes());
-        seg[4..6].copy_from_slice(&(9u16).to_be_bytes());
-        seg[8] = b;
-        deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
+        deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg(9001, port, &[b]), 64);
     }
-
-    // Snapshot each recv's first byte before the next call overwrites buf.
+    let mut got = alloc::vec::Vec::new();
     let mut buf = [0u8; 8];
-    let first = udp_recv(&sock, &mut buf);
-    let a = match first {
-        Ok((1, _)) => buf[0],
-        _ => {
-            udp_close(&sock);
-            return TestResult::Fail("first recv failed");
-        }
-    };
-    let mut buf = [0u8; 8];
-    let second = udp_recv(&sock, &mut buf);
-    let b_byte = match second {
-        Ok((1, _)) => buf[0],
-        _ => {
-            udp_close(&sock);
-            return TestResult::Fail("second recv failed");
-        }
-    };
-    let mut buf = [0u8; 8];
-    let third = udp_recv(&sock, &mut buf);
+    while let Ok((1, _)) = udp_recv(&sock, &mut buf) {
+        got.push(buf[0]);
+    }
     udp_close(&sock);
-
-    if a != b'B' || b_byte != b'C' {
-        return TestResult::Fail("oldest datagram not dropped (should be A)");
+    if got != [b'A', b'B'] {
+        return TestResult::Fail("full queue must keep A,B and drop the arriving C");
     }
-    match third {
-        Err(UdpError::WouldBlock) => TestResult::Pass,
-        _ => TestResult::Fail("third recv should have been empty"),
-    }
+    TestResult::Pass
 }
-kernel_test_in!("net/udp", smoke_udp_rcvbuf_overflow_drops_oldest);
+kernel_test_in!("net/udp", smoke_udp_rcvbuf_full_drops_newest);
 
 fn smoke_udp_large_datagram_under_mtu() -> TestResult {
     // 1400-byte payload: within typical 1500-byte MTU. Deliver and recv.
@@ -1119,3 +1119,444 @@ fn smoke_udp_ip_ttl_tos_setsockopt() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/udp", smoke_udp_ip_ttl_tos_setsockopt);
+
+/// A UDP segment `sport → dport` carrying `payload`, checksum disabled.
+fn seg(sport: u16, dport: u16, payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec![0u8; UDP_HDR_LEN + payload.len()];
+    v[0..2].copy_from_slice(&sport.to_be_bytes());
+    v[2..4].copy_from_slice(&dport.to_be_bytes());
+    v[4..6].copy_from_slice(&((UDP_HDR_LEN + payload.len()) as u16).to_be_bytes());
+    v[UDP_HDR_LEN..].copy_from_slice(payload);
+    v
+}
+
+/// Malformed length fields are dropped, trailing padding is trimmed
+/// (`__udp4_lib_rcv`, `net/ipv4/udp.c:2412-2418`).
+fn smoke_udp_deliver_validates_length_field() -> TestResult {
+    let port = 59020u16;
+    let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let mut buf = [0u8; 64];
+    // Shorter than a header: ignored.
+    deliver([10, 0, 0, 1], [0, 0, 0, 0], &[0u8; 7], 64);
+    // Length field bigger than the segment: short packet, dropped.
+    let mut long = seg(9001, port, b"data");
+    long[4..6].copy_from_slice(&100u16.to_be_bytes());
+    deliver([10, 0, 0, 1], [0, 0, 0, 0], &long, 64);
+    // Length field smaller than the header: dropped.
+    let mut tiny = seg(9001, port, b"data");
+    tiny[4..6].copy_from_slice(&4u16.to_be_bytes());
+    deliver([10, 0, 0, 1], [0, 0, 0, 0], &tiny, 64);
+    if udp_recv(&sock, &mut buf) != Err(UdpError::WouldBlock) {
+        udp_close(&sock);
+        return TestResult::Fail("a malformed datagram was queued");
+    }
+    // Link-layer padding after the datagram: trimmed to the length field.
+    let mut padded = seg(9001, port, b"abc");
+    padded.extend_from_slice(&[0xEE; 5]);
+    deliver([10, 0, 0, 1], [0, 0, 0, 0], &padded, 64);
+    let r = udp_recv(&sock, &mut buf);
+    udp_close(&sock);
+    match r {
+        Ok((3, _)) if &buf[..3] == b"abc" => TestResult::Pass,
+        _ => TestResult::Fail("padding was not trimmed to the UDP length field"),
+    }
+}
+kernel_test_in!("net/udp", smoke_udp_deliver_validates_length_field);
+
+/// A short receive buffer gets the head of the datagram; the rest is gone.
+fn smoke_udp_recv_truncates_to_buffer() -> TestResult {
+    let port = 59021u16;
+    let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &seg(9001, port, b"0123456789"),
+        64,
+    );
+    let mut small = [0u8; 4];
+    let first = udp_recv(&sock, &mut small);
+    let second = udp_recv(&sock, &mut [0u8; 16]);
+    udp_close(&sock);
+    if first != Ok((4, SocketAddrV4::new([10, 0, 0, 1], 9001))) || &small != b"0123" {
+        return TestResult::Fail("truncated recv did not return the first 4 bytes and source");
+    }
+    if second != Err(UdpError::WouldBlock) {
+        return TestResult::Fail("the truncated remainder was left queued");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_recv_truncates_to_buffer);
+
+/// Disconnect lifts the connected-peer filter.
+fn smoke_udp_disconnect_accepts_any_peer() -> TestResult {
+    let port = 59022u16;
+    let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    udp_connect(&sock, SocketAddrV4::new([10, 0, 0, 2], 9002));
+    deliver([10, 0, 0, 2], [0, 0, 0, 0], &seg(9002, port, b"p"), 64);
+    deliver([10, 0, 0, 3], [0, 0, 0, 0], &seg(9003, port, b"x"), 64);
+    let mut buf = [0u8; 4];
+    let peer_ok = udp_recv(&sock, &mut buf) == Ok((1, SocketAddrV4::new([10, 0, 0, 2], 9002)));
+    let filtered = udp_recv(&sock, &mut buf) == Err(UdpError::WouldBlock);
+    udp_disconnect(&sock);
+    deliver([10, 0, 0, 3], [0, 0, 0, 0], &seg(9003, port, b"y"), 64);
+    let after = udp_recv(&sock, &mut buf);
+    udp_close(&sock);
+    if !peer_ok {
+        return TestResult::Fail("connected socket did not receive from its peer");
+    }
+    if !filtered {
+        return TestResult::Fail("connected socket received from a stranger");
+    }
+    if after != Ok((1, SocketAddrV4::new([10, 0, 0, 3], 9003))) {
+        return TestResult::Fail("disconnected socket still filters");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_disconnect_accepts_any_peer);
+
+/// `udp_send` with no destination on an unconnected socket is refused.
+fn smoke_udp_send_unconnected_without_peer_fails() -> TestResult {
+    let sock = match udp_bind(
+        SocketAddrV4::new([0, 0, 0, 0], 59023),
+        UdpOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let r = udp_send(&sock, b"x", None);
+    udp_close(&sock);
+    if r != Err(UdpError::InvalidSocket) {
+        return TestResult::Fail("send without a destination did not fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_send_unconnected_without_peer_fails);
+
+/// The 65507-byte ceiling holds even with a larger SO_SNDBUF
+/// (`__ip_append_data`, `net/ipv4/ip_output.c:992-995`) — otherwise the
+/// 16-bit UDP/IP length fields would wrap — and SO_SNDBUF itself is honoured.
+fn smoke_udp_send_size_limits() -> TestResult {
+    let sock = match udp_bind(
+        SocketAddrV4::new([0, 0, 0, 0], 59024),
+        UdpOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let dst = Some(SocketAddrV4::new([10, 0, 0, 2], 9));
+    udp_setsockopt(&sock, UdpSockOpt::SndBuf(200_000));
+    let big = alloc::vec![0u8; UDP_MAX_PAYLOAD + 1];
+    let over_ip = udp_send(&sock, &big, dst);
+    udp_setsockopt(&sock, UdpSockOpt::SndBuf(10));
+    let over_sndbuf = udp_send(&sock, &big[..11], dst);
+    udp_close(&sock);
+    if over_ip != Err(UdpError::MsgTooLong) {
+        return TestResult::Fail("a 65508-byte payload was not refused");
+    }
+    if over_sndbuf != Err(UdpError::MsgTooLong) {
+        return TestResult::Fail("a payload over SO_SNDBUF was not refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_send_size_limits);
+
+/// ICMP errors land on the socket whose local addr/port sent the datagram;
+/// peek leaves them queued, recv drains them.
+fn smoke_udp_icmp_error_queue() -> TestResult {
+    let local = [10, 0, 0, 5];
+    let sock = match udp_bind(SocketAddrV4::new(local, 59025), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let err = SockError {
+        icmp_type: 3,
+        icmp_code: 3,
+        from_ip: [10, 0, 0, 9],
+    };
+    // Wrong local address: not ours.
+    deliver_icmp_error([10, 0, 0, 6], 59025, err.clone());
+    let none = udp_err_peek(&sock).is_none();
+    deliver_icmp_error(local, 59025, err);
+    let peeked = udp_err_peek(&sock).map(|e| (e.icmp_type, e.icmp_code));
+    let got = udp_err_recv(&sock).map(|e| e.from_ip);
+    let drained = udp_err_recv(&sock).is_none();
+    udp_close(&sock);
+    if !none {
+        return TestResult::Fail("an error for another local address was queued");
+    }
+    if peeked != Some((3, 3)) {
+        return TestResult::Fail("peek did not show the queued error");
+    }
+    if got != Some([10, 0, 0, 9]) || !drained {
+        return TestResult::Fail("recv did not drain exactly the one error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_icmp_error_queue);
+
+/// `/proc/net/udp` rows: state 7 (CLOSE) unconnected, 1 (ESTABLISHED)
+/// connected with the remote filled in, and the rx queue depth.
+fn smoke_udp_snapshot_rows() -> TestResult {
+    let port = 59026u16;
+    let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let row = |p: u16| snapshot().into_iter().find(|r| r.local_port == p);
+    let unconnected = row(port);
+    udp_connect(&sock, SocketAddrV4::new([10, 0, 0, 2], 9002));
+    deliver([10, 0, 0, 2], [0, 0, 0, 0], &seg(9002, port, b"q"), 64);
+    let connected = row(port);
+    udp_close(&sock);
+    let gone = row(port).is_none();
+    match unconnected {
+        Some(r) if r.state_code == 0x07 && r.remote_port == 0 && r.rx_queue == 0 => {}
+        _ => return TestResult::Fail("unconnected row is not CLOSE with an empty queue"),
+    }
+    match connected {
+        Some(r)
+            if r.state_code == 0x01
+                && r.remote_addr == [10, 0, 0, 2]
+                && r.remote_port == 9002
+                && r.rx_queue == 1 => {}
+        _ => {
+            return TestResult::Fail("connected row is not ESTABLISHED with the peer and 1 queued")
+        }
+    }
+    if !gone {
+        return TestResult::Fail("closed socket still listed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_snapshot_rows);
+
+/// Network namespaces are separate port spaces: the same port binds in two
+/// namespaces, a datagram reaches only its own namespace's socket, and
+/// tearing a namespace down removes its sockets.
+fn smoke_udp_namespace_isolation() -> TestResult {
+    const NS: u64 = 0x5EED_0001;
+    let port = 59027u16;
+    let any = SocketAddrV4::new([0, 0, 0, 0], port);
+    let host = match udp_bind(any, UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("host bind failed"),
+    };
+    let guest = match udp_bind_in(NS, any, UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => {
+            udp_close(&host);
+            return TestResult::Fail("same port in another namespace was refused");
+        }
+    };
+    deliver_in(
+        NS,
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &seg(9001, port, b"g"),
+        64,
+        0,
+    );
+    let mut buf = [0u8; 4];
+    let host_empty = udp_recv(&host, &mut buf) == Err(UdpError::WouldBlock);
+    let guest_got = udp_recv(&guest, &mut buf).is_ok();
+    remove_namespace(NS);
+    let torn_down = snapshot_in(NS).is_empty();
+    udp_close(&host);
+    if !host_empty {
+        return TestResult::Fail("a datagram crossed into the host namespace");
+    }
+    if !guest_got {
+        return TestResult::Fail("the namespace's own socket did not receive");
+    }
+    if !torn_down {
+        return TestResult::Fail("remove_namespace left sockets behind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_namespace_isolation);
+
+/// SO_BINDTODEVICE on receive — `compute_score` (`net/ipv4/udp.c:401-406`):
+/// a socket pinned to another device is not a candidate, and one pinned to
+/// the arrival device outranks an unbound one.
+fn smoke_udp_bindtodevice_rx_scoring() -> TestResult {
+    let port = 59028u16;
+    let any = SocketAddrV4::new([0, 0, 0, 0], port);
+    let opts = UdpOptions {
+        reuseport: true,
+        ..Default::default()
+    };
+    let (Ok(unbound), Ok(pinned)) = (udp_bind(any, opts.clone()), udp_bind(any, opts)) else {
+        return TestResult::Fail("reuseport binds failed");
+    };
+    udp_setsockopt(&pinned, UdpSockOpt::BindToDevice(5));
+    let mut buf = [0u8; 4];
+    let mut take = |s: &Arc<UdpSocket>| udp_recv(s, &mut buf).is_ok();
+    // Arrived on device 5: the pinned socket wins every time.
+    for _ in 0..4 {
+        deliver_in(
+            0,
+            [10, 0, 0, 1],
+            [0, 0, 0, 0],
+            &seg(9001, port, b"5"),
+            64,
+            5,
+        );
+    }
+    let pinned_all = (0..4).all(|_| take(&pinned)) && !take(&unbound);
+    // Arrived on device 6: the pinned socket is not a candidate.
+    deliver_in(
+        0,
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &seg(9001, port, b"6"),
+        64,
+        6,
+    );
+    let unbound_got = take(&unbound) && !take(&pinned);
+    udp_close(&unbound);
+    udp_close(&pinned);
+    if !pinned_all {
+        return TestResult::Fail("a device-bound socket did not outrank the unbound one");
+    }
+    if !unbound_got {
+        return TestResult::Fail("traffic from another device reached the device-bound socket");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_bindtodevice_rx_scoring);
+
+/// close() frees the port for a new bind.
+fn smoke_udp_close_frees_port() -> TestResult {
+    let addr = SocketAddrV4::new([127, 0, 0, 1], 59029);
+    let Ok(a) = udp_bind(addr, UdpOptions::default()) else {
+        return TestResult::Fail("bind failed");
+    };
+    udp_close(&a);
+    match udp_bind(addr, UdpOptions::default()) {
+        Ok(b) => {
+            udp_close(&b);
+            TestResult::Pass
+        }
+        Err(_) => TestResult::Fail("port still taken after close"),
+    }
+}
+kernel_test_in!("net/udp", smoke_udp_close_frees_port);
+
+/// Broadcast classification (`RTCF_BROADCAST`): the limited broadcast and a
+/// local subnet's `prefix | ~mask` (`fib_add_ifaddr`,
+/// `net/ipv4/fib_frontend.c:1147`) — not a host address that merely ends in
+/// .255, and not a /31's "broadcast".
+fn smoke_udp_broadcast_classification() -> TestResult {
+    const IFACE: &str = "udpbc0";
+    iface::register(IFACE, [0x02, 0, 0, 0, 0xBC, 0], |_| Ok(()));
+    iface::add_addr(IFACE, [10, 91, 0, 2], 16);
+    iface::add_addr(IFACE, [10, 92, 0, 0], 31);
+    let checks = [
+        ([255, 255, 255, 255], true),
+        ([10, 91, 255, 255], true),
+        ([10, 91, 1, 255], false),
+        ([10, 92, 0, 1], false),
+    ];
+    let ok = checks
+        .iter()
+        .all(|(ip, want)| iface::is_broadcast_in(0, *ip) == *want);
+    // And udp_send enforces it: the directed broadcast needs SO_BROADCAST.
+    let sock = match udp_bind(
+        SocketAddrV4::new([0, 0, 0, 0], 59030),
+        UdpOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let r = udp_send(&sock, b"x", Some(SocketAddrV4::new([10, 91, 255, 255], 9)));
+    udp_close(&sock);
+    iface::del_addr(IFACE, [10, 91, 0, 2], 16);
+    iface::del_addr(IFACE, [10, 92, 0, 0], 31);
+    if !ok {
+        return TestResult::Fail("broadcast classification is wrong");
+    }
+    if r != Err(UdpError::NoBroadcastPermission) {
+        return TestResult::Fail("directed broadcast without SO_BROADCAST was not refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_broadcast_classification);
+
+static WIRE_CAPTURE: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+
+fn wire_capture_send(frame: &[u8]) -> Result<(), ()> {
+    WIRE_CAPTURE.lock().push(frame.to_vec());
+    Ok(())
+}
+
+/// The frame `udp_send` puts on the wire: valid IPv4 header and checksum,
+/// IP_TTL / IP_TOS applied, UDP ports, length and a checksum that verifies
+/// over the pseudo-header (RFC 768).
+fn smoke_udp_send_wire_frame_is_well_formed() -> TestResult {
+    const IFACE: &str = "udpwire0";
+    const LOCAL: [u8; 4] = [10, 93, 0, 2];
+    const PEER: [u8; 4] = [10, 93, 0, 9];
+    const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x93, 9];
+    iface::register(IFACE, [0x02, 0, 0, 0, 0x93, 2], wire_capture_send);
+    iface::set_iface_ipv4(IFACE, LOCAL, LOCAL);
+    iface::add_addr(IFACE, LOCAL, 24);
+    crate::arp_cache::insert(IFACE, PEER, PEER_MAC);
+    crate::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+    WIRE_CAPTURE.lock().clear();
+
+    let sock = match udp_bind(SocketAddrV4::new(LOCAL, 59031), UdpOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    udp_setsockopt(&sock, UdpSockOpt::IpTtl(33));
+    udp_setsockopt(&sock, UdpSockOpt::IpTos(0x28));
+    let sent = udp_send(&sock, b"wire!", Some(SocketAddrV4::new(PEER, 5353)));
+    udp_close(&sock);
+    if sent != Ok(5) {
+        return TestResult::Fail("udp_send to an on-link peer failed");
+    }
+    let frames = core::mem::take(&mut *WIRE_CAPTURE.lock());
+    let Some(f) = frames.first() else {
+        return TestResult::Fail("no frame reached the interface");
+    };
+    if f.len() != ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + 5 {
+        return TestResult::Fail("frame length is not eth + ip + udp + payload");
+    }
+    if f[0..6] != PEER_MAC || u16::from_be_bytes([f[12], f[13]]) != ETHERTYPE_IPV4 {
+        return TestResult::Fail("ethernet header is wrong");
+    }
+    let ip = &f[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN];
+    if ip[0] != 0x45 || ip[1] != 0x28 || ip[8] != 33 || ip[9] != IP_PROTO_UDP {
+        return TestResult::Fail("IPv4 version/IHL, TOS, TTL or protocol is wrong");
+    }
+    if ip_checksum(ip) != 0 {
+        return TestResult::Fail("IPv4 header checksum does not verify");
+    }
+    if ip[12..16] != LOCAL || ip[16..20] != PEER {
+        return TestResult::Fail("IPv4 addresses are wrong");
+    }
+    let udp = &f[ETH_HDR_LEN + IPV4_HDR_LEN..];
+    let h = UdpHeader::decode(udp).unwrap_or_default();
+    if h.src_port != 59031 || h.dst_port != 5353 || h.length as usize != udp.len() {
+        return TestResult::Fail("UDP ports or length are wrong");
+    }
+    // Zero means "no checksum" on the wire; the sender always computes one
+    // (and sends 0xFFFF for a computed 0, RFC 768).
+    if h.checksum == 0 || crate::pkt_udp::verify_ipv4(LOCAL, PEER, udp).is_err() {
+        return TestResult::Fail("UDP checksum does not verify");
+    }
+    if &udp[UDP_HDR_LEN..] != b"wire!" {
+        return TestResult::Fail("payload is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_send_wire_frame_is_well_formed);

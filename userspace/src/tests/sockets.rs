@@ -694,6 +694,8 @@ fn smoke_socket_getpeername_after_connect() -> TestResult {
     let peer = build_sockaddr_in(0x7F00_0001, 9999);
     let _ = sock.dispatch_op(crate::socket::SocketOp::Connect { addr: peer });
     let r = sock.dispatch_op(crate::socket::SocketOp::GetPeerName);
+    // connect() autobound an ephemeral port; release it.
+    sock.unregister();
     match r {
         crate::socket::SocketOpResult::Addr(addr) => {
             match crate::socket::parse_sockaddr_in(&addr) {
@@ -1250,6 +1252,7 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
     let mut bind_addr: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     bind_addr.extend_from_slice(&LOCAL_PORT.to_be_bytes());
     bind_addr.extend_from_slice(&[0, 0, 0, 0]); // INADDR_ANY
+    bind_addr.extend_from_slice(&[0; 8]); // sin_zero: a full sockaddr_in
     if !matches!(
         sock.dispatch_op(crate::socket::SocketOp::Bind {
             addr: crate::socket::SockAddr {
@@ -1266,6 +1269,7 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
     let mut to: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     to.extend_from_slice(&PEER_PORT.to_be_bytes());
     to.extend_from_slice(&PEER);
+    to.extend_from_slice(&[0; 8]);
     let r = sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: b"ping",
         flags: 0,
@@ -1373,6 +1377,7 @@ fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
     let mut bind_addr: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     bind_addr.extend_from_slice(&PORT.to_be_bytes());
     bind_addr.extend_from_slice(&[0, 0, 0, 0]);
+    bind_addr.extend_from_slice(&[0; 8]);
     if !matches!(
         sock.dispatch_op(crate::socket::SocketOp::Bind {
             addr: crate::socket::SockAddr {
