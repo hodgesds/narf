@@ -2598,6 +2598,156 @@ fn smoke_userspace_parse_rejects_foreign_machine() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_parse_rejects_foreign_machine);
 
+/// Arch-neutral page-table walk for the auxv reader below. Mirrors
+/// `process::resolve_user_phys_byte`: returns the physical address backing
+/// `va`, in-page offset folded in.
+#[cfg(target_arch = "x86_64")]
+fn user_phys_of(root: narf_memory::PhysAddr, va: u64) -> Option<u64> {
+    // SAFETY: `root` is a live user page-table root from the loader and the
+    // walk only reads table entries for the page-aligned address.
+    let p = unsafe {
+        narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(va & !0xFFF))
+    }?;
+    Some(p.as_u64() | (va & 0xFFF))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn user_phys_of(root: narf_memory::PhysAddr, va: u64) -> Option<u64> {
+    // SAFETY: as above, against the aarch64 walker.
+    let p = unsafe {
+        narf_memory::aarch64::paging::translate(root, narf_memory::VirtAddr::new(va & !0xFFF))
+    }?;
+    Some(p.as_u64() | (va & 0xFFF))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_at_random_block_is_written() -> TestResult {
+    // AT_RANDOM — 16 bytes of CSPRNG material on the initial stack. musl's
+    // `__init_libc` reads them for its stack canary and pointer guard, so a
+    // process that starts without them runs with canary material libc had to
+    // invent.
+    //
+    // This test is deliberately NOT arch-gated. The entropy block used to be
+    // written under `cfg(target_arch = "x86_64")` because it called
+    // `narf_arch::x86_64::hwrng::fill_key_32`, and every other arch took a
+    // `None` arm — so on aarch64 no AT_RANDOM was emitted at all. Running the
+    // same assertions on both arches is the point.
+    use crate::{load_user_process_with, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_TOP};
+
+    const AT_RANDOM: u64 = 25;
+
+    // Minimal ET_DYN with one R|X PT_LOAD at link vaddr 0; the loader picks
+    // the base, so no arch-specific load address is baked in here.
+    let image = || -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; 0x2000];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&0x111u64.to_le_bytes()); // e_entry
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // R|X
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    };
+
+    // Read the 16 AT_RANDOM bytes of one freshly loaded process, or a
+    // failure reason.
+    let load_and_read = || -> Result<[u8; 16], &'static str> {
+        let bytes = image();
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised, which is the loader's `# Safety` contract; a
+        // non-empty argv is what makes it emit an auxv block at all.
+        let proc = match unsafe { load_user_process_with(&bytes, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return Err("load_user_process_with failed"),
+        };
+        let root = proc.address_space.root;
+        let read_u64 = |va: u64| -> Option<u64> {
+            let phys = user_phys_of(root, va)?;
+            // SAFETY: `phys` is the frame the walk just resolved for this
+            // user address; the read is 8-byte aligned by construction.
+            Some(unsafe { *narf_memory::PhysAddr::new(phys).kernel_ptr::<u64>() })
+        };
+
+        // Walk the SysV initial stack: argc, argv[argc], NULL, envp.., NULL,
+        // then (tag, value) pairs.
+        let rsp = proc.stack_top.as_u64();
+        let argc = read_u64(rsp).ok_or("rsp not materialised")?;
+        let mut at = rsp + 8 + argc * 8;
+        if read_u64(at) != Some(0) {
+            return Err("argv NULL terminator missing");
+        }
+        at += 8;
+        let mut guard = 0;
+        while read_u64(at) != Some(0) {
+            at += 8;
+            guard += 1;
+            if guard > 64 {
+                return Err("envp NULL terminator missing");
+            }
+        }
+        at += 8;
+
+        let mut at_random = None;
+        for _ in 0..64 {
+            let tag = read_u64(at).ok_or("auxv not materialised")?;
+            if tag == 0 {
+                break;
+            }
+            let val = read_u64(at + 8).ok_or("auxv value not materialised")?;
+            if tag == AT_RANDOM {
+                at_random = Some(val);
+            }
+            at += 16;
+        }
+        let va = at_random.ok_or("auxv carries no AT_RANDOM")?;
+
+        // It must point at the process's own stack, not at some other
+        // mapping or a kernel address.
+        if !(DEFAULT_USER_STACK_BASE..DEFAULT_USER_STACK_TOP).contains(&va) {
+            return Err("AT_RANDOM does not point into the user stack");
+        }
+
+        let mut out = [0u8; 16];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let phys = user_phys_of(root, va + i as u64).ok_or("AT_RANDOM page not mapped")?;
+            // SAFETY: `phys` is the frame backing this stack byte.
+            *slot = unsafe { *narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>() };
+        }
+        Ok(out)
+    };
+
+    let first = match load_and_read() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // The stack is handed over zero-filled, so an unwritten block reads as
+    // all zeroes — that is exactly the pre-fix aarch64 state, modulo the
+    // missing tag.
+    if first.iter().all(|b| *b == 0) {
+        return TestResult::Fail("AT_RANDOM block is all zeroes — never written");
+    }
+    // And it must be drawn per exec rather than being a fixed constant.
+    let second = match load_and_read() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if first == second {
+        return TestResult::Fail("AT_RANDOM identical across two execs — not random");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace", smoke_userspace_at_random_block_is_written);
+
 // ── execve smokes ───────────────────────────────────────────────
 //
 // `sys_execve` (Syscall::Execve = 179) replaces the current process
