@@ -499,7 +499,9 @@ fn smoke_abi_pidns_ioprio_set_resolves_in_caller_pid_ns() -> TestResult {
         const WORKER_PID: u64 = 0xA011;
         const IOPRIO_WHO_PROCESS: u64 = 1;
         const IOPRIO_DEFAULT: u64 = (2u64 << 13) | 4;
-        const WORKER_PRIO: u64 = 0x0AAA;
+        // IOPRIO_CLASS_IDLE — valid and distinct from the BE/4 default. (A
+        // CLASS_NONE word with a level set is -EINVAL in `ioprio_check_cap`.)
+        const WORKER_PRIO: u64 = 3u64 << 13;
 
         crate::pid_ns::__test_reset();
         let result = (|| {
@@ -547,7 +549,8 @@ fn smoke_abi_pidns_ioprio_get_resolves_in_caller_pid_ns() -> TestResult {
         const WORKER_PID: u64 = 0xA021;
         const IOPRIO_WHO_PROCESS: u64 = 1;
         const IOPRIO_DEFAULT: u64 = (2u64 << 13) | 4;
-        const WORKER_PRIO: u64 = 0x0246;
+        // IOPRIO_CLASS_BE level 1 — valid and distinct from the BE/4 default.
+        const WORKER_PRIO: u64 = (2u64 << 13) | 1;
 
         crate::pid_ns::__test_reset();
         let result = (|| {
