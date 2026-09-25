@@ -1507,9 +1507,7 @@ impl RegionTable {
     /// `mlockall(MCL_CURRENT)`. Keep the raw `mapped_bytes` statistic intact,
     /// but exclude that internal sentinel at admission boundaries.
     fn accounted_mapped_bytes(&self) -> u64 {
-        self.acct
-            .mapped_bytes
-            .saturating_sub(self.acct.guard_bytes)
+        self.acct.mapped_bytes.saturating_sub(self.acct.guard_bytes)
     }
 
     /// Linux `data_vm`: private writable mappings which are not stacks.
