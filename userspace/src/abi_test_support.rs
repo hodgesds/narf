@@ -137,6 +137,26 @@ pub fn setup() {
     // real enforcement against the default 1024 limit.
     fd::__test_clear_nofile_limit_lookup();
     install_task_id_lookup(task_lookup);
+    // Per-pid `/proc` hooks are a process-global like the lookup above, and the
+    // kernel-test build never runs the normal boot wiring that installs them.
+    // A test reaching `/proc/self/<file>` therefore depends on some EARLIER
+    // test having installed them (abi_fsx2's mountinfo smokes, abi_creds, ...):
+    // `TASK_INFO_HOOK` stays null until one does, `task_info` returns None
+    // without reaching userspace, the `/proc/<pid>` directory never
+    // materialises, and every path under it fails with ENOENT. That made two
+    // /proc/self smokes pass or fail purely on kernel-test registration order,
+    // which shifts with unrelated code changes.
+    //
+    // Installing here gives every ABI test the same `/proc` view, the way this
+    // harness already normalises mount namespaces, the root dir and the task-id
+    // lookup. Safe to repeat: every caller in the tree installs these same
+    // production functions, and the hooks have no clear path, so this can only
+    // ever replace an identical value.
+    narf_filesystem::procfs::install_proc_hooks(
+        crate::handlers::proc_current_pid,
+        crate::handlers::proc_list_pids,
+        crate::handlers::proc_task_info,
+    );
     // The no-AS baseline this harness promises is established above, by the
     // save-clear-restore of `address_space_lookup()`. An earlier version of this
     // file also installed a `None`-returning lookup here; upstream arrived at
