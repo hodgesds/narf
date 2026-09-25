@@ -2233,11 +2233,6 @@ fn smoke_abi_caps_setns_user_ns_reentry_is_einval() -> TestResult {
     with_setup(|| {
         const CLONE_NEWUSER: u64 = 0x1000_0000;
         const CLONE_NEWUTS: u64 = 0x0400_0000;
-        narf_filesystem::procfs::install_proc_hooks(
-            crate::handlers::proc_current_pid,
-            crate::handlers::proc_list_pids,
-            crate::handlers::proc_task_info,
-        );
         let path = b"/proc/self/ns/user\0";
         let fd = match call_open(path.as_ptr() as u64, 0) {
             Some(fd) if fd >= 0 => fd as u64,
