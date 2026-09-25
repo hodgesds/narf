@@ -6254,6 +6254,7 @@ pub fn proc_task_info(
         vmas,
         vm_size_bytes: memory_stats.mapped_bytes,
         resident_pages: memory_stats.resident_pages,
+        locked_bytes: memory_stats.locked_bytes,
         data_bytes: memory_stats
             .writable_nonexec_bytes
             .saturating_sub(stack_bytes),

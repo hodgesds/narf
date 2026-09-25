@@ -92,6 +92,10 @@ pub struct ProcTaskInfo {
     /// remain populated even when `vmas` was not requested.
     pub vm_size_bytes: u64,
     pub resident_pages: u64,
+    /// Linux `mm->locked_vm` — the status `VmLck:` line. stress-ng's mlock
+    /// stressor parses it after every mlock (`stress_mlock_pages`), and
+    /// real allocators read it to verify a lock took effect.
+    pub locked_bytes: u64,
     pub data_bytes: u64,
     pub stack_bytes: u64,
     /// Parent visible pid (0 = unknown/orphan).
@@ -2661,6 +2665,11 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let stack_kb = info.stack_bytes / 1024;
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmPeak:\t{} kB\n", vm_kb));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmSize:\t{} kB\n", vm_kb));
+    // VmLck between VmSize and VmHWM — Linux field order (fs/proc/task_mmu.c).
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("VmLck:\t{} kB\n", info.locked_bytes / 1024),
+    );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmHWM:\t{} kB\n", rss_kb));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmRSS:\t{} kB\n", rss_kb));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmData:\t{} kB\n", data_kb));
@@ -3285,6 +3294,7 @@ fn sample_task_info() -> ProcTaskInfo {
         vmas: Vec::new(),
         vm_size_bytes: 0,
         resident_pages: 0,
+        locked_bytes: 0,
         data_bytes: 0,
         stack_bytes: 0,
         ppid: 0,
@@ -3590,6 +3600,7 @@ fn smoke_pid_stat_real_fields() -> TestResult {
             private_pages: 0,
         }],
         vm_size_bytes: 8192,
+        locked_bytes: 0,
         resident_pages: 2,
         data_bytes: 0,
         stack_bytes: 0,
@@ -3700,6 +3711,7 @@ fn sample_info() -> ProcTaskInfo {
         vmas: Vec::new(),
         vm_size_bytes: 0,
         resident_pages: 0,
+        locked_bytes: 0,
         data_bytes: 0,
         stack_bytes: 0,
         ppid: 7,
@@ -3816,11 +3828,13 @@ fn smoke_pid_status_memory_fields_use_vma_sizes() -> TestResult {
     ];
     info.vm_size_bytes = 32 * 1024;
     info.resident_pages = 3;
+    info.locked_bytes = 8 * 1024;
     info.data_bytes = 16 * 1024;
     info.stack_bytes = 16 * 1024;
     let status = render_status(&info);
     for expected in [
         "VmSize:\t32 kB",
+        "VmLck:\t8 kB",
         "VmRSS:\t12 kB",
         "VmData:\t16 kB",
         "VmStk:\t16 kB",
