@@ -44,6 +44,7 @@ const VMALLOC_BASE: u64 = 0xFFFF_C000_0000_0000;
 ///     long-lived, so its no-op free is acceptable).
 ///   * upper 2 GiB — the frame-backed [`valloc`] heap fallback, with a
 ///     bitmap allocator that actually reclaims VA on `vfree`.
+///
 /// Total span the window occupies at whatever base it is placed at.
 const VMALLOC_SPAN: u64 = 4u64 << 30;
 
