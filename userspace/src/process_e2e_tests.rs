@@ -1046,6 +1046,22 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     crate::handlers::register_signal_waker(TID, noop_waker());
     crate::handlers::register_io_waiter(TID, noop_waker());
     crate::handlers::futex_register_waiter(FUTEX_UADDR, TID, noop_waker());
+    // Publish the park state the only PRODUCTION registrar
+    // (`futex_park_register_and_check`) publishes before it registers. The exit
+    // sweep's `futex_drop_task_waiters` is targeted: it drops the task's
+    // CURRENT park key (`uc.futex_uaddr`) rather than scanning all 256 futex
+    // buckets, because a 1000-thread exit storm hammered those global locks
+    // from every CPU. A registration whose owner has `futex_uaddr == 0` is
+    // therefore invisible to it — and is also a state production cannot
+    // reach, since that one registrar only registers when the field is
+    // non-zero and drops the key again on the requeue-retarget race. Without
+    // this the test asserted a sweep the kernel deliberately does not do.
+    crate::user_task::with_user_task_ctx(TID, |uc| {
+        uc.futex_uaddr
+            .store(FUTEX_UADDR, core::sync::atomic::Ordering::Release);
+        uc.futex_namespace
+            .store(0, core::sync::atomic::Ordering::Release);
+    });
     crate::handlers::set_proc_argv(TID, &["victim"]);
     crate::handlers::set_proc_comm(TID, "victim");
     crate::handlers::__test_parent_of_set(CHILD_PID, TID); // running child
