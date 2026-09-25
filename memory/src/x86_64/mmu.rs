@@ -202,7 +202,10 @@ const fn overlaps(base: u64, len: u64, lo: u64, hi: u64) -> bool {
 /// Clamped to a full PD so a pathologically large image cannot run past the
 /// slot and into the module text window above it.
 pub fn kernel_window_leaves() -> u64 {
-    let end = crate::kaslr::image_phys_bounds().1;
+    // The image's VIRTUAL extent, which physical relocation does not change.
+    // `image_phys_bounds().1` is the relocated physical end and would inflate
+    // the count by the delta.
+    let end = crate::kaslr::image_virt_extent();
     (end.next_multiple_of(1 << 21) >> 21).min(512)
 }
 
@@ -213,7 +216,23 @@ pub fn kernel_window_leaves() -> u64 {
 /// present leaf, which fails the seal — and a failed seal is reported as
 /// "the image could not be mapped".
 pub fn kernel_window_covers(phys: u64) -> bool {
-    phys < (kernel_window_leaves() << 21)
+    kernel_window_va(phys).is_some()
+}
+
+/// The window's virtual address for `phys`, or `None` if it maps no such frame.
+///
+/// The window is indexed by virtual offset and maps `offset + delta`, so
+/// inverting it means subtracting the physical relocation delta — not just
+/// adding the slid base. Callers used to do `kernel_virt_base() + phys`, which
+/// is right only while the image runs where the loader put it and otherwise
+/// names a VA `delta` bytes into the wrong frame. Keeping both directions in
+/// one function is deliberate: the stub has sixteen of these adjustments and
+/// missing any one of them silently reads the stale pre-relocation copy, which
+/// still exists and still looks valid.
+pub fn kernel_window_va(phys: u64) -> Option<u64> {
+    let off = phys.checked_sub(crate::kaslr::image_phys_delta())?;
+    (off < (kernel_window_leaves() << 21))
+        .then(|| crate::kaslr::kernel_virt_base().wrapping_add(off))
 }
 
 /// True if a leaf covering `[phys, phys + len)` must be executable through the
@@ -608,8 +627,27 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // the window no longer has to be both the image's home and a fixed
         // alias of the first GiB, which is a pair of requirements no single
         // 1 GiB PD can satisfy at once.
+        let phys_delta = crate::kaslr::image_phys_delta();
+        // The window deliberately starts at offset 0, not at the image's first
+        // leaf. Restricting it to the image looks more correct — Linux's text
+        // mapping covers the image and nothing else — but `text_poke` relies on
+        // this window aliasing low RAM: dropping the leaves below the image
+        // costs ~50 tests, BPF pack sealing and module loading among them
+        // ("could not seal the stub the peer executes"). The comment above
+        // claiming nothing needs the alias is wrong, and measurably so.
+        //
+        // That leaves the leaves below the image aliasing frames that are not
+        // the image once it is physically relocated. `bare_main` reserves them
+        // rather than unmapping them; see the reservation beside the image's.
         for two_mb in 0u64..kernel_window_leaves() {
-            let phys = two_mb << 21;
+            // `va_off` indexes the window; `phys` is where the bytes actually
+            // are. These differ by the physical relocation delta, and mapping
+            // `va_off` as if it were the frame leaves the window pointing at
+            // the pre-relocation copy — byte-identical, so execution continues,
+            // but outside `kernel_exec_phys_range`, so the leaf is marked NX
+            // and the first fetch after the CR3 load faults inside `init_mmu`.
+            let va_off = two_mb << 21;
+            let phys = va_off + phys_delta;
             let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
             if !kernel_window_leaf_needs_exec(phys, 1 << 21) {
                 flags |= PtFlags::NO_EXEC;
@@ -624,7 +662,7 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             // needed, and wrapping broke the contiguity that range mapping
             // assumes. Shrinking the window is what removes the conflict
             // rather than trading one half of it away.
-            let pd_index = (slide + phys) >> 21;
+            let pd_index = (slide + va_off) >> 21;
             if pd_index >= 512 {
                 // Only reachable if the image plus the slide outgrew the slot,
                 // which `KASLR_SLIDE_MASK` is chosen to prevent.

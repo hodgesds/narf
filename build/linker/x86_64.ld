@@ -50,6 +50,27 @@ KASLR_RELOC_RESERVE = 4M;
  * window. 0 = draw entropy as normal. */
 KASLR_SLIDE_FIXED = 0x00000000;
 
+/* Physical relocation: how far the boot stub copies the image before running
+ * it. The slide randomizes where the image APPEARS; this randomizes where it
+ * IS, which a VA slide cannot do because the loader places the image.
+ *
+ * Pinned for now, and 0 disables relocation entirely. A real value must be
+ *   - 2 MiB aligned, so the kernel window's 2 MiB pages still describe it;
+ *   - at least the image size, so the copy cannot overlap its own source
+ *     (the stub copies forward);
+ *   - inside RAM the identity map covers (PDPT[0..3] = the low 4 GiB) and
+ *     clear of anything the loader marked reserved — which is why choosing it
+ *     needs the memory map, and why this is pinned until the stub can parse
+ *     one. */
+/* Master switch for physical relocation. The target is chosen from the
+ * bootloader's memory map at boot (see `.Lphys_pick` in boot.S); only the Xen
+ * PVH handoff is parsed, so a multiboot2 boot simply does not relocate. */
+KASLR_PHYS_ENABLE = 1;
+
+/* Pin the delta to a specific value for reproducing a layout. Unvalidated, like
+ * KASLR_SLIDE_FIXED. 0 = choose one from the memory map. */
+KASLR_PHYS_FIXED = 0;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -123,6 +144,29 @@ SECTIONS
     /* Physical alias of `kaslr::KERNEL_SLIDE`, so the 32-bit pass can record
      * the slide it applied for the Rust conversions to read later. */
     __kernel_slide_phys = KERNEL_SLIDE - KERNEL_VIRT_BASE;
+
+    /* Physical alias of `kaslr::IMAGE_PHYS_DELTA`, so the 32-bit stub can
+     * record how far it moved the image. Link-time address; the stub adds the
+     * delta to reach the copy's. */
+    __image_phys_delta_phys = IMAGE_PHYS_DELTA - KERNEL_VIRT_BASE;
+
+    /* `_start_rust`'s offset within the image, as a link-time constant.
+     *
+     * The stub calls it by ABSOLUTE address (`KERNEL_VIRT_BASE + slide + this`)
+     * rather than with the `call rel32` that used to be there. A rel32 reaches
+     * +/-2 GiB from the instruction, and the stub executes at whatever physical
+     * address the image was relocated to while the target is in the kernel half
+     * -- so the call only reached while the physical target happened to be below
+     * the slide. Above it, the displacement overflowed and the 32-bit truncation
+     * jumped into nothing: a boot that hangs for one random pair of a slide and
+     * a delta and works for the next.
+     *
+     * It has to be an absolute linker symbol, not `_start_rust - KERNEL_VIRT_BASE`
+     * written in the asm: that expression leaves a relocation whose symbol value
+     * IS in the image, so `xtask relocs` would classify it as moving and add the
+     * slide a second time. This symbol's value is a small offset, so the
+     * classifier leaves it alone -- which is the whole point. */
+    __start_rust_off = _start_rust - KERNEL_VIRT_BASE;
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;

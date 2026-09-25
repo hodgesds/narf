@@ -1389,7 +1389,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let want_1g = narf_boot::args()
                 .parse_value::<usize>("hugepages_1g")
                 .unwrap_or(0);
-            let kernel_exclude = [(kstart, kend)];
+            // The kernel window maps `[delta, delta + window bytes)`, but only
+            // the image inside that span IS the image. Once the image is
+            // physically relocated, the leaves below it alias ordinary RAM
+            // under a writable higher-half alias — exactly what
+            // `smoke_kernel_window_does_not_alias_buddy_frames` forbids.
+            //
+            // Reserve those frames rather than declining to map them:
+            // `text_poke` relies on the window aliasing low RAM, and dropping
+            // those leaves costs ~50 tests (BPF pack sealing, module loading).
+            // See the window loop in `x86_64/mmu.rs`.
+            //
+            // Empty when the image runs where the loader put it, so this is
+            // inert unless physical relocation is on. The window's 2 MiB
+            // rounding tail past `kend` is a separate, pre-existing alias that
+            // relocation does not change.
+            let phys_delta = narf_memory::kaslr::image_phys_delta();
+            let exclude_buf = [(kstart, kend), (phys_delta, kstart)];
+            let kernel_exclude: &[(u64, u64)] = if phys_delta != 0 {
+                &exclude_buf
+            } else {
+                &exclude_buf[..1]
+            };
             let huge_excludes = if want_2m > 0 || want_1g > 0 {
                 // SAFETY: `regions` is the bootloader's usable-RAM map, the
                 // loaded kernel is explicitly protected, and this one-shot
@@ -1398,7 +1419,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 unsafe {
                     narf_memory::hugepage::reserve_from_regions(
                         &regions,
-                        &kernel_exclude,
+                        kernel_exclude,
                         want_2m,
                         want_1g,
                     )
@@ -1408,7 +1429,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             };
             let mut excludes: alloc::vec::Vec<(u64, u64)> =
                 alloc::vec::Vec::with_capacity(1 + huge_excludes.len());
-            excludes.extend_from_slice(&kernel_exclude);
+            excludes.extend_from_slice(kernel_exclude);
             excludes.extend(huge_excludes.iter().copied());
 
             // Keep the initramfs out of the buddy.
@@ -1589,10 +1610,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // bug is unbisectable without knowing the value.
                         let _ = writeln!(
                             console::Writer,
-                            "  mmu: kernel image slide {:#x}, base {:#018x}",
+                            "  mmu: kernel image slide {:#x}, base {:#018x}, phys delta {:#x} (at {:#x})",
                             narf_memory::kaslr::KERNEL_SLIDE
                                 .load(core::sync::atomic::Ordering::Relaxed),
-                            narf_memory::kaslr::kernel_virt_base()
+                            narf_memory::kaslr::kernel_virt_base(),
+                            // The delta is reported for the same reason as the
+                            // slide, and with a sharper edge: relocation fails
+                            // CLOSED, so "no safe target in the memory map" and
+                            // "the selector is broken" both show up as a clean
+                            // boot at delta 0. Printing where the image
+                            // actually landed is the only cheap way to tell a
+                            // working selector from a silent one.
+                            narf_memory::kaslr::image_phys_delta(),
+                            narf_memory::kaslr::image_phys_bounds().0
                         );
                         // Supervisor stores ignore the read-only bit unless
                         // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S
@@ -1731,12 +1761,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // is a direct call rather than a staged initcall precisely
                 // because the ordering is too load-bearing to delegate.
                 // `bpf/specification/spec.md` §4.1.
+                // Choose the text window's base before reserving the slots: the pack
+                // cursor and every range check are relative to it. The ARENA base
+                // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
+                // an undershoot lands in the guard slot.
+                narf_memory::bpf_text::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
                             "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
-                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::bpf_text_base(),
                             narf_memory::bpf_text::BPF_ARENA_BASE
                         );
                     }
@@ -1751,11 +1786,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // this, a frame-backed vmalloc mapping created later would live
                 // only in the AS that faulted it in, and a kernel access from
                 // another AS's CPU would hit an empty slot (cross-AS #PF).
+                // Choose the window's base before reserving its slot: the bump
+                // cursor and the valloc bitmap are both relative to it, and an
+                // ioremap already handed out at the old base would be stranded.
+                narf_memory::vmalloc::randomize_window();
                 match narf_memory::vmalloc::reserve_kernel_slot() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
-                            "  vmalloc: kernel VA slot {} reserved",
+                            "  vmalloc: window at {:#018x} (slot {})",
+                            narf_memory::vmalloc::vmalloc_base(),
                             narf_memory::vmalloc::KERNEL_PML4_SLOT
                         );
                     }
@@ -2540,17 +2580,43 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // windows still have to exist before anything maps into them,
                 // and keeping one call site shape across arches means the
                 // ordering rule is stated once.
+                // Choose the text window's base before reserving the slots: the pack
+                // cursor and every range check are relative to it. The ARENA base
+                // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
+                // an undershoot lands in the guard slot.
+                narf_memory::bpf_text::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
                             "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
-                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::bpf_text_base(),
                             narf_memory::bpf_text::BPF_ARENA_BASE
                         );
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
+                // vmalloc window: same treatment, and it was not reserved on
+                // aarch64 either — only the x86_64 path called it, so the
+                // slot's top-level entry was created lazily by the first
+                // `ioremap`. With a randomized base the ordering matters:
+                // the bump cursor and the valloc bitmap are relative to it.
+                narf_memory::vmalloc::randomize_window();
+                match narf_memory::vmalloc::reserve_kernel_slot() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  vmalloc: window at {:#018x} (slot {})",
+                            narf_memory::vmalloc::vmalloc_base(),
+                            narf_memory::vmalloc::KERNEL_PML4_SLOT
+                        );
+                    }
+                    Err(e) => {
+                        let _ =
+                            writeln!(console::Writer, "  vmalloc: slot reservation failed: {e:?}");
                     }
                 }
 

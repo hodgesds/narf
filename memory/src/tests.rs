@@ -16009,9 +16009,21 @@ fn smoke_kernel_window_does_not_alias_buddy_frames() -> TestResult {
 
     // Walk the live tables rather than asking `kernel_window_covers`: that is
     // the predicate the mapping code itself uses, so a test built on it would
-    // agree with `init_mmu` even if both were wrong. The window maps
-    // `kernel_virt_base() + phys`, slide included.
-    let va = crate::kaslr::kernel_virt_base().wrapping_add(phys);
+    // agree with `init_mmu` even if both were wrong.
+    //
+    // The window maps `kernel_virt_base() + off` to `off + delta`, so the VA
+    // that would alias `phys` is reached by SUBTRACTING the physical relocation
+    // delta, not by adding the base alone. `kernel_virt_base() + phys` names the
+    // VA of `phys + delta` instead — and since the image's pre-relocation RAM is
+    // free, the buddy hands out frames there and that VA lands inside the image,
+    // reporting an alias that does not exist. Reading the recorded delta keeps
+    // this independent of the mapping predicate.
+    let Some(off) = phys.checked_sub(crate::kaslr::image_phys_delta()) else {
+        // Below the window's physical coverage: no alias by construction.
+        free_frame(frame);
+        return TestResult::Pass;
+    };
+    let va = crate::kaslr::kernel_virt_base().wrapping_add(off);
     // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
     let cr3 = unsafe { read_cr3() };
     // SAFETY: the live PML4 is reachable through the direct map.

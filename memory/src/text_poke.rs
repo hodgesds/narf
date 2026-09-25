@@ -274,8 +274,11 @@ fn alias_vas(phys: u64) -> ([u64; 2], usize) {
     //
     // The base is the live, slid one: a hardcoded base is wrong by the slide,
     // which is the same failure from the other direction.
-    if crate::x86_64::mmu::kernel_window_covers(phys) {
-        out[n] = crate::kaslr::kernel_virt_base().wrapping_add(phys);
+    // `kernel_window_va` does both halves: the slid base AND the physical
+    // relocation delta. Adding the base to `phys` by hand was right only while
+    // the image ran where the loader put it.
+    if let Some(va) = crate::x86_64::mmu::kernel_window_va(phys) {
+        out[n] = va;
         n += 1;
     }
     if crate::addr::direct_map_live() {

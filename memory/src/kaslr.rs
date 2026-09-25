@@ -139,6 +139,68 @@ pub fn image_phys_bounds() -> (u64, u64) {
     }
     // SAFETY: two linker-populated words inside the image, read-only.
     let b = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() };
+    // The linker filled these with the LINK-TIME physical bounds; if the image
+    // was relocated they describe where it used to be. The frame allocator
+    // reserves this range, so a stale answer leaves the running image
+    // unreserved and hands it to the buddy.
+    let d = IMAGE_PHYS_DELTA.load(Ordering::Relaxed);
+    (b[0].wrapping_add(d), b[1].wrapping_add(d))
+}
+
+/// How far the image was physically relocated from its link-time load address,
+/// or 0 if it runs where the loader put it.
+///
+/// The VA slide (`KERNEL_SLIDE`) randomizes where the image appears; this
+/// randomizes where it actually IS. Both matter: a leaked physical address is
+/// as useful to an attacker as a leaked virtual one, and the loader puts the
+/// image at a fixed physical address that no VA randomization changes.
+///
+/// Written by `boot.S` after it copies the image and before any conversion
+/// runs, so no caller can observe a stale value. Zero is the correct answer
+/// when relocation is disabled or no suitable target was found, and it makes
+/// both conversions below reduce to their pre-relocation form.
+#[no_mangle]
+pub static IMAGE_PHYS_DELTA: AtomicU64 = AtomicU64::new(0);
+
+/// How far the running image sits from its link-time load address.
+///
+/// Prefer [`image_virt_to_phys`] or [`image_phys_bounds`]; this exists for the
+/// one caller that has to undo the displacement rather than apply it — the
+/// kernel window, which is indexed by VIRTUAL offset but maps PHYSICAL frames,
+/// so it needs the two apart. See `x86_64::mmu::kernel_window_va`.
+#[inline]
+pub fn image_phys_delta() -> u64 {
+    IMAGE_PHYS_DELTA.load(Ordering::Relaxed)
+}
+
+/// Size of the image as laid out by the linker, in bytes.
+///
+/// Deliberately delta-free, unlike [`image_phys_bounds`]. The image's VA extent
+/// does not change when it is physically relocated: the image is linked at
+/// `KERNEL_VIRT_BASE + <link-time phys>`, so the window that maps it needs this
+/// many bytes wherever the bytes actually live. Using the relocated physical
+/// end here would inflate the window by the delta — at a 256 MiB delta that is
+/// 176 leaves instead of 49, which overruns the PD the slide has to fit in.
+#[inline]
+pub fn image_virt_extent() -> u64 {
+    image_link_bounds().1
+}
+
+/// The image's LINK-TIME physical bounds — where the linker put it, not where
+/// it runs.
+///
+/// This is [`image_phys_bounds`] without the relocation delta applied, which
+/// makes it the image's offsets within its own virtual window: the image is
+/// linked at `KERNEL_VIRT_BASE + <link-time phys>`, so these double as the VA
+/// offsets of its first and last byte. The window that maps it is indexed by
+/// those offsets while mapping the relocated frames.
+#[inline]
+pub fn image_link_bounds() -> (u64, u64) {
+    unsafe extern "C" {
+        static __kernel_phys_bounds: [u64; 2];
+    }
+    // SAFETY: as `image_phys_bounds` — two linker-populated words in-image.
+    let b = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() };
     (b[0], b[1])
 }
 
@@ -148,7 +210,11 @@ pub fn image_phys_bounds() -> (u64, u64) {
 /// only while the slide is zero, and wrong by exactly the slide otherwise.
 #[inline]
 pub fn image_virt_to_phys(virt: u64) -> u64 {
+    // Two independent displacements: the VA slide, undone by subtracting the
+    // live virtual base, and the physical relocation, added back on. They are
+    // separate because the image can move in one, the other, or both.
     virt.wrapping_sub(kernel_virt_base())
+        .wrapping_add(IMAGE_PHYS_DELTA.load(Ordering::Relaxed))
 }
 
 #[cfg(feature = "kernel-test")]
@@ -276,15 +342,19 @@ mod kaslr_slide_tests {
     /// Overlap here would not fault. The image would quietly share addresses
     /// with module text, and the first module load would corrupt the kernel.
     fn smoke_kaslr_slid_image_clears_module_window() -> TestResult {
-        // Physical, and deliberately not converted — see
-        // `smoke_kaslr_image_bounds_stay_physical`.
-        let image_end_phys = image_phys_bounds().1;
-        let top = kernel_virt_base().wrapping_add(image_end_phys);
+        // The image's VIRTUAL extent, NOT `image_phys_bounds().1`. Both name the
+        // image's end and they differ by the physical relocation delta, which
+        // has nothing to do with where the image APPEARS — so folding it into a
+        // VA inflates the answer by the delta and fails this check for any
+        // slide + delta over about 926 MiB. That made the test fail for roughly
+        // one boot in three once the delta became random.
+        let image_end = image_virt_extent();
+        let top = kernel_virt_base().wrapping_add(image_end);
         if top > crate::module_text::MODULE_VA_BASE {
             return TestResult::Fail("the slid kernel image reaches the module text window");
         }
         #[cfg(target_arch = "x86_64")]
-        if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end_phys > KERNEL_IMAGE_SIZE {
+        if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end > KERNEL_IMAGE_SIZE {
             return TestResult::Fail("slide + image exceeds KERNEL_IMAGE_SIZE");
         }
         TestResult::Pass
