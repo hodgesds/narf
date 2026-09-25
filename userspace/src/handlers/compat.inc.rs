@@ -7067,11 +7067,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     // the same visible pid) under the TASK_TO_PID lock, THEN filter by
     // liveness — `task_get` takes the TASKS lock, which must never be
     // acquired while holding TASK_TO_PID (lock-order discipline).
-    let candidates: alloc::vec::Vec<u64> = task_pid_snapshot()
-        .into_iter()
-        .filter(|&(_, process)| process == pid)
-        .map(|(task, _)| task)
-        .collect();
+    let candidates: alloc::vec::Vec<u64> = thread_group_members(pid);
     let members: alloc::vec::Vec<u64> = candidates
         .into_iter()
         .filter(|&t| {

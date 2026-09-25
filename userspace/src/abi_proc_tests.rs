@@ -2874,3 +2874,49 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc_rlimit_nproc_defers_setuid_failure_to_execve
 );
+
+// The thread-group member index (TGID_MEMBERS) must return exactly the live
+// members of a group and MOVE a task between groups when its tgid changes — the
+// O(1) replacement for the `task_pid_snapshot()` O(all-tasks) global-lock scan
+// whose convoy under plasmashell's thread churn froze all 16 CPUs after login.
+fn smoke_abi_proc_thread_group_member_index() -> TestResult {
+    use crate::handlers::{__test_forget_task_pid, register_task_to_pid, thread_group_members};
+    // Synthetic ids well clear of any real task/pid so the live registry is
+    // untouched; cleaned up at the end either way.
+    const T: u64 = 0x7000_0001;
+    const T2: u64 = 0x7000_0002;
+    const A: u64 = 0x7000_1001;
+    const B: u64 = 0x7000_1002;
+
+    let sorted = |g: u64| {
+        let mut v = thread_group_members(g);
+        v.sort_unstable();
+        v
+    };
+
+    register_task_to_pid(A, T);
+    register_task_to_pid(B, T);
+    if sorted(T) != alloc::vec![A, B] {
+        __test_forget_task_pid(A);
+        __test_forget_task_pid(B);
+        return TestResult::Fail("group T must list both members A and B");
+    }
+
+    // Re-registering A under a new tgid must MOVE it, not leave a stale entry.
+    register_task_to_pid(A, T2);
+    let t_after = sorted(T);
+    let t2_after = sorted(T2);
+    __test_forget_task_pid(A);
+    __test_forget_task_pid(B);
+    if t_after != alloc::vec![B] {
+        return TestResult::Fail("after A moved out, group T must list only B");
+    }
+    if t2_after != alloc::vec![A] {
+        return TestResult::Fail("after A moved in, group T2 must list only A");
+    }
+    if !thread_group_members(T).is_empty() || !thread_group_members(T2).is_empty() {
+        return TestResult::Fail("forget must prune the member sets");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_thread_group_member_index);
