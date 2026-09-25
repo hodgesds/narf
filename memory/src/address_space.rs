@@ -10690,11 +10690,12 @@ impl AddressSpace {
         {
             return Some(len);
         }
-        self.regions
-            .lock()
-            .iter()
-            .find(|region| region.base.as_u64() == base)
-            .map(|region| region.len)
+        // Exact-base lookup through the ordered index — O(log n). The former
+        // linear `.iter().find()` made every /proc status/stat read walk the
+        // whole table (proc_task_info resolves the stack VMA's length per
+        // read; stress-ng --mlock reads status once per bogo op while growing
+        // the table, turning the stressor quadratic).
+        self.regions.lock().get(base).map(|region| region.len)
     }
 
     /// Materialise all pending regions into actual page-table entries.
