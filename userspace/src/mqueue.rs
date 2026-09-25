@@ -834,12 +834,20 @@ fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
     if !fs_notify_active() {
         return;
     }
+    // Each dispatch wakes ONLY the inotify/fanotify instances whose watch
+    // actually matched this path, via that instance's durable `Readiness` cell
+    // (see the `cell.set`/`cell.notify` at the end of each). A poll/epoll waiter
+    // on an inotify/fanotify fd arms that same cell, so the targeted wake covers
+    // it. We must NOT also fire the global `readiness::notify(0)` here: that is a
+    // system-wide wake-ALL of every parked io-waiter, and fs_notify runs on
+    // EVERY open/close/modify of ANY file — including the vast majority that no
+    // watch matches. During a desktop/systemd startup (thousands of library and
+    // config opens) that turned ordinary file I/O into a thundering-herd wake
+    // storm: every parked poll/epoll waiter (kwin, dbus, the whole session) woke
+    // on each unrelated open, re-scanned, found nothing, and re-parked — a
+    // system-wide busy-poll livelock that never let the greeter present.
     inotify_dispatch(abs_path, mask, is_dir);
     fanotify_dispatch(abs_path, mask as u64);
-    // Filesystem event fds participate in poll/epoll. Publishing after both
-    // queues are updated avoids a check-before-park waiter sleeping until the
-    // periodic backstop despite an event already being available.
-    narf_net::readiness::notify(0);
 }
 
 /// inotify half of [`fs_notify`]: for every instance, every watch whose
