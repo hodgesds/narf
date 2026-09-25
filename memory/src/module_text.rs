@@ -915,7 +915,16 @@ fn smoke_module_text_window_placement() -> TestResult {
             return TestResult::Fail("module window straddles an L1 slot boundary");
         }
         // ADRP reaches +/-4 GiB and the veneers rely on it.
-        let to_kernel = KERNEL_VIRT_BASE - MODULE_VA_BASE;
+        //
+        // Measured against kernel TEXT, not the RAM linear map's base. Those
+        // were the same address until the image got its own virtual offset
+        // (`KIMAGE_VOFFSET`), so subtracting `KERNEL_VIRT_BASE` said the right
+        // thing by accident; since the split, kernel text is at
+        // `kaslr::kernel_virt_base()` and this was measuring the distance to
+        // an unrelated window. `abs_diff` because the veneer only cares how
+        // far the branch has to reach, and the image can sit either side.
+        let text_base = crate::kaslr::kernel_virt_base();
+        let to_kernel = text_base.abs_diff(MODULE_VA_BASE);
         if to_kernel > (4u64 << 30) {
             return TestResult::Fail("module window is beyond ADRP reach of kernel text");
         }
