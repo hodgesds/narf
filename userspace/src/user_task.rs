@@ -177,6 +177,23 @@ pub struct UserTaskCtx {
     /// Retargeted alongside `futex_uaddr` when a `FUTEX_REQUEUE` moves
     /// this waiter to a new word.
     pub futex_val: AtomicU32,
+    /// Seqlock over the four-field futex park target above
+    /// (`futex_uaddr` / `futex_namespace` / `futex_park_gen` /
+    /// `futex_val`). A `FUTEX_REQUEUE` retargets a PARKED waiter by
+    /// storing those fields individually, and the park loop's
+    /// load→register window raced them: a re-poll could load the old
+    /// word, register on its queue after the requeue had already moved
+    /// the map entry to the new word, and (an untimed `FUTEX_WAIT` arms
+    /// NO backstop timer) strand forever with every future wake landing
+    /// on the other key — or mix old/new fields and wrongly "stay" by
+    /// comparing the DESTINATION generation snapshot against the SOURCE
+    /// key's counter. Writers (`futex_requeue_waiters_keyed`) bump to
+    /// odd, store the fields, bump to even; the park loop snapshots
+    /// before loading and re-validates after registering, treating any
+    /// movement (or an odd snapshot) as a spurious wake — musl re-checks
+    /// the word in userspace, so a spurious return is always safe and a
+    /// lost one never happens.
+    pub futex_park_seq: AtomicU64,
     /// Set non-null by `sys_execve` to hand a freshly-built
     /// `ExecRequest` to the polling routine. The routine takes
     /// ownership via `Box::from_raw` after the EXECVE longjmp
@@ -496,6 +513,7 @@ impl UserTaskCtx {
             futex_namespace: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
             futex_val: AtomicU32::new(0),
+            futex_park_seq: AtomicU64::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
@@ -1062,26 +1080,14 @@ fn park_should_block(
             // safety from re-checking the word in userspace after any
             // (possibly spurious) futex_wait return, and this park loop
             // otherwise swallows the backstop wake inside the kernel.
-            // NOTE: `fu` may have been retargeted by a FUTEX_REQUEUE while
-            // this task was parked — the load below naturally re-registers
-            // on the new word with the retargeted gen/val snapshots.
-            let fu = uc.futex_uaddr.load(Ordering::Acquire);
-            if fu != 0 {
-                let key =
-                    crate::handlers::futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
-                crate::handlers::futex_register_waiter_key(key, task_id, waker.clone());
-                let stay = crate::handlers::futex_park_should_stay(
-                    crate::handlers::futex_gen_key(key),
-                    uc.futex_park_gen.load(Ordering::Acquire),
-                    crate::handlers::futex_read_user_word(fu),
-                    uc.futex_val.load(Ordering::Acquire),
-                );
-                if !stay {
-                    crate::handlers::futex_drop_waiter_key(key, task_id);
-                    uc.sleep_deadline_ns.store(0, Ordering::Release);
-                    uc.futex_uaddr.store(0, Ordering::Release);
-                    uc.futex_namespace.store(0, Ordering::Release);
-                    return false; // wake landed / word changed → re-execute (musl re-checks)
+            // FUTEX_WAIT registration + stay decision, seqlocked against a
+            // concurrent FUTEX_REQUEUE retarget — the shared protocol lives
+            // in `futex_park_register_and_check` (see `futex_park_seq`).
+            match crate::handlers::futex_park_register_and_check(uc, task_id, &waker) {
+                crate::handlers::FutexParkCheck::NotWaiting
+                | crate::handlers::FutexParkCheck::Stay => {}
+                crate::handlers::FutexParkCheck::Wake => {
+                    return false; // wake landed / word changed / retarget raced → re-execute
                 }
             }
             // Blocked F_SETLKW: register on the lock key's waiter queue so
@@ -2281,38 +2287,22 @@ impl core::future::Future for UserTaskFuture {
                 // wake counter advanced since the syscall's snapshot, a wake
                 // raced us — clear the park and self-wake to re-enter user
                 // mode (musl re-checks the word) instead of sleeping it out.
-                let fu = this.task.uctx.futex_uaddr.load(Ordering::Acquire);
-                if fu != 0 {
-                    let key = crate::handlers::futex_key(
-                        this.task.uctx.futex_namespace.load(Ordering::Acquire),
-                        fu,
-                    );
-                    crate::handlers::futex_register_waiter_key(
-                        key,
+                // FUTEX_WAIT registration + stay decision, seqlocked against
+                // a concurrent FUTEX_REQUEUE retarget — shared protocol in
+                // `futex_park_register_and_check` (see `futex_park_seq`).
+                {
+                    let waker = cx.waker().clone();
+                    match crate::handlers::futex_park_register_and_check(
+                        &this.task.uctx,
                         crate::handlers::current_task_id(),
-                        cx.waker().clone(),
-                    );
-                    // Same stay-parked decision as the own-stack park loop:
-                    // gen guard for a racing FUTEX_WAKE plus the futex-word
-                    // re-validation that keeps a wakeless word rewrite
-                    // (musl condvar requeue handoff, robust-owner death)
-                    // from re-parking this task forever.
-                    let stay = crate::handlers::futex_park_should_stay(
-                        crate::handlers::futex_gen_key(key),
-                        this.task.uctx.futex_park_gen.load(Ordering::Acquire),
-                        crate::handlers::futex_read_user_word(fu),
-                        this.task.uctx.futex_val.load(Ordering::Acquire),
-                    );
-                    if !stay {
-                        crate::handlers::futex_drop_waiter_key(
-                            key,
-                            crate::handlers::current_task_id(),
-                        );
-                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        this.task.uctx.futex_uaddr.store(0, Ordering::Release);
-                        this.task.uctx.futex_namespace.store(0, Ordering::Release);
-                        cx.waker().wake_by_ref();
-                        return core::task::Poll::Pending;
+                        &waker,
+                    ) {
+                        crate::handlers::FutexParkCheck::NotWaiting
+                        | crate::handlers::FutexParkCheck::Stay => {}
+                        crate::handlers::FutexParkCheck::Wake => {
+                            cx.waker().wake_by_ref();
+                            return core::task::Poll::Pending;
+                        }
                     }
                 }
                 if deadline == u64::MAX {
