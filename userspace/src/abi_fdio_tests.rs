@@ -609,17 +609,20 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_fstat_neg);
 
 // ── fstatfs ────────────────────────────────────────────────────────
 //
-// The handler ignores the fd and fills synthetic "/" statfs into the
-// user buffer. The positive path needs a real user buffer the kernel
-// copy_to_user can write — in this harness there is no live user AS, so
-// only the buf_ptr==0 failure path is asserted.
+// `fs/statfs.c::fd_statfs`: an unopened fd is -EBADF (it used to fall
+// back to "/" and SUCCEED), and a bad destination is -EFAULT (it used to
+// be the -1 sentinel, which libc reads as EPERM).
 
 fn smoke_abi_fdio_fstatfs_neg() -> TestResult {
-    with_setup(|| {
-        // buf_ptr == 0 → fail sentinel (!0 == -1 as i64).
-        match call(Syscall::Fstatfs.raw(), a1(3, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("fstatfs with null buf was not the -1 sentinel"),
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        match call(Syscall::Fstatfs.raw(), a1(4545, 0)) {
+            Some(-9) => {}
+            _ => return Err("fstatfs on a closed fd was not -EBADF"),
+        }
+        let fd = open_fd(b"/abi/f\0")?;
+        match call(Syscall::Fstatfs.raw(), a1(fd as u64, 0)) {
+            Some(-14) => Ok(()),
+            _ => Err("fstatfs with a null buf was not -EFAULT"),
         }
     })
 }

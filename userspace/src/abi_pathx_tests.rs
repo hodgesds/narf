@@ -2429,7 +2429,7 @@ fn smoke_abi_pathx_renameat2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_renameat2_neg);
 
-// ── statfs (NARF-native path_ptr, path_len, buf) → 0 / -1 ──────────
+// ── statfs(path, buf) → 0 / -errno ─────────────────────────────────
 //
 // `sys_statfs` takes the Linux shape: (path NUL-term, buf).
 
@@ -2452,10 +2452,28 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_pos);
 fn smoke_abi_pathx_statfs_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        // buf_ptr == 0 → fill_statfs_for_path returns false → -1 sentinel.
+        // `user_statfs`: a resolved path with an unwritable buf is -EFAULT
+        // (was the -1 sentinel → EPERM)...
         match call(Syscall::Statfs.raw(), a1(path.as_ptr() as u64, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("statfs(null buf) was not the -1 sentinel"),
+            Some(-14) => {}
+            _ => return Err("statfs(null buf) was not -EFAULT"),
+        }
+        // ...but the lookup runs first: a missing name is -ENOENT even with
+        // a bad buf (it used to SUCCEED for any path under a mount), and a
+        // file used as a directory is -ENOTDIR.
+        let missing = b"/p2/nope\0";
+        match call(Syscall::Statfs.raw(), a1(missing.as_ptr() as u64, 0)) {
+            Some(-2) => {}
+            _ => return Err("statfs(missing path) was not -ENOENT"),
+        }
+        let through_file = b"/p2/f/x\0";
+        let mut buf = [0u8; 128];
+        match call(
+            Syscall::Statfs.raw(),
+            a1(through_file.as_ptr() as u64, buf.as_mut_ptr() as u64),
+        ) {
+            Some(-20) => Ok(()),
+            _ => Err("statfs through a regular file was not -ENOTDIR"),
         }
     })
 }

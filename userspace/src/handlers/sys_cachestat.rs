@@ -35,11 +35,13 @@ pub(crate) fn sys_cachestat(ctx: &mut dyn TrapContext) {
     let (fd, range_ptr, out_ptr, flags) = (a.arg0 as u32, a.arg1, a.arg2, a.arg3);
 
     let task = current_task_id();
-    let Some(entry_ops) = crate::fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()
-    else {
+    // `CLASS(fd, f)(fd)` refuses an O_PATH description as well as an
+    // unopened slot.
+    let Some(endpoint) = fdget_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };
+    let entry_ops = endpoint.ops.clone();
     let mut raw = [0u8; 16];
     // SAFETY: `range_ptr` is the user `struct cachestat_range`; copy_from_user
     // range-validates it and brackets the 16-byte read.
@@ -55,12 +57,8 @@ pub(crate) fn sys_cachestat(ctx: &mut dyn TrapContext) {
     // another user has read, which is why a read-only descriptor on someone
     // else's file is not enough.
     let (uid, gid) = entry_ops.owners();
-    let writable = crate::fd::with_table(task, |t| {
-        t.get(fd)
-            .map(|e| e.status_flags & 0b11 == 1 || e.status_flags & 0b11 == 2)
-    })
-    .flatten()
-    .unwrap_or(false);
+    // FMODE_WRITE: O_WRONLY or O_RDWR (accmode 3 carries neither mode).
+    let writable = matches!(endpoint.status_flags & crate::fd::O_ACCMODE, 1 | 2);
     if !writable && !inode_owner_or_capable(task, uid, gid) {
         ctx.set_return(errno_ret(EPERM));
         return;

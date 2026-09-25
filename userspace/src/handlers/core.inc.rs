@@ -4368,6 +4368,14 @@ fn copy_fd_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
     .flatten()
 }
 
+/// `fdget(fd)` as the fd-taking syscalls see it: an unopened slot AND an
+/// O_PATH description (FMODE_PATH, which `__fget_light` masks out) are both
+/// "no file", i.e. -EBADF at the caller. `fd_raw` users (fstatfs, fchdir,
+/// the `*at` dirfd) must keep using [`copy_fd_endpoint`].
+fn fdget_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
+    copy_fd_endpoint(task, fd_num).filter(|e| e.status_flags & crate::fd::O_PATH == 0)
+}
+
 fn copy_fd_endpoint_from_table(
     table: &crate::fd::FdTable,
     fd_num: u32,
@@ -14162,6 +14170,72 @@ fn dir_search_permitted(path: &str, task: u64) -> bool {
             exec: true,
         },
     )
+}
+
+/// `link_path_walk`'s `may_lookup` (MAY_EXEC) on every directory a walk to
+/// `path` traverses, for a path that DID resolve. [`path_lookup_errno`] only
+/// classifies failed walks, so without this a file inside a 0700 directory
+/// was reachable by anyone who could name it. The root itself is not
+/// checked, matching the `path_lookup_errno` walk.
+fn path_ancestors_searchable(path: &str, task: u64) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
+        return true;
+    };
+    let mut prefix = alloc::string::String::new();
+    for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(comp);
+        if !dir_search_permitted(&prefix, task) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `inode_permission(idmap, inode, mask)` for a node already looked up by
+/// path: mode bits plus, for a file-shaped node, its ACCESS ACL (the same
+/// `check_acl` step `open` and `access` take). A directory has no xattr
+/// surface here, so it is decided on its mode alone, as in `access_path`.
+/// Errors are positive errnos: -EACCES on refusal, and an ACL that does not
+/// decode is passed through as `check_acl` does rather than falling back to
+/// the mode bits.
+fn node_permission(
+    task: u64,
+    file: Option<&dyn narf_filesystem::FileOps>,
+    perms: u16,
+    uid: u32,
+    gid: u32,
+    is_dir: bool,
+    request: narf_filesystem::AccessRequest,
+) -> Result<(), i64> {
+    let acl = match file {
+        Some(file) if !is_dir => match poll_blocking(narf_filesystem::acl_of_file(
+            file,
+            narf_filesystem::AclType::Access,
+        )) {
+            Some(Ok(acl)) => acl,
+            Some(Err(narf_filesystem::FsError::Unsupported)) => return Err(EOPNOTSUPP),
+            Some(Err(_)) => return Err(EINVAL),
+            None => None,
+        },
+        _ => None,
+    };
+    if narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(task, uid, gid),
+        request,
+        acl.as_ref(),
+    ) {
+        Ok(())
+    } else {
+        Err(EACCES)
+    }
 }
 
 pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {

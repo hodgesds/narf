@@ -24,7 +24,10 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
+    // `fdget` refuses an O_PATH descriptor (FMODE_PATH) exactly as it does
+    // an unopened slot, so O_PATH is -EBADF — not the -EINVAL a real but
+    // read-only description gets below.
+    let Some(endpoint) = fdget_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };

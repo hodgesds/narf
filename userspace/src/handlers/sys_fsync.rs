@@ -12,9 +12,9 @@ pub(crate) fn sys_fdatasync(ctx: &mut dyn TrapContext) {
 fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
     let fd = ctx.args().arg0 as u32;
     let task = current_task_id();
-    let ops = fd::with_table(task, |t| t.get(fd).map(|entry| entry.ops.clone())).flatten();
-    let Some(ops) = ops else {
-        // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
+    // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM). An
+    // O_PATH descriptor is "not open" to `fdget` as well.
+    let Some(ops) = fdget_endpoint(task, fd).map(|e| e.ops) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };

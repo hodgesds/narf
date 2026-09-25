@@ -26,7 +26,7 @@ use narf_filesystem::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
-use crate::handlers::{copy_user_cstr, current_task_id};
+use crate::handlers::{copy_user_cstr, copy_user_cstr_checked, current_task_id};
 use crate::syscall::{SyscallReturn, TrapContext};
 
 use crate::errno::{to_ret as err, *};
@@ -1175,19 +1175,19 @@ impl FileOps for InotifyFile {
     }
 }
 
-fn instance_of(task: u64, fd_no: u32) -> Option<u64> {
-    fd::with_table(task, |t| {
-        t.get(fd_no).and_then(|e| e.ops.inotify_instance())
-    })
-    .flatten()
-}
-
 const IN_NONBLOCK: u64 = 0o4000;
 const IN_CLOEXEC: u64 = 0o2000000;
 
 /// `inotify_init1(flags)`.
+///
+/// `if (flags & ~(IN_CLOEXEC | IN_NONBLOCK)) return -EINVAL;` — checked
+/// before anything is allocated. An unknown bit used to be silently ignored.
 pub fn sys_inotify_init1(ctx: &mut dyn TrapContext) {
-    let flags = ctx.args().arg0;
+    let flags = ctx.args().arg0 as u32 as u64;
+    if flags & !(IN_CLOEXEC | IN_NONBLOCK) != 0 {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
     inotify_init_common(ctx, flags)
 }
 
@@ -1232,44 +1232,136 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
     };
     match task_open_call(task_open(file, cloexec, status)).flatten() {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        // `get_unused_fd_flags` failing is RLIMIT_NOFILE: -EMFILE.
+        None => ctx.set_return(err(EMFILE)),
     }
 }
 
+// inotify_add_watch mask bits (`include/uapi/linux/inotify.h`).
+const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+const IN_UNMOUNT: u32 = 0x0000_2000;
+const IN_IGNORED: u32 = 0x0000_8000;
+const IN_ONLYDIR: u32 = 0x0100_0000;
+const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+const IN_EXCL_UNLINK: u32 = 0x0400_0000;
+const IN_MASK_CREATE: u32 = 0x1000_0000;
+const IN_MASK_ADD: u32 = 0x2000_0000;
+const IN_ONESHOT: u32 = 0x8000_0000;
+/// `ALL_INOTIFY_BITS` (`include/linux/inotify.h`).
+const ALL_INOTIFY_BITS: u32 = IN_ALL_EVENTS
+    | IN_UNMOUNT
+    | IN_Q_OVERFLOW
+    | IN_IGNORED
+    | IN_ONLYDIR
+    | IN_DONT_FOLLOW
+    | IN_EXCL_UNLINK
+    | IN_MASK_CREATE
+    | IN_MASK_ADD
+    | IN_ISDIR
+    | IN_ONESHOT;
+
 /// `inotify_add_watch(fd, path, mask)`.
+///
+/// `fs/notify/inotify/inotify_user.c` validates in this order:
+///
+/// ```text
+///   if (mask & ~ALL_INOTIFY_BITS)    return -EINVAL;
+///   if (!(mask & ALL_INOTIFY_BITS))  return -EINVAL;
+///   CLASS(fd, f)(fd); if (fd_empty(f)) return -EBADF;
+///   if ((mask & IN_MASK_ADD) && (mask & IN_MASK_CREATE)) return -EINVAL;
+///   if (fd_file(f)->f_op != &inotify_fops)               return -EINVAL;
+///   inotify_find_inode():  user_path_at(..., LOOKUP_FOLLOW unless IN_DONT_FOLLOW,
+///                          LOOKUP_DIRECTORY if IN_ONLYDIR)   /* -EFAULT/-ENOENT/-ENOTDIR/... */
+///                          path_permission(&path, MAY_READ)  /* -EACCES */
+///   inotify_update_watch(): IN_MASK_CREATE on a watched inode -> -EEXIST
+/// ```
+///
+/// This used to accept any mask, report a non-inotify fd as -EBADF, an
+/// unreadable path pointer as -EINVAL, and watch names that did not exist.
 pub fn sys_inotify_add_watch(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
-    let id = match instance_of(task, a.arg0 as u32) {
-        Some(id) => id,
+    let mask = a.arg2 as u32;
+    if mask & !ALL_INOTIFY_BITS != 0 || mask & ALL_INOTIFY_BITS == 0 {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let is_inotify = match fd::with_table(task, |t| {
+        t.get(a.arg0 as u32).map(|e| e.ops.inotify_instance())
+    })
+    .flatten()
+    {
+        Some(instance) => instance,
         None => {
             ctx.set_return(err(EBADF));
             return;
         }
     };
-    let path = match copy_user_cstr(a.arg1, 4096) {
-        Some(p) if !p.is_empty() => p,
-        _ => {
-            ctx.set_return(err(EINVAL));
+    if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let Some(id) = is_inotify else {
+        ctx.set_return(err(EINVAL));
+        return;
+    };
+    let raw = match copy_user_cstr_checked(a.arg1, 4096) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(err(errno));
             return;
         }
     };
-    let mask = a.arg2 as u32;
+    let follow = mask & IN_DONT_FOLLOW == 0;
+    let found =
+        match crate::handlers::user_path_lookup(task, -100, &raw, follow, mask & IN_ONLYDIR != 0) {
+            Ok(found) => found,
+            Err(errno) => {
+                ctx.set_return(err(errno));
+                return;
+            }
+        };
+    if let Err(errno) = crate::handlers::looked_up_permission(
+        task,
+        &found,
+        follow,
+        narf_filesystem::AccessRequest {
+            read: true,
+            write: false,
+            exec: false,
+        },
+    ) {
+        ctx.set_return(err(errno));
+        return;
+    }
+    // Watches are keyed by the caller-view absolute path (events are
+    // dispatched by absolute path), so `f`, `./f` and `/cwd/f` name one
+    // watch the way they name one inode on Linux.
+    let path = found.user_path;
     let wd = with_inotify(|m| {
         let st = m.get_mut(&id)?;
         // Re-adding an already-watched path returns the existing wd and
-        // refreshes its mask (Linux replaces the mask unless IN_MASK_ADD).
+        // replaces its mask (ORs into it under IN_MASK_ADD); IN_MASK_CREATE
+        // refuses an existing watch.
         if let Some((wd, w)) = st.watches.iter_mut().find(|(_, w)| w.path == path) {
-            w.mask = mask;
-            return Some(*wd);
+            if mask & IN_MASK_CREATE != 0 {
+                return Some(Err(EEXIST));
+            }
+            if mask & IN_MASK_ADD != 0 {
+                w.mask |= mask;
+            } else {
+                w.mask = mask;
+            }
+            return Some(Ok(*wd));
         }
         let wd = st.next_wd;
         st.next_wd = st.next_wd.wrapping_add(1);
         st.watches.insert(wd, Watch { path, mask });
-        Some(wd)
+        Some(Ok(wd))
     });
     match wd {
-        Some(wd) => ctx.set_return(SyscallReturn::ok(wd as u64)),
+        Some(Ok(wd)) => ctx.set_return(SyscallReturn::ok(wd as u64)),
+        Some(Err(errno)) => ctx.set_return(err(errno)),
         None => ctx.set_return(err(EBADF)),
     }
 }
@@ -1278,8 +1370,18 @@ pub fn sys_inotify_add_watch(ctx: &mut dyn TrapContext) {
 pub fn sys_inotify_rm_watch(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
-    let id = match instance_of(task, a.arg0 as u32) {
-        Some(id) => id,
+    // `CLASS(fd, f)` -> -EBADF; an open fd that is not an inotify instance
+    // is `if (fd_file(f)->f_op != &inotify_fops) return -EINVAL;`.
+    let id = match fd::with_table(task, |t| {
+        t.get(a.arg0 as u32).map(|e| e.ops.inotify_instance())
+    })
+    .flatten()
+    {
+        Some(Some(id)) => id,
+        Some(None) => {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
         None => {
             ctx.set_return(err(EBADF));
             return;
@@ -1314,10 +1416,39 @@ pub fn sys_inotify_rm_watch(ctx: &mut dyn TrapContext) {
 // fanotify_init flags.
 const FAN_CLOEXEC: u64 = 0x0000_0001;
 const FAN_NONBLOCK: u64 = 0x0000_0002;
+const FAN_CLASS_CONTENT: u64 = 0x0000_0004;
+const FAN_CLASS_PRE_CONTENT: u64 = 0x0000_0008;
+const FAN_CLASS_BITS: u64 = FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
+const FAN_REPORT_PIDFD: u64 = 0x0000_0080;
+const FAN_REPORT_TID: u64 = 0x0000_0100;
+const FAN_REPORT_FID: u64 = 0x0000_0200;
+const FAN_REPORT_DIR_FID: u64 = 0x0000_0400;
+const FAN_REPORT_NAME: u64 = 0x0000_0800;
+const FAN_REPORT_TARGET_FID: u64 = 0x0000_1000;
+const FAN_REPORT_MNT: u64 = 0x0000_4000;
+const FANOTIFY_FID_BITS: u64 =
+    FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID;
+/// `FANOTIFY_INIT_FLAGS` (incl. FAN_ENABLE_AUDIT): every defined init bit.
+/// Probed on Linux 6.18: bits 0..=14 are known, 15+ are -EINVAL.
+const FANOTIFY_INIT_FLAGS: u64 = 0x0000_7fff;
+/// `FANOTIFY_ADMIN_INIT_FLAGS`: the permission classes, unlimited
+/// queue/marks, audit, pidfd/tid reporting and FAN_REPORT_FD_ERROR — the
+/// bits an unprivileged group may not ask for (probed: -EPERM).
+const FANOTIFY_ADMIN_INIT_FLAGS: u64 = 0x0000_21fc;
+/// `FANOTIFY_INIT_ALL_EVENT_F_BITS`: O_ACCMODE | O_APPEND | O_NONBLOCK |
+/// O_DSYNC | O_LARGEFILE | O_NOATIME | O_CLOEXEC | __O_SYNC.
+const FANOTIFY_INIT_ALL_EVENT_F_BITS: u64 = 0x001c_dc03;
 // fanotify_mark flags.
 const FAN_MARK_ADD: u64 = 0x0000_0001;
 const FAN_MARK_REMOVE: u64 = 0x0000_0002;
+const FAN_MARK_DONT_FOLLOW: u64 = 0x0000_0004;
+const FAN_MARK_ONLYDIR: u64 = 0x0000_0008;
 const FAN_MARK_FLUSH: u64 = 0x0000_0080;
+/// `FANOTIFY_MARK_TYPE_BITS`: FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM (and
+/// their union, FAN_MARK_MNTNS).
+const FANOTIFY_MARK_TYPE_BITS: u64 = 0x0000_0110;
+/// `FANOTIFY_MARK_FLAGS`: every defined mark flag (probed: 0x800+ is -EINVAL).
+const FANOTIFY_MARK_FLAGS: u64 = 0x0000_07ff;
 /// `struct fanotify_event_metadata` is a fixed 24 bytes.
 pub(crate) const FAN_EVENT_METADATA_LEN: usize = 24;
 const FANOTIFY_METADATA_VERSION: u8 = 3;
@@ -1563,8 +1694,52 @@ pub(crate) fn build_fan_metadata(mask: u64, fd: i32, pid: i32) -> [u8; FAN_EVENT
 }
 
 /// `fanotify_init(flags, event_f_flags)` → group fd.
+///
+/// `fs/notify/fanotify/fanotify_user.c` validates before creating the group:
+///
+/// ```text
+///   if (!capable(CAP_SYS_ADMIN) &&
+///       ((flags & FANOTIFY_ADMIN_INIT_FLAGS) ||
+///        !(flags & (FANOTIFY_FID_BITS | FAN_REPORT_MNT))))  return -EPERM;
+///   if (flags & ~FANOTIFY_INIT_FLAGS)                        return -EINVAL;
+///   if ((flags & FAN_REPORT_PIDFD) && (flags & FAN_REPORT_TID)) return -EINVAL;
+///   if (event_f_flags & ~FANOTIFY_INIT_ALL_EVENT_F_BITS)     return -EINVAL;
+///   if ((event_f_flags & O_ACCMODE) == 3)                    return -EINVAL;
+///   if (fid_mode && class != FAN_CLASS_NOTIF)                return -EINVAL;
+///   if ((fid_mode & FAN_REPORT_NAME) && !(fid_mode & FAN_REPORT_DIR_FID)) -EINVAL;
+///   if ((fid_mode & FAN_REPORT_TARGET_FID) && !(NAME && FID))             -EINVAL;
+///   ... class CONTENT|PRE_CONTENT together                   -> -EINVAL
+/// ```
+///
+/// Every flag combination used to be accepted, including from an
+/// unprivileged caller. (The group itself still delivers fd-style events
+/// whatever FAN_REPORT_* asked for — a LINUX-GAP outside errno parity.)
 pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
-    let flags = ctx.args().arg0;
+    let flags = ctx.args().arg0 as u32 as u64;
+    let event_f_flags = ctx.args().arg1 as u32 as u64;
+    if !crate::handlers::capable(crate::handlers::CAP_SYS_ADMIN)
+        && (flags & FANOTIFY_ADMIN_INIT_FLAGS != 0
+            || flags & (FANOTIFY_FID_BITS | FAN_REPORT_MNT) == 0)
+    {
+        ctx.set_return(err(EPERM));
+        return;
+    }
+    let fid_mode = flags & FANOTIFY_FID_BITS;
+    let invalid = flags & !FANOTIFY_INIT_FLAGS != 0
+        || (flags & FAN_REPORT_PIDFD != 0 && flags & FAN_REPORT_TID != 0)
+        || event_f_flags & !FANOTIFY_INIT_ALL_EVENT_F_BITS != 0
+        || event_f_flags & 0o3 == 0o3
+        || (fid_mode != 0 && flags & FAN_CLASS_BITS != 0)
+        || (fid_mode & FAN_REPORT_NAME != 0 && fid_mode & FAN_REPORT_DIR_FID == 0)
+        || (fid_mode & FAN_REPORT_TARGET_FID != 0
+            && (fid_mode & FAN_REPORT_NAME == 0 || fid_mode & FAN_REPORT_FID == 0))
+        // Probed: FAN_REPORT_MNT cannot be combined with fid reporting.
+        || (flags & FAN_REPORT_MNT != 0 && fid_mode != 0)
+        || flags & FAN_CLASS_BITS == FAN_CLASS_BITS;
+    if invalid {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
     let id = FANOTIFY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     FANOTIFY_ACTIVE.store(true, Ordering::Relaxed);
     with_fanotify(|m| {
@@ -1591,64 +1766,157 @@ pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
     };
     match task_open_call(task_open(file, cloexec, status)).flatten() {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        // `get_unused_fd_flags` failing is RLIMIT_NOFILE: -EMFILE.
+        None => ctx.set_return(err(EMFILE)),
     }
 }
 
 /// `fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)`.
+///
+/// `do_fanotify_mark` validates the arguments BEFORE resolving the group fd:
+///
+/// ```text
+///   if (upper_32_bits(mask))             return -EINVAL;
+///   if (flags & ~FANOTIFY_MARK_FLAGS)    return -EINVAL;
+///   switch (flags & (ADD | REMOVE | FLUSH)) {
+///   case ADD: case REMOVE: if (!mask) return -EINVAL; break;
+///   case FLUSH: if (flags & ~(FANOTIFY_MARK_TYPE_BITS | FLUSH)) return -EINVAL; break;
+///   default: return -EINVAL;
+///   }
+///   CLASS(fd, f)(fanotify_fd);  if (fd_empty(f)) return -EBADF;
+///   if (fd_file(f)->f_op != &fanotify_fops)     return -EINVAL;
+///   fanotify_find_path(): pathname NULL -> dfd itself (-EBADF, ONLYDIR -ENOTDIR),
+///                         else user_path_at(dfd, pathname, ...) + MAY_READ
+///   fanotify_remove_mark(): no such mark -> -ENOENT
+/// ```
+///
+/// This used to report a non-fanotify fd as -EBADF, validate nothing, mark
+/// names that did not exist, and answer a missing mark with -EINVAL.
 pub fn sys_fanotify_mark(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
-    let id = match fanotify_instance_of(task, a.arg0 as u32) {
-        Some(id) => id,
+    let flags = a.arg1 as u32 as u64;
+    let mask = a.arg2;
+    let dirfd = a.arg3 as i32 as i64;
+    if mask >> 32 != 0 || flags & !FANOTIFY_MARK_FLAGS != 0 {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let cmd = flags & (FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_FLUSH);
+    let args_ok = match cmd {
+        FAN_MARK_ADD | FAN_MARK_REMOVE => mask != 0,
+        FAN_MARK_FLUSH => flags & !(FANOTIFY_MARK_TYPE_BITS | FAN_MARK_FLUSH) == 0,
+        _ => false,
+    };
+    if !args_ok {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let id = match fd::with_table(task, |t| {
+        t.get(a.arg0 as u32).map(|e| e.ops.fanotify_instance())
+    })
+    .flatten()
+    {
+        Some(Some(id)) => id,
+        Some(None) => {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
         None => {
             ctx.set_return(err(EBADF));
             return;
         }
     };
-    let flags = a.arg1;
-    let mask = a.arg2;
-    // dirfd (arg3) is ignored — NARF resolves absolute paths / AT_FDCWD.
-    if flags & FAN_MARK_FLUSH != 0 {
-        with_fanotify(|m| {
-            if let Some(g) = m.get_mut(&id) {
-                g.marks.clear();
-            }
-        });
+    if cmd == FAN_MARK_FLUSH {
+        // NARF keeps inode marks only; a mount/filesystem flush has none
+        // of its kind to remove.
+        if flags & FANOTIFY_MARK_TYPE_BITS == 0 {
+            with_fanotify(|m| {
+                if let Some(g) = m.get_mut(&id) {
+                    g.marks.clear();
+                }
+            });
+        }
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    let path = match copy_user_cstr(a.arg4, 4096) {
-        Some(p) if !p.is_empty() => p,
-        _ => {
-            ctx.set_return(err(EINVAL));
+    let only_dir = flags & FAN_MARK_ONLYDIR != 0;
+    let path = if a.arg4 == 0 {
+        // A NULL pathname marks the object `dfd` itself refers to.
+        let is_dir = if dirfd < 0 {
+            None
+        } else {
+            fd::with_table(task, |t| {
+                t.get(dirfd as u32).map(|e| e.ops.as_dir().is_some())
+            })
+            .flatten()
+        };
+        let Some(is_dir) = is_dir else {
+            ctx.set_return(err(EBADF));
+            return;
+        };
+        if only_dir && !is_dir {
+            ctx.set_return(err(ENOTDIR));
             return;
         }
+        fd_path(task, dirfd as u32)
+    } else {
+        let raw = match copy_user_cstr_checked(a.arg4, 4096) {
+            Ok(p) => p,
+            Err(errno) => {
+                ctx.set_return(err(errno));
+                return;
+            }
+        };
+        let follow = flags & FAN_MARK_DONT_FOLLOW == 0;
+        let found = match crate::handlers::user_path_lookup(task, dirfd, &raw, follow, only_dir) {
+            Ok(found) => found,
+            Err(errno) => {
+                ctx.set_return(err(errno));
+                return;
+            }
+        };
+        if let Err(errno) = crate::handlers::looked_up_permission(
+            task,
+            &found,
+            follow,
+            narf_filesystem::AccessRequest {
+                read: true,
+                write: false,
+                exec: false,
+            },
+        ) {
+            ctx.set_return(err(errno));
+            return;
+        }
+        Some(found.user_path)
+    };
+    // An anonymous object (no path to key an inode mark on) is accepted, as
+    // Linux accepts it; NARF simply has no path event that could match it.
+    let Some(path) = path else {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
     };
     let r = with_fanotify(|m| {
         let g = m.get_mut(&id)?;
-        if flags & FAN_MARK_ADD != 0 {
+        if cmd == FAN_MARK_ADD {
             let e = g.marks.entry(path).or_insert(0);
             *e |= mask;
-            Some(true)
-        } else if flags & FAN_MARK_REMOVE != 0 {
-            if let Some(cur) = g.marks.get_mut(&path) {
-                *cur &= !mask;
-                if *cur == 0 {
-                    g.marks.remove(&path);
-                }
-                Some(true)
-            } else {
-                Some(false)
+            Some(Ok(()))
+        } else if let Some(cur) = g.marks.get_mut(&path) {
+            *cur &= !mask;
+            if *cur == 0 {
+                g.marks.remove(&path);
             }
+            Some(Ok(()))
         } else {
-            // Neither ADD nor REMOVE nor FLUSH set.
-            Some(false)
+            // `fanotify_remove_mark`: no mark on this object -> -ENOENT.
+            Some(Err(ENOENT))
         }
     });
     match r {
-        Some(true) => ctx.set_return(SyscallReturn::ok(0)),
-        Some(false) => ctx.set_return(err(EINVAL)),
+        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Err(errno)) => ctx.set_return(err(errno)),
         None => ctx.set_return(err(EBADF)),
     }
 }

@@ -36,7 +36,8 @@ pub(crate) fn sys_fadvise64(ctx: &mut dyn TrapContext) {
     let advice = args.arg3;
     let task = current_task_id();
 
-    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
+    // `fdget`: an O_PATH descriptor is -EBADF, like an unopened slot.
+    let Some(endpoint) = fdget_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };

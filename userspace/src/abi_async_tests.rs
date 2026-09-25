@@ -1375,13 +1375,13 @@ kernel_test_in!(
 // ════════════════════════════════════════════════════════════════════
 // inotify_add_watch(2) — sys_inotify_add_watch(fd, path, mask)
 //
-// Resolves the inotify instance from the fd, copies the NUL-terminated
-// path, allocates a watch descriptor (wd >= 1). A non-inotify / bad fd →
-// -EBADF.
+// Validates the mask (-EINVAL) before the fd (-EBADF), then requires an
+// inotify instance (-EINVAL otherwise), then looks the path up (-ENOENT /
+// -ENOTDIR / -EACCES) and allocates a watch descriptor (wd >= 1).
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_inotify_add_watch_pos() -> TestResult {
-    with_setup(|| {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
         let fd = match call(Syscall::InotifyInit1.raw(), a0(0)) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("inotify_init1 failed"),
@@ -1410,6 +1410,81 @@ fn smoke_abi_async_inotify_add_watch_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_add_watch_neg);
 
+/// `inotify_add_watch` errno ORDER (probed on Linux 6.18): a mask with no
+/// valid bit is -EINVAL even on a bad fd; an open fd that is not an inotify
+/// instance is -EINVAL, not -EBADF; a missing name is -ENOENT (it used to be
+/// watched anyway); IN_ONLYDIR on a file is -ENOTDIR; IN_MASK_CREATE on an
+/// existing watch is -EEXIST.
+fn smoke_abi_async_inotify_add_watch_errno_order() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let f = b"/abi/f\0";
+        if call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(999, f.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("mask 0 on a bad fd must be -EINVAL");
+        }
+        let ifd = match call(Syscall::InotifyInit1.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("inotify_init1 failed"),
+        };
+        let file_fd = match call_open(f.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open of the watch target failed"),
+        };
+        if call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(file_fd, f.as_ptr() as u64, 0x2),
+        ) != Some(EINVAL)
+        {
+            return Err("a non-inotify fd must be -EINVAL");
+        }
+        let missing = b"/abi/nope\0";
+        if call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(ifd, missing.as_ptr() as u64, 0x2),
+        ) != Some(ENOENT)
+        {
+            return Err("watching a missing path must be -ENOENT");
+        }
+        const IN_ONLYDIR: u64 = 0x0100_0000;
+        if call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(ifd, f.as_ptr() as u64, 0x2 | IN_ONLYDIR),
+        ) != Some(ENOTDIR)
+        {
+            return Err("IN_ONLYDIR on a regular file must be -ENOTDIR");
+        }
+        if !matches!(
+            call(Syscall::InotifyAddWatch.raw(), a2(ifd, f.as_ptr() as u64, 0x2)),
+            Some(wd) if wd >= 1
+        ) {
+            return Err("inotify_add_watch on an existing file failed");
+        }
+        const IN_MASK_CREATE: u64 = 0x1000_0000;
+        if call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(ifd, f.as_ptr() as u64, 0x2 | IN_MASK_CREATE),
+        ) != Some(EEXIST)
+        {
+            return Err("IN_MASK_CREATE on a watched inode must be -EEXIST");
+        }
+        if call(Syscall::InotifyRmWatch.raw(), a1(file_fd, 1)) != Some(EINVAL) {
+            return Err("inotify_rm_watch on a non-inotify fd must be -EINVAL");
+        }
+        // inotify_init1 rejects unknown flags up front.
+        if call(Syscall::InotifyInit1.raw(), a0(1)) != Some(EINVAL) {
+            return Err("inotify_init1 with an unknown flag must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_add_watch_errno_order
+);
+
 // ════════════════════════════════════════════════════════════════════
 // inotify_rm_watch(2) — sys_inotify_rm_watch(fd, wd)
 //
@@ -1418,7 +1493,7 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_add_watch_neg);
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_inotify_rm_watch_pos() -> TestResult {
-    with_setup(|| {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
         let fd = match call(Syscall::InotifyInit1.raw(), a0(0)) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("inotify_init1 failed"),
@@ -1823,14 +1898,14 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_init_cloexec);
 // ════════════════════════════════════════════════════════════════════
 // fanotify_mark(2) — sys_fanotify_mark(fd, flags, mask, dirfd, path)
 //
-// FAN_MARK_ADD (0x1) stores an inode mark on the NUL-terminated absolute
-// path (→ 0). A non-fanotify / bad fd → -EBADF.
+// FAN_MARK_ADD (0x1) stores an inode mark on an existing path (→ 0). A bad
+// fd → -EBADF; an open non-fanotify fd → -EINVAL.
 // ════════════════════════════════════════════════════════════════════
 
 const FAN_MARK_ADD: u64 = 0x1;
 
 fn smoke_abi_async_fanotify_mark_pos() -> TestResult {
-    with_setup(|| {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
         let fd = match call(Syscall::FanotifyInit.raw(), a1(0, 0)) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("fanotify_init failed"),
@@ -1872,6 +1947,54 @@ fn smoke_abi_async_fanotify_mark_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_mark_neg);
+
+/// `do_fanotify_mark` errno shape (probed on Linux 6.18): argument checks
+/// precede the fd (-EINVAL even on a bad fd), a missing name is -ENOENT, and
+/// removing a mark that was never added is -ENOENT (was -EINVAL).
+fn smoke_abi_async_fanotify_mark_errno_order() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        const FAN_MARK_REMOVE: u64 = 0x2;
+        let mark = |fd: u64, flags: u64, mask: u64, path: &[u8]| {
+            call(
+                Syscall::FanotifyMark.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: flags,
+                    arg2: mask,
+                    arg3: (-100i64) as u64,
+                    arg4: path.as_ptr() as u64,
+                    arg5: 0,
+                },
+            )
+        };
+        let f = b"/abi/f\0";
+        if mark(999, FAN_MARK_ADD, 0, f) != Some(EINVAL) {
+            return Err("FAN_MARK_ADD with mask 0 on a bad fd must be -EINVAL");
+        }
+        if mark(999, 0, 0x2, f) != Some(EINVAL) {
+            return Err("fanotify_mark with no command on a bad fd must be -EINVAL");
+        }
+        let fan = match call(Syscall::FanotifyInit.raw(), a1(0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fanotify_init failed"),
+        };
+        if mark(fan, FAN_MARK_ADD, 0x2, b"/abi/nope\0") != Some(ENOENT) {
+            return Err("marking a missing path must be -ENOENT");
+        }
+        if mark(fan, FAN_MARK_REMOVE, 0x2, f) != Some(ENOENT) {
+            return Err("removing an absent mark must be -ENOENT");
+        }
+        // Unknown fanotify_init flag bits are -EINVAL.
+        if call(Syscall::FanotifyInit.raw(), a1(0x8000_0000, 0)) != Some(EINVAL) {
+            return Err("fanotify_init with an unknown flag must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_fanotify_mark_errno_order
+);
 
 fn smoke_abi_async_fanotify_read_efault_does_not_publish_fd() -> TestResult {
     with_memfs("/fan", "fan", &[("f", b"x")], || {

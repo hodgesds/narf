@@ -1055,6 +1055,92 @@ fn path_lookup_errno(path: &str) -> i64 {
     ENOENT
 }
 
+/// A node found by [`user_path_lookup`].
+pub(crate) struct LookedUpPath {
+    /// Host-view absolute path (chroot applied), for resolver calls.
+    pub(crate) path: alloc::string::String,
+    /// Caller-view absolute path (no chroot prefix), for keys the caller's
+    /// later syscalls will name again.
+    pub(crate) user_path: alloc::string::String,
+    pub(crate) stat: narf_filesystem::Stat,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+/// `fs/namei.c::user_path_at(dfd, name, flags, &path)` errno shape for the
+/// syscalls that only need "find the node, or say why not":
+///
+/// ```text
+///   getname():          ""                    -> -ENOENT (no LOOKUP_EMPTY)
+///   link_path_walk():   non-dir component     -> -ENOTDIR
+///                       unsearchable dir      -> -EACCES
+///                       symlink cycle         -> -ELOOP
+///   LOOKUP_DIRECTORY or a trailing '/' on a non-directory -> -ENOTDIR
+/// ```
+///
+/// `dirfd` follows [`resolve_at_path`] (-EBADF / -ENOTDIR). Errors are
+/// POSITIVE errnos. `follow` is `LOOKUP_FOLLOW` for the final component.
+pub(crate) fn user_path_lookup(
+    task: u64,
+    dirfd: i64,
+    raw: &str,
+    follow: bool,
+    directory: bool,
+) -> Result<LookedUpPath, i64> {
+    if raw.is_empty() {
+        return Err(ENOENT);
+    }
+    let anchored = resolve_at_path(task, dirfd, raw).map_err(|e| -e)?;
+    let user_path = resolve_cwd_path_user(task, &anchored);
+    let path = resolve_cwd_path(task, &anchored);
+    // A trailing slash forces the final component to be followed and to be
+    // a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY` in `path_lookupat`).
+    let trailing_slash = raw.len() > 1 && raw.ends_with('/');
+    let Some((stat, _ino, _rdev, uid, gid, _attrs)) =
+        stat_ino_path_dir_aware_ext(&path, follow || trailing_slash)
+    else {
+        return Err(path_lookup_errno(&path));
+    };
+    if !path_ancestors_searchable(&path, task) {
+        return Err(EACCES);
+    }
+    if (directory || trailing_slash) && stat.mode.file_type != narf_filesystem::FileType::Dir {
+        return Err(ENOTDIR);
+    }
+    Ok(LookedUpPath {
+        path,
+        user_path,
+        stat,
+        uid,
+        gid,
+    })
+}
+
+/// `path_permission(&path, mask)` on a node [`user_path_lookup`] found:
+/// mode bits plus the file's ACCESS ACL. Errors are POSITIVE errnos.
+pub(crate) fn looked_up_permission(
+    task: u64,
+    found: &LookedUpPath,
+    follow: bool,
+    request: narf_filesystem::AccessRequest,
+) -> Result<(), i64> {
+    let is_dir = found.stat.mode.file_type == narf_filesystem::FileType::Dir;
+    let file = if is_dir {
+        None
+    } else {
+        resolve_file_absolute_ext(&found.path, follow)
+    };
+    node_permission(
+        task,
+        file.as_deref(),
+        found.stat.mode.perms,
+        found.uid,
+        found.gid,
+        is_dir,
+        request,
+    )
+}
+
 /// Did resolving `path` fail specifically because of a symlink cycle?
 ///
 /// Runs only from the failure classifier above, so the extra walk is never
@@ -2799,10 +2885,10 @@ const TMPFS_MAGIC: u64 = 0x0102_1994;
 const RAMFS_MAGIC: u64 = 0x8584_58f6;
 const EXT2_SUPER_MAGIC: u64 = 0xEF53;
 
-fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
-    if buf_ptr == 0 {
-        return false;
-    }
+/// Errors are POSITIVE errnos. The destination is only touched after the
+/// filesystem answered — `user_statfs`/`fd_statfs` run `vfs_statfs` first and
+/// `copy_to_user` last — so a bad `buf` never hides a lookup error.
+fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> Result<(), i64> {
     // Both statfs(path) and fstatfs(fd) hand us a path in the caller's
     // namespace: fds deliberately retain a chroot-relative path so
     // /proc/self/fd can expose a reopenable link. Re-root it before finding
@@ -2813,7 +2899,7 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
     let fs = match current_fs_arc_at(&path) {
         Some(fs) => fs,
-        None => return false,
+        None => return Err(ENOENT),
     };
     let f_type = match fs.name() {
         "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
@@ -2826,7 +2912,8 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     };
     let fs_stat = match poll_blocking(fs.statfs()) {
         Some(Ok(stat)) => stat,
-        _ => return false,
+        Some(Err(error)) => return Err(copy_fs_errno(error)),
+        None => return Err(EIO),
     };
     let stat = StatfsBuf {
         f_type,
@@ -2844,9 +2931,13 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // SAFETY: StatfsBuf is repr(C) of fifteen u64s with no padding; transmuting
     // it to a `[u8; size_of::<StatfsBuf>()]` reinterprets its bytes 1:1.
     let bytes: [u8; core::mem::size_of::<StatfsBuf>()] = unsafe { core::mem::transmute(stat) };
+    // A NULL destination is -EFAULT like any other unwritable one.
+    if buf_ptr == 0 {
+        return Err(EFAULT);
+    }
     // SAFETY: `buf_ptr` is the user statfs buffer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
+    unsafe { copy_to_user(buf_ptr, &bytes) }.map_err(|_| EFAULT)
 }
 
 // Per-task mount namespace table. Entries appear when a task calls
