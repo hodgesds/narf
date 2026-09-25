@@ -948,7 +948,7 @@ fn resolve_file_absolute_ext(
 /// Apply Linux `*at` anchoring before the ordinary cwd/chroot rewrite.
 /// Absolute paths ignore `dirfd`; relative paths require `AT_FDCWD` or an
 /// open directory fd. Errors are negative Linux errno values.
-fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
+pub(crate) fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
     const AT_FDCWD: i64 = -100;
     let dirfd = dirfd as i32 as i64;
     if raw.starts_with('/') || dirfd == AT_FDCWD {
@@ -975,7 +975,7 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
 /// Files come from the FileOps `stat()`; directories (mount roots and
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
-fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
+pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
     stat_ino_path_dir_aware(path).map(|(s, ..)| s)
 }
 
@@ -3200,7 +3200,7 @@ pub(crate) fn current_fs_arc_at(
     }
 }
 
-fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
+pub(crate) fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
     current_mount_namespace()
         .map(|ns| ns.list())
         .unwrap_or_else(|| narf_filesystem::registry().list())
@@ -3547,7 +3547,7 @@ fn current_bind_mount(
     r
 }
 
-fn current_move_mount(
+pub(crate) fn current_move_mount(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     source: &str,
     target: &str,

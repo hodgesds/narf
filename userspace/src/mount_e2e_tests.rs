@@ -766,13 +766,16 @@ fn open_tree_args(dfd: u64, path: &[u8], flags: u64) -> SyscallArgs {
 }
 
 // Build SyscallArgs for move_mount(from_dfd, from_path, to_dfd, to_path, flags).
+// Every caller moves a detached mount fd named by an empty `from_path`, which
+// Linux accepts only with MOVE_MOUNT_F_EMPTY_PATH (without it "" is -ENOENT).
 fn move_mount_args(from_dfd: u64, from_path: &[u8], to_dfd: u64, to_path: &[u8]) -> SyscallArgs {
+    const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x0000_0004;
     SyscallArgs {
         arg0: from_dfd,
         arg1: from_path.as_ptr() as u64,
         arg2: to_dfd,
         arg3: to_path.as_ptr() as u64,
-        arg4: 0,
+        arg4: MOVE_MOUNT_F_EMPTY_PATH,
         arg5: 0,
     }
 }
@@ -1079,6 +1082,18 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
     if !matches!(mnr.ret, Some(r) if r.value == 0) {
         return TestResult::Fail("mount /pvr_new failed");
     }
+    // put_old must exist as a directory: pivot_root resolves it with
+    // LOOKUP_DIRECTORY and a missing one is -ENOENT, as on Linux.
+    let put_old_dir = b"/pvr_new/old\0";
+    let mut mk = StubCtx {
+        args: SyscallArgs {
+            arg0: put_old_dir.as_ptr() as u64,
+            arg1: 0o755,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_mkdir(&mut mk);
 
     // unshare(CLONE_NEWNS): the task now has a private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;

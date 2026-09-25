@@ -5,13 +5,13 @@ use super::*;
 /// `fs/namespace.c::SYSCALL_DEFINE2(pivot_root)` → `path_pivot_root`:
 ///
 /// ```text
+///   if (!may_mount())              return -EPERM;
 ///   error = user_path_at(AT_FDCWD, new_root,
 ///                        LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &new);
 ///   if (error) return error;                    /* -EFAULT/-ENOENT/-ENOTDIR */
 ///   error = user_path_at(AT_FDCWD, put_old, ..., &old);
 ///   if (error) return error;
 ///   ...
-///   if (!may_mount())              return -EPERM;
 ///   if (d_unlinked(new->dentry))   return -ENOENT;
 ///   if (new_mnt == root_mnt || old_mnt == root_mnt)
 ///           return -EBUSY;  /* loop, on the same file system  */
@@ -19,7 +19,8 @@ use super::*;
 /// ```
 ///
 /// Both path arguments are resolved before any of the mount-topology checks,
-/// so a bad pointer or a missing directory beats every later error.
+/// so a bad pointer or a missing directory beats every later error — but
+/// the privilege check comes first of all.
 ///
 /// These were all the bare `-1` sentinel = EPERM. For pivot_root that is
 /// specifically destructive: EPERM is the answer a container runtime expects
@@ -27,24 +28,55 @@ use super::*;
 /// kernel/user cannot pivot" and falls back to `chroot()` — silently giving
 /// up the mount isolation it asked for — when the actual fault was a typo in
 /// the new root path (ENOENT) or a bind that had not landed yet.
+/// `user_path_at(..., LOOKUP_FOLLOW | LOOKUP_DIRECTORY)` for one pivot_root
+/// argument. `LOOKUP_DIRECTORY` splits a failure two ways: a name that
+/// resolves to a non-directory is -ENOTDIR, a name that resolves to nothing
+/// at all (including the empty string, which `getname` refuses) is -ENOENT.
+/// A runtime that assembled its root under a staging path needs the
+/// difference — ENOTDIR means "you bound a file here", ENOENT means "the
+/// bind has not happened yet". Errors are positive errno values.
+fn pivot_lookup_dir(raw: &str, resolved: &str) -> Result<(), i64> {
+    if raw.is_empty() {
+        return Err(ENOENT);
+    }
+    // `resolve_dir_absolute`, not `resolve_absolute(|_,_| true)`: the latter
+    // matches the root `/` mount as a fallback for ANY absolute path, so a
+    // non-existent new_root (e.g. `pivot_root("/nonexistent", ...)`) would
+    // bogusly pass, succeed, and install a garbage task root — corrupting
+    // every later path lookup for the task.
+    if resolve_dir_absolute(resolved).is_some() {
+        return Ok(());
+    }
+    Err(if stat_path_dir_aware(resolved).is_some() {
+        ENOTDIR
+    } else {
+        ENOENT
+    })
+}
+
 pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    let task = current_task_id();
+    // `SYSCALL_DEFINE2(pivot_root)` opens with `if (!may_mount()) return
+    // -EPERM;` — BEFORE either path is looked at, so an unprivileged caller
+    // gets EPERM even for a faulting pointer or a missing directory (probed
+    // on Linux 6.18). There was no privilege check here at all.
+    if !mount_admin(task) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
     // Linux ABI: pivot_root(const char *new_root, const char *put_old).
     // Both arguments are NUL-terminated strings; there are no explicit
     // lengths. The old NARF-native four-argument decoder retained the
     // terminator in the stored root and consumed the put_old pointer as a
     // length, so successful calls installed a path such as "/new_root\0".
+    //
+    // The two lookups run in order, each to completion: new_root's
+    // -EFAULT/-ENOENT/-ENOTDIR outranks anything wrong with put_old.
     let new_root = match copy_user_cstr_checked(args.arg0, 4096) {
         Ok(s) => s,
         Err(errno) => {
             // `user_path_at` on an unreadable name → -EFAULT.
-            ctx.set_return(errno_ret(errno));
-            return;
-        }
-    };
-    let put_old = match copy_user_cstr_checked(args.arg1, 4096) {
-        Ok(s) => s,
-        Err(errno) => {
             ctx.set_return(errno_ret(errno));
             return;
         }
@@ -58,35 +90,33 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     // sandbox fail with 226/EXIT_NAMESPACE and restart-loop, wedging boot.
     // resolve_cwd_path resolves against the cwd and re-roots under any active
     // chroot, so absolute paths keep their prior meaning.
-    let task = current_task_id();
     let new_root_resolved = resolve_cwd_path(task, &new_root);
+    // new_root must resolve to an EXISTING DIRECTORY (see `pivot_lookup_dir`).
+    if let Err(errno) = pivot_lookup_dir(&new_root, &new_root_resolved) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
+    // `put_old` gets the same `LOOKUP_FOLLOW | LOOKUP_DIRECTORY` lookup.
+    // It was never resolved at all, so a missing or non-directory put_old
+    // "succeeded" and the old root was bound at a path with nothing there.
+    let put_old = match copy_user_cstr_checked(args.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
     let put_old_resolved = resolve_cwd_path(task, &put_old);
+    if let Err(errno) = pivot_lookup_dir(&put_old, &put_old_resolved) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     // The caller's cwd as a host path, resolved in the CURRENT (pre-swap) root
     // frame. systemd does `fchdir(new_root_fd); pivot_root(".", ".")`, so this
     // equals new_root_resolved for that idiom. Captured before ROOT_DIR_TABLE is
     // updated so it uses the old chroot prefix.
     let cwd_host = resolve_cwd_path(task, ".");
     let prior_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
-    // new_root must resolve to an EXISTING DIRECTORY. Use `resolve_dir_absolute`,
-    // not `resolve_absolute(|_,_| true)`: the latter matches the root `/` mount
-    // as a fallback for ANY absolute path, so a non-existent new_root
-    // (e.g. `pivot_root("/nonexistent", ...)`) would bogusly pass the check,
-    // succeed, and install a garbage task root — corrupting every later path
-    // lookup for the task. Linux returns ENOTDIR/ENOENT here.
-    if resolve_dir_absolute(&new_root_resolved).is_none() {
-        // `LOOKUP_DIRECTORY` splits this two ways: a name that resolves to a
-        // non-directory is -ENOTDIR, a name that resolves to nothing at all is
-        // -ENOENT. A runtime that assembled its root under a staging path
-        // needs the difference — ENOTDIR means "you bound a file here",
-        // ENOENT means "the bind has not happened yet".
-        let errno = if stat_path_dir_aware(&new_root_resolved).is_some() {
-            ENOTDIR
-        } else {
-            ENOENT
-        };
-        ctx.set_return(errno_ret(errno));
-        return;
-    }
     // `new_mnt == root_mnt` → -EBUSY ("loop, on the same file system"): the
     // new root may not be the root the caller is already standing on, or the
     // swap would have nothing to move the old root onto. NARF compares the

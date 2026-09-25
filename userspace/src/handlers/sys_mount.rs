@@ -27,6 +27,29 @@ fn mount_target_exists(target: &str) -> bool {
         || current_file_exists(target)
 }
 
+/// `path` positively resolves to something that is not a directory.
+fn target_is_non_dir(path: &str) -> bool {
+    resolve_dir_absolute(path).is_none() && current_file_exists(path)
+}
+
+/// `graft_tree`'s `d_is_dir(mountpoint) != d_is_dir(mnt_root)` for a bind,
+/// answered only when both ends resolve (an unresolvable end is `false`).
+fn mount_type_mismatch(source: &str, target: &str) -> bool {
+    let src_dir = resolve_dir_absolute(source).is_some();
+    let tgt_dir = resolve_dir_absolute(target).is_some();
+    (src_dir && target_is_non_dir(target)) || (tgt_dir && target_is_non_dir(source))
+}
+
+/// `strndup_user` (`mm/util.c`) reports a string longer than its cap as
+/// -EINVAL, where `copy_user_cstr_checked` gives the pathname answer.
+fn strndup_user_errno(errno: i64) -> i64 {
+    if errno == ENAMETOOLONG {
+        EINVAL
+    } else {
+        errno
+    }
+}
+
 /// Split legacy overlayfs `lowerdir=` values. Linux treats an unescaped colon
 /// as a layer separator and permits `\:` and `\\` in pathnames.
 fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string::String>> {
@@ -138,7 +161,10 @@ const MS_NOUSER: u64 = 1 << 31;
 ///     so a file bound onto a file is legal — that is how a container gets
 ///     its own /etc/resolv.conf — while a filesystem onto a file, or a file
 ///     onto a directory, is -ENOTDIR. Reading this arm as "target must be a
-///     directory" and enforcing that would break file bind mounts.
+///     directory" and enforcing that would break file bind mounts. The
+///     mismatch test is applied for binds and new filesystems (see
+///     `mount_type_mismatch` / `target_is_non_dir`); overlay, FUSE and
+///     block-device mounts do not yet make it.
 ///   * -ENOTBLK (a block-device fstype whose `source` names a non-block file)
 ///     and -EACCES (an unsearchable target directory) have no NARF analogue:
 ///     the block layer here is a flat name→device registry with no file
@@ -181,13 +207,18 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     //
     // fstype may be NULL for MS_REMOUNT / MS_BIND / MS_MOVE. The cap is
     // `copy_mount_string`'s PAGE_SIZE.
+    //
+    // `strndup_user` answers an over-long string with -EINVAL, not the
+    // -ENAMETOOLONG `getname` uses for the target path below: these two are
+    // opaque strings, not pathnames (probed on Linux 6.18: a 4096-byte
+    // fstype or source is EINVAL, a 4096-byte target is ENAMETOOLONG).
     let fstype = if args.arg2 == 0 {
         alloc::string::String::new()
     } else {
         match copy_user_cstr_checked(args.arg2, 4096) {
             Ok(s) => s,
             Err(errno) => {
-                ctx.set_return(errno_ret(errno));
+                ctx.set_return(errno_ret(strndup_user_errno(errno)));
                 return;
             }
         }
@@ -199,7 +230,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         match copy_user_cstr_checked(args.arg0, 4096) {
             Ok(s) => s,
             Err(errno) => {
-                ctx.set_return(errno_ret(errno));
+                ctx.set_return(errno_ret(strndup_user_errno(errno)));
                 return;
             }
         }
@@ -223,6 +254,12 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `getname("")` without LOOKUP_EMPTY is -ENOENT. Resolving the empty
+    // string instead would name the cwd and mount over it.
+    if target_raw.is_empty() {
+        ctx.set_return(enoent);
+        return;
+    }
     // `do_mount` (fs/namespace.c:4163) resolves the target FIRST and returns
     // the lookup's error before `path_mount` ever runs:
     //
@@ -350,10 +387,16 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // MS_SHARED,NULL)` (make-rshared) at early boot, and per-service make-shared
     // during sandbox assembly — the peer groups this establishes are what let a
     // mount created under a shared /run propagate to every namespace sharing it.
-    if (flags & MS_PROPAGATION) != 0 && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0 {
-        // `flags_to_propagation_type`: EXACTLY one of the four propagation bits,
-        // else -EINVAL. (`is_power_of_2` of the propagation subset.)
-        let prop_bits = flags & MS_PROPAGATION;
+    //
+    // `path_mount` dispatches remount, then bind, then change_type, then
+    // move, so a propagation bit alongside MS_MOVE is a change_type request.
+    // `flags_to_propagation_type` takes `flags & ~(MS_REC | MS_SILENT)` —
+    // EVERY other bit, not just the propagation subset — and requires it to
+    // be exactly one propagation flag: MS_SHARED|MS_MOVE and
+    // MS_SHARED|MS_NOSUID are both -EINVAL (probed on Linux 6.18).
+    if (flags & MS_PROPAGATION) != 0 && (flags & (MS_BIND | MS_REMOUNT)) == 0 {
+        const MS_SILENT: u64 = 1 << 15;
+        let prop_bits = flags & !(MS_REC | MS_SILENT);
         let prop = if prop_bits == MS_SHARED {
             narf_filesystem::MntPropagation::Shared
         } else if prop_bits == MS_PRIVATE {
@@ -449,7 +492,13 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let auth = narf_filesystem::bootstrap_mount_authority();
     let domain = narf_lib::id::DomainId::DRIVER_0;
 
-    if (flags & MS_MOVE) != 0 {
+    // MS_BIND outranks MS_MOVE in `path_mount`'s dispatch.
+    if (flags & MS_MOVE) != 0 && (flags & MS_BIND) == 0 {
+        // `do_move_mount_old`: `if (!old_name || !*old_name) return -EINVAL;`
+        if source.is_empty() {
+            ctx.set_return(einval);
+            return;
+        }
         // A relative source (systemd's switch-root fallback does
         // `mount(".", "/", MS_MOVE)` after fchdir into the new root) resolves
         // against the caller's cwd, not as a literal path that matches no mount.
@@ -472,6 +521,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         };
         return match current_move_mount(&auth, move_source.as_str(), move_target) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            // `kern_path(old_name)` failing is -ENOENT; a source that resolves
+            // but is not the root of a mount is `do_move_mount`'s -EINVAL.
+            Err(narf_filesystem::FsError::NotFound) if mount_target_exists(&move_source) => {
+                ctx.set_return(einval)
+            }
             Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
             Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
             Err(_) => ctx.set_return(einval),
@@ -488,6 +542,14 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         // would resolve it against the cwd and bind something arbitrary.
         if source.is_empty() {
             ctx.set_return(einval);
+            return;
+        }
+        // `graft_tree`: `if (d_is_dir(mp) != d_is_dir(mnt_root)) return
+        // -ENOTDIR;` — a mismatch test, so file-on-file stays legal. Only
+        // decided when both ends positively resolve; a missing source falls
+        // through to the bind below and its -ENOENT.
+        if mount_type_mismatch(source_resolved.as_str(), target.as_str()) {
+            ctx.set_return(errno_ret(ENOTDIR));
             return;
         }
         let source_base = if source_resolved == "/" {
@@ -566,6 +628,14 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // uses, so both entry points recognize identical filesystems. Block-device
     // fstypes (fat/vfat/ext…) fall through below because build_fs can't
     // synthesize them without a device.
+    //
+    // `do_new_mount`: `if (!fstype) return -EINVAL;` — a NULL type pointer,
+    // as opposed to an empty or unknown name, which `get_fs_type` answers
+    // with -ENODEV below.
+    if args.arg2 == 0 {
+        ctx.set_return(einval);
+        return;
+    }
     {
         let (mount_uid, mount_gid) = current_fs_ids();
         match crate::mount_api::build_fs_with_options(
@@ -575,6 +645,12 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             mount_gid,
         ) {
             Ok(Some(fs)) => {
+                // A new filesystem's root is a directory, so `graft_tree`
+                // refuses a non-directory mountpoint with -ENOTDIR.
+                if target_is_non_dir(target.as_str()) {
+                    ctx.set_return(errno_ret(ENOTDIR));
+                    return;
+                }
                 return match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
                     Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
                 };

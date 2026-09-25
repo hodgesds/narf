@@ -33,10 +33,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
 use crate::handlers::{
-    apply_chroot, copy_from_user_vec, copy_user_cstr, copy_user_cstr_checked,
+    apply_chroot, copy_from_user_vec, copy_user_cstr_checked, current_change_propagation,
     current_clone_mount_subtree, current_clone_tree_at, current_fs_arc_at, current_mount_arc,
-    current_mount_flags_at, current_set_mount_flags, current_task_id, fd_path_for_task,
-    mount_admin, parse_proc_self_fd, resolve_cwd_path,
+    current_mount_flags_at, current_mount_list, current_set_mount_flags, current_task_id,
+    fd_path_for_task, mount_admin, parse_proc_self_fd, resolve_at_path, resolve_cwd_path,
+    stat_path_dir_aware,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
@@ -56,9 +57,24 @@ const FSCONFIG_SET_PATH_EMPTY: u64 = 4;
 const FSCONFIG_SET_FD: u64 = 5;
 const FSCONFIG_CMD_CREATE: u64 = 6;
 const FSCONFIG_CMD_RECONFIGURE: u64 = 7;
+/// Like CMD_CREATE but refuses to reuse an existing superblock. Every NARF
+/// CMD_CREATE builds a fresh instance, so the two behave identically here.
+const FSCONFIG_CMD_CREATE_EXCL: u64 = 8;
 // fsopen / fsmount / open_tree CLOEXEC bits.
 const FSOPEN_CLOEXEC: u64 = 0x0000_0001;
 const FSMOUNT_CLOEXEC: u64 = 0x0000_0001;
+// fspick(2) flags (`include/uapi/linux/mount.h`).
+const FSPICK_CLOEXEC: u64 = 0x0000_0001;
+const FSPICK_SYMLINK_NOFOLLOW: u64 = 0x0000_0002;
+const FSPICK_NO_AUTOMOUNT: u64 = 0x0000_0004;
+const FSPICK_EMPTY_PATH: u64 = 0x0000_0008;
+// move_mount(2) flags.
+const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x0000_0004;
+const MOVE_MOUNT_T_EMPTY_PATH: u64 = 0x0000_0040;
+const MOVE_MOUNT_SET_GROUP: u64 = 0x0000_0100;
+const MOVE_MOUNT_BENEATH: u64 = 0x0000_0200;
+const MOVE_MOUNT__MASK: u64 = 0x0000_0377;
+const AT_FDCWD: i32 = -100;
 const OPEN_TREE_CLOEXEC: u64 = 0o2000000; // O_CLOEXEC
 const OPEN_TREE_CLONE: u64 = 0x0000_0001;
 const OPEN_TREE_NAMESPACE: u64 = 0x0000_0002;
@@ -96,6 +112,81 @@ struct FsContext {
     options: BTreeMap<String, Option<String>>,
     uid: u32,
     gid: u32,
+    phase: CtxPhase,
+}
+
+/// `enum fs_context_phase` (`include/linux/fs_context.h`), reduced to the
+/// states the syscalls can observe. Each fsconfig/fsmount step is legal in
+/// exactly one phase and answers -EBUSY in the others (`fs/fsopen.c`):
+/// a second CMD_CREATE, a parameter after CMD_CREATE, CMD_RECONFIGURE on an
+/// fsopen context and a second fsmount are all -EBUSY on Linux 6.18.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtxPhase {
+    /// fsopen: parameters accepted, CMD_CREATE pending.
+    CreateParams,
+    /// CMD_CREATE succeeded; only fsmount is legal.
+    AwaitingMount,
+    /// fspick, or after fsmount (`vfs_clean_context`): parameters and
+    /// CMD_RECONFIGURE accepted.
+    ReconfParams,
+    /// A CMD_CREATE / CMD_RECONFIGURE failed; the context is dead.
+    Failed,
+}
+
+/// Is `fd_no` an open descriptor at all? Used to split "no such descriptor"
+/// (-EBADF) from "a descriptor of the wrong kind" (-EINVAL): `fs/fsopen.c`
+/// tests `f_op != &fscontext_fops` only after `fd_empty(f)`.
+fn fd_open(task: u64, fd_no: u32) -> bool {
+    fd::with_table(task, |t| t.get(fd_no).is_some()).unwrap_or(false)
+}
+
+/// `strndup_user` answers an over-long string with -EINVAL, where
+/// `copy_user_cstr_checked` gives the pathname answer (-ENAMETOOLONG).
+fn strndup_errno(errno: i64) -> i64 {
+    if errno == ENAMETOOLONG {
+        EINVAL
+    } else {
+        errno
+    }
+}
+
+/// `user_path_at(dfd, path, LOOKUP_EMPTY?, ...)` to the host (chroot-applied)
+/// path NARF's mount table is keyed by. `raw` empty names `dfd` itself, which
+/// the caller has already allowed (`AT_EMPTY_PATH` and friends); AT_FDCWD
+/// then names the cwd. Errors are positive errno values.
+fn resolve_at_mount_path(task: u64, dfd: u64, raw: &str) -> Result<String, i64> {
+    let joined = if raw.is_empty() {
+        if dfd as i32 == AT_FDCWD {
+            String::from(".")
+        } else {
+            u32::try_from(dfd as i32)
+                .ok()
+                .and_then(|fd| fd_path_for_task(task, fd))
+                .ok_or(EBADF)?
+        }
+    } else {
+        resolve_at_path(task, dfd as i64, raw).map_err(|e| -e)?
+    };
+    let resolved = resolve_cwd_path(task, &joined);
+    Ok(if resolved.len() > 1 {
+        String::from(resolved.trim_end_matches('/'))
+    } else {
+        resolved
+    })
+}
+
+/// `path_mounted()` after a successful lookup: Ok when `path` is the root
+/// of a mount, -ENOENT when it names nothing, -EINVAL when it names
+/// something that is not a mountpoint. Errors are positive errno values.
+fn require_mountpoint(path: &str) -> Result<(), i64> {
+    if current_mount_list().iter().any(|m| m == path) {
+        return Ok(());
+    }
+    Err(if stat_path_dir_aware(path).is_some() {
+        EINVAL
+    } else {
+        ENOENT
+    })
 }
 
 /// A detached mount (fsmount / open_tree) awaiting move_mount.
@@ -391,6 +482,16 @@ fn validate_open_tree_flags(flags: u64) -> Result<(), i64> {
 struct MountAttr {
     attr_set: u64,
     attr_clr: u64,
+    propagation: u64,
+}
+
+impl MountAttr {
+    /// `if (attr.attr_set == 0 && attr.attr_clr == 0 && attr.propagation ==
+    /// 0) return 0;` — "Don't bother walking through the mounts if this is a
+    /// nop." The path is then never resolved, so it cannot fail either.
+    fn is_nop(&self) -> bool {
+        self.attr_set == 0 && self.attr_clr == 0 && self.propagation == 0
+    }
 }
 
 fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<MountAttr, i64> {
@@ -452,6 +553,18 @@ fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<Mou
         if attr_clr & MOUNT_ATTR_IDMAP != 0 && !idmap_replace {
             return Err(EINVAL);
         }
+        // `build_mount_idmapped`: "Removal of idmappings is equivalent to
+        // setting nop_mnt_idmap" — a clear without a set returns 0 before
+        // `userns_fd` is looked at (probed on 6.18: open_tree_attr(CLONE)
+        // clearing IDMAP with a closed userns_fd succeeds). NARF mounts are
+        // never idmapped, so there is nothing to remove.
+        if attr_clr & MOUNT_ATTR_IDMAP != 0 && attr_set & MOUNT_ATTR_IDMAP == 0 {
+            return Ok(MountAttr {
+                attr_set,
+                attr_clr,
+                propagation,
+            });
+        }
         if userns_fd > i32::MAX as u64 {
             return Err(EINVAL);
         }
@@ -464,7 +577,11 @@ fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<Mou
         return Err(if exists { EINVAL } else { EBADF });
     }
 
-    Ok(MountAttr { attr_set, attr_clr })
+    Ok(MountAttr {
+        attr_set,
+        attr_clr,
+        propagation,
+    })
 }
 
 struct ReturnCapture<'a> {
@@ -507,17 +624,46 @@ fn discard_open_tree_fd(task: u64, fd_no: u32) {
 }
 
 /// `fsopen(fsname, flags)` → fs-context fd.
+///
+/// `fs/fsopen.c::SYSCALL_DEFINE2(fsopen)`, in order:
+///
+/// ```text
+/// if (!may_mount())               return -EPERM;
+/// if (flags & ~FSOPEN_CLOEXEC)    return -EINVAL;
+/// fs_name = strndup_user(_fs_name, PAGE_SIZE);   /* -EFAULT / -EINVAL */
+/// fs_type = get_fs_type(fs_name);
+/// if (!fs_type)                   return -ENODEV;
+/// ```
+///
+/// This accepted any flags, any name (reporting a faulting pointer as
+/// -EINVAL) and deferred an unknown fstype to CMD_CREATE, so a caller probing
+/// "does this kernel have fstype X" with fsopen got a context back for
+/// anything.
 pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let fsname = match copy_user_cstr(a.arg0, 256) {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            ctx.set_return(err(EINVAL));
+    if !mount_admin(current_task_id()) {
+        ctx.set_return(err(EPERM));
+        return;
+    }
+    if a.arg1 as u32 as u64 & !FSOPEN_CLOEXEC != 0 {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let fsname = match copy_user_cstr_checked(a.arg0, PAGE_SIZE) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(err(strndup_errno(errno)));
             return;
         }
     };
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // `get_fs_type`: the same dispatch CMD_CREATE builds from, so the two
+    // agree on which names exist ("" included — it names no filesystem).
     let (uid, gid) = crate::handlers::current_fs_ids();
+    if matches!(build_fs_with_options(&fsname, "", uid, gid), Ok(None)) {
+        ctx.set_return(err(ENODEV));
+        return;
+    }
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     with_contexts(|m| {
         m.insert(
             id,
@@ -527,6 +673,7 @@ pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
                 options: BTreeMap::new(),
                 uid,
                 gid,
+                phase: CtxPhase::CreateParams,
             },
         )
     });
@@ -543,114 +690,293 @@ pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
 }
 
 /// `fsconfig(fd, cmd, key, value, aux)`.
+///
+/// `fs/fsopen.c::SYSCALL_DEFINE5(fsconfig)` validates in this order, and
+/// every step was missing or out of place here:
+///
+/// ```text
+/// switch (cmd) {            /* argument shape, before the fd is touched */
+/// case FSCONFIG_SET_FLAG:   if (!_key || _value || aux)        return -EINVAL;
+/// case FSCONFIG_SET_STRING: if (!_key || !_value || aux)       return -EINVAL;
+/// case FSCONFIG_SET_BINARY: if (!_key || !_value || aux <= 0 || aux > 1M) ...
+/// case FSCONFIG_SET_PATH[_EMPTY]: if (!_key || !_value ||
+///                                     (aux != AT_FDCWD && aux < 0)) ...
+/// case FSCONFIG_SET_FD:     if (!_key || _value || aux < 0)    return -EINVAL;
+/// case FSCONFIG_CMD_CREATE[_EXCL] / _RECONFIGURE:
+///                           if (_key || _value || aux)         return -EINVAL;
+/// default:                                                     return -EOPNOTSUPP;
+/// }
+/// if (fd_empty(f))                          return -EBADF;
+/// if (fd_file(f)->f_op != &fscontext_fops)  return -EINVAL;
+/// param.key = strndup_user(_key, 256);      /* -EFAULT / -EINVAL */
+/// SET_STRING: strndup_user(_value, 256); SET_BINARY: memdup_user_nul;
+/// SET_PATH*: getname_flags(); SET_FD: fget(aux) or -EBADF;
+/// vfs_fsconfig_locked(): phase checks -> -EBUSY
+/// ```
+///
+/// An unknown command used to return 0, and CMD_CREATE_EXCL was one of them:
+/// a caller asking for an exclusive superblock was told it had one while
+/// nothing was built. All of the above was probed on Linux 6.18.
 pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
-    let id = match context_of(task, a.arg0 as u32) {
-        Some(id) => id,
-        None => {
-            ctx.set_return(err(EBADF));
+    let (cmd, key_ptr, value_ptr) = (a.arg1 as u32 as u64, a.arg2, a.arg3);
+    let aux = a.arg4 as i32;
+    let bad_shape = match cmd {
+        FSCONFIG_SET_FLAG => key_ptr == 0 || value_ptr != 0 || aux != 0,
+        FSCONFIG_SET_STRING => key_ptr == 0 || value_ptr == 0 || aux != 0,
+        FSCONFIG_SET_BINARY => key_ptr == 0 || value_ptr == 0 || aux <= 0 || aux > 1024 * 1024,
+        FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
+            key_ptr == 0 || value_ptr == 0 || (aux != AT_FDCWD && aux < 0)
+        }
+        FSCONFIG_SET_FD => key_ptr == 0 || value_ptr != 0 || aux < 0,
+        FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL | FSCONFIG_CMD_RECONFIGURE => {
+            key_ptr != 0 || value_ptr != 0 || aux != 0
+        }
+        _ => {
+            ctx.set_return(err(EOPNOTSUPP));
             return;
         }
     };
-    match a.arg1 {
-        FSCONFIG_CMD_CREATE => {
-            // Materialize the filesystem named by fsopen.
+    if bad_shape {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let fd_no = a.arg0 as u32;
+    let id = match context_of(task, fd_no) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(if fd_open(task, fd_no) { EINVAL } else { EBADF }));
+            return;
+        }
+    };
+    // Copy the key and value exactly as the kernel stages them.
+    let key = if key_ptr != 0 {
+        match copy_user_cstr_checked(key_ptr, 256) {
+            Ok(key) => Some(key),
+            Err(errno) => {
+                ctx.set_return(err(strndup_errno(errno)));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let value: Option<String> = match cmd {
+        FSCONFIG_SET_STRING => match copy_user_cstr_checked(value_ptr, 256) {
+            Ok(value) => Some(value),
+            Err(errno) => {
+                ctx.set_return(err(strndup_errno(errno)));
+                return;
+            }
+        },
+        FSCONFIG_SET_BINARY => {
+            // `memdup_user_nul(_value, aux)`: a blob of exactly `aux` bytes.
+            // SAFETY: copy_from_user_vec validates the whole user range.
+            match unsafe { copy_from_user_vec(value_ptr, aux as usize) } {
+                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(_) => {
+                    ctx.set_return(err(EFAULT));
+                    return;
+                }
+            }
+        }
+        FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
+            // `getname_flags`: an empty name is -ENOENT unless the
+            // _EMPTY form passed LOOKUP_EMPTY.
+            match copy_user_cstr_checked(value_ptr, 4096) {
+                Ok(path) if path.is_empty() && cmd == FSCONFIG_SET_PATH => {
+                    ctx.set_return(err(ENOENT));
+                    return;
+                }
+                Ok(path) => Some(path),
+                Err(errno) => {
+                    ctx.set_return(err(errno));
+                    return;
+                }
+            }
+        }
+        FSCONFIG_SET_FD => {
+            // `param.file = fget(aux); if (!param.file) -> -EBADF`.
+            if !fd_open(task, aux as u32) {
+                ctx.set_return(err(EBADF));
+                return;
+            }
+            None
+        }
+        _ => None,
+    };
+    match cmd {
+        FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL => {
+            // Materialize the filesystem named by fsopen. `vfs_cmd_create`:
+            // `if (fc->phase != FS_CONTEXT_CREATE_PARAMS) return -EBUSY;`,
+            // and a failed `vfs_get_tree` leaves the context FAILED.
             let r = with_contexts(|m| {
                 let c = m.get_mut(&id)?;
+                if c.phase != CtxPhase::CreateParams {
+                    return Some(Err(None));
+                }
                 let options = context_options(c);
-                match build_fs_with_options(&c.fsname, &options, c.uid, c.gid) {
+                let built = build_fs_with_options(&c.fsname, &options, c.uid, c.gid);
+                c.phase = match built {
+                    Ok(Some(_)) => CtxPhase::AwaitingMount,
+                    _ => CtxPhase::Failed,
+                };
+                match built {
                     Ok(Some(fs)) => {
                         c.created = Some(fs);
                         Some(Ok(true))
                     }
                     Ok(None) => Some(Ok(false)),
-                    Err(error) => Some(Err(error)),
+                    Err(error) => Some(Err(Some(error))),
                 }
             });
             match r {
                 Some(Ok(true)) => ctx.set_return(ok(0)),
                 Some(Ok(false)) => ctx.set_return(err(ENODEV)),
-                Some(Err(FsError::NoSpace)) => ctx.set_return(err(ENOSPC)),
-                Some(Err(FsError::Unsupported)) => ctx.set_return(err(EOPNOTSUPP)),
-                Some(Err(_)) => ctx.set_return(err(EINVAL)),
+                Some(Err(None)) => ctx.set_return(err(EBUSY)),
+                Some(Err(Some(FsError::NoSpace))) => ctx.set_return(err(ENOSPC)),
+                Some(Err(Some(FsError::Unsupported))) => ctx.set_return(err(EOPNOTSUPP)),
+                Some(Err(Some(_))) => ctx.set_return(err(EINVAL)),
                 None => ctx.set_return(err(EBADF)),
             }
         }
         // CMD_RECONFIGURE applies retained options to the selected live fs.
+        // `vfs_cmd_reconfigure`: only from FS_CONTEXT_RECONF_PARAMS (fspick,
+        // or after fsmount), else -EBUSY; a failure leaves the context FAILED.
         FSCONFIG_CMD_RECONFIGURE => {
             let result = with_contexts(|m| {
-                let context = m.get(&id)?;
-                let fs = context.created.as_ref()?;
+                let context = m.get_mut(&id)?;
+                if context.phase != CtxPhase::ReconfParams {
+                    return Some(Err(None));
+                }
+                let fs = context.created.clone()?;
                 let options = filesystem_reconfigure_options(context);
                 // `ro` and `noswap` are VFS mount attributes. NARF's mount
                 // registry does not model them yet, so an otherwise-empty
                 // remount is a successful no-op rather than an invalid tmpfs
                 // option (systemd's credentials fs depends on this).
-                Some(if options.is_empty() {
+                let result = if options.is_empty() {
                     Ok(())
                 } else {
                     fs.reconfigure(&options)
-                })
+                };
+                if result.is_err() {
+                    context.phase = CtxPhase::Failed;
+                }
+                Some(result.map_err(Some))
             });
             match result {
                 Some(Ok(())) => ctx.set_return(ok(0)),
-                Some(Err(FsError::NoSpace)) => ctx.set_return(err(ENOSPC)),
-                Some(Err(_)) => ctx.set_return(err(EINVAL)),
+                Some(Err(None)) => ctx.set_return(err(EBUSY)),
+                Some(Err(Some(FsError::NoSpace))) => ctx.set_return(err(ENOSPC)),
+                Some(Err(Some(_))) => ctx.set_return(err(EINVAL)),
                 None => ctx.set_return(err(EBADF)),
             }
         }
-        // Retain configuration options for CMD_CREATE/CMD_RECONFIGURE. The
-        // string/path/binary forms validate that user pointers are readable.
-        FSCONFIG_SET_STRING | FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_BINARY => {
-            let key = copy_user_cstr(a.arg2, 256);
-            let value = copy_user_cstr(a.arg3, 4096);
-            if let (Some(key), Some(value)) = (key, value) {
-                let found = with_contexts(|m| {
-                    m.get_mut(&id)
-                        .map(|context| context.options.insert(key, Some(value)))
-                        .is_some()
-                });
-                ctx.set_return(if found { ok(0) } else { err(EBADF) });
-            } else {
+        // Retain configuration options for CMD_CREATE/CMD_RECONFIGURE.
+        // Parameters are accepted only while the context takes them:
+        // `if (fc->phase != FS_CONTEXT_CREATE_PARAMS && fc->phase !=
+        // FS_CONTEXT_RECONF_PARAMS) return -EBUSY;`.
+        _ => {
+            let Some(key) = key else {
                 ctx.set_return(err(EINVAL));
-            }
+                return;
+            };
+            let r = with_contexts(|m| {
+                let context = m.get_mut(&id)?;
+                if !matches!(
+                    context.phase,
+                    CtxPhase::CreateParams | CtxPhase::ReconfParams
+                ) {
+                    return Some(false);
+                }
+                context.options.insert(key, value);
+                Some(true)
+            });
+            ctx.set_return(match r {
+                Some(true) => ok(0),
+                Some(false) => err(EBUSY),
+                None => err(EBADF),
+            });
         }
-        // FSCONFIG_SET_FLAG (value-less key) and FSCONFIG_SET_FD (numeric aux)
-        // carry no user string to validate; accept them.
-        FSCONFIG_SET_FLAG | FSCONFIG_SET_FD => {
-            if let Some(key) = copy_user_cstr(a.arg2, 256) {
-                let found = with_contexts(|m| {
-                    m.get_mut(&id)
-                        .map(|context| context.options.insert(key, None))
-                        .is_some()
-                });
-                ctx.set_return(if found { ok(0) } else { err(EBADF) });
-            } else {
-                ctx.set_return(err(EINVAL));
-            }
-        }
-        _ => ctx.set_return(ok(0)),
     }
 }
 
 /// `fsmount(fs_fd, flags, attr_flags)` → detached-mount fd.
+///
+/// `fs/namespace.c::SYSCALL_DEFINE3(fsmount)`, in order:
+///
+/// ```text
+/// if (!may_mount())                              return -EPERM;
+/// if ((flags & ~(FSMOUNT_CLOEXEC)) != 0)         return -EINVAL;
+/// if (attr_flags & ~FSMOUNT_VALID_FLAGS)         return -EINVAL;
+/// switch (attr_flags & MOUNT_ATTR__ATIME) {
+/// case STRICTATIME: case NOATIME: case RELATIME(0): break;
+/// default:                                       return -EINVAL; }
+/// if (fd_empty(f))                               return -EBADF;
+/// if (fd_file(f)->f_op != &fscontext_fops)       return -EINVAL;
+/// if (!fc->root)                                 return -EINVAL;
+/// if (fc->phase != FS_CONTEXT_AWAITING_MOUNT)    return -EBUSY;
+/// ...  vfs_clean_context(fc);  /* -> FS_CONTEXT_RECONF_PARAMS */
+/// ```
+///
+/// None of the flag checks or the phase test existed, and `attr_flags` was
+/// dropped: `fsmount(fd, 0, MOUNT_ATTR_RDONLY)` produced a writable mount.
 pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
+    const FSMOUNT_VALID_FLAGS: u64 = MOUNT_ATTR_RDONLY
+        | MOUNT_ATTR_NOSUID
+        | MOUNT_ATTR_NODEV
+        | MOUNT_ATTR_NOEXEC
+        | MOUNT_ATTR__ATIME
+        | 0x0000_0080 // MOUNT_ATTR_NODIRATIME
+        | MOUNT_ATTR_NOSYMFOLLOW;
     let a = *ctx.args();
     let task = current_task_id();
-    let id = match context_of(task, a.arg0 as u32) {
+    if !mount_admin(task) {
+        ctx.set_return(err(EPERM));
+        return;
+    }
+    let flags = a.arg1 as u32 as u64;
+    let attr_flags = a.arg2 as u32 as u64;
+    if flags & !FSMOUNT_CLOEXEC != 0
+        || attr_flags & !FSMOUNT_VALID_FLAGS != 0
+        || !matches!(
+            attr_flags & MOUNT_ATTR__ATIME,
+            0 | MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME
+        )
+    {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let fd_no = a.arg0 as u32;
+    let id = match context_of(task, fd_no) {
         Some(id) => id,
         None => {
-            ctx.set_return(err(EBADF));
+            ctx.set_return(err(if fd_open(task, fd_no) { EINVAL } else { EBADF }));
             return;
         }
     };
-    let fs = with_contexts(|m| m.get(&id).and_then(|c| c.created.clone()));
+    let fs = with_contexts(|m| {
+        let c = m.get_mut(&id)?;
+        // fsconfig(CMD_CREATE) wasn't called (or failed): no root.
+        let Some(fs) = c.created.clone() else {
+            return Some(Err(EINVAL));
+        };
+        if c.phase != CtxPhase::AwaitingMount {
+            return Some(Err(EBUSY));
+        }
+        c.phase = CtxPhase::ReconfParams;
+        Some(Ok(fs))
+    });
     let fs = match fs {
-        Some(fs) => fs,
+        Some(Ok(fs)) => fs,
+        Some(Err(errno)) => {
+            ctx.set_return(err(errno));
+            return;
+        }
         None => {
-            // fsconfig(CMD_CREATE) wasn't called.
-            ctx.set_return(err(EINVAL));
+            ctx.set_return(err(EBADF));
             return;
         }
     };
@@ -664,9 +990,24 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
             },
         )
     });
+    // The detached mount carries `attr_flags` from birth. NARF applies mount
+    // flags at the mount POINT, so record them the way
+    // `mount_setattr(fd, AT_EMPTY_PATH)` does and let `move_mount` land them.
+    if attr_flags & !MOUNT_ATTR__ATIME != 0 {
+        with_mount_attrs(|m| {
+            m.insert(
+                mid,
+                MountAttr {
+                    attr_set: attr_flags,
+                    attr_clr: 0,
+                    propagation: 0,
+                },
+            );
+        });
+    }
     match install_fd(
         Arc::new(MountObjectFile { id: mid }),
-        a.arg1 & FSMOUNT_CLOEXEC != 0,
+        flags & FSMOUNT_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),
         None => {
@@ -680,28 +1021,61 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
 }
 
 /// `move_mount(from_dfd, from_path, to_dfd, to_path, flags)`.
+///
+/// `fs/namespace.c::SYSCALL_DEFINE5(move_mount)` resolves the TARGET before
+/// it looks at the source at all:
+///
+/// ```text
+/// if (!may_mount())                                   return -EPERM;
+/// if (flags & ~MOVE_MOUNT__MASK)                      return -EINVAL;
+/// if (BENEATH and SET_GROUP both set)                 return -EINVAL;
+/// to_name = getname_maybe_null(to_pathname, T_EMPTY_PATH ? AT_EMPTY_PATH : 0);
+/// ... to_dfd / filename_lookup(to_dfd, to_name)       /* -EBADF/-ENOENT */
+/// from_name = getname_maybe_null(from_pathname, F_EMPTY_PATH ? ...);
+/// if (!from_name && from_dfd >= 0) { fd_empty -> -EBADF;
+///         return vfs_move_mount(&f_path, &to_path); }
+/// filename_lookup(from_dfd, from_name) ... vfs_move_mount()
+/// ```
+///
+/// So a closed source fd with a missing target is -ENOENT, an empty name
+/// without its `*_EMPTY_PATH` flag is -ENOENT, and a descriptor that is not a
+/// mount is `do_move_mount`'s -EINVAL — all probed on Linux 6.18. This
+/// handler used to answer EBADF first for every source fd it did not own,
+/// EINVAL for a faulting or relative target, and had no privilege check.
+///
+/// LINUX-GAP: the target is not required to exist (see sys_mount's doc for
+/// why the flat mount table cannot yet answer that for every fixture).
 pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
-    // from_dfd is the detached-mount fd from fsmount / open_tree.
-    let mid = match mount_of(task, a.arg0 as u32) {
-        Some(id) => id,
-        None => {
-            ctx.set_return(err(EBADF));
-            return;
+    if !mount_admin(task) {
+        ctx.set_return(err(EPERM));
+        return;
+    }
+    let flags = a.arg4 as u32 as u64;
+    if flags & !MOVE_MOUNT__MASK != 0
+        || flags & (MOVE_MOUNT_BENEATH | MOVE_MOUNT_SET_GROUP)
+            == (MOVE_MOUNT_BENEATH | MOVE_MOUNT_SET_GROUP)
+    {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    // `getname_maybe_null`: with the *_EMPTY_PATH flag a NULL or empty name
+    // means "the dfd itself"; without it an empty name is -ENOENT.
+    let copy_name = |ptr: u64, empty_ok: bool| -> Result<String, i64> {
+        if empty_ok && ptr == 0 {
+            return Ok(String::new());
         }
-    };
-    let to_path = match copy_user_cstr(a.arg3, 4096) {
-        Some(s) if !s.is_empty() && s.starts_with('/') => s,
-        _ => {
-            ctx.set_return(err(EINVAL));
-            return;
+        let name = copy_user_cstr_checked(ptr, 4096)?;
+        if name.is_empty() && !empty_ok {
+            return Err(ENOENT);
         }
+        Ok(name)
     };
-    let mount = match with_mounts(|m| m.get(&mid).cloned()) {
-        Some(mount) => mount,
-        None => {
-            ctx.set_return(err(EBADF));
+    let to_path = match copy_name(a.arg3, flags & MOVE_MOUNT_T_EMPTY_PATH != 0) {
+        Ok(name) => name,
+        Err(errno) => {
+            ctx.set_return(err(errno));
             return;
         }
     };
@@ -715,8 +1089,68 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
         .and_then(|fd| fd_path_for_task(task, fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or(to_path);
-    let target = apply_chroot(&target_path);
+    // A relative target resolves against `to_dfd`, as for any *at call.
+    let target = match resolve_at_mount_path(task, a.arg2, &target_path) {
+        Ok(target) => target,
+        Err(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    let from_path = match copy_name(a.arg1, flags & MOVE_MOUNT_F_EMPTY_PATH != 0) {
+        Ok(name) => name,
+        Err(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
     let auth = narf_filesystem::bootstrap_mount_authority();
+    // from_dfd is normally the detached-mount fd from fsmount / open_tree.
+    let from_fd = a.arg0 as u32;
+    let mid = match mount_of(task, from_fd) {
+        Some(id) => id,
+        None if !from_path.is_empty() => {
+            // The path form moves an ATTACHED mount, as `mount(MS_MOVE)` does:
+            // -ENOENT for a source that names nothing, -EINVAL for one that
+            // is not the root of a mount.
+            let source = match resolve_at_mount_path(task, a.arg0, &from_path) {
+                Ok(source) => source,
+                Err(errno) => {
+                    ctx.set_return(err(errno));
+                    return;
+                }
+            };
+            if let Err(errno) = require_mountpoint(&source) {
+                ctx.set_return(err(errno));
+                return;
+            }
+            ctx.set_return(
+                match crate::handlers::current_move_mount(&auth, &source, &target) {
+                    Ok(()) => ok(0),
+                    Err(FsError::Busy) => err(EBUSY),
+                    Err(_) => err(EINVAL),
+                },
+            );
+            return;
+        }
+        // An open descriptor that is not a mount NARF can move is
+        // `do_move_mount`'s "not a mount" -EINVAL; a closed one is -EBADF.
+        None => {
+            ctx.set_return(err(if fd_open(task, from_fd) {
+                EINVAL
+            } else {
+                EBADF
+            }));
+            return;
+        }
+    };
+    let mount = match with_mounts(|m| m.get(&mid).cloned()) {
+        Some(mount) => mount,
+        None => {
+            ctx.set_return(err(EBADF));
+            return;
+        }
+    };
     if current_mount_arc(&auth, &target, mount.fs).is_err() {
         ctx.set_return(err(EBUSY));
         return;
@@ -753,13 +1187,27 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(errno));
         return;
     }
-    let raw_path = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(err(EINVAL));
+    // `vfs_open_tree`: `if (detached && !may_mount()) return -EPERM;` after
+    // the flag checks and before the lookup — a plain O_PATH open_tree needs
+    // no privilege, a clone does (probed on 6.18).
+    if a.arg2 & OPEN_TREE_CLONE != 0 && !mount_admin(task) {
+        ctx.set_return(err(EPERM));
+        return;
+    }
+    // `user_path_at`: a faulting name is -EFAULT (it was reported as
+    // -EINVAL), and an empty one is -ENOENT unless AT_EMPTY_PATH asked for
+    // LOOKUP_EMPTY.
+    let raw_path = match copy_user_cstr_checked(a.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(err(errno));
             return;
         }
     };
+    if raw_path.is_empty() && a.arg2 & AT_EMPTY_PATH == 0 {
+        ctx.set_return(err(ENOENT));
+        return;
+    }
     // Mount-object fds returned by open_tree are valid dirfds for another
     // open_tree lookup. systemd first opens the mount covering `/run`, then
     // addresses `run` relative to that detached mount root.
@@ -897,6 +1345,12 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
 
 /// `open_tree_attr(dfd, path, flags, attr, size)` → an O_PATH or detached
 /// mount fd with atomically requested mount attributes.
+///
+/// After `vfs_open_tree`, `wants_mount_setattr` validates the attributes and
+/// `do_mount_setattr` applies them to the new file's path — a clone's
+/// detached mount, or for the O_PATH form the mount the path must be the
+/// root of (-EINVAL otherwise, probed on 6.18). The attributes used to be
+/// validated and then dropped.
 pub fn sys_open_tree_attr(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     if a.arg3 == 0 && a.arg4 != 0 {
@@ -919,12 +1373,27 @@ pub fn sys_open_tree_attr(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    let task = current_task_id();
     let fd_no = opened.value as u32;
     if a.arg3 != 0 {
-        if let Err(errno) =
-            validate_mount_attr(a.arg3, a.arg4 as usize, a.arg2 & OPEN_TREE_CLONE != 0)
-        {
-            discard_open_tree_fd(current_task_id(), fd_no);
+        let applied = validate_mount_attr(a.arg3, a.arg4 as usize, a.arg2 & OPEN_TREE_CLONE != 0)
+            .and_then(|attr| {
+                if attr.is_nop() {
+                    return Ok(());
+                }
+                if let Some(mid) = mount_of(task, fd_no) {
+                    // Detached: land the attributes when move_mount attaches it.
+                    with_mount_attrs(|m| {
+                        m.insert(mid, attr);
+                    });
+                    return Ok(());
+                }
+                let path = resolve_at_mount_path(task, u64::from(fd_no), "")?;
+                require_mountpoint(&path)?;
+                apply_mount_attr(&path, &attr)
+            });
+        if let Err(errno) = applied {
+            discard_open_tree_fd(task, fd_no);
             capture.inner.set_return(err(errno));
             return;
         }
@@ -934,16 +1403,55 @@ pub fn sys_open_tree_attr(ctx: &mut dyn TrapContext) {
 
 /// `fspick(dfd, path, flags)` → fs-context fd for an existing mount (for
 /// reconfiguration). The context starts already "created" with that fs.
+///
+/// `fs/fsopen.c::SYSCALL_DEFINE3(fspick)`:
+///
+/// ```text
+/// if (!may_mount())                               return -EPERM;
+/// if (flags & ~(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW |
+///               FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH)) return -EINVAL;
+/// ret = user_path_at(dfd, path, lookup_flags, &target);   /* -EFAULT/-ENOENT */
+/// if (target.mnt->mnt_root != target.dentry)      return -EINVAL;
+/// ```
+///
+/// This checked neither privilege nor flags, reported a faulting or relative
+/// path as -EINVAL, and handed back the COVERING filesystem for any path
+/// below a mount instead of refusing a non-mountpoint (probed on 6.18).
 pub fn sys_fspick(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) if !s.is_empty() && s.starts_with('/') => s,
-        _ => {
-            ctx.set_return(err(EINVAL));
+    let task = current_task_id();
+    if !mount_admin(task) {
+        ctx.set_return(err(EPERM));
+        return;
+    }
+    let flags = a.arg2 as u32 as u64;
+    if flags & !(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH)
+        != 0
+    {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let raw = match copy_user_cstr_checked(a.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(err(errno));
             return;
         }
     };
-    let fs = match narf_filesystem::registry().fs_arc_at(&path) {
+    if raw.is_empty() && flags & FSPICK_EMPTY_PATH == 0 {
+        ctx.set_return(err(ENOENT));
+        return;
+    }
+    let path = match resolve_at_mount_path(task, a.arg0, &raw)
+        .and_then(|path| require_mountpoint(&path).map(|()| path))
+    {
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    let fs = match current_fs_arc_at(&path) {
         Some(fs) => fs,
         None => {
             ctx.set_return(err(ENOENT));
@@ -961,10 +1469,11 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
                 options: BTreeMap::new(),
                 uid: 0,
                 gid: 0,
+                phase: CtxPhase::ReconfParams,
             },
         )
     });
-    match install_fd(Arc::new(FsContextFile { id }), a.arg2 & FSOPEN_CLOEXEC != 0) {
+    match install_fd(Arc::new(FsContextFile { id }), flags & FSPICK_CLOEXEC != 0) {
         Some(n) => ctx.set_return(ok(n as u64)),
         None => {
             // `fs/namespace.c` and `fs/fsopen.c` publish these descriptors with
@@ -986,6 +1495,13 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
 /// four attributes NARF's mount table carries are applied now; the rest are
 /// accepted-and-unapplied for the reason stated below, which is the same
 /// reason `mount(2)` already documents for `MS_RELATIME`.
+///
+/// The target is found as `user_path_at(dfd, path, ...)` then
+/// `do_mount_setattr`'s `if (!path_mounted(path)) return -EINVAL;`: a
+/// missing path (including an empty one without AT_EMPTY_PATH) is -ENOENT,
+/// an existing non-mountpoint -EINVAL, and a relative path resolves against
+/// `dfd` (probed on 6.18). It used to resolve every path against the cwd,
+/// treat "" as the cwd, and report a non-mountpoint as -ENOENT.
 pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     const ALLOWED_FLAGS: u64 = AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
@@ -1003,10 +1519,11 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     // `if (attr.attr_set == 0 && attr.attr_clr == 0 && attr.propagation == 0)
     // return 0; /* Tell caller to not bother. */` — a no-op request does not
     // resolve the path, so it cannot fail on it either.
-    if attr.attr_set == 0 && attr.attr_clr == 0 {
+    if attr.is_nop() {
         ctx.set_return(ok(0));
         return;
     }
+    let task = current_task_id();
     // `AT_EMPTY_PATH`: the target is the mount referred to by the fd (arg0),
     // not a path. systemd's new-mount-API sandbox sets a DETACHED fsmount /
     // open_tree mount read-only/nosuid/etc. this way BEFORE `move_mount`
@@ -1014,11 +1531,10 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     // the wrong mount (or fail), which aborted namespacing with EXIT_NAMESPACE
     // for every ProtectProc / PrivateDevices service — the logind/userdbd
     // failure. NARF applies mount flags at the mount POINT, so record the attrs
-    // against the detached mount now and apply them in `sys_move_mount`. A
-    // non-mount fd (e.g. AT_FDCWD with an empty name) falls through to the
-    // path branch below, which resolves the empty name against the cwd.
+    // against the detached mount now and apply them in `sys_move_mount`. Any
+    // other fd names the path it was opened on, below.
     if a.arg2 & AT_EMPTY_PATH != 0 {
-        if let Some(mid) = mount_of(current_task_id(), a.arg0 as u32) {
+        if let Some(mid) = mount_of(task, a.arg0 as u32) {
             with_mount_attrs(|m| {
                 m.insert(mid, attr);
             });
@@ -1026,7 +1542,7 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
             return;
         }
     }
-    let path = match copy_user_cstr_checked(a.arg1, 4096) {
+    let raw = match copy_user_cstr_checked(a.arg1, 4096) {
         Ok(p) => p,
         Err(errno) => {
             // `copy_user_cstr_checked` reports a POSITIVE errno and `err`
@@ -1035,7 +1551,31 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path = resolve_cwd_path(current_task_id(), &path);
+    if raw.is_empty() && a.arg2 & AT_EMPTY_PATH == 0 {
+        ctx.set_return(err(ENOENT));
+        return;
+    }
+    let path = match resolve_at_mount_path(task, a.arg0, &raw)
+        .and_then(|path| require_mountpoint(&path).map(|()| path))
+    {
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    // The propagation half is `do_change_type`'s, the same one mount(2)
+    // reaches with MS_SHARED & co; `validate_mount_attr` has already held it
+    // to at most one of the four types.
+    if attr.propagation != 0 {
+        let prop = match attr.propagation {
+            p if p == 1 << 20 => narf_filesystem::MntPropagation::Shared,
+            p if p == 1 << 19 => narf_filesystem::MntPropagation::Slave,
+            p if p == 1 << 18 => narf_filesystem::MntPropagation::Private,
+            _ => narf_filesystem::MntPropagation::Unbindable,
+        };
+        let _ = current_change_propagation(&path, prop, a.arg2 & AT_RECURSIVE != 0);
+    }
     match apply_mount_attr(&path, &attr) {
         Ok(()) => ctx.set_return(ok(0)),
         Err(errno) => ctx.set_return(err(errno)),

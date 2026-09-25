@@ -3046,6 +3046,15 @@ fn smoke_abi_fsx_pivot_root_pos() -> TestResult {
             return Err("setup mount of the new root failed");
         }
         let put_old = b"/abi-pvr-ok/old\0";
+        // put_old is resolved with LOOKUP_DIRECTORY too, so it must exist.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, put_old.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            crate::handlers::__test_root_dir_reset();
+            return Err("setup mkdir of put_old failed");
+        }
         let r = call(
             Syscall::PivotRoot.raw(),
             a2(new_root.as_ptr() as u64, put_old.as_ptr() as u64, 0),
@@ -3272,6 +3281,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_open_by_handle_at_neg);
 // a detached-mount fd. tmpfs is a buildable fs name (build_fs).
 
 const FSCONFIG_CMD_CREATE: u64 = 6;
+/// move_mount(2): the source is `from_dfd` itself (an fsmount/open_tree fd);
+/// without it an empty or NULL `from_path` is -ENOENT / -EFAULT.
+const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x0000_0004;
 
 fn smoke_abi_fsx_fsopen_pos() -> TestResult {
     with_setup(|| {
@@ -3286,11 +3298,17 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_fsopen_pos);
 
 fn smoke_abi_fsx_fsopen_neg() -> TestResult {
     with_setup(|| {
-        // Empty fsname → EINVAL.
+        // Empty fsname → `get_fs_type("")` finds nothing → ENODEV (Linux
+        // 6.18); it is not an argument-shape error.
         let fsname = b"\0";
-        match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+        if call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) != Some(ENODEV) {
+            return Err("fsopen with an empty fsname must return -ENODEV");
+        }
+        // Unknown flag bits are -EINVAL, checked before the name is read.
+        let tmpfs = b"tmpfs\0";
+        match call(Syscall::Fsopen.raw(), a1(tmpfs.as_ptr() as u64, 2)) {
             Some(v) if v == EINVAL => Ok(()),
-            _ => Err("fsopen with an empty fsname must return -EINVAL"),
+            _ => Err("fsopen with an unknown flag must return -EINVAL"),
         }
     })
 }
@@ -3335,6 +3353,25 @@ fn smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos() -> TestResult {
         ) != Some(0)
         {
             return Err("fsconfig(CMD_CREATE) setup failed");
+        }
+        // Parameters and CMD_RECONFIGURE are accepted only once the context
+        // is in the reconfigure phase — after fsmount, which is how systemd
+        // remounts its credentials fs read-only. Straight after CMD_CREATE
+        // both are -EBUSY.
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 0,
+                arg2: key.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(EBUSY)
+        {
+            return Err("fsconfig(SET_FLAG) awaiting fsmount must return -EBUSY");
+        }
+        if !matches!(call(Syscall::Fsmount.raw(), a2(fd, 0, 0)), Some(v) if v >= 0) {
+            return Err("fsmount setup failed");
         }
         if call(
             Syscall::Fsconfig.raw(),
@@ -3471,6 +3508,7 @@ fn smoke_abi_fsx_fsmount_reopen_dot_pos() -> TestResult {
             SyscallArgs {
                 arg0: reopened,
                 arg3: to.as_ptr() as u64,
+                arg4: MOVE_MOUNT_F_EMPTY_PATH,
                 ..Default::default()
             },
         ) {
@@ -3512,7 +3550,7 @@ fn smoke_abi_fsx_move_mount_pos() -> TestResult {
             arg1: 0,
             arg2: 0,
             arg3: to.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         match call(Syscall::MoveMount.raw(), args) {
@@ -3525,19 +3563,35 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_move_mount_pos);
 
 fn smoke_abi_fsx_move_mount_neg() -> TestResult {
     with_setup(|| {
-        // from_dfd 999 is not a detached-mount fd → EBADF.
-        let to = b"/abi-x\0";
+        // from_dfd 999 is not an open fd → EBADF. The target is resolved
+        // first, so it names something that exists.
+        let to = b"/\0";
         let args = SyscallArgs {
             arg0: 999,
             arg1: 0,
             arg2: 0,
             arg3: to.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
-        match call(Syscall::MoveMount.raw(), args) {
-            Some(v) if v == EBADF => Ok(()),
-            _ => Err("move_mount from an unknown fd must return -EBADF"),
+        if call(Syscall::MoveMount.raw(), args) != Some(EBADF) {
+            return Err("move_mount from an unknown fd must return -EBADF");
+        }
+        // Unknown flag bits are -EINVAL before anything is resolved.
+        let bad_flags = SyscallArgs { arg4: 0x80, ..args };
+        if call(Syscall::MoveMount.raw(), bad_flags) != Some(EINVAL) {
+            return Err("move_mount with an unknown flag must return -EINVAL");
+        }
+        // Without MOVE_MOUNT_F_EMPTY_PATH an empty source name is -ENOENT.
+        let empty = b"\0";
+        let no_empty_flag = SyscallArgs {
+            arg1: empty.as_ptr() as u64,
+            arg4: 0,
+            ..args
+        };
+        match call(Syscall::MoveMount.raw(), no_empty_flag) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("move_mount of \"\" without F_EMPTY_PATH must return -ENOENT"),
         }
     })
 }

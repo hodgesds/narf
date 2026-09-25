@@ -30,6 +30,9 @@ const XATTR_REPLACE: u64 = 2;
 // new-mount-API fsconfig commands.
 const FSCONFIG_SET_STRING: u64 = 1;
 const FSCONFIG_CMD_CREATE: u64 = 6;
+/// move_mount(2): the source is `from_dfd` itself (an fsmount/open_tree fd);
+/// without it an empty or NULL `from_path` is -ENOENT / -EFAULT.
+const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x0000_0004;
 
 // Open a MemFs-backed file via the (linux-compat) open syscall.
 fn open_memfs_fd(path: &[u8]) -> Result<u32, &'static str> {
@@ -1370,27 +1373,39 @@ fn smoke_abi_fsx2_mount_badtarget_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_badtarget_neg);
 
-// ── fsconfig: ENODEV on an un-buildable fsname ────────────────────────
+// ── fsopen: ENODEV on an un-buildable fsname ──────────────────────────
 //
-// fsopen accepts any non-empty fsname; fsconfig(CMD_CREATE) then calls
-// build_fs, which returns None for an unknown fs → ENODEV. The first file
-// only pins the tmpfs CMD_CREATE success and the EBADF (unknown fd) case.
+// `fsopen` itself runs `get_fs_type` and refuses an unknown name with
+// -ENODEV (Linux 6.18); it does not hand back a context that only fails at
+// CMD_CREATE. The fsconfig checks that follow are the ones `fs/fsopen.c`
+// makes before it even looks up the descriptor.
 
 fn smoke_abi_fsx2_fsconfig_enodev_neg() -> TestResult {
     with_setup(|| {
         let fsname = b"nosuchfs\0";
-        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
-            Some(v) if v >= 0 => v as u64,
-            _ => return Err("fsopen of an arbitrary fsname should still open a context"),
-        };
-        let args = SyscallArgs {
-            arg0: fd,
-            arg1: FSCONFIG_CMD_CREATE,
+        if call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) != Some(ENODEV) {
+            return Err("fsopen of an unknown fsname must return -ENODEV");
+        }
+        // An unknown fsconfig command is -EOPNOTSUPP even on a closed fd.
+        let unknown_cmd = SyscallArgs {
+            arg0: 999,
+            arg1: 99,
             ..Default::default()
         };
-        match call(Syscall::Fsconfig.raw(), args) {
-            Some(v) if v == ENODEV => Ok(()),
-            _ => Err("fsconfig(CMD_CREATE) on an un-buildable fsname must return -ENODEV"),
+        if call(Syscall::Fsconfig.raw(), unknown_cmd) != Some(EOPNOTSUPP) {
+            return Err("fsconfig with an unknown command must return -EOPNOTSUPP first");
+        }
+        // CMD_CREATE with a key is a shape error, also before the fd lookup.
+        let key = b"size\0";
+        let create_with_key = SyscallArgs {
+            arg0: 999,
+            arg1: FSCONFIG_CMD_CREATE,
+            arg2: key.as_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Fsconfig.raw(), create_with_key) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("fsconfig(CMD_CREATE, key) must return -EINVAL before -EBADF"),
         }
     })
 }
@@ -1518,11 +1533,12 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_tmpfs_option_rejected);
 
-// ── move_mount: EINVAL on a relative target (valid from_dfd) ──────────
+// ── move_mount: a relative target resolves against to_dfd ─────────────
 //
-// Build a real detached-mount fd, then pass a relative to_path. mount_of
-// succeeds, but the to_path branch rejects a non-'/' target → EINVAL. The
-// first file's negative pins EBADF (unknown from_dfd) — a different branch.
+// Build a real detached-mount fd, then pass a relative to_path with a
+// to_dfd that is not open. Like any *at call, the relative name resolves
+// against to_dfd, so the answer is -EBADF — not a blanket -EINVAL for "not
+// absolute" (Linux 6.18 attaches `move_mount(mfd, "", dirfd, "t", ...)`).
 
 fn smoke_abi_fsx2_move_mount_relpath_neg() -> TestResult {
     with_setup(|| {
@@ -1543,18 +1559,18 @@ fn smoke_abi_fsx2_move_mount_relpath_neg() -> TestResult {
             Some(v) if v >= 0 => v as u64,
             _ => return Err("fsmount setup failed"),
         };
-        let to = b"relative-target\0"; // not absolute → EINVAL
+        let to = b"relative-target\0"; // resolved against to_dfd 999 → EBADF
         let args = SyscallArgs {
             arg0: mfd,
             arg1: 0,
-            arg2: 0,
+            arg2: 999,
             arg3: to.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         match call(Syscall::MoveMount.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("move_mount with a relative to_path must return -EINVAL"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("move_mount with a relative to_path and a closed to_dfd must return -EBADF"),
         }
     })
 }
@@ -1590,6 +1606,7 @@ fn smoke_abi_fsx2_move_mount_private_namespace_pos() -> TestResult {
                 arg1: 0,
                 arg2: (-100i64) as u64,
                 arg3: target.as_ptr() as u64,
+                arg4: MOVE_MOUNT_F_EMPTY_PATH,
                 ..Default::default()
             };
             if call(Syscall::MoveMount.raw(), attach) != Some(0) {
@@ -1999,6 +2016,7 @@ fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
                 arg1: 0,
                 arg2: (-100i64) as u64,
                 arg3: target.as_ptr() as u64,
+                arg4: MOVE_MOUNT_F_EMPTY_PATH,
                 ..Default::default()
             };
             if call(Syscall::MoveMount.raw(), attach) != Some(0) {
@@ -2110,17 +2128,23 @@ fn smoke_abi_fsx2_open_tree_enoent_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_open_tree_enoent_neg);
 
-// ── fspick: EINVAL on a relative path ─────────────────────────────────
+// ── fspick: EINVAL on a path that is not a mount root ─────────────────
 //
-// The first file's fspick negative is lenient (accepts anything); pin the
-// concrete EINVAL relative-path guard branch here.
+// `fspick` requires `target.mnt->mnt_root == target.dentry`: a path that
+// exists but is not the root of a mount is -EINVAL (Linux 6.18), where a
+// relative path merely resolves against dfd like any *at call. Unknown flag
+// bits are -EINVAL before the path is looked at.
 
 fn smoke_abi_fsx2_fspick_relpath_neg() -> TestResult {
-    with_setup(|| {
-        let path = b"relative\0";
-        match call(Syscall::Fspick.raw(), a2(0, path.as_ptr() as u64, 0)) {
+    with_memfs("/abi-fspick", "abi-fspick", &[("f", b"hi")], || {
+        let below = b"/abi-fspick/f\0";
+        if call(Syscall::Fspick.raw(), a2(0, below.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("fspick of an existing non-mountpoint must return -EINVAL");
+        }
+        let root = b"/abi-fspick\0";
+        match call(Syscall::Fspick.raw(), a2(0, root.as_ptr() as u64, 0x10)) {
             Some(v) if v == EINVAL => Ok(()),
-            _ => Err("fspick with a relative path must return -EINVAL"),
+            _ => Err("fspick with an unknown flag must return -EINVAL"),
         }
     })
 }
@@ -2275,7 +2299,7 @@ fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
             Some(v) if v >= 0 => v as u64,
             _ => return Err("fsmount on a created context should return a mount fd"),
         };
-        // move_mount(mfd, "", AT_FDCWD, dest, 0).
+        // move_mount(mfd, "", AT_FDCWD, dest, MOVE_MOUNT_F_EMPTY_PATH).
         let empty = b"\0";
         let mut dest_c = [0u8; 32];
         dest_c[..dest.len()].copy_from_slice(dest.as_bytes());
@@ -2284,7 +2308,7 @@ fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
             arg1: empty.as_ptr() as u64,
             arg2: 0xffffffffffffff9c, // AT_FDCWD
             arg3: dest_c.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         if call(Syscall::MoveMount.raw(), mvargs) != Some(0) {
@@ -2349,7 +2373,7 @@ fn smoke_abi_fsx2_new_mount_api_procfd_target_pos() -> TestResult {
             arg1: empty.as_ptr() as u64,
             arg2: (-100i64) as u64, // AT_FDCWD
             arg3: procfd_target_c.as_ptr() as u64,
-            arg4: 0,
+            arg4: MOVE_MOUNT_F_EMPTY_PATH,
             ..Default::default()
         };
         let moved = call(Syscall::MoveMount.raw(), move_args) == Some(0);
