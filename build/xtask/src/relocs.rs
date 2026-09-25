@@ -182,6 +182,38 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
     if shoff == 0 || shnum == 0 {
         bail!("{} has no section headers", elf_path.display());
     }
+    // Validate the table fits before indexing into it. Without this a short
+    // read panics inside `u64_at` with a slice-index message naming neither the
+    // file nor the cause — which is what happened when this ran against an ELF
+    // the linker was still writing: the header already carried the final
+    // `e_shoff`, so it pointed past the truncated end.
+    let table_end = shoff.saturating_add(shnum.saturating_mul(shentsize));
+    if shentsize < 64 || table_end > bytes.len() {
+        bail!(
+            "{}: section header table ({shnum} x {shentsize} at {shoff}) runs past the \
+             end of a {} byte file — a truncated or concurrently-written image",
+            elf_path.display(),
+            bytes.len()
+        );
+    }
+
+    // Image VA extent, so `value_moves` can ask whether a value points INTO the
+    // image rather than merely at-or-above its base. See the use site.
+    let mut img_lo = u64::MAX;
+    let mut img_hi = 0u64;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let flags = u64_at(&bytes, sh + 0x08);
+        let addr = u64_at(&bytes, sh + 0x10);
+        let size = u64_at(&bytes, sh + 0x20);
+        if flags & SHF_ALLOC != 0 && addr >= base {
+            img_lo = img_lo.min(addr);
+            img_hi = img_hi.max(addr + size);
+        }
+    }
+    if img_lo >= img_hi {
+        bail!("no kernel-half sections found; cannot bound the image extent");
+    }
 
     // (sh_addr, sh_flags) per section, for deciding whether a relocation's
     // target moves with the kernel half.
@@ -249,7 +281,16 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
             // Where the encoded value points. `sh_link` names the symbol table
             // this relocation section indexes.
             let sym_value = symtab.get(&(sh_link, r_sym)).copied().unwrap_or(0);
-            let value_moves = sym_value.wrapping_add(addend) >= base || sym_value >= base;
+            // In the image, not merely at-or-above its base. A linker symbol
+            // can hold a value above the image and not be an image address at
+            // all: aarch64's `KERNEL_VIRT_BASE` is the RAM linear map, which
+            // sits ABOVE the image. Treating it as moving adds the slide to a
+            // base that must not move — the mirror of the `__kernel_start` /
+            // `__kernel_end` case below, where a physical-valued symbol sits
+            // BELOW the image and must not move either. Bounding by the extent
+            // covers both directions.
+            let in_image = |v: u64| v >= img_lo && v < img_hi;
+            let value_moves = in_image(sym_value.wrapping_add(addend)) || in_image(sym_value);
 
             if e_machine == EM_AARCH64 {
                 match (r_type, field_moves, value_moves) {
