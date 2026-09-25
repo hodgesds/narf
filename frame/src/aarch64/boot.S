@@ -157,7 +157,7 @@ _start:
     mov  x1, #0
 1:  str  xzr, [x0, x1]
     add  x1, x1, #8
-    cmp  x1, #(4096 * 6)    /* lo_L0, lo_L1, hi_L0, hi_L1, l2_lo_1, l2_hi_1 */
+    cmp  x1, #(4096 * 8)    /* + l1_img, l2_img for the image window */
     b.ne 1b
 
     /* lo_L0[0] -> lo_L1 */
@@ -263,10 +263,15 @@ _start:
     orr  x0, x0, #0x3           /* valid + table descriptor */
     str  x0, [x3, #(1 * 8)]
 
+    /* The linear map gets NO executable range. The image executes from its own
+     * window (built below), so passing the kernel-text extent here would leave
+     * a second executable alias of it — exactly the W^X hole the x86_64 side
+     * closed by shrinking its window to the image. An empty range (x1 == x2)
+     * makes every block PXN|UXN. */
     adrp x0, l2_hi_1
     add  x0, x0, #:lo12:l2_hi_1
-    ldr  x1, =__kernel_start
-    ldr  x2, =__text_end_phys
+    mov  x1, #0
+    mov  x2, #0
     bl   build_ram_l2
     adrp x3, l1_hi
     add  x3, x3, #:lo12:l1_hi
@@ -274,6 +279,40 @@ _start:
     add  x0, x0, #:lo12:l2_hi_1
     orr  x0, x0, #0x3
     str  x0, [x3, #(1 * 8)]
+
+    /* ── The kernel image's own window ──────────────────────────────────
+     *
+     * VA = phys + KIMAGE_VOFFSET + slide, which is where the image is linked
+     * and (after the apply pass above) where every absolute address in it now
+     * points. `KIMAGE_VOFFSET` is 1 GiB aligned, so VA and phys share 2 MiB
+     * alignment and a block mapping places the image exactly.
+     *
+     * hi_L0[510] -> l1_img -> l2_img, and l2_img[ (slide>>21) + i ] maps
+     * phys 0x4000_0000 + i*2MiB. The module window lives at l2_img[448..] and
+     * is populated later by `module_text`; the linker ASSERTs that the image
+     * plus the widest slide cannot reach it.
+     */
+    adrp x0, l0_hi
+    add  x0, x0, #:lo12:l0_hi
+    adrp x1, l1_img
+    add  x1, x1, #:lo12:l1_img
+    orr  x1, x1, #0x3
+    str  x1, [x0, #(510 * 8)]
+
+    adrp x0, l1_img
+    add  x0, x0, #:lo12:l1_img
+    adrp x1, l2_img
+    add  x1, x1, #:lo12:l2_img
+    orr  x1, x1, #0x3
+    str  x1, [x0, #(511 * 8)]
+
+    adrp x0, l2_img
+    add  x0, x0, #:lo12:l2_img
+    ldr  x1, =__kernel_start        /* exec range: kernel text, physical */
+    ldr  x2, =__text_end_phys
+    ldr  x4, =__kernel_end          /* image end, physical                */
+    mov  x3, x20                    /* slide                             */
+    bl   build_image_l2
 
     dsb sy
 
@@ -385,6 +424,44 @@ _start_rust_entry:
  *
  * Clobbers x3-x7. Runs pre-MMU at a low PA, so it must stay in `.boot`.
  */
+/* Fill `l2_img` for the kernel image.
+ *
+ * x0 = &l2_img, x1 = exec_start (phys), x2 = exec_end (phys),
+ * x3 = slide, x4 = image end (phys).
+ *
+ * Entry index is `(slide >> 21) + i` and the output PA is
+ * `0x4000_0000 + i*2MiB`, for i covering 0x4000_0000 .. page_up_2M(x4). The
+ * image starts at `KERNEL_LOAD_BASE` (0x4008_0000), part-way into the first
+ * block, so that block is mapped too — it also holds `.boot`, which is
+ * harmless here: this window is never used to execute `.boot`, and the block
+ * is PXN|UXN unless it overlaps kernel text.
+ */
+build_image_l2:
+    lsr  x3, x3, #21            /* slide in 2 MiB units -> index offset */
+    mov  x5, #0                 /* i */
+    movz x6, #0x4000, lsl #16   /* pa = 0x4000_0000 */
+1:
+    mov  x7, #0x401             /* valid block | AttrIndx=0 (Normal) | AF */
+    add  x8, x6, #0x200000      /* pa_end */
+    /* Overlap with the exec range iff pa < exec_end && exec_start < pa_end. */
+    cmp  x6, x2
+    b.hs 2f
+    cmp  x1, x8
+    b.lo 3f
+2:
+    mov  x9, #0x60
+    orr  x7, x7, x9, lsl #48    /* PXN (53) | UXN (54) */
+3:
+    orr  x7, x7, x6             /* | output PA */
+    add  x9, x5, x3             /* entry index = i + (slide >> 21) */
+    str  x7, [x0, x9, lsl #3]
+    mov  x6, x8
+    add  x5, x5, #1
+    /* Continue while pa < image end. */
+    cmp  x6, x4
+    b.lo 1b
+    ret
+
 build_ram_l2:
     mov  x3, #0                 /* i */
     movz x4, #0x4000, lsl #16   /* pa = 0x4000_0000 */
@@ -423,6 +500,14 @@ l1_hi:
 l2_lo_1:
     .skip 4096
 l2_hi_1:
+    .skip 4096
+/* The kernel image's own window, at L0[510]/L1[511]. Separate from the linear
+ * map above so the image can slide without rewriting entries that map
+ * unrelated physical addresses. The module window shares this L1 slot at
+ * L2[448..]; the image sits at L2[0..] plus its slide. */
+l1_img:
+    .skip 4096
+l2_img:
     .skip 4096
 
 .align 4

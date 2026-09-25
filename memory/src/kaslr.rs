@@ -69,7 +69,18 @@ pub static KERNEL_SLIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Base the kernel image is linked at, before any slide.
 pub const KERNEL_LINK_BASE: u64 = if cfg!(target_arch = "aarch64") {
-    0xFFFF_FF80_0000_0000
+    // `KIMAGE_VOFFSET` in `build/linker/aarch64.ld`, NOT `KERNEL_VIRT_BASE`.
+    //
+    // The image has its own virtual offset, separate from the linear map at
+    // `KERNEL_VIRT_BASE`, so that it can slide without disturbing the map of
+    // RAM. `phys = va - KERNEL_LINK_BASE` for an in-image address on both
+    // arches; on aarch64 the linear map's conversion is the different one
+    // (`PhysAddr::kernel_ptr`, `phys | KERNEL_PHYS_OFFSET`).
+    //
+    // Linux keeps the same two: `kimage_voffset` for `__pa_symbol()` and
+    // `PAGE_OFFSET` for the linear map, with `__virt_to_phys` dispatching on
+    // which range an address is in.
+    0xFFFF_FF7F_8000_0000
 } else {
     0xFFFF_FFFF_8000_0000
 };
@@ -154,11 +165,12 @@ mod kaslr_slide_tests {
         if slide & 0x1F_FFFF != 0 {
             return TestResult::Fail("the slide is not 2 MiB aligned");
         }
-        // Must stay clear of the module text window one GiB above the link
-        // base, or the image lands on top of it.
-        if slide >= (1 << 30) {
-            return TestResult::Fail("the slide reaches the module text window");
-        }
+        // Where the slide must stop is the module window, and
+        // `smoke_kaslr_slid_image_clears_module_window` asserts exactly that
+        // against `MODULE_VA_BASE`. This used to hardcode `>= 1 GiB` and call
+        // it "the module text window one GiB above the link base", which is
+        // true on x86_64 and only coincidentally true on aarch64, where the
+        // window sits at a different offset and the slack is 825 MiB.
 
         // The live base has to match where code actually is. Taking the
         // address of a function goes through a relocation, so this compares
@@ -170,12 +182,20 @@ mod kaslr_slide_tests {
         if here < KERNEL_LINK_BASE + slide {
             return TestResult::Fail("code address disagrees with the recorded slide");
         }
-        // And the conversion has to undo it: a text address minus the live
-        // base is a physical address inside the 1 GiB window.
-        if image_virt_to_phys(here) >= (1 << 30) {
-            return TestResult::Fail(
-                "image_virt_to_phys produced an out-of-window physical address",
-            );
+        // And the conversion has to undo it: a text address minus the live base
+        // is a physical address inside the loaded image.
+        //
+        // Containment, not an absolute bound. This read `>= (1 << 30)`, which
+        // is an x86_64 assumption: `KERNEL_LOAD_BASE` is 16 MiB there but
+        // 0x40080000 on aarch64, where RAM *starts* at 1 GiB, so a perfectly
+        // correct conversion tripped it. It stayed hidden because the case
+        // Skips while `KASLR_SLIDE_MASK` is 0, and aarch64's was — enabling
+        // the slide is what first ran this line. The same absolute bound had
+        // already been fixed once, in `smoke_kaslr_image_bounds_stay_physical`.
+        let phys = image_virt_to_phys(here);
+        let (kstart, kend) = image_phys_bounds();
+        if phys < kstart || phys >= kend {
+            return TestResult::Fail("image_virt_to_phys did not land inside the loaded image");
         }
         TestResult::Pass
     }
@@ -242,7 +262,6 @@ mod kaslr_slide_tests {
     ///
     /// Overlap here would not fault. The image would quietly share addresses
     /// with module text, and the first module load would corrupt the kernel.
-    #[cfg(target_arch = "x86_64")]
     fn smoke_kaslr_slid_image_clears_module_window() -> TestResult {
         // Physical, and deliberately not converted — see
         // `smoke_kaslr_image_bounds_stay_physical`.
@@ -251,12 +270,12 @@ mod kaslr_slide_tests {
         if top > crate::module_text::MODULE_VA_BASE {
             return TestResult::Fail("the slid kernel image reaches the module text window");
         }
+        #[cfg(target_arch = "x86_64")]
         if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end_phys > KERNEL_IMAGE_SIZE {
             return TestResult::Fail("slide + image exceeds KERNEL_IMAGE_SIZE");
         }
         TestResult::Pass
     }
-    #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/kaslr", smoke_kaslr_slid_image_clears_module_window);
 }
 

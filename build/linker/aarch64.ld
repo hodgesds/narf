@@ -7,6 +7,39 @@ ENTRY(_start)
 KERNEL_LOAD_BASE = 0x40080000;
 KERNEL_VIRT_BASE = 0xFFFFFF8000000000;
 
+/* Virtual offset of the kernel IMAGE, distinct from the linear map above.
+ *
+ * `KERNEL_VIRT_BASE` is the linear map: `PhysAddr::kernel_ptr` resolves every
+ * physical address to `phys | KERNEL_VIRT_BASE`, so that whole range is the
+ * image of RAM and nothing else may live in it. The kernel image used to live
+ * there too — image VA was `KERNEL_VIRT_BASE + phys` — which made the two
+ * inseparable: sliding the image inside the linear map's own L2 would
+ * overwrite entries for unrelated physical addresses.
+ *
+ * So the image gets its own offset. `phys = va - KIMAGE_VOFFSET` for anything
+ * in the image, exactly as `phys = va - KERNEL_VIRT_BASE` is on x86_64, and
+ * `kaslr::KERNEL_LINK_BASE` is this value. Linux draws the same line:
+ * `KIMAGE_VADDR` for the image, `PAGE_OFFSET` for the linear map, with
+ * `kimage_voffset` between them and `__pa_symbol()` using it.
+ *
+ * Placed in L0[510], the slot the module window already occupies, so the image
+ * and the module veneers stay within ADRP's +/-4 GiB of each other:
+ *
+ *   image        0xffffff7fc0080000  L0[510] L1[511] L2[0..36]
+ *   modules      0xffffff7ff8000000  L0[510] L1[511] L2[448..]
+ *
+ * Disjoint L2 ranges in one L1 slot, leaving ~824 MiB for the image to slide
+ * into. 1 GiB aligned so a 2 MiB block mapping can place the image exactly:
+ * VA and phys then share 2 MiB alignment. */
+KIMAGE_VOFFSET = 0xFFFFFF7F80000000;
+
+/* Mirror of `memory::module_text::MODULE_VA_BASE`. Only used to bound the
+ * KASLR slide below: the image must not slide into the module window that
+ * shares this L1 slot. Kept in step with the Rust constant by
+ * `smoke_module_text_window_placement`, which checks the window's own
+ * placement, and by the ASSERT at the end of this file. */
+MODULE_VA_BASE_LD = 0xFFFFFF7FF8000000;
+
 /* Bytes reserved in-image for the KASLR relocation table. `xtask` fills it
  * after the link; the header magic is what the apply pass keys on, so an
  * unfilled reserve is a skipped slide rather than a slide by garbage.
@@ -18,17 +51,7 @@ KERNEL_VIRT_BASE = 0xFFFFFF8000000000;
  * headroom; `xtask` fails the build if the table outgrows it. */
 KASLR_RELOC_RESERVE = 1M;
 
-/* KASLR slide bound. Still 0: the table is built and the apply pass in
- * `boot.S` is wired, but the image and the RAM linear map share
- * `hi_L1[1]` — image VA is `KERNEL_VIRT_BASE + phys`, which is also what
- * `PhysAddr::kernel_ptr` resolves to — so sliding the image inside that slot
- * would overwrite linear entries for unrelated physical addresses. The image
- * needs its own VA region first (Linux: `KIMAGE_VADDR` separate from
- * `PAGE_OFFSET`, with `kimage_voffset` between them).
- *
- * Derived from the image the way x86_64's is once that lands. */
-KASLR_ENABLE = 0;
-KASLR_SLIDE_MASK = 0x00000000;
+
 
 /* Debug: pin the slide instead of drawing entropy, so a slide-dependent
  * failure is reproducible. Masked and aligned by the same code as a drawn
@@ -61,9 +84,9 @@ SECTIONS
         __boot_data_end = .;
     } :boot
 
-    . += KERNEL_VIRT_BASE;
+    . += KIMAGE_VOFFSET;
 
-    .text : AT(ADDR(.text) - KERNEL_VIRT_BASE) ALIGN(4K) {
+    .text : AT(ADDR(.text) - KIMAGE_VOFFSET) ALIGN(4K) {
         __text_start = .;
         *(.text .text.*)
         __text_end = .;
@@ -83,7 +106,7 @@ SECTIONS
      * and consumes the `.rela.dyn` R_AARCH64_RELATIVE entries directly
      * (arch/arm64/kernel/pi/relocate.c). NARF reuses its own table format on
      * both arches so there is one encoder and one apply pass to reason about. */
-    .kaslr_relocs : AT(ADDR(.kaslr_relocs) - KERNEL_VIRT_BASE) ALIGN(4K) {
+    .kaslr_relocs : AT(ADDR(.kaslr_relocs) - KIMAGE_VOFFSET) ALIGN(4K) {
         __kaslr_relocs_start = .;
         QUAD(0);
         . = __kaslr_relocs_start + KASLR_RELOC_RESERVE;
@@ -92,13 +115,13 @@ SECTIONS
 
     /* Physical aliases for the apply pass. It runs in `.boot`, before the MMU,
      * where there is no kernel-half addressing at all. */
-    __kaslr_relocs_phys = __kaslr_relocs_start - KERNEL_VIRT_BASE;
+    __kaslr_relocs_phys = __kaslr_relocs_start - KIMAGE_VOFFSET;
 
     /* Physical alias of `kaslr::KERNEL_SLIDE`, so the pass can record the
      * slide it applied for the Rust conversions to read later. */
-    __kernel_slide_phys = KERNEL_SLIDE - KERNEL_VIRT_BASE;
+    __kernel_slide_phys = KERNEL_SLIDE - KIMAGE_VOFFSET;
 
-    .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
+    .rodata : AT(ADDR(.rodata) - KIMAGE_VOFFSET) ALIGN(4K) {
         __rodata_start = .;
         *(.rodata .rodata.*)
         . = ALIGN(4);
@@ -124,13 +147,13 @@ SECTIONS
         __rodata_end = .;
     } :rodata
 
-    .data : AT(ADDR(.data) - KERNEL_VIRT_BASE) ALIGN(4K) {
+    .data : AT(ADDR(.data) - KIMAGE_VOFFSET) ALIGN(4K) {
         __data_start = .;
         *(.data .data.*)
         __data_end = .;
     } :data
 
-    .bss : AT(ADDR(.bss) - KERNEL_VIRT_BASE) ALIGN(4K) {
+    .bss : AT(ADDR(.bss) - KIMAGE_VOFFSET) ALIGN(4K) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
@@ -157,7 +180,7 @@ SECTIONS
      * KASLR pass leaves them alone — `relocs.rs` matches on whether the
      * encoded VALUE moves, not just the field.
      */
-    .kernel_bounds : AT(ADDR(.kernel_bounds) - KERNEL_VIRT_BASE) ALIGN(8) {
+    .kernel_bounds : AT(ADDR(.kernel_bounds) - KIMAGE_VOFFSET) ALIGN(8) {
         __kernel_phys_bounds = .;
         QUAD(__kernel_start);
         QUAD(__kernel_end);
@@ -177,23 +200,23 @@ SECTIONS
      * symbol. The low identity map is still live during bring-up, so the
      * address is directly usable as a pointer.
      */
-    .ap_boot_syms : AT(ADDR(.ap_boot_syms) - KERNEL_VIRT_BASE) ALIGN(8) {
+    .ap_boot_syms : AT(ADDR(.ap_boot_syms) - KIMAGE_VOFFSET) ALIGN(8) {
         __ap_boot_syms = .;
         QUAD(_ap_start);
         QUAD(AP_STACKS);
     } :data
 
 
-    __kernel_end = . - KERNEL_VIRT_BASE;
+    __kernel_end = . - KIMAGE_VOFFSET;
 
     /* Physical end of `.text`. `boot.S` builds its L2 tables before the
      * MMU is on, so it can only compare *physical* addresses; doing the
-     * `- KERNEL_VIRT_BASE` here keeps a 64-bit constant and a subtraction
+     * `- KIMAGE_VOFFSET` here keeps a 64-bit constant and a subtraction
      * out of the assembly. Everything at or past this address — .rodata,
      * .data, .bss, .got, and every frame the buddy later hands out — is
      * mapped PXN|UXN in both the TTBR0 identity map and the TTBR1 kernel
      * window, so it has no executable alias. */
-    __text_end_phys = __text_end - KERNEL_VIRT_BASE;
+    __text_end_phys = __text_end - KIMAGE_VOFFSET;
 
     /* Aliased high-VA view of the boot stack. The boot stack
      * itself lives in `.boot.data` at low-VA so boot.S's
@@ -218,5 +241,41 @@ SECTIONS
     }
 }
 
-ASSERT(__boot_end <= __text_start - KERNEL_VIRT_BASE,
+/* KASLR slide bound, derived from the image the way x86_64's is.
+ *
+ * The image now has its own VA offset (`KIMAGE_VOFFSET`), so it can slide
+ * without touching the linear map. What bounds it is the module window above
+ * it in the same L1 slot: image top plus the widest slide must stay below
+ * `MODULE_VA_BASE`, or a slid image would land on module text.
+ *
+ * Masks are contiguous and 2 MiB aligned, `m(k) = 2^k - 2 MiB`, because the
+ * slide is `entropy & MASK` and a gap in the mask is a bit the slide can never
+ * set. Largest fitting `m(k)` without log2 or a ternary: since
+ * `m(k) - m(k-1) == 2^(k-1)`, summing `2^(k-1)` over every `m(k)` that fits
+ * telescopes to the largest. Same construction as the x86_64 script.
+ *
+ * `KASLR_ENABLE = 0` turns it off wholesale; the mask reaching 0 is what
+ * `smoke_kaslr_kernel_image_is_slid` keys on to Skip rather than Pass. */
+KASLR_ENABLE = 1;
+KASLR_SLIDE_SLACK = MODULE_VA_BASE_LD - (KIMAGE_VOFFSET + __kernel_end);
+KASLR_SLIDE_MASK = KASLR_ENABLE * (
+      (KASLR_SLIDE_SLACK >= 0x3FE00000) * 0x20000000
+    + (KASLR_SLIDE_SLACK >= 0x1FE00000) * 0x10000000
+    + (KASLR_SLIDE_SLACK >= 0x0FE00000) * 0x08000000
+    + (KASLR_SLIDE_SLACK >= 0x07E00000) * 0x04000000
+    + (KASLR_SLIDE_SLACK >= 0x03E00000) * 0x02000000
+    + (KASLR_SLIDE_SLACK >= 0x01E00000) * 0x01000000
+    + (KASLR_SLIDE_SLACK >= 0x00E00000) * 0x00800000
+    + (KASLR_SLIDE_SLACK >= 0x00600000) * 0x00400000
+    + (KASLR_SLIDE_SLACK >= 0x00200000) * 0x00200000);
+
+ASSERT(__boot_end <= __text_start - KIMAGE_VOFFSET,
        "linker: .boot section must come before .text — see build/ §4")
+
+/* The image plus the widest slide the mask allows must stay clear of the
+ * module window in the same L1 slot. Same guard the x86_64 script has against
+ * its module text window, and the reason the mask is derived rather than
+ * hand-picked. */
+ASSERT(KIMAGE_VOFFSET + __kernel_end + KASLR_SLIDE_MASK <= MODULE_VA_BASE_LD,
+       "linker: image + KASLR_SLIDE_MASK reaches the module window — lower the mask \
+or move MODULE_VA_BASE (and module_text::MODULE_VA_BASE with it)")
