@@ -2408,7 +2408,9 @@ fn smoke_abi_pathx_renameat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("old", b"x")], || {
         let old = b"/p2/old\0";
         let new = b"/p2/new\0";
-        // RENAME_EXCHANGE (2) is unsupported → -EINVAL.
+        // RENAME_EXCHANGE (2) with a destination that does not exist →
+        // -ENOENT (`do_renameat2`: `if ((flags & RENAME_EXCHANGE) &&
+        // d_is_negative(new_dentry)) goto exit5;`).
         match call_raw(
             Syscall::Renameat2.raw(),
             SyscallArgs {
@@ -2420,8 +2422,8 @@ fn smoke_abi_pathx_renameat2_neg() -> TestResult {
                 arg5: 0,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == EINVAL => Ok(()),
-            _ => Err("renameat2(RENAME_EXCHANGE) was not -EINVAL"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == ENOENT => Ok(()),
+            _ => Err("renameat2(RENAME_EXCHANGE) onto a missing name was not -ENOENT"),
         }
     })
 }
@@ -4794,7 +4796,7 @@ fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
             _ => return Err("renameat2 with invalid flags must return -EINVAL"),
         }
 
-        // 2. Unsupported RENAME_EXCHANGE (2) -> -EINVAL (-22)
+        // 2. RENAME_EXCHANGE (2) onto a missing name -> -ENOENT (-2)
         match call(
             Syscall::Renameat2.raw(),
             a4(
@@ -4805,8 +4807,8 @@ fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
                 2,
             ),
         ) {
-            Some(EINVAL) => {}
-            _ => return Err("renameat2 with RENAME_EXCHANGE must return -EINVAL"),
+            Some(ENOENT) => {}
+            _ => return Err("renameat2(RENAME_EXCHANGE) onto a missing name must return -ENOENT"),
         }
 
         // 3. Mutually exclusive RENAME_NOREPLACE (1) | RENAME_EXCHANGE (2) -> -EINVAL (-22)
@@ -4862,6 +4864,147 @@ fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_pathx_renameat2_flags_and_empty_paths
+);
+
+/// Namespace-mutation errnos that depend on the RAW last component (a final
+/// `.`/`..`, a trailing slash) or on `fs/namei.c`'s check ORDER — each one
+/// observed on Linux 6.18 tmpfs. NARF normalised the path first, so e.g.
+/// `rmdir("d/.")` removed `d` and `rename("f", "x/")` created `x`.
+fn smoke_abi_pathx_namespace_mutation_linux_errnos() -> TestResult {
+    const AT_REMOVEDIR: u64 = 0x200;
+    const S_IFREG: u64 = 0o100000;
+    const S_IFDIR: u64 = 0o040000;
+    with_memfs("/p2_ns", "p2_ns", &[("f", b"hi")], || {
+        let p = |s: &'static [u8]| s.as_ptr() as u64;
+        let ren = |old: &'static [u8], new: &'static [u8], flags: u64| {
+            call(
+                Syscall::Renameat2.raw(),
+                a4(AT_FDCWD, p(old), AT_FDCWD, p(new), flags),
+            )
+        };
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, p(b"/p2_ns/d\0"), 0o755),
+        ) != Some(0)
+            || call(
+                Syscall::Mkdirat.raw(),
+                a2(AT_FDCWD, p(b"/p2_ns/d/sub\0"), 0o755),
+            ) != Some(0)
+        {
+            return Err("fixture mkdir failed");
+        }
+        // do_rmdir: LAST_DOT -> EINVAL, LAST_DOTDOT -> ENOTEMPTY.
+        let rmdir =
+            |s: &'static [u8]| call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, p(s), AT_REMOVEDIR));
+        if rmdir(b"/p2_ns/d/sub/.\0") != Some(EINVAL) {
+            return Err("rmdir(\"d/.\") must be -EINVAL (and must not remove d)");
+        }
+        if rmdir(b"/p2_ns/d/..\0") != Some(ENOTEMPTY) {
+            return Err("rmdir(\"d/..\") must be -ENOTEMPTY");
+        }
+        // do_unlinkat: a trailing slash on a file is ENOTDIR; `.` is EISDIR.
+        let unlink = |s: &'static [u8]| call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, p(s), 0));
+        if unlink(b"/p2_ns/f/\0") != Some(ENOTDIR) {
+            return Err("unlink(\"f/\") must be -ENOTDIR (and must not remove f)");
+        }
+        if unlink(b"/p2_ns/d/.\0") != Some(EISDIR) {
+            return Err("unlink(\"d/.\") must be -EISDIR");
+        }
+        // unlinkat validates flags before reading the path.
+        if call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, 0, 1)) != Some(EINVAL) {
+            return Err("unlinkat(bad flag, NULL) must be -EINVAL, not -EFAULT");
+        }
+        // A file as a non-final component is ENOTDIR, not ENOENT.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, p(b"/p2_ns/f/x\0"), 0o755),
+        ) != Some(ENOTDIR)
+        {
+            return Err("mkdir(\"f/x\") must be -ENOTDIR");
+        }
+        // mknod: may_mknod before getname; EEXIST before anything else;
+        // a trailing slash on a new name is ENOENT.
+        let mknod =
+            |path: u64, mode: u64| call(Syscall::Mknodat.raw(), a3(AT_FDCWD, path, mode, 0));
+        if mknod(0, S_IFDIR) != Some(EPERM) {
+            return Err("mknodat(NULL, S_IFDIR) must be -EPERM (may_mknod runs first)");
+        }
+        if mknod(p(b"/p2_ns/new/\0"), S_IFREG | 0o644) != Some(ENOENT) {
+            return Err("mknod(\"new/\") must be -ENOENT, not create new");
+        }
+        if mknod(p(b"/p2_ns/f\0"), S_IFREG | 0o644) != Some(EEXIST) {
+            return Err("mknod on an existing name must be -EEXIST");
+        }
+        // symlink: an empty TARGET is -ENOENT; trailing slash; EEXIST.
+        let symlink = |t: &'static [u8], l: &'static [u8]| {
+            call(Syscall::Symlinkat.raw(), a2(p(t), AT_FDCWD, p(l)))
+        };
+        if symlink(b"\0", b"/p2_ns/l\0") != Some(ENOENT) {
+            return Err("symlink(\"\", l) must be -ENOENT");
+        }
+        if symlink(b"t\0", b"/p2_ns/l/\0") != Some(ENOENT) {
+            return Err("symlink(t, \"l/\") must be -ENOENT");
+        }
+        if symlink(b"t\0", b"/p2_ns/f\0") != Some(EEXIST) {
+            return Err("symlink onto an existing name must be -EEXIST");
+        }
+        // link: a directory source is EPERM (was EXDEV across directories);
+        // a missing source is ENOENT even when the new name exists.
+        let link = |o: &'static [u8], n: &'static [u8]| {
+            call(Syscall::Linkat.raw(), a4(AT_FDCWD, p(o), AT_FDCWD, p(n), 0))
+        };
+        if link(b"/p2_ns/d\0", b"/p2_ns/d/sub/d2\0") != Some(EPERM) {
+            return Err("link(dir, new) must be -EPERM");
+        }
+        if link(b"/p2_ns/nx\0", b"/p2_ns/f\0") != Some(ENOENT) {
+            return Err("link(missing, existing) must be -ENOENT (old name is looked up first)");
+        }
+        if link(b"/p2_ns/f/\0", b"/p2_ns/g\0") != Some(ENOTDIR) {
+            return Err("link(\"f/\", g) must be -ENOTDIR");
+        }
+        // rename: do_renameat2 / vfs_rename order.
+        if ren(b"/p2_ns/d\0", b"/p2_ns/d/sub/x\0", 0) != Some(EINVAL) {
+            return Err("rename(d, d/sub/x) must be -EINVAL");
+        }
+        if ren(b"/p2_ns/d/sub\0", b"/p2_ns/d\0", 0) != Some(ENOTEMPTY) {
+            return Err("rename(d/sub, d) must be -ENOTEMPTY");
+        }
+        if ren(b"/p2_ns/f\0", b"/p2_ns/x/\0", 0) != Some(ENOTDIR) {
+            return Err("rename(f, \"x/\") must be -ENOTDIR");
+        }
+        if ren(b"/p2_ns/d/.\0", b"/p2_ns/y\0", 0) != Some(EBUSY) {
+            return Err("rename(\"d/.\", y) must be -EBUSY");
+        }
+        if ren(b"/p2_ns/f\0", b"/p2_ns/d\0", 0) != Some(EISDIR) {
+            return Err("rename(file, dir) must be -EISDIR");
+        }
+        if ren(b"/p2_ns/d\0", b"/p2_ns/f\0", 0) != Some(ENOTDIR) {
+            return Err("rename(dir, file) must be -ENOTDIR");
+        }
+        if ren(b"/p2_ns/nx\0", b"/p2_ns/f\0", 1) != Some(ENOENT) {
+            return Err("renameat2(missing, existing, NOREPLACE) must be -ENOENT");
+        }
+        if ren(b"/p2_ns/f\0", b"/p2_ns/nx/y\0", 0) != Some(ENOENT) {
+            return Err("rename into a missing directory must be -ENOENT, not -EXDEV");
+        }
+        if call(Syscall::Renameat2.raw(), a4(AT_FDCWD, 0, AT_FDCWD, 0, 8)) != Some(EINVAL) {
+            return Err("renameat2(NULL, NULL, bad flag) must be -EINVAL, not -EFAULT");
+        }
+        // Nothing above may have mutated the tree.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, p(b"/p2_ns/d/sub\0"), 0o755),
+        ) != Some(EEXIST)
+            || mknod(p(b"/p2_ns/f\0"), S_IFREG | 0o644) != Some(EEXIST)
+        {
+            return Err("a refused call removed or moved a fixture");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_namespace_mutation_linux_errnos
 );
 
 fn smoke_abi_pathx_readlinkat_bufsiz_and_empty_path() -> TestResult {

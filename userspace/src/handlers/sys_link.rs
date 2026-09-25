@@ -17,6 +17,13 @@ pub(crate) fn sys_link(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `filename_lookup(old)` runs before the new name's `getname()` error
+    // is looked at, and `getname()` rejects "" with -ENOENT: an empty old
+    // name outranks an unreadable new one.
+    if old_raw.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     let new_raw = match copy_user_cstr_checked(args.arg1, 4096) {
         Ok(s) => s,
         Err(errno) => {

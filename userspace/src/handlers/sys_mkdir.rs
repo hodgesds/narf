@@ -63,11 +63,25 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         ctx.set_return(errno_ret(EEXIST));
         return;
     }
+    // A final `.`/`..` is never created: `filename_create` answers EEXIST
+    // for it once the walk THROUGH the named directory succeeds. That
+    // directory is not there (the check above), so the walk's own errno
+    // stands — `mkdir("nx/.")` is ENOENT and `mkdir("file/.")` ENOTDIR.
+    // Lexical normalisation turned the former into `mkdir("nx")`, which
+    // created it.
+    let last = LastComponent::of(raw_path);
+    if !last.is_norm() {
+        let errno = parentat_dir(path_ref, last).err().unwrap_or(-EEXIST);
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            // Parent directory doesn't exist.
-            ctx.set_return(errno_ret(ENOENT));
+            // The walk to the parent failed: -ENOENT for a missing
+            // component, but -ENOTDIR when one is a file (`mkdir("f/x")`),
+            // -EACCES / -ELOOP as `link_path_walk` reports them.
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path_ref)) as u64));
             return;
         }
     };

@@ -26,6 +26,14 @@ pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `do_symlinkat` reports the TARGET name's `getname()` failure first,
+    // and that includes the empty string: `getname()` without LOOKUP_EMPTY
+    // rejects "" with -ENOENT. An empty target used to be accepted and a
+    // symlink to nothing created.
+    if target_str.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     let link_str = match copy_user_cstr_checked(link_ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
@@ -45,6 +53,7 @@ pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let last = LastComponent::of(&link_str);
     let link_path = resolve_cwd_path(task, &joined);
-    symlink_absolute(ctx, &target_str, &link_path);
+    symlink_absolute(ctx, &target_str, &link_path, last);
 }

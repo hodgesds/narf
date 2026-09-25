@@ -2472,32 +2472,8 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     const S_IFCHR: u64 = 0o020000;
     const S_IFBLK: u64 = 0o060000;
     const S_IFIFO: u64 = 0o010000;
-    // `fs/namei.c::may_mknod` screens the node type BEFORE `filename_create`
-    // looks the path up, so a mode mknod cannot create outranks a bad path:
-    //
-    //     case S_IFREG: case S_IFCHR: case S_IFBLK:
-    //     case S_IFIFO: case S_IFSOCK: case 0:  return 0;
-    //     case S_IFDIR:                         return -EPERM;
-    //     default:                              return -EINVAL;
-    //
-    // A directory is EPERM — mkdir(2) is the only way to make one, and glibc
-    // relies on that to decide whether to fall back. NARF used to accept
-    // S_IFDIR here and create the directory, which is a NARF-only extension
-    // no portable caller can use, and reported every other malformed mode as
-    // the `-1` sentinel (EPERM) — colliding with the one mode that really is
-    // EPERM and hiding the EINVAL that says "this node type does not exist".
-    {
-        const S_IFREG: u64 = 0o100000;
-        const S_IFCHR_M: u64 = 0o020000;
-        const S_IFBLK_M: u64 = 0o060000;
-        const S_IFIFO_M: u64 = 0o010000;
-        const S_IFSOCK: u64 = 0o140000;
-        const S_IFDIR_M: u64 = 0o040000;
-        match mode & S_IFMT {
-            0 | S_IFREG | S_IFCHR_M | S_IFBLK_M | S_IFIFO_M | S_IFSOCK => {}
-            S_IFDIR_M => return errno_ret(EPERM), // -EPERM
-            _ => return errno_ret(EINVAL),        // -EINVAL
-        }
+    if let Err(errno) = may_mknod(mode) {
+        return SyscallReturn::ok(errno as u64);
     }
     if raw_path.is_empty() {
         return errno_ret(ENOENT); // -ENOENT
@@ -2506,33 +2482,46 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     // applied its dirfd so a relative path is resolved against the dirfd's
     // directory, not the cwd. `resolve_cwd_path` then only normalises a
     // cwd-relative `mknod(2)` path (absolute inputs pass through unchanged).
+    // The last-component shape is read off the RAW string first, since
+    // normalising erases a trailing slash and a final `.`.
+    let last = LastComponent::of(raw_path);
     let path = resolve_cwd_path(current_task_id(), raw_path);
-    let path_ref = {
-        let t = path.trim_end_matches('/');
-        if t.is_empty() {
-            // No LOOKUP_EMPTY on this path, so `getname()` rejects "" with
-            // -ENOENT rather than the sentinel's EPERM.
-            return errno_ret(ENOENT);
-        }
-        t
-    };
+    let fmt = mode & S_IFMT;
+    // `filename_create`: walk errors, then EEXIST for an existing name (or
+    // `.`/`..`/`/`), then ENOENT for a trailing slash — all BEFORE the
+    // read-only, permission and CAP_MKNOD checks below. The one NARF-local
+    // exception is the empty regular-file placeholder a FIFO/device node
+    // may replace (see the unlink further down).
+    match filename_create_check(&path, last) {
+        Ok(()) => {}
+        Err(errno)
+            if errno == -EEXIST
+                && last == LastComponent::Norm
+                && (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
+                && resolve_parent_dir_async(&path)
+                    .and_then(|(parent, leaf)| poll_blocking(parent.lookup_async(&leaf)))
+                    .and_then(Result::ok)
+                    .is_some_and(|entry| {
+                        entry.stat().mode.file_type == narf_filesystem::FileType::File
+                            && entry.stat().size == 0
+                    }) => {}
+        Err(errno) => return SyscallReturn::ok(errno as u64),
+    }
+    let path_ref = path.as_str();
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            return errno_ret(ENOENT); // -ENOENT
+            return SyscallReturn::ok((-path_lookup_errno(path_ref)) as u64);
         }
     };
     if let Err(errno) = mnt_want_write(path_ref) {
         return SyscallReturn::ok(errno as u64);
     }
     // `do_mknodat` -> `filename_create` -> `may_create(dir, ..)`: write+exec
-    // on the directory gaining the node. CAP_MKNOD for a device node is a
-    // separate gate (`may_mknod` above screened the TYPE, not the
-    // privilege) and is not modelled here.
+    // on the directory gaining the node.
     if let Err(errno) = may_create_in(&*parent, current_task_id()) {
         return SyscallReturn::ok(errno as u64);
     }
-    let fmt = mode & S_IFMT;
     // `vfs_mknod`:
     //
     //     if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout &&
@@ -2548,6 +2537,54 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     if (fmt == S_IFCHR || fmt == S_IFBLK) && !capable(CAP_MKNOD) {
         return errno_ret(EPERM); // -EPERM
     }
+    mknod_create(&*parent, &leaf, mode, fmt, dev)
+}
+
+/// `fs/namei.c::may_mknod` — the node-type screen `do_mknodat` runs before
+/// it even reads the pathname, so a bad mode outranks -EFAULT for a bad
+/// path pointer and every path-walk error.
+fn may_mknod(mode: u64) -> Result<(), i64> {
+    const S_IFMT: u64 = 0o170000;
+    // `fs/namei.c::may_mknod` screens the node type BEFORE `filename_create`
+    // looks the path up, so a mode mknod cannot create outranks a bad path:
+    //
+    //     case S_IFREG: case S_IFCHR: case S_IFBLK:
+    //     case S_IFIFO: case S_IFSOCK: case 0:  return 0;
+    //     case S_IFDIR:                         return -EPERM;
+    //     default:                              return -EINVAL;
+    //
+    // A directory is EPERM — mkdir(2) is the only way to make one, and glibc
+    // relies on that to decide whether to fall back. NARF used to accept
+    // S_IFDIR here and create the directory, which is a NARF-only extension
+    // no portable caller can use, and reported every other malformed mode as
+    // the `-1` sentinel (EPERM) — colliding with the one mode that really is
+    // EPERM and hiding the EINVAL that says "this node type does not exist".
+    const S_IFREG: u64 = 0o100000;
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFBLK: u64 = 0o060000;
+    const S_IFIFO: u64 = 0o010000;
+    const S_IFSOCK: u64 = 0o140000;
+    const S_IFDIR: u64 = 0o040000;
+    match mode & S_IFMT {
+        0 | S_IFREG | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK => Ok(()),
+        S_IFDIR => Err(-EPERM),
+        _ => Err(-EINVAL),
+    }
+}
+
+/// The node-creating tail of [`mknod_common`], once every `filename_create`
+/// / `vfs_mknod` check has passed.
+fn mknod_create(
+    parent: &dyn narf_filesystem::DirOps,
+    leaf: &str,
+    mode: u64,
+    fmt: u64,
+    dev: u64,
+) -> SyscallReturn {
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFBLK: u64 = 0o060000;
+    const S_IFIFO: u64 = 0o010000;
+    let leaf = alloc::string::String::from(leaf);
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
         if (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
@@ -2604,7 +2641,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             // setgid parent hands down its group. A device node or FIFO in
             // a shared group directory has to land in that group like
             // anything else.
-            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o7777) as u16, false);
+            let inherited = inherit_acls_from_parent(parent, (mode & 0o7777) as u16, false);
             let _ = poll_blocking(n.set_owners(inherited.uid, inherited.gid));
             let _ = poll_blocking(n.set_perms(inherited.mode));
             if let Some(blob) = inherited.access.as_ref() {
@@ -3237,7 +3274,7 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
 }
 
 /// Map an `FsError` from `DirOps::rename` to the Linux errno userspace
-/// expects. `NotFound` → ENOENT (source is gone), `Busy` → EEXIST,
+/// expects. `NotFound` → ENOENT (source is gone), `Busy` → ENOTEMPTY,
 /// `InvalidPath` → EINVAL, `CrossDevice` → EXDEV, `ReadOnly` → EROFS,
 /// everything else → EPERM.
 /// Never a bare -1 → systemd renames propagation dirs during mount
@@ -3246,7 +3283,12 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
         FsError::NotFound => -ENOENT,
-        FsError::Busy => -EEXIST,
+        // The backends (memfs `validate_replacement`, ext2's empty check)
+        // report a non-empty destination DIRECTORY as `Busy`; `->rename`
+        // answers that with -ENOTEMPTY. It used to read EEXIST, an errno
+        // plain rename(2) never returns (RENAME_NOREPLACE's EEXIST is decided
+        // by `rename_impl` before the backend is reached).
+        FsError::Busy => -ENOTEMPTY,
         FsError::InvalidPath => -EINVAL,
         FsError::CrossDevice => -EXDEV,
         FsError::ReadOnly => -EROFS,  // inode_permission
@@ -3263,6 +3305,123 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         _ => -EPERM,
     };
     code as u64
+}
+
+/// `nd->last_type` plus "did the last component carry trailing slashes"
+/// (`last.name[last.len] != 0`) for a caller's RAW pathname.
+///
+/// NARF normalises a path lexically (`resolve_cwd_path`) before resolving
+/// it, which erases exactly the two facts `fs/namei.c` bases several
+/// namespace-mutation errnos on: `rmdir("d/.")` is -EINVAL and
+/// `rename("d/.", x)` -EBUSY (LAST_DOT), `unlink("f/")` is -ENOTDIR and
+/// `mknod("new/")` -ENOENT (trailing slash). Classify BEFORE normalising.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LastComponent {
+    /// `LAST_NORM`, no trailing slash.
+    Norm,
+    /// `LAST_NORM` followed by one or more `/`.
+    NormSlash,
+    /// `LAST_DOT` — the path ends in `.`.
+    Dot,
+    /// `LAST_DOTDOT` — the path ends in `..`.
+    DotDot,
+    /// `LAST_ROOT` — the path is only slashes.
+    Root,
+}
+
+impl LastComponent {
+    pub(crate) fn of(raw: &str) -> Self {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return if raw.is_empty() { Self::Norm } else { Self::Root };
+        }
+        match trimmed.rsplit('/').next().unwrap_or(trimmed) {
+            "." => Self::Dot,
+            ".." => Self::DotDot,
+            _ if trimmed.len() != raw.len() => Self::NormSlash,
+            _ => Self::Norm,
+        }
+    }
+
+    pub(crate) fn is_norm(self) -> bool {
+        matches!(self, Self::Norm | Self::NormSlash)
+    }
+}
+
+/// The parent directory of a normalised absolute path (`"/"` for `"/x"`).
+fn parent_of_abs(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
+}
+
+/// Is `path` a strict descendant of `ancestor` (both normalised absolute)?
+fn path_is_strictly_under(path: &str, ancestor: &str) -> bool {
+    if ancestor == "/" {
+        return path != "/";
+    }
+    path.len() > ancestor.len()
+        && path.starts_with(ancestor)
+        && path.as_bytes()[ancestor.len()] == b'/'
+}
+
+/// What `lookup_one_qstr_excl` finds at a normalised absolute path, without
+/// following a final symlink: `None` = negative dentry, `Some(is_dir)`.
+fn namespace_node_kind(path: &str) -> Option<bool> {
+    stat_ino_path_dir_aware_ext(path, false)
+        .map(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+}
+
+/// `filename_parentat`: walk to the directory the last component lives in.
+/// Returns that directory's path, or the negative errno the walk fails with
+/// (-ENOENT / -ENOTDIR / -EACCES / -ELOOP, via `path_lookup_errno`). For a
+/// `.`/`..` last component the walk goes THROUGH the named directory, so
+/// the normalised path itself must resolve.
+fn parentat_dir(path: &str, last: LastComponent) -> Result<alloc::string::String, i64> {
+    let dir = match last {
+        LastComponent::Root => return Ok(alloc::string::String::from("/")),
+        LastComponent::Dot | LastComponent::DotDot => path,
+        _ => parent_of_abs(path),
+    };
+    // The dir-aware stat covers real directories, mount roots, synthetic
+    // mount ancestors and — since intermediate components are followed —
+    // a symlink to a directory (`/proc/self/…`).
+    if stat_ino_path_dir_aware(dir)
+        .is_some_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+    {
+        return Ok(alloc::string::String::from(dir));
+    }
+    // `path_lookup_errno` classifies every component BEFORE the leaf, so
+    // hand it a path whose parent is `dir`.
+    Err(-path_lookup_errno(&alloc::format!("{dir}/.")))
+}
+
+/// `fs/namei.c::filename_create` up to (not including) `mnt_want_write`,
+/// for a non-directory create (`mknod`, `symlink`, `link`'s new name):
+///
+/// ```text
+/// error = filename_parentat(..);             /* walk errors */
+/// if (unlikely(type != LAST_NORM)) -EEXIST;  /* ".", "..", "/" */
+/// dentry = lookup_one_qstr_excl(.., LOOKUP_CREATE | LOOKUP_EXCL);
+///                                            /* positive -> -EEXIST */
+/// if (unlikely(!create_flags) && last.name[last.len]) -ENOENT;
+/// if (unlikely(err2 /* mnt_want_write */)) -EROFS;
+/// ```
+///
+/// So an existing name is EEXIST whatever else is wrong with the request —
+/// a read-only mount or an unwritable directory included — and a trailing
+/// slash on a name that does not exist is ENOENT, not a silently created
+/// node.
+fn filename_create_check(path: &str, last: LastComponent) -> Result<(), i64> {
+    parentat_dir(path, last)?;
+    if !last.is_norm() || namespace_node_kind(path).is_some() {
+        return Err(-EEXIST);
+    }
+    if last == LastComponent::NormSlash {
+        return Err(-ENOENT);
+    }
+    Ok(())
 }
 
 // ── Mkdir / Rmdir / Rename — Tier-3b directory mutation ────────────
@@ -3607,12 +3766,51 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         return;
     }
     let task = current_task_id();
+    let old_last = LastComponent::of(old_raw);
+    let new_last = LastComponent::of(new_raw);
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);
+    // `do_linkat` resolves the OLD name first (`filename_lookup`, no
+    // LOOKUP_FOLLOW), so a missing source is -ENOENT (or the walk's
+    // -ENOTDIR) whatever is wrong with the new name. A trailing slash makes
+    // the lookup demand a directory: `link("file/", x)` is -ENOTDIR.
+    let old_is_dir = match namespace_node_kind(&old_path) {
+        Some(is_dir) => is_dir,
+        None => {
+            ctx.set_return(errno_ret(path_lookup_errno(&old_path)));
+            return;
+        }
+    };
+    if !old_is_dir && old_last == LastComponent::NormSlash {
+        ctx.set_return(errno_ret(ENOTDIR));
+        return;
+    }
+    // Then `filename_create(newdfd, new, ..)`: walk errors, EEXIST for an
+    // existing name — the backend used to decide that AFTER the read-only
+    // and permission checks, and before noticing a missing source — and
+    // ENOENT for a trailing slash on a new name.
+    if let Err(errno) = filename_create_check(&new_path, new_last) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // Only the directory GAINING a name is written, so only that mount
     // needs to be writable — a hard link from a read-only mount into a
     // writable one is legal.
     if let Err(errno) = mnt_want_write(&new_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `do_linkat`: `if (old_path.mnt != new_path.mnt) goto out (-EXDEV)` —
+    // before `vfs_link` runs `may_create`, so a cross-mount link is EXDEV
+    // even into a directory the caller could not write.
+    if current_mount_id_at(&old_path) != current_mount_id_at(parent_of_abs(&new_path)) {
+        ctx.set_return(errno_ret(EXDEV));
+        return;
+    }
+    // `vfs_link` -> `may_create(new_dir, ..)`. The OLD name is only read, so
+    // it needs no directory write permission — only the directory gaining a
+    // name does.
+    if let Err(errno) = check_may_create(&new_path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
@@ -3622,11 +3820,11 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         ctx.set_return(errno_ret(EPERM)); // -EPERM
         return;
     }
-    // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
-    // OLD name is only read, so it needs no directory write permission —
-    // only the directory gaining a name does.
-    if let Err(errno) = check_may_create(&new_path) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+    // `vfs_link`: `if (S_ISDIR(inode->i_mode)) return -EPERM;`. The backends
+    // refuse a directory as `InvalidPath`, which the cross-directory branch
+    // below reported as EXDEV.
+    if old_is_dir {
+        ctx.set_return(errno_ret(EPERM)); // -EPERM
         return;
     }
     let (Some(old_split), Some(new_split)) = (old_path.rfind('/'), new_path.rfind('/')) else {
@@ -3709,11 +3907,15 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
     };
     let new_leaf = alloc::string::String::from(&new_path[split + 1..]);
     if new_leaf.is_empty() {
-        return -22; // -EINVAL
+        // Only `/` normalises to an empty leaf: `filename_create` answers
+        // LAST_ROOT with -EEXIST.
+        return -EEXIST;
     }
     let dir_path = if split == 0 { "/" } else { &new_path[..split] };
     let Some(dir) = resolve_dir_absolute(dir_path) else {
-        return -2; // -ENOENT: target directory doesn't exist
+        // The walk to the target directory failed; say why (ENOENT, or
+        // ENOTDIR for a file component) as `link_path_walk` does.
+        return -path_lookup_errno(new_path);
     };
     match poll_blocking(dir.link_node(&new_leaf, node)) {
         Some(Ok(())) => {

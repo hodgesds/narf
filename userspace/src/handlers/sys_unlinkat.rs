@@ -20,6 +20,13 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
     let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let flags = args.arg2;
+    // `SYSCALL_DEFINE3(unlinkat)`: `if ((flag & ~AT_REMOVEDIR) != 0) return
+    // -EINVAL;` is the very first statement, ahead of `getname()` — a bad
+    // flag outranks -EFAULT, an empty path and a bad dirfd.
+    if flags & !AT_REMOVEDIR != 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
     let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
@@ -31,10 +38,6 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }
-    if flags & !AT_REMOVEDIR != 0 {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
     let task = current_task_id();
     let joined = match resolve_at_path(task, dirfd, &path_str) {
         Ok(p) => p,
@@ -44,10 +47,11 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
         }
     };
     // Re-apply the caller's chroot exactly as the cwd form does.
+    let last = LastComponent::of(&path_str);
     let path = resolve_cwd_path(task, &joined);
     if (flags & AT_REMOVEDIR) != 0 {
-        rmdir_absolute(ctx, &path);
+        rmdir_absolute(ctx, &path, last);
     } else {
-        unlink_absolute(ctx, &path);
+        unlink_absolute(ctx, &path, last);
     }
 }

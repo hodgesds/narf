@@ -38,6 +38,14 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `filename_linkat` looks the OLD name up before the new name's
+    // `getname()` error is examined; without AT_EMPTY_PATH an empty old
+    // name is -ENOENT from `getname()` itself, so it outranks an
+    // unreadable new one.
+    if old_raw.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     let new_raw = match copy_user_cstr_checked(args.arg3, 4096) {
         Ok(s) => s,
         Err(errno) => {

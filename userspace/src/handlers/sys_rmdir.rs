@@ -20,13 +20,36 @@ pub(crate) fn sys_rmdir(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }
+    let last = LastComponent::of(&path);
     let path = resolve_cwd_path(current_task_id(), &path);
-    rmdir_absolute(ctx, &path);
+    rmdir_absolute(ctx, &path, last);
 }
 
 /// `rmdir` on an ALREADY-absolute path, so `sys_unlinkat(AT_REMOVEDIR)` can
 /// resolve against its dirfd first and share this body.
-pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
+///
+/// `last` is the shape of the caller's RAW last component.
+pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastComponent) {
+    // `do_rmdir`, before `mnt_want_write`:
+    //
+    //     switch (type) {
+    //     case LAST_DOTDOT: error = -ENOTEMPTY; goto exit;
+    //     case LAST_DOT:    error = -EINVAL;    goto exit;
+    //     case LAST_ROOT:   error = -EBUSY;     goto exit;
+    //     }
+    //
+    // Lexical normalisation used to turn `rmdir("d/.")` into `rmdir("d")`
+    // and remove the directory.
+    let early = match last {
+        LastComponent::DotDot => Some(ENOTEMPTY),
+        LastComponent::Dot => Some(EINVAL),
+        LastComponent::Root => Some(EBUSY),
+        _ => None,
+    };
+    if let Some(errno) = early {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     // `do_rmdir` -> `may_delete(dir, dentry, 1)` — the same parent-directory
     // and sticky checks `unlink` makes, run inside the one resolution this
     // already does rather than costing a second path walk.
@@ -42,6 +65,14 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
                 refused = Some(errno);
                 return None;
             }
+        }
+        // `vfs_rmdir`, after `may_delete`: `if (is_local_mountpoint(dentry))
+        // -EBUSY`. NARF's mount table is flat, so the covered directory is
+        // still an ordinary (often empty) entry in the parent filesystem and
+        // the backend would happily remove it from under the mount.
+        if current_path_is_mount_root(path) {
+            refused = Some(-EBUSY);
+            return None;
         }
         poll_blocking(parent.rmdir(leaf))
     });
@@ -60,7 +91,8 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
         // teardown rmdir of /run/systemd/propagate/<unit>).
         Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rmdir_errno(e))),
         // The parent path/filesystem didn't resolve, or the async poll never
-        // completed → the target directory can't exist. Linux: ENOENT.
-        _ => ctx.set_return(errno_ret(ENOENT)),
+        // completed → the target directory can't exist. `link_path_walk`
+        // says why: ENOENT, or ENOTDIR for a file component.
+        _ => ctx.set_return(errno_ret(path_lookup_errno(path))),
     }
 }
