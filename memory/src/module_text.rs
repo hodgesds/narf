@@ -141,10 +141,85 @@ pub const MODULE_VA_BASE: u64 = crate::kaslr::KERNEL_LINK_BASE + crate::kaslr::K
 /// Still within ADRP's ±4 GiB of kernel text — about 1.1 GiB — so the veneers
 /// in `narf_modules::plt` continue to resolve.
 #[cfg(target_arch = "aarch64")]
-pub const MODULE_VA_BASE: u64 = 0xFFFF_FF7F_F800_0000;
+pub const MODULE_VA_BASE: u64 = 0xFFFF_FF7F_E800_0000;
 /// Base kernel VA of the module image window.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const MODULE_VA_BASE: u64 = 0;
+
+/// Bytes reserved for the module window to move within.
+///
+/// The window itself is [`MODULE_VA_USABLE`]; the region is what the base may
+/// be chosen from, so the slack is `REGION - USABLE`.
+///
+/// x86_64 gets the whole of `PML4[511]/PDPT[511]`. The window sits at the
+/// bottom of that 1 GiB slot and the image is in the slot below, so the room
+/// above the window is free: moving into it costs the image's slide nothing,
+/// and every choice still decodes to the same PML4 and PDPT indices that
+/// `smoke_module_text_window_placement` asserts.
+#[cfg(target_arch = "x86_64")]
+pub const MODULE_VA_REGION: u64 = 1 << 30;
+/// aarch64 reserves the top 384 MiB of the image's L1 slot: the 128 MiB window
+/// plus 256 MiB for it to move in (128 positions).
+///
+/// The window used to sit at the very top with nothing above it, so moving it
+/// meant taking room from the image's slide. It does not, because the slide
+/// mask is quantised to `2^k - 2 MiB`: with 384 MiB reserved the image still
+/// has 569 MiB of slack, which admits the same 510 MiB mask as before. Only at
+/// 512 MiB would the mask drop to 254 MiB. `build/linker/aarch64.ld` derives
+/// the mask from this same region base and ASSERTs the image cannot reach it.
+#[cfg(target_arch = "aarch64")]
+pub const MODULE_VA_REGION: u64 = 384 << 20;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub const MODULE_VA_REGION: u64 = MODULE_VA_USABLE;
+
+/// Live base of the module window, or 0 before it is chosen.
+///
+/// Randomized inside the region that starts at `MODULE_VA_BASE_DEFAULT`, for
+/// the reason the image and the x86_64 direct map are: a fixed base makes every
+/// module's text address a constant an attacker already knows. Linux has
+/// `CONFIG_RANDOMIZE_MODULE_REGION_FULL` for the same purpose.
+///
+/// Zero means "not chosen yet", and [`module_va_base`] falls back to the
+/// default so every accessor is correct before the pick and after it.
+static MODULE_VA_BASE_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Base of the module window in force.
+#[inline]
+pub fn module_va_base() -> u64 {
+    let v = MODULE_VA_BASE_LIVE.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        MODULE_VA_BASE
+    } else {
+        v
+    }
+}
+
+/// Choose this boot's module-window base, inside the reserved region.
+///
+/// Must run before [`reserve_kernel_slot`] and before the first module load:
+/// every accessor reads the chosen base, and a module already mapped at the
+/// default would be stranded. `bare_main` calls it at boot on the BSP, so no
+/// other CPU can observe the base changing.
+///
+/// 2 MiB granularity so the window stays huge-page aligned, matching the
+/// image slide. Falls back to the default when the region has no slack or
+/// entropy is unavailable, rather than pretending to randomize.
+pub fn randomize_window() {
+    const GRAN: u64 = 2 << 20;
+    if MODULE_VA_REGION <= MODULE_VA_USABLE {
+        return;
+    }
+    let slots = (MODULE_VA_REGION - MODULE_VA_USABLE) / GRAN + 1;
+    if slots <= 1 {
+        return;
+    }
+    let (r, src) = crate::kaslr::random_u64();
+    if src == crate::kaslr::EntropySource::TscMix && r == 0 {
+        return;
+    }
+    let base = MODULE_VA_BASE + (r % slots) * GRAN;
+    MODULE_VA_BASE_LIVE.store(base, core::sync::atomic::Ordering::Release);
+}
 
 /// Bytes of window handed out. 128 MiB is Linux arm64's module-region size and
 /// is far more than a NARF module set will use; the bound exists so the VA
@@ -475,7 +550,8 @@ pub fn is_module_va(addr: u64) -> bool {
     #[cfg(target_arch = "aarch64")]
     let addr =
         narf_arch::aarch64::mte::with_tag(addr, narf_arch::aarch64::mte::UNTAGGED_KERNEL_TAG);
-    (MODULE_VA_BASE..MODULE_VA_BASE + MODULE_VA_USABLE).contains(&addr)
+    let base = module_va_base();
+    (base..base + MODULE_VA_USABLE).contains(&addr)
 }
 
 // ── Root ───────────────────────────────────────────────────────────────
@@ -486,9 +562,13 @@ fn kernel_root() -> Result<PhysAddr, ModuleTextError> {
 }
 
 /// Top-level page-table slot the module window lives in.
+///
+/// No longer `const`: the base is chosen at boot. The slot it decodes to is
+/// the same for every choice within the region, but deriving it rather than
+/// asserting it keeps the two from drifting.
 #[inline]
-pub const fn kernel_top_slot() -> usize {
-    ((MODULE_VA_BASE >> 39) & 0x1FF) as usize
+pub fn kernel_top_slot() -> usize {
+    ((module_va_base() >> 39) & 0x1FF) as usize
 }
 
 /// Pre-populate the module window's top-level page-table entry in the live
@@ -603,7 +683,7 @@ pub fn alloc(pages: usize, domain: DomainId) -> Result<ModuleImage, ModuleTextEr
         .lock()
         .alloc_run(want)
         .ok_or(ModuleTextError::VaExhausted)?;
-    let base = MODULE_VA_BASE + (va_page as u64) * 4096;
+    let base = module_va_base() + (va_page as u64) * 4096;
 
     let mut mapped = 0usize;
     while mapped < pages {
@@ -873,9 +953,21 @@ const RET42: &[u8] = &[0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 /// windows. If someone moves `MODULE_VA_BASE`, this fails at boot instead of
 /// surfacing as "every module with a kernel call fails to relocate".
 fn smoke_module_text_window_placement() -> TestResult {
+    // The LIVE base, not the region base. `MODULE_VA_BASE` is where the region
+    // starts; the window is placed somewhere inside it at boot, and it is that
+    // address the veneers and the page-table walk actually use. Asserting the
+    // region base would pass while the chosen window sat somewhere illegal.
+    let win_base = module_va_base();
+    if win_base < MODULE_VA_BASE || win_base + MODULE_VA_USABLE > MODULE_VA_BASE + MODULE_VA_REGION
+    {
+        return TestResult::Fail("module window is outside its reserved region");
+    }
+    if win_base & ((2 << 20) - 1) != 0 {
+        return TestResult::Fail("module window base is not 2 MiB aligned");
+    }
     #[cfg(target_arch = "x86_64")]
     {
-        if (MODULE_VA_BASE >> 39) & 0x1FF != 511 || (MODULE_VA_BASE >> 30) & 0x1FF != 511 {
+        if (win_base >> 39) & 0x1FF != 511 || (win_base >> 30) & 0x1FF != 511 {
             return TestResult::Fail("module window is not at PML4[511] PDPT[511]");
         }
         // The kernel image is linked at -2 GiB. Both ends of the module window
@@ -884,8 +976,7 @@ fn smoke_module_text_window_placement() -> TestResult {
         // The shared constant, not a local copy: a file-local const with the
         // right name and a stale value agrees with itself and with the test,
         // which is how this class of bug survives review.
-        let far =
-            (MODULE_VA_BASE + MODULE_VA_USABLE) as i64 - crate::kaslr::KERNEL_LINK_BASE as i64;
+        let far = (win_base + MODULE_VA_USABLE) as i64 - crate::kaslr::KERNEL_LINK_BASE as i64;
         if far > i32::MAX as i64 {
             return TestResult::Fail("module window top is out of PC32 range of kernel text");
         }
@@ -903,14 +994,14 @@ fn smoke_module_text_window_placement() -> TestResult {
         // Checking "which L1 slots does boot.S write" instead of this is
         // what put the window on top of the image of physical 2-3 GiB, where
         // it corrupted the module image on a 2 GiB QEMU machine.
-        if MODULE_VA_BASE + MODULE_VA_USABLE > KERNEL_VIRT_BASE {
+        if win_base + MODULE_VA_USABLE > KERNEL_VIRT_BASE {
             return TestResult::Fail("module window overlaps the RAM linear map");
         }
-        if MODULE_VA_BASE >> 48 != 0xFFFF {
+        if win_base >> 48 != 0xFFFF {
             return TestResult::Fail("module window is not a TTBR1 address");
         }
-        let l1 = (MODULE_VA_BASE >> 30) & 0x1FF;
-        let end_l1 = ((MODULE_VA_BASE + MODULE_VA_USABLE - 1) >> 30) & 0x1FF;
+        let l1 = (win_base >> 30) & 0x1FF;
+        let end_l1 = ((win_base + MODULE_VA_USABLE - 1) >> 30) & 0x1FF;
         if end_l1 != l1 {
             return TestResult::Fail("module window straddles an L1 slot boundary");
         }
@@ -924,7 +1015,7 @@ fn smoke_module_text_window_placement() -> TestResult {
         // an unrelated window. `abs_diff` because the veneer only cares how
         // far the branch has to reach, and the image can sit either side.
         let text_base = crate::kaslr::kernel_virt_base();
-        let to_kernel = text_base.abs_diff(MODULE_VA_BASE);
+        let to_kernel = text_base.abs_diff(win_base);
         if to_kernel > (4u64 << 30) {
             return TestResult::Fail("module window is beyond ADRP reach of kernel text");
         }

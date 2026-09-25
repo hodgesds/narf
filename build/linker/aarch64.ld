@@ -33,12 +33,20 @@ KERNEL_VIRT_BASE = 0xFFFFFF8000000000;
  * VA and phys then share 2 MiB alignment. */
 KIMAGE_VOFFSET = 0xFFFFFF7F80000000;
 
-/* Mirror of `memory::module_text::MODULE_VA_BASE`. Only used to bound the
- * KASLR slide below: the image must not slide into the module window that
- * shares this L1 slot. Kept in step with the Rust constant by
- * `smoke_module_text_window_placement`, which checks the window's own
- * placement, and by the ASSERT at the end of this file. */
-MODULE_VA_BASE_LD = 0xFFFFFF7FF8000000;
+/* Start of the region reserved for the module window — the mirror of
+ * `memory::module_text::MODULE_VA_BASE`, which is the region base, not the
+ * window's live address.
+ *
+ * The window is 128 MiB and the region is 384 MiB, so the window's base is
+ * drawn from the remaining 256 MiB (128 positions at 2 MiB). It is the region,
+ * not the window, that bounds the image's slide: the image must not slide into
+ * any address the window might later occupy.
+ *
+ * Taking 384 MiB costs the image nothing. The slide mask is quantised to
+ * `2^k - 2 MiB`, and the remaining slack (569 MiB) still admits the same
+ * 510 MiB mask the full slot did — only at 512 MiB would the region force the
+ * mask down to 254 MiB. */
+MODULE_VA_BASE_LD = 0xFFFFFF7FE8000000;
 
 /* Bytes reserved in-image for the KASLR relocation table. `xtask` fills it
  * after the link; the header magic is what the apply pass keys on, so an
