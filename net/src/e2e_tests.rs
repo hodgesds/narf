@@ -2497,6 +2497,69 @@ kernel_test_in!(
     smoke_ipv4_redirect_offlink_suppressed_and_rate_limited
 );
 
+// ── Off-link output resolves the gateway, not the destination ──────────────
+//
+// Linux `ip_neigh_for_gw()` (include/net/route.h) resolves the route's gateway
+// when the route has one and the destination only when it does not. UDP, ICMP
+// and TCP each picked their own address instead: UDP and ICMP always took the
+// destination, TCP always took `iface.gateway`. Taking the destination is
+// correct exactly when it is on-link — which every other smoke's destination
+// is, so the whole class was invisible.
+//
+// This case is deliberately off-link: the frame must carry the GATEWAY's MAC.
+// Before the fix the stack ARPs 203.0.113.5 on a link that cannot answer for
+// it and `udp_send` fails `NetworkUnreachable`.
+
+fn smoke_udp_offlink_resolves_gateway_mac() -> TestResult {
+    const OL_IFACE: &str = "e2e-ol1";
+    const OL_LOCAL: [u8; 4] = [10, 0, 9, 15];
+    const OL_GW: [u8; 4] = [10, 0, 9, 2];
+    const OL_FAR: [u8; 4] = [203, 0, 113, 5];
+    const GW_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x21];
+    const SRC_PORT: u16 = 56099;
+    const DST_PORT: u16 = 16099;
+
+    full_reset(OL_IFACE, OL_LOCAL, OL_GW);
+    // A default route through the gateway, on this interface.
+    iface::set_gateway(OL_IFACE, OL_GW);
+    // The gateway is resolvable; the far host deliberately is NOT, so an
+    // attempt to ARP the destination cannot succeed against a stale entry.
+    crate::tcp_stack::__arp_insert_legacy(OL_GW, GW_MAC);
+    arp_cache::insert(OL_IFACE, OL_GW, GW_MAC);
+
+    let sock = match crate::udp_sock::udp_bind(
+        SocketAddrV4::new(OL_LOCAL, SRC_PORT),
+        crate::udp_sock::UdpOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("udp_bind failed"),
+    };
+    drain_captured();
+    let payload = b"offlink";
+    let sent = crate::udp_sock::udp_send(&sock, payload, Some(SocketAddrV4::new(OL_FAR, DST_PORT)));
+    let frames = drain_captured();
+    crate::udp_sock::udp_close(&sock);
+
+    if sent.is_err() {
+        return TestResult::Fail(
+            "udp_send to an off-link destination failed to resolve a next hop",
+        );
+    }
+    let frame = match frames.first() {
+        Some(f) => f,
+        None => return TestResult::Fail("no frame emitted for an off-link destination"),
+    };
+    if frame[0..6] != GW_MAC {
+        return TestResult::Fail("off-link frame was not addressed to the gateway's MAC");
+    }
+    // The IP destination must still be the far host — only the L2 hop changes.
+    if frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20] != OL_FAR {
+        return TestResult::Fail("off-link frame does not carry the far host as IP destination");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_udp_offlink_resolves_gateway_mac);
+
 // ── net.ipv4.tcp_{window_scaling,timestamps,sack} ───────────────────────────
 //
 // The three option knobs were stored in a crate the TCP code cannot see, so

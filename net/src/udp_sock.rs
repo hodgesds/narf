@@ -413,7 +413,18 @@ fn udp_send_inner(
         // dropped rather than held. That IS a divergence, and a smaller one
         // than stalling the caller: the ARP request still goes out, so the
         // next datagram resolves.
-        crate::tcp_stack::arp_resolve_in(net_ns_id, dst_ip, arp_timeout_ms)
+        // Resolve the route's NEXT HOP, not the destination. Linux's
+        // `ip_neigh_for_gw()` (include/net/route.h) uses the route's gateway
+        // when it has one and the destination only when it does not, which is
+        // `rt_nexthop()`. ARPing an off-link destination asks the local link
+        // about a host that is not on it, so it can never resolve and every
+        // off-link datagram failed `NetworkUnreachable`. Correct for an
+        // on-link peer, where the next hop IS the destination, which is why
+        // every existing smoke passed.
+        let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip))
+            .map(|r| r.nexthop.0)
+            .unwrap_or(dst_ip);
+        crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, arp_timeout_ms)
             .map_err(|_| UdpError::NetworkUnreachable)?
     };
 
