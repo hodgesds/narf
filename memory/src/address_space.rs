@@ -766,11 +766,13 @@ struct RegionTable {
     /// Kept under the same lock as `Region::phys` so the two authorities can
     /// never disagree at a visible transaction boundary.
     swap_pages: BTreeMap<u64, SwapPageState>,
-    /// Lazily-maintained `mm->total_vm` equivalent. Structural and mutable
-    /// region access invalidates it; read-mostly admission paths recompute at
-    /// most once between VMA mutations instead of walking a fragmented stack
-    /// twice for every fault.
-    mapped_bytes_cache: Cell<Option<u64>>,
+    /// Maintained Linux mm-counters (total_vm/locked_vm/data_vm/RSS). See
+    /// [`RegionAcct`] for the maintenance contract. Replaces the former lazy
+    /// `mapped_bytes_cache`: the cache was invalidated by every mutation, so
+    /// a mutate-then-read pattern (the stress-ng --mlock loop, one mmap+mlock
+    /// then one /proc status read per bogo op) recomputed an O(regions) walk
+    /// per op — quadratic as the table grew.
+    acct: RegionAcct,
     /// Cumulative bytes in the exact-adjacent stack chain at `base`.
     /// Automatic growth moves the chain base monotonically downward and can
     /// update this in O(1); any other VMA mutation invalidates it.
@@ -792,6 +794,102 @@ struct RegionTable {
 struct RegionEntry {
     region: Region,
     mapping_id: u64,
+}
+
+/// Maintained Linux mm-counter equivalents (`mm->total_vm`, `locked_vm`,
+/// `data_vm`, and the RSS counter). Every region insert/remove and every
+/// in-place mutation of a region's `len`, `perms`, or backing adjusts these,
+/// so `/proc` status/stat/statm renders and RLIMIT admission checks are O(1)
+/// instead of a full table walk. stress-ng --mlock reads /proc/self/status
+/// after every mlock while growing the table by ~4 regions per op — the walk
+/// made that quadratic (measured 103→768 µs/op over 8k ops; Linux is flat).
+///
+/// Maintenance contract: regions enter and leave the table ONLY through
+/// `insert_reserved`/`push_sorted_reserved`/`remove` (splits and punches
+/// detach, mutate, reinsert — automatic). The residual in-place mutation
+/// sites (brk tail growth, mremap in-place resize, anonymous coalescing,
+/// mlockall/munlockall sweeps, whole-region perms changes, and the
+/// 0↔frame backing-slot writes) each apply their own delta; the
+/// kernel-test recount assert (`debug_recount_acct`) pins the invariant.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct RegionAcct {
+    /// Sum of every region's `len` (Linux `mm->total_vm`, in bytes).
+    mapped_bytes: u64,
+    /// Bytes in synthetic STACK_GUARD entries — excluded from
+    /// `accounted_mapped_bytes` (Linux's guard gap is not a VMA).
+    guard_bytes: u64,
+    /// Bytes in LOCKED regions, excluding LOCK_EXEMPT/STACK_GUARD
+    /// (Linux `mm->locked_vm`, in bytes).
+    locked_bytes: u64,
+    /// Bytes in writable, non-executable regions (Linux `mm->data_vm`).
+    wnx_bytes: u64,
+    /// Count of nonzero backing slots (Linux RSS).
+    resident_pages: u64,
+}
+
+/// Nonzero backing slots in a phys list — a region's resident-page count.
+#[inline]
+fn resident_count(phys: &[PhysAddr]) -> u64 {
+    phys.iter().filter(|phys| phys.raw() != 0).count() as u64
+}
+
+impl RegionAcct {
+    #[inline]
+    fn locked_accountable(perms: RegionPerms) -> bool {
+        perms.contains(RegionPerms::LOCKED)
+            && !perms.contains(RegionPerms::LOCK_EXEMPT)
+            && !perms.contains(RegionPerms::STACK_GUARD)
+    }
+
+    #[inline]
+    fn wnx_accountable(perms: RegionPerms) -> bool {
+        perms.contains(RegionPerms::WRITE) && !perms.contains(RegionPerms::EXEC)
+    }
+
+    /// Add the len/perms-derived contribution (everything except resident).
+    #[inline]
+    fn add_flat(&mut self, perms: RegionPerms, len: u64) {
+        self.mapped_bytes = self.mapped_bytes.saturating_add(len);
+        if perms.contains(RegionPerms::STACK_GUARD) {
+            self.guard_bytes = self.guard_bytes.saturating_add(len);
+        }
+        if Self::locked_accountable(perms) {
+            self.locked_bytes = self.locked_bytes.saturating_add(len);
+        }
+        if Self::wnx_accountable(perms) {
+            self.wnx_bytes = self.wnx_bytes.saturating_add(len);
+        }
+    }
+
+    #[inline]
+    fn sub_flat(&mut self, perms: RegionPerms, len: u64) {
+        self.mapped_bytes = self.mapped_bytes.saturating_sub(len);
+        if perms.contains(RegionPerms::STACK_GUARD) {
+            self.guard_bytes = self.guard_bytes.saturating_sub(len);
+        }
+        if Self::locked_accountable(perms) {
+            self.locked_bytes = self.locked_bytes.saturating_sub(len);
+        }
+        if Self::wnx_accountable(perms) {
+            self.wnx_bytes = self.wnx_bytes.saturating_sub(len);
+        }
+    }
+
+    #[inline]
+    fn add_region(&mut self, region: &Region) {
+        self.add_flat(region.perms, region.len);
+        self.resident_pages = self
+            .resident_pages
+            .saturating_add(resident_count(&region.phys));
+    }
+
+    #[inline]
+    fn sub_region(&mut self, region: &Region) {
+        self.sub_flat(region.perms, region.len);
+        self.resident_pages = self
+            .resident_pages
+            .saturating_sub(resident_count(&region.phys));
+    }
 }
 
 impl Default for RegionTable {
@@ -820,7 +918,7 @@ impl RegionTable {
             demand_pages: DemandClaims::try_new()?,
             cow_pages: BTreeMap::new(),
             swap_pages: BTreeMap::new(),
-            mapped_bytes_cache: Cell::new(Some(0)),
+            acct: RegionAcct::default(),
             stack_chain_cache: Cell::new(None),
             #[cfg(target_arch = "x86_64")]
             anon_reclaim_cursor: Cell::new(0),
@@ -833,8 +931,19 @@ impl RegionTable {
 
     #[inline]
     fn invalidate_region_caches(&self) {
-        self.mapped_bytes_cache.set(None);
         self.stack_chain_cache.set(None);
+    }
+
+    /// Test invariant: recompute [`RegionAcct`] from a full walk. Any
+    /// divergence from the maintained counters means an in-place mutation
+    /// site is missing its accounting delta.
+    #[allow(dead_code)]
+    fn debug_recount_acct(&self) -> RegionAcct {
+        let mut acct = RegionAcct::default();
+        for region in self.iter() {
+            acct.add_region(region);
+        }
+        acct
     }
 
     #[inline]
@@ -994,13 +1103,15 @@ impl RegionTable {
 
     fn insert_reserved(&mut self, region: Region) -> Option<Region> {
         self.invalidate_region_caches();
+        self.acct.add_region(&region);
         let base = region.base.as_u64();
         let id = self.next_mapping_id;
         self.next_mapping_id = self
             .next_mapping_id
             .checked_add(1)
             .expect("VMA publication generation exhausted");
-        self.by_base
+        let replaced = self
+            .by_base
             .insert_reserved(
                 base,
                 RegionEntry {
@@ -1008,11 +1119,16 @@ impl RegionTable {
                     mapping_id: id,
                 },
             )
-            .map(|entry| entry.region)
+            .map(|entry| entry.region);
+        if let Some(replaced) = &replaced {
+            self.acct.sub_region(replaced);
+        }
+        replaced
     }
 
     fn push_sorted_reserved(&mut self, region: Region) {
         self.invalidate_region_caches();
+        self.acct.add_region(&region);
         let base = region.base.as_u64();
         let id = self.next_mapping_id;
         self.next_mapping_id = self
@@ -1036,6 +1152,7 @@ impl RegionTable {
     fn remove(&mut self, base: u64) -> Option<Region> {
         self.invalidate_region_caches();
         let region = self.by_base.remove(base)?.region;
+        self.acct.sub_region(&region);
         let end = region.base.as_u64().saturating_add(region.len);
         self.demand_pages.retain_outside(region.base.as_u64(), end);
         self.cow_pages
@@ -1203,6 +1320,17 @@ impl RegionTable {
             self.remove(successor_base)
                 .expect("anonymous merge successor disappeared")
         });
+        // The sources' contributions were subtracted when `remove` detached
+        // them; absorbing transfers their length and backing into the
+        // (in-table) destination, so re-add them here. The merge-compatibility
+        // gate guarantees identical accountable perms (COW aside, which does
+        // not affect any counter).
+        if let Some(source) = current.as_ref() {
+            self.acct.add_region(source);
+        }
+        if let Some(source) = successor.as_ref() {
+            self.acct.add_region(source);
+        }
         let destination = self
             .get_mut(destination_base)
             .expect("anonymous merge destination disappeared after source removal");
@@ -1349,13 +1477,7 @@ impl RegionTable {
     }
 
     fn locked_bytes(&self) -> u64 {
-        self.iter()
-            .filter(|region| {
-                region.perms.contains(RegionPerms::LOCKED)
-                    && !region.perms.contains(RegionPerms::LOCK_EXEMPT)
-                    && !region.perms.contains(RegionPerms::STACK_GUARD)
-            })
-            .fold(0, |total, region| total.saturating_add(region.len))
+        self.acct.locked_bytes
     }
 
     fn locked_overlap_bytes(&self, lo: u64, hi: u64) -> u64 {
@@ -1374,14 +1496,7 @@ impl RegionTable {
     }
 
     fn mapped_bytes(&self) -> u64 {
-        if let Some(bytes) = self.mapped_bytes_cache.get() {
-            return bytes;
-        }
-        let bytes = self
-            .iter()
-            .fold(0u64, |total, region| total.saturating_add(region.len));
-        self.mapped_bytes_cache.set(Some(bytes));
-        bytes
+        self.acct.mapped_bytes
     }
 
     /// Bytes represented by Linux-style VMAs for resource-limit accounting.
@@ -1392,9 +1507,9 @@ impl RegionTable {
     /// `mlockall(MCL_CURRENT)`. Keep the raw `mapped_bytes` statistic intact,
     /// but exclude that internal sentinel at admission boundaries.
     fn accounted_mapped_bytes(&self) -> u64 {
-        self.iter()
-            .filter(|region| !region.perms.contains(RegionPerms::STACK_GUARD))
-            .fold(0, |total, region| total.saturating_add(region.len))
+        self.acct
+            .mapped_bytes
+            .saturating_sub(self.acct.guard_bytes)
     }
 
     /// Linux `data_vm`: private writable mappings which are not stacks.
@@ -1499,6 +1614,8 @@ pub struct AddressSpaceMemoryStats {
     pub mapped_bytes: u64,
     pub resident_pages: u64,
     pub writable_nonexec_bytes: u64,
+    /// Linux `mm->locked_vm` equivalent — feeds `/proc/<pid>/status` VmLck.
+    pub locked_bytes: u64,
 }
 
 const MAX_NUMA_HINTS: usize = 64;
@@ -1761,7 +1878,9 @@ pub struct AddressSpace {
 // value small enough that nested syscall/fork frames cannot silently consume
 // a material fraction of the 32 KiB kernel-task stack again. Large bounded
 // tables belong behind preallocated stable storage, not inline here.
-const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1024);
+// (1056: the maintained mm-counters [`RegionAcct`] added 40 inline bytes,
+// net +24 after the retired mapped_bytes_cache Cell.)
+const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1056);
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -2661,6 +2780,10 @@ impl AddressSpace {
             // Extend the length only; phys stays at its faulted prefix and
             // grows lazily on fault (see the demand-paged insert below).
             heap_tail.len += add_len;
+            // In-place growth bypasses the insert/remove accounting
+            // primitives; the tail's perms are exactly `tail_perms` (the
+            // extend_in_place gate requires it).
+            regions.acct.add_flat(tail_perms, add_len);
         } else {
             // Demand-paged: publish the tail with an EMPTY phys list. Each
             // page materializes its slot on first fault (finish_demand_page),
@@ -4189,6 +4312,12 @@ impl AddressSpace {
             .checked_add(new_len - selected_old_len)
             .ok_or(AddressSpaceError::OutOfRange)?;
         let (rb, rl) = (region_base, region.len);
+        let region_perms = region.perms;
+        // In-place growth bypasses the insert/remove accounting primitives
+        // (appended backing slots are zero, so only the flat part moves).
+        regions
+            .acct
+            .add_flat(region_perms, rl.saturating_sub(region_len));
         drop(regions);
         drop(huge);
         // Keep the mmap-allocation cursor past the grown region, exactly as
@@ -5145,8 +5274,23 @@ impl AddressSpace {
             let source = regions
                 .get_mut(source_region_base)
                 .expect("shared relocation source disappeared under region lock");
+            let acct_perms = source.perms;
+            let acct_old_len = source.len;
+            let acct_old_resident = resident_count(&source.phys);
             source.len = old_lo - source_region_base;
             source.phys = head_phys;
+            let acct_new_len = source.len;
+            let acct_new_resident = resident_count(&source.phys);
+            // In-place truncation bypasses the insert/remove accounting
+            // primitives: the tail's length and its (relocated or released)
+            // backing leave this region here.
+            regions.acct.sub_flat(acct_perms, acct_old_len);
+            regions.acct.add_flat(acct_perms, acct_new_len);
+            regions.acct.resident_pages = regions
+                .acct
+                .resident_pages
+                .saturating_sub(acct_old_resident)
+                .saturating_add(acct_new_resident);
             regions.invalidate_mapping(source_region_base);
         }
         drop(regions);
@@ -5433,6 +5577,14 @@ impl AddressSpace {
             .get_mut(old_lo)
             .expect("DONTUNMAP source disappeared under region lock");
         let moved_phys = core::mem::replace(&mut source.phys, lazy_source);
+        // The moved backing leaves the (in-table) source in place — an
+        // in-place mutation the insert/remove accounting primitives can't
+        // see. The destination's own insert re-adds it.
+        let acct_moved_resident = resident_count(&moved_phys);
+        regions.acct.resident_pages = regions
+            .acct
+            .resident_pages
+            .saturating_sub(acct_moved_resident);
         let mut moved = Region {
             base: new_base,
             len,
@@ -5450,6 +5602,10 @@ impl AddressSpace {
                     .get_mut(old_lo)
                     .expect("DONTUNMAP rollback source disappeared")
                     .phys = core::mem::take(&mut moved.phys);
+                regions.acct.resident_pages = regions
+                    .acct
+                    .resident_pages
+                    .saturating_add(acct_moved_resident);
                 drop(regions);
                 drop(huge);
                 // x86 leaf removal above is deliberately local so normal
@@ -7876,6 +8032,9 @@ impl AddressSpace {
             return Err(error);
         }
         *slot = phys;
+        // Demand fill: one more resident page (the slot was verified zero
+        // above; in-place backing writes bypass the insert/remove accounting).
+        regions.acct.resident_pages = regions.acct.resident_pages.saturating_add(1);
         // Publication, reverse-map ownership, and ticket retirement are one
         // region-lock transaction. An overlapping unmap cannot free `phys`
         // between the leaf install and rmap registration.
@@ -8143,6 +8302,10 @@ impl AddressSpace {
                             assert_eq!(region.phys[index], *phys);
                             region.phys[index] = PhysAddr::new(0);
                         }
+                        // Swapped out: one fewer resident page (in-place
+                        // backing write, invisible to the insert/remove
+                        // accounting primitives).
+                        table.acct.resident_pages = table.acct.resident_pages.saturating_sub(1);
                         // Evicted to swap → no longer resident here; drop its rmap.
                         crate::rmap::remove(*phys, self.root, VirtAddr::new(va));
                         table.swap_pages.insert(va, SwapPageState::Swapped);
@@ -8323,6 +8486,10 @@ impl AddressSpace {
                         assert_eq!(region.phys[index], PhysAddr::new(0));
                         region.phys[index] = *phys;
                     }
+                    // Swapped back in: one more resident page (in-place
+                    // backing write, invisible to the insert/remove
+                    // accounting primitives).
+                    table.acct.resident_pages = table.acct.resident_pages.saturating_add(1);
                     // Faulted back in and resident again → re-record its rmap.
                     crate::rmap::add(*phys, self.root, VirtAddr::new(va));
                     table.swap_pages.remove(&va);
@@ -8812,15 +8979,14 @@ impl AddressSpace {
             })
             .is_none());
         assert!(regions.insert_reserved(guard).is_none());
-        // Both insertions invalidated the conservative caches. The new stack
-        // chain is exactly the admitted old chain plus this interval; publish
-        // that identity while the VMA transaction still excludes mutation.
+        // Both insertions invalidated the stack-chain cache. The new chain is
+        // exactly the admitted old chain plus this interval; publish that
+        // identity while the VMA transaction still excludes mutation. (The
+        // mm-counters need no help — the guard remove/reinsert and the grown
+        // region's insert maintained them.)
         regions
             .stack_chain_cache
             .set(Some((plan.new_guard_base + 0x1000, plan.total_stack_bytes)));
-        regions
-            .mapped_bytes_cache
-            .set(Some(plan.total_mapped_bytes));
         drop(regions);
         drop(huge);
         drop(_vma_guard);
@@ -9075,15 +9241,31 @@ impl AddressSpace {
             regions.future_lock = future;
             if let Some(mode) = current {
                 let bits = mode.region_bits().0;
+                // In-place lock-bit sweep bypasses the insert/remove
+                // accounting primitives — accumulate the locked_vm delta
+                // (only lock bits change; the other counters are untouched).
+                let mut locked_add = 0u64;
+                let mut locked_sub = 0u64;
                 regions.for_each_mut(|region| {
                     if region.perms.contains(RegionPerms::STACK_GUARD)
                         || region.perms.contains(RegionPerms::LOCK_EXEMPT)
                     {
                         return;
                     }
+                    let was = region.perms.contains(RegionPerms::LOCKED);
                     region.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
                     region.perms.0 |= bits;
+                    match (was, region.perms.contains(RegionPerms::LOCKED)) {
+                        (false, true) => locked_add = locked_add.saturating_add(region.len),
+                        (true, false) => locked_sub = locked_sub.saturating_add(region.len),
+                        _ => {}
+                    }
                 });
+                regions.acct.locked_bytes = regions
+                    .acct
+                    .locked_bytes
+                    .saturating_add(locked_add)
+                    .saturating_sub(locked_sub);
             }
             drop(regions);
             drop(huge);
@@ -9104,6 +9286,9 @@ impl AddressSpace {
         regions.for_each_mut(|region| {
             region.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
         });
+        // Every LOCKED bit is now clear, so locked_vm is exactly zero
+        // (guard/exempt regions never carry accountable lock bytes).
+        regions.acct.locked_bytes = 0;
         Ok(())
     }
 
@@ -9339,15 +9524,41 @@ impl AddressSpace {
             return Err(AddressSpaceError::NotImplemented);
         }
         let mut hits = Vec::new();
+        // Wholesale in-place perms replacement bypasses the insert/remove
+        // accounting primitives — replay each hit's flat contribution.
+        let mut acct_delta = RegionAcct::default();
+        let mut acct_sub = RegionAcct::default();
         g.for_each_overlapping_mut(lo, hi, |r| {
             let rb = r.base.as_u64();
             let re = rb.saturating_add(r.len);
             if rb >= hi || re <= lo {
                 return;
             }
+            acct_sub.add_flat(r.perms, r.len);
             r.perms = new_perms;
+            acct_delta.add_flat(r.perms, r.len);
             hits.push(r.clone());
         });
+        g.acct.mapped_bytes = g
+            .acct
+            .mapped_bytes
+            .saturating_add(acct_delta.mapped_bytes)
+            .saturating_sub(acct_sub.mapped_bytes);
+        g.acct.guard_bytes = g
+            .acct
+            .guard_bytes
+            .saturating_add(acct_delta.guard_bytes)
+            .saturating_sub(acct_sub.guard_bytes);
+        g.acct.locked_bytes = g
+            .acct
+            .locked_bytes
+            .saturating_add(acct_delta.locked_bytes)
+            .saturating_sub(acct_sub.locked_bytes);
+        g.acct.wnx_bytes = g
+            .acct
+            .wnx_bytes
+            .saturating_add(acct_delta.wnx_bytes)
+            .saturating_sub(acct_sub.wnx_bytes);
         if hits.is_empty() {
             return Err(AddressSpaceError::Unmapped);
         }
@@ -9884,6 +10095,13 @@ impl AddressSpace {
                     r.phys[i] = PhysAddr::new(0);
                 }
             });
+            // Every frame queued for release above left a backing slot in
+            // this table (in-place writes, invisible to the insert/remove
+            // accounting primitives).
+            g.acct.resident_pages = g
+                .acct
+                .resident_pages
+                .saturating_sub(to_release.len() as u64);
         }
         if !touched {
             return Err(AddressSpaceError::Unmapped);
@@ -10067,6 +10285,10 @@ impl AddressSpace {
                 }
                 budget = budget.saturating_sub(taken.len());
             });
+            // Every discarded lazyfree page zeroed a backing slot above
+            // (in-place writes, invisible to the insert/remove accounting
+            // primitives).
+            g.acct.resident_pages = g.acct.resident_pages.saturating_sub(freed.len() as u64);
         }
         if freed.is_empty() {
             return 0;
@@ -10440,19 +10662,18 @@ impl AddressSpace {
             }
         }
         {
+            // Base-page regions come from the maintained mm-counters — O(1),
+            // not a table walk. /proc status/stat/statm reads hit this on
+            // every render (stress-ng --mlock does one per bogo op).
             let regions = self.regions.lock();
-            for region in regions.iter() {
-                stats.mapped_bytes = stats.mapped_bytes.saturating_add(region.len);
-                stats.resident_pages = stats.resident_pages.saturating_add(
-                    region.phys.iter().filter(|phys| phys.as_u64() != 0).count() as u64,
-                );
-                if region.perms.contains(RegionPerms::WRITE)
-                    && !region.perms.contains(RegionPerms::EXEC)
-                {
-                    stats.writable_nonexec_bytes =
-                        stats.writable_nonexec_bytes.saturating_add(region.len);
-                }
-            }
+            stats.mapped_bytes = stats.mapped_bytes.saturating_add(regions.acct.mapped_bytes);
+            stats.resident_pages = stats
+                .resident_pages
+                .saturating_add(regions.acct.resident_pages);
+            stats.writable_nonexec_bytes = stats
+                .writable_nonexec_bytes
+                .saturating_add(regions.acct.wnx_bytes);
+            stats.locked_bytes = stats.locked_bytes.saturating_add(regions.acct.locked_bytes);
         }
         stats
     }
@@ -12633,14 +12854,16 @@ fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
     }
 }
 
-/// VMA accounting caches are exact across inserts, topology/permission
-/// mutation, backing-only publication, and removal. This is the correctness
-/// boundary that lets repeated stack growth avoid rescanning an ever-longer
-/// fragment chain without trusting stale RLIMIT accounting.
+/// The maintained mm-counters ([`RegionAcct`]) are exact across inserts,
+/// detach-mutate-reinsert topology changes, permission rewrites, backing-slot
+/// publication, and removal — verified against a full-walk recount at every
+/// step. This is the correctness boundary that lets /proc renders and RLIMIT
+/// admission read O(1) counters instead of walking a fragmented table.
 fn smoke_memory_region_accounting_caches_track_mutation() -> TestResult {
     let mut table = RegionTable::new();
     let base = 0x0000_0080_1000_0000u64;
     let stack_perms = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT;
+    let consistent = |table: &RegionTable| table.debug_recount_acct() == table.acct;
     assert!(table
         .insert(Region {
             base: VirtAddr::new(base),
@@ -12651,21 +12874,37 @@ fn smoke_memory_region_accounting_caches_track_mutation() -> TestResult {
         .expect("cache test RegionIndex reservation")
         .is_none());
     if table.mapped_bytes() != 0x1000 || table.contiguous_stack_bytes_from(base) != 0x1000 {
-        return TestResult::Fail("initial VMA accounting cache is wrong");
+        return TestResult::Fail("initial VMA accounting is wrong");
+    }
+    if table.acct.resident_pages != 0 || !consistent(&table) {
+        return TestResult::Fail("lazy insert accounted resident pages");
     }
 
+    // Backing-slot publication (the demand-fault shape): the flat counters
+    // and the stack chain are untouched; resident accounting is the fault
+    // path's job (`finish_demand_page` — exercised at the AddressSpace layer).
     table
         .containing_backing_mut(base)
         .expect("cache test backing region")
         .phys[0] = PhysAddr::new(0x4000);
-    if table.mapped_bytes_cache.get() != Some(0x1000)
-        || table.stack_chain_cache.get() != Some((base, 0x1000))
-    {
-        return TestResult::Fail("backing-only mutation invalidated topology accounting");
+    table.acct.resident_pages += 1; // what finish_demand_page does
+    if table.stack_chain_cache.get() != Some((base, 0x1000)) || !consistent(&table) {
+        return TestResult::Fail("backing-only mutation broke topology accounting");
     }
 
-    table.get_mut(base).expect("cache test stack region").len = 0x2000;
-    if table.mapped_bytes() != 0x2000 || table.contiguous_stack_bytes_from(base) != 0x2000 {
+    // Topology mutation follows the detach-mutate-reinsert contract; the
+    // primitives carry the counters.
+    let mut grown = table.remove(base).expect("cache test stack region");
+    grown.len = 0x2000;
+    assert!(table
+        .insert(grown)
+        .expect("cache test regrow reservation")
+        .is_none());
+    if table.mapped_bytes() != 0x2000
+        || table.contiguous_stack_bytes_from(base) != 0x2000
+        || table.acct.resident_pages != 1
+        || !consistent(&table)
+    {
         return TestResult::Fail("VMA length mutation retained stale accounting");
     }
     assert!(table
@@ -12680,16 +12919,24 @@ fn smoke_memory_region_accounting_caches_track_mutation() -> TestResult {
     if table.mapped_bytes() != 0x3000 || table.contiguous_stack_bytes_from(base) != 0x3000 {
         return TestResult::Fail("VMA insertion retained stale accounting");
     }
+    if table.acct.wnx_bytes != 0x3000 || !consistent(&table) {
+        return TestResult::Fail("writable-nonexec accounting is wrong after inserts");
+    }
 
-    table
-        .get_mut(base + 0x2000)
-        .expect("cache test successor")
-        .perms = RegionPerms::READ;
+    let mut successor = table.remove(base + 0x2000).expect("cache test successor");
+    successor.perms = RegionPerms::READ;
+    assert!(table
+        .insert(successor)
+        .expect("cache test reperm reservation")
+        .is_none());
     if table.contiguous_stack_bytes_from(base) != 0x2000 {
         return TestResult::Fail("permission mutation retained a stale stack chain");
     }
+    if table.acct.wnx_bytes != 0x2000 || !consistent(&table) {
+        return TestResult::Fail("permission mutation retained stale wnx accounting");
+    }
     let _ = table.remove(base + 0x2000);
-    if table.mapped_bytes() == 0x2000 {
+    if table.mapped_bytes() == 0x2000 && consistent(&table) {
         TestResult::Pass
     } else {
         TestResult::Fail("VMA removal retained stale mapped-byte accounting")
@@ -12699,6 +12946,69 @@ kernel_test_in!(
     "memory",
     smoke_memory_region_accounting_caches_track_mutation
 );
+
+/// LOCKED-flag accounting: `locked_bytes` tracks `set_region_flag_range`
+/// splits (drain + reinsert) and the in-place mlockall/munlockall sweeps,
+/// verified against a full recount.
+fn smoke_memory_region_locked_bytes_accounting() -> TestResult {
+    let space = AddressSpace::empty();
+    let base = 0x0000_0080_2000_0000u64;
+    // Three pages, all lazy — the mlock metadata paths don't need backing.
+    if space
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 0x3000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE,
+            phys: alloc::vec![PhysAddr::new(0); 3],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("mapping the lock test region failed");
+    }
+    // Lock the middle page: the split must move exactly one page into
+    // locked_vm.
+    if space
+        .mlock_range_onfault(VirtAddr::new(base + 0x1000), 0x1000)
+        .is_err()
+    {
+        return TestResult::Fail("mlock_range_onfault failed");
+    }
+    {
+        let regions = space.regions.lock();
+        if regions.locked_bytes() != 0x1000 || regions.debug_recount_acct() != regions.acct {
+            return TestResult::Fail("mlock split miscounted locked_vm");
+        }
+    }
+    if space.memory_stats().locked_bytes != 0x1000 {
+        return TestResult::Fail("memory_stats does not surface locked_vm");
+    }
+    if space.munlock_range(VirtAddr::new(base), 0x3000).is_err() {
+        return TestResult::Fail("munlock_range failed");
+    }
+    {
+        let regions = space.regions.lock();
+        if regions.locked_bytes() != 0 || regions.debug_recount_acct() != regions.acct {
+            return TestResult::Fail("munlock retained stale locked_vm");
+        }
+    }
+    // munlock_all's whole-table sweep resets the counter exactly.
+    if space
+        .mlock_range_onfault(VirtAddr::new(base), 0x3000)
+        .is_err()
+    {
+        return TestResult::Fail("re-lock for munlock_all failed");
+    }
+    if space.munlock_all().is_err() {
+        return TestResult::Fail("munlock_all failed");
+    }
+    let regions = space.regions.lock();
+    if regions.locked_bytes() == 0 && regions.debug_recount_acct() == regions.acct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("munlock_all retained stale locked_vm")
+    }
+}
+kernel_test_in!("memory", smoke_memory_region_locked_bytes_accounting);
 
 fn smoke_memory_numa_candidate_seeks_from_cursor() -> TestResult {
     let mut table = RegionTable::new();
