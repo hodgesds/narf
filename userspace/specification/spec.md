@@ -1083,6 +1083,43 @@ reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
 
+AF_INET `SOCK_DGRAM` (UDP) follows Linux v6.12 `net/ipv4/{af_inet,udp,
+datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
+- `bind` requires a 16-byte `sockaddr_in` (`EINVAL`), `AF_INET` or
+  `AF_UNSPEC`+`INADDR_ANY` (`EAFNOSUPPORT`), and a local, broadcast,
+  multicast or wildcard address (`EADDRNOTAVAIL`); a second bind is `EINVAL`.
+  Port 0 allocates an ephemeral port. Bindings conflict (`EADDRINUSE`) when
+  their addresses overlap (`INADDR_ANY` overlaps everything) and their
+  devices are compatible, unless both set `SO_REUSEADDR`, or both set
+  `SO_REUSEPORT` with one uid.
+- `connect` and `sendto` autobind an unbound socket (exhaustion is `EAGAIN`).
+  `connect` fixes an unbound local address to the route's source and makes
+  the socket receive only from its peer; datagrams already queued stay
+  queued. `connect(AF_UNSPEC)` disconnects, releasing an autobound port and a
+  route-chosen address and clearing `SO_BINDTODEVICE`.
+- `sendto` errors, in order: `EMSGSIZE` (`len > 0xFFFF`), `EOPNOTSUPP`
+  (`MSG_OOB`), `EINVAL` (short address or port 0), `EAFNOSUPPORT`,
+  `EDESTADDRREQ` (no destination, unconnected), `ENETUNREACH`, `EACCES`
+  (broadcast without `SO_BROADCAST`), `EMSGSIZE` (payload > 65507), a pending
+  socket error, `EPIPE` after `SHUT_WR` (no `SIGPIPE`). A broadcast is also
+  delivered to every matching local listener.
+- Receive-side socket selection is `__udp4_lib_lookup`: exact-address sockets
+  before wildcard ones, connected sockets only for their peer and outranking
+  unconnected ones, device-bound sockets only for their device, ties to the
+  newest binding, `SO_REUSEPORT` groups split by flow. A full `SO_RCVBUF`
+  drops the arriving datagram.
+- `recv` supports `MSG_PEEK`, `MSG_TRUNC` (and sets it in `msg_flags`), and
+  `MSG_DONTWAIT`; `MSG_ERRQUEUE` returns `EAGAIN` (no ICMP error queue is
+  kept). An empty queue is `EAGAIN` even when unbound, and `0` after
+  `SHUT_RD`. A connected socket whose datagram reaches no local socket gets
+  `ECONNREFUSED` once, from the next `recv`/`send`/`SO_ERROR`, and polls
+  `POLLERR`.
+- `shutdown` with an invalid `how` is `EINVAL`, and on an unconnected socket
+  sets the bits but returns `ENOTCONN`. `listen`/`accept` are `EOPNOTSUPP`.
+  `getsockname` on an unbound socket is `0.0.0.0:0`. Addresses are returned
+  as full 16-byte `sockaddr_in`. `SO_PROTOCOL` for protocol 0 is
+  `IPPROTO_UDP`.
+
 ### 3.3 BPF XDP program compatibility
 
 `BPF_PROG_LOAD` accepts Linux program type 6 (`BPF_PROG_TYPE_XDP`) and records

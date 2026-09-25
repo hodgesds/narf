@@ -43,7 +43,8 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             // Broken-pipe sendmsg raises SIGPIPE to the sender unless
             // MSG_NOSIGNAL is set (Linux sk_stream_error net/core/stream.c:194,
             // unix_stream_sendmsg net/unix/af_unix.c:2500). errno 32 == EPIPE.
-            if errno == 32 && flags & crate::socket::MSG_NOSIGNAL == 0 {
+            // UDP's EPIPE never signals (see sys_socket_send).
+            if errno == 32 && flags & crate::socket::MSG_NOSIGNAL == 0 && !sock.is_inet_dgram() {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }
             ctx.set_return(errno_ret(errno));

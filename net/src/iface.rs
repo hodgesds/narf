@@ -612,6 +612,57 @@ pub fn get_addrs(iface_name: &str) -> alloc::vec::Vec<(crate::ipv4::Ipv4Addr, u8
         .collect()
 }
 
+/// True if `ip` is one of `net_ns_id`'s own IPv4 addresses: an interface's
+/// primary address, any address added with [`add_addr`], or anything in
+/// 127.0.0.0/8 (Linux installs `local 127.0.0.0/8 dev lo` in the local
+/// table, so the whole block is `RTN_LOCAL`).
+///
+/// This is the `inet_addr_type_table() == RTN_LOCAL` test that `__inet_bind`
+/// (`net/ipv4/af_inet.c:494`) and the loopback-delivery decision need.
+pub fn is_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> bool {
+    if ip[0] == 127 {
+        return true;
+    }
+    snapshot_all_in(net_ns_id).iter().any(|i| {
+        i.ipv4 == ip
+            || crate::ifaddr::iface_addrs(&i.name)
+                .iter()
+                .any(|a| a.addr.0 == ip)
+    })
+}
+
+/// True if a datagram to `ip` would be a broadcast (`RTCF_BROADCAST`).
+///
+/// Two cases, both from Linux:
+/// - the limited broadcast 255.255.255.255 (`ipv4_is_lbcast`,
+///   `ip_route_output_key_hash_rcu`);
+/// - a local subnet's directed broadcast, `prefix | ~mask`, which
+///   `fib_add_ifaddr` (`net/ipv4/fib_frontend.c:1147`) installs as an
+///   `RTN_BROADCAST` route only when `ifa_prefixlen < 31`.
+///
+/// A host address that merely ends in `.255` (e.g. 10.0.1.255 in a /16) is
+/// NOT a broadcast.
+pub fn is_broadcast_in(net_ns_id: u64, ip: [u8; 4]) -> bool {
+    if ip == [255, 255, 255, 255] {
+        return true;
+    }
+    let dst = u32::from_be_bytes(ip);
+    snapshot_all_in(net_ns_id).iter().any(|i| {
+        crate::ifaddr::iface_addrs(&i.name).iter().any(|a| {
+            if a.prefix_len >= 31 {
+                return false;
+            }
+            let mask = if a.prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - a.prefix_len)
+            };
+            let prefix = u32::from_be_bytes(a.addr.0) & mask;
+            prefix != 0 && dst == prefix | !mask
+        })
+    })
+}
+
 /// Install the iface's default gateway as a route (0.0.0.0/0 via
 /// gateway).
 ///

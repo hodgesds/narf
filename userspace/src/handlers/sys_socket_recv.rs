@@ -28,7 +28,9 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
     // recv() + its own poll loop; parking here stalls its dbus auth handshake,
     // and the old "set 0 then yield" path could even surface a spurious 0 (EOF).
     const MSG_DONTWAIT: u32 = 0x40;
-    let nonblock = (flags & MSG_DONTWAIT) != 0
+    // MSG_ERRQUEUE never waits either: `ip_recv_error` returns EAGAIN at once
+    // when the error queue is empty (net/ipv4/ip_sockglue.c:535).
+    let nonblock = (flags & (MSG_DONTWAIT | crate::socket::MSG_ERRQUEUE)) != 0
         || fd::with_table(current_task_id(), |t| {
             t.status_flags(fd)
                 .map(|flags| flags & crate::fd::O_NONBLOCK != 0)

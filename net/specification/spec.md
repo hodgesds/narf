@@ -248,6 +248,14 @@ is namespace-scoped. ICMP echo and raw delivery, plus ICMP-originated TCP/UDP
 errors, are restricted to the receiving namespace. TCP, UDP, and ICMP output resolves only namespace-owned
 interfaces and routes and traverses that namespace's `LOCAL_OUT` and
 `POST_ROUTING` netfilter hooks.
+`iface::is_local_addr_in(ns, ip)` reports whether `ip` is one of the
+namespace's addresses (or in 127.0.0.0/8); `iface::is_broadcast_in(ns, ip)`
+reports the limited broadcast or a local subnet's `prefix | ~mask` for
+prefixes shorter than /31 (Linux `RTCF_BROADCAST`). `udp_sock` sends refuse a
+payload over `UDP_MAX_PAYLOAD` (65507) regardless of `SO_SNDBUF`, require
+`SO_BROADCAST` for exactly those broadcast destinations, drop an arriving
+datagram when the receive queue is full, and drop received datagrams whose
+length field is shorter than the header or longer than the segment.
 Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
