@@ -1731,12 +1731,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // is a direct call rather than a staged initcall precisely
                 // because the ordering is too load-bearing to delegate.
                 // `bpf/specification/spec.md` §4.1.
+                // Choose the text window's base before reserving the slots: the pack
+                // cursor and every range check are relative to it. The ARENA base
+                // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
+                // an undershoot lands in the guard slot.
+                narf_memory::bpf_text::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
                             "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
-                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::bpf_text_base(),
                             narf_memory::bpf_text::BPF_ARENA_BASE
                         );
                     }
@@ -2545,12 +2550,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // windows still have to exist before anything maps into them,
                 // and keeping one call site shape across arches means the
                 // ordering rule is stated once.
+                // Choose the text window's base before reserving the slots: the pack
+                // cursor and every range check are relative to it. The ARENA base
+                // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
+                // an undershoot lands in the guard slot.
+                narf_memory::bpf_text::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
                             "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
-                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::bpf_text_base(),
                             narf_memory::bpf_text::BPF_ARENA_BASE
                         );
                     }

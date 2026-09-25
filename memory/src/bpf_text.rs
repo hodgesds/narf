@@ -139,6 +139,53 @@ pub const BPF_ARENA_BASE: u64 = 0xFFFF_8980_0000_0000;
 /// Bytes covered by one PML4 / L0 slot.
 pub const SLOT_SPAN: u64 = 1u64 << 39;
 
+/// Live base of the BPF text window, or 0 before it is chosen.
+///
+/// Randomized inside slot [`BPF_TEXT_PML4_SLOT`], never across slots: the
+/// neighbouring slot is the arena's lower guard and must stay unmapped, so the
+/// offset is bounded to keep `base + BPF_TEXT_USABLE` inside this slot.
+///
+/// The ARENA base is deliberately NOT randomized. `bpf_arena.rs` asserts at
+/// compile time that `BPF_ARENA_BASE % SLOT_SPAN == 0`, because an undershoot
+/// from the first arena slot has to land in the unmapped guard slot below the
+/// window — that is what makes the verifier's fixed displacement bound a
+/// cross-program isolation property. Moving the base off its slot boundary
+/// would put mapped memory there instead. Randomizing the arena means moving
+/// its whole slot and both guards, which is a different change.
+static BPF_TEXT_BASE_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Base of the BPF text window in force.
+#[inline]
+pub fn bpf_text_base() -> u64 {
+    let v = BPF_TEXT_BASE_LIVE.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        BPF_TEXT_BASE
+    } else {
+        v
+    }
+}
+
+/// Choose this boot's BPF text base, inside the slot it already owns.
+///
+/// Must run before the first pack is allocated: `NEXT_PACK_VA` and every range
+/// check are relative to the base, and a pack already mapped at the old base
+/// would be stranded. `bare_main` calls it beside the slot reservation.
+///
+/// `PACK_HUGE_BYTES` granularity, because a pack's base must be aligned to it
+/// for the huge mapping. Falls back to the compile-time base when entropy is
+/// unavailable rather than pretending to randomize.
+pub fn randomize_window() {
+    let gran = PACK_HUGE_BYTES;
+    let slots = (SLOT_SPAN - BPF_TEXT_USABLE) / gran + 1;
+    let (r, src) = crate::kaslr::random_u64();
+    if src == crate::kaslr::EntropySource::TscMix && r == 0 {
+        return;
+    }
+    let base = BPF_TEXT_BASE + (r % slots) * gran;
+    BPF_TEXT_BASE_LIVE.store(base, core::sync::atomic::Ordering::Release);
+    NEXT_PACK_VA.store(base as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Usable prefix of the text window. A slot is 512 GiB; we only ever hand out
 /// the low 1 GiB of it, which is 512 hugepage packs — far more JIT text than
 /// any plausible workload, and it keeps the pack index arithmetic in a `u32`.
@@ -298,7 +345,7 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
     // constant, this fires at boot instead of silently colliding with vmalloc
     // (272) or the direct map (384).
     debug_assert_eq!(
-        ((BPF_TEXT_BASE >> 39) & 0x1FF) as usize,
+        ((bpf_text_base() >> 39) & 0x1FF) as usize,
         BPF_TEXT_PML4_SLOT,
         "BPF_TEXT_BASE does not decode to BPF_TEXT_PML4_SLOT"
     );
@@ -639,7 +686,10 @@ static PACKS: IrqSafeSpinLock<Vec<Pack>> = IrqSafeSpinLock::new(Vec::new());
 /// Next pack VA to hand out. Bump-only; a pack's VA is never recycled, which
 /// costs nothing (the window is 512 GiB) and removes a whole class of
 /// stale-TLB bug.
-static NEXT_PACK_VA: AtomicUsize = AtomicUsize::new(BPF_TEXT_BASE as usize);
+/// Next pack VA. Zero until first use or `randomize_window`, then an absolute
+/// VA inside the window — it cannot be a `const` initialiser any more because
+/// the base is chosen at boot.
+static NEXT_PACK_VA: AtomicUsize = AtomicUsize::new(0);
 
 // ── Allocation handle ──────────────────────────────────────────────────
 
@@ -1120,8 +1170,16 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
     // Pack VAs are always 2 MiB-aligned so a hugepage pack can take a PMD
     // leaf. Small packs waste the remainder of their 2 MiB slot of VA; the
     // window is 512 GiB, so that is free.
+    // Initialise on first use rather than trusting `randomize_window` to have
+    // run: a zero cursor would hand out packs from address 0.
+    let _ = NEXT_PACK_VA.compare_exchange(
+        0,
+        bpf_text_base() as usize,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
     let base = NEXT_PACK_VA.fetch_add(PACK_HUGE_BYTES as usize, Ordering::Relaxed) as u64;
-    if base + PACK_HUGE_BYTES > BPF_TEXT_BASE + BPF_TEXT_USABLE {
+    if base + PACK_HUGE_BYTES > bpf_text_base() + BPF_TEXT_USABLE {
         return Err(TextError::Exhausted);
     }
 
@@ -1751,7 +1809,7 @@ fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
             return TestResult::Fail("bpf_text::alloc failed");
         }
     };
-    if a.va < BPF_TEXT_BASE || a.va >= BPF_TEXT_BASE + BPF_TEXT_USABLE {
+    if a.va < bpf_text_base() || a.va >= bpf_text_base() + BPF_TEXT_USABLE {
         free(a);
         return TestResult::Fail("allocation landed outside the text window");
     }
@@ -1857,7 +1915,7 @@ fn smoke_bpf_text_extable_recovers_probe_fault() -> TestResult {
 
     // The guard slot between the two BPF windows. Canonical, kernel-half,
     // and never mapped by anything.
-    let unmapped = BPF_TEXT_BASE + SLOT_SPAN;
+    let unmapped = bpf_text_base() + SLOT_SPAN;
     // SAFETY: `a.va` holds a sealed `extern "C"` stub taking one pointer-sized
     // argument. Its single load is registered in the extable, so a fault at it
     // is recovered by the trap handler rather than being fatal.
