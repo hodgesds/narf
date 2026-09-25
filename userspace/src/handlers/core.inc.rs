@@ -9821,10 +9821,9 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
             .store(true, core::sync::atomic::Ordering::Release);
     }
     // Find live CLONE_THREAD siblings sharing this visible pid.
-    let siblings: alloc::vec::Vec<u64> = task_pid_snapshot()
+    let siblings: alloc::vec::Vec<u64> = thread_group_members(pid)
         .into_iter()
-        .filter(|&(task, process)| process == pid && task != tid)
-        .map(|(task, _)| task)
+        .filter(|&task| task != tid)
         .filter(|&task| {
             crate::task::task_get(task).is_some_and(|task| {
                 task.state.load(core::sync::atomic::Ordering::Acquire)
@@ -11675,8 +11674,8 @@ fn wait_parent_ids(waiter: u64, options: u32) -> alloc::vec::Vec<u64> {
     if thread_group_live_count(waiter_tgid) <= 1 {
         return parents;
     }
-    for (task, tgid) in task_pid_snapshot() {
-        if tgid == waiter_tgid && task != waiter {
+    for task in thread_group_members(waiter_tgid) {
+        if task != waiter {
             parents.push(task);
         }
     }
@@ -12693,6 +12692,7 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                     if let Some(m) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
                         m.remove(&tid);
                     }
+                    tgid_member_remove(tid, child_pid);
                 }
             }
         }
@@ -12958,9 +12958,9 @@ fn find_thread_group_reaper(dying: u64) -> Option<u64> {
             return Some(leader);
         }
     }
-    task_pid_snapshot().into_iter().find_map(|(task, pid)| {
-        (pid == tgid && task != dying && signal_target_exists(task)).then_some(task)
-    })
+    thread_group_members(tgid)
+        .into_iter()
+        .find(|&task| task != dying && signal_target_exists(task))
 }
 
 fn orphanize_children_of(parent_tid: u64) {
@@ -13254,6 +13254,95 @@ static LINUX_TID_TO_TASK: [PidTaskMapShard; PID_TASK_SHARDS] =
 static PID_TASK_MUTATION: narf_lib::sync::IrqSafeSpinLock<()> =
     narf_lib::sync::IrqSafeSpinLock::new(());
 
+/// Reverse index of [`TASK_TO_PID`]: visible pid (tgid) → the set of member
+/// TaskIds. Maintained alongside every `TASK_TO_PID` write so that
+/// "enumerate the threads of group `pid`" — needed on every thread exit
+/// (`find_thread_group_reaper`), group teardown (`zap_thread_group`), reap
+/// (`collect_reap_parents`) and group-signal — is O(live group size) instead
+/// of the O(all-tasks) locked full-registry snapshot it used to be. That
+/// snapshot (`task_pid_snapshot`) holds the global [`PID_TASK_MUTATION`] for
+/// its whole O(N) build, so under a process with hundreds of threads
+/// (plasmashell's Qt pools) all 16 CPUs convoyed on it — an all-CPU CPL=0
+/// kernel spin that froze the CachyOS desktop right after login.
+///
+/// Removal is best-effort: a dead TaskId may transiently linger in a set, so
+/// consumers MUST re-check liveness (they already do, via `signal_target_exists`
+/// / `task_get`). The invariant that matters is NO FALSE NEGATIVE: every live
+/// member is present, because every `TASK_TO_PID` insert routes through
+/// [`set_task_pid_locked`].
+static TGID_MEMBERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, alloc::collections::BTreeSet<u64>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn tgid_member_add(task: u64, tgid: u64) {
+    TGID_MEMBERS
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .entry(tgid)
+        .or_default()
+        .insert(task);
+}
+
+fn tgid_member_remove(task: u64, tgid: u64) {
+    let mut g = TGID_MEMBERS.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(set) = map.get_mut(&tgid) {
+            set.remove(&task);
+            if set.is_empty() {
+                map.remove(&tgid);
+            }
+        }
+    }
+}
+
+/// Set `TASK_TO_PID[task] = tgid` AND keep the [`TGID_MEMBERS`] reverse index
+/// in sync (moving the task between groups if its tgid changed — the rare
+/// exec-de-thread case). Caller holds [`PID_TASK_MUTATION`]; the shard lock and
+/// the index lock are always taken in this order (PID_TASK_MUTATION →
+/// TGID_MEMBERS), and the reader [`thread_group_members`] takes only the index
+/// lock, so there is no lock-order cycle.
+fn set_task_pid_locked(task: u64, tgid: u64) {
+    let old = TASK_TO_PID[pid_task_shard(task)]
+        .map
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task, tgid);
+    if old != Some(tgid) {
+        if let Some(o) = old {
+            tgid_member_remove(task, o);
+        }
+        tgid_member_add(task, tgid);
+    }
+}
+
+/// Live-or-zombie member TaskIds of thread group `tgid`, O(group size).
+/// May include a task that has since exited (best-effort removal); callers
+/// re-check liveness. Replaces `task_pid_snapshot().filter(pid == tgid)`.
+pub(crate) fn thread_group_members(tgid: u64) -> alloc::vec::Vec<u64> {
+    TGID_MEMBERS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&tgid))
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// Test-only: drop a task's TASK_TO_PID row and its [`TGID_MEMBERS`] entry, so a
+/// unit test that seeds synthetic (task, tgid) pairs can leave the live registry
+/// as it found it.
+#[doc(hidden)]
+pub fn __test_forget_task_pid(task: u64) {
+    let _mutation = PID_TASK_MUTATION.lock();
+    let old = TASK_TO_PID[pid_task_shard(task)]
+        .map
+        .lock()
+        .as_mut()
+        .and_then(|m| m.remove(&task));
+    if let Some(tgid) = old {
+        tgid_member_remove(task, tgid);
+    }
+}
+
 #[inline]
 fn pid_task_shard(id: u64) -> usize {
     (id as usize) & (PID_TASK_SHARDS - 1)
@@ -13274,18 +13363,6 @@ fn pid_task_snapshot() -> alloc::vec::Vec<(u64, u64)> {
     snapshot
 }
 
-/// Task-keyed counterpart to [`pid_task_snapshot`].
-fn task_pid_snapshot() -> alloc::vec::Vec<(u64, u64)> {
-    let _mutation = PID_TASK_MUTATION.lock();
-    let mut snapshot = alloc::vec::Vec::new();
-    for shard in TASK_TO_PID.iter() {
-        if let Some(map) = shard.map.lock().as_ref() {
-            snapshot.extend(map.iter().map(|(&task, &pid)| (task, pid)));
-        }
-    }
-    snapshot.sort_unstable_by_key(|&(task, _)| task);
-    snapshot
-}
 
 pub fn pid_task_map_init() {
     for shard in PID_TO_TASK.iter() {
@@ -13300,6 +13377,7 @@ pub fn pid_task_map_init() {
     for shard in LINUX_TID_TO_TASK.iter() {
         *shard.map.lock() = Some(BTreeMap::new());
     }
+    *TGID_MEMBERS.lock() = Some(BTreeMap::new());
 }
 
 pub fn pid_task_map_reset() {
@@ -13315,6 +13393,7 @@ pub fn pid_task_map_reset() {
     for shard in LINUX_TID_TO_TASK.iter() {
         *shard.map.lock() = None;
     }
+    *TGID_MEMBERS.lock() = None;
 }
 
 /// Register a (ProcessId → TaskId) mapping. Called by `sys_fork` and
@@ -13322,11 +13401,7 @@ pub fn pid_task_map_reset() {
 /// Records both directions simultaneously so all translations are O(1).
 pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
     let _mutation = PID_TASK_MUTATION.lock();
-    TASK_TO_PID[pid_task_shard(task_raw)]
-        .map
-        .lock()
-        .get_or_insert_with(BTreeMap::new)
-        .insert(task_raw, pid_raw);
+    set_task_pid_locked(task_raw, pid_raw);
     // Self-initialize: the map may be `None` if `wait_init` hasn't run
     // yet (early boot, or the kernel-test harness which boots straight
     // into the smoke runner). Without this a `fork` registration would
@@ -13340,11 +13415,7 @@ pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
 
 pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
     let _mutation = PID_TASK_MUTATION.lock();
-    TASK_TO_PID[pid_task_shard(task_raw)]
-        .map
-        .lock()
-        .get_or_insert_with(BTreeMap::new)
-        .insert(task_raw, pid_raw);
+    set_task_pid_locked(task_raw, pid_raw);
 }
 
 
@@ -13352,11 +13423,7 @@ pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
 /// process IDs share one allocator; TaskId remains scheduler-private.
 fn register_thread_task_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
     let _mutation = PID_TASK_MUTATION.lock();
-    TASK_TO_PID[pid_task_shard(task_raw)]
-        .map
-        .lock()
-        .get_or_insert_with(BTreeMap::new)
-        .insert(task_raw, tgid_raw);
+    set_task_pid_locked(task_raw, tgid_raw);
     TASK_TO_LINUX_TID[pid_task_shard(task_raw)]
         .map
         .lock()
@@ -13422,6 +13489,7 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
     if let Some(m) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
         m.remove(&tid);
     }
+    tgid_member_remove(tid, pid);
 }
 
 /// Linux `signal->live`: per-thread-group (per-`pid`) count of live
