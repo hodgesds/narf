@@ -801,13 +801,6 @@ fn with_procfs(
     // `handlers::kernel_buffers_guard` and `with_setup`, which does the same
     // for the tests that use the closure form of this harness.
     let _kbuf = crate::handlers::kernel_buffers_guard();
-    // TASK_INFO / CURRENT_PID / LIST_PIDS — needed by every renderer and by
-    // `/proc/self` resolution; none has a hook-absent assertion elsewhere.
-    narf_filesystem::procfs::install_proc_hooks(
-        crate::handlers::proc_current_pid,
-        crate::handlers::proc_list_pids,
-        crate::handlers::proc_task_info,
-    );
     // FD_PATH: snapshot so we can restore the exact prior slot (0 in a
     // kernel-test build) after the test, keeping the un-hooked fd-lookup
     // assertion valid. Install by re-pointing through the restore seam.
