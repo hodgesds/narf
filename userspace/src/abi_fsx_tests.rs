@@ -310,7 +310,9 @@ fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
                 "the directory xattr did not follow its inode through a rename",
             ));
         }
-        if left_behind != Some(ENODATA) {
+        // The old name no longer exists, so the lookup fails before any
+        // xattr code runs: -ENOENT (`filename_lookup`), not -ENODATA.
+        if left_behind != Some(ENOENT) {
             return finish(Err("the old directory name still answered for the xattr"));
         }
         finish(Ok(()))
@@ -527,6 +529,14 @@ kernel_test_in!(
 ///
 /// The errno is EACCES — the same one `open` uses for a mode denial.
 fn smoke_abi_fsx_directory_write_permission_is_required() -> TestResult {
+    // Dropping every uid to 1000 drops the capabilities with it, so
+    // `setresuid(0, 0, 0)` is -EPERM afterwards, exactly as in Linux. The
+    // later root-only setup (chmod of the root-owned directory) needs root
+    // back, which only the test hooks can restore.
+    let restore_root = || {
+        crate::handlers::__test_uidgid_reset();
+        crate::handlers::__test_caps_reset();
+    };
     with_memfs("/abi-dirperm", "abi-dirperm", &[], || {
         let dir = b"/abi-dirperm/ro\0";
         let existing = b"/abi-dirperm/ro/file\0";
@@ -569,7 +579,7 @@ fn smoke_abi_fsx_directory_write_permission_is_required() -> TestResult {
             a2(existing.as_ptr() as u64, AT_FDCWD, fresh.as_ptr() as u64),
         );
         // Restore BEFORE asserting so a failure cannot strand the task.
-        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        restore_root();
         if created.map(|fd| fd >= 0).unwrap_or(false) {
             return Err("O_CREAT succeeded in a directory the caller cannot write");
         }
@@ -605,7 +615,7 @@ fn smoke_abi_fsx_directory_write_permission_is_required() -> TestResult {
                 let _ = call(Syscall::Close.raw(), a0(fd as u64));
             }
         }
-        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        restore_root();
         if !now_created.map(|fd| fd >= 0).unwrap_or(false) {
             return Err("O_CREAT still failed on a world-writable directory — test is vacuous");
         }
@@ -1779,7 +1789,10 @@ fn smoke_abi_fsx_immutable_file_refuses_changes() -> TestResult {
         &[("f", b"data"), ("other", b"x")],
         || {
             let path = b"/abi-imm/f\0";
-            let other = b"/abi-imm/other\0";
+            // A FRESH name: `do_linkat` runs `filename_create` on the target
+            // first, so an existing one is -EEXIST before `vfs_link` ever
+            // sees the immutable flag (probed on 6.18 tmpfs).
+            let other = b"/abi-imm/linked\0";
             let moved = b"/abi-imm/moved\0";
             let set_flags = |flags: u32| -> Option<i64> {
                 let fd = call_open(path.as_ptr() as u64, 0)?;

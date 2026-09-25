@@ -1255,9 +1255,11 @@ fn smoke_abi_path_link_neg() -> TestResult {
             return Err("link(.., existing) should return -EEXIST");
         }
         // Cross-directory → -EXDEV (same-parent restriction, like rename).
+        // `/q` does not exist, so `filename_create` fails its lookup before
+        // the cross-mount EXDEV check is reached: -ENOENT, as on Linux.
         let elsewhere = b"/q/new\0";
-        if call_link(old.as_ptr() as u64, elsewhere.as_ptr() as u64) != Some(-18) {
-            return Err("cross-directory link should return -EXDEV");
+        if call_link(old.as_ptr() as u64, elsewhere.as_ptr() as u64) != Some(-2) {
+            return Err("link into a missing directory should return -ENOENT");
         }
         Ok(())
     })
@@ -1912,7 +1914,9 @@ kernel_test_in!("syscall_abi", smoke_abi_path_nested_tmpfs_mount);
 // target sit in different directories, and came back EXDEV: KSycoca
 // reported "Invalid cross-device link" and never wrote its database.
 fn smoke_abi_path_linkat_proc_fd_materialises_tmpfile() -> TestResult {
-    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    // The full O_TMPFILE value: `__O_TMPFILE | O_DIRECTORY`. The bare
+    // `__O_TMPFILE` bit is -EINVAL (`build_open_flags`).
+    const O_TMPFILE_BIT: u64 = 0o20_000_000 | 0o200_000;
     const O_RDWR: u64 = 2;
     const AT_SYMLINK_FOLLOW: u64 = 0x400;
     with_memfs("/p", "p", &[("seed", b"x")], || {

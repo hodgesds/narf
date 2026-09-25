@@ -1169,15 +1169,19 @@ fn smoke_abi_misc_path_family_efault_and_enametoolong() -> TestResult {
             }
             exercised += 1;
             let num = sc.raw();
+            // The third word is mkdir's mode but unlinkat's FLAGS, and
+            // unlinkat rejects unknown flags (-EINVAL) before it copies the
+            // path, so it must be 0 there.
+            let third = if sc == Syscall::Unlinkat { 0 } else { 0o755 };
             let bad = if at_form {
-                a2(AT_FDCWD, AI_BAD_PTR, 0o755)
+                a2(AT_FDCWD, AI_BAD_PTR, third)
             } else {
-                a1(AI_BAD_PTR, 0o755)
+                a1(AI_BAD_PTR, third)
             };
             let toolong = if at_form {
-                a2(AT_FDCWD, lp, 0o755)
+                a2(AT_FDCWD, lp, third)
             } else {
-                a1(lp, 0o755)
+                a1(lp, third)
             };
             match call(num, bad) {
                 Some(v) if v == AI_EFAULT => {}
