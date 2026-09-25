@@ -15110,9 +15110,18 @@ pub fn hostname_init() {
             g.push_str("narf");
         }
     }
-    let mut g = DOMAINNAME.lock();
-    if g.is_empty() {
-        g.push_str("(none)");
+    // `DOMAINNAME` only exists in the non-container build — same split as
+    // `uts_domainname_for_current`. With the feature on there is nothing to
+    // seed: a fresh `UtsNs` already carries "(none)", which is what the doc
+    // above says and what `ensure_defaults` relies on. Without this gate the
+    // whole crate fails to compile under `--features container`, so no kernel
+    // test suite can build at all.
+    #[cfg(not(feature = "container"))]
+    {
+        let mut g = DOMAINNAME.lock();
+        if g.is_empty() {
+            g.push_str("(none)");
+        }
     }
 }
 
@@ -15133,9 +15142,19 @@ pub fn __test_hostname_reset() {
 /// after `smoke_abi_creds_setdomainname_pos`.
 #[doc(hidden)]
 pub fn __test_domainname_reset() {
-    let mut g = DOMAINNAME.lock();
-    g.clear();
-    g.push_str("(none)");
+    // Same split as `uts_domainname_for_current`: with `container` on, the
+    // domainname lives in the task's UTS namespace and this static is not
+    // compiled. Resetting the namespace's copy is what mirrors it.
+    #[cfg(feature = "container")]
+    {
+        let _ = uts_set_domainname_for_current("(none)");
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let mut g = DOMAINNAME.lock();
+        g.clear();
+        g.push_str("(none)");
+    }
 }
 
 // ── Wave-72 — uname(2), setdomainname(2), SysV IPC get-by-key ─────
