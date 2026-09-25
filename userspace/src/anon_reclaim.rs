@@ -38,6 +38,15 @@ impl AnonReclaimer for TaskAnonReclaimer {
                 continue;
             };
             let remaining = target_pages - freed;
+            // First tier: discard still-clean MADV_FREE pages — no IO, no
+            // swap requirement, exactly the pages userspace already declared
+            // disposable. Linux reclaims lazyfree pages before swapping for
+            // the same reason.
+            freed = freed.saturating_add(aspace.discard_lazyfree_pages(remaining));
+            if freed >= target_pages {
+                break;
+            }
+            let remaining = target_pages - freed;
             // Collect this space's cold private-anon runs (bounded to what we
             // still need), plan a bounded batch, and execute it. Holding the
             // `Arc` pins the address space so its `Drop` teardown cannot free

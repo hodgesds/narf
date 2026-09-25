@@ -2,10 +2,13 @@
 use super::*;
 
 /// `madvise(addr, len, advice)` — Linux syscall 28. The kernel honours
-/// MADV_DONTNEED (4) and MADV_FREE (8) as "release backing frames; next
-/// access reads zero." Implemented performance-only hints are accepted as
-/// no-ops. Unknown values and semantic controls NARF cannot honor return
-/// EINVAL instead of claiming a state transition that did not happen.
+/// MADV_DONTNEED (4) as "release backing frames; next access reads zero"
+/// and MADV_FREE (8) as Linux's lazy variant: pages are marked discardable
+/// but stay mapped until memory pressure harvests the ones never rewritten
+/// (`AddressSpace::madvise_free` / `discard_lazyfree_pages`). Implemented
+/// performance-only hints are accepted as no-ops. Unknown values and
+/// semantic controls NARF cannot honor return EINVAL instead of claiming a
+/// state transition that did not happen.
 ///
 /// `arg0` = base, `arg1` = len, `arg2` = advice.
 ///
@@ -137,7 +140,22 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     }
 
     match advice {
-        MADV_DONTNEED | MADV_FREE => match as_ref.madvise_dontneed(base, len) {
+        // MADV_FREE is LAZY: resident pages are marked discardable (clean +
+        // LAZYFREE leaf) but stay mapped and writable, so a freed-then-reused
+        // page re-dirties purely in hardware instead of paying the demand-
+        // fault + zero path per page. Reclaim discards still-clean marked
+        // pages first (see `discard_lazyfree_pages`), swap second — Linux's
+        // shape. MADV_DONTNEED keeps the eager release semantics ("next read
+        // observes zeroes") that its contract requires.
+        MADV_FREE => match as_ref.madvise_free(base, len) {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(narf_memory::AddressSpaceError::AlignmentMismatch)
+            | Err(narf_memory::AddressSpaceError::OutOfRange) => {
+                ctx.set_return(errno_ret(EINVAL))
+            }
+            Err(_) => ctx.set_return(errno_ret(ENOMEM)),
+        },
+        MADV_DONTNEED => match as_ref.madvise_dontneed(base, len) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
             // The range was validated above, so what is left is a coverage
             // failure: Linux's madvise_walk_vmas returns ENOMEM when the

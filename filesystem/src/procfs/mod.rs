@@ -1233,6 +1233,16 @@ pub(crate) fn task_file_owners(pid: u64) -> (u32, u32) {
 struct ProcPidFile {
     pid: u64,
     field: PidField,
+    /// Rendered-body cache: one generation serves every chunk of a
+    /// sequential read. A read starting at offset 0 regenerates — Linux's
+    /// seq_file traversal shape, where content is snapshotted per pass and
+    /// rewinding starts a fresh one. Without this every read(2) re-ran the
+    /// task_info VMA snapshot and re-rendered the complete file, so a plain
+    /// read loop paid full generation per chunk plus once more for the EOF
+    /// probe — and stress-ng --madvise, which rereads /proc/self/smaps on
+    /// every MADV_FREE advice roll (~500 reads per bogo-op), turned procfs
+    /// rendering into the entire benchmark.
+    rendered: narf_lib::sync::IrqSafeSpinLock<Option<String>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1261,6 +1271,14 @@ impl FileOps for ProcPidFile {
         let pid = self.pid;
         let field = self.field;
         Box::pin(async move {
+            // Continuation reads serve the pass's cached rendering; only an
+            // offset-0 read (a fresh pass) regenerates. See the `rendered`
+            // field for why this matters.
+            if offset > 0 && !matches!(field, PidField::Cmdline) {
+                if let Some(body) = self.rendered.lock().as_deref() {
+                    return slice_read(body.as_bytes(), offset, buf);
+                }
+            }
             let query = if matches!(
                 field,
                 PidField::Maps | PidField::NumaMaps | PidField::Smaps | PidField::SmapsRollup
@@ -1288,7 +1306,9 @@ impl FileOps for ProcPidFile {
                 PidField::SmapsRollup => render_smaps_rollup(&info),
                 PidField::Comm => format!("{}\n", info.comm),
             };
-            slice_read(body.as_bytes(), offset, buf)
+            let read = slice_read(body.as_bytes(), offset, buf);
+            *self.rendered.lock() = Some(body);
+            read
         })
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -1431,6 +1451,7 @@ impl DirOps for ProcPidDir {
         Some(Arc::new(ProcPidFile {
             pid: self.pid,
             field,
+            rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
         }))
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
@@ -3085,6 +3106,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
     let f = ProcPidFile {
         pid: 1,
         field: PidField::Comm,
+        rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let perms = f.stat().mode.perms;
     if perms != 0o644 {
@@ -3098,6 +3120,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
     let ro = ProcPidFile {
         pid: 1,
         field: PidField::Stat,
+        rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     if ro.stat().mode.perms != 0o444 {
         return TestResult::Fail("a read-only per-pid file is no longer 0444");
@@ -3113,6 +3136,7 @@ fn smoke_comm_write_updates_read() -> TestResult {
     let f = ProcPidFile {
         pid: PID,
         field: PidField::Comm,
+        rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // Write with a trailing newline (Linux userspace shape).
     match poll_once(f.write(0, b"newname\n")) {
@@ -3130,6 +3154,7 @@ fn smoke_comm_write_truncates_to_15() -> TestResult {
     let f = ProcPidFile {
         pid: PID,
         field: PidField::Comm,
+        rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // 30 ASCII 'a' chars + newline — handler must accept and truncate.
     let long_name = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
@@ -3148,6 +3173,7 @@ fn smoke_non_comm_write_returns_readonly() -> TestResult {
     let f = ProcPidFile {
         pid: 1,
         field: PidField::Stat,
+        rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let wr = poll_once(f.write(0, b"ignored\n"));
     if matches!(wr, Some(Err(FsError::ReadOnly))) {
