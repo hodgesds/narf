@@ -1726,6 +1726,12 @@ pub struct AddressSpace {
     /// (kwin's deterministic heap-UAF SIGSEGV). `0` = unset; first use seeds it
     /// to the brk arena base.
     brk_top: core::sync::atomic::AtomicU64,
+    /// Exclusive high end of this AS's initial user stack, as the loader
+    /// placed it. AS-scoped (like `brk_top`) so every CLONE_VM thread
+    /// reports the same `[stack]` end. 0 until a loader sets it — the
+    /// stack top is randomised per exec (`kaslr::user_stack_top`), so
+    /// `/proc/<pid>/stat`'s startstack cannot be a fixed constant.
+    stack_top: core::sync::atomic::AtomicU64,
     /// Linux `RLIMIT_DATA` charges the file-backed program data span in
     /// addition to growth above `start_brk`. The ELF loader publishes that
     /// immutable span before the new task becomes runnable; fork inherits it.
@@ -1850,6 +1856,7 @@ impl AddressSpace {
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
+            stack_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
@@ -2377,6 +2384,19 @@ impl AddressSpace {
         self.brk_top.load(core::sync::atomic::Ordering::Acquire)
     }
 
+    /// Exclusive high end of the initial user stack, or 0 if no loader
+    /// has recorded one. See the `stack_top` field.
+    pub fn stack_top(&self) -> u64 {
+        self.stack_top.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record the initial user-stack top. Called once by the process
+    /// loader, after stack-top randomisation has picked the value.
+    pub fn set_stack_top(&self, top: u64) {
+        self.stack_top
+            .store(top, core::sync::atomic::Ordering::Release);
+    }
+
     /// Publish the main executable's Linux `end_data - start_data` charge.
     /// The ELF loader calls this before making the task runnable.
     pub fn set_program_data_bytes(&self, bytes: u64) {
@@ -2689,6 +2709,7 @@ impl AddressSpace {
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
+            stack_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
@@ -2724,6 +2745,7 @@ impl AddressSpace {
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
+            stack_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),

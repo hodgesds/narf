@@ -9907,6 +9907,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         },
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        // Zero sentinel, like `entry` above: a cloned task resumes from
+        // saved (rip, rsp) and nothing re-derives addresses from the
+        // program bias. The image itself is the parent's, already mapped
+        // in the shared/copied AS.
+        program_bias: 0,
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 

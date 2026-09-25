@@ -197,6 +197,7 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
     };
     let pending = crate::user_task::prepare_user_process_initial(
         crate::UserProcess {
+            program_bias: 0,
             pid: crate::ProcessId(0xC10E),
             address_space: address_space.clone(),
             entry: crate::loader::EntryPoint(narf_memory::VirtAddr::new(0x400000)),

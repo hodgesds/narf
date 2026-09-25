@@ -45,7 +45,11 @@ const ELFDATA2LSB: u8 = 1;
 // on: an ELF built for another architecture is not executable here, and
 // letting one through means the process faults on garbage instructions
 // at its entry point instead of `execve` returning ENOEXEC.
+// Both are listed so `EM_NATIVE` below reads as a choice between them
+// rather than a bare number; only one is live per build.
+#[allow(dead_code)]
 const EM_X86_64: u16 = 62;
+#[allow(dead_code)]
 const EM_AARCH64: u16 = 183;
 
 /// `e_machine` value this build can execute. Mirrors Linux's
@@ -168,7 +172,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
     //     binary using it is rejected rather than silently mis-parsed.
     const PHENTSIZE64: usize = 56;
     const MAX_PHNUM: usize = 65536 / PHENTSIZE64;
-    if entsize != PHENTSIZE64 || phnum < 1 || phnum > MAX_PHNUM {
+    if entsize != PHENTSIZE64 || !(1..=MAX_PHNUM).contains(&phnum) {
         return Err(ElfError::BadPhoff);
     }
     let ph_table_end = phoff

@@ -40,6 +40,11 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
 
+    // This test asserts the exact entry and stack top, which the loader now
+    // randomises per exec. Pin the canonical layout: what varies is covered
+    // by `smoke_userspace_aslr_randomises_program_base_and_stack_top`.
+    let _aslr = UserAslrGuard::off();
+
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
     bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     bytes.extend_from_slice(&2u16.to_le_bytes());
@@ -379,20 +384,10 @@ fn smoke_userspace_at_phdr_matches_pt_phdr() -> TestResult {
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
 
-    // Must match `PROGRAM_DYN_BASE` in `process.rs` — the fixed load
-    // base an ET_DYN program image gets.
-    const BIAS: u64 = 0x0000_0080_0000_0000;
     const PHDR_OFF: u64 = 0x1000; // e_phoff: phdrs in the second file page
     const PHDR_VA: u64 = 0x1_0000; // PT_PHDR.p_vaddr (link-time)
     const PHNUM: u16 = 3;
     const PHENTSIZE: u16 = 56;
-
-    let want = PHDR_VA + BIAS;
-    // The value main's `segments.first()` derivation would produce.
-    let stale = PHDR_OFF + BIAS;
-    if want == stale {
-        return TestResult::Fail("test image does not distinguish the two derivations");
-    }
 
     let mut b = alloc::vec![0u8; 0x2000];
     b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -441,6 +436,16 @@ fn smoke_userspace_at_phdr_matches_pt_phdr() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
+
+    // The ET_DYN load base is randomised per exec, so the expectation has
+    // to come from the bias the loader actually used, not a constant.
+    let bias = proc.program_bias;
+    let want = PHDR_VA + bias;
+    // The value the old `segments.first()` derivation would produce.
+    let stale = PHDR_OFF + bias;
+    if want == stale {
+        return TestResult::Fail("test image does not distinguish the two derivations");
+    }
 
     let rsp = proc.stack_top.as_u64();
     if !(DEFAULT_USER_STACK_BASE..DEFAULT_USER_STACK_TOP).contains(&rsp) {
@@ -532,6 +537,159 @@ fn smoke_userspace_at_phdr_matches_pt_phdr() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_at_phdr_matches_pt_phdr);
 
+/// Minimal ET_DYN image used by the ASLR tests: one R|X PT_LOAD at link
+/// vaddr 0, plus the PT_PHDR the loader reads for AT_PHDR.
+#[cfg(target_arch = "x86_64")]
+fn aslr_test_dyn_image() -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 0x2000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&0x111u64.to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());
+    // PT_PHDR.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&6u32.to_le_bytes());
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&64u64.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&64u64.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&112u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&112u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+    // PT_LOAD, R|X, whole first page.
+    let ph = 64 + 56;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    b
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_aslr_pinned_off_is_canonical() -> TestResult {
+    // The control for the randomisation test below: with user ASLR pinned
+    // off, the ET_DYN program base and the stack top are exactly the
+    // nominal constants. This is what makes the "they vary" assertions
+    // meaningful — it pins down what is being perturbed.
+    use crate::{load_user_process_with, DEFAULT_USER_STACK_TOP};
+
+    use crate::loader::PROGRAM_DYN_BASE;
+    let _guard = UserAslrGuard::off();
+    let bytes = aslr_test_dyn_image();
+
+    for _ in 0..3 {
+        // SAFETY: harness keeps the low 4 GiB identity-mapped and the frame
+        // allocator initialised, satisfying the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&bytes, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("load_user_process_with failed"),
+        };
+        if proc.program_bias != PROGRAM_DYN_BASE {
+            return TestResult::Fail("ASLR off: ET_DYN base should be PROGRAM_DYN_BASE");
+        }
+        if proc.address_space.stack_top() != DEFAULT_USER_STACK_TOP {
+            return TestResult::Fail("ASLR off: stack top should be the nominal top");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_aslr_pinned_off_is_canonical);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_aslr_randomises_program_base_and_stack_top() -> TestResult {
+    // PIE and stack randomisation. `PROGRAM_DYN_BASE`, the PT_INTERP base
+    // and the stack top used to be fixed constants — only the mmap/brk
+    // arenas were randomised — while `kaslr.rs` documented userspace ASLR
+    // over "stack / mmap / brk". A fixed PIE base is the most useful thing
+    // an attacker can be handed, so the program base and stack top are now
+    // drawn per exec.
+    //
+    // Two things get asserted, because either alone is passable by a stub:
+    // that the values VARY across loads (a wired-but-constant
+    // implementation fails this), and that every draw stays inside its
+    // window and alignment (a randomisation that wanders fails this).
+    use crate::{load_user_process_with, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_TOP};
+    use narf_memory::kaslr::{USER_ELF_RANDOM_BITS, USER_STACK_RANDOM_BITS};
+
+    use crate::loader::PROGRAM_DYN_BASE;
+    // The window `user_elf_slot` may pick within, and the jitter window
+    // `user_stack_top` may subtract.
+    let elf_window = 1u64 << USER_ELF_RANDOM_BITS;
+    let stack_window = 1u64 << USER_STACK_RANDOM_BITS;
+
+    // ASLR is on by default; assert that rather than forcing it, so a
+    // regression that leaves it off is caught here.
+    if !narf_memory::kaslr::user_aslr_enabled() {
+        return TestResult::Fail("user ASLR should be on by default");
+    }
+
+    let bytes = aslr_test_dyn_image();
+    // 8 samples: with ~12 bits of effective entropy (24-bit window, 4 KiB
+    // granularity) the chance of 8 identical draws is ~(1/4096)^7, so this
+    // does not flake, while a constant implementation fails every time.
+    let mut bases = alloc::vec::Vec::new();
+    let mut tops = alloc::vec::Vec::new();
+    for _ in 0..8 {
+        // SAFETY: as above — harness satisfies the loader's contract.
+        let proc = match unsafe { load_user_process_with(&bytes, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("load_user_process_with failed"),
+        };
+        let base = proc.program_bias;
+        let top = proc.address_space.stack_top();
+
+        // The nominal base must stay unmapped: `user_elf_slot` never
+        // returns the base itself, because several ABI tests use
+        // 0x80_0000_0000 as a known-bad user pointer.
+        if base <= PROGRAM_DYN_BASE {
+            return TestResult::Fail("ET_DYN base must be strictly above the nominal base");
+        }
+        if base >= PROGRAM_DYN_BASE + elf_window {
+            return TestResult::Fail("ET_DYN base outside its randomisation window");
+        }
+        if base & 0xFFF != 0 {
+            return TestResult::Fail("ET_DYN base not page-aligned");
+        }
+        // The stack top only ever moves DOWN, so existing bounds checks
+        // against the nominal top keep holding.
+        if top > DEFAULT_USER_STACK_TOP {
+            return TestResult::Fail("stack top must never exceed the nominal top");
+        }
+        if top <= DEFAULT_USER_STACK_TOP - stack_window {
+            return TestResult::Fail("stack top below its jitter window");
+        }
+        if top & 0xFFF != 0 {
+            return TestResult::Fail("stack top not page-aligned");
+        }
+        // And the entry RSP still lands inside the reserved stack region.
+        let rsp = proc.stack_top.as_u64();
+        if !(DEFAULT_USER_STACK_BASE..DEFAULT_USER_STACK_TOP).contains(&rsp) {
+            return TestResult::Fail("rsp outside the stack region");
+        }
+        bases.push(base);
+        tops.push(top);
+    }
+
+    if bases.iter().all(|b| *b == bases[0]) {
+        return TestResult::Fail("ET_DYN base identical across 8 loads — not randomised");
+    }
+    if tops.iter().all(|t| *t == tops[0]) {
+        return TestResult::Fail("stack top identical across 8 loads — not randomised");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_aslr_randomises_program_base_and_stack_top
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     // PT_INTERP follow-through. Build two minimal ELFs:
@@ -552,6 +710,11 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     //   - The aux vector on the stack carries AT_PAGESZ, AT_ENTRY,
     //     AT_BASE with the expected values.
     use crate::{interp::__test_clear_interpreters, load_user_process_with, register_interpreter};
+
+    // The PT_INTERP base is randomised per exec; this test asserts exact
+    // interp-relative addresses, so pin the canonical layout. That the base
+    // actually moves is covered by the ASLR tests above.
+    let _aslr = UserAslrGuard::off();
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
 
@@ -1188,7 +1351,6 @@ fn smoke_userspace_apply_relr_relocations() -> TestResult {
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
 
-    const BIAS: u64 = 0x0000_0080_0000_0000; // PROGRAM_DYN_BASE (ET_DYN load bias)
     const SEG_VA: u64 = 0x1000; // link-time p_vaddr (small — ET_DYN)
     const SEG_FOFF: u64 = 0x1000;
     // Seeded slots (link-time vaddrs) + their pre-relocation values.
@@ -1277,12 +1439,15 @@ fn smoke_userspace_apply_relr_relocations() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
+    // ET_DYN load base is randomised per exec — read the bias the loader
+    // actually used rather than assuming PROGRAM_DYN_BASE.
+    let bias = proc.program_bias;
     let image = crate::parse_elf(&bytes).unwrap();
     // SAFETY: `proc` was just built from `bytes`; its AS is mapped and matches
-    // `image`. BIAS is the ET_DYN load bias the loader applied.
+    // `image`. bias is the ET_DYN load bias the loader applied.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, BIAS, true).unwrap()
+        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, bias, true).unwrap()
     };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
@@ -1299,16 +1464,16 @@ fn smoke_userspace_apply_relr_relocations() -> TestResult {
         })
     };
 
-    // Each covered slot must be link_time_value + BIAS, applied once.
+    // Each covered slot must be link_time_value + bias, applied once.
     for (va, val) in [(A_VA, A_VAL), (B_VA, B_VAL), (C_VA, C_VAL)] {
-        match read_u64(va + BIAS) {
-            Some(got) if got == val.wrapping_add(BIAS) => {}
+        match read_u64(va + bias) {
+            Some(got) if got == val.wrapping_add(bias) => {}
             Some(_) => return TestResult::Fail("RELR slot not link_time+bias (double-apply?)"),
             None => return TestResult::Fail("RELR slot not materialised"),
         }
     }
     // The unmarked slot must be untouched.
-    match read_u64(U_VA + BIAS) {
+    match read_u64(U_VA + bias) {
         Some(got) if got == U_VAL => TestResult::Pass,
         Some(_) => TestResult::Fail("RELR relocated a slot the bitmap did not mark"),
         None => TestResult::Fail("RELR untouched-slot not materialised"),
@@ -1916,7 +2081,7 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
     // SAFETY: Valid memory or trusted environment
-    let (as_arc, entry) = match unsafe { load_elf_bytes(&bytes) } {
+    let (as_arc, entry, _bias) = match unsafe { load_elf_bytes(&bytes) } {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("load_elf_bytes failed on minimal ELF"),
     };
@@ -1990,7 +2155,7 @@ fn smoke_userspace_load_elf_bss_is_demand_zero() -> TestResult {
 
     // SAFETY: the kernel-test harness supplies the loader's identity-map and
     // initialized-frame-allocator preconditions.
-    let (as_, _) = match unsafe { load_elf_bytes(&bytes) } {
+    let (as_, _, _) = match unsafe { load_elf_bytes(&bytes) } {
         Ok(loaded) => loaded,
         Err(_) => return TestResult::Fail("BSS ELF failed to load"),
     };

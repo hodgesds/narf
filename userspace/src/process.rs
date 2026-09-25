@@ -92,6 +92,12 @@ pub struct UserProcess {
     pub entry_arg: Option<u64>,
     /// Exact PT_LOAD and stack VMAs committed by the loader.
     pub loaded_mappings: alloc::vec::Vec<LoadedMapping>,
+    /// Load bias applied to the program image: 0 for ET_EXEC, and the
+    /// randomised PML4[1] base for ET_DYN. Callers that need to know
+    /// where a PIE actually landed (auxv construction, `/proc` maps, a
+    /// test asserting a computed address) must read this rather than a
+    /// constant — the base is drawn per exec.
+    pub program_bias: u64,
 }
 
 /// Errors from `load_user_process`.
@@ -203,7 +209,7 @@ pub unsafe fn load_user_process_with_root(
     // identity map + initialised frame allocator), which is precisely what
     // `load_elf_bytes` needs to map the program's PT_LOAD segments.
     // SAFETY: Valid memory or trusted environment
-    let (address_space, program_entry) = unsafe { load_elf_bytes(bytes) }?;
+    let (address_space, program_entry, program_bias) = unsafe { load_elf_bytes(bytes) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
     // and we have its bytes registered, load it at a fixed bias and
@@ -211,7 +217,12 @@ pub unsafe fn load_user_process_with_root(
     // is then responsible for relocating the program and jumping to
     // `AT_ENTRY`. Bias is well-separated from the typical low-half
     // program load address so the two ranges never collide.
-    const INTERP_BIAS: u64 = 0x0000_4000_0000_0000;
+    // Interpreter load base. Randomised like the program base — a fixed
+    // ld.so base is the most useful thing an attacker can be handed,
+    // since the interpreter is the one object guaranteed to be mapped and
+    // full of gadgets. The nominal base is a user-range address well
+    // clear of the program window and the mmap arena.
+    let interp_bias: u64 = narf_memory::kaslr::user_elf_slot(0x0000_4000_0000_0000);
     let image = crate::parse_elf(bytes).map_err(LoadBytesError::Elf)?;
     // Mirror Linux binfmt_elf's `start_data` / `end_data` bookkeeping for
     // RLIMIT_DATA: each PT_LOAD contributes its start and file-backed end;
@@ -248,16 +259,11 @@ pub unsafe fn load_user_process_with_root(
     // own relocation pass first would `UnresolvedSymbol`-fail on
     // those externals — they're defined inside libc.so, which
     // ld-musl hasn't mapped yet at this point.
-    // Must match the bias `loader::load_elf_bytes` picked. PIE
-    // (ET_DYN) binaries get `PROGRAM_DYN_BASE`; ET_EXEC stays
-    // at 0.
-    // PML4[1] base. Bit 39 set, bit 47 clear → user range, NOT
-    // the kernel high half.
-    const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
-    let program_bias = match image.kind {
-        crate::ExecKind::Elf64Dyn => PROGRAM_DYN_BASE,
-        _ => 0,
-    };
+    // `program_bias` comes back from `load_elf_bytes` above — it is the
+    // bias that was actually used to map the segments. This used to be
+    // recomputed here from a second copy of PROGRAM_DYN_BASE, kept in
+    // sync by comment; with a randomised base a second draw would give a
+    // different answer, so the loader now reports the one it picked.
     let segment_mapping =
         |seg: &crate::Segment, bias: u64, filename: Option<alloc::string::String>| {
             let vaddr = seg.vaddr.wrapping_add(bias);
@@ -341,11 +347,11 @@ pub unsafe fn load_user_process_with_root(
         {
             let interp_entry =
                 // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
-                // INTERP_BIAS is a fixed user-range offset well-separated from the
+                // interp_bias is a randomised user-range base well-separated from the
                 // program's load range, so appending the interp's segments here
                 // cannot collide with pages already mapped.
                 // SAFETY: Valid memory or trusted environment
-                unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
+                unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?;
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is
             // idempotent for the program pages already installed.
@@ -356,15 +362,15 @@ pub unsafe fn load_user_process_with_root(
             // Re-parse so we can drive the interpreter's PT_DYNAMIC
             // through the same relocation pass — the interpreter is
             // typically an ET_DYN object with its own .rela.dyn that
-            // needs the INTERP_BIAS applied as the load offset.
+            // needs the interp_bias applied as the load offset.
             let interp_image = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
             loaded_mappings.extend(interp_image.segments.iter().map(|seg| {
-                segment_mapping(seg, INTERP_BIAS, Some(alloc::string::String::from(name)))
+                segment_mapping(seg, interp_bias, Some(alloc::string::String::from(name)))
             }));
             if !interp_image.dynamic.is_empty() {
                 // SAFETY: the interp's segments were just mapped + materialized
-                // at INTERP_BIAS above, so its PT_DYNAMIC relocation sites are
-                // walkable; INTERP_BIAS is the matching load offset to apply.
+                // at interp_bias above, so its PT_DYNAMIC relocation sites are
+                // walkable; interp_bias is the matching load offset to apply.
                 // SAFETY: Valid memory or trusted environment
                 unsafe {
                     // apply_relr = false: the interpreter self-relocates its
@@ -376,7 +382,7 @@ pub unsafe fn load_user_process_with_root(
                         interp_bytes,
                         &interp_image,
                         &address_space,
-                        INTERP_BIAS,
+                        interp_bias,
                         false,
                     )
                 }?;
@@ -398,13 +404,36 @@ pub unsafe fn load_user_process_with_root(
     // a real 8 MiB stack (see `DEFAULT_USER_STACK_RESERVED`). Frames come
     // from the global freelist (not contiguous), so we build a per-page
     // scatter list ordered low→high; index 0 == region base.
+    // Stack-top jitter, mirroring Linux's `randomize_stack_top()`: the high
+    // end moves *down* by a random page-aligned amount inside the reserved
+    // window, so `DEFAULT_USER_STACK_BASE ..= DEFAULT_USER_STACK_TOP` still
+    // bounds the stack and only the entry RSP varies.
+    //
+    // This has to be picked BEFORE the backing is laid out. The loader
+    // writes argv/envp/auxv (and the AT_RANDOM block) straight through the
+    // direct map rather than by faulting, so those pages must already have
+    // frames — which means the eagerly-committed window has to end at the
+    // jittered top, not at the region end. Jittering after the fact put the
+    // top in the lazy `phys 0` range and the writes silently found nothing.
+    let stack_top_v = narf_memory::kaslr::user_stack_top(DEFAULT_USER_STACK_TOP);
+    // Publish it for `/proc/<pid>/stat`'s startstack, which used to report
+    // the fixed nominal top.
+    address_space.set_stack_top(stack_top_v);
+
     let total_pages = (DEFAULT_USER_STACK_RESERVED >> 12) as usize;
     let commit_pages = ((DEFAULT_USER_STACK_BYTES + 0xFFF) >> 12) as usize;
-    let lazy_pages = total_pages - commit_pages;
+    // Pages above the jittered top: reserved VA that the initial stack never
+    // uses. Clamped so a future widening of the jitter window can't eat into
+    // the committed window.
+    let lazy_high = core::cmp::min(
+        ((DEFAULT_USER_STACK_TOP - stack_top_v) >> 12) as usize,
+        total_pages.saturating_sub(commit_pages),
+    );
+    let lazy_low = total_pages - commit_pages - lazy_high;
     let mut stack_phys_list: alloc::vec::Vec<PhysAddr> =
         alloc::vec::Vec::with_capacity(total_pages);
     // Low pages: reserved-but-lazy (demand-zero on fault).
-    for _ in 0..lazy_pages {
+    for _ in 0..lazy_low {
         stack_phys_list.push(PhysAddr::new(0));
     }
     // Top pages: eagerly-allocated zeroed frames for the argv/auxv block.
@@ -417,6 +446,10 @@ pub unsafe fn load_user_process_with_root(
             core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
         }
         stack_phys_list.push(phys);
+    }
+    // Tail above the jittered top — reserved, never backed eagerly.
+    for _ in 0..lazy_high {
+        stack_phys_list.push(PhysAddr::new(0));
     }
 
     let mut stack_perms = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT;
@@ -482,8 +515,10 @@ pub unsafe fn load_user_process_with_root(
     // SAFETY: Valid memory or trusted environment
     unsafe { address_space.materialize() }.map_err(|_| ProcessLoadError::StackMaterializeFailed)?;
 
-    let stack_bytes = DEFAULT_USER_STACK_RESERVED;
-    let stack_top_v = DEFAULT_USER_STACK_BASE + stack_bytes;
+    // Extent of the stack below the (jittered) top — what
+    // `init_sysv_stack` treats as the writable window
+    // `[stack_top_v - stack_bytes, stack_top_v)`.
+    let stack_bytes = stack_top_v - DEFAULT_USER_STACK_BASE;
 
     // AT_RANDOM: 16 bytes of CSPRNG-grade entropy living at the top
     // of the user stack. musl's __init_libc reads these for ASLR
@@ -583,7 +618,7 @@ pub unsafe fn load_user_process_with_root(
         for default in [
             AuxEntry::Pagesz(4096),
             AuxEntry::Entry(program_entry.0.as_u64()),
-            AuxEntry::Base(if interp_loaded { INTERP_BIAS } else { 0 }),
+            AuxEntry::Base(if interp_loaded { interp_bias } else { 0 }),
             AuxEntry::Phdr(at_phdr),
             AuxEntry::PhEnt(e_phentsize as u32),
             AuxEntry::PhNum(e_phnum as u32),
@@ -713,6 +748,7 @@ pub unsafe fn load_user_process_with_root(
         fs_base,
         entry_arg: None,
         loaded_mappings,
+        program_bias,
     })
 }
 
@@ -776,10 +812,30 @@ fn resolve_user_phys_byte(root: PhysAddr, vaddr: u64) -> Option<u64> {
     Some(p.as_u64() + off)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// aarch64 form. `narf_memory::aarch64::paging::translate` has the same
+/// signature and return convention as the x86_64 one, so this is the
+/// same walk against a different module.
+///
+/// This was a `None` stub reading "aarch64 paging::translate isn't in
+/// narf-memory yet". It is — `memory/src/aarch64/paging.rs` grew a full
+/// L0→L3 walker (blocks included) — so the stub was stale, and with it
+/// every user process on aarch64 got a zeroed startup stack: argc/argv/
+/// envp/auxv and the AT_RANDOM block are all written through this
+/// helper, and a `None` makes each write silently do nothing.
+#[cfg(target_arch = "aarch64")]
+fn resolve_user_phys_byte(root: PhysAddr, vaddr: u64) -> Option<u64> {
+    let page = vaddr & !0xFFFu64;
+    let off = vaddr & 0xFFFu64;
+    // SAFETY: `root` is the address space's L0/TTBR0 phys frame and `page` is
+    // a page-aligned user vaddr; `translate` only reads descriptors through
+    // the kernel direct map and performs no writes.
+    let p = unsafe { narf_memory::aarch64::paging::translate(root, VirtAddr::new(page)) }?;
+    Some(p.as_u64() + off)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn resolve_user_phys_byte(_root: PhysAddr, _vaddr: u64) -> Option<u64> {
-    // aarch64 paging::translate isn't in narf-memory yet; the
-    // SysV-stack init path is x86_64-only at Stage 4 first cut.
+    // No page-table walker for this arch.
     None
 }
 

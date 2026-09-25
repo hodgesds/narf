@@ -29,6 +29,28 @@ pub(crate) const EM_NATIVE_TEST: u16 = if cfg!(target_arch = "x86_64") {
     0
 };
 
+/// Pins user-mode ASLR off for the duration of a test and restores the
+/// previous setting on drop. The loader randomises the ET_DYN program
+/// base, the PT_INTERP base and the stack top, so a test that wants to
+/// assert the *canonical* layout has to turn that off — and must put it
+/// back, or every later test in the binary silently runs unrandomised.
+#[allow(dead_code)] // x86_64-only consumers today
+pub(crate) struct UserAslrGuard(bool);
+
+#[allow(dead_code)]
+impl UserAslrGuard {
+    /// Disable user ASLR until the guard drops.
+    pub(crate) fn off() -> Self {
+        UserAslrGuard(narf_memory::kaslr::set_user_aslr(false))
+    }
+}
+
+impl Drop for UserAslrGuard {
+    fn drop(&mut self) {
+        narf_memory::kaslr::set_user_aslr(self.0);
+    }
+}
+
 /// Static so the AS-lookup `fn` pointer can resolve it without a
 /// closure capture.
 static PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);

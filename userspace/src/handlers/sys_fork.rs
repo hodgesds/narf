@@ -225,6 +225,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),
+        // Zero sentinel for the same reason as `entry` / `stack_top`
+        // below: the child resumes from the saved trap state.
+        program_bias: 0,
         // entry / stack_top are NOT consulted when we resume the
         // child via UserTaskFuture::resume_with — the saved state
         // carries the real (rip, rsp). They're left at zero

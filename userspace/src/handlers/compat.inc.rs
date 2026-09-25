@@ -5924,9 +5924,15 @@ pub fn proc_task_info(
     let brk_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
         .map(|as_arc| as_arc.brk_top())
         .unwrap_or(0);
-    // Stack top — the exclusive high end of the user-stack region.
-    // Stage-1 just reports the standard fixed top.
-    let stack_top = crate::process::DEFAULT_USER_STACK_TOP;
+    // Stack top — the exclusive high end of the user-stack region. Read
+    // it off the task's AS (like `brk_top` above): the loader jitters the
+    // stack top per exec (`kaslr::user_stack_top`), so a fixed constant
+    // here would report a startstack the process never had. Falls back to
+    // the nominal top for a task whose AS predates a loader run.
+    let stack_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+        .map(|as_arc| as_arc.stack_top())
+        .filter(|&t| t != 0)
+        .unwrap_or(crate::process::DEFAULT_USER_STACK_TOP);
     // Comm name — from the PROC_COMM table (written at exec time
     // or via prctl(PR_SET_NAME)). Falls back to a "task-N"
     // default when no name has been set.
