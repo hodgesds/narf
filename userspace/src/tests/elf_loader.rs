@@ -270,6 +270,267 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_load_user_process_with_argv);
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_parse_pt_phdr() -> TestResult {
+    // PT_PHDR parsing. A self-relocating ET_DYN computes its load bias
+    // from AT_PHDR, which the loader must publish as `PT_PHDR.p_vaddr +
+    // bias`. Assert `parse_elf` captures the PT_PHDR p_vaddr into
+    // `image.phdr_vaddr`, and that its absence leaves the field `None`
+    // (so the loader's first-PT_LOAD fallback still applies).
+    use crate::parse_elf;
+
+    // p_vaddr for the PT_PHDR header — deliberately NOT equal to
+    // `e_phoff` so a regression that silently keeps the old
+    // first-PT_LOAD derivation would produce a different value.
+    const PHDR_VADDR: u64 = 0x40;
+
+    fn write_with_pt_phdr() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x2000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&0x1111u64.to_le_bytes()); // e_entry
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // 2 phdrs
+                                                            // Phdr 0 — PT_PHDR.
+        let mut ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&6u32.to_le_bytes()); // PT_PHDR
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&64u64.to_le_bytes()); // p_offset
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&PHDR_VADDR.to_le_bytes()); // p_vaddr
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&PHDR_VADDR.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x70u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x70u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+        // Phdr 1 — PT_LOAD (so the image has a loadable segment).
+        ph = 64 + 56;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&0u64.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    }
+
+    let image = match parse_elf(&write_with_pt_phdr()) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("parse_elf failed on PT_PHDR image"),
+    };
+    if image.phdr_vaddr != Some(PHDR_VADDR) {
+        return TestResult::Fail("image.phdr_vaddr should capture PT_PHDR.p_vaddr");
+    }
+
+    // Absence path: this image carries no PT_PHDR, so the field must
+    // stay None (the loader then uses its first-PT_LOAD fallback).
+    let mut b = alloc::vec![0u8; 0x1000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&0x1111u64.to_le_bytes());
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // 1 phdr (PT_LOAD)
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    match parse_elf(&b) {
+        Ok(i) if i.phdr_vaddr.is_none() => TestResult::Pass,
+        Ok(_) => TestResult::Fail("no-PT_PHDR image should leave phdr_vaddr None"),
+        Err(_) => TestResult::Fail("parse_elf failed on no-PT_PHDR image"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_parse_pt_phdr);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_at_phdr_matches_pt_phdr() -> TestResult {
+    // Regression test for the AT_PHDR derivation itself — it reads the
+    // tag back out of the auxv block the loader wrote onto the user
+    // stack, which is the value a static-PIE ET_DYN actually consumes.
+    //
+    // The image is laid out so the two candidate derivations disagree:
+    // the phdr table sits at file offset 0x1000, which the *second*
+    // PT_LOAD maps (at link vaddr 0x1_0000) — the first PT_LOAD covers
+    // only the ELF header page (file 0..0x1000 at vaddr 0). Nothing in
+    // the ABI requires the phdr-bearing PT_LOAD to be `segments[0]` with
+    // `file_off == 0`; `-z separate-code` / RELRO layouts can and do
+    // place it elsewhere.
+    //
+    //   correct (PT_PHDR.p_vaddr + bias) : 0x1_0000 + bias
+    //   old    (first PT_LOAD heuristic) : (0 - 0 + e_phoff) + bias
+    //                                    = 0x1000 + bias
+    //
+    // So deriving AT_PHDR from `segments.first()` publishes an address
+    // 0xF000 below the real phdr table; the self-relocator then computes
+    // `l_addr = AT_PHDR - PT_PHDR.p_vaddr` short by that much and skews
+    // every R_X86_64_RELATIVE / _IRELATIVE it applies.
+    use crate::{load_user_process_with, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_TOP};
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+
+    // Must match `PROGRAM_DYN_BASE` in `process.rs` — the fixed load
+    // base an ET_DYN program image gets.
+    const BIAS: u64 = 0x0000_0080_0000_0000;
+    const PHDR_OFF: u64 = 0x1000; // e_phoff: phdrs in the second file page
+    const PHDR_VA: u64 = 0x1_0000; // PT_PHDR.p_vaddr (link-time)
+    const PHNUM: u16 = 3;
+    const PHENTSIZE: u16 = 56;
+
+    let want = PHDR_VA + BIAS;
+    // The value main's `segments.first()` derivation would produce.
+    let stale = PHDR_OFF + BIAS;
+    if want == stale {
+        return TestResult::Fail("test image does not distinguish the two derivations");
+    }
+
+    let mut b = alloc::vec![0u8; 0x2000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(PHDR_VA + 0x100).to_le_bytes()); // e_entry, in PT_LOAD #1
+    b[0x20..0x28].copy_from_slice(&PHDR_OFF.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    b[0x36..0x38].copy_from_slice(&PHENTSIZE.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&PHNUM.to_le_bytes());
+
+    let mut put = |idx: usize, ty: u32, flags: u32, off: u64, va: u64, sz: u64, align: u64| {
+        let ph = PHDR_OFF as usize + idx * PHENTSIZE as usize;
+        b[ph..ph + 0x04].copy_from_slice(&ty.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&flags.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&off.to_le_bytes()); // p_offset
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&va.to_le_bytes()); // p_vaddr
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&va.to_le_bytes()); // p_paddr
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&sz.to_le_bytes()); // p_filesz
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&sz.to_le_bytes()); // p_memsz
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&align.to_le_bytes());
+    };
+    // PT_PHDR first (the ABI requires it to precede the loadable entries),
+    // describing the table at file 0x1000 / vaddr PHDR_VA.
+    put(
+        0,
+        6,
+        4,
+        PHDR_OFF,
+        PHDR_VA,
+        PHNUM as u64 * PHENTSIZE as u64,
+        8,
+    );
+    // PT_LOAD #0 — the ELF-header page only. Deliberately does NOT cover
+    // `e_phoff`, which is what breaks the first-PT_LOAD heuristic.
+    put(1, 1, 4, 0, 0, 0x1000, 0x1000);
+    // PT_LOAD #1 — R|X, maps the phdr table page at PHDR_VA.
+    put(2, 1, 5, PHDR_OFF, PHDR_VA, 0x1000, 0x1000);
+
+    // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
+    // frame allocator initialised, satisfying the loader's `# Safety` contract;
+    // `b` lives for the whole call. A non-empty argv is what makes the loader
+    // emit the auxv block this test reads back.
+    let proc = match unsafe { load_user_process_with(&b, &["x"], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+
+    let rsp = proc.stack_top.as_u64();
+    if !(DEFAULT_USER_STACK_BASE..DEFAULT_USER_STACK_TOP).contains(&rsp) {
+        return TestResult::Fail("rsp not inside stack region");
+    }
+    let read_u64 = |vaddr: u64| -> Option<u64> {
+        let p =
+            // SAFETY: `proc.address_space.root` is this test process's live page-table
+            // root, identity-reachable as `translate` requires; the walk only reads
+            // table entries for the page-aligned `vaddr`.
+            unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        // SAFETY: `p` is the phys frame `translate` just resolved for this page;
+        // OR-ing the in-page offset stays within that identity-mapped frame, and the
+        // `u64` read is aligned because every `vaddr` below is 8-byte aligned.
+        Some(unsafe {
+            *narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u64>()
+        })
+    };
+
+    // Walk the SysV initial process stack to the auxv block:
+    // argc, argv[argc], NULL, envp[..], NULL, then (tag, val) pairs.
+    let argc = match read_u64(rsp) {
+        Some(v) => v,
+        None => return TestResult::Fail("rsp not materialised"),
+    };
+    if argc != 1 {
+        return TestResult::Fail("argc should be 1");
+    }
+    let mut at = rsp + 8 + argc * 8; // → argv NULL terminator
+    if read_u64(at) != Some(0) {
+        return TestResult::Fail("argv NULL terminator missing");
+    }
+    at += 8;
+    // Skip envp (empty here, but walk it rather than assume).
+    let mut guard = 0;
+    while read_u64(at) != Some(0) {
+        at += 8;
+        guard += 1;
+        if guard > 64 {
+            return TestResult::Fail("envp NULL terminator missing");
+        }
+    }
+    at += 8; // → first auxv tag
+
+    // Scan the auxv pairs for AT_PHDR (3), AT_PHENT (4), AT_PHNUM (5).
+    let mut at_phdr: Option<u64> = None;
+    let mut at_phent: Option<u64> = None;
+    let mut at_phnum: Option<u64> = None;
+    for _ in 0..64 {
+        let tag = match read_u64(at) {
+            Some(t) => t,
+            None => return TestResult::Fail("auxv not materialised"),
+        };
+        if tag == 0 {
+            break;
+        }
+        let val = match read_u64(at + 8) {
+            Some(v) => v,
+            None => return TestResult::Fail("auxv value not materialised"),
+        };
+        match tag {
+            3 => at_phdr = Some(val),
+            4 => at_phent = Some(val),
+            5 => at_phnum = Some(val),
+            _ => {}
+        }
+        at += 16;
+    }
+
+    match at_phdr {
+        None => return TestResult::Fail("auxv carries no AT_PHDR"),
+        // The specific wrong value the first-PT_LOAD derivation yields.
+        Some(v) if v == stale => {
+            return TestResult::Fail("AT_PHDR derived from first PT_LOAD, not PT_PHDR")
+        }
+        Some(v) if v != want => return TestResult::Fail("AT_PHDR != PT_PHDR.p_vaddr + load bias"),
+        Some(_) => {}
+    }
+    // A correct AT_PHDR with a wrong table description still breaks the
+    // self-relocator's phdr walk, so pin both alongside it.
+    if at_phent != Some(PHENTSIZE as u64) {
+        return TestResult::Fail("AT_PHENT != e_phentsize");
+    }
+    if at_phnum != Some(PHNUM as u64) {
+        return TestResult::Fail("AT_PHNUM != e_phnum");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_at_phdr_matches_pt_phdr);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_load_user_process_with_interp() -> TestResult {
