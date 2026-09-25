@@ -137,6 +137,14 @@ pub fn setup() {
     // real enforcement against the default 1024 limit.
     fd::__test_clear_nofile_limit_lookup();
     install_task_id_lookup(task_lookup);
+    // setdomainname(2)/sethostname(2) are process-global with no per-test
+    // scope, and `/proc/sys/kernel/{hostname,domainname}` plus `uname(2)` all
+    // resolve to these slots. A case that sets either one otherwise leaves it
+    // for every later test in this shared image — which is exactly how
+    // `smoke_kernel_domainname_default` came to fail after
+    // `smoke_abi_creds_setdomainname_pos` ran first.
+    crate::handlers::__test_hostname_reset();
+    crate::handlers::__test_domainname_reset();
     // Per-pid `/proc` hooks are a process-global like the lookup above, and the
     // kernel-test build never runs the normal boot wiring that installs them.
     // A test reaching `/proc/self/<file>` therefore depends on some EARLIER
