@@ -6208,6 +6208,8 @@ fn smoke_process_mprotect_deny_wx() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(TASK);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
+    // run after kernel boot has installed the page tables.
     let as_ = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -6271,6 +6273,8 @@ fn smoke_sys_munlockall_returns_ok() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(TASK);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
+    // run after kernel boot has installed the page tables.
     let as_ = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
