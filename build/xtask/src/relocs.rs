@@ -56,8 +56,17 @@ const EM_AARCH64: u16 = 0xB7;
 /// Kernel-half base. Sections at or above this slide; the boot stub below it,
 /// linked at `KERNEL_LOAD_BASE` so it can run before the MMU, does not.
 pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
-/// aarch64's kernel half — `KERNEL_VIRT_BASE` in `build/linker/aarch64.ld`.
-pub const KERNEL_VIRT_BASE_AARCH64: u64 = 0xFFFF_FF80_0000_0000;
+/// aarch64's kernel IMAGE offset — `KIMAGE_VOFFSET` in
+/// `build/linker/aarch64.ld`, NOT its `KERNEL_VIRT_BASE`.
+///
+/// What this constant has to be is the base the image is linked against, since
+/// it decides both which fields move and what the encoded offsets are relative
+/// to. On aarch64 those differ: `KERNEL_VIRT_BASE` is the linear map of RAM and
+/// the image sits below it at its own offset, so using the linear base here
+/// classified every single image site as belonging to the boot stub —
+/// `0 abs64 ... 606237 low left alone` — and the slide was applied to the page
+/// tables while no absolute address was patched.
+pub const KIMAGE_VOFFSET_AARCH64: u64 = 0xFFFF_FF7F_8000_0000;
 
 /// Relocation sites to patch, split by the width of the field each one writes.
 #[derive(Debug, Default)]
@@ -163,7 +172,7 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
     let e_machine = u16_at(&bytes, 0x12);
     let base = match e_machine {
         EM_X86_64 => KERNEL_VIRT_BASE,
-        EM_AARCH64 => KERNEL_VIRT_BASE_AARCH64,
+        EM_AARCH64 => KIMAGE_VOFFSET_AARCH64,
         other => bail!("unsupported e_machine {other:#x} for a KASLR relocation table"),
     };
 
