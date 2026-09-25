@@ -2944,6 +2944,8 @@ mod aarch64_el0_preemption_e2e {
             fs_base: None,
             entry_arg: None,
             loaded_mappings: alloc::vec::Vec::new(),
+            // Hand-built image at a fixed CODE_VADDR — no ELF load bias.
+            program_bias: 0,
         })
     }
 
@@ -3823,6 +3825,8 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         fs_base: None,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        // Hand-built image at a fixed CODE_VADDR — no ELF load bias.
+        program_bias: 0,
     };
 
     // Boot the executor + wire the user-task hooks so Yield/Exit
