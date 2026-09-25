@@ -16613,6 +16613,21 @@ mod child_reap_signalfd_tests {
         // first and exposes it. Establish the initialised signal state a real
         // parent has (and clear any prior case's leaked bits) up front.
         super::signal_init();
+        // Same story for the wait/parent-link tables, and for the same reason:
+        // `PARENT_OF`, `PENDING_TERMINATION` and friends start as `None` and are
+        // only populated by `wait_init()` (which a real boot runs once at
+        // userspace init). Both writers below are
+        // `if let Some(map) = table.lock().as_mut()`, so against a `None` table
+        // they SILENTLY DO NOTHING: the parent link is never recorded,
+        // `get_wait_recipient` then returns None, and `on_child_exit` takes its
+        // orphan path — no SIGCHLD staged, no signalfd wake, waker count 0.
+        //
+        // This test used to pass only because some earlier test in the boot
+        // happened to have called `wait_init()` first. Adding 42 UDP ABI cases
+        // in #423 reordered the set and that stopped being true, which is the
+        // same failure mode (and the same fix) as the `signal_init()` call
+        // above — one table over.
+        super::wait_init();
         // What fork/exit set up before on_child_exit: the natural-parent link
         // with a SIGCHLD exit-signal, and the staged wstatus.
         super::parent_of_set_with_signal(child, parent, 17); // SIGCHLD
