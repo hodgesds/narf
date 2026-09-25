@@ -6235,6 +6235,15 @@ fn smoke_process_mprotect_deny_wx() -> TestResult {
     install_address_space_lookup(lookup_proc_parent_as);
     LOOKUP_TASK.store(TASK, Ordering::Relaxed);
 
+    // Dispatching through `kernel_syscall_entry` needs a syscall table
+    // installed: `__test_clear_global()` above removed the previous test's,
+    // and without a fresh one the entry finds no handler, leaves `ctx.ret`
+    // None, and the assertions below read that as the syscall having
+    // returned the wrong thing rather than as never having run.
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
     // Try to set W|X using mprotect
     let mut ctx = StubCtx {
         args: SyscallArgs {
@@ -6282,6 +6291,15 @@ fn smoke_sys_munlockall_returns_ok() -> TestResult {
     *PROC_PARENT_AS.lock() = Some(as_);
     install_address_space_lookup(lookup_proc_parent_as);
     LOOKUP_TASK.store(TASK, core::sync::atomic::Ordering::Relaxed);
+
+    // Dispatching through `kernel_syscall_entry` needs a syscall table
+    // installed: `__test_clear_global()` above removed the previous test's,
+    // and without a fresh one the entry finds no handler, leaves `ctx.ret`
+    // None, and the assertions below read that as the syscall having
+    // returned the wrong thing rather than as never having run.
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
 
     let mut ctx = StubCtx {
         args: SyscallArgs {
