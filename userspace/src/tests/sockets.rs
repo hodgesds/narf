@@ -569,7 +569,8 @@ fn smoke_socket_so_bindtodevice_round_trip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_so_bindtodevice_round_trip);
 
-/// sockaddr_in with invalid family rejected by Connect.
+/// sockaddr_in with invalid family rejected by Connect: `tcp_v4_connect`
+/// answers a foreign `sin_family` with -EAFNOSUPPORT.
 fn smoke_socket_sockaddr_invalid_family_rejected() -> TestResult {
     let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_STREAM);
     let mut bogus = crate::socket::make_sockaddr_in(0x7F00_0001, 4321);
@@ -577,11 +578,11 @@ fn smoke_socket_sockaddr_invalid_family_rejected() -> TestResult {
     let r = sock.dispatch_op(crate::socket::SocketOp::Connect { addr: bogus });
     if matches!(
         r,
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AfNoSupport)
     ) {
         TestResult::Pass
     } else {
-        TestResult::Fail("invalid family was not rejected")
+        TestResult::Fail("invalid family was not rejected with EAFNOSUPPORT")
     }
 }
 kernel_test_in!("userspace", smoke_socket_sockaddr_invalid_family_rejected);
@@ -989,15 +990,9 @@ fn smoke_net_ns_dual_bind_same_port() -> TestResult {
     use crate::socket::{SockAddr, SocketFile, SocketOp, SocketOpResult};
     use crate::socket::{AF_INET, SOCK_DGRAM};
 
-    // sockaddr_in body: port (BE) + ip (BE). Port 7777, 0.0.0.0.
-    let port: u16 = 7777;
-    let mut body = alloc::vec::Vec::new();
-    body.extend_from_slice(&port.to_be_bytes());
-    body.extend_from_slice(&0u32.to_be_bytes());
-    let mk_addr = || SockAddr {
-        family: AF_INET,
-        body: body.clone(),
-    };
+    // A full sockaddr_in (port, ip, sin_zero): `inet_bind_sk` rejects an
+    // address shorter than sizeof(struct sockaddr_in). Port 7777, 0.0.0.0.
+    let mk_addr = || -> SockAddr { crate::socket::make_sockaddr_in(0, 7777) };
 
     // ns 100 and ns 200 both bind 0.0.0.0:7777 — both succeed.
     let s1 = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
@@ -1053,14 +1048,9 @@ fn smoke_net_ns_loopback_delivery_and_final_teardown() -> TestResult {
 
     let port = 19001u16;
     let loopback = u32::from_be_bytes([127, 0, 0, 1]);
-    let addr = SockAddr {
-        family: AF_INET,
-        body: [
-            port.to_be_bytes().as_slice(),
-            loopback.to_be_bytes().as_slice(),
-        ]
-        .concat(),
-    };
+    // A full sockaddr_in: `inet_bind_sk` / `ip4_datagram_connect` reject an
+    // address shorter than sizeof(struct sockaddr_in).
+    let addr: SockAddr = crate::socket::make_sockaddr_in(loopback, port);
     if !matches!(
         receiver.dispatch_op(SocketOp::Bind { addr: addr.clone() }),
         SocketOpResult::Ok(_)
