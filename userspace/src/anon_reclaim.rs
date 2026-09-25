@@ -37,6 +37,11 @@ impl AnonReclaimer for TaskAnonReclaimer {
             let Some(aspace) = narf_scheduler::address_space_of(TaskId(tid)) else {
                 continue;
             };
+            // Tier zero: drain this space's deferred-flush quarantine — the
+            // parked frames are already unmapped and only await their batch
+            // invalidation, so under pressure they are the cheapest memory
+            // in the system.
+            aspace.flush_deferred();
             let remaining = target_pages - freed;
             // First tier: discard still-clean MADV_FREE pages — no IO, no
             // swap requirement, exactly the pages userspace already declared

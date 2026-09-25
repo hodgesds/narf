@@ -6112,11 +6112,25 @@ pub fn proc_task_info(
         tracer_pid: crate::ptrace::get_task_tracer(pid)
             .map(|tracer| report_pid_to(tid, tracer))
             .unwrap_or(0),
-        fd_table_size: fd::with_table(tid, |t| t.fd_table_size())
-            // Linux's table starts at NR_OPEN_DEFAULT and never shrinks
-            // below it, so neither does this. The value must never
-            // UNDERSTATE the highest open descriptor: a consumer scanning
-            // `0..FDSize` would otherwise walk past live fds.
+        // `try_with_table`, never `with_table`: a stat-family syscall on a
+        // `/proc/self` fd reaches here (owners → task_info) while ALREADY
+        // holding this task's fd-table lock, and that lock is a non-reentrant
+        // IrqSafeSpinLock — a blocking re-acquire self-deadlocks with IF=0.
+        // The non-blocking read falls back to the floor on contention, which
+        // mirrors Linux reading `fdtable::max_fds` locklessly under RCU. The
+        // stat-path callers also clone their FileOps out of the lock first, so
+        // this guard is defence-in-depth (it also protects the fatal-fault
+        // VMA dump, which calls proc_task_info from any faulting context).
+        fd_table_size: fd::try_with_table(tid, |t| t.fd_table_size())
+            // Floored at NR_OPEN_DEFAULT (64), Linux's initial table size.
+            // This is BEST-EFFORT: `try_with_table` returns None when the
+            // shard or table lock is momentarily contended (a sibling thread
+            // mid-fd-syscall, or the re-entrant stat path), and we then report
+            // the 64 floor rather than block. So for a process with >64 fds a
+            // racing read can understate FDSize — an accepted trade to keep
+            // /proc introspection non-blocking (no in-tree consumer relies on
+            // the exact capacity; an exact lock-free AtomicU64 is the eventual
+            // fix, matching Linux's RCU `fdtable::max_fds`).
             .unwrap_or(0)
             .max(64),
     })
@@ -7539,11 +7553,30 @@ fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
 }
 
 fn futex_drop_task_waiters(task_id: u64) {
-    for bucket in &FUTEX_WAITERS {
-        bucket.values.lock().retain(|_, waiters| {
-            waiters.remove(&task_id);
-            !waiters.is_empty()
-        });
+    // Targeted: the park loop is the only registrar, it registers exactly
+    // one key (the task's live `futex_uaddr`), and every non-stay exit from
+    // the loop drops that key — including the seqlock retarget path, whose
+    // requeue moves the entry AND the uaddr together. So at drop time every
+    // registration this task can own sits under its CURRENT park key. The
+    // old shape swept all 256 bucket locks per task exit; a 1000-thread
+    // exit storm hammered those global locks from every CPU at once.
+    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
+        let uaddr = uc.futex_uaddr.load(Ordering::Acquire);
+        (uaddr != 0).then(|| futex_key(uc.futex_namespace.load(Ordering::Acquire), uaddr))
+    });
+    match key {
+        Some(Some(key)) => futex_drop_waiter_key(key, task_id),
+        // Not parked: nothing registered, nothing to sweep.
+        Some(None) => {}
+        // Ctx already gone (racing teardown) — conservative full sweep.
+        None => {
+            for bucket in &FUTEX_WAITERS {
+                bucket.values.lock().retain(|_, waiters| {
+                    waiters.remove(&task_id);
+                    !waiters.is_empty()
+                });
+            }
+        }
     }
 }
 
@@ -7755,12 +7788,23 @@ fn futex_requeue_waiters_keyed(
     };
     // Retarget each mover's park state OUTSIDE the table lock (the task
     // registry lock in with_user_task_ctx must never nest inside it).
+    // Seqlocked against the mover's own park loop: bump to odd, store the
+    // four target fields, bump to even. A re-poll racing this window used
+    // to load the OLD word, register on its queue after the map entry had
+    // already moved here, and — an untimed FUTEX_WAIT arms no backstop
+    // timer — strand forever while every wake landed on the new key (the
+    // stress-ng --pthread 0.33x collapse: musl's condvar broadcast limped
+    // from strand to backstop instead of chaining wakes). The park loop
+    // re-validates the sequence after registering and turns any movement
+    // into a spurious return; musl re-checks the word in userspace.
     for tid in &moved {
         crate::user_task::with_user_task_ctx(*tid, |uc| {
+            uc.futex_park_seq.fetch_add(1, Ordering::AcqRel);
             uc.futex_park_gen.store(gen2, Ordering::Release);
             uc.futex_val.store(new_val, Ordering::Release);
-            uc.futex_uaddr.store(uaddr2, Ordering::Release);
             uc.futex_namespace.store(key2.namespace, Ordering::Release);
+            uc.futex_uaddr.store(uaddr2, Ordering::Release);
+            uc.futex_park_seq.fetch_add(1, Ordering::Release);
         });
     }
     (woken, moved.len())
@@ -7780,6 +7824,75 @@ pub(crate) fn futex_read_user_word(uaddr: u64) -> Option<u32> {
         Some(u32::from_ne_bytes(b))
     } else {
         None
+    }
+}
+
+/// Outcome of [`futex_park_register_and_check`]: what the park loop should
+/// do about the task's futex wait, if any.
+pub(crate) enum FutexParkCheck {
+    /// No futex park is active (`futex_uaddr == 0`) — fall through to the
+    /// other park sources.
+    NotWaiting,
+    /// Registered on the (seqlock-validated) word's wait queue and the wait
+    /// still holds — keep parking.
+    Stay,
+    /// A wake landed, the word changed, or a `FUTEX_REQUEUE` retarget raced
+    /// the registration: the park fields are cleared and any stale queue
+    /// entry dropped. The caller must return control to userspace as a
+    /// (possibly spurious) futex wake — musl re-checks the word.
+    Wake,
+}
+
+/// The single home of the futex park-target seqlock protocol shared by both
+/// park loops (the own-stack loop and `UserTaskFuture::poll`): snapshot
+/// `futex_park_seq`, load the target fields, register on the word's wait
+/// queue, then re-validate the sequence. An odd snapshot or any movement
+/// across the load→register window means a `FUTEX_REQUEUE` was mid-retarget
+/// — the just-inserted entry may name the stale word, so it is dropped and
+/// the wait resolves as a spurious wake. Keeping this in one function keeps
+/// the ordering invariant (seq before fields; re-check after register) from
+/// drifting between the two call sites.
+pub(crate) fn futex_park_register_and_check(
+    uc: &crate::user_task::UserTaskCtx,
+    task_id: u64,
+    waker: &core::task::Waker,
+) -> FutexParkCheck {
+    let clear = |uc: &crate::user_task::UserTaskCtx| {
+        uc.sleep_deadline_ns.store(0, Ordering::Release);
+        uc.futex_uaddr.store(0, Ordering::Release);
+        uc.futex_namespace.store(0, Ordering::Release);
+    };
+    let seq_before = uc.futex_park_seq.load(Ordering::Acquire);
+    let fu = uc.futex_uaddr.load(Ordering::Acquire);
+    if fu == 0 {
+        return FutexParkCheck::NotWaiting;
+    }
+    if seq_before & 1 != 0 {
+        // Retarget in flight: the fields are mid-rewrite.
+        clear(uc);
+        return FutexParkCheck::Wake;
+    }
+    let key = futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+    futex_register_waiter_key(key, task_id, waker.clone());
+    if uc.futex_park_seq.load(Ordering::Acquire) != seq_before {
+        // A requeue retargeted us between the field loads and the
+        // registration — the entry we just inserted names the stale word.
+        futex_drop_waiter_key(key, task_id);
+        clear(uc);
+        return FutexParkCheck::Wake;
+    }
+    let stay = futex_park_should_stay(
+        futex_gen_key(key),
+        uc.futex_park_gen.load(Ordering::Acquire),
+        futex_read_user_word(fu),
+        uc.futex_val.load(Ordering::Acquire),
+    );
+    if stay {
+        FutexParkCheck::Stay
+    } else {
+        futex_drop_waiter_key(key, task_id);
+        clear(uc);
+        FutexParkCheck::Wake
     }
 }
 
@@ -11738,9 +11851,14 @@ mod aio {
             return EBADF;
         }
         let mut kbuf = alloc::vec![0u8; len];
-        let outcome = fd::with_table(tid, |t| {
-            let entry = t.get(fd_no)?;
-            let ops = entry.ops.clone();
+        // Clone the ops out from under the fd-table lock, then run the BLOCKING
+        // read outside it. `poll_blocking` parks/yields, and `FileOps::read`
+        // on a /proc node re-enters `with_table` — holding this non-reentrant
+        // IrqSafeSpinLock (IF=0) across either self-deadlocks (e.g. aio PREAD of
+        // /proc/self/fd/N) or parks a CPU with the lock held. See the stat-family
+        // fix in the same class.
+        let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
+        let outcome = ops.map(|ops| {
             poll_blocking(ops.read(offset, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
                 .ok()
@@ -11773,9 +11891,10 @@ mod aio {
         if !fd::with_table(tid, |t| t.get(fd_no).is_some()).unwrap_or(false) {
             return EBADF;
         }
-        let outcome = fd::with_table(tid, |t| {
-            let entry = t.get(fd_no)?;
-            let ops = entry.ops.clone();
+        // Clone ops out, then run the blocking write outside the lock — same
+        // non-reentrant / park-with-lock-held hazard as do_pread.
+        let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
+        let outcome = ops.map(|ops| {
             poll_blocking(ops.write(offset, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
                 .ok()
@@ -11853,11 +11972,13 @@ mod aio {
             return;
         }
         let one = 1u64.to_le_bytes();
-        let _ = fd::with_table(tid, |t| {
-            let entry = t.get(iocb.aio_resfd)?;
-            let ops = entry.ops.clone();
-            poll_blocking(ops.write(0, &one))
-        });
+        // Clone ops out, then write outside the lock — aio_resfd is any
+        // caller-supplied fd, so the blocking write must not run with the
+        // fd-table lock held (see do_pread).
+        let ops = fd::with_table(tid, |t| t.get(iocb.aio_resfd).map(|e| e.ops.clone())).flatten();
+        if let Some(ops) = ops {
+            let _ = poll_blocking(ops.write(0, &one));
+        }
     }
 
     /// Execute one decoded iocb synchronously; return its `res` (bytes or

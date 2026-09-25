@@ -64,20 +64,21 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         // flag validation on this branch at all.
         let out_ptr = stat_out as *mut linux_compat::Stat;
         let task = current_task_id();
-        let stat = fd::with_table(task, |t| {
-            t.get(dirfd as u32)
-                .map(|e| {
-                (
-                    e.ops.stat(),
-                    e.ops.owners(),
-                    e.ops.rdev(),
-                    e.ops.ino(),
-                    e.ops.inode_attrs(),
-                )
-            })
-        });
-        let (s, (uid, gid), rdev, ino, attrs) = match stat {
-            Some(Some(tuple)) => tuple,
+        // Clone the FileOps out from under the fd-table lock before querying:
+        // `owners()` on a procfs node reaches `proc_task_info` →
+        // `with_table(same task)`, and the table lock is a non-reentrant
+        // IrqSafeSpinLock, so calling it inside the closure self-deadlocks on
+        // `newfstatat(fd,"",AT_EMPTY_PATH)` of a `/proc/self` fd (which is how
+        // modern glibc implements `fstat`). See sys_fstat_linux.
+        let ops = fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.clone()));
+        let (s, (uid, gid), rdev, ino, attrs) = match ops {
+            Some(Some(ops)) => (
+                ops.stat(),
+                ops.owners(),
+                ops.rdev(),
+                ops.ino(),
+                ops.inode_attrs(),
+            ),
             _ => {
                 ctx.set_return(errno_ret(EBADF));
                 return;

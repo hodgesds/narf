@@ -542,6 +542,49 @@ impl Region {
     }
 }
 
+/// Deferred remote-TLB-flush batch — see the `AddressSpace::deferred_flush`
+/// field doc for the full contract. Regions keep OWNERSHIP of their data
+/// frames while parked here; `page_tables` holds detached (already
+/// unregistered) page-table frames. `pages` counts 4 KiB units for the
+/// drain threshold; `ranges` are the page-aligned `[lo, hi)` virtual spans
+/// whose remote invalidation is still pending.
+#[derive(Default)]
+struct DeferredFlush {
+    ranges: Vec<(u64, u64)>,
+    regions: Vec<Region>,
+    page_tables: Vec<crate::frame::PhysFrame>,
+    /// Data frames extracted by the splitting punch path (no owning region
+    /// survives them); freed COW-aware at drain, after the batch flush.
+    loose_frames: Vec<crate::frame::PhysFrame>,
+    pages: u64,
+}
+
+impl DeferredFlush {
+    /// Drain threshold in 4 KiB pages: one tag-wide broadcast per this much
+    /// quarantined memory. 512 pages (2 MiB) matches the ranged-flush
+    /// ceiling — past it a single flush was already tag-wide, so batching
+    /// N unmaps into one costs no extra invalidation breadth.
+    const DRAIN_PAGES: u64 = 512;
+    /// Range-list cap so the overlap probe stays O(small).
+    const MAX_RANGES: usize = 64;
+
+    fn overlaps(&self, lo: u64, hi: u64) -> bool {
+        self.ranges.iter().any(|&(rlo, rhi)| lo < rhi && rlo < hi)
+    }
+}
+
+impl core::fmt::Debug for DeferredFlush {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeferredFlush")
+            .field("ranges", &self.ranges.len())
+            .field("regions", &self.regions.len())
+            .field("page_tables", &self.page_tables.len())
+            .field("loose_frames", &self.loose_frames.len())
+            .field("pages", &self.pages)
+            .finish()
+    }
+}
+
 /// Copy the explicit portion of one virtual-page window out of a sparse
 /// backing prefix. Omitted trailing slots remain implicit demand-zero pages in
 /// the returned fragment.
@@ -1637,6 +1680,26 @@ pub struct AddressSpace {
     /// mutate their VMAs concurrently while making limit admission +
     /// MAP_FIXED replacement + publication indivisible to CLONE_VM peers.
     vma_transaction: IrqSafeSpinLock<()>,
+    /// Deferred remote-TLB-flush quarantine — the mmu_gather-across-
+    /// operations batching Linux uses for unmap storms. An eligible unmap
+    /// (whole-VMA munmap / exact punch) clears its leaves LOCALLY, then
+    /// parks the removed region (its data frames still owned) and any
+    /// detached page-table frames here instead of paying a cross-CPU
+    /// broadcast per call; one coalesced tag-wide invalidation retires the
+    /// whole batch and only then do the frames free. A 1000-thread exit
+    /// storm (musl `pthread_exit` munmaps its own stack) previously fired
+    /// 1000 broadcasts × 15 busy vCPUs — ~60 µs per exit under KVM, 3x
+    /// Linux — and now pays one broadcast per ~512 quarantined pages.
+    ///
+    /// Correctness contract: a quarantined frame is never reused before the
+    /// batch flush (frames free only at drain), and no VA inside a pending
+    /// range may be re-mapped before a drain (`map_region_inner` and the
+    /// punch paths call [`Self::flush_deferred_if_overlapping`]). A remote
+    /// CPU with a stale translation can still touch the OLD frame during
+    /// the window — undefined behaviour for the program (access after
+    /// munmap) but never corruption of anyone else's memory, the same
+    /// window Linux's batched reclaim flush accepts.
+    deferred_flush: IrqSafeSpinLock<DeferredFlush>,
     /// Per-AS mmap cursor: next free virt for a no-hint mmap.
     /// Lives here (not on a single global) so each process gets its
     /// own monotonically-increasing arena instead of a shared race.
@@ -1783,6 +1846,7 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
+            deferred_flush: IrqSafeSpinLock::new(DeferredFlush::default()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
@@ -2621,6 +2685,7 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(regions),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
+            deferred_flush: IrqSafeSpinLock::new(DeferredFlush::default()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
@@ -2655,6 +2720,7 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(regions),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
+            deferred_flush: IrqSafeSpinLock::new(DeferredFlush::default()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
             brk_top: core::sync::atomic::AtomicU64::new(0),
@@ -3133,6 +3199,8 @@ impl AddressSpace {
         requested_lock: Option<FutureLockPolicy>,
         lock_admission: Option<(u64, bool)>,
     ) -> Result<(MappingReceipt, bool), AddressSpaceError> {
+        // Deferred-flush publisher gate (see `map_region_inner`).
+        self.flush_deferred_if_overlapping(region.base.as_u64(), region.len.div_ceil(0x1000));
         if region.perms.contains(RegionPerms::LOCK_ONFAULT) {
             region.perms.0 |= RegionPerms::LOCKED.0;
         }
@@ -3668,6 +3736,8 @@ impl AddressSpace {
         limit_bytes: u64,
         bypass_limit: bool,
     ) -> Result<(), AddressSpaceError> {
+        // Deferred-flush publisher gate (see `map_region_inner`).
+        self.flush_deferred_if_overlapping(region.base.as_u64(), region.len.div_ceil(0x1000));
         if let Err(error) =
             self.check_locked_mapping_limit(region.len, explicit_lock, limit_bytes, bypass_limit)
         {
@@ -4320,6 +4390,8 @@ impl AddressSpace {
         limits: MremapLimits,
         shared_transaction_held: bool,
     ) -> Result<Option<(u64, u64)>, FixedRelocationError> {
+        // Deferred-flush publisher gate (see `map_region_inner`).
+        self.flush_deferred_if_overlapping(new_base.as_u64(), new_len.div_ceil(0x1000));
         let early = |error| FixedRelocationError {
             error,
             target_punched: false,
@@ -4754,6 +4826,8 @@ impl AddressSpace {
         new_len: u64,
         limits: MremapLimits,
     ) -> Result<Option<(u64, u64)>, AddressSpaceError> {
+        // Deferred-flush publisher gate (see `map_region_inner`).
+        self.flush_deferred_if_overlapping(new_base.as_u64(), new_len.div_ceil(0x1000));
         let (old_lo, old_hi, new_lo, new_hi) =
             Self::relocation_bounds(old_base, old_len, new_base, new_len)?;
 
@@ -5501,6 +5575,8 @@ impl AddressSpace {
         limits: MremapLimits,
         shared_transaction_held: bool,
     ) -> Result<(), FixedRelocationError> {
+        // Deferred-flush publisher gate (see `map_region_inner`).
+        self.flush_deferred_if_overlapping(new_base.as_u64(), len.div_ceil(0x1000));
         let early = |error| FixedRelocationError {
             error,
             target_punched: false,
@@ -5546,6 +5622,8 @@ impl AddressSpace {
         mode: SharedMremapMode,
         limits: MremapLimits,
     ) -> Result<Option<(u64, u64)>, AddressSpaceError> {
+        // Deferred-flush publisher gate (see `map_region_inner`).
+        self.flush_deferred_if_overlapping(destination.as_u64(), len.div_ceil(0x1000));
         let (source_lo, source_hi, destination_lo, destination_hi) =
             Self::relocation_bounds(source, len, destination, len)?;
 
@@ -6287,6 +6365,22 @@ impl AddressSpace {
             drop(regions);
             drop(huge);
             let reclaimed = self.detach_empty_page_tables(region.base, region.len >> 12);
+            // Private anonymous whole-VMA munmap — the malloc/free and
+            // thread-stack-exit hot shape — joins the deferred-flush batch
+            // instead of paying a broadcast per call (see `deferred_flush`).
+            // SHARED regions keep the synchronous path: their frames may
+            // return to an external owner's cache, which must not observe a
+            // deferred release.
+            if !region.perms.contains(RegionPerms::SHARED)
+                && !region.perms.contains(RegionPerms::FILE_DEMAND)
+            {
+                let (pt_frames, span_lo, span_pages) = match reclaimed {
+                    Some((frames, rlo, rspan)) => (frames, rlo.as_u64(), rspan),
+                    None => (Vec::new(), region.base.as_u64(), region.len >> 12),
+                };
+                self.defer_unmap_flush(span_lo, span_pages, region, pt_frames);
+                return Ok(());
+            }
             match &reclaimed {
                 Some((_, lo, span)) => self.flush_region_broadcast(*lo, *span),
                 None => self.flush_region_broadcast(region.base, region.len >> 12),
@@ -6585,6 +6679,19 @@ impl AddressSpace {
         } else {
             None
         };
+        // A punch that touched NO shared region (the common case — musl's
+        // thread-stack teardown spans a PROT_NONE guard plus the stack, two
+        // private regions) joins the deferred-flush batch: one quarantined
+        // entry instead of a broadcast per call. Shared punches keep the
+        // synchronous ordering their external owners rely on.
+        if punched_pages > 0 && !shared && shared_to_release.is_empty() {
+            let (pt_frames, span_lo, span_pages) = match reclaimed {
+                Some((frames, rlo, rspan)) => (frames, rlo.as_u64(), rspan),
+                None => (Vec::new(), base.as_u64(), (hi - lo) >> 12),
+            };
+            self.defer_punch_flush(span_lo, span_pages, to_free, pt_frames);
+            return Ok(());
+        }
         if punched_pages > 0 {
             match &reclaimed {
                 Some((_, rlo, span)) => self.flush_region_broadcast(*rlo, *span),
@@ -6684,6 +6791,169 @@ impl AddressSpace {
             }
             Some((detached, VirtAddr::new(lo), (end - lo) >> 12))
         }
+    }
+
+    /// Park an eligible unmap's aftermath in the deferred-flush quarantine
+    /// instead of paying a per-call cross-CPU broadcast: the region keeps
+    /// owning its data frames, detached page tables ride along, and one
+    /// coalesced tag-wide invalidation retires the whole batch at the
+    /// threshold. Callers must already have torn down the range's leaves
+    /// LOCALLY. Falls back to an immediate drain when the batch is full.
+    fn defer_unmap_flush(
+        &self,
+        base: u64,
+        pages: u64,
+        region: Region,
+        page_tables: Vec<crate::frame::PhysFrame>,
+    ) {
+        enum Outcome {
+            Queued,
+            Drain(DeferredFlush),
+            // Reservation failed: hand the values back for a synchronous
+            // flush. The deferral is an optimization, never a requirement.
+            Fallback(Region, Vec<crate::frame::PhysFrame>),
+        }
+        let outcome = {
+            let mut d = self.deferred_flush.lock();
+            let reserved = d.ranges.try_reserve(1).is_ok()
+                && d.regions.try_reserve(1).is_ok()
+                && d.page_tables.try_reserve(page_tables.len()).is_ok();
+            if !reserved {
+                Outcome::Fallback(region, page_tables)
+            } else {
+                d.ranges.push((base, base.saturating_add(pages << 12)));
+                d.regions.push(region);
+                d.page_tables.extend(page_tables);
+                d.pages = d.pages.saturating_add(pages);
+                if d.pages >= DeferredFlush::DRAIN_PAGES
+                    || d.ranges.len() >= DeferredFlush::MAX_RANGES
+                {
+                    Outcome::Drain(core::mem::take(&mut *d))
+                } else {
+                    Outcome::Queued
+                }
+            }
+        };
+        match outcome {
+            Outcome::Queued => {}
+            Outcome::Drain(batch) => self.drain_deferred_batch(batch),
+            Outcome::Fallback(region, page_tables) => {
+                self.flush_region_broadcast(VirtAddr::new(base), pages);
+                if self.root.as_u64() != 0 {
+                    self.free_region_frames(&region);
+                }
+                if !page_tables.is_empty() {
+                    // SAFETY: detached + unregistered by the caller; the
+                    // broadcast above retired stale walks.
+                    unsafe { crate::frame::free_unique_frame_batch(&page_tables) };
+                }
+            }
+        }
+    }
+
+    /// Splitting-punch sibling of [`Self::defer_unmap_flush`]: park a
+    /// punched range's extracted data frames (plus detached page tables)
+    /// without an owning region. Same threshold-drain behaviour; falls back
+    /// to a synchronous flush + free when the quarantine cannot reserve.
+    fn defer_punch_flush(
+        &self,
+        base: u64,
+        pages: u64,
+        frames: Vec<crate::frame::PhysFrame>,
+        page_tables: Vec<crate::frame::PhysFrame>,
+    ) {
+        enum Outcome {
+            Queued,
+            Drain(DeferredFlush),
+            Fallback(Vec<crate::frame::PhysFrame>, Vec<crate::frame::PhysFrame>),
+        }
+        let outcome = {
+            let mut d = self.deferred_flush.lock();
+            let reserved = d.ranges.try_reserve(1).is_ok()
+                && d.loose_frames.try_reserve(frames.len()).is_ok()
+                && d.page_tables.try_reserve(page_tables.len()).is_ok();
+            if !reserved {
+                Outcome::Fallback(frames, page_tables)
+            } else {
+                d.ranges.push((base, base.saturating_add(pages << 12)));
+                d.loose_frames.extend(frames);
+                d.page_tables.extend(page_tables);
+                d.pages = d.pages.saturating_add(pages);
+                if d.pages >= DeferredFlush::DRAIN_PAGES
+                    || d.ranges.len() >= DeferredFlush::MAX_RANGES
+                {
+                    Outcome::Drain(core::mem::take(&mut *d))
+                } else {
+                    Outcome::Queued
+                }
+            }
+        };
+        match outcome {
+            Outcome::Queued => {}
+            Outcome::Drain(batch) => self.drain_deferred_batch(batch),
+            Outcome::Fallback(frames, page_tables) => {
+                self.flush_region_broadcast(VirtAddr::new(base), pages);
+                if self.root.as_u64() != 0 {
+                    crate::frame::free_frame_batch(&frames);
+                }
+                if !page_tables.is_empty() {
+                    // SAFETY: detached + unregistered by the caller; the
+                    // broadcast above retired stale walks.
+                    unsafe { crate::frame::free_unique_frame_batch(&page_tables) };
+                }
+            }
+        }
+    }
+
+    /// Retire one taken quarantine batch: a single tag-wide invalidation,
+    /// then the frame releases the broadcast was protecting.
+    fn drain_deferred_batch(&self, batch: DeferredFlush) {
+        if batch.regions.is_empty() && batch.page_tables.is_empty() {
+            return;
+        }
+        // Tag-wide: the batch spans scattered ranges; any page count past
+        // the ranged ceiling selects the tag-wide form.
+        self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
+        if self.root.as_u64() != 0 {
+            for region in &batch.regions {
+                self.free_region_frames(region);
+            }
+        }
+        if !batch.page_tables.is_empty() {
+            // SAFETY: every parked table was detached from this root and
+            // unregistered before it entered the batch; the broadcast above
+            // retired stale walks. Page tables are never COW-shared.
+            unsafe { crate::frame::free_unique_frame_batch(&batch.page_tables) };
+        }
+        if self.root.as_u64() != 0 && !batch.loose_frames.is_empty() {
+            // Extracted data frames from splitting punches: COW-aware batch
+            // free, same as the synchronous path's `free_frame_batch`.
+            crate::frame::free_frame_batch(&batch.loose_frames);
+        }
+    }
+
+    /// Drain the deferred-flush quarantine unconditionally. Reclaim calls
+    /// this to turn parked frames into free memory; teardown calls it so no
+    /// frame outlives its address space's final invalidation.
+    pub fn flush_deferred(&self) {
+        let batch = core::mem::take(&mut *self.deferred_flush.lock());
+        self.drain_deferred_batch(batch);
+    }
+
+    /// Drain the quarantine IF `[base, base + pages*4096)` intersects a
+    /// pending range. Every path that PUBLISHES a mapping calls this before
+    /// insertion — the single choke point that keeps a re-mapped VA from
+    /// aliasing a stale remote translation of its previous life.
+    fn flush_deferred_if_overlapping(&self, base: u64, pages: u64) {
+        let hi = base.saturating_add(pages << 12);
+        let batch = {
+            let mut d = self.deferred_flush.lock();
+            if !d.overlaps(base, hi) {
+                return;
+            }
+            core::mem::take(&mut *d)
+        };
+        self.drain_deferred_batch(batch);
     }
 
     /// One batched cross-CPU TLB invalidation for `pages` pages starting at
@@ -12084,6 +12354,13 @@ impl Drop for AddressSpace {
     /// allocator slot can be reused; tag-0 switches flush on root changes.
     /// Kernel-half PML4 entries on x86_64 are never reclaimed.
     fn drop(&mut self) {
+        // Release any deferred-flush quarantine first: its regions own data
+        // frames (and detached page tables) that the region-table walk below
+        // will never see — without this drain they would leak at every
+        // process exit. The lifetime-tag retirement below already provides
+        // the final invalidation ordering the quarantine's own drain also
+        // performs.
+        self.flush_deferred();
         // Nonzero process tags preserve translations across context switches.
         // Last-Arc ownership proves the root is inactive; retire the complete
         // lifetime tag BEFORE any data or table frame can be reused. Releasing
@@ -12670,43 +12947,6 @@ fn smoke_memory_anon_merge_joins_dense_neighbours() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_anon_merge_joins_dense_neighbours);
-
-/// Coalescing is best-effort: when the padding reservation cannot be
-/// satisfied (here a sparse destination whose zero-pad would need terabytes),
-/// the merge declines before removing anything and both VMAs survive with
-/// their original shapes and frame placement.
-fn smoke_memory_anon_merge_reserve_failure_leaves_regions_intact() -> TestResult {
-    let base = 0x0000_0081_0500_0000u64;
-    let huge_pages = 1u64 << 40;
-    let source_base = base + (huge_pages << 12);
-    let table = match coalesce_preserving_placement(
-        alloc::vec![
-            merge_test_region(base, huge_pages, alloc::vec![PhysAddr::new(0x4D_000)]),
-            merge_test_region(source_base, 1, alloc::vec![PhysAddr::new(0x4E_000)]),
-        ],
-        source_base,
-    ) {
-        Ok(table) => table,
-        Err(reason) => return TestResult::Fail(reason),
-    };
-    if table.iter().count() != 2 {
-        return TestResult::Fail("a failed padding reservation still merged the VMAs");
-    }
-    let destination_intact = table
-        .get(base)
-        .is_some_and(|region| region.len == huge_pages << 12 && region.phys.len() == 1);
-    let source_intact = table
-        .get(source_base)
-        .is_some_and(|region| region.len == 4096 && region.phys.len() == 1);
-    if !destination_intact || !source_intact {
-        return TestResult::Fail("a declined merge changed a region's shape");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_reserve_failure_leaves_regions_intact
-);
 
 /// Demand ownership is page-scoped, and removing/replacing a VMA cancels an
 /// outstanding ticket before its slow path can publish into the new mapping.

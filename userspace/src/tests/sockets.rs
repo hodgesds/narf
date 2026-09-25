@@ -1429,3 +1429,57 @@ fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_socket_bindtodevice_filters_receive);
+
+/// setsockopt of a read-only SOL_SOCKET option is ENOPROTOOPT, not EINVAL:
+/// Linux `sk_setsockopt` (net/core/sock.c) — `case SO_TYPE: case
+/// SO_PROTOCOL: case SO_DOMAIN: case SO_ERROR: return -ENOPROTOOPT;`.
+fn smoke_socket_setsockopt_readonly_is_enoprotoopt() -> TestResult {
+    use crate::socket::{SocketOp, SocketOpResult, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_TYPE};
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_STREAM);
+    let one = 1u32.to_ne_bytes();
+    for name in [SO_TYPE, SO_PROTOCOL, SO_DOMAIN, SO_ERROR] {
+        let r = sock.dispatch_op(SocketOp::SetSockOpt {
+            level: crate::socket::SOL_SOCKET,
+            name,
+            value: &one,
+        });
+        match r {
+            SocketOpResult::Err(e) if e.errno() == crate::errno::ENOPROTOOPT as i32 => {}
+            _ => return TestResult::Fail("setsockopt of a read-only option must be ENOPROTOOPT"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_setsockopt_readonly_is_enoprotoopt);
+
+/// Kernel-TCP errnos cross into the socket layer unchanged, except that
+/// EAGAIN / EPIPE / ENOTCONN fold into the variants callers act on (park,
+/// SIGPIPE) — whose errno is still the same Linux value.
+fn smoke_socket_stack_errno_passthrough() -> TestResult {
+    use crate::errno;
+    use crate::socket::SockError;
+    for e in [
+        errno::EAGAIN,
+        errno::EPIPE,
+        errno::ENOTCONN,
+        errno::ECONNRESET,
+        errno::ECONNREFUSED,
+        errno::ETIMEDOUT,
+        errno::EHOSTUNREACH,
+        errno::ENETUNREACH,
+        errno::EHOSTDOWN,
+        errno::ENONET,
+        errno::EPROTO,
+    ] {
+        if SockError::from_stack(e as i32).errno() != e as i32 {
+            return TestResult::Fail("kernel-TCP errno changed crossing into SockError");
+        }
+    }
+    if SockError::from_stack(errno::EAGAIN as i32) != SockError::WouldBlock
+        || SockError::from_stack(errno::EPIPE as i32) != SockError::Pipe
+    {
+        return TestResult::Fail("EAGAIN / EPIPE must map to WouldBlock / Pipe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_stack_errno_passthrough);

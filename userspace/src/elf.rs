@@ -44,6 +44,7 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 
+const PT_PHDR: u32 = 6;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
@@ -136,6 +137,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
     let mut dynamic: Vec<DynEntry> = Vec::new();
     let mut tls: Option<TlsTemplate> = None;
     let mut stack_flags: Option<SegmentFlags> = None;
+    let mut phdr_vaddr: Option<u64> = None;
 
     for i in 0..phnum {
         let off = phoff + i * entsize;
@@ -255,6 +257,16 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                 }
                 stack_flags = Some(flags);
             }
+            PT_PHDR => {
+                // The program-header table's own link-time vaddr. This is
+                // the authoritative source for AT_PHDR (the loader biases
+                // it by the load base): a self-relocating ET_DYN derives
+                // its load bias as `AT_PHDR - PT_PHDR.p_vaddr`, so AT_PHDR
+                // MUST agree with this header rather than being inferred
+                // from PT_LOAD ordering. Capture the raw p_vaddr; the
+                // loader adds the bias.
+                phdr_vaddr = Some(p_vaddr);
+            }
             PT_NOTE => {
                 // Not fully implemented, just parsed.
             }
@@ -270,6 +282,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
         dynamic,
         tls,
         stack_flags,
+        phdr_vaddr,
         argv: Vec::new(),
         envp: Vec::new(),
         aux: Vec::new(),

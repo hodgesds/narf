@@ -610,9 +610,31 @@ pub enum SockError {
     AfNoSupport,
     /// `ENETUNREACH` — no route to the destination.
     NetUnreach,
+    /// `ENOPROTOOPT` — `setsockopt` of a read-only `SOL_SOCKET` option
+    /// (Linux `sk_setsockopt`, net/core/sock.c: SO_TYPE / SO_PROTOCOL /
+    /// SO_DOMAIN / SO_ERROR).
+    NoProtoOpt,
+    /// An errno produced by the kernel TCP stack (`narf_net::tcp::core`'s
+    /// `*_errno` calls), which already chose Linux's errno for the condition
+    /// (e.g. ECONNRESET, ETIMEDOUT, EHOSTUNREACH). Positive value.
+    Stack(i32),
 }
 
 impl SockError {
+    /// Wrap a kernel-TCP errno, folding the two that callers act on (EAGAIN
+    /// parks the task; EPIPE raises SIGPIPE) into their dedicated variants.
+    pub(crate) fn from_stack(e: i32) -> Self {
+        if e == errno::EAGAIN as i32 {
+            Self::WouldBlock
+        } else if e == errno::EPIPE as i32 {
+            Self::Pipe
+        } else if e == errno::ENOTCONN as i32 {
+            Self::NotConnected
+        } else {
+            Self::Stack(e)
+        }
+    }
+
     /// Map onto the libc-style errno value the user sees on -1.
     pub fn errno(self) -> i32 {
         match self {
@@ -639,6 +661,8 @@ impl SockError {
             Self::Access => errno::EACCES as i32,
             Self::AfNoSupport => errno::EAFNOSUPPORT as i32,
             Self::NetUnreach => errno::ENETUNREACH as i32,
+            Self::NoProtoOpt => errno::ENOPROTOOPT as i32,
+            Self::Stack(e) => e,
         }
     }
 }
@@ -3724,7 +3748,7 @@ impl SocketFile {
             (SOL_SOCKET, SO_TYPE)
             | (SOL_SOCKET, SO_DOMAIN)
             | (SOL_SOCKET, SO_PROTOCOL)
-            | (SOL_SOCKET, SO_ERROR) => SocketOpResult::Err(SockError::InvalidArg),
+            | (SOL_SOCKET, SO_ERROR) => SocketOpResult::Err(SockError::NoProtoOpt),
             (IPPROTO_TCP, TCP_NODELAY) => match read_u32(value) {
                 Ok(v) => {
                     opts.tcp_nodelay = v != 0;
@@ -3863,9 +3887,20 @@ impl SocketFile {
         };
         let write_bool = |buf: &mut [u8], v: bool| write_u32(buf, v as u32);
         if level == SOL_SOCKET && name == SO_ERROR {
-            let e = self.take_pending_error();
-            let val = e.map(|e| e.errno() as u32).unwrap_or(0);
-            return write_u32(buf, val);
+            // Linux `sk_getsockopt`: `-sock_error(sk)`, else the soft error,
+            // each cleared once read. A kernel-TCP socket's errors live on its
+            // TCB (`take_sock_error` applies the same order there).
+            let mut val = self.take_pending_error().map_or(0, |e| e.errno());
+            if val == 0 {
+                let tcb = match &*self.state.lock() {
+                    SocketState::InetWired { tcb_id, .. } => Some(*tcb_id),
+                    _ => None,
+                };
+                if let Some(id) = tcb {
+                    val = narf_net::tcp_stack::take_sock_error(id);
+                }
+            }
+            return write_u32(buf, val as u32);
         }
         // SO_ACCEPTCONN: 1 if the socket is `listen()`ing, else 0. Handled
         // before the `options` lock so we never nest state under options.
@@ -4688,8 +4723,11 @@ impl SocketFile {
                         let is_loopback = (ip >> 24) == 127;
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
-                            match narf_net::tcp_stack::connect_in(self.net_ns_id(), ip_bytes, port)
-                            {
+                            match narf_net::tcp_stack::connect_errno_in(
+                                self.net_ns_id(),
+                                ip_bytes,
+                                port,
+                            ) {
                                 Ok(tcb_id) => {
                                     let mut state = self.state.lock();
                                     if matches!(&*state, SocketState::Fresh) {
@@ -4702,8 +4740,10 @@ impl SocketFile {
                                     }
                                     return SocketOpResult::Err(SockError::AlreadyConnected);
                                 }
-                                Err(_) => {
-                                    return SocketOpResult::Err(SockError::ConnectionRefused);
+                                // ENETUNREACH / EHOSTUNREACH / ECONNREFUSED /
+                                // ETIMEDOUT / ICMP-derived, as Linux reports.
+                                Err(e) => {
+                                    return SocketOpResult::Err(SockError::from_stack(e));
                                 }
                             }
                         }
@@ -4761,6 +4801,11 @@ impl SocketFile {
                 Err(e) => SocketOpResult::Err(e),
             },
             SocketOp::Shutdown { how } => {
+                // Linux `inet_shutdown` (net/ipv4/af_inet.c) validates `how`
+                // before looking at the socket state: -EINVAL.
+                if how > SHUT_RDWR {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
                 let state = self.state.lock();
                 match &*state {
                     SocketState::InetConnected { tx, rx, .. } => {
@@ -4775,13 +4820,20 @@ impl SocketFile {
                         SocketOpResult::Ok(0)
                     }
                     SocketState::InetWired { tcb_id, .. } => {
-                        // The kernel TCP stack doesn't expose a
-                        // half-close path yet. SHUT_RDWR sends a
-                        // FIN via tcp_stack::close.
-                        if how == SHUT_RDWR {
-                            let _ = narf_net::tcp_stack::close(*tcb_id);
+                        // SHUT_WR / SHUT_RDWR queue a FIN after the pending
+                        // data; SHUT_RD makes drained reads return 0.
+                        // ENOTCONN once the connection is gone (TCP_CLOSE).
+                        let how = match how {
+                            SHUT_RD => narf_net::tcp_stack::Shutdown::Read,
+                            SHUT_WR => narf_net::tcp_stack::Shutdown::Write,
+                            _ => narf_net::tcp_stack::Shutdown::Both,
+                        };
+                        let id = *tcb_id;
+                        drop(state);
+                        match narf_net::tcp_stack::shutdown_errno(id, how) {
+                            Ok(()) => SocketOpResult::Ok(0),
+                            Err(e) => SocketOpResult::Err(SockError::from_stack(e)),
                         }
-                        SocketOpResult::Ok(0)
                     }
                     _ => SocketOpResult::Err(SockError::NotConnected),
                 }
@@ -5317,7 +5369,11 @@ impl SocketFile {
         if let SocketState::InetWired { tcb_id, .. } = &*state {
             let id = *tcb_id;
             drop(state);
-            return narf_net::tcp_stack::send(id, buf).map_err(|_| SockError::Pipe);
+            // EAGAIN when the send buffer is full (was Ok(0), which a
+            // caller reads as "sent nothing, no error"); the pending
+            // ECONNRESET/ETIMEDOUT/... once, then EPIPE, after the
+            // connection died (Linux `tcp_sendmsg_locked`).
+            return narf_net::tcp_stack::send_errno(id, buf).map_err(SockError::from_stack);
         }
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. }
@@ -5369,10 +5425,11 @@ impl SocketFile {
         if let SocketState::InetWired { tcb_id, .. } = &*state {
             let id = *tcb_id;
             drop(state);
-            let n = narf_net::tcp_stack::recv(id, buf).map_err(|_| SockError::NotConnected)?;
-            if n == 0 && !buf.is_empty() {
-                return Err(SockError::WouldBlock);
-            }
+            // Ok(0) is EOF (peer FIN, or a shut-down / torn-down socket);
+            // EAGAIN only when the connection is live with nothing queued.
+            // Previously every empty read was EAGAIN, so a reader never saw
+            // EOF, and a reset read as ENOTCONN instead of ECONNRESET.
+            let n = narf_net::tcp_stack::recv_errno(id, buf).map_err(SockError::from_stack)?;
             return Ok((n, None));
         }
         let rx = match &*state {

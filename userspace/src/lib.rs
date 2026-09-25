@@ -460,6 +460,16 @@ pub struct ExecImage {
     /// than PT_TLS).
     pub tls: Option<TlsTemplate>,
     pub stack_flags: Option<SegmentFlags>,
+    /// Link-time virtual address of the program-header table, taken
+    /// from the `PT_PHDR` program header when the ELF carries one.
+    /// `None` when there is no `PT_PHDR` (rare — hand-written or
+    /// fully-static ELFs may omit it). The loader biases this by the
+    /// load base to compute `AT_PHDR`, which is the authoritative,
+    /// PT_LOAD-order-independent source a self-relocating ET_DYN
+    /// (static-PIE glibc / musl `rcrt1`) reads to derive its load
+    /// bias (`l_addr = AT_PHDR - PT_PHDR.p_vaddr`). See the AT_PHDR
+    /// construction in `process::load_user_process_with`.
+    pub phdr_vaddr: Option<u64>,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
     pub aux: Vec<AuxEntry>,
@@ -475,6 +485,7 @@ impl ExecImage {
             dynamic: Vec::new(),
             tls: None,
             stack_flags: None,
+            phdr_vaddr: None,
             argv: Vec::new(),
             envp: Vec::new(),
             aux: Vec::new(),

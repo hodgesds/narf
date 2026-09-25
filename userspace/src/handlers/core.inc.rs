@@ -2917,19 +2917,20 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 /// Mirrors the `AT_EMPTY_PATH` branch of `sys_newfstatat`.
 fn stat_linux_fd(ctx: &mut dyn TrapContext, n: u32, out_ptr: *mut linux_compat::Stat) {
     let task = current_task_id();
-    let stat = fd::with_table(task, |t| {
-        t.get(n).map(|e| {
-            (
-                e.ops.stat(),
-                e.ops.owners(),
-                e.ops.rdev(),
-                e.ops.ino(),
-                e.ops.inode_attrs(),
-            )
-        })
-    });
-    let (s, (uid, gid), rdev, ino, attrs) = match stat {
-        Some(Some(tuple)) => tuple,
+    // Clone the FileOps out from under the fd-table lock before querying:
+    // `owners()` on a procfs node reaches `proc_task_info` →
+    // `with_table(same task)` (a non-reentrant IrqSafeSpinLock), so querying
+    // inside the closure self-deadlocks when `/proc/self/fd/N` names a procfs
+    // node. See sys_fstat_linux.
+    let ops = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone()));
+    let (s, (uid, gid), rdev, ino, attrs) = match ops {
+        Some(Some(ops)) => (
+            ops.stat(),
+            ops.owners(),
+            ops.rdev(),
+            ops.ino(),
+            ops.inode_attrs(),
+        ),
         _ => {
             ctx.set_return(errno_ret(EBADF));
             return;
@@ -15093,12 +15094,26 @@ static HOSTNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
 static DOMAINNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
 
-/// Initialise the hostname slot to `"narf"`. Idempotent so the
-/// boot path can call this without coordination.
+/// Initialise the hostname slot to `"narf"` and the domainname slot to
+/// `"(none)"`. Idempotent so the boot path can call this without
+/// coordination.
+///
+/// `"(none)"` is Linux's `init_uts_ns.domainname`, and it is what both the
+/// container build's fresh `UtsNs` and procfs's own pre-hook `ensure_defaults`
+/// use — this slot was the one place left defaulting to the empty string.
+/// Since `/proc/sys/kernel/domainname` and `uname(2)` both resolve here in a
+/// non-container build, an empty default made them report "" where Linux
+/// reports "(none)".
 pub fn hostname_init() {
-    let mut g = HOSTNAME.lock();
+    {
+        let mut g = HOSTNAME.lock();
+        if g.is_empty() {
+            g.push_str("narf");
+        }
+    }
+    let mut g = DOMAINNAME.lock();
     if g.is_empty() {
-        g.push_str("narf");
+        g.push_str("(none)");
     }
 }
 
@@ -15108,6 +15123,20 @@ pub fn __test_hostname_reset() {
     let mut g = HOSTNAME.lock();
     g.clear();
     g.push_str("narf");
+}
+
+/// Test hook: clear the domainname back to the boot default.
+///
+/// `setdomainname(2)` is a process-global write with no per-test scope, so a
+/// case that sets one leaves it for every later test in the shared kernel-test
+/// image. Since `/proc/sys/kernel/domainname` and `uname(2)` both resolve
+/// here, that made `smoke_kernel_domainname_default` fail whenever it ran
+/// after `smoke_abi_creds_setdomainname_pos`.
+#[doc(hidden)]
+pub fn __test_domainname_reset() {
+    let mut g = DOMAINNAME.lock();
+    g.clear();
+    g.push_str("(none)");
 }
 
 // ── Wave-72 — uname(2), setdomainname(2), SysV IPC get-by-key ─────
