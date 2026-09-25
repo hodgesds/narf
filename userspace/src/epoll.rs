@@ -1034,7 +1034,28 @@ fn epoll_ops(task: u64, epfd: u32) -> Option<Arc<dyn FileOps>> {
 /// `FileOps::poll_readiness` mirrors what `collect_ready` would deliver but
 /// does not acknowledge sources, consume EPOLLET tokens, or disarm oneshots.
 pub fn epoll_fd_has_ready(task: u64, epfd: u32) -> bool {
-    epoll_ops(task, epfd).is_some_and(|ops| ops.poll_readiness() & narf_filesystem::POLL_IN != 0)
+    // The own-stack park recheck (`park_should_block`) asks this to decide
+    // whether an about-to-park `epoll_wait` should instead re-execute. It MUST
+    // use the same ET-aware delivery decision as `collect_ready` — i.e.
+    // `has_deliverable` — NOT the level predicate `poll_readiness()`.
+    //
+    // `poll_readiness()` reports POLL_IN whenever ANY interest fd is level-ready,
+    // including an EPOLLET fd whose edge was already consumed (readable, but
+    // last_mask already holds the bit) or an EPOLLEXCLUSIVE fd this task cannot
+    // claim. `collect_ready` correctly delivers nothing for those, so the level
+    // predicate made the recheck answer "ready, don't park" while the re-executed
+    // `epoll_wait` delivered zero events — park_should_block returns false, the
+    // task never yields, and it re-scans forever: a 100%-CPU `epoll_wait` livelock
+    // that needed NO wake to sustain (every readiness wake path stays quiet). On
+    // the CachyOS desktop this pinned dbus-broker / systemd event loops and the
+    // greeter never presented. `has_deliverable` mirrors `collect_ready`'s per-fd
+    // ET / EPOLLEXCLUSIVE decision, so the recheck and the delivery agree and the
+    // park either delivers or genuinely blocks. (Invariant pinned by
+    // `smoke_epoll_has_deliverable_matches_collect_ready`.)
+    epoll_ops(task, epfd)
+        .as_ref()
+        .and_then(as_epoll)
+        .is_some_and(|inst| inst.has_deliverable(task))
 }
 
 /// View an fd's ops as an `EpollInstance`, if it is one.
@@ -2053,4 +2074,93 @@ mod tests {
         "userspace/epoll",
         smoke_epoll_has_deliverable_matches_collect_ready
     );
+
+    /// The scheduler's park recheck calls `epoll_fd_has_ready(task, epfd)` — it
+    /// resolves the epoll fd through the task's fd table and must return the
+    /// ET-aware `has_deliverable` verdict, NOT the old `poll_readiness() &
+    /// POLL_IN` level probe. Those disagree exactly on the two spin-prone shapes
+    /// below: the level probe reports "ready", so the recheck answered "don't
+    /// park", the re-executed `epoll_wait` delivered nothing, and the task spun
+    /// at 100% CPU (the greeter never presented). This pins the CALL SITE, so a
+    /// revert back to the level predicate fails here even though the oracle test
+    /// above still passes. Installs a real epoll fd because that is the only path
+    /// `epoll_fd_has_ready` takes.
+    fn smoke_epoll_fd_has_ready_is_et_aware() -> TestResult {
+        __test_reset();
+        // A task id distinct from the oracle test's TASK so the fd table is
+        // fresh; `with_table` seeds stdio at 0/1/2, so installs land at fd 3.
+        let task: u64 = 0xE9_02;
+
+        let install = |ep: Arc<EpollInstance>| -> Option<u32> {
+            fd::install(
+                task,
+                crate::fd::FdEntry {
+                    ops: ep as Arc<dyn FileOps>,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: crate::fd::O_RDWR,
+                },
+            )
+        };
+
+        // (1) EPOLLIN|ET, edge already consumed (level-readable, last_mask holds
+        //     POLL_IN, not on the ready list). `collect_ready` delivers nothing,
+        //     so the recheck must say "park". The old predicate returned
+        //     `POLL_IN & POLL_IN != 0` == true here → the self-wake spin.
+        {
+            let (ep, _f) = one_fd(EPOLLIN | EPOLLET, POLL_IN, POLL_IN, true, false);
+            let epfd = match install(ep) {
+                Some(fd) => fd,
+                None => return TestResult::Fail("could not install epoll fd (ET-consumed case)"),
+            };
+            let ready = epoll_fd_has_ready(task, epfd);
+            let _ = fd::with_table(task, |t| t.close(epfd));
+            if ready {
+                return TestResult::Fail(
+                    "ET-consumed IN: epoll_fd_has_ready must be false (level predicate regressed)",
+                );
+            }
+        }
+
+        // (2) EPOLLEXCLUSIVE|IN readable but the claim is held by ANOTHER owner:
+        //     `collect_ready` skips it, so the recheck must too. `poll_readiness`
+        //     omits the claim and would report POLL_IN here → the exclusive spin.
+        {
+            let (ep, _f) = one_fd(EPOLLIN | EPOLLEXCLUSIVE, POLL_IN, 0, false, false);
+            if !exclusive_try_claim(FD, task ^ 0xFF) {
+                return TestResult::Fail("could not seed a foreign exclusive claim");
+            }
+            let epfd = match install(ep) {
+                Some(fd) => fd,
+                None => return TestResult::Fail("could not install epoll fd (exclusive case)"),
+            };
+            let ready = epoll_fd_has_ready(task, epfd);
+            let _ = fd::with_table(task, |t| t.close(epfd));
+            __test_reset();
+            if ready {
+                return TestResult::Fail(
+                    "exclusive-owned-by-other: epoll_fd_has_ready must be false",
+                );
+            }
+        }
+
+        // (3) Positive control: a level-triggered readable fd IS deliverable, so
+        //     the recheck reports ready (re-exec delivers the event, no wasted
+        //     park). Guards against over-correcting to "always park".
+        {
+            let (ep, _f) = one_fd(EPOLLIN, POLL_IN, 0, false, false);
+            let epfd = match install(ep) {
+                Some(fd) => fd,
+                None => return TestResult::Fail("could not install epoll fd (LT case)"),
+            };
+            let ready = epoll_fd_has_ready(task, epfd);
+            let _ = fd::with_table(task, |t| t.close(epfd));
+            if !ready {
+                return TestResult::Fail("LT readable: epoll_fd_has_ready must be true");
+            }
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/epoll", smoke_epoll_fd_has_ready_is_et_aware);
 }
