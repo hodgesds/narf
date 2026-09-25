@@ -13,8 +13,6 @@ pub(crate) fn sys_munlockall(ctx: &mut dyn TrapContext) {
     };
     match as_ref.munlock_all() {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(error) => ctx.set_return(SyscallReturn::ok(
-            (-super::handler_sys_mlock::mlock_errno(error)) as u64,
-        )),
+        Err(error) => ctx.set_return(errno_ret(super::handler_sys_mlock::mlock_errno(error))),
     }
 }

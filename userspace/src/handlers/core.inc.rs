@@ -8625,7 +8625,7 @@ fn mprotect_core(
         match transition {
             // W^X refusals, whatever the caller holds → EACCES.
             narf_memory::wx::WxTransition::DenyWX | narf_memory::wx::WxTransition::DenyXtoWX => {
-                Err(13)
+                Err(EACCES)
             }
             narf_memory::wx::WxTransition::NeedsCapJit => {
                 let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id()) else {
