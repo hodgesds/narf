@@ -41,6 +41,26 @@ const EI_DATA: usize = 5;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
+// `e_machine` values. The loader accepts only the machine it is running
+// on: an ELF built for another architecture is not executable here, and
+// letting one through means the process faults on garbage instructions
+// at its entry point instead of `execve` returning ENOEXEC.
+// Both are listed so `EM_NATIVE` below reads as a choice between them
+// rather than a bare number; only one is live per build.
+#[allow(dead_code)]
+const EM_X86_64: u16 = 62;
+#[allow(dead_code)]
+const EM_AARCH64: u16 = 183;
+
+/// `e_machine` value this build can execute. Mirrors Linux's
+/// per-arch `elf_check_arch()`.
+#[cfg(target_arch = "x86_64")]
+const EM_NATIVE: u16 = EM_X86_64;
+#[cfg(target_arch = "aarch64")]
+const EM_NATIVE: u16 = EM_AARCH64;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const EM_NATIVE: u16 = 0;
+
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 
@@ -66,6 +86,10 @@ pub enum ElfError {
     Not64Bit,
     NotLittleEndian,
     BadType,
+    /// `e_machine` names an architecture this kernel cannot execute.
+    /// Linux's equivalent is `elf_check_arch()` failing, which
+    /// `binfmt_elf` reports as ENOEXEC.
+    WrongMachine,
     BadPhoff,
     InterpOutOfBounds,
     /// PT_DYNAMIC's file region (p_offset .. p_offset+p_filesz) lies
@@ -75,6 +99,10 @@ pub enum ElfError {
     /// PT_TLS file region lies outside the input bytes, mem_size <
     /// file_size, or the alignment isn't a power of two.
     TlsOutOfBounds,
+    /// A PT_LOAD claims more file bytes than memory bytes
+    /// (`p_filesz > p_memsz`), which cannot be mapped coherently.
+    /// Linux's `binfmt_elf` rejects this with EINVAL.
+    SegmentFileSizeExceedsMemSize,
     /// More than one PT_TLS segment was present. The SysV ABI allows
     /// only one TLS template per ELF — the dynamic loader's IE-model
     /// thread-pointer arithmetic assumes a single contiguous block.
@@ -114,6 +142,16 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
         _ => return Err(ElfError::BadType),
     };
 
+    // `e_machine` must match the running architecture. Without this an
+    // aarch64 binary loads on x86_64 (and vice versa): the PT_LOADs map,
+    // the entry point is a valid mapped address, and the process dies on
+    // the first foreign instruction instead of being rejected up front.
+    // The module loader already enforces the equivalent for ET_REL.
+    let e_machine = read_u16(bytes, 0x12);
+    if e_machine != EM_NATIVE {
+        return Err(ElfError::WrongMachine);
+    }
+
     let e_entry = read_u64(bytes, 0x18);
     let e_phoff = read_u64(bytes, 0x20);
     let e_phentsize = read_u16(bytes, 0x36);
@@ -123,13 +161,25 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
     let entsize = e_phentsize as usize;
     let phnum = e_phnum as usize;
 
-    if phnum > 0 {
-        let ph_table_end = phoff
-            .checked_add(entsize.checked_mul(phnum).ok_or(ElfError::BadPhoff)?)
-            .ok_or(ElfError::BadPhoff)?;
-        if ph_table_end > bytes.len() || entsize < 56 {
-            return Err(ElfError::BadPhoff);
-        }
+    // Program-header table sanity, matching Linux's `load_elf_phdrs()`:
+    //   * `e_phentsize` must be exactly `sizeof(Elf64_Phdr)`. Accepting a
+    //     larger stride (the previous `entsize < 56` test) parses a table
+    //     shape no toolchain emits and no other loader would agree with.
+    //   * at least one program header, and no more than fit in Linux's
+    //     64 KiB table cap — `65536 / 56 == 1170`. This also keeps the
+    //     0xFFFF PN_XNUM sentinel out: Linux does not implement PN_XNUM
+    //     for executables either (it is a section-count escape), so a
+    //     binary using it is rejected rather than silently mis-parsed.
+    const PHENTSIZE64: usize = 56;
+    const MAX_PHNUM: usize = 65536 / PHENTSIZE64;
+    if entsize != PHENTSIZE64 || !(1..=MAX_PHNUM).contains(&phnum) {
+        return Err(ElfError::BadPhoff);
+    }
+    let ph_table_end = phoff
+        .checked_add(entsize.checked_mul(phnum).ok_or(ElfError::BadPhoff)?)
+        .ok_or(ElfError::BadPhoff)?;
+    if ph_table_end > bytes.len() {
+        return Err(ElfError::BadPhoff);
     }
 
     let mut segments = Vec::new();
@@ -150,6 +200,13 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
 
         match p_type {
             PT_LOAD => {
+                // A segment cannot carry more file bytes than it has
+                // memory bytes to hold them. Linux answers this with
+                // EINVAL; NARF previously clamped the page count and
+                // silently truncated the copy instead.
+                if p_filesz > p_memsz {
+                    return Err(ElfError::SegmentFileSizeExceedsMemSize);
+                }
                 let mut flags = SegmentFlags::default();
                 if p_flags & PF_R != 0 {
                     flags = flags | SegmentFlags::READ;

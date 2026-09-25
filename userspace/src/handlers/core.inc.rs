@@ -9915,6 +9915,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         },
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        // Zero sentinel, like `entry` above: a cloned task resumes from
+        // saved (rip, rsp) and nothing re-derives addresses from the
+        // program bias. The image itself is the parent's, already mapped
+        // in the shared/copied AS.
+        program_bias: 0,
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 
@@ -15066,7 +15071,7 @@ pub fn __test_write_current_nice(prio: i32) -> bool {
 // expects. Caller-side libc translates negative-on-overflow
 // per the POSIX clock_t bound.
 
-const CLK_TCK_HZ: u64 = 100;
+pub(crate) const CLK_TCK_HZ: u64 = 100;
 
 // ── Getrusage — populate the glibc rusage struct ──────────────────
 //

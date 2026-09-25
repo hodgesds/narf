@@ -535,6 +535,18 @@ pub enum AuxEntry {
     /// Base address of the vDSO ELF header (`AT_SYSINFO_EHDR` = 33). libc
     /// parses the vDSO from here to resolve `__vdso_*` / `__kernel_*`.
     SysInfoEhdr(u64),
+    /// AT_CLKTCK — `times()` tick rate. glibc's `sysconf(_SC_CLK_TCK)`
+    /// reads this; without it libc falls back to a compiled-in 100, which
+    /// is right today only by coincidence.
+    Clktck(u64),
+    /// AT_FLAGS — Linux always emits this (as 0 on x86_64/aarch64).
+    Flags(u64),
+    /// AT_HWCAP2 — second CPU-capability word. 0 until NARF advertises
+    /// any of the bits it gates.
+    Hwcap2(u64),
+    /// AT_MINSIGSTKSZ — the smallest usable `sigaltstack` size, which
+    /// glibc uses for its dynamic MINSIGSTKSZ/SIGSTKSZ.
+    MinSigStkSz(u64),
 }
 
 impl AuxEntry {
@@ -558,6 +570,10 @@ impl AuxEntry {
             AuxEntry::Gid(_) => 13,
             AuxEntry::Egid(_) => 14,
             AuxEntry::SysInfoEhdr(_) => 33,
+            AuxEntry::Flags(_) => 8,
+            AuxEntry::Clktck(_) => 17,
+            AuxEntry::Hwcap2(_) => 26,
+            AuxEntry::MinSigStkSz(_) => 51,
         }
     }
 }

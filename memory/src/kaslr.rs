@@ -43,6 +43,19 @@ const RAND_RETRIES: u32 = 32;
 /// of headroom for both slack and arena.
 pub const USER_MMAP_RANDOM_BITS: u32 = 24;
 
+/// Load-base randomisation slack for user ELF images — the ET_DYN
+/// program base and the PT_INTERP base. 24 bits = 16 MiB of slack at
+/// 4 KiB granularity, the same order as [`USER_MMAP_RANDOM_BITS`].
+/// Linux's equivalent is `arch_mmap_rnd()` added to `ELF_ET_DYN_BASE`.
+pub const USER_ELF_RANDOM_BITS: u32 = 24;
+
+/// Stack-top jitter, mirroring Linux's `randomize_stack_top()`: the
+/// stack's high end is pushed *down* by a random amount rather than the
+/// whole region being moved, so the arena keeps its nominal bounds.
+/// 20 bits = up to 1 MiB of jitter at 4 KiB granularity, which fits
+/// inside the reserved RLIMIT_STACK window with room to spare.
+pub const USER_STACK_RANDOM_BITS: u32 = 20;
+
 /// Kernel-image randomisation slack. The kernel-half mapping is fixed
 /// at 0xFFFF_FF80_0000_0000 (aarch64) / 0xFFFF_FFFF_8000_0000 (x86_64);
 /// the random offset is added to that. 30 bits = 1 GiB of slack on
@@ -313,6 +326,63 @@ pub fn user_mmap_slot(base: u64) -> u64 {
     let (r, _) = random_u64();
     let mask = ((1u64 << USER_MMAP_RANDOM_BITS) - 1) & !0xFFF;
     base + (r & mask)
+}
+
+/// Master switch for user-mode address randomisation, mirroring Linux's
+/// `randomize_va_space` sysctl / `norandmaps` boot flag.
+///
+/// On by default. It exists so a caller that must see the canonical,
+/// unrandomised layout can pin it — the kernel-test suite asserts exact
+/// load addresses in places, and a test that wants to prove *what* the
+/// randomisation does needs to be able to turn it off to compare.
+static USER_ASLR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable user-mode ASLR. Returns the previous setting, so a
+/// caller can restore it (see `UserAslrGuard` in the userspace tests).
+#[inline]
+pub fn set_user_aslr(on: bool) -> bool {
+    USER_ASLR.swap(on, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Whether user-mode ASLR is in force.
+#[inline]
+pub fn user_aslr_enabled() -> bool {
+    USER_ASLR.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Pick the load base for a user ELF image (ET_DYN program or
+/// PT_INTERP) above `base`.
+///
+/// The offset is always at least one page, so `base` itself is never
+/// mapped by the image. That costs a bit of entropy at the bottom of the
+/// range and buys a guarantee callers rely on: the nominal base stays a
+/// reliably-unmapped address, which is what makes it usable as a
+/// known-bad pointer (several ABI tests use it that way).
+#[inline]
+pub fn user_elf_slot(base: u64) -> u64 {
+    if !user_aslr_enabled() {
+        return base;
+    }
+    let (r, _) = random_u64();
+    let mask = ((1u64 << USER_ELF_RANDOM_BITS) - 1) & !0xFFF;
+    // `| 0x1000` rather than `+ 0x1000`: keeps the result inside the
+    // masked window instead of letting the maximum draw overflow past it.
+    base + ((r & mask) | 0x1000)
+}
+
+/// Lower a user stack's top end by a random, page-aligned amount.
+///
+/// Returns a value in `(top - 2^USER_STACK_RANDOM_BITS, top]`, so the
+/// result is never above `top` and callers that bound-check against the
+/// nominal top stay correct.
+#[inline]
+pub fn user_stack_top(top: u64) -> u64 {
+    if !user_aslr_enabled() {
+        return top;
+    }
+    let (r, _) = random_u64();
+    let mask = ((1u64 << USER_STACK_RANDOM_BITS) - 1) & !0xFFF;
+    top - (r & mask)
 }
 
 /// Pick a *candidate* kernel-image slide by drawing fresh entropy.

@@ -352,27 +352,18 @@ pub unsafe fn load_elf_into_at(
 /// - Frame allocator must be initialised.
 pub unsafe fn load_elf_bytes(
     bytes: &[u8],
-) -> Result<(Arc<AddressSpace>, EntryPoint), LoadBytesError> {
+) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
     // SAFETY: Valid memory or trusted environment
     let addr_space = unsafe { AddressSpace::new_for_user() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    // Bias selection. ET_EXEC binaries name their absolute load
-    // addresses in PT_LOAD vaddrs (NARF expects those in PML4[1] —
-    // see `init.ld` / `hello_static_x86_64.S`); bias is 0. ET_DYN
-    // binaries (PIE) declare segments at vaddr 0 and expect the
-    // loader to pick a real base. PML4[0] is kernel-shared with
-    // U=0, so vaddr=0 + bias=0 is unmapped from user mode; bias
-    // them by `PROGRAM_DYN_BASE` to land in PML4[1].
-    // PML4[1] base (bit 39 set, bit 47 clear → user range).
-    const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
+    // Bias selection — see `program_load_bias`. ET_EXEC names absolute
+    // load addresses in its PT_LOAD vaddrs (NARF expects those in
+    // PML4[1] — see `init.ld` / `hello_static_x86_64.S`), so bias 0.
     let image = crate::parse_elf(bytes)?;
-    let bias = match image.kind {
-        crate::ExecKind::Elf64Dyn => PROGRAM_DYN_BASE,
-        _ => 0,
-    };
+    let bias = program_load_bias(image.kind);
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
     // SAFETY: Valid memory or trusted environment
@@ -385,7 +376,36 @@ pub unsafe fn load_elf_bytes(
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    Ok((Arc::new(addr_space), EntryPoint(VirtAddr::new(entry))))
+    Ok((Arc::new(addr_space), EntryPoint(VirtAddr::new(entry)), bias))
+}
+
+/// PML4[1] base — the nominal bottom of the ET_DYN load window, and the
+/// base [`program_load_bias`] randomises above. Public because the
+/// canonical (ASLR-off) layout is asserted by tests, which should read
+/// the one definition rather than restate the number.
+pub const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
+
+/// Pick the load bias for a program image.
+///
+/// ET_EXEC binaries name absolute load addresses in their PT_LOAD
+/// vaddrs, so their bias is 0. ET_DYN (PIE) declares segments at vaddr 0
+/// and leaves the base to the loader: it goes in PML4[1] (bit 39 set,
+/// bit 47 clear → user range, not the kernel high half; PML4[0] is
+/// kernel-shared with U=0, so vaddr 0 + bias 0 is unmapped from user
+/// mode), randomised within [`narf_memory::kaslr::USER_ELF_RANDOM_BITS`]
+/// of slack above that base.
+///
+/// This is the ONLY place the program base is chosen. It used to be
+/// computed here *and* independently in `process.rs`, with a comment on
+/// each telling the reader to keep them in sync — which a randomised
+/// base turns from a maintenance note into a bug, since two draws
+/// disagree. `load_elf_bytes` now returns the bias it used and callers
+/// consume that.
+pub fn program_load_bias(kind: crate::ExecKind) -> u64 {
+    match kind {
+        crate::ExecKind::Elf64Dyn => narf_memory::kaslr::user_elf_slot(PROGRAM_DYN_BASE),
+        _ => 0,
+    }
 }
 
 // ── PT_DYNAMIC relocation processing ────────────────────────────────
@@ -536,12 +556,32 @@ fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mu
     Some(narf_memory::PhysAddr::new(p.as_u64() + off).kernel_mut_ptr::<u8>())
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// aarch64 form of the above. `narf_memory::aarch64::paging::translate`
+/// has the same signature and return convention as the x86_64 one
+/// (blocks fold in the in-block offset, a 4 KiB page returns the frame
+/// base), so this is the same three lines against a different module.
+///
+/// This used to be a `None` stub whose comment said aarch64
+/// `paging::translate` "isn't wired in narf-memory yet". It has been
+/// there for a while — the stub simply outlived it, which made every
+/// ET_DYN needing relocation fail on aarch64 with
+/// `RelocTargetUnmapped`.
+#[cfg(target_arch = "aarch64")]
+fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mut u8> {
+    let page = vaddr & !0xFFFu64;
+    let off = vaddr & 0xFFFu64;
+    let p =
+        // SAFETY: `addr_space.root` is the live top-level (L0/TTBR0) table
+        // of the address space being loaded into; `translate` only reads
+        // descriptors reachable from it and `page` is page-aligned.
+        unsafe { narf_memory::aarch64::paging::translate(addr_space.root, VirtAddr::new(page)) }?;
+    Some(narf_memory::PhysAddr::new(p.as_u64() + off).kernel_mut_ptr::<u8>())
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn user_vaddr_to_kernel_ptr(_addr_space: &AddressSpace, _vaddr: u64) -> Option<*mut u8> {
-    // aarch64 paging::translate isn't wired in narf-memory yet, same
-    // story as `init_sysv_stack`. Relocation is x86_64-only at this
-    // tier; arches without translate fall through and return None,
-    // which the caller surfaces as `RelocTargetUnmapped`.
+    // No page-table walker for this arch: callers surface the miss as
+    // `RelocTargetUnmapped`.
     None
 }
 
