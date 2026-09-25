@@ -1751,11 +1751,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // this, a frame-backed vmalloc mapping created later would live
                 // only in the AS that faulted it in, and a kernel access from
                 // another AS's CPU would hit an empty slot (cross-AS #PF).
+                // Choose the window's base before reserving its slot: the bump
+                // cursor and the valloc bitmap are both relative to it, and an
+                // ioremap already handed out at the old base would be stranded.
+                narf_memory::vmalloc::randomize_window();
                 match narf_memory::vmalloc::reserve_kernel_slot() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
-                            "  vmalloc: kernel VA slot {} reserved",
+                            "  vmalloc: window at {:#018x} (slot {})",
+                            narf_memory::vmalloc::vmalloc_base(),
                             narf_memory::vmalloc::KERNEL_PML4_SLOT
                         );
                     }
@@ -2551,6 +2556,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
+                // vmalloc window: same treatment, and it was not reserved on
+                // aarch64 either — only the x86_64 path called it, so the
+                // slot's top-level entry was created lazily by the first
+                // `ioremap`. With a randomized base the ordering matters:
+                // the bump cursor and the valloc bitmap are relative to it.
+                narf_memory::vmalloc::randomize_window();
+                match narf_memory::vmalloc::reserve_kernel_slot() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  vmalloc: window at {:#018x} (slot {})",
+                            narf_memory::vmalloc::vmalloc_base(),
+                            narf_memory::vmalloc::KERNEL_PML4_SLOT
+                        );
+                    }
+                    Err(e) => {
+                        let _ =
+                            writeln!(console::Writer, "  vmalloc: slot reservation failed: {e:?}");
                     }
                 }
 

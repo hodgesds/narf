@@ -44,9 +44,69 @@ const VMALLOC_BASE: u64 = 0xFFFF_C000_0000_0000;
 ///     long-lived, so its no-op free is acceptable).
 ///   * upper 2 GiB — the frame-backed [`valloc`] heap fallback, with a
 ///     bitmap allocator that actually reclaims VA on `vfree`.
-const IOREMAP_LIMIT: u64 = VMALLOC_BASE + (2u64 << 30);
-const VALLOC_BASE: u64 = IOREMAP_LIMIT;
-const VALLOC_LIMIT: u64 = VMALLOC_BASE + (4u64 << 30);
+/// Total span the window occupies at whatever base it is placed at.
+const VMALLOC_SPAN: u64 = 4u64 << 30;
+
+/// Live base of the vmalloc window, or 0 before it is chosen.
+///
+/// Randomized inside its own PML4/L0 slot, for the reason the image and the
+/// module window are: a fixed base makes every ioremap and valloc address a
+/// constant an attacker already knows. Only the offset within the slot moves,
+/// so [`KERNEL_PML4_SLOT`] stays exact and the boot-time slot reservation is
+/// unchanged — the failure mode of moving between slots is that another window
+/// or the linear map is aliased.
+///
+/// Zero means "not chosen"; [`vmalloc_base`] falls back to the compile-time
+/// base so every accessor is correct before the pick and after it.
+static VMALLOC_BASE_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Base of the vmalloc window in force.
+#[inline]
+pub fn vmalloc_base() -> u64 {
+    let v = VMALLOC_BASE_LIVE.load(Ordering::Acquire);
+    if v == 0 {
+        VMALLOC_BASE
+    } else {
+        v
+    }
+}
+
+#[inline]
+fn ioremap_limit() -> u64 {
+    vmalloc_base() + (2u64 << 30)
+}
+#[inline]
+fn valloc_base() -> u64 {
+    ioremap_limit()
+}
+#[inline]
+fn valloc_limit() -> u64 {
+    vmalloc_base() + VMALLOC_SPAN
+}
+
+/// Choose this boot's vmalloc base, inside the slot it already owns.
+///
+/// Must run before the first `ioremap` or `valloc`: the bump cursor and the
+/// `valloc` bitmap are both relative to the base, and anything already mapped
+/// at the old base would be stranded. `bare_main` calls it next to the slot
+/// reservation, on the BSP, before any driver probes.
+///
+/// 2 MiB granularity, matching the image slide and the module window, so a
+/// window mapping can still use huge pages. Falls back to the compile-time
+/// base when entropy is unavailable rather than pretending to randomize.
+pub fn randomize_window() {
+    const GRAN: u64 = 2 << 20;
+    const SLOT_SPAN: u64 = 1u64 << 39;
+    let slots = (SLOT_SPAN - VMALLOC_SPAN) / GRAN + 1;
+    let (r, src) = crate::kaslr::random_u64();
+    if src == crate::kaslr::EntropySource::TscMix && r == 0 {
+        return;
+    }
+    let base = VMALLOC_BASE + (r % slots) * GRAN;
+    VMALLOC_BASE_LIVE.store(base, Ordering::Release);
+    // The bump cursor is an absolute VA, so it has to follow the base.
+    CURSOR.store(base, Ordering::Relaxed);
+}
 /// Pages in the `valloc` half; one bit each in `VALLOC_MAP`.
 const VALLOC_PAGES: usize = (2usize << 30) / 4096;
 const VALLOC_WORDS: usize = VALLOC_PAGES / 64;
@@ -63,7 +123,10 @@ pub const KERNEL_PML4_SLOT: usize = 272;
 #[cfg(target_arch = "aarch64")]
 pub const KERNEL_PML4_SLOT: usize = 384;
 
-static CURSOR: AtomicU64 = AtomicU64::new(VMALLOC_BASE);
+/// Bump cursor for the ioremap half. Zero until first use or
+/// `randomize_window`, then an absolute VA inside the window — it cannot be a
+/// `const` initialiser any more because the base is chosen at boot.
+static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 /// A reserved kernel-VA range. Holders should keep it alive for
 /// the lifetime of the mapping it backs (device BAR, etc.).
@@ -92,10 +155,15 @@ pub fn alloc(len: u64) -> Result<VmRange, VmallocError> {
     }
     // Bump-pointer atomic CAS so concurrent callers don't
     // overlap.
+    // Initialise the cursor on first use. It cannot be a `const` initialiser
+    // because the base is chosen at boot, and doing it here rather than relying
+    // on `randomize_window` having run keeps the allocator correct whatever the
+    // call order — a zero cursor would otherwise hand out VA from address 0.
+    let _ = CURSOR.compare_exchange(0, vmalloc_base(), Ordering::AcqRel, Ordering::Relaxed);
     loop {
         let cur = CURSOR.load(Ordering::Relaxed);
         let end = cur.checked_add(len_pg).ok_or(VmallocError::Exhausted)?;
-        if end > IOREMAP_LIMIT {
+        if end > ioremap_limit() {
             return Err(VmallocError::Exhausted);
         }
         match CURSOR.compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed) {
@@ -120,13 +188,15 @@ pub fn free(range: VmRange) {
 
 /// Total bytes claimed since boot — diagnostic only.
 pub fn claimed_bytes() -> u64 {
-    CURSOR.load(Ordering::Relaxed) - VMALLOC_BASE
+    CURSOR
+        .load(Ordering::Relaxed)
+        .saturating_sub(vmalloc_base())
 }
 
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    CURSOR.store(VMALLOC_BASE, Ordering::Relaxed);
+    CURSOR.store(vmalloc_base(), Ordering::Relaxed);
 }
 
 // ── Frame-backed vmalloc (kernel-heap large-allocation fallback) ───────
@@ -280,7 +350,7 @@ unsafe fn unmap_and_free(base: u64, count: usize) {
 /// `vfree` vs the contiguous buddy free.
 #[inline]
 pub fn is_valloc_ptr(ptr: *const u8) -> bool {
-    (VALLOC_BASE..VALLOC_LIMIT).contains(&(ptr as u64))
+    (valloc_base()..valloc_limit()).contains(&(ptr as u64))
 }
 
 /// Allocate `size` bytes of virtually-contiguous, physically-SCATTERED kernel
@@ -293,7 +363,7 @@ pub fn valloc(size: usize) -> Option<NonNull<u8>> {
         return None;
     }
     let base_page = VALLOC_MAP.lock().alloc_run(n)?;
-    let base = VALLOC_BASE + (base_page as u64) * 4096;
+    let base = valloc_base() + (base_page as u64) * 4096;
 
     let mut done = 0usize;
     while done < n {
@@ -334,7 +404,7 @@ pub unsafe fn vfree(ptr: NonNull<u8>, size: usize) {
     let base = ptr.as_ptr() as u64;
     // SAFETY: forwarded from the caller's contract; these are our pages.
     unsafe { unmap_and_free(base, n) };
-    let base_page = ((base - VALLOC_BASE) / 4096) as usize;
+    let base_page = ((base - valloc_base()) / 4096) as usize;
     VALLOC_MAP.lock().free_run(base_page, n);
 }
 
@@ -345,7 +415,7 @@ pub unsafe fn vfree(ptr: NonNull<u8>, size: usize) {
 /// BEFORE the first user address space is created. Idempotent.
 pub fn reserve_kernel_slot() -> Result<(), VmallocError> {
     debug_assert_eq!(
-        ((VMALLOC_BASE >> 39) & 0x1FF) as usize,
+        ((vmalloc_base() >> 39) & 0x1FF) as usize,
         KERNEL_PML4_SLOT,
         "VMALLOC_BASE does not decode to KERNEL_PML4_SLOT"
     );
