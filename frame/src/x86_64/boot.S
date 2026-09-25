@@ -108,6 +108,44 @@ _start:
      * boot-time jitter, which is what `kaslr.rs` already documents as
      * acceptable for slot picking.
      */
+    /* ── Physical relocation ────────────────────────────────────────────
+     *
+     * Copy the image to `KASLR_PHYS_FIXED` bytes above where the loader put
+     * it and continue executing from the copy. The VA slide below randomizes
+     * where the image APPEARS; this randomizes where it IS, which the slide
+     * cannot do — the loader chooses the physical address.
+     *
+     * ebp holds the delta for the rest of the stub. Every physical address
+     * the stub uses afterwards is a link-time one, so each gets ebp added:
+     * the relocation table, the GOT bounds, the page tables, and the two
+     * values recorded for Rust. Miss one and it reads or writes the stale
+     * copy, which still exists and still looks valid.
+     *
+     * The copy runs forward, so the delta must be at least the image size or
+     * it would overwrite its own source. The linker script states that bound.
+     */
+    mov ebp, 0                                  /* physical delta */
+    mov eax, offset KASLR_PHYS_FIXED
+    test eax, eax
+    jz .Lphys_done                              /* 0 = no relocation */
+    mov ebp, eax
+
+    mov esi, offset __kernel_start
+    mov edi, esi
+    add edi, ebp
+    mov ecx, offset __kernel_end
+    sub ecx, esi
+    add ecx, 3
+    shr ecx, 2                                  /* bytes -> dwords */
+    cld
+    rep movsd
+
+    /* Continue in the copy. Everything after this label runs at +ebp. */
+    mov eax, offset .Lphys_done
+    add eax, ebp
+    jmp eax
+.Lphys_done:
+
     mov ebx, 0                                  /* slide, filled in below */
 
     /* A pinned slide (KASLR_SLIDE_FIXED != 0) skips entropy entirely. It
@@ -144,10 +182,20 @@ _start:
 
     /* Record it for the Rust conversions (`kaslr::KERNEL_SLIDE`). */
     mov eax, offset __kernel_slide_phys
+    add eax, ebp                                /* the copy's, not the original's */
     mov [eax], ebx
     mov dword ptr [eax + 4], 0
 
+    /* Record the physical delta for `kaslr::image_virt_to_phys` and
+     * `image_phys_bounds`. The frame allocator reserves those bounds, so a
+     * missing delta leaves the running image unreserved. */
+    mov eax, offset __image_phys_delta_phys
+    add eax, ebp
+    mov [eax], ebp
+    mov dword ptr [eax + 4], 0
+
     mov esi, offset __kaslr_relocs_phys
+    add esi, ebp
     cmp dword ptr [esi], 0x4B41534C             /* "KASL" */
     jne .Lreloc_done                            /* never patched — skip */
     mov ecx, [esi + 4]                          /* abs64 count   */
@@ -159,6 +207,7 @@ _start:
     test ecx, ecx
     jz .Lreloc_32s
     mov eax, [esi]
+    add eax, ebp                                /* site is link-time phys */
     add [eax], ebx                              /* low half      */
     adc dword ptr [eax + 4], 0                  /* carry, hi = 0 */
     add esi, 4
@@ -169,6 +218,7 @@ _start:
     test edx, edx
     jz .Lreloc_pc
     mov eax, [esi]
+    add eax, ebp
     add [eax], ebx
     add esi, 4
     dec edx
@@ -180,7 +230,24 @@ _start:
     test edi, edi
     jz .Lreloc_done
     mov eax, [esi]
+    add eax, ebp
+    /* += slide - delta, not just += slide.
+     *
+     * A PC-relative field is slide-invariant only when its source and its
+     * target move together, which is why these sites need patching at all: the
+     * target moves with the slide and the boot stub does not. Physical
+     * relocation breaks the other half of that — the SOURCE moves too, by
+     * `delta`, because the instruction itself was copied.
+     *
+     *   link time  disp  = (KVB + off) - link_phys
+     *   runtime    want    (KVB + slide + off) - (link_phys + delta)
+     *                    = disp + slide - delta
+     *
+     * Adding only the slide leaves the call `delta` short, which lands on the
+     * UNSLID `_start_rust` — mapped by nothing, so the first call into Rust
+     * takes a not-present instruction fetch and triple-faults with no output. */
     add [eax], ebx
+    sub [eax], ebp
     add esi, 4
     dec edi
     jmp .Lreloc_pc
@@ -199,7 +266,9 @@ _start:
      * or low entry) and is left alone.
      */
     mov esi, offset __got_phys_start
+    add esi, ebp
     mov edi, offset __got_phys_end
+    add edi, ebp
 .Lgot:
     cmp esi, edi
     jae .Lgot_done
@@ -223,18 +292,26 @@ _start:
      * Four PDPT entries with PS=1 cover 0..4 GiB at zero memory
      * cost (PDPT is already a full page).
      */
+    /* Page tables are inside the copied image, so their physical addresses
+     * moved with it. `esi`/`edi` are in use below, so `ecx` carries the two
+     * table addresses here. */
     lea eax, [pdpt]
+    add eax, ebp
     or  eax, 0x3                                /* P | RW */
 
-    mov [pml4], eax                             /* PML4[0] */
-    mov [pml4 + 511 * 8], eax                   /* PML4[511] */
+    mov ecx, offset pml4
+    add ecx, ebp
+    mov [ecx], eax                              /* PML4[0] */
+    mov [ecx + 511 * 8], eax                    /* PML4[511] */
 
     /* PDPT[0..3] = 0..3 GiB | (P | RW | PS) — identity 0..4 GiB.
      * PDPT[510]  = 0 | (P | RW | PS)         — higher-half = phys 0..1 GiB. */
-    mov dword ptr [pdpt + 0 * 8],     0x00000083  /* 0..1 GiB */
-    mov dword ptr [pdpt + 1 * 8],     0x40000083  /* 1..2 GiB */
-    mov dword ptr [pdpt + 2 * 8],     0x80000083  /* 2..3 GiB */
-    mov dword ptr [pdpt + 3 * 8],     0xC0000083  /* 3..4 GiB */
+    mov ecx, offset pdpt
+    add ecx, ebp
+    mov dword ptr [ecx + 0 * 8],      0x00000083  /* 0..1 GiB */
+    mov dword ptr [ecx + 1 * 8],      0x40000083  /* 1..2 GiB */
+    mov dword ptr [ecx + 2 * 8],      0x80000083  /* 2..3 GiB */
+    mov dword ptr [ecx + 3 * 8],      0xC0000083  /* 3..4 GiB */
 
     /* ── higher-half kernel window, slid ──
      *
@@ -253,6 +330,7 @@ _start:
      * is live, which is where `text_poke::alias_vas` already looks.
      */
     mov edi, offset pd_kernel_lo
+    add edi, ebp
     mov ecx, 1024                               /* one 4 KiB table, dwords */
     xor eax, eax
     rep stosd
@@ -268,8 +346,10 @@ _start:
     jae .Lkmap_done
     shl eax, 3
     mov edi, offset pd_kernel_lo
+    add edi, ebp
     add edi, eax
     mov eax, edx
+    add eax, ebp                                /* the image's new phys  */
     or  eax, 0x83                               /* P | RW | PS          */
     mov [edi], eax
     mov dword ptr [edi + 4], 0
@@ -279,12 +359,16 @@ _start:
 .Lkmap_done:
 
     lea eax, [pd_kernel_lo]
+    add eax, ebp
     or  eax, 0x3
-    mov [pdpt + 510 * 8], eax
-    mov dword ptr [pdpt + 510 * 8 + 4], 0
+    mov ecx, offset pdpt
+    add ecx, ebp
+    mov [ecx + 510 * 8], eax
+    mov dword ptr [ecx + 510 * 8 + 4], 0
 
-    /* CR3 = &PML4 */
+    /* CR3 = &PML4, in the copy */
     mov eax, offset pml4
+    add eax, ebp
     mov cr3, eax
 
     /* CR4.PAE = 1 */
@@ -304,10 +388,27 @@ _start:
     mov cr0, eax
 
     /* Load our GDT and far-jump into 64-bit code. */
-    lgdt [gdt_ptr]
-    
+    /* Both of these name link-time addresses, so both need the delta.
+     *
+     * `gdt_ptr`'s base is `.quad gdt`, a low-half address the relocation
+     * classifier correctly ignores (it does not move with the slide), so the
+     * stub has to fix it itself. Leaving it stale would load GDTR with a
+     * pointer into the ORIGINAL image, which is no longer inside the reserved
+     * physical bounds — so the buddy allocator could hand that memory out from
+     * under a live GDT.
+     *
+     * The far return is the one that must not be missed: landing on the
+     * original `long_mode_start` means `call _start_rust` below executes from
+     * the original image, whose pcrel displacement was never patched (the
+     * patch went to the copy), so it jumps to the UNSLID `_start_rust`. */
+    mov eax, offset gdt_ptr
+    add eax, ebp
+    add dword ptr [eax + 2], ebp                /* base -> the copy's GDT */
+    lgdt [eax]
+
     push 0x08
     mov eax, offset long_mode_start
+    add eax, ebp                                /* continue in the copy */
     push eax
     retf
 .size _start, . - _start

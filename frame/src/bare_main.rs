@@ -1389,7 +1389,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let want_1g = narf_boot::args()
                 .parse_value::<usize>("hugepages_1g")
                 .unwrap_or(0);
-            let kernel_exclude = [(kstart, kend)];
+            // The kernel window maps `[delta, delta + window bytes)`, but only
+            // the image inside that span IS the image. Once the image is
+            // physically relocated, the leaves below it alias ordinary RAM
+            // under a writable higher-half alias — exactly what
+            // `smoke_kernel_window_does_not_alias_buddy_frames` forbids.
+            //
+            // Reserve those frames rather than declining to map them:
+            // `text_poke` relies on the window aliasing low RAM, and dropping
+            // those leaves costs ~50 tests (BPF pack sealing, module loading).
+            // See the window loop in `x86_64/mmu.rs`.
+            //
+            // Empty when the image runs where the loader put it, so this is
+            // inert unless physical relocation is on. The window's 2 MiB
+            // rounding tail past `kend` is a separate, pre-existing alias that
+            // relocation does not change.
+            let phys_delta = narf_memory::kaslr::image_phys_delta();
+            let exclude_buf = [(kstart, kend), (phys_delta, kstart)];
+            let kernel_exclude: &[(u64, u64)] = if phys_delta != 0 {
+                &exclude_buf
+            } else {
+                &exclude_buf[..1]
+            };
             let huge_excludes = if want_2m > 0 || want_1g > 0 {
                 // SAFETY: `regions` is the bootloader's usable-RAM map, the
                 // loaded kernel is explicitly protected, and this one-shot
@@ -1398,7 +1419,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 unsafe {
                     narf_memory::hugepage::reserve_from_regions(
                         &regions,
-                        &kernel_exclude,
+                        kernel_exclude,
                         want_2m,
                         want_1g,
                     )
@@ -1408,7 +1429,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             };
             let mut excludes: alloc::vec::Vec<(u64, u64)> =
                 alloc::vec::Vec::with_capacity(1 + huge_excludes.len());
-            excludes.extend_from_slice(&kernel_exclude);
+            excludes.extend_from_slice(kernel_exclude);
             excludes.extend(huge_excludes.iter().copied());
 
             // Keep the initramfs out of the buddy.

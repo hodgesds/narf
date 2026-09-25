@@ -50,6 +50,20 @@ KASLR_RELOC_RESERVE = 4M;
  * window. 0 = draw entropy as normal. */
 KASLR_SLIDE_FIXED = 0x00000000;
 
+/* Physical relocation: how far the boot stub copies the image before running
+ * it. The slide randomizes where the image APPEARS; this randomizes where it
+ * IS, which a VA slide cannot do because the loader places the image.
+ *
+ * Pinned for now, and 0 disables relocation entirely. A real value must be
+ *   - 2 MiB aligned, so the kernel window's 2 MiB pages still describe it;
+ *   - at least the image size, so the copy cannot overlap its own source
+ *     (the stub copies forward);
+ *   - inside RAM the identity map covers (PDPT[0..3] = the low 4 GiB) and
+ *     clear of anything the loader marked reserved — which is why choosing it
+ *     needs the memory map, and why this is pinned until the stub can parse
+ *     one. */
+KASLR_PHYS_FIXED = 0;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -123,6 +137,11 @@ SECTIONS
     /* Physical alias of `kaslr::KERNEL_SLIDE`, so the 32-bit pass can record
      * the slide it applied for the Rust conversions to read later. */
     __kernel_slide_phys = KERNEL_SLIDE - KERNEL_VIRT_BASE;
+
+    /* Physical alias of `kaslr::IMAGE_PHYS_DELTA`, so the 32-bit stub can
+     * record how far it moved the image. Link-time address; the stub adds the
+     * delta to reach the copy's. */
+    __image_phys_delta_phys = IMAGE_PHYS_DELTA - KERNEL_VIRT_BASE;
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;

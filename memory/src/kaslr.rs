@@ -162,6 +162,48 @@ pub fn image_phys_bounds() -> (u64, u64) {
 #[no_mangle]
 pub static IMAGE_PHYS_DELTA: AtomicU64 = AtomicU64::new(0);
 
+/// How far the running image sits from its link-time load address.
+///
+/// Prefer [`image_virt_to_phys`] or [`image_phys_bounds`]; this exists for the
+/// one caller that has to undo the displacement rather than apply it — the
+/// kernel window, which is indexed by VIRTUAL offset but maps PHYSICAL frames,
+/// so it needs the two apart. See `x86_64::mmu::kernel_window_va`.
+#[inline]
+pub fn image_phys_delta() -> u64 {
+    IMAGE_PHYS_DELTA.load(Ordering::Relaxed)
+}
+
+/// Size of the image as laid out by the linker, in bytes.
+///
+/// Deliberately delta-free, unlike [`image_phys_bounds`]. The image's VA extent
+/// does not change when it is physically relocated: the image is linked at
+/// `KERNEL_VIRT_BASE + <link-time phys>`, so the window that maps it needs this
+/// many bytes wherever the bytes actually live. Using the relocated physical
+/// end here would inflate the window by the delta — at a 256 MiB delta that is
+/// 176 leaves instead of 49, which overruns the PD the slide has to fit in.
+#[inline]
+pub fn image_virt_extent() -> u64 {
+    image_link_bounds().1
+}
+
+/// The image's LINK-TIME physical bounds — where the linker put it, not where
+/// it runs.
+///
+/// This is [`image_phys_bounds`] without the relocation delta applied, which
+/// makes it the image's offsets within its own virtual window: the image is
+/// linked at `KERNEL_VIRT_BASE + <link-time phys>`, so these double as the VA
+/// offsets of its first and last byte. The window that maps it is indexed by
+/// those offsets while mapping the relocated frames.
+#[inline]
+pub fn image_link_bounds() -> (u64, u64) {
+    unsafe extern "C" {
+        static __kernel_phys_bounds: [u64; 2];
+    }
+    // SAFETY: as `image_phys_bounds` — two linker-populated words in-image.
+    let b = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() };
+    (b[0], b[1])
+}
+
 /// Physical address of an in-image kernel-virtual address.
 ///
 /// Use this instead of subtracting a hardcoded base: the constant is right
