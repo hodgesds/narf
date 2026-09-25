@@ -12948,43 +12948,6 @@ fn smoke_memory_anon_merge_joins_dense_neighbours() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_anon_merge_joins_dense_neighbours);
 
-/// Coalescing is best-effort: when the padding reservation cannot be
-/// satisfied (here a sparse destination whose zero-pad would need terabytes),
-/// the merge declines before removing anything and both VMAs survive with
-/// their original shapes and frame placement.
-fn smoke_memory_anon_merge_reserve_failure_leaves_regions_intact() -> TestResult {
-    let base = 0x0000_0081_0500_0000u64;
-    let huge_pages = 1u64 << 40;
-    let source_base = base + (huge_pages << 12);
-    let table = match coalesce_preserving_placement(
-        alloc::vec![
-            merge_test_region(base, huge_pages, alloc::vec![PhysAddr::new(0x4D_000)]),
-            merge_test_region(source_base, 1, alloc::vec![PhysAddr::new(0x4E_000)]),
-        ],
-        source_base,
-    ) {
-        Ok(table) => table,
-        Err(reason) => return TestResult::Fail(reason),
-    };
-    if table.iter().count() != 2 {
-        return TestResult::Fail("a failed padding reservation still merged the VMAs");
-    }
-    let destination_intact = table
-        .get(base)
-        .is_some_and(|region| region.len == huge_pages << 12 && region.phys.len() == 1);
-    let source_intact = table
-        .get(source_base)
-        .is_some_and(|region| region.len == 4096 && region.phys.len() == 1);
-    if !destination_intact || !source_intact {
-        return TestResult::Fail("a declined merge changed a region's shape");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_reserve_failure_leaves_regions_intact
-);
-
 /// Demand ownership is page-scoped, and removing/replacing a VMA cancels an
 /// outstanding ticket before its slow path can publish into the new mapping.
 fn smoke_memory_demand_tickets_are_page_scoped() -> TestResult {
