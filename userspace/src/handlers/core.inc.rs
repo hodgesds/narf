@@ -4093,6 +4093,27 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     Ok(())
 }
 
+/// `fs/read_write.c::rw_verify_area` position/length half, for a file whose
+/// position is meaningful (Linux passes `ppos == NULL` for FMODE_STREAM, so
+/// callers skip streams unless Linux uses `f_pos` unconditionally):
+///
+/// ```text
+///   if (unlikely((ssize_t) count < 0)) return -EINVAL;
+///   if (pos < 0) return -EINVAL;                     /* !unsigned_offsets */
+///   else if ((loff_t) (pos + count) < 0) return -EINVAL;
+/// ```
+///
+/// So `pread(fd, buf, 10, INT64_MAX - 5)` is -EINVAL, not a 0-byte EOF.
+fn rw_verify_area_pos(pos: u64, count: usize) -> Result<(), i64> {
+    if count > isize::MAX as usize
+        || (pos as i64) < 0
+        || (pos as i64).checked_add(count as i64).is_none()
+    {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone)]
 struct ImportedRwIovec {
     base: u64,
@@ -4108,12 +4129,29 @@ fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<Impor
     }
     // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
     let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
+    // `lib/iov_iter.c::copy_iovec_from_user` rejects an iov_len with the
+    // ssize_t sign bit set (-EINVAL) while copying the array — before
+    // `__import_iovec` runs a single access_ok, so a negative length outranks
+    // a bad base in an earlier element.
+    if raw
+        .chunks_exact(16)
+        .any(|slot| (u64::from_ne_bytes(slot[8..].try_into().unwrap()) as i64) < 0)
+    {
+        return Err(EINVAL as u64);
+    }
     let mut out = alloc::vec::Vec::with_capacity(iovcnt);
     let mut remaining = LINUX_MAX_RW_COUNT;
     for slot in raw.chunks_exact(16) {
         let base = u64::from_ne_bytes(slot[..8].try_into().unwrap());
         let requested = u64::from_ne_bytes(slot[8..].try_into().unwrap()) as usize;
-        validate_rw_user_range(base, requested)?;
+        // A one-element vector takes `__import_iovec_ubuf` -> `import_ubuf`,
+        // which clamps to MAX_RW_COUNT BEFORE access_ok; the multi-element
+        // loop checks the full length first.
+        if iovcnt == 1 {
+            validate_rw_user_range(base, core::cmp::min(requested, remaining))?;
+        } else {
+            validate_rw_user_range(base, requested)?;
+        }
         let len = core::cmp::min(requested, remaining);
         remaining -= len;
         out.push(ImportedRwIovec { base, len });
@@ -4133,10 +4171,19 @@ fn copy_fd_endpoint_from_table(
     fd_num: u32,
 ) -> Option<CopyFdEndpoint> {
     let entry = table.get(fd_num)?;
+    let status_flags = table.status_flags(fd_num)?;
+    // `fdget()` is `__fget_light(fd, FMODE_PATH)`: an O_PATH file is
+    // invisible to every fdget() user, so it is -EBADF at lookup time — before
+    // ESPIPE (pread/preadv), EFAULT (splice offsets), or the -EINVAL that
+    // ftruncate/fallocate give a non-writable file. Only fdget_raw() callers
+    // (fstat, fchdir, *at dirfds…) may see O_PATH, and none of them use this.
+    if status_flags & crate::fd::O_PATH != 0 {
+        return None;
+    }
     Some(CopyFdEndpoint {
         ops: entry.ops.clone(),
         description: table.description(fd_num)?,
-        status_flags: table.status_flags(fd_num)?,
+        status_flags,
     })
 }
 
@@ -8055,6 +8102,21 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         return;
     }
 
+    // vfs_readv/vfs_writev: rw_verify_area(pos, tot_len) sits between the
+    // `!tot_len` short-circuit and the flag word. The `pos == -1` form checks
+    // the shared f_pos (NULL, i.e. skipped, for a stream).
+    let verify_pos = if use_current_pos {
+        (!endpoint.ops.is_stream()).then(|| endpoint.description.offset())
+    } else {
+        Some(pos)
+    };
+    if let Some(verify_pos) = verify_pos {
+        if let Err(errno) = rw_verify_area_pos(verify_pos, count) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    }
+
     // Only now does the flag word matter. `vfs_readv`/`vfs_writev` reach
     // `kiocb_set_rw_flags` (via do_iter_readv_writev) AFTER the FMODE check,
     // after `import_iovec`, and after the `if (!tot_len) goto out;`
@@ -8134,6 +8196,13 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             // in-memory coherent filesystem already satisfies, and RWF_HIPRI
             // is a scheduling hint.
         }
+    }
+
+    // A directory has no read_iter: do_loop_readv_writev reaches
+    // generic_read_dir -> -EISDIR once the flag word has been accepted.
+    if !is_write && endpoint.ops.as_dir().is_some() {
+        ctx.set_return(errno_ret(EISDIR));
+        return;
     }
 
     if use_current_pos {

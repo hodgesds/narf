@@ -183,16 +183,22 @@ impl VmspliceReadEnd<'_> {
 /// sampled. In particular a full nonblocking pipe plus an invalid payload
 /// range is EFAULT, not EAGAIN. Zero-length elements do not touch iov_base.
 fn validate_vmsplice_iovecs(iov_buf: &[u8], nr: usize) -> Result<usize, u64> {
+    // copy_iovec_from_user reads iov_len through ssize_t and rejects a value
+    // with the sign bit set while copying the WHOLE array — before
+    // __import_iovec's per-element access_ok — so a negative length in any
+    // element outranks a bad base in an earlier one.
+    for i in 0..nr {
+        let o = i * 16;
+        let len_raw = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8]));
+        if len_raw > isize::MAX as u64 {
+            return Err(EINVAL as u64);
+        }
+    }
     let mut total = 0usize;
     for i in 0..nr {
         let o = i * 16;
         let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
         let len_raw = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8]));
-        // copy_iovec_from_user reads iov_len through ssize_t and rejects a
-        // value with the sign bit set before initializing the iterator.
-        if len_raw > isize::MAX as u64 {
-            return Err(EINVAL as u64);
-        }
         let len = len_raw as usize;
         if len == 0 {
             continue;

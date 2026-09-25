@@ -1869,6 +1869,11 @@ fn smoke_abi_fdio_pipe_lseek_espipe_neg() -> TestResult {
         if call(Syscall::Lseek.raw(), a2(wr as u64, 0, 2)) != Some(ESPIPE) {
             return Err("lseek(pipe write end, SEEK_END) was not -ESPIPE");
         }
+        // `ksys_lseek` rejects whence > SEEK_MAX before vfs_llseek's
+        // FMODE_LSEEK test, so a bad whence on a pipe is -EINVAL.
+        if call(Syscall::Lseek.raw(), a2(rd as u64, 0, 99)) != Some(EINVAL) {
+            return Err("lseek(pipe, whence=99) was not -EINVAL");
+        }
         Ok(())
     })
 }
@@ -3638,8 +3643,29 @@ fn smoke_abi_fdio_copy_file_range_overflow_overlap_immutable() -> TestResult {
             _ => return Err("copy_file_range overlapping same-file ranges must return -EINVAL"),
         }
 
-        // 2. Offsets overflowing loff_t -> -EOVERFLOW (-75).
-        let mut off_in_overflow = (i64::MAX - 100) as u64;
+        // 1b. The overlap test uses the EOF-shortened count: [0, 1000) of an
+        // 8-byte file copied to offset 100 is really [0, 8) -> [100, 108).
+        let mut off_in = 0u64;
+        let mut off_out = 100u64;
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: &mut off_in as *mut u64 as u64,
+                arg2: in_fd as u64,
+                arg3: &mut off_out as *mut u64 as u64,
+                arg4: 1000,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == 8 => {}
+            _ => return Err("copy_file_range overlap check ignored EOF shortening"),
+        }
+
+        // 2. `pos + len` wrapping u64 -> -EOVERFLOW (-75). Linux tests the
+        // RAW len (`pos_in + count < pos_in`), so off_in = 1, len = SIZE_MAX
+        // wraps even though the copy would be clamped to MAX_RW_COUNT.
+        let mut off_in_overflow = 1u64;
         let mut off_out_valid = 0u64;
         match call_raw(
             Syscall::CopyFileRange.raw(),
@@ -3648,12 +3674,46 @@ fn smoke_abi_fdio_copy_file_range_overflow_overlap_immutable() -> TestResult {
                 arg1: &mut off_in_overflow as *mut u64 as u64,
                 arg2: out_fd as u64,
                 arg3: &mut off_out_valid as *mut u64 as u64,
-                arg4: 200,
+                arg4: u64::MAX,
                 arg5: 0,
             },
         ) {
             r if r.status == SyscallReturn::OK && r.value as i64 == -75 => {}
-            _ => return Err("copy_file_range with overflowing offset must return -EOVERFLOW"),
+            _ => return Err("copy_file_range with wrapping offset+len must return -EOVERFLOW"),
+        }
+        // A position near LLONG_MAX that does not wrap u64 is simply past
+        // EOF: count shortens to 0 and the call returns 0, not -EOVERFLOW.
+        let mut off_in_past_eof = (i64::MAX - 100) as u64;
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: &mut off_in_past_eof as *mut u64 as u64,
+                arg2: out_fd as u64,
+                arg3: &mut off_out_valid as *mut u64 as u64,
+                arg4: 200,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value == 0 => {}
+            _ => return Err("copy_file_range past EOF near LLONG_MAX must return 0"),
+        }
+        // *off_out = LLONG_MAX is at s_maxbytes -> -EFBIG (-27).
+        let mut off_in_zero = 0u64;
+        let mut off_out_max = i64::MAX as u64;
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: &mut off_in_zero as *mut u64 as u64,
+                arg2: out_fd as u64,
+                arg3: &mut off_out_max as *mut u64 as u64,
+                arg4: 1,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == -27 => {}
+            _ => return Err("copy_file_range to *off_out = LLONG_MAX must return -EFBIG"),
         }
 
         // 3. Immutable destination -> -EPERM (-1).

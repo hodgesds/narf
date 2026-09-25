@@ -5,12 +5,19 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let offset = args.arg1 as i64;
-    let whence = args.arg2;
+    // `unsigned int whence`: the syscall ABI drops the upper register half.
+    let whence = args.arg2 as u32 as u64;
     let task = current_task_id();
     // Linux errno: bad fd → -EBADF; bad whence / negative or overflowing
     // result → -EINVAL (was a blanket InvalidOp).
+    //
+    // `fdget_pos()` ignores O_PATH files (FMODE_PATH), so an O_PATH fd is
+    // -EBADF here exactly like a closed one.
     let resolved = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
+        if t.status_flags(fd)? & crate::fd::O_PATH != 0 {
+            return None;
+        }
         Some((entry.ops.clone(), t.description(fd)?))
     });
     let (ops, description) = match resolved {
@@ -20,6 +27,14 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `ksys_lseek`: `retval = -EINVAL; if (whence <= SEEK_MAX) ... vfs_llseek`
+    // — an out-of-range whence is -EINVAL before vfs_llseek's FMODE_LSEEK
+    // (-ESPIPE) test, so `lseek(pipe, 0, 99)` is EINVAL, not ESPIPE.
+    const SEEK_MAX: u64 = 4; // SEEK_HOLE
+    if whence > SEEK_MAX {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
     let _position_guard = match poll_blocking(description.position_lock.lock()) {
         Some(guard) => guard,
         None => {

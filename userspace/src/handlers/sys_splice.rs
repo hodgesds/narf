@@ -111,22 +111,23 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    if requested > isize::MAX as usize
-        || explicit_in.is_some_and(|offset| {
-            (offset as i64) < 0
-                || offset
-                    .checked_add(requested as u64)
-                    .is_none_or(|end| end > i64::MAX as u64)
-        })
-        || explicit_out.is_some_and(|offset| {
-            (offset as i64) < 0
-                || offset
-                    .checked_add(requested as u64)
-                    .is_none_or(|end| end > i64::MAX as u64)
-        })
-    {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
+    // do_splice runs rw_verify_area only on the NON-pipe side, against the
+    // explicit offset or that file's f_pos: pipe->file checks (out, len),
+    // file->pipe checks (in, len). pipe->pipe has no position at all, so
+    // `splice(p0, NULL, q1, NULL, SIZE_MAX, 0)` is a legal "move what's
+    // there" rather than the -EINVAL a blanket ssize_t test gave it.
+    let verify = if in_is_pipe && !out_is_pipe {
+        Some(explicit_out.unwrap_or_else(|| output.description.offset()))
+    } else if out_is_pipe && !in_is_pipe {
+        Some(explicit_in.unwrap_or_else(|| input.description.offset()))
+    } else {
+        None
+    };
+    if let Some(pos) = verify {
+        if let Err(errno) = rw_verify_area_pos(pos, requested) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
     }
 
     // Two descriptors for the two ends of one pipe name the same
