@@ -4632,14 +4632,6 @@ fn copy_fd_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
     .flatten()
 }
 
-/// `fdget(fd)` as the fd-taking syscalls see it: an unopened slot AND an
-/// O_PATH description (FMODE_PATH, which `__fget_light` masks out) are both
-/// "no file", i.e. -EBADF at the caller. `fd_raw` users (fstatfs, fchdir,
-/// the `*at` dirfd) must keep using [`copy_fd_endpoint`].
-fn fdget_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
-    copy_fd_endpoint(task, fd_num).filter(|e| e.status_flags & crate::fd::O_PATH == 0)
-}
-
 fn copy_fd_endpoint_from_table(
     table: &crate::fd::FdTable,
     fd_num: u32,

@@ -14,7 +14,7 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
     let task = current_task_id();
     // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM). An
     // O_PATH descriptor is "not open" to `fdget` as well.
-    let Some(ops) = fdget_endpoint(task, fd).map(|e| e.ops) else {
+    let Some(ops) = copy_fd_endpoint(task, fd).map(|e| e.ops) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };

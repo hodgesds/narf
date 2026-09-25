@@ -37,7 +37,7 @@ pub(crate) fn sys_cachestat(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     // `CLASS(fd, f)(fd)` refuses an O_PATH description as well as an
     // unopened slot.
-    let Some(endpoint) = fdget_endpoint(task, fd) else {
+    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };

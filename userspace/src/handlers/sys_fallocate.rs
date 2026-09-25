@@ -44,7 +44,7 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     // `fdget`: an O_PATH descriptor is -EBADF before any argument check.
-    let Some(endpoint) = fdget_endpoint(task, fd) else {
+    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };
