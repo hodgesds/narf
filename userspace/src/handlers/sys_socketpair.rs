@@ -7,9 +7,7 @@ use super::*;
 /// SOCK_CLOEXEC / SOCK_NONBLOCK flag bits, which apply to both ends.
 pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let domain = args.arg0 as u16;
     let raw_type = args.arg1 as u32;
-    let _protocol = args.arg2 as u32;
     let sv_ptr = args.arg3;
     // `net/socket.c::__sys_socketpair`:
     //
@@ -31,36 +29,27 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let kind = raw_type & SOCK_TYPE_MASK;
+    // `__sys_socketpair` creates both ends with `sock_create` first, so the
+    // family/type/protocol errors (-EAFNOSUPPORT, -EINVAL, -ESOCKTNOSUPPORT,
+    // -EPROTONOSUPPORT, -EPERM) come from the same validation as socket(2).
+    // Only AF_UNIX implements `->socketpair`; any other family that creates
+    // successfully is -EOPNOTSUPP (`sock_no_socketpair`).
+    let (domain, kind, _protocol) = match handler_sys_socket::validate_socket_create(
+        args.arg0,
+        raw_type & SOCK_TYPE_MASK,
+        args.arg2,
+        current_task_id(),
+    ) {
+        Ok(v) => v,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
     let cloexec = flags & crate::fd::O_CLOEXEC != 0;
     let nonblock = flags & crate::fd::O_NONBLOCK != 0;
-    // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL. Match its error
-    // order: sock_create rejects an unknown family with -EAFNOSUPPORT; a known
-    // family that lacks a ->socketpair op (every non-UNIX family here) is
-    // -EOPNOTSUPP; and AF_UNIX with an unsupported type is -ESOCKTNOSUPPORT.
-    // STREAM is byte-stream; SEQPACKET and DGRAM retain one record per send.
-    let family_known = matches!(
-        domain,
-        crate::socket::AF_UNIX
-            | crate::socket::AF_INET
-            | crate::socket::AF_INET6
-            | crate::socket::AF_BYPASS
-            | crate::socket::AF_NETLINK
-    );
-    let kind_ok = matches!(
-        kind,
-        crate::socket::SOCK_STREAM | crate::socket::SOCK_SEQPACKET | crate::socket::SOCK_DGRAM
-    );
-    if !family_known {
-        ctx.set_return(errno_ret(EAFNOSUPPORT));
-        return;
-    }
     if domain != crate::socket::AF_UNIX {
         ctx.set_return(errno_ret(EOPNOTSUPP));
-        return;
-    }
-    if !kind_ok {
-        ctx.set_return(errno_ret(ESOCKTNOSUPPORT));
         return;
     }
     let (a, b) = crate::socket::SocketFile::unix_pair(kind);
