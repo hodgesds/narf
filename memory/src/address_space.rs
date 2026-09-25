@@ -12507,6 +12507,27 @@ fn coalesce_preserving_placement(
 }
 
 /// `(region count, len, raw phys prefix)` of the region at `base`.
+/// Every region in the table as `(base, len, phys)`, in ascending base order.
+///
+/// `merged_shape` reports only the region at one base, which is enough when the
+/// expected outcome is a single merged region. A DECLINED merge has to pin both
+/// participants: a partial mutation that resized the neighbour while leaving the
+/// region count alone would otherwise pass.
+fn table_shape(table: &RegionTable) -> Vec<(u64, u64, Vec<u64>)> {
+    let mut shape: Vec<(u64, u64, Vec<u64>)> = table
+        .iter()
+        .map(|region| {
+            (
+                region.base.as_u64(),
+                region.len,
+                region.phys.iter().map(|p| p.raw()).collect(),
+            )
+        })
+        .collect();
+    shape.sort_unstable_by_key(|entry| entry.0);
+    shape
+}
+
 fn merged_shape(table: &RegionTable, base: u64) -> Option<(usize, u64, Vec<u64>)> {
     let count = table.iter().count();
     table.get(base).map(|region| {
@@ -12543,7 +12564,12 @@ fn smoke_memory_anon_merge_skips_sparse_successor() -> TestResult {
         Ok(table) => table,
         Err(reason) => return TestResult::Fail(reason),
     };
-    if merged_shape(&table, base) != Some((2, 2 * 4096, alloc::vec![0x41_000, 0x42_000])) {
+    if table_shape(&table)
+        != alloc::vec![
+            (base, 2 * 4096, alloc::vec![0x41_000, 0x42_000]),
+            (base + 0x2000, 3 * 4096, alloc::vec![0x43_000]),
+        ]
+    {
         return TestResult::Fail("a sparse successor was absorbed into the destination");
     }
     TestResult::Pass
@@ -12569,7 +12595,12 @@ fn smoke_memory_anon_merge_skips_sparse_current() -> TestResult {
         Ok(table) => table,
         Err(reason) => return TestResult::Fail(reason),
     };
-    if merged_shape(&table, base) != Some((2, 2 * 4096, alloc::vec![0x48_000])) {
+    if table_shape(&table)
+        != alloc::vec![
+            (base, 2 * 4096, alloc::vec![0x48_000]),
+            (base + 0x2000, 2 * 4096, alloc::vec![0x49_000, 0x4A_000]),
+        ]
+    {
         return TestResult::Fail("a sparse current region absorbed its successor");
     }
     TestResult::Pass
@@ -12591,7 +12622,12 @@ fn smoke_memory_anon_merge_skips_sparse_predecessor() -> TestResult {
         Ok(table) => table,
         Err(reason) => return TestResult::Fail(reason),
     };
-    if merged_shape(&table, base) != Some((2, 2 * 4096, Vec::new())) {
+    if table_shape(&table)
+        != alloc::vec![
+            (base, 2 * 4096, Vec::new()),
+            (base + 0x2000, 4096, alloc::vec![0x4B_000]),
+        ]
+    {
         return TestResult::Fail("a dense insert was folded into its sparse predecessor");
     }
     TestResult::Pass
