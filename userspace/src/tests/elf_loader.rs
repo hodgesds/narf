@@ -989,6 +989,10 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_parse_pt_tls() -> TestResult {
+    // NB: this test is NOT arch-gated, so its synthetic images must name the
+    // running machine — `parse_elf` enforces `e_machine == EM_NATIVE`
+    // (elf_check_arch parity). A hardcoded EM_X86_64 made it fail on aarch64
+    // with `WrongMachine` before reaching any PT_TLS assertion.
     // PT_TLS parsing. Hand-build a minimal ELF with one PT_LOAD (so the
     // parser sees a "loadable" image) and one PT_TLS pointing at known
     // bytes, then assert `parse_elf` populates `image.tls` with those
@@ -1006,7 +1010,7 @@ fn smoke_userspace_parse_pt_tls() -> TestResult {
         let mut b = alloc::vec![0u8; FSIZE];
         b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
         b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
         b[0x18..0x20].copy_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
         b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
@@ -1071,7 +1075,7 @@ fn smoke_userspace_parse_pt_tls() -> TestResult {
         let mut b = alloc::vec![0u8; FSIZE];
         b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
-        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
         b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
         b[0x18..0x20].copy_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
         b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
