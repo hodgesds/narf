@@ -7539,11 +7539,30 @@ fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
 }
 
 fn futex_drop_task_waiters(task_id: u64) {
-    for bucket in &FUTEX_WAITERS {
-        bucket.values.lock().retain(|_, waiters| {
-            waiters.remove(&task_id);
-            !waiters.is_empty()
-        });
+    // Targeted: the park loop is the only registrar, it registers exactly
+    // one key (the task's live `futex_uaddr`), and every non-stay exit from
+    // the loop drops that key — including the seqlock retarget path, whose
+    // requeue moves the entry AND the uaddr together. So at drop time every
+    // registration this task can own sits under its CURRENT park key. The
+    // old shape swept all 256 bucket locks per task exit; a 1000-thread
+    // exit storm hammered those global locks from every CPU at once.
+    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
+        let uaddr = uc.futex_uaddr.load(Ordering::Acquire);
+        (uaddr != 0).then(|| futex_key(uc.futex_namespace.load(Ordering::Acquire), uaddr))
+    });
+    match key {
+        Some(Some(key)) => futex_drop_waiter_key(key, task_id),
+        // Not parked: nothing registered, nothing to sweep.
+        Some(None) => {}
+        // Ctx already gone (racing teardown) — conservative full sweep.
+        None => {
+            for bucket in &FUTEX_WAITERS {
+                bucket.values.lock().retain(|_, waiters| {
+                    waiters.remove(&task_id);
+                    !waiters.is_empty()
+                });
+            }
+        }
     }
 }
 
@@ -7755,12 +7774,23 @@ fn futex_requeue_waiters_keyed(
     };
     // Retarget each mover's park state OUTSIDE the table lock (the task
     // registry lock in with_user_task_ctx must never nest inside it).
+    // Seqlocked against the mover's own park loop: bump to odd, store the
+    // four target fields, bump to even. A re-poll racing this window used
+    // to load the OLD word, register on its queue after the map entry had
+    // already moved here, and — an untimed FUTEX_WAIT arms no backstop
+    // timer — strand forever while every wake landed on the new key (the
+    // stress-ng --pthread 0.33x collapse: musl's condvar broadcast limped
+    // from strand to backstop instead of chaining wakes). The park loop
+    // re-validates the sequence after registering and turns any movement
+    // into a spurious return; musl re-checks the word in userspace.
     for tid in &moved {
         crate::user_task::with_user_task_ctx(*tid, |uc| {
+            uc.futex_park_seq.fetch_add(1, Ordering::AcqRel);
             uc.futex_park_gen.store(gen2, Ordering::Release);
             uc.futex_val.store(new_val, Ordering::Release);
-            uc.futex_uaddr.store(uaddr2, Ordering::Release);
             uc.futex_namespace.store(key2.namespace, Ordering::Release);
+            uc.futex_uaddr.store(uaddr2, Ordering::Release);
+            uc.futex_park_seq.fetch_add(1, Ordering::Release);
         });
     }
     (woken, moved.len())
@@ -7780,6 +7810,75 @@ pub(crate) fn futex_read_user_word(uaddr: u64) -> Option<u32> {
         Some(u32::from_ne_bytes(b))
     } else {
         None
+    }
+}
+
+/// Outcome of [`futex_park_register_and_check`]: what the park loop should
+/// do about the task's futex wait, if any.
+pub(crate) enum FutexParkCheck {
+    /// No futex park is active (`futex_uaddr == 0`) — fall through to the
+    /// other park sources.
+    NotWaiting,
+    /// Registered on the (seqlock-validated) word's wait queue and the wait
+    /// still holds — keep parking.
+    Stay,
+    /// A wake landed, the word changed, or a `FUTEX_REQUEUE` retarget raced
+    /// the registration: the park fields are cleared and any stale queue
+    /// entry dropped. The caller must return control to userspace as a
+    /// (possibly spurious) futex wake — musl re-checks the word.
+    Wake,
+}
+
+/// The single home of the futex park-target seqlock protocol shared by both
+/// park loops (the own-stack loop and `UserTaskFuture::poll`): snapshot
+/// `futex_park_seq`, load the target fields, register on the word's wait
+/// queue, then re-validate the sequence. An odd snapshot or any movement
+/// across the load→register window means a `FUTEX_REQUEUE` was mid-retarget
+/// — the just-inserted entry may name the stale word, so it is dropped and
+/// the wait resolves as a spurious wake. Keeping this in one function keeps
+/// the ordering invariant (seq before fields; re-check after register) from
+/// drifting between the two call sites.
+pub(crate) fn futex_park_register_and_check(
+    uc: &crate::user_task::UserTaskCtx,
+    task_id: u64,
+    waker: &core::task::Waker,
+) -> FutexParkCheck {
+    let clear = |uc: &crate::user_task::UserTaskCtx| {
+        uc.sleep_deadline_ns.store(0, Ordering::Release);
+        uc.futex_uaddr.store(0, Ordering::Release);
+        uc.futex_namespace.store(0, Ordering::Release);
+    };
+    let seq_before = uc.futex_park_seq.load(Ordering::Acquire);
+    let fu = uc.futex_uaddr.load(Ordering::Acquire);
+    if fu == 0 {
+        return FutexParkCheck::NotWaiting;
+    }
+    if seq_before & 1 != 0 {
+        // Retarget in flight: the fields are mid-rewrite.
+        clear(uc);
+        return FutexParkCheck::Wake;
+    }
+    let key = futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+    futex_register_waiter_key(key, task_id, waker.clone());
+    if uc.futex_park_seq.load(Ordering::Acquire) != seq_before {
+        // A requeue retargeted us between the field loads and the
+        // registration — the entry we just inserted names the stale word.
+        futex_drop_waiter_key(key, task_id);
+        clear(uc);
+        return FutexParkCheck::Wake;
+    }
+    let stay = futex_park_should_stay(
+        futex_gen_key(key),
+        uc.futex_park_gen.load(Ordering::Acquire),
+        futex_read_user_word(fu),
+        uc.futex_val.load(Ordering::Acquire),
+    );
+    if stay {
+        FutexParkCheck::Stay
+    } else {
+        futex_drop_waiter_key(key, task_id);
+        clear(uc);
+        FutexParkCheck::Wake
     }
 }
 
