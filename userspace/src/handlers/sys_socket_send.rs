@@ -5,7 +5,11 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let buf_ptr = args.arg1;
-    let buf_len = args.arg2 as usize;
+    // `import_ubuf` clamps an oversized length to MAX_RW_COUNT rather than
+    // failing it. A stream send then transfers a prefix; every datagram
+    // protocol's own size limit (UDP 65507, AF_UNIX sndbuf) is far below the
+    // NARF bound and still reports -EMSGSIZE for the clamped length.
+    let buf_len = core::cmp::min(args.arg2 as usize, MAX_USER_COPY);
     let flags = args.arg3 as u32;
     // arg4 / arg5: sendto's destination address (NULL/0 for
     // connected stream sockets, non-NULL for connectionless
@@ -66,12 +70,12 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             // unix_stream_sendmsg (net/unix/af_unix.c:2500). SIGPIPE's default
             // action is Terminate, so a client that neither sets MSG_NOSIGNAL nor
             // ignores SIGPIPE dies here exactly as on Linux.
-            // UDP never signals: its EPIPE comes from `sock_alloc_send_pskb`
-            // (net/core/sock.c:2873), and only the stream error path raises
-            // SIGPIPE (net/core/stream.c:191).
+            // Datagram/seqpacket sockets never signal: their EPIPE comes from
+            // `sock_alloc_send_pskb` (net/core/sock.c:2873), and only the
+            // stream error paths raise SIGPIPE (net/core/stream.c:191).
             if e == crate::socket::SockError::Pipe
                 && flags & crate::socket::MSG_NOSIGNAL == 0
-                && !sock.is_inet_dgram()
+                && sock.epipe_raises_sigpipe()
             {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }

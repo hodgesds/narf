@@ -43,8 +43,8 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             // Broken-pipe sendmsg raises SIGPIPE to the sender unless
             // MSG_NOSIGNAL is set (Linux sk_stream_error net/core/stream.c:194,
             // unix_stream_sendmsg net/unix/af_unix.c:2500). errno 32 == EPIPE.
-            // UDP's EPIPE never signals (see sys_socket_send).
-            if errno == 32 && flags & crate::socket::MSG_NOSIGNAL == 0 && !sock.is_inet_dgram() {
+            // Datagram/seqpacket EPIPEs never signal (see sys_socket_send).
+            if errno == EPIPE && flags & crate::socket::MSG_NOSIGNAL == 0 && sock.epipe_raises_sigpipe() {
                 raise_signal_pending(current_task_id(), 13); // SIGPIPE
             }
             ctx.set_return(errno_ret(errno));
@@ -111,16 +111,17 @@ pub(super) fn sendmsg_on_socket(
         let off = i * 16;
         let ptr = u64::from_ne_bytes(iov_raw[off..off + 8].try_into().unwrap());
         let len = u64::from_ne_bytes(iov_raw[off + 8..off + 16].try_into().unwrap());
-        let Ok(len) = usize::try_from(len) else {
-            return SendMsgResult::Error(22); // EINVAL
-        };
+        // `iovec_from_user`: a negative (as ssize_t) iov_len is -EINVAL; the
+        // running total is then clamped to MAX_RW_COUNT (here MAX_USER_COPY)
+        // rather than rejected, so an oversized stream send is a short send.
+        if (len as i64) < 0 {
+            return SendMsgResult::Error(EINVAL);
+        }
+        let len = core::cmp::min(len as usize, MAX_USER_COPY - total_len);
         if len != 0 && validate_user_range(ptr, len).is_err() {
             return SendMsgResult::Error(14); // EFAULT
         }
-        total_len = match total_len.checked_add(len) {
-            Some(n) if n <= MAX_USER_COPY => n,
-            _ => return SendMsgResult::Error(22), // bounded NARF transfer
-        };
+        total_len += len;
         vectors.push((ptr, len));
     }
 
@@ -158,6 +159,12 @@ pub(super) fn sendmsg_on_socket(
     #[cfg(feature = "syscall-trace")]
     crate::socket::dbg_dbus_peek("TX", &total);
 
+    // SCM_RIGHTS is an AF_UNIX facility. `__scm_send` rejects it for any
+    // other family and `ip_cmsg_send` / `sock_cmsg_send` (TCP, UDP) fall to
+    // their default arm: -EINVAL, not the -ENOTCONN of the unix send path.
+    if !passed_fds.is_empty() && sock.domain != crate::socket::AF_UNIX {
+        return SendMsgResult::Error(EINVAL);
+    }
     if !passed_fds.is_empty() {
         // A *connected* AF_UNIX datagram socketpair delivers over its crossed
         // rings, not the address registry — so its SCM_RIGHTS send goes through

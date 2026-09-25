@@ -7573,3 +7573,417 @@ fn window_contains(hay: &[u8], needle: &[u8]) -> bool {
     }
     hay.windows(needle.len()).any(|w| w == needle)
 }
+
+// ─────────────────── Networking errno audit (Linux parity) ───────────────────
+//
+// Each smoke below pins one errno (or success) that previously diverged from
+// Linux. The comment on each cites the Linux function that decides it.
+
+const SO_BINDTODEVICE: u64 = 25;
+const IPPROTO_TCP: u64 = 6;
+const TCP_NODELAY: u64 = 1;
+const TCP_ULP: u64 = 31;
+const MSG_NOSIGNAL: u64 = 0x4000;
+
+fn socket_errno(domain: u64, kind: u64, proto: u64) -> Result<i64, &'static str> {
+    call(Syscall::SocketOpen.raw(), a2(domain, kind, proto)).ok_or("socket status")
+}
+
+/// `__sock_create` / `inet_create` / `unix_create` / `netlink_create`
+/// type and protocol validation.
+fn smoke_abi_socket_create_type_protocol_errnos() -> TestResult {
+    with_setup(|| {
+        const AF_INET6: u64 = 10;
+        const SOCK_SEQPACKET: u64 = 5;
+        const IPPROTO_UDP: u64 = 17;
+        // type >= SOCK_MAX → -EINVAL (before the family lookup).
+        if socket_errno(AF_UNIX, 11, 0)? != EINVAL {
+            return Err("socket(AF_UNIX, 11) is not -EINVAL");
+        }
+        // A family index past NPROTO must not alias a real family via u16
+        // truncation (65537 & 0xffff == AF_UNIX).
+        if socket_errno(65537, SOCK_STREAM, 0)? != EAFNOSUPPORT {
+            return Err("socket(65537) is not -EAFNOSUPPORT");
+        }
+        if socket_errno(AF_INET, SOCK_STREAM, IPPROTO_UDP)? != EPROTONOSUPPORT {
+            return Err("socket(AF_INET, SOCK_STREAM, IPPROTO_UDP) is not -EPROTONOSUPPORT");
+        }
+        if socket_errno(AF_INET, SOCK_SEQPACKET, 0)? != ESOCKTNOSUPPORT {
+            return Err("socket(AF_INET, SOCK_SEQPACKET) is not -ESOCKTNOSUPPORT");
+        }
+        if socket_errno(AF_INET, SOCK_RAW, 0)? != EPROTONOSUPPORT {
+            return Err("socket(AF_INET, SOCK_RAW, 0) is not -EPROTONOSUPPORT");
+        }
+        if socket_errno(AF_UNIX, SOCK_STREAM, 5)? != EPROTONOSUPPORT {
+            return Err("socket(AF_UNIX, SOCK_STREAM, 5) is not -EPROTONOSUPPORT");
+        }
+        if socket_errno(AF_NETLINK, SOCK_STREAM, 0)? != ESOCKTNOSUPPORT {
+            return Err("socket(AF_NETLINK, SOCK_STREAM) is not -ESOCKTNOSUPPORT");
+        }
+        if socket_errno(AF_NETLINK, SOCK_RAW, 32)? != EPROTONOSUPPORT {
+            return Err("socket(AF_NETLINK, SOCK_RAW, 32) is not -EPROTONOSUPPORT");
+        }
+        // No IPv6 datagram support: refused at creation so resolvers fall
+        // back to IPv4, instead of a socket whose every op is -EOPNOTSUPP.
+        if socket_errno(AF_INET6, SOCK_DGRAM, 0)? != EAFNOSUPPORT {
+            return Err("socket(AF_INET6, SOCK_DGRAM) is not -EAFNOSUPPORT");
+        }
+        // AF_UNIX SOCK_RAW is remapped to SOCK_DGRAM by `unix_create`.
+        let fd = socket_errno(AF_UNIX, SOCK_RAW, 0)?;
+        if fd < 0 {
+            return Err("socket(AF_UNIX, SOCK_RAW) failed");
+        }
+        let mut val = [0u8; 4];
+        let mut optlen = 4u32.to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd as u64,
+            arg1: SOL_SOCKET,
+            arg2: SO_TYPE,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::SocketGetSockOpt.raw(), args) != Some(0)
+            || u32::from_ne_bytes(val) != SOCK_DGRAM as u32
+        {
+            return Err("AF_UNIX SOCK_RAW did not become SOCK_DGRAM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_create_type_protocol_errnos
+);
+
+/// `do_sock_getsockopt`: NULL optlen → -EFAULT, negative *optlen → -EINVAL;
+/// `sk_getsockopt`: unknown option → -ENOPROTOOPT, and a short buffer is
+/// truncated (with the clamped length written back), not rejected.
+fn smoke_abi_socket_getsockopt_len_errnos() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let mut val = [0u8; 4];
+        let get = |name: u64, val: u64, len: u64| {
+            call(
+                Syscall::SocketGetSockOpt.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: SOL_SOCKET,
+                    arg2: name,
+                    arg3: val,
+                    arg4: len,
+                    ..Default::default()
+                },
+            )
+        };
+        if get(SO_TYPE, val.as_mut_ptr() as u64, 0) != Some(EFAULT) {
+            return Err("getsockopt with a NULL optlen is not -EFAULT");
+        }
+        let mut neg = (-1i32).to_ne_bytes();
+        if get(SO_TYPE, val.as_mut_ptr() as u64, neg.as_mut_ptr() as u64) != Some(EINVAL) {
+            return Err("getsockopt with a negative optlen is not -EINVAL");
+        }
+        let mut four = 4u32.to_ne_bytes();
+        if get(0x7fff, val.as_mut_ptr() as u64, four.as_mut_ptr() as u64) != Some(ENOPROTOOPT) {
+            return Err("getsockopt of an unknown SOL_SOCKET option is not -ENOPROTOOPT");
+        }
+        let mut one = 1u32.to_ne_bytes();
+        val = [0xAA; 4];
+        if get(SO_TYPE, val.as_mut_ptr() as u64, one.as_mut_ptr() as u64) != Some(0) {
+            return Err("getsockopt(SO_TYPE) with optlen 1 did not succeed");
+        }
+        if u32::from_ne_bytes(one) != 1 || val[0] != SOCK_STREAM as u8 || val[1] != 0xAA {
+            return Err("getsockopt(SO_TYPE) with optlen 1 did not truncate to one byte");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_len_errnos);
+
+/// Option levels: AF_UNIX has no proto setsockopt (`do_sock_setsockopt` →
+/// -EOPNOTSUPP); kTLS is not implemented, so `TCP_ULP` is -ENOENT
+/// (`tcp_set_ulp`) instead of a silent success; SO_BINDTODEVICE accepts a
+/// zero optlen (unbind).
+fn smoke_abi_socket_setsockopt_level_errnos() -> TestResult {
+    with_setup(|| {
+        let set = |fd: u64, level: u64, name: u64, val: &[u8]| {
+            call(
+                Syscall::SocketSetSockOpt.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: level,
+                    arg2: name,
+                    arg3: val.as_ptr() as u64,
+                    arg4: val.len() as u64,
+                    ..Default::default()
+                },
+            )
+        };
+        let one = 1u32.to_ne_bytes();
+        let unix = open_unix_stream()?;
+        if set(unix, IPPROTO_TCP, TCP_NODELAY, &one) != Some(EOPNOTSUPP) {
+            return Err("setsockopt(AF_UNIX, IPPROTO_TCP) is not -EOPNOTSUPP");
+        }
+        let tcp = socket_errno(AF_INET, SOCK_STREAM, 0)?;
+        if tcp < 0 {
+            return Err("socket(AF_INET, SOCK_STREAM) failed");
+        }
+        if set(tcp as u64, IPPROTO_TCP, TCP_ULP, b"tls\0") != Some(ENOENT) {
+            return Err("setsockopt(TCP_ULP, \"tls\") is not -ENOENT");
+        }
+        let udp = socket_errno(AF_INET, SOCK_DGRAM, 0)?;
+        if udp < 0 {
+            return Err("socket(AF_INET, SOCK_DGRAM) failed");
+        }
+        if set(udp as u64, SOL_SOCKET, SO_BINDTODEVICE, &[]) != Some(0) {
+            return Err("setsockopt(SO_BINDTODEVICE, optlen 0) did not unbind");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_setsockopt_level_errnos
+);
+
+/// `move_addr_to_user` for getsockname: NULL addrlen → -EFAULT, negative
+/// *addrlen → -EINVAL, and truncation reports the full length. An unbound
+/// AF_INET TCP socket reports 0.0.0.0:0 (`inet_getname`), not -ENOTCONN.
+fn smoke_abi_socket_getsockname_move_addr_errnos() -> TestResult {
+    with_setup(|| {
+        let tcp = socket_errno(AF_INET, SOCK_STREAM, 0)?;
+        if tcp < 0 {
+            return Err("socket(AF_INET, SOCK_STREAM) failed");
+        }
+        let n = Syscall::SocketGetSockName.raw();
+        let mut addr = [0xAAu8; 16];
+        if call(n, a2(tcp as u64, addr.as_mut_ptr() as u64, 0)) != Some(EFAULT) {
+            return Err("getsockname with a NULL addrlen is not -EFAULT");
+        }
+        let mut neg = (-1i32).to_ne_bytes();
+        if call(
+            n,
+            a2(
+                tcp as u64,
+                addr.as_mut_ptr() as u64,
+                neg.as_mut_ptr() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("getsockname with a negative addrlen is not -EINVAL");
+        }
+        let mut len = 4u32.to_ne_bytes();
+        if call(
+            n,
+            a2(
+                tcp as u64,
+                addr.as_mut_ptr() as u64,
+                len.as_mut_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("getsockname on an unbound AF_INET TCP socket did not succeed");
+        }
+        if u32::from_ne_bytes(len) != 16 {
+            return Err("getsockname did not report the full sockaddr_in length");
+        }
+        if u16::from_ne_bytes([addr[0], addr[1]]) != AF_INET as u16 || addr[4] != 0xAA {
+            return Err("getsockname did not truncate to the caller's addrlen");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getsockname_move_addr_errnos
+);
+
+/// `tcp_sendmsg_locked` → `sk_stream_wait_connect`: a never-connected TCP
+/// socket is -EPIPE (+SIGPIPE unless MSG_NOSIGNAL), not -ENOTCONN.
+fn smoke_abi_socket_tcp_send_unconnected_epipe() -> TestResult {
+    with_setup(|| {
+        let tcp = socket_errno(AF_INET, SOCK_STREAM, 0)?;
+        if tcp < 0 {
+            return Err("socket(AF_INET, SOCK_STREAM) failed");
+        }
+        let task = crate::handlers::current_task_id();
+        crate::handlers::clear_signal_pending(task, 13);
+        let msg = *b"x";
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(tcp as u64, msg.as_ptr() as u64, 1, MSG_NOSIGNAL),
+        );
+        let raised = crate::handlers::signal_pending_bits(task) & crate::handlers::sig_bit(13) != 0;
+        crate::handlers::clear_signal_pending(task, 13);
+        if r != Some(EPIPE) {
+            return Err("send on an unconnected TCP socket is not -EPIPE");
+        }
+        if raised {
+            return Err("send(MSG_NOSIGNAL) raised SIGPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_tcp_send_unconnected_epipe
+);
+
+/// `inet_bind_sk`: a short address is -EINVAL; a foreign family is
+/// -EAFNOSUPPORT.
+fn smoke_abi_socket_tcp_bind_family_errnos() -> TestResult {
+    with_setup(|| {
+        let tcp = socket_errno(AF_INET, SOCK_STREAM, 0)?;
+        if tcp < 0 {
+            return Err("socket(AF_INET, SOCK_STREAM) failed");
+        }
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&10u16.to_ne_bytes()); // AF_INET6
+        sa[2..4].copy_from_slice(&41999u16.to_be_bytes());
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let n = Syscall::SocketBind.raw();
+        if call(n, a2(tcp as u64, sa.as_ptr() as u64, 16)) != Some(EAFNOSUPPORT) {
+            return Err("TCP bind with an AF_INET6 family is not -EAFNOSUPPORT");
+        }
+        sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        if call(n, a2(tcp as u64, sa.as_ptr() as u64, 8)) != Some(EINVAL) {
+            return Err("TCP bind with an 8-byte address is not -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_tcp_bind_family_errnos
+);
+
+/// `unix_listen` accepts a socket already in TCP_LISTEN (backlog update).
+fn smoke_abi_socket_unix_listen_twice_ok() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-listen-twice");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(fd, 4)) != Some(0) {
+            return Err("first listen failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(fd, 64)) != Some(0) {
+            return Err("listen on an already-listening socket is not 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_unix_listen_twice_ok);
+
+/// `__sys_accept4_file` reports the peer through `move_addr_to_user`: an
+/// unbound AF_UNIX client is family-only (addrlen 2).
+fn smoke_abi_socket_accept_writes_peer_addr() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-accept-peer");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 4)) != Some(0) {
+            return Err("listen failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("connect failed");
+        }
+        let mut peer = [0xAAu8; 110];
+        let mut plen = (peer.len() as u32).to_ne_bytes();
+        let conn = call(
+            Syscall::SocketAccept.raw(),
+            a2(srv, peer.as_mut_ptr() as u64, plen.as_mut_ptr() as u64),
+        )
+        .ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept failed");
+        }
+        if u32::from_ne_bytes(plen) != 2 || u16::from_ne_bytes([peer[0], peer[1]]) != AF_UNIX as u16
+        {
+            return Err("accept did not report the unbound AF_UNIX peer");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_accept_writes_peer_addr
+);
+
+/// `___sys_recvmsg` header validation runs before anything is dequeued:
+/// msg_iovlen > UIO_MAXIOV → -EMSGSIZE, negative msg_namelen → -EINVAL. A
+/// blocking-mode recvmsg / recvmmsg with nothing queued never returns 0.
+fn smoke_abi_socket_recvmsg_header_errnos() -> TestResult {
+    with_setup(|| {
+        let (fd0, fd1) = make_pair(SOCK_DGRAM | SOCK_NONBLOCK)?;
+        let mut data = [0u8; 8];
+        let iov: [u64; 2] = [data.as_mut_ptr() as u64, data.len() as u64];
+        let mut name = [0u8; 16];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1025u64.to_ne_bytes());
+        let n = Syscall::SocketRecvMsg.raw();
+        if call(n, a2(fd1, msg.as_mut_ptr() as u64, 0)) != Some(EMSGSIZE_ERR) {
+            return Err("recvmsg with msg_iovlen 1025 is not -EMSGSIZE");
+        }
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[0..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(-1i32).to_ne_bytes());
+        // Queue a datagram: the header errors must leave it in place.
+        let payload = *b"keep";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("send failed");
+        }
+        if call(n, a2(fd1, msg.as_mut_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("recvmsg with a negative msg_namelen is not -EINVAL");
+        }
+        msg[8..12].copy_from_slice(&16u32.to_ne_bytes());
+        if call(n, a2(fd1, msg.as_mut_ptr() as u64, 0)) != Some(payload.len() as i64) {
+            return Err("the datagram was consumed by a rejected recvmsg");
+        }
+        // Empty queue, non-blocking: -EAGAIN from both recvmsg and recvmmsg
+        // (whose first-message error is returned, not a count of 0).
+        if call(n, a2(fd1, msg.as_mut_ptr() as u64, 0)) != Some(EAGAIN) {
+            return Err("recvmsg on an empty non-blocking socket is not -EAGAIN");
+        }
+        let mut mmsg = [0u8; 64];
+        mmsg[..56].copy_from_slice(&msg);
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a3(fd1, mmsg.as_mut_ptr() as u64, 1, 0),
+        ) != Some(EAGAIN)
+        {
+            return Err("recvmmsg on an empty non-blocking socket is not -EAGAIN");
+        }
+        let bad_ts: [i64; 2] = [0, 1_000_000_000];
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(fd1, mmsg.as_mut_ptr() as u64, 1, 0, bad_ts.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("recvmmsg with tv_nsec out of range is not -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_header_errnos);

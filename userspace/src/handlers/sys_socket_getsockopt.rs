@@ -20,12 +20,20 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Read the in/out length field via SMAP bracket.
-    let in_len = if len_ptr != 0 {
-        read_user_u32(len_ptr) as usize
-    } else {
-        0
-    };
+    // `do_sock_getsockopt`: `get_user(len, optlen)` faults → -EFAULT (a NULL
+    // optlen included), then `len < 0` → -EINVAL.
+    let mut len_raw = [0u8; 4];
+    // SAFETY: copy_from_user range-validates `len_ptr` and SMAP-brackets the read.
+    if unsafe { copy_from_user(&mut len_raw, len_ptr) }.is_err() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
+    let in_len_signed = i32::from_ne_bytes(len_raw);
+    if in_len_signed < 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    let in_len = in_len_signed as usize;
     // NETLINK_LIST_MEMBERSHIPS is a length-query option: Linux answers a
     // `getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL, &len)` (optval
     // NULL, *optlen 0) by writing the required bitmap byte length into optlen
@@ -67,48 +75,6 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    if val_ptr == 0 {
-        // Linux: the option handler copies the value into optval; a NULL buffer
-        // faults → -EFAULT.
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    }
-    if in_len == 0 {
-        // `net/core/sock.c::sk_getsockopt` validates the length as
-        //
-        //     if (copy_from_sockptr(&len, optlen, sizeof(int))) return -EFAULT;
-        //     if (len < 0)                                      return -EINVAL;
-        //
-        // so ZERO is not rejected — only a negative length is. An int option
-        // then clamps `len = min_t(unsigned int, len, sizeof(int))`, copies
-        // `len` (i.e. nothing) and writes the clamped length back, returning
-        // 0.
-        //
-        // The previous note called -EINVAL "the closest errno" because the
-        // generic path "can't satisfy an unsized query". But an optlen of 0
-        // is not an unsized query: the answer does not depend on the
-        // option's width, because zero bytes are copied whatever it is. This
-        // is the shape a caller uses to ask "how big is it?", and returning
-        // EINVAL makes that probe look like a rejected option — the same
-        // failure the NETLINK_LIST_MEMBERSHIPS special case above was added
-        // to work around, one option at a time.
-        //
-        // `return copy_to_sockptr(optlen, &len, sizeof(int)) ? -EFAULT : 0;`
-        // — the write-back is checked, so a faulting optlen is -EFAULT.
-        // (`write_user_u32` discards its copy result, which is exactly the
-        // failure this arm has to report, so the copy is done directly.)
-        if len_ptr != 0 {
-            let zero = 0u32.to_ne_bytes();
-            // SAFETY: copy_to_user range-validates `len_ptr` and
-            // SMAP-brackets the 4-byte write.
-            if unsafe { copy_to_user(len_ptr, &zero) }.is_err() {
-                ctx.set_return(errno_ret(EFAULT));
-                return;
-            }
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
     // Optional Unix-peer metadata needs a typed "protocol option unavailable"
     // result. The generic unknown-option sentinel is -1 (EPERM to libc) and is
     // treated as fatal.
@@ -121,13 +87,17 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-ENOPROTOOPT) as u64));
         return;
     }
-    // Validate the output range before allocating — prevents OOM from a
-    // user-supplied in_len larger than MAX_USER_COPY.
-    if validate_user_range(val_ptr, in_len).is_err() {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    }
-    let mut buf = alloc::vec![0u8; in_len];
+    // Every option handler copies at most `min(len, sizeof(value))` bytes, so
+    // the kernel staging buffer never needs to exceed the largest value NARF
+    // produces (SO_PEERGROUPS: NGROUPS_MAX gids). SO_PEERCRED is staged at
+    // full width so its pid can be namespace-translated before truncation.
+    const GETSOCKOPT_MAX_STAGE: usize = 65536 * 4;
+    let stage_len = if level == crate::socket::SOL_SOCKET && name == crate::socket::SO_PEERCRED {
+        core::cmp::max(in_len, 12)
+    } else {
+        core::cmp::min(in_len, GETSOCKOPT_MAX_STAGE)
+    };
+    let mut buf = alloc::vec![0u8; stage_len];
     let result = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
         level,
         name,
@@ -164,17 +134,13 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
                 for (slot, gid) in buf[..translated_n].chunks_exact_mut(4).zip(groups) {
                     slot.copy_from_slice(&gid.to_ne_bytes());
                 }
-                write_user_u32(len_ptr, translated_n as u32);
-                // SAFETY: val_ptr was range-validated above.
-                let _ = unsafe { copy_to_user(val_ptr, &buf[..translated_n]) };
-                ctx.set_return(SyscallReturn::ok(0));
+                ctx.set_return(copy_sockopt_out(val_ptr, len_ptr, &buf[..translated_n]));
                 return;
             }
-            // Write value + updated optlen back to user under SMAP bracket.
-            // SAFETY: val_ptr from userspace; AS active.
-            let _ = unsafe { copy_to_user(val_ptr, &buf[..n]) };
-            write_user_u32(len_ptr, n as u32);
-            ctx.set_return(SyscallReturn::ok(0));
+            // Write value + updated optlen back to user under SMAP bracket,
+            // never more than the caller's optlen.
+            let n = core::cmp::min(n, in_len);
+            ctx.set_return(copy_sockopt_out(val_ptr, len_ptr, &buf[..n]));
         }
         crate::socket::SocketOpResult::Err(e) => {
             // SO_PEERGROUPS on ERANGE: Linux writes the required byte length
@@ -202,4 +168,20 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         }
         _ => ctx.set_return(errno_ret(EINVAL)), // unreachable
     }
+}
+
+/// Copy a getsockopt value and its length back to the caller. Linux
+/// `sk_getsockopt` & co. check both `copy_to_sockptr` calls, so a faulting
+/// optval or optlen is -EFAULT rather than a silent success.
+fn copy_sockopt_out(val_ptr: u64, len_ptr: u64, value: &[u8]) -> SyscallReturn {
+    // SAFETY: copy_to_user range-validates the user address and SMAP-brackets
+    // the write; a zero-length value touches nothing.
+    if !value.is_empty() && unsafe { copy_to_user(val_ptr, value) }.is_err() {
+        return errno_ret(EFAULT);
+    }
+    // SAFETY: as above, for the 4-byte optlen out-parameter.
+    if unsafe { copy_to_user(len_ptr, &(value.len() as u32).to_ne_bytes()) }.is_err() {
+        return errno_ret(EFAULT);
+    }
+    SyscallReturn::ok(0)
 }

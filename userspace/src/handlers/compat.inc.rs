@@ -9633,6 +9633,38 @@ fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAd
     })
 }
 
+/// Linux `move_addr_to_user`: report a kernel sockaddr to a user
+/// `(sockaddr *, socklen_t *)` pair. `get_user(len, ulen)` faults → -EFAULT,
+/// `len < 0` → -EINVAL, then `min(len, klen)` bytes are copied (-EFAULT on a
+/// fault) and the FULL `klen` is stored back so a caller can detect
+/// truncation. `None` reports an empty address (`klen == 0`), as a
+/// connection-oriented protocol that fills no `msg_name` does.
+fn move_addr_to_user(addr: Option<&crate::socket::SockAddr>, uaddr: u64, ulen: u64) -> Result<(), i64> {
+    let mut len_raw = [0u8; 4];
+    // SAFETY: copy_from_user range-validates `ulen` (NULL included) and
+    // SMAP-brackets the read.
+    unsafe { copy_from_user(&mut len_raw, ulen) }.map_err(|_| EFAULT)?;
+    let len = i32::from_ne_bytes(len_raw);
+    if len < 0 {
+        return Err(EINVAL);
+    }
+    let encoded = addr.map(|a| {
+        let mut out = alloc::vec::Vec::with_capacity(2 + a.body.len());
+        out.extend_from_slice(&a.family.to_ne_bytes());
+        out.extend_from_slice(&a.body);
+        out
+    });
+    let encoded = encoded.as_deref().unwrap_or(&[]);
+    let n = core::cmp::min(len as usize, encoded.len());
+    // SAFETY: copy_to_user range-validates `uaddr` and SMAP-brackets the write.
+    if n != 0 && unsafe { copy_to_user(uaddr, &encoded[..n]) }.is_err() {
+        return Err(EFAULT);
+    }
+    // SAFETY: as above, for the 4-byte length out-parameter.
+    unsafe { copy_to_user(ulen, &(encoded.len() as u32).to_ne_bytes()) }.map_err(|_| EFAULT)?;
+    Ok(())
+}
+
 /// Return the listener's shared open-file-description `O_NONBLOCK` state.
 ///
 /// `SocketFile` is shared across dup, exec remapping, and SCM_RIGHTS while an
@@ -9658,8 +9690,8 @@ pub(crate) fn __test_socket_listener_nonblock(fd: u32) -> bool {
 fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
-    let _addr_out = args.arg1;
-    let _addr_len_out = args.arg2;
+    let addr_out = args.arg1;
+    let addr_len_out = args.arg2;
     // Linux accept4 error ORDER (net/socket.c): __sys_accept4 does
     // `fd_empty → -EBADF` FIRST, then __sys_accept4_file checks
     // `flags & ~(SOCK_CLOEXEC|SOCK_NONBLOCK) → -EINVAL` BEFORE
@@ -9697,7 +9729,24 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     // Single-shot: pop pending if any, else WouldBlock-style yield
     // mirroring sys_futex. Caller (libc accept) loops.
     match sock.dispatch_op(crate::socket::SocketOp::Accept) {
-        crate::socket::SocketOpResult::Accepted { socket, .. } => {
+        crate::socket::SocketOpResult::Accepted { socket, peer } => {
+            // `__sys_accept4_file`: when `upeer_sockaddr` is non-NULL the peer
+            // name is reported through `move_addr_to_user` BEFORE the new fd
+            // is installed; a faulting addrlen/address (-EFAULT) or a negative
+            // *addrlen (-EINVAL) fails the call and the connection is dropped.
+            if addr_out != 0 {
+                let peer = peer.or_else(|| socket.peer_addr()).or_else(|| {
+                    // `unix_getname(peer=2)` of an unbound client: family only.
+                    (socket.domain == crate::socket::AF_UNIX).then(|| crate::socket::SockAddr {
+                        family: crate::socket::AF_UNIX,
+                        body: alloc::vec::Vec::new(),
+                    })
+                });
+                if let Err(errno) = move_addr_to_user(peer.as_ref(), addr_out, addr_len_out) {
+                    ctx.set_return(errno_ret(errno));
+                    return;
+                }
+            }
             // accept4 flag bits: SOCK_NONBLOCK marks the new endpoint
             // non-blocking; SOCK_CLOEXEC sets FD_CLOEXEC on the slot.
             let nonblock = flags & crate::fd::O_NONBLOCK != 0;
@@ -9775,9 +9824,13 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 crate::user_task::current_user_task(),
                 crate::user_task::yield_hook(),
             ) {
-                // Rewind past the 2-byte `syscall` instruction so the
+                // Rewind past the syscall instruction (`syscall` / `svc`) so the
                 // resumed task re-issues accept; do NOT set a return value.
-                let resume_rip = ctx.rip().wrapping_sub(2);
+                #[cfg(target_arch = "x86_64")]
+                const SYSCALL_INSN_LEN: u64 = 2;
+                #[cfg(target_arch = "aarch64")]
+                const SYSCALL_INSN_LEN: u64 = 4;
+                let resume_rip = ctx.rip().wrapping_sub(SYSCALL_INSN_LEN);
                 ctx.set_rip(resume_rip);
                 let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
                 // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();

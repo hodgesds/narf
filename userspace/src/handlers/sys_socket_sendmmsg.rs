@@ -66,6 +66,16 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
                 break;
             }
             handler_sys_socket_sendmsg::SendMsgResult::Error(errno) => {
+                // SIGPIPE is raised inside the protocol send path in Linux
+                // (`sk_stream_error` / `unix_stream_sendmsg`), so a batch
+                // hitting a broken stream signals even when it goes on to
+                // report a positive count.
+                if errno == EPIPE
+                    && flags & crate::socket::MSG_NOSIGNAL == 0
+                    && sock.epipe_raises_sigpipe()
+                {
+                    raise_signal_pending(current_task_id(), 13); // SIGPIPE
+                }
                 first_error = errno;
                 break;
             }

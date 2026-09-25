@@ -384,9 +384,17 @@ fn smoke_abi_misc_sendmmsg_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_misc_sendmmsg_neg);
 
 fn smoke_abi_misc_recvmmsg_pos() -> TestResult {
-    with_setup(|| match call(Syscall::Recvmmsg.raw(), a3(3, 0, 0, 0)) {
-        Some(0) => Ok(()),
-        _ => Err("recvmmsg with vlen 0 should return 0"),
+    with_setup(|| {
+        // `do_recvmmsg` resolves the descriptor even for vlen=0 (as sendmmsg
+        // does), so use a live socket; the vector pointer is never touched.
+        let fd = call(Syscall::SocketOpen.raw(), a2(1, 1, 0)).ok_or("socket setup failed")?;
+        if fd < 0 {
+            return Err("socket setup failed");
+        }
+        match call(Syscall::Recvmmsg.raw(), a3(fd as u64, 0, 0, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("recvmmsg with vlen 0 should return 0"),
+        }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_recvmmsg_pos);
@@ -394,10 +402,12 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_recvmmsg_pos);
 fn smoke_abi_misc_recvmmsg_neg() -> TestResult {
     with_setup(|| {
         let hdr = [0u8; 64];
+        // `do_recvmmsg` → `sockfd_lookup_light` fails first: -EBADF, not a
+        // count of zero datagrams.
         let args = a3(99, hdr.as_ptr() as u64, 1, 0);
         match call(Syscall::Recvmmsg.raw(), args) {
-            Some(0) => Ok(()),
-            _ => Err("recvmmsg on a bad fd should report 0 received"),
+            Some(EBADF) => Ok(()),
+            _ => Err("recvmmsg on a bad fd should return EBADF"),
         }
     })
 }

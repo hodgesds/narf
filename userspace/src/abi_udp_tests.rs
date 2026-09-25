@@ -1399,3 +1399,42 @@ kernel_test_in!(
     "syscall_abi/udp",
     smoke_abi_udp_and_tcp_ports_are_independent
 );
+
+/// recvmsg honours the caller's `msg_namelen`: `move_addr_to_user` copies at
+/// most that many bytes of the source address (it used to write the whole
+/// sockaddr past a short buffer) and stores the full length back.
+fn smoke_abi_udp_recvmsg_short_namelen_truncates() -> TestResult {
+    with_setup(|| {
+        let rx = receiver(41190)?;
+        let tx = receiver(41191)?;
+        sendto(&tx, b"abc", LO, 41190)?;
+        let mut data = [0u8; 8];
+        let mut from = [0xAAu8; 16];
+        let iov: [u64; 2] = [data.as_mut_ptr() as u64, data.len() as u64];
+        let mut msg = [0u8; 56];
+        msg[0..8].copy_from_slice(&(from.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&4u32.to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        let r = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx.0, msg.as_mut_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if r != 3 {
+            return Err("recvmsg did not return the datagram");
+        }
+        let namelen = u32::from_ne_bytes([msg[8], msg[9], msg[10], msg[11]]);
+        if namelen != 16 {
+            return Err("recvmsg did not report the full sockaddr_in length");
+        }
+        if from[4..] != [0xAA; 12] {
+            return Err("recvmsg wrote the source address past msg_namelen");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/udp",
+    smoke_abi_udp_recvmsg_short_namelen_truncates
+);

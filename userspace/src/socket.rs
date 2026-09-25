@@ -324,6 +324,10 @@ pub const TCP_KEEPINTVL: u32 = 5;
 pub const TCP_KEEPCNT: u32 = 6;
 pub const TCP_QUICKACK: u32 = 12;
 pub const TCP_CONGESTION: u32 = 13;
+/// `TCP_ULP` — attach an upper-layer protocol (kTLS). include/uapi/linux/tcp.h.
+pub const TCP_ULP: u32 = 31;
+/// `SOL_TLS` — kernel-TLS option level. include/linux/socket.h.
+pub const SOL_TLS: u32 = 282;
 pub const TCP_USER_TIMEOUT: u32 = 18;
 
 pub const IP_TOS: u32 = 1;
@@ -1918,6 +1922,14 @@ impl SocketFile {
         self.domain == AF_INET && self.kind == SOCK_DGRAM
     }
 
+    /// Whether an EPIPE from a send raises SIGPIPE (absent MSG_NOSIGNAL).
+    /// Linux signals only from the byte-stream paths — `sk_stream_error`
+    /// (TCP) and `unix_stream_sendmsg`. Datagram and seqpacket EPIPEs come
+    /// from `sock_alloc_send_pskb` / `unix_dgram_sendmsg`, which never signal.
+    pub fn epipe_raises_sigpipe(&self) -> bool {
+        self.kind == SOCK_STREAM
+    }
+
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Acquire)
     }
@@ -1938,11 +1950,11 @@ impl SocketFile {
     pub fn local_addr(&self) -> Option<SockAddr> {
         let state = self.state.lock();
         match &*state {
-            // An unbound AF_INET datagram socket reports 0.0.0.0:0
-            // (`inet_getname`, `net/ipv4/af_inet.c:819-823`), not ENOTCONN.
-            SocketState::Fresh if self.domain == AF_INET && self.kind == SOCK_DGRAM => {
-                Some(make_sockaddr_in(0, 0))
-            }
+            // An unbound AF_INET socket of any type reports 0.0.0.0:0
+            // (`inet_getname`, `net/ipv4/af_inet.c:819-823`), and an unbound
+            // AF_INET6 one [::]:0 (`inet6_getname`) — never ENOTCONN.
+            SocketState::Fresh if self.domain == AF_INET => Some(make_sockaddr_in(0, 0)),
+            SocketState::Fresh if self.domain == AF_INET6 => Some(make_sockaddr_in6([0u8; 16], 0)),
             SocketState::InetListener { addr, port, .. } => Some(make_sockaddr_in(*addr, *port)),
             SocketState::InetConnected {
                 peer_addr,
@@ -3531,11 +3543,37 @@ impl SocketFile {
             }
             Ok(u32::from_ne_bytes([slot[0], slot[1], slot[2], slot[3]]))
         };
+        // Linux `do_sock_setsockopt`: a non-SOL_SOCKET level on a family whose
+        // proto_ops has no `setsockopt` (AF_UNIX) is -EOPNOTSUPP.
+        if self.domain == AF_UNIX && level != SOL_SOCKET {
+            return SocketOpResult::Err(SockError::NotSupported);
+        }
+        // `netlink_setsockopt`: `if (level != SOL_NETLINK) return -ENOPROTOOPT;`
+        if self.domain == AF_NETLINK && level != SOL_SOCKET && level != SOL_NETLINK {
+            return SocketOpResult::Err(SockError::NoProtoOpt);
+        }
+        // Kernel TLS offload is not implemented. Reporting success for
+        // `TCP_ULP "tls"` / `SOL_TLS` would make OpenSSL/GnuTLS hand the kernel
+        // plaintext records it never encrypts. Linux answers an unknown ULP
+        // with -ENOENT (`tcp_set_ulp` → `__tcp_ulp_find_autoload`), and a
+        // SOL_TLS option with no TLS ULP attached reaches `ip_setsockopt`,
+        // which rejects the foreign level with -ENOPROTOOPT.
+        if level == IPPROTO_TCP && name == TCP_ULP {
+            return SocketOpResult::Err(SockError::NoEntry);
+        }
+        if level == SOL_TLS {
+            return SocketOpResult::Err(SockError::NoProtoOpt);
+        }
+        // `sk_setsockopt`: every SOL_SOCKET option but SO_BINDTODEVICE (whose
+        // zero-length form unbinds) starts with
+        // `if (optlen < sizeof(int)) return -EINVAL;`.
+        if level == SOL_SOCKET && name != SO_BINDTODEVICE && value.len() < 4 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
         if level == SOL_NETLINK {
-            let value = match read_u32(value) {
-                Ok(v) => v,
-                Err(e) => return SocketOpResult::Err(e),
-            };
+            // `netlink_setsockopt` reads the int only when
+            // `optlen >= sizeof(int)`; a shorter value is treated as 0.
+            let value = read_u32(value).unwrap_or(0);
             let flag = value != 0;
             match name {
                 NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
@@ -3564,7 +3602,8 @@ impl SocketFile {
                 NETLINK_CAP_ACK => self.netlink_cap_ack.store(flag, Ordering::Release),
                 NETLINK_EXT_ACK => self.netlink_ext_ack.store(flag, Ordering::Release),
                 NETLINK_GET_STRICT_CHK => self.netlink_strict_check.store(flag, Ordering::Release),
-                _ => return SocketOpResult::Err(SockError::NotSupported),
+                // `netlink_setsockopt` default: -ENOPROTOOPT.
+                _ => return SocketOpResult::Err(SockError::NoProtoOpt),
             }
             return SocketOpResult::Ok(0);
         }
@@ -3878,14 +3917,25 @@ impl SocketFile {
     /// returns the byte count via `OptValue`. Integers are
     /// native-endian 4 bytes per Linux ABI.
     fn handle_getsockopt(&self, level: u32, name: u32, buf: &mut [u8]) -> SocketOpResult {
+        // Linux `sk_getsockopt` / `do_tcp_getsockopt` / `ip_getsockopt` clamp
+        // `len = min(len, sizeof(int))` and copy that many bytes rather than
+        // rejecting a short buffer (a 1-byte `unsigned char` read of IP_TTL is
+        // the classic case); the clamped length is written back to optlen.
         let write_u32 = |buf: &mut [u8], v: u32| -> SocketOpResult {
-            if buf.len() < 4 {
-                return SocketOpResult::Err(SockError::InvalidArg);
-            }
-            buf[..4].copy_from_slice(&v.to_ne_bytes());
-            SocketOpResult::OptValue { n: 4 }
+            let n = core::cmp::min(buf.len(), 4);
+            buf[..n].copy_from_slice(&v.to_ne_bytes()[..n]);
+            SocketOpResult::OptValue { n }
         };
         let write_bool = |buf: &mut [u8], v: bool| write_u32(buf, v as u32);
+        // Linux `do_sock_getsockopt`: AF_UNIX has no proto `getsockopt`, so any
+        // level but SOL_SOCKET is -EOPNOTSUPP; `netlink_getsockopt` rejects a
+        // foreign level with -ENOPROTOOPT.
+        if self.domain == AF_UNIX && level != SOL_SOCKET {
+            return SocketOpResult::Err(SockError::NotSupported);
+        }
+        if self.domain == AF_NETLINK && level != SOL_SOCKET && level != SOL_NETLINK {
+            return SocketOpResult::Err(SockError::NoProtoOpt);
+        }
         if level == SOL_SOCKET && name == SO_ERROR {
             // Linux `sk_getsockopt`: `-sock_error(sk)`, else the soft error,
             // each cleared once read. A kernel-TCP socket's errors live on its
@@ -3925,12 +3975,13 @@ impl SocketFile {
             (SOL_SOCKET, SO_KEEPALIVE) => write_bool(buf, opts.keepalive),
             (SOL_SOCKET, SO_BROADCAST) => write_bool(buf, opts.broadcast),
             (SOL_SOCKET, SO_LINGER) => {
-                if buf.len() < 8 {
-                    return SocketOpResult::Err(SockError::InvalidArg);
-                }
-                buf[..4].copy_from_slice(&(opts.linger_on as u32).to_ne_bytes());
-                buf[4..8].copy_from_slice(&opts.linger_sec.to_ne_bytes());
-                SocketOpResult::OptValue { n: 8 }
+                // `sk_getsockopt` copies `min(len, sizeof(struct linger))`.
+                let mut linger = [0u8; 8];
+                linger[..4].copy_from_slice(&(opts.linger_on as u32).to_ne_bytes());
+                linger[4..8].copy_from_slice(&opts.linger_sec.to_ne_bytes());
+                let n = core::cmp::min(buf.len(), linger.len());
+                buf[..n].copy_from_slice(&linger[..n]);
+                SocketOpResult::OptValue { n }
             }
             (SOL_SOCKET, SO_RCVBUF) => write_u32(buf, opts.rcvbuf),
             (SOL_SOCKET, SO_SNDBUF) => write_u32(buf, opts.sndbuf),
@@ -3948,14 +3999,17 @@ impl SocketFile {
             // captured at connect()/accept()/socketpair() time. systemd's
             // Varlink / D-Bus / logind identify peers via SO_PEERCRED.
             (SOL_SOCKET, SO_PEERCRED) => {
-                if buf.len() < 12 {
-                    return SocketOpResult::Err(SockError::InvalidArg);
-                }
+                // `sk_getsockopt` copies `min(len, sizeof(struct ucred))`. The
+                // syscall layer hands in at least 12 bytes so it can translate
+                // the pid before truncating.
                 let c = self.peer_cred();
-                buf[0..4].copy_from_slice(&c.pid.to_ne_bytes());
-                buf[4..8].copy_from_slice(&c.uid.to_ne_bytes());
-                buf[8..12].copy_from_slice(&c.gid.to_ne_bytes());
-                SocketOpResult::OptValue { n: 12 }
+                let mut ucred = [0u8; 12];
+                ucred[0..4].copy_from_slice(&c.pid.to_ne_bytes());
+                ucred[4..8].copy_from_slice(&c.uid.to_ne_bytes());
+                ucred[8..12].copy_from_slice(&c.gid.to_ne_bytes());
+                let n = core::cmp::min(buf.len(), ucred.len());
+                buf[..n].copy_from_slice(&ucred[..n]);
+                SocketOpResult::OptValue { n }
             }
             (SOL_SOCKET, SO_PEERGROUPS) => {
                 let groups = self.peer_groups();
@@ -4036,7 +4090,10 @@ impl SocketFile {
                 }
                 SocketOpResult::OptValue { n: required }
             }
-            _ => SocketOpResult::Err(SockError::NotSupported),
+            // Unknown option: `sk_getsockopt`, `ip_getsockopt`,
+            // `do_tcp_getsockopt` and `netlink_getsockopt` all return
+            // -ENOPROTOOPT.
+            _ => SocketOpResult::Err(SockError::NoProtoOpt),
         }
     }
 
@@ -4198,6 +4255,11 @@ impl SocketFile {
                 let mut state = self.state.lock();
                 let addr = match &*state {
                     SocketState::UnixBound { addr } => addr.clone(),
+                    // `unix_listen` accepts TCP_LISTEN as well as TCP_CLOSE: a
+                    // repeat listen() only updates the backlog (NARF's accept
+                    // queue is unbounded). Socket-activated daemons re-listen
+                    // on inherited fds, so this must not be -EINVAL.
+                    SocketState::UnixListener { .. } => return SocketOpResult::Ok(0),
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 *state = SocketState::UnixListener {
@@ -4561,8 +4623,15 @@ impl SocketFile {
     fn dispatch_inet_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
-                if addr.family != AF_INET || addr.body.len() < 6 {
+                // `inet_bind_sk`: `addr_len < sizeof(struct sockaddr_in)` →
+                // -EINVAL, then a family other than AF_INET → -EAFNOSUPPORT
+                // (AF_UNSPEC is tolerated only with INADDR_ANY).
+                if addr.body.len() < SOCKADDR_IN_BODY_LEN {
                     return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let any = addr.body[2..6] == [0, 0, 0, 0];
+                if addr.family != AF_INET && !(addr.family == 0 /* AF_UNSPEC */ && any) {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
                 }
                 // sockaddr_in body: port (u16 BE) + ip (u32 BE).
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
@@ -4696,8 +4765,13 @@ impl SocketFile {
                 }
             }
             SocketOp::Connect { addr } => {
-                if addr.family != AF_INET || addr.body.len() < 6 {
+                // `tcp_v4_connect`: `addr_len < sizeof(struct sockaddr_in)` →
+                // -EINVAL; `sin_family != AF_INET` → -EAFNOSUPPORT.
+                if addr.body.len() < SOCKADDR_IN_BODY_LEN {
                     return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                if addr.family != AF_INET {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
                 }
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
                 let ip =
@@ -5203,16 +5277,19 @@ impl SocketFile {
     fn dispatch_inet6_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
-                if addr.family != AF_INET6 || addr.body.len() < 18 {
+                // `inet6_bind`: `addr_len < SIN6_LEN_RFC2133` (24) → -EINVAL, then
+                // `sin6_family != AF_INET6` → -EAFNOSUPPORT.
+                if addr.body.len() < 22 {
                     return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                if addr.family != AF_INET6 {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
                 }
                 // sockaddr_in6: port (u16 BE) + flowinfo (u32) + addr ([u8; 16])
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
                 let mut ip = [0u8; 16];
                 // flowinfo = body[2..6]; addr = body[6..22]
-                let off = if addr.body.len() >= 22 { 6 } else { 2 };
-                let span = core::cmp::min(16, addr.body.len() - off);
-                ip[..span].copy_from_slice(&addr.body[off..off + span]);
+                ip.copy_from_slice(&addr.body[6..22]);
                 let mut state = self.state.lock();
                 if matches!(&*state, SocketState::Fresh) {
                     let mut listeners = INET6_LISTENERS.lock();
@@ -5266,14 +5343,17 @@ impl SocketFile {
                 }
             }
             SocketOp::Connect { addr } => {
-                if addr.family != AF_INET6 || addr.body.len() < 18 {
+                // `tcp_v6_connect`: `addr_len < SIN6_LEN_RFC2133` (24) → -EINVAL, then
+                // `sin6_family != AF_INET6` → -EAFNOSUPPORT.
+                if addr.body.len() < 22 {
                     return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                if addr.family != AF_INET6 {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
                 }
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
                 let mut ip = [0u8; 16];
-                let off = if addr.body.len() >= 22 { 6 } else { 2 };
-                let span = core::cmp::min(16, addr.body.len() - off);
-                ip[..span].copy_from_slice(&addr.body[off..off + span]);
+                ip.copy_from_slice(&addr.body[6..22]);
                 let listener = {
                     let listeners = INET6_LISTENERS.lock();
                     let m = listeners.as_ref();
@@ -5379,6 +5459,15 @@ impl SocketFile {
             SocketState::UnixConnected { tx, .. }
             | SocketState::InetConnected { tx, .. }
             | SocketState::Inet6Connected { tx, .. } => tx.clone(),
+            // `tcp_sendmsg_locked` → `sk_stream_wait_connect`: any TCP state
+            // but SYN_SENT/SYN_RECV (never-connected, listening, closed) is
+            // -EPIPE, which `sk_stream_error` turns into SIGPIPE. AF_UNIX
+            // stream/seqpacket report -ENOTCONN (`unix_stream_sendmsg`).
+            _ if self.kind == SOCK_STREAM
+                && (self.domain == AF_INET || self.domain == AF_INET6) =>
+            {
+                return Err(SockError::Pipe);
+            }
             _ => return Err(SockError::NotConnected),
         };
         if tx.is_closed() {
@@ -5876,6 +5965,13 @@ impl RingBuf {
         fds: Vec<ScmRightsFile>,
         cred: Ucred,
     ) -> Result<usize, SockError> {
+        // A record larger than the whole ring can never be queued; reporting
+        // "no room yet" would park a blocking sender forever and spin a
+        // non-blocking one on EAGAIN. `unix_dgram_sendmsg` answers an
+        // oversized record with -EMSGSIZE.
+        if src.len() > RING_CAP {
+            return Err(SockError::MsgSize);
+        }
         let mut g = self.inner.lock();
         if src.len() > RING_CAP.saturating_sub(g.packet_bytes) {
             return Ok(0);
