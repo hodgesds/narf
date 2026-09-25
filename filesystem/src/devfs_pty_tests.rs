@@ -120,11 +120,13 @@ fn smoke_pty_master_write_echoes_to_master() -> TestResult {
         Some(Ok(5)) if &sbuf[..5] == b"ping\n" => {}
         _ => return TestResult::Fail("slave did not read the cooked line"),
     }
-    // Master reads back the ECHO "ping\n".
+    // Master reads back the ECHO. With OPOST|ONLCR (the cooked default) the
+    // echoed newline is CR-LF, so "ping\n" echoes as "ping\r\n"; without the CR
+    // the echo staircases down-and-right in a real terminal (konsole did).
     let mut ebuf = [0u8; 16];
     match poll_once(master.read(0, &mut ebuf)) {
-        Some(Ok(5)) if &ebuf[..5] == b"ping\n" => {}
-        _ => return TestResult::Fail("master did not read back the ECHO"),
+        Some(Ok(6)) if &ebuf[..6] == b"ping\r\n" => {}
+        _ => return TestResult::Fail("master did not read back the CR-LF ECHO"),
     }
     // Slave replies; master reads it (raw on the master side).
     if !matches!(poll_once(slave.write(0, b"pong")), Some(Ok(4))) {
@@ -138,6 +140,35 @@ fn smoke_pty_master_write_echoes_to_master() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/pty", smoke_pty_master_write_echoes_to_master);
+
+// A cooked-mode echoed newline must be CR-LF (OPOST|ONLCR). Two typed lines echo
+// as "a\r\nb\r\n"; a bare LF for each would staircase the cursor down-and-right —
+// exactly what konsole displayed before the echo went through ONLCR.
+fn smoke_pty_echo_newline_is_crlf() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    // Keep the slave open so the pair stays live; the echo is what we check.
+    let _slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    if !matches!(poll_once(master.write(0, b"a\nb\n")), Some(Ok(4))) {
+        return TestResult::Fail("master write didn't return 4");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"a\r\nb\r\n" => TestResult::Pass,
+        Some(Ok(n)) => {
+            let _ = n;
+            TestResult::Fail("echoed newline was not CR-LF (the staircase bug)")
+        }
+        _ => TestResult::Fail("master read of echo failed"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_echo_newline_is_crlf);
 
 // ── Test 3: slave write → master read (slave_tx_to_master) ───────────────────
 
@@ -2118,3 +2149,107 @@ fn smoke_pty_packet_termios_flow_change() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/pty", smoke_pty_packet_termios_flow_change);
+
+// ── PTY readiness wake tests ──────────────────────────────────────────────────
+//
+// A parked poll/epoll/read on one PTY endpoint MUST be woken when the peer
+// writes. Before the durable readiness cells, a master write completed a line in
+// the slave's input queue but woke nothing, so a shell blocked reading its tty
+// only advanced when unrelated activity nudged the global readiness generation —
+// on an idle desktop that never came, and konsole's "Enter did nothing".
+
+static PTY_WAKE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A `Waker` whose every wake bumps [`PTY_WAKE_COUNT`] — lets a test assert that
+/// arming a readiness waiter and then writing the peer actually fired it.
+fn counting_waker() -> Waker {
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        raw()
+    }
+    unsafe fn wake(_: *const ()) {
+        PTY_WAKE_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn wake_by_ref(_: *const ()) {
+        PTY_WAKE_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn drop(_: *const ()) {}
+    fn raw() -> RawWaker {
+        const VTAB: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    // SAFETY: the vtable never dereferences the null data pointer; clone returns
+    // an equivalently-valid waker. Upholds the Waker contract.
+    unsafe { Waker::from_raw(raw()) }
+}
+
+// A master write that completes a line must wake a slave poll/epoll/read waiter.
+fn smoke_pty_master_write_wakes_slave_poller() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    let waker = counting_waker();
+    // Arm a POLLIN waiter on the slave: no completed line yet, so Pending.
+    match slave.arm_readiness(0xABCD, crate::POLL_IN, &waker) {
+        Some(Poll::Pending) => {}
+        Some(Poll::Ready(m)) => {
+            let _ = m;
+            return TestResult::Fail("slave POLLIN ready before any input arrived");
+        }
+        None => return TestResult::Fail("PtySlave must expose a durable readiness cell"),
+    }
+
+    // The master types a full line. The line discipline completes it and MUST
+    // wake the parked slave waiter.
+    if !matches!(poll_once(master.write(0, b"ls\n")), Some(Ok(3))) {
+        return TestResult::Fail("master write didn't return 3");
+    }
+    if PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+        return TestResult::Fail("master write did not wake the parked slave poller");
+    }
+    // The completed line is now readable (ICRNL mapped the CR to NL).
+    if (slave.poll_readiness() & crate::POLL_IN) == 0 {
+        return TestResult::Fail("slave not POLLIN-readable after the completed line");
+    }
+    let mut buf = [0u8; 16];
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(3)) if &buf[..3] == b"ls\n" => {}
+        _ => return TestResult::Fail("slave did not read back the completed line"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_master_write_wakes_slave_poller);
+
+// The symmetric direction: a slave write must wake a master poll/epoll/read.
+fn smoke_pty_slave_write_wakes_master_poller() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    PTY_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    let waker = counting_waker();
+    match master.arm_readiness(0x1234, crate::POLL_IN, &waker) {
+        Some(Poll::Pending) => {}
+        Some(Poll::Ready(_)) => return TestResult::Fail("master POLLIN ready before output"),
+        None => return TestResult::Fail("PtyMaster must expose a durable readiness cell"),
+    }
+    if !matches!(poll_once(slave.write(0, b"pong")), Some(Ok(4))) {
+        return TestResult::Fail("slave write didn't return 4");
+    }
+    if PTY_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+        return TestResult::Fail("slave write did not wake the parked master poller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_slave_write_wakes_master_poller);
