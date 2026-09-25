@@ -526,29 +526,41 @@ pub unsafe fn load_user_process_with_root(
     // and shrink `stack_top_v` so init_sysv_stack lays argv strings
     // BELOW the entropy block (no overwrite).
     //
-    // Source preference: RDSEED → RDRAND → TSC fallback, via the
-    // arch hwrng path. fill_key_32 writes 32 bytes; we only need 16
-    // but using the same call keeps the entropy source uniform with
-    // the rest of NARF's seed-material code.
+    // Drawn from `narf_filesystem::csprng` — the ChaCha20 pool that also
+    // backs /dev/random, /dev/urandom and `getrandom(2)`, matching Linux,
+    // whose AT_RANDOM comes from `get_random_bytes`. It seeds itself on
+    // first use, so it is safe this early in a process's life, and it is
+    // arch-neutral: `gather_entropy` prefers RDSEED/RDRAND on x86_64 and
+    // RNDRRS/RNDR on aarch64, falling back to a timer mix only where
+    // neither exists.
+    //
+    // This block used to be `cfg(target_arch = "x86_64")`, with the other
+    // arches taking a `None` arm, because it called
+    // `narf_arch::x86_64::hwrng::fill_key_32` and no aarch64 equivalent
+    // exists. The consequence was that an aarch64 process got NO AT_RANDOM
+    // at all: musl's `__init_libc` reads those 16 bytes for its stack
+    // canary and pointer guard, so every aarch64 process ran with canary
+    // material libc had to invent from an absent auxv entry. Going through
+    // the CSPRNG removes the arch dependency rather than adding a second
+    // per-arch entropy path — the same reason `sys_getrandom` stopped using
+    // the old per-arch helpers.
     //
     // Only emitted when an interpreter was actually loaded — the
     // NARF-native (no-interpreter) path keeps the all-zero top-of-
     // stack contract that the smoke tests assert against. We determine
     // this by checking if args/envp/auxv are completely empty.
-    #[cfg(target_arch = "x86_64")]
     let (stack_top_v, at_random_vaddr) =
         if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
             let entropy_va = stack_top_v - 16;
-            let mut key = [0u8; 32];
-            let _src = narf_arch::x86_64::hwrng::fill_key_32(&mut key);
+            let mut key = [0u8; 16];
+            narf_filesystem::csprng::fill(&mut key);
             let root = address_space.root;
-            for (i, &byte) in key[..16].iter().enumerate() {
+            for (i, &byte) in key.iter().enumerate() {
                 if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
                     // SAFETY: stack region is mapped+materialised R+W
                     // above; reached through the kernel direct map (this
                     // runs with a user CR3 live, which no longer carries
                     // the low identity map).
-                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
                     }
@@ -558,8 +570,6 @@ pub unsafe fn load_user_process_with_root(
         } else {
             (stack_top_v, None)
         };
-    #[cfg(not(target_arch = "x86_64"))]
-    let (stack_top_v, at_random_vaddr): (u64, Option<u64>) = (stack_top_v, None);
 
     // Build the final aux vector: caller-supplied entries take
     // precedence; we append interp-related defaults (AT_ENTRY,
@@ -653,7 +663,8 @@ pub unsafe fn load_user_process_with_root(
             }
         }
         // Linux-compat AT_RANDOM stamp. Only emitted when the entropy
-        // block was actually written (x86_64 + linux-compat feature).
+        // block was actually written (i.e. this is an argv/envp/auxv or
+        // interpreter-bearing exec, not the all-zero-stack native path).
         if let Some(va) = at_random_vaddr {
             let tag = AuxEntry::Random(0).tag();
             if !final_aux.iter().any(|e| e.tag() == tag) {
