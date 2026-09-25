@@ -109,6 +109,59 @@ fn align_up(n: u64, align: u64) -> Option<u64> {
     n.checked_add(mask).map(|x| x & !mask)
 }
 
+/// Resolve a user vaddr in the freshly-staged TLS region to its physical
+/// address. Arch-neutral wrapper: the two page-table walkers have the same
+/// signature and return convention (a 4 KiB page returns the frame base).
+#[inline]
+fn phys_of(root: PhysAddr, vaddr: u64) -> Option<u64> {
+    let page = vaddr & !0xFFFu64;
+    let off = vaddr & 0xFFFu64;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `root` is the AS's live top-level table, reachable through the
+    // kernel direct map; the walk only reads table entries.
+    let p = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }?;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above, against the aarch64 walker.
+    let p = unsafe { narf_memory::aarch64::paging::translate(root, VirtAddr::new(page)) }?;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let p = {
+        let _ = root;
+        return None;
+    };
+    Some(p.as_u64() + off)
+}
+
+/// Signed displacement from the thread pointer to the FIRST byte of the
+/// static TLS block, for this arch's TLS variant.
+///
+/// This is the one place that encodes where the block sits relative to the
+/// thread pointer, because two things have to agree exactly: [`stage_tls`],
+/// which places the image, and the loader's TLS relocation arm, which tells
+/// the binary where to find it. A variable at template offset `s` with addend
+/// `A` is reached at `tp + displacement + s`, so the relocation value is
+/// `displacement + s + A` on both variants — the arch difference lives here
+/// and nowhere else.
+///
+/// * **Variant II** (x86_64): the block is BELOW the thread pointer, which
+///   points at the TCB, so the displacement is `-mem_size_aligned` and
+///   accesses are `mov fs:[negative]`.
+/// * **Variant I** (aarch64): the thread pointer points at the TCB and the
+///   block sits ABOVE it, past [`TCB_RESERVE`] reserved words, rounded up to
+///   the template's alignment. The displacement is positive.
+///
+/// Returns `None` only on alignment overflow.
+pub fn block_displacement_from_tp(template: &crate::TlsTemplate) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mem_size_aligned = align_up(template.mem_size, template.align)?;
+        i64::try_from(mem_size_aligned).ok().map(|v| -v)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        i64::try_from(align_up(TCB_RESERVE, template.align)?).ok()
+    }
+}
+
 /// Allocate + populate a per-task TLS block in `address_space` from
 /// `image.tls`, copying the initial template image out of `bytes`,
 /// and return the **fs_base user vaddr** the caller will plant into
@@ -149,8 +202,14 @@ pub unsafe fn stage_tls(
     // accessors assume `fs_base` is `template.align`-aligned.
     let mem_size_aligned =
         align_up(template.mem_size, template.align).ok_or(TlsError::AlignOverflow)?;
+    // Both variants need image + TCB; which one comes first is the variant
+    // (see `block_displacement_from_tp`). Variant I rounds the TCB reserve up
+    // to the template's alignment so the block itself lands aligned, so it can
+    // need a few more bytes than variant II's plain `TCB_RESERVE` tail.
+    let block_disp = block_displacement_from_tp(template).ok_or(TlsError::AlignOverflow)?;
+    let tcb_to_block = if block_disp > 0 { block_disp as u64 } else { 0 };
     let total_bytes = mem_size_aligned
-        .checked_add(TCB_RESERVE)
+        .checked_add(core::cmp::max(TCB_RESERVE, tcb_to_block))
         .ok_or(TlsError::AlignOverflow)?;
     // Page-round the mapping; sub-page TLS blocks are common (ours
     // is typically <128 bytes) but we map at page granularity.
@@ -192,11 +251,25 @@ pub unsafe fn stage_tls(
     // SAFETY: Valid memory or trusted environment
     unsafe { address_space.materialize() }.map_err(TlsError::Materialize)?;
 
-    // Layout (low → high): `[ template image (mem_size_aligned) ][ TCB ]`.
-    // fs_base sits at the TCB start; user-side TLS reads land at
-    // negative offsets within the template region.
-    let tls_image_base = region_base;
-    let fs_base = tls_image_base + mem_size_aligned;
+    // Layout, low → high, per TLS variant:
+    //
+    //   variant II (x86_64): `[ template image (mem_size_aligned) ][ TCB ]`
+    //                         ^region_base                        ^tp
+    //   variant I (aarch64):  `[ TCB + align pad ][ template image ]`
+    //                          ^tp == region_base  ^tp + block_disp
+    //
+    // In both cases `tls_image_base == tp + block_displacement_from_tp(..)`,
+    // which is exactly what the loader's TLS relocation arm adds to a
+    // symbol's template offset — so staging and relocation cannot disagree
+    // about where the block lives.
+    let (tp, tls_image_base) = if block_disp < 0 {
+        // Block below the thread pointer: image first, tp at the TCB.
+        (region_base + mem_size_aligned, region_base)
+    } else {
+        // Block above the thread pointer: tp at the TCB, image past it.
+        (region_base, region_base + block_disp as u64)
+    };
+    let fs_base = tp;
 
     // Copy `file_size` bytes from the ELF into the TLS image area.
     // The remaining `mem_size - file_size` bytes (BSS-style tail)
@@ -213,57 +286,49 @@ pub unsafe fn stage_tls(
         // resolves to a phys reached through the kernel direct map
         // GiB of the kernel's view.
         // SAFETY: Valid memory or trusted environment
-        let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
-            .ok_or(TlsError::Translate)?;
+        let _ = (page, off);
+        let phys = phys_of(root, vaddr).ok_or(TlsError::Translate)?;
         // SAFETY: direct-mapped phys; exclusive ownership through
         // the duration of staging (no other CPU is in this AS yet).
-        // SAFETY: Valid memory or trusted environment
         unsafe {
-            *narf_memory::PhysAddr::new(phys.as_u64() + off).kernel_mut_ptr::<u8>() = b;
+            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = b;
         }
     }
 
-    // Write the TCB self-pointer at *(fs_base) = fs_base. relibc
-    // reads `*(fs:0)` to validate / canonicalise its TCB on entry;
-    // an uninitialised slot would either trip its sanity check or —
-    // worse — silently land on the previous task's TCB.
+    // Variant II only: write the TCB self-pointer at `*(tp) == tp`. relibc
+    // reads `*(fs:0)` to validate / canonicalise its TCB on entry, and
+    // `narf_user_runtime::thread_pointer()` reads the same slot on x86_64 to
+    // discover the TCB without needing `rdfsbase`; an uninitialised slot would
+    // either trip relibc's sanity check or — worse — silently land on the
+    // previous task's TCB.
+    //
+    // Deliberately NOT done on variant I. There the thread pointer's first two
+    // words are the ABI-reserved TCB, whose first slot is the dtv pointer that
+    // libc owns; planting `tp` there would hand libc a dtv that is really a
+    // self-pointer. aarch64 needs no such slot anyway — `thread_pointer()`
+    // reads `mrs tpidr_el0` directly — so the reserved words stay zero, which
+    // is what the per-page zeroing above already left.
+    #[cfg(target_arch = "x86_64")]
     {
-        let page = fs_base & !0xFFFu64;
         let off = fs_base & 0xFFFu64;
-        // SAFETY: same reasoning as the image-copy loop above; the
-        // TCB sits inside the just-mapped region by construction
-        // (`fs_base + 8 <= region_base + mapped_bytes`).
-        // SAFETY: Valid memory or trusted environment
-        let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
-            .ok_or(TlsError::Translate)?;
-        // The TCB self-pointer is 8 bytes; `fs_base` is `align`-
-        // aligned (we rounded `mem_size` up to `align`, so the TCB
-        // start is at least `align`-aligned, which the ELF parser
-        // enforces is a power of two ≥ 1). For any `align ≥ 8` the
-        // qword store stays within a single page; for the (rare)
-        // `align < 8` case the TCB sits at `align`-aligned offset
-        // and may straddle if `(off & 7) != 0`. We guard with a
-        // per-byte fallback to keep the path correct without
-        // assuming alignment we didn't enforce.
-        let value = fs_base;
+        let phys = phys_of(root, fs_base).ok_or(TlsError::Translate)?;
+        // The TCB self-pointer is 8 bytes and `tp` is `align`-aligned. For any
+        // `align >= 8` the qword store stays inside one page; a smaller align
+        // can straddle, so fall back to bytes rather than assume alignment we
+        // did not enforce.
         if off + 8 <= 4096 {
-            // SAFETY: dst lies within a single mapped phys page.
+            // SAFETY: `phys` backs a mapped page of the region we just staged,
+            // and the 8 bytes lie within it.
             unsafe {
-                *narf_memory::PhysAddr::new(phys.as_u64() + off).kernel_mut_ptr::<u64>() = value;
+                *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u64>() = fs_base;
             }
         } else {
-            // Slow path: byte-wise across the page boundary.
             for i in 0..8 {
-                let v = fs_base + i;
-                let p = v & !0xFFFu64;
-                let o = v & 0xFFFu64;
+                let ph = phys_of(root, fs_base + i).ok_or(TlsError::Translate)?;
+                let byte = (fs_base >> (i * 8)) as u8;
                 // SAFETY: both pages are mapped + materialised.
-                let ph = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(p)) }
-                    .ok_or(TlsError::Translate)?;
-                let byte = (value >> (i * 8)) as u8;
-                // SAFETY: identity-mapped, exclusive.
                 unsafe {
-                    *narf_memory::PhysAddr::new(ph.as_u64() + o).kernel_mut_ptr::<u8>() = byte;
+                    *narf_memory::PhysAddr::new(ph).kernel_mut_ptr::<u8>() = byte;
                 }
             }
         }

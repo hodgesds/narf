@@ -2894,6 +2894,135 @@ kernel_test_in!(
     smoke_userspace_relative_reloc_uses_native_type_code
 );
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_tls_block_sits_where_relocations_say() -> TestResult {
+    // The TLS variant contract, asserted on both arches from one test.
+    //
+    // A thread-local at template offset `s` is reached as
+    // `tp + block_displacement_from_tp(template) + s`, and TWO independent
+    // pieces of the kernel have to agree on that displacement:
+    // `tls::stage_tls`, which physically copies the template image, and the
+    // loader's TPREL relocation arm, which tells the binary where to look.
+    // This test pins them to each other by reading the staged bytes back
+    // through the displacement the relocation would use.
+    //
+    // The sign is the variant: NEGATIVE on x86_64 (variant II — block below
+    // the thread pointer, `mov fs:[-n]`) and POSITIVE on aarch64 (variant I —
+    // block above the ABI-reserved TCB words). aarch64 staged nothing at all
+    // before this: `process.rs` left `fs_base` None off x86_64, so a fresh
+    // image entered EL0 with `tpidr_el0 == 0`.
+    use crate::load_user_process_with;
+
+    // A recognisable initial image, one byte per position.
+    const TLS_BYTES: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    const TLS_FOFF: u64 = 0x1000;
+    const TLS_ALIGN: u64 = 8;
+
+    let mut b = alloc::vec![0u8; 0x2000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&0x1111u64.to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // PT_LOAD + PT_TLS
+
+    // Phdr 0 — PT_LOAD (R|X) so the image has a loadable segment.
+    let mut ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&TLS_FOFF.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    // Phdr 1 — PT_TLS naming the 8 initial bytes at file offset TLS_FOFF.
+    ph = 64 + 56;
+    b[ph..ph + 0x04].copy_from_slice(&7u32.to_le_bytes()); // PT_TLS
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&TLS_FOFF.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&0x2000u64.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&0x2000u64.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&(TLS_BYTES.len() as u64).to_le_bytes()); // filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&(TLS_BYTES.len() as u64).to_le_bytes()); // memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&TLS_ALIGN.to_le_bytes());
+    b[TLS_FOFF as usize..TLS_FOFF as usize + TLS_BYTES.len()].copy_from_slice(&TLS_BYTES);
+
+    let image = match crate::parse_elf(&b) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("parse_elf failed"),
+    };
+    let template = match image.tls.as_ref() {
+        Some(t) => t.clone(),
+        None => return TestResult::Fail("PT_TLS was not parsed"),
+    };
+    let disp = match crate::tls::block_displacement_from_tp(&template) {
+        Some(d) => d,
+        None => return TestResult::Fail("block displacement overflowed"),
+    };
+
+    // Pin the displacement's VALUE from the ABI, not from the function under
+    // test. Both the staging and the byte-check below go through
+    // `block_displacement_from_tp`, so a displacement that is wrong but
+    // *consistently* wrong would still round-trip — only an independent
+    // expectation catches that.
+    //
+    //   variant II (x86_64): block below tp, so -align_up(mem_size, align)
+    //                       = -align_up(8, 8) = -8
+    //   variant I (aarch64): block above tp past the two reserved TCB words,
+    //                       rounded to align: +align_up(16, 8) = +16
+    const TCB_RESERVE_WORDS: i64 = 16;
+    let want_disp: i64 = if cfg!(target_arch = "x86_64") {
+        -(TLS_BYTES.len() as i64)
+    } else {
+        TCB_RESERVE_WORDS
+    };
+    if disp != want_disp {
+        return TestResult::Fail("block displacement is not the ABI value for this variant");
+    }
+
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let proc = match unsafe { load_user_process_with(&b, &["x"], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+    let tp = match proc.fs_base {
+        Some(tp) => tp,
+        None => return TestResult::Fail("loader staged no thread pointer"),
+    };
+    if tp & (TLS_ALIGN - 1) != 0 {
+        return TestResult::Fail("thread pointer is not template-aligned");
+    }
+
+    // Read the initial image back through the displacement a TPREL relocation
+    // would hand the binary. If staging and the relocation formula disagree,
+    // these bytes are not the ones we put in the ELF.
+    let block = tp.wrapping_add(disp as u64);
+    for (i, want) in TLS_BYTES.iter().enumerate() {
+        let va = block.wrapping_add(i as u64);
+        let phys = match user_phys_of(proc.address_space.root, va) {
+            Some(p) => p,
+            None => return TestResult::Fail("TLS block byte is not mapped"),
+        };
+        // SAFETY: `phys` is the frame backing this staged TLS byte.
+        let got = unsafe { *narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>() };
+        if got != *want {
+            return TestResult::Fail("TLS initial image is not at tp + displacement");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_tls_block_sits_where_relocations_say
+);
+
 // ── execve smokes ───────────────────────────────────────────────
 //
 // `sys_execve` (Syscall::Execve = 179) replaces the current process
