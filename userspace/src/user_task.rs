@@ -1083,7 +1083,7 @@ fn park_should_block(
             // FUTEX_WAIT registration + stay decision, seqlocked against a
             // concurrent FUTEX_REQUEUE retarget — the shared protocol lives
             // in `futex_park_register_and_check` (see `futex_park_seq`).
-            match crate::handlers::futex_park_register_and_check(uc, task_id, &waker) {
+            match crate::handlers::futex_park_register_and_check(uc, task_id, waker) {
                 crate::handlers::FutexParkCheck::NotWaiting
                 | crate::handlers::FutexParkCheck::Stay => {}
                 crate::handlers::FutexParkCheck::Wake => {

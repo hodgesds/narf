@@ -6112,11 +6112,25 @@ pub fn proc_task_info(
         tracer_pid: crate::ptrace::get_task_tracer(pid)
             .map(|tracer| report_pid_to(tid, tracer))
             .unwrap_or(0),
-        fd_table_size: fd::with_table(tid, |t| t.fd_table_size())
-            // Linux's table starts at NR_OPEN_DEFAULT and never shrinks
-            // below it, so neither does this. The value must never
-            // UNDERSTATE the highest open descriptor: a consumer scanning
-            // `0..FDSize` would otherwise walk past live fds.
+        // `try_with_table`, never `with_table`: a stat-family syscall on a
+        // `/proc/self` fd reaches here (owners → task_info) while ALREADY
+        // holding this task's fd-table lock, and that lock is a non-reentrant
+        // IrqSafeSpinLock — a blocking re-acquire self-deadlocks with IF=0.
+        // The non-blocking read falls back to the floor on contention, which
+        // mirrors Linux reading `fdtable::max_fds` locklessly under RCU. The
+        // stat-path callers also clone their FileOps out of the lock first, so
+        // this guard is defence-in-depth (it also protects the fatal-fault
+        // VMA dump, which calls proc_task_info from any faulting context).
+        fd_table_size: fd::try_with_table(tid, |t| t.fd_table_size())
+            // Floored at NR_OPEN_DEFAULT (64), Linux's initial table size.
+            // This is BEST-EFFORT: `try_with_table` returns None when the
+            // shard or table lock is momentarily contended (a sibling thread
+            // mid-fd-syscall, or the re-entrant stat path), and we then report
+            // the 64 floor rather than block. So for a process with >64 fds a
+            // racing read can understate FDSize — an accepted trade to keep
+            // /proc introspection non-blocking (no in-tree consumer relies on
+            // the exact capacity; an exact lock-free AtomicU64 is the eventual
+            // fix, matching Linux's RCU `fdtable::max_fds`).
             .unwrap_or(0)
             .max(64),
     })
@@ -11837,9 +11851,14 @@ mod aio {
             return EBADF;
         }
         let mut kbuf = alloc::vec![0u8; len];
-        let outcome = fd::with_table(tid, |t| {
-            let entry = t.get(fd_no)?;
-            let ops = entry.ops.clone();
+        // Clone the ops out from under the fd-table lock, then run the BLOCKING
+        // read outside it. `poll_blocking` parks/yields, and `FileOps::read`
+        // on a /proc node re-enters `with_table` — holding this non-reentrant
+        // IrqSafeSpinLock (IF=0) across either self-deadlocks (e.g. aio PREAD of
+        // /proc/self/fd/N) or parks a CPU with the lock held. See the stat-family
+        // fix in the same class.
+        let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
+        let outcome = ops.map(|ops| {
             poll_blocking(ops.read(offset, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
                 .ok()
@@ -11872,9 +11891,10 @@ mod aio {
         if !fd::with_table(tid, |t| t.get(fd_no).is_some()).unwrap_or(false) {
             return EBADF;
         }
-        let outcome = fd::with_table(tid, |t| {
-            let entry = t.get(fd_no)?;
-            let ops = entry.ops.clone();
+        // Clone ops out, then run the blocking write outside the lock — same
+        // non-reentrant / park-with-lock-held hazard as do_pread.
+        let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
+        let outcome = ops.map(|ops| {
             poll_blocking(ops.write(offset, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
                 .ok()
@@ -11952,11 +11972,13 @@ mod aio {
             return;
         }
         let one = 1u64.to_le_bytes();
-        let _ = fd::with_table(tid, |t| {
-            let entry = t.get(iocb.aio_resfd)?;
-            let ops = entry.ops.clone();
-            poll_blocking(ops.write(0, &one))
-        });
+        // Clone ops out, then write outside the lock — aio_resfd is any
+        // caller-supplied fd, so the blocking write must not run with the
+        // fd-table lock held (see do_pread).
+        let ops = fd::with_table(tid, |t| t.get(iocb.aio_resfd).map(|e| e.ops.clone())).flatten();
+        if let Some(ops) = ops {
+            let _ = poll_blocking(ops.write(0, &one));
+        }
     }
 
     /// Execute one decoded iocb synchronously; return its `res` (bytes or
