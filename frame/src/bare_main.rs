@@ -1610,10 +1610,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // bug is unbisectable without knowing the value.
                         let _ = writeln!(
                             console::Writer,
-                            "  mmu: kernel image slide {:#x}, base {:#018x}",
+                            "  mmu: kernel image slide {:#x}, base {:#018x}, phys delta {:#x} (at {:#x})",
                             narf_memory::kaslr::KERNEL_SLIDE
                                 .load(core::sync::atomic::Ordering::Relaxed),
-                            narf_memory::kaslr::kernel_virt_base()
+                            narf_memory::kaslr::kernel_virt_base(),
+                            // The delta is reported for the same reason as the
+                            // slide, and with a sharper edge: relocation fails
+                            // CLOSED, so "no safe target in the memory map" and
+                            // "the selector is broken" both show up as a clean
+                            // boot at delta 0. Printing where the image
+                            // actually landed is the only cheap way to tell a
+                            // working selector from a silent one.
+                            narf_memory::kaslr::image_phys_delta(),
+                            narf_memory::kaslr::image_phys_bounds().0
                         );
                         // Supervisor stores ignore the read-only bit unless
                         // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S
