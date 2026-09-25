@@ -6200,7 +6200,7 @@ kernel_test_in!("userspace/process", smoke_process_fork_copies_rlimit);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_mprotect_deny_wx() -> TestResult {
-    use narf_memory::{AddressSpace, Region, RegionPerms, PhysAddr, VirtAddr};
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
     const TASK: u64 = 0xF0_03;
     const EACCES: i64 = -13;
@@ -6218,12 +6218,15 @@ fn smoke_process_mprotect_deny_wx() -> TestResult {
 
     // Create an un-executable mapping
     let base = VirtAddr::new(0x2000_0000);
-    if as_.map_region(Region {
-        base,
-        len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
-    }).is_err() {
+    if as_
+        .map_region(Region {
+            base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
         teardown_process_state();
         return TestResult::Fail("Failed to map region");
     }
@@ -6261,8 +6264,7 @@ kernel_test_in!("userspace/process", smoke_process_mprotect_deny_wx);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_sys_munlockall_returns_ok() -> TestResult {
-    use narf_memory::{AddressSpace};
-
+    use narf_memory::AddressSpace;
 
     const TASK: u64 = 0xF0_04;
     crate::syscall::__test_clear_global();
