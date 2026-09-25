@@ -1446,6 +1446,11 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
     }
     let (group_dead, was_multithreaded) = crate::handlers::thread_group_live_dec_state(pid);
     if group_dead {
+        // Complete the wait4 rusage snapshot with the process's vm size —
+        // once per process, here, while the last thread's AS is still
+        // resolvable (per-thread `record_exit_rusage` records cpu only;
+        // the region walk is too expensive to run per sibling exit).
+        crate::handlers::finalize_exit_rusage_vm(pid, tid);
         let process = PROCESS_EXIT_OBSERVERS.lock().clone();
         for o in process.iter() {
             o(pid, tid);
