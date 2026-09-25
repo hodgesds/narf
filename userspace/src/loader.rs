@@ -537,6 +537,17 @@ const R_DTPOFF64: u32 = 17;
 #[cfg(target_arch = "x86_64")]
 const R_TPOFF64: u32 = 18;
 
+// aarch64 equivalents. The TPREL arithmetic is no longer variant-II-specific:
+// it asks `tls::block_displacement_from_tp` where the block sits relative to
+// the thread pointer, which is negative on variant II and positive on
+// variant I, so the same `displacement + S + A` serves both.
+#[cfg(target_arch = "aarch64")]
+const R_DTPMOD64: u32 = 1028; // R_AARCH64_TLS_DTPMOD
+#[cfg(target_arch = "aarch64")]
+const R_DTPOFF64: u32 = 1029; // R_AARCH64_TLS_DTPREL
+#[cfg(target_arch = "aarch64")]
+const R_TPOFF64: u32 = 1030; // R_AARCH64_TLS_TPREL
+
 /// Lookup helper — return the value paired with the *first*
 /// occurrence of `tag` in `dynamic`. PT_DYNAMIC duplicates would
 /// be malformed; we treat first-wins as the spec does.
@@ -770,9 +781,6 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
 /// gating. An undefined symbol returns 0 (the conventional template
 /// base), matching how ld-musl emits TPOFF64 with `sym_ix == 0` for
 /// the program's own TLS template.
-// Only the variant-II TLS arms call this, and those are x86_64-only
-// (see the TLS relocation constants above).
-#[cfg(target_arch = "x86_64")]
 fn resolve_tls_symbol_offset(
     bytes: &[u8],
     image: &ExecImage,
@@ -792,29 +800,10 @@ fn resolve_tls_symbol_offset(
     Ok(read_u64_le(&slice[8..16]))
 }
 
-/// Compute the TLS block size used by TPOFF64. The block size is
-/// `template.mem_size` rounded up to `template.align` — matches
-/// `tls.rs::stage_tls`'s `mem_size_aligned` so the negative-offset
-/// arithmetic agrees with where the kernel actually places the image.
-/// Returns 0 when the image has no PT_TLS — TPOFF64 against a binary
-/// without TLS is degenerate but should not abort relocation.
-// As above: variant-II TLS math, x86_64-only.
-#[cfg(target_arch = "x86_64")]
-fn tls_block_size(image: &ExecImage) -> u64 {
-    match &image.tls {
-        Some(t) => {
-            let align = if t.align == 0 { 1 } else { t.align };
-            let mask = align - 1;
-            (t.mem_size + mask) & !mask
-        }
-        None => 0,
-    }
-}
-
 /// Walk DT_RELA + DT_JMPREL and patch each entry.
 ///
 /// `vaddr_bias` is the load offset applied to PT_LOAD vaddrs and
-/// to R_X86_64_RELATIVE addends — `0` for an ET_EXEC program,
+/// to RELATIVE addends — `0` for an ET_EXEC program,
 /// non-zero for an ET_DYN interpreter loaded at a chosen base.
 ///
 /// `apply_relr` gates the DT_RELR pass. A self-relocating object — an
@@ -1049,14 +1038,12 @@ unsafe fn process_rela_array(
                 // by the ABI for these two types; ignore it.
                 resolve_symbol(bytes, image, sym_ix, vaddr_bias)?
             }
-            #[cfg(target_arch = "x86_64")]
             R_DTPMOD64 => {
                 // Module ID. The static-tls model has exactly one TLS
                 // module (the program's PT_TLS template), so the value
                 // is always 1 regardless of sym_ix. Addend is reserved.
                 1
             }
-            #[cfg(target_arch = "x86_64")]
             R_DTPOFF64 => {
                 // Offset of `sym` within its TLS template image, plus
                 // addend. sym_ix == 0 is the common "anonymous" form
@@ -1069,24 +1056,34 @@ unsafe fn process_rela_array(
                 };
                 s.wrapping_add(r_addend as u64)
             }
-            #[cfg(target_arch = "x86_64")]
             R_TPOFF64 => {
-                // Initial-exec TLS offset from `fs_base`. The NARF TLS
-                // layout (tls.rs::stage_tls) places the TLS image
-                // immediately below the TCB and points fs_base at the
-                // TCB start, so a variable at template offset `s` lives
-                // at `fs_base - tls_block_size + s`. The runtime patch
-                // site is reached via `mov fs:[disp]`, so the value we
-                // write is the signed displacement `s - tls_block_size + A`.
+                // Initial-exec offset from the thread pointer. A variable at
+                // template offset `s` lives at
+                // `tp + block_displacement_from_tp(template) + s`, so the value
+                // the patch site needs is that displacement plus `s + A`.
+                //
+                // `tls::block_displacement_from_tp` is the single definition of
+                // where the block sits relative to `tp`, shared with
+                // `tls::stage_tls`, which physically places it. It is negative
+                // on variant II (x86_64: block below the thread pointer, so
+                // `mov fs:[negative]`) and positive on variant I (aarch64:
+                // block above the ABI-reserved TCB words). Restating the
+                // arithmetic here instead would let the relocation and the
+                // staging drift apart, which is exactly the failure mode that
+                // two copies of PROGRAM_DYN_BASE produced once the value
+                // stopped being a constant.
                 let s = if sym_ix == 0 {
                     0
                 } else {
                     resolve_tls_symbol_offset(bytes, image, sym_ix)?
                 };
-                let tls_size = tls_block_size(image);
-                (s as i64)
-                    .wrapping_sub(tls_size as i64)
-                    .wrapping_add(r_addend) as u64
+                let template = image
+                    .tls
+                    .as_ref()
+                    .ok_or(LoadBytesError::UnsupportedRelocation)?;
+                let disp = crate::tls::block_displacement_from_tp(template)
+                    .ok_or(LoadBytesError::UnsupportedRelocation)?;
+                disp.wrapping_add(s as i64).wrapping_add(r_addend) as u64
             }
             R_IRELATIVE | R_NONE => {
                 // Cannot resolve IRELATIV in kernel space. Skip it.

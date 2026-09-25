@@ -80,7 +80,9 @@ pub mod socket;
 pub mod syscall;
 pub mod sysvipc;
 pub mod task;
-#[cfg(target_arch = "x86_64")]
+// TLS staging is arch-neutral now: `tls::block_displacement_from_tp` encodes
+// the variant (block below the thread pointer on x86_64, above the reserved
+// TCB words on aarch64) and `stage_tls` lays the block out accordingly.
 pub mod tls;
 pub mod user_task;
 pub mod vdso;
@@ -176,7 +178,6 @@ pub use syscall::{
     SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext, SA_NODEFER, SA_ONSTACK,
     SA_RESETHAND, SA_RESTART, SA_SIGINFO, SYS_NUMBER_MASK, SYS_VERSION_MASK, SYS_VERSION_SHIFT,
 };
-#[cfg(target_arch = "x86_64")]
 pub use tls::{stage_tls, TlsError, TLS_REGION_BASE};
 pub use user_task::{
     clear_current as clear_current_user_task, current_user_task,

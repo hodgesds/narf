@@ -3205,9 +3205,14 @@ impl core::future::Future for UserTaskFuture {
         complete_set_child_tid(&mut this.set_child_tid, &this.task);
 
         // Program an explicit per-task TPIDR_EL0 after activating the task AS.
-        // Fresh images start at zero until their runtime writes TPIDR_EL0;
-        // clone/fork supplies Some(live_parent_tls), including Some(0). Never
-        // inherit whichever user thread happened to run previously on this CPU.
+        // `process.fs_base` now carries a kernel-staged variant-I thread
+        // pointer for every image: `process.rs` runs `tls::stage_tls` on both
+        // arches, synthesising a TCB-only template when the binary has no
+        // PT_TLS. It used to be `None` here (staging was x86_64-only), so this
+        // wrote 0 and a fresh aarch64 image entered EL0 with no thread pointer
+        // at all — anything reading `tpidr_el0` got zero until its own runtime
+        // wrote one. clone/fork still supplies Some(live_parent_tls), including
+        // Some(0). Never inherit whichever user thread ran previously here.
         let tls_base = this.process.fs_base.unwrap_or(0);
         // SAFETY: TPIDR_EL0 is writable at EL1 without affecting EL1 TLS.
         unsafe {

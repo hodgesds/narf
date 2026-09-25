@@ -120,11 +120,9 @@ pub enum ProcessLoadError {
     /// PT_TLS staging (allocate + map + populate the per-task TLS
     /// block) failed. Per-thread TLS is required by relibc Path B,
     /// so a binary with `PT_TLS` that fails to stage is unrunnable.
-    #[cfg(target_arch = "x86_64")]
     Tls(crate::tls::TlsError),
 }
 
-#[cfg(target_arch = "x86_64")]
 impl From<crate::tls::TlsError> for ProcessLoadError {
     fn from(e: crate::tls::TlsError) -> Self {
         ProcessLoadError::Tls(e)
@@ -717,20 +715,25 @@ pub unsafe fn load_user_process_with_root(
     // Synthesising an empty `TlsTemplate { mem_size = 0 }` makes
     // `stage_tls` allocate a 4-KiB region whose first qword holds
     // `*fs:[0] = fs_base`, satisfying the read.
-    #[cfg(target_arch = "x86_64")]
     let fs_base = {
-        // The synthetic-TLS path needs room *before* the TCB for
-        // negative-offset thread-local accesses. SysV-AMD64
-        // (and glibc / relibc / Rust stdlib) use the
-        // initial-exec model: TLS variables live at NEGATIVE
-        // offsets from `fs_base`; only the TCB self-pointer +
-        // dtv-vector fields sit at positive offsets. Errno in
-        // particular is generated as `*(fs:[0] - 8)` (see the
+        // The synthetic-TLS path needs room for thread-local accesses on
+        // whichever side of the thread pointer this arch's TLS variant puts
+        // the block — `tls::stage_tls` places it and
+        // `tls::block_displacement_from_tp` says which side.
+        //
+        // Variant II (x86_64, SysV-AMD64, as glibc / relibc / the Rust stdlib
+        // assume): TLS variables live at NEGATIVE offsets from the thread
+        // pointer; only the TCB self-pointer and dtv fields sit above it.
+        // Errno in particular is generated as `*(fs:[0] - 8)` (see the
         // narf_libc::stdio::fwrite disassembly that drove this).
-        // 4 KiB is overkill for narf-libc's small TLS surface
-        // today (errno + STDOUT slots) but matches the page-round
-        // already done downstream and leaves headroom for a
-        // future relibc swap.
+        //
+        // Variant I (aarch64): the block sits ABOVE the reserved TCB words, so
+        // the same headroom is consumed upwards instead. Either way the
+        // synthetic template just needs to be big enough.
+        //
+        // 4 KiB is overkill for narf-libc's small TLS surface today (errno +
+        // STDOUT slots) but matches the page-round already done downstream and
+        // leaves headroom for a future relibc swap.
         const SYNTHETIC_TLS_HEADROOM: u64 = 4096;
         let template = image.tls.clone().unwrap_or(crate::TlsTemplate {
             file_off: 0,
@@ -748,8 +751,6 @@ pub unsafe fn load_user_process_with_root(
         // SAFETY: Valid memory or trusted environment
         Some(unsafe { crate::tls::stage_tls(&synthetic_image, bytes, &address_space) }?)
     };
-    #[cfg(not(target_arch = "x86_64"))]
-    let fs_base: Option<u64> = None;
 
     Ok(UserProcess {
         pid,
