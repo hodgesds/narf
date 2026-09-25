@@ -203,9 +203,20 @@ fn smoke_memory_sparse_anonymous_metadata_preserves_offsets() -> TestResult {
     {
         return TestResult::Fail("sparse anonymous setup failed");
     }
+    // Demand-paged neighbours are deliberately NOT coalesced: a sparse `phys`
+    // prefix makes every later fault and punch in a merged run pay for the
+    // whole span (see `coalesce_anonymous_around`). Both reservations stay as
+    // their own region with an untouched empty prefix.
     let reserved = aspace.regions_snapshot();
-    if reserved.len() != 1 || reserved[0].len != 3 * 4096 || !reserved[0].phys.is_empty() {
-        return TestResult::Fail("sparse reservation coalescing materialized its tail");
+    if reserved.len() != 2
+        || reserved[0].base.as_u64() != base
+        || reserved[0].len != 2 * 4096
+        || reserved[1].base.as_u64() != base + 2 * 4096
+        || reserved[1].len != 4096
+        || !reserved[0].phys.is_empty()
+        || !reserved[1].phys.is_empty()
+    {
+        return TestResult::Fail("sparse reservations did not stay separate and lazy");
     }
 
     if aspace
