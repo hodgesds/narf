@@ -1769,11 +1769,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // lives under PML4[511], which `init_mmu` already built, so
                 // this is a no-op; on aarch64 it is a fresh L0 entry that
                 // must exist before the first `insmod` walks it.
+                // Choose the window's base before reserving its slot: the
+                // reservation and every later accessor read the chosen base,
+                // and a module mapped at the default would be stranded.
+                narf_memory::module_text::randomize_window();
                 match narf_memory::module_text::reserve_kernel_slot() {
                     Ok(()) => {
                         let _ = writeln!(
                             console::Writer,
-                            "  module_text: kernel VA slot {} reserved",
+                            "  module_text: window at {:#018x} (slot {})",
+                            narf_memory::module_text::module_va_base(),
                             narf_memory::module_text::kernel_top_slot()
                         );
                     }
@@ -2546,6 +2551,35 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
+                // Module window: choose its base, then reserve the top-level
+                // entry for it.
+                //
+                // Neither ran on aarch64 before. `reserve_kernel_slot`'s own
+                // doc says it should — "creating the entry once, at a known
+                // point, is still preferable to doing it under whatever lock
+                // and context the first `insmod` happens to arrive with" — but
+                // only the x86_64 path called it, so the entry was created
+                // lazily by the first module load. With a randomized base the
+                // ordering also matters for correctness: every accessor must
+                // see the chosen base before anything maps into the window.
+                narf_memory::module_text::randomize_window();
+                match narf_memory::module_text::reserve_kernel_slot() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  module_text: window at {:#018x} (slot {})",
+                            narf_memory::module_text::module_va_base(),
+                            narf_memory::module_text::kernel_top_slot()
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  module_text: slot reservation failed: {e:?}"
+                        );
                     }
                 }
 
