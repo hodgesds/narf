@@ -9425,11 +9425,9 @@ impl AddressSpace {
     ///    in `demand_alloc_page` and gets a freshly-zeroed frame.
     ///
     /// Behavioural difference from Linux:
-    /// - MADV_DONTNEED and MADV_FREE collapse to the same shape
-    ///   here (eager release + lazy zero-on-fault). The lazy-reclaim
-    ///   distinction Linux makes between the two requires a swap /
-    ///   page-aging path NARF doesn't have yet; both end up with
-    ///   "next access reads zero," which is what callers need.
+    /// - MADV_DONTNEED only: eager release + lazy zero-on-fault,
+    ///   the "next access reads zero" contract. MADV_FREE takes the
+    ///   lazy path instead — see [`Self::madvise_free`].
     /// - LOCKED regions silently keep their pages backed (madvise
     ///   is a hint; an mlock'd page must stay resident). The region
     ///   is treated as "touched" for the return value but no frames
@@ -9612,6 +9610,181 @@ impl AddressSpace {
             crate::frame::free_frame_batch(&to_release);
         }
         Ok(())
+    }
+
+    /// Linux-shaped lazy `madvise(MADV_FREE)`: mark the range's resident
+    /// pages discardable WITHOUT unmapping them. Each present leaf gets the
+    /// software `LAZYFREE` bit with DIRTY + ACCESSED cleared and stays
+    /// present and writable, so a later store re-dirties it purely in
+    /// hardware — no fault, no refault, no zero-fill. Pages still clean when
+    /// memory pressure looks are discarded without IO by
+    /// [`Self::discard_lazyfree_pages`].
+    ///
+    /// The prior implementation collapsed MADV_FREE into MADV_DONTNEED
+    /// (eager release), which made every freed-then-reused page pay the full
+    /// demand-fault + zero path: 1.44 ms per freed-and-rewritten 4 MiB
+    /// against Linux's 0.40 ms, the whole stress-ng --madvise gap.
+    ///
+    /// Validation and skip rules mirror `madvise_dontneed`: ENOMEM on holes,
+    /// LOCKED and SHARED regions are honoured as no-ops. Pages already
+    /// swapped out are left untouched (they are cold; their slots free on
+    /// unmap). aarch64 keeps the eager collapse until its paging helper
+    /// lands.
+    pub fn madvise_free(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        #[cfg(not(target_arch = "x86_64"))]
+        return self.madvise_dontneed(base, len);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if base.as_u64() & 0xFFF != 0 {
+                return Err(AddressSpaceError::AlignmentMismatch);
+            }
+            if len == 0 {
+                return Ok(());
+            }
+            let lo = base.as_u64();
+            let rounded_len = len
+                .checked_add(0xFFF)
+                .map(|value| value & !0xFFF)
+                .ok_or(AddressSpaceError::OutOfRange)?;
+            let hi = lo
+                .checked_add(rounded_len)
+                .filter(|end| *end <= Self::USER_HALF_END)
+                .ok_or(AddressSpaceError::OutOfRange)?;
+
+            let mut touched = false;
+            let mut marked = 0u64;
+            {
+                let regions = self.regions.lock();
+                if !Self::regions_cover_range(&regions, lo, hi) {
+                    return Err(AddressSpaceError::Unmapped);
+                }
+                regions.for_each_overlapping(lo, hi, |r| {
+                    let rb = r.base.as_u64();
+                    let re = rb.saturating_add(r.len);
+                    if rb >= hi || re <= lo {
+                        return;
+                    }
+                    touched = true;
+                    // Same no-op classes as madvise_dontneed: mlock'd pages
+                    // stay resident and dirty; SHARED frames are borrowed.
+                    if r.perms.contains(RegionPerms::LOCKED)
+                        || r.perms.contains(RegionPerms::SHARED)
+                    {
+                        return;
+                    }
+                    let start_v = lo.max(rb);
+                    let end_v = hi.min(re);
+                    let start_i = ((start_v - rb) >> 12) as usize;
+                    let end_i = ((end_v - rb) >> 12) as usize;
+                    // Only the materialized prefix can hold leaves; the
+                    // sparse tail is already demand-zero.
+                    let backed_end = end_i.min(r.phys.len());
+                    let backed_start = start_i.min(backed_end);
+                    if self.root.as_u64() != 0 && backed_start < backed_end {
+                        let backed_v = rb + backed_start as u64 * 4096;
+                        // SAFETY: identity-mapped; the run lies in a bookkept
+                        // region of this AS and the region lock keeps it
+                        // stable through the batched walk.
+                        marked += unsafe {
+                            crate::x86_64::paging::lazyfree_mark_4kb_local_range(
+                                self.root,
+                                VirtAddr::new(backed_v),
+                                (backed_end - backed_start) as u64,
+                            )
+                        }
+                        .unwrap_or(0);
+                    }
+                });
+            }
+            if !touched {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            // Remote CPUs may cache these leaves with DIRTY already set,
+            // letting stores skip the D-bit assist that records a rewrite.
+            // One broadcast retires those entries before the mark means
+            // anything to the discard pass.
+            if marked > 0 {
+                self.flush_region_broadcast(base, (hi - lo) >> 12);
+            }
+            Ok(())
+        }
+    }
+
+    /// Discard still-clean `MADV_FREE` pages — the IO-free first tier of
+    /// anonymous reclaim, run before swap-based eviction. Walks this
+    /// space's private anonymous regions and retires every leaf whose
+    /// `LAZYFREE` bit survives with DIRTY still clear (see
+    /// `lazyfree_take_clean_4kb_range` for the walker-race contract);
+    /// rewritten pages lose the mark and stay resident. Returns the number
+    /// of pages freed, stopping once `max_pages` have been collected.
+    #[cfg(target_arch = "x86_64")]
+    pub fn discard_lazyfree_pages(&self, max_pages: usize) -> usize {
+        if self.root.as_u64() == 0 || max_pages == 0 {
+            return 0;
+        }
+        let mut freed: Vec<crate::frame::PhysFrame> = Vec::new();
+        if freed.try_reserve(max_pages.min(4096)).is_err() {
+            return 0;
+        }
+        {
+            let mut g = self.regions.lock();
+            let root = self.root;
+            let mut budget = max_pages;
+            g.for_each_overlapping_mut(0, Self::USER_HALF_END, |r| {
+                if budget == 0 {
+                    return;
+                }
+                if r.perms.contains(RegionPerms::LOCKED)
+                    || r.perms.contains(RegionPerms::SHARED)
+                    || r.perms.contains(RegionPerms::FILE_DEMAND)
+                    || r.phys.is_empty()
+                {
+                    return;
+                }
+                let rb = r.base.as_u64();
+                let span = r.phys.len() as u64;
+                // Collect (phys, va) pairs under the same region lock that
+                // keeps the phys slots stable, then retire bookkeeping for
+                // exactly the taken pages.
+                let mut taken: Vec<(PhysAddr, u64)> = Vec::new();
+                if taken.try_reserve(span.min(budget as u64) as usize).is_err() {
+                    return;
+                }
+                // SAFETY: identity-mapped; the run is this region's
+                // materialized prefix, stable under the region lock.
+                let _ = unsafe {
+                    crate::x86_64::paging::lazyfree_take_clean_4kb_range(
+                        root,
+                        VirtAddr::new(rb),
+                        span,
+                        |phys, va| taken.push((phys, va.as_u64())),
+                    )
+                };
+                // Every taken page must be retired — the helper walks whole
+                // regions, and leaving one unmapped but bookkept would strand
+                // a "backed" slot over an absent PTE. The budget therefore
+                // only limits which regions are visited, not this loop.
+                for &(phys, va) in taken.iter() {
+                    let index = ((va - rb) >> 12) as usize;
+                    // Mirror madvise_dontneed's per-page retirement: drop the
+                    // rmap owner before the frame can return to the buddy and
+                    // stamp the slot demand-zero.
+                    crate::rmap::remove(phys, root, VirtAddr::new(va));
+                    r.phys[index] = PhysAddr::new(0);
+                    freed.push(crate::frame::PhysFrame::new(phys));
+                }
+                budget = budget.saturating_sub(taken.len());
+            });
+        }
+        if freed.is_empty() {
+            return 0;
+        }
+        // ONE cross-CPU invalidation before any frame is reused. The spans
+        // are scattered across regions, so use the tag-wide form (any page
+        // count past the ranged-flush ceiling selects it).
+        self.flush_region_broadcast(VirtAddr::new(0), Self::USER_HALF_END >> 12);
+        crate::frame::free_frame_batch(&freed);
+        freed.len()
     }
 
     /// PTE-walk helper for `change_perms_range`. For each page in

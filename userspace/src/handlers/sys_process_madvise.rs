@@ -53,8 +53,13 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
     };
     let mut total: u64 = 0;
     for (base, len) in iov {
-        if advice == MADV_DONTNEED || advice == MADV_FREE {
+        // Same split as sys_madvise: DONTNEED keeps the eager "next read
+        // observes zeros" contract, FREE takes the lazy mark-discardable
+        // path (see AddressSpace::madvise_free).
+        if advice == MADV_DONTNEED {
             let _ = as_ref.madvise_dontneed(VirtAddr::new(base), len);
+        } else if advice == MADV_FREE {
+            let _ = as_ref.madvise_free(VirtAddr::new(base), len);
         }
         total = total.saturating_add(len);
     }

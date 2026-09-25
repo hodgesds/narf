@@ -41,6 +41,13 @@ impl PtFlags {
     /// PS=1 PD entry maps 2 MiB. Never set in a PML4 entry.
     pub const HUGE_PAGE: Self = Self(1 << 7);
     pub const GLOBAL: Self = Self(1 << 8);
+    /// Software MADV_FREE marker in AVL bit 9 (hardware-ignored, SDM Vol. 3
+    /// §4.5). Set with DIRTY + ACCESSED cleared while the leaf stays present
+    /// and writable: a later store re-dirties the page entirely via the
+    /// hardware D-bit assist (no fault), and a leaf still clean at reclaim
+    /// time is discardable without IO. See `lazyfree_mark_4kb_local_range`
+    /// and `lazyfree_take_clean_4kb_range`.
+    pub const LAZYFREE: Self = Self(1 << 9);
     /// Execute-disable bit (IA32_EFER.NXE must be set for this to be
     /// interpreted; without NXE the bit is reserved-zero).
     pub const NO_EXEC: Self = Self(1 << 63);
@@ -1860,6 +1867,223 @@ pub unsafe fn unmap_4kb_local_range(
         unsafe { flush_user_tlb_local() };
     }
     Ok(removed)
+}
+
+/// Mark every present 4 KiB leaf in the run as MADV_FREE'd: set the software
+/// [`PtFlags::LAZYFREE`] bit and clear DIRTY + ACCESSED while keeping the
+/// leaf present and writable. A later store re-dirties the page entirely in
+/// hardware (the locked D-bit assist walk), so a freed-then-reused page
+/// costs no fault; a page still clean when reclaim looks is discardable
+/// without IO (`lazyfree_take_clean_4kb_range`). LOCAL invalidation only —
+/// the caller MUST broadcast an invalidation covering the run before relying
+/// on the cleared D bits: a remote CPU whose TLB cached the leaf with D
+/// already set skips the assist and its stores would go unrecorded.
+///
+/// Returns the number of leaves marked.
+///
+/// # Safety
+/// Same contract as [`unmap_4kb_local_range`]: identity-reachable root, the
+/// run lies inside a bookkept region of this address space.
+pub unsafe fn lazyfree_mark_4kb_local_range(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError> {
+    if !is_canonical(base) {
+        return Err(MapError::NonCanonical);
+    }
+    if base.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if pages > 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let mut marked = 0;
+    const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+    let per_page_invalidate = pages <= FULL_FLUSH_PAGE_CEILING;
+    // SAFETY: root is identity-reachable per the caller's contract and the
+    // per-root mutation lock remains held for the complete walk.
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.raw() + page * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            cached_pt = core::ptr::null_mut();
+            let pml4e = pml4.entries[idx.pml4];
+            if pml4e.is_present() {
+                // SAFETY: present non-leaf entry points at an identity-mapped
+                // page table under this root.
+                let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
+                let pdpte = pdpt.entries[idx.pdpt];
+                if pdpte.is_present() && !pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                    // SAFETY: same, one level lower.
+                    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
+                    let pde = pd.entries[idx.pd];
+                    if pde.is_present() && !pde.flags().contains(PtFlags::HUGE_PAGE) {
+                        cached_pt = pde.addr().kernel_mut_ptr::<PageTable>();
+                    }
+                }
+            }
+        }
+        if cached_pt.is_null() {
+            continue;
+        }
+        // SAFETY: cached_pt came from the present PDE for this key; the root
+        // lock prevents replacement during the batch.
+        let pt = unsafe { &mut *cached_pt };
+        let leaf = pt.entries[idx.pt];
+        if !leaf.is_present() {
+            continue;
+        }
+        let flags = PtFlags(
+            (leaf.flags().bits() | PtFlags::LAZYFREE.bits())
+                & !(PtFlags::DIRTY.bits() | PtFlags::ACCESSED.bits()),
+        );
+        pt.entries[idx.pt] = PageTableEntry::new(leaf.addr(), flags);
+        marked += 1;
+        if per_page_invalidate {
+            // SAFETY: the just-rewritten leaf owns this page-aligned VA.
+            unsafe { invlpg(virt) };
+        }
+    }
+    if marked != 0 && !per_page_invalidate {
+        // SAFETY: all rewrites are published under the root lock; one
+        // non-global flush retires stale-D local translations.
+        unsafe { flush_user_tlb_local() };
+    }
+    Ok(marked)
+}
+
+/// Retire the still-clean [`PtFlags::LAZYFREE`] leaves in the run: each such
+/// leaf is atomically swapped to EMPTY and reported through `take(phys, va)`;
+/// a leaf whose DIRTY bit came back (the page was stored to after MADV_FREE)
+/// instead has its LAZYFREE bit cleared and stays mapped. The atomic swap
+/// orders against the page walker's locked D-bit assist: an assist that
+/// lands first is visible in the swapped-out entry (the page is kept), one
+/// that starts after the swap finds the leaf empty and takes the ordinary
+/// demand-fault path instead of writing. Non-LAZYFREE leaves are untouched.
+///
+/// LOCAL invalidation only. The caller MUST broadcast an invalidation
+/// covering the run before freeing any reported frame — a remote CPU may
+/// still hold a read translation for it.
+///
+/// Returns the number of leaves retired.
+///
+/// # Safety
+/// Same contract as [`unmap_4kb_local_range`].
+pub unsafe fn lazyfree_take_clean_4kb_range(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+    mut take: impl FnMut(PhysAddr, VirtAddr),
+) -> Result<u64, MapError> {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    if !is_canonical(base) {
+        return Err(MapError::NonCanonical);
+    }
+    if base.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if pages > 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let mut taken = 0;
+    const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+    let per_page_invalidate = pages <= FULL_FLUSH_PAGE_CEILING;
+    // SAFETY: root is identity-reachable per the caller's contract and the
+    // per-root mutation lock remains held for the complete walk.
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.raw() + page * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            cached_pt = core::ptr::null_mut();
+            let pml4e = pml4.entries[idx.pml4];
+            if pml4e.is_present() {
+                // SAFETY: present non-leaf entry points at an identity-mapped
+                // page table under this root.
+                let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
+                let pdpte = pdpt.entries[idx.pdpt];
+                if pdpte.is_present() && !pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                    // SAFETY: same, one level lower.
+                    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
+                    let pde = pd.entries[idx.pd];
+                    if pde.is_present() && !pde.flags().contains(PtFlags::HUGE_PAGE) {
+                        cached_pt = pde.addr().kernel_mut_ptr::<PageTable>();
+                    }
+                }
+            }
+        }
+        if cached_pt.is_null() {
+            continue;
+        }
+        // SAFETY: cached_pt came from the present PDE for this key; the root
+        // lock prevents replacement during the batch.
+        let pt = unsafe { &mut *cached_pt };
+        let leaf = pt.entries[idx.pt];
+        if !leaf.is_present() || !leaf.flags().contains(PtFlags::LAZYFREE) {
+            continue;
+        }
+        if leaf.flags().contains(PtFlags::DIRTY) {
+            // Rewritten since MADV_FREE — the page is live again. Clearing
+            // LAZYFREE with a plain store is fine: a concurrent D-assist
+            // can only re-set a bit we are keeping set.
+            pt.entries[idx.pt] =
+                PageTableEntry::new(leaf.addr(), PtFlags(leaf.flags().bits() & !PtFlags::LAZYFREE.bits()));
+            continue;
+        }
+        // SAFETY: a PageTableEntry is a repr-compatible u64 slot; the atomic
+        // swap serializes against the hardware walker's locked D-bit assist
+        // on other CPUs (software mutation is excluded by the root lock).
+        let slot = unsafe {
+            &*(core::ptr::addr_of_mut!(pt.entries[idx.pt]) as *mut u64 as *const AtomicU64)
+        };
+        let old = PageTableEntry::from_raw(slot.swap(0, Ordering::AcqRel));
+        if old.flags().contains(PtFlags::DIRTY) {
+            // A store's D-assist landed between the read above and the swap:
+            // the page is live. Reinstall it (root lock still held, so no
+            // software mutator raced) with LAZYFREE dropped.
+            pt.entries[idx.pt] = PageTableEntry::new(
+                old.addr(),
+                PtFlags(old.flags().bits() & !PtFlags::LAZYFREE.bits()),
+            );
+            continue;
+        }
+        take(old.addr(), virt);
+        taken += 1;
+        if per_page_invalidate {
+            // SAFETY: the just-cleared leaf owned this page-aligned VA.
+            unsafe { invlpg(virt) };
+        }
+    }
+    if taken != 0 && !per_page_invalidate {
+        // SAFETY: all affected leaves are already clear under the root lock;
+        // one non-global flush retires their local translations.
+        unsafe { flush_user_tlb_local() };
+    }
+    Ok(taken)
 }
 
 unsafe fn unmap_4kb_impl(
