@@ -237,6 +237,15 @@ impl RecvBuf {
         self.limit.saturating_sub(used) as u32
     }
 
+    /// Receive window to advertise: buffer space past `rcv_nxt`. Out-of-order
+    /// data already sits *inside* this window, so it must not shrink it —
+    /// moving the right edge left (RFC 9293 §3.8.6.2.1: SHOULD NOT shrink)
+    /// also changed the window on every duplicate ACK, which disqualifies
+    /// them as duplicates (RFC 5681 §2) and so disabled fast retransmit.
+    pub fn window(&self) -> u32 {
+        self.limit.saturating_sub(self.in_order.len()) as u32
+    }
+
     /// User-facing read. Pops up to `dst.len()` bytes from
     /// `in_order`. Returns the byte count.
     pub fn read(&mut self, dst: &mut [u8]) -> usize {
@@ -271,12 +280,14 @@ impl RecvBuf {
             // Whole segment was already consumed.
             return rcv_nxt;
         }
-        // Clamp to free window so we don't overflow the buffer.
-        let free = self.free_window() as usize;
-        let take = data.len().min(free);
-        if take == 0 {
+        // Clamp to the window's right edge, `rcv_nxt + window()`, so
+        // in-order + out-of-order bytes never exceed the buffer.
+        let offset = seq.wrapping_sub(rcv_nxt) as usize;
+        let window = self.window() as usize;
+        if offset >= window {
             return rcv_nxt;
         }
+        let take = data.len().min(window - offset);
         let data = &data[..take];
 
         if seq == rcv_nxt {

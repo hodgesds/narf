@@ -92,6 +92,12 @@ pub fn send_arp_request_in(net_ns_id: u64, target_ip: [u8; 4]) -> Result<(), ()>
 
 /// Resolve `ip` to a MAC: cache → ARP-request → busy-wait for reply.
 /// Returns the MAC on success, `Err(())` on timeout.
+/// Non-blocking neighbour lookup: the cached MAC for `ip`, or `None`.
+/// For RX-path callers (e.g. a TCP reset) that must never spin on ARP.
+pub(crate) fn arp_cached_in(net_ns_id: u64, ip: [u8; 4]) -> Option<[u8; 6]> {
+    arp_lookup_local(net_ns_id, ip)
+}
+
 pub fn arp_resolve(ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
     arp_resolve_in(0, ip, timeout_ms)
 }

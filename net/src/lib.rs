@@ -119,6 +119,7 @@ pub use stack::{
 mod dhcp_dns_e2e_tests;
 mod e2e_tests;
 mod ipv6_e2e_tests;
+mod tcp_e2e_tests;
 mod tcp_timer_e2e_tests;
 mod tests;
 
