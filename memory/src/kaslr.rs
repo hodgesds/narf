@@ -139,8 +139,28 @@ pub fn image_phys_bounds() -> (u64, u64) {
     }
     // SAFETY: two linker-populated words inside the image, read-only.
     let b = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() };
-    (b[0], b[1])
+    // The linker filled these with the LINK-TIME physical bounds; if the image
+    // was relocated they describe where it used to be. The frame allocator
+    // reserves this range, so a stale answer leaves the running image
+    // unreserved and hands it to the buddy.
+    let d = IMAGE_PHYS_DELTA.load(Ordering::Relaxed);
+    (b[0].wrapping_add(d), b[1].wrapping_add(d))
 }
+
+/// How far the image was physically relocated from its link-time load address,
+/// or 0 if it runs where the loader put it.
+///
+/// The VA slide (`KERNEL_SLIDE`) randomizes where the image appears; this
+/// randomizes where it actually IS. Both matter: a leaked physical address is
+/// as useful to an attacker as a leaked virtual one, and the loader puts the
+/// image at a fixed physical address that no VA randomization changes.
+///
+/// Written by `boot.S` after it copies the image and before any conversion
+/// runs, so no caller can observe a stale value. Zero is the correct answer
+/// when relocation is disabled or no suitable target was found, and it makes
+/// both conversions below reduce to their pre-relocation form.
+#[no_mangle]
+pub static IMAGE_PHYS_DELTA: AtomicU64 = AtomicU64::new(0);
 
 /// Physical address of an in-image kernel-virtual address.
 ///
@@ -148,7 +168,11 @@ pub fn image_phys_bounds() -> (u64, u64) {
 /// only while the slide is zero, and wrong by exactly the slide otherwise.
 #[inline]
 pub fn image_virt_to_phys(virt: u64) -> u64 {
+    // Two independent displacements: the VA slide, undone by subtracting the
+    // live virtual base, and the physical relocation, added back on. They are
+    // separate because the image can move in one, the other, or both.
     virt.wrapping_sub(kernel_virt_base())
+        .wrapping_add(IMAGE_PHYS_DELTA.load(Ordering::Relaxed))
 }
 
 #[cfg(feature = "kernel-test")]
