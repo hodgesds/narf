@@ -2595,8 +2595,10 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     // remembers to run: the apply pass in `boot.S` keys on the table's magic
     // and silently skips a slide when it is absent, so a forgotten patch would
     // not fail the build or the boot — it would just quietly disable KASLR.
-    // Only x86_64 carries the table today.
-    if matches!(args.arch, Arch::X86_64) {
+    // Both kernel arches carry a table now. aarch64's is much smaller: under
+    // `code-model=small` the only class a slide touches is R_AARCH64_ABS64,
+    // because every other absolute reference is a PC-relative ADRP+ADD pair.
+    if matches!(args.arch, Arch::X86_64 | Arch::Aarch64) {
         let elf = out.join(&args.package);
         if elf.is_file() {
             let table = relocs::patch(&elf).with_context(|| {

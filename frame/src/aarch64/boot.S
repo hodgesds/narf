@@ -57,6 +57,97 @@ _start:
     add  x0, x0, #:lo12:stack_top
     mov  sp, x0
 
+    /* ── KASLR: pick a slide and apply the relocation table ─────────────
+     *
+     * Runs here, with the MMU off and `.boot` executing at its load address,
+     * because every site the table names is a PHYSICAL address and every
+     * value it patches is a kernel-half VA that nothing may dereference until
+     * it has been fixed up.
+     *
+     * x20 holds the slide from here to the page-table build. x19 already holds
+     * the DTB pointer and must survive.
+     *
+     * Entropy: RNDR (FEAT_RNG, CPUID ID_AA64ISAR0_EL1.RNDR != 0) when the CPU
+     * has it, the virtual counter otherwise. CNTVCT alone is boot-time jitter,
+     * which `kaslr.rs` already documents as acceptable for slot picking and is
+     * what the x86_64 stub falls back to as well.
+     */
+    mov  x20, #0                        /* slide, filled in below */
+
+    ldr  x0, =KASLR_SLIDE_MASK
+    cbz  x0, .Lkaslr_done               /* mask 0 -> KASLR disabled */
+
+    /* A pinned slide skips entropy entirely; it still passes through the mask
+     * and alignment below, so it cannot escape the window. */
+    ldr  x1, =KASLR_SLIDE_FIXED
+    cbnz x1, .Lkaslr_have
+
+    /* ID_AA64ISAR0_EL1.RNDR is bits [63:60]. */
+    mrs  x1, id_aa64isar0_el1
+    lsr  x1, x1, #60
+    cbz  x1, .Lkaslr_tsc
+    mrs  x1, s3_3_c2_c4_0               /* RNDR */
+    cbnz x1, .Lkaslr_have               /* RNDR reads 0 on failure */
+.Lkaslr_tsc:
+    mrs  x1, cntvct_el0
+
+.Lkaslr_have:
+    and  x1, x1, x0                     /* clamp to the window  */
+    and  x1, x1, #0xFFFFFFFFFFE00000    /* 2 MiB align          */
+    mov  x20, x1
+    cbz  x20, .Lkaslr_done              /* drew zero: nothing to apply */
+
+    /* Record it for the Rust conversions (`kaslr::KERNEL_SLIDE`). */
+    ldr  x0, =__kernel_slide_phys
+    str  x20, [x0]
+
+    /* Apply the table. Header: magic, n_abs64, n_abs32s, n_pcrel32,
+     * n_abs64_low, then the site lists as u32 offsets.
+     *
+     * Both aarch64 lists are 64-bit absolute fields and both resolve to
+     * PHYSICAL addresses: image `phys == VA - KERNEL_VIRT_BASE`, so a
+     * kernel-half site stored relative to the base IS its physical address,
+     * and a low-half site is physical already. One loop covers both.
+     * `abs32s` and `pcrel32` are x86_64 classes and are always 0 here.
+     */
+    ldr  x0, =__kaslr_relocs_phys
+    ldr  w1, [x0]
+    mov  w2, #0x534C                    /* "KASL" = 0x4B41534C */
+    movk w2, #0x4B41, lsl #16
+    cmp  w1, w2
+    b.ne .Lkaslr_done                   /* never patched — skip the slide */
+
+    ldr  w3, [x0, #4]                   /* n_abs64                     */
+    ldr  w4, [x0, #16]                  /* n_abs64_low                 */
+    add  x3, x3, x4                     /* both lists, one loop        */
+    add  x5, x0, #20                    /* -> first site offset        */
+
+    /* The abs32s/pcrel32 lists sit between abs64 and abs64_low in the
+     * encoding, and are empty on aarch64 — asserted rather than assumed,
+     * because a nonzero count would make the second list start elsewhere. */
+    ldr  w6, [x0, #8]
+    ldr  w7, [x0, #12]
+    orr  w6, w6, w7
+    cbnz w6, .Lkaslr_bad
+
+.Lkaslr_apply:
+    cbz  x3, .Lkaslr_done
+    ldr  w6, [x5], #4                   /* site offset == physical addr */
+    ldr  x7, [x6]
+    add  x7, x7, x20
+    str  x7, [x6]
+    sub  x3, x3, #1
+    b    .Lkaslr_apply
+
+.Lkaslr_bad:
+    /* An x86_64-only list is populated: the encoding is not what this pass
+     * expects and the site offsets cannot be trusted. Hang rather than patch
+     * the wrong words -- there is no console this early. */
+    wfi
+    b    .Lkaslr_bad
+
+.Lkaslr_done:
+
     /* --- Build temporary 4-level page tables ---
      * lo_L0 -> lo_L1 -> Blocks
      * hi_L0 -> hi_L1 -> Blocks
@@ -66,7 +157,7 @@ _start:
     mov  x1, #0
 1:  str  xzr, [x0, x1]
     add  x1, x1, #8
-    cmp  x1, #(4096 * 6)    /* lo_L0, lo_L1, hi_L0, hi_L1, l2_lo_1, l2_hi_1 */
+    cmp  x1, #(4096 * 8)    /* + l1_img, l2_img for the image window */
     b.ne 1b
 
     /* lo_L0[0] -> lo_L1 */
@@ -172,10 +263,15 @@ _start:
     orr  x0, x0, #0x3           /* valid + table descriptor */
     str  x0, [x3, #(1 * 8)]
 
+    /* The linear map gets NO executable range. The image executes from its own
+     * window (built below), so passing the kernel-text extent here would leave
+     * a second executable alias of it — exactly the W^X hole the x86_64 side
+     * closed by shrinking its window to the image. An empty range (x1 == x2)
+     * makes every block PXN|UXN. */
     adrp x0, l2_hi_1
     add  x0, x0, #:lo12:l2_hi_1
-    ldr  x1, =__kernel_start
-    ldr  x2, =__text_end_phys
+    mov  x1, #0
+    mov  x2, #0
     bl   build_ram_l2
     adrp x3, l1_hi
     add  x3, x3, #:lo12:l1_hi
@@ -183,6 +279,40 @@ _start:
     add  x0, x0, #:lo12:l2_hi_1
     orr  x0, x0, #0x3
     str  x0, [x3, #(1 * 8)]
+
+    /* ── The kernel image's own window ──────────────────────────────────
+     *
+     * VA = phys + KIMAGE_VOFFSET + slide, which is where the image is linked
+     * and (after the apply pass above) where every absolute address in it now
+     * points. `KIMAGE_VOFFSET` is 1 GiB aligned, so VA and phys share 2 MiB
+     * alignment and a block mapping places the image exactly.
+     *
+     * hi_L0[510] -> l1_img -> l2_img, and l2_img[ (slide>>21) + i ] maps
+     * phys 0x4000_0000 + i*2MiB. The module window lives at l2_img[448..] and
+     * is populated later by `module_text`; the linker ASSERTs that the image
+     * plus the widest slide cannot reach it.
+     */
+    adrp x0, l0_hi
+    add  x0, x0, #:lo12:l0_hi
+    adrp x1, l1_img
+    add  x1, x1, #:lo12:l1_img
+    orr  x1, x1, #0x3
+    str  x1, [x0, #(510 * 8)]
+
+    adrp x0, l1_img
+    add  x0, x0, #:lo12:l1_img
+    adrp x1, l2_img
+    add  x1, x1, #:lo12:l2_img
+    orr  x1, x1, #0x3
+    str  x1, [x0, #(511 * 8)]
+
+    adrp x0, l2_img
+    add  x0, x0, #:lo12:l2_img
+    ldr  x1, =__kernel_start        /* exec range: kernel text, physical */
+    ldr  x2, =__text_end_phys
+    ldr  x4, =__kernel_end          /* image end, physical                */
+    mov  x3, x20                    /* slide                             */
+    bl   build_image_l2
 
     dsb sy
 
@@ -260,7 +390,25 @@ _start_rust_entry:
     mov x0, #0xfeed
     movk x0, #0xd00d, lsl #16
     mov x1, x19
-    bl  _start_rust
+    /* Indirect through a literal, not `bl _start_rust`.
+     *
+     * `.boot` is linked low (KERNEL_LOAD_BASE) and `_start_rust` is in the
+     * kernel half, so a direct `bl` is ~512 GiB out of CALL26's +/-128 MiB
+     * range and LLD silently inserts a range-extension thunk:
+     *
+     *     ldr x16, [pc+8] ; br x16 ; .quad _start_rust
+     *
+     * That `.quad` holds a kernel-half address and carries NO relocation
+     * record -- LLD resolves it at link time, so `--emit-relocs` reports
+     * nothing and a KASLR slide cannot see it. The x86_64 GOT is invisible
+     * for exactly this reason and needs its own fixup pass; here the whole
+     * problem is avoidable. A literal loaded with `ldr =` gets a real
+     * R_AARCH64_ABS64 record, which the relocation table already carries.
+     *
+     * x16 is IP0, the register a veneer is allowed to clobber, and x0/x1 hold
+     * the arguments. */
+    ldr x16, =_start_rust
+    blr x16
 
 1:  wfi
     b 1b
@@ -276,6 +424,44 @@ _start_rust_entry:
  *
  * Clobbers x3-x7. Runs pre-MMU at a low PA, so it must stay in `.boot`.
  */
+/* Fill `l2_img` for the kernel image.
+ *
+ * x0 = &l2_img, x1 = exec_start (phys), x2 = exec_end (phys),
+ * x3 = slide, x4 = image end (phys).
+ *
+ * Entry index is `(slide >> 21) + i` and the output PA is
+ * `0x4000_0000 + i*2MiB`, for i covering 0x4000_0000 .. page_up_2M(x4). The
+ * image starts at `KERNEL_LOAD_BASE` (0x4008_0000), part-way into the first
+ * block, so that block is mapped too — it also holds `.boot`, which is
+ * harmless here: this window is never used to execute `.boot`, and the block
+ * is PXN|UXN unless it overlaps kernel text.
+ */
+build_image_l2:
+    lsr  x3, x3, #21            /* slide in 2 MiB units -> index offset */
+    mov  x5, #0                 /* i */
+    movz x6, #0x4000, lsl #16   /* pa = 0x4000_0000 */
+1:
+    mov  x7, #0x401             /* valid block | AttrIndx=0 (Normal) | AF */
+    add  x8, x6, #0x200000      /* pa_end */
+    /* Overlap with the exec range iff pa < exec_end && exec_start < pa_end. */
+    cmp  x6, x2
+    b.hs 2f
+    cmp  x1, x8
+    b.lo 3f
+2:
+    mov  x9, #0x60
+    orr  x7, x7, x9, lsl #48    /* PXN (53) | UXN (54) */
+3:
+    orr  x7, x7, x6             /* | output PA */
+    add  x9, x5, x3             /* entry index = i + (slide >> 21) */
+    str  x7, [x0, x9, lsl #3]
+    mov  x6, x8
+    add  x5, x5, #1
+    /* Continue while pa < image end. */
+    cmp  x6, x4
+    b.lo 1b
+    ret
+
 build_ram_l2:
     mov  x3, #0                 /* i */
     movz x4, #0x4000, lsl #16   /* pa = 0x4000_0000 */
@@ -314,6 +500,14 @@ l1_hi:
 l2_lo_1:
     .skip 4096
 l2_hi_1:
+    .skip 4096
+/* The kernel image's own window, at L0[510]/L1[511]. Separate from the linear
+ * map above so the image can slide without rewriting entries that map
+ * unrelated physical addresses. The module window shares this L1 slot at
+ * L2[448..]; the image sits at L2[0..] plus its slide. */
+l1_img:
+    .skip 4096
+l2_img:
     .skip 4096
 
 .align 4

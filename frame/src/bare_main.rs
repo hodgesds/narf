@@ -1361,14 +1361,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
             // Bring the frame allocator online. Exclude the kernel image
             // itself so we don't hand out our own code/data as free frames.
-            // SAFETY: __kernel_start / __kernel_end are linker-provided
-            // symbols bounding the loaded image in physical memory.
-            extern "C" {
-                static __kernel_start: u8;
-                static __kernel_end: u8;
-            }
-            let kstart = core::ptr::addr_of!(__kernel_start) as u64;
-            let kend = core::ptr::addr_of!(__kernel_end) as u64;
+            // Physical bounds from the linker-populated high-half word, not
+            // from the addresses of `__kernel_start` / `__kernel_end`: those
+            // symbols hold physical values, and referencing them from
+            // kernel-half code needs a PC-relative page reference across
+            // ~512 GiB, which aarch64 ADRP cannot make.
+            let (kstart, kend) = narf_memory::kaslr::image_phys_bounds();
 
             let regions: alloc::vec::Vec<narf_memory::UsableRegion> = info
                 .memory_map
@@ -1584,6 +1582,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: direct map at PML4[{}] ({:#018x})",
                             narf_memory::direct_map_base() >> 39 & 0x1FF,
                             narf_memory::direct_map_base()
+                        );
+                        // Same reasoning for the image itself: a zero slide
+                        // and a slide that was computed but never applied
+                        // look identical in a boot log, and a slide-dependent
+                        // bug is unbisectable without knowing the value.
+                        let _ = writeln!(
+                            console::Writer,
+                            "  mmu: kernel image slide {:#x}, base {:#018x}",
+                            narf_memory::kaslr::KERNEL_SLIDE
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                            narf_memory::kaslr::kernel_virt_base()
                         );
                         // Supervisor stores ignore the read-only bit unless
                         // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S

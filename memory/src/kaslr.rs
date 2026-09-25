@@ -69,15 +69,64 @@ pub static KERNEL_SLIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Base the kernel image is linked at, before any slide.
 pub const KERNEL_LINK_BASE: u64 = if cfg!(target_arch = "aarch64") {
-    0xFFFF_FF80_0000_0000
+    // `KIMAGE_VOFFSET` in `build/linker/aarch64.ld`, NOT `KERNEL_VIRT_BASE`.
+    //
+    // The image has its own virtual offset, separate from the linear map at
+    // `KERNEL_VIRT_BASE`, so that it can slide without disturbing the map of
+    // RAM. `phys = va - KERNEL_LINK_BASE` for an in-image address on both
+    // arches; on aarch64 the linear map's conversion is the different one
+    // (`PhysAddr::kernel_ptr`, `phys | KERNEL_PHYS_OFFSET`).
+    //
+    // Linux keeps the same two: `kimage_voffset` for `__pa_symbol()` and
+    // `PAGE_OFFSET` for the linear map, with `__virt_to_phys` dispatching on
+    // which range an address is in.
+    0xFFFF_FF7F_8000_0000
 } else {
     0xFFFF_FFFF_8000_0000
 };
+
+/// VA span reserved for the kernel image, and the offset at which the module
+/// text window begins.
+///
+/// Linux spells the same relationship
+/// `MODULES_VADDR = __START_KERNEL_map + KERNEL_IMAGE_SIZE`
+/// (arch/x86/include/asm/pgtable_64_types.h), and bounds its own slide by it.
+/// `module_text::MODULE_VA_BASE` is derived from this rather than written out
+/// as an address, and `build/linker/x86_64.ld` asserts at link time that
+/// `__kernel_end + KASLR_SLIDE_MASK` fits inside it — the image plus its
+/// widest slide must not reach the module window.
+///
+/// x86_64 only: on aarch64 the module window sits *below* the kernel base
+/// rather than above the image, so no such span exists. See the placement
+/// rationale on `MODULE_VA_BASE`.
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_IMAGE_SIZE: u64 = 1 << 30;
 
 /// The kernel image's live virtual base — link base plus the applied slide.
 #[inline]
 pub fn kernel_virt_base() -> u64 {
     KERNEL_LINK_BASE + KERNEL_SLIDE.load(Ordering::Relaxed)
+}
+
+/// Physical bounds of the loaded image: `[start, end)`.
+///
+/// Reads a high-half word the linker populated, NOT the addresses of
+/// `__kernel_start` / `__kernel_end`. Those symbols hold physical values
+/// because `.boot` is linked low, and taking their address from kernel-half
+/// code emits a PC-relative page reference across ~512 GiB — beyond aarch64
+/// ADRP's range, which is what forces `code-model=large` there. Linux keeps
+/// the same information in a runtime word (`kimage_voffset`) for the same
+/// reason; the linker can fill this one in directly.
+///
+/// See `.kernel_bounds` in `build/linker/*.ld`.
+#[inline]
+pub fn image_phys_bounds() -> (u64, u64) {
+    unsafe extern "C" {
+        static __kernel_phys_bounds: [u64; 2];
+    }
+    // SAFETY: two linker-populated words inside the image, read-only.
+    let b = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() };
+    (b[0], b[1])
 }
 
 /// Physical address of an in-image kernel-virtual address.
@@ -108,21 +157,20 @@ mod kaslr_slide_tests {
             // `KASLR_SLIDE_MASK` is 0 in the linker script, so the machinery
             // is built and exercised but deliberately inert.
             //
-            // Enabling it boots and runs most of the suite, but regresses
-            // `drivers/storage/nvme-e2e`, so the mask stays at 0 until that is
-            // understood. A Skip rather than a Pass on purpose: an inert KASLR
-            // must not read as a working one.
+            // A Skip rather than a Pass on purpose: an inert KASLR must not
+            // read as a working one.
             return TestResult::Skip("KASLR_SLIDE_MASK is 0 — the image is not slid");
         }
         // 2 MiB pages back the window, so anything finer cannot be mapped.
         if slide & 0x1F_FFFF != 0 {
             return TestResult::Fail("the slide is not 2 MiB aligned");
         }
-        // Must stay clear of the module text window one GiB above the link
-        // base, or the image lands on top of it.
-        if slide >= (1 << 30) {
-            return TestResult::Fail("the slide reaches the module text window");
-        }
+        // Where the slide must stop is the module window, and
+        // `smoke_kaslr_slid_image_clears_module_window` asserts exactly that
+        // against `MODULE_VA_BASE`. This used to hardcode `>= 1 GiB` and call
+        // it "the module text window one GiB above the link base", which is
+        // true on x86_64 and only coincidentally true on aarch64, where the
+        // window sits at a different offset and the slack is 825 MiB.
 
         // The live base has to match where code actually is. Taking the
         // address of a function goes through a relocation, so this compares
@@ -134,16 +182,101 @@ mod kaslr_slide_tests {
         if here < KERNEL_LINK_BASE + slide {
             return TestResult::Fail("code address disagrees with the recorded slide");
         }
-        // And the conversion has to undo it: a text address minus the live
-        // base is a physical address inside the 1 GiB window.
-        if image_virt_to_phys(here) >= (1 << 30) {
-            return TestResult::Fail(
-                "image_virt_to_phys produced an out-of-window physical address",
-            );
+        // And the conversion has to undo it: a text address minus the live base
+        // is a physical address inside the loaded image.
+        //
+        // Containment, not an absolute bound. This read `>= (1 << 30)`, which
+        // is an x86_64 assumption: `KERNEL_LOAD_BASE` is 16 MiB there but
+        // 0x40080000 on aarch64, where RAM *starts* at 1 GiB, so a perfectly
+        // correct conversion tripped it. It stayed hidden because the case
+        // Skips while `KASLR_SLIDE_MASK` is 0, and aarch64's was — enabling
+        // the slide is what first ran this line. The same absolute bound had
+        // already been fixed once, in `smoke_kaslr_image_bounds_stay_physical`.
+        let phys = image_virt_to_phys(here);
+        let (kstart, kend) = image_phys_bounds();
+        if phys < kstart || phys >= kend {
+            return TestResult::Fail("image_virt_to_phys did not land inside the loaded image");
         }
         TestResult::Pass
     }
     kernel_test_in!("memory/kaslr", smoke_kaslr_kernel_image_is_slid);
+
+    /// The image-bounding linker symbols are PHYSICAL and must not be slid.
+    ///
+    /// `__kernel_start` and `__kernel_end` are defined outside the virtual
+    /// window (before `. += KERNEL_VIRT_BASE`, and as `. - KERNEL_VIRT_BASE`
+    /// respectively), so they already hold physical addresses. The linker
+    /// nonetheless emits them with a real section index rather than
+    /// `SHN_ABS`, which makes them indistinguishable from ordinary pointers
+    /// to a relocation-table builder that keys only on the field's location.
+    ///
+    /// Adding the slide to them is silent and catastrophic. It moved the
+    /// frame allocator's reserved range to `[start + slide, end + slide)`,
+    /// leaving the image's first `slide` bytes free for the buddy to hand
+    /// out — the kernel allocating its own code as scratch — and it pushed
+    /// `kernel_exec_phys_range`'s start past the real start of text, mapping
+    /// that text NX so instruction fetch faulted inside the fault handler.
+    ///
+    /// Neither shows up as a wrong slide, so the sibling test above passes
+    /// throughout. The invariant that does catch it is containment: text lies
+    /// inside the image, in physical terms, at every slide.
+    fn smoke_kaslr_image_bounds_stay_physical() -> TestResult {
+        unsafe extern "C" {
+            static __text_start: u8;
+            static __text_end: u8;
+        }
+        let (kstart, kend) = image_phys_bounds();
+        // These two are virtual and SHOULD move, so convert them.
+        let tstart = image_virt_to_phys(core::ptr::addr_of!(__text_start) as u64);
+        let tend = image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
+
+        // A size bound, not an address bound. `KERNEL_LOAD_BASE` is 16 MiB on
+        // x86_64 but 0x40080000 on aarch64, where RAM starts at 1 GiB, so
+        // "under 1 GiB" is an x86 assumption and not an invariant. The size is
+        // one on both.
+        if kend <= kstart || kend - kstart > (1 << 30) {
+            return TestResult::Fail("image bounds are not a sane physical range");
+        }
+        if tstart < kstart {
+            return TestResult::Fail(
+                "kernel text starts below __kernel_start — a physical linker symbol was slid",
+            );
+        }
+        if tend > kend {
+            return TestResult::Fail(
+                "kernel text ends above __kernel_end — a physical linker symbol was slid",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/kaslr", smoke_kaslr_image_bounds_stay_physical);
+
+    /// The slid image must stay clear of the module text window.
+    ///
+    /// The slide moves the image *up*, toward `MODULE_VA_BASE`, so the window
+    /// is what bounds it. `build/linker/x86_64.ld` asserts the same thing at
+    /// link time against `KASLR_SLIDE_MASK`, which is the stronger check
+    /// because it covers every slide the mask can produce rather than the one
+    /// this boot drew. This case covers what that cannot: that the slide
+    /// actually applied is inside the mask, i.e. that `boot.S` masked it.
+    ///
+    /// Overlap here would not fault. The image would quietly share addresses
+    /// with module text, and the first module load would corrupt the kernel.
+    fn smoke_kaslr_slid_image_clears_module_window() -> TestResult {
+        // Physical, and deliberately not converted — see
+        // `smoke_kaslr_image_bounds_stay_physical`.
+        let image_end_phys = image_phys_bounds().1;
+        let top = kernel_virt_base().wrapping_add(image_end_phys);
+        if top > crate::module_text::MODULE_VA_BASE {
+            return TestResult::Fail("the slid kernel image reaches the module text window");
+        }
+        #[cfg(target_arch = "x86_64")]
+        if KERNEL_SLIDE.load(Ordering::Relaxed) + image_end_phys > KERNEL_IMAGE_SIZE {
+            return TestResult::Fail("slide + image exceeds KERNEL_IMAGE_SIZE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/kaslr", smoke_kaslr_slid_image_clears_module_window);
 }
 
 /// Pull one 64-bit value of randomness using the best available source.
@@ -182,8 +315,16 @@ pub fn user_mmap_slot(base: u64) -> u64 {
     base + (r & mask)
 }
 
-/// Pick a kernel-image slide. Caller adds this to the fixed kernel-half
-/// base before installing the page tables.
+/// Pick a *candidate* kernel-image slide by drawing fresh entropy.
+///
+/// NOT an accessor for the slide in force — read [`KERNEL_SLIDE`] for that.
+/// Every call returns a different number, so using this where the applied
+/// slide was meant yields a plausible-looking wrong answer rather than an
+/// error; it has already done so once, in the boot log.
+///
+/// `boot.S` picks the live slide itself, long before Rust runs, because the
+/// relocations must be applied before any slid address is dereferenced. That
+/// leaves this function with no caller on the boot path.
 #[inline]
 pub fn kernel_slide() -> u64 {
     let (r, _) = random_u64();
