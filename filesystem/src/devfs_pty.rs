@@ -600,6 +600,19 @@ pub struct Pty {
     /// (Linux: `tty->link->read_buf` from the slave's perspective)
     pub(crate) slave_tx_to_master: ByteRing<4096>,
 
+    /// Durable readiness for the MASTER endpoint (readable ⇔ `slave_tx_to_master`
+    /// has deliverable bytes). Set after every queue/state mutation so a parked
+    /// master poll/epoll/read (a terminal emulator's event loop) wakes on the
+    /// exact edge. Before this the PTY exposed no cell, so a blocked peer only
+    /// re-checked when unrelated activity nudged the global readiness generation.
+    pub(crate) master_readiness: narf_lib::readiness::Readiness,
+
+    /// Durable readiness for the SLAVE endpoint (readable ⇔ `input` has a
+    /// completed line / raw bytes / latched EOF). The missing wake here is why a
+    /// shell under konsole never saw a typed line until something else nudged the
+    /// generation — pressing Enter appeared to do nothing.
+    pub(crate) slave_readiness: narf_lib::readiness::Readiness,
+
     /// Non-canonical read timing (VMIN/VTIME). Linux keeps the equivalent
     /// on the stack of `n_tty_read`, which blocks; NARF's reads are
     /// poll-and-retry, so the deadline has to outlive one attempt.
@@ -745,6 +758,66 @@ impl Pty {
     pub(crate) fn hung_up(&self) -> bool {
         self.slave_ever_opened.load(Ordering::Acquire)
             && self.slave_opens.load(Ordering::Acquire) == 0
+    }
+
+    /// Level readiness of the MASTER endpoint — the single source of truth for
+    /// both `PtyMaster::poll_readiness` and [`Self::sync_master_readiness`], so
+    /// the durable cell can never disagree with the poll mask (a disagreement
+    /// spins an event loop on a POLLIN that yields no byte). Mirrors Linux
+    /// `n_tty_poll` on the master side. Takes the input lock briefly; callers
+    /// must NOT already hold it.
+    pub(crate) fn master_poll_mask(&self) -> u32 {
+        let mut mask = crate::POLL_OUT;
+        let stopped = self.input.lock().stopped;
+        if !stopped && self.slave_tx_to_master.len() > 0 {
+            mask |= crate::POLL_IN;
+        }
+        if self.packet.load(Ordering::Acquire) && self.pktstatus.load(Ordering::Acquire) != 0 {
+            mask |= crate::POLL_IN | crate::POLL_PRI;
+        }
+        if self.hung_up() {
+            mask |= crate::POLL_HUP;
+        }
+        mask
+    }
+
+    /// Level readiness of the SLAVE endpoint — shared by `PtySlave::poll_readiness`
+    /// and [`Self::sync_slave_readiness`]. Takes the input lock; callers must NOT
+    /// already hold it.
+    pub(crate) fn slave_poll_mask(&self) -> u32 {
+        let mut mask = crate::POLL_OUT;
+        if self.input.lock().readable() > 0 {
+            mask |= crate::POLL_IN;
+        }
+        if self.master_closed.load(Ordering::Acquire) {
+            mask |= crate::POLL_HUP;
+        }
+        mask
+    }
+
+    /// Every readiness bit the two PTY endpoints ever assert — the clear-mask
+    /// complement so [`narf_lib::readiness::Readiness::set`] tracks the current
+    /// level exactly and fires waiters on the rising edge.
+    const PTY_READY_BITS: u32 =
+        crate::POLL_IN | crate::POLL_OUT | crate::POLL_ERR | crate::POLL_HUP | crate::POLL_PRI;
+
+    /// Reconcile the master cell to the current level and wake any master
+    /// poll/epoll/read waiter whose interest just went ready. Call after any
+    /// mutation that can change what the master can read (a slave write, the
+    /// line discipline's echo of a master write, a slave close). Must be called
+    /// with the input lock released.
+    pub(crate) fn sync_master_readiness(&self) {
+        let m = self.master_poll_mask();
+        self.master_readiness.set(m, Self::PTY_READY_BITS & !m);
+    }
+
+    /// Reconcile the slave cell and wake a parked slave reader/poller (the
+    /// shell) when a completed line, raw byte, EOF or hangup arrives. Call after
+    /// a master write feeds the line discipline, a slave read drains input, or
+    /// the master closes. Must be called with the input lock released.
+    pub(crate) fn sync_slave_readiness(&self) {
+        let m = self.slave_poll_mask();
+        self.slave_readiness.set(m, Self::PTY_READY_BITS & !m);
     }
 
     /// Decide whether a non-canonical read may return, per the VMIN/VTIME
@@ -969,21 +1042,28 @@ impl Pty {
         }
         let t = *self.termios.lock();
         let mut sigs: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        let mut echo_raw: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         {
             let mut state = self.input.lock();
-            crate::ntty::feed_byte(
-                &mut state,
-                &t,
-                b,
-                &mut |c| self.slave_tx_to_master.push(&[c]),
-                &mut |bb| match signal_for_cc(&t, bb) {
+            crate::ntty::feed_byte(&mut state, &t, b, &mut |c| echo_raw.push(c), &mut |bb| {
+                match signal_for_cc(&t, bb) {
                     Some(sig) => {
                         sigs.push(sig);
                         true
                     }
                     None => false,
-                },
-            );
+                }
+            });
+        }
+        if !echo_raw.is_empty() {
+            // OPOST the echo, as the master write path does (Linux __process_echoes).
+            let mut processed: alloc::vec::Vec<u8> =
+                alloc::vec::Vec::with_capacity(echo_raw.len() + 8);
+            {
+                let mut out = self.output.lock();
+                crate::ntty::process_output(&mut out, &t, &echo_raw, &mut |b| processed.push(b));
+            }
+            self.slave_tx_to_master.push(&processed);
         }
         if !sigs.is_empty() {
             let pgrp = self.ctrl.lock().fg_pgrp;
@@ -991,6 +1071,8 @@ impl Pty {
                 pty_deliver_signal(pgrp, sig);
             }
         }
+        // The injected byte may have completed a line for the slave reader.
+        self.sync_slave_readiness();
         Ok(0)
     }
 
@@ -1006,6 +1088,9 @@ impl Pty {
         self.master_closed.store(true, Ordering::Release);
         self.slave_opens.store(0, Ordering::Release);
         self.slave_ever_opened.store(true, Ordering::Release);
+        // Both ends just hung up — wake their parked readers/pollers.
+        self.sync_slave_readiness();
+        self.sync_master_readiness();
         Ok(0)
     }
 
@@ -1054,6 +1139,10 @@ impl Pty {
         } else {
             self.raise_pkt(TIOCPKT_START, TIOCPKT_STOP);
         }
+        // `stopped` gates the master's readable output; a packet-mode status
+        // byte is itself readable — reconcile so a TCXONC/^S/^Q transition wakes
+        // the master.
+        self.sync_master_readiness();
     }
 
     /// Note a termios change for packet mode.
@@ -1229,6 +1318,8 @@ impl Pty {
                 raw: [0u8; TERMIOS_WIRE_LEN],
             }),
             slave_tx_to_master: ByteRing::new(),
+            master_readiness: narf_lib::readiness::Readiness::new(crate::POLL_OUT),
+            slave_readiness: narf_lib::readiness::Readiness::new(crate::POLL_OUT),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
             ctrl: IrqSafeSpinLock::new(PtyControl::default()),
@@ -1978,6 +2069,9 @@ impl Drop for PtyMaster {
         // peer AND `tty_vhangup`s it, so a slave still reading must now see
         // end-of-file rather than wait for a writer that can never return.
         self.pty.master_closed.store(true, Ordering::Release);
+        // Wake a slave parked in read/poll so it sees the EOF/HUP now instead of
+        // waiting for a writer that can never return.
+        self.pty.sync_slave_readiness();
         ptmx_close(self.pty.index);
     }
 }
@@ -2052,6 +2146,9 @@ impl FileOps for PtyMaster {
         if n == 0 {
             return Box::pin(async move { Err(FsError::WouldBlock) });
         }
+        // Draining may have emptied the queue — clear the cell's POLL_IN so the
+        // next slave write is a rising edge that actually wakes this reader.
+        self.pty.sync_master_readiness();
         Box::pin(async move { Ok(n) })
     }
 
@@ -2068,24 +2165,35 @@ impl FileOps for PtyMaster {
         // IXON transitions driven by a typed ^S/^Q become START/STOP control
         // packets, the `pty_start`/`pty_stop` handlers' job in Linux.
         let was_stopped = self.pty.input.lock().stopped;
+        // Collect the line discipline's echo bytes RAW, then flush them through
+        // OPOST below — Linux buffers echo (`add_echo_byte`) and later runs it
+        // through `do_output_char` in `__process_echoes` when `O_OPOST`, which is
+        // what turns an echoed `\n` into CR-LF (and expands tabs, etc.). Echoing
+        // raw here is what "staircased" konsole. Deferring OPOST also keeps the
+        // input lock and the output lock from nesting.
+        let mut echo_raw: Vec<u8> = Vec::new();
         {
             let pty = &*self.pty;
             let mut state = pty.input.lock();
             for &b in buf {
-                crate::ntty::feed_byte(
-                    &mut state,
-                    &t,
-                    b,
-                    &mut |c| pty.slave_tx_to_master.push(&[c]),
-                    &mut |bb| match signal_for_cc(&t, bb) {
+                crate::ntty::feed_byte(&mut state, &t, b, &mut |c| echo_raw.push(c), &mut |bb| {
+                    match signal_for_cc(&t, bb) {
                         Some(sig) => {
                             sigs.push(sig);
                             true
                         }
                         None => false,
-                    },
-                );
+                    }
+                });
             }
+        }
+        if !echo_raw.is_empty() {
+            let mut processed: Vec<u8> = Vec::with_capacity(echo_raw.len() + 8);
+            {
+                let mut out = self.pty.output.lock();
+                crate::ntty::process_output(&mut out, &t, &echo_raw, &mut |b| processed.push(b));
+            }
+            self.pty.slave_tx_to_master.push(&processed);
         }
         let now_stopped = self.pty.input.lock().stopped;
         if now_stopped != was_stopped {
@@ -2097,6 +2205,11 @@ impl FileOps for PtyMaster {
                 pty_deliver_signal(pgrp, sig);
             }
         }
+        // Wake both peers off the input lock: the line discipline may have
+        // completed a line for the SLAVE reader (this is the Enter/typed-line
+        // wake konsole's shell needs) and echoed bytes to the MASTER reader.
+        self.pty.sync_slave_readiness();
+        self.pty.sync_master_readiness();
         let n = buf.len();
         Box::pin(async move { Ok(n) })
     }
@@ -2382,27 +2495,22 @@ impl FileOps for PtyMaster {
     /// (`pty.c` `set_bit`/`clear_bit` on `tty->link->flags`), which the
     /// open counter reproduces.
     fn poll_readiness(&self) -> u32 {
-        let mut mask = crate::POLL_OUT;
-        // Stopped output is not readable output — the poll mask has to agree
-        // with `read`, or an event loop spins on a POLLIN that never yields
-        // a byte.
-        let stopped = self.pty.input.lock().stopped;
-        if !stopped && self.pty.slave_tx_to_master.len() > 0 {
-            mask |= crate::POLL_IN;
-        }
-        // `n_tty_poll`: `if (tty->ctrl.packet && tty->link->ctrl.pktstatus)
-        // mask |= EPOLLPRI | EPOLLIN | EPOLLRDNORM;` — a control packet is
-        // readable even while output is stopped, which is exactly when a
-        // STOP packet needs to reach the reader.
-        if self.pty.packet.load(Ordering::Acquire)
-            && self.pty.pktstatus.load(Ordering::Acquire) != 0
-        {
-            mask |= crate::POLL_IN | crate::POLL_PRI;
-        }
-        if self.pty.hung_up() {
-            mask |= crate::POLL_HUP;
-        }
-        mask
+        self.pty.master_poll_mask()
+    }
+
+    /// The master's readiness transitions asynchronously (a slave write, the
+    /// echo of a master write, a slave close), so it drives a durable cell and
+    /// declares it — the poll/epoll layer then arms the cell instead of falling
+    /// back to the global-generation re-scan.
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        // Reconcile the lazily-maintained cell for a first observer before it
+        // arms, exactly as the pipe does in `activate_readiness`.
+        self.pty.sync_master_readiness();
+        Some(&self.pty.master_readiness)
     }
 }
 
@@ -2422,6 +2530,11 @@ impl Drop for PtySlave {
     fn drop(&mut self) {
         let prev = self.pty.slave_opens.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0, "PtySlave dropped without a matching open");
+        // Last slave gone → the master is now hung up; wake its parked
+        // read/poll so it gets EIO/HUP instead of blocking forever.
+        if prev == 1 {
+            self.pty.sync_master_readiness();
+        }
     }
 }
 
@@ -2475,6 +2588,9 @@ impl FileOps for PtySlave {
                 return Box::pin(async move { Ok(0) });
             }
             let n = self.pty.input.lock().drain_into(buf);
+            // Draining may have emptied the queue — reconcile so the next master
+            // write is a rising edge that wakes this reader again.
+            self.pty.sync_slave_readiness();
             return Box::pin(async move {
                 if n == 0 {
                     // The caller passed a zero-length buffer.
@@ -2505,6 +2621,9 @@ impl FileOps for PtySlave {
         }
         let n = state.drain_into(buf);
         drop(state);
+        // Reconcile after draining the completed line so a further line arriving
+        // from the master re-fires the edge.
+        self.pty.sync_slave_readiness();
         // `readable() != 0` counts buffered bytes, but ICANON only RELEASES a
         // completed line — an incomplete line, or input consumed as a signal
         // character (^C), drains 0. That is would-block, not end-of-file; the
@@ -2546,6 +2665,8 @@ impl FileOps for PtySlave {
             crate::ntty::process_output(&mut out, &t, buf, &mut |c| processed.push(c));
         }
         self.pty.slave_tx_to_master.push(&processed);
+        // The master (terminal emulator) may be parked reading this output.
+        self.pty.sync_master_readiness();
         // Linux reports the bytes the CALLER supplied, not the expanded
         // count: a `\n` that became CR-NL still consumed one byte of the
         // caller's buffer.
@@ -2762,17 +2883,20 @@ impl FileOps for PtySlave {
     /// readable byte; POLLOUT always. Mirrors the ConsoleFile pattern but
     /// reads from the per-PTY discipline instead of the global input ring.
     fn poll_readiness(&self) -> u32 {
-        let mut mask = crate::POLL_OUT;
-        if self.pty.input.lock().readable() > 0 {
-            mask |= crate::POLL_IN;
-        }
-        // Linux `n_tty_poll`: EPOLLHUP once the peer closed. Without it a
-        // shell sitting in poll/epoll on its tty never learns the terminal
-        // went away and never exits.
-        if self.pty.master_closed.load(Ordering::Acquire) {
-            mask |= crate::POLL_HUP;
-        }
-        mask
+        self.pty.slave_poll_mask()
+    }
+
+    /// The slave's readiness transitions asynchronously (a master write feeding
+    /// the line discipline, or the master closing), so it drives a durable cell.
+    /// This is the wake a shell's blocked `read`/poll relies on to see a line the
+    /// instant Enter completes it, instead of stalling until unrelated activity.
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        self.pty.sync_slave_readiness();
+        Some(&self.pty.slave_readiness)
     }
 
     /// Job control: the slave's tty id is its `/dev/pts/<N>` index.
