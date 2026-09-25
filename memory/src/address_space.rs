@@ -12345,10 +12345,15 @@ fn merged_shape(table: &RegionTable, base: u64) -> Option<(usize, u64, Vec<u64>)
     })
 }
 
-/// A fully materialized destination absorbs a sparse source by plain append:
-/// every source frame's offset from the destination end equals its offset in
-/// the source, and the merged prefix stays shorter than the merged region.
-fn smoke_memory_anon_merge_full_destination_absorbs_sparse_source() -> TestResult {
+/// `coalesce_anonymous_around` declines when the SUCCESSOR is sparse.
+///
+/// A sparse neighbour's `phys` is a materialized prefix shorter than its page
+/// count, and absorbing one makes every later fault and punch in the combined
+/// region pay for the whole merged span — the malloc-scaling collapse the
+/// guard exists to prevent. Each of the three tests below pins one of the
+/// positions the guard inspects, so narrowing it re-breaks a test rather than
+/// only a benchmark.
+fn smoke_memory_anon_merge_skips_sparse_successor() -> TestResult {
     let base = 0x0000_0081_0000_0000u64;
     let table = match coalesce_preserving_placement(
         alloc::vec![
@@ -12357,6 +12362,7 @@ fn smoke_memory_anon_merge_full_destination_absorbs_sparse_source() -> TestResul
                 2,
                 alloc::vec![PhysAddr::new(0x41_000), PhysAddr::new(0x42_000)],
             ),
+            // 3 pages, 1 materialized entry — sparse.
             merge_test_region(base + 0x2000, 3, alloc::vec![PhysAddr::new(0x43_000)]),
         ],
         base + 0x2000,
@@ -12364,80 +12370,20 @@ fn smoke_memory_anon_merge_full_destination_absorbs_sparse_source() -> TestResul
         Ok(table) => table,
         Err(reason) => return TestResult::Fail(reason),
     };
-    if merged_shape(&table, base) != Some((1, 5 * 4096, alloc::vec![0x41_000, 0x42_000, 0x43_000]))
-    {
-        return TestResult::Fail("full destination did not append the sparse source prefix");
+    if merged_shape(&table, base) != Some((2, 2 * 4096, alloc::vec![0x41_000, 0x42_000])) {
+        return TestResult::Fail("a sparse successor was absorbed into the destination");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_full_destination_absorbs_sparse_source
-);
+kernel_test_in!("memory", smoke_memory_anon_merge_skips_sparse_successor);
 
-/// A fully lazy source (empty prefix) merges into a sparse destination
-/// without padding: the destination prefix is untouched and every page the
-/// source contributed stays demand-zero behind it.
-fn smoke_memory_anon_merge_lazy_source_leaves_sparse_destination() -> TestResult {
-    let base = 0x0000_0081_0100_0000u64;
-    let table = match coalesce_preserving_placement(
-        alloc::vec![
-            merge_test_region(base, 3, alloc::vec![PhysAddr::new(0x44_000)]),
-            merge_test_region(base + 0x3000, 2, Vec::new()),
-        ],
-        base + 0x3000,
-    ) {
-        Ok(table) => table,
-        Err(reason) => return TestResult::Fail(reason),
-    };
-    if merged_shape(&table, base) != Some((1, 5 * 4096, alloc::vec![0x44_000])) {
-        return TestResult::Fail("lazy source merge disturbed the sparse destination prefix");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_lazy_source_leaves_sparse_destination
-);
-
-/// A source with resident frames merges into a sparse destination by
-/// zero-padding the destination prefix out to its page count first; the
-/// source frames then land at their original virtual pages past the pad.
-fn smoke_memory_anon_merge_pads_sparse_destination_for_resident_source() -> TestResult {
-    let base = 0x0000_0081_0200_0000u64;
-    let table = match coalesce_preserving_placement(
-        alloc::vec![
-            merge_test_region(base, 3, alloc::vec![PhysAddr::new(0x45_000)]),
-            merge_test_region(
-                base + 0x3000,
-                2,
-                alloc::vec![PhysAddr::new(0x46_000), PhysAddr::new(0x47_000)],
-            ),
-        ],
-        base + 0x3000,
-    ) {
-        Ok(table) => table,
-        Err(reason) => return TestResult::Fail(reason),
-    };
-    if merged_shape(&table, base)
-        != Some((1, 5 * 4096, alloc::vec![0x45_000, 0, 0, 0x46_000, 0x47_000]))
-    {
-        return TestResult::Fail("sparse destination was not zero-padded before the append");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_pads_sparse_destination_for_resident_source
-);
-
-/// The successor direction pads too: a sparse current region absorbing a
-/// materialized successor gains explicit zero slots for its own demand-zero
-/// tail so the successor's frames keep their virtual pages.
-fn smoke_memory_anon_merge_pads_sparse_current_for_resident_successor() -> TestResult {
+/// Same rule with the sparse region as the CURRENT (just-inserted) one, and a
+/// fully materialized successor that would otherwise be absorbed.
+fn smoke_memory_anon_merge_skips_sparse_current() -> TestResult {
     let base = 0x0000_0081_0300_0000u64;
     let table = match coalesce_preserving_placement(
         alloc::vec![
+            // 2 pages, 1 materialized entry — sparse.
             merge_test_region(base, 2, alloc::vec![PhysAddr::new(0x48_000)]),
             merge_test_region(
                 base + 0x2000,
@@ -12450,43 +12396,71 @@ fn smoke_memory_anon_merge_pads_sparse_current_for_resident_successor() -> TestR
         Ok(table) => table,
         Err(reason) => return TestResult::Fail(reason),
     };
-    if merged_shape(&table, base)
-        != Some((1, 4 * 4096, alloc::vec![0x48_000, 0, 0x49_000, 0x4A_000]))
-    {
-        return TestResult::Fail("sparse current region was not zero-padded for its successor");
+    if merged_shape(&table, base) != Some((2, 2 * 4096, alloc::vec![0x48_000])) {
+        return TestResult::Fail("a sparse current region absorbed its successor");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_pads_sparse_current_for_resident_successor
-);
+kernel_test_in!("memory", smoke_memory_anon_merge_skips_sparse_current);
 
-/// Three-way merge where the predecessor absorption grows the destination:
-/// the successor's padding target is the post-growth page count (predecessor
-/// pages + current pages), not the predecessor's original size.
-fn smoke_memory_anon_merge_pads_grown_destination_before_successor() -> TestResult {
+/// Same rule in the PREDECESSOR direction: a dense insert must not be folded
+/// backwards into a sparse predecessor.
+fn smoke_memory_anon_merge_skips_sparse_predecessor() -> TestResult {
     let base = 0x0000_0081_0400_0000u64;
     let table = match coalesce_preserving_placement(
         alloc::vec![
-            merge_test_region(base, 1, alloc::vec![PhysAddr::new(0x4B_000)]),
-            merge_test_region(base + 0x1000, 2, Vec::new()),
-            merge_test_region(base + 0x3000, 1, alloc::vec![PhysAddr::new(0x4C_000)]),
+            // 2 pages, empty prefix — fully lazy, therefore sparse.
+            merge_test_region(base, 2, Vec::new()),
+            merge_test_region(base + 0x2000, 1, alloc::vec![PhysAddr::new(0x4B_000)]),
         ],
-        base + 0x1000,
+        base + 0x2000,
     ) {
         Ok(table) => table,
         Err(reason) => return TestResult::Fail(reason),
     };
-    if merged_shape(&table, base) != Some((1, 4 * 4096, alloc::vec![0x4B_000, 0, 0, 0x4C_000])) {
-        return TestResult::Fail("successor padding ignored the predecessor-merge growth");
+    if merged_shape(&table, base) != Some((2, 2 * 4096, Vec::new())) {
+        return TestResult::Fail("a dense insert was folded into its sparse predecessor");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "memory",
-    smoke_memory_anon_merge_pads_grown_destination_before_successor
-);
+kernel_test_in!("memory", smoke_memory_anon_merge_skips_sparse_predecessor);
+
+/// The win the guard deliberately keeps: neighbours whose prefixes are FULLY
+/// materialized still coalesce, so the region count stays low for touched
+/// mappings. Without this, narrowing `coalesce_anonymous_around` to "never
+/// merge" would pass every test above.
+fn smoke_memory_anon_merge_joins_dense_neighbours() -> TestResult {
+    let base = 0x0000_0081_0500_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(
+                base,
+                2,
+                alloc::vec![PhysAddr::new(0x51_000), PhysAddr::new(0x52_000)],
+            ),
+            merge_test_region(
+                base + 0x2000,
+                2,
+                alloc::vec![PhysAddr::new(0x53_000), PhysAddr::new(0x54_000)],
+            ),
+        ],
+        base + 0x2000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base)
+        != Some((
+            1,
+            4 * 4096,
+            alloc::vec![0x51_000, 0x52_000, 0x53_000, 0x54_000],
+        ))
+    {
+        return TestResult::Fail("fully materialized neighbours no longer coalesce");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_anon_merge_joins_dense_neighbours);
 
 /// Coalescing is best-effort: when the padding reservation cannot be
 /// satisfied (here a sparse destination whose zero-pad would need terabytes),

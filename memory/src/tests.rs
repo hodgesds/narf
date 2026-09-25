@@ -203,9 +203,20 @@ fn smoke_memory_sparse_anonymous_metadata_preserves_offsets() -> TestResult {
     {
         return TestResult::Fail("sparse anonymous setup failed");
     }
+    // Demand-paged neighbours are deliberately NOT coalesced: a sparse `phys`
+    // prefix makes every later fault and punch in a merged run pay for the
+    // whole span (see `coalesce_anonymous_around`). Both reservations stay as
+    // their own region with an untouched empty prefix.
     let reserved = aspace.regions_snapshot();
-    if reserved.len() != 1 || reserved[0].len != 3 * 4096 || !reserved[0].phys.is_empty() {
-        return TestResult::Fail("sparse reservation coalescing materialized its tail");
+    if reserved.len() != 2
+        || reserved[0].base.as_u64() != base
+        || reserved[0].len != 2 * 4096
+        || reserved[1].base.as_u64() != base + 2 * 4096
+        || reserved[1].len != 4096
+        || !reserved[0].phys.is_empty()
+        || !reserved[1].phys.is_empty()
+    {
+        return TestResult::Fail("sparse reservations did not stay separate and lazy");
     }
 
     if aspace
@@ -15862,14 +15873,13 @@ fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
     // VMA is allowed and publishes a SEPARATE heap tail.
     let a = AddressSpace::empty();
     let foreign = VirtAddr::new(0x0000_0000_7000_0000);
-    if a
-        .map_region(Region {
-            base: foreign,
-            len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
-        })
-        .is_err()
+    if a.map_region(Region {
+        base: foreign,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
     {
         return TestResult::Fail("foreign brk-root setup failed");
     }
@@ -15898,9 +15908,9 @@ fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
     let heap_ok = a.lookup(VirtAddr::new(free)).is_some_and(|region| {
         region.base.as_u64() == free && region.perms.contains(RegionPerms::BRK_HEAP)
     });
-    let foreign_ok = a
-        .lookup(foreign)
-        .is_some_and(|region| region.len == 0x1000 && !region.perms.contains(RegionPerms::BRK_HEAP));
+    let foreign_ok = a.lookup(foreign).is_some_and(|region| {
+        region.len == 0x1000 && !region.perms.contains(RegionPerms::BRK_HEAP)
+    });
     if heap_ok && foreign_ok {
         TestResult::Pass
     } else {
