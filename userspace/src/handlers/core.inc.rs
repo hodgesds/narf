@@ -9253,11 +9253,19 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // still served; over-waking a namespace with no waiter is a cheap no-op.
     let key = futex_key(entry.futex_namespace, uaddr);
     futex_bump_counter_key(key);
-    futex_wake_waiters_key(key, u32::MAX);
+    // Wake ONE waiter per namespace — Linux parity and load-bearing for
+    // musl. mm_release fires `do_futex(tidptr, FUTEX_WAKE, 1, ...)`
+    // (kernel/fork.c): musl points CLONE_CHILD_CLEARTID at its GLOBAL
+    // `__thread_list_lock`, so every concurrently-exiting thread parks on
+    // this ONE word and the exit wake is a lock HANDOFF. Waking u32::MAX
+    // here woke every parked sibling per exit (measured ~69/exit in a
+    // 1000-thread exit storm); one won the lock and the rest re-parked —
+    // an O(n²) thundering herd that was ~70% of NARF's per-exit cost.
+    let _ = futex_wake_waiters_key(key, 1);
     if entry.futex_namespace != 0 {
         let shared_key = futex_key(0, uaddr);
         futex_bump_counter_key(shared_key);
-        futex_wake_waiters_key(shared_key, u32::MAX);
+        let _ = futex_wake_waiters_key(shared_key, 1);
     }
 }
 
