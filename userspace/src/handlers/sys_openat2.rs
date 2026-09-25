@@ -83,16 +83,18 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
     // no size is both below 24 and above 4096 — but worth not "tidying"
     // into a single range check, because the two syscalls really do differ
     // and a reader comparing them should see that.
-    if how_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
-        return;
-    }
     if size < OPEN_HOW_SIZE_VER0 {
         ctx.set_return(SyscallReturn::ok(EINVAL as u64));
         return;
     }
     if size > 4096 {
         ctx.set_return(SyscallReturn::ok(E2BIG as u64));
+        return;
+    }
+    // A NULL `how` is only discovered by `copy_struct_from_user`, after the
+    // size checks: -EFAULT, not the -EINVAL this used to answer ahead of them.
+    if how_ptr == 0 {
+        ctx.set_return(SyscallReturn::ok(EFAULT as u64));
         return;
     }
 
@@ -136,6 +138,29 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `do_sys_openat2`: `build_open_flags` (above), then `getname` — so a
+    // bad pathname is -EFAULT / -ENAMETOOLONG / -ENOENT (empty) ahead of
+    // anything the resolve flags or the dirfd could report — then `FD_ADD`
+    // reserves the descriptor (-EMFILE) before `path_init` inspects dirfd.
+    let raw = match copy_user_cstr_checked(args.arg1, 4096) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
+    if raw.is_empty() {
+        use crate::errno::wire::ENOENT;
+        ctx.set_return(SyscallReturn::ok(ENOENT as u64));
+        return;
+    }
+    let task = current_task_id();
+    if !fd::has_free_descriptor(task) {
+        use crate::errno::wire::EMFILE;
+        ctx.set_return(SyscallReturn::ok(EMFILE as u64));
+        return;
+    }
+
     // `RESOLVE_CACHED`: "only complete if it can be done without any
     // blocking operations". NARF's walk drives `poll_blocking` at every
     // component — it has no cached-only mode to fall back to — so it can
@@ -148,8 +173,7 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let task = current_task_id();
-    let scope = match build_scope(task, args.arg0, resolve) {
+    let scope = match build_scope(task, args.arg0, resolve, &raw) {
         Ok(s) => s,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));
@@ -161,25 +185,17 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
     // `follow_dotdot` (`fs/namei.c:2186`) refuses the moment a `..` would
     // leave the scope, so `../dir/file` is rejected even though it lands
     // back inside — and an absolute pathname is rejected outright, because
-    // it is not below the dirfd by construction. A destination-only check
-    // permits both, which is weaker than what the caller asked for.
+    // it is not below the dirfd by construction (`build_scope` already
+    // answered that case, ahead of any dirfd check). A destination-only
+    // check permits both, which is weaker than what the caller asked for.
     //
     // `RESOLVE_IN_ROOT` deliberately does NOT get this: there, `..` at the
     // root clamps to the root rather than escaping, which is the whole
     // difference between the two flags.
-    if scope.beneath {
-        let raw = match copy_user_cstr_checked(args.arg1, 4096) {
-            Ok(p) => p,
-            Err(errno) => {
-                ctx.set_return(SyscallReturn::ok((-errno) as u64));
-                return;
-            }
-        };
-        if lexically_escapes(&raw) {
-            use crate::errno::wire::EXDEV;
-            ctx.set_return(SyscallReturn::ok(EXDEV as u64));
-            return;
-        }
+    if scope.beneath && lexically_escapes(&raw) {
+        use crate::errno::wire::EXDEV;
+        ctx.set_return(SyscallReturn::ok(EXDEV as u64));
+        return;
     }
 
     // `openat2` is an extensible version of `openat`, not of NARF's legacy
@@ -212,7 +228,7 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
 /// first as the boundary the walk may not cross, the second as the "/" it
 /// is measured from. `AT_FDCWD` means the working directory, which is what
 /// `nd->root` is set to for a relative walk.
-fn build_scope(task: u64, dirfd: u64, resolve: u64) -> Result<ResolveScope, i64> {
+fn build_scope(task: u64, dirfd: u64, resolve: u64, path: &str) -> Result<ResolveScope, i64> {
     let mut scope = ResolveScope {
         no_symlinks: resolve & RESOLVE_NO_SYMLINKS != 0,
         no_magiclinks: resolve & RESOLVE_NO_MAGICLINKS != 0,
@@ -224,12 +240,32 @@ fn build_scope(task: u64, dirfd: u64, resolve: u64) -> Result<ResolveScope, i64>
     if !(scope.beneath || scope.in_root) {
         return Ok(scope);
     }
+    // `path_init`: an absolute path starts at the root WITHOUT consulting
+    // dirfd — unless LOOKUP_IN_ROOT, which uses dirfd as that root — and
+    // `nd_jump_root` refuses the jump under LOOKUP_BENEATH with -EXDEV. So
+    // `openat2(bad_fd, "/abs", RESOLVE_BENEATH)` is EXDEV, not EBADF.
+    if path.starts_with('/') && !scope.in_root {
+        use crate::errno::wire::EXDEV;
+        return Err(EXDEV);
+    }
     const AT_FDCWD: i32 = -100;
     let root = if dirfd as u32 as i32 == AT_FDCWD {
         cwd_of(task)
     } else {
-        // A scoped resolution against a descriptor that is not a directory
-        // — or not open at all — has no root to be measured from.
+        // `path_init`'s relative arm: `if (fd_empty(f)) return -EBADF;`
+        // then `if (*s && !d_can_lookup(dentry)) return -ENOTDIR;`. A
+        // regular-file dirfd used to pass here (it has a path), so the
+        // walk then reported something about the path instead.
+        use crate::errno::wire::ENOTDIR;
+        let is_dir = fd::with_table(task, |t| {
+            t.get(dirfd as u32).map(|e| e.ops.as_dir().is_some())
+        })
+        .flatten();
+        match is_dir {
+            None => return Err(EBADF),
+            Some(false) => return Err(ENOTDIR),
+            Some(true) => {}
+        }
         fd_path_for_task(task, dirfd as u32).ok_or(EBADF)?
     };
     scope.root = apply_chroot(&root);
@@ -272,6 +308,13 @@ fn validate_open_how(flags: u64, mode: u64, resolve: u64) -> Result<(), i64> {
         return Err(EINVAL);
     }
 
+    // `if ((how->resolve & RESOLVE_BENEATH) && (how->resolve &
+    // RESOLVE_IN_ROOT)) return -EINVAL;` — "Scoping flags are mutually
+    // exclusive."
+    if resolve & RESOLVE_BENEATH != 0 && resolve & RESOLVE_IN_ROOT != 0 {
+        return Err(EINVAL);
+    }
+
     // "Block bugs where O_DIRECTORY | O_CREAT created regular files."
     if flags & (O_DIRECTORY | O_CREAT) == (O_DIRECTORY | O_CREAT) {
         return Err(EINVAL);
@@ -292,6 +335,14 @@ fn validate_open_how(flags: u64, mode: u64, resolve: u64) -> Result<(), i64> {
     // "O_PATH only permits certain other flags to be set."
     if flags & O_PATH != 0 && flags_checked & !O_PATH_FLAGS != 0 {
         return Err(EINVAL);
+    }
+    // `if (how->resolve & RESOLVE_CACHED) { /* Don't bother even trying for
+    // create/truncate/tmpfile open */ if (flags & (O_TRUNC | O_CREAT |
+    // __O_TMPFILE)) return -EAGAIN; }` — still inside build_open_flags, so
+    // ahead of the pathname copy.
+    if resolve & RESOLVE_CACHED != 0 && flags & (0o1000 | O_CREAT | O_TMPFILE_BIT) != 0 {
+        use crate::errno::wire::EAGAIN;
+        return Err(EAGAIN);
     }
     Ok(())
 }

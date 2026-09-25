@@ -302,7 +302,9 @@ fn rw_hint_set(ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>, hint: u64) 
 pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
-    let cmd = args.arg1;
+    // `SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned
+    // long, arg)`: register bits above the low 32 are not part of `cmd`.
+    let cmd = args.arg1 as u32 as u64;
     let arg = args.arg2;
     let task = current_task_id();
 
@@ -378,6 +380,29 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EBADF));
             return;
         };
+        // `setfl`'s two permission refusals, before anything changes:
+        //
+        //   if (((arg ^ filp->f_flags) & O_APPEND) && IS_APPEND(inode))
+        //           return -EPERM;
+        //   if ((arg & O_NOATIME) && !(filp->f_flags & O_NOATIME))
+        //           if (!inode_owner_or_capable(...)) return -EPERM;
+        //
+        // Without the first, `open(O_APPEND)` + `F_SETFL(0)` stripped the
+        // append-only guarantee `may_open` had just enforced.
+        if (requested ^ old) & crate::fd::O_APPEND != 0
+            && ops.inode_flags() & narf_filesystem::FS_APPEND_FL != 0
+        {
+            ctx.set_return(errno_ret(EPERM));
+            return;
+        }
+        const O_NOATIME: u32 = 0o1000000;
+        if requested & O_NOATIME != 0 && old & O_NOATIME == 0 {
+            let (uid, gid) = ops.owners();
+            if !inode_owner_or_capable(task, uid, gid) {
+                ctx.set_return(errno_ret(EPERM));
+                return;
+            }
+        }
         let mut new_flags = (old & !mask) | (requested & mask);
         let wanted_async = requested & crate::fd::O_ASYNC != 0;
         let had_async = old & crate::fd::O_ASYNC != 0;
@@ -499,6 +524,31 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             }
             return;
         }
+    }
+
+    // F_DUPFD_QUERY (1027, Linux 6.10): "does `arg` name the same open file
+    // description as `fd`?" — `f_dupfd_query`: `CLASS(fd_raw, f)(fd); if
+    // (fd_empty(f)) return -EBADF; return fd_file(f) == filp;`. It is on
+    // `check_fcntl_cmd`'s O_PATH whitelist, so it is answered ahead of the
+    // gate below. It used to fall through to the unknown-command -EINVAL,
+    // which callers read as "kernel too old" and fall back to kcmp.
+    const F_DUPFD_QUERY: u64 = 1027;
+    if cmd == F_DUPFD_QUERY {
+        let answer = fd::with_table(task, |t| {
+            let this = t.description(fd)?;
+            Some(
+                t.description(arg as u32)
+                    .map(|other| alloc::sync::Arc::ptr_eq(&this, &other)),
+            )
+        })
+        .flatten();
+        ctx.set_return(match answer {
+            Some(Some(same)) => SyscallReturn::ok(same as u64),
+            // Either descriptor closed: -EBADF (the entry's own fdget_raw
+            // for `fd`, `f_dupfd_query`'s for `arg`).
+            _ => errno_ret(EBADF),
+        });
+        return;
     }
 
     // Linux applies its FMODE_PATH command gate after fdget_raw and before
@@ -743,6 +793,11 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             } else {
                 (task, crate::fd::locks::LockKind::Posix)
             };
+            // Access mode of the description, for `check_fmode_for_setlk`.
+            let access = fd::with_table(task, |t| t.status_flags(fd))
+                .flatten()
+                .unwrap_or(0)
+                & crate::fd::O_ACCMODE;
             // Pull the `struct flock` from user memory.
             let mut bytes = alloc::vec![0u8; flock_size()];
             // SAFETY: `arg` is the user `struct flock` pointer; copy_from_user
@@ -775,6 +830,15 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             const SEEK_SET: i16 = 0;
             const SEEK_CUR: i16 = 1;
             const SEEK_END: i16 = 2;
+            use crate::fd::locks::{F_RDLCK, F_UNLCK, F_WRLCK};
+            // `fcntl_getlk` opens with `if (cmd != F_OFD_GETLK &&
+            // flock->l_type != F_RDLCK && flock->l_type != F_WRLCK) goto
+            // out;` (-EINVAL) — before `flock_to_posix_lock` even looks at
+            // l_whence. A plain F_GETLK asking about F_UNLCK is meaningless.
+            if cmd == F_GETLK && uf.l_type != F_RDLCK && uf.l_type != F_WRLCK {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
             let origin: i64 = match uf.l_whence {
                 SEEK_SET => 0,
                 SEEK_CUR => fd::with_table(task, |t| t.offset(fd))
@@ -793,6 +857,46 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             };
             let mut uf = uf;
             uf.l_start = abs_start;
+            // The rest of `flock64_to_posix_lock`, in its order:
+            //
+            //   if (fl->fl_start < 0) return -EINVAL;
+            //   if (l->l_len > 0) {
+            //           if (l->l_len - 1 > OFFSET_MAX - fl->fl_start)
+            //                   return -EOVERFLOW;
+            //   } else if (l->l_len < 0) {
+            //           if (fl->fl_start + l->l_len < 0) return -EINVAL;
+            //   }
+            //   return assign_type(&fl->c, l->l_type);   /* -EINVAL */
+            //
+            // The range end used to saturate instead of overflowing, and an
+            // unknown l_type reached the lock table as if it were a lock.
+            if abs_start < 0 {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
+            if uf.l_len > 0 && uf.l_len - 1 > i64::MAX - abs_start {
+                ctx.set_return(errno_ret(EOVERFLOW));
+                return;
+            }
+            if uf.l_len < 0 && abs_start + uf.l_len < 0 {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
+            if !matches!(uf.l_type, F_RDLCK | F_WRLCK | F_UNLCK) {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
+            // `check_fmode_for_setlk`: a read lock needs FMODE_READ and a
+            // write lock FMODE_WRITE, else -EBADF — checked before the OFD
+            // l_pid test. (F_GETLK only asks; it needs neither.)
+            if !is_getlk {
+                let readable = access == crate::fd::O_RDONLY || access == crate::fd::O_RDWR;
+                let writable = access == crate::fd::O_WRONLY || access == crate::fd::O_RDWR;
+                if (uf.l_type == F_RDLCK && !readable) || (uf.l_type == F_WRLCK && !writable) {
+                    ctx.set_return(errno_ret(EBADF));
+                    return;
+                }
+            }
             // `if (flock->l_pid != 0) goto out;` — the OFD commands reject a
             // non-zero l_pid outright rather than ignoring it, so a caller
             // that filled the field in (as it would for F_GETLK) learns the

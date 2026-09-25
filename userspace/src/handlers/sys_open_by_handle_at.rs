@@ -26,6 +26,21 @@ pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
     }
     let hbytes = u32::from_ne_bytes(hdr[0..4].try_into().unwrap()) as usize;
     let htype = i32::from_ne_bytes(hdr[4..8].try_into().unwrap());
+    // `handle_to_path` validates the header before it decodes anything:
+    //
+    //   if ((f_handle.handle_bytes > MAX_HANDLE_SZ) || (f_handle.handle_bytes == 0))
+    //           return -EINVAL;
+    //   if (f_handle.handle_type < 0 || FILEID_USER_FLAGS(...) & ~...)
+    //           return -EINVAL;
+    //
+    // so a malformed header is -EINVAL even when its type is foreign — it
+    // used to be -ESTALE for any unknown type first. NARF's path-carrying
+    // handles can exceed Linux's 128-byte MAX_HANDLE_SZ, hence the larger
+    // bound (see `sys_name_to_handle_at`).
+    if hbytes == 0 || hbytes > 4096 || htype < 0 {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
     // An nsfs handle resolves through the namespace tree, not the VFS:
     // `nsfs_fh_to_dentry` looks the id up, cross-checks the type and inode
     // against what it found, and applies the same visibility rule
@@ -66,10 +81,6 @@ pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
     }
     if htype != NARF_HANDLE_TYPE {
         ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
-        return;
-    }
-    if hbytes == 0 || hbytes > 4096 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
     // SAFETY: copy_from_user_vec validates the f_handle range.

@@ -681,20 +681,34 @@ fn smoke_abi_fsx2_fgetxattr_erange_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fgetxattr_erange_neg);
 
-// ── name_to_handle_at: EINVAL on an empty path ────────────────────────
+// ── name_to_handle_at: an empty path ─────────────────────────────────
 //
-// sys_name_to_handle_at rejects an empty path BEFORE the existence check.
-// The first file pins ENOENT (missing path) and 0 (success), not EINVAL.
+// Without AT_EMPTY_PATH, `user_path_at` -> `getname` refuses "" with
+// -ENOENT, as for every path syscall (NARF used to answer -EINVAL, which
+// blames the flags). With AT_EMPTY_PATH the dirfd itself is encoded, so a
+// closed dirfd is -EBADF. The smoke keeps its historical name.
 
 fn smoke_abi_fsx2_name_to_handle_at_einval_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
-        let path = b"\0"; // empty → EINVAL
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let path = b"\0"; // empty
         let mut hbuf = [0u8; 64];
         hbuf[0..4].copy_from_slice(&32u32.to_ne_bytes());
         let args = a3(0, path.as_ptr() as u64, hbuf.as_mut_ptr() as u64, 0);
         match call(Syscall::NameToHandleAt.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("name_to_handle_at with an empty path must return -EINVAL"),
+            Some(v) if v == ENOENT => {}
+            _ => return Err("name_to_handle_at with an empty path must return -ENOENT"),
+        }
+        let args = a4(
+            9999,
+            path.as_ptr() as u64,
+            hbuf.as_mut_ptr() as u64,
+            0,
+            AT_EMPTY_PATH,
+        );
+        match call(Syscall::NameToHandleAt.raw(), args) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("name_to_handle_at(closed fd, \"\", AT_EMPTY_PATH) must return -EBADF"),
         }
     })
 }

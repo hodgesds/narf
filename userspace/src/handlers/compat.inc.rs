@@ -12826,8 +12826,6 @@ mod handler_sys_name_to_handle_at;
 mod handler_sys_newfstatat_linux;
 #[path = "sys_noop_ok.rs"]
 mod handler_sys_noop_ok;
-#[path = "sys_open.rs"]
-mod handler_sys_open;
 #[path = "sys_open_by_handle_at.rs"]
 mod handler_sys_open_by_handle_at;
 #[path = "sys_open_linux.rs"]
@@ -13342,7 +13340,6 @@ pub(crate) use {
     handler_sys_munlockall::sys_munlockall,
     handler_sys_munmap::sys_munmap,
     handler_sys_noop_ok::sys_noop_ok,
-    handler_sys_open::sys_open,
     handler_sys_open_linux::sys_open_linux,
     handler_sys_openat::sys_openat,
     handler_sys_openat2::sys_openat2,

@@ -11,6 +11,11 @@ pub(crate) fn sys_open_linux(ctx: &mut dyn TrapContext) {
     let path_uptr = args.arg0;
     let flags = args.arg1;
     let mode = args.arg2 as u32;
+    // `build_open_flags` precedes `getname` (see `open_build_flags`).
+    if let Err(errno) = open_build_flags(flags) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {

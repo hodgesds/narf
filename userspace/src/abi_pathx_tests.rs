@@ -846,8 +846,9 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_exact_errnos);
 
 // ── openat2 (dirfd, NUL-term path, open_how*, size) → fd / -EINVAL ──
 //
-// open_how is { u64 flags; u64 mode; u64 resolve } (24 bytes). how==NULL
-// or size<24 → -EINVAL; otherwise forwards to sys_open with the flags.
+// open_how is { u64 flags; u64 mode; u64 resolve } (24 bytes). size<24 →
+// -EINVAL, size>PAGE_SIZE → -E2BIG, then how==NULL → -EFAULT (the struct
+// copy); otherwise forwards to sys_openat with the flags.
 
 fn smoke_abi_pathx_openat2_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
@@ -1042,17 +1043,181 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_open_tree_path_fd_mkdirat);
 fn smoke_abi_pathx_openat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        // how==NULL → -EINVAL (structural check before any path work).
+        // how==NULL with a valid size is `copy_struct_from_user`'s -EFAULT;
+        // the size checks run first, so a short size is still -EINVAL.
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 8),
+        ) != Some(EINVAL)
+        {
+            return Err("openat2(how=NULL, size=8) was not -EINVAL");
+        }
         match call(
             Syscall::Openat2.raw(),
             a3(AT_FDCWD, path.as_ptr() as u64, 0, 24),
         ) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("openat2(how=NULL) was not -EINVAL"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("openat2(how=NULL) was not -EFAULT"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_neg);
+
+/// `open`/`openat` flag and object-type errnos, each against `fs/open.c` /
+/// `fs/namei.c` (and confirmed on a Linux 6.18 host):
+///
+/// * `build_open_flags` (ahead of `getname`, so ahead of -EFAULT):
+///   O_DIRECTORY|O_CREAT and a bare / read-only O_TMPFILE are -EINVAL.
+/// * `do_open`: O_CREAT|O_EXCL on anything that exists — a dangling
+///   symlink included, O_EXCL implying O_NOFOLLOW — is -EEXIST; O_DIRECTORY
+///   on a non-directory -ENOTDIR; write intent on a directory -EISDIR.
+/// * the walk: a regular file used as a directory is -ENOTDIR, with or
+///   without O_CREAT; a trailing slash with O_CREAT is -EISDIR.
+/// * O_TRUNC actually truncates.
+fn smoke_abi_pathx_open_flag_errnos() -> TestResult {
+    with_memfs("/opf", "opf", &[("f", b"hello")], || {
+        const O_WRONLY: u64 = 0o1;
+        const O_RDWR: u64 = 0o2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_TRUNC: u64 = 0o1000;
+        const O_DIRECTORY: u64 = 0o200000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        const O_TMPFILE: u64 = 0o20000000 | O_DIRECTORY;
+        let open = |path: &[u8], flags: u64| {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, path.as_ptr() as u64, flags, 0o644),
+            )
+        };
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(
+                c"nowhere".as_ptr() as u64,
+                AT_FDCWD,
+                c"/opf/dang".as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("could not create the dangling symlink fixture");
+        }
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, c"/opf/d".as_ptr() as u64, 0o755),
+        ) != Some(0)
+        {
+            return Err("could not create the directory fixture");
+        }
+        let cases: [(&[u8], u64, i64, &str); 13] = [
+            (
+                b"/opf/zz\0",
+                O_DIRECTORY | O_CREAT,
+                EINVAL,
+                "O_DIRECTORY|O_CREAT must be -EINVAL",
+            ),
+            (
+                b"/opf/d\0",
+                O_TMPFILE,
+                EINVAL,
+                "O_TMPFILE|O_RDONLY must be -EINVAL",
+            ),
+            (
+                b"/opf/d\0",
+                0o20000000 | O_RDWR,
+                EINVAL,
+                "__O_TMPFILE without O_DIRECTORY must be -EINVAL",
+            ),
+            (
+                b"/opf/f\0",
+                O_TMPFILE | O_RDWR,
+                ENOTDIR,
+                "O_TMPFILE on a file must be -ENOTDIR",
+            ),
+            (
+                b"/opf/f\0",
+                O_CREAT | O_EXCL | O_RDWR,
+                EEXIST,
+                "O_CREAT|O_EXCL on a file must be -EEXIST",
+            ),
+            (
+                b"/opf/dang\0",
+                O_CREAT | O_EXCL | O_RDWR,
+                EEXIST,
+                "O_CREAT|O_EXCL on a dangling symlink must be -EEXIST",
+            ),
+            (
+                b"/opf/d\0",
+                O_CREAT | O_EXCL,
+                EEXIST,
+                "O_CREAT|O_EXCL on a directory must be -EEXIST",
+            ),
+            (
+                b"/opf/f\0",
+                O_DIRECTORY,
+                ENOTDIR,
+                "O_DIRECTORY on a file must be -ENOTDIR",
+            ),
+            (
+                b"/opf/dang\0",
+                O_DIRECTORY | O_NOFOLLOW,
+                ENOTDIR,
+                "O_DIRECTORY|O_NOFOLLOW on a symlink must be -ENOTDIR",
+            ),
+            (
+                b"/opf/d\0",
+                O_WRONLY,
+                EISDIR,
+                "a write-open of a directory must be -EISDIR",
+            ),
+            (
+                b"/opf/f/x\0",
+                0,
+                ENOTDIR,
+                "a file used as a directory must be -ENOTDIR",
+            ),
+            (
+                b"/opf/f/x\0",
+                O_CREAT | O_RDWR,
+                ENOTDIR,
+                "O_CREAT below a file must be -ENOTDIR",
+            ),
+            (
+                b"/opf/new/\0",
+                O_CREAT | O_RDWR,
+                EISDIR,
+                "O_CREAT with a trailing slash must be -EISDIR",
+            ),
+        ];
+        for (path, flags, want, msg) in cases {
+            if open(path, flags) != Some(want) {
+                return Err(msg);
+            }
+        }
+        if open(b"/opf/missing/x\0", O_CREAT | O_RDWR) != Some(ENOENT) {
+            return Err("O_CREAT below a missing directory must be -ENOENT");
+        }
+        // O_TRUNC empties the file it opens.
+        let fd = match open(b"/opf/f\0", O_WRONLY | O_TRUNC) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_WRONLY|O_TRUNC) of an existing file failed"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let fd = match open(b"/opf/f\0", 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("reopen after O_TRUNC failed"),
+        };
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) != Some(0)
+        {
+            return Err("O_TRUNC did not truncate the file");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_open_flag_errnos);
 
 /// Regression: `openat2` with a real dirfd + a RELATIVE path under
 /// `RESOLVE_IN_ROOT` must resolve ONCE, rooted at the dirfd — not double-root
@@ -4768,6 +4933,20 @@ fn smoke_abi_pathx_openat2_struct_rules() -> TestResult {
         if openat2_at(AT_FDCWD, path, &openat2_how(0, 0, 1 << 20)) != Some(EINVAL) {
             return Err("an undefined resolve flag must be -EINVAL");
         }
+        // "Scoping flags are mutually exclusive."
+        if openat2_at(
+            AT_FDCWD,
+            path,
+            &openat2_how(0, 0, RESOLVE_BENEATH | RESOLVE_IN_ROOT),
+        ) != Some(EINVAL)
+        {
+            return Err("RESOLVE_BENEATH|RESOLVE_IN_ROOT must be -EINVAL");
+        }
+        // RESOLVE_CACHED refuses create/truncate/tmpfile in build_open_flags.
+        if openat2_at(AT_FDCWD, path, &openat2_how(O_CREAT, 0o644, RESOLVE_CACHED)) != Some(EAGAIN)
+        {
+            return Err("RESOLVE_CACHED with O_CREAT must be -EAGAIN");
+        }
         Ok(())
     })
 }
@@ -4844,6 +5023,25 @@ fn smoke_abi_pathx_openat2_scoped() -> TestResult {
         // BENEATH refuses it even though this one names a file inside.
         if openat2_at(dfd, b"/o2b/f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EXDEV) {
             return Err("RESOLVE_BENEATH must refuse an absolute pathname");
+        }
+        // `path_init` jumps to the root for an absolute path without looking
+        // at dirfd, so even a closed dirfd is EXDEV there; a relative path
+        // needs the dirfd — closed is EBADF, a non-directory ENOTDIR.
+        if openat2_at(9999, b"/o2b/f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EXDEV) {
+            return Err("RESOLVE_BENEATH with an absolute path must be -EXDEV before dirfd");
+        }
+        if openat2_at(9999, b"f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EBADF) {
+            return Err("RESOLVE_BENEATH with a closed dirfd must be -EBADF");
+        }
+        let ffd = match openat2_at(AT_FDCWD, b"/o2b/f\0", &openat2_how(0, 0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the scope file"),
+        };
+        if openat2_at(ffd, b"../f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(ENOTDIR) {
+            return Err("RESOLVE_BENEATH with a regular-file dirfd must be -ENOTDIR");
+        }
+        if openat2_at(ffd, b"/f\0", &openat2_how(0, 0, RESOLVE_IN_ROOT)) != Some(ENOTDIR) {
+            return Err("RESOLVE_IN_ROOT with a regular-file dirfd must be -ENOTDIR");
         }
         // IN_ROOT: the same climb lands back at the root rather than
         // escaping, so it resolves instead of failing.

@@ -2857,7 +2857,9 @@ kernel_test_in!(
 fn smoke_abi_ioerrno_linkat_across_filesystems_is_exdev() -> TestResult {
     const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
     const AT_EMPTY_PATH: u64 = 0x1000;
-    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    // The full O_TMPFILE value: `__O_TMPFILE | O_DIRECTORY`. `build_open_flags`
+    // refuses the bare `__O_TMPFILE` bit with -EINVAL.
+    const O_TMPFILE_BIT: u64 = 0o20_000_000 | 0o200_000;
     const O_RDWR: u64 = 2;
 
     // Filesystem A is the harness's mount; B is a SECOND, independent MemFs
@@ -2960,7 +2962,9 @@ kernel_test_in!(
 fn smoke_abi_o_tmpfile_owned_by_creator_is_reopenable() -> TestResult {
     const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
     const AT_EMPTY_PATH: u64 = 0x1000;
-    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    // The full O_TMPFILE value: `__O_TMPFILE | O_DIRECTORY`. `build_open_flags`
+    // refuses the bare `__O_TMPFILE` bit with -EINVAL.
+    const O_TMPFILE_BIT: u64 = 0o20_000_000 | 0o200_000;
     const O_RDWR: u64 = 2;
     const O_RDONLY: u64 = 0;
     const EACCES: i64 = -13;

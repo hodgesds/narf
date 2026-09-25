@@ -4886,6 +4886,92 @@ kernel_test_in!(
     smoke_abi_fdio_fcntl_handled_commands_still_work
 );
 
+/// Record-lock argument checks (`fcntl_getlk` / `flock64_to_posix_lock` /
+/// `check_fmode_for_setlk`), F_DUPFD_QUERY, the 32-bit `cmd`, and the
+/// O_PATH / flag checks of flock(2) and memfd_create(2) — each confirmed on a
+/// Linux 6.18 host.
+fn smoke_abi_fdio_lock_and_fd_arg_errnos() -> TestResult {
+    const F_GETFD: u64 = 1;
+    const F_GETLK: u64 = 5;
+    const F_SETLK: u64 = 6;
+    const F_DUPFD_QUERY: u64 = 1027;
+    const O_PATH: u64 = 0o10000000;
+    const LOCK_SH: u64 = 1;
+    fn flock_bytes(ty: i16, whence: i16, start: i64, len: i64) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0..2].copy_from_slice(&ty.to_ne_bytes());
+        b[2..4].copy_from_slice(&whence.to_ne_bytes());
+        b[8..16].copy_from_slice(&start.to_ne_bytes());
+        b[16..24].copy_from_slice(&len.to_ne_bytes());
+        b
+    }
+    with_memfs("/abi-lkarg", "abi-lkarg", &[("f", b"xxxx")], || {
+        let ro = open_fd_flags(b"/abi-lkarg/f\0", 0)? as u64; // O_RDONLY
+        let lk = |fd: u64, cmd: u64, b: &mut [u8; 32]| {
+            call(Syscall::Fcntl.raw(), a2(fd, cmd, b.as_mut_ptr() as u64))
+        };
+        // F_GETLK only asks about F_RDLCK / F_WRLCK.
+        if lk(ro, F_GETLK, &mut flock_bytes(2, 0, 0, 0)) != Some(EINVAL) {
+            return Err("F_GETLK with l_type=F_UNLCK must be -EINVAL");
+        }
+        // An unknown l_type never reaches the lock table.
+        if lk(ro, F_SETLK, &mut flock_bytes(99, 0, 0, 0)) != Some(EINVAL) {
+            return Err("F_SETLK with an unknown l_type must be -EINVAL");
+        }
+        // A range whose end passes OFFSET_MAX.
+        if lk(ro, F_SETLK, &mut flock_bytes(0, 0, 10, i64::MAX)) != Some(EOVERFLOW) {
+            return Err("F_SETLK with an overflowing range must be -EOVERFLOW");
+        }
+        // A write lock needs a writable description.
+        if lk(ro, F_SETLK, &mut flock_bytes(1, 0, 0, 0)) != Some(EBADF) {
+            return Err("F_SETLK(F_WRLCK) on an O_RDONLY fd must be -EBADF");
+        }
+        // F_DUPFD_QUERY: same description -> 1, another open -> 0, closed -> EBADF.
+        let dup = match call(Syscall::Dup.raw(), a0(ro)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("dup failed"),
+        };
+        let other = open_fd_flags(b"/abi-lkarg/f\0", 0)? as u64;
+        if call(Syscall::Fcntl.raw(), a2(ro, F_DUPFD_QUERY, dup)) != Some(1)
+            || call(Syscall::Fcntl.raw(), a2(ro, F_DUPFD_QUERY, other)) != Some(0)
+            || call(Syscall::Fcntl.raw(), a2(ro, F_DUPFD_QUERY, 4444)) != Some(EBADF)
+        {
+            return Err("F_DUPFD_QUERY must answer 1 / 0 / -EBADF");
+        }
+        // `cmd` is an unsigned int: high register bits do not change it.
+        if call(Syscall::Fcntl.raw(), a2(ro, (1 << 32) | F_GETFD, 0)).is_none_or(|v| v < 0) {
+            return Err("fcntl must ignore the high 32 bits of cmd");
+        }
+        // flock's fdget does not see O_PATH descriptors.
+        let path_fd = open_fd_flags(b"/abi-lkarg/f\0", O_PATH)? as u64;
+        if call(Syscall::Flock.raw(), a1(path_fd, LOCK_SH)) != Some(EBADF) {
+            return Err("flock on an O_PATH fd must be -EBADF");
+        }
+        // memfd_create: sanitize_flags, then alloc_name, then the fd.
+        if call(Syscall::MemfdCreate.raw(), a1(c"x".as_ptr() as u64, 0x100)) != Some(EINVAL) {
+            return Err("memfd_create with an unknown flag must be -EINVAL");
+        }
+        if call(
+            Syscall::MemfdCreate.raw(),
+            a1(c"x".as_ptr() as u64, 0x8 | 0x10),
+        ) != Some(EINVAL)
+        {
+            return Err("memfd_create with MFD_EXEC|MFD_NOEXEC_SEAL must be -EINVAL");
+        }
+        // 250 chars + NUL: one past MFD_NAME_MAX_LEN (249).
+        let mut long = [b'a'; 251];
+        long[250] = 0;
+        if call(Syscall::MemfdCreate.raw(), a1(long.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("memfd_create with a 250-byte name must be -EINVAL");
+        }
+        if call(Syscall::MemfdCreate.raw(), a1(0, 0)) != Some(EFAULT) {
+            return Err("memfd_create with a NULL name must be -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_lock_and_fd_arg_errnos);
+
 // ── RLIMIT_FSIZE ────────────────────────────────────────────────────
 //
 // `fs/read_write.c::generic_write_check_limits` for writes and

@@ -1157,6 +1157,49 @@ fn proc_namespace_fd_from_path(
     namespace_fd_for_task(target_task, flavour)
 }
 
+/// `fs/open.c::build_open_how` + the flag half of `build_open_flags`, as the
+/// legacy `open`/`openat`/`creat` entries apply them. Runs before `getname`
+/// in `do_sys_openat2`, so its -EINVAL outranks -EFAULT on the pathname and
+/// -EMFILE; callers invoke it before copying the path. Returns the effective
+/// flags (O_PATH strips every flag outside `O_PATH_FLAGS`) or a positive
+/// errno.
+///
+/// ```text
+///   if (how.flags & O_PATH) how.flags &= O_PATH_FLAGS;          /* build_open_how */
+///   if ((flags & (O_DIRECTORY | O_CREAT)) == (O_DIRECTORY | O_CREAT)) return -EINVAL;
+///   if (flags & __O_TMPFILE) {
+///           if ((flags & O_TMPFILE_MASK) != O_TMPFILE) return -EINVAL;
+///           if (!(acc_mode & MAY_WRITE)) return -EINVAL;
+///   }
+/// ```
+fn open_build_flags(flags: u64) -> Result<u64, i64> {
+    const O_DIRECTORY: u64 = 0o200000;
+    const O_NOFOLLOW: u64 = 0o400000;
+    const O_CLOEXEC: u64 = 0o2000000;
+    const O_PATH: u64 = 0o10000000;
+    const O_TMPFILE_BIT: u64 = 0o20000000;
+    let mut flags = flags;
+    if flags & O_PATH != 0 {
+        flags &= O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
+    }
+    if flags & (O_DIRECTORY | O_CREAT) == (O_DIRECTORY | O_CREAT) {
+        return Err(EINVAL);
+    }
+    if flags & O_TMPFILE_BIT != 0 {
+        // O_TMPFILE_MASK = __O_TMPFILE | O_DIRECTORY | O_CREAT; O_CREAT
+        // with O_DIRECTORY was refused just above.
+        if flags & O_DIRECTORY == 0 {
+            return Err(EINVAL);
+        }
+        // ACC_MODE: O_RDONLY is the only access mode without MAY_WRITE
+        // (the "3" ioctl-only mode maps to MAY_READ | MAY_WRITE).
+        if flags & 0o3 == 0 {
+            return Err(EINVAL);
+        }
+    }
+    Ok(flags)
+}
+
 fn open_impl(
     ctx: &mut dyn TrapContext,
     path_owned_raw: alloc::string::String,
@@ -1182,6 +1225,32 @@ fn open_impl(
             return;
         }
     }
+    // `build_open_flags` runs first of all (see `open_build_flags`); the
+    // entry points already ran it ahead of their pathname copy, so this only
+    // yields the effective (O_PATH-stripped) flags for them.
+    let flags = match open_build_flags(flags) {
+        Ok(flags) => flags,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
+    // Linux open/openat reject an empty pathname with ENOENT. Do this before
+    // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
+    // the cwd itself and accidentally opens a directory. dbus-broker probes an
+    // optional empty path this way; opening cwd produced a regular fd that it
+    // added to epoll, yielding an infinite readable-at-EOF loop. It is
+    // `getname`'s answer, so it also precedes the descriptor reservation
+    // below: `open("", …)` with a full table is ENOENT, not EMFILE.
+    if path_owned_raw.is_empty() {
+        ctx.set_return(errno_ret(ENOENT)); // -ENOENT
+        return;
+    }
+    // A trailing slash makes the final component a directory lookup
+    // (`open_last_lookups`: `if (nd->last.name[nd->last.len]) nd->flags |=
+    // LOOKUP_FOLLOW | LOOKUP_DIRECTORY;`), and on the create side it is
+    // -EISDIR outright. Captured before normalization strips it.
+    let trailing_slash = mnt_len == 0 && path_owned_raw.len() > 1 && path_owned_raw.ends_with('/');
     // Linux's `FD_ADD(flags, do_file_open(...))` reserves the lowest-free fd
     // before evaluating path lookup or O_CREAT. Apart from preserving exact
     // EMFILE precedence, that ordering is transactional: descriptor exhaustion
@@ -1208,15 +1277,15 @@ fn open_impl(
     let want_r = access_mode == 0 || access_mode == 2;
     let want_w = access_mode == 1 || access_mode == 2;
     let task = current_task_id();
-    // Linux open/openat reject an empty pathname with ENOENT. Do this before
-    // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
-    // the cwd itself and accidentally opens a directory. dbus-broker probes an
-    // optional empty path this way; opening cwd produced a regular fd that it
-    // added to epoll, yielding an infinite readable-at-EOF loop.
-    if path_owned_raw.is_empty() {
-        ctx.set_return(errno_ret(ENOENT)); // -ENOENT
-        return;
-    }
+    // `build_open_flags`: `if (flags & O_EXCL) { ... flags |= O_NOFOLLOW; }`
+    // under O_CREAT — an exclusive create never follows a final symlink, so a
+    // dangling link is EEXIST rather than a file created at its target.
+    const O_EXCL: u64 = 0o200;
+    let excl_create = flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL);
+    // O_DIRECTORY or a trailing slash: the final object must be a directory
+    // (`do_open`: `if ((nd->flags & LOOKUP_DIRECTORY) && !d_can_lookup(...))
+    // return -ENOTDIR;`).
+    let want_dir = flags & 0o200000 != 0 || trailing_slash;
     // Resolve relative paths against the task's cwd and collapse
     // `.`/`..` (absolute-mount form only; the explicit-mount form below
     // keeps its already-relative-to-the-mount path). This is what makes
@@ -1263,7 +1332,10 @@ fn open_impl(
         // path it asked the kernel to refuse. Outside one, an unresolvable
         // path keeps the long-standing "use it as written and let the
         // lookup fail" behaviour, which is what the other callers rely on.
-        match resolve_vfs_symlink_path_scoped(&path_owned, flags & 0o400000 == 0) {
+        match resolve_vfs_symlink_path_scoped(
+            &path_owned,
+            flags & 0o400000 == 0 && !excl_create,
+        ) {
             Ok(resolved) => resolved,
             Err(errno) if current_resolve_scope().is_some() => {
                 ctx.set_return(SyscallReturn::ok(errno as u64));
@@ -1275,6 +1347,26 @@ fn open_impl(
         path_owned
     };
     let path: &str = &path_owned;
+
+    // `open_last_lookups`, create side: once the parent has been walked,
+    // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR);`
+    // — `open("x/", O_CREAT)` is EISDIR whether `x` is missing, a file or a
+    // directory. A parent that does not resolve fails its walk first
+    // (ENOENT / ENOTDIR). Checked before anything below can create `x`.
+    if trailing_slash && flags & O_CREAT != 0 {
+        let parent = match path.rsplit_once('/') {
+            Some(("", _)) => "/",
+            Some((parent, _)) => parent,
+            None => "/",
+        };
+        let errno = if resolve_dir_absolute(parent).is_some() {
+            EISDIR
+        } else {
+            path_lookup_errno(path)
+        };
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
 
     // RLIMIT_NOFILE is enforced by the fd table itself now, so every
     // allocation site reports -EMFILE the same way. The pre-check that used
@@ -1366,12 +1458,55 @@ fn open_impl(
                     None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
                 }
             }
-            // Directory resolves but its FS can't hold an anonymous inode,
-            // or the path doesn't name a directory at all: EOPNOTSUPP so
-            // the caller falls back rather than treating it as fatal.
-            _ => ctx.set_return(errno_ret(EOPNOTSUPP)), // -EOPNOTSUPP
+            // Directory resolves but its FS can't hold an anonymous inode:
+            // EOPNOTSUPP so the caller falls back rather than treating it as
+            // fatal.
+            Some(_) => ctx.set_return(errno_ret(EOPNOTSUPP)), // -EOPNOTSUPP
+            // No directory there. `do_tmpfile` walks the path with
+            // LOOKUP_DIRECTORY first, so this is the walk's own answer — a
+            // non-directory is -ENOTDIR and a missing one -ENOENT — not a
+            // capability of the filesystem (EOPNOTSUPP would send the caller
+            // to its named-temp fallback in a directory that isn't there).
+            None => {
+                let errno = if stat_path_dir_aware(path).is_some() {
+                    ENOTDIR
+                } else {
+                    path_lookup_errno(path)
+                };
+                ctx.set_return(errno_ret(errno));
+            }
         }
         return;
+    }
+
+    // `do_open`: `if ((open_flag & O_EXCL) && !(file->f_mode & FMODE_CREATED))
+    // return -EEXIST;` — any existing object at the final component, a
+    // directory or a (possibly dangling) symlink included, since O_EXCL made
+    // the final lookup non-following. This open path never checked O_EXCL,
+    // so `O_CREAT|O_EXCL` on an existing file silently opened it: lock-file
+    // and mkstemp-style callers all believed they had created a fresh file.
+    if excl_create && mnt_len == 0 {
+        let exists = match fast_create.as_ref() {
+            Some(FastCreateResolution::Existing { .. }) => true,
+            Some(FastCreateResolution::Missing { .. }) => false,
+            None => {
+                current_resolve_absolute(path, |fs, rel| {
+                    if rel.is_empty() {
+                        fs.root_file()
+                    } else {
+                        poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                            .and_then(|r| r.ok())
+                    }
+                })
+                .flatten()
+                .is_some()
+                    || resolve_dir_absolute(path).is_some()
+            }
+        };
+        if exists {
+            ctx.set_return(errno_ret(EEXIST)); // -EEXIST
+            return;
+        }
     }
 
     // O_NOFOLLOW: don't follow a final-component symlink. With O_PATH this
@@ -1402,6 +1537,14 @@ fn open_impl(
         .flatten();
         if let Some(lops) = leaf {
             if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
+                // An unfollowed symlink is not a directory: O_DIRECTORY
+                // reports that (-ENOTDIR, `complete_walk`'s LOOKUP_DIRECTORY
+                // check) before `may_open` can reach its S_IFLNK -ELOOP, and
+                // for O_PATH as well as a real open.
+                if want_dir {
+                    ctx.set_return(errno_ret(ENOTDIR)); // -ENOTDIR
+                    return;
+                }
                 if flags & O_PATH == 0 {
                     ctx.set_return(errno_ret(ELOOP)); // -ELOOP
                     return;
@@ -1479,8 +1622,18 @@ fn open_impl(
         .as_ref()
         .map(|o| o.stat().mode.file_type == narf_filesystem::FileType::Dir)
         .unwrap_or(false);
+    // A directory cannot be opened for writing: `do_open`'s
+    // `if (open_flag & O_CREAT) { ... if (d_is_dir(...)) return -EISDIR; }`
+    // and `may_open`'s `case S_IFDIR: if (acc_mode & MAY_WRITE) return
+    // -EISDIR;`, where O_TRUNC adds MAY_WRITE and the ioctl-only access mode
+    // 3 carries it too. O_PATH reaches here with every such flag stripped.
+    let dir_write_intent = flags & (O_CREAT | 0o1000) != 0 || access_mode != 0;
     if fast_create.is_none() && (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
+            if dir_write_intent {
+                ctx.set_return(errno_ret(EISDIR)); // -EISDIR
+                return;
+            }
             let new_fd = reservation.install(crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
@@ -1615,9 +1768,15 @@ fn open_impl(
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
                         narf_filesystem::FsError::SymlinkLoop => 40,   // ELOOP
                         narf_filesystem::FsError::CrossDevice => 18,      // EXDEV
-                        narf_filesystem::FsError::Busy => 16,             // EBUSY
+                        // The name is taken — the backends' "exists"
+                        // (`memfs::create_with_attrs`), which linkat/rename
+                        // already read as EEXIST.
+                        narf_filesystem::FsError::Busy => 17,             // EEXIST
                         narf_filesystem::FsError::ReadOnly => 30,         // EROFS
-                        narf_filesystem::FsError::Unsupported => 95,      // EOPNOTSUPP
+                        // The directory has no create op (the trait default):
+                        // `lookup_open`'s `if (!dir_inode->i_op->create)
+                        // { error = -EACCES; ... }` — sysfs answers EACCES.
+                        narf_filesystem::FsError::Unsupported => 13,      // EACCES
                         narf_filesystem::FsError::BrokenPipe => 32,       // EPIPE
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
@@ -1632,22 +1791,52 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
                     return;
                 }
-                None | Some(None) => {
+                // The parent did not resolve: that is the walk's failure
+                // (`link_path_walk`), -ENOENT for a missing component or
+                // -ENOTDIR for a non-directory one — `open("file/x",
+                // O_CREAT)` is ENOTDIR. It used to be -EIO, which reads as
+                // a device error for a caller that merely named a missing
+                // directory.
+                None => {
+                    ctx.set_return(errno_ret(path_lookup_errno(path)));
+                    return;
+                }
+                Some(None) => {
                     ctx.set_return(errno_ret(EIO)); // -EIO
                     return;
                 }
             }
         }
         None => {
-            // Missing file (no O_CREAT): report -ENOENT, not the generic
-            // -1 sentinel. musl maps the raw return to -errno, so a
+            // Missing file (no O_CREAT): report the lookup's errno, not the
+            // generic -1 sentinel. musl maps the raw return to -errno, so a
             // daemon that opens an optional file (e.g. redis probing for
             // dump.rdb) sees ENOENT and continues instead of treating it
-            // as a fatal EPERM. Native callers detect the negative range.
-            ctx.set_return(errno_ret(ENOENT)); // -ENOENT
+            // as a fatal EPERM. A non-directory prefix component is
+            // -ENOTDIR (`open("/etc/passwd/x")`), as for stat — see
+            // `path_lookup_errno`.
+            ctx.set_return(errno_ret(path_lookup_errno(path)));
             return;
         }
     };
+
+    // `do_open`, on the object the walk found: O_DIRECTORY (or a trailing
+    // slash) on a non-directory is -ENOTDIR — for O_PATH too, whose
+    // `path_lookupat` applies the same LOOKUP_DIRECTORY check — and a
+    // directory reached with write intent is -EISDIR (see
+    // `dir_write_intent`). The directory branch above covers directories
+    // that resolve as `DirOps`; this covers directory-typed file nodes.
+    {
+        let is_dir = ops.stat().mode.file_type == narf_filesystem::FileType::Dir;
+        if want_dir && !is_dir {
+            ctx.set_return(errno_ret(ENOTDIR)); // -ENOTDIR
+            return;
+        }
+        if is_dir && dir_write_intent && !created {
+            ctx.set_return(errno_ret(EISDIR)); // -EISDIR
+            return;
+        }
+    }
 
     // O_PATH: install a bare path-reference fd. Per Linux `do_dentry_open`,
     // an O_PATH open resolves the node but invokes NO file operation — no
@@ -1717,6 +1906,11 @@ fn open_impl(
     // FSes report (uid=0, gid=0, perms=0o666) so non-root tasks see
     // the "other" triplet's rw bits and pass; the gate is structural
     // until ext2/minix start surfacing real owners.
+    // `build_open_flags`: `if (flags & O_TRUNC) acc_mode |= MAY_WRITE;` —
+    // truncating is writing, so O_RDONLY|O_TRUNC still needs write
+    // permission, a writable mount and a mutable inode. `do_open` drops
+    // O_TRUNC (and the whole acc_mode) for a file it just created.
+    let may_write = want_w || (flags & 0o1000 != 0 && !created);
     let (stat, file_uid, file_gid) = if created {
         // Linux's may_open() permission check applies to an existing inode.
         // A newly created file is already open under the creation intent;
@@ -1729,7 +1923,7 @@ fn open_impl(
         (Some(stat), file_uid, file_gid)
     };
     if let Some(stat) = stat {
-        let wanted = u16::from(want_r) * 0o4 + u16::from(want_w) * 0o2;
+        let wanted = u16::from(want_r) * 0o4 + u16::from(may_write) * 0o2;
         let owner = current_host_fsuid(task) == file_uid;
         // Linux tests inode ownership before `check_acl`: ACL_USER_OBJ is
         // already mirrored into the mode's owner triplet, and no named ACL
@@ -1801,7 +1995,7 @@ fn open_impl(
     // inside it still cannot reach a device.
     if narf_filesystem::any_restricted_mounts() {
         let mnt = current_mount_flags_at(path);
-        if want_w && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
+        if may_write && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
             ctx.set_return(errno_ret(EROFS)); // -EROFS
             return;
         }
@@ -1831,7 +2025,7 @@ fn open_impl(
         const O_APPEND: u64 = 0o2000;
         const O_TRUNC: u64 = 0o1000;
         let iflags = ops.inode_flags();
-        if want_w && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        if may_write && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
             ctx.set_return(errno_ret(EPERM)); // -EPERM
             return;
         }
@@ -1849,6 +2043,32 @@ fn open_impl(
         if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
             ctx.set_return(denied);
             return;
+        }
+    }
+
+    // O_TRUNC: `do_open` -> `handle_truncate` -> `do_truncate(..., 0, ...)`
+    // for an existing regular file, whatever the access mode (Linux
+    // truncates on O_RDONLY|O_TRUNC too). This open path accepted O_TRUNC
+    // but never truncated, so `creat()` / `open(O_WRONLY|O_CREAT|O_TRUNC)`
+    // over a longer file left its old tail behind the new contents. Like
+    // `truncate(2)`, the size change also clears set-user/group-ID. A
+    // backend without a size op (`Unsupported` — synthetic attribute files
+    // written with `echo > …`) keeps opening as before.
+    if flags & 0o1000 != 0
+        && !created
+        && ops.stat().mode.file_type == narf_filesystem::FileType::File
+        && ops.stat().size != 0
+    {
+        match poll_blocking(ops.truncate(0)) {
+            Some(Ok(())) => {
+                file_remove_privs(ops.as_ref(), task);
+                crate::mqueue::notify_modify_path(path);
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(error)) => {
+                ctx.set_return(errno_ret(copy_fs_errno(error)));
+                return;
+            }
         }
     }
 
