@@ -2238,33 +2238,6 @@ fn do_execve_resolved(
     ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
 }
 
-/// A `TrapContext` proxy that overrides the syscall args while forwarding
-/// the return + control-flow hooks to the wrapped context. Used by the
-/// `*at`/`*at2` reshapers to call an existing handler with a different
-/// argument layout.
-struct ArgReshape<'a> {
-    inner: &'a mut dyn TrapContext,
-    args: SyscallArgs,
-}
-impl<'a> TrapContext for ArgReshape<'a> {
-    fn args(&self) -> &SyscallArgs {
-        &self.args
-    }
-    fn set_return(&mut self, ret: SyscallReturn) {
-        self.inner.set_return(ret);
-    }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
-    }
-    fn rip(&self) -> u64 {
-        0
-    }
-    fn set_rip(&mut self, _rip: u64) {}
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
-}
-
 /// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
 /// These are the magic symlinks glibc's fexecve / systemd's spawn execve.
 pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
@@ -13259,7 +13232,7 @@ pub(crate) use {
     handler_sys_fb_info::sys_fb_info,
     handler_sys_fb_ring_map::sys_fb_ring_map,
     handler_sys_fchdir::sys_fchdir,
-    handler_sys_fchmod_or_fchown::{sys_fchmod, sys_fchown},
+    handler_sys_fchmod_or_fchown::{fchmod_fd, fchown_fd, sys_fchmod, sys_fchown},
     handler_sys_fchmodat::{sys_fchmodat, sys_fchmodat2},
     handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat,
     handler_sys_fcntl::sys_fcntl,

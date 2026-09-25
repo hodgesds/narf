@@ -7,10 +7,9 @@
 //! mount_setattr).
 //!
 //! Shares the harness in [`crate::abi_test_support`]; every test drives
-//! `kernel_syscall_entry` through a synthetic `AbiCtx`. The xattr handlers
-//! store into a side `BTreeMap` keyed by the (chroot-resolved) path string,
-//! so a positive set/get round-trips even against a path that names no real
-//! inode. The fd-keyed `f*xattr` family keys on an `anon_inode:[Type]`
+//! `kernel_syscall_entry` through a synthetic `AbiCtx`. The path-form xattr
+//! handlers need a real inode (a missing path is -ENOENT, as in Linux), so
+//! those cases run against a seeded MemFs. The fd-keyed `f*xattr` family keys on an `anon_inode:[Type]`
 //! placeholder derived from the fd's `FileOps` type, so an open MemFs fd is
 //! enough to reach the success path.
 
@@ -42,11 +41,13 @@ fn open_memfs_fd(path: &[u8]) -> Result<u32, &'static str> {
 // ── setxattr / getxattr (path-keyed) ──────────────────────────────────
 //
 // Linux shape: setxattr(path, name, value, size, flags). arg0 is a bare
-// NUL-terminated path pointer (no length). The store is a side table keyed
-// by the resolved path string, so the path need not name a real inode.
+// NUL-terminated path pointer (no length). The path must name a real
+// inode: like Linux's `filename_lookup`, a missing one is -ENOENT.
 
 fn smoke_abi_fsx_setxattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("x", b"hi")], || {
         let path = b"/abi/x\0";
         let name = b"user.k\0";
         let val = b"hello";
@@ -67,7 +68,9 @@ fn smoke_abi_fsx_setxattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_pos);
 
 fn smoke_abi_fsx_setxattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("x", b"hi")], || {
         // An empty name is -ERANGE, not -EINVAL.
         // `fs/xattr.c::import_xattr_name`:
         //
@@ -104,7 +107,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_neg);
 /// and read back, which is worse than any errno — `getfattr` then reports
 /// an attribute the kernel never accepted.
 fn smoke_abi_fsx_setxattr_vfs_rejections() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("x", b"hi")], || {
         let path = b"/abi/x\0";
         let val = b"v";
         let set = |name: &[u8], size: u64, flags: u64| {
@@ -159,6 +164,48 @@ fn smoke_abi_fsx_setxattr_vfs_rejections() -> TestResult {
         );
         if get != Some(EOPNOTSUPP) {
             return Err("getxattr of an unknown namespace must return -EOPNOTSUPP");
+        }
+        // The lookup runs BEFORE the handler is resolved: a missing path is
+        // -ENOENT even for an unknown prefix, and nothing is stored.
+        let missing = b"/abi/no-such-file\0";
+        let missing_set = call(
+            Syscall::Setxattr.raw(),
+            SyscallArgs {
+                arg0: missing.as_ptr() as u64,
+                arg1: unknown.as_ptr() as u64,
+                arg2: val.as_ptr() as u64,
+                arg3: 1,
+                ..Default::default()
+            },
+        );
+        if missing_set != Some(ENOENT) {
+            return Err("setxattr on a missing path must return -ENOENT");
+        }
+        let user = b"user.k\0";
+        let missing_get = call(
+            Syscall::Getxattr.raw(),
+            SyscallArgs {
+                arg0: missing.as_ptr() as u64,
+                arg1: user.as_ptr() as u64,
+                ..Default::default()
+            },
+        );
+        if missing_get != Some(ENOENT) {
+            return Err("getxattr on a missing path must return -ENOENT");
+        }
+        // ...and the name import runs BEFORE the lookup: `fgetxattr` on a
+        // bad descriptor with an empty name is -ERANGE, not -EBADF.
+        let empty = b"\0";
+        let bad_fd_get = call(
+            Syscall::Fgetxattr.raw(),
+            SyscallArgs {
+                arg0: 999,
+                arg1: empty.as_ptr() as u64,
+                ..Default::default()
+            },
+        );
+        if bad_fd_get != Some(ERANGE) {
+            return Err("fgetxattr(bad fd, \"\") must return -ERANGE before -EBADF");
         }
         Ok(())
     })
@@ -832,7 +879,49 @@ fn smoke_abi_fsx_xattr_and_acl_writes_are_permission_checked() -> TestResult {
                 ..Default::default()
             },
         );
+        // `security.*` skips `inode_permission` altogether; commoncap's
+        // `cap_inode_setxattr` refuses it without CAP_SYS_ADMIN: EPERM.
+        let security = setxattr(b"security.k\0", b"v");
+        // The `setattr_prepare` gates for a non-owner (Linux 6.18 probe):
+        // chmod EPERM; chown EPERM unless nothing changes; an explicit
+        // timestamp EPERM; a plain `touch` without write permission EACCES.
+        let chmod = call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o600));
+        let chown_noop = call(
+            Syscall::Chown.raw(),
+            a2(path.as_ptr() as u64, u32::MAX as u64, u32::MAX as u64),
+        );
+        let chown = call(
+            Syscall::Chown.raw(),
+            a2(path.as_ptr() as u64, 1000, u32::MAX as u64),
+        );
+        let touch = call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        );
+        let explicit: [i64; 4] = [5, 0, 5, 0];
+        let stamp = call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, explicit.as_ptr() as u64, 0),
+        );
         crate::handlers::__test_uidgid_reset();
+        if security != Some(EPERM) {
+            return Err("setxattr(security.*) without CAP_SYS_ADMIN must return -EPERM");
+        }
+        if chmod != Some(EPERM) {
+            return Err("chmod by a non-owner must return -EPERM");
+        }
+        if chown_noop != Some(0) {
+            return Err("chown(-1, -1) by a non-owner changes nothing and must succeed");
+        }
+        if chown != Some(EPERM) {
+            return Err("chown by a non-owner must return -EPERM");
+        }
+        if touch != Some(EACCES) {
+            return Err("utimensat(NULL) on an unwritable file must return -EACCES");
+        }
+        if stamp != Some(EPERM) {
+            return Err("utimensat(explicit times) by a non-owner must return -EPERM");
+        }
         if writable.map(|fd| fd >= 0).unwrap_or(false) {
             return Err("the unprivileged caller can write the file — the mode staging is vacuous");
         }
@@ -1137,6 +1226,12 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
         let cpath = b"/abi-suid/prog\0";
         let task = crate::handlers::current_task_id();
         let stage = |mode: u64| -> Result<(), &'static str> {
+            // Staging is a privileged step: chown/chmod of a file the
+            // caller does not own is EPERM (`setattr_prepare`), and the
+            // previous case left the task as CALLER with the effective
+            // capability set cleared by its exec.
+            crate::handlers::__test_uidgid_reset();
+            crate::handlers::__test_caps_reset();
             if call(
                 Syscall::Chown.raw(),
                 a2(cpath.as_ptr() as u64, OWNER as u64, GROUP as u64),
@@ -1217,6 +1312,9 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
         // ── a setuid-ROOT binary regenerates capabilities ────────────
         // Without this the new program would be uid 0 with an empty
         // permitted set — the one state Linux never leaves a process in.
+        // Staged as root again, for the same reason as `stage`.
+        crate::handlers::__test_uidgid_reset();
+        crate::handlers::__test_caps_reset();
         if call(Syscall::Chown.raw(), a2(cpath.as_ptr() as u64, 0, 0)) != Some(0) {
             crate::handlers::__test_uidgid_reset();
             return Err("chown root of the test binary failed");
@@ -1888,7 +1986,9 @@ fn smoke_abi_fsx_append_only_allows_appends_only() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_append_only_allows_appends_only);
 
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("g", b"hi")], || {
         let path = b"/abi/g\0";
         let name = b"user.k\0";
         let val = b"abcd";
@@ -1921,7 +2021,9 @@ fn smoke_abi_fsx_getxattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_getxattr_pos);
 
 fn smoke_abi_fsx_getxattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("missing", b"hi")], || {
         // No attribute was ever set on this path → ENODATA.
         let path = b"/abi/missing\0";
         let name = b"user.absent\0";
@@ -1943,7 +2045,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_getxattr_neg);
 // ── listxattr (path-keyed) ────────────────────────────────────────────
 
 fn smoke_abi_fsx_listxattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("l", b"hi")], || {
         let path = b"/abi/l\0";
         let name = b"user.one\0";
         let val = b"v";
@@ -1969,7 +2073,9 @@ fn smoke_abi_fsx_listxattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_listxattr_pos);
 
 fn smoke_abi_fsx_listxattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("l2", b"hi")], || {
         // Buffer too small for the stored list → ERANGE.
         let path = b"/abi/l2\0";
         let name = b"user.longname\0";
@@ -1999,7 +2105,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_listxattr_neg);
 // ── removexattr (path-keyed) ──────────────────────────────────────────
 
 fn smoke_abi_fsx_removexattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("r", b"hi")], || {
         let path = b"/abi/r\0";
         let name = b"user.rm\0";
         let val = b"v";
@@ -2024,7 +2132,9 @@ fn smoke_abi_fsx_removexattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_removexattr_pos);
 
 fn smoke_abi_fsx_removexattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("r2", b"hi")], || {
         // Remove of an attribute that was never set → ENODATA.
         let path = b"/abi/r2\0";
         let name = b"user.absent\0";
@@ -2043,7 +2153,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_removexattr_neg);
 // non-l variants, so they round-trip identically.
 
 fn smoke_abi_fsx_lsetxattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lx", b"hi")], || {
         let path = b"/abi/lx\0";
         let name = b"user.l\0";
         let val = b"vv";
@@ -2064,7 +2176,9 @@ fn smoke_abi_fsx_lsetxattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_lsetxattr_pos);
 
 fn smoke_abi_fsx_lsetxattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lx", b"hi")], || {
         let path = b"/abi/lx\0";
         // Empty name → ERANGE (`import_xattr_name`), not EINVAL.
         let name = b"\0";
@@ -2086,7 +2200,9 @@ fn smoke_abi_fsx_lsetxattr_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_lsetxattr_neg);
 
 fn smoke_abi_fsx_lgetxattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lg", b"hi")], || {
         let path = b"/abi/lg\0";
         let name = b"user.l\0";
         let val = b"xyz";
@@ -2117,7 +2233,9 @@ fn smoke_abi_fsx_lgetxattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_lgetxattr_pos);
 
 fn smoke_abi_fsx_lgetxattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lg-absent", b"hi")], || {
         let path = b"/abi/lg-absent\0";
         let name = b"user.absent\0";
         let gargs = SyscallArgs {
@@ -2136,7 +2254,9 @@ fn smoke_abi_fsx_lgetxattr_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_lgetxattr_neg);
 
 fn smoke_abi_fsx_llistxattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("ll", b"hi")], || {
         let path = b"/abi/ll\0";
         let name = b"user.q\0"; // "user.q\0" = 7 bytes
         let val = b"v";
@@ -2161,7 +2281,9 @@ fn smoke_abi_fsx_llistxattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_llistxattr_pos);
 
 fn smoke_abi_fsx_llistxattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("ll2", b"hi")], || {
         let path = b"/abi/ll2\0";
         let name = b"user.bigname\0";
         let val = b"v";
@@ -2187,7 +2309,9 @@ fn smoke_abi_fsx_llistxattr_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_llistxattr_neg);
 
 fn smoke_abi_fsx_lremovexattr_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lr", b"hi")], || {
         let path = b"/abi/lr\0";
         let name = b"user.l\0";
         let val = b"v";
@@ -2212,7 +2336,9 @@ fn smoke_abi_fsx_lremovexattr_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx_lremovexattr_pos);
 
 fn smoke_abi_fsx_lremovexattr_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lr-absent", b"hi")], || {
         let path = b"/abi/lr-absent\0";
         let name = b"user.absent\0";
         let rargs = a1(path.as_ptr() as u64, name.as_ptr() as u64);

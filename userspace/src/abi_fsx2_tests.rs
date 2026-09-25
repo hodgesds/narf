@@ -394,7 +394,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_efault_neg);
 // runs; a bogus value pointer fails → ok(-EFAULT).
 
 fn smoke_abi_fsx2_setxattr_value_efault_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("vf", b"hi")], || {
         let path = b"/abi/vf\0";
         let name = b"user.vf\0";
         let args = SyscallArgs {
@@ -418,7 +420,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_value_efault_neg);
 // xattr_set_core flag branch: flags & XATTR_REPLACE && !exists → ok(-ENODATA).
 
 fn smoke_abi_fsx2_setxattr_replace_missing_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("repl", b"hi")], || {
         let path = b"/abi/repl\0";
         let name = b"user.repl\0";
         let val = b"v";
@@ -444,7 +448,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_replace_missing_neg);
 // → ok(-EEXIST). This is the positive-feature path for the create flag.
 
 fn smoke_abi_fsx2_setxattr_create_exists_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("cre", b"hi")], || {
         let path = b"/abi/cre\0";
         let name = b"user.cre\0";
         let val = b"v";
@@ -482,7 +488,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_setxattr_create_exists_pos);
 // (ENODATA) case; ERANGE on the *value* buffer is unhit there.
 
 fn smoke_abi_fsx2_getxattr_erange_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("ge", b"hi")], || {
         let path = b"/abi/ge\0";
         let name = b"user.ge\0";
         let val = b"abcdefgh"; // 8 bytes
@@ -519,7 +527,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_erange_neg);
 // length. The first file only exercises getxattr(size=0) (length probe).
 
 fn smoke_abi_fsx2_getxattr_copyout_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("gc", b"hi")], || {
         let path = b"/abi/gc\0";
         let name = b"user.gc\0";
         let val = b"wxyz"; // 4 bytes
@@ -559,7 +569,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_copyout_pos);
 // `if (error == 0 || error == sizeof(kname->name)) return -ERANGE;`.
 
 fn smoke_abi_fsx2_getxattr_emptyname_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("gn", b"hi")], || {
         let path = b"/abi/gn\0";
         let name = b"\0"; // empty → ERANGE
         let gargs = SyscallArgs {
@@ -584,7 +596,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_emptyname_neg);
 // pins listxattr(size=0) and the ERANGE case.
 
 fn smoke_abi_fsx2_listxattr_copyout_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("lc", b"hi")], || {
         let path = b"/abi/lc\0";
         let name = b"user.lc\0"; // "user.lc\0" = 8 bytes
         let val = b"v";
@@ -615,7 +629,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattr_copyout_pos);
 // 0 (not an error). Pins the "names empty, size 0" exit.
 
 fn smoke_abi_fsx2_listxattr_empty_pos() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("empty-list", b"hi")], || {
         let path = b"/abi/empty-list\0";
         let largs = a2(path.as_ptr() as u64, 0, 0);
         match call(Syscall::Listxattr.raw(), largs) {
@@ -635,7 +651,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattr_empty_pos);
 // `if (error == 0 || error == sizeof(kname->name)) return -ERANGE;`.
 
 fn smoke_abi_fsx2_removexattr_emptyname_neg() -> TestResult {
-    with_setup(|| {
+    // xattr calls on a missing path are -ENOENT (`filename_lookup`),
+    // so the named inode has to exist.
+    with_memfs("/abi", "abi", &[("rn", b"hi")], || {
         let path = b"/abi/rn\0";
         let name = b"\0"; // empty → ERANGE
         let rargs = a1(path.as_ptr() as u64, name.as_ptr() as u64);
@@ -3705,7 +3723,7 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_attr_size_and_flag_rules);
 ///
 /// `if (!name && dfd >= 0) { filepath = fd_file(f)->f_path; }` — and
 /// AT_FDCWD is NOT a descriptor, so it falls through to the path branch,
-/// which has no path: -EBADF.
+/// where the empty lookup names the cwd.
 fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
     const AT_FDCWD: u64 = (-100i64) as u64;
     const AT_EMPTY_PATH: u64 = 0x1000;
@@ -3739,7 +3757,14 @@ fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
         if call(Syscall::FileGetattr.raw(), bad) != Some(EBADF) {
             return Err("AT_EMPTY_PATH on a closed descriptor must be -EBADF");
         }
-        // AT_FDCWD is not a descriptor, so it cannot name a file.
+        // AT_FDCWD is not a descriptor, so it falls through to
+        // `filename_lookup(AT_FDCWD, NULL, ...)` — whose empty walk names
+        // the cwd, a directory, which has (empty) flags. Linux 6.18 answers
+        // 0 here, not EBADF.
+        let dir = c"/fattr3";
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("chdir to the test mount should succeed");
+        }
         let cwd = SyscallArgs {
             arg0: AT_FDCWD,
             arg1: 0,
@@ -3748,8 +3773,38 @@ fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
             arg4: AT_EMPTY_PATH,
             ..Default::default()
         };
-        if call(Syscall::FileGetattr.raw(), cwd) != Some(EBADF) {
-            return Err("AT_FDCWD with a NULL path must be -EBADF");
+        if call(Syscall::FileGetattr.raw(), cwd) != Some(0) {
+            return Err("AT_FDCWD with a NULL path + AT_EMPTY_PATH must name the cwd");
+        }
+        // An O_PATH descriptor is not handed out by `fdget`: -EBADF.
+        const O_PATH: u64 = 0o10000000;
+        let opath = match call_open(path.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_PATH) should succeed"),
+        };
+        let via_opath = SyscallArgs {
+            arg0: opath,
+            arg1: 0,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), via_opath) != Some(EBADF) {
+            return Err("file_getattr on an O_PATH descriptor must be -EBADF");
+        }
+        let _ = call(Syscall::Close.raw(), a0(opath));
+        // `at_flags` is checked before `usize`: EINVAL, not E2BIG.
+        let both_bad = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: 8000,
+            arg4: 0x8000,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), both_bad) != Some(EINVAL) {
+            return Err("a bad at_flags must be -EINVAL ahead of an oversized usize");
         }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())

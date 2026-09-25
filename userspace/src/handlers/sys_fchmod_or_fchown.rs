@@ -1,9 +1,19 @@
 #[allow(unused_imports)]
 use super::*;
 
-fn fd_ops(fd: u32) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+/// The open file behind `fd`, or `None` when there is none.
+///
+/// `allow_path` selects between Linux's two descriptor lookups: `fchmod` /
+/// `fchown` use `fdget`, which does not hand out O_PATH files (-EBADF),
+/// while the `AT_EMPTY_PATH` arm of `fchmodat2` / `fchownat` resolves the
+/// descriptor as a path and accepts them (probed on Linux 6.18).
+fn fd_ops(fd: u32, allow_path: bool) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
     fd::with_table(current_task_id(), |table| {
-        table.get(fd).map(|entry| entry.ops.clone())
+        let entry = table.get(fd)?;
+        if !allow_path && table.status_flags(fd).unwrap_or(0) & crate::fd::O_PATH != 0 {
+            return None;
+        }
+        Some(entry.ops.clone())
     })
     .flatten()
 }
@@ -22,13 +32,25 @@ fn fd_metadata_errno(error: narf_filesystem::FsError, chown: bool) -> i64 {
 }
 
 pub(crate) fn sys_fchmod(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
+    let (fd, mode) = (ctx.args().arg0 as u32, ctx.args().arg1);
+    fchmod_fd(ctx, fd, mode, false);
+}
+
+/// `chmod_common` on the file behind a descriptor. Shared by `fchmod` and
+/// the `AT_EMPTY_PATH` arm of `fchmodat2`.
+pub(crate) fn fchmod_fd(ctx: &mut dyn TrapContext, fd: u32, mode: u64, allow_path: bool) {
     let task = current_task_id();
-    let Some(ops) = fd_ops(fd) else {
+    let Some(ops) = fd_ops(fd, allow_path) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };
-    let mode = (ctx.args().arg1 as u32 & 0o7777) as u16;
+    let (uid, gid) = ops.owners();
+    let is_symlink = ops.stat().mode.file_type == narf_filesystem::FileType::Symlink;
+    if let Err(errno) = chmod_setattr_check(task, ops.inode_flags(), is_symlink, uid, gid) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
+    let mode = (mode as u32 & 0o7777) as u16;
     match poll_blocking(ops.set_perms(mode)) {
         Some(Ok(())) => {
             crate::mqueue::notify_attrib_fd(task, fd);
@@ -42,15 +64,36 @@ pub(crate) fn sys_fchmod(ctx: &mut dyn TrapContext) {
 }
 
 pub(crate) fn sys_fchown(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
+    let a = *ctx.args();
+    fchown_fd(ctx, a.arg0 as u32, a.arg1 as u32, a.arg2 as u32, false);
+}
+
+/// `chown_common` on the file behind a descriptor. Shared by `fchown` and
+/// the `AT_EMPTY_PATH` arm of `fchownat`.
+pub(crate) fn fchown_fd(
+    ctx: &mut dyn TrapContext,
+    fd: u32,
+    requested_uid: u32,
+    requested_gid: u32,
+    allow_path: bool,
+) {
     let task = current_task_id();
-    let Some(ops) = fd_ops(fd) else {
+    let Some(ops) = fd_ops(fd, allow_path) else {
         ctx.set_return(errno_ret(EBADF));
         return;
     };
     let (old_uid, old_gid) = ops.owners();
-    let requested_uid = ctx.args().arg1 as u32;
-    let requested_gid = ctx.args().arg2 as u32;
+    if let Err(errno) = chown_setattr_check(
+        task,
+        ops.inode_flags(),
+        old_uid,
+        old_gid,
+        requested_uid,
+        requested_gid,
+    ) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     let uid = if requested_uid == u32::MAX {
         old_uid
     } else {

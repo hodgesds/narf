@@ -32,6 +32,9 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let task = current_task_id();
+    let requested_uid = args.arg2 as u32;
+    let requested_gid = args.arg3 as u32;
 
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -40,50 +43,22 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         }
         let dirfd = args.arg0 as i32 as i64;
         if dirfd == -100 {
-            let path = resolve_cwd_path(current_task_id(), ".");
+            let path = resolve_cwd_path(task, ".");
             if let Some(dir) = resolve_dir_absolute(&path) {
-                let (old_uid, old_gid) = dir.dir_owners();
-                let uid = if args.arg2 as u32 == u32::MAX {
-                    old_uid
-                } else {
-                    args.arg2 as u32
-                };
-                let gid = if args.arg3 as u32 == u32::MAX {
-                    old_gid
-                } else {
-                    args.arg3 as u32
-                };
-                match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
-                    Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-                    Some(Err(error)) => {
-                        ctx.set_return(errno_ret(chown_errno(error)))
-                    }
-                    None => ctx.set_return(errno_ret(EIO)),
-                }
+                chown_dir(ctx, &path, dir, requested_uid, requested_gid, task);
             } else {
                 ctx.set_return(errno_ret(ENOENT));
             }
         } else if dirfd >= 0 {
-            let proxy_args = SyscallArgs {
-                arg0: args.arg0,
-                arg1: args.arg2,
-                arg2: args.arg3,
-                arg3: 0,
-                arg4: 0,
-                arg5: 0,
-            };
-            let mut proxy = ArgReshape {
-                inner: ctx,
-                args: proxy_args,
-            };
-            sys_fchown(&mut proxy);
+            // The descriptor is resolved as a PATH here, so an O_PATH
+            // descriptor is fine (unlike `fchown`'s `fdget`).
+            fchown_fd(ctx, dirfd as u32, requested_uid, requested_gid, true);
         } else {
             ctx.set_return(errno_ret(EBADF));
         }
         return;
     }
 
-    let task = current_task_id();
     let effective = match resolve_at_path(task, args.arg0 as i64, &raw) {
         Ok(path) => path,
         Err(errno) => {
@@ -92,24 +67,30 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         }
     };
     let path = resolve_cwd_path(task, &effective);
-    // `chown_common`'s caller does `mnt_want_write` first: an ownership
-    // change is a write to the inode.
-    if let Err(errno) = mnt_want_write(&path) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
-    }
-    // `may_setattr` bars ATTR_UID/ATTR_GID on an immutable or append-only
-    // inode.
-    if path_inode_flags(&path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
-        ctx.set_return(errno_ret(EPERM));
-        return;
-    }
     let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let requested_uid = args.arg2 as u32;
-    let requested_gid = args.arg3 as u32;
 
+    // `do_fchownat`: `user_path_at` first (ENOENT / ENOTDIR), then
+    // `mnt_want_write` (EROFS), then `chown_common` -> `notify_change`.
     if let Some(file) = resolve_file_absolute_ext(&path, follow_final) {
+        // An ownership change is a write to the inode.
+        if let Err(errno) = mnt_want_write(&path) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
         let (old_uid, old_gid) = file.owners();
+        // `may_setattr` (immutable / append-only), then `chown_ok` /
+        // `chgrp_ok`: EPERM for a caller who may not make this change.
+        if let Err(errno) = chown_setattr_check(
+            task,
+            file.inode_flags(),
+            old_uid,
+            old_gid,
+            requested_uid,
+            requested_gid,
+        ) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
         let uid = if requested_uid == u32::MAX {
             old_uid
         } else {
@@ -132,27 +113,54 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     }
 
     if let Some(dir) = resolve_dir_absolute(&path) {
-        let (old_uid, old_gid) = dir.dir_owners();
-        let uid = if requested_uid == u32::MAX {
-            old_uid
-        } else {
-            requested_uid
-        };
-        let gid = if requested_gid == u32::MAX {
-            old_gid
-        } else {
-            requested_gid
-        };
-        match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
-            Some(Ok(())) => {
-                crate::mqueue::notify_attrib(&path, true);
-                ctx.set_return(SyscallReturn::ok(0));
-            }
-            Some(Err(error)) => ctx.set_return(errno_ret(chown_errno(error))),
-            None => ctx.set_return(errno_ret(EIO)),
-        }
+        chown_dir(ctx, &path, dir, requested_uid, requested_gid, task);
         return;
     }
 
-    ctx.set_return(errno_ret(ENOENT));
+    ctx.set_return(errno_ret(path_lookup_errno(&path)));
+}
+
+/// `chown_common` on a directory reached through `DirOps`.
+fn chown_dir(
+    ctx: &mut dyn TrapContext,
+    path: &str,
+    dir: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    requested_uid: u32,
+    requested_gid: u32,
+    task: u64,
+) {
+    if let Err(errno) = mnt_want_write(path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    let (old_uid, old_gid) = dir.dir_owners();
+    if let Err(errno) = chown_setattr_check(
+        task,
+        path_inode_flags(path),
+        old_uid,
+        old_gid,
+        requested_uid,
+        requested_gid,
+    ) {
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
+    let uid = if requested_uid == u32::MAX {
+        old_uid
+    } else {
+        requested_uid
+    };
+    let gid = if requested_gid == u32::MAX {
+        old_gid
+    } else {
+        requested_gid
+    };
+    match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
+        Some(Ok(())) => {
+            crate::mqueue::notify_attrib(path, true);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        Some(Err(error)) => ctx.set_return(errno_ret(chown_errno(error))),
+        None => ctx.set_return(errno_ret(EIO)),
+    }
 }

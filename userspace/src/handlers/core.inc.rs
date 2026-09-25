@@ -6591,68 +6591,120 @@ const XATTR_AT_FDCWD: i64 = -100;
 ///
 /// `filename_maybe_null` is what makes a NULL pathname legal, and only with
 /// AT_EMPTY_PATH; the `dfd >= 0` guard is why `AT_FDCWD` with a NULL path
-/// still takes the path branch (and fails there) rather than silently
-/// operating on the cwd.
+/// still takes the path branch — where the empty lookup names the cwd. The
+/// list/remove bodies lack that guard (see `cwd_ok` below).
 ///
 /// Returns the resolved absolute path (or the `f*xattr` fd key) together
 /// with the `follow_final` the caller must hand to the core.
-fn xattr_at_path(dfd: i64, path_ptr: u64, at_flags: u32) -> Result<(alloc::string::String, bool), i64> {
-    if at_flags & !(XATTR_AT_SYMLINK_NOFOLLOW | XATTR_AT_EMPTY_PATH) != 0 {
-        return Err(XE_INVAL);
-    }
+fn xattr_at_path(
+    dfd: i64,
+    path_ptr: u64,
+    at_flags: u32,
+    cwd_ok: bool,
+) -> Result<(alloc::string::String, bool), i64> {
+    // The caller (`xattr_*_at`) has already run the `at_flags` check and
+    // imported the name/value: `path_*xattrat` does both BEFORE it touches
+    // the pathname, so a bad name is -ERANGE even when the path or the
+    // descriptor is also bad.
     let follow = at_flags & XATTR_AT_SYMLINK_NOFOLLOW == 0;
+    let task = current_task_id();
+    // `int dfd`: only the low 32 bits of the register are the argument.
+    let dfd = dfd as i32 as i64;
     // A NULL pathname is `filename_maybe_null` returning NULL, which is only
     // legal with AT_EMPTY_PATH; an empty STRING reaches the same arm because
     // `getname_flags` maps "" + AT_EMPTY_PATH to it too.
-    let empty = if path_ptr == 0 {
+    let raw = if path_ptr == 0 {
         if at_flags & XATTR_AT_EMPTY_PATH == 0 {
             // `getname` on a NULL pointer is -EFAULT.
             return Err(XE_FAULT);
         }
-        true
+        alloc::string::String::new()
     } else {
         let raw = copy_user_cstr(path_ptr, 4096).ok_or(XE_FAULT)?;
-        if raw.is_empty() {
-            if at_flags & XATTR_AT_EMPTY_PATH == 0 {
-                // `getname` rejects "" without AT_EMPTY_PATH: -ENOENT.
-                return Err(-ENOENT);
-            }
-            true
-        } else {
-            let task = current_task_id();
-            let anchored = apply_chroot(&resolve_at_path(task, dfd, &raw)?);
-            // The VFS-level symlink walk, exactly as `open` runs it:
-            //
-            //   resolve_vfs_symlink_path(&path_owned, flags & O_NOFOLLOW == 0)
-            //
-            // This is where LOOKUP_FOLLOW actually lives. It has the mount
-            // table, so it can follow an ABSOLUTE symlink target out of the
-            // filesystem the link sits on — which the in-filesystem resolver
-            // cannot, since it restarts such a target at its own mount root.
-            // Every absolute target (`/usr/bin/awk` -> `/etc/alternatives/awk`,
-            // and every `/lib` -> `/usr/lib` merge) depends on that.
-            //
-            // `unwrap_or` keeps a path the walk could not resolve: the xattr
-            // core reports the real errno for a missing name, and swallowing
-            // it here would turn every ENOENT into a resolution failure.
-            let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
-            return Ok((resolved, follow));
+        if raw.is_empty() && at_flags & XATTR_AT_EMPTY_PATH == 0 {
+            // `getname` rejects "" without AT_EMPTY_PATH: -ENOENT.
+            return Err(-ENOENT);
         }
+        raw
     };
-    debug_assert!(empty);
-    // The fd branch. `dfd >= 0` is Linux's guard: AT_FDCWD here is not a
-    // descriptor, so it cannot name a file and falls through to the path
-    // branch, which has no path — -EBADF.
-    if dfd < 0 || dfd == XATTR_AT_FDCWD {
-        return Err(XE_BADF);
+    if raw.is_empty() {
+        // `path_setxattrat` / `path_getxattrat` test
+        // `if (!filename && dfd >= 0)`: only a real descriptor takes the fd
+        // branch, and AT_FDCWD falls through to `filename_*xattr(AT_FDCWD,
+        // NULL, ...)`, whose empty lookup lands on the cwd itself. The list
+        // and remove bodies test plain `if (!filename)`, so there AT_FDCWD
+        // reaches `fdget` and is -EBADF. Probed on Linux 6.18:
+        // `fgetxattr(AT_FDCWD, ...)` / `fsetxattr` act on the cwd, while
+        // `fremovexattr` / `flistxattr` / `listxattrat(AT_FDCWD, "",
+        // AT_EMPTY_PATH)` are EBADF. `cwd_ok` selects the former.
+        if cwd_ok && dfd == XATTR_AT_FDCWD {
+            return xattr_lookup(task, dfd, ".", follow);
+        }
+        if dfd < 0 {
+            return Err(XE_BADF);
+        }
+        // `CLASS(fd, f)(dfd)` is `fdget`, which does not hand out O_PATH
+        // files: `fgetxattr(open(p, O_PATH), ...)` is -EBADF.
+        let status = fd::with_table(task, |t| t.status_flags(dfd as u32)).flatten();
+        if status.is_some_and(|flags| flags & crate::fd::O_PATH != 0) {
+            return Err(XE_BADF);
+        }
+        // Same side-table key the `f*xattr` family uses, so an AT_EMPTY_PATH
+        // call and an `f*xattr` call on the same descriptor address the same
+        // attributes. (Both are separate from the path-keyed family — see
+        // `xattr_fd_key`.)
+        return xattr_fd_key(dfd as u32)
+            .map(|key| (key, follow))
+            .ok_or(XE_BADF);
     }
-    // Same side-table key the `f*xattr` family uses, so an AT_EMPTY_PATH
-    // call and an `f*xattr` call on the same descriptor address the same
-    // attributes. (Both are separate from the path-keyed family — see
-    // `xattr_fd_key`.)
-    xattr_fd_key(dfd as u32)
-        .map(|key| (key, follow))
-        .ok_or(XE_BADF)
+    xattr_lookup(task, dfd, &raw, follow)
+}
+
+/// The `filename_lookup` half of [`xattr_at_path`].
+fn xattr_lookup(
+    task: u64,
+    dfd: i64,
+    raw: &str,
+    follow: bool,
+) -> Result<(alloc::string::String, bool), i64> {
+    // `resolve_cwd_path`, not a bare `apply_chroot`: a RELATIVE name has to
+    // be joined onto the cwd before anything can resolve it (`apply_chroot`
+    // passes relative paths through untouched).
+    let anchored = resolve_cwd_path(task, &resolve_at_path(task, dfd, raw)?);
+    // The VFS-level symlink walk, exactly as `open` runs it:
+    //
+    //   resolve_vfs_symlink_path(&path_owned, flags & O_NOFOLLOW == 0)
+    //
+    // This is where LOOKUP_FOLLOW actually lives. It has the mount
+    // table, so it can follow an ABSOLUTE symlink target out of the
+    // filesystem the link sits on — which the in-filesystem resolver
+    // cannot, since it restarts such a target at its own mount root.
+    // Every absolute target (`/usr/bin/awk` -> `/etc/alternatives/awk`,
+    // and every `/lib` -> `/usr/lib` merge) depends on that.
+    //
+    // `unwrap_or` keeps a path the walk could not resolve, so the check
+    // below can classify WHY it did not resolve.
+    let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
+    // `filename_lookup` fails before any xattr code runs: a name that is
+    // not there is -ENOENT (-ENOTDIR / -ELOOP / -EACCES from the walk),
+    // never a silent store into the path-keyed side table. A node the
+    // xattr resolver cannot reach but `stat` can (a synthetic filesystem
+    // with no xattr store) still exists, and keeps the side table.
+    // With LOOKUP_FOLLOW a dangling final symlink is -ENOENT too: the walk
+    // above left it unexpanded, and the xattr resolver (which never follows)
+    // would otherwise find the link itself.
+    let exists = stat_ino_path_dir_aware_ext(&resolved, follow).is_some()
+        || match xattr_target(&resolved) {
+            Some(XattrTarget::File(file)) => {
+                !follow || file.stat().mode.file_type != narf_filesystem::FileType::Symlink
+            }
+            Some(XattrTarget::Dir(_)) => true,
+            None => false,
+        };
+    if !exists {
+        return Err(-path_lookup_errno(&resolved));
+    }
+    Ok((resolved, follow))
 }
 
 /// `struct xattr_args` (`include/uapi/linux/xattr.h`), read with
@@ -6749,22 +6801,20 @@ fn xattr_import_name(ptr: u64) -> Result<alloc::string::String, i64> {
     }
 }
 
-/// `fs/xattr.c::xattr_resolve_name` + `xattr_permission`, for the handler
-/// set every NARF filesystem with xattrs presents (`security`, `trusted`,
-/// `user`, and `system` for the two POSIX ACL names).
+/// `fs/xattr.c::xattr_resolve_name`, for the handler set every NARF
+/// filesystem with xattrs presents (`security`, `trusted`, `user`, and
+/// `system` for the two POSIX ACL names).
 ///
-/// `write` selects Linux's asymmetry: a namespace the caller may not touch
-/// answers `-EPERM` to a set/remove and `-ENODATA` to a get, so a
-/// `getxattr` can never be used to probe for the existence of an attribute
-/// the caller is not allowed to read.
-fn xattr_namespace_ok(name: &str, write: bool) -> Result<(), i64> {
-    if name.starts_with("security.") {
-        return Ok(());
-    }
-    // `xattr_permission` waves `system.*` through to the filesystem, but on
-    // every filesystem NARF has the only `system.*` handlers are the two
-    // POSIX ACL names; anything else fails to resolve to a handler, which
-    // is `xattr_resolve_name`'s -EOPNOTSUPP.
+/// This runs LAST among the VFS checks — after the lookup,
+/// `mnt_want_write` and `xattr_permission` — because Linux only resolves
+/// the handler inside `__vfs_setxattr` / `__vfs_getxattr` /
+/// `__vfs_removexattr`. So `setxattr("/nonexistent", "foo.bar")` is ENOENT,
+/// a read-only mount is EROFS, and an unwritable file is EACCES, all ahead
+/// of the EOPNOTSUPP an unknown prefix earns (probed on Linux 6.18). The
+/// `trusted.*` privilege rule is `xattr_permission`'s, not this one's.
+fn xattr_resolve_name(name: &str) -> Result<(), i64> {
+    // On every filesystem NARF has, the only `system.*` handlers are the
+    // two POSIX ACL names; anything else fails to resolve to a handler.
     if name.starts_with("system.") {
         return if is_acl_xattr(name) {
             Ok(())
@@ -6772,15 +6822,7 @@ fn xattr_namespace_ok(name: &str, write: bool) -> Result<(), i64> {
             Err(XE_OPNOTSUPP)
         };
     }
-    if name.starts_with("trusted.") {
-        // "The trusted.* namespace can only be accessed by privileged
-        // users."
-        if !capable(CAP_SYS_ADMIN) {
-            return Err(if write { XE_PERM } else { XE_NODATA });
-        }
-        return Ok(());
-    }
-    if name.starts_with("user.") {
+    if name.starts_with("security.") || name.starts_with("trusted.") || name.starts_with("user.") {
         return Ok(());
     }
     // No handler for this prefix: `xattr_resolve_name` returns -EOPNOTSUPP.
@@ -6803,6 +6845,7 @@ const XE_NOSPC: i64 = -28;
 const XE_DQUOT: i64 = -122;
 const XE_IO: i64 = -5;
 const XE_BADF: i64 = -9;
+const XE_ROFS: i64 = -30;
 
 /// Map an `FsError` from an xattr operation onto Linux's errno.
 ///
@@ -6824,6 +6867,7 @@ fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
         FsError::NoSpace => XE_NOSPC,
         FsError::QuotaExceeded => XE_DQUOT,
         FsError::InvalidData => XE_INVAL,
+        FsError::ReadOnly => XE_ROFS,
         _ => XE_IO,
     })
 }
@@ -6850,6 +6894,81 @@ fn inode_owner_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
     capable_wrt_inode(task, file_uid, file_gid, CAP_FOWNER)
 }
 
+/// `fs/attr.c::notify_change` + `setattr_prepare` for an `ATTR_MODE`
+/// change (chmod / fchmod / fchmodat / fchmodat2), in their order:
+///
+/// ```text
+/// may_setattr:     if (IS_IMMUTABLE(inode) || IS_APPEND(inode)) return -EPERM;
+/// notify_change:   if (S_ISLNK(inode->i_mode)) return -EOPNOTSUPP;
+/// setattr_prepare: if (!inode_owner_or_capable(idmap, inode)) return -EPERM;
+/// ```
+///
+/// Returns a positive errno. Without the owner test any task that could
+/// name a file could re-permission it (Linux: EPERM for a non-owner).
+fn chmod_setattr_check(
+    task: u64,
+    iflags: u32,
+    is_symlink: bool,
+    uid: u32,
+    gid: u32,
+) -> Result<(), i64> {
+    if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        return Err(EPERM);
+    }
+    if is_symlink {
+        return Err(EOPNOTSUPP);
+    }
+    if !inode_owner_or_capable(task, uid, gid) {
+        return Err(EPERM);
+    }
+    Ok(())
+}
+
+/// `fs/attr.c::notify_change` + `setattr_prepare` for a chown. `new_uid` /
+/// `new_gid` are `u32::MAX` for "leave unchanged", which sets neither
+/// ATTR_UID nor ATTR_GID — so `chown(p, -1, -1)` succeeds for anyone, even
+/// on an immutable inode (probed on Linux 6.18). Otherwise:
+///
+/// ```text
+/// chown_ok: (owner && uid unchanged) || capable_wrt_inode_uidgid(CAP_CHOWN)
+/// chgrp_ok: (owner && (gid unchanged || in_group_p(gid))) || capable_wrt_inode_uidgid(CAP_CHOWN)
+/// ```
+///
+/// both -EPERM. Returns a positive errno.
+fn chown_setattr_check(
+    task: u64,
+    iflags: u32,
+    file_uid: u32,
+    file_gid: u32,
+    new_uid: u32,
+    new_gid: u32,
+) -> Result<(), i64> {
+    let set_uid = new_uid != u32::MAX;
+    let set_gid = new_gid != u32::MAX;
+    if !set_uid && !set_gid {
+        return Ok(());
+    }
+    // `may_setattr`: ATTR_UID / ATTR_GID on an immutable or append-only inode.
+    if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        return Err(EPERM);
+    }
+    if capable_wrt_inode(task, file_uid, file_gid, CAP_CHOWN) {
+        return Ok(());
+    }
+    let owner = current_host_fsuid(task) == file_uid;
+    if set_uid && !(owner && new_uid == file_uid) {
+        return Err(EPERM);
+    }
+    if set_gid {
+        let ids = read_uidgid(task);
+        let in_group = ids.fsgid == new_gid || read_groups(task).contains(&new_gid);
+        if !(owner && (new_gid == file_gid || in_group)) {
+            return Err(EPERM);
+        }
+    }
+    Ok(())
+}
+
 /// The inode an xattr call names. A directory is an inode with extended
 /// attributes, but path resolution hands back `DirOps` for one, so the
 /// `FileOps` form alone can never see it.
@@ -6864,12 +6983,27 @@ impl XattrTarget {
         match self {
             Self::File(file) => {
                 let (uid, gid) = file.owners();
-                (uid, gid, file.stat().mode.perms, false)
+                let mode = file.stat().mode;
+                // Ext2 hands directories out through `FileOps` too.
+                let is_dir = mode.file_type == narf_filesystem::FileType::Dir;
+                (uid, gid, mode.perms, is_dir)
             }
             Self::Dir(dir) => {
                 let (uid, gid) = dir.dir_owners();
                 (uid, gid, dir.dir_mode(), true)
             }
+        }
+    }
+
+    /// `S_ISREG(mode) || S_ISDIR(mode)` — the only inodes `xattr_permission`
+    /// lets carry `user.*` attributes.
+    fn user_xattr_capable(&self) -> bool {
+        match self {
+            Self::File(file) => matches!(
+                file.stat().mode.file_type,
+                narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+            ),
+            Self::Dir(_) => true,
         }
     }
 
@@ -6897,7 +7031,55 @@ fn xattr_target(path: &str) -> Option<XattrTarget> {
     resolve_dir_absolute(path).map(XattrTarget::Dir)
 }
 
-/// The permission gate for one xattr operation on one inode.
+/// `XATTR_NAME_CAPS`.
+const XATTR_NAME_CAPS: &str = "security.capability";
+/// Linux `CAP_SETFCAP` — "set arbitrary capabilities on a file".
+const CAP_SETFCAP: u32 = 31;
+
+/// `security/commoncap.c::cap_convert_nscap`'s validation of a
+/// `security.capability` value, which `vfs_setxattr` runs (for a non-empty
+/// value) after `mnt_want_write` and before `xattr_permission`:
+///
+/// ```text
+/// if (!validheader(size, cap)) return -EINVAL;
+/// if (!capable_wrt_inode_uidgid(idmap, inode, CAP_SETFCAP)) return -EPERM;
+/// ```
+///
+/// `validheader` accepts exactly a v2 header in `XATTR_CAPS_SZ_2` (20)
+/// bytes or a v3 header in `XATTR_CAPS_SZ_3` (24); a v1 blob, a wrong
+/// revision or a wrong size is EINVAL (probed on Linux 6.18).
+fn xattr_caps_check(value: &[u8], target: Option<&XattrTarget>, task: u64) -> Result<(), i64> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
+    let rev = value
+        .get(0..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & VFS_CAP_REVISION_MASK);
+    let valid = matches!(
+        (value.len(), rev),
+        (20, Some(0x0200_0000)) | (24, Some(0x0300_0000))
+    );
+    if !valid {
+        return Err(XE_INVAL);
+    }
+    let permitted = match target {
+        Some(t) => {
+            let (uid, gid, ..) = t.meta();
+            capable_wrt_inode(task, uid, gid, CAP_SETFCAP)
+        }
+        None => capable(CAP_SETFCAP),
+    };
+    if permitted {
+        Ok(())
+    } else {
+        Err(XE_PERM)
+    }
+}
+
+/// The permission gate for one xattr operation on one inode, in Linux's
+/// order: `may_write_xattr`, then `xattr_permission`, then the LSM hook
+/// (`security_inode_setxattr` / `_removexattr`, i.e. commoncap).
 ///
 /// The two name classes take different routes in Linux, and conflating
 /// them gets the answer wrong in both directions. `do_setxattr` sends the
@@ -6905,12 +7087,16 @@ fn xattr_target(path: &str) -> Option<XattrTarget> {
 /// whose only check is `inode_owner_or_capable` (EPERM) — write permission
 /// on the inode is neither required nor sufficient. Everything else goes
 /// through `vfs_setxattr` -> `xattr_permission`, which ends at
-/// `inode_permission(idmap, inode, mask)`.
+/// `inode_permission(idmap, inode, mask)` — except for `security.*` and
+/// `system.*`, which it waves through to the LSM / filesystem.
 ///
 /// Reading an ACL has no check at all (`vfs_get_acl` performs none), which
 /// matches the mode bits being world-readable through `stat`.
+///
+/// `target` is `None` for a node NARF can only reach through the
+/// side table; the name-only rules still apply to it.
 fn xattr_permission_check(
-    target: &XattrTarget,
+    target: Option<&XattrTarget>,
     name: &str,
     write: bool,
     task: u64,
@@ -6921,64 +7107,111 @@ fn xattr_permission_check(
     // append-only inode".
     if write {
         let iflags = match target {
-            XattrTarget::File(file) => file.inode_flags(),
-            XattrTarget::Dir(_) => 0,
+            Some(XattrTarget::File(file)) => file.inode_flags(),
+            _ => 0,
         };
         if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
             return Err(XE_PERM);
         }
     }
-    let (uid, gid, perms, is_dir) = target.meta();
     if is_acl_xattr(name) {
+        let Some(target) = target else {
+            return Ok(());
+        };
         if !write {
             return Ok(());
         }
+        let (uid, gid, _, is_dir) = target.meta();
         // `set_posix_acl` tests the DEFAULT-on-a-non-directory case FIRST
         // and answers `acl ? -EACCES : 0` without ever consulting the
         // owner. Leaving that arm to the filesystem keeps Linux's
         // precedence, which putting EPERM in front of it would invert.
-        let default_on_file =
-            !is_dir && name == narf_filesystem::AclType::Default.xattr_name();
+        let default_on_file = !is_dir && name == narf_filesystem::AclType::Default.xattr_name();
         if !default_on_file && !inode_owner_or_capable(task, uid, gid) {
             return Err(XE_PERM);
         }
         return Ok(());
     }
-    // The rest of `xattr_permission`. The sticky-directory rule first: on
-    // a directory with S_ISVTX, `user.*` may only be WRITTEN by someone who
-    // passes `inode_owner_or_capable`, so a shared `/tmp` cannot have its
-    // entries relabelled by passers-by.
-    if write
-        && is_dir
-        && perms & 0o1000 != 0
-        && name.starts_with("user.")
-        && !inode_owner_or_capable(task, uid, gid)
+    // "No restriction for security.* and system.* from the VFS. Decision
+    // on these is left to the underlying filesystem / security module."
+    // Applying `inode_permission` to them answered EACCES where Linux
+    // answers EPERM (a `security.*` write) or ENODATA (a read).
+    let vfs_exempt = name.starts_with("security.") || name.starts_with("system.");
+    if !vfs_exempt {
+        if name.starts_with("trusted.") {
+            // "The trusted.* namespace can only be accessed by privileged
+            // users." A read answers ENODATA, so a getxattr can never be
+            // used to probe for an attribute the caller may not see.
+            if !capable(CAP_SYS_ADMIN) {
+                return Err(if write { XE_PERM } else { XE_NODATA });
+            }
+        } else if let Some(target) = target {
+            let (uid, gid, perms, is_dir) = target.meta();
+            if name.starts_with("user.") {
+                // "In the user.* namespace, only regular files and
+                // directories can have extended attributes."
+                if !target.user_xattr_capable() {
+                    return Err(if write { XE_PERM } else { XE_NODATA });
+                }
+                // "For sticky directories, only the owner and privileged
+                // users can write attributes" — so a shared `/tmp` cannot
+                // have its entries relabelled by passers-by.
+                if write && is_dir && perms & 0o1000 != 0 && !inode_owner_or_capable(task, uid, gid)
+                {
+                    return Err(XE_PERM);
+                }
+            }
+            // ...ending at `inode_permission(idmap, inode, mask)`: setting
+            // an attribute needs WRITE on the inode, reading one needs READ.
+            let permitted = narf_filesystem::posix_access_ok_with_acl(
+                narf_filesystem::FileOwner {
+                    uid,
+                    gid,
+                    perms,
+                    is_dir,
+                },
+                &accessor_for_inode(task, uid, gid),
+                narf_filesystem::AccessRequest {
+                    read: !write,
+                    write,
+                    exec: false,
+                },
+                target.access_acl().as_ref(),
+            );
+            if !permitted {
+                return Err(XE_ACCES);
+            }
+        }
+    }
+    // The LSM hook. With no LSM claiming the name, commoncap decides:
+    // `cap_inode_setxattr` / `cap_inode_removexattr` require CAP_SYS_ADMIN
+    // to write any `security.*` name other than `security.capability`,
+    // which has its own rules ([`xattr_caps_check`] for a set,
+    // [`xattr_caps_remove_check`] for a removal). Reads are unrestricted.
+    if write && name.starts_with("security.") && name != XATTR_NAME_CAPS && !capable(CAP_SYS_ADMIN)
     {
         return Err(XE_PERM);
     }
-    // ...ending at `inode_permission(idmap, inode, mask)`: setting an
-    // attribute needs WRITE on the inode, reading one needs READ. Nothing
-    // enforced that, so a file's `security.*` label could be rewritten by
-    // anyone who could name it.
-    let permitted = narf_filesystem::posix_access_ok_with_acl(
-        narf_filesystem::FileOwner {
-            uid,
-            gid,
-            perms,
-            is_dir,
-        },
-        &accessor_for_inode(task, uid, gid),
-        narf_filesystem::AccessRequest {
-            read: !write,
-            write,
-            exec: false,
-        },
-        target.access_acl().as_ref(),
-    );
+    Ok(())
+}
+
+/// `cap_inode_removexattr` for `security.capability`:
+/// `if (!capable_wrt_inode_uidgid(idmap, inode, CAP_SETFCAP)) return -EPERM;`
+fn xattr_caps_remove_check(name: &str, target: Option<&XattrTarget>, task: u64) -> Result<(), i64> {
+    if name != XATTR_NAME_CAPS {
+        return Ok(());
+    }
+    let permitted = match target {
+        Some(t) => {
+            let (uid, gid, ..) = t.meta();
+            capable_wrt_inode(task, uid, gid, CAP_SETFCAP)
+        }
+        None => capable(CAP_SETFCAP),
+    };
     if permitted {
         Ok(())
     } else {
-        Err(XE_ACCES)
+        Err(XE_PERM)
     }
 }
 
@@ -7023,7 +7256,21 @@ fn is_acl_xattr(name: &str) -> bool {
         || name == narf_filesystem::AclType::Default.xattr_name()
 }
 
-fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
+/// What `setxattr_copy` produced: the imported name, the copied value and
+/// the validated flags.
+pub(crate) struct XattrSetArgs {
+    name: alloc::string::String,
+    value: alloc::vec::Vec<u8>,
+    flags: u64,
+}
+
+/// `fs/xattr.c::setxattr_copy` (name/value/size/flags at arg1..arg4).
+///
+/// `path_setxattrat` runs this BEFORE it looks at the pathname or the
+/// descriptor, so `fsetxattr(bad_fd, "", ...)` is ERANGE and
+/// `setxattr(bad_ptr, "user.a", v, 70000, 0)` is E2BIG (probed on Linux
+/// 6.18) — the lookup's EFAULT / ENOENT / EBADF never get a say.
+fn xattr_set_copy(ctx: &mut dyn TrapContext) -> Result<XattrSetArgs, i64> {
     let a = *ctx.args();
     let size = a.arg3 as usize;
     let flags = a.arg4;
@@ -7032,49 +7279,44 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     // TOGETHER is not rejected here — `simple_xattr_set` fails it with
     // EEXIST or ENODATA depending on whether the attribute exists.
     if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
-        ctx.set_return(SyscallReturn::ok(XE_INVAL as u64));
-        return;
+        return Err(XE_INVAL);
     }
-    let name = match xattr_import_name(a.arg1) {
-        Ok(name) => name,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    };
+    let name = xattr_import_name(a.arg1)?;
     if size > XATTR_SIZE_MAX {
-        ctx.set_return(SyscallReturn::ok(XE_2BIG as u64));
-        return;
-    }
-    if let Err(errno) = xattr_namespace_ok(&name, true) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
+        return Err(XE_2BIG);
     }
     let value = if size == 0 {
         alloc::vec::Vec::new()
     } else {
         // SAFETY: size != 0; copy_from_user_vec range-validates a.arg2.
-        match unsafe { copy_from_user_vec(a.arg2, size) } {
-            Ok(v) => v,
-            Err(_) => {
-                ctx.set_return(SyscallReturn::ok(XE_FAULT as u64));
-                return;
-            }
-        }
+        unsafe { copy_from_user_vec(a.arg2, size) }.map_err(|_| XE_FAULT)?
     };
-    // `setxattr` -> `mnt_want_write` before anything else touches the
-    // inode: an attribute is state on the filesystem like any other.
+    Ok(XattrSetArgs { name, value, flags })
+}
+
+fn xattr_set_core(path: alloc::string::String, args: XattrSetArgs, ctx: &mut dyn TrapContext) {
+    let XattrSetArgs { name, value, flags } = args;
+    let task = current_task_id();
+    // `filename_setxattr` -> `mnt_want_write` before anything else touches
+    // the inode: an attribute is state on the filesystem like any other.
     if let Err(errno) = mnt_want_write(&path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
     // A path can name a file or a directory; both are inodes with xattrs.
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
+    // `vfs_setxattr`: `cap_convert_nscap` for `security.capability`, then
+    // `xattr_permission` + the LSM hook, then `xattr_resolve_name`.
+    let checked = (if name == XATTR_NAME_CAPS {
+        xattr_caps_check(&value, target.as_ref(), task)
+    } else {
+        Ok(())
+    })
+    .and_then(|()| xattr_permission_check(target.as_ref(), &name, true, task))
+    .and_then(|()| xattr_resolve_name(&name));
+    if let Err(errno) = checked {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
     }
     let stored = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
@@ -7124,26 +7366,20 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
 
 /// `getxattr` / `lgetxattr` / `fgetxattr` core (name at arg1, value at
 /// arg2, size at arg3).
-fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
+fn xattr_get_core(
+    path: alloc::string::String,
+    name: alloc::string::String,
+    ctx: &mut dyn TrapContext,
+) {
     let a = *ctx.args();
-    let name = match xattr_import_name(a.arg1) {
-        Ok(name) => name,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    };
-    if let Err(errno) = xattr_namespace_ok(&name, false) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
-    }
     let size = a.arg3 as usize;
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        if let Err(errno) = xattr_permission_check(target, &name, false, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
+    // `vfs_getxattr`: `xattr_permission(MAY_READ)`, then the handler lookup.
+    if let Err(errno) = xattr_permission_check(target.as_ref(), &name, false, current_task_id())
+        .and_then(|()| xattr_resolve_name(&name))
+    {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
     }
     let fetched = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.get_xattr(&name)),
@@ -7193,16 +7429,11 @@ fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
+    // `vfs_listxattr` makes no permission check at all: only
+    // `security_inode_listxattr`, which commoncap does not implement. A
+    // mode-000 file owned by someone else still lists (probed on Linux
+    // 6.18), so demanding READ here answered EACCES where Linux succeeds.
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        // `listxattr` needs READ on the inode, like any other read of its
-        // metadata. The empty name is the whole-inode form, so there is no
-        // namespace to resolve.
-        if let Err(errno) = xattr_permission_check(target, "", false, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    }
     let listed = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.list_xattr()),
         Some(XattrTarget::Dir(dir)) => poll_blocking(dir.list_xattr()),
@@ -7249,29 +7480,25 @@ fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
 }
 
 /// `removexattr` / `lremovexattr` / `fremovexattr` core (name at arg1).
-fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let name = match xattr_import_name(a.arg1) {
-        Ok(name) => name,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
-    };
-    if let Err(errno) = xattr_namespace_ok(&name, true) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
-        return;
-    }
+fn xattr_remove_core(
+    path: alloc::string::String,
+    name: alloc::string::String,
+    ctx: &mut dyn TrapContext,
+) {
+    let task = current_task_id();
     if let Err(errno) = mnt_want_write(&path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
     let target = xattr_target(&path);
-    if let Some(target) = target.as_ref() {
-        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
-            ctx.set_return(SyscallReturn::ok(errno as u64));
-            return;
-        }
+    // `vfs_removexattr`: `xattr_permission(MAY_WRITE)`, the LSM hook, then
+    // the handler lookup in `__vfs_removexattr`.
+    if let Err(errno) = xattr_permission_check(target.as_ref(), &name, true, task)
+        .and_then(|()| xattr_caps_remove_check(&name, target.as_ref(), task))
+        .and_then(|()| xattr_resolve_name(&name))
+    {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
     }
     let removed = match target {
         Some(XattrTarget::File(file)) => poll_blocking(file.remove_xattr(&name)),
@@ -7317,61 +7544,302 @@ fn wall_now_ns() -> u64 {
     (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64
 }
 
-/// Apply `set_times` to an absolute (already cwd/chroot-resolved) path.
-/// Returns the Linux result: 0, -ENOENT, or 0 for a resolvable node
-/// whose FS doesn't track times (lenient legacy behavior, incl. dirs —
-/// resolve_async only yields files, so directories take the
-/// stat-dir-aware fallback).
-fn set_path_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> i64 {
-    // `do_utimes` -> `mnt_want_write`: stamping a timestamp is a write.
-    if let Err(errno) = mnt_want_write(path) {
-        return errno;
+/// A `timespec[2]` exactly as the caller supplied it — raw `(tv_sec,
+/// tv_nsec)` pairs — or `None` for a NULL `times`. Validation is deferred
+/// to [`utimes_request`] because Linux validates `tv_nsec` in `vfs_utimes`,
+/// AFTER the lookup (probed on Linux 6.18: a bad `tv_nsec` on a missing path
+/// is ENOENT, and on a bad descriptor EBADF).
+pub(crate) type UtimesSpec = Option<[(i64, i64); 2]>;
+
+pub(crate) const UTIME_NOW: i64 = 0x3FFF_FFFF;
+pub(crate) const UTIME_OMIT: i64 = 0x3FFF_FFFE;
+
+/// `fs/utimes.c::vfs_utimes`' reading of the times: `(atime, mtime,
+/// touch)`, with `None` for an omitted slot. `touch` is Linux's ATTR_TOUCH
+/// — times NULL, or both UTIME_NOW — which is the only form a non-owner
+/// with write permission may use. Returns a negative errno.
+fn utimes_request(times: UtimesSpec) -> Result<(Option<u64>, Option<u64>, bool), i64> {
+    let now = wall_now_ns();
+    let Some(t) = times else {
+        return Ok((Some(now), Some(now), true));
+    };
+    // `nsec_valid`: UTIME_NOW / UTIME_OMIT, or 0..=999_999_999.
+    let nsec_valid = |n: i64| n == UTIME_NOW || n == UTIME_OMIT || (0..1_000_000_000).contains(&n);
+    if !nsec_valid(t[0].1) || !nsec_valid(t[1].1) {
+        return Err(-EINVAL);
     }
-    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
-    });
-    match ops {
-        Some(Some(Ok(o))) => {
-            // Unsupported → lenient 0 (see module comment above).
-            let _ = o.set_times(atime_ns, mtime_ns);
-            0
+    // "if (times && times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec ==
+    // UTIME_NOW) times = NULL;"
+    if t[0].1 == UTIME_NOW && t[1].1 == UTIME_NOW {
+        return Ok((Some(now), Some(now), true));
+    }
+    let slot = |(sec, nsec): (i64, i64)| match nsec {
+        UTIME_OMIT => None,
+        UTIME_NOW => Some(now),
+        n => Some((sec.max(0) as u64).saturating_mul(1_000_000_000) + n as u64),
+    };
+    Ok((slot(t[0]), slot(t[1]), false))
+}
+
+/// `fs/attr.c::may_setattr` + `setattr_prepare` for a timestamp change.
+///
+/// ```text
+/// ATTR_TIMES_SET: IS_IMMUTABLE || IS_APPEND -> -EPERM;
+///                 !inode_owner_or_capable   -> -EPERM
+/// ATTR_TOUCH:     IS_IMMUTABLE              -> -EPERM;
+///                 !inode_owner_or_capable && inode_permission(MAY_WRITE) fails -> -EACCES
+/// ```
+///
+/// So a stranger who can write the file may `touch` it but not set an
+/// explicit time (probed on Linux 6.18). NARF checked neither, so any task
+/// could back-date any file it could name. Returns a negative errno.
+fn utimes_permission(target: &XattrTarget, touch: bool, task: u64) -> Result<(), i64> {
+    let iflags = match target {
+        XattrTarget::File(file) => file.inode_flags(),
+        XattrTarget::Dir(_) => 0,
+    };
+    let (uid, gid, perms, is_dir) = target.meta();
+    if !touch {
+        if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+            return Err(-EPERM);
         }
-        _ => {
-            // Not a plain file — a directory still validates (0), a
-            // missing path is -ENOENT, matching the old stubs.
-            if stat_path_dir_aware(path).is_some() {
-                0
-            } else {
-                -2
-            }
-        }
+        return if inode_owner_or_capable(task, uid, gid) {
+            Ok(())
+        } else {
+            Err(-EPERM)
+        };
+    }
+    if iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        return Err(-EPERM);
+    }
+    if inode_owner_or_capable(task, uid, gid) {
+        return Ok(());
+    }
+    let writable = narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: true,
+            exec: false,
+        },
+        target.access_acl().as_ref(),
+    );
+    if writable {
+        Ok(())
+    } else {
+        Err(-EACCES)
     }
 }
 
-/// Shared utimes body: `timeval[2]` (sec + USEC) at `tv_ptr`, NULL =
-/// both now. Used by utimes(235) and futimesat(261).
-fn utimes_common(ctx: &mut dyn TrapContext, raw_path: &str, tv_ptr: u64) {
-    let (at, mt) = if tv_ptr == 0 {
-        let now = wall_now_ns();
-        (now, now)
-    } else {
-        let mut buf = [0u8; 32];
-        // SAFETY: non-zero user timeval[2] pointer; copy_from_user
-        // range-validates and SMAP-brackets the 32-byte read.
-        if unsafe { copy_from_user(&mut buf, tv_ptr) }.is_err() {
-            ctx.set_return(errno_ret(EFAULT));
+/// `fs/utimes.c::do_utimes` — the body behind utime / utimes / futimesat /
+/// utimensat, with Linux's split:
+///
+/// ```text
+/// if (filename == NULL && dfd != AT_FDCWD) return do_utimes_fd(dfd, times, flags);
+/// return do_utimes_path(dfd, filename, times, flags);
+/// ```
+///
+/// `do_utimes_fd`: `flags` must be 0 (EINVAL), then `fdget` (EBADF, and
+/// O_PATH descriptors are not handed out), then `vfs_utimes`.
+/// `do_utimes_path`: flags check (EINVAL), `user_path_at` (EFAULT / ENOENT
+/// / ENOTDIR / EBADF), then `vfs_utimes`: tv_nsec (EINVAL), `mnt_want_write`
+/// (EROFS), `notify_change` (EPERM / EACCES).
+pub(crate) fn do_utimes(
+    ctx: &mut dyn TrapContext,
+    dfd: i64,
+    path_ptr: u64,
+    times: UtimesSpec,
+    flags: u64,
+) {
+    const AT_FDCWD: i64 = -100;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let task = current_task_id();
+    let dfd = dfd as i32 as i64;
+
+    if path_ptr == 0 && dfd != AT_FDCWD {
+        if flags != 0 {
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
-        let tv = |o: usize| -> u64 {
-            let sec = i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
-            let usec = i64::from_ne_bytes(buf[o + 8..o + 16].try_into().unwrap());
-            (sec.max(0) as u64).saturating_mul(1_000_000_000) + (usec.max(0) as u64) * 1_000
+        let ops = if dfd < 0 {
+            None
+        } else {
+            fd::with_table(task, |t| {
+                let entry = t.get(dfd as u32)?;
+                if t.status_flags(dfd as u32).unwrap_or(0) & crate::fd::O_PATH != 0 {
+                    return None;
+                }
+                Some(entry.ops.clone())
+            })
+            .flatten()
         };
-        (tv(0), tv(16))
+        match ops {
+            Some(ops) => utimes_fd(ctx, task, dfd as u32, ops, times),
+            None => ctx.set_return(errno_ret(EBADF)),
+        }
+        return;
+    }
+
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    // A NULL pathname here (AT_FDCWD) is `getname(NULL)`: -EFAULT.
+    let raw = match copy_user_cstr_checked(path_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
     };
-    let path = resolve_cwd_path(current_task_id(), raw_path);
-    let r = set_path_times(&path, Some(at), Some(mt));
-    ctx.set_return(SyscallReturn::ok(r as u64));
+    let raw: &str = if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            ctx.set_return(errno_ret(ENOENT));
+            return;
+        }
+        if dfd == AT_FDCWD {
+            "."
+        } else if dfd >= 0 {
+            // LOOKUP_EMPTY names the descriptor itself; unlike `fdget`, a
+            // path lookup accepts an O_PATH descriptor.
+            let ops = fd::with_table(task, |t| t.get(dfd as u32).map(|e| e.ops.clone())).flatten();
+            match ops {
+                Some(ops) => utimes_fd(ctx, task, dfd as u32, ops, times),
+                None => ctx.set_return(errno_ret(EBADF)),
+            }
+            return;
+        } else {
+            ctx.set_return(errno_ret(EBADF));
+            return;
+        }
+    } else {
+        &raw
+    };
+    let effective = match resolve_at_path(task, dfd, raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    let path = resolve_cwd_path(task, &effective);
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let target = resolve_file_absolute_ext(&path, follow)
+        .map(XattrTarget::File)
+        .or_else(|| resolve_dir_absolute(&path).map(XattrTarget::Dir));
+    // A node only `stat` can see (a synthetic filesystem) still exists; it
+    // keeps the old lenient accept, since there is nothing to stamp.
+    if target.is_none() && stat_ino_path_dir_aware_ext(&path, follow).is_none() {
+        ctx.set_return(errno_ret(path_lookup_errno(&path)));
+        return;
+    }
+    let (atime, mtime, touch) = match utimes_request(times) {
+        Ok(req) => req,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    // `vfs_utimes` -> `mnt_want_write`: stamping a timestamp is a write.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    let mut is_dir = false;
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = utimes_permission(target, touch, task) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+        match target {
+            // Filesystems without `set_times` keep the lenient accept: the
+            // path was validated, and there is no store to update.
+            XattrTarget::File(file) => {
+                let _ = file.set_times(atime, mtime);
+                is_dir = file.as_dir().is_some();
+            }
+            XattrTarget::Dir(_) => is_dir = true,
+        }
+    }
+    // inotify: a successful timestamp change is IN_ATTRIB on the path.
+    crate::mqueue::notify_attrib(&path, is_dir);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `vfs_utimes` on the file behind a descriptor.
+fn utimes_fd(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    fd: u32,
+    ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    times: UtimesSpec,
+) {
+    let (atime, mtime, touch) = match utimes_request(times) {
+        Ok(req) => req,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    // Only inodes whose ownership NARF models faithfully are gated: an
+    // anonymous object (pipe, socket, eventfd) reports the default (0, 0)
+    // owner, which would wrongly refuse its own creator.
+    let modelled = matches!(
+        ops.stat().mode.file_type,
+        narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+    );
+    let target = XattrTarget::File(ops);
+    if modelled {
+        if let Err(errno) = utimes_permission(&target, touch, task) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    if let XattrTarget::File(ops) = target {
+        // set_times is lenient — unsupported FileOps → 0.
+        let _ = ops.set_times(atime, mtime);
+    }
+    // inotify: a timestamp change is IN_ATTRIB on the fd's file.
+    crate::mqueue::notify_attrib_fd(task, fd);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// The `timeval[2]` shared by utimes(235) and futimesat(261), read and
+/// checked the way `do_futimesat` does it — BEFORE the pathname is looked
+/// at (probed on Linux 6.18: `utimes(bad_ptr, {usec = 1000000})` is
+/// EINVAL):
+///
+/// ```text
+/// if (copy_from_user(&times, utimes, sizeof(times))) return -EFAULT;
+/// if (times[0].tv_usec >= 1000000 || times[0].tv_usec < 0 ||
+///     times[1].tv_usec >= 1000000 || times[1].tv_usec < 0) return -EINVAL;
+/// ```
+///
+/// The usec check also catches UTIME_NOW / UTIME_OMIT, which only
+/// utimensat may use. Returns a positive errno.
+pub(crate) fn utimes_read_timeval(tv_ptr: u64) -> Result<UtimesSpec, i64> {
+    if tv_ptr == 0 {
+        return Ok(None);
+    }
+    let mut buf = [0u8; 32];
+    // SAFETY: non-zero user timeval[2] pointer; copy_from_user
+    // range-validates and SMAP-brackets the 32-byte read.
+    if unsafe { copy_from_user(&mut buf, tv_ptr) }.is_err() {
+        return Err(EFAULT);
+    }
+    let word = |o: usize| i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+    let (s0, u0, s1, u1) = (word(0), word(8), word(16), word(24));
+    if !(0..1_000_000).contains(&u0) || !(0..1_000_000).contains(&u1) {
+        return Err(EINVAL);
+    }
+    Ok(Some([(s0, u0 * 1_000), (s1, u1 * 1_000)]))
 }
 
 // ── pkey_alloc / pkey_free / pkey_mprotect ───────────────────────────
