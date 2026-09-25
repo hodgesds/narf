@@ -1102,7 +1102,11 @@ fn smoke_net_ns_loopback_delivery_and_final_teardown() -> TestResult {
     if narf_net::route::route_list_in(namespace_id).is_empty() {
         return TestResult::Fail("live socket did not retain namespace state");
     }
+    // Close both endpoints. The sender autobound on connect()
+    // (`inet_autobind`), so it holds a port-table entry — and with it the
+    // namespace — until unregistered, exactly like the bound receiver.
     receiver.unregister();
+    sender.unregister();
     drop(receiver);
     drop(sender);
     if !narf_net::route::route_list_in(namespace_id).is_empty() {
