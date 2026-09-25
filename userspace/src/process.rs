@@ -595,6 +595,17 @@ pub unsafe fn load_user_process_with_root(
             // session bus ("Unable to autolaunch when setuid") and stalls
             // startplasma/plasmashell. NARF processes are uid 0 (root) with
             // uid==euid, so emit a consistent, non-secure set.
+            // Linux emits these on every exec. Without them libc falls
+            // back to compiled-in guesses: AT_CLKTCK drives
+            // sysconf(_SC_CLK_TCK) (must agree with `times()`, which uses
+            // CLK_TCK_HZ), AT_MINSIGSTKSZ drives glibc's dynamic
+            // MINSIGSTKSZ/SIGSTKSZ (must agree with what sigaltstack
+            // actually accepts), and AT_FLAGS / AT_HWCAP2 are the
+            // always-present zero words.
+            AuxEntry::Flags(0),
+            AuxEntry::Clktck(crate::handlers::CLK_TCK_HZ),
+            AuxEntry::Hwcap2(0),
+            AuxEntry::MinSigStkSz(crate::handlers::MIN_SIGSTKSZ),
             AuxEntry::Uid(0),
             AuxEntry::Euid(0),
             AuxEntry::Gid(0),
@@ -944,6 +955,10 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
         AuxEntry::Gid(v) => v as u64,
         AuxEntry::Egid(v) => v as u64,
         AuxEntry::SysInfoEhdr(v) => v,
+        AuxEntry::Flags(v) => v,
+        AuxEntry::Clktck(v) => v,
+        AuxEntry::Hwcap2(v) => v,
+        AuxEntry::MinSigStkSz(v) => v,
     };
     (key, val)
 }

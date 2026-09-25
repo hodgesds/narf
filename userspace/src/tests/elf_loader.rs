@@ -2294,7 +2294,10 @@ fn smoke_userspace_parse_minimal_elf64() -> TestResult {
     // version 1, OS/ABI 0, abi-version 0, 7 bytes pad.
     bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     bytes.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
-    bytes.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64 (ignored here)
+                                                  // e_machine must name the running arch — `parse_elf` enforces it.
+                                                  // This test is not arch-gated, so a hardcoded EM_X86_64 would make
+                                                  // it fail on aarch64.
+    bytes.extend_from_slice(&EM_NATIVE_TEST.to_le_bytes()); // e_machine
     bytes.extend_from_slice(&1u32.to_le_bytes()); // e_version
     bytes.extend_from_slice(&0x401000u64.to_le_bytes()); // e_entry
     bytes.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
@@ -2360,6 +2363,71 @@ fn smoke_userspace_parse_minimal_elf64() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_userspace_parse_minimal_elf64);
+
+fn smoke_userspace_parse_rejects_foreign_machine() -> TestResult {
+    // `e_machine` gate (Linux's `elf_check_arch`, reported as ENOEXEC).
+    // Before this, the loader validated magic / ELFCLASS64 / ELFDATA2LSB
+    // / e_type and then ignored e_machine entirely, so an aarch64 binary
+    // was accepted on x86_64 and vice versa: its PT_LOADs mapped fine and
+    // the process died on the first foreign instruction at its entry
+    // point instead of execve returning ENOEXEC. The module loader
+    // already enforced the equivalent for ET_REL.
+    use crate::{parse_elf, ElfError};
+
+    const EM_X86_64: u16 = 62;
+    const EM_AARCH64: u16 = 183;
+    // The machine that is NOT this build's, i.e. the one that must be
+    // rejected. Also covers a nonsense machine (EM_NONE).
+    let foreign = if EM_NATIVE_TEST == EM_X86_64 {
+        EM_AARCH64
+    } else {
+        EM_X86_64
+    };
+
+    // Minimal ET_EXEC with one PT_LOAD, parameterised on e_machine so the
+    // accept and reject cases differ in exactly that field.
+    let build = |machine: u16| -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; 64 + 56];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&machine.to_le_bytes()); // e_machine
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        b[0x18..0x20].copy_from_slice(&0x401000u64.to_le_bytes()); // e_entry
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0x401000u64.to_le_bytes()); // p_vaddr
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        b
+    };
+
+    // The foreign-arch image must be rejected, and specifically as
+    // WrongMachine — not as some incidental later error.
+    match parse_elf(&build(foreign)) {
+        Err(ElfError::WrongMachine) => {}
+        Err(_) => return TestResult::Fail("foreign e_machine rejected for the wrong reason"),
+        Ok(_) => return TestResult::Fail("foreign e_machine accepted — elf_check_arch missing"),
+    }
+    // EM_NONE is equally not this machine.
+    match parse_elf(&build(0)) {
+        Err(ElfError::WrongMachine) => {}
+        Err(_) => return TestResult::Fail("EM_NONE rejected for the wrong reason"),
+        Ok(_) => return TestResult::Fail("EM_NONE accepted"),
+    }
+    // The control: the same image naming the running machine still parses,
+    // so the gate rejects the arch rather than the image shape.
+    match parse_elf(&build(EM_NATIVE_TEST)) {
+        Ok(_) => TestResult::Pass,
+        Err(_) => TestResult::Fail("native e_machine should still parse"),
+    }
+}
+kernel_test_in!("userspace", smoke_userspace_parse_rejects_foreign_machine);
 
 // ── execve smokes ───────────────────────────────────────────────
 //

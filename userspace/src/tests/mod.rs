@@ -16,6 +16,19 @@ pub(crate) use crate::syscall::{
 #[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 pub(crate) use crate::{install_address_space_lookup, install_core_syscalls, install_global};
 
+/// `e_machine` for the arch these tests run on. `parse_elf` enforces
+/// `e_machine == EM_NATIVE` (Linux's `elf_check_arch`), so a synthetic
+/// ELF that is meant to *parse* has to name the running machine rather
+/// than a hardcoded EM_X86_64 — otherwise the test only passes on x86_64.
+#[allow(dead_code)] // only the arch-agnostic parse tests need it
+pub(crate) const EM_NATIVE_TEST: u16 = if cfg!(target_arch = "x86_64") {
+    62 // EM_X86_64
+} else if cfg!(target_arch = "aarch64") {
+    183 // EM_AARCH64
+} else {
+    0
+};
+
 /// Static so the AS-lookup `fn` pointer can resolve it without a
 /// closure capture.
 static PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);

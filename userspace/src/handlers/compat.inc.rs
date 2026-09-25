@@ -8154,7 +8154,7 @@ const SS_DISABLE: u32 = 2;
 const SS_ONSTACK: u32 = 1;
 /// Minimum altstack size — Linux MINSIGSTKSZ on x86_64 is 2048;
 /// we honour the same lower bound.
-const MIN_SIGSTKSZ: u64 = 2048;
+pub(crate) const MIN_SIGSTKSZ: u64 = 2048;
 
 static SIG_ALTSTACK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, SigAltStack>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);

@@ -15058,7 +15058,7 @@ pub fn __test_write_current_nice(prio: i32) -> bool {
 // expects. Caller-side libc translates negative-on-overflow
 // per the POSIX clock_t bound.
 
-const CLK_TCK_HZ: u64 = 100;
+pub(crate) const CLK_TCK_HZ: u64 = 100;
 
 // ── Getrusage — populate the glibc rusage struct ──────────────────
 //
