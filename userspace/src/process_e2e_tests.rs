@@ -6197,3 +6197,107 @@ fn smoke_process_fork_copies_rlimit() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_fork_copies_rlimit);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_mprotect_deny_wx() -> TestResult {
+    use narf_memory::{AddressSpace, Region, RegionPerms, PhysAddr, VirtAddr};
+
+    const TASK: u64 = 0xF0_03;
+    const EACCES: i64 = -13;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(TASK);
+
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+
+    // Create an un-executable mapping
+    let base = VirtAddr::new(0x2000_0000);
+    if as_.map_region(Region {
+        base,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    }).is_err() {
+        teardown_process_state();
+        return TestResult::Fail("Failed to map region");
+    }
+
+    *PROC_PARENT_AS.lock() = Some(as_);
+    install_address_space_lookup(lookup_proc_parent_as);
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+
+    // Try to set W|X using mprotect
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0x2000_0000,
+            arg1: 0x1000,
+            arg2: 0b111, // PROT_READ | PROT_WRITE | PROT_EXEC
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::MProtect.raw(), &mut ctx);
+
+    let outcome = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == EACCES => TestResult::Pass,
+        Some(r) if r.status == SyscallReturn::OK => {
+            TestResult::Fail("mprotect setting WX must return -EACCES")
+        }
+        _ => TestResult::Fail("mprotect setting WX must return -EACCES (got non-Ok)"),
+    };
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    outcome
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_mprotect_deny_wx);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_sys_munlockall_returns_ok() -> TestResult {
+    use narf_memory::{AddressSpace};
+
+
+    const TASK: u64 = 0xF0_04;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(TASK);
+
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+
+    *PROC_PARENT_AS.lock() = Some(as_);
+    install_address_space_lookup(lookup_proc_parent_as);
+    LOOKUP_TASK.store(TASK, core::sync::atomic::Ordering::Relaxed);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            ..Default::default()
+        },
+        ret: None,
+    };
+
+    kernel_syscall_entry(Syscall::Munlockall.raw(), &mut ctx);
+
+    let outcome = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => TestResult::Pass,
+        _ => TestResult::Fail("sys_munlockall did not return success"),
+    };
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    outcome
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_sys_munlockall_returns_ok);
