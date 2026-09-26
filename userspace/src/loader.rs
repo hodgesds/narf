@@ -48,6 +48,34 @@ impl From<AddressSpaceError> for LoadError {
 }
 
 /// Convert `SegmentFlags` (ELF PF_*) into `RegionPerms`.
+/// Whether this image's executable pages may be marked Guarded for aarch64
+/// Branch Target Identification.
+///
+/// Requires BOTH halves, and neither is optional:
+///
+///   - the image declared `GNU_PROPERTY_AARCH64_FEATURE_1_BTI` in its
+///     `PT_GNU_PROPERTY` note, meaning every indirect branch target in it was
+///     compiled with a `BTI` landing pad. Guarding a binary that did not declare
+///     it kills it on its first PLT call, so this can never come from policy;
+///   - the CPU implements FEAT_BTI. The GP bit is ignored by hardware that does
+///     not, but gating here keeps the page tables honest about what is enforced
+///     rather than relying on that.
+///
+/// x86_64 always returns false: its equivalent (CET's IBT) is MSR state and a
+/// shadow stack, not a page attribute, so the recorded `x86_ibt` property has no
+/// page-table effect to apply yet.
+fn image_wants_guarded_pages(image: &ExecImage) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        image.properties.aarch64_bti && narf_arch::aarch64::bti::caps()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = image;
+        false
+    }
+}
+
 fn perms_of(f: SegmentFlags) -> RegionPerms {
     let mut p = RegionPerms::default();
     if f.contains(SegmentFlags::READ) {
@@ -82,6 +110,12 @@ where
         return Err(LoadError::BadEntry);
     }
 
+    // One decision for the whole image, as above: declared BTI or not.
+    let guarded = if image_wants_guarded_pages(image) {
+        RegionPerms::GUARDED
+    } else {
+        RegionPerms::default()
+    };
     for seg in &image.segments {
         // Drain `pages` frames from the pool into a per-page scatter
         // list. The freelist allocator returns frames in arbitrary
@@ -96,7 +130,7 @@ where
         addr_space.map_region(Region {
             base: VirtAddr::new(seg.vaddr),
             len: pages << 12,
-            perms: perms_of(seg.flags),
+            perms: perms_of(seg.flags) | guarded,
             phys,
         })?;
     }
@@ -355,6 +389,14 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
     // BSS suffix. Keeping the split page in the file prefix mirrors Linux's
     // elf_load(): padzero() clears that page and vm_brk_flags() creates only
     // the following full pages as anonymous demand-zero memory.
+    // One decision for the whole image: a binary either declared BTI or it did
+    // not, so every executable segment is guarded or none is.
+    let guarded = if image_wants_guarded_pages(image) {
+        RegionPerms::GUARDED
+    } else {
+        RegionPerms::default()
+    };
+
     let mut cursor: usize = 0;
     for (index, (seg, &(file_pages, memory_pages))) in
         image.segments.iter().zip(page_counts.iter()).enumerate()
@@ -379,7 +421,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
 
         let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
         let region_base = vaddr & !0xFFF;
-        let perms = perms_of(seg.flags);
+        let perms = perms_of(seg.flags) | guarded;
 
         if file_pages != 0 {
             if is_demand {

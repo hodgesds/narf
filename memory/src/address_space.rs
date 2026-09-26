@@ -388,6 +388,20 @@ impl RegionPerms {
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
     /// Used by callers that want to compare permissions without
     /// caring about the internal LOCKED bit.
+    /// The mapping's executable pages may be marked Guarded, enabling aarch64
+    /// Branch Target Identification on them.
+    ///
+    /// Set by the ELF loader only when the image's `PT_GNU_PROPERTY` note
+    /// declares `GNU_PROPERTY_AARCH64_FEATURE_1_BTI` *and* the CPU implements
+    /// FEAT_BTI. It cannot be set by policy: BTI faults an indirect branch that
+    /// does not land on a `BTI` instruction, so guarding a binary built without
+    /// landing pads kills it on its first PLT call. A binary that did not ask for
+    /// it must never get it.
+    ///
+    /// Ignored on x86_64, whose equivalent (CET/IBT) needs MSR state and a
+    /// shadow stack rather than a page attribute.
+    pub const GUARDED: RegionPerms = RegionPerms(1 << 19);
+
     pub const PROT_MASK: RegionPerms = RegionPerms(0b111);
 
     #[inline]
@@ -1721,6 +1735,11 @@ fn user_leaf_flags(perms: RegionPerms, writable: bool) -> crate::aarch64::paging
     };
     if !perms.contains(RegionPerms::EXEC) {
         flags = flags | PtFlags::UXN | PtFlags::PXN;
+    } else if perms.contains(RegionPerms::GUARDED) {
+        // Guarded Page: an indirect branch into this page must land on a `BTI`
+        // (or `PACIASP`/`PACIBSP`) instruction or the CPU takes a Branch Target
+        // Exception. Only meaningful on an executable page, hence the `else`.
+        flags = flags | PtFlags::GUARDED;
     }
     flags
 }
@@ -7554,11 +7573,10 @@ impl AddressSpace {
         unsafe {
             map_4kb_scatter_range(self.root, region.base, &region.phys, |index, phys| {
                 let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[index]);
-                let flags = user_leaf_flags(
+                user_leaf_flags(
                     region.perms,
                     user_page_writable_at_count(region.perms, phys, cow_count),
-                );
-                flags
+                )
             })
         }
         .map_err(Self::paging_install_error)
@@ -10472,8 +10490,7 @@ impl AddressSpace {
                         let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
                         user_page_writable_at_count(r.perms, p, cow_count)
                     };
-                    let flags = user_leaf_flags(r.perms, writable);
-                    flags
+                    user_leaf_flags(r.perms, writable)
                 })
             };
         }
@@ -11008,11 +11025,10 @@ impl AddressSpace {
             let install = unsafe {
                 map_4kb_scatter_range(self.root, window_base, slice, |index, phys| {
                     let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[index]);
-                    let flags = user_leaf_flags(
+                    user_leaf_flags(
                         r.perms,
                         user_page_writable_at_count(r.perms, phys, cow_count),
-                    );
-                    flags
+                    )
                 })
             };
             if install.is_err() {

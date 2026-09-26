@@ -5206,3 +5206,120 @@ fn smoke_userspace_boot_path_load_demand_pages() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("userspace/elf", smoke_userspace_boot_path_load_demand_pages);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_bti_guards_only_declaring_images() -> TestResult {
+    // aarch64 Branch Target Identification, driven by the binary's own
+    // `PT_GNU_PROPERTY` note. The kernel detected FEAT_BTI and never enabled it:
+    // `bti.rs` had `caps()` and a comment saying the descriptor GP bit "is a
+    // `memory/` concern", and nothing in `memory/` set it.
+    //
+    // The NEGATIVE case is the one that matters. BTI faults an indirect branch
+    // that does not land on a `BTI` instruction, so guarding a binary compiled
+    // without landing pads kills it on its first PLT call — a crash with no
+    // diagnostic pointing back here. An over-eager guard bit is far worse than a
+    // missing one, so this test checks both directions and would fail if the
+    // loader ever guarded by policy rather than by declaration.
+    use crate::load_user_process_with;
+    use narf_memory::{RegionPerms, VirtAddr};
+
+    const SEG_FOFF: u64 = 0x1000;
+    const AARCH64_AND: u32 = 0xc000_0000;
+    const BTI_BIT: u32 = 1 << 0;
+
+    // An ET_DYN with one R|X PT_LOAD, optionally carrying a property note that
+    // declares BTI.
+    let image = |declare_bti: bool| -> alloc::vec::Vec<u8> {
+        let note_foff = 0x800usize;
+        let mut b = alloc::vec![0u8; (SEG_FOFF + 0x1000) as usize];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&(if declare_bti { 2u16 } else { 1u16 }).to_le_bytes());
+        let ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        if declare_bti {
+            // NT_GNU_PROPERTY_TYPE_0 note: "GNU\0", one FEATURE_1_AND record.
+            let desc_len = 16usize; // pr_type, pr_datasz, 4-byte bitmap, pad
+            b[note_foff..note_foff + 4].copy_from_slice(&4u32.to_le_bytes());
+            b[note_foff + 4..note_foff + 8].copy_from_slice(&(desc_len as u32).to_le_bytes());
+            b[note_foff + 8..note_foff + 12].copy_from_slice(&5u32.to_le_bytes());
+            b[note_foff + 12..note_foff + 16].copy_from_slice(b"GNU\0");
+            let d = note_foff + 16;
+            b[d..d + 4].copy_from_slice(&AARCH64_AND.to_le_bytes());
+            b[d + 4..d + 8].copy_from_slice(&4u32.to_le_bytes());
+            b[d + 8..d + 12].copy_from_slice(&BTI_BIT.to_le_bytes());
+            let ph1 = ph + 56;
+            let note_len = (16 + desc_len) as u64;
+            b[ph1..ph1 + 0x04].copy_from_slice(&0x6474_e553u32.to_le_bytes());
+            b[ph1 + 0x04..ph1 + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+            b[ph1 + 0x08..ph1 + 0x10].copy_from_slice(&(note_foff as u64).to_le_bytes());
+            b[ph1 + 0x20..ph1 + 0x28].copy_from_slice(&note_len.to_le_bytes());
+            b[ph1 + 0x28..ph1 + 0x30].copy_from_slice(&note_len.to_le_bytes());
+            b[ph1 + 0x30..ph1 + 0x38].copy_from_slice(&8u64.to_le_bytes());
+        }
+        b
+    };
+
+    // Load and report whether the text region carries GUARDED.
+    let guarded_of = |declare_bti: bool| -> Result<bool, &'static str> {
+        let bytes = image(declare_bti);
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised — the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&bytes, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return Err("load failed"),
+        };
+        let text_va = proc.program_bias.wrapping_add(SEG_FOFF);
+        let guarded = proc
+            .address_space
+            .lookup(VirtAddr::new(text_va))
+            .map(|region| region.perms.contains(RegionPerms::GUARDED));
+        let pid = proc.pid;
+        drop(proc);
+        crate::release_pid(pid);
+        guarded.ok_or("text segment is not mapped")
+    };
+
+    // A binary that did NOT declare BTI must never be guarded — on either arch,
+    // and regardless of what the CPU supports.
+    match guarded_of(false) {
+        Ok(true) => return TestResult::Fail("an image without the BTI property was guarded"),
+        Ok(false) => {}
+        Err(why) => return TestResult::Fail(why),
+    }
+
+    // A binary that declared it is guarded exactly when the hardware has
+    // FEAT_BTI. Comparing against the same capability the loader consults keeps
+    // this meaningful on a CPU without BTI (where the answer is "not guarded")
+    // instead of skipping.
+    #[cfg(target_arch = "aarch64")]
+    let want = narf_arch::aarch64::bti::caps();
+    // x86_64 has no page-attribute equivalent: CET/IBT is MSR state and a shadow
+    // stack, so a declaring image must still come back unguarded here.
+    #[cfg(not(target_arch = "aarch64"))]
+    let want = false;
+
+    match guarded_of(true) {
+        Ok(got) if got == want => TestResult::Pass,
+        Ok(_) => TestResult::Fail("a BTI-declaring image did not match the CPU's capability"),
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace/elf",
+    smoke_userspace_bti_guards_only_declaring_images
+);
