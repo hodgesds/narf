@@ -1491,6 +1491,11 @@ fn smoke_abi_ipc_sem_otime_linux_updates() -> TestResult {
             return Err("SETVAL without a completed waiter must not advance sem_otime");
         }
 
+        // A reset fixture uses a value `now_seconds()` never returns. Zero
+        // won't do: early in a run the wall clock can still read 0 s (on
+        // aarch64 it is uptime until something sets it).
+        const RESET: i64 = -1;
+
         const OWNER: u64 = FAKE_TASK + 38;
         let mut zero_undo = [0u8; 6];
         zero_undo[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
@@ -1501,15 +1506,15 @@ fn smoke_abi_ipc_sem_otime_linux_updates() -> TestResult {
             return Err("zero SEM_UNDO setup operation failed");
         }
         set_task(FAKE_TASK);
-        if !crate::sysvipc::__test_set_sem_otime(id, 0) {
+        if !crate::sysvipc::__test_set_sem_otime(id, RESET) {
             return Err("failed to reset sem_otime test fixture");
         }
         crate::sysvipc::sem_undo_process_exit(owner_pid, OWNER);
-        if sem_otime(id)? == 0 {
+        if sem_otime(id)? == RESET {
             return Err("process exit with an all-zero SEM_UNDO row must advance sem_otime");
         }
 
-        if !crate::sysvipc::__test_set_sem_otime(id, 0) {
+        if !crate::sysvipc::__test_set_sem_otime(id, RESET) {
             return Err("failed to reset sem_otime before waiter test");
         }
         const WAITER: u64 = FAKE_TASK + 39;
@@ -1521,7 +1526,7 @@ fn smoke_abi_ipc_sem_otime_linux_updates() -> TestResult {
             return Err("semaphore decrement did not queue for sem_otime test");
         }
         set_task(FAKE_TASK);
-        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) || sem_otime(id)? == 0 {
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) || sem_otime(id)? == RESET {
             return Err("SETVAL completing a waiter must advance sem_otime");
         }
         set_task(WAITER);
