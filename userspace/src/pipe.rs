@@ -1542,6 +1542,15 @@ impl FileOps for PipeRead {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        // A plain poll()/select waiter — not just epoll's persistent arm — must
+        // mark the pipe poll-observed. Otherwise the write side skips
+        // `sync_readiness` on a non-edge write (see `copy_from_user_into_pipe`,
+        // gated on `was_empty || new_full || poll_usage`) and never republishes
+        // POLL_IN/POLL_OUT to this parked waiter. That is the fish fd_monitor
+        // self-pipe hang: fish parks in poll() on the notify read end while only
+        // its iothread writes it, so without this the wake is lost and fish
+        // stalls at startup until a SIGINT (Ctrl-C) breaks the poll.
+        self.shared.poll_usage.store(true, Ordering::Release);
         self.shared.activate_readiness();
         Some(self.shared.readiness.arm(task_id, interest, waker))
     }
@@ -1552,6 +1561,10 @@ impl FileOps for PipeRead {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        // See `arm_readiness`: a plain poll()/select waiter must mark the pipe
+        // poll-observed so the write side does not skip `sync_readiness` and lose
+        // this parked waiter's wake.
+        self.shared.poll_usage.store(true, Ordering::Release);
         self.shared.activate_readiness();
         Some(
             self.shared
@@ -1683,6 +1696,15 @@ impl FileOps for PipeWrite {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        // A plain poll()/select waiter — not just epoll's persistent arm — must
+        // mark the pipe poll-observed. Otherwise the write side skips
+        // `sync_readiness` on a non-edge write (see `copy_from_user_into_pipe`,
+        // gated on `was_empty || new_full || poll_usage`) and never republishes
+        // POLL_IN/POLL_OUT to this parked waiter. That is the fish fd_monitor
+        // self-pipe hang: fish parks in poll() on the notify read end while only
+        // its iothread writes it, so without this the wake is lost and fish
+        // stalls at startup until a SIGINT (Ctrl-C) breaks the poll.
+        self.shared.poll_usage.store(true, Ordering::Release);
         self.shared.activate_readiness();
         Some(self.shared.readiness.arm(task_id, interest, waker))
     }
@@ -1693,6 +1715,10 @@ impl FileOps for PipeWrite {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        // See `arm_readiness`: a plain poll()/select waiter must mark the pipe
+        // poll-observed so the write side does not skip `sync_readiness` and lose
+        // this parked waiter's wake.
+        self.shared.poll_usage.store(true, Ordering::Release);
         self.shared.activate_readiness();
         Some(
             self.shared
