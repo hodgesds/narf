@@ -2640,8 +2640,11 @@ pub struct StatBuf {
 // Other modes (KEEP_SIZE, PUNCH_HOLE, COLLAPSE_RANGE, ...) are
 // rejected — MemFs has no hole-tracking and the validate harness
 // doesn't exercise them.
-
-const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
+//
+// The implementation and the flag constant both live in
+// `handlers/sys_fallocate.rs`. A duplicate `FALLOC_FL_ZERO_RANGE` was left
+// behind here when the handler moved out; it carried the same value (0x10), so
+// it was dead rather than wrong, and clippy's `dead_code` is what surfaced it.
 
 // ── CopyFileRange — chunked file→file copy ─────────────────────────
 //

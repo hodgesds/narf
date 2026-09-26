@@ -1049,7 +1049,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(
             console::Writer,
             "  kvm-pv: send_ipi={} tlb_flush={}",
-            pv_send_ipi, pv_tlb
+            pv_send_ipi,
+            pv_tlb
         );
 
         // Per-task kernel-stack retargeting is independent of the LAPIC
