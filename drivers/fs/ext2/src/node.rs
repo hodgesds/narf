@@ -100,7 +100,13 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
                 file_type,
                 perms: inode.mode & 0o7777,
             },
-            mtime_cycles: 0,
+            // Report the on-disk `i_mtime` (wall-clock seconds since the epoch),
+            // not a hardcoded 0 (which made every ext2 file claim mtime 1970 and
+            // broke `ls -l`, `make`, `git`, `tar`, and any autoload/cache that
+            // keys on mtime). `Stat.mtime_cycles` is consumed by statx via
+            // `cycles_to_ns`, so encode the wall-clock ns through `ns_to_cycles`
+            // (its exact inverse) — the same round-trip memfs uses.
+            mtime_cycles: narf_time::ns_to_cycles((inode.mtime as u64) * 1_000_000_000),
         }
     }
 
