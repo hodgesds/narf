@@ -214,8 +214,8 @@ pub unsafe fn load_user_process_with_root(
 /// # Safety
 /// Same contract as [`load_user_process_with_root`].
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn load_user_process_with_root_file(
-    bytes: &[u8],
+pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     argv: &[&str],
     envp: &[&str],
     aux: &[AuxEntry],
@@ -227,8 +227,11 @@ pub unsafe fn load_user_process_with_root_file(
     // identity map + initialised frame allocator), which is precisely what
     // `load_elf_bytes` needs to map the program's PT_LOAD segments.
     // SAFETY: Valid memory or trusted environment
-    let (address_space, program_entry, program_bias) =
-        unsafe { crate::loader::load_elf_bytes_file(bytes, file) }?;
+    // The image comes back parsed: with a file-backed source, re-parsing it
+    // here would re-read the header and program headers from the device for
+    // bytes the loader already had.
+    let (address_space, program_entry, program_bias, image) =
+        unsafe { crate::loader::load_elf_bytes_file(src, file) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
     // and we have its bytes registered, load it at a fixed bias and
@@ -242,7 +245,7 @@ pub unsafe fn load_user_process_with_root_file(
     // full of gadgets. The nominal base is a user-range address well
     // clear of the program window and the mmap arena.
     let interp_bias: u64 = narf_memory::kaslr::user_elf_slot(0x0000_4000_0000_0000);
-    let image = crate::parse_elf(bytes).map_err(LoadBytesError::Elf)?;
+
     // Mirror Linux binfmt_elf's `start_data` / `end_data` bookkeeping for
     // RLIMIT_DATA: each PT_LOAD contributes its start and file-backed end;
     // the load bias cancels when the span is subtracted. The interpreter is
@@ -623,9 +626,14 @@ pub unsafe fn load_user_process_with_root_file(
     // PT_LOAD segment (the phdrs sit at file-offset `e_phoff`, which that
     // segment maps at `vaddr - file_off + e_phoff`) only when the ELF
     // omits PT_PHDR (rare: some hand-written / fully-static objects).
-    let e_phoff = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap_or([0; 8]));
-    let e_phentsize = u16::from_le_bytes(bytes[0x36..0x38].try_into().unwrap_or([0; 2]));
-    let e_phnum = u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap_or([0; 2]));
+    // One 64-byte header read, not three indexes into a whole-file buffer. A
+    // failed read leaves the zeros, which is the same lenient outcome the
+    // `unwrap_or` gave when the buffer was too short.
+    let mut ehdr = [0u8; 64];
+    let _ = src.read_exact_at(0, &mut ehdr);
+    let e_phoff = u64::from_le_bytes(ehdr[0x20..0x28].try_into().unwrap_or([0; 8]));
+    let e_phentsize = u16::from_le_bytes(ehdr[0x36..0x38].try_into().unwrap_or([0; 2]));
+    let e_phnum = u16::from_le_bytes(ehdr[0x38..0x3a].try_into().unwrap_or([0; 2]));
     let first_load = image.segments.first();
     // ET_DYN binaries' PT_PHDR / PT_LOAD vaddrs are 0-relative; bias
     // them by `program_bias` so AT_PHDR points at the actual runtime
@@ -770,7 +778,7 @@ pub unsafe fn load_user_process_with_root_file(
         // SAFETY: low-4-GiB identity map + frame allocator are the
         // same Stage-4 invariants the rest of this routine rides on.
         // SAFETY: Valid memory or trusted environment
-        Some(unsafe { crate::tls::stage_tls(&synthetic_image, bytes, &address_space) }?)
+        Some(unsafe { crate::tls::stage_tls(&synthetic_image, src, &address_space) }?)
     };
 
     Ok(UserProcess {

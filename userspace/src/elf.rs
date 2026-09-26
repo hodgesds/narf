@@ -99,6 +99,11 @@ pub enum ElfError {
     /// PT_TLS file region lies outside the input bytes, mem_size <
     /// file_size, or the alignment isn't a power of two.
     TlsOutOfBounds,
+    /// The image source could not produce the bytes that were asked for —
+    /// a filesystem error, or a short read before the range the caller needs.
+    /// Only a file-backed [`ExecBytes`] can raise it; an in-memory slice fails
+    /// its bounds check as `TooShort` instead.
+    ImageReadFailed,
     /// A PT_LOAD claims more file bytes than memory bytes
     /// (`p_filesz > p_memsz`), which cannot be mapped coherently.
     /// Linux's `binfmt_elf` rejects this with EINVAL.
@@ -132,6 +137,22 @@ pub trait ExecBytes {
     /// needs exactly the range it asked for, and treating a truncated read as
     /// success would silently parse zero bytes as ELF fields.
     fn read_exact_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ElfError>;
+}
+
+impl ExecBytes for [u8] {
+    #[inline]
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    #[inline]
+    fn read_exact_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ElfError> {
+        let start = usize::try_from(off).map_err(|_| ElfError::TooShort)?;
+        let end = start.checked_add(dst.len()).ok_or(ElfError::TooShort)?;
+        let src = self.get(start..end).ok_or(ElfError::TooShort)?;
+        dst.copy_from_slice(src);
+        Ok(())
+    }
 }
 
 impl ExecBytes for &[u8] {

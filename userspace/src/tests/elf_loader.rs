@@ -1244,7 +1244,7 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     unsafe {
-        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false).unwrap()
+        crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, 0, false).unwrap()
     };
 
     // Read back the slot through the AS — same translate-and-cast
@@ -1451,7 +1451,8 @@ fn smoke_userspace_apply_relr_relocations() -> TestResult {
     // `image`. bias is the ET_DYN load bias the loader applied.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, bias, true).unwrap()
+        crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, bias, true)
+            .unwrap()
     };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
@@ -1609,7 +1610,7 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     unsafe {
-        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false).unwrap()
+        crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, 0, false).unwrap()
     };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
@@ -1741,8 +1742,9 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false) }
-    {
+    match unsafe {
+        crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, 0, false)
+    } {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // No DT_STRTAB + st_name=0 → name buffer must be empty.
             if name == [0u8; 32] {
@@ -1782,8 +1784,9 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false) }
-    {
+    match unsafe {
+        crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, 0, false)
+    } {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             if &name[..6] != b"printf" {
                 return TestResult::Fail("name buffer doesn't start with \"printf\"");
@@ -1832,8 +1835,9 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false) }
-    {
+    match unsafe {
+        crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, 0, false)
+    } {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // First 32 bytes must equal the source's first 32 bytes,
             // and *all* 32 must be non-zero (we truncated mid-name,
@@ -2859,7 +2863,7 @@ fn smoke_userspace_relative_reloc_uses_native_type_code() -> TestResult {
         // SAFETY: `proc`'s segments were just mapped and materialised from
         // these same bytes at `bias`, which is what the relocation pass needs.
         if unsafe {
-            crate::loader::apply_relocations(&bytes, &image, &proc.address_space, bias, false)
+            crate::loader::apply_relocations(&bytes[..], &image, &proc.address_space, bias, false)
         }
         .is_err()
         {
@@ -3701,7 +3705,7 @@ fn smoke_userspace_exec_demand_pages_text_from_file() -> TestResult {
     // SAFETY: the harness keeps the kernel direct map live and the frame
     // allocator initialised — the loader's `# Safety` contract.
     let eager = match unsafe {
-        load_user_process_with_root_file(&b, &["x"], &[], &[], None, alloc_pid(), None)
+        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), None)
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("eager control load failed"),
@@ -3717,7 +3721,7 @@ fn smoke_userspace_exec_demand_pages_text_from_file() -> TestResult {
     let ops: Arc<dyn FileOps> = Arc::new(FileImage(b.clone()));
     // SAFETY: as above; `ops` outlives the load.
     let proc = match unsafe {
-        load_user_process_with_root_file(&b, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), Some(&ops))
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("demand load failed"),
@@ -3915,7 +3919,7 @@ fn smoke_userspace_exec_demand_zero_fills_split_bss_page() -> TestResult {
     // SAFETY: the harness keeps the kernel direct map live and the frame
     // allocator initialised — the loader's `# Safety` contract.
     let proc = match unsafe {
-        load_user_process_with_root_file(&b, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), Some(&ops))
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("split-BSS load failed"),
@@ -3996,4 +4000,173 @@ fn smoke_userspace_exec_demand_zero_fills_split_bss_page() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_userspace_exec_demand_zero_fills_split_bss_page
+);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_exec_reads_headers_not_whole_file() -> TestResult {
+    // `execve` used to read the entire binary into a `Vec` before the loader
+    // could look at it, so a 1 MiB image cost 1 MiB of I/O and 1 MiB of
+    // allocation even once its text was demand-paged and never copied. The
+    // residency win was real; the I/O was not won at all.
+    //
+    // This counts bytes actually pulled through `FileOps::read` for a load of a
+    // 1 MiB image whose single text segment is demand-paged, and requires the
+    // total to be a few hundred bytes — the ELF header, the program headers,
+    // and the second header read that AT_PHDR needs. Under the old code the
+    // count is the whole file, so this fails by three orders of magnitude.
+    //
+    // It then faults one page and requires the count to grow by exactly one
+    // page: what the process touches is what the kernel reads. Linux reaches
+    // the same place from the other side — `load_elf_phdrs` reads the phdr
+    // table and `elf_map` mmaps the rest, so the image is never read whole.
+    use crate::handlers::install_address_space_lookup;
+    use crate::{alloc_pid, load_user_process_with_root_file};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_memory::{AddressSpace, VirtAddr};
+
+    const TEXT_PAGES: u64 = 256;
+    const TEXT_BYTES: u64 = TEXT_PAGES * 4096;
+    const SEG_FOFF: u64 = 0x1000;
+    // This image's load reads the 64-byte ELF header, its single 56-byte
+    // program header, and the 64 bytes AT_PHDR re-reads: 184 bytes, measured.
+    // The ceiling sits above that and BELOW 424, which is what the same load
+    // cost while the image was parsed three times on the way down (three
+    // header+phdr pairs plus the AT_PHDR read). So this catches a regression to
+    // re-parsing — which costs device round trips for bytes already in hand —
+    // and not merely a regression to reading the whole file, which would miss
+    // by three orders of magnitude.
+    const HEADER_READ_CEILING: u64 = 256;
+
+    static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+    static EXEC_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+    fn exec_as_lookup() -> Option<Arc<AddressSpace>> {
+        EXEC_AS.lock().clone()
+    }
+
+    struct CountingFile(alloc::vec::Vec<u8>);
+    impl FileOps for CountingFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            let off = offset as usize;
+            let n = if off >= self.0.len() {
+                0
+            } else {
+                let n = core::cmp::min(self.0.len() - off, buf.len());
+                buf[..n].copy_from_slice(&self.0[off..off + n]);
+                n
+            };
+            READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: self.0.len() as u64,
+                blocks: self.0.len().div_ceil(512) as u64,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    let mut b = alloc::vec![0u8; (SEG_FOFF + TEXT_BYTES) as usize];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_offset
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_paddr
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // p_filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // p_memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    for k in 0..TEXT_PAGES {
+        let start = (SEG_FOFF + k * 4096) as usize;
+        b[start..start + 4096].fill(0x41u8.wrapping_add(k as u8));
+    }
+    let file_size = b.len() as u64;
+
+    let ops: Arc<dyn FileOps> = Arc::new(CountingFile(b));
+    // The real type `execve` hands the loader, not a test stand-in.
+    let source = crate::handlers::ExecSource::File {
+        ops: Arc::clone(&ops),
+        size: file_size,
+    };
+
+    READ_BYTES.store(0, Ordering::Relaxed);
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let proc = match unsafe {
+        load_user_process_with_root_file(&source, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("file-sourced load failed"),
+    };
+    let after_load = READ_BYTES.load(Ordering::Relaxed);
+    let text_va = proc.program_bias.wrapping_add(SEG_FOFF);
+    *EXEC_AS.lock() = Some(Arc::clone(&proc.address_space));
+    install_address_space_lookup(exec_as_lookup);
+
+    let checks = || -> Result<(), &'static str> {
+        if after_load >= file_size {
+            return Err("the whole image was still read");
+        }
+        if after_load > HEADER_READ_CEILING {
+            return Err("more than the headers was read");
+        }
+        if after_load == 0 {
+            return Err("nothing was read at all — the image cannot have parsed");
+        }
+        // One touched page, one page of I/O.
+        // SAFETY: `text_va` lies in this process's FILE_DEMAND text region.
+        if unsafe {
+            proc.address_space
+                .demand_alloc_page(VirtAddr::new(text_va + 8 * 4096))
+        }
+        .is_err()
+        {
+            return Err("demand fault on a text page failed");
+        }
+        let faulted = READ_BYTES.load(Ordering::Relaxed) - after_load;
+        if faulted == 0 || faulted > 4096 {
+            return Err("a demand fault did not read exactly its own page");
+        }
+        Ok(())
+    };
+    let verdict = checks();
+    *EXEC_AS.lock() = None;
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "BENCH exec-io: file_bytes={} read_at_load={}",
+            file_size,
+            after_load
+        );
+    }
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_exec_reads_headers_not_whole_file
 );

@@ -178,9 +178,9 @@ pub fn block_displacement_from_tp(template: &crate::TlsTemplate) -> Option<i64> 
 /// - The frame allocator must be initialised.
 /// - `address_space` must have been constructed via `new_for_user`
 ///   so its `materialize` is meaningful.
-pub unsafe fn stage_tls(
+pub unsafe fn stage_tls<S: crate::elf::ExecBytes + ?Sized>(
     image: &ExecImage,
-    bytes: &[u8],
+    src: &S,
     address_space: &AddressSpace,
 ) -> Result<u64, TlsError> {
     let template = image.tls.as_ref().expect("stage_tls called without PT_TLS");
@@ -190,10 +190,11 @@ pub unsafe fn stage_tls(
     // re-check so a stage_tls call that's handed a mismatched
     // (image, bytes) pair still surfaces an error rather than
     // memcpying out of bounds.
-    let file_end = (template.file_off as usize)
-        .checked_add(template.file_size as usize)
+    let file_end = template
+        .file_off
+        .checked_add(template.file_size)
         .ok_or(TlsError::ImageOutOfBounds)?;
-    if file_end > bytes.len() {
+    if file_end > src.size() {
         return Err(TlsError::ImageOutOfBounds);
     }
 
@@ -275,24 +276,30 @@ pub unsafe fn stage_tls(
     // The remaining `mem_size - file_size` bytes (BSS-style tail)
     // are already zero from the per-page write_bytes above.
     let root = address_space.root;
-    let src = &bytes
-        [template.file_off as usize..template.file_off as usize + template.file_size as usize];
-    for (i, &b) in src.iter().enumerate() {
-        let vaddr = tls_image_base + i as u64;
-        let page = vaddr & !0xFFFu64;
-        let off = vaddr & 0xFFFu64;
-        // SAFETY: we just mapped + materialised the TLS region;
-        // every vaddr in `[region_base, region_base + mapped_bytes)`
-        // resolves to a phys reached through the kernel direct map
-        // GiB of the kernel's view.
-        // SAFETY: Valid memory or trusted environment
-        let _ = (page, off);
-        let phys = phys_of(root, vaddr).ok_or(TlsError::Translate)?;
-        // SAFETY: direct-mapped phys; exclusive ownership through
-        // the duration of staging (no other CPU is in this AS yet).
-        unsafe {
-            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = b;
+    // Read the template through the image source in bounded chunks rather than
+    // indexing a whole-file buffer. A TLS template is typically well under a
+    // page (ours is ~128 bytes), so one stack buffer covers the common case in
+    // a single read and nothing is allocated either way.
+    let mut buf = [0u8; 256];
+    let mut done: u64 = 0;
+    while done < template.file_size {
+        let chunk = core::cmp::min(buf.len() as u64, template.file_size - done) as usize;
+        src.read_exact_at(template.file_off + done, &mut buf[..chunk])
+            .map_err(|_| TlsError::ImageOutOfBounds)?;
+        for (i, &b) in buf[..chunk].iter().enumerate() {
+            let vaddr = tls_image_base + done + i as u64;
+            // SAFETY: we just mapped + materialised the TLS region;
+            // every vaddr in `[region_base, region_base + mapped_bytes)`
+            // resolves to a phys reached through the kernel direct map
+            // GiB of the kernel's view.
+            let phys = phys_of(root, vaddr).ok_or(TlsError::Translate)?;
+            // SAFETY: direct-mapped phys; exclusive ownership through
+            // the duration of staging (no other CPU is in this AS yet).
+            unsafe {
+                *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = b;
+            }
         }
+        done += chunk as u64;
     }
 
     // Variant II only: write the TCB self-pointer at `*(tp) == tp`. relibc

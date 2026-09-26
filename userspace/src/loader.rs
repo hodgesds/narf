@@ -220,13 +220,35 @@ pub unsafe fn load_elf_into_at(
 ///
 /// # Safety
 /// Same contract as [`load_elf_into_at`].
-pub unsafe fn load_elf_into_at_file(
-    bytes: &[u8],
+pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
 ) -> Result<u64, LoadBytesError> {
-    let image = crate::parse_elf(bytes)?;
+    let image = crate::elf::parse_from(src)?;
+    // SAFETY: forwarding this function's own contract.
+    unsafe { load_image_into_at(&image, src, addr_space, vaddr_bias, file) }
+}
+
+/// [`load_elf_into_at_file`] for a caller that has already parsed the image.
+///
+/// Parsing is no longer free: a file-backed source pays real reads for the
+/// header and the program headers, so an image that was parsed once and then
+/// re-parsed twice on the way down cost three round trips to the device for
+/// bytes it already had. Every caller inside this crate threads the parsed
+/// image through instead.
+///
+/// # Safety
+/// Same contract as [`load_elf_into_at_file`]; additionally `image` must be the
+/// parse of `src`, since the segment offsets it carries are used to read it.
+unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
+    image: &ExecImage,
+    src: &S,
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+    file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+) -> Result<u64, LoadBytesError> {
     if image.segments.is_empty() {
         return Err(LoadBytesError::Load(LoadError::NoSegments));
     }
@@ -470,35 +492,36 @@ pub unsafe fn load_elf_into_at_file(
         let frames = &allocated[cursor..cursor + file_pages];
         cursor += file_pages;
 
-        let start = seg.file_off as usize;
-        let end = start
-            .checked_add(seg.file_size as usize)
+        // The image is READ here, one page at a time, rather than indexed out
+        // of a whole-file buffer: a file-backed source reads only the bytes an
+        // eager segment actually needs, and a demand-paged segment is skipped
+        // above so it reads none at all.
+        let file_end = seg
+            .file_off
+            .checked_add(seg.file_size)
             .ok_or(LoadBytesError::ByteCopyOutOfBounds)?;
-        if end > bytes.len() {
+        if file_end > src.size() {
             return Err(LoadBytesError::ByteCopyOutOfBounds);
         }
-        let src = &bytes[start..end];
+        let total = seg.file_size as usize;
 
         let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
         let in_page = (vaddr & 0xFFF) as usize;
 
         let mut written: usize = 0;
         for (i, &frame) in frames.iter().enumerate() {
-            if written >= src.len() {
+            if written >= total {
                 break;
             }
             let dst_off = if i == 0 { in_page } else { 0 };
-            let chunk = core::cmp::min(4096 - dst_off, src.len() - written);
+            let chunk = core::cmp::min(4096 - dst_off, total - written);
             // SAFETY: `frame` is an identity-mapped freshly-allocated
             // 4 KiB phys frame; chunk + dst_off <= 4 KiB.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr().add(written),
-                    (frame.kernel_mut_ptr::<u8>()).add(dst_off),
-                    chunk,
-                );
-            }
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut((frame.kernel_mut_ptr::<u8>()).add(dst_off), chunk)
+            };
+            src.read_exact_at(seg.file_off + written as u64, dst)
+                .map_err(LoadBytesError::Elf)?;
             written += chunk;
         }
     }
@@ -526,7 +549,7 @@ pub unsafe fn load_elf_bytes(
     bytes: &[u8],
 ) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
     // SAFETY: forwarding this function's contract; `None` keeps the eager path.
-    unsafe { load_elf_bytes_file(bytes, None) }
+    unsafe { load_elf_bytes_file(bytes, None) }.map(|(a, e, b, _image)| (a, e, b))
 }
 
 /// [`load_elf_bytes`], demand-paging the program image from `file` when it is
@@ -534,10 +557,10 @@ pub unsafe fn load_elf_bytes(
 ///
 /// # Safety
 /// Same contract as [`load_elf_bytes`].
-pub unsafe fn load_elf_bytes_file(
-    bytes: &[u8],
+pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
+) -> Result<(Arc<AddressSpace>, EntryPoint, u64, ExecImage), LoadBytesError> {
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
     // SAFETY: Valid memory or trusted environment
@@ -547,12 +570,12 @@ pub unsafe fn load_elf_bytes_file(
     // Bias selection — see `program_load_bias`. ET_EXEC names absolute
     // load addresses in its PT_LOAD vaddrs (NARF expects those in
     // PML4[1] — see `init.ld` / `hello_static_x86_64.S`), so bias 0.
-    let image = crate::parse_elf(bytes)?;
+    let image = crate::elf::parse_from(src)?;
     let bias = program_load_bias(image.kind);
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
     // SAFETY: Valid memory or trusted environment
-    let entry = unsafe { load_elf_into_at_file(bytes, &addr_space, bias, file) }?;
+    let entry = unsafe { load_image_into_at(&image, src, &addr_space, bias, file) }?;
 
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed
@@ -561,7 +584,12 @@ pub unsafe fn load_elf_bytes_file(
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    Ok((Arc::new(addr_space), EntryPoint(VirtAddr::new(entry)), bias))
+    Ok((
+        Arc::new(addr_space),
+        EntryPoint(VirtAddr::new(entry)),
+        bias,
+        image,
+    ))
 }
 
 /// PML4[1] base — the nominal bottom of the ET_DYN load window, and the
@@ -740,18 +768,17 @@ fn dt_lookup(dynamic: &[DynEntry], tag: i64) -> Option<u64> {
     dynamic.iter().find(|e| e.tag == tag).map(|e| e.val)
 }
 
-/// Translate a DT_* in-memory address to a slice of the input ELF
-/// bytes. The dynamic-linker tables (DT_RELA / DT_JMPREL pointers)
-/// are recorded as the *vaddr* the linker assigned them at link
-/// time; we resolve them back to file offsets by matching against
-/// each PT_LOAD's `[vaddr, vaddr + file_size)` span and applying
-/// the same `(file_off - vaddr)` translation.
-fn resolve_dt_pointer<'a>(
-    bytes: &'a [u8],
-    image: &ExecImage,
-    dt_addr: u64,
-    needed: u64,
-) -> Option<&'a [u8]> {
+/// Translate a DT_* in-memory address to a FILE OFFSET. The dynamic-linker
+/// tables (DT_RELA / DT_JMPREL pointers) are recorded as the *vaddr* the
+/// linker assigned them at link time; we resolve them back to file offsets by
+/// matching against each PT_LOAD's `[vaddr, vaddr + file_size)` span and
+/// applying the same `(file_off - vaddr)` translation.
+///
+/// This used to hand back a sub-slice of a whole-file buffer. It returns an
+/// offset instead so the caller can READ that range from an image it does not
+/// hold in memory — the point of the exercise. Bounds against the image's own
+/// length move to the readers below, which know its size.
+fn dt_file_offset(image: &ExecImage, dt_addr: u64, needed: u64) -> Option<u64> {
     for seg in &image.segments {
         // A DT_* pointer is in-bounds for a segment when it lies in
         // [vaddr, vaddr + file_size). file_size (not mem_size) is the
@@ -767,14 +794,52 @@ fn resolve_dt_pointer<'a>(
         if avail < needed {
             return None;
         }
-        let file_start = (seg.file_off + off_in_seg) as usize;
-        let file_end = file_start.checked_add(needed as usize)?;
-        if file_end > bytes.len() {
-            return None;
-        }
-        return Some(&bytes[file_start..file_end]);
+        return seg.file_off.checked_add(off_in_seg);
     }
     None
+}
+
+/// Read a DT_*-addressed range into `dst`, which fixes the length.
+///
+/// Used for the fixed-size reads — an `Elf64_Sym` is 24 bytes, a symbol name
+/// at most 32 — so these stay allocation-free on a stack buffer, as the
+/// slice-indexing version was.
+fn read_dt_exact<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
+    image: &ExecImage,
+    dt_addr: u64,
+    dst: &mut [u8],
+) -> Option<()> {
+    let off = dt_file_offset(image, dt_addr, dst.len() as u64)?;
+    if off.checked_add(dst.len() as u64)? > src.size() {
+        return None;
+    }
+    src.read_exact_at(off, dst).ok()
+}
+
+/// Read a whole DT_*-addressed table (DT_RELA, DT_JMPREL, DT_RELR) into an
+/// owned buffer.
+///
+/// `needed` is derived from DT_RELASZ/DT_RELRSZ, which come from the image
+/// itself, so it is attacker-controlled: it is bounded against the image size
+/// before anything is reserved, and the reservation is fallible. A table is
+/// read once here rather than per entry.
+fn read_dt_table<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
+    image: &ExecImage,
+    dt_addr: u64,
+    needed: u64,
+) -> Option<alloc::vec::Vec<u8>> {
+    let off = dt_file_offset(image, dt_addr, needed)?;
+    if off.checked_add(needed)? > src.size() {
+        return None;
+    }
+    let len = usize::try_from(needed).ok()?;
+    let mut buf = alloc::vec::Vec::new();
+    buf.try_reserve_exact(len).ok()?;
+    buf.resize(len, 0u8);
+    src.read_exact_at(off, &mut buf).ok()?;
+    Some(buf)
 }
 
 #[inline]
@@ -851,8 +916,8 @@ fn user_vaddr_to_kernel_ptr(_addr_space: &AddressSpace, _vaddr: u64) -> Option<*
 /// performed: this round only resolves internally-defined symbols
 /// where sym_idx is sufficient. External symbol resolution needs
 /// `st_name → string table → host resolver` and lands later.
-fn resolve_symbol(
-    bytes: &[u8],
+fn resolve_symbol<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     image: &ExecImage,
     sym_idx: u32,
     vaddr_bias: u64,
@@ -866,8 +931,9 @@ fn resolve_symbol(
                 .ok_or(LoadBytesError::SymtabOutOfBounds)?,
         )
         .ok_or(LoadBytesError::SymtabOutOfBounds)?;
-    let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
-        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let mut sym = [0u8; ELF64_SYM_SIZE as usize];
+    read_dt_exact(src, image, entry_addr, &mut sym).ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let slice = &sym[..];
 
     // Layout: st_name(4) | st_info(1) | st_other(1) | st_shndx(2)
     //       | st_value(8) | st_size(8).
@@ -875,7 +941,7 @@ fn resolve_symbol(
     let st_value = read_u64_le(&slice[8..16]);
 
     if st_value == 0 && st_shndx == SHN_UNDEF {
-        let name = resolve_symbol_name(bytes, image, sym_idx);
+        let name = resolve_symbol_name(src, image, sym_idx);
         return Err(LoadBytesError::UnresolvedSymbol { idx: sym_idx, name });
     }
     Ok(st_value.wrapping_add(vaddr_bias))
@@ -895,7 +961,11 @@ fn resolve_symbol(
 /// The fixed-size buffer keeps the loader path alloc-free; the
 /// 32-byte cap is sized for typical libc symbols (`printf`, `malloc`,
 /// `__libc_start_main`) and documented as truncating for longer ones.
-fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32] {
+fn resolve_symbol_name<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
+    image: &ExecImage,
+    sym_idx: u32,
+) -> [u8; 32] {
     let empty = [0u8; 32];
 
     // Walk to the Elf64_Sym slot to read st_name. We mirror
@@ -912,10 +982,11 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
         Some(a) => a,
         None => return empty,
     };
-    let sym_slice = match resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE) {
-        Some(s) => s,
-        None => return empty,
-    };
+    let mut sym_buf = [0u8; ELF64_SYM_SIZE as usize];
+    if read_dt_exact(src, image, entry_addr, &mut sym_buf).is_none() {
+        return empty;
+    }
+    let sym_slice = &sym_buf[..];
     let st_name = u32::from_le_bytes([sym_slice[0], sym_slice[1], sym_slice[2], sym_slice[3]]);
     // st_name == 0 → SysV "no name" convention; strtab[0] is the
     // canonical empty string and we treat it the same as missing.
@@ -940,9 +1011,10 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
     // bounded. Once we have a slice, scan for the NUL terminator
     // and copy the prefix.
     let mut out = [0u8; 32];
-    for cap in (1u64..=32).rev() {
-        if let Some(s) = resolve_dt_pointer(bytes, image, name_addr, cap) {
-            for (i, &b) in s.iter().enumerate() {
+    let mut name_buf = [0u8; 32];
+    for cap in (1usize..=32).rev() {
+        if read_dt_exact(src, image, name_addr, &mut name_buf[..cap]).is_some() {
+            for (i, &b) in name_buf[..cap].iter().enumerate() {
                 // Stop on NUL: terminator is not part of the name,
                 // and the buffer's already pre-zeroed so the trailing
                 // bytes naturally NUL-pad.
@@ -966,8 +1038,8 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
 /// gating. An undefined symbol returns 0 (the conventional template
 /// base), matching how ld-musl emits TPOFF64 with `sym_ix == 0` for
 /// the program's own TLS template.
-fn resolve_tls_symbol_offset(
-    bytes: &[u8],
+fn resolve_tls_symbol_offset<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     image: &ExecImage,
     sym_idx: u32,
 ) -> Result<u64, LoadBytesError> {
@@ -980,9 +1052,9 @@ fn resolve_tls_symbol_offset(
                 .ok_or(LoadBytesError::SymtabOutOfBounds)?,
         )
         .ok_or(LoadBytesError::SymtabOutOfBounds)?;
-    let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
-        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
-    Ok(read_u64_le(&slice[8..16]))
+    let mut sym = [0u8; ELF64_SYM_SIZE as usize];
+    read_dt_exact(src, image, entry_addr, &mut sym).ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    Ok(read_u64_le(&sym[8..16]))
 }
 
 /// Walk DT_RELA + DT_JMPREL and patch each entry.
@@ -1006,8 +1078,8 @@ fn resolve_tls_symbol_offset(
 /// - The kernel must be running with the low 4 GiB identity-mapped
 ///   (we write through `paging::translate`'s phys output cast to a
 ///   raw pointer).
-pub unsafe fn apply_relocations(
-    bytes: &[u8],
+pub unsafe fn apply_relocations<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
@@ -1030,9 +1102,10 @@ pub unsafe fn apply_relocations(
             let needed = count
                 .checked_mul(relaent)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            let slice = resolve_dt_pointer(bytes, image, rela_addr, needed)
+            let table = read_dt_table(src, image, rela_addr, needed)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            // SAFETY: `resolve_dt_pointer` returned a `slice` of exactly
+            let slice = &table[..];
+            // SAFETY: `read_dt_table` returned a `slice` of exactly
             // `needed == count * relaent` in-bounds bytes of the image, so
             // each `Elf64_Rela` entry read by `process_rela_array` is fully
             // backed; `addr_space` is the target space whose pages this
@@ -1043,7 +1116,7 @@ pub unsafe fn apply_relocations(
                     slice,
                     count as usize,
                     relaent as usize,
-                    bytes,
+                    src,
                     image,
                     addr_space,
                     vaddr_bias,
@@ -1065,9 +1138,10 @@ pub unsafe fn apply_relocations(
                 let needed = count
                     .checked_mul(relaent)
                     .ok_or(LoadBytesError::RelaOutOfBounds)?;
-                let slice = resolve_dt_pointer(bytes, image, jmprel_addr, needed)
+                let table = read_dt_table(src, image, jmprel_addr, needed)
                     .ok_or(LoadBytesError::RelaOutOfBounds)?;
-                // SAFETY: `resolve_dt_pointer` returned a `slice` of exactly
+                let slice = &table[..];
+                // SAFETY: `read_dt_table` returned a `slice` of exactly
                 // `needed == count * relaent` in-bounds bytes of the image, so
                 // each `Elf64_Rela` PLT entry read by `process_rela_array` is
                 // fully backed; `addr_space` is the target space whose pages
@@ -1078,7 +1152,7 @@ pub unsafe fn apply_relocations(
                         slice,
                         count as usize,
                         relaent as usize,
-                        bytes,
+                        src,
                         image,
                         addr_space,
                         vaddr_bias,
@@ -1106,8 +1180,9 @@ pub unsafe fn apply_relocations(
             if relrent != 8 {
                 return Err(LoadBytesError::UnsupportedRelocation);
             }
-            let slice = resolve_dt_pointer(bytes, image, relr_addr, relrsz)
+            let table = read_dt_table(src, image, relr_addr, relrsz)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
+            let slice = &table[..];
             // `for_each_relr_target` is a pure decoder; the closure does
             // the per-slot read-modify-write. A closure can't return an
             // error mid-walk, so the first unmapped slot latches into
@@ -1177,11 +1252,11 @@ pub(crate) fn for_each_relr_target(relr: &[u8], mut visit: impl FnMut(u64)) {
 /// Iterate `Elf64_Rela { r_offset, r_info, r_addend }` entries and
 /// patch each one. Encapsulated so DT_RELA + DT_JMPREL can share
 /// the per-entry decoding without duplicating the loop.
-unsafe fn process_rela_array(
+unsafe fn process_rela_array<S: crate::elf::ExecBytes + ?Sized>(
     slice: &[u8],
     count: usize,
     entsize: usize,
-    bytes: &[u8],
+    src: &S,
     image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
@@ -1215,13 +1290,13 @@ unsafe fn process_rela_array(
             }
             R_ABS64 => {
                 // S + A — symbol address (biased) plus addend.
-                let s = resolve_symbol(bytes, image, sym_ix, vaddr_bias)?;
+                let s = resolve_symbol(src, image, sym_ix, vaddr_bias)?;
                 s.wrapping_add(r_addend as u64)
             }
             R_GLOB_DAT | R_JUMP_SLOT => {
                 // S — bare symbol address. The addend slot is reserved
                 // by the ABI for these two types; ignore it.
-                resolve_symbol(bytes, image, sym_ix, vaddr_bias)?
+                resolve_symbol(src, image, sym_ix, vaddr_bias)?
             }
             R_DTPMOD64 => {
                 // Module ID. The static-tls model has exactly one TLS
@@ -1237,7 +1312,7 @@ unsafe fn process_rela_array(
                 let s = if sym_ix == 0 {
                     0
                 } else {
-                    resolve_tls_symbol_offset(bytes, image, sym_ix)?
+                    resolve_tls_symbol_offset(src, image, sym_ix)?
                 };
                 s.wrapping_add(r_addend as u64)
             }
@@ -1260,7 +1335,7 @@ unsafe fn process_rela_array(
                 let s = if sym_ix == 0 {
                     0
                 } else {
-                    resolve_tls_symbol_offset(bytes, image, sym_ix)?
+                    resolve_tls_symbol_offset(src, image, sym_ix)?
                 };
                 let template = image
                     .tls
