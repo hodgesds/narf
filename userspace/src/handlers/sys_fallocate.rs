@@ -27,6 +27,7 @@ use super::*;
 /// to "fall back to writing zeroes" — took the slow path for what is really
 /// a caller bug.
 pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
+
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let mode = args.arg1;
@@ -111,7 +112,13 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
             Some(Err(error)) => return Err(error),
         }
-        if mode != 0 && mode != FALLOC_FL_ZERO_RANGE {
+        // Linux `vfs_fallocate` never emulates a mode the filesystem does
+        // not implement — it returns EOPNOTSUPP and lets userspace decide
+        // (glibc's posix_fallocate falls back to writes for mode 0 only).
+        // The old ZERO_RANGE emulation here wrote zeros over the whole
+        // range in 4 KiB chunks; on tmpfs-backed shm objects that turned a
+        // call Linux refuses in O(1) into a full data pass.
+        if mode != 0 {
             return Err(narf_filesystem::FsError::Unsupported);
         }
         let cur_size = ops.stat().size;
@@ -123,23 +130,6 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
                 .is_none()
         {
             return Err(narf_filesystem::FsError::NoSpace);
-        }
-        if mode == FALLOC_FL_ZERO_RANGE && len > 0 && offset < cur_size {
-            // Zero existing bytes in [offset, min(target_end, old size)].
-            // We do this in 4-KiB chunks of zeros via a fresh write.
-            let zero_end = core::cmp::min(target_end, cur_size);
-            let mut cur = offset;
-            let chunk = [0u8; 4096];
-            while cur < zero_end {
-                let span = core::cmp::min(zero_end - cur, chunk.len() as u64) as usize;
-                let n = poll_blocking(ops.write(cur, &chunk[..span]))
-                    .and_then(|r| r.ok())
-                    .unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                cur += n as u64;
-            }
         }
         Ok(())
     })();
