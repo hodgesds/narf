@@ -324,6 +324,30 @@ mod audit {
         }
     }
 
+    /// True if `frame` is currently marked allocated. The demand-fault
+    /// self-heal uses this to refuse re-mapping a `phys[idx]` that a racing
+    /// teardown already returned to the buddy (stale-backing use-after-free).
+    pub fn is_allocated(frame: u64) -> bool {
+        let idx = (frame / 64) as usize;
+        if idx >= WORDS {
+            // Untracked high frame: assume allocated so a legit mapping outside
+            // the audited window is never wrongly rejected.
+            return true;
+        }
+        BITS[idx].load(Ordering::Relaxed) & (1u64 << (frame % 64)) != 0
+    }
+
+    /// file:line of the most recent prior free of `frame` — the op that leaked
+    /// it while a region kept `phys[idx]` pointing at it.
+    pub fn prior_free_site(frame: u64) -> (&'static str, u32) {
+        ring_prior_free(frame)
+    }
+
+    /// file:line where `frame` was last allocated (low window only).
+    pub fn alloc_site_of(frame: u64) -> (&'static str, u32) {
+        alloc_site(frame)
+    }
+
     pub fn mark_free(frame: u64, order: u8) {
         for f in frame..frame + super::order_frames(order) {
             let idx = (f / 64) as usize;
@@ -366,6 +390,30 @@ fn audit_alloc(frame: u64, order: u8) {
 #[inline]
 fn audit_free(frame: u64, order: u8) {
     audit::mark_free(frame, order);
+}
+
+/// Audit view of one physical frame: `(is_allocated, prior_free_site,
+/// alloc_site)`. `None` unless `frame-alloc-audit` is compiled in. The
+/// demand-fault self-heal consults this to refuse re-mapping a `phys[idx]`
+/// that a racing teardown already freed, and to name the leaking free.
+#[inline]
+pub fn frame_audit_state(
+    phys: crate::PhysAddr,
+) -> Option<(bool, (&'static str, u32), (&'static str, u32))> {
+    #[cfg(feature = "frame-alloc-audit")]
+    {
+        let frame = phys.raw() >> 12;
+        Some((
+            audit::is_allocated(frame),
+            audit::prior_free_site(frame),
+            audit::alloc_site_of(frame),
+        ))
+    }
+    #[cfg(not(feature = "frame-alloc-audit"))]
+    {
+        let _ = phys;
+        None
+    }
 }
 
 /// Transition one live-allocator frame from owned to per-CPU-cache free.
