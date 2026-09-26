@@ -4151,7 +4151,26 @@ fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
         return TestResult::Fail("no-hint mmap rescanned a low hole before its high-water hint");
     }
 
-    let unaligned_hint = AddressSpace::MMAP_CURSOR_BASE + 0x20_0001;
+    // Derive the hint from where this address space's mappings actually END,
+    // not from the nominal `MMAP_CURSOR_BASE`.
+    //
+    // `find_unmapped_area_locked` honours a non-fixed hint only when the
+    // aligned interval is FREE; otherwise it silently falls back to the
+    // floor-up search. This test's own three mappings sit at
+    // `[cursor_at_start, cursor_at_start + 3 * LEN)`, and `cursor_at_start` is
+    // `kaslr::user_mmap_slot(MMAP_CURSOR_BASE)` — the constant plus a random
+    // page-aligned offset of up to 16 MiB. A hint of `constant + 0x20_0001`
+    // therefore overlapped those mappings whenever that draw landed in a
+    // ~64 KiB window just below 2 MiB, which is a ~0.4% flake: rare enough to
+    // look like noise (it failed once in 13 runs here) and entirely
+    // reproducible in principle, since the collision is with the test's own
+    // regions rather than anything external.
+    //
+    // `high_water + LEN` is above every mapping made above, so the hinted
+    // interval is free no matter where the floor landed. `+ 0x20_0001` keeps it
+    // clear and, deliberately, page-UNALIGNED — the alignment-then-honour
+    // behaviour is the property under test.
+    let unaligned_hint = high_water.as_u64() + LEN + 0x20_0001;
     let aligned_hint = VirtAddr::new((unaligned_hint + 4095) & !4095);
     let hinted = match aspace.map_private_anonymous_region_anywhere_limited(
         lazy_region(),
