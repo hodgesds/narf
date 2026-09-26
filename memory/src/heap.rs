@@ -108,11 +108,53 @@ impl core::fmt::Debug for BumpAllocator {
 }
 
 /// How many SPILL regions the bootstrap arena can be extended with.
+///
 /// The buddy hands out at most `1 << MAX_ORDER` frames (32 MiB) per
-/// allocation, so a handful of regions covers a very large machine:
-/// the pre-slab reservation costs ~16 bytes per 4 KiB frame, i.e.
-/// ~0.4% of RAM, so 8 × 32 MiB of spill covers ~64 GiB.
-const MAX_SPILL_REGIONS: usize = 8;
+/// allocation, so this count is what actually bounds how much RAM the kernel
+/// can boot with.
+///
+/// Sizing, corrected. This said "~16 bytes per 4 KiB frame ... so 8 × 32 MiB of
+/// spill covers ~64 GiB", and both halves were wrong:
+///
+///   * `reserve_growth_capacity` reserves `Σ over orders (frames >> order)`
+///     entries of 8 bytes **per migratetype**, and `NUM_MIGRATE_TYPES` is 2.
+///     `Σ (frames >> order)` is ~2·frames, so the cost is ~2·8·2 = **32** bytes
+///     per frame, not 16.
+///   * `ensure_bootstrap_headroom` then asks for that plus a quarter, plus
+///     1 MiB — ~40 bytes per frame, or ~10.5 MiB per GiB of RAM.
+///
+/// So 8 regions covered ~25 GiB, not 64: a 32 GiB boot exhausted all eight,
+/// `add_bootstrap_spill` returned false, the donation loop gave up, and the
+/// reservation then died in `handle_alloc_error` with no indication that the
+/// spill capacity was the limit.
+///
+/// At ~10.5 MiB per GiB and 32 MiB per region, a machine of R GiB needs about
+/// R/3 regions. 128 covers ~380 GiB; the cost is 128 × 3 words of `.bss`.
+pub const MAX_SPILL_REGIONS: usize = 128;
+
+/// How many SPILL slots have been handed out, so the allocation path scans only
+/// the regions that exist rather than all [`MAX_SPILL_REGIONS`] of them. Slots
+/// are filled in order and never released, so the used ones are always a prefix.
+static SPILL_USED: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes `ensure_bootstrap_headroom` wanted but could not obtain.
+///
+/// Non-zero means the arena is smaller than the pre-slab reservation about to
+/// run against it, i.e. the boot is about to die in `handle_alloc_error`. Kept
+/// as a number rather than a panic so the shortfall is reportable — see
+/// `smoke_bootstrap_arena_covers_reservation`, which is what turns "this machine
+/// is too big to boot" from a bare allocator panic into a named failure.
+static BOOTSTRAP_SHORTFALL: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that the arena came up `bytes` short of what was asked for.
+pub fn set_bootstrap_shortfall(bytes: usize) {
+    BOOTSTRAP_SHORTFALL.store(bytes, Ordering::Relaxed);
+}
+
+/// Bytes the bootstrap arena came up short, or 0 if it covered the reservation.
+pub fn bootstrap_shortfall() -> usize {
+    BOOTSTRAP_SHORTFALL.load(Ordering::Relaxed)
+}
 
 /// One buddy-donated extension of the bootstrap arena: `(base, len,
 /// cursor)`. `base == 0` means the slot is unused. Written only by
@@ -146,7 +188,7 @@ pub unsafe fn add_bootstrap_spill(base: *mut u8, len: usize) -> bool {
     if base.is_null() || len == 0 {
         return false;
     }
-    for slot in SPILL.iter() {
+    for (i, slot) in SPILL.iter().enumerate() {
         if slot
             .0
             .compare_exchange(0, base as usize, Ordering::AcqRel, Ordering::Relaxed)
@@ -154,6 +196,9 @@ pub unsafe fn add_bootstrap_spill(base: *mut u8, len: usize) -> bool {
         {
             slot.1.store(len, Ordering::Release);
             slot.2.store(0, Ordering::Release);
+            // Publish the count only after the region is fully described, so a
+            // reader bounded by it never sees a slot with a base but no length.
+            SPILL_USED.fetch_max(i + 1, Ordering::Release);
             return true;
         }
     }
@@ -165,7 +210,8 @@ pub unsafe fn add_bootstrap_spill(base: *mut u8, len: usize) -> bool {
 /// a large pre-slab reservation.
 pub fn bootstrap_remaining() -> usize {
     let mut free = BOOTSTRAP_CAPACITY.saturating_sub(OFFSET.load(Ordering::Relaxed));
-    for slot in SPILL.iter() {
+    let used = SPILL_USED.load(Ordering::Acquire);
+    for slot in SPILL.iter().take(used) {
         if slot.0.load(Ordering::Acquire) != 0 {
             let len = slot.1.load(Ordering::Acquire);
             free += len.saturating_sub(slot.2.load(Ordering::Relaxed));
@@ -186,7 +232,10 @@ pub(crate) fn in_bootstrap(ptr: *mut u8) -> bool {
     if p >= base && p < end {
         return true;
     }
-    for slot in SPILL.iter() {
+    // Bounded by the used count: this runs on every dealloc to decide bump-vs-slab
+    // routing, and a machine that never donated must not pay for the unused slots.
+    let used = SPILL_USED.load(Ordering::Acquire);
+    for slot in SPILL.iter().take(used) {
         let sbase = slot.0.load(Ordering::Acquire);
         if sbase != 0 && p >= sbase && p < sbase + slot.1.load(Ordering::Acquire) {
             return true;
@@ -200,7 +249,8 @@ pub(crate) fn in_bootstrap(ptr: *mut u8) -> bool {
 fn spill_alloc(layout: Layout) -> *mut u8 {
     let align = layout.align().max(1);
     let size = layout.size();
-    for slot in SPILL.iter() {
+    let used = SPILL_USED.load(Ordering::Acquire);
+    for slot in SPILL.iter().take(used) {
         let base = slot.0.load(Ordering::Acquire);
         if base == 0 {
             continue;
@@ -378,7 +428,8 @@ pub const fn capacity_bytes() -> usize {
 pub fn spill_stats() -> (usize, usize) {
     let mut n = 0;
     let mut bytes = 0;
-    for slot in SPILL.iter() {
+    let used = SPILL_USED.load(Ordering::Acquire);
+    for slot in SPILL.iter().take(used) {
         if slot.0.load(Ordering::Acquire) != 0 {
             n += 1;
             bytes += slot.1.load(Ordering::Acquire);
