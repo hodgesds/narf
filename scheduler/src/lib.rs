@@ -1088,6 +1088,14 @@ impl core::ops::Deref for PerCpuHandoffFlag {
     }
 }
 
+/// Fresh wakes targeting each CPU since its executor last began a dispatch
+/// round. Written by wakers (any CPU), reset by the owning executor once per
+/// round; `wake_place_and_kick` reads it as the migration backlog gate. A
+/// round-scoped counter cannot drift: whatever a round leaves behind, the
+/// next round's reset clears.
+static WAKE_PRESSURE: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+
 static CPU_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
@@ -4132,6 +4140,13 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
         unsafe { wake_race_stamp(&*ptr, home) };
         note_runnable_peer(home, task);
+        // Backlog gauge for wake-time placement (see WAKE_PRESSURE): one
+        // fresh wake toward `home` since its last dispatch round. Re-wakes
+        // of an already-awake slot add no queue load and are skipped by the
+        // prev_awake gate above.
+        if (home as usize) < WAKE_PRESSURE.len() {
+            WAKE_PRESSURE[home as usize].fetch_add(1, Ordering::AcqRel);
+        }
     }
     let mut dispatch_home = home;
     if urgent_task == Some(task) {
@@ -4275,30 +4290,18 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
     // executor spinning on an empty queue picks a kicked wake up immediately
     // and cache-hot, while migration pays a cross-queue move plus — for a
     // halted destination — a full HLT wakeup. Migrate only when home has a
-    // REAL backlog. The fresh wakee's awake flag is already set (the waker
-    // swaps it before placement), so a runnable count of 1 means "only this
-    // wake": kick home. Early-exit scan; the count is a heuristic, not a
-    // barrier. Without this gate the futexbench5 cold-wake chain regressed
-    // 3.7 -> 9.5 µs/wake — every wake whose home happened to be polling was
-    // pushed to a HALTED sibling and paid its HLT latency — while the
-    // exit-storm case this placement exists for (wakes arriving faster than
-    // dispatch) still crosses the threshold on the second queued wake.
-    let backlog = {
-        let q = READY[home as usize].lock();
-        q.as_ref().map_or(0usize, |dq| {
-            let mut runnable = 0usize;
-            for slot in dq.iter() {
-                if slot.awake.executor_runnable() {
-                    runnable += 1;
-                    if runnable >= 2 {
-                        break;
-                    }
-                }
-            }
-            runnable
-        })
-    };
-    if backlog < 2 {
+    // REAL backlog: at least one OTHER fresh wake since home's executor last
+    // began a dispatch round (the exit-storm shape placement exists for —
+    // wakes arriving faster than dispatch — crosses this on its second
+    // queued wake). `WAKE_PRESSURE[home]` counts this wake too (the waker
+    // bumped it before dispatching here), so `< 2` means "only this wake":
+    // kick home. Without a backlog gate the futexbench5 cold-wake chain
+    // regressed 3.7 -> 9.5 µs/wake — every wake whose home happened to be
+    // polling was pushed to a HALTED sibling and paid its HLT latency. The
+    // counter replaces this gate's first shape (a READY[home] lock + slot
+    // scan per wake), whose lock acquisition was itself worth ~1.5 µs on
+    // the cold-wake path.
+    if WAKE_PRESSURE[home as usize].load(Ordering::Acquire) < 2 {
         resched_remote(home);
         return;
     }
@@ -4868,6 +4871,10 @@ pub fn run_until_empty() {
                 .expect("scheduler::run_until_empty before init")
                 .len()
         };
+        // A new dispatch round begins: wakes counted before this point are
+        // about to be serviced, so they no longer constitute backlog for the
+        // wake-time placement gate (see WAKE_PRESSURE).
+        WAKE_PRESSURE[cpu].store(0, Ordering::Release);
 
         for _ in 0..round_len {
             // The pluggable policy sees only a read-only candidate view and
