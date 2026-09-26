@@ -396,10 +396,13 @@ fn audit_free(frame: u64, order: u8) {
 /// alloc_site)`. `None` unless `frame-alloc-audit` is compiled in. The
 /// demand-fault self-heal consults this to refuse re-mapping a `phys[idx]`
 /// that a racing teardown already freed, and to name the leaking free.
+/// `(allocated, alloc_site, prior_free_site)` for one frame, each site a
+/// `(file, line)` pair. Named so the tuple does not have to be spelled out at
+/// every use — `clippy::type_complexity` rejects the inline form.
+pub type FrameAuditState = Option<(bool, (&'static str, u32), (&'static str, u32))>;
+
 #[inline]
-pub fn frame_audit_state(
-    phys: crate::PhysAddr,
-) -> Option<(bool, (&'static str, u32), (&'static str, u32))> {
+pub fn frame_audit_state(phys: crate::PhysAddr) -> FrameAuditState {
     #[cfg(feature = "frame-alloc-audit")]
     {
         let frame = phys.raw() >> 12;

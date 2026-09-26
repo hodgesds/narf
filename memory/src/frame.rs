@@ -1729,6 +1729,13 @@ pub(crate) unsafe fn free_unique_frame_batch(frames: &[PhysFrame]) {
 /// # Safety
 /// Every non-zero, non-reserved input frame must be exclusively owned by the
 /// caller and absent from the COW and page-table ownership registries.
+// Only caller today is `smoke_free_unique_phys_batch_spans_windows_without_leak`
+// below, so this is dead outside the kernel-test build. The doc above says
+// address-space teardown uses it; no such call site exists yet, so the `allow`
+// is deliberately scoped to the non-test configs — the kernel-test build still
+// dead-code-checks it, and wiring the documented teardown user will not need
+// the attribute touched.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
 #[cfg_attr(feature = "frame-alloc-audit", track_caller)]
 pub(crate) unsafe fn free_unique_phys_batch(phys_list: &[PhysAddr]) {
     #[cfg(feature = "frame-alloc-audit")]
@@ -1828,7 +1835,7 @@ fn buddy_prepare_unreferenced_frame(phys: PhysAddr) {
                     }
                     // SAFETY: reads our own stack within a bounded window.
                     let w = unsafe { core::ptr::read_volatile((sp + i * 8) as *const u64) };
-                    if w >= 0xffff_ffff_8000_0000 && w < 0xffff_ffff_ffff_0000 {
+                    if (0xffff_ffff_8000_0000..0xffff_ffff_ffff_0000).contains(&w) {
                         let _ = write!(chain, " {w:#x}");
                         hits += 1;
                     }
@@ -1981,6 +1988,7 @@ pub(crate) fn buddy_free_phys_batch(phys_list: &[PhysAddr]) {
 ///
 /// # Safety
 /// Forwarded from [`free_unique_phys_batch`].
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
 unsafe fn buddy_free_unique_phys_batch(phys_list: &[PhysAddr]) {
     let mut valid = [PhysAddr::new(0); FREE_BATCH_WINDOW];
     let mut valid_len = 0usize;
