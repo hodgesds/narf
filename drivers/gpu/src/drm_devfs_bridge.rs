@@ -117,6 +117,13 @@ pub struct DriCardFile {
     /// `card<N>` get distinct ids and only one can be master at a time.
     open_id: u64,
     metadata: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm_registry::DrmNodeMetadata>>,
+    /// Per-open virtio-gpu resource namespace, mirroring [`DriRenderFile`].
+    /// Every VIRTGPU ioctl is `DRM_RENDER_ALLOW` in Linux, which the PRIMARY
+    /// (card) node also serves for an authenticated client — and Mesa's
+    /// GBM/EGL compositor context is created on `card0`, so it issues
+    /// GETPARAM/GET_CAPS/CONTEXT_INIT there. Kept even for a non-virtio card;
+    /// the dispatcher is gated on the card's advertised driver name.
+    virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -147,12 +154,22 @@ impl DriCardFile {
             index,
             open_id,
             metadata,
+            virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
         })
     }
 }
 
 impl Drop for DriCardFile {
     fn drop(&mut self) {
+        // Quiesce any virtio-gpu host resources this open created (Mesa may
+        // build its render context + resources on the card node, not just the
+        // render node — see the `virtgpu` field). Mirrors DriRenderFile::drop:
+        // if teardown fails, `release_virtgpu_resource` retains the backing
+        // rather than free pages a live host resource may still DMA into.
+        let ctx_id = self.virtgpu.ctx_id();
+        for resource in self.virtgpu.drain_resources() {
+            crate::drm_ioctl_bridge::release_virtgpu_resource(ctx_id, resource);
+        }
         // drm_master_release: if this fd held DRM master, drop it so the device
         // is free for the next session's SET_MASTER (greeter→user handoff).
         if let Some(ms) = crate::drm_registry::mode_state(self.index) {
@@ -295,6 +312,22 @@ impl FileOps for DriCardFile {
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        // Mesa's GBM/EGL compositor context is created on the PRIMARY (card)
+        // node and issues the VIRTGPU driver ioctls (GETPARAM/GET_CAPS/
+        // CONTEXT_INIT/RESOURCE_CREATE/EXECBUFFER/…) there — every one is
+        // `DRM_RENDER_ALLOW` in Linux, which the primary node serves for an
+        // authenticated client (`drivers/gpu/drm/virtio/virtgpu_ioctl.c`).
+        // Route them to this open's per-open virtio-gpu dispatcher FIRST,
+        // exactly as DriRenderFile does, then fall through to the card/KMS
+        // path for everything else (dispatch_virtgpu_render returns
+        // `Unsupported` for non-VIRTGPU cmds). Without this the card-node
+        // probe returned ENOTTY and Mesa dropped every GL client to llvmpipe.
+        if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
+            match crate::drm_ioctl_bridge::dispatch_virtgpu_render(cmd, arg, &self.virtgpu) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+        }
         crate::drm_ioctl_bridge::dispatch_card(
             self.index,
             self.open_id,
