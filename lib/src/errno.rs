@@ -46,7 +46,7 @@ pub const EPIPE: i64 = 32;
 pub const EDOM: i64 = 33;
 pub const ERANGE: i64 = 34;
 
-// ── Linux errno extensions (35..133) — <asm-generic/errno.h> ──────────────
+// ── Linux errno extensions (35..134) — <asm-generic/errno.h> ──────────────
 
 pub const EDEADLK: i64 = 35;
 pub const ENAMETOOLONG: i64 = 36;
@@ -150,6 +150,8 @@ pub const EOWNERDEAD: i64 = 130;
 pub const ENOTRECOVERABLE: i64 = 131;
 pub const ERFKILL: i64 = 132;
 pub const EHWPOISON: i64 = 133;
+/// Wrong file type for the intended operation (`asm-generic/errno.h`, 134).
+pub const EFTYPE: i64 = 134;
 
 // ── Linux kernel-internal error codes (512..531) — <linux/errno.h> ────────
 
@@ -320,4 +322,5 @@ pub mod wire {
     pub const ENOTRECOVERABLE: i64 = -super::ENOTRECOVERABLE;
     pub const ERFKILL: i64 = -super::ERFKILL;
     pub const EHWPOISON: i64 = -super::EHWPOISON;
+    pub const EFTYPE: i64 = -super::EFTYPE;
 }

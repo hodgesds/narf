@@ -136,6 +136,46 @@ pub struct SockError {
     pub from_ip: [u8; 4],
 }
 
+impl SockError {
+    /// The Linux errno and hard/soft class `udp_err` (net/ipv4/udp.c)
+    /// derives from this ICMP error. See [`icmp_err_convert`].
+    pub fn linux_errno(&self) -> Option<(i32, bool)> {
+        icmp_err_convert(self.icmp_type, self.icmp_code)
+    }
+}
+
+/// `udp_err`'s mapping of an ICMPv4 error `(type, code)` to `(errno, hard)`:
+///
+/// - Destination Unreachable code 0..=15 → `icmp_err_convert[code]`
+///   (the table in `tcp::core`); higher codes → `EHOSTUNREACH`, soft.
+/// - Fragmentation Needed → `EMSGSIZE`, hard (default `IP_PMTUDISC_WANT`).
+/// - Parameter Problem → `EPROTO`, hard.
+/// - Time Exceeded and any other type → `EHOSTUNREACH`, soft.
+/// - Source Quench / Redirect → `None` (never reported to the socket).
+///
+/// Linux sets `sk_err` only for hard errors on a connected socket unless
+/// `IP_RECVERR` is on; callers apply that rule, this only maps.
+pub fn icmp_err_convert(icmp_type: u8, icmp_code: u8) -> Option<(i32, bool)> {
+    use crate::tcp::core::{ICMP_UNREACH_ERRNO, ICMP_UNREACH_FATAL};
+    use narf_lib::errno as e;
+    const DEST_UNREACH: u8 = 3;
+    const SOURCE_QUENCH: u8 = 4;
+    const REDIRECT: u8 = 5;
+    const PARAMETERPROB: u8 = 12;
+    const FRAG_NEEDED: u8 = 4;
+    let (errno, hard) = match icmp_type {
+        SOURCE_QUENCH | REDIRECT => return None,
+        PARAMETERPROB => (e::EPROTO, true),
+        DEST_UNREACH if icmp_code == FRAG_NEEDED => (e::EMSGSIZE, true),
+        DEST_UNREACH => match ICMP_UNREACH_ERRNO.get(icmp_code as usize) {
+            Some(errno) => (*errno, ICMP_UNREACH_FATAL[icmp_code as usize]),
+            None => (e::EHOSTUNREACH, false),
+        },
+        _ => (e::EHOSTUNREACH, false),
+    };
+    Some((errno as i32, hard))
+}
+
 // ── UDP socket ─────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -798,8 +838,14 @@ pub fn deliver_icmp_error_in(
             .entries
             .lock()
             .iter()
+            // `__udp4_lib_lookup` matches a wildcard (INADDR_ANY) bind as
+            // well as an exact one; requiring an exact local address meant a
+            // socket bound to 0.0.0.0 never saw its ICMP errors (so never
+            // learned ECONNREFUSED).
             .filter(|(p, s)| {
-                *p == orig_src_port && s.net_ns_id == net_ns_id && s.local.ip == orig_src_ip
+                *p == orig_src_port
+                    && s.net_ns_id == net_ns_id
+                    && (s.local.ip == orig_src_ip || s.local.ip == [0, 0, 0, 0])
             })
             .map(|(_, s)| s.clone())
             .collect()

@@ -14,7 +14,6 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
-const NLM_F_DUMP: u16 = 0x300;
 
 pub const AUDIT_GET: u16 = 1000;
 pub const AUDIT_SET: u16 = 1001;
@@ -28,6 +27,23 @@ const AUDIT_FIRST_USER_MSG: u16 = 1100;
 const AUDIT_LAST_USER_MSG: u16 = 1199;
 const AUDIT_FIRST_USER_MSG2: u16 = 2100;
 const AUDIT_LAST_USER_MSG2: u16 = 2999;
+
+// `audit_netlink_ok` (kernel/audit.c) classes. Obsolete list/add/del are
+// -EOPNOTSUPP; configuration writes require CAP_AUDIT_CONTROL, which a
+// Linux uid never confers here, so they are -EPERM like AUDIT_SET.
+const AUDIT_LIST: u16 = 1002;
+const AUDIT_ADD: u16 = 1003;
+const AUDIT_DEL: u16 = 1004;
+const AUDIT_ADD_RULE: u16 = 1011;
+const AUDIT_DEL_RULE: u16 = 1012;
+const AUDIT_TRIM: u16 = 1014;
+const AUDIT_MAKE_EQUIV: u16 = 1015;
+const AUDIT_TTY_SET: u16 = 1017;
+const AUDIT_SET_FEATURE: u16 = 1018;
+// Recognised read-only control queries NARF does not implement yet.
+const AUDIT_SIGNAL_INFO: u16 = 1010;
+const AUDIT_TTY_GET: u16 = 1016;
+const AUDIT_GET_FEATURE: u16 = 1019;
 
 const EINVAL: i32 = 22;
 const EPERM: i32 = 1;
@@ -80,14 +96,21 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     }
     let mut replies = match kind {
         AUDIT_GET => alloc::vec![status(seq)],
-        AUDIT_LIST_RULES if flags & NLM_F_DUMP == NLM_F_DUMP => {
+        // `audit_receive_msg` answers AUDIT_LIST_RULES with the rule list
+        // and NLMSG_DONE whether or not NLM_F_DUMP is set; `auditctl -l`
+        // sends it as a plain REQUEST|ACK.
+        AUDIT_LIST_RULES => {
             alloc::vec![frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes())]
         }
-        AUDIT_SET => alloc::vec![error(EPERM, seq, request)],
+        AUDIT_SET | AUDIT_ADD_RULE | AUDIT_DEL_RULE | AUDIT_TRIM | AUDIT_MAKE_EQUIV
+        | AUDIT_TTY_SET | AUDIT_SET_FEATURE => alloc::vec![error(EPERM, seq, request)],
         AUDIT_USER
         | AUDIT_FIRST_USER_MSG..=AUDIT_LAST_USER_MSG
         | AUDIT_FIRST_USER_MSG2..=AUDIT_LAST_USER_MSG2 => Vec::new(),
-        _ => alloc::vec![error(EOPNOTSUPP, seq, request)],
+        AUDIT_LIST | AUDIT_ADD | AUDIT_DEL | AUDIT_SIGNAL_INFO | AUDIT_TTY_GET
+        | AUDIT_GET_FEATURE => alloc::vec![error(EOPNOTSUPP, seq, request)],
+        // `audit_netlink_ok`: "bad msg" → -EINVAL.
+        _ => alloc::vec![error(EINVAL, seq, request)],
     };
     if flags & NLM_F_ACK != 0
         && !replies

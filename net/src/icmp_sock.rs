@@ -41,7 +41,7 @@ use crate::pkt::{
     ETH_HDR_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPV4_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP,
     IP_PROTO_UDP,
 };
-use crate::pkt_icmp_extra::{ICMP_DEST_UNREACHABLE, ICMP_TIME_EXCEEDED};
+use crate::pkt_icmp_extra::{ICMP_DEST_UNREACHABLE, ICMP_PARAMETER_PROBLEM, ICMP_TIME_EXCEEDED};
 use crate::tcp_stack::{arp_resolve_in, nf_tx_filter_in};
 use crate::udp_sock::{deliver_icmp_error_in, SockError};
 
@@ -168,6 +168,11 @@ pub fn icmp_echo_send(
     seq: u16,
     payload: &[u8],
 ) -> Result<(), IcmpError2> {
+    // -EMSGSIZE before any routing work, as in `ping_v4_sendmsg`; beyond
+    // this `ip_total as u16` would wrap and emit a malformed datagram.
+    if payload.len() > ICMP_ECHO_MAX_PAYLOAD {
+        return Err(IcmpError2::MsgTooLong);
+    }
     // Wave-47: route by destination, not boot-time primary.
     let iface = iface::for_dst_in(sock.net_ns_id, target).ok_or(IcmpError2::NoInterface)?;
     let dst_mac = if target == [255, 255, 255, 255] {
@@ -289,7 +294,14 @@ pub enum IcmpError2 {
     NoInterface,
     NetworkUnreachable,
     BufferTooSmall,
+    /// Echo payload does not fit one IPv4 datagram (`ping_common_sendmsg` /
+    /// `__ip_append_data` → -EMSGSIZE).
+    MsgTooLong,
 }
+
+/// Largest ICMP echo payload one IPv4 datagram carries: `0xFFFF` minus
+/// the 20-byte IPv4 header and the 8-byte echo header.
+pub const ICMP_ECHO_MAX_PAYLOAD: usize = 0xFFFF - IPV4_HDR_LEN - 8;
 
 // ── RX dispatch ────────────────────────────────────────────────────
 //
@@ -324,7 +336,9 @@ pub fn on_icmp_rx_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body
             // Deliver to waiting echo sockets.
             handle_echo_reply(net_ns_id, src_ip, icmp_body);
         }
-        ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED => {
+        // `icmp_rcv` hands Parameter Problem to `icmp_unreach` as well, so
+        // the originating socket sees EPROTO (`udp_err` / `tcp_v4_err`).
+        ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED | ICMP_PARAMETER_PROBLEM => {
             // Route the error back to the originating socket.
             deliver_error_in(net_ns_id, src_ip, icmp_type, icmp_code, icmp_body);
         }

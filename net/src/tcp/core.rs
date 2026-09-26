@@ -3282,8 +3282,9 @@ const ICMP_FRAG_NEEDED: u8 = 4;
 const NR_ICMP_UNREACH: u8 = 15;
 
 /// Linux `icmp_err_convert[code].errno` (net/ipv4/icmp.c), indexed by the
-/// destination-unreachable code 0..=NR_ICMP_UNREACH.
-const ICMP_UNREACH_ERRNO: [i64; 16] = [
+/// destination-unreachable code 0..=NR_ICMP_UNREACH. Shared with
+/// `udp_sock::icmp_err_convert`.
+pub const ICMP_UNREACH_ERRNO: [i64; 16] = [
     errno::ENETUNREACH,  // ICMP_NET_UNREACH
     errno::EHOSTUNREACH, // ICMP_HOST_UNREACH
     errno::ENOPROTOOPT,  // ICMP_PROT_UNREACH
@@ -3300,6 +3301,13 @@ const ICMP_UNREACH_ERRNO: [i64; 16] = [
     errno::EHOSTUNREACH, // ICMP_PKT_FILTERED
     errno::EHOSTUNREACH, // ICMP_PREC_VIOLATION
     errno::EHOSTUNREACH, // ICMP_PREC_CUTOFF
+];
+
+/// Linux `icmp_err_convert[code].fatal`, the hard/soft column of the same
+/// table (`udp_err` uses it as `harderr`; `tcp_v4_err` does not).
+pub const ICMP_UNREACH_FATAL: [bool; 16] = [
+    false, false, true, true, false, false, true, true, true, true, true, false, false, true, true,
+    true,
 ];
 
 /// Apply an ICMP error about one of our segments to its connection.

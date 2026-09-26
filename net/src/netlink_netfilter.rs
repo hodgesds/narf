@@ -15,6 +15,8 @@ const NLM_F_MULTI: u16 = 2;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NLA_F_NET_BYTEORDER: u16 = 1 << 14;
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
@@ -22,6 +24,7 @@ const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const IPCTNL_MSG_CT_NEW: u16 = 0;
 const IPCTNL_MSG_CT_GET: u16 = 1;
 const AF_INET: u8 = 2;
+const NFPROTO_UNSPEC: u8 = 0;
 const NFT_MSG_NEWTABLE: u16 = 0;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_DELTABLE: u16 = 2;
@@ -315,6 +318,7 @@ fn mutation_error(error: crate::netfilter::filter::RulesetError) -> i32 {
 fn mutate_nft(
     net_ns_id: u64,
     message: u16,
+    flags: u16,
     request: &[u8],
     admin: Option<&crate::netfilter::NetfilterAdminHandle>,
 ) -> i32 {
@@ -359,7 +363,25 @@ fn mutate_nft(
         }
         _ => return EOPNOTSUPP,
     };
-    result.err().map(mutation_error).unwrap_or(0)
+    match result {
+        Ok(()) => 0,
+        // `nf_tables_newtable` / `nf_tables_newchain`: an existing object is
+        // -EEXIST only under NLM_F_EXCL, -EOPNOTSUPP under NLM_F_REPLACE, and
+        // otherwise an in-place update that succeeds. NARF tables and empty
+        // chains carry no updatable attributes, so the update is a no-op.
+        Err(crate::netfilter::filter::RulesetError::AlreadyExists)
+            if matches!(message, NFT_MSG_NEWTABLE | NFT_MSG_NEWCHAIN) =>
+        {
+            if flags & NLM_F_EXCL != 0 {
+                EEXIST
+            } else if flags & NLM_F_REPLACE != 0 {
+                EOPNOTSUPP
+            } else {
+                0
+            }
+        }
+        Err(error) => mutation_error(error),
+    }
 }
 
 fn build_one(
@@ -386,7 +408,20 @@ fn build_one(
     if subsystem != NFNL_SUBSYS_CTNETLINK && subsystem != NFNL_SUBSYS_NFTABLES {
         return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
     }
-    if request.len() < NLMSG_HDRLEN + 4 || request[NLMSG_HDRLEN] != AF_INET {
+    if request.len() < NLMSG_HDRLEN + 4 {
+        return Ok(alloc::vec![error(EINVAL, seq, request)]);
+    }
+    let family = request[NLMSG_HDRLEN];
+    if subsystem == NFNL_SUBSYS_NFTABLES {
+        // nf_tables: an unsupported `nfgen_family` is -EOPNOTSUPP
+        // (`nft_supported_family`). NARF keeps one IPv4 ruleset, so only
+        // NFPROTO_IPV4 is supported — plus NFPROTO_UNSPEC on GET, which
+        // Linux dumps as "every family" (`nft list ruleset`).
+        let get = matches!(message, NFT_MSG_GETTABLE | NFT_MSG_GETCHAIN);
+        if family != AF_INET && !(get && family == NFPROTO_UNSPEC) {
+            return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
+        }
+    } else if family != AF_INET {
         return Ok(alloc::vec![error(EINVAL, seq, request)]);
     }
     if subsystem == NFNL_SUBSYS_NFTABLES {
@@ -394,7 +429,7 @@ fn build_one(
             message,
             NFT_MSG_NEWTABLE | NFT_MSG_DELTABLE | NFT_MSG_NEWCHAIN | NFT_MSG_DELCHAIN
         ) {
-            let errno = mutate_nft(net_ns_id, message, request, admin);
+            let errno = mutate_nft(net_ns_id, message, flags, request, admin);
             return Ok(if errno != 0 || flags & NLM_F_ACK != 0 {
                 alloc::vec![error(errno, seq, request)]
             } else {

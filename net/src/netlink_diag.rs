@@ -17,6 +17,12 @@ const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
 
 pub const SOCK_DIAG_BY_FAMILY: u16 = 20;
+/// `linux/inet_diag.h`: legacy `inet_diag_req` query type.
+pub const TCPDIAG_GETSOCK: u16 = 18;
+/// `linux/sock_diag.h`: socket-destroy request.
+pub const SOCK_DESTROY: u16 = 21;
+/// `linux/socket.h` `AF_MAX` (one past `AF_MCTP`).
+const AF_MAX: u8 = 46;
 pub const AF_INET: u8 = 2;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
@@ -137,16 +143,37 @@ fn build_one(net_ns_id: u64, request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     if flags & NLM_F_REQUEST == 0 {
         return Ok(alloc::vec![error(EINVAL, seq, request)]);
     }
-    if kind != SOCK_DIAG_BY_FAMILY {
-        return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
+    // `sock_diag_rcv_msg` (net/core/sock_diag.c): TCPDIAG_GETSOCK needs the
+    // legacy inet compat hook (-EOPNOTSUPP when absent, as here), and
+    // SOCK_DESTROY needs a handler `destroy` op (-EOPNOTSUPP). Every other
+    // type is a bad message: -EINVAL.
+    match kind {
+        SOCK_DIAG_BY_FAMILY => {}
+        TCPDIAG_GETSOCK | SOCK_DESTROY => {
+            return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
+        }
+        _ => return Ok(alloc::vec![error(EINVAL, seq, request)]),
     }
-    if request.len() < NLMSG_HDRLEN + 56 {
+    // `__sock_diag_cmd`: a truncated `sock_diag_req` or a family >= AF_MAX
+    // is -EINVAL; a family with no registered handler is -ENOENT.
+    if request.len() < NLMSG_HDRLEN + 4 {
         return Ok(alloc::vec![error(EINVAL, seq, request)]);
     }
     let family = request[NLMSG_HDRLEN];
     let protocol = request[NLMSG_HDRLEN + 1];
-    if family != AF_INET || !matches!(protocol, IPPROTO_TCP | IPPROTO_UDP) {
-        return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
+    if family >= AF_MAX {
+        return Ok(alloc::vec![error(EINVAL, seq, request)]);
+    }
+    if family != AF_INET {
+        return Ok(alloc::vec![error(ENOENT, seq, request)]);
+    }
+    // `inet_diag_handler_cmd`: short `inet_diag_req_v2` → -EINVAL.
+    if request.len() < NLMSG_HDRLEN + 56 {
+        return Ok(alloc::vec![error(EINVAL, seq, request)]);
+    }
+    // `inet_diag_lock_handler`: no `inet_diag_table[protocol]` → -ENOENT.
+    if !matches!(protocol, IPPROTO_TCP | IPPROTO_UDP) {
+        return Ok(alloc::vec![error(ENOENT, seq, request)]);
     }
 
     let requested_states = u32::from_ne_bytes(
@@ -285,7 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_protocol_returns_eopnotsupp() {
+    fn unsupported_protocol_returns_enoent() {
+        // `inet_diag_lock_handler`: no handler for the protocol → -ENOENT.
         let replies = build_replies(&request(132)).unwrap();
         assert_eq!(
             i32::from_ne_bytes(
@@ -293,7 +321,7 @@ mod tests {
                     .try_into()
                     .unwrap()
             ),
-            -EOPNOTSUPP
+            -ENOENT
         );
     }
 

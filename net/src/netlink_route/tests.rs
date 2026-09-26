@@ -729,7 +729,8 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
                 .try_into()
                 .unwrap()
         ),
-        -ENOENT
+        // `fib_table_delete` answers a missing route with -ESRCH.
+        -ESRCH
     );
 }
 
