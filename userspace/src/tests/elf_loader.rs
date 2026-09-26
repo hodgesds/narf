@@ -1924,7 +1924,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // and materialised above, and the low-4-GiB identity map is live, meeting
     // `init_sysv_stack`'s `# Safety` contract.
     // SAFETY: Valid memory or trusted environment
-    let rsp_v = match unsafe { init_sysv_stack(&as_, stack_top, 4096, &argv, &envp, &aux) } {
+    let rsp_v = match unsafe { init_sysv_stack(&as_, stack_top, 4096, &argv, &envp, &aux, None) } {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("init_sysv_stack overflowed unexpectedly"),
     };
@@ -3718,7 +3718,7 @@ fn smoke_userspace_exec_demand_pages_text_from_file() -> TestResult {
     // SAFETY: the harness keeps the kernel direct map live and the frame
     // allocator initialised — the loader's `# Safety` contract.
     let eager = match unsafe {
-        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), None)
+        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), None, None)
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("eager control load failed"),
@@ -3734,7 +3734,16 @@ fn smoke_userspace_exec_demand_pages_text_from_file() -> TestResult {
     let ops: Arc<dyn FileOps> = Arc::new(FileImage(b.clone()));
     // SAFETY: as above; `ops` outlives the load.
     let proc = match unsafe {
-        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+        load_user_process_with_root_file(
+            &b[..],
+            &["x"],
+            &[],
+            &[],
+            None,
+            alloc_pid(),
+            Some(&ops),
+            None,
+        )
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("demand load failed"),
@@ -3932,7 +3941,16 @@ fn smoke_userspace_exec_demand_zero_fills_split_bss_page() -> TestResult {
     // SAFETY: the harness keeps the kernel direct map live and the frame
     // allocator initialised — the loader's `# Safety` contract.
     let proc = match unsafe {
-        load_user_process_with_root_file(&b[..], &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+        load_user_process_with_root_file(
+            &b[..],
+            &["x"],
+            &[],
+            &[],
+            None,
+            alloc_pid(),
+            Some(&ops),
+            None,
+        )
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("split-BSS load failed"),
@@ -4123,7 +4141,16 @@ fn smoke_userspace_exec_reads_headers_not_whole_file() -> TestResult {
     // SAFETY: the harness keeps the kernel direct map live and the frame
     // allocator initialised — the loader's `# Safety` contract.
     let proc = match unsafe {
-        load_user_process_with_root_file(&source, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+        load_user_process_with_root_file(
+            &source,
+            &["x"],
+            &[],
+            &[],
+            None,
+            alloc_pid(),
+            Some(&ops),
+            None,
+        )
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("file-sourced load failed"),
@@ -4293,7 +4320,16 @@ fn smoke_userspace_exec_loads_multi_gigabyte_binary() -> TestResult {
     // SAFETY: the harness keeps the kernel direct map live and the frame
     // allocator initialised — the loader's `# Safety` contract.
     let proc = match unsafe {
-        load_user_process_with_root_file(&source, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+        load_user_process_with_root_file(
+            &source,
+            &["x"],
+            &[],
+            &[],
+            None,
+            alloc_pid(),
+            Some(&ops),
+            None,
+        )
     } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("6 GiB image failed to load"),
@@ -4711,3 +4747,126 @@ fn smoke_userspace_auxv_reports_real_hwcaps() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("userspace/elf", smoke_userspace_auxv_reports_real_hwcaps);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_auxv_carries_execfn() -> TestResult {
+    // AT_EXECFN is the path `execve` was given. glibc expands `$ORIGIN` in an
+    // RPATH from its directory, so a bundled application resolves its own
+    // libraries through it; absent, the process falls back to /proc/self/exe or
+    // fails outright.
+    //
+    // The distinction this test pins is that AT_EXECFN is NOT argv[0]. argv[0]
+    // is whatever the caller chose — "-bash" for a login shell, the applet name
+    // for a multi-call binary like busybox — so resolving $ORIGIN from it would
+    // point at the wrong directory. The image below is loaded with an argv[0]
+    // deliberately unlike the path, and the entry must follow the path.
+    use crate::{alloc_pid, load_user_process_with_root_file};
+
+    const AT_EXECFN: u64 = 31;
+    const AT_NULL: u64 = 0;
+    const PATH: &str = "/usr/lib/narf/real-binary";
+    const ARGV0: &str = "-notthepath";
+
+    let mut b = alloc::vec![0u8; 0x2000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&0x1040u64.to_le_bytes());
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let proc = match unsafe {
+        load_user_process_with_root_file(
+            &b[..],
+            &[ARGV0],
+            &["HOME=/root"],
+            &[],
+            None,
+            alloc_pid(),
+            None,
+            Some(PATH),
+        )
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load failed"),
+    };
+    let root = proc.address_space.root;
+    let sp = proc.stack_top.as_u64();
+
+    let read_u64 = |va: u64| -> Option<u64> {
+        let phys = user_phys_of(root, va)?;
+        // SAFETY: `phys` backs this mapped stack qword.
+        Some(unsafe { core::ptr::read_unaligned(narf_memory::PhysAddr::new(phys).kernel_ptr()) })
+    };
+    let read_u8 = |va: u64| -> Option<u8> {
+        let phys = user_phys_of(root, va)?;
+        // SAFETY: `phys` backs this mapped stack byte.
+        Some(unsafe { *narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>() })
+    };
+
+    let verdict = (|| -> Result<(), &'static str> {
+        let argc = read_u64(sp).ok_or("argc unmapped")?;
+        if argc != 1 {
+            return Err("argc is not 1");
+        }
+        let argv0_ptr = read_u64(sp + 8).ok_or("argv[0] unmapped")?;
+        let mut cursor = sp + 8 + (argc + 1) * 8;
+        while read_u64(cursor).ok_or("envp walk left the stack")? != 0 {
+            cursor += 8;
+        }
+        cursor += 8;
+        let mut execfn: Option<u64> = None;
+        for _ in 0..64 {
+            let key = read_u64(cursor).ok_or("auxv walk left the stack")?;
+            let val = read_u64(cursor + 8).ok_or("auxv walk left the stack")?;
+            if key == AT_NULL {
+                break;
+            }
+            if key == AT_EXECFN {
+                execfn = Some(val);
+            }
+            cursor += 16;
+        }
+        let at = execfn.ok_or("AT_EXECFN is absent from the auxv")?;
+        if at == argv0_ptr {
+            return Err("AT_EXECFN points at argv[0] rather than the exec path");
+        }
+        // Read the NUL-terminated string back and compare it to the path.
+        let mut got = alloc::vec::Vec::new();
+        for i in 0..PATH.len() as u64 + 1 {
+            let byte = read_u8(at + i).ok_or("AT_EXECFN string is not mapped")?;
+            if byte == 0 {
+                break;
+            }
+            got.push(byte);
+        }
+        if got.as_slice() != PATH.as_bytes() {
+            return Err("AT_EXECFN does not name the exec path");
+        }
+        Ok(())
+    })();
+
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace/elf", smoke_userspace_auxv_carries_execfn);

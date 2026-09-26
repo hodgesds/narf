@@ -2109,6 +2109,11 @@ fn do_execve_resolved(
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
             exec_file.as_ref(),
+            // AT_EXECFN — the path this exec resolved, which is what glibc
+            // expands `$ORIGIN` against. `cur_path` and not `argv_refs[0]`:
+            // after a `#!` line it names the interpreter actually being mapped,
+            // and a caller's argv[0] may be anything at all.
+            Some(cur_path.as_str()),
         )
     } {
         Ok(p) => p,
