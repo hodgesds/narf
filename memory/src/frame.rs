@@ -398,6 +398,100 @@ pub struct UsableRegion {
     pub len: u64,
 }
 
+/// Physical range carved out of the memory map for the bootstrap arena, as
+/// `(phys, len)`; `(0, 0)` when the fixed `.bss` array is big enough.
+static CARVE_PHYS: AtomicU64 = AtomicU64::new(0);
+static CARVE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes the pre-slab buddy reservation will want, from the frame count alone.
+///
+/// Mirrors `BuddyZone::reservation_bytes` summed over zones, which is possible
+/// before the zones exist because the total is distribution-independent:
+/// `Σ over orders (frames >> order)` is ~2·frames however the frames are split,
+/// and each entry costs 8 bytes in each of the `NUM_MIGRATE_TYPES` partitions.
+/// So ~32 bytes per 4 KiB frame, plus the same 25% margin and slack
+/// `ensure_bootstrap_headroom` applies.
+fn projected_reservation_bytes(total_frames: usize) -> usize {
+    let per_frame = 2 * core::mem::size_of::<u64>() * crate::buddy::NUM_MIGRATE_TYPES;
+    let need = total_frames.saturating_mul(per_frame);
+    // The same margin `ensure_bootstrap_headroom` applies, and no more: this
+    // number decides WHETHER to carve, so padding it here would make small
+    // machines reserve a range they never needed. A 1 GiB boot projects ~11 MiB
+    // against a 12 MiB `.bss` array and must come out with no carve at all,
+    // exactly as before this existed.
+    need.saturating_add(need / 4).saturating_add(1 << 20)
+}
+
+/// Pick a contiguous physical range to host the bootstrap arena, or `None` when
+/// the fixed `.bss` array already covers the projected reservation.
+///
+/// Why a carve-out and not more buddy donations: the arena is a bump allocator,
+/// so a single allocation has to fit inside ONE region. The largest free-list
+/// Vec is `(zone_frames + 64) * 8` bytes — 32 MiB + 512 for a 16 GiB zone — and
+/// a buddy donation can never exceed `1 << MAX_ORDER` frames, i.e. 32 MiB. So a
+/// 32 GiB machine failed with "memory allocation of 33554944 bytes failed" no
+/// matter how many donations were allowed: the request was 512 bytes larger than
+/// the biggest block the buddy can ever hand out. Taking the range before the
+/// buddy is populated is what makes an arbitrarily large contiguous arena
+/// possible, and is how Linux sources per-page metadata (memblock, pre-buddy).
+///
+/// Carves from the END of the largest usable region: the low addresses hold the
+/// kernel image, the initrd and the firmware tables, and every exclude the
+/// caller passed is honoured anyway.
+fn plan_bootstrap_carve(
+    usable: &[UsableRegion],
+    exclude: &[(u64, u64)],
+    total_frames: usize,
+) -> Option<(u64, usize)> {
+    let target = projected_reservation_bytes(total_frames);
+    if target <= crate::heap::HEAP_CAPACITY {
+        // Small machine: the `.bss` array covers it, so change nothing.
+        return None;
+    }
+    // Slack is added to the SIZE, not to the decision above: once a carve is
+    // happening, leave room for the per-zone per-order constants and the other
+    // pre-slab bump users (per-CPU init, driver probe).
+    let want = (target - crate::heap::HEAP_CAPACITY + (32 << 20)).next_multiple_of(2 << 20);
+
+    let mut best: Option<(u64, usize)> = None;
+    for r in usable {
+        let start = (r.start.raw() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end = (r.start.raw() + r.len) & !(PAGE_SIZE - 1);
+        if end <= start || (end - start) as usize <= want {
+            continue;
+        }
+        // Take the tail, 2 MiB aligned.
+        let base = (end - want as u64) & !((2 << 20) - 1);
+        if base < start {
+            continue;
+        }
+        // Reject if it meets anything the caller already reserved. Checked per
+        // page because an exclude may sit anywhere inside the tail.
+        let mut clear = true;
+        let mut a = base;
+        while a < base + want as u64 {
+            if is_excluded(a, exclude) {
+                clear = false;
+                break;
+            }
+            a += PAGE_SIZE;
+        }
+        if !clear {
+            continue;
+        }
+        if best.is_none_or(|(_, len)| want > len) {
+            best = Some((base, want));
+        }
+    }
+    best
+}
+
+/// The carved bootstrap-arena range, if one was reserved by `init_from_map`.
+pub fn bootstrap_carve() -> Option<(u64, usize)> {
+    let len = CARVE_LEN.load(Ordering::Acquire);
+    (len != 0).then(|| (CARVE_PHYS.load(Ordering::Acquire), len))
+}
+
 /// Initialise the frame allocator from a slice of usable regions. `exclude`
 /// is a list of half-open byte ranges that must NOT be handed out — the
 /// kernel image itself, the boot-info structure, the PVH hvm_start_info,
@@ -422,6 +516,30 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
             (start < end).then_some((start, end - start))
         }));
     }
+    // Count the frames first so the arena carve-out can be sized from them, then
+    // treat the carve as one more excluded range: it must never reach the buddy,
+    // because the bump arena hands out pointers into it that are never freed.
+    // Counted arithmetically, not by walking every page: this runs before the
+    // two passes below, which are already O(frames), and a 1 TiB machine has
+    // 268M of them — no reason to add a third walk just to get a total.
+    let frame_count: usize = usable
+        .iter()
+        .map(|r| {
+            let first = (r.start.raw() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let last = (r.start.raw() + r.len) & !(PAGE_SIZE - 1);
+            last.checked_sub(first)
+                .map_or(0, |span| (span / PAGE_SIZE) as usize)
+        })
+        .sum();
+    let carve = plan_bootstrap_carve(usable, exclude, frame_count);
+    let mut eff_exclude: Vec<(u64, u64)> = exclude.to_vec();
+    if let Some((base, len)) = carve {
+        CARVE_PHYS.store(base, Ordering::Release);
+        CARVE_LEN.store(len, Ordering::Release);
+        eff_exclude.push((base, base + len as u64));
+    }
+    let exclude: &[(u64, u64)] = &eff_exclude;
+
     let mut total = 0usize;
     let mut reserved = 0usize;
     let mut zone0 = ZONES[0].0.lock();
@@ -500,10 +618,28 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
 pub fn reserve_for_slab_promotion() {
     // The reservation below runs one zone at a time and, on a large
     // machine, wants far more than the fixed 12 MiB `.bss` bootstrap
-    // arena holds (~16 bytes/frame, so ~3 GiB was the hard ceiling —
-    // an 8 GiB boot died right here). Buddy frames are already live, so
-    // top the bootstrap arena up from the buddy FIRST, without holding
-    // the lock, then reserve.
+    // arena holds — ~32 bytes/frame, so ~1.5 GiB was the hard ceiling
+    // before this path existed and an 8 GiB boot died right here. Buddy
+    // frames are already live, so top the bootstrap arena up from the
+    // buddy FIRST, without holding the lock, then reserve.
+    //
+    // (This comment said 16 bytes/frame, halving the real cost: the
+    // per-order capacity is reserved once per migratetype and there are
+    // two. The same error in `heap.rs` is what sized the spill capacity
+    // for ~25 GiB while claiming 64.)
+    // Hand the arena its carved-out range first, if there is one. Done here
+    // rather than in `init_from_map` because the arena needs a mapped VA and the
+    // direct map only exists after `init_mmu`; the range is already excluded
+    // from the buddy, so nothing else can have taken it in between.
+    if let Some((base, len)) = bootstrap_carve() {
+        let vbase = PhysAddr::new(base).kernel_mut_ptr::<u8>();
+        // SAFETY: excluded from every donation in `init_from_map`, so it is RAM
+        // owned by nobody else, and reachable through the live direct map. The
+        // bump arena never frees, which matches the carve being permanent.
+        unsafe {
+            crate::heap::add_bootstrap_spill(vbase, len);
+        }
+    }
     let need: usize = ZONES
         .iter()
         .map(|zone| zone.0.lock().reservation_bytes())
@@ -553,6 +689,7 @@ fn ensure_bootstrap_headroom(need: usize) {
             // Can't grow the arena. The reservation may still fit what
             // we already have; if not, the existing OOM panic reports it
             // — no worse than before this path existed.
+            crate::heap::set_bootstrap_shortfall(target.saturating_sub(have));
             return;
         };
         let bytes = (1usize << order) * PAGE_SIZE as usize;
@@ -564,14 +701,22 @@ fn ensure_bootstrap_headroom(need: usize) {
         // leak-forever contract.
         let donated = unsafe { crate::heap::add_bootstrap_spill(vbase, bytes) };
         if !donated {
-            // All spill slots full — we've donated as much as the arena
-            // can track. Stop; the reservation uses whatever's available.
+            // All spill slots full — we've donated as much as the arena can
+            // track. Record the shortfall before giving up: this used to return
+            // silently, and the boot then died in `handle_alloc_error` with
+            // nothing pointing at MAX_SPILL_REGIONS as the limit. That is how a
+            // 32 GiB machine failed to boot while the sizing comment claimed 64.
+            crate::heap::set_bootstrap_shortfall(target.saturating_sub(have));
             return;
         }
         have += bytes;
         guard += 1;
-        if guard > 64 {
-            break; // defensive: never spin the donation loop
+        if guard > crate::heap::MAX_SPILL_REGIONS + 4 {
+            // Defensive: never spin. Tied to the slot count, which is the real
+            // limit — a bare 64 here silently capped donations below the slot
+            // capacity once that count was raised past it.
+            crate::heap::set_bootstrap_shortfall(target.saturating_sub(have));
+            break;
         }
     }
 }
@@ -985,6 +1130,29 @@ pub fn alloc_user_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocEr
 /// all RAM — typically after MMU init + a high-mem ioremap pass.
 pub(crate) static EARLY_PHYS_CEILING: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(4u64 << 30);
+
+/// Upper bound a physical address handed out by the frame allocator must stay
+/// under, for the CURRENT stage of boot.
+///
+/// [`EARLY_PHYS_CEILING`] while it is in force, and the top of boot-donated RAM
+/// once [`release_early_ceiling`] has lifted it. Both answer the same question —
+/// "is this address one the kernel can actually reach?" — and which one applies
+/// changes when the direct map comes up.
+///
+/// Exists because several tests hardcoded `4 GiB`, which was only ever the
+/// ceiling's DEFAULT value. Once the direct map covers all RAM the ceiling is
+/// deliberately cleared and frames above 4 GiB are both legal and reachable, so
+/// those tests failed on any host with more than 4 GiB of RAM while the code was
+/// behaving correctly. A count-derived bound (`total_frames * PAGE_SIZE`) is not
+/// a substitute: RAM is not contiguous from 0, so a frame legitimately above
+/// that size still sits in usable RAM.
+pub fn phys_alloc_ceiling() -> u64 {
+    let early = EARLY_PHYS_CEILING.load(core::sync::atomic::Ordering::Acquire);
+    if early != 0 {
+        return early;
+    }
+    managed_phys_end()
+}
 
 /// Allow the allocator to return frames at any physical address.
 /// Call once a kernel direct map covers all installed RAM.

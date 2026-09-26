@@ -1774,11 +1774,18 @@ fn smoke_frame_alloc_roundtrip() -> TestResult {
 kernel_test_in!("memory", smoke_frame_alloc_roundtrip);
 
 fn smoke_frame_alloc_returns_pointer_in_ram() -> TestResult {
-    // Catches a buddy mis-init that hands back frames past the
-    // early MMU identity-map ceiling (4 GiB on x86_64).
-    // Allocations that come from above the ceiling page-fault on
-    // first access via the kernel direct-map path.
-    let usable_bytes: u64 = 4u64 << 30;
+    // Catches a buddy mis-init that hands back frames the kernel cannot reach —
+    // those page-fault on first access through the direct-map path.
+    //
+    // The bound is the CURRENT one, not a hardcoded 4 GiB. 4 GiB is only
+    // `EARLY_PHYS_CEILING`'s default: once the direct map covers all RAM the
+    // ceiling is deliberately cleared, and by the time this suite runs, frames
+    // above 4 GiB are both legal and reachable. Hardcoding it failed this test
+    // on every host with more than 4 GiB of RAM while the allocator was correct.
+    let usable_bytes: u64 = crate::frame::phys_alloc_ceiling();
+    if usable_bytes == 0 {
+        return TestResult::Skip("frame allocator not initialised");
+    }
     let mut leaked: alloc::vec::Vec<crate::PhysFrame> = alloc::vec::Vec::with_capacity(32);
     for _ in 0..32 {
         match crate::alloc_frame() {
@@ -1821,12 +1828,19 @@ fn smoke_frame_alloc_returns_pointer_in_ram() -> TestResult {
 kernel_test_in!("memory", smoke_frame_alloc_returns_pointer_in_ram);
 
 fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
-    // Same guarantee for the slab. Catches the case where a slab
-    // class is grown from a buddy frame past the early MMU
-    // ceiling (4 GiB) — every slab object inside
+    // Same guarantee for the slab: catches a slab class grown from a buddy frame
+    // the kernel cannot reach, which would make every object inside it fault on
+    // first touch.
+    //
+    // Checked on both arches now. The bound used to be a hardcoded 4 GiB, which
+    // is x86_64's early-ceiling default and meaningless on aarch64 (RAM starts at
+    // 1 GiB there), so the assertion was gated to x86_64. `phys_alloc_ceiling`
+    // is the live bound on either arch, so there is nothing arch-specific left.
     use core::alloc::Layout;
-    #[cfg(target_arch = "x86_64")]
-    let usable_bytes: u64 = 4u64 << 30;
+    let usable_bytes: u64 = crate::frame::phys_alloc_ceiling();
+    if usable_bytes == 0 {
+        return TestResult::Skip("frame allocator not initialised");
+    }
     // Cover every size class (16 .. 4096) to stress every class's
     // grow path. Each class returns its first block from a freshly
     // grown buddy frame after a few allocs.
@@ -1843,7 +1857,6 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
                     // KERNEL_DIRECT_MAP_BASE. Invert it to recover the
                     // physical address the range check is really about.
                     let raw = crate::PhysAddr::from_kernel_ptr(p.as_ptr()).raw();
-                    #[cfg(target_arch = "x86_64")]
                     if raw >= usable_bytes {
                         for (q, ql) in held.drain(..) {
                             // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -2006,20 +2019,23 @@ fn smoke_alloc_pages_on_returns_in_ram() -> TestResult {
     // (the QEMU PCI hole), allocations from that node would land
     // there and a downstream dereference would fault.
     use crate::frame::alloc_pages_on;
-    // The kernel direct/identity map covers the low 4 GiB on x86_64; an
-    // allocation above that ceiling page-faults on first access. RAM is
-    // NOT contiguous from 0 (PCI hole + reserved regions), so
+    // RAM is NOT contiguous from 0 (PCI hole + reserved regions), so
     // `total_frames * PAGE_SIZE` is not a valid upper bound — a frame
-    // legitimately above that count-derived size still sits in usable
-    // RAM (that mismatch made this test intermittently fail). Use the
-    // same 4 GiB ceiling as `smoke_frame_alloc_returns_pointer_in_ram`.
-    const RAM_CEILING: u64 = 4u64 << 30;
+    // legitimately above that count-derived size still sits in usable RAM, which
+    // is what made an earlier version of this test intermittently fail. The fix
+    // then was a hardcoded 4 GiB, which is `EARLY_PHYS_CEILING`'s default and
+    // wrong once the direct map lifts it; `phys_alloc_ceiling` is whichever
+    // bound is actually in force, and accounts for the holes.
+    let ram_ceiling: u64 = crate::frame::phys_alloc_ceiling();
+    if ram_ceiling == 0 {
+        return TestResult::Skip("frame allocator not initialised");
+    }
     let pages = match alloc_pages_on(0, 0) {
         Ok(p) => p,
         Err(_) => return TestResult::Skip("alloc_pages_on failed"),
     };
     let phys = pages.start_address().raw();
-    let ok_range = phys < RAM_CEILING;
+    let ok_range = phys < ram_ceiling;
     let ok_align = phys & (crate::PAGE_SIZE - 1) == 0;
     crate::frame::free_pages(pages, 0);
     if !ok_range {
@@ -2032,21 +2048,28 @@ fn smoke_alloc_pages_on_returns_in_ram() -> TestResult {
 }
 kernel_test_in!("memory", smoke_alloc_pages_on_returns_in_ram);
 
-fn smoke_alloc_pages_on_node1_below_4gb() -> TestResult {
-    // Node 1 specifically — under the boot identity map, the
-    // allocator must never hand back a frame above 4 GiB physical
-    // because nothing maps that range. The EARLY_PHYS_CEILING
-    // mechanism is supposed to enforce this. Catches a NUMA-
-    // redistribution bug where node 1's zone ends up with
-    // out-of-range frames.
+fn smoke_alloc_pages_on_node1_stays_in_managed_ram() -> TestResult {
+    // Node 1 specifically: the allocator must never hand back a frame the kernel
+    // cannot reach, because nothing maps that range. `EARLY_PHYS_CEILING`
+    // enforces it while the boot identity map is all there is. Catches a NUMA-
+    // redistribution bug where node 1's zone ends up with out-of-range frames.
+    //
+    // Renamed from `..._below_4gb`: the name encoded the ceiling's DEFAULT value
+    // as the invariant. The ceiling is cleared once the direct map covers all
+    // RAM, so on a host with more than 4 GiB this reported a bug that was not
+    // there. The invariant is "inside reachable RAM", which is what
+    // `phys_alloc_ceiling` returns at either stage.
     use crate::frame::alloc_pages_on;
-    const FOUR_GB: u64 = 4u64 << 30;
+    let ceiling = crate::frame::phys_alloc_ceiling();
+    if ceiling == 0 {
+        return TestResult::Skip("frame allocator not initialised");
+    }
     let mut leaked = alloc::vec::Vec::with_capacity(8);
     let mut bad_count = 0u32;
     for _ in 0..8 {
         match alloc_pages_on(1, 0) {
             Ok(p) => {
-                if p.start_address().raw() >= FOUR_GB {
+                if p.start_address().raw() >= ceiling {
                     bad_count += 1;
                 }
                 leaked.push(p);
@@ -2058,11 +2081,11 @@ fn smoke_alloc_pages_on_node1_below_4gb() -> TestResult {
         crate::frame::free_pages(p, 0);
     }
     if bad_count > 0 {
-        return TestResult::Fail("alloc_pages_on(node=1) returned a frame >= 4 GiB");
+        return TestResult::Fail("alloc_pages_on(node=1) returned a frame outside reachable RAM");
     }
     TestResult::Pass
 }
-kernel_test_in!("memory", smoke_alloc_pages_on_node1_below_4gb);
+kernel_test_in!("memory", smoke_alloc_pages_on_node1_stays_in_managed_ram);
 
 fn smoke_domain_primitive_trait() -> TestResult {
     // Trait-level dispatch through `arch::Domain::*`.
@@ -16438,3 +16461,35 @@ fn smoke_memory_fork_inherits_mmap_floor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_fork_inherits_mmap_floor);
+
+/// The bootstrap arena covered the pre-slab buddy reservation.
+///
+/// `reserve_for_slab_promotion` reserves the pessimistic per-order free-list
+/// capacity — ~32 bytes per 4 KiB frame — out of a bump arena that is a fixed
+/// 12 MiB of `.bss` plus at most `MAX_SPILL_REGIONS` buddy-donated 32 MiB
+/// regions. Run out and the boot dies in `handle_alloc_error`, deep in the
+/// allocator, with nothing naming the spill capacity as the limit: that is how a
+/// 32 GiB machine failed to boot while the sizing comment claimed 64 GiB.
+///
+/// A number rather than a panic is what makes it testable at all. The shortfall
+/// is recorded when the donation loop gives up, so this case names the failure
+/// and reports how far short it fell — and it scales with whatever RAM the
+/// machine running it has, which is the property that was missing.
+fn smoke_bootstrap_arena_covers_reservation() -> TestResult {
+    let short = crate::heap::bootstrap_shortfall();
+    if short != 0 {
+        // Deliberately not a Skip: on a machine this large the boot only got
+        // here because the reservation happened to fit anyway, and the next
+        // allocation of that size is the one that dies.
+        return TestResult::Fail(
+            "bootstrap arena came up short of the pre-slab reservation — \
+             raise heap::MAX_SPILL_REGIONS (see spill_stats/bootstrap_shortfall)",
+        );
+    }
+    let (regions, _bytes) = crate::heap::spill_stats();
+    if regions > crate::heap::MAX_SPILL_REGIONS {
+        return TestResult::Fail("more spill regions than the slot count allows");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bootstrap_arena_covers_reservation);
