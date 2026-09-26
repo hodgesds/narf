@@ -542,6 +542,84 @@ impl Region {
             || self.perms.contains(RegionPerms::ANON_MERGEABLE)
     }
 
+    /// The frame backing page `index` of this region, or a zero `PhysAddr` when
+    /// that page has no backing.
+    ///
+    /// Zero and "past the materialized prefix" mean the same thing — unbacked —
+    /// which is what lets a sparse region carry only the pages that have
+    /// actually faulted. Going through an accessor rather than indexing is what
+    /// will allow the prefix to stop being a dense `Vec`: today a fault at page
+    /// `i` grows the vector to `i + 1` entries, so touching one page far into a
+    /// large mapping costs eight bytes per page of the *offset*, not of the
+    /// pages in use. An unprivileged `mmap` of a terabyte plus one fault near
+    /// its end is therefore a multi-gigabyte kernel allocation; `try_reserve`
+    /// turns that into a clean failure rather than a panic, but cheap address
+    /// space should not convert into expensive kernel memory at all.
+    #[inline]
+    pub fn backing_at(&self, index: usize) -> PhysAddr {
+        self.phys.get(index).copied().unwrap_or(PhysAddr::new(0))
+    }
+
+    /// Whether page `index` has backing.
+    #[inline]
+    pub fn has_backing(&self, index: usize) -> bool {
+        self.backing_at(index).raw() != 0
+    }
+
+    /// Pages this region currently carries backing slots for — the length of the
+    /// materialized prefix, NOT the region's page count. A sparse region's
+    /// unfaulted tail is absent rather than zero-filled.
+    #[inline]
+    pub fn materialized_pages(&self) -> usize {
+        self.phys.len()
+    }
+
+    /// Iterate the materialized backing slots, including zero (unbacked) ones.
+    #[inline]
+    pub fn backing_iter(&self) -> impl Iterator<Item = PhysAddr> + '_ {
+        self.phys.iter().copied()
+    }
+
+    /// Publish `phys` as the backing for page `index`, growing the materialized
+    /// prefix if needed.
+    ///
+    /// Growth is fallible and geometric: `try_reserve_exact(1)` would reallocate
+    /// and copy the whole prefix on nearly every sequential fault, which can turn
+    /// reclaimable pressure into a metadata failure while extending a large
+    /// mapping.
+    /// Store the backing for page `index`, whose slot must already exist.
+    ///
+    /// Every caller publishes into a slot the fault path reserved with
+    /// [`Region::reserve_backing_slot`] before it entered the filesystem, or
+    /// clears one it is tearing down — so growth here would mean a caller lost
+    /// track of the reservation, which is a bug rather than a condition to
+    /// handle. Out-of-range is therefore ignored (and caught in debug) instead of
+    /// silently extending the prefix.
+    fn store_backing(&mut self, index: usize, phys: PhysAddr) {
+        debug_assert!(
+            index < self.phys.len(),
+            "store_backing past the materialized prefix — slot was not reserved"
+        );
+        if let Some(slot) = self.phys.get_mut(index) {
+            *slot = phys;
+        }
+    }
+
+    /// Ensure page `index` has a backing slot, without publishing a frame into
+    /// it. The demand-fault path reserves the slot before entering the
+    /// filesystem, so that a metadata failure happens while nothing outside
+    /// `memory` has observed the fault yet.
+    fn reserve_backing_slot(&mut self, index: usize) -> Result<(), AddressSpaceError> {
+        if index >= self.phys.len() {
+            let additional = index + 1 - self.phys.len();
+            self.phys
+                .try_reserve(additional)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            self.phys.resize(index + 1, PhysAddr::new(0));
+        }
+        Ok(())
+    }
+
     /// Number of virtual pages which can possibly have a leaf PTE. Sparse
     /// demand-zero tails have never faulted, so walking them during teardown
     /// cannot remove a mapping and only turns an O(1) reservation into an
@@ -549,7 +627,7 @@ impl Region {
     #[inline]
     fn pte_span_pages(&self) -> u64 {
         if self.allows_sparse_backing() {
-            self.phys.len() as u64
+            self.materialized_pages() as u64
         } else {
             (self.len + 0xFFF) >> 12
         }
@@ -3894,7 +3972,7 @@ impl AddressSpace {
             regions
                 .get_mut(region_base)
                 .expect("shared alias region disappeared under lock")
-                .phys[page_idx] = new_phys;
+                .store_backing(page_idx, new_phys);
             // Transfer the reverse-map owner from the old frame to the new one,
             // exactly as Linux page migration moves a folio's mapping
             // (mm/migrate.c `folio_migrate_mapping` / `remove_migration_ptes`)
@@ -8044,20 +8122,10 @@ impl AddressSpace {
         let region = regions
             .containing_backing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
-        if index >= region.phys.len() {
-            let additional = index + 1 - region.phys.len();
-            // Sequential faults must grow geometrically. `try_reserve_exact(1)`
-            // reallocates and copies the complete resident prefix on nearly
-            // every page, and can turn otherwise reclaimable pressure into a
-            // metadata AllocationFailed/SEGV while extending a large mmap.
-            // `try_reserve` remains fallible and the visible length still ends
-            // at this exact page; only spare private Vec capacity is retained.
-            region
-                .phys
-                .try_reserve(additional)
-                .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            region.phys.resize(index + 1, PhysAddr::new(0));
-        }
+        // Reserve this page's backing slot. `set_backing` owns the growth policy
+        // (fallible and geometric — see its doc), so the fault path no longer
+        // reaches into the representation to do it.
+        region.reserve_backing_slot(index)?;
         let ticket = regions.demand_pages.insert_new(v)?;
         Ok(DemandPageClaim::Owner {
             ticket,
@@ -8373,7 +8441,7 @@ impl AddressSpace {
                                 .expect("swap victim region disappeared during transaction");
                             let index = ((va - region.base.as_u64()) >> 12) as usize;
                             assert_eq!(region.phys[index], *phys);
-                            region.phys[index] = PhysAddr::new(0);
+                            region.store_backing(index, PhysAddr::new(0));
                         }
                         // Swapped out: one fewer resident page (in-place
                         // backing write, invisible to the insert/remove
@@ -8552,7 +8620,7 @@ impl AddressSpace {
                             .expect("swap-in region disappeared during transaction");
                         let index = ((va - region.base.as_u64()) >> 12) as usize;
                         assert_eq!(region.phys[index], PhysAddr::new(0));
-                        region.phys[index] = *phys;
+                        region.store_backing(index, *phys);
                     }
                     // Swapped back in: one more resident page (in-place
                     // backing write, invisible to the insert/remove
@@ -10154,7 +10222,7 @@ impl AddressSpace {
                     let va = VirtAddr::new(rb + (i as u64) * 4096);
                     crate::rmap::remove(p, self.root, va);
                     to_release.push(crate::frame::PhysFrame::new(p));
-                    r.phys[i] = PhysAddr::new(0);
+                    r.store_backing(i, PhysAddr::new(0));
                 }
             });
             // Every frame queued for release above left a backing slot in
@@ -10342,7 +10410,7 @@ impl AddressSpace {
                     // rmap owner before the frame can return to the buddy and
                     // stamp the slot demand-zero.
                     crate::rmap::remove(phys, root, VirtAddr::new(va));
-                    r.phys[index] = PhysAddr::new(0);
+                    r.store_backing(index, PhysAddr::new(0));
                     freed.push(crate::frame::PhysFrame::new(phys));
                 }
                 budget = budget.saturating_sub(taken.len());
@@ -11509,7 +11577,7 @@ impl AddressSpace {
                     .containing_backing_mut(v)
                     .expect("COW region disappeared under its lock");
                 let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
-                region.phys[page_idx] = new_phys;
+                region.store_backing(page_idx, new_phys);
                 // This owner's page now maps its private copy: move its rmap
                 // entry (other COW sharers of `old_phys` keep theirs).
                 crate::rmap::remove(old_phys, self.root, VirtAddr::new(v));

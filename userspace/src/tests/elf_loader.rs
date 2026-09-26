@@ -3842,7 +3842,7 @@ fn smoke_userspace_exec_demand_pages_text_from_file() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
-    "userspace",
+    "userspace/elf",
     smoke_userspace_exec_demand_pages_text_from_file
 );
 
@@ -4029,7 +4029,7 @@ fn smoke_userspace_exec_demand_zero_fills_split_bss_page() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
-    "userspace",
+    "userspace/elf",
     smoke_userspace_exec_demand_zero_fills_split_bss_page
 );
 
@@ -4373,6 +4373,28 @@ fn smoke_userspace_exec_loads_multi_gigabyte_binary() -> TestResult {
                 return Err("a faulted page came from the wrong file offset");
             }
         }
+
+        // What those two faults cost in region metadata. A `Region` carries a
+        // dense prefix of backing slots, so a fault at page `i` grows it to
+        // `i + 1` entries — eight bytes per page of the OFFSET, not of the pages
+        // in use. Two touched pages here, one of them 4 GiB in, so the prefix is
+        // ~1M slots (~8 MiB) for 8 KiB of resident data. Printed rather than
+        // asserted: it is a property of the representation, and the number is the
+        // oracle for making that representation sparse.
+        {
+            use core::fmt::Write as _;
+            let slots = proc
+                .address_space
+                .lookup(VirtAddr::new(text_va))
+                .map(|region| region.materialized_pages())
+                .unwrap_or(0);
+            let _ = writeln!(
+                narf_console::Writer,
+                "BENCH region-metadata: touched_pages=2 backing_slots={} slot_bytes={}",
+                slots,
+                slots * core::mem::size_of::<narf_memory::PhysAddr>()
+            );
+        }
         Ok(())
     };
     let verdict = checks();
@@ -4396,7 +4418,7 @@ fn smoke_userspace_exec_loads_multi_gigabyte_binary() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
-    "userspace",
+    "userspace/elf",
     smoke_userspace_exec_loads_multi_gigabyte_binary
 );
 
