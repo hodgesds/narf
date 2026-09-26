@@ -195,6 +195,28 @@ pub fn enter(domain: DomainId) -> DomainScope {
             // globals behind the four exported ABI functions, and its kernel
             // stack are all plain Normal.
             //
+            // Tag checking also needs `PSTATE.TCO` clear, and that cannot be
+            // assumed: the architecture SETS TCO on every exception entry so a
+            // handler cannot trip a tag fault on its own accesses, and only
+            // `eret` restores it from `SPSR_ELx.TCO`. The user-task preemption
+            // and park paths enter EL1 through an exception and then divert
+            // into kernel code instead of returning through `eret`, so TCO
+            // stayed set for the rest of the boot on that CPU — after one EL0
+            // excursion, `TCF=Sync` still read back correctly, `domain_heap`
+            // still handed out tagged pointers, and every cross-domain access
+            // that should have faulted silently succeeded. Three smokes
+            // (`*_untagged_access_faults_in_scope`) were the only things in the
+            // tree that noticed.
+            //
+            // Clearing it here makes the guarantee self-contained: entering a
+            // domain enforces that domain, rather than inheriting whether the
+            // last thing to take an exception happened to return the way the
+            // architecture expects. `exit` deliberately does NOT put a stale
+            // `1` back — TCO clear is the correct state for kernel code, so
+            // restoring a leaked value would re-break the next scope.
+            //
+            // SAFETY: MTE is present (checked above), so MSR TCO is legal.
+            unsafe { mte::set_tco(false) };
             // SAFETY: MTE is present; both ids are 0..=15.
             let saved = unsafe { Mte::enter_domain(DomainId::FRAME.raw(), domain.raw()) };
             return DomainScope {

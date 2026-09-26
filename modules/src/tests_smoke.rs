@@ -652,6 +652,113 @@ kernel_test_in!(
     smoke_module_domain_untagged_access_faults_in_scope
 );
 
+/// `domain::enter` must enforce even when `PSTATE.TCO` arrives set.
+///
+/// TCO (Tag Check Override) suppresses EVERY tag check at the current
+/// exception level, and it is invisible to the two registers a reader would
+/// check: `SCTLR_EL1.TCF` still reads `Synchronous` and `TCR_EL1.TCMA` still
+/// reads 0. The architecture sets TCO on exception entry and only `eret`
+/// restores it, so the user-task preemption and park paths — which enter EL1
+/// through an exception and then divert into kernel code rather than returning
+/// through `eret` — used to leave it set for the rest of the boot.
+///
+/// The effect was silent and total: after one EL0 excursion, `domain::enter`
+/// still armed `TCF=Sync`, `domain_heap` still handed out tagged pointers, and
+/// every cross-domain access that should have faulted just succeeded. The
+/// sibling `*_untagged_access_faults_in_scope` smokes caught it, but only when
+/// something had already been to EL0 in the same boot — so they reported it as
+/// an ordering flake rather than as a live hole in domain isolation.
+///
+/// This case sets TCO itself, so it pins the invariant regardless of what ran
+/// before it.
+#[cfg(target_arch = "aarch64")]
+fn smoke_module_domain_enter_clears_tag_check_override() -> TestResult {
+    use core::alloc::Layout;
+    use core::arch::asm;
+    use narf_arch::aarch64::{mte, probe};
+    use narf_lib::id::DomainId;
+    use narf_memory::domain_heap;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let layout = match Layout::from_size_align(64, 16) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("bad layout"),
+    };
+    let p = match domain_heap::alloc(layout, DomainId::SCRATCH) {
+        Some(p) => p,
+        None => return TestResult::Skip("the domain heap declined a SCRATCH allocation"),
+    };
+    let tagged = p as u64;
+    let plain = mte::with_tag(tagged, mte::UNTAGGED_KERNEL_TAG);
+    if tagged == plain {
+        // SAFETY: from `domain_heap::alloc` with this layout.
+        unsafe { domain_heap::free(p, layout) };
+        return TestResult::Skip("the domain heap returned an untagged pointer");
+    }
+
+    // Reproduce the leak: arrive at `domain::enter` with checks overridden,
+    // exactly as a return-from-EL0 that skipped `eret` leaves the CPU.
+    // SAFETY: MTE is present, so MSR TCO is legal at EL1.
+    unsafe { mte::set_tco(true) };
+    // SAFETY: MRS TCO, same precondition.
+    if !unsafe { mte::tco() } {
+        // SAFETY: allocated above.
+        unsafe { domain_heap::free(p, layout) };
+        return TestResult::Fail("could not set PSTATE.TCO — the premise does not hold");
+    }
+
+    let caught = {
+        let scope = crate::domain::enter(DomainId::SCRATCH);
+        // SAFETY: MRS TCO; `enter` is expected to have cleared it.
+        let tco_in_scope = unsafe { mte::tco() };
+        let recovery: u64;
+        // SAFETY: ADR of a local label, resolved forward into the block below.
+        unsafe {
+            asm!("adr {r}, 98f", r = out(reg) recovery, options(nostack, preserves_flags));
+        }
+        probe::arm(recovery);
+        // SAFETY: expected to raise a synchronous tag check fault; the armed
+        // probe redirects ELR_EL1 to `98:` instead of taking the fatal path.
+        unsafe {
+            asm!(
+                "ldr {t}, [{p}]",
+                "98:",
+                p = in(reg) plain,
+                t = out(reg) _,
+                options(nostack),
+            );
+        }
+        let c = probe::disarm();
+        crate::domain::exit(scope);
+        (c, tco_in_scope)
+    };
+
+    // SAFETY: allocated above and no longer read.
+    unsafe { domain_heap::free(p, layout) };
+    // Leave the CPU the way kernel code expects to find it.
+    // SAFETY: MTE is present.
+    unsafe { mte::set_tco(false) };
+
+    if caught.1 {
+        return TestResult::Fail("domain::enter left PSTATE.TCO set");
+    }
+    if !caught.0.fired {
+        return TestResult::Fail("tag check did not fault with TCO set on entry");
+    }
+    const DFSC_TAG_CHECK: u64 = 0b01_0001;
+    if caught.0.esr & 0x3F != DFSC_TAG_CHECK {
+        return TestResult::Fail("the fault was not a synchronous tag check fault");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "modules/domain",
+    smoke_module_domain_enter_clears_tag_check_override
+);
+
 fn smoke_elf_rejects_class32() -> TestResult {
     let mut bytes = ElfBuilder::new_x86_64()
         .modinfo(&modinfo_text("a", 0))
