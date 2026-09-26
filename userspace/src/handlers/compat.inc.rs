@@ -9103,6 +9103,24 @@ pub fn default_sync_signal_delivery(
                 // pin whether the fault is a slightly-off pointer (adjacent
                 // overwrite / stale TLB) or a wild value (deeper corruption).
                 ctx.dump_gprs();
+                // Faulting instruction bytes. Decoding the exact deref (e.g.
+                // `mov rax,[reg+off]`) pins WHICH register held the NULL base
+                // and at WHAT offset — the GPR file above then names the
+                // syscall/library return that came back NULL, without an
+                // offline symbolize against the (per-boot-biased) app binary.
+                {
+                    let rip = ctx.rip();
+                    let mut ibytes = [0u8; 16];
+                    // SAFETY: copy_from_user range-validates the source VA and
+                    // SMAP-brackets the read; a bad/partial read just errors.
+                    if unsafe { copy_from_user(&mut ibytes, rip) }.is_ok() {
+                        let _ =
+                            writeln!(narf_console::Writer, "  insn@{:x}={:02x?}", rip, ibytes);
+                    } else {
+                        let _ =
+                            writeln!(narf_console::Writer, "  insn@{:x}=<unreadable>", rip);
+                    }
+                }
                 #[cfg(target_arch = "x86_64")]
                 dump_fatal_x86_address_space(info.addr);
                 // Dump plausible return addresses off the faulting stack so

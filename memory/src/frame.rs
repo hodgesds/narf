@@ -1808,11 +1808,37 @@ fn buddy_prepare_unreferenced_frame(phys: PhysAddr) {
                     first_root = o.root.raw();
                 }
             });
+            // Capture the free-path return-address chain into the panic
+            // message BEFORE panic! runs — the panic/format machinery would
+            // otherwise bury the culprit under its own frames (the generic
+            // stack-word scan only saw fmt/unwind frames). Walk our own stack
+            // upward and collect words that look like kernel return addresses;
+            // symbolize offline: static = runtime - kaslr_slide, then
+            // `addr2line -e narf-frame`.
+            let mut chain = alloc::string::String::new();
+            {
+                use core::fmt::Write as _;
+                // Address of a stack local ≈ current rsp — portable, no asm.
+                let anchor = 0u64;
+                let sp = core::ptr::addr_of!(anchor) as u64;
+                let mut hits = 0u32;
+                for i in 0..256u64 {
+                    if hits >= 40 {
+                        break;
+                    }
+                    // SAFETY: reads our own stack within a bounded window.
+                    let w = unsafe { core::ptr::read_volatile((sp + i * 8) as *const u64) };
+                    if w >= 0xffff_ffff_8000_0000 && w < 0xffff_ffff_ffff_0000 {
+                        let _ = write!(chain, " {w:#x}");
+                        hits += 1;
+                    }
+                }
+            }
             panic!(
                 "buddy free of {phys:?} with {owners} live rmap owner(s) \
                  (first root={first_root:#x} va={first_va:#x}): a teardown/free \
                  path returned this frame without rmap::remove (Linux bad_page: \
-                 nonzero mapcount)"
+                 nonzero mapcount) chain:{chain}"
             );
         }
     }
