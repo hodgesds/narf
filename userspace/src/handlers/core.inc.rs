@@ -2632,16 +2632,6 @@ pub struct StatBuf {
 
 // ── Fallocate — preallocate file space ─────────────────────────────
 //
-// Linux fallocate(2) modes we honour:
-//   - 0 (default)              : ensure file is >= offset + len.
-//   - FALLOC_FL_ZERO_RANGE 0x10: zero the given range; extend
-//                                the file if it ends before
-//                                offset + len.
-// Other modes (KEEP_SIZE, PUNCH_HOLE, COLLAPSE_RANGE, ...) are
-// rejected — MemFs has no hole-tracking and the validate harness
-// doesn't exercise them.
-
-const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
 
 // ── CopyFileRange — chunked file→file copy ─────────────────────────
 //
