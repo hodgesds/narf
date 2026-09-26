@@ -167,6 +167,15 @@ pub const EEXIST: i32 = 17;
 pub const ENODEV: i32 = 19;
 pub const EINVAL: i32 = 22;
 pub const ENETUNREACH: i32 = 101;
+/// `fib_table_delete` / `ip6_route_del`: deleting a route that is not in
+/// the FIB answers `-ESRCH` ("No such process"), not `-ENOENT`.
+pub const ESRCH: i32 = 3;
+/// `inet_rtm_deladdr` / `inet6_addr_del`: no such address on the device;
+/// also `eth_prepare_mac_addr_change` for a multicast / all-zero MAC.
+pub const EADDRNOTAVAIL: i32 = 99;
+/// `neigh_add` / `neigh_delete`: `neigh_find_table()` has no table for the
+/// requested `ndm_family`.
+pub const EAFNOSUPPORT: i32 = 97;
 pub const NLMSGERR_ATTR_MSG: u16 = 1;
 
 // ── parsed request header ───────────────────────────────────────────────
@@ -653,9 +662,19 @@ pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
                 let requested_name = find_attr(req, 16, IFLA_IFNAME).and_then(|raw| {
                     core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok()
                 });
+                // `rtnl_getlink`: a positive ifindex selects by index only;
+                // otherwise IFLA_IFNAME selects by name; with neither the
+                // request is malformed (-EINVAL), not a missing device.
+                if ifindex <= 0 && requested_name.is_none() {
+                    out.push(build_error(EINVAL, seq, pid, req));
+                    return out;
+                }
                 let selected = links.iter().find(|link| {
-                    (ifindex > 0 && link.ifindex == ifindex as u32)
-                        || requested_name.is_some_and(|name| link.name == name)
+                    if ifindex > 0 {
+                        link.ifindex == ifindex as u32
+                    } else {
+                        requested_name.is_some_and(|name| link.name == name)
+                    }
                 });
                 if let Some(link) = selected {
                     let mut message = build_newlink(link, seq, pid);
@@ -750,19 +769,28 @@ pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
                 }
                 out.push(build_done(seq, pid));
             } else {
-                if req.len() < NLMSG_HDRLEN + 12 || req[NLMSG_HDRLEN] != AF_INET {
+                if req.len() < NLMSG_HDRLEN + 12 {
                     out.push(build_error(EINVAL, seq, pid, req));
                     return out;
                 }
-                let Some(dst) = find_attr(req, 12, RTA_DST) else {
-                    out.push(build_error(EINVAL, seq, pid, req));
+                // `rtnetlink_rcv_msg` dispatches a doit by family; a family
+                // without an RTM_GETROUTE doit (AF_UNSPEC, or AF_INET6 which
+                // NARF has not implemented) answers -EOPNOTSUPP.
+                if req[NLMSG_HDRLEN] != AF_INET {
+                    out.push(build_error(EOPNOTSUPP, seq, pid, req));
                     return out;
+                }
+                // `inet_rtm_getroute`: `nla_get_in_addr_default(tb[RTA_DST], 0)`
+                // — an absent RTA_DST looks up 0.0.0.0, it is not an error.
+                let dst = match find_attr(req, 12, RTA_DST) {
+                    None => [0; 4],
+                    Some(raw) if raw.len() == 4 => raw.try_into().unwrap_or([0; 4]),
+                    Some(_) => {
+                        out.push(build_error(EINVAL, seq, pid, req));
+                        return out;
+                    }
                 };
-                if dst.len() != 4 {
-                    out.push(build_error(EINVAL, seq, pid, req));
-                    return out;
-                }
-                let dst = crate::ipv4::Ipv4Addr(dst.try_into().unwrap_or([0; 4]));
+                let dst = crate::ipv4::Ipv4Addr(dst);
                 if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
                     if let Some(link) = links.iter().find(|link| link.name == route.iface) {
                         let mut message = build_newroute(&route, link.ifindex, seq, pid);
@@ -933,6 +961,19 @@ fn admin_errno(error: crate::AdminError) -> i32 {
     }
 }
 
+/// `do_setlink` → `dev_set_mac_address` → `eth_prepare_mac_addr_change`
+/// rejects a multicast / all-zero address with `-EADDRNOTAVAIL`; every other
+/// admin failure keeps the shared mapping.
+fn link_admin_errno(error: crate::AdminError) -> i32 {
+    match error {
+        crate::AdminError::InvalidMac => EADDRNOTAVAIL,
+        other => admin_errno(other),
+    }
+}
+
+/// IPv4 FIB insert (`fib_table_insert`, net/ipv4/fib_trie.c): an existing
+/// alias is `-EEXIST` under `NLM_F_EXCL` or without `NLM_F_REPLACE`; a new
+/// alias needs `NLM_F_CREATE` or the insert is `-ENOENT`.
 fn validate_new_flags(exists: bool, flags: u16) -> Result<(), i32> {
     if exists {
         if flags & NLM_F_EXCL != 0 || flags & NLM_F_REPLACE == 0 {
@@ -947,6 +988,92 @@ fn validate_new_flags(exists: bool, flags: u16) -> Result<(), i32> {
     }
 }
 
+/// `inet_rtm_newaddr` (net/ipv4/devinet.c) and `inet6_rtm_newaddr`
+/// (net/ipv6/addrconf.c): an existing address is `-EEXIST` under
+/// `NLM_F_EXCL` or without `NLM_F_REPLACE`. A new address is inserted even
+/// without `NLM_F_CREATE` ("userspace already relies on not having to
+/// provide this").
+fn validate_new_addr_flags(exists: bool, flags: u16) -> Result<(), i32> {
+    if exists && (flags & NLM_F_EXCL != 0 || flags & NLM_F_REPLACE == 0) {
+        Err(EEXIST)
+    } else {
+        Ok(())
+    }
+}
+
+/// IPv6 FIB insert (`fib6_add_rt2node`, net/ipv6/ip6_fib.c): existing-route
+/// rules match IPv4, but a missing route without `NLM_F_CREATE` is still
+/// added (with a "NLM_F_CREATE should be set" warning) unless
+/// `NLM_F_REPLACE` asked to replace something — then `-ENOENT`.
+fn validate_new_route6_flags(exists: bool, flags: u16) -> Result<(), i32> {
+    if exists {
+        validate_new_flags(true, flags)
+    } else if flags & NLM_F_REPLACE != 0 && flags & NLM_F_CREATE == 0 {
+        Err(ENOENT)
+    } else {
+        Ok(())
+    }
+}
+
+/// `neigh_add` (net/core/neighbour.c): a missing entry needs
+/// `NLM_F_CREATE` (`-ENOENT`); an existing entry is `-EEXIST` only under
+/// `NLM_F_EXCL` — without `NLM_F_REPLACE` Linux still updates it (minus
+/// the override flags) and succeeds.
+fn validate_new_neigh_flags(exists: bool, flags: u16) -> Result<(), i32> {
+    if exists {
+        if flags & NLM_F_EXCL != 0 {
+            Err(EEXIST)
+        } else {
+            Ok(())
+        }
+    } else if flags & NLM_F_CREATE != 0 {
+        Ok(())
+    } else {
+        Err(ENOENT)
+    }
+}
+
+/// Resolve the device an `RTM_NEWLINK` / `RTM_SETLINK` names, with the
+/// errno ladder of `__rtnl_newlink` / `rtnl_setlink` (net/core/rtnetlink.c).
+fn resolve_link(request: &[u8], msg_type: u16, flags: u16) -> Result<alloc::string::String, i32> {
+    let ifindex = i32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
+    let requested_name = find_attr(request, 16, IFLA_IFNAME)
+        .and_then(|raw| core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok());
+    if msg_type == RTM_NEWLINK && ifindex < 0 {
+        // "ifindex can't be negative"
+        return Err(EINVAL);
+    }
+    let named = ifindex > 0 || requested_name.is_some();
+    if !named && msg_type == RTM_SETLINK {
+        return Err(EINVAL);
+    }
+    let found = if ifindex > 0 {
+        iface_name_for_index(ifindex as u32)
+    } else {
+        requested_name
+            .and_then(|name| ifindex_for_name(name).map(|_| alloc::string::String::from(name)))
+    };
+    match found {
+        Some(name) => {
+            if msg_type == RTM_NEWLINK {
+                // `rtnl_changelink`.
+                if flags & NLM_F_EXCL != 0 {
+                    return Err(EEXIST);
+                }
+                if flags & NLM_F_REPLACE != 0 {
+                    return Err(EOPNOTSUPP);
+                }
+            }
+            Ok(name)
+        }
+        // SETLINK, or NEWLINK without NLM_F_CREATE: the device does not exist.
+        None if msg_type == RTM_SETLINK || flags & NLM_F_CREATE == 0 => Err(ENODEV),
+        // NEWLINK create: NARF registers no `rtnl_link_ops` kinds, which is
+        // `__rtnl_newlink`'s "Unknown device type" -EOPNOTSUPP.
+        None => Err(EOPNOTSUPP),
+    }
+}
+
 fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<(), i32> {
     let hdr = parse_hdr(request).ok_or(EINVAL)?;
     let admin = admin.ok_or(EPERM)?;
@@ -955,11 +1082,7 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             if request.len() < NLMSG_HDRLEN + 16 {
                 return Err(EINVAL);
             }
-            let ifindex = i32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
-            if ifindex <= 0 {
-                return Err(EINVAL);
-            }
-            let iface_name = iface_name_for_index(ifindex as u32).ok_or(ENODEV)?;
+            let iface_name = resolve_link(request, hdr.msg_type, hdr.flags)?;
             if iface_name != admin.iface_name() {
                 return Err(EPERM);
             }
@@ -982,7 +1105,7 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 }
                 admin
                     .set_mac(mac.try_into().map_err(|_| EINVAL)?)
-                    .map_err(admin_errno)?;
+                    .map_err(link_admin_errno)?;
             }
             Ok(())
         }
@@ -992,6 +1115,12 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             }
             let family = request[NLMSG_HDRLEN];
             let prefix_len = request[NLMSG_HDRLEN + 1];
+            // Address handlers are registered for PF_INET / PF_INET6 only;
+            // `rtnetlink_rcv_msg` answers any other family -EOPNOTSUPP
+            // before a handler (and its device lookup) runs.
+            if !matches!(family, AF_INET | AF_INET6) {
+                return Err(EOPNOTSUPP);
+            }
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
             if iface_name != admin.iface_name() {
@@ -1009,10 +1138,11 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                             .iter()
                             .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
                     if hdr.msg_type == RTM_NEWADDR {
-                        validate_new_flags(exists, hdr.flags)?;
+                        validate_new_addr_flags(exists, hdr.flags)?;
                         admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
                     } else if !exists {
-                        Err(ENOENT)
+                        // `inet_rtm_deladdr`: "ipv4: Address not found".
+                        Err(EADDRNOTAVAIL)
                     } else {
                         admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
                     }
@@ -1027,10 +1157,11 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                                 existing.addr == addr && existing.prefix_len == prefix_len
                             });
                     if hdr.msg_type == RTM_NEWADDR {
-                        validate_new_flags(exists, hdr.flags)?;
+                        validate_new_addr_flags(exists, hdr.flags)?;
                         admin.add_ipv6(addr, prefix_len).map_err(admin_errno)
                     } else if !exists {
-                        Err(ENOENT)
+                        // `inet6_addr_del`: "address not found".
+                        Err(EADDRNOTAVAIL)
                     } else {
                         admin.del_ipv6(addr, prefix_len).map_err(admin_errno)
                     }
@@ -1044,10 +1175,12 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             }
             let family = request[NLMSG_HDRLEN];
             let prefix_len = request[NLMSG_HDRLEN + 1];
-            if (family == AF_INET && prefix_len > 32)
-                || (family == AF_INET6 && prefix_len > 128)
-                || !matches!(family, AF_INET | AF_INET6)
-            {
+            // Route handlers exist for PF_INET / PF_INET6 only (see the
+            // address branch): any other family is -EOPNOTSUPP.
+            if !matches!(family, AF_INET | AF_INET6) {
+                return Err(EOPNOTSUPP);
+            }
+            if (family == AF_INET && prefix_len > 32) || (family == AF_INET6 && prefix_len > 128) {
                 return Err(EINVAL);
             }
             let scope = match request[NLMSG_HDRLEN + 6] {
@@ -1092,11 +1225,12 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 });
                 if hdr.msg_type == RTM_DELROUTE {
                     if !exists {
-                        return Err(ENOENT);
+                        // `ip6_route_del`: `int err = -ESRCH;`.
+                        return Err(ESRCH);
                     }
                     return admin.del_ipv6_route(dst, prefix_len).map_err(admin_errno);
                 }
-                validate_new_flags(exists, hdr.flags)?;
+                validate_new_route6_flags(exists, hdr.flags)?;
                 let gateway = match find_attr(request, 12, RTA_GATEWAY) {
                     Some(raw) if raw.len() == 16 => Some(raw.try_into().map_err(|_| EINVAL)?),
                     Some(_) => return Err(EINVAL),
@@ -1132,7 +1266,8 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             });
             if hdr.msg_type == RTM_DELROUTE {
                 if !exists {
-                    return Err(ENOENT);
+                    // `fib_table_delete`: no matching alias → -ESRCH.
+                    return Err(ESRCH);
                 }
                 return admin
                     .del_ipv4_route(dst, prefix_len, table)
@@ -1193,10 +1328,13 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 AF_INET6 if dst.len() == 16 => crate::ipv6::ndp::neigh_list()
                     .iter()
                     .any(|entry| entry.iface == admin.iface_name() && entry.ip == dst),
-                _ => return Err(EINVAL),
+                // Short NDA_DST for a known table: "Invalid network address".
+                AF_INET | AF_INET6 => return Err(EINVAL),
+                // `neigh_find_table()` found no table for this family.
+                _ => return Err(EAFNOSUPPORT),
             };
             if hdr.msg_type == RTM_NEWNEIGH {
-                validate_new_flags(exists, hdr.flags)?;
+                validate_new_neigh_flags(exists, hdr.flags)?;
             } else if !exists {
                 return Err(ENOENT);
             }
@@ -1427,6 +1565,9 @@ fn append_extended_ack(message: &mut Vec<u8>) {
         EPERM => b"interface admin capability required\0",
         ENOENT => b"requested network object does not exist\0",
         EEXIST => b"network object already exists\0",
+        ESRCH => b"no such route\0",
+        EADDRNOTAVAIL => b"address not available\0",
+        EAFNOSUPPORT => b"address family not supported\0",
         ENODEV => b"network interface does not exist\0",
         EINVAL => b"invalid rtnetlink request\0",
         EOPNOTSUPP => b"rtnetlink operation not supported\0",

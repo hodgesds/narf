@@ -251,6 +251,12 @@ pub fn parse_options_and_payload(buf: &[u8]) -> Result<(Vec<CoapOption>, &[u8], 
     while pos < buf.len() {
         if buf[pos] == PAYLOAD_MARKER {
             pos += 1;
+            // RFC 7252 §3: "The presence of a marker followed by a
+            // zero-length payload MUST be processed as a message format
+            // error."
+            if pos == buf.len() {
+                return Err(CoapError::Truncated);
+            }
             return Ok((options, &buf[pos..], buf.len()));
         }
         let head = buf[pos];

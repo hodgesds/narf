@@ -157,8 +157,23 @@ the family-specific IPv4 or IPv6 group. Only sockets subscribed through
 `nl_groups` or `NETLINK_ADD_MEMBERSHIP` receive them.
 
 Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
-`NLM_F_REPLACE` semantics. Duplicate exclusive creates return `EEXIST`;
-replacement or deletion of missing state returns `ENOENT`.
+`NLM_F_REPLACE` semantics per object, with the errnos of the Linux handler:
+an existing address or route is `EEXIST` under `NLM_F_EXCL` or without
+`NLM_F_REPLACE`; a new IPv4 route needs `NLM_F_CREATE` (`ENOENT`,
+`fib_table_insert`) while a new address or IPv6 route does not (only an IPv6
+`NLM_F_REPLACE` of a missing route is `ENOENT`); a missing neighbor needs
+`NLM_F_CREATE` (`ENOENT`) and an existing one is `EEXIST` only under
+`NLM_F_EXCL` (`neigh_add`). Deleting a missing route returns `ESRCH`
+(`fib_table_delete` / `ip6_route_del`), a missing address `EADDRNOTAVAIL`
+(`inet_rtm_deladdr` / `inet6_addr_del`), a missing neighbor `ENOENT`.
+Address and route requests for a family other than IPv4/IPv6 return
+`EOPNOTSUPP`; neighbor requests for such a family return `EAFNOSUPPORT`.
+`RTM_SETLINK` resolves the device by positive ifindex or, with ifindex 0, by
+`IFLA_IFNAME` (neither: `EINVAL`; unknown: `ENODEV`). `RTM_NEWLINK` on an
+existing device returns `EEXIST` under `NLM_F_EXCL` and `EOPNOTSUPP` under
+`NLM_F_REPLACE`; for a missing device it returns `ENODEV` without
+`NLM_F_CREATE` and `EOPNOTSUPP` with it (no link kinds are registered). An
+invalid (multicast or all-zero) `IFLA_ADDRESS` returns `EADDRNOTAVAIL`.
 
 When `NETLINK_EXT_ACK` is enabled, failed requests carry
 `NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
@@ -170,11 +185,13 @@ extended-ACK attributes follow the capped request header.
 When `NETLINK_GET_STRICT_CHK` is enabled, requests must carry
 `NLM_F_REQUEST`, the Linux fixed request structure for their message type,
 and a valid family selector. Malformed strict requests return `EINVAL`.
-Non-dump `RTM_GETLINK` resolves one interface by ifindex or `IFLA_IFNAME`,
-returning a non-multipart reply or `ENODEV`.
+Non-dump `RTM_GETLINK` resolves one interface by positive ifindex or else
+`IFLA_IFNAME`, returning a non-multipart reply, `ENODEV` when the named
+interface is absent, or `EINVAL` when neither selector is present.
 Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
-lookup for `RTA_DST`, returning the selected route as one non-multipart reply
-or `ENETUNREACH`.
+lookup for `RTA_DST` (absent: 0.0.0.0, as `inet_rtm_getroute`), returning
+the selected route as one non-multipart reply or `ENETUNREACH`; a family
+other than `AF_INET` returns `EOPNOTSUPP`.
 Address dumps honor `ifa_family` and `ifa_index`; route dumps honor
 `rtm_family` and `rtm_table`; neighbor and qdisc dumps honor their interface
 index selectors. A valid filter with no matching objects returns an empty dump
@@ -193,7 +210,10 @@ registry by interface name, so frame-ring-only drivers appear exactly once.
 `NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
 `CTRL_CMD_GETFAMILY` supports name or numeric-ID lookup and dump enumeration
 with Linux-compatible family, supported-operation, and multicast-group
-attributes; unknown families return `ENOENT`. Multiple
+attributes; unknown families return `ENOENT`. A request addressed to an
+unregistered family ID returns `ENOENT` (`genl_rcv_msg`); a command absent
+from the family's operation table, or a dump of a do-only operation, returns
+`EOPNOTSUPP` before the family callback runs (`genl_get_cmd`). Multiple
 aligned control requests may be batched in one datagram and retain independent
 sequence numbers.
 Subsystems may register additional generic-netlink families by stable ID and
@@ -211,7 +231,10 @@ namespace-scoped transport snapshots, followed by
 `NLMSG_DONE`. Aligned requests may be batched, their sequences remain
 independent, and `NLM_F_ACK` adds a zero-error acknowledgement after a
 successful query. Messages without `NLM_F_REQUEST` return `EINVAL`.
-Unsupported address families and transport protocols return `EOPNOTSUPP`.
+Errnos follow `sock_diag_rcv_msg` / `inet_diag`: unknown message types and
+families `>= AF_MAX` return `EINVAL`; `TCPDIAG_GETSOCK` and `SOCK_DESTROY`
+return `EOPNOTSUPP`; address families and transport protocols without a
+handler return `ENOENT`.
 
 `NETLINK_NETFILTER` accepts IPv4 conntrack `IPCTNL_MSG_CT_GET` dumps and
 emits Linux nfnetlink `IPCTNL_MSG_CT_NEW` records with original/reply tuples,
@@ -223,7 +246,12 @@ non-multipart record, and report `ENOENT` when the canonical table has no
 match. Creating or deleting nftables tables and empty chains requires a
 delegated namespace-matched `NetfilterAdminHandle` with ruleset rights;
 missing, revoked, cross-namespace, or rights-attenuated authority returns
-`EPERM`, and deleting a non-empty object returns `EBUSY`. Rule-expression and
+`EPERM`, and deleting a non-empty object returns `EBUSY`. Creating a table or
+chain that already exists returns `EEXIST` under `NLM_F_EXCL`, `EOPNOTSUPP`
+under `NLM_F_REPLACE`, and otherwise succeeds as a no-op update
+(`nf_tables_newtable` / `nf_tables_newchain`). nf_tables requests for a
+family other than IPv4 return `EOPNOTSUPP` (`nft_supported_family`), except
+that `NFPROTO_UNSPEC` table/chain dumps list the IPv4 ruleset. Rule-expression and
 conntrack mutations plus unsupported nfnetlink subsystems return
 `EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
 
@@ -256,6 +284,19 @@ payload over `UDP_MAX_PAYLOAD` (65507) regardless of `SO_SNDBUF`, require
 `SO_BROADCAST` for exactly those broadcast destinations, drop an arriving
 datagram when the receive queue is full, and drop received datagrams whose
 length field is shorter than the header or longer than the segment.
+ICMP errors quoting a UDP datagram reach sockets bound to the exact source
+address or to `INADDR_ANY` (`__udp4_lib_lookup`), and Parameter Problem is
+delivered like Destination Unreachable and Time Exceeded.
+`udp_sock::SockError::linux_errno()` /
+`udp_sock::icmp_err_convert(type, code) -> Option<(errno, hard)>` give the
+Linux errno and hard/soft class of a queued ICMP error as `udp_err` derives
+them, from the shared `tcp::core::ICMP_UNREACH_ERRNO` /
+`ICMP_UNREACH_FATAL` (`icmp_err_convert[]`) table: Fragmentation Needed
+`EMSGSIZE` hard, Parameter Problem `EPROTO` hard, Time Exceeded
+`EHOSTUNREACH` soft, Source Quench / Redirect not reported. ICMP echo
+payloads above `icmp_sock::ICMP_ECHO_MAX_PAYLOAD` fail
+`IcmpError2::MsgTooLong` (Linux `EMSGSIZE`).
+
 Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
@@ -265,8 +306,13 @@ ARP-resolution, DHCP, route, and netfilter state; physical interfaces return
 to the initial namespace without retaining dead-namespace routes.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
-an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`
-because Linux uid and capability bits do not confer NARF audit authority.
+an empty completed `AUDIT_LIST_RULES` list (with or without `NLM_F_DUMP`).
+`AUDIT_SET` and the other configuration writes (`AUDIT_ADD_RULE`,
+`AUDIT_DEL_RULE`, `AUDIT_TRIM`, `AUDIT_MAKE_EQUIV`, `AUDIT_TTY_SET`,
+`AUDIT_SET_FEATURE`) return `EPERM` because Linux uid and capability bits do
+not confer NARF audit authority. Obsolete `AUDIT_LIST`/`AUDIT_ADD`/`AUDIT_DEL`
+and unimplemented read queries return `EOPNOTSUPP`; unknown message types
+return `EINVAL` (`audit_netlink_ok`).
 
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the

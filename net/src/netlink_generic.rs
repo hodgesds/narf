@@ -250,10 +250,26 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
             .iter()
             .find(|family| family.id == kind)
             .copied();
+        // `genl_rcv_msg`: `genl_family_find_byid()` miss → -ENOENT.
         let Some(family) = family else {
-            return Ok(vec![error(EOPNOTSUPP, seq, request)]);
+            return Ok(vec![error(ENOENT, seq, request)]);
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+        // `genl_family_rcv_msg` → `genl_get_cmd()`: the command must be in
+        // the family's op table with the DO or DUMP capability the request
+        // asks for, else -EOPNOTSUPP before the family sees it.
+        let wanted = if dump {
+            GENL_CMD_CAP_DUMP
+        } else {
+            GENL_CMD_CAP_DO
+        };
+        if !family
+            .operations
+            .iter()
+            .any(|op| op.command == command && op.flags & wanted != 0)
+        {
+            return Ok(vec![error(EOPNOTSUPP, seq, request)]);
+        }
         let mut out = match (family.handler)(command, &request[NLMSG_HDRLEN + 4..], dump) {
             Ok(payloads) => payloads
                 .into_iter()

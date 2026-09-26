@@ -38,6 +38,10 @@ pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 
 // ── POSIX-numbered constants ────────────────────────────────────
 
+/// `AF_UNSPEC`: on connect(2) it dissolves an association
+/// (`inet_dgram_connect` / `__inet_stream_connect` / `unix_dgram_connect` /
+/// `netlink_connect`).
+pub const AF_UNSPEC: u16 = 0;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
@@ -452,6 +456,11 @@ impl UnixAddr {
     pub fn parse(body: &[u8]) -> Option<Self> {
         if body.is_empty() {
             return Some(UnixAddr::Unnamed);
+        }
+        // `unix_validate_addr`: addr_len > sizeof(struct sockaddr_un) (110,
+        // i.e. a 108-byte sun_path) → EINVAL.
+        if body.len() > 108 {
+            return None;
         }
         if body[0] == 0 {
             // Abstract: the name is the raw bytes after the leading NUL,
@@ -895,6 +904,9 @@ pub struct SockOptions {
     pub ip_recvttl: bool,
     pub ip_mtu: u32,
     pub ip_multicast_ttl: u32,
+    /// IP_FREEBIND / IP_TRANSPARENT: permit binding an address no local
+    /// interface owns (`inet_addr_valid_or_nonlocal`).
+    pub ip_freebind: bool,
 }
 
 impl Default for SockOptions {
@@ -925,6 +937,7 @@ impl Default for SockOptions {
             ip_recvttl: false,
             ip_mtu: 1500,
             ip_multicast_ttl: 1,
+            ip_freebind: false,
         }
     }
 }
@@ -968,6 +981,9 @@ enum SocketState {
         /// `Some(id)` once a kernel-stack listener is open (non-loopback
         /// binds); `None` for loopback-only listeners.
         listen_id: Option<u32>,
+        /// TCP_LISTEN vs bound-only TCP_CLOSE: a merely-bound socket fails
+        /// accept with EINVAL, may still connect, and reports SO_ACCEPTCONN 0.
+        listening: bool,
     },
     /// AF_INET connected endpoint — same ring shape as UnixConnected.
     InetConnected {
@@ -1019,6 +1035,8 @@ enum SocketState {
         port: u16,
         backlog: u32,
         pending: VecDeque<Arc<SocketFile>>,
+        /// TCP_LISTEN vs bound-only, as for `InetListener`.
+        listening: bool,
     },
     Inet6Connected {
         tx: Arc<RingBuf>,
@@ -1473,10 +1491,15 @@ impl SocketFile {
             Some(v) => v,
             None => return SocketOpResult::Err(SockError::InvalidArg),
         };
-        if self.netlink_portid.load(Ordering::Acquire) != 0 {
+        // `netlink_bind`: an already-bound socket may bind again only to its
+        // own portid (updating its groups); any other nl_pid is EINVAL.
+        let current = self.netlink_portid.load(Ordering::Acquire);
+        if current != 0 && requested != current {
             return SocketOpResult::Err(SockError::InvalidArg);
         }
-        let portid = if requested == 0 {
+        let portid = if current != 0 {
+            current
+        } else if requested == 0 {
             loop {
                 let candidate = NEXT_NETLINK_PORTID.fetch_add(1, Ordering::Relaxed).max(1);
                 if !self.netlink_port_in_use(candidate) {
@@ -1769,6 +1792,13 @@ impl SocketFile {
     }
 
     fn connect_netlink(&self, addr: &SockAddr) -> SocketOpResult {
+        // `netlink_connect`: AF_UNSPEC resets the default destination to the
+        // kernel and succeeds.
+        if addr.family == AF_UNSPEC {
+            self.netlink_peer_portid.store(0, Ordering::Release);
+            self.netlink_peer_groups.store(0, Ordering::Release);
+            return SocketOpResult::Ok(0);
+        }
         let (portid, groups) = match Self::netlink_addr(addr) {
             Some(v) => v,
             None => return SocketOpResult::Err(SockError::InvalidArg),
@@ -1913,6 +1943,13 @@ impl SocketFile {
     }
 
     /// Toggle the O_NONBLOCK flag (fcntl F_SETFL path).
+    /// Whether the socket is still in its initial (never bound / connected)
+    /// state — bind(2) uses it to decide whether a pathname node may be
+    /// created before the family op runs its already-bound check.
+    pub(crate) fn is_fresh(&self) -> bool {
+        matches!(&*self.state.lock(), SocketState::Fresh)
+    }
+
     pub fn set_nonblock(&self, on: bool) {
         self.nonblock.store(on, Ordering::Release);
     }
@@ -2119,9 +2156,13 @@ impl SocketFile {
                         narf_net::tcp_stack::remove_tcb(*id);
                         crate::handlers::clear_tcb_owner(*id);
                     }
+                    self.inet_tcp_release_port();
                     Reg::Inet(*addr, *port)
                 }
-                SocketState::Inet6Listener { addr, port, .. } => Reg::Inet6(*addr, *port),
+                SocketState::Inet6Listener { addr, port, .. } => {
+                    self.inet6_release_port();
+                    Reg::Inet6(*addr, *port)
+                }
                 SocketState::UnixDgram { addr: Some(a), .. } => match a {
                     UnixAddr::Path(p) => Reg::UnixDgram(
                         bound_path
@@ -2156,14 +2197,27 @@ impl SocketFile {
                     map.remove(&n);
                 }
             }
+            // Only unpublish the entry if it is THIS socket: a merely-bound
+            // (never listening) socket must not evict another's listener.
             Reg::Inet(a, p) => {
                 if let Some(map) = INET_LISTENERS.lock().as_mut() {
-                    map.remove(&(self.net_ns_id(), a, p));
+                    let key = (self.net_ns_id(), a, p);
+                    if map
+                        .get(&key)
+                        .is_some_and(|l| core::ptr::eq(Arc::as_ptr(l), self))
+                    {
+                        map.remove(&key);
+                    }
                 }
             }
             Reg::Inet6(a, p) => {
                 if let Some(map) = INET6_LISTENERS.lock().as_mut() {
-                    map.remove(&(a, p));
+                    if map
+                        .get(&(a, p))
+                        .is_some_and(|l| core::ptr::eq(Arc::as_ptr(l), self))
+                    {
+                        map.remove(&(a, p));
+                    }
                 }
             }
             Reg::UnixDgram(p) => {
@@ -2209,16 +2263,78 @@ pub fn make_sockaddr_in(addr: u32, port: u16) -> SockAddr {
     }
 }
 
-/// Build an IPv6 sockaddr body.
+/// Build an IPv6 sockaddr body: port, flowinfo, address and `sin6_scope_id`,
+/// so the reported length is `sizeof(struct sockaddr_in6)` (28), as
+/// `inet6_getname` returns.
 pub fn make_sockaddr_in6(addr: [u8; 16], port: u16) -> SockAddr {
-    let mut body = Vec::with_capacity(2 + 4 + 16);
+    let mut body = Vec::with_capacity(SOCKADDR_IN6_BODY_LEN);
     body.extend_from_slice(&port.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes()); // flowinfo
     body.extend_from_slice(&addr);
+    body.extend_from_slice(&0u32.to_ne_bytes()); // sin6_scope_id
     SockAddr {
         family: AF_INET6,
         body,
     }
+}
+
+/// Bytes after `sa_family` in a `struct sockaddr_in6` (28 - 2).
+const SOCKADDR_IN6_BODY_LEN: usize = 26;
+/// `SIN6_LEN_RFC2133` (24) minus `sa_family`: the shortest sockaddr_in6
+/// `inet6_bind_sk` / `tcp_v6_connect` accept.
+const SOCKADDR_IN6_MIN_BODY_LEN: usize = 22;
+/// `CAP_NET_BIND_SERVICE` (include/uapi/linux/capability.h).
+const CAP_NET_BIND_SERVICE: u32 = 10;
+/// `ip_unprivileged_port_start` default: lower ports need
+/// CAP_NET_BIND_SERVICE (`inet_port_requires_bind_service`).
+const INET_PROT_SOCK: u16 = 1024;
+/// `IP_FREEBIND` / `IP_TRANSPARENT` (include/uapi/linux/in.h).
+const IP_FREEBIND: u32 = 15;
+const IP_TRANSPARENT: u32 = 19;
+
+/// `__inet_bind` / `raw_bind`: `inet_addr_valid_or_nonlocal` — without
+/// IP_FREEBIND the address must be INADDR_ANY, local (all of 127/8 is on
+/// `lo`), multicast or a broadcast address.
+pub(crate) fn inet4_bindable(ns: u64, ip: u32, freebind: bool) -> bool {
+    let b = ip.to_be_bytes();
+    freebind
+        || ip == 0
+        || (224..=239).contains(&b[0])
+        || narf_net::iface::is_local_addr_in(ns, b)
+        || narf_net::iface::is_broadcast_in(ns, b)
+}
+
+/// `__inet_bind` / `__inet6_bind`: a non-zero port below
+/// `ip_unprivileged_port_start` needs CAP_NET_BIND_SERVICE (EACCES).
+pub(crate) fn inet_port_denied(port: u16) -> bool {
+    port != 0
+        && port < INET_PROT_SOCK
+        && !crate::handlers::task_capable(crate::handlers::current_task_id(), CAP_NET_BIND_SERVICE)
+}
+
+/// `do_ip_setsockopt`'s int decode: a full int when `optlen >= 4`, else the
+/// single byte when `optlen >= 1`; `None` for `optlen == 0`.
+fn read_ip_int(value: &[u8]) -> Option<i32> {
+    if value.len() >= 4 {
+        Some(i32::from_ne_bytes([value[0], value[1], value[2], value[3]]))
+    } else {
+        value.first().map(|b| *b as i32)
+    }
+}
+
+/// Validate an AF_INET6 sockaddr (`inet6_bind_sk` / `tcp_v6_connect`):
+/// shorter than SIN6_LEN_RFC2133 is EINVAL, a foreign family EAFNOSUPPORT.
+fn inet6_sockaddr(addr: &SockAddr) -> Result<([u8; 16], u16), SockError> {
+    if addr.body.len() < SOCKADDR_IN6_MIN_BODY_LEN {
+        return Err(SockError::InvalidArg);
+    }
+    if addr.family != AF_INET6 {
+        return Err(SockError::AfNoSupport);
+    }
+    let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
+    let mut ip = [0u8; 16];
+    ip.copy_from_slice(&addr.body[6..22]);
+    Ok((ip, port))
 }
 
 /// Parse a `sockaddr_in`-shaped body into (ip, port) in host byte
@@ -2920,6 +3036,10 @@ impl SocketFile {
             }
             SocketOp::GetSockOpt { level, name, buf } => {
                 return self.handle_getsockopt(level, name, buf);
+            }
+            // `netlink_ops.shutdown = sock_no_shutdown` → EOPNOTSUPP.
+            SocketOp::Shutdown { .. } if self.domain == AF_NETLINK => {
+                return SocketOpResult::Err(SockError::NotSupported);
             }
             _ => {}
         }
@@ -3795,40 +3915,57 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            // `tcp_sock_set_keepidle_locked`: 1..=MAX_TCP_KEEPIDLE (32767).
             (IPPROTO_TCP, TCP_KEEPIDLE) => match read_u32(value) {
+                Ok(v) if !(1..=32_767).contains(&(v as i32)) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
                 Ok(v) => {
                     opts.tcp_keepidle = v;
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            // `tcp_sock_set_keepintvl`: 1..=MAX_TCP_KEEPINTVL (32767).
             (IPPROTO_TCP, TCP_KEEPINTVL) => match read_u32(value) {
+                Ok(v) if !(1..=32_767).contains(&(v as i32)) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
                 Ok(v) => {
                     opts.tcp_keepintvl = v;
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            // `tcp_sock_set_keepcnt`: 1..=MAX_TCP_KEEPCNT (127).
             (IPPROTO_TCP, TCP_KEEPCNT) => match read_u32(value) {
+                Ok(v) if !(1..=127).contains(&(v as i32)) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
                 Ok(v) => {
                     opts.tcp_keepcnt = v;
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            // `tcp_sock_set_user_timeout`: negative → EINVAL.
             (IPPROTO_TCP, TCP_USER_TIMEOUT) => match read_u32(value) {
+                Ok(v) if (v as i32) < 0 => SocketOpResult::Err(SockError::InvalidArg),
                 Ok(v) => {
                     opts.tcp_user_timeout = v;
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            // `tcp_sock_set_maxseg`: `val && (val < TCP_MIN_MSS (88) ||
+            // val > MAX_TCP_WINDOW (32767))` → EINVAL; 0 restores the default.
             (IPPROTO_TCP, TCP_MAXSEG) => match read_u32(value) {
                 Ok(v) => {
-                    if !(88..=65_535).contains(&v) {
+                    let v = v as i32;
+                    if v != 0 && !(88..=32_767).contains(&v) {
                         return SocketOpResult::Err(SockError::InvalidArg);
                     }
-                    opts.tcp_maxseg = v;
+                    opts.tcp_maxseg = if v == 0 { 1460 } else { v as u32 };
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
@@ -3847,39 +3984,69 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
-            (IPPROTO_TCP, TCP_CONGESTION) => match core::str::from_utf8(value) {
-                Ok(s) => {
-                    let n = s.trim_end_matches('\0');
-                    match n {
-                        "reno" | "cubic" | "bbr" | "vegas" | "westwood" => {
-                            opts.tcp_congestion = String::from(n);
-                            SocketOpResult::Ok(0)
-                        }
-                        _ => SocketOpResult::Err(SockError::InvalidArg),
+            // `tcp_set_congestion_control`: an algorithm that is not
+            // registered (`tcp_ca_find_autoload` → NULL) is ENOENT.
+            (IPPROTO_TCP, TCP_CONGESTION) => {
+                let n = core::str::from_utf8(value)
+                    .unwrap_or("")
+                    .split('\0')
+                    .next()
+                    .unwrap_or("");
+                match n {
+                    "reno" | "cubic" | "bbr" | "vegas" | "westwood" => {
+                        opts.tcp_congestion = String::from(n);
+                        SocketOpResult::Ok(0)
                     }
+                    _ => SocketOpResult::Err(SockError::NoEntry),
                 }
-                Err(_) => SocketOpResult::Err(SockError::InvalidArg),
-            },
-            (IPPROTO_IP, IP_TTL) => match read_u32(value) {
-                Ok(v) => {
-                    if v == 0 || v > 255 {
-                        return SocketOpResult::Err(SockError::InvalidArg);
-                    }
-                    opts.ip_ttl = v;
+            }
+            // `do_ip_setsockopt` IP_TTL: optlen < 1 → EINVAL; -1 restores
+            // the default; otherwise 1..=255. Int options accept a 1-byte
+            // optval (`optlen >= sizeof(char)`).
+            (IPPROTO_IP, IP_TTL) => match read_ip_int(value) {
+                Some(-1) => {
+                    opts.ip_ttl = 64;
                     SocketOpResult::Ok(0)
                 }
-                Err(e) => SocketOpResult::Err(e),
-            },
-            (IPPROTO_IP, IP_TOS) => match read_u32(value) {
-                Ok(v) => {
-                    if v > 255 {
-                        return SocketOpResult::Err(SockError::InvalidArg);
-                    }
-                    opts.ip_tos = v;
+                Some(v) if (1..=255).contains(&v) => {
+                    opts.ip_ttl = v as u32;
                     SocketOpResult::Ok(0)
                 }
-                Err(e) => SocketOpResult::Err(e),
+                _ => SocketOpResult::Err(SockError::InvalidArg),
             },
+            // `ip_sock_set_tos`: no range check — `inet->tos` is a u8, and a
+            // stream socket keeps its own ECN bits.
+            (IPPROTO_IP, IP_TOS) => match read_ip_int(value) {
+                Some(v) => {
+                    let mut tos = (v as u32) & 0xFF;
+                    if self.kind == SOCK_STREAM {
+                        tos = (tos & !0x3) | (opts.ip_tos & 0x3);
+                    }
+                    opts.ip_tos = tos;
+                    SocketOpResult::Ok(0)
+                }
+                None => {
+                    opts.ip_tos = 0;
+                    SocketOpResult::Ok(0)
+                }
+            },
+            // IP_FREEBIND / IP_TRANSPARENT relax `__inet_bind`'s
+            // EADDRNOTAVAIL. IP_TRANSPARENT needs CAP_NET_RAW or
+            // CAP_NET_ADMIN (`do_ip_setsockopt`) — EPERM otherwise.
+            (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IP, IP_TRANSPARENT) => {
+                let v = read_ip_int(value).unwrap_or(0);
+                if name == IP_TRANSPARENT
+                    && v != 0
+                    && !crate::handlers::task_capable(
+                        crate::handlers::current_task_id(),
+                        crate::handlers::CAP_NET_RAW,
+                    )
+                {
+                    return SocketOpResult::Err(SockError::PermDenied);
+                }
+                opts.ip_freebind = v != 0;
+                SocketOpResult::Ok(0)
+            }
             (IPPROTO_IP, IP_PKTINFO) => match read_u32(value) {
                 Ok(v) => {
                     opts.ip_pktinfo = v != 0;
@@ -3894,16 +4061,24 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
-            (IPPROTO_IP, IP_MULTICAST_TTL) => match read_u32(value) {
-                Ok(v) => {
-                    if v > 255 {
-                        return SocketOpResult::Err(SockError::InvalidArg);
-                    }
-                    opts.ip_multicast_ttl = v;
-                    SocketOpResult::Ok(0)
+            // `do_ip_setsockopt` IP_MULTICAST_TTL: SOCK_STREAM → EINVAL;
+            // optlen < 1 → EINVAL; -1 means 1; otherwise 0..=255.
+            (IPPROTO_IP, IP_MULTICAST_TTL) => {
+                if self.kind == SOCK_STREAM {
+                    return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                Err(e) => SocketOpResult::Err(e),
-            },
+                match read_ip_int(value) {
+                    Some(-1) => {
+                        opts.ip_multicast_ttl = 1;
+                        SocketOpResult::Ok(0)
+                    }
+                    Some(v) if (0..=255).contains(&v) => {
+                        opts.ip_multicast_ttl = v as u32;
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
             // Accept-and-ignore any option NARF doesn't model, rather
             // than failing it. Linux returns success (or ENOPROTOOPT) for
             // benign unknown options; returning an error makes real
@@ -3927,6 +4102,15 @@ impl SocketFile {
             SocketOpResult::OptValue { n }
         };
         let write_bool = |buf: &mut [u8], v: bool| write_u32(buf, v as u32);
+        // `do_ip_getsockopt` copyval: a short buffer gets one byte when the
+        // value fits in a u8, else `min(len, sizeof(int))` bytes.
+        let write_ip = |buf: &mut [u8], v: u32| -> SocketOpResult {
+            if buf.len() < 4 && !buf.is_empty() && v <= 255 {
+                buf[0] = v as u8;
+                return SocketOpResult::OptValue { n: 1 };
+            }
+            write_u32(buf, v)
+        };
         // Linux `do_sock_getsockopt`: AF_UNIX has no proto `getsockopt`, so any
         // level but SOL_SOCKET is -EOPNOTSUPP; `netlink_getsockopt` rejects a
         // foreign level with -ENOPROTOOPT.
@@ -3935,6 +4119,17 @@ impl SocketFile {
         }
         if self.domain == AF_NETLINK && level != SOL_SOCKET && level != SOL_NETLINK {
             return SocketOpResult::Err(SockError::NoProtoOpt);
+        }
+        // INET: a level that is neither the transport's own (`tcp_getsockopt`
+        // / `udp_getsockopt` pass it on) nor SOL_IP reaches
+        // `do_ip_getsockopt`: `if (level != SOL_IP) return -EOPNOTSUPP;`.
+        if matches!(self.domain, AF_INET | AF_INET6)
+            && level != SOL_SOCKET
+            && level != IPPROTO_IP
+            && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
+            && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
+        {
+            return SocketOpResult::Err(SockError::NotSupported);
         }
         if level == SOL_SOCKET && name == SO_ERROR {
             // Linux `sk_getsockopt`: `-sock_error(sk)`, else the soft error,
@@ -3960,11 +4155,19 @@ impl SocketFile {
         // sd_is_socket(fd, AF_UNIX, 0, 0). An error here made accept_fd false
         // → no NEGOTIATE_UNIX_FD → elogind CreateSession "Not supported".
         if level == SOL_SOCKET && name == SO_ACCEPTCONN {
+            // `sk_getsockopt`: `sk_state == TCP_LISTEN` — a merely-bound
+            // INET socket reports 0.
             let listening = matches!(
                 &*self.state.lock(),
                 SocketState::UnixListener { .. }
-                    | SocketState::InetListener { .. }
-                    | SocketState::Inet6Listener { .. }
+                    | SocketState::InetListener {
+                        listening: true,
+                        ..
+                    }
+                    | SocketState::Inet6Listener {
+                        listening: true,
+                        ..
+                    }
             );
             return write_bool(buf, listening);
         }
@@ -4038,12 +4241,29 @@ impl SocketFile {
                 buf[..n].copy_from_slice(&bytes[..n]);
                 SocketOpResult::OptValue { n }
             }
-            (IPPROTO_IP, IP_TTL) => write_u32(buf, opts.ip_ttl),
-            (IPPROTO_IP, IP_TOS) => write_u32(buf, opts.ip_tos),
+            (IPPROTO_IP, IP_TTL) => write_ip(buf, opts.ip_ttl),
+            (IPPROTO_IP, IP_TOS) => write_ip(buf, opts.ip_tos),
             (IPPROTO_IP, IP_PKTINFO) => write_bool(buf, opts.ip_pktinfo),
             (IPPROTO_IP, IP_RECVTTL) => write_bool(buf, opts.ip_recvttl),
-            (IPPROTO_IP, IP_MTU) => write_u32(buf, opts.ip_mtu),
-            (IPPROTO_IP, IP_MULTICAST_TTL) => write_u32(buf, opts.ip_multicast_ttl),
+            // `do_ip_getsockopt` IP_MTU: no cached route (unconnected) →
+            // ENOTCONN.
+            (IPPROTO_IP, IP_MTU) => {
+                let connected = matches!(
+                    &*self.state.lock(),
+                    SocketState::InetConnected { .. }
+                        | SocketState::InetWired { .. }
+                        | SocketState::InetDgram { peer: Some(_), .. }
+                        | SocketState::InetRaw { peer: Some(_), .. }
+                );
+                if !connected {
+                    return SocketOpResult::Err(SockError::NotConnected);
+                }
+                write_ip(buf, opts.ip_mtu)
+            }
+            (IPPROTO_IP, IP_MULTICAST_TTL) => write_ip(buf, opts.ip_multicast_ttl),
+            (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IP, IP_TRANSPARENT) => {
+                write_ip(buf, opts.ip_freebind as u32)
+            }
             (SOL_NETLINK, NETLINK_PKTINFO) => {
                 write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
             }
@@ -4105,10 +4325,22 @@ impl SocketFile {
     fn dispatch_inet_raw(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
-                let (ip, _port) = match parse_sockaddr_in(&addr) {
-                    Some(v) => v,
-                    None => return SocketOpResult::Err(SockError::InvalidArg),
-                };
+                // `raw_bind`: a connected socket or addrlen < sizeof(sockaddr_in)
+                // is EINVAL (no family check), then a non-local address is
+                // EADDRNOTAVAIL. Raw sockets have no port, so no EACCES.
+                if addr.body.len() < SOCKADDR_IN_BODY_LEN
+                    || matches!(
+                        &*self.state.lock(),
+                        SocketState::InetRaw { peer: Some(_), .. }
+                    )
+                {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let ip =
+                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
+                if let Err(e) = self.inet4_bind_precheck(ip, None) {
+                    return SocketOpResult::Err(e);
+                }
                 let mut state = self.state.lock();
                 if let SocketState::InetRaw { local_addr, .. } = &mut *state {
                     *local_addr = ip;
@@ -4118,10 +4350,24 @@ impl SocketFile {
                 }
             }
             SocketOp::Connect { addr } => {
-                let (ip, port) = match parse_sockaddr_in(&addr) {
-                    Some(v) => v,
-                    None => return SocketOpResult::Err(SockError::InvalidArg),
-                };
+                // `inet_dgram_connect`: AF_UNSPEC disconnects.
+                if addr.family == AF_UNSPEC {
+                    if let SocketState::InetRaw { peer, .. } = &mut *self.state.lock() {
+                        *peer = None;
+                    }
+                    return SocketOpResult::Ok(0);
+                }
+                // `ip4_datagram_connect`: EINVAL (short) → EAFNOSUPPORT.
+                if addr.body.len() < SOCKADDR_IN_BODY_LEN {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                if addr.family != AF_INET {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
+                }
+                let (ip, port) = parse_sockaddr_in(&addr).unwrap_or((0, 0));
+                if ip == 0xFFFF_FFFF && !self.options.lock().broadcast {
+                    return SocketOpResult::Err(SockError::Access);
+                }
                 let mut state = self.state.lock();
                 if let SocketState::InetRaw { peer, .. } = &mut *state {
                     *peer = Some((ip, port));
@@ -4130,35 +4376,59 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
-            SocketOp::Send {
-                buf,
-                flags: _,
-                addr,
-            } => {
+            SocketOp::Send { buf, flags, addr } => {
+                // `raw_sendmsg` order: len > 0xFFFF (EMSGSIZE) → MSG_OOB
+                // (EOPNOTSUPP) → short msg_name (EINVAL) → a non-zero foreign
+                // family (EAFNOSUPPORT) → no name, not connected
+                // (EDESTADDRREQ).
+                if buf.len() > 0xFFFF {
+                    return SocketOpResult::Err(SockError::MsgSize);
+                }
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(SockError::NotSupported);
+                }
+                let explicit = match addr {
+                    Some(a) if a.body.len() < SOCKADDR_IN_BODY_LEN => {
+                        return SocketOpResult::Err(SockError::InvalidArg)
+                    }
+                    // A non-zero foreign family; AF_UNSPEC (0) is tolerated.
+                    Some(a) if a.family != AF_INET && a.family != AF_UNSPEC => {
+                        return SocketOpResult::Err(SockError::AfNoSupport)
+                    }
+                    Some(a) => Some((
+                        u32::from_be_bytes([a.body[2], a.body[3], a.body[4], a.body[5]]),
+                        u16::from_be_bytes([a.body[0], a.body[1]]),
+                    )),
+                    None => None,
+                };
                 let state = self.state.lock();
                 let (protocol, dest) = match &*state {
                     SocketState::InetRaw { protocol, peer, .. } => {
-                        let dest = if let Some(a) = addr {
-                            match parse_sockaddr_in(&a) {
-                                Some(v) => v,
-                                None => return SocketOpResult::Err(SockError::InvalidArg),
-                            }
+                        let dest = if let Some(d) = explicit {
+                            d
                         } else if let Some(d) = peer {
                             *d
                         } else {
-                            return SocketOpResult::Err(SockError::InvalidArg);
+                            return SocketOpResult::Err(SockError::DestAddrReq);
                         };
                         (*protocol, dest)
                     }
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 drop(state);
+                if dest.0 == 0xFFFF_FFFF && !self.options.lock().broadcast {
+                    return SocketOpResult::Err(SockError::Access);
+                }
                 if protocol == IPPROTO_ICMP {
                     return self.deliver_icmp_loopback(buf, dest);
                 }
                 SocketOpResult::Ok(buf.len() as u64)
             }
-            SocketOp::Recv { buf, flags: _ } => {
+            SocketOp::Recv { buf, flags } => {
+                // `raw_recvmsg`: MSG_OOB → EOPNOTSUPP.
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(SockError::NotSupported);
+                }
                 let mut state = self.state.lock();
                 if let SocketState::InetRaw { inbox, .. } = &mut *state {
                     if let Some(pkt) = inbox.pop_front() {
@@ -4174,14 +4444,21 @@ impl SocketFile {
                 }
                 SocketOpResult::Err(SockError::NotConnected)
             }
-            SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            // `inet_shutdown`: bad `how` → EINVAL; unconnected (TCP_CLOSE) →
+            // ENOTCONN; connected → 0.
+            SocketOp::Shutdown { how } => {
+                if how > SHUT_RDWR {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                match &*self.state.lock() {
+                    SocketState::InetRaw { peer: Some(_), .. } => SocketOpResult::Ok(0),
+                    _ => SocketOpResult::Err(SockError::NotConnected),
+                }
+            }
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
-    /// Loopback ICMP echo: pushes the payload to our own inbox so
-    /// a paired `recvfrom` returns the same bytes. Minimal moral
-    /// equivalent of the in-kernel ICMP path.
     fn deliver_icmp_loopback(&self, buf: &[u8], dest: (u32, u16)) -> SocketOpResult {
         let mut state = self.state.lock();
         if let SocketState::InetRaw { inbox, .. } = &mut *state {
@@ -4418,10 +4695,16 @@ impl SocketFile {
                 // the commit happens after the server end is safely queued (so a
                 // listener torn down mid-connect leaves the client fd usable,
                 // not half-connected).
+                // `unix_stream_connect` switch (after the peer lookup):
+                // TCP_CLOSE proceeds, TCP_ESTABLISHED is EISCONN, anything
+                // else (a listener) is EINVAL.
                 let local_addr = match &*self.state.lock() {
                     SocketState::Fresh => None,
                     SocketState::UnixBound { addr } => Some(addr.clone()),
-                    _ => return SocketOpResult::Err(SockError::AlreadyConnected),
+                    SocketState::UnixConnected { .. } => {
+                        return SocketOpResult::Err(SockError::AlreadyConnected)
+                    }
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 // Mint two ring buffers; one direction each.
                 let a_to_b = Arc::new(RingBuf::new());
@@ -4540,6 +4823,20 @@ impl SocketFile {
                 self.set_peer_groups(listener_groups);
                 SocketOpResult::Ok(0)
             }
+            // `unix_stream_sendmsg`: a destination address on a stream socket
+            // is EISCONN when connected and EOPNOTSUPP otherwise (MSG_OOB is
+            // checked first, in `do_send`'s leading test).
+            SocketOp::Send {
+                flags,
+                addr: Some(_),
+                ..
+            } if self.kind == SOCK_STREAM && flags & MSG_OOB == 0 => {
+                if matches!(&*self.state.lock(), SocketState::UnixConnected { .. }) {
+                    SocketOpResult::Err(SockError::AlreadyConnected)
+                } else {
+                    SocketOpResult::Err(SockError::NotSupported)
+                }
+            }
             SocketOp::Send {
                 buf,
                 flags,
@@ -4623,9 +4920,11 @@ impl SocketFile {
     fn dispatch_inet_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
-                // `inet_bind_sk`: `addr_len < sizeof(struct sockaddr_in)` →
-                // -EINVAL, then a family other than AF_INET → -EAFNOSUPPORT
-                // (AF_UNSPEC is tolerated only with INADDR_ANY).
+                // `inet_bind_sk` + `__inet_bind` check order: short addrlen
+                // (EINVAL) → foreign family (EAFNOSUPPORT; AF_UNSPEC only
+                // with INADDR_ANY) → non-local address (EADDRNOTAVAIL) →
+                // privileged port (EACCES) → already bound (EINVAL) → port
+                // conflict (EADDRINUSE, `inet_csk_get_port`).
                 if addr.body.len() < SOCKADDR_IN_BODY_LEN {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
@@ -4637,44 +4936,59 @@ impl SocketFile {
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
                 let ip =
                     u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
+                if let Err(e) = self.inet4_bind_precheck(ip, Some(port)) {
+                    return SocketOpResult::Err(e);
+                }
                 let mut state = self.state.lock();
-                match &*state {
-                    SocketState::Fresh => {
-                        let key = (self.net_ns_id(), ip, port);
-                        let reuseaddr = self.options.lock().reuseaddr;
-                        let mut listeners = INET_LISTENERS.lock();
-                        let map = listeners.get_or_insert_with(BTreeMap::new);
-                        // SO_REUSEADDR (Linux): permit double-bind to
-                        // the same (addr, port) when the option is
-                        // set. Linux ref: net/ipv4/inet_connection_sock.c
-                        // inet_csk_bind_conflict() — `reuse` short-
-                        // circuits the conflict check.
-                        if map.contains_key(&key) && !reuseaddr {
-                            return SocketOpResult::Err(SockError::AddrInUse);
-                        }
+                if !matches!(&*state, SocketState::Fresh) {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                match self.inet_tcp_claim_port(ip, port) {
+                    Ok(port) => {
                         *state = SocketState::InetListener {
                             addr: ip,
                             port,
                             backlog: 0,
                             pending: VecDeque::new(),
                             listen_id: None,
+                            listening: false,
                         };
                         SocketOpResult::Ok(0)
                     }
-                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                    Err(e) => SocketOpResult::Err(e),
                 }
             }
             SocketOp::Listen { backlog } => {
                 let mut state = self.state.lock();
+                // `__inet_listen_sk` → `inet_csk_listen_start` → `get_port(sk,
+                // 0)`: listen(2) on a never-bound TCP socket autobinds it to an
+                // ephemeral port on INADDR_ANY rather than failing.
+                if matches!(&*state, SocketState::Fresh) {
+                    match self.inet_tcp_claim_port(0, 0) {
+                        Ok(port) => {
+                            *state = SocketState::InetListener {
+                                addr: 0,
+                                port,
+                                backlog: 0,
+                                pending: VecDeque::new(),
+                                listen_id: None,
+                                listening: false,
+                            };
+                        }
+                        Err(e) => return SocketOpResult::Err(e),
+                    }
+                }
                 match &mut *state {
                     SocketState::InetListener {
                         addr,
                         port,
                         backlog: b,
                         listen_id,
+                        listening,
                         ..
                     } => {
                         *b = backlog;
+                        *listening = true;
                         let addr = *addr;
                         let port = *port;
                         // Non-loopback (0.0.0.0 / wired IP) binds also open a
@@ -4704,22 +5018,29 @@ impl SocketFile {
                         map.insert(key, self.clone());
                         SocketOpResult::Ok(0)
                     }
+                    // `__inet_listen_sk`: any state but CLOSE/LISTEN → EINVAL.
                     _ => SocketOpResult::Err(SockError::InvalidArg),
                 }
             }
             SocketOp::Accept => {
+                // `inet_csk_accept`: `sk_state != TCP_LISTEN` → EINVAL. A
+                // bound-but-not-listening socket is NOT an empty listener.
+                let kernel_listen_id = {
+                    let state = self.state.lock();
+                    match &*state {
+                        SocketState::InetListener {
+                            listening: true,
+                            listen_id,
+                            ..
+                        } => *listen_id,
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
                 // Kernel-stack listener first: pop a completed off-box
                 // connection from the accept-queue (its SYN/handshake was
                 // driven by tcp_stack::rx_handler) and wrap the child TCB
                 // as an InetWired endpoint whose send/recv forward to the
                 // stack.
-                let kernel_listen_id = {
-                    let state = self.state.lock();
-                    match &*state {
-                        SocketState::InetListener { listen_id, .. } => *listen_id,
-                        _ => None,
-                    }
-                };
                 if let Some(lid) = kernel_listen_id {
                     if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(lid) {
                         let child = SocketFile::new(AF_INET, SOCK_STREAM);
@@ -4751,7 +5072,11 @@ impl SocketFile {
                 // Loopback pending queue.
                 let mut state = self.state.lock();
                 match &mut *state {
-                    SocketState::InetListener { pending, .. } => {
+                    SocketState::InetListener {
+                        listening: true,
+                        pending,
+                        ..
+                    } => {
                         if let Some(s) = pending.pop_front() {
                             SocketOpResult::Accepted {
                                 socket: s,
@@ -4765,8 +5090,22 @@ impl SocketFile {
                 }
             }
             SocketOp::Connect { addr } => {
-                // `tcp_v4_connect`: `addr_len < sizeof(struct sockaddr_in)` →
-                // -EINVAL; `sin_family != AF_INET` → -EAFNOSUPPORT.
+                // `__inet_stream_connect`: AF_UNSPEC dissolves the association
+                // (`tcp_disconnect`) and succeeds.
+                if addr.family == AF_UNSPEC {
+                    self.inet_stream_disconnect();
+                    return SocketOpResult::Ok(0);
+                }
+                // The socket-state switch runs BEFORE `tcp_v4_connect` looks at
+                // the address: a connected socket is EISCONN, and so is a
+                // listener (`sk_state != TCP_CLOSE`). Checking state first also
+                // keeps a doomed connect from enqueueing a ghost server end on
+                // the target listener.
+                if !Self::inet_stream_connectable(&self.state.lock()) {
+                    return SocketOpResult::Err(SockError::AlreadyConnected);
+                }
+                // `tcp_v4_connect`: addrlen < sizeof(sockaddr_in) → EINVAL,
+                // then a foreign family → EAFNOSUPPORT.
                 if addr.body.len() < SOCKADDR_IN_BODY_LEN {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
@@ -4804,12 +5143,14 @@ impl SocketFile {
                             ) {
                                 Ok(tcb_id) => {
                                     let mut state = self.state.lock();
-                                    if matches!(&*state, SocketState::Fresh) {
+                                    if Self::inet_stream_connectable(&state) {
                                         *state = SocketState::InetWired {
                                             tcb_id,
                                             peer_addr: ip,
                                             peer_port: port,
                                         };
+                                        drop(state);
+                                        self.inet_tcp_release_port();
                                         return SocketOpResult::Ok(0);
                                     }
                                     return SocketOpResult::Err(SockError::AlreadyConnected);
@@ -4838,7 +5179,12 @@ impl SocketFile {
                 }
                 {
                     let mut lst = listener.state.lock();
-                    if let SocketState::InetListener { pending, .. } = &mut *lst {
+                    if let SocketState::InetListener {
+                        listening: true,
+                        pending,
+                        ..
+                    } = &mut *lst
+                    {
                         pending.push_back(server_end);
                         // Durable accept wake; poll_readiness clears on accept.
                         listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
@@ -4849,17 +5195,21 @@ impl SocketFile {
                     }
                 }
                 let mut state = self.state.lock();
-                match &*state {
-                    SocketState::Fresh => {
-                        *state = SocketState::InetConnected {
-                            tx: a_to_b,
-                            rx: b_to_a,
-                            peer_addr: ip,
-                            peer_port: port,
-                        };
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::AlreadyConnected),
+                if Self::inet_stream_connectable(&state) {
+                    *state = SocketState::InetConnected {
+                        tx: a_to_b,
+                        rx: b_to_a,
+                        peer_addr: ip,
+                        peer_port: port,
+                    };
+                    drop(state);
+                    // The loopback connected state does not model a local
+                    // port, so a client that bound first gives its port back
+                    // rather than leaking the reservation.
+                    self.inet_tcp_release_port();
+                    SocketOpResult::Ok(0)
+                } else {
+                    SocketOpResult::Err(SockError::AlreadyConnected)
                 }
             }
             SocketOp::Send {
@@ -4870,18 +5220,23 @@ impl SocketFile {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(e) => SocketOpResult::Err(e),
             },
-            SocketOp::Recv { buf, flags } => match self.do_recv(buf, flags) {
-                Ok((n, peer)) => SocketOpResult::Received { n, peer },
-                Err(e) => SocketOpResult::Err(e),
-            },
+            SocketOp::Recv { buf, flags } => {
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(self.inet_stream_oob_recv_error());
+                }
+                match self.do_recv(buf, flags) {
+                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
             SocketOp::Shutdown { how } => {
-                // Linux `inet_shutdown` (net/ipv4/af_inet.c) validates `how`
-                // before looking at the socket state: -EINVAL.
+                // `inet_shutdown`: a `how` outside SHUT_RD..=SHUT_RDWR is
+                // EINVAL before the socket state is consulted.
                 if how > SHUT_RDWR {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                let state = self.state.lock();
-                match &*state {
+                let mut state = self.state.lock();
+                match &mut *state {
                     SocketState::InetConnected { tx, rx, .. } => {
                         if how == SHUT_WR || how == SHUT_RDWR {
                             tx.close();
@@ -4909,10 +5264,239 @@ impl SocketFile {
                             Err(e) => SocketOpResult::Err(SockError::from_stack(e)),
                         }
                     }
+                    // `inet_shutdown` TCP_LISTEN arm: not an error; a shutdown
+                    // that includes the receive side stops the listener
+                    // (`tcp_disconnect`).
+                    SocketState::InetListener {
+                        listening: true, ..
+                    } => {
+                        if how != SHUT_WR {
+                            self.inet_stop_listening_locked(&mut state);
+                        }
+                        SocketOpResult::Ok(0)
+                    }
+                    // TCP_CLOSE (fresh or merely bound) → ENOTCONN.
                     _ => SocketOpResult::Err(SockError::NotConnected),
                 }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// `__inet_stream_connect`'s SS_UNCONNECTED + TCP_CLOSE case: a fresh or
+    /// merely-bound socket may connect; anything else is EISCONN.
+    fn inet_stream_connectable(state: &SocketState) -> bool {
+        matches!(
+            state,
+            SocketState::Fresh
+                | SocketState::InetListener {
+                    listening: false,
+                    ..
+                }
+                | SocketState::Inet6Listener {
+                    listening: false,
+                    ..
+                }
+        )
+    }
+
+    /// `tcp_recvmsg_locked` with MSG_OOB: a listener is ENOTCONN; otherwise
+    /// `tcp_recv_urg` finds no urgent byte (NARF carries none) → EINVAL.
+    fn inet_stream_oob_recv_error(&self) -> SockError {
+        if matches!(
+            &*self.state.lock(),
+            SocketState::InetListener {
+                listening: true,
+                ..
+            } | SocketState::Inet6Listener {
+                listening: true,
+                ..
+            }
+        ) {
+            SockError::NotConnected
+        } else {
+            SockError::InvalidArg
+        }
+    }
+
+    /// connect(AF_UNSPEC) on a stream socket — `tcp_disconnect`: drop an
+    /// established association or stop listening, keeping any bound port.
+    fn inet_stream_disconnect(self: &Arc<Self>) {
+        let mut state = self.state.lock();
+        match &*state {
+            SocketState::InetConnected { tx, rx, .. }
+            | SocketState::Inet6Connected { tx, rx, .. } => {
+                tx.close();
+                rx.close();
+                *state = SocketState::Fresh;
+                drop(state);
+                narf_net::readiness::notify(0);
+            }
+            SocketState::InetWired { tcb_id, .. } => {
+                let id = *tcb_id;
+                *state = SocketState::Fresh;
+                drop(state);
+                let _ = narf_net::tcp_stack::close(id);
+                crate::handlers::clear_tcb_owner(id);
+            }
+            SocketState::InetListener {
+                listening: true, ..
+            }
+            | SocketState::Inet6Listener {
+                listening: true, ..
+            } => self.inet_stop_listening_locked(&mut state),
+            _ => {}
+        }
+    }
+
+    /// Take a listening INET socket back to bound-but-closed
+    /// (`inet_csk_listen_stop`): unpublish it, drop its kernel-stack listener
+    /// and its not-yet-accepted connections. Caller holds `self.state`.
+    fn inet_stop_listening_locked(self: &Arc<Self>, state: &mut SocketState) {
+        match state {
+            SocketState::InetListener {
+                addr,
+                port,
+                pending,
+                listen_id,
+                listening,
+                ..
+            } => {
+                if let Some(id) = listen_id.take() {
+                    narf_net::tcp_stack::remove_tcb(id);
+                    crate::handlers::clear_tcb_owner(id);
+                }
+                pending.clear();
+                *listening = false;
+                let key = (self.net_ns_id(), *addr, *port);
+                if let Some(map) = INET_LISTENERS.lock().as_mut() {
+                    if map.get(&key).is_some_and(|l| Arc::ptr_eq(l, self)) {
+                        map.remove(&key);
+                    }
+                }
+            }
+            SocketState::Inet6Listener {
+                addr,
+                port,
+                pending,
+                listening,
+                ..
+            } => {
+                pending.clear();
+                *listening = false;
+                let key = (*addr, *port);
+                if let Some(map) = INET6_LISTENERS.lock().as_mut() {
+                    if map.get(&key).is_some_and(|l| Arc::ptr_eq(l, self)) {
+                        map.remove(&key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The address-dependent part of `__inet_bind` / `raw_bind` that
+    /// precedes the socket-state check: EADDRNOTAVAIL for an address no local
+    /// interface owns (unless IP_FREEBIND / IP_TRANSPARENT), then — when
+    /// `port` is `Some` — EACCES for a port below
+    /// `ip_unprivileged_port_start` without CAP_NET_BIND_SERVICE.
+    fn inet4_bind_precheck(&self, ip: u32, port: Option<u16>) -> Result<(), SockError> {
+        let freebind = self.options.lock().ip_freebind;
+        if !inet4_bindable(self.net_ns_id(), ip, freebind) {
+            return Err(SockError::AddrNotAvail);
+        }
+        if port.is_some_and(inet_port_denied) {
+            return Err(SockError::Access);
+        }
+        Ok(())
+    }
+
+    /// Reserve `(ip, port)` for this TCP socket — `inet_csk_get_port`.
+    /// Port 0 picks an ephemeral port. Two bindings conflict when they share
+    /// a port and their addresses are equal or either is INADDR_ANY, unless
+    /// both set SO_REUSEPORT, or both set SO_REUSEADDR and the existing one
+    /// is not listening (`inet_bind_conflict`).
+    fn inet_tcp_claim_port(self: &Arc<Self>, ip: u32, port: u16) -> Result<u16, SockError> {
+        let ns = self.net_ns_id();
+        let (reuseaddr, reuseport) = {
+            let o = self.options.lock();
+            (o.reuseaddr, o.reuseport)
+        };
+        let listeners = INET_LISTENERS.lock();
+        let mut binds = INET_TCP_BINDS.lock();
+        binds.retain(|b| b.owner.strong_count() != 0);
+        let me = Arc::as_ptr(self);
+        let conflicts = |binds: &Vec<InetTcpBind>, port: u16| {
+            binds.iter().any(|b| {
+                if b.ns != ns || b.port != port || !(b.ip == ip || b.ip == 0 || ip == 0) {
+                    return false;
+                }
+                if Weak::as_ptr(&b.owner) == me {
+                    return false;
+                }
+                let listening = listeners.as_ref().is_some_and(|m| {
+                    m.get(&(b.ns, b.ip, b.port))
+                        .is_some_and(|l| Arc::as_ptr(l) == Weak::as_ptr(&b.owner))
+                });
+                let shared = (reuseport && b.reuseport) || (reuseaddr && b.reuseaddr && !listening);
+                !shared
+            })
+        };
+        let (port, ephemeral) = if port == 0 {
+            let mut rejected = Vec::new();
+            let mut chosen = None;
+            for _ in 0..64 {
+                let Some(p) = crate::ephemeral_port::alloc(
+                    AF_INET,
+                    0,
+                    crate::ephemeral_port::SocketProto::Tcp,
+                ) else {
+                    break;
+                };
+                if conflicts(&binds, p) {
+                    rejected.push(p);
+                } else {
+                    chosen = Some(p);
+                    break;
+                }
+            }
+            for p in rejected {
+                crate::ephemeral_port::free(AF_INET, 0, crate::ephemeral_port::SocketProto::Tcp, p);
+            }
+            // `inet_csk_find_open_port` exhausting the range → EADDRINUSE.
+            (chosen.ok_or(SockError::AddrInUse)?, true)
+        } else {
+            if conflicts(&binds, port) {
+                return Err(SockError::AddrInUse);
+            }
+            (port, false)
+        };
+        binds.push(InetTcpBind {
+            owner: Arc::downgrade(self),
+            ns,
+            ip,
+            port,
+            reuseaddr,
+            reuseport,
+            ephemeral,
+        });
+        Ok(port)
+    }
+
+    /// Drop this socket's TCP port reservation (close, or connect from a
+    /// bound state in the loopback model).
+    fn inet_tcp_release_port(&self) {
+        let me: *const SocketFile = self;
+        let mut freed = Vec::new();
+        INET_TCP_BINDS.lock().retain(|b| {
+            let mine = Weak::as_ptr(&b.owner) == me;
+            if mine && b.ephemeral {
+                freed.push(b.port);
+            }
+            !mine && b.owner.strong_count() != 0
+        });
+        for p in freed {
+            crate::ephemeral_port::free(AF_INET, 0, crate::ephemeral_port::SocketProto::Tcp, p);
         }
     }
 
@@ -4990,6 +5574,17 @@ impl SocketFile {
                 SocketOpResult::Ok(0)
             }
             SocketOp::Connect { addr } => {
+                // `unix_dgram_connect`: AF_UNSPEC breaks the association
+                // ("1003.1g breaking connected state with AF_UNSPEC") and
+                // succeeds; any other non-AF_UNIX family fails
+                // `unix_validate_addr` with EINVAL.
+                if addr.family == AF_UNSPEC {
+                    *self.connected_unix_path.lock() = None;
+                    if let SocketState::UnixDgram { peer, .. } = &mut *self.state.lock() {
+                        *peer = None;
+                    }
+                    return SocketOpResult::Ok(0);
+                }
                 if addr.family != AF_UNIX {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
@@ -5059,6 +5654,10 @@ impl SocketFile {
                 let (local_addr, dest_addr, connected_path) = match &*state {
                     SocketState::UnixDgram { addr: la, peer, .. } => {
                         let dest = if let Some(a) = addr {
+                            // `unix_validate_addr`: sun_family != AF_UNIX → EINVAL.
+                            if a.family != AF_UNIX {
+                                return SocketOpResult::Err(SockError::InvalidArg);
+                            }
                             match UnixAddr::parse(&a.body) {
                                 Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
                                 _ => return SocketOpResult::Err(SockError::InvalidArg),
@@ -5080,6 +5679,9 @@ impl SocketFile {
                     // SOCK_DGRAM socket — sd_notify sends from such a socket.)
                     SocketState::Fresh => {
                         let dest = match addr {
+                            Some(a) if a.family != AF_UNIX => {
+                                return SocketOpResult::Err(SockError::InvalidArg)
+                            }
                             Some(a) => match UnixAddr::parse(&a.body) {
                                 Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
                                 _ => return SocketOpResult::Err(SockError::InvalidArg),
@@ -5262,10 +5864,17 @@ impl SocketFile {
                     }
                     return SocketOpResult::Received { n, peer };
                 }
-                SocketOpResult::Err(SockError::NotConnected)
+                // `unix_dgram_recvmsg` needs neither a name nor a peer: an
+                // unbound socket just has an empty queue (EAGAIN / block).
+                SocketOpResult::Err(SockError::WouldBlock)
             }
             SocketOp::Listen { .. } | SocketOp::Accept => {
                 SocketOpResult::Err(SockError::NotSupported)
+            }
+            // `unix_shutdown`: `mode` outside SHUT_RD..=SHUT_RDWR → EINVAL;
+            // no ENOTCONN for an unconnected AF_UNIX socket.
+            SocketOp::Shutdown { how } if how > SHUT_RDWR => {
+                SocketOpResult::Err(SockError::InvalidArg)
             }
             SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
@@ -5277,31 +5886,35 @@ impl SocketFile {
     fn dispatch_inet6_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
-                // `inet6_bind`: `addr_len < SIN6_LEN_RFC2133` (24) → -EINVAL, then
-                // `sin6_family != AF_INET6` → -EAFNOSUPPORT.
-                if addr.body.len() < 22 {
-                    return SocketOpResult::Err(SockError::InvalidArg);
+                // `inet6_bind_sk`: addrlen < SIN6_LEN_RFC2133 → EINVAL, then
+                // `__inet6_bind`: a foreign family → EAFNOSUPPORT, then the
+                // privileged-port check (EACCES), double bind (EINVAL) and the
+                // port conflict (EADDRINUSE).
+                let (ip, port) = match inet6_sockaddr(&addr) {
+                    Ok(v) => v,
+                    Err(e) => return SocketOpResult::Err(e),
+                };
+                if port != 0
+                    && port < INET_PROT_SOCK
+                    && !crate::handlers::task_capable(
+                        crate::handlers::current_task_id(),
+                        CAP_NET_BIND_SERVICE,
+                    )
+                {
+                    return SocketOpResult::Err(SockError::Access);
                 }
-                if addr.family != AF_INET6 {
-                    return SocketOpResult::Err(SockError::AfNoSupport);
-                }
-                // sockaddr_in6: port (u16 BE) + flowinfo (u32) + addr ([u8; 16])
-                let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let mut ip = [0u8; 16];
-                // flowinfo = body[2..6]; addr = body[6..22]
-                ip.copy_from_slice(&addr.body[6..22]);
                 let mut state = self.state.lock();
                 if matches!(&*state, SocketState::Fresh) {
-                    let mut listeners = INET6_LISTENERS.lock();
-                    let map = listeners.get_or_insert_with(BTreeMap::new);
-                    if map.contains_key(&(ip, port)) {
-                        return SocketOpResult::Err(SockError::AddrInUse);
-                    }
+                    let port = match self.inet6_claim_port(ip, port) {
+                        Ok(p) => p,
+                        Err(e) => return SocketOpResult::Err(e),
+                    };
                     *state = SocketState::Inet6Listener {
                         addr: ip,
                         port,
                         backlog: 0,
                         pending: VecDeque::new(),
+                        listening: false,
                     };
                     return SocketOpResult::Ok(0);
                 }
@@ -5309,14 +5922,31 @@ impl SocketFile {
             }
             SocketOp::Listen { backlog } => {
                 let mut state = self.state.lock();
+                // `inet_csk_listen_start` autobinds a never-bound socket to an
+                // ephemeral port on the unspecified address.
+                if matches!(&*state, SocketState::Fresh) {
+                    let port = match self.inet6_claim_port([0u8; 16], 0) {
+                        Ok(p) => p,
+                        Err(e) => return SocketOpResult::Err(e),
+                    };
+                    *state = SocketState::Inet6Listener {
+                        addr: [0u8; 16],
+                        port,
+                        backlog: 0,
+                        pending: VecDeque::new(),
+                        listening: false,
+                    };
+                }
                 if let SocketState::Inet6Listener {
                     addr,
                     port,
                     backlog: b,
+                    listening,
                     ..
                 } = &mut *state
                 {
                     *b = backlog;
+                    *listening = true;
                     let key = (*addr, *port);
                     drop(state);
                     let mut listeners = INET6_LISTENERS.lock();
@@ -5324,12 +5954,19 @@ impl SocketFile {
                     map.insert(key, self.clone());
                     SocketOpResult::Ok(0)
                 } else {
+                    // `__inet_listen_sk`: not CLOSE/LISTEN → EINVAL.
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
             SocketOp::Accept => {
                 let mut state = self.state.lock();
-                if let SocketState::Inet6Listener { pending, .. } = &mut *state {
+                // `inet_csk_accept`: not TCP_LISTEN → EINVAL.
+                if let SocketState::Inet6Listener {
+                    listening: true,
+                    pending,
+                    ..
+                } = &mut *state
+                {
                     if let Some(s) = pending.pop_front() {
                         SocketOpResult::Accepted {
                             socket: s,
@@ -5343,17 +5980,20 @@ impl SocketFile {
                 }
             }
             SocketOp::Connect { addr } => {
-                // `tcp_v6_connect`: `addr_len < SIN6_LEN_RFC2133` (24) → -EINVAL, then
-                // `sin6_family != AF_INET6` → -EAFNOSUPPORT.
-                if addr.body.len() < 22 {
-                    return SocketOpResult::Err(SockError::InvalidArg);
+                // `__inet_stream_connect`: AF_UNSPEC disconnects; the state
+                // switch (EISCONN) precedes `tcp_v6_connect`'s address checks
+                // (EINVAL short, EAFNOSUPPORT foreign family).
+                if addr.family == AF_UNSPEC {
+                    self.inet_stream_disconnect();
+                    return SocketOpResult::Ok(0);
                 }
-                if addr.family != AF_INET6 {
-                    return SocketOpResult::Err(SockError::AfNoSupport);
+                if !Self::inet_stream_connectable(&self.state.lock()) {
+                    return SocketOpResult::Err(SockError::AlreadyConnected);
                 }
-                let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&addr.body[6..22]);
+                let (ip, port) = match inet6_sockaddr(&addr) {
+                    Ok(v) => v,
+                    Err(e) => return SocketOpResult::Err(e),
+                };
                 let listener = {
                     let listeners = INET6_LISTENERS.lock();
                     let m = listeners.as_ref();
@@ -5382,7 +6022,12 @@ impl SocketFile {
                 }
                 {
                     let mut lst = listener.state.lock();
-                    if let SocketState::Inet6Listener { pending, .. } = &mut *lst {
+                    if let SocketState::Inet6Listener {
+                        listening: true,
+                        pending,
+                        ..
+                    } = &mut *lst
+                    {
                         pending.push_back(server_end);
                         // Durable accept wake; poll_readiness clears on accept.
                         listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
@@ -5393,13 +6038,17 @@ impl SocketFile {
                     }
                 }
                 let mut state = self.state.lock();
-                if matches!(&*state, SocketState::Fresh) {
+                if Self::inet_stream_connectable(&state) {
                     *state = SocketState::Inet6Connected {
                         tx: a_to_b,
                         rx: b_to_a,
                         peer_addr: ip,
                         peer_port: port,
                     };
+                    drop(state);
+                    // The loopback connected state models no local port: a
+                    // client that bound first gives its reservation back.
+                    self.inet6_release_port();
                     SocketOpResult::Ok(0)
                 } else {
                     SocketOpResult::Err(SockError::AlreadyConnected)
@@ -5413,27 +6062,98 @@ impl SocketFile {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(e) => SocketOpResult::Err(e),
             },
-            SocketOp::Recv { buf, flags } => match self.do_recv(buf, flags) {
-                Ok((n, peer)) => SocketOpResult::Received { n, peer },
-                Err(e) => SocketOpResult::Err(e),
-            },
+            SocketOp::Recv { buf, flags } => {
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(self.inet_stream_oob_recv_error());
+                }
+                match self.do_recv(buf, flags) {
+                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
             SocketOp::Shutdown { how } => {
-                let state = self.state.lock();
-                if let SocketState::Inet6Connected { tx, rx, .. } = &*state {
-                    if how == SHUT_WR || how == SHUT_RDWR {
-                        tx.close();
+                // `inet_shutdown` (shared by AF_INET6): bad `how` → EINVAL,
+                // TCP_CLOSE → ENOTCONN, TCP_LISTEN → 0.
+                if how > SHUT_RDWR {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::Inet6Connected { tx, rx, .. } => {
+                        if how == SHUT_WR || how == SHUT_RDWR {
+                            tx.close();
+                        }
+                        if how == SHUT_RD || how == SHUT_RDWR {
+                            rx.close();
+                        }
+                        drop(state);
+                        narf_net::readiness::notify(0);
+                        SocketOpResult::Ok(0)
                     }
-                    if how == SHUT_RD || how == SHUT_RDWR {
-                        rx.close();
+                    SocketState::Inet6Listener {
+                        listening: true, ..
+                    } => {
+                        if how != SHUT_WR {
+                            self.inet_stop_listening_locked(&mut state);
+                        }
+                        SocketOpResult::Ok(0)
                     }
-                    drop(state);
-                    narf_net::readiness::notify(0);
-                    SocketOpResult::Ok(0)
-                } else {
-                    SocketOpResult::Err(SockError::NotConnected)
+                    _ => SocketOpResult::Err(SockError::NotConnected),
                 }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// AF_INET6 stream port reservation. Port 0 draws an ephemeral port;
+    /// otherwise a port already held by another AF_INET6 stream socket on the
+    /// same (or the unspecified) address is EADDRINUSE unless both set
+    /// SO_REUSEPORT (a simplified `inet_bind_conflict`).
+    fn inet6_claim_port(self: &Arc<Self>, ip: [u8; 16], port: u16) -> Result<u16, SockError> {
+        let reuseport = self.options.lock().reuseport;
+        let mut binds = INET6_TCP_BINDS.lock();
+        binds.retain(|b| b.owner.strong_count() != 0);
+        let (port, ephemeral) = if port == 0 {
+            let p =
+                crate::ephemeral_port::alloc(AF_INET6, 0, crate::ephemeral_port::SocketProto::Tcp)
+                    .ok_or(SockError::AddrInUse)?;
+            (p, true)
+        } else {
+            let unspecified = [0u8; 16];
+            let me = Arc::as_ptr(self);
+            if binds.iter().any(|b| {
+                b.port == port
+                    && Weak::as_ptr(&b.owner) != me
+                    && (b.ip == ip || b.ip == unspecified || ip == unspecified)
+                    && !(reuseport && b.reuseport)
+            }) {
+                return Err(SockError::AddrInUse);
+            }
+            (port, false)
+        };
+        binds.push(Inet6TcpBind {
+            owner: Arc::downgrade(self),
+            ip,
+            port,
+            reuseport,
+            ephemeral,
+        });
+        Ok(port)
+    }
+
+    /// Drop this socket's AF_INET6 port reservation.
+    fn inet6_release_port(&self) {
+        let me: *const SocketFile = self;
+        let mut freed = Vec::new();
+        INET6_TCP_BINDS.lock().retain(|b| {
+            let mine = Weak::as_ptr(&b.owner) == me;
+            if mine && b.ephemeral {
+                freed.push(b.port);
+            }
+            !mine && b.owner.strong_count() != 0
+        });
+        for p in freed {
+            crate::ephemeral_port::free(AF_INET6, 0, crate::ephemeral_port::SocketProto::Tcp, p);
         }
     }
 
@@ -6311,9 +7031,35 @@ fn unbind_path_key(key: &UnixPathKey) -> bool {
 /// connect path serves them until the NIC TX side wires in.
 static INET_LISTENERS: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(None);
 
+/// One AF_INET stream port reservation (the `inet_bind_bucket` owner list),
+/// held from bind(2) (or listen(2) autobind) until close whether or not the
+/// socket listens, so a second bind of the port is EADDRINUSE as
+/// `inet_csk_get_port` reports it. `owner` is weak: a socket dropped without
+/// `unregister` simply stops conflicting.
+struct InetTcpBind {
+    owner: Weak<SocketFile>,
+    ns: u64,
+    ip: u32,
+    port: u16,
+    reuseaddr: bool,
+    reuseport: bool,
+    ephemeral: bool,
+}
+static INET_TCP_BINDS: IrqSafeSpinLock<Vec<InetTcpBind>> = IrqSafeSpinLock::new(Vec::new());
+
 /// AF_INET6 listener registry keyed by (ipv6, port). Same loopback-
 /// only constraint as INET_LISTENERS.
 static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new(None);
+
+/// One AF_INET6 stream port reservation — see `InetTcpBind`.
+struct Inet6TcpBind {
+    owner: Weak<SocketFile>,
+    ip: [u8; 16],
+    port: u16,
+    reuseport: bool,
+    ephemeral: bool,
+}
+static INET6_TCP_BINDS: IrqSafeSpinLock<Vec<Inet6TcpBind>> = IrqSafeSpinLock::new(Vec::new());
 
 /// AF_UNIX datagram-bound registry: path → socket.
 static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =

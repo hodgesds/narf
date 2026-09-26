@@ -25,7 +25,9 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     // A pathname AF_UNIX bind materialises a real S_IFSOCK inode in Linux.
     // Grab the path before the op consumes `addr` (family is checked in the
     // op; AF_UNIX bodies are the sun_path bytes).
-    let unix_path: Option<alloc::string::String> = if addr.family == crate::socket::AF_UNIX {
+    let unix_path: Option<alloc::string::String> = if addr.family == crate::socket::AF_UNIX
+        && sock.domain == crate::socket::AF_UNIX
+    {
         core::str::from_utf8(&addr.body)
             .ok()
             .map(|s| alloc::string::String::from(s.trim_end_matches('\0')))
@@ -36,8 +38,24 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     // socket.  The registry key is consequently the inode identity from the
     // outset, which lets a later file bind find the same endpoint through a
     // different mount parent.
-    if let Some(p) = unix_path.as_deref() {
-        create_unix_socket_node(p);
+    //
+    // Its `vfs_mknod` runs BEFORE the already-bound test, and an existing
+    // name fails it with EEXIST, which `unix_bind_bsd` reports as
+    // EADDRINUSE — so a path that exists (a stale socket node, a regular
+    // file, …) is EADDRINUSE even for an already-bound socket, while a fresh
+    // path on an already-bound socket falls through to the op's EINVAL (and
+    // must not leave a node behind).
+    // `unix_validate_addr` (an over-long sun_path is EINVAL) runs before the
+    // mknod, so only a well-formed address may create a node.
+    let well_formed = addr.body.len() <= 108;
+    if let Some(p) = unix_path.as_deref().filter(|p| !p.is_empty() && well_formed) {
+        if crate::handlers::unix_path_final_node_exists(p) {
+            ctx.set_return(errno_ret(EADDRINUSE));
+            return;
+        }
+        if sock.is_fresh() {
+            create_unix_socket_node(p);
+        }
     }
     match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),

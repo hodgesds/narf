@@ -176,6 +176,9 @@ pub fn decode_name(msg: &[u8], pos: usize) -> Result<(String, usize), DnsError> 
     let mut p = pos;
     let mut hops = 0usize;
     let mut consumed_at_first_pointer: Option<usize> = None;
+    // Octets the name would occupy uncompressed: each label's length byte
+    // plus its bytes, plus the terminating root label.
+    let mut wire_len = 1usize;
 
     loop {
         if hops > 32 {
@@ -206,6 +209,13 @@ pub fn decode_name(msg: &[u8], pos: usize) -> Result<(String, usize), DnsError> 
                 }
                 if len > 63 || p + 1 + len > msg.len() {
                     return Err(DnsError::BadLabel);
+                }
+                // RFC 1035 §2.3.4 / §3.1: a name is at most 255 octets.
+                // Compression pointers can otherwise splice labels into a
+                // name far longer than any legal one.
+                wire_len += 1 + len;
+                if wire_len > 255 {
+                    return Err(DnsError::BadName);
                 }
                 if !name.is_empty() {
                     name.push('.');

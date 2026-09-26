@@ -426,8 +426,8 @@ impl Tuple {
     }
 }
 
-/// Minimal IPv4 header offsets, no options. Stage-3 callers populate
-/// fixed-format frames, so we can index without parsing.
+/// Fixed IPv4 header offsets. These precede any options, so they hold for
+/// every IHL; the L4 header's offset does not — see [`ipv4_l4_offset`].
 pub const IPV4_OFF_PROTO: usize = 9;
 pub const IPV4_OFF_SRC: usize = 12;
 pub const IPV4_OFF_DST: usize = 16;
@@ -435,12 +435,41 @@ pub const IPV4_MIN_HDR_LEN: usize = 20;
 pub const L4_OFF_SPORT: usize = 0;
 pub const L4_OFF_DPORT: usize = 2;
 
-/// Extract the 5-tuple from a packet whose layout is
-/// `IPv4 header (20 bytes, no options) || L4 header`. For ICMP the
-/// "src/dst port" fields are repurposed: `src_port = (type<<8)|code`,
-/// `dst_port = id`. Returns `None` if the packet is too short.
+/// Offset of the L4 header in an IPv4 packet — `IHL * 4`, validated
+/// against the buffer. `None` when the header length field is malformed.
+///
+/// RFC 791: the transport header starts after IHL 32-bit words, not at a
+/// fixed 20 bytes. Reading it at offset 20 of a packet carrying IP options
+/// (IHL > 5) matched filter rules and keyed conntrack on option bytes, and
+/// pointed NAT's port + checksum rewrite into the options.
+pub fn ipv4_l4_offset(packet: &[u8]) -> Option<usize> {
+    if packet.len() < IPV4_MIN_HDR_LEN {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < IPV4_MIN_HDR_LEN || packet.len() < ihl {
+        return None;
+    }
+    Some(ihl)
+}
+
+/// True iff `packet` is an IPv4 fragment other than the first. Its fragment
+/// offset is non-zero, so what follows the IP header is the middle of the
+/// datagram's payload, not a transport header (RFC 791).
+pub fn ipv4_is_later_fragment(packet: &[u8]) -> bool {
+    packet.len() >= 8 && u16::from_be_bytes([packet[6], packet[7]]) & 0x1FFF != 0
+}
+
+/// Extract the 5-tuple from an IPv4 packet, locating the L4 header via
+/// the IHL. For ICMP the "src/dst port" fields are repurposed:
+/// `src_port = (type<<8)|code`, `dst_port = id`. A non-first fragment has
+/// no L4 header, so its ports are reported as 0 rather than read out of
+/// payload bytes. Returns `None` if the packet is too short or its header
+/// length is malformed.
 pub fn parse_tuple_ipv4(packet: &[u8]) -> Option<Tuple> {
-    if packet.len() < IPV4_MIN_HDR_LEN + 4 {
+    let ihl = ipv4_l4_offset(packet)?;
+    let later_fragment = ipv4_is_later_fragment(packet);
+    if !later_fragment && packet.len() < ihl + 4 {
         return None;
     }
     let proto = packet[IPV4_OFF_PROTO];
@@ -456,7 +485,16 @@ pub fn parse_tuple_ipv4(packet: &[u8]) -> Option<Tuple> {
         packet[IPV4_OFF_DST + 2],
         packet[IPV4_OFF_DST + 3],
     ];
-    let l4 = &packet[IPV4_MIN_HDR_LEN..];
+    if later_fragment {
+        return Some(Tuple {
+            src_ip,
+            dst_ip,
+            src_port: 0,
+            dst_port: 0,
+            proto,
+        });
+    }
+    let l4 = &packet[ihl..];
     match L4Proto::from_u8(proto) {
         L4Proto::Tcp | L4Proto::Udp => {
             let src_port = u16::from_be_bytes([l4[L4_OFF_SPORT], l4[L4_OFF_SPORT + 1]]);

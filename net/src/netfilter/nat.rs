@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::{
-    conntrack, parse_tuple_ipv4, HookPoint, L4Proto, PktCtx, Tuple, Verdict, IPV4_MIN_HDR_LEN,
-    IPV4_OFF_DST, IPV4_OFF_SRC, L4_OFF_DPORT, L4_OFF_SPORT,
+    conntrack, parse_tuple_ipv4, HookPoint, L4Proto, PktCtx, Tuple, Verdict, IPV4_OFF_DST,
+    IPV4_OFF_SRC, L4_OFF_DPORT, L4_OFF_SPORT,
 };
 
 /// First port in the NAT ephemeral range — matches Linux's default
@@ -248,6 +248,30 @@ fn csum_incremental(old_csum: u16, old_word: u16, new_word: u16) -> u16 {
     !(folded as u16)
 }
 
+/// Offset of the L4 header a rewrite may touch: past the IPv4 options
+/// (IHL, not a fixed 20 bytes), and `None` for a non-first fragment, whose
+/// bytes after the IP header are datagram payload — rewriting "ports" or a
+/// "checksum" there silently corrupts the user's data.
+fn l4_rewrite_offset(packet: &[u8]) -> Option<usize> {
+    if super::ipv4_is_later_fragment(packet) {
+        return None;
+    }
+    super::ipv4_l4_offset(packet)
+}
+
+/// Store a rewritten L4 checksum. RFC 768: a computed UDP checksum of zero
+/// is transmitted as all ones, because an on-wire zero means "no checksum";
+/// storing a zero an incremental update produced would silently switch
+/// checksumming off for that datagram (Linux: `CSUM_MANGLED_0`).
+fn put_l4_csum(l4: &mut [u8], csum_off: usize, proto: u8, value: u16) {
+    let value = if value == 0 && proto == 17 {
+        0xFFFF
+    } else {
+        value
+    };
+    l4[csum_off..csum_off + 2].copy_from_slice(&value.to_be_bytes());
+}
+
 /// Update IP src/dst + L4 checksums after rewriting `src_ip`.
 fn rewrite_src_ip(packet: &mut [u8], new_src: [u8; 4]) {
     let old = [
@@ -276,7 +300,10 @@ fn rewrite_src_ip(packet: &mut [u8], new_src: [u8; 4]) {
     // L4 checksum incremental update — TCP at offset 16, UDP at offset 6
     // within the L4 header.
     let proto = packet[9];
-    let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
+    let Some(l4_off) = l4_rewrite_offset(packet) else {
+        return;
+    };
+    let l4 = &mut packet[l4_off..];
     let (csum_off, applies) = match L4Proto::from_u8(proto) {
         L4Proto::Tcp => (16, l4.len() >= 18),
         L4Proto::Udp => (6, l4.len() >= 8),
@@ -296,7 +323,7 @@ fn rewrite_src_ip(packet: &mut [u8], new_src: [u8; 4]) {
                 u16::from_be_bytes([old[2], old[3]]),
                 u16::from_be_bytes([new_src[2], new_src[3]]),
             );
-            l4[csum_off..csum_off + 2].copy_from_slice(&new_l4.to_be_bytes());
+            put_l4_csum(l4, csum_off, proto, new_l4);
         }
     }
 }
@@ -325,7 +352,10 @@ fn rewrite_dst_ip(packet: &mut [u8], new_dst: [u8; 4]) {
     packet[10..12].copy_from_slice(&new_csum.to_be_bytes());
 
     let proto = packet[9];
-    let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
+    let Some(l4_off) = l4_rewrite_offset(packet) else {
+        return;
+    };
+    let l4 = &mut packet[l4_off..];
     let (csum_off, applies) = match L4Proto::from_u8(proto) {
         L4Proto::Tcp => (16, l4.len() >= 18),
         L4Proto::Udp => (6, l4.len() >= 8),
@@ -344,7 +374,7 @@ fn rewrite_dst_ip(packet: &mut [u8], new_dst: [u8; 4]) {
                 u16::from_be_bytes([old[2], old[3]]),
                 u16::from_be_bytes([new_dst[2], new_dst[3]]),
             );
-            l4[csum_off..csum_off + 2].copy_from_slice(&new_l4.to_be_bytes());
+            put_l4_csum(l4, csum_off, proto, new_l4);
         }
     }
 }
@@ -352,7 +382,10 @@ fn rewrite_dst_ip(packet: &mut [u8], new_dst: [u8; 4]) {
 /// Update L4 src port + L4 checksum after rewriting `src_port`.
 fn rewrite_src_port(packet: &mut [u8], new_port: u16) {
     let proto = packet[9];
-    let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
+    let Some(l4_off) = l4_rewrite_offset(packet) else {
+        return;
+    };
+    let l4 = &mut packet[l4_off..];
     if l4.len() < 4 {
         return;
     }
@@ -367,7 +400,7 @@ fn rewrite_src_port(packet: &mut [u8], new_port: u16) {
         let cur = u16::from_be_bytes([l4[csum_off], l4[csum_off + 1]]);
         if cur != 0 || proto == 6 {
             let new_l4 = csum_incremental(cur, old, new_port);
-            l4[csum_off..csum_off + 2].copy_from_slice(&new_l4.to_be_bytes());
+            put_l4_csum(l4, csum_off, proto, new_l4);
         }
     }
 }
@@ -375,7 +408,10 @@ fn rewrite_src_port(packet: &mut [u8], new_port: u16) {
 /// Update L4 dst port + L4 checksum after rewriting `dst_port`.
 fn rewrite_dst_port(packet: &mut [u8], new_port: u16) {
     let proto = packet[9];
-    let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
+    let Some(l4_off) = l4_rewrite_offset(packet) else {
+        return;
+    };
+    let l4 = &mut packet[l4_off..];
     if l4.len() < 4 {
         return;
     }
@@ -390,7 +426,7 @@ fn rewrite_dst_port(packet: &mut [u8], new_port: u16) {
         let cur = u16::from_be_bytes([l4[csum_off], l4[csum_off + 1]]);
         if cur != 0 || proto == 6 {
             let new_l4 = csum_incremental(cur, old, new_port);
-            l4[csum_off..csum_off + 2].copy_from_slice(&new_l4.to_be_bytes());
+            put_l4_csum(l4, csum_off, proto, new_l4);
         }
     }
 }

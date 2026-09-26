@@ -104,13 +104,33 @@ struct FragBuf {
     total: Option<u16>,
     /// Final next-header value (carried in the first fragment).
     nh: u8,
+    /// Monotonic time the first-arriving fragment was received.
+    first_ns: u64,
 }
 
 static FRAGS: IrqSafeSpinLock<BTreeMap<FragKey, FragBuf>> = IrqSafeSpinLock::new(BTreeMap::new());
 
+/// RFC 8200 §4.5: reassembly not complete within 60 seconds of the
+/// first-arriving fragment must be abandoned.
+pub const FRAG_REASSEMBLY_TIMEOUT_NS: u64 = 60_000_000_000;
+
 /// Process a fragment. Returns `Some((nh, body))` if the assembly is
 /// complete; `None` otherwise.
 pub fn process_fragment(
+    src: [u8; 16],
+    dst: [u8; 16],
+    frag_hdr: &[u8],
+    fragment_payload: &[u8],
+) -> Option<(u8, Vec<u8>)> {
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    process_fragment_at(now, src, dst, frag_hdr, fragment_payload)
+}
+
+/// [`process_fragment`] with an explicit clock, so the reassembly timeout
+/// can be exercised deterministically.
+#[doc(hidden)]
+pub fn process_fragment_at(
+    now_ns: u64,
     src: [u8; 16],
     dst: [u8; 16],
     frag_hdr: &[u8],
@@ -127,14 +147,64 @@ pub fn process_fragment(
     let id = u32::from_be_bytes([frag_hdr[4], frag_hdr[5], frag_hdr[6], frag_hdr[7]]);
     let key = FragKey { src, dst, id };
 
+    // RFC 8200 §4.5: a fragment whose offset + length exceeds 65535 is
+    // discarded, and so is a non-final fragment whose length is not a
+    // multiple of 8 octets. The first check also keeps `offset + len` from
+    // overflowing the u16 arithmetic below.
+    let end = frag_offset as usize + fragment_payload.len();
+    if end > u16::MAX as usize || (more && fragment_payload.len() % 8 != 0) {
+        return None;
+    }
+    let end = end as u16;
+
     let mut g = FRAGS.lock();
-    let buf = g.entry(key).or_default();
+    // Abandon reassemblies that outlived the 60 s window. Without this, a
+    // datagram that never completes pins its fragments forever.
+    g.retain(|_, b| now_ns.saturating_sub(b.first_ns) < FRAG_REASSEMBLY_TIMEOUT_NS);
+    let buf = g.entry(key).or_insert_with(|| FragBuf {
+        first_ns: now_ns,
+        ..FragBuf::default()
+    });
+    // RFC 5722 / RFC 8200 §4.5: overlapping fragments abandon the whole
+    // reassembly. An exact duplicate may instead simply be dropped.
+    let mut duplicate = false;
+    for (off, data) in &buf.pieces {
+        let o_end = *off as usize + data.len();
+        if *off == frag_offset && data.as_slice() == fragment_payload {
+            duplicate = true;
+            break;
+        }
+        if (frag_offset as usize) < o_end && (*off as usize) < end as usize {
+            g.remove(&key);
+            return None;
+        }
+    }
+    if duplicate {
+        return None;
+    }
+    // A last fragment that disagrees with an earlier one about where the
+    // datagram ends, or a piece reaching past a known end, cannot belong to
+    // one consistent datagram.
+    let max_end = buf
+        .pieces
+        .iter()
+        .map(|(off, data)| *off as usize + data.len())
+        .max()
+        .unwrap_or(0);
+    let inconsistent = match buf.total {
+        Some(total) => end > total || (!more && end != total),
+        None => !more && max_end > end as usize,
+    };
+    if inconsistent {
+        g.remove(&key);
+        return None;
+    }
     if frag_offset == 0 {
         buf.nh = nh;
     }
     buf.pieces.push((frag_offset, fragment_payload.to_vec()));
     if !more {
-        buf.total = Some(frag_offset + fragment_payload.len() as u16);
+        buf.total = Some(end);
     }
 
     // Have we got everything? Sum the piece lengths and compare to
@@ -299,10 +369,11 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
     // Validate the upper-layer checksum.
     let computed = pseudo_checksum(src_ip, dst_ip, NEXT_HEADER_ICMPV6, body);
     if computed != 0 {
-        // Real RX path: silently drop. Tests synthesise frames with
-        // an already-set checksum so they round-trip to zero.
-        // (Returning false here would let raw socket consumers
-        // re-process the same bytes; better to claim and drop.)
+        // RFC 4443 §2.4 / RFC 4861 §6.1, §7.1: a message whose checksum
+        // does not verify is silently discarded — before it can touch the
+        // neighbour cache, the router list or SLAAC state. Claim it
+        // (return true) so raw-socket consumers don't re-process the bytes.
+        return true;
     }
     match hdr.typ {
         ICMPV6_ECHO_REQUEST => {

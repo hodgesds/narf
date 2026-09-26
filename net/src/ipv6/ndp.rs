@@ -211,11 +211,16 @@ pub enum NdRxResult {
 /// Process an inbound Neighbor Solicitation. If the `target` matches
 /// one of *our* iface addresses, emit a Neighbor Advertisement.
 pub fn on_ns(iface: &str, src_mac_opt: Option<[u8; 6]>, body: &[u8]) -> NdRxResult {
-    if body.len() < 24 || body[0] != ICMPV6_NEIGHBOR_SOLICITATION {
+    // RFC 4861 §7.1.1: ICMP Code must be 0 and the Target Address must not
+    // be multicast.
+    if body.len() < 24 || body[0] != ICMPV6_NEIGHBOR_SOLICITATION || body[1] != 0 {
         return NdRxResult::Ignored;
     }
     let mut target = [0u8; 16];
     target.copy_from_slice(&body[8..24]);
+    if target[0] == 0xFF {
+        return NdRxResult::Ignored;
+    }
     // Walk options and record any Source LL Address.
     let mut sll: Option<[u8; 6]> = None;
     for opt in iter_nd_options(&body[24..]) {
@@ -251,11 +256,16 @@ pub fn on_ns(iface: &str, src_mac_opt: Option<[u8; 6]>, body: &[u8]) -> NdRxResu
 /// Process an inbound Neighbor Advertisement. Update the neighbor
 /// cache; if the target was tentative-DAD, signal `DadConflict`.
 pub fn on_na(iface: &str, body: &[u8]) -> NdRxResult {
-    if body.len() < 24 || body[0] != ICMPV6_NEIGHBOR_ADVERTISEMENT {
+    // RFC 4861 §7.1.2: ICMP Code must be 0 and the Target Address must not
+    // be multicast.
+    if body.len() < 24 || body[0] != ICMPV6_NEIGHBOR_ADVERTISEMENT || body[1] != 0 {
         return NdRxResult::Ignored;
     }
     let mut target = [0u8; 16];
     target.copy_from_slice(&body[8..24]);
+    if target[0] == 0xFF {
+        return NdRxResult::Ignored;
+    }
     let flags = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
     let mut tll: Option<[u8; 6]> = None;
     for opt in iter_nd_options(&body[24..]) {
@@ -315,7 +325,13 @@ pub struct RaPrefix {
 /// list and the prefix list; returns the parsed info so SLAAC can
 /// run against it.
 pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Option<RaInfo> {
-    if body.len() < 16 || body[0] != ICMPV6_ROUTER_ADVERTISEMENT {
+    // RFC 4861 §6.1.2: ICMP Code must be 0, and the source must be a
+    // link-local address — routers are identified by their link-local
+    // address, and anything else is either off-link or forged.
+    if body.len() < 16 || body[0] != ICMPV6_ROUTER_ADVERTISEMENT || body[1] != 0 {
+        return None;
+    }
+    if !(src_addr[0] == 0xFE && src_addr[1] & 0xC0 == 0x80) {
         return None;
     }
     let mo_flags = body[5];
@@ -417,7 +433,8 @@ pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Optio
 /// Process an inbound Redirect (RFC 4861 §8). The body layout is:
 /// 4 bytes reserved + 16 bytes target + 16 bytes destination.
 pub fn on_redirect(iface: &str, body: &[u8]) -> NdRxResult {
-    if body.len() < 40 || body[0] != ICMPV6_REDIRECT {
+    // RFC 4861 §8.1: ICMP Code must be 0.
+    if body.len() < 40 || body[0] != ICMPV6_REDIRECT || body[1] != 0 {
         return NdRxResult::Ignored;
     }
     let mut target = [0u8; 16];
