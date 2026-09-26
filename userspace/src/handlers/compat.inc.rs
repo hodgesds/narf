@@ -7071,20 +7071,37 @@ pub fn timer_tick_raise_due_signals() {
         // handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn
         // — the same "no big on-stack array in IRQ context" hazard the timer
         // wheel documents (`timer_wheel::drain_due_to_deferred`).
-        let mut after: Option<u64> = None;
-        while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
-            after = Some(t);
-            // SIGALRM (14). Slot was pre-created when the timer was armed, so
-            // this only sets a bit in an existing entry (never allocates).
-            let _ = raise_signal_pending_irq(t, 14);
-            // Wake the owner if it's parked so waitpid/pause returns EINTR and
-            // SIGALRM is delivered on its return-to-user. For the currently
-            // running owner (the original CPU-bound case) this is a harmless
-            // no-op — it has no parked waker and takes the signal on this
-            // trap's return. Every lock `wake_signal` touches is an
-            // `IrqSafeSpinLock`, so this is safe from the timer ISR.
-            wake_signal(t);
-        }
+        raise_due_itimer_real(now);
+    }
+}
+
+/// Drain-and-raise every due ITIMER_REAL owner at `now`. Shared by the
+/// timer-tick hook above and the park loop's backstop kick
+/// (`park_should_block`): a parked owner's own 1 ms backstop treadmill
+/// otherwise never raises — its re-executed syscall parks again without
+/// reaching the syscall-EXIT hook, the posix-timer sleep pump only runs
+/// from nested waits (not the executor's `run_io` rounds), and an idle
+/// CPU's tick interrupts the executor, not user mode. The raise then
+/// depended on UNRELATED system activity — measured 6.5 s (and worse) of
+/// SIGALRM latency to a task parked in a FIFO open on an idle guest.
+///
+/// Alloc-free and IRQ-safe (O(1)-stack take-one drain; see the stack
+/// hazard note above). Every lock `wake_signal` touches is an
+/// `IrqSafeSpinLock`, so both the timer ISR and executor contexts may
+/// call this.
+pub(crate) fn raise_due_itimer_real(now: u64) {
+    let mut after: Option<u64> = None;
+    while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
+        after = Some(t);
+        // SIGALRM (14). Slot was pre-created when the timer was armed, so
+        // this only sets a bit in an existing entry (never allocates).
+        let _ = raise_signal_pending_irq(t, 14);
+        // Wake the owner if it's parked so waitpid/pause returns EINTR and
+        // SIGALRM is delivered on its return-to-user. For the currently
+        // running owner (the original CPU-bound case) this is a harmless
+        // no-op — it has no parked waker and takes the signal on this
+        // trap's return.
+        wake_signal(t);
     }
 }
 

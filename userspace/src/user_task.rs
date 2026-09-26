@@ -910,6 +910,19 @@ fn park_should_block(
     }
     if deadline != 0 {
         let now = narf_scheduler::narf_time::monotonic_ns();
+        // Kick due ITIMER_REAL owners from the park loop itself (gated to
+        // one atomic load when none is armed). A parked owner's ONLY
+        // reliable periodic execution is this backstop re-check: its
+        // re-executed syscall parks again without reaching the syscall-exit
+        // raise hook, and the posix-timer sleep pump does not run from the
+        // executor's io rounds — so without this kick, SIGALRM to a parked
+        // task waited on unrelated system activity (seconds on an idle
+        // guest; stress-ng --dup's EINTR-driven FIFO opens ran at 0.003x
+        // Linux). Raising before the signal check below lets a fresh due
+        // SIGALRM break THIS park evaluation, not the next one.
+        if crate::posix_timer::itimer_real_due_at(now) {
+            crate::handlers::raise_due_itimer_real(now);
+        }
         // Linux interruptible-sleep semantics: a deliverable pending signal
         // breaks ANY deadline park — finite ones included. nanosleep/futex/
         // poll are all signal-interruptible on Linux (-EINTR); restricting

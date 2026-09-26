@@ -1089,6 +1089,13 @@ pub fn itimer_real_due_now() -> Option<u64> {
     (now >= deadline).then_some(now)
 }
 
+/// The [`itimer_real_due_now`] gate against a clock the caller already read
+/// — one acquire load, no clock read, no lock. (The `u64::MAX` disarmed
+/// sentinel can never compare due.)
+pub fn itimer_real_due_at(now: u64) -> bool {
+    NEXT_ITIMER_REAL_DEADLINE_NS.load(Ordering::Acquire) <= now
+}
+
 /// Ensure the `sleep_pumps` callback that fires interval timers is
 /// registered. Idempotent — the boot path never calls
 /// `posix_timer_init`, so the first armed itimer wires the pump.
