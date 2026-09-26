@@ -66,6 +66,32 @@ KASLR_RELOC_RESERVE = 1M;
  * value, so it cannot widen the window. 0 = draw entropy. */
 KASLR_SLIDE_FIXED = 0x00000000;
 
+/* Physical relocation: copy the image this many bytes up from where the loader
+ * put it and run from the copy. The VA slide randomizes where the image
+ * APPEARS; this randomizes where it IS.
+ *
+ * Unlike x86_64 this is still a pin rather than a value chosen at boot. The
+ * memory map arrives in the DTB — big-endian, nested, string-keyed — so walking
+ * it to /memory and /chosen is a much larger job in assembly than the flat
+ * PVH array the x86_64 stub reads, and picking a target without it would be
+ * guessing at where RAM and the initrd are.
+ *
+ * Constraints a value here must satisfy, unchecked because nothing parses the
+ * map yet:
+ *   - target + image size stays inside RAM (QEMU virt: 0x4000_0000 up);
+ *   - target stays below 2 GiB, which is all the TTBR0 identity map covers
+ *     (lo_L1[0..1], two 1 GiB blocks) and `.boot` executes there post-MMU;
+ *   - at least the image's size, so the forward copy cannot eat its source;
+ *   - clear of the DTB and the initrd the loader placed.
+ * 0 = run where the loader put us.
+ *
+ * 0x1000_0000 puts the copy at 0x5008_0000..0x541e_6db0. QEMU's virt machine
+ * places the kernel, the initrd and the DTB all inside the first 256 MiB of RAM
+ * (the DTB lands at 0x4f00_0000, just under the 0x5000_0000 mark), so starting
+ * above that clears every one of them; it also still fits inside boot-smoke's
+ * 512 MiB, not just the suite's 1 GiB. */
+KASLR_PHYS_FIXED = 0x10000000;
+
 PHDRS
 {
     boot   PT_LOAD FLAGS(5); /* R-X */
@@ -128,6 +154,11 @@ SECTIONS
     /* Physical alias of `kaslr::KERNEL_SLIDE`, so the pass can record the
      * slide it applied for the Rust conversions to read later. */
     __kernel_slide_phys = KERNEL_SLIDE - KIMAGE_VOFFSET;
+
+    /* Physical alias of `kaslr::IMAGE_PHYS_DELTA`, so the stub can record how
+     * far it moved the image. A link-time address: the stub adds the delta
+     * itself to reach the copy's word. */
+    __image_phys_delta_phys = IMAGE_PHYS_DELTA - KIMAGE_VOFFSET;
 
     .rodata : AT(ADDR(.rodata) - KIMAGE_VOFFSET) ALIGN(4K) {
         __rodata_start = .;

@@ -1562,6 +1562,30 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // queues exist — `spawn` here, before `scheduler::init`, would panic.
             narf_memory::reclaim::set_kswapd_wake_hook(kswapd_wake);
 
+            // Report the image's placement on BOTH arches.
+            //
+            // A zero slide and a slide computed but never applied look identical
+            // in a boot log, and a layout-dependent bug is unbisectable without
+            // the value. The delta has a sharper edge still: physical relocation
+            // fails CLOSED, so "no safe target" and "the selector is broken" are
+            // the same clean boot at delta 0.
+            //
+            // This used to live inside the x86_64-only MMU-handoff block below,
+            // which meant aarch64 — where the stub keeps its own page tables and
+            // there is no handoff to narrate — printed neither number, and a
+            // physical relocation that silently did not happen there was
+            // indistinguishable from one that did.
+            {
+                let _ = writeln!(
+                    console::Writer,
+                    "  mmu: kernel image slide {:#x}, base {:#018x}, phys delta {:#x} (at {:#x})",
+                    narf_memory::kaslr::KERNEL_SLIDE.load(core::sync::atomic::Ordering::Relaxed),
+                    narf_memory::kaslr::kernel_virt_base(),
+                    narf_memory::kaslr::image_phys_delta(),
+                    narf_memory::kaslr::image_phys_bounds().0
+                );
+            }
+
             // MMU handoff per console/ §3.1. The three-step sequence
             // (print, swap, remap) is orchestrated here because
             // memory/ can't depend on console/ without creating a
@@ -1603,26 +1627,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: direct map at PML4[{}] ({:#018x})",
                             narf_memory::direct_map_base() >> 39 & 0x1FF,
                             narf_memory::direct_map_base()
-                        );
-                        // Same reasoning for the image itself: a zero slide
-                        // and a slide that was computed but never applied
-                        // look identical in a boot log, and a slide-dependent
-                        // bug is unbisectable without knowing the value.
-                        let _ = writeln!(
-                            console::Writer,
-                            "  mmu: kernel image slide {:#x}, base {:#018x}, phys delta {:#x} (at {:#x})",
-                            narf_memory::kaslr::KERNEL_SLIDE
-                                .load(core::sync::atomic::Ordering::Relaxed),
-                            narf_memory::kaslr::kernel_virt_base(),
-                            // The delta is reported for the same reason as the
-                            // slide, and with a sharper edge: relocation fails
-                            // CLOSED, so "no safe target in the memory map" and
-                            // "the selector is broken" both show up as a clean
-                            // boot at delta 0. Printing where the image
-                            // actually landed is the only cheap way to tell a
-                            // working selector from a silent one.
-                            narf_memory::kaslr::image_phys_delta(),
-                            narf_memory::kaslr::image_phys_bounds().0
                         );
                         // Supervisor stores ignore the read-only bit unless
                         // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S
