@@ -2434,8 +2434,15 @@ impl FileOps for MemFile {
         Box::pin(async move {
             const KEEP_SIZE: u32 = 0x01;
             const PUNCH_HOLE: u32 = 0x02;
-            const ZERO_RANGE: u32 = 0x10;
-            if len == 0 || mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0 {
+            // Linux tmpfs parity (mm/shmem.c::shmem_fallocate): only plain
+            // preallocation and PUNCH_HOLE|KEEP_SIZE are supported —
+            // ZERO_RANGE (and every other mode) gets EOPNOTSUPP. The old
+            // ZERO_RANGE emulation here materialised AND memset the whole
+            // range; stress-ng --shm issues a whole-object ZERO_RANGE per
+            // bogo op (ignoring the error Linux gives it), so NARF paid a
+            // second full 8 MiB materialisation per op that Linux refuses
+            // in O(1).
+            if len == 0 || mode & !(KEEP_SIZE | PUNCH_HOLE) != 0 {
                 return Err(FsError::Unsupported);
             }
             if mode & PUNCH_HOLE != 0 {
@@ -2445,34 +2452,48 @@ impl FileOps for MemFile {
                 return self.punch_hole(offset, len);
             }
             let end = offset.checked_add(len).ok_or(FsError::NoSpace)?;
-            let chunk = [0u8; PAGE_SIZE as usize];
-            let old_len = self.data.lock().len;
-            let mut position = offset;
-            while position < end {
-                let within = position % PAGE_SIZE;
-                let count = core::cmp::min(PAGE_SIZE - within, end - position) as usize;
-                if mode & ZERO_RANGE != 0
-                    || !self.data.lock().pages.contains_key(&(position / PAGE_SIZE))
-                {
-                    self.write_inner(position, &chunk[..count])?;
-                }
-                position += count as u64;
-            }
+            // Materialise every hole in [offset, end) as ONE data-lock
+            // transaction: bulk block reservation, batch page allocation,
+            // single insert pass. The previous shape called write_inner per
+            // 4 KiB page (two lock acquisitions, a per-page block charge, an
+            // mtime touch, and a redundant zero memcpy into a fresh zeroed
+            // page each time) — ~1 ms per 8 MiB call, and the per-page
+            // superblock charge convoyed concurrent workers.
+            let uid = self.uid.load(Ordering::Relaxed);
+            let gid = self.gid.load(Ordering::Relaxed);
             let mut data = self.data.lock();
-            let new_len = if mode & KEEP_SIZE != 0 {
-                old_len
-            } else {
-                core::cmp::max(old_len, end)
-            };
-            // Plain fallocate over already-backed bytes is a semantic no-op.
-            // Linux leaves both the inode contents and its page-cache folios
-            // valid in that case; invalidating NARF's mmap cache here forced
-            // the next mapper to re-read and re-snapshot an unchanged page.
-            // A write_inner call above already advanced the generation while
-            // holding this same data lock. Only a pure EOF extension still
-            // needs a generation change here.
-            if data.len != new_len {
-                data.len = new_len;
+            let missing = data.missing_pages(offset, len as usize)?;
+            if !missing.is_empty() {
+                let count = missing.len() as u64;
+                let superblock = &self._inode_lease.superblock;
+                superblock.reserve_blocks(uid, gid, count)?;
+                let mut allocated = Vec::new();
+                if allocated.try_reserve_exact(missing.len()).is_err() {
+                    superblock.release_blocks(uid, gid, count);
+                    return Err(FsError::NoSpace);
+                }
+                for index in &missing {
+                    match Self::alloc_zero_page() {
+                        Ok(page) => allocated.push((*index, page)),
+                        Err(error) => {
+                            // Preallocation is all-or-nothing (Linux undoes
+                            // the partial folio allocation on failure too).
+                            drop(allocated);
+                            superblock.release_blocks(uid, gid, count);
+                            return Err(error);
+                        }
+                    }
+                }
+                for (index, page) in allocated {
+                    data.pages.insert(index, page);
+                }
+            }
+            // Plain fallocate over already-backed bytes is a semantic no-op:
+            // fresh pages read as zeros exactly like the holes they replace,
+            // so no mmap-cache generation change is needed. Only the EOF
+            // extension below is observable.
+            if mode & KEEP_SIZE == 0 && end > data.len {
+                data.len = end;
             }
             drop(data);
             Ok(())
