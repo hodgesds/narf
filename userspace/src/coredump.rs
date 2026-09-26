@@ -140,6 +140,120 @@ fn write_at(file: &dyn FileOps, limit: u64, offset: u64, buf: &[u8]) -> Result<(
     Ok(())
 }
 
+/// `struct elf_prpsinfo` — the note that tells a debugger *which* process this
+/// core belongs to. Without it `gdb` opens a core with registers and memory but
+/// no program name or command line.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct ElfPrpsinfo {
+    pr_state: u8,
+    pr_sname: u8,
+    pr_zomb: u8,
+    pr_nice: i8,
+    pr_flag: u64,
+    pr_uid: u32,
+    pr_gid: u32,
+    pr_pid: i32,
+    pr_ppid: i32,
+    pr_pgrp: i32,
+    pr_sid: i32,
+    /// Short name, `comm`-style, NUL-padded.
+    pr_fname: [u8; 16],
+    /// The command line, space-separated and NUL-padded — Linux fills this
+    /// from the first 80 bytes of the process's argv area.
+    pr_psargs: [u8; 80],
+}
+
+impl Default for ElfPrpsinfo {
+    fn default() -> Self {
+        Self {
+            pr_state: 0,
+            pr_sname: 0,
+            pr_zomb: 0,
+            pr_nice: 0,
+            pr_flag: 0,
+            pr_uid: 0,
+            pr_gid: 0,
+            pr_pid: 0,
+            pr_ppid: 0,
+            pr_pgrp: 0,
+            pr_sid: 0,
+            pr_fname: [0; 16],
+            pr_psargs: [0; 80],
+        }
+    }
+}
+
+/// Test-only: a prpsinfo carrying just a pid and a short name, so the note
+/// format can be exercised without the /proc plumbing.
+#[doc(hidden)]
+pub(crate) fn __test_prpsinfo(pid: i32, name: &[u8]) -> ElfPrpsinfo {
+    let mut info = ElfPrpsinfo {
+        pr_pid: pid,
+        ..ElfPrpsinfo::default()
+    };
+    let take = core::cmp::min(name.len(), info.pr_fname.len() - 1);
+    info.pr_fname[..take].copy_from_slice(&name[..take]);
+    info
+}
+
+/// Append one ELF note: header, name padded to 4, descriptor padded to 4.
+///
+/// `n_namesz` counts the terminating NUL (a "CORE" note declares 5), and both
+/// the name and the descriptor are padded to a 4-byte boundary. Getting this
+/// wrong does not fail loudly — a debugger walking the segment simply lands
+/// mid-header on the next note and stops reading, silently dropping every note
+/// after the malformed one.
+fn push_note(buf: &mut Vec<u8>, name: &[u8], n_type: u32, desc: &[u8]) {
+    let namesz = name.len() as u32 + 1;
+    let nhdr = Elf64_Nhdr {
+        n_namesz: namesz,
+        n_descsz: desc.len() as u32,
+        n_type,
+    };
+    // SAFETY: `nhdr` is a live local of exactly this size with no padding
+    // beyond its three u32 fields.
+    buf.extend_from_slice(unsafe { slice_from_ref(&nhdr) });
+    buf.extend_from_slice(name);
+    buf.push(0);
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
+    buf.extend_from_slice(desc);
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
+}
+
+/// Build the whole `PT_NOTE` payload.
+///
+/// Linux's `elf_core_dump` writes NT_PRSTATUS, NT_PRPSINFO, NT_SIGINFO,
+/// NT_AUXV, NT_FILE and the FP register sets. This kernel wrote only
+/// NT_PRSTATUS, which gives a debugger registers and memory but no idea what
+/// program it is looking at. NT_PRPSINFO and NT_AUXV are added here because
+/// both have a source already: `comm`/argv from the /proc bookkeeping, and the
+/// auxv the process was started with.
+///
+/// Still missing, and deliberately not faked: NT_FILE, which needs a path per
+/// file-backed mapping and the VMA layer keeps none (only the executable's own
+/// path is retained), and NT_FPREGSET, which needs the task's FPU save area
+/// exposed here. Emitting either with invented contents would be worse than
+/// omitting it — a debugger trusts NT_FILE to locate shared objects.
+pub(crate) fn build_note_segment(
+    regs: &user_regs_struct,
+    prpsinfo: &ElfPrpsinfo,
+    auxv: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // SAFETY: both are live locals of exactly their declared size.
+    push_note(&mut buf, b"CORE", 1, unsafe { slice_from_ref(regs) });
+    push_note(&mut buf, b"CORE", 3, unsafe { slice_from_ref(prpsinfo) });
+    if !auxv.is_empty() {
+        push_note(&mut buf, b"CORE", 6, auxv);
+    }
+    buf
+}
+
 pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     // `fs/coredump.c`: `cprm.limit = rlimit(RLIMIT_CORE)`, then
     // `if (cprm->limit < binfmt->min_coredump) return false;` — and
@@ -264,8 +378,43 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
 
     let mut phdrs = Vec::new();
     let note_offset = 64 + num_phdrs as u64 * 56;
-    let note_desc_size = core::mem::size_of::<user_regs_struct>() as u64;
-    let note_size = 12 + 8 + note_desc_size; // Elf64_Nhdr + name("CORE\0\0\0") + desc
+    // Process identity for NT_PRPSINFO, from the same /proc bookkeeping that
+    // serves `comm` and `cmdline`.
+    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
+    let mut prpsinfo = ElfPrpsinfo {
+        pr_pid: pid as i32,
+        ..ElfPrpsinfo::default()
+    };
+    if let Some(comm) = crate::handlers::proc_comm_of(pid) {
+        let bytes = comm.as_bytes();
+        let take = core::cmp::min(bytes.len(), prpsinfo.pr_fname.len() - 1);
+        prpsinfo.pr_fname[..take].copy_from_slice(&bytes[..take]);
+    }
+    {
+        // `cmdline` is NUL-separated; `pr_psargs` is the space-separated form.
+        let argv = crate::handlers::proc_argv_of(pid);
+        let mut at = 0usize;
+        for (i, part) in argv
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .enumerate()
+        {
+            if i > 0 && at < prpsinfo.pr_psargs.len() - 1 {
+                prpsinfo.pr_psargs[at] = b' ';
+                at += 1;
+            }
+            let room = prpsinfo.pr_psargs.len() - 1 - at;
+            let take = core::cmp::min(part.len(), room);
+            prpsinfo.pr_psargs[at..at + take].copy_from_slice(&part[..take]);
+            at += take;
+            if at >= prpsinfo.pr_psargs.len() - 1 {
+                break;
+            }
+        }
+    }
+    let auxv = crate::handlers::proc_auxv_of(pid);
+    let note_buf = build_note_segment(&user_regs, &prpsinfo, &auxv);
+    let note_size = note_buf.len() as u64;
 
     phdrs.push(Elf64_Phdr {
         p_type: 4, // PT_NOTE
@@ -321,21 +470,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
         }
     }
 
-    // Write Note
-    let mut note_buf = Vec::new();
-    let nhdr = Elf64_Nhdr {
-        n_namesz: 5,
-        n_descsz: note_desc_size as u32,
-        n_type: 1, // NT_PRSTATUS
-    };
-    // SAFETY: nhdr is valid reference, size matches.
-    let nhdr_slice = unsafe { slice_from_ref(&nhdr) };
-    note_buf.extend_from_slice(nhdr_slice);
-    note_buf.extend_from_slice(b"CORE\0\0\0");
-    // SAFETY: user_regs is valid reference, size matches.
-    let regs_slice = unsafe { slice_from_ref(&user_regs) };
-    note_buf.extend_from_slice(regs_slice);
-
+    // Write the notes built above.
     if write_at(file.as_ref(), limit, note_offset, &note_buf).is_err() {
         return;
     }

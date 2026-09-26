@@ -5010,3 +5010,89 @@ kernel_test_in!(
     "userspace/tls",
     smoke_userspace_clone_settls_programs_child_tls
 );
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_coredump_notes_are_well_formed() -> TestResult {
+    // A core dump carried exactly one note, NT_PRSTATUS, so a debugger got
+    // registers and memory with no idea which program produced them. NT_PRPSINFO
+    // (name and command line) and NT_AUXV are added; both had a source already
+    // in the /proc bookkeeping.
+    //
+    // The note format is the thing worth testing, because getting it wrong fails
+    // silently: a debugger walking PT_NOTE lands mid-header on the next note and
+    // stops, dropping every note after the malformed one — so a wrong pad in the
+    // first note would discard the rest and look like they were never written.
+    // This walks the segment the way a consumer does.
+    use crate::coredump::{__test_prpsinfo, build_note_segment};
+
+    const NT_PRSTATUS: u32 = 1;
+    const NT_PRPSINFO: u32 = 3;
+    const NT_AUXV: u32 = 6;
+
+    let regs = Default::default();
+    let info = __test_prpsinfo(4242, b"crasher");
+    // A plausible auxv tail: AT_PAGESZ then AT_NULL.
+    let mut auxv = alloc::vec::Vec::new();
+    auxv.extend_from_slice(&6u64.to_ne_bytes());
+    auxv.extend_from_slice(&4096u64.to_ne_bytes());
+    auxv.extend_from_slice(&0u64.to_ne_bytes());
+    auxv.extend_from_slice(&0u64.to_ne_bytes());
+
+    let seg = build_note_segment(&regs, &info, &auxv);
+
+    // Walk it: n_namesz, n_descsz, n_type, name padded to 4, desc padded to 4.
+    let mut seen: alloc::vec::Vec<(u32, u32)> = alloc::vec::Vec::new();
+    let mut off = 0usize;
+    while off + 12 <= seg.len() {
+        let namesz = u32::from_ne_bytes(seg[off..off + 4].try_into().unwrap_or([0; 4]));
+        let descsz = u32::from_ne_bytes(seg[off + 4..off + 8].try_into().unwrap_or([0; 4]));
+        let ntype = u32::from_ne_bytes(seg[off + 8..off + 12].try_into().unwrap_or([0; 4]));
+        if namesz == 0 {
+            return TestResult::Fail("a note declared a zero-length name");
+        }
+        let name_at = off + 12;
+        let name_end = name_at + namesz as usize;
+        if name_end > seg.len() {
+            return TestResult::Fail("a note's name runs past the segment");
+        }
+        if &seg[name_at..name_end - 1] != b"CORE" || seg[name_end - 1] != 0 {
+            return TestResult::Fail("a note is not a NUL-terminated CORE note");
+        }
+        let desc_at = (name_end + 3) & !3;
+        let desc_end = desc_at + descsz as usize;
+        if desc_end > seg.len() {
+            return TestResult::Fail("a note's descriptor runs past the segment");
+        }
+        seen.push((ntype, descsz));
+        off = (desc_end + 3) & !3;
+    }
+    if off != seg.len() {
+        return TestResult::Fail("the note segment has trailing bytes — a pad is wrong");
+    }
+
+    // All three present, in the order a consumer expects to find them.
+    let types: alloc::vec::Vec<u32> = seen.iter().map(|(t, _)| *t).collect();
+    if types != alloc::vec![NT_PRSTATUS, NT_PRPSINFO, NT_AUXV] {
+        return TestResult::Fail("the note segment does not carry PRSTATUS, PRPSINFO and AUXV");
+    }
+    // The auxv descriptor must be the bytes handed in, not a truncation.
+    if seen[2].1 as usize != auxv.len() {
+        return TestResult::Fail("the AUXV note's descriptor size does not match its input");
+    }
+    // PRPSINFO must be the full 136-byte struct — a short one reads as garbage
+    // fields rather than being rejected.
+    if seen[1].1 != 136 {
+        return TestResult::Fail("NT_PRPSINFO is not the expected 136-byte elf_prpsinfo");
+    }
+    // An empty auxv omits the note rather than emitting an empty one.
+    let without = build_note_segment(&regs, &info, &[]);
+    if without.len() >= seg.len() {
+        return TestResult::Fail("an empty auxv still emitted a note");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace/elf",
+    smoke_userspace_coredump_notes_are_well_formed
+);
