@@ -87,12 +87,20 @@ fn e2e_kernel_hostname_write_propagates() -> TestResult {
     sys_kernel::register_all();
 
     let path = &["sys", "kernel", "hostname"];
-    if sysctl_write(path, b"narftest\n").is_none() {
-        return TestResult::Fail("kernel/hostname not found in registry");
-    }
+    // The write's RESULT is checked rather than discarded. This write is routed
+    // to the real UTS namespace and is refused without CAP_SYS_ADMIN in that
+    // namespace's owning user namespace, so swallowing the error turned a
+    // permission refusal into an indistinguishable "read-back mismatch".
+    let wrote = match sysctl_write(path, b"narftest\n") {
+        None => return TestResult::Fail("kernel/hostname not found in registry"),
+        Some(r) => r,
+    };
     let val = sysctl_read(path);
     // Restore default.
     let _ = sysctl_write(path, b"narf\n");
+    if wrote.is_err() {
+        return TestResult::Fail("kernel/hostname write was REFUSED (uts-admin check)");
+    }
     match val.as_deref() {
         Some("narftest") => TestResult::Pass,
         _ => TestResult::Fail("kernel/hostname write did not propagate: read-back mismatch"),

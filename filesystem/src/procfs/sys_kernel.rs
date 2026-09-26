@@ -656,10 +656,13 @@ fn smoke_kernel_hostname_write_roundtrip() -> TestResult {
         Some(f) => f,
         None => return TestResult::Fail("kernel/hostname not found"),
     };
-    let _ = f.write(b"testhost\n");
+    let wrote = f.write(b"testhost\n");
     let val = read_sys("kernel/hostname");
     // Restore.
     *HOSTNAME.lock() = String::from("narf");
+    if wrote.is_err() {
+        return TestResult::Fail("hostname write was REFUSED (uts-admin check)");
+    }
     match val {
         Some(s) if s == "testhost\n" => TestResult::Pass,
         _ => TestResult::Fail("hostname write+read round-trip failed"),
