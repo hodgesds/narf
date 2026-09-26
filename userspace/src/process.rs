@@ -1124,9 +1124,79 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
 /// vector. Returns `None` when the path doesn't resolve, the file
 /// is empty, the read exceeds 64 MiB (defensive cap — a sane ld-musl
 /// is <200 KiB), or any read short-circuits with `FsError`.
-pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+/// Resolve an absolute path to its `FileOps` and size, through the CALLER'S
+/// mount namespace.
+///
+/// Shared by [`read_path_from_vfs`], which then slurps the whole file, and by
+/// [`load_user_process_from_path`], which hands the `FileOps` to the loader so
+/// the image is demand-paged instead. Both need the same namespace-aware walk:
+/// resolving globally instead returns `None` for a binary reachable only through
+/// a task's private mount table, which is how a pivot_rooted service sandbox
+/// presents its own rootfs.
+pub fn resolve_exec_file(
+    abs_path: &str,
+) -> Option<(alloc::sync::Arc<dyn narf_filesystem::FileOps>, u64)> {
     use crate::handlers::poll_io_to_completion;
     use narf_filesystem::resolve_async;
+
+    let file = crate::handlers::current_resolve_absolute(abs_path, |fs, rel| {
+        poll_io_to_completion(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+    })
+    .flatten()?;
+    let stat = poll_io_to_completion(file.stat_async()).and_then(|r| r.ok())?;
+    if stat.size == 0 {
+        return None;
+    }
+    Some((file, stat.size))
+}
+
+/// Load a process directly from a filesystem path, demand-paging its image.
+///
+/// This is the boot-time counterpart to `execve`'s path. Boot-init used to slurp
+/// its PID 1 into a `Vec` with [`read_path_from_vfs`] and hand the loader a byte
+/// slice, which meant the one process on the system guaranteed to be large —
+/// systemd — got neither demand paging nor header-only reads, while every
+/// `execve` after it did. There was no reason for the asymmetry beyond which
+/// function boot happened to call.
+///
+/// `AT_EXECFN` is set from `abs_path`, as `execve` sets it from the path it
+/// resolved, so a PID 1 with an `$ORIGIN`-relative RPATH resolves it the same way
+/// here as it would after an exec.
+///
+/// # Safety
+/// Same contract as [`load_user_process_with_root`].
+pub unsafe fn load_user_process_from_path(
+    abs_path: &str,
+    argv: &[&str],
+    envp: &[&str],
+    aux: &[AuxEntry],
+    root: Option<&str>,
+    pid: crate::ProcessId,
+) -> Result<UserProcess, ProcessLoadError> {
+    let (file, size) = resolve_exec_file(abs_path).ok_or(ProcessLoadError::Load(
+        LoadBytesError::Elf(crate::ElfError::TooShort),
+    ))?;
+    let source = crate::handlers::ExecSource::File {
+        ops: alloc::sync::Arc::clone(&file),
+        size,
+    };
+    // SAFETY: forwarding this function's own contract.
+    unsafe {
+        load_user_process_with_root_file(
+            &source,
+            argv,
+            envp,
+            aux,
+            root,
+            pid,
+            Some(&file),
+            Some(abs_path),
+        )
+    }
+}
+
+pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+    use crate::handlers::poll_io_to_completion;
 
     // 1. Walk the VFS to a FileOps for `abs_path`, through the CALLER'S mount
     //    namespace — not the global registry. This slurps the ELF interpreter
@@ -1136,16 +1206,10 @@ pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
     //    returned None → the dynamic PIE loaded with NO interpreter → the entry
     //    fell to the load bias and the process jumped to a null/uninitialised
     //    RIP (#PF faultva=0 rip=0, SIGSEGV) before executing a single syscall.
-    let file = crate::handlers::current_resolve_absolute(abs_path, |fs, rel| {
-        poll_io_to_completion(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-    })
-    .flatten()?;
-
     // 2. stat() to size the read; cap at 64 MiB.
     const MAX_INTERP_BYTES: u64 = 64 * 1024 * 1024;
-    let stat = poll_io_to_completion(file.stat_async()).and_then(|r| r.ok())?;
-    let size = stat.size;
-    if size == 0 || size > MAX_INTERP_BYTES {
+    let (file, size) = resolve_exec_file(abs_path)?;
+    if size > MAX_INTERP_BYTES {
         return None;
     }
 

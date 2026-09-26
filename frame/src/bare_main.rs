@@ -5153,10 +5153,15 @@ fn boot_userspace_init() {
     // The task's root is installed before it is enqueued, so systemd is the
     // first and only process in its PID-1 chain — no chroot shell/launcher is
     // involved.
-    fn spawn_rooted_pid1(name: &'static str, bytes: &[u8], root: &str) -> bool {
-        if bytes.is_empty() {
-            return false;
-        }
+    /// Spawn a rooted PID 1 straight from its path.
+    ///
+    /// Takes the PATH, not the bytes: the loader resolves the file itself and
+    /// demand-pages the image, the way `execve` has since #472. Slurping it into
+    /// a `Vec` here meant the one process on the system guaranteed to be large —
+    /// systemd is tens of megabytes — was the only one that paid the full read
+    /// and the full resident cost, while every process it went on to exec did
+    /// not.
+    fn spawn_rooted_pid1(name: &'static str, path: &str, root: &str) -> bool {
         let argv = [name];
         let envp = [
             "container=narf",
@@ -5164,8 +5169,8 @@ fn boot_userspace_init() {
         ];
         // SAFETY: boot has the loader's identity mapping and frame allocator.
         let proc = match unsafe {
-            load_user_process_with_root(
-                bytes,
+            narf_userspace::process::load_user_process_from_path(
+                path,
                 &argv,
                 &envp,
                 &[],
@@ -5799,14 +5804,16 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
     let systemd_pid1 = narf_boot::args().has_flag("systemd_pid1");
     if systemd_pid1 {
         let systemd_path = "/mnt/usr/lib/systemd/systemd";
-        let systemd = narf_userspace::process::read_path_from_vfs(systemd_path);
-        if systemd.is_none() {
+        // Resolve-only: confirms the binary is reachable and gives the same
+        // diagnostic as before without reading a byte of it. The loader opens it
+        // again and demand-pages from there.
+        if narf_userspace::process::resolve_exec_file(systemd_path).is_none() {
             let _ = writeln!(
                 console::Writer,
                 "  boot-init: systemd_pid1 requested but {systemd_path} is unavailable"
             );
         } else {
-            spawn_rooted_pid1("systemd", systemd.as_deref().unwrap_or(&[]), "/mnt");
+            spawn_rooted_pid1("systemd", systemd_path, "/mnt");
         }
         let _ = baked_shell;
         return;
