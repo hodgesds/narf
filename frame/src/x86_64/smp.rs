@@ -201,6 +201,12 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         let _ = narf_arch::x86_64::errata::apply_for_current_cpu();
     }
 
+    // 1c. KVM steal-time registration for this vCPU: enables the
+    //     preempted-vCPU TLB-flush elision (`kvm_pv::try_flush_preempted`)
+    //     to see THIS CPU's preempted byte. Signature/feature-gated no-op
+    //     elsewhere; the frame allocator is live well before APs start.
+    narf_memory::kvm_pv::register_steal_time_current_cpu();
+
     // Speculation controls are per-CPU state. Apply the protected policy
     // here before this AP can run scheduler work.
     // SAFETY: CPL0, IRQs masked, and this AP is not yet online.

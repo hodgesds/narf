@@ -395,7 +395,27 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
 unsafe fn shoot_request_mask(va: u64, pages: u64, tag: u16, target_mask: u64) {
     let source = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
     let source_bit = 1u64 << source;
-    let targets = target_mask & narf_lib::smp::online_bitmap() & !source_bit;
+    let mut targets = target_mask & narf_lib::smp::online_bitmap() & !source_bit;
+    if targets == 0 {
+        return;
+    }
+    // KVM PV_TLB_FLUSH: a peer vCPU the host has scheduled out cannot touch
+    // a stale translation, and `try_flush_preempted` CAS-es the
+    // KVM_VCPU_FLUSH_TLB request into its steal-time byte — the host then
+    // flushes that vCPU's whole guest TLB before it executes again, which
+    // covers any ranged/tagged request this fan-out carries. Such peers are
+    // dropped from BOTH the send set and the ack wait; without this, a
+    // shootdown stalls for the remainder of the preempted vCPU's host
+    // timeslice. Losing the CAS race means the vCPU is being scheduled back
+    // in — it stays in `targets` and gets the IPI like any running peer.
+    let mut scan = targets;
+    while scan != 0 {
+        let target = scan.trailing_zeros() as usize;
+        scan &= scan - 1;
+        if narf_memory::kvm_pv::try_flush_preempted(target) {
+            targets &= !(1u64 << target);
+        }
+    }
     if targets == 0 {
         return;
     }

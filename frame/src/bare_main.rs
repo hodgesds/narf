@@ -1039,6 +1039,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             if x2apic_active { "x2APIC" } else { "xAPIC" }
         );
 
+        // KVM paravirt: one-hypercall IPI broadcasts and preempted-vCPU
+        // TLB-flush elision. Detection is signature-gated, so this is a
+        // no-op on bare metal / TCG / non-KVM hypervisors. The BSP's
+        // steal-time area registers here; each AP registers its own in
+        // `_ap_start_rust`.
+        let (pv_send_ipi, pv_tlb) = narf_memory::kvm_pv::detect();
+        narf_memory::kvm_pv::register_steal_time_current_cpu();
+        let _ = writeln!(
+            console::Writer,
+            "  kvm-pv: send_ipi={} tlb_flush={}",
+            pv_send_ipi, pv_tlb
+        );
+
         // Per-task kernel-stack retargeting is independent of the LAPIC
         // access mode. Both x2APIC and the xAPIC fallback run user tasks on
         // their own kernel stacks, so both must update TSS.rsp0 and the

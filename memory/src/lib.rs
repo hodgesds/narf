@@ -55,6 +55,8 @@ pub mod ro_after_init;
 // must not self-report. Exempt the whole module (the corruptor we hunt lives
 // in the scheduler, not here).
 #[cfg_attr(feature = "kasan", sanitize(address = "off"))]
+#[cfg(target_arch = "x86_64")]
+pub mod kvm_pv;
 pub mod slab;
 pub mod spd5;
 pub mod swap;

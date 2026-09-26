@@ -511,6 +511,12 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
 ///   [19:18]  Dest Shorthand (00 = no shorthand, use [63:32])
 ///   [63:32]  Destination APIC ID (x2APIC: full 32-bit)
 fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
+    // KVM PV_SEND_IPI: the whole target set in ONE hypercall instead of a
+    // vmexit-per-target ICR loop (either mode below). Falls through to the
+    // architectural paths off-KVM or if the host rejects the call.
+    if narf_memory::kvm_pv::pv_send_ipi(cpu_mask, vector) {
+        return;
+    }
     if !X2APIC_ACTIVE.load(Ordering::Acquire) {
         // xAPIC MMIO fallback. Same ICR fields as below, but split
         // across two 32-bit registers: ICR_HI carries the destination
