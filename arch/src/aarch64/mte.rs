@@ -217,6 +217,9 @@ pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
 /// (kernel mappings on QEMU `-machine virt,mte=on` qualify). The
 /// `SCTLR_EL1.TCF` — Tag Check Fault mode for EL1, bits [41:40].
 pub const TCF_SHIFT: u32 = 40;
+
+/// `PSTATE.TCO` bit position, in both PSTATE and `SPSR_ELx`.
+pub const TCO_SHIFT: u32 = 25;
 /// Mask of the `SCTLR_EL1.TCF` field.
 pub const TCF_MASK: u64 = 0b11 << TCF_SHIFT;
 /// `TCF` = Ignore: tag mismatches are not reported. The boot default.
@@ -224,6 +227,54 @@ pub const TCF_IGNORE: u64 = 0b00;
 /// `TCF` = Synchronous: a mismatch raises a Data Abort at the faulting
 /// instruction, so `FAR_EL1` and `ELR_EL1` name the access precisely.
 pub const TCF_SYNC: u64 = 0b01;
+
+/// Read `PSTATE.TCO` — Tag Check Override.
+///
+/// While set, EVERY MTE tag check is suppressed at the current exception
+/// level, regardless of `SCTLR_ELx.TCF` and `TCR_ELx.TCMA`. It is therefore
+/// invisible to [`tcf_mode`]: tag checking can read as `Synchronous` while no
+/// check can possibly fire.
+///
+/// The architecture SETS this on exception entry, so a handler cannot trip a
+/// tag fault on its own accesses, and `eret` restores it from `SPSR_ELx.TCO`.
+/// Nothing else in NARF writes it, which is what made it a leak: a path that
+/// enters EL1 through an exception and then diverts into kernel code instead
+/// of returning through `eret` — which is exactly what the user-task
+/// preemption and park paths do — leaves TCO set for every subsequent kernel
+/// access on that CPU.
+///
+/// # Safety
+/// `MRS TCO` is legal at EL1 when MTE is implemented; check [`supported`].
+#[inline]
+pub unsafe fn tco() -> bool {
+    let v: u64;
+    // SAFETY: TCO is S3_3_C4_C2_7. Spelled by encoding because the mnemonic
+    // needs the assembler to have `+mte` enabled, which the kernel target does
+    // not guarantee. Reads PSTATE; no memory effect.
+    unsafe {
+        core::arch::asm!("mrs {v}, S3_3_C4_C2_7", v = out(reg) v, options(nostack, nomem));
+    }
+    (v >> TCO_SHIFT) & 1 != 0
+}
+
+/// Set or clear `PSTATE.TCO`. See [`tco`] for why this matters.
+///
+/// # Safety
+/// `MSR TCO` is legal at EL1 when MTE is implemented; check [`supported`].
+/// Setting it disables all tag checking for this exception level, so a caller
+/// that sets it owns the window.
+#[inline]
+pub unsafe fn set_tco(on: bool) {
+    let v: u64 = u64::from(on) << TCO_SHIFT;
+    // SAFETY: as above; `MSR TCO, Xt` takes the field from bit 25 of `Xt`.
+    unsafe {
+        core::arch::asm!(
+            "msr S3_3_C4_C2_7, {v}",
+            v = in(reg) v,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+}
 
 /// The `TCF` mode currently programmed in `SCTLR_EL1`.
 ///
