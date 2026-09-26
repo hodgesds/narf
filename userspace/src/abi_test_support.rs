@@ -217,6 +217,18 @@ pub fn teardown() {
     crate::pid_ns::__test_reset();
     #[cfg(feature = "container")]
     crate::namespaces::__test_reset_all();
+    // Capabilities, for the same reason as everything else here: a case that
+    // drops them (`drop_all_caps`, or any `capset` arm) writes a zeroed entry
+    // into the per-task table, and nothing put it back. `setup` reinstalls a
+    // clean credential for the next `with_setup` case, so the leak is invisible
+    // between them — but a BARE case inherits it, and reads its own subject as
+    // unprivileged.
+    //
+    // That is what made `/proc/sys/kernel/hostname` fail on aarch64 and pass on
+    // x86_64: the write routes to the UTS namespace and is refused without
+    // CAP_SYS_ADMIN, and only the aarch64 link order happened to put a
+    // capability-dropping case before it.
+    crate::handlers::__test_caps_reset();
     __test_clear_global();
     fd::__test_reset();
     *TEST_AS.lock() = None;
