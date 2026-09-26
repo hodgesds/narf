@@ -5540,6 +5540,13 @@ fn boot_userspace_init() {
                     "alarmloop_smoke",
                     narf_verification::NARF_ALARMLOOP_SMOKE_ELF,
                 ),
+                // Blocking FIFO open is signal-interruptible (-EINTR), and
+                // the writer/reader rendezvous still completes when the
+                // peer is present.
+                (
+                    "fifoeintr_smoke",
+                    narf_verification::NARF_FIFOEINTR_SMOKE_ELF,
+                ),
                 // (b) Preemptive scheduling: a CPU-bound child is time-
                 // sliced so the parent's timed sleep returns on time.
                 (

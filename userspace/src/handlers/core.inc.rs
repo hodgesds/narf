@@ -2289,6 +2289,28 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
     fifo_park_or_finish(ctx, fd);
 }
 
+/// Abort a blocking FIFO open because a deliverable signal is pending.
+///
+/// The open installed its fd (and registered its direction's open count)
+/// BEFORE parking, so failing the syscall must unwind both: removing the
+/// table entry drops the `FifoHandle`, whose Drop unregisters the end and
+/// re-syncs the peer-presence readiness a counterpart may be parked on. The
+/// pending-fd re-entry slot is cleared so the rewound RIP (if the signal
+/// handler returns into the syscall) starts a fresh open instead of resuming
+/// a dead one.
+fn fifo_open_abort_eintr(ctx: &mut dyn TrapContext, task: u64, fd: u32) {
+    let _ = fd::with_table(task, |t| t.take(fd));
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: live per-task ctx; single-threaded syscall.
+        unsafe {
+            (*uctx)
+                .fifo_open_pending_fd
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+    ctx.set_return(errno_ret(EINTR));
+}
+
 /// Park the current task on the shared I/O-waker registry and RIP-rewind so
 /// the syscall re-executes (and `resume_fifo_open` re-checks the peer). The
 /// timer wheel remains only a ~1ms lost-wake backstop. Falls back to returning
@@ -2316,6 +2338,21 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
                         return;
                     }
                     Poll::Pending => {
+                        // fifo(7) blocking open waits INTERRUPTIBLY: Linux's
+                        // `wait_for_partner` returns -ERESTARTSYS on a signal
+                        // and `fifo_open`'s error path releases the just-
+                        // registered end. NARF's RIP-rewind re-execution would
+                        // otherwise restart the open unconditionally — a task
+                        // whose itimer fires every 1ms re-parks forever and
+                        // never sees EINTR. Checked after `arm_peer` so a peer
+                        // that appeared concurrently still wins over the
+                        // signal, matching wait_event_interruptible's
+                        // condition-before-signal ordering.
+                        if has_interrupting_signal(task) {
+                            handle.disarm_peer(task);
+                            fifo_open_abort_eintr(ctx, task, fd);
+                            return;
+                        }
                         let parked = park_reexecute_on_io(ctx);
                         handle.disarm_peer(task);
                         if parked {

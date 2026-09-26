@@ -610,6 +610,7 @@ fn main() {
         "relpaths_smoke",
         "consoletty_smoke",
         "alarmloop_smoke",
+        "fifoeintr_smoke",
         "preemptsched_smoke",
         "fpu_preempt_smoke",
         "procfs2_smoke",

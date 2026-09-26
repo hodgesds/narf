@@ -3214,7 +3214,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "scm_smoke",
     ]) {
         "net"
-    } else if has(&["sig", "alarmloop", "preemptsched"]) {
+    } else if has(&["sig", "alarmloop", "fifoeintr", "preemptsched"]) {
         "signals"
     } else if has(&[
         "futex",
@@ -3591,6 +3591,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("consoletty_smoke", "consoletty-ok"),
         // (a) Preemptive SIGALRM raised+delivered to a CPU-bound busy loop.
         ("alarmloop_smoke", "alarmloop-ok"),
+        // Blocking FIFO open EINTRs on a caught signal (fifo(7) interruptible
+        // wait_for_partner) and still rendezvouses when a writer appears.
+        ("fifoeintr_smoke", "fifoeintr-ok"),
         // (b) Timer-driven preemption: a CPU-bound child can't stall parent.
         ("preemptsched_smoke", "preemptsched-ok"),
         // x87 + AVX state survives real user sched_yield switches, peer
