@@ -3526,7 +3526,20 @@ fn smoke_userspace_execve_divergence_frees_address_space() -> TestResult {
     let had_req = !req_ptr.is_null();
     if had_req {
         // SAFETY: non-null pending_exec is always a Box::into_raw'd ExecRequest.
+        // SAFETY: non-null pending_exec is always a Box::into_raw'd ExecRequest.
         drop(unsafe { alloc::boxed::Box::from_raw(req_ptr) });
+        // Undo the scheduler-side publication too. `replace_address_space`
+        // stores a clone of the new AS in this CPU's ACTIVE_USER_AS cell and in
+        // PENDING_SLOT_AS whenever it targets the current task; production
+        // releases both when the polling routine applies the exec, but this
+        // test longjmped past that poll. Without this the new AS stays live and
+        // the count below measures the fixture — and because the publication
+        // only happens when CURRENT_TASK held this test's id, the assertion was
+        // nondeterministic: it ambushed three unrelated changes before anyone
+        // noticed it was measuring scheduler residue rather than exec cleanup.
+        narf_scheduler::__test_clear_published_address_space(narf_scheduler::TaskId(
+            crate::handlers::current_task_id(),
+        ));
     }
 
     crate::user_task::__test_clear_execve_hook();
@@ -3551,7 +3564,7 @@ fn smoke_userspace_execve_divergence_frees_address_space() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
-    "userspace",
+    "userspace/exec",
     smoke_userspace_execve_divergence_frees_address_space
 );
 
@@ -4350,3 +4363,245 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_exec_loads_multi_gigabyte_binary
 );
+
+/// Build an ELF whose `PT_GNU_PROPERTY` segment carries `desc` as the
+/// descriptor of an `NT_GNU_PROPERTY_TYPE_0` note.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn property_image(desc: &[u8], note_type: u32, name: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    const SEG_FOFF: u64 = 0x1000;
+    const NOTE_FOFF: usize = 0x800;
+    let mut b = alloc::vec![0u8; (SEG_FOFF + 0x1000) as usize];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // two phdrs
+                                                        // phdr 0: the R|X PT_LOAD.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    // The note: n_namesz, n_descsz, n_type, "GNU\0", then desc.
+    let note_len = 16 + desc.len();
+    b[NOTE_FOFF..NOTE_FOFF + 4].copy_from_slice(&4u32.to_le_bytes());
+    b[NOTE_FOFF + 4..NOTE_FOFF + 8].copy_from_slice(&(desc.len() as u32).to_le_bytes());
+    b[NOTE_FOFF + 8..NOTE_FOFF + 12].copy_from_slice(&note_type.to_le_bytes());
+    b[NOTE_FOFF + 12..NOTE_FOFF + 16].copy_from_slice(name);
+    b[NOTE_FOFF + 16..NOTE_FOFF + 16 + desc.len()].copy_from_slice(desc);
+    // phdr 1: PT_GNU_PROPERTY over exactly that note.
+    let ph1 = ph + 56;
+    b[ph1..ph1 + 0x04].copy_from_slice(&0x6474_e553u32.to_le_bytes());
+    b[ph1 + 0x04..ph1 + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    b[ph1 + 0x08..ph1 + 0x10].copy_from_slice(&(NOTE_FOFF as u64).to_le_bytes());
+    b[ph1 + 0x20..ph1 + 0x28].copy_from_slice(&(note_len as u64).to_le_bytes());
+    b[ph1 + 0x28..ph1 + 0x30].copy_from_slice(&(note_len as u64).to_le_bytes());
+    b[ph1 + 0x30..ph1 + 0x38].copy_from_slice(&8u64.to_le_bytes());
+    b
+}
+
+/// One `GNU_PROPERTY_*_FEATURE_1_AND` record: type, 4-byte bitmap, padded to 8.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn feature_record(pr_type: u32, bits: u32) -> alloc::vec::Vec<u8> {
+    let mut r = alloc::vec::Vec::new();
+    r.extend_from_slice(&pr_type.to_le_bytes());
+    r.extend_from_slice(&4u32.to_le_bytes()); // pr_datasz
+    r.extend_from_slice(&bits.to_le_bytes());
+    r.extend_from_slice(&0u32.to_le_bytes()); // pad to 8
+    r
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_parses_gnu_property_note() -> TestResult {
+    use crate::parse_elf;
+    // `PT_GNU_PROPERTY` is how a binary says which hardware-security features
+    // it was BUILT for, and that is the only safe basis for enabling them:
+    // BTI faults an indirect branch that does not land on a `BTI` instruction,
+    // so turning it on for a binary compiled without landing pads kills it on
+    // its first PLT call. Linux reads the same note in
+    // `arch_parse_elf_property`.
+    //
+    // Both feature words are checked on both arches deliberately. The note is
+    // architecture-neutral data — a cross-compiled image carries whichever word
+    // its target uses — and a parser that only decoded the running arch's word
+    // would silently report "no features" for the other, which is
+    // indistinguishable from a binary that opted out.
+    const AARCH64_AND: u32 = 0xc000_0000;
+    const X86_AND: u32 = 0xc000_0002;
+
+    // aarch64: BTI | MTE set, PAC clear.
+    let img = property_image(&feature_record(AARCH64_AND, 0b101), 5, b"GNU\0");
+    let props = match parse_elf(&img) {
+        Ok(image) => image.properties,
+        Err(_) => return TestResult::Fail("an image with a valid property note failed to parse"),
+    };
+    if !props.aarch64_bti || !props.aarch64_mte || props.aarch64_pac {
+        return TestResult::Fail("aarch64 feature bits decoded wrongly");
+    }
+
+    // x86: SHSTK only.
+    let img = property_image(&feature_record(X86_AND, 0b10), 5, b"GNU\0");
+    let props = match parse_elf(&img) {
+        Ok(image) => image.properties,
+        Err(_) => return TestResult::Fail("x86 property note failed to parse"),
+    };
+    if props.x86_shstk != true || props.x86_ibt {
+        return TestResult::Fail("x86 feature bits decoded wrongly");
+    }
+
+    // Two records, ascending — both must land, and an unknown type between
+    // them must be skipped rather than ending the walk.
+    let mut desc = feature_record(0x1000_0000, 0);
+    desc.extend_from_slice(&feature_record(AARCH64_AND, 0b1));
+    desc.extend_from_slice(&feature_record(X86_AND, 0b1));
+    let img = property_image(&desc, 5, b"GNU\0");
+    let props = match parse_elf(&img) {
+        Ok(image) => image.properties,
+        Err(_) => return TestResult::Fail("multi-record property note failed to parse"),
+    };
+    if !props.aarch64_bti || !props.x86_ibt {
+        return TestResult::Fail("a record after an unknown pr_type was not decoded");
+    }
+
+    // An image with no property segment reports no features, and does not fail.
+    let plain = property_image(&feature_record(AARCH64_AND, 0b111), 5, b"GNU\0");
+    let mut no_prop = plain.clone();
+    no_prop[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // drop the second phdr
+    match parse_elf(&no_prop) {
+        Ok(image) if image.properties == crate::ElfProperties::default() => TestResult::Pass,
+        Ok(_) => TestResult::Fail("an image without PT_GNU_PROPERTY reported features"),
+        Err(_) => TestResult::Fail("an image without PT_GNU_PROPERTY failed to parse"),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace/elf", smoke_userspace_parses_gnu_property_note);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_rejects_malformed_gnu_property() -> TestResult {
+    use crate::parse_elf;
+    // Each of these is a shape Linux's `parse_elf_property` rejects with
+    // -ENOEXEC. They matter more than the happy path: every one of them would
+    // otherwise decode as "no features", which is indistinguishable from a
+    // binary that opted out — so a malformed note would silently disable an
+    // enforcement the binary asked for, in exactly the direction an attacker
+    // would want.
+    const AARCH64_AND: u32 = 0xc000_0000;
+    const X86_AND: u32 = 0xc000_0002;
+
+    // pr_datasz claims more than the note holds.
+    let mut oversize = alloc::vec::Vec::new();
+    oversize.extend_from_slice(&AARCH64_AND.to_le_bytes());
+    oversize.extend_from_slice(&64u32.to_le_bytes()); // datasz past the end
+    oversize.extend_from_slice(&1u32.to_le_bytes());
+    oversize.extend_from_slice(&0u32.to_le_bytes());
+    if parse_elf(&property_image(&oversize, 5, b"GNU\0")).is_ok() {
+        return TestResult::Fail("a record claiming data past the note was accepted");
+    }
+
+    // Records must be sorted and unique on pr_type; a duplicate would let a
+    // second record override the first.
+    let mut duplicate = feature_record(AARCH64_AND, 0b111);
+    duplicate.extend_from_slice(&feature_record(AARCH64_AND, 0));
+    if parse_elf(&property_image(&duplicate, 5, b"GNU\0")).is_ok() {
+        return TestResult::Fail("duplicate pr_type was accepted");
+    }
+    let mut descending = feature_record(X86_AND, 0b1);
+    descending.extend_from_slice(&feature_record(AARCH64_AND, 0b1));
+    if parse_elf(&property_image(&descending, 5, b"GNU\0")).is_ok() {
+        return TestResult::Fail("out-of-order pr_type was accepted");
+    }
+
+    // A feature word too short to hold its bitmap.
+    let mut short = alloc::vec::Vec::new();
+    short.extend_from_slice(&AARCH64_AND.to_le_bytes());
+    short.extend_from_slice(&2u32.to_le_bytes()); // datasz = 2, needs 4
+    short.extend_from_slice(&0u32.to_le_bytes());
+    short.extend_from_slice(&0u32.to_le_bytes());
+    if parse_elf(&property_image(&short, 5, b"GNU\0")).is_ok() {
+        return TestResult::Fail("a 2-byte feature word was accepted");
+    }
+
+    // A truncated record header (under 8 bytes of remaining descriptor).
+    let mut stub = feature_record(AARCH64_AND, 0b1);
+    stub.extend_from_slice(&[0u8; 4]);
+    if parse_elf(&property_image(&stub, 5, b"GNU\0")).is_ok() {
+        return TestResult::Fail("a trailing partial record header was accepted");
+    }
+
+    // A note that is not a GNU property note is not an error — it simply
+    // carries no properties. Linux ignores these too rather than failing an
+    // exec over a note it does not recognise.
+    let other_type = property_image(&feature_record(AARCH64_AND, 0b111), 3, b"GNU\0");
+    match parse_elf(&other_type) {
+        Ok(image) if image.properties == crate::ElfProperties::default() => {}
+        Ok(_) => return TestResult::Fail("a non-property note yielded properties"),
+        Err(_) => return TestResult::Fail("a non-property note failed the parse"),
+    }
+    let other_name = property_image(&feature_record(AARCH64_AND, 0b111), 5, b"AND\0");
+    match parse_elf(&other_name) {
+        Ok(image) if image.properties == crate::ElfProperties::default() => TestResult::Pass,
+        Ok(_) => TestResult::Fail("a non-GNU note name yielded properties"),
+        Err(_) => TestResult::Fail("a non-GNU note name failed the parse"),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace/elf",
+    smoke_userspace_rejects_malformed_gnu_property
+);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_max_align_tracks_pt_load() -> TestResult {
+    use crate::parse_elf;
+    // `maximum_alignment()` in `fs/binfmt_elf.c`. A toolchain asks for 2 MiB
+    // when it wants the segment eligible for a huge mapping, and a
+    // non-power-of-two value is skipped as malformed rather than failing the
+    // image — both behaviours are pinned here because the loader consumes this
+    // to choose the load base.
+    let mut b = property_image(&feature_record(0xc000_0000, 0), 5, b"GNU\0");
+    let ph = 64usize;
+
+    // Baseline: the helper builds a 4 KiB-aligned PT_LOAD.
+    match parse_elf(&b) {
+        Ok(image) if image.max_align == 4096 => {}
+        Ok(image) => {
+            let _ = image;
+            return TestResult::Fail("default alignment should be the page size");
+        }
+        Err(_) => return TestResult::Fail("baseline image failed to parse"),
+    }
+
+    // 2 MiB is honoured.
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x20_0000u64.to_le_bytes());
+    match parse_elf(&b) {
+        Ok(image) if image.max_align == 0x20_0000 => {}
+        Ok(_) => return TestResult::Fail("a 2 MiB p_align was not picked up"),
+        Err(_) => return TestResult::Fail("2 MiB-aligned image failed to parse"),
+    }
+
+    // A non-power-of-two alignment is skipped, leaving the page-size floor.
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x30_0000u64.to_le_bytes());
+    match parse_elf(&b) {
+        Ok(image) if image.max_align == 4096 => {}
+        Ok(_) => return TestResult::Fail("a non-power-of-two p_align was honoured"),
+        Err(_) => return TestResult::Fail("odd-aligned image failed to parse"),
+    }
+
+    // An alignment below the page size never lowers the floor.
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&64u64.to_le_bytes());
+    match parse_elf(&b) {
+        Ok(image) if image.max_align == 4096 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("a sub-page p_align lowered the floor"),
+        Err(_) => TestResult::Fail("sub-page-aligned image failed to parse"),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace/elf", smoke_userspace_max_align_tracks_pt_load);
