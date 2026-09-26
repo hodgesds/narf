@@ -86,6 +86,16 @@ impl PtFlags {
     /// Access Flag: must be 1 to avoid Access Flag faults.
     pub const AF: Self = Self(1 << 10);
 
+    /// GP — Guarded Page (ARM DDI0487 D8.4, FEAT_BTI). An indirect branch whose
+    /// target lies in a guarded page must land on a `BTI`, `PACIASP` or
+    /// `PACIBSP` instruction; otherwise the CPU takes a Branch Target Exception.
+    ///
+    /// Only set for executable user pages belonging to an image that declared
+    /// `GNU_PROPERTY_AARCH64_FEATURE_1_BTI`. The bit is ignored by hardware
+    /// without FEAT_BTI, but the loader gates on `bti::caps()` anyway rather than
+    /// relying on that.
+    pub const GUARDED: Self = Self(1 << 50);
+
     /// MAIR attribute index (bits 4:2). These MUST match `MAIR_EL1` as
     /// programmed in `frame/src/aarch64/boot.S` and `smp_entry.S`:
     ///
