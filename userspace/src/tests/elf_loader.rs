@@ -4870,3 +4870,89 @@ fn smoke_userspace_auxv_carries_execfn() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("userspace/elf", smoke_userspace_auxv_carries_execfn);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_load_base_honours_segment_alignment() -> TestResult {
+    // A toolchain that wants its text eligible for a huge mapping says so with
+    // `p_align = 2 MiB`. `binfmt_elf` rounds the randomised load bias DOWN to
+    // that alignment (`load_bias &= ~(alignment - 1)`); a loader that ignores it
+    // places the segment at a 4 KiB boundary, where no 2 MiB entry can ever back
+    // it no matter what the memory subsystem is capable of.
+    use crate::load_user_process_with;
+    use crate::loader::PROGRAM_DYN_BASE;
+
+    let image = |align: u64| -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; 0x2000];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&0x1040u64.to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&align.to_le_bytes());
+        b
+    };
+
+    let load = |align: u64| -> Result<u64, &'static str> {
+        let bytes = image(align);
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised — the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&bytes, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return Err("load failed"),
+        };
+        let bias = proc.program_bias;
+        let pid = proc.pid;
+        drop(proc);
+        crate::release_pid(pid);
+        Ok(bias)
+    };
+
+    // 2 MiB alignment must be honoured, several draws over, because the base is
+    // randomised and a single pass could be aligned by luck.
+    for _ in 0..8 {
+        let bias = match load(0x20_0000) {
+            Ok(b) => b,
+            Err(why) => return TestResult::Fail(why),
+        };
+        if bias & 0x1F_FFFF != 0 {
+            return TestResult::Fail("a 2 MiB-aligned image did not land 2 MiB-aligned");
+        }
+        // The nominal base stays unmapped: ABI tests use it as a known-bad user
+        // pointer, so rounding down must never land the image exactly on it
+        // when randomisation is active.
+        if bias < PROGRAM_DYN_BASE {
+            return TestResult::Fail("alignment pushed the base below its window");
+        }
+    }
+
+    // A page-aligned image is unaffected — the bias keeps page granularity and
+    // stays inside the window.
+    let bias = match load(0x1000) {
+        Ok(b) => b,
+        Err(why) => return TestResult::Fail(why),
+    };
+    if bias & 0xFFF != 0 {
+        return TestResult::Fail("a page-aligned image lost page alignment");
+    }
+    if bias < PROGRAM_DYN_BASE {
+        return TestResult::Fail("page-aligned base fell below its window");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace/elf",
+    smoke_userspace_load_base_honours_segment_alignment
+);
