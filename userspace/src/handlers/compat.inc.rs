@@ -6176,7 +6176,16 @@ pub fn proc_task_info(
     let mut vmas = alloc::vec::Vec::new();
     if query == TaskInfoQuery::Vmas {
         if let Some(as_arc) = as_arc {
-            for r in as_arc.numa_regions_snapshot() {
+            let mut snapshot = as_arc.numa_regions_snapshot();
+            // Fallible: this runs on the fatal-fault diagnostic path, where the
+            // kernel heap may be exhausted. If the output can't be reserved, drop
+            // the VMA list (empty snapshot => the loop is a no-op) rather than
+            // abort the whole kernel — a userspace fault must never panic it via a
+            // diagnostic allocation.
+            if vmas.try_reserve(snapshot.len()).is_err() {
+                snapshot.clear();
+            }
+            for r in snapshot {
                 let base = r.base.as_u64();
                 let end = base + r.len;
                 let prot = r.perms.prot_only();

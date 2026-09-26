@@ -7860,7 +7860,14 @@ impl AddressSpace {
         let mut out = Vec::new();
         {
             let huge = self.huge_regions.lock();
-            out.reserve(huge.len());
+            // Fallible: this snapshot is taken on the fatal-fault diagnostic path,
+            // where the kernel heap may already be exhausted. A failed reserve
+            // degrades to a partial (or empty) snapshot rather than aborting the
+            // whole kernel — a userspace fault must never panic the kernel via a
+            // diagnostic allocation. Callers already tolerate a short list.
+            if out.try_reserve(huge.len()).is_err() {
+                return out;
+            }
             for region in huge.iter() {
                 let page_bytes = match region.size {
                     crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
@@ -7891,7 +7898,10 @@ impl AddressSpace {
         }
         {
             let regions = self.regions.lock();
-            out.reserve(regions.len());
+            // Fallible (see the huge-region reserve above): never abort on OOM.
+            if out.try_reserve(regions.len()).is_err() {
+                return out;
+            }
             for region in regions.iter() {
                 let mut node_pages = [0u64; crate::frame::MAX_NUMA_NODES];
                 let mut resident_pages = 0u64;
