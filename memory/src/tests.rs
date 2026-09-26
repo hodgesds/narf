@@ -16419,3 +16419,35 @@ fn smoke_memory_fork_inherits_mmap_floor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_fork_inherits_mmap_floor);
+
+/// The bootstrap arena covered the pre-slab buddy reservation.
+///
+/// `reserve_for_slab_promotion` reserves the pessimistic per-order free-list
+/// capacity — ~32 bytes per 4 KiB frame — out of a bump arena that is a fixed
+/// 12 MiB of `.bss` plus at most `MAX_SPILL_REGIONS` buddy-donated 32 MiB
+/// regions. Run out and the boot dies in `handle_alloc_error`, deep in the
+/// allocator, with nothing naming the spill capacity as the limit: that is how a
+/// 32 GiB machine failed to boot while the sizing comment claimed 64 GiB.
+///
+/// A number rather than a panic is what makes it testable at all. The shortfall
+/// is recorded when the donation loop gives up, so this case names the failure
+/// and reports how far short it fell — and it scales with whatever RAM the
+/// machine running it has, which is the property that was missing.
+fn smoke_bootstrap_arena_covers_reservation() -> TestResult {
+    let short = crate::heap::bootstrap_shortfall();
+    if short != 0 {
+        // Deliberately not a Skip: on a machine this large the boot only got
+        // here because the reservation happened to fit anyway, and the next
+        // allocation of that size is the one that dies.
+        return TestResult::Fail(
+            "bootstrap arena came up short of the pre-slab reservation — \
+             raise heap::MAX_SPILL_REGIONS (see spill_stats/bootstrap_shortfall)",
+        );
+    }
+    let (regions, _bytes) = crate::heap::spill_stats();
+    if regions > crate::heap::MAX_SPILL_REGIONS {
+        return TestResult::Fail("more spill regions than the slot count allows");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bootstrap_arena_covers_reservation);
