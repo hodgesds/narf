@@ -1044,12 +1044,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // no-op on bare metal / TCG / non-KVM hypervisors. The BSP's
         // steal-time area registers here; each AP registers its own in
         // `_ap_start_rust`.
-        let (pv_send_ipi, pv_tlb) = narf_memory::kvm_pv::detect();
+        let (pv_send_ipi_supported, pv_tlb) = narf_memory::kvm_pv::detect();
         narf_memory::kvm_pv::register_steal_time_current_cpu();
         let _ = writeln!(
             console::Writer,
-            "  kvm-pv: send_ipi={} tlb_flush={}",
-            pv_send_ipi, pv_tlb
+            "  kvm-pv: send_ipi=off (supported={}) tlb_flush={}",
+            pv_send_ipi_supported, pv_tlb
         );
 
         // Per-task kernel-stack retargeting is independent of the LAPIC

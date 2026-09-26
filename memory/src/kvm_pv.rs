@@ -52,6 +52,8 @@ const KVM_VCPU_PREEMPTED: u8 = 1 << 0;
 const KVM_VCPU_FLUSH_TLB: u8 = 1 << 1;
 
 static SEND_IPI_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Host advertised KVM_FEATURE_PV_SEND_IPI (whether or not we use it).
+static SEND_IPI_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static TLB_FLUSH_FEATURE: AtomicBool = AtomicBool::new(false);
 static STEAL_TIME_FEATURE: AtomicBool = AtomicBool::new(false);
 /// `vmmcall` (AMD) vs `vmcall` (Intel) — the wrong one is #UD.
@@ -128,13 +130,35 @@ pub fn detect() -> (bool, bool) {
     let intel = vendor.ebx == u32::from_le_bytes(*b"Genu");
     USE_VMMCALL.store(!intel, Ordering::Relaxed);
 
-    let send_ipi = features & KVM_FEATURE_PV_SEND_IPI != 0;
+    let send_ipi_supported = features & KVM_FEATURE_PV_SEND_IPI != 0;
     let steal = features & KVM_FEATURE_STEAL_TIME != 0;
     let tlb = features & KVM_FEATURE_PV_TLB_FLUSH != 0;
-    SEND_IPI_ACTIVE.store(send_ipi, Ordering::Release);
+    // PV_SEND_IPI stays OFF even when advertised. KVM advertises the bit
+    // unconditionally, including on hosts whose hardware virtualises guest
+    // ICR writes (AMD AVIC / Intel APICv+IPI-virt) — there a native fixed
+    // IPI to a RUNNING vCPU costs no vmexit at all, and the hypercall
+    // replaces that free write with a mandatory exit. Measured on the AMD
+    // AVIC bench host (16 vCPUs, stress-ng, 10 s, 2 workers): sock 2291 ->
+    // 1069 bogo-ops/s and shm 111 -> 55 with the hypercall path on; fork
+    // unchanged. The guest cannot see whether the host runs APIC
+    // virtualisation, so the safe default is the native path; a non-APICv
+    // deployment can opt in with [`enable_send_ipi`]. (Preempted targets
+    // are already covered: PV_TLB_FLUSH elides them from shootdowns, and a
+    // fixed IPI to a preempted vCPU is delivered on its next resume either
+    // way.)
+    SEND_IPI_SUPPORTED.store(send_ipi_supported, Ordering::Release);
     STEAL_TIME_FEATURE.store(steal, Ordering::Release);
     TLB_FLUSH_FEATURE.store(tlb && steal, Ordering::Release);
-    (send_ipi, tlb && steal)
+    (send_ipi_supported, tlb && steal)
+}
+
+/// Opt in to `KVM_HC_SEND_IPI` broadcasts. Only sensible on hosts WITHOUT
+/// hardware APIC virtualisation (see the [`detect`] rationale); no-op when
+/// the host never advertised the feature.
+pub fn enable_send_ipi() {
+    if SEND_IPI_SUPPORTED.load(Ordering::Acquire) {
+        SEND_IPI_ACTIVE.store(true, Ordering::Release);
+    }
 }
 
 /// Register this CPU's steal-time area with the host. Called once per CPU
