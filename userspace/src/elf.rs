@@ -573,7 +573,7 @@ fn read_gnu_property_segment<S: ExecBytes + ?Sized>(
     file_off: u64,
     file_size: u64,
 ) -> Result<ElfProperties, ElfError> {
-    if file_size < 16 || file_size > MAX_PROPERTY_BYTES {
+    if !(16..=MAX_PROPERTY_BYTES).contains(&file_size) {
         return Err(ElfError::BadGnuProperty);
     }
     let end = file_off

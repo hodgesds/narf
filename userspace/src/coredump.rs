@@ -247,6 +247,8 @@ pub(crate) fn build_note_segment(
     let mut buf = Vec::new();
     // SAFETY: both are live locals of exactly their declared size.
     push_note(&mut buf, b"CORE", 1, unsafe { slice_from_ref(regs) });
+    // SAFETY: `prpsinfo` is a live reference to a `#[repr(C)]` struct of
+    // exactly this size, read as bytes for the note descriptor.
     push_note(&mut buf, b"CORE", 3, unsafe { slice_from_ref(prpsinfo) });
     if !auxv.is_empty() {
         push_note(&mut buf, b"CORE", 6, auxv);

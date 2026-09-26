@@ -4489,7 +4489,7 @@ fn smoke_userspace_parses_gnu_property_note() -> TestResult {
         Ok(image) => image.properties,
         Err(_) => return TestResult::Fail("x86 property note failed to parse"),
     };
-    if props.x86_shstk != true || props.x86_ibt {
+    if !props.x86_shstk || props.x86_ibt {
         return TestResult::Fail("x86 feature bits decoded wrongly");
     }
 

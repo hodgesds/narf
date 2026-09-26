@@ -273,6 +273,20 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
     }
 
     __test_clear_global();
+    // Pin this test's task identity, the way the other namespace smokes in this
+    // file do. `sys_sethostname` gates on `uts_admin(current_task_id())`, and
+    // `current_task_id` resolves through whichever lookup was installed LAST —
+    // so without this the test inherits a previous test's task id and its
+    // privileges. That made the result depend on registration order: it passed
+    // for as long as nothing reordered the suite, then failed with "sethostname
+    // did not return 0" (an EPERM) when eight unrelated tests were added
+    // elsewhere in the tree and shifted its position.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static HOSTNAME_TASK: AtomicU64 = AtomicU64::new(0x_0057_0001);
+    fn hostname_task_lookup() -> u64 {
+        HOSTNAME_TASK.load(Ordering::Relaxed)
+    }
+    crate::handlers::install_task_id_lookup(hostname_task_lookup);
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
