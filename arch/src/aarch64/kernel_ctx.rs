@@ -28,6 +28,16 @@ pub struct KernelContext {
     pub domain_active: u64,
     pub domain_sctlr: u64,
     pub domain_gcr: u64,
+    /// `PSTATE.TCO` as it stood in the outgoing context.
+    ///
+    /// TCO is execution state exactly like `daif` above, and it has to travel
+    /// with the context for the same reason: the architecture SETS it on
+    /// exception entry so a handler cannot trip a tag fault on its own
+    /// accesses, and only `eret` restores it. A switch out of a trap context
+    /// never `eret`s, so without carrying it here TCO stayed set for every
+    /// subsequent kernel access on this CPU — silently disabling every MTE tag
+    /// check, and with it domain isolation.
+    pub domain_tco: u64,
 }
 
 const _: () = {
@@ -39,6 +49,7 @@ const _: () = {
     assert!(core::mem::offset_of!(KernelContext, domain_active) == 112);
     assert!(core::mem::offset_of!(KernelContext, domain_sctlr) == 120);
     assert!(core::mem::offset_of!(KernelContext, domain_gcr) == 128);
+    assert!(core::mem::offset_of!(KernelContext, domain_tco) == 136);
     assert!(core::mem::size_of::<KernelContext>() == 144);
     assert!(core::mem::align_of::<KernelContext>() == 16);
 };
@@ -63,6 +74,11 @@ impl KernelContext {
             domain_active: 0,
             domain_sctlr: 0,
             domain_gcr: 0,
+            // A fresh context has no saved TCO. `kernel_switch` clears TCO on
+            // the outgoing side, so a context with `domain_active == 0` is
+            // entered with checks live rather than inheriting whatever the
+            // last exception left behind.
+            domain_tco: 0,
         }
     }
 
@@ -107,11 +123,21 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "str x11, [x0, #112]",
         "str x9, [x0, #120]",
         "str x10, [x0, #128]",
+        // PSTATE.TCO travels with the context, and kernel code past this point
+        // must run with tag checks live: TCO is set by the architecture on
+        // exception entry and only `eret` clears it, so a switch out of a trap
+        // context would otherwise leave it set forever. TCO is S3_3_C4_C2_7,
+        // spelled by encoding because the mnemonic needs `+mte` on the
+        // assembler.
+        "mrs x11, S3_3_C4_C2_7",
+        "str x11, [x0, #136]",
+        "msr S3_3_C4_C2_7, xzr",
         "b 4f",
         "3:",
         "str xzr, [x0, #112]",
         "str xzr, [x0, #120]",
         "str xzr, [x0, #128]",
+        "str xzr, [x0, #136]",
         "4:",
         "stp x19, x20, [x0, #0]",
         "stp x21, x22, [x0, #16]",
@@ -137,8 +163,10 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "cbz x9, 5f",
         "ldr x9, [x1, #120]",
         "ldr x10, [x1, #128]",
+        "ldr x11, [x1, #136]",
         "msr s3_0_c1_c0_6, x10",
         "msr sctlr_el1, x9",
+        "msr S3_3_C4_C2_7, x11",
         "isb",
         "5:",
         "msr daif, x17",
