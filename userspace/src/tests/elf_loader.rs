@@ -4956,3 +4956,57 @@ kernel_test_in!(
     "userspace/elf",
     smoke_userspace_load_base_honours_segment_alignment
 );
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_clone_settls_programs_child_tls() -> TestResult {
+    // `CLONE_SETTLS` is how every threading library gives a new thread its
+    // thread pointer: libc allocates the TLS block itself and hands the kernel
+    // the pointer to install in FS_BASE (x86_64) or TPIDR_EL0 (aarch64). The
+    // kernel implemented it and NOTHING covered it — so a regression would have
+    // stayed silent until a threaded program ran, and then presented as
+    // corruption inside libc rather than as a failed clone.
+    //
+    // The case worth pinning is `CLONE_SETTLS` with `tls == 0`. It must install
+    // zero, not fall back to inheriting the parent's register: inheriting would
+    // hand two threads the same TLS block, and that corruption surfaces far from
+    // its cause.
+    use crate::handlers::__test_clone_tls_base;
+
+    const CLONE_SETTLS: u64 = 0x0008_0000;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const TP: u64 = 0x7f00_1234_5000;
+
+    if __test_clone_tls_base(CLONE_SETTLS, TP) != Some(TP) {
+        return TestResult::Fail("CLONE_SETTLS did not install the requested thread pointer");
+    }
+    // Set alongside the flags a real pthread_create passes.
+    if __test_clone_tls_base(CLONE_SETTLS | CLONE_VM, TP) != Some(TP) {
+        return TestResult::Fail("CLONE_SETTLS ignored the thread pointer when combined");
+    }
+    if __test_clone_tls_base(CLONE_SETTLS, 0) != Some(0) {
+        return TestResult::Fail("CLONE_SETTLS with tls==0 inherited instead of installing zero");
+    }
+    // Without the flag the child inherits the live register — whatever it is,
+    // including None outside a user task. Compared against the same source the
+    // production path reads, so this holds in any harness state.
+    // The inherit branch's own source, read through the same hook so the
+    // comparison holds in any harness state.
+    let inherited = __test_clone_tls_base(0, 0xdead_beef);
+    if __test_clone_tls_base(CLONE_VM, TP) != inherited {
+        return TestResult::Fail("a clone without CLONE_SETTLS did not inherit the live register");
+    }
+    if __test_clone_tls_base(0, 0) != inherited {
+        return TestResult::Fail("a plain fork did not inherit the live register");
+    }
+    // And the inherit branch must genuinely ignore the tls argument rather than
+    // happening to agree with it.
+    if inherited == Some(0xdead_beef) {
+        return TestResult::Fail("the inherit branch used the tls argument");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace/tls",
+    smoke_userspace_clone_settls_programs_child_tls
+);
