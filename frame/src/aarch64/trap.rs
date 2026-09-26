@@ -135,20 +135,55 @@ pub extern "C" fn rust_aarch64_sync(frame: &TrapFrame) -> ! {
 ///   falls through to fatal otherwise.
 /// - Anything else: fatal — delegates to `rust_aarch64_sync` which
 ///   prints diagnostics and calls `exit_kernel`.
+const EC_SVC_AARCH64: u64 = 0b01_0101;
+const EC_DATA_ABORT_LOWER_EL: u64 = 0b10_0100;
+/// Data Abort taken from the *current* EL — i.e. a kernel fault. Until the
+/// BPF extable landed, this EC had no handler at all: it fell straight
+/// through to `rust_aarch64_sync` and `exit_kernel(42)`. There is no
+/// `arch/src/aarch64/probe.rs` either, so this is aarch64's first kernel
+/// fault-recovery surface, not a re-wiring of an existing one.
+const EC_DATA_ABORT_CURRENT_EL: u64 = 0b10_0101;
+/// Instruction Abort taken from a lower EL — an EL0 *fetch* from a page
+/// with no translation. Unlike x86_64, where one `#PF` covers reads,
+/// writes and fetches and the handler never inspects the access type,
+/// aarch64 raises a different exception class for a fetch, and it had no
+/// handler here: it fell through to `rust_aarch64_sync` and killed the
+/// task. Nothing produced an unbacked *executable* user page before, so
+/// the gap was latent; demand-paged program text is exactly such a page,
+/// and every aarch64 process would die on its first instruction without
+/// this arm. Linux routes the same class to the same place —
+/// `ESR_ELx_EC_IABT_LOW` → `el0_ia()` → `do_page_fault()` with
+/// `vm_flags = VM_EXEC`.
+const EC_INSTRUCTION_ABORT_LOWER_EL: u64 = 0b10_0000;
+
+/// Whether an abort taken from EL0 with this exception class is one
+/// [`try_heal_user_abort`] can service: a data abort (a read or a write) or an
+/// instruction abort (a fetch). Both carry a faulting address in `FAR_EL1` and
+/// the same fault-status encoding; only a data abort also carries WnR.
+///
+/// Split out from the dispatcher because the dispatcher reads `ESR_EL1` and
+/// `FAR_EL1` and so cannot be called from a test, while this can.
+const fn el0_abort_is_healable(ec: u64) -> bool {
+    ec == EC_DATA_ABORT_LOWER_EL || ec == EC_INSTRUCTION_ABORT_LOWER_EL
+}
+
+/// Whether an abort's ISS fault-status field reports "no translation at this
+/// level" — DFSC for a data abort, IFSC for an instruction abort, same
+/// encoding in bits [5:0] (Arm ARM DDI0487 D5.4), top four bits `0b0001` with
+/// the level in the low two. This is the demand-paging case; `0b0011` is a
+/// permission fault, which a fetch must not treat as one.
+const fn abort_is_translation_fault(fsc: u64) -> bool {
+    /// Top four bits of a translation fault's status code; the low two carry
+    /// the level at which the walk found no entry.
+    const FSC_TRANSLATION_FAULT_TOP: u64 = 0b00_0100;
+    (fsc & 0b11_1100) == FSC_TRANSLATION_FAULT_TOP
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
     // SAFETY: ESR_EL1 read at EL1 is always defined.
     let esr = unsafe { sysreg::read_esr_el1() };
     let ec = (esr >> 26) & 0x3F;
-
-    const EC_SVC_AARCH64: u64 = 0b01_0101;
-    const EC_DATA_ABORT_LOWER_EL: u64 = 0b10_0100;
-    /// Data Abort taken from the *current* EL — i.e. a kernel fault. Until the
-    /// BPF extable landed, this EC had no handler at all: it fell straight
-    /// through to `rust_aarch64_sync` and `exit_kernel(42)`. There is no
-    /// `arch/src/aarch64/probe.rs` either, so this is aarch64's first kernel
-    /// fault-recovery surface, not a re-wiring of an existing one.
-    const EC_DATA_ABORT_CURRENT_EL: u64 = 0b10_0101;
 
     if ec == EC_SVC_AARCH64 {
         // Convention: x8 = syscall number, x0..x5 = args. Return
@@ -180,12 +215,13 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
-    if ec == EC_DATA_ABORT_LOWER_EL {
+    if el0_abort_is_healable(ec) {
         // SAFETY: FAR_EL1 read at EL1 is always defined.
         let far = unsafe { sysreg::read_far_el1() };
         // Demand paging / stack grow / COW split for the EL0 fault. On
-        // success we `eret` back to the faulting user instruction.
-        if try_heal_user_data_abort(esr, far, true) {
+        // success we `eret` back to the faulting user instruction — or, for an
+        // instruction abort, to the instruction that could not be fetched.
+        if try_heal_user_abort(esr, far, true) {
             return;
         }
         // Fall through to fatal if the abort wasn't a recoverable
@@ -211,7 +247,7 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // pointer bug can't be COW/demand-heal-attempted. This mirrors the
         // x86_64 #PF handler servicing a CPL=0 fault on a user vaddr.
         let may_wait_for_reclaim = !narf_arch::aarch64::uaccess::guarded_copy_armed();
-        if in_user_half(far) && try_heal_user_data_abort(esr, far, may_wait_for_reclaim) {
+        if in_user_half(far) && try_heal_user_abort(esr, far, may_wait_for_reclaim) {
             return;
         }
 
@@ -259,15 +295,21 @@ fn in_user_half(a: u64) -> bool {
     a < 0x0000_8000_0000_0000
 }
 
-/// Attempt to heal a data abort whose faulting address is `far`, using the
-/// active user address space: demand-page a fresh translation-fault page,
-/// grow the stack into a `STACK_GUARD` region, or COW-split a write
-/// permission fault. Returns `true` iff the fault was fully recovered and
-/// the faulting instruction can be re-executed via `eret`.
+/// Attempt to heal an abort whose faulting address is `far`, using the active
+/// user address space: demand-page a fresh translation-fault page, grow the
+/// stack into a `STACK_GUARD` region, or COW-split a write permission fault.
+/// Returns `true` iff the fault was fully recovered and the faulting
+/// instruction can be re-executed via `eret`.
 ///
-/// Shared by the EL0 (lower-EL) abort path and the EL1 (current-EL) guarded
-/// user-copy path so both apply the identical heal-first policy.
-fn try_heal_user_data_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
+/// Shared by the EL0 (lower-EL) data and instruction abort paths and the EL1
+/// (current-EL) guarded user-copy path, so all apply the identical heal-first
+/// policy. Instruction and data aborts share the fault-status encoding in ISS
+/// bits [5:0] (IFSC and DFSC), which is what the translation-fault test below
+/// reads. WnR (bit 6) exists only for a data abort and reads as zero for an
+/// instruction abort, so a fetch is classified as a non-write and can never
+/// take the COW arm — matching Linux, which sets `vm_flags = VM_EXEC` without
+/// `FAULT_FLAG_WRITE` for `ESR_ELx_EC_IABT_LOW`.
+fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
     // ISS field for a Data Abort (Arm ARM DDI0487 D5.4):
     //   bit  6  (WnR)  : 0 = read, 1 = write
     //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011 indicate a
@@ -277,11 +319,10 @@ fn try_heal_user_data_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> b
     const ISS_WNR: u64 = 1 << 6;
     const DFSC_MASK: u64 = 0x3F;
     const DFSC_PERMISSION_FAULT_TOP: u64 = 0b00_1100;
-    const DFSC_TRANSLATION_FAULT_TOP: u64 = 0b00_0100;
     let is_write = (iss & ISS_WNR) != 0;
     let dfsc = iss & DFSC_MASK;
     let is_perm_fault = (dfsc & 0b11_1100) == DFSC_PERMISSION_FAULT_TOP;
-    let is_translation_fault = (dfsc & 0b11_1100) == DFSC_TRANSLATION_FAULT_TOP;
+    let is_translation_fault = abort_is_translation_fault(dfsc);
 
     // Stack auto-extension + demand paging on translation fault (no PTE
     // installed). mmap's deferred-back path surfaces here; if the vaddr lands
@@ -1333,3 +1374,58 @@ fn dump_frame(f: &TrapFrame) {
     let _ = writeln!(Writer, "  x2:  {:#018x}   x3:  {:#018x}", f.x2, f.x3);
     let _ = writeln!(Writer, "  x30: {:#018x}", f.x30);
 }
+
+/// An EL0 *fetch* from a page with no translation must reach the same healer
+/// as a load or a store.
+///
+/// aarch64 raises a different exception class for a fetch than for a data
+/// access, and this dispatcher handled only the data-abort classes: an
+/// instruction abort fell through to `rust_aarch64_sync` and killed the task.
+/// Nothing produced an unbacked *executable* user page before demand-paged
+/// program text, so the gap was latent — and it is invisible to a test that
+/// resolves a page by calling `demand_alloc_page` directly, because that never
+/// goes through the trap dispatcher at all. With demand-paged text every
+/// aarch64 process dies on its first instruction without the instruction-abort
+/// arm, so the classification is pinned here.
+fn smoke_aarch64_instruction_abort_is_demand_healable() -> TestResult {
+    // EC 0b100000 — Instruction Abort from a lower EL. This is the one the
+    // dispatcher used to drop.
+    if !el0_abort_is_healable(0b10_0000) {
+        return TestResult::Fail("EL0 instruction abort is not routed to the healer");
+    }
+    // EC 0b100100 — Data Abort from a lower EL, the case that always worked.
+    if !el0_abort_is_healable(0b10_0100) {
+        return TestResult::Fail("EL0 data abort stopped being routed to the healer");
+    }
+    // A current-EL abort is a kernel fault: it has its own arm (BPF extable,
+    // guarded-copy fixup) and must not be swept into the EL0 path.
+    if el0_abort_is_healable(0b10_0101) || el0_abort_is_healable(0b10_0001) {
+        return TestResult::Fail("a current-EL abort must not take the EL0 heal path");
+    }
+    // An `svc` is not an abort.
+    if el0_abort_is_healable(EC_SVC_AARCH64) {
+        return TestResult::Fail("SVC must not take the abort heal path");
+    }
+
+    // IFSC and DFSC share bits [5:0]. Translation fault at levels 0..3 is the
+    // demand-paging case; a permission fault is not, and a fetch must not be
+    // COW-split.
+    for level in 0..4u64 {
+        if !abort_is_translation_fault(0b00_0100 | level) {
+            return TestResult::Fail("a translation fault was not classified as demand-pageable");
+        }
+        if abort_is_translation_fault(0b00_1100 | level) {
+            return TestResult::Fail("a permission fault was classified as demand-pageable");
+        }
+    }
+    // Access flag fault (0b0010xx) and address size fault (0b0000xx) are
+    // neither: they must not be mistaken for a missing translation.
+    if abort_is_translation_fault(0b00_1000) || abort_is_translation_fault(0b00_0000) {
+        return TestResult::Fail("a non-translation fault status was misclassified");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "aarch64",
+    smoke_aarch64_instruction_abort_is_demand_healable
+);
