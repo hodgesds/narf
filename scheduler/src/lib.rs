@@ -1904,6 +1904,28 @@ pub fn dbg_resched_counts() -> (u64, u64) {
     )
 }
 
+/// Test-only: undo the scheduler-side publication that
+/// [`replace_address_space`] performs when it targets the *current* task — the
+/// per-CPU `ACTIVE_USER_AS` cell and this task's `PENDING_SLOT_AS` entry.
+///
+/// In production both are correct and load-bearing: after an `execve` the task
+/// really does run on the new address space, and the polling routine that
+/// applies the staged `ExecRequest` owns them until the task retires. A test
+/// that longjmps past that poll has no such owner, so the two clones keep the
+/// new address space alive — and any "did this exec leak?" assertion then
+/// measures the fixture rather than the code under test. Worse, whether they
+/// exist at all depends on whether `CURRENT_TASK` for this CPU happened to hold
+/// the test's task id, which makes such an assertion silently nondeterministic:
+/// it passed or failed with unrelated changes to the crate.
+#[doc(hidden)]
+pub fn __test_clear_published_address_space(id: TaskId) {
+    *active_user_as_slot().lock() = None;
+    let shard = task_affinity_shard(id);
+    let mut pending = PENDING_SLOT_AS[shard].lock();
+    pending.retain(|(k, _)| *k != id.raw());
+    PENDING_SLOT_AS_LEN[shard].store(pending.len(), Ordering::Release);
+}
+
 /// Test-only: force a CPU's published halted flag, so the kernel-test
 /// suite can pin the cross-core wake/spawn kick protocol (`enqueue_on` →
 /// `resched_remote`) without a second physical CPU. Never call outside
