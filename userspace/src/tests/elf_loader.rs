@@ -3023,6 +3023,109 @@ kernel_test_in!(
     smoke_userspace_tls_block_sits_where_relocations_say
 );
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_exec_load_cost_bench() -> TestResult {
+    // A MEASUREMENT, not an assertion.
+    //
+    // Exec today reads the whole binary into a `Vec` and then copies every
+    // PT_LOAD page into freshly allocated frames, so its cost scales with file
+    // size whether or not the process touches those pages. Demand paging
+    // changes exactly two observable quantities — how long a load takes, and
+    // how much memory it leaves resident — and nothing in the suite measured
+    // either, so there was no way to tell a win from a regression.
+    //
+    // `stress-bench` cannot serve here: its own rootfs script notes that
+    // "stress-ng workers fork() in-process (they don't re-exec the binary), so
+    // they sidestep the busybox same-binary-exec bug" — it deliberately avoids
+    // exec, and its Alpine rootfs is a build-time artifact this tree does not
+    // carry.
+    //
+    // The numbers are printed rather than asserted so this cannot flake; the
+    // only assertion is that the loads succeeded and left the text resident,
+    // which is what makes the resident figure meaningful.
+    use crate::load_user_process_with;
+
+    // 1 MiB of text: large enough that per-page work dominates the fixed
+    // per-exec cost, small enough that eight iterations stay well inside the
+    // frame budget the other loader smokes already use.
+    const TEXT_PAGES: u64 = 256;
+    const TEXT_BYTES: u64 = TEXT_PAGES * 4096;
+    const ITERS: u64 = 8;
+    const SEG_FOFF: u64 = 0x1000;
+
+    let mut b = alloc::vec![0u8; (SEG_FOFF + TEXT_BYTES) as usize];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x111).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    // One R|X PT_LOAD, page-aligned and congruent, no BSS tail — the shape a
+    // real text segment has apart from its partial last page.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    let mut resident = 0u64; // resident PAGES, not bytes
+    let start = narf_time::now_cycles();
+    for _ in 0..ITERS {
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised — the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&b, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("bench load failed"),
+        };
+        // `mapped_bytes` is the VIRTUAL figure — its own doc notes that lazy
+        // slots "contribute virtual bytes but not resident pages", so it counts
+        // the 8 MiB reserved stack VA and would not move when text becomes
+        // demand-paged. `resident_pages` is the one that measures backing.
+        resident = proc.address_space.memory_stats().resident_pages;
+        // Give the pid and the address space back before the next iteration.
+        // Dropping `proc` alone left the user-PML4 live count raised, which a
+        // LATER smoke (`..._execve_divergence_frees_address_space`) checks
+        // against a baseline — so an unreleased benchmark broke a test that has
+        // nothing to do with it. A measurement must not perturb the suite it
+        // runs inside.
+        let pid = proc.pid;
+        drop(proc);
+        crate::release_pid(pid);
+    }
+    let cycles = narf_time::now_cycles().wrapping_sub(start);
+
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "BENCH exec-load: text_pages={} iters={} cycles_per_load={} resident_pages_per_proc={}",
+            TEXT_PAGES,
+            ITERS,
+            cycles / ITERS,
+            resident
+        );
+    }
+
+    // The text must actually be resident for the resident figure to mean
+    // anything — an eager loader maps every file page up front. When this path
+    // becomes demand-paged the expectation inverts, and that inversion is the
+    // result being measured, so the bound is stated as "at least the text" and
+    // will be revisited deliberately rather than silently.
+    if resident < TEXT_PAGES {
+        return TestResult::Fail("bench: text was not resident after an eager load");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace", smoke_userspace_exec_load_cost_bench);
+
 // ── execve smokes ───────────────────────────────────────────────
 //
 // `sys_execve` (Syscall::Execve = 179) replaces the current process
