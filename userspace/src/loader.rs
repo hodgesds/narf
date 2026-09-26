@@ -110,6 +110,11 @@ where
 /// Composes `ElfError` + `LoadError` + frame-allocator failure.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LoadBytesError {
+    /// The image's `PT_LOAD` span does not fit the one PML4 slot a program is
+    /// placed in ([`PROGRAM_WINDOW_BYTES`] minus the ASLR slack). Mapping it
+    /// anyway would put VA outside the slot, which faults fatally on first
+    /// touch rather than failing the exec.
+    ImageWindowOverflow,
     Elf(crate::ElfError),
     Load(LoadError),
     NoFrame,
@@ -571,6 +576,23 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     // load addresses in its PT_LOAD vaddrs (NARF expects those in
     // PML4[1] — see `init.ld` / `hello_static_x86_64.S`), so bias 0.
     let image = crate::elf::parse_from(src)?;
+    // An image is placed inside one PML4 slot. Check it fits before mapping
+    // anything: VA that falls outside the slot is either another mapping's or,
+    // on the old slot-1 layout, kernel MMIO — and a region mapped there faults
+    // fatally on first touch instead of failing the exec.
+    if image.kind == crate::ExecKind::Elf64Dyn {
+        let span = image
+            .segments
+            .iter()
+            .try_fold(0u64, |acc, seg| {
+                seg.vaddr.checked_add(seg.mem_size).map(|end| acc.max(end))
+            })
+            .ok_or(LoadBytesError::ImageWindowOverflow)?;
+        let usable = PROGRAM_WINDOW_BYTES - (1u64 << narf_memory::kaslr::USER_ELF_RANDOM_BITS);
+        if span > usable {
+            return Err(LoadBytesError::ImageWindowOverflow);
+        }
+    }
     let bias = program_load_bias(image.kind);
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
@@ -592,11 +614,35 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     ))
 }
 
-/// PML4[1] base — the nominal bottom of the ET_DYN load window, and the
-/// base [`program_load_bias`] randomises above. Public because the
-/// canonical (ASLR-off) layout is asserted by tests, which should read
-/// the one definition rather than restate the number.
-pub const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
+/// PML4 slot 2 (1 TiB) — the nominal bottom of the ET_DYN load window, and
+/// the base [`program_load_bias`] randomises above. Public because the
+/// canonical (ASLR-off) layout is asserted by tests, which should read the one
+/// definition rather than restate the number.
+///
+/// This used to be PML4 slot 1 (512 GiB), which capped a PIE image at **1 GiB**
+/// — not by policy but by accident of the page tables. Slot 1 is shared: the
+/// kernel's high-MMIO identity window occupies virt 512 GiB..1 TiB as 1 GiB
+/// huge pages in PDPT[1..512], and `new_user_pml4` copies those into every
+/// address space (kernel code servicing a syscall touches MMIO under the user's
+/// CR3, so the inheritance is load-bearing) leaving the program only PDPT[0].
+/// A PIE image larger than that mapped without complaint — the VMA layer knows
+/// nothing of the inherited entries — and then died on the first fault past
+/// 513 GiB with `EncounteredHugePage`, because the walk hit kernel MMIO.
+///
+/// Slot 2 is one of the "reserved-zero" user-half slots (see the slot map in
+/// `paging.rs`), so the image gets a private 512 GiB with no inherited
+/// anything. ET_EXEC statics still link into slot 1 at 0x0000_0080_0000_1000
+/// (`init.ld`), where 1 GiB is ample, so `new_user_pml4` keeps its slot-1
+/// handling.
+pub const PROGRAM_DYN_BASE: u64 = 0x0000_0100_0000_0000;
+
+/// How much contiguous VA a program image may occupy: one PML4 slot.
+///
+/// The randomisation slack is drawn inside this, so the usable span for an
+/// image is the window minus that slack. An image that does not fit is
+/// rejected rather than mapped into VA it could never fault — the failure mode
+/// the 1 GiB slot-1 ceiling used to produce.
+pub const PROGRAM_WINDOW_BYTES: u64 = 512u64 << 30;
 
 /// Pick the load bias for a program image.
 ///
@@ -817,29 +863,115 @@ fn read_dt_exact<S: crate::elf::ExecBytes + ?Sized>(
     src.read_exact_at(off, dst).ok()
 }
 
-/// Read a whole DT_*-addressed table (DT_RELA, DT_JMPREL, DT_RELR) into an
-/// owned buffer.
+/// How much of a relocation table is held in memory at once.
 ///
-/// `needed` is derived from DT_RELASZ/DT_RELRSZ, which come from the image
-/// itself, so it is attacker-controlled: it is bounded against the image size
-/// before anything is reserved, and the reservation is fallible. A table is
-/// read once here rather than per entry.
-fn read_dt_table<S: crate::elf::ExecBytes + ?Sized>(
+/// A table's size comes from the image (DT_RELASZ, DT_PLTRELSZ, DT_RELRSZ), so
+/// it must never become the size of an allocation: a multi-gigabyte binary can
+/// name a relocation table larger than anything worth holding in kernel memory,
+/// and a malformed one can name a table larger than memory. One window is read
+/// at a time, and the window is this size whatever the table is.
+const RELOC_STREAM_BYTES: usize = 4096;
+
+/// A bounded window onto a DT_*-addressed table, plus where it starts.
+///
+/// Validating the whole table's span up front keeps the old behaviour — a table
+/// running off the end of its segment or the image is rejected before a single
+/// entry is applied, rather than half-applied and then failed.
+struct DtTableWindow {
+    file_off: u64,
+    buf: alloc::vec::Vec<u8>,
+}
+
+impl DtTableWindow {
+    /// `needed` is the table's full byte length; it is bounded against the
+    /// segment (by `dt_file_offset`) and the image, but never allocated.
+    fn open<S: crate::elf::ExecBytes + ?Sized>(
+        src: &S,
+        image: &ExecImage,
+        dt_addr: u64,
+        needed: u64,
+        entsize: usize,
+    ) -> Option<Self> {
+        let file_off = dt_file_offset(image, dt_addr, needed)?;
+        if file_off.checked_add(needed)? > src.size() {
+            return None;
+        }
+        // The window must hold at least one whole entry, so an absurd entsize
+        // is rejected here rather than silently making no progress.
+        if entsize == 0 || entsize > RELOC_STREAM_BYTES {
+            return None;
+        }
+        let window = (RELOC_STREAM_BYTES / entsize) * entsize;
+        let mut buf = alloc::vec::Vec::new();
+        buf.try_reserve_exact(window).ok()?;
+        buf.resize(window, 0u8);
+        Some(Self { file_off, buf })
+    }
+
+    /// Entries per window — at least one.
+    fn stride(&self, entsize: usize) -> usize {
+        self.buf.len() / entsize
+    }
+
+    /// Fill the window with `entries` entries starting at entry index `from`.
+    fn fill<S: crate::elf::ExecBytes + ?Sized>(
+        &mut self,
+        src: &S,
+        from: u64,
+        entries: usize,
+        entsize: usize,
+    ) -> Result<&[u8], LoadBytesError> {
+        let bytes = entries
+            .checked_mul(entsize)
+            .ok_or(LoadBytesError::RelaOutOfBounds)?;
+        let at = from
+            .checked_mul(entsize as u64)
+            .and_then(|skip| self.file_off.checked_add(skip))
+            .ok_or(LoadBytesError::RelaOutOfBounds)?;
+        src.read_exact_at(at, &mut self.buf[..bytes])
+            .map_err(LoadBytesError::Elf)?;
+        Ok(&self.buf[..bytes])
+    }
+}
+
+/// Walk a DT_RELA-shaped table (DT_RELA or DT_JMPREL) in bounded windows,
+/// patching every entry.
+///
+/// Entries are independent, so streaming gives exactly the result reading the
+/// whole table gave — with an allocation that no longer tracks the image.
+///
+/// # Safety
+/// Same contract as [`process_rela_array`], which this forwards each window to.
+unsafe fn stream_rela_table<S: crate::elf::ExecBytes + ?Sized>(
     src: &S,
     image: &ExecImage,
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
     dt_addr: u64,
-    needed: u64,
-) -> Option<alloc::vec::Vec<u8>> {
-    let off = dt_file_offset(image, dt_addr, needed)?;
-    if off.checked_add(needed)? > src.size() {
-        return None;
+    count: u64,
+    entsize: u64,
+) -> Result<(), LoadBytesError> {
+    let needed = count
+        .checked_mul(entsize)
+        .ok_or(LoadBytesError::RelaOutOfBounds)?;
+    let entsize = usize::try_from(entsize).map_err(|_| LoadBytesError::RelaOutOfBounds)?;
+    let mut window = DtTableWindow::open(src, image, dt_addr, needed, entsize)
+        .ok_or(LoadBytesError::RelaOutOfBounds)?;
+    let stride = window.stride(entsize);
+    let mut done: u64 = 0;
+    while done < count {
+        let n = core::cmp::min(stride as u64, count - done) as usize;
+        let slice = window.fill(src, done, n, entsize)?;
+        // SAFETY: the window holds exactly `n * entsize` in-bounds bytes of the
+        // image, so each `Elf64_Rela` entry is fully backed; `addr_space` is the
+        // target space whose pages this relocation patches. Forwarding this
+        // function's own contract.
+        unsafe {
+            process_rela_array(slice, n, entsize, src, image, addr_space, vaddr_bias)?;
+        }
+        done += n as u64;
     }
-    let len = usize::try_from(needed).ok()?;
-    let mut buf = alloc::vec::Vec::new();
-    buf.try_reserve_exact(len).ok()?;
-    buf.resize(len, 0u8);
-    src.read_exact_at(off, &mut buf).ok()?;
-    Some(buf)
+    Ok(())
 }
 
 #[inline]
@@ -1099,27 +1231,12 @@ pub unsafe fn apply_relocations<S: crate::elf::ExecBytes + ?Sized>(
         // path). When absent we fall back to RELASZ/RELAENT.
         let count = if relaent != 0 { relasz / relaent } else { 0 };
         if count > 0 {
-            let needed = count
-                .checked_mul(relaent)
-                .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            let table = read_dt_table(src, image, rela_addr, needed)
-                .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            let slice = &table[..];
-            // SAFETY: `read_dt_table` returned a `slice` of exactly
-            // `needed == count * relaent` in-bounds bytes of the image, so
-            // each `Elf64_Rela` entry read by `process_rela_array` is fully
-            // backed; `addr_space` is the target space whose pages this
-            // relocation patches.
-            // SAFETY: Valid memory or trusted environment
+            // SAFETY: forwarding this function's contract; the table's span is
+            // validated against its segment and the image before any entry is
+            // applied.
             unsafe {
-                process_rela_array(
-                    slice,
-                    count as usize,
-                    relaent as usize,
-                    src,
-                    image,
-                    addr_space,
-                    vaddr_bias,
+                stream_rela_table(
+                    src, image, addr_space, vaddr_bias, rela_addr, count, relaent,
                 )?;
             }
         }
@@ -1135,27 +1252,18 @@ pub unsafe fn apply_relocations<S: crate::elf::ExecBytes + ?Sized>(
             let relaent = dt_lookup(&image.dynamic, DT_RELAENT).unwrap_or(24);
             let count = if relaent != 0 { pltrelsz / relaent } else { 0 };
             if count > 0 {
-                let needed = count
-                    .checked_mul(relaent)
-                    .ok_or(LoadBytesError::RelaOutOfBounds)?;
-                let table = read_dt_table(src, image, jmprel_addr, needed)
-                    .ok_or(LoadBytesError::RelaOutOfBounds)?;
-                let slice = &table[..];
-                // SAFETY: `read_dt_table` returned a `slice` of exactly
-                // `needed == count * relaent` in-bounds bytes of the image, so
-                // each `Elf64_Rela` PLT entry read by `process_rela_array` is
-                // fully backed; `addr_space` is the target space whose pages
-                // this relocation patches.
-                // SAFETY: Valid memory or trusted environment
+                // SAFETY: as for DT_RELA above — forwarding this function's
+                // contract, with the table's span validated before any entry is
+                // applied.
                 unsafe {
-                    process_rela_array(
-                        slice,
-                        count as usize,
-                        relaent as usize,
+                    stream_rela_table(
                         src,
                         image,
                         addr_space,
                         vaddr_bias,
+                        jmprel_addr,
+                        count,
+                        relaent,
                     )?;
                 }
             }
@@ -1180,33 +1288,53 @@ pub unsafe fn apply_relocations<S: crate::elf::ExecBytes + ?Sized>(
             if relrent != 8 {
                 return Err(LoadBytesError::UnsupportedRelocation);
             }
-            let table = read_dt_table(src, image, relr_addr, relrsz)
+            // Streamed in bounded windows like the RELA tables, carrying the
+            // decoder's cursor across window boundaries so the table still
+            // decodes as the single stream it is. RELR is dense — one 8-byte
+            // entry covers up to 63 slots — but its size still comes from the
+            // image, and nothing that comes from the image gets to size an
+            // allocation.
+            let entries = relrsz / 8;
+            let mut window = DtTableWindow::open(src, image, relr_addr, relrsz, 8)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            let slice = &table[..];
-            // `for_each_relr_target` is a pure decoder; the closure does
+            let stride = window.stride(8);
+            let mut cursor: u64 = 0;
+            let mut done: u64 = 0;
+            // `for_each_relr_target_from` is a pure decoder; the closure does
             // the per-slot read-modify-write. A closure can't return an
             // error mid-walk, so the first unmapped slot latches into
             // `err` and later slots short-circuit.
             let mut err: Result<(), LoadBytesError> = Ok(());
-            for_each_relr_target(slice, |slot_va| {
+            while done < entries {
+                let n = core::cmp::min(stride as u64, entries - done) as usize;
+                let slice = window.fill(src, done, n, 8)?;
+                cursor = for_each_relr_target_from(slice, cursor, |slot_va| {
+                    if err.is_err() {
+                        return;
+                    }
+                    let target_va = slot_va.wrapping_add(vaddr_bias);
+                    match user_vaddr_to_kernel_ptr(addr_space, target_va) {
+                        // SAFETY: `dst` points into an identity-mapped phys
+                        // frame backing the user's mapped page; the slot is
+                        // 8 bytes wide and RELR r_offsets are 8-aligned by
+                        // construction. Read the link-time value, add the
+                        // load bias, write it back.
+                        // SAFETY: Valid memory or trusted environment
+                        Some(dst) => unsafe {
+                            let cur = core::ptr::read_unaligned(dst as *const u64);
+                            core::ptr::write_unaligned(
+                                dst as *mut u64,
+                                cur.wrapping_add(vaddr_bias),
+                            );
+                        },
+                        None => err = Err(LoadBytesError::RelocTargetUnmapped),
+                    }
+                });
                 if err.is_err() {
-                    return;
+                    break;
                 }
-                let target_va = slot_va.wrapping_add(vaddr_bias);
-                match user_vaddr_to_kernel_ptr(addr_space, target_va) {
-                    // SAFETY: `dst` points into an identity-mapped phys
-                    // frame backing the user's mapped page; the slot is
-                    // 8 bytes wide and RELR r_offsets are 8-aligned by
-                    // construction. Read the link-time value, add the
-                    // load bias, write it back.
-                    // SAFETY: Valid memory or trusted environment
-                    Some(dst) => unsafe {
-                        let cur = core::ptr::read_unaligned(dst as *const u64);
-                        core::ptr::write_unaligned(dst as *mut u64, cur.wrapping_add(vaddr_bias));
-                    },
-                    None => err = Err(LoadBytesError::RelocTargetUnmapped),
-                }
-            });
+                done += n as u64;
+            }
             err?;
         }
     }
@@ -1225,9 +1353,20 @@ pub unsafe fn apply_relocations<S: crate::elf::ExecBytes + ?Sized>(
 /// of the 63 slots starting at the cursor are relocated (bit 0 is the
 /// tag). A bitmap always advances the cursor by 63 slots regardless of
 /// which bits were set, so runs of bitmaps chain contiguously.
-pub(crate) fn for_each_relr_target(relr: &[u8], mut visit: impl FnMut(u64)) {
+/// Walk a DT_RELR bitmap, resumable across a chunk boundary.
+///
+/// RELR is a stream, not an array: an even entry sets the cursor and an odd one
+/// is a bitmap of the 63 slots following it. The only state carried between
+/// entries is that cursor, so handing it in and getting it back lets a caller
+/// walk a table in bounded windows and still decode it as one stream. A whole
+/// table read into one buffer is the `cursor = 0` case.
+pub(crate) fn for_each_relr_target_from(
+    relr: &[u8],
+    start_cursor: u64,
+    mut visit: impl FnMut(u64),
+) -> u64 {
     let n = relr.len() / 8;
-    let mut cursor: u64 = 0;
+    let mut cursor: u64 = start_cursor;
     for i in 0..n {
         let e = read_u64_le(&relr[i * 8..i * 8 + 8]);
         if e & 1 == 0 {
@@ -1247,6 +1386,7 @@ pub(crate) fn for_each_relr_target(relr: &[u8], mut visit: impl FnMut(u64)) {
             cursor = cursor.wrapping_add(63 * 8);
         }
     }
+    cursor
 }
 
 /// Iterate `Elf64_Rela { r_offset, r_info, r_addend }` entries and

@@ -1687,6 +1687,14 @@ const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BA
 /// (`BINPRM_BUF_SIZE`, fs/exec.c) before consulting a binfmt handler.
 const EXEC_PREFIX_BYTES: usize = 256;
 
+/// What opening an exec image yields: the sniffing prefix, the resolved file,
+/// and the file's size at open time.
+type ExecOpen = (
+    alloc::vec::Vec<u8>,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    u64,
+);
+
 /// The image an `execve` is loading, as something the ELF loader can READ from
 /// rather than a buffer it must be handed whole.
 ///
@@ -1874,14 +1882,7 @@ fn do_execve_resolved(
     // Returns the image bytes AND the file they came from: the loader
     // demand-pages each PT_LOAD from the latter, so the bytes here serve only
     // the shebang sniff and the ELF metadata the parser needs.
-    let read_exec = |p: &str| -> Result<
-        (
-            alloc::vec::Vec<u8>,
-            alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            u64,
-        ),
-        i64,
-    > {
+    let read_exec = |p: &str| -> Result<ExecOpen, i64> {
         let ep = apply_chroot(p);
         // Resolve through the caller's PRIVATE mount namespace, not the global
         // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
@@ -1932,9 +1933,21 @@ fn do_execve_resolved(
         if file_size == 0 {
             return Err(-ENOEXEC); // ENOEXEC — empty file is not an executable
         }
-        if file_size > 64 * 1024 * 1024 {
-            return Err(-E2BIG); // E2BIG
-        }
+        // No upper bound on image size. There used to be one — 64 MiB, E2BIG —
+        // and it existed for one reason: the whole file was read into a `Vec`,
+        // so a large binary was a large allocation and a 4 GiB one was a dead
+        // kernel. Nothing allocates per byte of image any more. The header and
+        // program headers are read, eagerly-copied segments are read a page at
+        // a time into the frame they land in, demand-paged segments are read on
+        // touch, and relocation tables stream through a fixed window; a
+        // multi-gigabyte binary costs what its *touched pages* cost.
+        //
+        // Linux has no equivalent limit, and E2BIG is not even the error it
+        // would use — that code is for argv/envp exceeding `MAX_ARG_STRLEN`,
+        // which is checked separately. A real Chromium or Qt WebEngine build
+        // clears 64 MiB on its own, so this rejected binaries Linux runs.
+        // What still bounds an exec: RLIMIT_AS and the frame allocator, per
+        // page actually touched, which is the bound that should apply.
         // Read only the PREFIX — enough to recognise a `#!` line and an ELF
         // header. The image itself is read through `ExecSource::File` below, a
         // segment at a time, and a demand-paged segment is not read here at

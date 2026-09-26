@@ -1285,14 +1285,14 @@ fn smoke_userspace_relr_decode() -> TestResult {
     // glibc/ld-linux (Debian 13, "-z pack-relative-relocs") emit their
     // RELATIVE relocations here; the loader was blind to the table, so
     // an interpreter loaded that way ran with un-biased pointers and
-    // #GP'd. This exercises the pure `for_each_relr_target` decoder:
+    // #GP'd. This exercises the pure `for_each_relr_target_from` decoder:
     //   entry 0 (even)  → address 0x1000: relocate the slot there.
     //   entry 1 (odd)   → bitmap over the 63 slots after 0x1008; bits
     //                     1, 3, 63 set → slots 0, 2, 62.
     //   entry 2 (even)  → address 0x2000: relocate that slot.
     // The bitmap word: bit 0 is the tag, bit N (N≥1) marks the slot at
     // cursor + (N−1)*8.
-    use crate::loader::for_each_relr_target;
+    use crate::loader::for_each_relr_target_from;
 
     const BITMAP: u64 = 1 | (1u64 << 1) | (1u64 << 3) | (1u64 << 63);
     let mut table = alloc::vec::Vec::<u8>::new();
@@ -1310,7 +1310,7 @@ fn smoke_userspace_relr_decode() -> TestResult {
     ];
 
     let mut visited = alloc::vec::Vec::<u64>::new();
-    for_each_relr_target(&table, |va| visited.push(va));
+    for_each_relr_target_from(&table, 0, |va| visited.push(va));
     if visited.as_slice() != expected {
         return TestResult::Fail("RELR decode visited the wrong slot sequence");
     }
@@ -1327,7 +1327,7 @@ fn smoke_userspace_relr_decode() -> TestResult {
         (0x2000, 0x55),
     ];
     let mut mem = alloc::vec::Vec::<(u64, u64)>::from(seeds);
-    for_each_relr_target(&table, |va| {
+    for_each_relr_target_from(&table, 0, |va| {
         if let Some(slot) = mem.iter_mut().find(|(a, _)| *a == va) {
             slot.1 = slot.1.wrapping_add(BIAS);
         }
@@ -4169,4 +4169,184 @@ fn smoke_userspace_exec_reads_headers_not_whole_file() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_userspace_exec_reads_headers_not_whole_file
+);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_exec_loads_multi_gigabyte_binary() -> TestResult {
+    // A 6 GiB binary, loaded on a machine that could not hold it.
+    //
+    // `execve` used to read the whole image into a `Vec`, so image size was
+    // bounded by kernel memory and capped at 64 MiB with E2BIG — a limit Linux
+    // does not have, and one that a real Chromium or Qt WebEngine build exceeds
+    // on its own. Nothing allocates per byte of image now, so the bound that
+    // should apply is the pages the process actually touches.
+    //
+    // The file here is synthetic and sparse: `stat()` reports 6 GiB and reads
+    // are fabricated from the offset, so the test needs no more memory than the
+    // pages it faults. The byte at file offset `f` is `(f >> 12) as u8`, the
+    // page index truncated — which makes a faulted page's contents prove WHICH
+    // file offset was read.
+    //
+    // The second fault is past 4 GiB deliberately. Every offset on this path is
+    // u64, but a single `as u32`/`as usize` truncation anywhere in it would go
+    // unnoticed until a binary crossed that line, and would then read the wrong
+    // page rather than fail.
+    use crate::handlers::install_address_space_lookup;
+    use crate::{alloc_pid, load_user_process_with_root_file};
+    use alloc::sync::Arc;
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_memory::{AddressSpace, RegionPerms, VirtAddr};
+
+    const SEG_FOFF: u64 = 0x1000;
+    const FILE_SIZE: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
+    const TEXT_BYTES: u64 = FILE_SIZE - SEG_FOFF;
+    // Two probes: one ordinary low page, one past the 32-bit boundary.
+    const LOW_PAGE_FOFF: u64 = SEG_FOFF + 8 * 4096;
+    const HIGH_PAGE_FOFF: u64 = 4 * 1024 * 1024 * 1024 + 0x1000;
+
+    static HUGE_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+    fn huge_as_lookup() -> Option<Arc<AddressSpace>> {
+        HUGE_AS.lock().clone()
+    }
+    // Byte value at a file offset, for a page-aligned read.
+    fn byte_at(file_off: u64) -> u8 {
+        (file_off >> 12) as u8
+    }
+
+    struct SparseHugeFile {
+        header: alloc::vec::Vec<u8>,
+    }
+    impl FileOps for SparseHugeFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            let n = if offset >= FILE_SIZE {
+                0
+            } else {
+                let avail = (FILE_SIZE - offset) as usize;
+                let n = core::cmp::min(avail, buf.len());
+                for (i, slot) in buf[..n].iter_mut().enumerate() {
+                    let at = offset + i as u64;
+                    *slot = if (at as usize) < self.header.len() {
+                        self.header[at as usize]
+                    } else {
+                        byte_at(at)
+                    };
+                }
+                n
+            };
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: FILE_SIZE,
+                blocks: FILE_SIZE.div_ceil(512),
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    // Only the headers are stored; the 6 GiB of "text" is fabricated.
+    let mut header = alloc::vec![0u8; SEG_FOFF as usize];
+    header[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    header[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    header[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    header[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    header[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes()); // e_entry
+    header[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    header[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    header[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    header[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    header[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    header[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    header[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_offset
+    header[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_vaddr
+    header[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_paddr
+    header[ph + 0x20..ph + 0x28].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // p_filesz
+    header[ph + 0x28..ph + 0x30].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // p_memsz
+    header[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    let ops: Arc<dyn FileOps> = Arc::new(SparseHugeFile { header });
+    let source = crate::handlers::ExecSource::File {
+        ops: Arc::clone(&ops),
+        size: FILE_SIZE,
+    };
+
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let proc = match unsafe {
+        load_user_process_with_root_file(&source, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("6 GiB image failed to load"),
+    };
+    let root = proc.address_space.root;
+    let text_va = proc.program_bias.wrapping_add(SEG_FOFF);
+    let resident = proc.address_space.memory_stats().resident_pages;
+    *HUGE_AS.lock() = Some(Arc::clone(&proc.address_space));
+    install_address_space_lookup(huge_as_lookup);
+
+    let checks = || -> Result<(), &'static str> {
+        // 6 GiB of text, and the whole process is smaller than a megabyte.
+        if resident > 256 {
+            return Err("a 6 GiB image left more than 1 MiB resident");
+        }
+        match proc.address_space.lookup(VirtAddr::new(text_va)) {
+            Some(region)
+                if region.perms.contains(RegionPerms::FILE_DEMAND)
+                    && region.len >= TEXT_BYTES & !0xFFF => {}
+            Some(_) => return Err("the 6 GiB text segment is not one demand-paged region"),
+            None => return Err("the 6 GiB text segment is not mapped"),
+        }
+
+        for probe_foff in [LOW_PAGE_FOFF, HIGH_PAGE_FOFF] {
+            let va = text_va + (probe_foff - SEG_FOFF);
+            // SAFETY: `va` lies in this process's FILE_DEMAND text region.
+            // SAFETY: `va` lies in this process's FILE_DEMAND text region.
+            if unsafe { proc.address_space.demand_alloc_page(VirtAddr::new(va)) }.is_err() {
+                return Err("demand fault inside the 6 GiB image failed");
+            }
+            let phys = user_phys_of(root, va).ok_or("faulted page published no leaf")?;
+            // SAFETY: `phys` is the live frame the fault installed.
+            let page = unsafe {
+                core::slice::from_raw_parts(
+                    narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+                    4096,
+                )
+            };
+            let want = byte_at(probe_foff);
+            if page.iter().any(|byte| *byte != want) {
+                return Err("a faulted page came from the wrong file offset");
+            }
+        }
+        Ok(())
+    };
+    let verdict = checks();
+    *HUGE_AS.lock() = None;
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "BENCH exec-huge: file_bytes={} resident_pages_after_load={}",
+            FILE_SIZE,
+            resident
+        );
+    }
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_exec_loads_multi_gigabyte_binary
 );
