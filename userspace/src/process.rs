@@ -20,8 +20,8 @@ use alloc::sync::Arc;
 use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    alloc_pid, interp, load_elf_bytes, loader::apply_relocations, loader::load_elf_into_at,
-    loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
+    alloc_pid, interp, loader::apply_relocations, loader::load_elf_into_at, loader::LoadBytesError,
+    AuxEntry, EntryPoint, ProcessId,
 };
 
 /// Eagerly-committed top-of-stack window: 128 KiB of real frames at the
@@ -203,11 +203,32 @@ pub unsafe fn load_user_process_with_root(
     root: Option<&str>,
     pid: crate::ProcessId,
 ) -> Result<UserProcess, ProcessLoadError> {
+    // SAFETY: forwarding this fn's contract; `None` keeps the eager path.
+    unsafe { load_user_process_with_root_file(bytes, argv, envp, aux, root, pid, None) }
+}
+
+/// [`load_user_process_with_root`], demand-paging the program image from
+/// `file`. `execve` passes the binary it resolved, so a process pays for the
+/// pages it touches rather than for the whole image.
+///
+/// # Safety
+/// Same contract as [`load_user_process_with_root`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn load_user_process_with_root_file(
+    bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    aux: &[AuxEntry],
+    root: Option<&str>,
+    pid: crate::ProcessId,
+    file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+) -> Result<UserProcess, ProcessLoadError> {
     // SAFETY: caller upholds this fn's `# Safety` contract (live low-4-GiB
     // identity map + initialised frame allocator), which is precisely what
     // `load_elf_bytes` needs to map the program's PT_LOAD segments.
     // SAFETY: Valid memory or trusted environment
-    let (address_space, program_entry, program_bias) = unsafe { load_elf_bytes(bytes) }?;
+    let (address_space, program_entry, program_bias) =
+        unsafe { crate::loader::load_elf_bytes_file(bytes, file) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
     // and we have its bytes registered, load it at a fixed bias and

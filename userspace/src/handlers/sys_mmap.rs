@@ -592,6 +592,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     writeback_phys: None,
                                     private_copy: false,
                                     replace: destructive_fixed,
+                                    zero_from: None,
                                 },
                                 || {
                                     // SAFETY: VMA -> shared transactions are held;
@@ -695,6 +696,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     writeback_phys: None,
                                     private_copy: false,
                                     replace: destructive_fixed,
+                                    zero_from: None,
                                 },
                                 || {
                                     // SAFETY: VMA -> shared transactions are held
@@ -1056,6 +1058,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         writeback_phys,
                         private_copy: false,
                         replace: destructive_fixed,
+                        zero_from: None,
                     },
                     || {
                         // SAFETY: VMA -> shared transactions are held and the
@@ -1121,6 +1124,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         writeback_phys: None,
                         private_copy: true,
                         replace: destructive_fixed,
+                        zero_from: None,
                     },
                     || {
                         // SAFETY: the VMA transaction and owner bucket remain

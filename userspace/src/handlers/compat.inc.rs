@@ -1799,7 +1799,16 @@ fn do_execve_resolved(
     // aborted the search on the first miss, so any binary not in the first
     // PATH entry (e.g. weston in /usr/bin while PATH starts with /bin) was
     // "can't execute: Invalid argument" even though it existed.
-    let read_exec = |p: &str| -> Result<alloc::vec::Vec<u8>, i64> {
+    // Returns the image bytes AND the file they came from: the loader
+    // demand-pages each PT_LOAD from the latter, so the bytes here serve only
+    // the shebang sniff and the ELF metadata the parser needs.
+    let read_exec = |p: &str| -> Result<
+        (
+            alloc::vec::Vec<u8>,
+            alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+        ),
+        i64,
+    > {
         let ep = apply_chroot(p);
         // Resolve through the caller's PRIVATE mount namespace, not the global
         // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
@@ -1880,7 +1889,7 @@ fn do_execve_resolved(
             }
         }
         buf.truncate(off);
-        Ok(buf)
+        Ok((buf, ops))
     };
 
     // Step 3: read the image. A leading `#!` is an interpreter directive
@@ -1892,6 +1901,11 @@ fn do_execve_resolved(
     let mut cur_path = alloc::string::String::from(path);
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
     let elf_buf;
+    // The resolved binary, when the image came from a filesystem path. Handing
+    // it to the loader lets each PT_LOAD be demand-paged instead of copied, so
+    // a process pays for the pages it touches. `None` for the fexecve/memfd
+    // arm below, whose bytes are already in hand with no file behind them.
+    let mut exec_file: Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> = None;
     // Whether the image came from an fd rather than a path, and whether a
     // `#!` line was followed to reach it — both decide whether the file's
     // set-user-ID bits may be honoured below.
@@ -1910,7 +1924,7 @@ fn do_execve_resolved(
     } else {
         let mut depth = 0u32;
         loop {
-            let buf = match read_exec(&cur_path) {
+            let (buf, resolved_ops) = match read_exec(&cur_path) {
                 Ok(b) => b,
                 Err(code) => {
                     ctx.set_return(SyscallReturn::ok(code as u64));
@@ -1957,6 +1971,7 @@ fn do_execve_resolved(
                 return;
             }
             elf_buf = buf;
+            exec_file = Some(resolved_ops);
             break;
         }
     }
@@ -1988,13 +2003,14 @@ fn do_execve_resolved(
     // task is running.
     // SAFETY: Valid memory or trusted environment
     let new_proc = match unsafe {
-        crate::process::load_user_process_with_root(
+        crate::process::load_user_process_with_root_file(
             &elf_buf,
             &argv_refs,
             &envp_refs,
             &[],
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
+            exec_file.as_ref(),
         )
     } {
         Ok(p) => p,
