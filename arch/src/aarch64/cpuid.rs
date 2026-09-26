@@ -87,6 +87,30 @@ fn read_id_aa64isar1() -> u64 {
     v
 }
 
+#[inline]
+fn read_id_aa64isar0() -> u64 {
+    let v: u64;
+    // SAFETY: reads ID_AA64ISAR0_EL1; no side effects.
+    unsafe {
+        asm!("mrs {v}, ID_AA64ISAR0_EL1", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// Large System Extensions atomics (`ID_AA64ISAR0_EL1.Atomic`, bits 23:20).
+///
+/// Reported to userspace as `HWCAP_ATOMICS`, which libc's lock fast paths
+/// select on: without LSE they use load-exclusive/store-exclusive loops, and an
+/// `LDADD`/`CASAL` issued on a CPU that lacks the extension is an undefined
+/// instruction.
+///
+/// # Safety
+/// `MRS` on `ID_AA64ISAR0_EL1` is legal at EL1 and has no side effects.
+pub unsafe fn lse_atomics() -> bool {
+    (read_id_aa64isar0() >> 20) & 0xF != 0
+}
+
 /// Read the generic-timer frequency from CNTFRQ_EL0 (Hz).
 ///
 /// # Safety

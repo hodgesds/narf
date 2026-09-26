@@ -650,6 +650,11 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             .unwrap_or(0),
     };
 
+    // AT_HWCAP / AT_HWCAP2 — what the hardware can actually do. Emitted from
+    // probed state rather than as zero words: libc reads these before it may
+    // execute a feature-dependent instruction, and on aarch64 `HWCAP2_MTE` is
+    // the only way a program learns Memory Tagging is available at all.
+    let (hwcap, hwcap2) = crate::hwcap::hwcaps();
     let mut final_aux = aux.to_vec();
     if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
         for default in [
@@ -676,7 +681,8 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // always-present zero words.
             AuxEntry::Flags(0),
             AuxEntry::Clktck(crate::handlers::CLK_TCK_HZ),
-            AuxEntry::Hwcap2(0),
+            AuxEntry::Hwcap(hwcap),
+            AuxEntry::Hwcap2(hwcap2),
             AuxEntry::MinSigStkSz(crate::handlers::MIN_SIGSTKSZ),
             AuxEntry::Uid(0),
             AuxEntry::Euid(0),

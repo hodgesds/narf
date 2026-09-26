@@ -4605,3 +4605,109 @@ fn smoke_userspace_max_align_tracks_pt_load() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("userspace/elf", smoke_userspace_max_align_tracks_pt_load);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_auxv_reports_real_hwcaps() -> TestResult {
+    // AT_HWCAP is how a process discovers what the CPU can do before it may
+    // execute a feature-dependent instruction. This kernel emitted no AT_HWCAP
+    // entry at all and a hardcoded `AT_HWCAP2 = 0`, so on aarch64 libc fell back
+    // to its generic string routines and — more to the point — no program could
+    // discover Memory Tagging, which this kernel supports.
+    //
+    // Read back from the process's own stack rather than from the builder: the
+    // entry has to survive `init_sysv_stack`'s layout to be worth anything, and
+    // an auxv the loader believes in but never writes is the exact failure this
+    // suite has hit before with AT_RANDOM.
+    use crate::load_user_process_with;
+
+    const AT_HWCAP: u64 = 16;
+    const AT_HWCAP2: u64 = 26;
+    const AT_NULL: u64 = 0;
+
+    let image = || -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; 0x2000];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&0x1040u64.to_le_bytes()); // e_entry
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    };
+
+    let bytes = image();
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let proc = match unsafe { load_user_process_with(&bytes, &["x"], &["A=1"], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load failed"),
+    };
+    let root = proc.address_space.root;
+    let sp = proc.stack_top.as_u64();
+
+    let read_u64 = |va: u64| -> Option<u64> {
+        let phys = user_phys_of(root, va)?;
+        // SAFETY: `phys` backs this mapped stack qword.
+        Some(unsafe { core::ptr::read_unaligned(narf_memory::PhysAddr::new(phys).kernel_ptr()) })
+    };
+
+    // SysV layout: argc, argv[], NULL, envp[], NULL, then the auxv pairs.
+    let find_aux = |tag: u64| -> Option<u64> {
+        let argc = read_u64(sp)?;
+        let mut cursor = sp + 8 + (argc + 1) * 8;
+        while read_u64(cursor)? != 0 {
+            cursor += 8;
+        }
+        cursor += 8;
+        for _ in 0..64 {
+            let key = read_u64(cursor)?;
+            let val = read_u64(cursor + 8)?;
+            if key == AT_NULL {
+                return None;
+            }
+            if key == tag {
+                return Some(val);
+            }
+            cursor += 16;
+        }
+        None
+    };
+
+    let (want_hwcap, want_hwcap2) = crate::hwcap::hwcaps();
+    let verdict = match (find_aux(AT_HWCAP), find_aux(AT_HWCAP2)) {
+        (None, _) => TestResult::Fail("AT_HWCAP is absent from the auxv"),
+        (_, None) => TestResult::Fail("AT_HWCAP2 is absent from the auxv"),
+        (Some(cap), Some(cap2)) => {
+            if cap != want_hwcap || cap2 != want_hwcap2 {
+                TestResult::Fail("auxv HWCAP words disagree with the probed capabilities")
+            } else if cap == 0 {
+                // Every machine this kernel runs on has *some* capability: on
+                // aarch64 FP and AdvSIMD are mandatory in ARMv8-A, and on
+                // x86_64 CPUID.1:EDX always reports at least FPU. A zero word
+                // means the probe silently failed rather than the CPU being
+                // bare, which is what the old hardcoded zero looked like.
+                TestResult::Fail("AT_HWCAP is zero — the probe reported nothing")
+            } else {
+                TestResult::Pass
+            }
+        }
+    };
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    verdict
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace/elf", smoke_userspace_auxv_reports_real_hwcaps);

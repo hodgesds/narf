@@ -52,6 +52,7 @@ pub mod epoll;
 pub mod errno;
 pub mod fd;
 pub mod handlers;
+pub mod hwcap;
 pub mod init;
 pub mod interp;
 pub mod io_mux;
