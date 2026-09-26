@@ -118,6 +118,19 @@ fn register_test_card_unmastered() -> u32 {
     crate::drm_registry::register_drm_card_with_state(card, make_test_card())
 }
 
+/// Register a fresh test card whose driver name is `virtio_gpu` (mastered), so
+/// the VIRTGPU-driver-ioctl routing on both the card and render nodes is
+/// exercised. `BochsCard` reports `"bochs"` and never trips that gate.
+fn register_test_virtio_card() -> u32 {
+    let name = format!("card{}", crate::drm_registry::count());
+    let card = Arc::new(crate::drm_devfs_bridge::VirtioGpuCard::new(name));
+    let idx = crate::drm_registry::register_drm_card_with_state(card, make_test_card());
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().master_open(SMOKE_MASTER_ID);
+    }
+    idx
+}
+
 // ── 1. _IOC encoding round-trip ────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -630,6 +643,108 @@ fn smoke_dri_card_file_ioctl_routes_through_bridge() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_dri_card_file_ioctl_routes_through_bridge
+);
+
+// ── 12b. VIRTGPU driver ioctls are served on the virtio_gpu CARD node ───
+//
+// GAP A regression: Mesa's GBM/EGL compositor context is created on card0 and
+// issues VIRTGPU_GETPARAM/GET_CAPS/CONTEXT_INIT there. Every VIRTGPU ioctl is
+// DRM_RENDER_ALLOW in Linux, which the primary (card) node serves too. Before
+// the fix `DriCardFile::ioctl` went straight to the card/KMS dispatcher, so a
+// VIRTGPU ioctl fell through to `handle_generic` → ENOTTY (Unsupported) and
+// Mesa dropped every GL client to llvmpipe.
+
+/// POSITIVE: a VIRTGPU ioctl on the virtio_gpu card node is routed to the
+/// per-open virtio-gpu dispatcher (GETPARAM(3D_FEATURES) → Ok), NOT ENOTTY.
+#[allow(dead_code)]
+fn smoke_dri_card_virtgpu_ioctl_routed() -> TestResult {
+    let idx = register_test_virtio_card();
+    use narf_filesystem::DirOps;
+    let dir = crate::drm_devfs_bridge::DriDir;
+    let name = format!("card{}", idx);
+    let f = match dir.lookup(&name) {
+        Some(f) => f,
+        None => return TestResult::Fail("DriDir::lookup(card) failed"),
+    };
+    // GETPARAM writes the param value to the user pointer in `value`; point it
+    // at a local word. Param 1 (3D_FEATURES) returns 0 when no device is probed
+    // (kernel-test), but crucially returns Ok — proving it reached the VIRTGPU
+    // dispatcher rather than falling through to the card path's ENOTTY.
+    let mut out: u32 = 0xdead_beef;
+    let mut req = crate::drm_uapi::DrmVirtGpuGetParamUapi {
+        param: 1,
+        value: &mut out as *mut u32 as u64,
+    };
+    match f.ioctl(
+        crate::drm_uapi::DRM_IOCTL_VIRTGPU_GETPARAM,
+        &mut req as *mut _ as usize,
+    ) {
+        Ok(_) => TestResult::Pass,
+        Err(narf_filesystem::FsError::Unsupported) => TestResult::Fail(
+            "VIRTGPU_GETPARAM on virtio card node returned Unsupported — not routed",
+        ),
+        Err(_) => TestResult::Fail("VIRTGPU_GETPARAM on virtio card node errored unexpectedly"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_dri_card_virtgpu_ioctl_routed);
+
+/// NEGATIVE (gate is driver-scoped): the SAME VIRTGPU ioctl on a non-virtio
+/// (bochs) card node still returns Unsupported — the routing must not hijack
+/// VIRTGPU ioctl numbers on cards without a virtio-gpu private UAPI.
+#[allow(dead_code)]
+fn smoke_dri_card_virtgpu_ioctl_bochs_unsupported() -> TestResult {
+    let idx = register_test_card(); // BochsCard → driver "bochs"
+    use narf_filesystem::DirOps;
+    let dir = crate::drm_devfs_bridge::DriDir;
+    let name = format!("card{}", idx);
+    let f = match dir.lookup(&name) {
+        Some(f) => f,
+        None => return TestResult::Fail("DriDir::lookup(card) failed"),
+    };
+    let mut out: u32 = 0;
+    let mut req = crate::drm_uapi::DrmVirtGpuGetParamUapi {
+        param: 1,
+        value: &mut out as *mut u32 as u64,
+    };
+    match f.ioctl(
+        crate::drm_uapi::DRM_IOCTL_VIRTGPU_GETPARAM,
+        &mut req as *mut _ as usize,
+    ) {
+        Err(narf_filesystem::FsError::Unsupported) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("VIRTGPU_GETPARAM on bochs card node should be Unsupported"),
+        Err(_) => TestResult::Fail("VIRTGPU_GETPARAM on bochs card node wrong error variant"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_dri_card_virtgpu_ioctl_bochs_unsupported
+);
+
+/// NO-REGRESSION: a KMS ioctl (GETRESOURCES) still works on the virtio_gpu
+/// card node — the VIRTGPU dispatcher returns Unsupported for it and the call
+/// falls through to the card/KMS path unchanged.
+#[allow(dead_code)]
+fn smoke_dri_card_virtio_kms_still_routes() -> TestResult {
+    let idx = register_test_virtio_card();
+    use narf_filesystem::DirOps;
+    let dir = crate::drm_devfs_bridge::DriDir;
+    let name = format!("card{}", idx);
+    let f = match dir.lookup(&name) {
+        Some(f) => f,
+        None => return TestResult::Fail("DriDir::lookup(card) failed"),
+    };
+    let mut req = DrmModeCardResUapi::default();
+    match f.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut req as *mut _ as usize) {
+        Ok(_) if req.count_crtcs > 0 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("GETRESOURCES on virtio card node returned 0 crtcs"),
+        Err(_) => {
+            TestResult::Fail("GETRESOURCES on virtio card node errored — KMS fall-through broken")
+        }
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_dri_card_virtio_kms_still_routes
 );
 
 // ── 13. DriRenderFile render node rejects SETCRTC ──────────────────────
