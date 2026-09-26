@@ -3023,6 +3023,109 @@ kernel_test_in!(
     smoke_userspace_tls_block_sits_where_relocations_say
 );
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_exec_load_cost_bench() -> TestResult {
+    // A MEASUREMENT, not an assertion.
+    //
+    // Exec today reads the whole binary into a `Vec` and then copies every
+    // PT_LOAD page into freshly allocated frames, so its cost scales with file
+    // size whether or not the process touches those pages. Demand paging
+    // changes exactly two observable quantities — how long a load takes, and
+    // how much memory it leaves resident — and nothing in the suite measured
+    // either, so there was no way to tell a win from a regression.
+    //
+    // `stress-bench` cannot serve here: its own rootfs script notes that
+    // "stress-ng workers fork() in-process (they don't re-exec the binary), so
+    // they sidestep the busybox same-binary-exec bug" — it deliberately avoids
+    // exec, and its Alpine rootfs is a build-time artifact this tree does not
+    // carry.
+    //
+    // The numbers are printed rather than asserted so this cannot flake; the
+    // only assertion is that the loads succeeded and left the text resident,
+    // which is what makes the resident figure meaningful.
+    use crate::load_user_process_with;
+
+    // 1 MiB of text: large enough that per-page work dominates the fixed
+    // per-exec cost, small enough that eight iterations stay well inside the
+    // frame budget the other loader smokes already use.
+    const TEXT_PAGES: u64 = 256;
+    const TEXT_BYTES: u64 = TEXT_PAGES * 4096;
+    const ITERS: u64 = 8;
+    const SEG_FOFF: u64 = 0x1000;
+
+    let mut b = alloc::vec![0u8; (SEG_FOFF + TEXT_BYTES) as usize];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x111).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    // One R|X PT_LOAD, page-aligned and congruent, no BSS tail — the shape a
+    // real text segment has apart from its partial last page.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    let mut resident = 0u64; // resident PAGES, not bytes
+    let start = narf_time::now_cycles();
+    for _ in 0..ITERS {
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised — the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&b, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("bench load failed"),
+        };
+        // `mapped_bytes` is the VIRTUAL figure — its own doc notes that lazy
+        // slots "contribute virtual bytes but not resident pages", so it counts
+        // the 8 MiB reserved stack VA and would not move when text becomes
+        // demand-paged. `resident_pages` is the one that measures backing.
+        resident = proc.address_space.memory_stats().resident_pages;
+        // Give the pid and the address space back before the next iteration.
+        // Dropping `proc` alone left the user-PML4 live count raised, which a
+        // LATER smoke (`..._execve_divergence_frees_address_space`) checks
+        // against a baseline — so an unreleased benchmark broke a test that has
+        // nothing to do with it. A measurement must not perturb the suite it
+        // runs inside.
+        let pid = proc.pid;
+        drop(proc);
+        crate::release_pid(pid);
+    }
+    let cycles = narf_time::now_cycles().wrapping_sub(start);
+
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "BENCH exec-load: text_pages={} iters={} cycles_per_load={} resident_pages_per_proc={}",
+            TEXT_PAGES,
+            ITERS,
+            cycles / ITERS,
+            resident
+        );
+    }
+
+    // The text must actually be resident for the resident figure to mean
+    // anything — an eager loader maps every file page up front. When this path
+    // becomes demand-paged the expectation inverts, and that inversion is the
+    // result being measured, so the bound is stated as "at least the text" and
+    // will be revisited deliberately rather than silently.
+    if resident < TEXT_PAGES {
+        return TestResult::Fail("bench: text was not resident after an eager load");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace", smoke_userspace_exec_load_cost_bench);
+
 // ── execve smokes ───────────────────────────────────────────────
 //
 // `sys_execve` (Syscall::Execve = 179) replaces the current process
@@ -3478,3 +3581,419 @@ fn smoke_userspace_loader_stamps_caller_pid() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_loader_stamps_caller_pid);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_exec_demand_pages_text_from_file() -> TestResult {
+    // The coverage for demand-paged exec. Before this, the loader's
+    // FILE_DEMAND branch was wired but nothing in the tree drove it: a probe
+    // placed inside it printed nothing across a full boot-smoke, because
+    // boot-init does not load its binary through the path-based `execve` that
+    // supplies the `Arc<dyn FileOps>`. Code on the exec path that no test
+    // enters is code that works by assumption.
+    //
+    // Three things are asserted, each of which fails for a different way the
+    // conversion could be wrong:
+    //
+    //   1. The load leaves the text UNBACKED (FILE_DEMAND, empty `phys`, no
+    //      leaf in the page tables) and drops `resident_pages` by at least the
+    //      text page count against the eager load of the same image. An eager
+    //      fallback — the likely silent failure, since the loader quietly
+    //      treats a `None` file as "copy everything" — cannot pass this.
+    //   2. A faulted page carries the bytes of ITS OWN file offset, not page
+    //      zero's. Every page is filled with a distinct value so an off-by-one
+    //      page in the offset arithmetic is visible rather than plausible.
+    //   3. The partial last page is the file's tail followed by zeroes. A
+    //      `p_filesz` that is not a page multiple is the normal shape of real
+    //      text, and reading past EOF must zero-fill rather than leak or fail.
+    use crate::handlers::install_address_space_lookup;
+    use crate::{alloc_pid, load_user_process_with_root_file};
+    use alloc::sync::Arc;
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_memory::{AddressSpace, RegionPerms, VirtAddr};
+
+    // `mapped_file::demand_frame` resolves a faulting address against the
+    // CURRENT user address space — at a real fault that is the faulting
+    // process's, but a kernel test has no current user task, so the fault would
+    // find no mapping owner and fail for a reason that has nothing to do with
+    // the loader. Publishing the loaded process here is what the other
+    // FILE_DEMAND smokes in `sys_mmap` do, and it is cleared again in teardown
+    // so no later test inherits a stale address space.
+    static DEMAND_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+    fn demand_as_lookup() -> Option<Arc<AddressSpace>> {
+        DEMAND_AS.lock().clone()
+    }
+
+    // Above the loader's small-image floor (64 KiB), with a partial last page:
+    // 23 full pages plus a 100-byte tail. A segment under the floor is copied
+    // eagerly by design, so a test below it would assert the eager path while
+    // claiming to cover the demand one.
+    const TEXT_PAGES: u64 = 24;
+    const TAIL_BYTES: u64 = 100;
+    const TEXT_BYTES: u64 = (TEXT_PAGES - 1) * 4096 + TAIL_BYTES;
+    const SEG_FOFF: u64 = 0x1000;
+    // Page k is filled with this byte, in the file and so in memory.
+    let page_byte = |k: u64| -> u8 { 0x41u8.wrapping_add(k as u8) };
+
+    let mut b = alloc::vec![0u8; (SEG_FOFF + TEXT_BYTES) as usize];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    // One R|X PT_LOAD, file offset congruent with the link vaddr modulo the
+    // page size — the condition the loader requires before it may demand-page
+    // a segment, since a non-congruent segment's page cannot be filled by a
+    // single aligned file read.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_offset
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_paddr
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // p_filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&TEXT_BYTES.to_le_bytes()); // p_memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    for k in 0..TEXT_PAGES {
+        let start = (SEG_FOFF + k * 4096) as usize;
+        let end = core::cmp::min(start + 4096, b.len());
+        b[start..end].fill(page_byte(k));
+    }
+    // The header bytes overlap no segment page: the segment starts at 0x1000.
+    debug_assert!(SEG_FOFF as usize >= ph + 56);
+
+    // A file whose size ends mid-page, so the loader's last read is short and
+    // the rest of that page has to come from zeroing rather than from the file.
+    struct FileImage(alloc::vec::Vec<u8>);
+    impl FileOps for FileImage {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            let off = offset as usize;
+            let n = if off >= self.0.len() {
+                0
+            } else {
+                let n = core::cmp::min(self.0.len() - off, buf.len());
+                buf[..n].copy_from_slice(&self.0[off..off + n]);
+                n
+            };
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: self.0.len() as u64,
+                blocks: self.0.len().div_ceil(512) as u64,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    // The control: the same image with no file source must still load eagerly.
+    // Its resident figure is the baseline the demand load is measured against,
+    // so a change in the eager path cannot make this test pass vacuously.
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let eager = match unsafe {
+        load_user_process_with_root_file(&b, &["x"], &[], &[], None, alloc_pid(), None)
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("eager control load failed"),
+    };
+    let eager_resident = eager.address_space.memory_stats().resident_pages;
+    let eager_pid = eager.pid;
+    drop(eager);
+    crate::release_pid(eager_pid);
+    if eager_resident < TEXT_PAGES {
+        return TestResult::Fail("eager control did not make the text resident");
+    }
+
+    let ops: Arc<dyn FileOps> = Arc::new(FileImage(b.clone()));
+    // SAFETY: as above; `ops` outlives the load.
+    let proc = match unsafe {
+        load_user_process_with_root_file(&b, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("demand load failed"),
+    };
+    let root = proc.address_space.root;
+    let text_va = proc.program_bias.wrapping_add(SEG_FOFF);
+    let resident = proc.address_space.memory_stats().resident_pages;
+    *DEMAND_AS.lock() = Some(Arc::clone(&proc.address_space));
+    install_address_space_lookup(demand_as_lookup);
+    {
+        // Printed next to `BENCH exec-load`'s eager figure so the saving is a
+        // number in the log rather than an inference from a passing assertion.
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "BENCH exec-demand: text_pages={} resident_eager={} resident_demand={}",
+            TEXT_PAGES,
+            eager_resident,
+            resident
+        );
+    }
+
+    // `proc` must be released whichever way the checks end, and a closure that
+    // moved it could not be defined before the checks that read it — so the
+    // checks run in a borrowing closure and teardown happens once, after.
+    let checks = || -> Result<(), &'static str> {
+        match proc.address_space.lookup(VirtAddr::new(text_va)) {
+            Some(region)
+                if region.perms.contains(RegionPerms::FILE_DEMAND) && region.phys.is_empty() => {}
+            Some(_) => return Err("text segment was not published FILE_DEMAND"),
+            None => return Err("text segment is not mapped at all"),
+        }
+        if resident + TEXT_PAGES > eager_resident {
+            return Err("demand load left the text resident");
+        }
+        if user_phys_of(root, text_va).is_some() {
+            return Err("demand text has a leaf before any fault");
+        }
+
+        // A middle page: its own bytes, not page zero's.
+        const PROBE: u64 = 3;
+        let probe_va = text_va + PROBE * 4096;
+        // SAFETY: `probe_va` lies in this process's FILE_DEMAND text region.
+        if unsafe {
+            proc.address_space
+                .demand_alloc_page(VirtAddr::new(probe_va))
+        }
+        .is_err()
+        {
+            return Err("demand fault on a text page failed");
+        }
+        let phys = user_phys_of(root, probe_va).ok_or("demand fault published no leaf")?;
+        // SAFETY: `phys` is the live frame the fault just installed for this page.
+        let got = unsafe {
+            core::slice::from_raw_parts(narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(), 4096)
+        };
+        if got.iter().any(|byte| *byte != page_byte(PROBE)) {
+            return Err("faulted text page holds the wrong file offset");
+        }
+
+        // The partial last page: file tail, then zeroes.
+        let tail_va = text_va + (TEXT_PAGES - 1) * 4096;
+        // SAFETY: as above, for the segment's last page.
+        if unsafe { proc.address_space.demand_alloc_page(VirtAddr::new(tail_va)) }.is_err() {
+            return Err("demand fault on the partial page failed");
+        }
+        let tail_phys =
+            user_phys_of(root, tail_va).ok_or("partial page fault published no leaf")?;
+        // SAFETY: as above, for the partial page's frame.
+        let tail = unsafe {
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(tail_phys).kernel_ptr::<u8>(),
+                4096,
+            )
+        };
+        if tail[..TAIL_BYTES as usize]
+            .iter()
+            .any(|byte| *byte != page_byte(TEXT_PAGES - 1))
+        {
+            return Err("partial page is missing the file's tail bytes");
+        }
+        if tail[TAIL_BYTES as usize..].iter().any(|byte| *byte != 0) {
+            return Err("partial page past EOF was not zero-filled");
+        }
+        Ok(())
+    };
+    let verdict = checks();
+    *DEMAND_AS.lock() = None;
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_exec_demand_pages_text_from_file
+);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_exec_demand_zero_fills_split_bss_page() -> TestResult {
+    // `binfmt_elf`'s `padzero()`, on the demand path.
+    //
+    // When a segment's `p_memsz` exceeds its `p_filesz` the file image ends
+    // mid-page and the rest of that page is `.bss`, which must read as zero.
+    // The file almost always has bytes there — the next segment, the section
+    // headers — so a fault that simply reads a page from the file surfaces them
+    // as initialised data where the C runtime guarantees zeroes, and nothing
+    // reports it. Linux's comment on `padzero` says it outright: "otherwise
+    // this memory will contain the junk from the file that should not be
+    // present."
+    //
+    // Linux keeps the segment mapped from the file and clears that tail with
+    // `clear_user` right after `elf_map`, which faults the page in to do it.
+    // Here the window travels with the mapping owner and the fault clears the
+    // tail of the private copy it just filled — same bytes, page still lazy.
+    //
+    // The image below puts 0xFF immediately after the segment's file image, so
+    // a missing zero fill cannot be mistaken for anything else.
+    use crate::handlers::install_address_space_lookup;
+    use crate::{alloc_pid, load_user_process_with_root_file};
+    use alloc::sync::Arc;
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_memory::{AddressSpace, RegionPerms, VirtAddr};
+
+    static SPLIT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+    fn split_as_lookup() -> Option<Arc<AddressSpace>> {
+        SPLIT_AS.lock().clone()
+    }
+
+    const SEG_FOFF: u64 = 0x1000;
+    // Over the loader's 64 KiB floor, ending 0x64 bytes into its last page so
+    // the `.bss` starts mid-page.
+    const FILE_SIZE: u64 = 64 * 1024 + 0x64;
+    const MEM_SIZE: u64 = FILE_SIZE + 0x1000;
+    const TRAILING: u64 = 0x1000;
+    const SPLIT_PAGE: u64 = FILE_SIZE & !0xFFF;
+
+    let mut b = alloc::vec![0u8; (SEG_FOFF + FILE_SIZE + TRAILING) as usize];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_offset
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes()); // p_paddr
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&FILE_SIZE.to_le_bytes()); // p_filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&MEM_SIZE.to_le_bytes()); // p_memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    let image_start = SEG_FOFF as usize;
+    let image_end = (SEG_FOFF + FILE_SIZE) as usize;
+    b[image_start..image_end].fill(0x5A);
+    b[image_end..].fill(0xFF); // the junk a bare file read would surface
+
+    struct FileImage(alloc::vec::Vec<u8>);
+    impl FileOps for FileImage {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            let off = offset as usize;
+            let n = if off >= self.0.len() {
+                0
+            } else {
+                let n = core::cmp::min(self.0.len() - off, buf.len());
+                buf[..n].copy_from_slice(&self.0[off..off + n]);
+                n
+            };
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: self.0.len() as u64,
+                blocks: self.0.len().div_ceil(512) as u64,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    let ops: Arc<dyn FileOps> = Arc::new(FileImage(b.clone()));
+    // SAFETY: the harness keeps the kernel direct map live and the frame
+    // allocator initialised — the loader's `# Safety` contract.
+    let proc = match unsafe {
+        load_user_process_with_root_file(&b, &["x"], &[], &[], None, alloc_pid(), Some(&ops))
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("split-BSS load failed"),
+    };
+    let root = proc.address_space.root;
+    let seg_va = proc.program_bias.wrapping_add(SEG_FOFF);
+    *SPLIT_AS.lock() = Some(Arc::clone(&proc.address_space));
+    install_address_space_lookup(split_as_lookup);
+
+    let checks = || -> Result<(), &'static str> {
+        // A mid-page `.bss` is no longer a reason to fall back to the eager
+        // copy: the segment is demand-paged like any other.
+        match proc.address_space.lookup(VirtAddr::new(seg_va)) {
+            Some(region) if region.perms.contains(RegionPerms::FILE_DEMAND) => Ok(()),
+            Some(_) => Err("a segment with a mid-page BSS was not demand-paged"),
+            None => Err("split-BSS segment is not mapped"),
+        }?;
+
+        let split_va = seg_va + SPLIT_PAGE;
+        // SAFETY: `split_va` lies in this process's FILE_DEMAND region.
+        if unsafe {
+            proc.address_space
+                .demand_alloc_page(VirtAddr::new(split_va))
+        }
+        .is_err()
+        {
+            return Err("demand fault on the split BSS page failed");
+        }
+        let phys = user_phys_of(root, split_va).ok_or("split page fault published no leaf")?;
+        // SAFETY: `phys` is the live frame the fault installed for this page.
+        let page = unsafe {
+            core::slice::from_raw_parts(narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(), 4096)
+        };
+        let split_off = (FILE_SIZE & 0xFFF) as usize;
+        if page[..split_off].iter().any(|byte| *byte != 0x5A) {
+            return Err("split page lost the file bytes before p_filesz");
+        }
+        if page[split_off..].iter().any(|byte| *byte != 0) {
+            return Err("split page's BSS head was not zero-filled");
+        }
+
+        // And a full page before the split still comes from the file, so the
+        // zero fill is a window rather than a blanket.
+        let earlier_va = seg_va + SPLIT_PAGE - 4096;
+        // SAFETY: as above, for an earlier page of the same region.
+        if unsafe {
+            proc.address_space
+                .demand_alloc_page(VirtAddr::new(earlier_va))
+        }
+        .is_err()
+        {
+            return Err("demand fault on a full file page failed");
+        }
+        let earlier = user_phys_of(root, earlier_va).ok_or("full file page has no leaf")?;
+        // SAFETY: `earlier` is that page's live frame.
+        let earlier_page = unsafe {
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(earlier).kernel_ptr::<u8>(),
+                4096,
+            )
+        };
+        if earlier_page.iter().any(|byte| *byte != 0x5A) {
+            return Err("a full file page before the split was zeroed or misread");
+        }
+        Ok(())
+    };
+    let verdict = checks();
+    *SPLIT_AS.lock() = None;
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_exec_demand_zero_fills_split_bss_page
+);

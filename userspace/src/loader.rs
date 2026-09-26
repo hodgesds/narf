@@ -186,6 +186,46 @@ pub unsafe fn load_elf_into_at(
     addr_space: &AddressSpace,
     vaddr_bias: u64,
 ) -> Result<u64, LoadBytesError> {
+    // SAFETY: forwarding this function's own contract; `None` selects the
+    // historical eager-copy path unchanged.
+    unsafe { load_elf_into_at_file(bytes, addr_space, vaddr_bias, None) }
+}
+
+/// [`load_elf_into_at`], optionally demand-paging the file image.
+///
+/// With `file = Some(ops)`, a PT_LOAD whose biased vaddr is page-congruent
+/// with its file offset is mapped as a private `FILE_DEMAND` region instead of
+/// having its pages allocated and copied: exactly the registration `mmap`
+/// builds for a `MAP_PRIVATE` file mapping, so faults are served by the same
+/// `mapped_file::demand_frame` hook. Pages are then read once, on first touch,
+/// rather than every exec paying for the whole image.
+///
+/// Segments that are not congruent, or carry no file bytes, keep the eager
+/// path — as does every caller passing `None` (the in-memory execve flavour,
+/// the interpreter, and the tests).
+///
+/// The BSS suffix deliberately stays OUTSIDE the `FILE_DEMAND` region:
+/// `load_file_demand_page` reports no page past EOF, so a BSS page routed to
+/// the file hook would fault fatally instead of reading as zero. The page the
+/// BSS *shares* with the file image does stay in the region, with a
+/// `zero_from` window on the owner so the fault clears its tail — the same
+/// bytes `binfmt_elf` produces by calling `padzero()` after `elf_map`.
+///
+/// One behaviour genuinely changes, and it changes TOWARDS Linux: a read error
+/// or a truncation discovered after the load no longer fails the `execve` with
+/// `ENOEXEC` — it kills the running process on the fault, as a truncated
+/// `mmap`ped text segment does on Linux. Demand paging cannot preserve the old
+/// answer, because the read that would have detected the problem is precisely
+/// the read it defers.
+///
+/// # Safety
+/// Same contract as [`load_elf_into_at`].
+pub unsafe fn load_elf_into_at_file(
+    bytes: &[u8],
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+    file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+) -> Result<u64, LoadBytesError> {
     let image = crate::parse_elf(bytes)?;
     if image.segments.is_empty() {
         return Err(LoadBytesError::Load(LoadError::NoSegments));
@@ -218,12 +258,56 @@ pub unsafe fn load_elf_into_at(
         })
         .collect();
 
+    // Which segments will be demand-paged. Decided BEFORE the allocation loop
+    // below, because a demand-paged segment must reserve no frames at all —
+    // that saving is the point.
+    //
+    // Congruence is the requirement: a whole VA page can only be served by a
+    // whole file page when `vaddr` and `file_off` agree modulo the page size.
+    // The ELF ABI guarantees it and real binaries honour it (redis-server's RW
+    // segment sits at off 0x283c90 / vaddr 0x284c90 — both 0xc90), but a
+    // malformed image must fall back rather than map the wrong bytes.
+    //
+    // A floor goes with it. There is no fault-around here yet — each page of a
+    // FILE_DEMAND segment costs its own fault, file read, frame allocation and
+    // leaf install — so for a segment of a few pages the faults cost more than
+    // the bulk copy they replace, and demand paging would be a latency
+    // regression on exactly the small binaries a shell runs most (`true`,
+    // `echo`). Above the floor the saving dominates, and a process that never
+    // touches a page never pays for it at all. When fault-around lands this
+    // floor should drop, not disappear: the crossover moves, it does not
+    // vanish.
+    //
+    // 64 KiB is not arbitrary. Linux maps a file fault's neighbours in a window
+    // of exactly that size — `fault_around_pages = 65536 >> PAGE_SHIFT` in
+    // mm/memory.c — so below it Linux itself resolves an image in roughly one
+    // fault's worth of mapping work, and lazy mapping buys nothing there
+    // either.
+    const DEMAND_MIN_FILE_BYTES: u64 = 64 * 1024;
+    let demand: alloc::vec::Vec<bool> = image
+        .segments
+        .iter()
+        .map(|seg| {
+            file.is_some()
+                && seg.file_size >= DEMAND_MIN_FILE_BYTES
+                && (seg.vaddr.wrapping_add(vaddr_bias) & 0xFFF) == (seg.file_off & 0xFFF)
+        })
+        .collect();
+    if file.is_some() && demand.iter().any(|d| *d) {
+        // Installed here for the same reason `sys_mmap` installs it lazily:
+        // the hook is only meaningful once a FILE_DEMAND region exists.
+        narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+    }
+
     // Allocate only file-image frames up front, chunk by chunk. Linux maps
     // full BSS pages as anonymous demand-zero memory; allocating them here
     // inflated every exec, fork COW retain, and child teardown in proportion
     // to an ELF's untouched BSS (stress-ng reserves about 6.8 MiB).
     let mut allocated: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
-    for &(file_pages, _) in &page_counts {
+    for (index, &(file_pages, _)) in page_counts.iter().enumerate() {
+        if demand[index] {
+            continue;
+        }
         for _ in 0..file_pages {
             let f = narf_memory::alloc_frame().map_err(|_| LoadBytesError::NoFrame)?;
             allocated.push(f.start_address());
@@ -245,29 +329,108 @@ pub unsafe fn load_elf_into_at(
     // elf_load(): padzero() clears that page and vm_brk_flags() creates only
     // the following full pages as anonymous demand-zero memory.
     let mut cursor: usize = 0;
-    for (seg, &(file_pages, memory_pages)) in image.segments.iter().zip(page_counts.iter()) {
-        let end = cursor
-            .checked_add(file_pages)
-            .ok_or(LoadBytesError::NoFrame)?;
-        if end > allocated.len() {
-            return Err(LoadBytesError::NoFrame);
-        }
-        let phys: alloc::vec::Vec<PhysAddr> = allocated[cursor..end].to_vec();
-        cursor = end;
+    for (index, (seg, &(file_pages, memory_pages))) in
+        image.segments.iter().zip(page_counts.iter()).enumerate()
+    {
+        let is_demand = demand[index];
+        let phys: alloc::vec::Vec<PhysAddr> = if is_demand {
+            // No frames were reserved for this segment, and none are mapped:
+            // a sparse FILE_DEMAND region represents every page as absent
+            // until the first touch grows it.
+            alloc::vec::Vec::new()
+        } else {
+            let end = cursor
+                .checked_add(file_pages)
+                .ok_or(LoadBytesError::NoFrame)?;
+            if end > allocated.len() {
+                return Err(LoadBytesError::NoFrame);
+            }
+            let taken = allocated[cursor..end].to_vec();
+            cursor = end;
+            taken
+        };
 
         let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
         let region_base = vaddr & !0xFFF;
         let perms = perms_of(seg.flags);
 
         if file_pages != 0 {
-            addr_space
-                .map_region(Region {
+            if is_demand {
+                let ops = file.expect("demand implies a file source");
+                let len = (file_pages as u64) << 12;
+                let region = Region {
                     base: VirtAddr::new(region_base),
-                    len: (file_pages as u64) << 12,
-                    perms,
+                    len,
+                    perms: perms | RegionPerms::FILE_DEMAND,
                     phys,
-                })
-                .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+                };
+                // The owner has to become visible atomically with the mapping,
+                // or a fault could reach a FILE_DEMAND region with no owner to
+                // read from — hence the VMA transaction and the locked receipt
+                // variant, which is the shape `sys_mmap`'s private lazy-file
+                // path uses.
+                addr_space
+                    .with_vma_transaction(|| {
+                        crate::mapped_file::publish_current_mapping(
+                            addr_space.identity(),
+                            crate::mapped_file::MappingOwnerRegistration {
+                                base: region_base,
+                                len,
+                                file_offset: seg.file_off & !0xFFF,
+                                ops: alloc::sync::Arc::clone(ops),
+                                lifetime: None,
+                                writeback_phys: None,
+                                private_copy: true,
+                                replace: false,
+                                // `binfmt_elf`'s `padzero()`. When `p_memsz`
+                                // exceeds `p_filesz` the file image ends
+                                // mid-page and the rest of that page is `.bss`,
+                                // which must read as zero — while the file
+                                // almost always continues there with the next
+                                // segment or the section headers. Linux clears
+                                // it with `clear_user` straight after
+                                // `elf_map`, faulting the page in to do so;
+                                // handing the window to the fault instead keeps
+                                // the page lazy and lands the same bytes.
+                                //
+                                // Linux also gives up on this zeroing when the
+                                // segment is not writable (`clear_user` fails
+                                // and the error is ignored unless PROT_WRITE),
+                                // leaving file bytes in a read-only segment's
+                                // `.bss` head. Nothing needs that bug
+                                // reproduced.
+                                zero_from: (seg.mem_size > seg.file_size)
+                                    .then(|| seg.file_off.wrapping_add(seg.file_size)),
+                            },
+                            || {
+                                // SAFETY: the VMA transaction and the owner
+                                // bucket stay locked until the owner is
+                                // visible, which is the contract this variant
+                                // documents.
+                                unsafe {
+                                    addr_space.map_region_locked_limited_receipt(
+                                        region,
+                                        false,
+                                        u64::MAX,
+                                        false,
+                                    )
+                                }
+                            },
+                            |_receipt| Ok(()),
+                        )
+                    })
+                    .map(|_| ())
+                    .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+            } else {
+                addr_space
+                    .map_region(Region {
+                        base: VirtAddr::new(region_base),
+                        len: (file_pages as u64) << 12,
+                        perms,
+                        phys,
+                    })
+                    .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+            }
         }
 
         if memory_pages > file_pages {
@@ -294,7 +457,16 @@ pub unsafe fn load_elf_into_at(
     // final partial page stays zero past file_size; full BSS pages have no
     // frame here and fault through the ordinary anonymous demand-zero path.
     let mut cursor: usize = 0;
-    for (seg, &(file_pages, _)) in image.segments.iter().zip(page_counts.iter()) {
+    for (index, (seg, &(file_pages, _))) in
+        image.segments.iter().zip(page_counts.iter()).enumerate()
+    {
+        if demand[index] {
+            // Nothing to copy and nothing reserved: `demand_frame` reads this
+            // segment's pages on first touch, zero-filling any tail past
+            // `p_filesz` exactly as the eager path does below. The cursor must
+            // NOT advance — no frames were allocated for this segment.
+            continue;
+        }
         let frames = &allocated[cursor..cursor + file_pages];
         cursor += file_pages;
 
@@ -353,6 +525,19 @@ pub unsafe fn load_elf_into_at(
 pub unsafe fn load_elf_bytes(
     bytes: &[u8],
 ) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
+    // SAFETY: forwarding this function's contract; `None` keeps the eager path.
+    unsafe { load_elf_bytes_file(bytes, None) }
+}
+
+/// [`load_elf_bytes`], demand-paging the program image from `file` when it is
+/// page-congruent. See [`load_elf_into_at_file`].
+///
+/// # Safety
+/// Same contract as [`load_elf_bytes`].
+pub unsafe fn load_elf_bytes_file(
+    bytes: &[u8],
+    file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
     // SAFETY: Valid memory or trusted environment
@@ -367,7 +552,7 @@ pub unsafe fn load_elf_bytes(
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
     // SAFETY: Valid memory or trusted environment
-    let entry = unsafe { load_elf_into_at(bytes, &addr_space, bias) }?;
+    let entry = unsafe { load_elf_into_at_file(bytes, &addr_space, bias, file) }?;
 
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed

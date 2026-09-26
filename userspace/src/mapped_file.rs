@@ -70,6 +70,21 @@ struct MappingOwner {
     /// their frame list so fsync/msync can copy dirty bytes back to FileOps.
     /// Device mappings leave this `None`: they already alias device memory.
     writeback: Option<FileWriteback>,
+    /// File offset at and beyond which this mapping must read as zero, even
+    /// though the file has bytes there — `binfmt_elf`'s `padzero()` window.
+    ///
+    /// An ELF segment whose `p_memsz` exceeds its `p_filesz` ends its file
+    /// image mid-page, and the rest of that page is `.bss`: it must read as
+    /// zero, while the file almost always continues with the next segment or
+    /// the section headers. Linux zeroes it with `clear_user` right after
+    /// `elf_map`, which faults the page in and clears the tail of the private
+    /// copy; doing it here instead keeps the page lazy and reaches the same
+    /// bytes. Honoured only for `private_copy` mappings — zeroing a shared
+    /// page-cache page would corrupt the file for everyone.
+    ///
+    /// Absolute in the FILE, not relative to `base`, so `punch` moving `base`
+    /// and `file_offset` cannot invalidate it.
+    zero_from: Option<u64>,
 }
 
 type MappingOwners = Arc<IrqSafeSpinLock<Vec<MappingOwner>>>;
@@ -147,6 +162,8 @@ pub(crate) struct MappingOwnerRegistration {
     pub(crate) writeback_phys: Option<Vec<PhysAddr>>,
     pub(crate) private_copy: bool,
     pub(crate) replace: bool,
+    /// See [`MappingOwner::zero_from`]. Only the ELF loader sets it.
+    pub(crate) zero_from: Option<u64>,
 }
 
 pub(crate) fn publish_current_mapping(
@@ -164,6 +181,7 @@ pub(crate) fn publish_current_mapping(
         writeback_phys,
         private_copy,
         replace,
+        zero_from,
     } = registration;
     let owner_bucket = mapping_owners(address_space_id);
     let mut owners = owner_bucket.lock();
@@ -182,6 +200,7 @@ pub(crate) fn publish_current_mapping(
             offset: file_offset,
             phys,
         }),
+        zero_from,
     });
     // Publication and owner registration are now atomic with respect to
     // faults. Release the IRQ-safe global table before PTE materialization,
@@ -822,7 +841,7 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
     let page = vaddr & !0xFFFu64;
     let address_space_id = current_address_space_id()?;
     let owner_bucket = existing_mapping_owners(address_space_id)?;
-    let (offset, ops, generic_fallback, private_copy) = {
+    let (offset, ops, generic_fallback, private_copy, zero_from) = {
         let owners = owner_bucket.lock();
         let owner = owners.iter().find(|mapping| {
             page >= mapping.base && page < mapping.base.saturating_add(mapping.len)
@@ -832,12 +851,32 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
             Arc::clone(&owner.ops),
             owner.writeback.is_some(),
             owner.private_copy,
+            owner.zero_from,
         )
     };
     if private_copy {
-        return crate::handlers::load_file_demand_page(&ops, offset)
-            .ok()
-            .map(|phys| phys.raw());
+        let phys = crate::handlers::load_file_demand_page(&ops, offset).ok()?;
+        // `padzero()`: the bytes from an ELF segment's `p_filesz` to the end of
+        // that page are `.bss` and must read as zero, not as whatever the file
+        // holds there. Only this private copy is touched.
+        if let Some(zero_from) = zero_from {
+            // `saturating_sub`, not `checked_sub`: a page that begins at or
+            // after the zero point is zero in its entirety, not left alone.
+            let in_page = zero_from.saturating_sub(offset);
+            if in_page < 4096 {
+                // SAFETY: `phys` is the frame just allocated for this mapping
+                // and is reachable through the kernel direct map; nothing else
+                // can observe it until this returns.
+                unsafe {
+                    core::ptr::write_bytes(
+                        phys.kernel_mut_ptr::<u8>().add(in_page as usize),
+                        0,
+                        4096 - in_page as usize,
+                    );
+                }
+            }
+        }
+        return Some(phys.raw());
     }
     if !generic_fallback {
         return ops.mmap_fault(offset).ok();
@@ -1073,6 +1112,8 @@ fn register(
         lifetime,
         private_copy: false,
         writeback,
+        // Not an ELF segment: no `padzero` window.
+        zero_from: None,
     });
 }
 
@@ -1167,6 +1208,7 @@ fn prepare_aliases_locked(
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
+            zero_from: mapping.zero_from,
             writeback,
         });
     }
@@ -1298,6 +1340,7 @@ fn prepare_relocated_owners_locked(
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
+            zero_from: mapping.zero_from,
             writeback,
         });
     }
@@ -1391,6 +1434,7 @@ fn prepare_punch_suffixes_locked(
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
+            zero_from: mapping.zero_from,
             writeback,
         });
     }
@@ -1497,6 +1541,7 @@ fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
                     ops: Arc::clone(&mapping.ops),
                     lifetime: mapping.lifetime.clone(),
                     private_copy: mapping.private_copy,
+                    zero_from: mapping.zero_from,
                     writeback: mapping.writeback.clone(),
                 };
                 if let Some(wb) = suffix.writeback.as_mut() {
@@ -1548,6 +1593,7 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
+            zero_from: mapping.zero_from,
             writeback: mapping.writeback.clone(),
         })
         .collect();
