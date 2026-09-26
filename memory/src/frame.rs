@@ -519,16 +519,18 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     // Count the frames first so the arena carve-out can be sized from them, then
     // treat the carve as one more excluded range: it must never reach the buddy,
     // because the bump arena hands out pointers into it that are never freed.
-    let mut frame_count = 0usize;
-    for r in usable {
-        let first = (r.start.raw() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let last = (r.start.raw() + r.len) & !(PAGE_SIZE - 1);
-        let mut a = first;
-        while a + PAGE_SIZE <= last {
-            frame_count += 1;
-            a += PAGE_SIZE;
-        }
-    }
+    // Counted arithmetically, not by walking every page: this runs before the
+    // two passes below, which are already O(frames), and a 1 TiB machine has
+    // 268M of them — no reason to add a third walk just to get a total.
+    let frame_count: usize = usable
+        .iter()
+        .map(|r| {
+            let first = (r.start.raw() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let last = (r.start.raw() + r.len) & !(PAGE_SIZE - 1);
+            last.checked_sub(first)
+                .map_or(0, |span| (span / PAGE_SIZE) as usize)
+        })
+        .sum();
     let carve = plan_bootstrap_carve(usable, exclude, frame_count);
     let mut eff_exclude: Vec<(u64, u64)> = exclude.to_vec();
     if let Some((base, len)) = carve {
