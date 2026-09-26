@@ -83,3 +83,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     narf_lib::directmap::set_offset(crate::KERNEL_PHYS_OFFSET);
     Ok(PhysAddr::new(ttbr0))
 }
+
+/// Physical address the image window maps from, before the delta.
+/// `build_image_l2` indexes from the RAM base, not from 0 as on x86_64.
+pub const KERNEL_WINDOW_PHYS_BASE: u64 = 0x4000_0000;

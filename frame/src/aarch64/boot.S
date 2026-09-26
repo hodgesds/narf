@@ -29,8 +29,35 @@ _start:
      * need nothing: a VA does not move when the image does, and the window
      * built below maps it to the copy.
      */
+    /* Not while someone else's page tables are live.
+     *
+     * The Linux arm64 boot protocol enters with the MMU off, which is the state
+     * the QEMU `-kernel` path gives us and what everything below assumes. A UEFI
+     * boot does NOT: after ExitBootServices the firmware's tables are still
+     * installed, and memory the loader did not allocate as code is mapped XN. So
+     * branching into a copy the firmware knows nothing about takes an
+     * instruction abort — "Permission fault, second level" at the copy's first
+     * byte, which is exactly how the aarch64 UEFI smoke failed.
+     *
+     * Relocating would mean tearing down the firmware's mappings first, with
+     * its stack and data still in use. Declining is the honest answer: the image
+     * still gets the VA slide, and only the physical randomization is lost on
+     * this path. */
+    mov  x21, #0                        /* delta, and the value `.Lphys_done`
+                                         * records — every path reaching it must
+                                         * have x21 set, including the two that
+                                         * decline below */
+    mrs  x0, sctlr_el1
+    tbnz x0, #0, .Lphys_done            /* SCTLR_EL1.M: MMU already on */
+
     ldr  x21, =KASLR_PHYS_FIXED
-    cbz  x21, .Lphys_done
+    cbnz x21, .Lphys_go                 /* pinned: use it verbatim */
+    ldr  x0, =KASLR_PHYS_ENABLE
+    cbz  x0, .Lphys_done
+    b    .Lfdt_pick                     /* falls through to .Lphys_go or
+                                         * .Lphys_done; no `bl`, because the
+                                         * stack is not set up yet */
+.Lphys_go:
 
     ldr  x0, =__kernel_start            /* link-time phys: NOT slid, the value */
     ldr  x1, =__kernel_end              /* is low-half so the table skips it   */
@@ -503,6 +530,456 @@ _start_rust_entry:
  * Clobbers x3-x9, and x11 in `build_image_l2`. Runs pre-MMU at a low PA, so it
  * must stay in `.boot`.
  */
+
+/* ── Physical relocation target selection from the DTB ───────────────────
+ *
+ * Reached by a `b` (not `bl`) from the relocation block above, because `sp` is
+ * not set up yet: this runs before the stack pointer is established, so nothing
+ * here may push. It exits by branching to `.Lphys_go` with x21 = delta, or to
+ * `.Lphys_done` to decline. `bl` IS used for one leaf helper below — x30 is
+ * otherwise unused this early, and the helper never nests.
+ *
+ * In:  x19 = DTB pointer, as the loader left it in x0.
+ * Out: x21 = chosen delta (branching to .Lphys_go), or no relocation.
+ *
+ * Why a DTB walk rather than the flat array the x86_64 side reads: the PVH
+ * handoff hands over `(memmap_paddr, memmap_entries)` and every entry is a
+ * fixed 24-byte record. A devicetree has neither — RAM extent lives in
+ * `/memory`'s `reg`, the initrd bounds in `/chosen`, and reaching either means
+ * walking the structure block token by token with the strings block as a side
+ * table. Everything is big-endian, so every field needs a `rev`.
+ *
+ * The walk deliberately keys on PROPERTY names, never node names:
+ *
+ *   - `reg` is not unique (almost every node has one), so a `reg` is only
+ *     remembered as a candidate; a `device_type = "memory"` in the same node is
+ *     what commits it as RAM. The QEMU virt DTB emits `reg` BEFORE
+ *     `device_type`, which is why it is remembered rather than looked up.
+ *   - `linux,initrd-start` / `linux,initrd-end` ARE unique, so they need no
+ *     node context at all.
+ *
+ * That avoids parsing node names ("memory@40000000" needs a prefix match, and
+ * the unit address varies by machine) — the name bytes are only skipped, never
+ * compared. Property values may be 4-byte aligned, so every 64-bit field is
+ * read as two 32-bit halves.
+ *
+ * Anything unexpected — bad magic, an unknown token, a `reg` that is not
+ * 2+2 cells, more ranges than the small fixed tables hold — declines rather
+ * than guesses. Failing closed costs the randomization; guessing costs the boot.
+ */
+
+
+.Lfdt_pick:
+    /* ── Locate the DTB ──
+     *
+     * x19 holds whatever was in x0 at entry, which for the Linux arm64 boot
+     * protocol is the DTB's physical address. QEMU's `-kernel` does NOT follow
+     * that protocol for a raw ELF — it jumps to the ELF entry with the registers
+     * zeroed — so x19 is 0 on the path this tree actually boots, and relying on
+     * it silently declined to relocate at all.
+     *
+     * Same three-step search the Rust side already does in `scan_for_dtb`:
+     * the handoff pointer, then the fixed address xtask force-loads the blob at,
+     * then a bounded scan of low RAM for the magic.
+     */
+    movz w1, #0xfeed
+    movk w1, #0xd00d, lsl #16           /* w1 = FDT magic, host order */
+
+    mov  x2, x19                        /* 1. the handoff pointer */
+    cbz  x2, 1f
+    ldr  w0, [x2]
+    rev  w0, w0
+    cmp  w0, w1
+    b.eq .Lfdt_have
+
+1:  movz x2, #0x4F00, lsl #16           /* 2. DTB_LOAD_ADDR */
+    ldr  w0, [x2]
+    rev  w0, w0
+    cmp  w0, w1
+    b.eq .Lfdt_have
+
+    /* 3. Scan [0x4000_0000, 0x5000_0000) on 4-byte strides. Bounded, and the
+     * same window the Rust fallback uses. */
+    movz x2, #0x4000, lsl #16
+    movz x3, #0x5000, lsl #16
+2:  cmp  x2, x3
+    b.hs .Lphys_done                    /* no DTB anywhere: decline */
+    ldr  w0, [x2]
+    rev  w0, w0
+    cmp  w0, w1
+    b.eq .Lfdt_have
+    add  x2, x2, #4
+    b    2b
+
+.Lfdt_have:
+    mov  x19, x2                        /* the DTB the rest of the walk reads */
+
+    ldr  w2, [x19, #4]                  /* totalsize   */
+    rev  w2, w2
+    ldr  w3, [x19, #8]                  /* off_dt_struct */
+    rev  w3, w3
+    ldr  w4, [x19, #12]                 /* off_dt_strings */
+    rev  w4, w4
+
+    /* Reset the tables, then record the DTB itself as the first thing the copy
+     * must not land on. */
+    adrp x9, fdt_nram
+    add  x9, x9, #:lo12:fdt_nram
+    str  xzr, [x9]                      /* fdt_nram = 0 */
+    adrp x9, fdt_navoid
+    add  x9, x9, #:lo12:fdt_navoid
+    str  xzr, [x9]                      /* fdt_navoid = 0 */
+    adrp x9, fdt_initrd_start
+    add  x9, x9, #:lo12:fdt_initrd_start
+    str  xzr, [x9]
+    str  xzr, [x9, #8]                  /* fdt_initrd_end */
+
+    mov  x0, x19                        /* DTB base */
+    mov  x1, x2                         /* totalsize */
+    bl   .Lfdt_add_avoid
+
+    add  x4, x19, x4                    /* x4 = strings block */
+    add  x5, x19, x3                    /* x5 = cursor into struct block */
+    add  x6, x19, x2                    /* x6 = hard bound (dtb + totalsize) */
+    mov  x24, #0                        /* have a remembered `reg` */
+
+.Lfdt_tok:
+    cmp  x5, x6
+    b.hs .Lfdt_walk_done                /* ran off the end without FDT_END */
+    ldr  w8, [x5]
+    rev  w8, w8
+    add  x5, x5, #4
+    cmp  w8, #1                         /* FDT_BEGIN_NODE */
+    b.eq .Lfdt_begin
+    cmp  w8, #2                         /* FDT_END_NODE   */
+    b.eq .Lfdt_endnode
+    cmp  w8, #3                         /* FDT_PROP       */
+    b.eq .Lfdt_prop
+    cmp  w8, #4                         /* FDT_NOP        */
+    b.eq .Lfdt_tok
+    cmp  w8, #9                         /* FDT_END        */
+    b.eq .Lfdt_walk_done
+    b    .Lphys_done                    /* unknown token: decline */
+
+.Lfdt_begin:
+    /* Skip the NUL-terminated node name, then 4-align. Never compared — see
+     * the header comment. */
+    mov  x24, #0                        /* new node: forget any `reg` */
+1:  ldrb w9, [x5], #1
+    cbnz w9, 1b
+    add  x5, x5, #3
+    and  x5, x5, #0xFFFFFFFFFFFFFFFC
+    b    .Lfdt_tok
+
+.Lfdt_endnode:
+    mov  x24, #0
+    b    .Lfdt_tok
+
+.Lfdt_prop:
+    ldr  w10, [x5]                      /* plen   */
+    rev  w10, w10
+    ldr  w11, [x5, #4]                  /* nameoff */
+    rev  w11, w11
+    add  x5, x5, #8
+    mov  x25, x5                        /* value */
+    mov  x26, x10                       /* plen  */
+    /* Advance past the value now, 4-aligned, so every branch below can just
+     * fall back to .Lfdt_tok. */
+    add  x5, x5, x10
+    add  x5, x5, #3
+    and  x5, x5, #0xFFFFFFFFFFFFFFFC
+
+    add  x13, x4, x11                   /* property name — kept HERE, because
+                                         * `.Lfdt_streq` advances the pointers it
+                                         * is given, so every compare below has
+                                         * to start from a fresh copy */
+
+    /* `reg`: remember it as a candidate. 2 address cells + 2 size cells is
+     * 16 bytes; anything else is a layout this code does not model. */
+    mov  x9, x13
+    adr  x10, .Lfdt_s_reg
+    bl   .Lfdt_streq
+    cbz  w12, 2f
+    cmp  x26, #16
+    b.ne .Lfdt_tok
+    mov  x0, x25
+    bl   .Lfdt_be64
+    mov  x22, x0                        /* base */
+    add  x0, x25, #8
+    bl   .Lfdt_be64
+    mov  x23, x0                        /* size */
+    mov  x24, #1
+    b    .Lfdt_tok
+
+2:  /* `device_type`: commits the remembered `reg` when the value is "memory". */
+    mov  x9, x13
+    adr  x10, .Lfdt_s_devtype
+    bl   .Lfdt_streq
+    cbz  w12, 3f
+    cbz  x24, .Lfdt_tok                 /* no `reg` in this node */
+    mov  x9, x25                        /* compare the VALUE */
+    adr  x10, .Lfdt_s_memory
+    bl   .Lfdt_streq
+    cbz  w12, .Lfdt_tok
+    mov  x0, x22
+    mov  x1, x23
+    bl   .Lfdt_add_ram
+    mov  x24, #0
+    b    .Lfdt_tok
+
+3:  /* `linux,initrd-start` / `-end`: unique, so no node context needed. The
+     * FDT spec allows either width for these, and QEMU's choice varies. */
+    mov  x9, x13
+    adr  x10, .Lfdt_s_initrd_start
+    bl   .Lfdt_streq
+    cbz  w12, 4f
+    mov  x0, x25
+    mov  x1, x26
+    bl   .Lfdt_cellval
+    adrp x9, fdt_initrd_start
+    add  x9, x9, #:lo12:fdt_initrd_start
+    str  x0, [x9]
+    b    .Lfdt_tok
+
+4:  mov  x9, x13
+    adr  x10, .Lfdt_s_initrd_end
+    bl   .Lfdt_streq
+    cbz  w12, .Lfdt_tok
+    mov  x0, x25
+    mov  x1, x26
+    bl   .Lfdt_cellval
+    adrp x9, fdt_initrd_start
+    add  x9, x9, #:lo12:fdt_initrd_start
+    str  x0, [x9, #8]
+    b    .Lfdt_tok
+
+.Lfdt_walk_done:
+    /* The initrd, if the loader passed one. Clobbering it would destroy the
+     * rootfs while the copy itself reported success. */
+    adrp x9, fdt_initrd_start
+    add  x9, x9, #:lo12:fdt_initrd_start
+    ldr  x0, [x9]
+    ldr  x1, [x9, #8]
+    cbz  x0, 5f
+    cmp  x1, x0
+    b.ls 5f
+    sub  x1, x1, x0
+    bl   .Lfdt_add_avoid
+5:
+    /* No RAM node found: decline rather than guess at an extent. */
+    adrp x9, fdt_nram
+    add  x9, x9, #:lo12:fdt_nram
+    ldr  x0, [x9]
+    cbz  x0, .Lphys_done
+
+    /* Image span and floor, both 2 MiB rounded. Placing at or above the image's
+     * end keeps the delta positive and no smaller than the image, so the
+     * forward copy cannot overwrite its own source. */
+    ldr  x9, =__kernel_start
+    ldr  x10, =__kernel_end
+    sub  x11, x10, x9
+    add  x11, x11, #0xfff                   /* + (2 MiB - 1): an `add` immediate */
+    add  x11, x11, #0x1ff, lsl #12          /* is 12 bits, so it takes two */
+    and  x11, x11, #0xFFFFFFFFFFE00000
+    adrp x12, fdt_span
+    add  x12, x12, #:lo12:fdt_span
+    str  x11, [x12]                         /* fdt_span */
+    add  x13, x10, #0xfff
+    add  x13, x13, #0x1ff, lsl #12
+    and  x13, x13, #0xFFFFFFFFFFE00000
+    str  x13, [x12, #8]                     /* fdt_floor */
+
+    mov  x27, #64                           /* attempts */
+.Lfdt_try:
+    cbz  x27, .Lphys_done
+    sub  x27, x27, #1
+
+    /* Sample the DELTA, not the target.
+     *
+     * The image window maps 2 MiB BLOCKS, and a block descriptor's output
+     * address must be 2 MiB aligned. `__kernel_start` is 0x4008_0000 here — 512
+     * KiB aligned, NOT 2 MiB — so a 2 MiB aligned TARGET yields a delta that is
+     * not, every mapped output address inherits that misalignment, and the
+     * descriptors are malformed: the boot hangs the moment the MMU comes up.
+     * (x86_64 never hit this because its load base is 16 MiB aligned, so there
+     * the two are interchangeable.)
+     *
+     * Aligning the delta instead keeps `link_pa + delta` aligned for every
+     * block, and the target inherits the load base's own offset. */
+    bl   .Lfdt_rand                         /* x0 = random */
+    and  x0, x0, #0x7FE00000                /* 2 MiB aligned delta, < 2 GiB */
+    adrp x12, fdt_span
+    add  x12, x12, #:lo12:fdt_span
+    ldr  x11, [x12]                         /* span */
+    cmp  x0, x11
+    b.lo .Lfdt_try                          /* delta < image span: the forward
+                                             * copy would eat its own source */
+    ldr  x9, =__kernel_start
+    add  x0, x9, x0                         /* target = load base + delta */
+    add  x14, x0, x11
+    /* The TTBR0 identity map covers 0..2 GiB (lo_L1[0..1]); `.boot` executes at
+     * its physical address after the MMU comes up, so the copy must land inside
+     * that window. */
+    movz x15, #0x8000, lsl #16              /* 2 GiB */
+    cmp  x14, x15
+    b.hi .Lfdt_try
+
+    mov  x28, x0                            /* candidate */
+    bl   .Lfdt_in_ram
+    cbz  w12, .Lfdt_try
+    bl   .Lfdt_clear
+    cbz  w12, .Lfdt_try
+
+    ldr  x9, =__kernel_start
+    sub  x21, x28, x9
+    b    .Lphys_go
+
+/* x9, x10 = NUL-terminated strings. w12 = 1 if equal. Clobbers x9-x12.
+ * A leaf: called with `bl` from the walk, never nested. */
+.Lfdt_streq:
+    ldrb w11, [x9], #1
+    ldrb w12, [x10], #1
+    cmp  w11, w12
+    b.ne 1f
+    cbnz w11, .Lfdt_streq
+    mov  w12, #1
+    ret
+1:  mov  w12, #0
+    ret
+
+/* x0 = pointer to a big-endian 64-bit FDT value, possibly only 4-byte aligned,
+ * so it is read as two halves. Returns x0. */
+.Lfdt_be64:
+    ldr  w9, [x0]
+    rev  w9, w9
+    ldr  w10, [x0, #4]
+    rev  w10, w10
+    lsl  x9, x9, #32
+    orr  x0, x9, x10
+    ret
+
+/* x0 = value pointer, x1 = property length. Returns x0 = the value, accepting
+ * both the 4-byte and 8-byte encodings the FDT spec allows. Length 0 or any
+ * other size yields 0, which the caller treats as absent. */
+.Lfdt_cellval:
+    cmp  x1, #4
+    b.ne 1f
+    ldr  w9, [x0]
+    rev  w9, w9
+    mov  x0, x9
+    ret
+1:  cmp  x1, #8
+    b.ne 2f
+    b    .Lfdt_be64
+2:  mov  x0, #0
+    ret
+
+/* x0 = base, x1 = size. Appends a RAM range, ignoring empties and declining the
+ * whole selection if the table is full. */
+.Lfdt_add_ram:
+    cbz  x1, 9f
+    adrp x9, fdt_nram
+    add  x9, x9, #:lo12:fdt_nram
+    ldr  x10, [x9]
+    cmp  x10, #4
+    b.hs .Lphys_done                    /* more memory nodes than modelled */
+    adrp x11, fdt_ram
+    add  x11, x11, #:lo12:fdt_ram
+    add  x11, x11, x10, lsl #4
+    stp  x0, x1, [x11]
+    add  x10, x10, #1
+    str  x10, [x9]
+9:  ret
+
+/* x0 = base, x1 = length. Appends an avoid range, same rules. */
+.Lfdt_add_avoid:
+    cbz  x1, 9f
+    adrp x9, fdt_navoid
+    add  x9, x9, #:lo12:fdt_navoid
+    ldr  x10, [x9]
+    cmp  x10, #8
+    b.hs .Lphys_done
+    adrp x11, fdt_avoid
+    add  x11, x11, #:lo12:fdt_avoid
+    add  x11, x11, x10, lsl #4
+    stp  x0, x1, [x11]
+    add  x10, x10, #1
+    str  x10, [x9]
+9:  ret
+
+/* w12 = 1 if [x28, x28 + span) lies entirely inside ONE RAM range. Straddling
+ * two is rejected: adjacent table entries need not be adjacent in reality. */
+.Lfdt_in_ram:
+    adrp x9, fdt_nram
+    add  x9, x9, #:lo12:fdt_nram
+    ldr  x10, [x9]
+    adrp x11, fdt_ram
+    add  x11, x11, #:lo12:fdt_ram
+    adrp x13, fdt_span
+    add  x13, x13, #:lo12:fdt_span
+    ldr  x13, [x13]
+    add  x14, x28, x13                  /* candidate end */
+1:  cbz  x10, 8f
+    ldp  x15, x16, [x11]
+    add  x16, x15, x16                  /* range end */
+    cmp  x28, x15
+    b.lo 2f
+    cmp  x14, x16
+    b.hi 2f
+    mov  w12, #1
+    ret
+2:  add  x11, x11, #16
+    sub  x10, x10, #1
+    b    1b
+8:  mov  w12, #0
+    ret
+
+/* w12 = 1 if [x28, x28 + span) overlaps nothing on the avoid list. Two ranges
+ * are disjoint iff one ends at or before the other begins. */
+.Lfdt_clear:
+    adrp x9, fdt_navoid
+    add  x9, x9, #:lo12:fdt_navoid
+    ldr  x10, [x9]
+    adrp x11, fdt_avoid
+    add  x11, x11, #:lo12:fdt_avoid
+    adrp x13, fdt_span
+    add  x13, x13, #:lo12:fdt_span
+    ldr  x13, [x13]
+    add  x14, x28, x13                  /* candidate end */
+1:  cbz  x10, 8f
+    ldp  x15, x16, [x11]
+    add  x16, x15, x16                  /* avoid end */
+    cmp  x15, x14
+    b.hs 2f                             /* starts at or after our end */
+    cmp  x28, x16
+    b.hs 2f                             /* we start at or after its end */
+    mov  w12, #0                        /* overlap */
+    ret
+2:  add  x11, x11, #16
+    sub  x10, x10, #1
+    b    1b
+8:  mov  w12, #1
+    ret
+
+/* x0 = 64 random bits. RNDR when the CPU has FEAT_RNG, the virtual counter
+ * otherwise — the same source and the same caveat as the slide: CNTVCT alone is
+ * boot-time jitter. */
+.Lfdt_rand:
+    mrs  x9, id_aa64isar0_el1
+    lsr  x9, x9, #60
+    cbz  x9, 1f
+    mrs  x0, s3_3_c2_c4_0               /* RNDR */
+    cbnz x0, 2f                         /* reads 0 on failure */
+1:  mrs  x0, cntvct_el0
+2:  ret
+
+.Lfdt_s_reg:           .asciz "reg"
+.Lfdt_s_devtype:       .asciz "device_type"
+.Lfdt_s_memory:        .asciz "memory"
+.Lfdt_s_initrd_start:  .asciz "linux,initrd-start"
+.Lfdt_s_initrd_end:    .asciz "linux,initrd-end"
+.align 2
+
 /* Fill `l2_img` for the kernel image.
  *
  * x0 = &l2_img, x1 = exec_start (phys), x2 = exec_end (phys),
@@ -600,6 +1077,20 @@ l2_img:
     .skip 4096
 
 .align 4
+/* Scratch for `.Lfdt_pick`: RAM ranges and avoid ranges harvested from the DTB,
+ * plus the image span and floor. Dead once the copy is done. */
+.align 3
+fdt_nram:          .quad 0
+fdt_ram:           .space 4 * 16        /* 4 x (base, size); `.fill n,16` would
+                                          * silently truncate the element size
+                                          * to 8 and halve the table */
+fdt_navoid:        .quad 0
+fdt_avoid:         .space 8 * 16        /* 8 x (base, len) */
+fdt_initrd_start:  .quad 0
+fdt_initrd_end:    .quad 0
+fdt_span:          .quad 0
+fdt_floor:         .quad 0
+
 stack_bottom:
     .skip 4096 * 16
 .global stack_top

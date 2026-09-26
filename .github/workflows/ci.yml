@@ -825,6 +825,30 @@ jobs:
           cargo xtask test --arch=aarch64 --features cgroup-all,container \
             --subsystem verification
 
+      # Large-memory arm. Everything about frame placement — the bootstrap
+      # arena carve-out, the buddy's per-zone reservation, KASLR's physical
+      # relocation target — is sized from installed RAM, so the amount of RAM
+      # the suite runs with decides how much of that code is reachable at all.
+      #
+      # This exists because a KASLR bug shipped that nothing here could have
+      # caught locally: the selector draws a physical target from the memory
+      # map, and on the 1 GiB default it cannot draw one above ~900 MiB. The
+      # bug needed a delta over 1 GiB. Separately, five allocation smokes
+      # hardcoded a 4 GiB bound and could only fail above it.
+      #
+      # 8 GiB rather than the 2 GiB default: it puts the carve-out on the real
+      # path (a 1 GiB boot never carves), and clears the 4 GiB line that the
+      # reach-ceiling assertions are about. Scoped to the two subsystems that
+      # own this code, so it is a guard rather than a second full run.
+      - name: cargo xtask test — large-memory frame placement
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "2400"
+          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
+          NARF_QEMU_MEM_MB: "8192"
+        run: |
+          cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container \
+            --subsystem memory,memory/kaslr
+
       # Same shape, same reason, x86_64 side: the xAPIC fallback (no x2APIC)
       # is the path real Renoir/Phoenix firmware puts us on when it refuses
       # IA32_APIC_BASE.EXTD, and for its whole life no suite ran it. Three

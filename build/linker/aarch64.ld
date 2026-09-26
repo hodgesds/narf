@@ -90,7 +90,11 @@ KASLR_SLIDE_FIXED = 0x00000000;
  * (the DTB lands at 0x4f00_0000, just under the 0x5000_0000 mark), so starting
  * above that clears every one of them; it also still fits inside boot-smoke's
  * 512 MiB, not just the suite's 1 GiB. */
-KASLR_PHYS_FIXED = 0x10000000;
+/* Master switch for physical relocation. With it on and KASLR_PHYS_FIXED at 0,
+ * `.Lfdt_pick` in boot.S chooses the target from the DTB at boot. */
+KASLR_PHYS_ENABLE = 1;
+
+KASLR_PHYS_FIXED = 0;
 
 PHDRS
 {
@@ -192,13 +196,6 @@ SECTIONS
         __data_end = .;
     } :data
 
-    .bss : AT(ADDR(.bss) - KIMAGE_VOFFSET) ALIGN(4K) {
-        __bss_start = .;
-        *(.bss .bss.*)
-        *(COMMON)
-        __bss_end = .;
-    } :data
-
     /* Physical bounds of the loaded image, as VALUES in a high-half word.
      *
      * `__kernel_start` / `__kernel_end` are physical addresses, because `.boot`
@@ -244,6 +241,31 @@ SECTIONS
         QUAD(_ap_start);
         QUAD(AP_STACKS);
     } :data
+
+    /* `.bss` is LAST in this segment, deliberately.
+     *
+     * It is NOBITS, so it occupies no file bytes — but only if nothing with file
+     * bytes follows it in the same PT_LOAD. `.kernel_bounds` and
+     * `.ap_boot_syms` used to sit after it, and because a segment's file image
+     * has to be contiguous, the ELF then padded across the whole ~52 MiB `.bss`
+     * hole: `p_filesz` came out equal to `p_memsz`.
+     *
+     * That silently disabled the UEFI loader's headroom strategy. It only
+     * `AllocateAddress`es up to `file_backed_end` and claims the `.bss` tail
+     * after ExitBootServices, precisely so the image can outgrow the
+     * conventional-memory block it loads into — but with `file_backed_end ==
+     * load_end` there was no tail to defer, the allocation spanned the
+     * BOOT_SERVICES_DATA block AAVMF parks at 0x4400_0000, and the aarch64 UEFI
+     * boot died with `Allocation` while RAM was plentiful.
+     *
+     * Keeping `.bss` last also drops ~52 MiB of zero padding from the ELF. */
+    .bss : AT(ADDR(.bss) - KIMAGE_VOFFSET) ALIGN(4K) {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        __bss_end = .;
+    } :data
+
 
 
     __kernel_end = . - KIMAGE_VOFFSET;

@@ -469,7 +469,18 @@ _start:
     mov [reloc_esp], esp
 
     cmp dword ptr [ebx], 0x336EC578             /* "xEn3" — PVH handoff? */
-    jne .Lphys_pick_fail
+    je .Lphys_pvh
+
+    /* Multiboot2 has no magic inside the info structure — offset 0 is its
+     * total_size — so the loader magic in EAX is what identifies it. `_start`
+     * stashed EAX, and this routine was reached by a `call`, so it sits one
+     * dword above the return address. */
+    mov eax, [esp + 4]
+    cmp eax, 0x36D76289
+    je .Lphys_mb2
+    jmp .Lphys_pick_fail                        /* handoff we do not parse */
+
+.Lphys_pvh:
 
     /* Every field consumed here has to sit below 4 GiB, because this code is
      * 32-bit and the target must land inside the identity map anyway. A
@@ -559,8 +570,127 @@ _start:
     jmp .Lphys_mod_loop
 .Lphys_mods_done:
     mov [reloc_navoid], edi
+    jmp .Lphys_sample                           /* past the multiboot2 walk */
 
-    /* At or above the image's end: makes the delta positive and no smaller than
+    /* ── Multiboot2 ───────────────────────────────────────────────────────
+     *
+     * Reaches the SAME candidate machinery as the PVH path: multiboot2's
+     * memory-map entries are `(base u64, length u64, type u32, reserved u32)`,
+     * which is byte-for-byte the PVH entry layout, so only the map's LOCATION
+     * differs. `reloc_mmap` + `reloc_nent` are set from the tag and everything
+     * after — the in-RAM test, the avoid list, the rejection sampler — is shared.
+     *
+     * Spec: multiboot2 §3.1 (info request) and §3.6 (tags). The structure is
+     * `total_size u32, reserved u32`, then 8-byte-aligned tags of
+     * `type u32, size u32, payload`, terminated by a type-0 tag.
+     *
+     * UNVERIFIED BY BOOT. Nothing in this tree can boot multiboot2: QEMU's
+     * `-kernel` uses PVH for an ELF64 image, and `grub-mkrescue` needs xorriso,
+     * which is not installed here. The code follows the spec and fails closed —
+     * an entry_size that is not 24, a truncated tag, a field above 4 GiB, or a
+     * bogus map all decline — but it has not been run. Treat the first real
+     * multiboot2 boot as the test.
+     */
+.Lphys_mb2:
+    xor edi, edi                                /* avoid-list count, as PVH does */
+    mov dword ptr [reloc_nent], 0
+    mov ecx, [ebx]                              /* total_size */
+    cmp ecx, 16
+    jb .Lphys_pick_fail
+    /* The walk's end bound lives in memory: edi is the avoid-list count that
+     * `.Lphys_add_avoid` maintains, and this routine needs both. */
+    mov eax, ebx
+    add eax, ecx
+    mov [reloc_mb2_end], eax
+    /* The info structure itself is the first thing to avoid. */
+    mov eax, ebx
+    call .Lphys_add_avoid
+
+    mov esi, ebx
+    add esi, 8                                  /* first tag */
+
+.Lphys_mb2_tag:
+    add esi, 7
+    and esi, 0xFFFFFFF8                         /* tags are 8-byte aligned */
+    cmp esi, [reloc_mb2_end]
+    jae .Lphys_pick_fail                        /* ran off the end: no end tag */
+    mov eax, [esi]                              /* tag type */
+    mov ecx, [esi + 4]                          /* tag size */
+    cmp ecx, 8
+    jb .Lphys_pick_fail                         /* a tag cannot be smaller */
+    test eax, eax
+    jz .Lphys_mb2_done                          /* type 0: end of tags */
+
+    cmp eax, 6                                  /* memory map */
+    je .Lphys_mb2_mmap
+    cmp eax, 3                                  /* module */
+    je .Lphys_mb2_mod
+    cmp eax, 1                                  /* boot command line */
+    je .Lphys_mb2_cmdline
+.Lphys_mb2_next:
+    add esi, [esi + 4]
+    jmp .Lphys_mb2_tag
+
+.Lphys_mb2_mmap:
+    /* type u32, size u32, entry_size u32, entry_version u32, then entries. */
+    cmp ecx, 16
+    jbe .Lphys_mb2_next                         /* header only, no entries */
+    cmp dword ptr [esi + 8], 24
+    jne .Lphys_pick_fail                        /* not the layout shared with PVH */
+    mov eax, esi
+    add eax, 16
+    mov [reloc_mmap], eax
+    mov eax, ecx
+    sub eax, 16
+    shr eax, 3                                  /* /24 == /8/3 */
+    mov edx, 0xAAAAAAAB                         /* reciprocal of 3 */
+    mul edx
+    shr edx, 1
+    mov [reloc_nent], edx
+    test edx, edx
+    jz .Lphys_pick_fail
+    jmp .Lphys_mb2_next
+
+.Lphys_mb2_mod:
+    /* type u32, size u32, mod_start u32, mod_end u32, then the string. The
+     * initramfs arrives this way; overlapping it destroys the rootfs while the
+     * copy itself reports success. */
+    cmp ecx, 16
+    jb .Lphys_pick_fail
+    mov eax, [esi + 8]                          /* mod_start */
+    mov edx, [esi + 12]                         /* mod_end   */
+    cmp edx, eax
+    jbe .Lphys_mb2_next
+    push esi
+    mov ecx, edx
+    sub ecx, eax
+    call .Lphys_add_avoid
+    pop esi
+    jmp .Lphys_mb2_next
+
+.Lphys_mb2_cmdline:
+    /* The whole tag, string included — no need to measure the string. */
+    push esi
+    mov eax, esi
+    call .Lphys_add_avoid
+    pop esi
+    jmp .Lphys_mb2_next
+
+.Lphys_mb2_done:
+    cmp dword ptr [reloc_nent], 0
+    je .Lphys_pick_fail                         /* no usable map: decline */
+    mov eax, offset __kernel_end
+    sub eax, offset __kernel_start
+    add eax, 0x1FFFFF
+    and eax, 0xFFE00000
+    mov [reloc_size], eax
+    mov [reloc_navoid], edi
+
+.Lphys_sample:
+    /* Shared by both handoffs: the map and the avoid list are in place, so what
+     * remains is picking a target that satisfies every bound.
+     *
+     * At or above the image's end: makes the delta positive and no smaller than
      * the image, so the forward copy cannot eat its own source. */
     mov eax, offset __kernel_end
     add eax, 0x1FFFFF
@@ -802,6 +932,7 @@ reloc_size:     .long 0
 reloc_floor:    .long 0
 reloc_target:   .long 0
 reloc_navoid:   .long 0
+reloc_mb2_end:  .long 0
 reloc_avoid:    .fill 32, 8, 0                  /* 32 x (base, length) */
 
 /* 16-byte aligned, explicitly.
