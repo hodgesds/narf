@@ -1682,6 +1682,86 @@ const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BA
 // SIG_DFL stay as-is; user-installed handlers reset to SIG_DFL
 // per POSIX §8.5.4 — we don't enforce that yet, future fix).
 
+/// How much of an exec image is read before anything decides what it is: a
+/// `#!` line, or an ELF header. Linux fills `bprm->buf` with exactly this much
+/// (`BINPRM_BUF_SIZE`, fs/exec.c) before consulting a binfmt handler.
+const EXEC_PREFIX_BYTES: usize = 256;
+
+/// What opening an exec image yields: the sniffing prefix, the resolved file,
+/// and the file's size at open time.
+type ExecOpen = (
+    alloc::vec::Vec<u8>,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    u64,
+);
+
+/// The image an `execve` is loading, as something the ELF loader can READ from
+/// rather than a buffer it must be handed whole.
+///
+/// `execve` used to read the entire binary into a `Vec` — tens of MiB for a
+/// browser or a Qt application — purely so the loader could index it. With
+/// demand paging most of those bytes are never touched again: the loader wants
+/// the header, the program headers, the dynamic tables, and the file bytes of
+/// whichever segments are copied eagerly. Reading through the file supplies
+/// exactly those. Linux never reads the image whole either; `load_elf_phdrs`
+/// reads the phdr table and `elf_map` mmaps the rest.
+pub(crate) enum ExecSource {
+    /// An image already in memory with no file behind it: the fexecve/memfd
+    /// arm, where the caller's fd is the only thing that ever held the bytes.
+    Mem(alloc::vec::Vec<u8>),
+    /// A filesystem binary, read on demand through its `FileOps`.
+    File {
+        ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+        /// Size at open time. The loader bounds every read against it, so a
+        /// file truncated under us short-reads into `ImageReadFailed` rather
+        /// than silently parsing zeros.
+        size: u64,
+    },
+}
+
+impl crate::elf::ExecBytes for ExecSource {
+    fn size(&self) -> u64 {
+        match self {
+            ExecSource::Mem(bytes) => bytes.len() as u64,
+            ExecSource::File { size, .. } => *size,
+        }
+    }
+
+    fn read_exact_at(&self, off: u64, dst: &mut [u8]) -> Result<(), crate::elf::ElfError> {
+        match self {
+            ExecSource::Mem(bytes) => {
+                crate::elf::ExecBytes::read_exact_at(&bytes[..], off, dst)
+            }
+            ExecSource::File { ops, size } => {
+                let end = off
+                    .checked_add(dst.len() as u64)
+                    .ok_or(crate::elf::ElfError::TooShort)?;
+                if end > *size {
+                    return Err(crate::elf::ElfError::TooShort);
+                }
+                let mut done = 0usize;
+                while done < dst.len() {
+                    // `poll_io_to_completion`, not the budget-capped
+                    // `poll_blocking`, for the same reason the old whole-image
+                    // read used it: overrunning a healthy read under concurrent
+                    // block I/O surfaced as execve(2) = EIO, and dropping an
+                    // in-flight future abandons a virtio-blk request that is
+                    // still DMA-ing into a pooled scratch buffer.
+                    match poll_io_to_completion(ops.read(off + done as u64, &mut dst[done..])) {
+                        // A read that stops short of a range inside the file
+                        // means the file changed under us or the device is
+                        // lying; either way the caller must not get zeros.
+                        Some(Ok(0)) => return Err(crate::elf::ElfError::ImageReadFailed),
+                        Some(Ok(n)) => done += n,
+                        _ => return Err(crate::elf::ElfError::ImageReadFailed),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Shared execve body: `path_owned` is the already-resolved (kernel-side)
 /// pathname of the image; `argv_uptr`/`envp_uptr` are the user vectors.
 /// `image_override`, when `Some`, supplies the ELF bytes directly (skipping
@@ -1802,13 +1882,7 @@ fn do_execve_resolved(
     // Returns the image bytes AND the file they came from: the loader
     // demand-pages each PT_LOAD from the latter, so the bytes here serve only
     // the shebang sniff and the ELF metadata the parser needs.
-    let read_exec = |p: &str| -> Result<
-        (
-            alloc::vec::Vec<u8>,
-            alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-        ),
-        i64,
-    > {
+    let read_exec = |p: &str| -> Result<ExecOpen, i64> {
         let ep = apply_chroot(p);
         // Resolve through the caller's PRIVATE mount namespace, not the global
         // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
@@ -1859,12 +1933,30 @@ fn do_execve_resolved(
         if file_size == 0 {
             return Err(-ENOEXEC); // ENOEXEC — empty file is not an executable
         }
-        if file_size > 64 * 1024 * 1024 {
-            return Err(-E2BIG); // E2BIG
-        }
-        let mut buf = alloc::vec![0u8; file_size];
+        // No upper bound on image size. There used to be one — 64 MiB, E2BIG —
+        // and it existed for one reason: the whole file was read into a `Vec`,
+        // so a large binary was a large allocation and a 4 GiB one was a dead
+        // kernel. Nothing allocates per byte of image any more. The header and
+        // program headers are read, eagerly-copied segments are read a page at
+        // a time into the frame they land in, demand-paged segments are read on
+        // touch, and relocation tables stream through a fixed window; a
+        // multi-gigabyte binary costs what its *touched pages* cost.
+        //
+        // Linux has no equivalent limit, and E2BIG is not even the error it
+        // would use — that code is for argv/envp exceeding `MAX_ARG_STRLEN`,
+        // which is checked separately. A real Chromium or Qt WebEngine build
+        // clears 64 MiB on its own, so this rejected binaries Linux runs.
+        // What still bounds an exec: RLIMIT_AS and the frame allocator, per
+        // page actually touched, which is the bound that should apply.
+        // Read only the PREFIX — enough to recognise a `#!` line and an ELF
+        // header. The image itself is read through `ExecSource::File` below, a
+        // segment at a time, and a demand-paged segment is not read here at
+        // all. Linux does the same: `bprm->buf` is `BINPRM_BUF_SIZE` = 256
+        // bytes, filled before any binfmt handler is consulted.
+        let prefix_len = core::cmp::min(file_size, EXEC_PREFIX_BYTES);
+        let mut buf = alloc::vec![0u8; prefix_len];
         let mut off = 0usize;
-        while off < file_size {
+        while off < prefix_len {
             match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
@@ -1889,7 +1981,7 @@ fn do_execve_resolved(
             }
         }
         buf.truncate(off);
-        Ok((buf, ops))
+        Ok((buf, ops, file_size as u64))
     };
 
     // Step 3: read the image. A leading `#!` is an interpreter directive
@@ -1900,7 +1992,7 @@ fn do_execve_resolved(
     // script still terminates. Without this, every `#!`-script execve EINVALs.
     let mut cur_path = alloc::string::String::from(path);
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
-    let elf_buf;
+    let exec_src;
     // The resolved binary, when the image came from a filesystem path. Handing
     // it to the loader lets each PT_LOAD be demand-paged instead of copied, so
     // a process pays for the pages it touches. `None` for the fexecve/memfd
@@ -1920,26 +2012,29 @@ fn do_execve_resolved(
             ctx.set_return(errno_ret(ENOEXEC));
             return;
         }
-        elf_buf = bytes;
+        exec_src = ExecSource::Mem(bytes);
     } else {
         let mut depth = 0u32;
         loop {
-            let (buf, resolved_ops) = match read_exec(&cur_path) {
+            let (prefix, resolved_ops, file_size) = match read_exec(&cur_path) {
                 Ok(b) => b,
                 Err(code) => {
                     ctx.set_return(SyscallReturn::ok(code as u64));
                     return;
                 }
             };
-            if buf.len() >= 2 && &buf[..2] == b"#!" {
+            if prefix.len() >= 2 && &prefix[..2] == b"#!" {
                 if depth >= 4 {
                     ctx.set_return(errno_ret(ELOOP)); // -ELOOP
                     return;
                 }
                 depth += 1;
                 followed_shebang = true;
-                let line_end = buf.iter().position(|&c| c == b'\n').unwrap_or(buf.len());
-                let line = core::str::from_utf8(&buf[2..line_end]).unwrap_or("").trim();
+                let line_end = prefix
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .unwrap_or(prefix.len());
+                let line = core::str::from_utf8(&prefix[2..line_end]).unwrap_or("").trim();
                 // interpreter = first whitespace-delimited token; the remainder
                 // (trimmed) is a SINGLE optional argument (Linux semantics).
                 let (interp, optarg) = match line.find([' ', '\t']) {
@@ -1965,12 +2060,15 @@ fn do_execve_resolved(
                 cur_argv = new_argv;
                 continue;
             }
-            if buf.len() < 64 {
+            if file_size < 64 {
                 // Too small for a valid ELF and not a shebang → ENOEXEC.
                 ctx.set_return(errno_ret(ENOEXEC));
                 return;
             }
-            elf_buf = buf;
+            exec_src = ExecSource::File {
+                ops: alloc::sync::Arc::clone(&resolved_ops),
+                size: file_size,
+            };
             exec_file = Some(resolved_ops);
             break;
         }
@@ -2004,7 +2102,7 @@ fn do_execve_resolved(
     // SAFETY: Valid memory or trusted environment
     let new_proc = match unsafe {
         crate::process::load_user_process_with_root_file(
-            &elf_buf,
+            &exec_src,
             &argv_refs,
             &envp_refs,
             &[],
@@ -2112,7 +2210,7 @@ fn do_execve_resolved(
         drop(argv_refs);
         drop(envp_refs);
         drop(new_proc);
-        drop(elf_buf);
+        drop(exec_src);
         drop(cur_argv);
         drop(cur_path);
         drop(argv_strs);
@@ -2236,7 +2334,7 @@ fn do_execve_resolved(
         drop(argv_refs);
         drop(envp_refs);
         drop(new_proc);
-        drop(elf_buf);
+        drop(exec_src);
         drop(cur_argv);
         drop(cur_path);
         drop(argv_strs);

@@ -1633,6 +1633,50 @@ impl NumaHints {
     }
 }
 
+/// Translate a leaf-install failure on the demand path into an address-space
+/// error, faithfully.
+///
+/// Every one of these sites used to collapse the whole `MapError` enum into
+/// `NotImplemented`, which is both wrong and actively misleading: a frame
+/// allocator that could not supply an intermediate page table reported "not
+/// implemented", so a diagnosable resource failure looked like a missing
+/// feature. That cost real debugging time on a demand fault 4 GiB into a
+/// multi-gigabyte mapping.
+#[cfg(target_arch = "x86_64")]
+fn demand_map_error(error: crate::x86_64::paging::MapError) -> AddressSpaceError {
+    use crate::x86_64::paging::MapError;
+    match error {
+        // No frame for an intermediate table — the same shape as any other
+        // metadata allocation failure, and `ENOMEM` at the syscall boundary.
+        MapError::FrameExhausted => AddressSpaceError::AllocationFailed,
+        // A 4 KiB leaf under a live 1 GiB/2 MiB page needs an explicit demote,
+        // which this path does not do.
+        MapError::EncounteredHugePage => AddressSpaceError::NotImplemented,
+        MapError::NonCanonical | MapError::UnalignedVirt | MapError::UnalignedPhys => {
+            AddressSpaceError::OutOfRange
+        }
+        // A peer CPU installed the leaf between the claim and the install; the
+        // caller's view of this page is stale rather than unsupported.
+        MapError::AlreadyMapped => AddressSpaceError::StaleMapping,
+        MapError::NotMapped => AddressSpaceError::Unmapped,
+    }
+}
+
+/// [`demand_map_error`] for aarch64's own `MapError`.
+#[cfg(target_arch = "aarch64")]
+fn demand_map_error(error: crate::aarch64::paging::MapError) -> AddressSpaceError {
+    use crate::aarch64::paging::MapError;
+    match error {
+        MapError::NoFrame => AddressSpaceError::AllocationFailed,
+        MapError::EncounteredBlock => AddressSpaceError::NotImplemented,
+        MapError::NonCanonical | MapError::UnalignedVirt | MapError::UnalignedPhys => {
+            AddressSpaceError::OutOfRange
+        }
+        MapError::AlreadyMapped => AddressSpaceError::StaleMapping,
+        MapError::NotMapped => AddressSpaceError::Unmapped,
+    }
+}
+
 fn release_failed_huge_region(
     region: HugeRegion,
     error: AddressSpaceError,
@@ -8602,7 +8646,7 @@ impl AddressSpace {
                     }
                     Ok(())
                 }
-                Err(_) => Err(AddressSpaceError::NotImplemented),
+                Err(error) => Err(demand_map_error(error)),
             }
         })?;
         let DemandPageClaim::Owner {
@@ -8654,7 +8698,7 @@ impl AddressSpace {
             // `phys` has just become this page's backing and the root is live.
             match unsafe { map_4kb_demand(self.root, VirtAddr::new(v), phys, flags) } {
                 Ok(()) => Ok(()),
-                Err(_) => Err(AddressSpaceError::NotImplemented),
+                Err(error) => Err(demand_map_error(error)),
             }
         }) {
             Ok(published) => published,
@@ -8725,7 +8769,7 @@ impl AddressSpace {
                     }
                     Ok(())
                 }
-                Err(_) => Err(AddressSpaceError::NotImplemented),
+                Err(error) => Err(demand_map_error(error)),
             }
         })?;
         let DemandPageClaim::Owner {
@@ -8775,7 +8819,7 @@ impl AddressSpace {
             // region-lock transaction against this live TTBR0 root.
             match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
                 Ok(()) => Ok(()),
-                Err(_) => Err(AddressSpaceError::NotImplemented),
+                Err(error) => Err(demand_map_error(error)),
             }
         }) {
             Ok(published) => published,

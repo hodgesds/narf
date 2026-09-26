@@ -110,6 +110,11 @@ where
 /// Composes `ElfError` + `LoadError` + frame-allocator failure.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LoadBytesError {
+    /// The image's `PT_LOAD` span does not fit the one PML4 slot a program is
+    /// placed in ([`PROGRAM_WINDOW_BYTES`] minus the ASLR slack). Mapping it
+    /// anyway would put VA outside the slot, which faults fatally on first
+    /// touch rather than failing the exec.
+    ImageWindowOverflow,
     Elf(crate::ElfError),
     Load(LoadError),
     NoFrame,
@@ -220,13 +225,35 @@ pub unsafe fn load_elf_into_at(
 ///
 /// # Safety
 /// Same contract as [`load_elf_into_at`].
-pub unsafe fn load_elf_into_at_file(
-    bytes: &[u8],
+pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
 ) -> Result<u64, LoadBytesError> {
-    let image = crate::parse_elf(bytes)?;
+    let image = crate::elf::parse_from(src)?;
+    // SAFETY: forwarding this function's own contract.
+    unsafe { load_image_into_at(&image, src, addr_space, vaddr_bias, file) }
+}
+
+/// [`load_elf_into_at_file`] for a caller that has already parsed the image.
+///
+/// Parsing is no longer free: a file-backed source pays real reads for the
+/// header and the program headers, so an image that was parsed once and then
+/// re-parsed twice on the way down cost three round trips to the device for
+/// bytes it already had. Every caller inside this crate threads the parsed
+/// image through instead.
+///
+/// # Safety
+/// Same contract as [`load_elf_into_at_file`]; additionally `image` must be the
+/// parse of `src`, since the segment offsets it carries are used to read it.
+unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
+    image: &ExecImage,
+    src: &S,
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+    file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+) -> Result<u64, LoadBytesError> {
     if image.segments.is_empty() {
         return Err(LoadBytesError::Load(LoadError::NoSegments));
     }
@@ -470,35 +497,36 @@ pub unsafe fn load_elf_into_at_file(
         let frames = &allocated[cursor..cursor + file_pages];
         cursor += file_pages;
 
-        let start = seg.file_off as usize;
-        let end = start
-            .checked_add(seg.file_size as usize)
+        // The image is READ here, one page at a time, rather than indexed out
+        // of a whole-file buffer: a file-backed source reads only the bytes an
+        // eager segment actually needs, and a demand-paged segment is skipped
+        // above so it reads none at all.
+        let file_end = seg
+            .file_off
+            .checked_add(seg.file_size)
             .ok_or(LoadBytesError::ByteCopyOutOfBounds)?;
-        if end > bytes.len() {
+        if file_end > src.size() {
             return Err(LoadBytesError::ByteCopyOutOfBounds);
         }
-        let src = &bytes[start..end];
+        let total = seg.file_size as usize;
 
         let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
         let in_page = (vaddr & 0xFFF) as usize;
 
         let mut written: usize = 0;
         for (i, &frame) in frames.iter().enumerate() {
-            if written >= src.len() {
+            if written >= total {
                 break;
             }
             let dst_off = if i == 0 { in_page } else { 0 };
-            let chunk = core::cmp::min(4096 - dst_off, src.len() - written);
+            let chunk = core::cmp::min(4096 - dst_off, total - written);
             // SAFETY: `frame` is an identity-mapped freshly-allocated
             // 4 KiB phys frame; chunk + dst_off <= 4 KiB.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr().add(written),
-                    (frame.kernel_mut_ptr::<u8>()).add(dst_off),
-                    chunk,
-                );
-            }
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut((frame.kernel_mut_ptr::<u8>()).add(dst_off), chunk)
+            };
+            src.read_exact_at(seg.file_off + written as u64, dst)
+                .map_err(LoadBytesError::Elf)?;
             written += chunk;
         }
     }
@@ -526,7 +554,7 @@ pub unsafe fn load_elf_bytes(
     bytes: &[u8],
 ) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
     // SAFETY: forwarding this function's contract; `None` keeps the eager path.
-    unsafe { load_elf_bytes_file(bytes, None) }
+    unsafe { load_elf_bytes_file(bytes, None) }.map(|(a, e, b, _image)| (a, e, b))
 }
 
 /// [`load_elf_bytes`], demand-paging the program image from `file` when it is
@@ -534,10 +562,10 @@ pub unsafe fn load_elf_bytes(
 ///
 /// # Safety
 /// Same contract as [`load_elf_bytes`].
-pub unsafe fn load_elf_bytes_file(
-    bytes: &[u8],
+pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
+) -> Result<(Arc<AddressSpace>, EntryPoint, u64, ExecImage), LoadBytesError> {
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
     // SAFETY: Valid memory or trusted environment
@@ -547,12 +575,29 @@ pub unsafe fn load_elf_bytes_file(
     // Bias selection — see `program_load_bias`. ET_EXEC names absolute
     // load addresses in its PT_LOAD vaddrs (NARF expects those in
     // PML4[1] — see `init.ld` / `hello_static_x86_64.S`), so bias 0.
-    let image = crate::parse_elf(bytes)?;
+    let image = crate::elf::parse_from(src)?;
+    // An image is placed inside one PML4 slot. Check it fits before mapping
+    // anything: VA that falls outside the slot is either another mapping's or,
+    // on the old slot-1 layout, kernel MMIO — and a region mapped there faults
+    // fatally on first touch instead of failing the exec.
+    if image.kind == crate::ExecKind::Elf64Dyn {
+        let span = image
+            .segments
+            .iter()
+            .try_fold(0u64, |acc, seg| {
+                seg.vaddr.checked_add(seg.mem_size).map(|end| acc.max(end))
+            })
+            .ok_or(LoadBytesError::ImageWindowOverflow)?;
+        let usable = PROGRAM_WINDOW_BYTES - (1u64 << narf_memory::kaslr::USER_ELF_RANDOM_BITS);
+        if span > usable {
+            return Err(LoadBytesError::ImageWindowOverflow);
+        }
+    }
     let bias = program_load_bias(image.kind);
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
     // SAFETY: Valid memory or trusted environment
-    let entry = unsafe { load_elf_into_at_file(bytes, &addr_space, bias, file) }?;
+    let entry = unsafe { load_image_into_at(&image, src, &addr_space, bias, file) }?;
 
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed
@@ -561,14 +606,43 @@ pub unsafe fn load_elf_bytes_file(
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    Ok((Arc::new(addr_space), EntryPoint(VirtAddr::new(entry)), bias))
+    Ok((
+        Arc::new(addr_space),
+        EntryPoint(VirtAddr::new(entry)),
+        bias,
+        image,
+    ))
 }
 
-/// PML4[1] base — the nominal bottom of the ET_DYN load window, and the
-/// base [`program_load_bias`] randomises above. Public because the
-/// canonical (ASLR-off) layout is asserted by tests, which should read
-/// the one definition rather than restate the number.
-pub const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
+/// PML4 slot 2 (1 TiB) — the nominal bottom of the ET_DYN load window, and
+/// the base [`program_load_bias`] randomises above. Public because the
+/// canonical (ASLR-off) layout is asserted by tests, which should read the one
+/// definition rather than restate the number.
+///
+/// This used to be PML4 slot 1 (512 GiB), which capped a PIE image at **1 GiB**
+/// — not by policy but by accident of the page tables. Slot 1 is shared: the
+/// kernel's high-MMIO identity window occupies virt 512 GiB..1 TiB as 1 GiB
+/// huge pages in PDPT[1..512], and `new_user_pml4` copies those into every
+/// address space (kernel code servicing a syscall touches MMIO under the user's
+/// CR3, so the inheritance is load-bearing) leaving the program only PDPT[0].
+/// A PIE image larger than that mapped without complaint — the VMA layer knows
+/// nothing of the inherited entries — and then died on the first fault past
+/// 513 GiB with `EncounteredHugePage`, because the walk hit kernel MMIO.
+///
+/// Slot 2 is one of the "reserved-zero" user-half slots (see the slot map in
+/// `paging.rs`), so the image gets a private 512 GiB with no inherited
+/// anything. ET_EXEC statics still link into slot 1 at 0x0000_0080_0000_1000
+/// (`init.ld`), where 1 GiB is ample, so `new_user_pml4` keeps its slot-1
+/// handling.
+pub const PROGRAM_DYN_BASE: u64 = 0x0000_0100_0000_0000;
+
+/// How much contiguous VA a program image may occupy: one PML4 slot.
+///
+/// The randomisation slack is drawn inside this, so the usable span for an
+/// image is the window minus that slack. An image that does not fit is
+/// rejected rather than mapped into VA it could never fault — the failure mode
+/// the 1 GiB slot-1 ceiling used to produce.
+pub const PROGRAM_WINDOW_BYTES: u64 = 512u64 << 30;
 
 /// Pick the load bias for a program image.
 ///
@@ -740,18 +814,17 @@ fn dt_lookup(dynamic: &[DynEntry], tag: i64) -> Option<u64> {
     dynamic.iter().find(|e| e.tag == tag).map(|e| e.val)
 }
 
-/// Translate a DT_* in-memory address to a slice of the input ELF
-/// bytes. The dynamic-linker tables (DT_RELA / DT_JMPREL pointers)
-/// are recorded as the *vaddr* the linker assigned them at link
-/// time; we resolve them back to file offsets by matching against
-/// each PT_LOAD's `[vaddr, vaddr + file_size)` span and applying
-/// the same `(file_off - vaddr)` translation.
-fn resolve_dt_pointer<'a>(
-    bytes: &'a [u8],
-    image: &ExecImage,
-    dt_addr: u64,
-    needed: u64,
-) -> Option<&'a [u8]> {
+/// Translate a DT_* in-memory address to a FILE OFFSET. The dynamic-linker
+/// tables (DT_RELA / DT_JMPREL pointers) are recorded as the *vaddr* the
+/// linker assigned them at link time; we resolve them back to file offsets by
+/// matching against each PT_LOAD's `[vaddr, vaddr + file_size)` span and
+/// applying the same `(file_off - vaddr)` translation.
+///
+/// This used to hand back a sub-slice of a whole-file buffer. It returns an
+/// offset instead so the caller can READ that range from an image it does not
+/// hold in memory — the point of the exercise. Bounds against the image's own
+/// length move to the readers below, which know its size.
+fn dt_file_offset(image: &ExecImage, dt_addr: u64, needed: u64) -> Option<u64> {
     for seg in &image.segments {
         // A DT_* pointer is in-bounds for a segment when it lies in
         // [vaddr, vaddr + file_size). file_size (not mem_size) is the
@@ -767,14 +840,138 @@ fn resolve_dt_pointer<'a>(
         if avail < needed {
             return None;
         }
-        let file_start = (seg.file_off + off_in_seg) as usize;
-        let file_end = file_start.checked_add(needed as usize)?;
-        if file_end > bytes.len() {
-            return None;
-        }
-        return Some(&bytes[file_start..file_end]);
+        return seg.file_off.checked_add(off_in_seg);
     }
     None
+}
+
+/// Read a DT_*-addressed range into `dst`, which fixes the length.
+///
+/// Used for the fixed-size reads — an `Elf64_Sym` is 24 bytes, a symbol name
+/// at most 32 — so these stay allocation-free on a stack buffer, as the
+/// slice-indexing version was.
+fn read_dt_exact<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
+    image: &ExecImage,
+    dt_addr: u64,
+    dst: &mut [u8],
+) -> Option<()> {
+    let off = dt_file_offset(image, dt_addr, dst.len() as u64)?;
+    if off.checked_add(dst.len() as u64)? > src.size() {
+        return None;
+    }
+    src.read_exact_at(off, dst).ok()
+}
+
+/// How much of a relocation table is held in memory at once.
+///
+/// A table's size comes from the image (DT_RELASZ, DT_PLTRELSZ, DT_RELRSZ), so
+/// it must never become the size of an allocation: a multi-gigabyte binary can
+/// name a relocation table larger than anything worth holding in kernel memory,
+/// and a malformed one can name a table larger than memory. One window is read
+/// at a time, and the window is this size whatever the table is.
+const RELOC_STREAM_BYTES: usize = 4096;
+
+/// A bounded window onto a DT_*-addressed table, plus where it starts.
+///
+/// Validating the whole table's span up front keeps the old behaviour — a table
+/// running off the end of its segment or the image is rejected before a single
+/// entry is applied, rather than half-applied and then failed.
+struct DtTableWindow {
+    file_off: u64,
+    buf: alloc::vec::Vec<u8>,
+}
+
+impl DtTableWindow {
+    /// `needed` is the table's full byte length; it is bounded against the
+    /// segment (by `dt_file_offset`) and the image, but never allocated.
+    fn open<S: crate::elf::ExecBytes + ?Sized>(
+        src: &S,
+        image: &ExecImage,
+        dt_addr: u64,
+        needed: u64,
+        entsize: usize,
+    ) -> Option<Self> {
+        let file_off = dt_file_offset(image, dt_addr, needed)?;
+        if file_off.checked_add(needed)? > src.size() {
+            return None;
+        }
+        // The window must hold at least one whole entry, so an absurd entsize
+        // is rejected here rather than silently making no progress.
+        if entsize == 0 || entsize > RELOC_STREAM_BYTES {
+            return None;
+        }
+        let window = (RELOC_STREAM_BYTES / entsize) * entsize;
+        let mut buf = alloc::vec::Vec::new();
+        buf.try_reserve_exact(window).ok()?;
+        buf.resize(window, 0u8);
+        Some(Self { file_off, buf })
+    }
+
+    /// Entries per window — at least one.
+    fn stride(&self, entsize: usize) -> usize {
+        self.buf.len() / entsize
+    }
+
+    /// Fill the window with `entries` entries starting at entry index `from`.
+    fn fill<S: crate::elf::ExecBytes + ?Sized>(
+        &mut self,
+        src: &S,
+        from: u64,
+        entries: usize,
+        entsize: usize,
+    ) -> Result<&[u8], LoadBytesError> {
+        let bytes = entries
+            .checked_mul(entsize)
+            .ok_or(LoadBytesError::RelaOutOfBounds)?;
+        let at = from
+            .checked_mul(entsize as u64)
+            .and_then(|skip| self.file_off.checked_add(skip))
+            .ok_or(LoadBytesError::RelaOutOfBounds)?;
+        src.read_exact_at(at, &mut self.buf[..bytes])
+            .map_err(LoadBytesError::Elf)?;
+        Ok(&self.buf[..bytes])
+    }
+}
+
+/// Walk a DT_RELA-shaped table (DT_RELA or DT_JMPREL) in bounded windows,
+/// patching every entry.
+///
+/// Entries are independent, so streaming gives exactly the result reading the
+/// whole table gave — with an allocation that no longer tracks the image.
+///
+/// # Safety
+/// Same contract as [`process_rela_array`], which this forwards each window to.
+unsafe fn stream_rela_table<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
+    image: &ExecImage,
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+    dt_addr: u64,
+    count: u64,
+    entsize: u64,
+) -> Result<(), LoadBytesError> {
+    let needed = count
+        .checked_mul(entsize)
+        .ok_or(LoadBytesError::RelaOutOfBounds)?;
+    let entsize = usize::try_from(entsize).map_err(|_| LoadBytesError::RelaOutOfBounds)?;
+    let mut window = DtTableWindow::open(src, image, dt_addr, needed, entsize)
+        .ok_or(LoadBytesError::RelaOutOfBounds)?;
+    let stride = window.stride(entsize);
+    let mut done: u64 = 0;
+    while done < count {
+        let n = core::cmp::min(stride as u64, count - done) as usize;
+        let slice = window.fill(src, done, n, entsize)?;
+        // SAFETY: the window holds exactly `n * entsize` in-bounds bytes of the
+        // image, so each `Elf64_Rela` entry is fully backed; `addr_space` is the
+        // target space whose pages this relocation patches. Forwarding this
+        // function's own contract.
+        unsafe {
+            process_rela_array(slice, n, entsize, src, image, addr_space, vaddr_bias)?;
+        }
+        done += n as u64;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -851,8 +1048,8 @@ fn user_vaddr_to_kernel_ptr(_addr_space: &AddressSpace, _vaddr: u64) -> Option<*
 /// performed: this round only resolves internally-defined symbols
 /// where sym_idx is sufficient. External symbol resolution needs
 /// `st_name → string table → host resolver` and lands later.
-fn resolve_symbol(
-    bytes: &[u8],
+fn resolve_symbol<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     image: &ExecImage,
     sym_idx: u32,
     vaddr_bias: u64,
@@ -866,8 +1063,9 @@ fn resolve_symbol(
                 .ok_or(LoadBytesError::SymtabOutOfBounds)?,
         )
         .ok_or(LoadBytesError::SymtabOutOfBounds)?;
-    let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
-        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let mut sym = [0u8; ELF64_SYM_SIZE as usize];
+    read_dt_exact(src, image, entry_addr, &mut sym).ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let slice = &sym[..];
 
     // Layout: st_name(4) | st_info(1) | st_other(1) | st_shndx(2)
     //       | st_value(8) | st_size(8).
@@ -875,7 +1073,7 @@ fn resolve_symbol(
     let st_value = read_u64_le(&slice[8..16]);
 
     if st_value == 0 && st_shndx == SHN_UNDEF {
-        let name = resolve_symbol_name(bytes, image, sym_idx);
+        let name = resolve_symbol_name(src, image, sym_idx);
         return Err(LoadBytesError::UnresolvedSymbol { idx: sym_idx, name });
     }
     Ok(st_value.wrapping_add(vaddr_bias))
@@ -895,7 +1093,11 @@ fn resolve_symbol(
 /// The fixed-size buffer keeps the loader path alloc-free; the
 /// 32-byte cap is sized for typical libc symbols (`printf`, `malloc`,
 /// `__libc_start_main`) and documented as truncating for longer ones.
-fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32] {
+fn resolve_symbol_name<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
+    image: &ExecImage,
+    sym_idx: u32,
+) -> [u8; 32] {
     let empty = [0u8; 32];
 
     // Walk to the Elf64_Sym slot to read st_name. We mirror
@@ -912,10 +1114,11 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
         Some(a) => a,
         None => return empty,
     };
-    let sym_slice = match resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE) {
-        Some(s) => s,
-        None => return empty,
-    };
+    let mut sym_buf = [0u8; ELF64_SYM_SIZE as usize];
+    if read_dt_exact(src, image, entry_addr, &mut sym_buf).is_none() {
+        return empty;
+    }
+    let sym_slice = &sym_buf[..];
     let st_name = u32::from_le_bytes([sym_slice[0], sym_slice[1], sym_slice[2], sym_slice[3]]);
     // st_name == 0 → SysV "no name" convention; strtab[0] is the
     // canonical empty string and we treat it the same as missing.
@@ -940,9 +1143,10 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
     // bounded. Once we have a slice, scan for the NUL terminator
     // and copy the prefix.
     let mut out = [0u8; 32];
-    for cap in (1u64..=32).rev() {
-        if let Some(s) = resolve_dt_pointer(bytes, image, name_addr, cap) {
-            for (i, &b) in s.iter().enumerate() {
+    let mut name_buf = [0u8; 32];
+    for cap in (1usize..=32).rev() {
+        if read_dt_exact(src, image, name_addr, &mut name_buf[..cap]).is_some() {
+            for (i, &b) in name_buf[..cap].iter().enumerate() {
                 // Stop on NUL: terminator is not part of the name,
                 // and the buffer's already pre-zeroed so the trailing
                 // bytes naturally NUL-pad.
@@ -966,8 +1170,8 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
 /// gating. An undefined symbol returns 0 (the conventional template
 /// base), matching how ld-musl emits TPOFF64 with `sym_ix == 0` for
 /// the program's own TLS template.
-fn resolve_tls_symbol_offset(
-    bytes: &[u8],
+fn resolve_tls_symbol_offset<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     image: &ExecImage,
     sym_idx: u32,
 ) -> Result<u64, LoadBytesError> {
@@ -980,9 +1184,9 @@ fn resolve_tls_symbol_offset(
                 .ok_or(LoadBytesError::SymtabOutOfBounds)?,
         )
         .ok_or(LoadBytesError::SymtabOutOfBounds)?;
-    let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
-        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
-    Ok(read_u64_le(&slice[8..16]))
+    let mut sym = [0u8; ELF64_SYM_SIZE as usize];
+    read_dt_exact(src, image, entry_addr, &mut sym).ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    Ok(read_u64_le(&sym[8..16]))
 }
 
 /// Walk DT_RELA + DT_JMPREL and patch each entry.
@@ -1006,8 +1210,8 @@ fn resolve_tls_symbol_offset(
 /// - The kernel must be running with the low 4 GiB identity-mapped
 ///   (we write through `paging::translate`'s phys output cast to a
 ///   raw pointer).
-pub unsafe fn apply_relocations(
-    bytes: &[u8],
+pub unsafe fn apply_relocations<S: crate::elf::ExecBytes + ?Sized>(
+    src: &S,
     image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
@@ -1027,26 +1231,12 @@ pub unsafe fn apply_relocations(
         // path). When absent we fall back to RELASZ/RELAENT.
         let count = if relaent != 0 { relasz / relaent } else { 0 };
         if count > 0 {
-            let needed = count
-                .checked_mul(relaent)
-                .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            let slice = resolve_dt_pointer(bytes, image, rela_addr, needed)
-                .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            // SAFETY: `resolve_dt_pointer` returned a `slice` of exactly
-            // `needed == count * relaent` in-bounds bytes of the image, so
-            // each `Elf64_Rela` entry read by `process_rela_array` is fully
-            // backed; `addr_space` is the target space whose pages this
-            // relocation patches.
-            // SAFETY: Valid memory or trusted environment
+            // SAFETY: forwarding this function's contract; the table's span is
+            // validated against its segment and the image before any entry is
+            // applied.
             unsafe {
-                process_rela_array(
-                    slice,
-                    count as usize,
-                    relaent as usize,
-                    bytes,
-                    image,
-                    addr_space,
-                    vaddr_bias,
+                stream_rela_table(
+                    src, image, addr_space, vaddr_bias, rela_addr, count, relaent,
                 )?;
             }
         }
@@ -1062,26 +1252,18 @@ pub unsafe fn apply_relocations(
             let relaent = dt_lookup(&image.dynamic, DT_RELAENT).unwrap_or(24);
             let count = if relaent != 0 { pltrelsz / relaent } else { 0 };
             if count > 0 {
-                let needed = count
-                    .checked_mul(relaent)
-                    .ok_or(LoadBytesError::RelaOutOfBounds)?;
-                let slice = resolve_dt_pointer(bytes, image, jmprel_addr, needed)
-                    .ok_or(LoadBytesError::RelaOutOfBounds)?;
-                // SAFETY: `resolve_dt_pointer` returned a `slice` of exactly
-                // `needed == count * relaent` in-bounds bytes of the image, so
-                // each `Elf64_Rela` PLT entry read by `process_rela_array` is
-                // fully backed; `addr_space` is the target space whose pages
-                // this relocation patches.
-                // SAFETY: Valid memory or trusted environment
+                // SAFETY: as for DT_RELA above — forwarding this function's
+                // contract, with the table's span validated before any entry is
+                // applied.
                 unsafe {
-                    process_rela_array(
-                        slice,
-                        count as usize,
-                        relaent as usize,
-                        bytes,
+                    stream_rela_table(
+                        src,
                         image,
                         addr_space,
                         vaddr_bias,
+                        jmprel_addr,
+                        count,
+                        relaent,
                     )?;
                 }
             }
@@ -1106,32 +1288,53 @@ pub unsafe fn apply_relocations(
             if relrent != 8 {
                 return Err(LoadBytesError::UnsupportedRelocation);
             }
-            let slice = resolve_dt_pointer(bytes, image, relr_addr, relrsz)
+            // Streamed in bounded windows like the RELA tables, carrying the
+            // decoder's cursor across window boundaries so the table still
+            // decodes as the single stream it is. RELR is dense — one 8-byte
+            // entry covers up to 63 slots — but its size still comes from the
+            // image, and nothing that comes from the image gets to size an
+            // allocation.
+            let entries = relrsz / 8;
+            let mut window = DtTableWindow::open(src, image, relr_addr, relrsz, 8)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
-            // `for_each_relr_target` is a pure decoder; the closure does
+            let stride = window.stride(8);
+            let mut cursor: u64 = 0;
+            let mut done: u64 = 0;
+            // `for_each_relr_target_from` is a pure decoder; the closure does
             // the per-slot read-modify-write. A closure can't return an
             // error mid-walk, so the first unmapped slot latches into
             // `err` and later slots short-circuit.
             let mut err: Result<(), LoadBytesError> = Ok(());
-            for_each_relr_target(slice, |slot_va| {
+            while done < entries {
+                let n = core::cmp::min(stride as u64, entries - done) as usize;
+                let slice = window.fill(src, done, n, 8)?;
+                cursor = for_each_relr_target_from(slice, cursor, |slot_va| {
+                    if err.is_err() {
+                        return;
+                    }
+                    let target_va = slot_va.wrapping_add(vaddr_bias);
+                    match user_vaddr_to_kernel_ptr(addr_space, target_va) {
+                        // SAFETY: `dst` points into an identity-mapped phys
+                        // frame backing the user's mapped page; the slot is
+                        // 8 bytes wide and RELR r_offsets are 8-aligned by
+                        // construction. Read the link-time value, add the
+                        // load bias, write it back.
+                        // SAFETY: Valid memory or trusted environment
+                        Some(dst) => unsafe {
+                            let cur = core::ptr::read_unaligned(dst as *const u64);
+                            core::ptr::write_unaligned(
+                                dst as *mut u64,
+                                cur.wrapping_add(vaddr_bias),
+                            );
+                        },
+                        None => err = Err(LoadBytesError::RelocTargetUnmapped),
+                    }
+                });
                 if err.is_err() {
-                    return;
+                    break;
                 }
-                let target_va = slot_va.wrapping_add(vaddr_bias);
-                match user_vaddr_to_kernel_ptr(addr_space, target_va) {
-                    // SAFETY: `dst` points into an identity-mapped phys
-                    // frame backing the user's mapped page; the slot is
-                    // 8 bytes wide and RELR r_offsets are 8-aligned by
-                    // construction. Read the link-time value, add the
-                    // load bias, write it back.
-                    // SAFETY: Valid memory or trusted environment
-                    Some(dst) => unsafe {
-                        let cur = core::ptr::read_unaligned(dst as *const u64);
-                        core::ptr::write_unaligned(dst as *mut u64, cur.wrapping_add(vaddr_bias));
-                    },
-                    None => err = Err(LoadBytesError::RelocTargetUnmapped),
-                }
-            });
+                done += n as u64;
+            }
             err?;
         }
     }
@@ -1150,9 +1353,20 @@ pub unsafe fn apply_relocations(
 /// of the 63 slots starting at the cursor are relocated (bit 0 is the
 /// tag). A bitmap always advances the cursor by 63 slots regardless of
 /// which bits were set, so runs of bitmaps chain contiguously.
-pub(crate) fn for_each_relr_target(relr: &[u8], mut visit: impl FnMut(u64)) {
+/// Walk a DT_RELR bitmap, resumable across a chunk boundary.
+///
+/// RELR is a stream, not an array: an even entry sets the cursor and an odd one
+/// is a bitmap of the 63 slots following it. The only state carried between
+/// entries is that cursor, so handing it in and getting it back lets a caller
+/// walk a table in bounded windows and still decode it as one stream. A whole
+/// table read into one buffer is the `cursor = 0` case.
+pub(crate) fn for_each_relr_target_from(
+    relr: &[u8],
+    start_cursor: u64,
+    mut visit: impl FnMut(u64),
+) -> u64 {
     let n = relr.len() / 8;
-    let mut cursor: u64 = 0;
+    let mut cursor: u64 = start_cursor;
     for i in 0..n {
         let e = read_u64_le(&relr[i * 8..i * 8 + 8]);
         if e & 1 == 0 {
@@ -1172,16 +1386,17 @@ pub(crate) fn for_each_relr_target(relr: &[u8], mut visit: impl FnMut(u64)) {
             cursor = cursor.wrapping_add(63 * 8);
         }
     }
+    cursor
 }
 
 /// Iterate `Elf64_Rela { r_offset, r_info, r_addend }` entries and
 /// patch each one. Encapsulated so DT_RELA + DT_JMPREL can share
 /// the per-entry decoding without duplicating the loop.
-unsafe fn process_rela_array(
+unsafe fn process_rela_array<S: crate::elf::ExecBytes + ?Sized>(
     slice: &[u8],
     count: usize,
     entsize: usize,
-    bytes: &[u8],
+    src: &S,
     image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
@@ -1215,13 +1430,13 @@ unsafe fn process_rela_array(
             }
             R_ABS64 => {
                 // S + A — symbol address (biased) plus addend.
-                let s = resolve_symbol(bytes, image, sym_ix, vaddr_bias)?;
+                let s = resolve_symbol(src, image, sym_ix, vaddr_bias)?;
                 s.wrapping_add(r_addend as u64)
             }
             R_GLOB_DAT | R_JUMP_SLOT => {
                 // S — bare symbol address. The addend slot is reserved
                 // by the ABI for these two types; ignore it.
-                resolve_symbol(bytes, image, sym_ix, vaddr_bias)?
+                resolve_symbol(src, image, sym_ix, vaddr_bias)?
             }
             R_DTPMOD64 => {
                 // Module ID. The static-tls model has exactly one TLS
@@ -1237,7 +1452,7 @@ unsafe fn process_rela_array(
                 let s = if sym_ix == 0 {
                     0
                 } else {
-                    resolve_tls_symbol_offset(bytes, image, sym_ix)?
+                    resolve_tls_symbol_offset(src, image, sym_ix)?
                 };
                 s.wrapping_add(r_addend as u64)
             }
@@ -1260,7 +1475,7 @@ unsafe fn process_rela_array(
                 let s = if sym_ix == 0 {
                     0
                 } else {
-                    resolve_tls_symbol_offset(bytes, image, sym_ix)?
+                    resolve_tls_symbol_offset(src, image, sym_ix)?
                 };
                 let template = image
                     .tls
