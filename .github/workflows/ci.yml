@@ -200,6 +200,27 @@ jobs:
             --features boot-smoke,cgroup-all,bpf-idle,bpf-leds,container \
             -- -D warnings
 
+      # Third pass with `user-mode-e2e`. Same reasoning as the container pass
+      # and the same history: the feature gates real code that NOTHING in CI
+      # compiled. `UserProcess` gained a `program_bias` field; every call site
+      # the default feature set compiles was updated, but two builders inside
+      # `cfg(feature = "user-mode-e2e")` in narf-verification were not, and
+      # `cargo xtask test --features user-mode-e2e` stopped compiling for four
+      # merges before anyone ran it.
+      #
+      # The feature chains `kernel-test` (frame/Cargo.toml), so this pass also
+      # lints the in-kernel test code on the bare-metal target, which the
+      # default passes above do not. It is the only CI coverage of the
+      # user-mode e2e harnesses — the suites that enter ring 3 / EL0 for real.
+      - name: cargo clippy (kernel / user-mode-e2e / ${{ matrix.arch }})
+        run: |
+          cargo clippy -p narf-frame \
+            --target ${{ matrix.arch }}-unknown-none \
+            -Zbuild-std=core,compiler_builtins,alloc \
+            -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 \
+            --features user-mode-e2e \
+            -- -D warnings
+
       - name: aarch64 UEFI loader tests + clippy
         if: matrix.arch == 'aarch64'
         run: |
@@ -838,6 +859,38 @@ jobs:
         run: |
           cargo xtask test --arch=x86_64 --features cgroup-all,container \
             --subsystem interrupts
+
+      # Run the tests the `user-mode-e2e` feature gates. The clippy pass in
+      # `clippy-kernel` proves they COMPILE on both arches; this proves they
+      # pass, and it is the only CI step that executes user code for real —
+      # ring 3 on x86_64, EL0 on aarch64 (including
+      # `smoke_aarch64_el0_tick_preempts_and_preserves_context`, which is the
+      # sole end-to-end check that generic-timer preemption returns an EL0
+      # task to the executor).
+      #
+      # Scoped to the two subsystems that hold e2e-gated tests —
+      # `verification` (the EL0/ring-3 harnesses) and `userspace` (feature-
+      # gated cases in tests/{misc,process,signals,time}.rs and
+      # process_e2e_tests.rs) — for the same reason as the virtio-mmio and
+      # xAPIC steps above: a regression guard, not a second full run. Locally
+      # under TCG that is 552 tests in ~95s on x86_64 and 376 in ~13s on
+      # aarch64, against ~8500 for the whole suite.
+      #
+      # NOT the full suite on purpose, and not only for time: with this
+      # feature set aarch64 also compiles three MTE smokes
+      # (`*_untagged_access_faults_in_scope`) that fail today — they reproduce
+      # at 09448884, the last commit where this configuration built at all, so
+      # they are a pre-existing gap rather than something this step introduced.
+      # Widening the scope means fixing those first; leaving them outside it
+      # keeps this step honest instead of red-by-default.
+      - name: cargo xtask test — user-mode e2e harnesses
+        timeout-minutes: 20
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "1200"
+          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "600"
+        run: |
+          cargo xtask test --arch=${{ matrix.arch }} --features user-mode-e2e \
+            --subsystem verification,userspace
 
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
