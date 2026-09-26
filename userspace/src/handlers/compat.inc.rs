@@ -8719,6 +8719,9 @@ fn build_delivery_params(
         si_addr,
         si_value,
         si_pid,
+        // The caller stamps this after building: only the syscall-exit
+        // delivery path can know the frame is a restart-pending park.
+        prerewound_syscall: false,
     }
 }
 
@@ -8751,7 +8754,19 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bo
     // u64::MAX = no restriction: consider every deliverable signal. The
     // timer-IRQ preemptive path calls the restricted form with a narrower
     // mask (eager / fatal-unhandled only).
-    default_signal_delivery_restricted(ctx, syscall_no, u64::MAX)
+    default_signal_delivery_restricted(ctx, syscall_no, u64::MAX, false)
+}
+
+/// Delivery over a RESTART-PENDING syscall frame: the in-flight syscall
+/// parked and rewound RIP for re-execution (`syscall_parked_restarting` +
+/// exit-RIP still at the syscall instruction). `syscall_no` is the real
+/// wire number so the SA_RESTART restartability decision applies; a caught
+/// signal without SA_RESTART (or on a never-restartable syscall) completes
+/// the syscall as -EINTR instead of letting the rewound RIP restart it
+/// (Linux `handle_signal` semantics).
+#[inline]
+pub fn default_signal_delivery_restart_pending(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
+    default_signal_delivery_restricted(ctx, syscall_no, u64::MAX, true)
 }
 
 /// Body of `default_signal_delivery`, but only signals whose bit is set in
@@ -8763,6 +8778,7 @@ pub(crate) fn default_signal_delivery_restricted(
     ctx: &mut dyn TrapContext,
     syscall_no: u32,
     restrict: u64,
+    prerewound: bool,
 ) -> bool {
     if !ctx.returning_to_user() {
         return false;
@@ -8773,7 +8789,7 @@ pub(crate) fn default_signal_delivery_restricted(
     if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
         return false;
     }
-    default_signal_delivery_restricted_active(ctx, syscall_no, restrict)
+    default_signal_delivery_restricted_active(ctx, syscall_no, restrict, prerewound)
 }
 
 #[inline(never)]
@@ -8781,6 +8797,7 @@ fn default_signal_delivery_restricted_active(
     ctx: &mut dyn TrapContext,
     syscall_no: u32,
     restrict: u64,
+    prerewound: bool,
 ) -> bool {
     let task = current_task_id();
 
@@ -8912,12 +8929,25 @@ fn default_signal_delivery_restricted_active(
             }
             None => (info.code, info.value, info.pid, 0),
         });
-    let params = build_delivery_params(
+    let mut params = build_delivery_params(
         task, action, signum, syscall_no, si_code, si_addr, si_value, si_pid,
     );
+    params.prerewound_syscall = prerewound;
     let interrupted_rsp = ctx.user_rsp();
     if !ctx.deliver_signal(&params) {
         return false;
+    }
+    // The frame builder just converted a restart-pending syscall to a
+    // completed -EINTR (prerewound + no SA_RESTART keep). The re-execution
+    // that would have unwound the park's cross-execution state now never
+    // happens — release it here (today: the FIFO open's pre-installed fd,
+    // whose open count would otherwise register a phantom reader/writer
+    // forever) and drop the restart marker.
+    const SA_RESTART: u32 = 0x10_00_00_00;
+    if params.prerewound_syscall
+        && !((params.flags & SA_RESTART) != 0 && params.restartable_syscall)
+    {
+        abort_restart_pending_park_state(task);
     }
     // If this task is parked in rt_sigtimedwait, this handler-bound signal
     // (necessarily OUT of the sigwait set — in-set signals are blocked and

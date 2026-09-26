@@ -365,6 +365,18 @@ pub struct UserTaskCtx {
     /// re-opening. Cleared (and the fd returned) once the peer appears.
     pub fifo_open_pending_fd: AtomicU64,
 
+    /// True while an in-flight syscall has parked via `own_stack_block`
+    /// (every blocking park funnels through it). Together with an exit-trap
+    /// RIP still rewound to the syscall instruction, this identifies a
+    /// syscall that will RESTART rather than one that completed — the
+    /// distinction Linux's `handle_signal` needs: delivering a caught
+    /// signal over a restart-pending frame must complete the syscall as
+    /// `-EINTR` unless SA_RESTART (for a restartable syscall) keeps the
+    /// rewind. RIP arithmetic alone can't tell — execve and sigreturn also
+    /// leave exit-RIP ≠ entry-RIP. Cleared when the syscall completes
+    /// (exit-trap sees RIP == entry) or when a delivery converts it.
+    pub syscall_parked_restarting: AtomicBool,
+
     // ── stall-watchdog diagnostics ──────────────────────────────────
     /// Monotonic count of park-condition re-checks: bumped on every
     /// `park_should_block` pass (own-stack park loop) and every
@@ -530,6 +542,7 @@ impl UserTaskCtx {
             console_read_pending: AtomicBool::new(false),
             blocking_deadline_ns: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
+            syscall_parked_restarting: AtomicBool::new(false),
             kern_span_start_ns: AtomicU64::new(0),
             kern_account_ready: AtomicU64::new(0),
             dbg_park_checks: AtomicU64::new(0),
