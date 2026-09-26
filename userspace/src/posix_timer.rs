@@ -173,6 +173,7 @@ pub fn posix_timer_init() {
     *TIMERS.lock() = Some(BTreeMap::new());
     *ITIMERS.lock() = Some(BTreeMap::new());
     NEXT_ITIMER_REAL_DEADLINE_NS.store(NO_ITIMER_REAL_DEADLINE, Ordering::Release);
+    CPU_ITIMERS_ARMED.store(0, Ordering::Release);
     if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         // Register a sleep-pump so timer expiries fire even while a
         // user task is parked in `sys_sleep` / `sys_clock_nanosleep`.
@@ -186,6 +187,7 @@ pub fn __test_reset() {
     *TIMERS.lock() = Some(BTreeMap::new());
     *ITIMERS.lock() = Some(BTreeMap::new());
     NEXT_ITIMER_REAL_DEADLINE_NS.store(NO_ITIMER_REAL_DEADLINE, Ordering::Release);
+    CPU_ITIMERS_ARMED.store(0, Ordering::Release);
 }
 
 /// Exit-time disarm: drop the dying task's POSIX timers and interval
@@ -989,12 +991,26 @@ fn nanosleep_common(
 //   ITIMER_REAL    (0) — wall-clock; delivers SIGALRM.
 //   ITIMER_VIRTUAL (1) — user CPU time; delivers SIGVTALRM.
 //   ITIMER_PROF    (2) — user+sys CPU time; delivers SIGPROF.
-// NARF fully wires ITIMER_REAL (driven by the same `sleep_pumps` pump
-// as the POSIX timers above). VIRTUAL/PROF have no CPU-time accounting
-// yet, so they round-trip through set/getitimer but never fire.
+// ITIMER_REAL is driven by the same `sleep_pumps` pump as the POSIX
+// timers above plus the per-tick IRQ scan. VIRTUAL/PROF are CPU-clock
+// timers: their `next_fire_ns` is a deadline on the owning task's CPU
+// time (user for VIRTUAL, user+sys for PROF), not the monotonic clock,
+// and they are checked from the timer tick / syscall-exit hook for the
+// CURRENTLY RUNNING task only ([`itimer_cpu_tick`]) — a parked task's
+// CPU clock does not advance, so there is nothing to pump for it. That
+// is Linux's shape too: `run_posix_cpu_timers` samples from the tick in
+// the task's own context.
+//
+// Divergence, documented: Linux itimers live on the shared signal
+// struct (process-wide); NARF keys them per arming task. A VIRTUAL/PROF
+// timer here measures the arming thread's CPU clock, not the thread
+// group's sum.
 
 const ITIMER_REAL: u64 = 0;
+const ITIMER_VIRTUAL: u64 = 1;
 const ITIMER_PROF: u64 = 2;
+const SIGVTALRM: u32 = 26;
+const SIGPROF: u32 = 27;
 
 /// One `which` slot's armed state. `itimerval` carries microseconds,
 /// not nanoseconds — converted to ns on the way in.
@@ -1020,6 +1036,13 @@ static ITIMERS: IrqSafeSpinLock<Option<BTreeMap<u64, [Itimer; 3]>>> = IrqSafeSpi
 const NO_ITIMER_REAL_DEADLINE: u64 = u64::MAX;
 static NEXT_ITIMER_REAL_DEADLINE_NS: AtomicU64 = AtomicU64::new(NO_ITIMER_REAL_DEADLINE);
 
+/// Count of armed ITIMER_VIRTUAL/ITIMER_PROF slots across all tasks — the
+/// per-tick fast gate for [`itimer_cpu_tick`]. Zero (nobody profiles) costs
+/// the tick one acquire load; the count is recomputed under the `ITIMERS`
+/// lock by every table mutation, so it can never go stale-high for longer
+/// than the next set/exit sweep and never stale-low at all.
+static CPU_ITIMERS_ARMED: AtomicU64 = AtomicU64::new(0);
+
 fn refresh_itimer_real_deadline_locked(map: &BTreeMap<u64, [Itimer; 3]>) {
     let next = map
         .values()
@@ -1028,6 +1051,17 @@ fn refresh_itimer_real_deadline_locked(map: &BTreeMap<u64, [Itimer; 3]>) {
         .min()
         .unwrap_or(NO_ITIMER_REAL_DEADLINE);
     NEXT_ITIMER_REAL_DEADLINE_NS.store(next, Ordering::Release);
+    let cpu_armed = map
+        .values()
+        .flat_map(|slots| {
+            [
+                slots[ITIMER_VIRTUAL as usize].next_fire_ns,
+                slots[ITIMER_PROF as usize].next_fire_ns,
+            ]
+        })
+        .filter(|deadline| *deadline != 0)
+        .count() as u64;
+    CPU_ITIMERS_ARMED.store(cpu_armed, Ordering::Release);
 }
 
 fn with_itimers<R>(f: impl FnOnce(&mut BTreeMap<u64, [Itimer; 3]>) -> R) -> R {
@@ -1053,6 +1087,13 @@ pub fn itimer_real_due_now() -> Option<u64> {
     }
     let now = narf_scheduler::narf_time::monotonic_ns();
     (now >= deadline).then_some(now)
+}
+
+/// The [`itimer_real_due_now`] gate against a clock the caller already read
+/// — one acquire load, no clock read, no lock. (The `u64::MAX` disarmed
+/// sentinel can never compare due.)
+pub fn itimer_real_due_at(now: u64) -> bool {
+    NEXT_ITIMER_REAL_DEADLINE_NS.load(Ordering::Acquire) <= now
 }
 
 /// Ensure the `sleep_pumps` callback that fires interval timers is
@@ -1197,7 +1238,11 @@ pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
     let which = which as usize;
 
     let task = current_task_id();
-    let now = narf_scheduler::narf_time::monotonic_ns();
+    // REAL deadlines live on the monotonic clock; VIRTUAL/PROF deadlines on
+    // the task's own CPU clock (user / user+sys), advanced by
+    // `itimer_cpu_tick`. Sampled here so the armed value means "this much
+    // MORE user/CPU time", exactly like Linux's `it_virt_expires` bases.
+    let now = itimer_now_for(task, which);
     let next_fire = if value_ns == 0 {
         0
     } else {
@@ -1269,7 +1314,9 @@ pub fn sys_getitimer(ctx: &mut dyn TrapContext) {
     }
     let which = which as usize;
     let task = current_task_id();
-    let now = narf_scheduler::narf_time::monotonic_ns();
+    // Remaining time is deadline-minus-now ON THE SLOT'S OWN CLOCK —
+    // monotonic for REAL, this task's CPU clock for VIRTUAL/PROF.
+    let now = itimer_now_for(task, which);
     let slot = with_itimers(|m| m.get(&task).map(|s| s[which]).unwrap_or_default());
     let mut out = [0u8; 32];
     write_itimerval(&mut out, slot, now);
@@ -1492,6 +1539,159 @@ pub fn itimer_real_take_one_due_irq(now: u64, after: Option<u64>) -> Option<u64>
     // deadline (or the disarmed sentinel) before its next fast-path probe.
     refresh_itimer_real_deadline_locked(map);
     None
+}
+
+/// Sample `task`'s CPU clocks for the VIRTUAL (user) and PROF (user+sys)
+/// itimers, including the in-flight slice. Without the live slice a task
+/// spinning in user mode folds its counters only when something preempts
+/// it — so the very workload a profiling timer exists to sample would be
+/// the one whose clock lags a whole slice behind (same reasoning as
+/// `rlimit_cpu_tick`). Only meaningful for the CURRENT task: the slice
+/// belongs to the caller's CPU.
+///
+/// Uses the try-lock counter read so the timer-ISR caller can never
+/// deadlock against a registry holder; a miss just defers to the next
+/// tick.
+fn cpu_clocks_now_try(task: u64) -> Option<(u64, u64)> {
+    let (user, kern) = crate::task::cpu_times_try(task)?;
+    let slice = narf_scheduler::stackful::current_slice_elapsed_ns();
+    let virt = user.saturating_add(slice);
+    let prof = user.saturating_add(kern).saturating_add(slice);
+    Some((virt, prof))
+}
+
+/// The blocking-read variant for the task's own syscall context
+/// (`setitimer`/`getitimer`), where taking the registry lock is fine and a
+/// deferred answer is not.
+fn cpu_clocks_now(task: u64) -> (u64, u64) {
+    let (user, kern) = crate::task::cpu_times(task);
+    let slice = narf_scheduler::stackful::current_slice_elapsed_ns();
+    (
+        user.saturating_add(slice),
+        user.saturating_add(kern).saturating_add(slice),
+    )
+}
+
+/// The reference instant a `which` slot's deadlines live on: monotonic ns
+/// for ITIMER_REAL, the task's CPU clock for VIRTUAL/PROF. Every
+/// remaining-time computation must use the slot's own clock or getitimer
+/// would report a REAL-sized remainder on a CPU timer.
+fn itimer_now_for(task: u64, which: usize) -> u64 {
+    if which == ITIMER_REAL as usize {
+        return narf_scheduler::narf_time::monotonic_ns();
+    }
+    let (virt, prof) = cpu_clocks_now(task);
+    if which == ITIMER_VIRTUAL as usize {
+        virt
+    } else {
+        prof
+    }
+}
+
+/// Timer-tick / syscall-exit check of the CURRENT task's CPU itimers —
+/// what makes `setitimer(ITIMER_VIRTUAL/PROF)` actually fire. Mirrors
+/// Linux's `run_posix_cpu_timers`: sampled from the tick in the running
+/// task's own context, because a CPU clock only advances while its task
+/// runs (a parked owner needs no pump — its deadline cannot come due).
+///
+/// Alloc-free and IRQ-safe: one acquire load when nobody profiles, then a
+/// try-read of the CPU counters and an `IrqSafeSpinLock`ed slot advance;
+/// signals are raised via the alloc-free `raise_signal_pending_irq` (the
+/// slot was pre-seeded by `setitimer`). No wake is needed — the owner is
+/// the currently running task, and delivery happens on this trap's return
+/// to user.
+pub fn itimer_cpu_tick() {
+    if CPU_ITIMERS_ARMED.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let task = current_task_id();
+    if task == 0 {
+        return;
+    }
+    let Some((virt_now, prof_now)) = cpu_clocks_now_try(task) else {
+        return;
+    };
+    let (fire_virtual, fire_prof) = itimer_cpu_check_due(task, virt_now, prof_now);
+    if fire_virtual {
+        let _ = crate::handlers::raise_signal_pending_irq(task, SIGVTALRM);
+    }
+    if fire_prof {
+        let _ = crate::handlers::raise_signal_pending_irq(task, SIGPROF);
+    }
+}
+
+/// The slot-advance core of [`itimer_cpu_tick`], against SUPPLIED clock
+/// samples so a kernel test can drive expiry deterministically. Advances a
+/// periodic slot / disarms a one-shot under the `ITIMERS` lock and returns
+/// `(virtual_due, prof_due)`.
+fn itimer_cpu_check_due(task: u64, virt_now: u64, prof_now: u64) -> (bool, bool) {
+    let mut fire_virtual = false;
+    let mut fire_prof = false;
+    let mut g = ITIMERS.lock();
+    let Some(map) = g.as_mut() else {
+        return (false, false);
+    };
+    let Some(slots) = map.get_mut(&task) else {
+        return (false, false);
+    };
+    let mut disarmed = false;
+    for (which, now, fire) in [
+        (ITIMER_VIRTUAL as usize, virt_now, &mut fire_virtual),
+        (ITIMER_PROF as usize, prof_now, &mut fire_prof),
+    ] {
+        let slot = &mut slots[which];
+        if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
+            continue;
+        }
+        if slot.interval_ns == 0 {
+            slot.next_fire_ns = 0;
+            disarmed = true;
+        } else {
+            let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
+            slot.next_fire_ns = slot
+                .next_fire_ns
+                .saturating_add(slot.interval_ns.saturating_mul(fires));
+        }
+        *fire = true;
+    }
+    if disarmed {
+        // A one-shot just went away; republish the armed count so the
+        // fast gate can drop back to a single load.
+        refresh_itimer_real_deadline_locked(map);
+    }
+    (fire_virtual, fire_prof)
+}
+
+/// Test hook — run the CPU-itimer due-check against supplied clocks.
+#[doc(hidden)]
+pub fn __test_itimer_cpu_check_due(task: u64, virt_now: u64, prof_now: u64) -> (bool, bool) {
+    itimer_cpu_check_due(task, virt_now, prof_now)
+}
+
+/// Test hook — the armed-count fast gate's current value.
+#[doc(hidden)]
+pub fn __test_cpu_itimers_armed() -> u64 {
+    CPU_ITIMERS_ARMED.load(Ordering::Acquire)
+}
+
+/// Test hook — directly arm a task's VIRTUAL/PROF slot (CPU-clock
+/// deadline), bypassing the syscall path, so a kernel test can drive
+/// [`itimer_cpu_tick`] against injected `__test_add_cpu_ns` time.
+#[doc(hidden)]
+pub fn __test_arm_itimer_cpu(task: u64, which: usize, next_fire_ns: u64, interval_ns: u64) {
+    with_itimers(|m| {
+        let slots = m.entry(task).or_default();
+        slots[which] = Itimer {
+            next_fire_ns,
+            interval_ns,
+        };
+    });
+}
+
+/// Test hook — read a task's VIRTUAL/PROF next-fire deadline (0 = disarmed).
+#[doc(hidden)]
+pub fn __test_itimer_cpu_next_fire(task: u64, which: usize) -> u64 {
+    with_itimers(|m| m.get(&task).map(|s| s[which].next_fire_ns).unwrap_or(0))
 }
 
 /// Sleep-pump: walks every per-task timer table, fires expired

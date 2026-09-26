@@ -1127,6 +1127,7 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
         altstack_sp: 0,
         altstack_size: 0,
         restartable_syscall: true,
+        prerewound_syscall: false,
         si_code: 0,
         si_addr: 0,
         si_value: 0,
@@ -1209,6 +1210,7 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
         altstack_sp: altstack.base(),
         altstack_size: altstack.len(),
         restartable_syscall: false,
+        prerewound_syscall: false,
         si_code: 0,
         si_addr: 0,
         si_value: 0,
@@ -1282,6 +1284,7 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
         altstack_sp: 0,
         altstack_size: 0,
         restartable_syscall: false,
+        prerewound_syscall: false,
         si_code: 1, // SEGV_MAPERR
         si_addr: 0xDEAD_AAAA,
         si_value: 0,

@@ -7084,6 +7084,11 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
 /// interrupts disabled from the trap handler. The raised signal is then
 /// delivered by `signal_delivery_hook` on the same trap's return to user.
 pub fn timer_tick_raise_due_signals() {
+    // CPU itimers (ITIMER_VIRTUAL → SIGVTALRM, ITIMER_PROF → SIGPROF) for
+    // the interrupted/current task. Checked ahead of the REAL scan because
+    // the REAL fast gate below returns from the whole function; both paths
+    // are alloc-free and one-atomic-load cheap when unused.
+    crate::posix_timer::itimer_cpu_tick();
     {
         let Some(now) = crate::posix_timer::itimer_real_due_now() else {
             return;
@@ -7104,20 +7109,37 @@ pub fn timer_tick_raise_due_signals() {
         // handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn
         // — the same "no big on-stack array in IRQ context" hazard the timer
         // wheel documents (`timer_wheel::drain_due_to_deferred`).
-        let mut after: Option<u64> = None;
-        while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
-            after = Some(t);
-            // SIGALRM (14). Slot was pre-created when the timer was armed, so
-            // this only sets a bit in an existing entry (never allocates).
-            let _ = raise_signal_pending_irq(t, 14);
-            // Wake the owner if it's parked so waitpid/pause returns EINTR and
-            // SIGALRM is delivered on its return-to-user. For the currently
-            // running owner (the original CPU-bound case) this is a harmless
-            // no-op — it has no parked waker and takes the signal on this
-            // trap's return. Every lock `wake_signal` touches is an
-            // `IrqSafeSpinLock`, so this is safe from the timer ISR.
-            wake_signal(t);
-        }
+        raise_due_itimer_real(now);
+    }
+}
+
+/// Drain-and-raise every due ITIMER_REAL owner at `now`. Shared by the
+/// timer-tick hook above and the park loop's backstop kick
+/// (`park_should_block`): a parked owner's own 1 ms backstop treadmill
+/// otherwise never raises — its re-executed syscall parks again without
+/// reaching the syscall-EXIT hook, the posix-timer sleep pump only runs
+/// from nested waits (not the executor's `run_io` rounds), and an idle
+/// CPU's tick interrupts the executor, not user mode. The raise then
+/// depended on UNRELATED system activity — measured 6.5 s (and worse) of
+/// SIGALRM latency to a task parked in a FIFO open on an idle guest.
+///
+/// Alloc-free and IRQ-safe (O(1)-stack take-one drain; see the stack
+/// hazard note above). Every lock `wake_signal` touches is an
+/// `IrqSafeSpinLock`, so both the timer ISR and executor contexts may
+/// call this.
+pub(crate) fn raise_due_itimer_real(now: u64) {
+    let mut after: Option<u64> = None;
+    while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
+        after = Some(t);
+        // SIGALRM (14). Slot was pre-created when the timer was armed, so
+        // this only sets a bit in an existing entry (never allocates).
+        let _ = raise_signal_pending_irq(t, 14);
+        // Wake the owner if it's parked so waitpid/pause returns EINTR and
+        // SIGALRM is delivered on its return-to-user. For the currently
+        // running owner (the original CPU-bound case) this is a harmless
+        // no-op — it has no parked waker and takes the signal on this
+        // trap's return.
+        wake_signal(t);
     }
 }
 
@@ -8735,6 +8757,9 @@ fn build_delivery_params(
         si_addr,
         si_value,
         si_pid,
+        // The caller stamps this after building: only the syscall-exit
+        // delivery path can know the frame is a restart-pending park.
+        prerewound_syscall: false,
     }
 }
 
@@ -8767,7 +8792,19 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bo
     // u64::MAX = no restriction: consider every deliverable signal. The
     // timer-IRQ preemptive path calls the restricted form with a narrower
     // mask (eager / fatal-unhandled only).
-    default_signal_delivery_restricted(ctx, syscall_no, u64::MAX)
+    default_signal_delivery_restricted(ctx, syscall_no, u64::MAX, false)
+}
+
+/// Delivery over a RESTART-PENDING syscall frame: the in-flight syscall
+/// parked and rewound RIP for re-execution (`syscall_parked_restarting` +
+/// exit-RIP still at the syscall instruction). `syscall_no` is the real
+/// wire number so the SA_RESTART restartability decision applies; a caught
+/// signal without SA_RESTART (or on a never-restartable syscall) completes
+/// the syscall as -EINTR instead of letting the rewound RIP restart it
+/// (Linux `handle_signal` semantics).
+#[inline]
+pub fn default_signal_delivery_restart_pending(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
+    default_signal_delivery_restricted(ctx, syscall_no, u64::MAX, true)
 }
 
 /// Body of `default_signal_delivery`, but only signals whose bit is set in
@@ -8779,6 +8816,7 @@ pub(crate) fn default_signal_delivery_restricted(
     ctx: &mut dyn TrapContext,
     syscall_no: u32,
     restrict: u64,
+    prerewound: bool,
 ) -> bool {
     if !ctx.returning_to_user() {
         return false;
@@ -8789,7 +8827,7 @@ pub(crate) fn default_signal_delivery_restricted(
     if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
         return false;
     }
-    default_signal_delivery_restricted_active(ctx, syscall_no, restrict)
+    default_signal_delivery_restricted_active(ctx, syscall_no, restrict, prerewound)
 }
 
 #[inline(never)]
@@ -8797,6 +8835,7 @@ fn default_signal_delivery_restricted_active(
     ctx: &mut dyn TrapContext,
     syscall_no: u32,
     restrict: u64,
+    prerewound: bool,
 ) -> bool {
     let task = current_task_id();
 
@@ -8928,12 +8967,25 @@ fn default_signal_delivery_restricted_active(
             }
             None => (info.code, info.value, info.pid, 0),
         });
-    let params = build_delivery_params(
+    let mut params = build_delivery_params(
         task, action, signum, syscall_no, si_code, si_addr, si_value, si_pid,
     );
+    params.prerewound_syscall = prerewound;
     let interrupted_rsp = ctx.user_rsp();
     if !ctx.deliver_signal(&params) {
         return false;
+    }
+    // The frame builder just converted a restart-pending syscall to a
+    // completed -EINTR (prerewound + no SA_RESTART keep). The re-execution
+    // that would have unwound the park's cross-execution state now never
+    // happens — release it here (today: the FIFO open's pre-installed fd,
+    // whose open count would otherwise register a phantom reader/writer
+    // forever) and drop the restart marker.
+    const SA_RESTART: u32 = 0x10_00_00_00;
+    if params.prerewound_syscall
+        && !((params.flags & SA_RESTART) != 0 && params.restartable_syscall)
+    {
+        abort_restart_pending_park_state(task);
     }
     // If this task is parked in rt_sigtimedwait, this handler-bound signal
     // (necessarily OUT of the sigwait set — in-set signals are blocked and

@@ -286,6 +286,16 @@ pub struct SigDeliveryParams {
     /// user `siginfo_t` when `SA_SIGINFO` is set; harmless for other
     /// signals since that union slot is unused by them.
     pub si_value: u64,
+    /// `true` when the interrupted frame's RIP is ALREADY rewound to the
+    /// syscall instruction by a blocking park (restart-pending syscall).
+    /// The arch then inverts the usual SA_RESTART handling: with
+    /// SA_RESTART on a restartable syscall the saved RIP is kept as-is
+    /// (the rewind IS the restart); otherwise the saved RIP is advanced
+    /// past the syscall instruction and the saved RAX becomes `-EINTR`,
+    /// completing the syscall — Linux `handle_signal` over an
+    /// `ERESTARTSYS` frame. Only the x86_64 syscall-instruction exit path
+    /// sets this today.
+    pub prerewound_syscall: bool,
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────
@@ -3871,11 +3881,20 @@ pub fn kernel_syscall_entry_plain_with_state(
     // reaches here — those deliver at their own yield point. The null-state
     // plain path (no user frame to rewrite) self-checks out.
     //
-    // SYSCALL_NUM_NONE, not `num`: this syscall COMPLETED (returned a real
-    // value), so SA_RESTART must NOT rewind RIP to re-run it — that's only
-    // for syscalls *interrupted* mid-flight (which in NARF park at a yield
-    // point and restart there). A completed syscall's return value stands,
-    // exactly as Linux preserves it across a handler.
+    // Which frame is delivery rewriting? Two cases, mirroring Linux's
+    // `handle_signal`:
+    //
+    //  * COMPLETED (RIP == entry_rip): pass SYSCALL_NUM_NONE — SA_RESTART
+    //    must NOT rewind RIP to re-run a syscall that returned a real value.
+    //  * RESTART-PENDING (the handler parked and rewound RIP for
+    //    re-execution — `syscall_parked_restarting` + a rewound RIP; the
+    //    flag guards against execve/sigreturn, which also leave RIP moved):
+    //    pass the real `num` and the prerewound marker. Delivering a caught
+    //    signal over this frame must COMPLETE the syscall as -EINTR unless
+    //    SA_RESTART on a restartable syscall keeps the rewind — the
+    //    unconditional-restart it replaced meant no blocking FIFO open /
+    //    read / wait could ever observe EINTR from a handled signal
+    //    (stress-ng --dup ran at 0.003x Linux on exactly this).
     if !user_state.is_null() {
         // Linux drives ITIMER_REAL from an independent hrtimer. Check the
         // cached earliest deadline before every kernel→user transition so a
@@ -3883,7 +3902,31 @@ pub fn kernel_syscall_entry_plain_with_state(
         // timer IRQs keep landing at CPL=0. The no-timer common path is one
         // atomic load; the locked all-task scan runs only after a deadline.
         crate::handlers::timer_tick_raise_due_signals();
-        crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+        let restart_pending = ctx.rip() != entry_rip
+            && crate::user_task::current_user_task().is_some_and(|u| {
+                // SAFETY: the in-flight task's poller-pinned ctx; atomic load.
+                unsafe {
+                    (*u).syscall_parked_restarting
+                        .load(core::sync::atomic::Ordering::Acquire)
+                }
+            });
+        if restart_pending {
+            crate::handlers::default_signal_delivery_restart_pending(&mut ctx, num);
+        } else {
+            crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+        }
+        if ctx.rip() == entry_rip {
+            // Completed (or a delivery just converted the restart to -EINTR):
+            // drop the marker so a later RIP-moving syscall (execve,
+            // sigreturn) can't be mistaken for a restart-pending park.
+            if let Some(u) = crate::user_task::current_user_task() {
+                // SAFETY: as above; atomic store only.
+                unsafe {
+                    (*u).syscall_parked_restarting
+                        .store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+        }
         // TIF_NEED_RESCHED-at-syscall-exit: the tick only preempts at CPL=3, so
         // a syscall-dense task (e.g. stress-ng --sigrt's tight sigqueue loop)
         // never yields and starves its CPU's siblings — the forked RT waiters
@@ -4196,10 +4239,26 @@ mod sigframe {
         } else {
             state.rip
         };
-        let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
-            state.rip.wrapping_sub(2)
+        // The context the handler returns into (via sigreturn's mcontext or
+        // the naive path's pushed return address). Three shapes:
+        //  * restart-pending frame (RIP already at the `syscall` insn):
+        //    SA_RESTART on a restartable syscall keeps it — the rewind IS
+        //    the restart. Anything else completes the syscall as -EINTR:
+        //    RIP advances past the instruction and RAX carries the errno.
+        //  * completed frame + SA_RESTART restartable: rewind by the 2-byte
+        //    `syscall` width so the handler's return re-issues it.
+        //  * completed frame otherwise: resume exactly where we stopped.
+        const EINTR_RAX: u64 = (-4i64) as u64;
+        let (saved_rip, saved_rax) = if params.prerewound_syscall {
+            if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
+                (state.rip, state.rax)
+            } else {
+                (state.rip.wrapping_add(2), EINTR_RAX)
+            }
+        } else if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
+            (state.rip.wrapping_sub(2), state.rax)
         } else {
-            state.rip
+            (state.rip, state.rax)
         };
 
         let stack_top = if want_altstack {
@@ -4243,7 +4302,7 @@ mod sigframe {
                     rbp: state.rbp,
                     rbx: state.rbx,
                     rdx: state.rdx,
-                    rax: state.rax,
+                    rax: saved_rax,
                     rcx: state.rcx,
                     rsp: state.rsp,
                     rip: saved_rip,

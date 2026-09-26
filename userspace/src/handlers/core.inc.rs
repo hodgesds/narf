@@ -2289,6 +2289,53 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
     fifo_park_or_finish(ctx, fd);
 }
 
+/// Release the cross-execution park state of a restart-pending syscall
+/// whose signal delivery just completed it as -EINTR (see
+/// `default_signal_delivery_restart_pending`): the re-execution that would
+/// normally re-check/unwind that state never happens. Today the only park
+/// state that deliberately persists across re-executions is the FIFO
+/// open's pre-installed fd — remove it so its open count stops
+/// advertising a phantom endpoint to the peer rendezvous. Also drops the
+/// restart marker: the syscall is complete.
+pub(crate) fn abort_restart_pending_park_state(task: u64) {
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx; atomics only.
+        let pending = unsafe {
+            (*uctx)
+                .syscall_parked_restarting
+                .store(false, core::sync::atomic::Ordering::Release);
+            (*uctx)
+                .fifo_open_pending_fd
+                .swap(0, core::sync::atomic::Ordering::AcqRel)
+        };
+        if pending != 0 {
+            let _ = fd::with_table(task, |t| t.take((pending - 1) as u32));
+        }
+    }
+}
+
+/// Abort a blocking FIFO open because a deliverable signal is pending.
+///
+/// The open installed its fd (and registered its direction's open count)
+/// BEFORE parking, so failing the syscall must unwind both: removing the
+/// table entry drops the `FifoHandle`, whose Drop unregisters the end and
+/// re-syncs the peer-presence readiness a counterpart may be parked on. The
+/// pending-fd re-entry slot is cleared so the rewound RIP (if the signal
+/// handler returns into the syscall) starts a fresh open instead of resuming
+/// a dead one.
+fn fifo_open_abort_eintr(ctx: &mut dyn TrapContext, task: u64, fd: u32) {
+    let _ = fd::with_table(task, |t| t.take(fd));
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: live per-task ctx; single-threaded syscall.
+        unsafe {
+            (*uctx)
+                .fifo_open_pending_fd
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+    ctx.set_return(errno_ret(EINTR));
+}
+
 /// Park the current task on the shared I/O-waker registry and RIP-rewind so
 /// the syscall re-executes (and `resume_fifo_open` re-checks the peer). The
 /// timer wheel remains only a ~1ms lost-wake backstop. Falls back to returning
@@ -2316,6 +2363,21 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
                         return;
                     }
                     Poll::Pending => {
+                        // fifo(7) blocking open waits INTERRUPTIBLY: Linux's
+                        // `wait_for_partner` returns -ERESTARTSYS on a signal
+                        // and `fifo_open`'s error path releases the just-
+                        // registered end. NARF's RIP-rewind re-execution would
+                        // otherwise restart the open unconditionally — a task
+                        // whose itimer fires every 1ms re-parks forever and
+                        // never sees EINTR. Checked after `arm_peer` so a peer
+                        // that appeared concurrently still wins over the
+                        // signal, matching wait_event_interruptible's
+                        // condition-before-signal ordering.
+                        if has_interrupting_signal(task) {
+                            handle.disarm_peer(task);
+                            fifo_open_abort_eintr(ctx, task, fd);
+                            return;
+                        }
                         let parked = park_reexecute_on_io(ctx);
                         handle.disarm_peer(task);
                         if parked {
@@ -12276,6 +12338,13 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
     let is_wait = crate::user_task::current_user_task().is_some_and(|uctx| {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
         unsafe {
+            // Every blocking park funnels through here — mark the syscall
+            // restart-pending so the exit trap can distinguish a rewound
+            // will-re-execute frame from a completed one when it delivers a
+            // signal (see `syscall_parked_restarting`).
+            (*uctx)
+                .syscall_parked_restarting
+                .store(true, core::sync::atomic::Ordering::Release);
             (*uctx)
                 .wait_child_pending
                 .load(core::sync::atomic::Ordering::Acquire)

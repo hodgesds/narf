@@ -487,9 +487,9 @@ pub(crate) fn thread_group_cpu_ns_try(pid: u64) -> Option<u64> {
     )
 }
 
-/// Non-blocking form for timer-trap diagnostics. `None` means registry lock
+/// Non-blocking form for timer-trap callers (the unix-latency-trace
+/// diagnostics and the CPU-itimer tick check). `None` means registry lock
 /// contention; an absent task is a successful zero snapshot.
-#[cfg(feature = "unix-latency-trace")]
 pub(crate) fn cpu_times_try(tid: u64) -> Option<(u64, u64)> {
     let tasks = TASKS.try_lock()?;
     Some(tasks.get(&tid).map_or((0, 0), |task| {

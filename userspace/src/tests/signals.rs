@@ -843,6 +843,79 @@ kernel_test_in!(
     smoke_userspace_itimer_real_check_due_irq_fires_and_rearms
 );
 
+// CPU itimers (ITIMER_VIRTUAL/ITIMER_PROF): deadlines live on the task's
+// CPU clock and are advanced by the per-tick check. A one-shot past its
+// clock fires once then disarms (and drops the armed-count fast gate); a
+// periodic re-arms strictly ahead of the supplied clock; the two `which`
+// slots are independent (a due PROF must not fire VIRTUAL). This is what
+// makes `setitimer(ITIMER_PROF)` deliver SIGPROF at all — before this
+// wave the slots round-tripped but never fired.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_itimer_cpu_check_due_fires_and_rearms() -> TestResult {
+    use crate::posix_timer::{
+        __test_arm_itimer_cpu, __test_cpu_itimers_armed, __test_itimer_cpu_check_due,
+        __test_itimer_cpu_next_fire, __test_reset,
+    };
+    const ITIMER_VIRTUAL: usize = 1;
+    const ITIMER_PROF: usize = 2;
+    __test_reset();
+    let task = 0x1773_1773_u64;
+    let cpu_now = 5_000_000_u64; // 5 ms of CPU time consumed
+
+    // One-shot PROF already past the CPU clock → fires once, disarms, and
+    // the armed gate drops back to zero. VIRTUAL (disarmed) must not fire.
+    __test_arm_itimer_cpu(task, ITIMER_PROF, cpu_now - 1, 0);
+    if __test_cpu_itimers_armed() != 1 {
+        __test_reset();
+        return TestResult::Fail("arming PROF did not raise the armed gate");
+    }
+    let (virt, prof) = __test_itimer_cpu_check_due(task, cpu_now, cpu_now);
+    if virt || !prof {
+        __test_reset();
+        return TestResult::Fail("one-shot PROF past its CPU deadline: want (false, true)");
+    }
+    if __test_itimer_cpu_next_fire(task, ITIMER_PROF) != 0 {
+        __test_reset();
+        return TestResult::Fail("one-shot PROF not disarmed after firing");
+    }
+    if __test_cpu_itimers_armed() != 0 {
+        __test_reset();
+        return TestResult::Fail("armed gate did not drop after the one-shot disarm");
+    }
+    let (virt, prof) = __test_itimer_cpu_check_due(task, cpu_now, cpu_now);
+    if virt || prof {
+        __test_reset();
+        return TestResult::Fail("disarmed PROF reported due again");
+    }
+
+    // Periodic VIRTUAL (1 ms): past deadline fires once and re-arms
+    // strictly ahead of the supplied clock; not due again before it.
+    let interval = 1_000_000_u64;
+    __test_arm_itimer_cpu(task, ITIMER_VIRTUAL, cpu_now - 1, interval);
+    let (virt, prof) = __test_itimer_cpu_check_due(task, cpu_now, cpu_now);
+    if !virt || prof {
+        __test_reset();
+        return TestResult::Fail("periodic VIRTUAL past its CPU deadline: want (true, false)");
+    }
+    if __test_itimer_cpu_next_fire(task, ITIMER_VIRTUAL) <= cpu_now {
+        __test_reset();
+        return TestResult::Fail("periodic VIRTUAL did not re-arm past the supplied clock");
+    }
+    let (virt, _) = __test_itimer_cpu_check_due(task, cpu_now, cpu_now);
+    if virt {
+        __test_reset();
+        return TestResult::Fail("re-armed periodic VIRTUAL reported due before its deadline");
+    }
+
+    __test_reset();
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_itimer_cpu_check_due_fires_and_rearms
+);
+
 #[cfg(not(feature = "user-mode-e2e"))]
 fn smoke_userspace_signal_delivery_lowest_first_multiple_pending() -> TestResult {
     // Two signals pending at once. The async delivery hook must pick
