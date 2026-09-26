@@ -3,8 +3,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Returns the normalised attr bytes, or a positive errno.
-fn copy_attr(uattr: u64) -> Result<[u8; SCHED_ATTR_SIZE], i64> {
+/// `sched_copy_attr` — returns the normalised attr, or a positive errno.
+fn copy_attr(uattr: u64) -> Result<SchedAttr, i64> {
     // `err_size` writes `sizeof(*attr)` back before failing. Best-effort:
     // the errno stands even if the caller's buffer turned out unwritable,
     // matching `put_user`'s return being ignored on this path.
@@ -31,12 +31,11 @@ fn copy_attr(uattr: u64) -> Result<[u8; SCHED_ATTR_SIZE], i64> {
     }
 
     let known = size.min(SCHED_ATTR_SIZE);
-    let mut attr = [0u8; SCHED_ATTR_SIZE];
+    let mut bytes = [0u8; SCHED_ATTR_SIZE];
     // SAFETY: copy_from_user range-validates the read; `known` is at most
     // the struct this kernel knows.
-    match unsafe { copy_from_user(&mut attr[..known], uattr) } {
-        Ok(_) => {}
-        Err(_) => return Err(EFAULT),
+    if unsafe { copy_from_user(&mut bytes[..known], uattr) }.is_err() {
+        return Err(EFAULT);
     }
 
     // `copy_struct_from_user`: every byte past the struct THIS kernel knows
@@ -56,40 +55,53 @@ fn copy_attr(uattr: u64) -> Result<[u8; SCHED_ATTR_SIZE], i64> {
         }
     }
 
+    let mut attr = SchedAttr::from_bytes(&bytes);
     // `if ((attr->sched_flags & SCHED_FLAG_UTIL_CLAMP) && size <
     // SCHED_ATTR_SIZE_VER1) return -EINVAL;`
     //
     // -EINVAL here, NOT the -E2BIG above: the size was acceptable, the
-    // combination was not. NARF knows only VER0, so every util-clamp
-    // request lands here — a pre-VER1 kernel's answer, and the reason the
-    // constant is named rather than inlined.
-    let flags = u64::from_ne_bytes(attr[8..16].try_into().unwrap());
-    if flags & SCHED_FLAG_UTIL_CLAMP != 0 && size < SCHED_ATTR_SIZE_VER1 {
+    // combination was not.
+    if attr.flags & SCHED_FLAG_UTIL_CLAMP != 0 && size < SCHED_ATTR_SIZE_VER1 {
         return Err(EINVAL);
     }
-    // `__sched_setscheduler`: `if (attr->sched_flags & ~SCHED_FLAG_ALL)
-    // return -EINVAL;` — a flag no kernel defines is a caller expecting
-    // something that will not happen, and silence would be the wrong answer.
-    if flags & !SCHED_FLAG_ALL != 0 {
-        return Err(EINVAL);
-    }
+    // "XXX: Do we want to be lenient like existing syscalls; or do we want
+    // to be strict and return an error on out-of-bounds values?" — Linux
+    // chose lenient: the nice is clamped, not refused.
+    attr.nice = attr.nice.clamp(-20, 19);
     Ok(attr)
 }
 
 /// `SYSCALL_DEFINE3(sched_setattr, pid_t pid, struct sched_attr __user *uattr,
 /// unsigned int flags)`.
+///
+/// ```text
+/// if (unlikely(!uattr || pid < 0 || flags))            return -EINVAL;
+/// retval = sched_copy_attr(uattr, &attr);               /* E2BIG/EFAULT/EINVAL */
+/// if ((int)attr.sched_policy < 0)                       return -EINVAL;
+/// if (attr.sched_flags & SCHED_FLAG_KEEP_POLICY)
+///         attr.sched_policy = SETPARAM_POLICY;
+/// CLASS(find_get_task, p)(pid); if (!p)                 return -ESRCH;
+/// if (attr.sched_flags & SCHED_FLAG_KEEP_PARAMS)
+///         get_params(p, &attr);
+/// return sched_setattr(p, &attr);                       /* __sched_setscheduler */
+/// ```
+///
+/// This used to store the raw struct bytes after checking only the flag
+/// mask — so an unknown flag beat -ESRCH, SCHED_FIFO at priority 0 and a
+/// SCHED_DEADLINE triple that fails `__checkparam_dl` both succeeded, an
+/// unprivileged task could claim a deadline reservation, and the nice it
+/// asked for never reached getpriority. The whole of `__sched_setscheduler`
+/// now runs, in [`sched_setscheduler_checked`].
 pub(crate) fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let uattr = a.arg1;
-    // `if (unlikely(!uattr || pid < 0 || flags)) return -EINVAL;` — all
-    // three before the struct is read, so a caller that got two things wrong
-    // is not told about the second one first.
-    let pid = a.arg0 as u32 as i32;
-    if uattr == 0 || pid < 0 || a.arg2 != 0 {
+    // `pid_t pid`, `unsigned int flags` — the low 32 bits of each.
+    let pid = a.arg0 as i32;
+    if uattr == 0 || pid < 0 || a.arg2 as u32 != 0 {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let attr = match copy_attr(uattr) {
+    let mut attr = match copy_attr(uattr) {
         Ok(a) => a,
         Err(e) => {
             ctx.set_return(errno_ret(e));
@@ -97,39 +109,24 @@ pub(crate) fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
         }
     };
     // `if ((int)attr.sched_policy < 0) return -EINVAL;` — the cast is
-    // load-bearing: `sched_policy` is a `__u32`, and the check is for a
-    // value that would be negative as a signed int.
-    let policy = i32::from_ne_bytes(attr[4..8].try_into().unwrap());
-    if policy < 0 {
+    // load-bearing: `sched_policy` is a `__u32`.
+    if attr.policy < 0 {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    // `CLASS(find_get_task, p)(pid); if (!p) return -ESRCH;` — pid 0 is the
-    // caller. Storing attributes for a pid that does not exist would leave
-    // the table answering `sched_getattr` for a process nobody can see.
-    let task = match resolve_sched_target(pid as u64) {
-        Some(t) => t,
-        None => {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        }
-    };
-    SCHED_ATTR_TABLE
-        .lock()
-        .get_or_insert_with(alloc::collections::BTreeMap::new)
-        .insert(task, attr);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `find_process_by_pid(pid)` with Linux's `pid == 0 ? current : ...`.
-pub(crate) fn resolve_sched_target(pid: u64) -> Option<u64> {
-    if pid == 0 {
-        return Some(current_task_id());
+    if attr.flags & SCHED_FLAG_KEEP_POLICY != 0 {
+        attr.policy = SETPARAM_POLICY;
     }
-    pid_to_task_raw(pid).or_else(|| {
-        // The harness and early boot register tasks by raw id; accept a live
-        // registry entry under its own id so a self-directed call works
-        // before the pid mapping exists.
-        crate::task::task_get(pid).map(|_| pid)
-    })
+    let Some(task) = find_process_by_pid(pid) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
+    };
+    if attr.flags & SCHED_FLAG_KEEP_PARAMS != 0 {
+        let st = read_sched_state(task);
+        sched_get_params(task, &st, &mut attr);
+    }
+    match sched_setscheduler_checked(task, &attr) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(e) => ctx.set_return(errno_ret(e)),
+    }
 }

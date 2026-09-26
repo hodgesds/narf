@@ -622,9 +622,28 @@ security boundary.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
 calling task's accumulated user and kernel accounting.
-`sched_setscheduler(2)` accepts Linux's `SCHED_RESET_ON_FORK` modifier on every
-otherwise-supported policy; the cooperative scheduler retains compatibility
-state without assigning Linux real-time scheduling authority.
+The scheduling-policy syscalls (`sched_setscheduler`, `sched_setparam`,
+`sched_setattr`, their getters, and `sched_rr_get_interval`) keep a per-task
+policy record (policy, RT priority, `reset_on_fork`, `SCHED_DEADLINE`
+reservation, fair-class custom slice) and validate against it in the order of
+Linux's `__sched_setscheduler`, returning Linux's errnos: `EINVAL` for bad
+arguments, policies, priority/policy disagreement and failed
+`__checkparam_dl`; `ESRCH` for a pid naming no task; `EFAULT` for faulting
+buffers; `EPERM` from `user_check_sched_setscheduler` (RLIMIT_RTPRIO,
+RLIMIT_NICE, leaving `SCHED_IDLE`, clearing `reset_on_fork`, any
+`SCHED_DEADLINE` request, another user's task — all overridable only by host
+`CAP_SYS_NICE`); `EBUSY` from deadline bandwidth admission (default 95% per
+online CPU) and from narrowing a deadline task's affinity; `EOPNOTSUPP` for
+util-clamp requests (no uclamp support; `sched_attr` is published at VER0).
+`SCHED_EXT` is recognised by the priority-range queries but is not a settable
+policy. `sched_setattr` writes a fair task's nice through to the value
+`getpriority` reports. `RLIMIT_RTPRIO` defaults to `{0, 0}`. `fork`/`clone`
+inherit policy, RT priority and nice, apply `SCHED_RESET_ON_FORK`, and fail
+with `EAGAIN` from a `SCHED_DEADLINE` task without it. The record is ABI
+state only: the cooperative scheduler does not grant Linux real-time or
+deadline scheduling authority from it.
+`ioprio_set(2)` rejects undefined classes and `IOPRIO_CLASS_NONE` with a
+level (`EINVAL`), and applies `set_task_ioprio`'s owner check (`EPERM`).
 `sched_yield(2)` returns success and then uses the common completed-syscall
 return path to deliver any pending signal; it is not interrupted with
 `EINTR`. An own-stack task yields when another runnable task, deferred wake,

@@ -76,6 +76,12 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
+    // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — a
+    // SCHED_DEADLINE reservation cannot be duplicated into a child.
+    if sched_fork_denied(current_task_id()) {
+        ctx.set_return(errno_ret(EAGAIN));
+        return;
+    }
 
     let parent_as = match current_address_space() {
         Some(a) => a,
@@ -302,6 +308,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     cap_fork(parent_pid, child_tid.raw());
     // fork(2) copies (never shares) a pre-existing io_context.
     ioprio_fork(parent_pid, child_tid.raw(), false);
+    // `sched_fork`: policy, RT priority and nice are inherited, subject to
+    // SCHED_RESET_ON_FORK.
+    sched_fork(parent_pid, child_tid.raw());
     // POSIX inheritance — fd / cwd / brk / sigaction handlers are
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).

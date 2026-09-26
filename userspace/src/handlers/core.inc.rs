@@ -8813,42 +8813,6 @@ pub fn clear_mempolicy_for_fault() {
     narf_memory::mempolicy_clear();
 }
 
-// ── sched_setattr / sched_getattr ────────────────────────────────────
-//
-// Extended scheduling attributes. NARF's scheduler doesn't honour the
-// deadline params, but the whole `struct sched_attr` round-trips through
-// a per-task side table so getattr reflects setattr.
-
-/// `SCHED_ATTR_SIZE_VER0` — the smallest valid `struct sched_attr`.
-/// `SCHED_ATTR_SIZE_VER0` (`include/uapi/linux/sched/types.h:7`) — the first
-/// published `struct sched_attr`, and the largest NARF knows.
-///
-/// Linux's current `sizeof(struct sched_attr)` is `SCHED_ATTR_SIZE_VER1`
-/// (56): VER1 added `sched_util_min`/`sched_util_max`, which need uclamp
-/// support in the scheduler. NARF has none, so it reports VER0 — which is
-/// not a shortfall in the ABI but a legitimate configuration of it. A
-/// modern caller passing 56 bytes with those fields ZERO is accepted
-/// (`copy_struct_from_user` ignores a zero tail); one that actually asks
-/// for util clamping gets -E2BIG, which is exactly what a pre-VER1 kernel
-/// answers and is how the caller learns to stop asking.
-const SCHED_ATTR_SIZE_VER0: usize = 48;
-/// `SCHED_ATTR_SIZE_VER1` — named so the `SCHED_FLAG_UTIL_CLAMP` rule can
-/// cite the size it requires, even though NARF never accepts one this big.
-const SCHED_ATTR_SIZE_VER1: usize = 56;
-/// The largest `sched_attr` this kernel understands.
-const SCHED_ATTR_SIZE: usize = SCHED_ATTR_SIZE_VER0;
-
-/// `SCHED_FLAG_UTIL_CLAMP` (`include/uapi/linux/sched.h:140`) —
-/// `UTIL_CLAMP_MIN | UTIL_CLAMP_MAX`.
-const SCHED_FLAG_UTIL_CLAMP: u64 = 0x20 | 0x40;
-/// `SCHED_FLAG_ALL` — every flag the ABI defines. A flag outside this is a
-/// caller expecting something no kernel does.
-const SCHED_FLAG_ALL: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
-
-static SCHED_ATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, [u8; SCHED_ATTR_SIZE]>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
-
 // ── adjtimex / clock_adjtime ─────────────────────────────────────────
 //
 // Kernel clock-discipline interface. NARF runs no NTP discipline, so a
@@ -10570,6 +10534,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
+    // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — threads
+    // included; a SCHED_DEADLINE reservation cannot be duplicated.
+    if sched_fork_denied(current_task_id()) {
+        ctx.set_return(errno_ret(EAGAIN));
+        return;
+    }
 
     // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
     // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
@@ -11062,6 +11032,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // otherwise a present context is copied. This includes ioprio state.
     const CLONE_IO: u64 = 0x8000_0000;
     ioprio_fork(parent_pid, child_tid.raw(), flags & CLONE_IO != 0);
+    // `sched_fork`: policy, RT priority and nice are inherited, subject to
+    // SCHED_RESET_ON_FORK.
+    sched_fork(parent_pid, child_tid.raw());
 
     // fd table: CLONE_FILES (every pthread) SHARES one table with the parent —
     // an fd opened by any thread is visible to all, and close/dup affect all
@@ -12788,12 +12761,7 @@ fn release_task_tables(tid: u64) {
             NICE_CUSTOM_ROWS.fetch_sub(1, Ordering::Release);
         }
     }
-    if let Some(m) = SCHED_PARAM_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = SCHED_ATTR_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
+    sched_state_release(tid);
     if let Some(m) = UMASK_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
@@ -15147,6 +15115,11 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
     // everything-is-privileged shape as the capability gaps this branch
     // closes, wearing an rlimit's clothes.
     t[13] = RLimitPair { cur: 0, max: 0 };
+    // RLIMIT_RTPRIO = 14. Also `{ 0, 0 }` in Linux's INIT_RLIMITS, and for
+    // the same reason: `user_check_sched_setscheduler` lets an unprivileged
+    // task enter SCHED_FIFO/SCHED_RR only up to this ceiling. Infinity made
+    // every task a real-time-capable one.
+    t[14] = RLimitPair { cur: 0, max: 0 };
     // RLIMIT_CORE = 4.
     t[4] = RLimitPair {
         cur: 0,
@@ -15879,92 +15852,6 @@ fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {
     let entry = m.entry(task).or_default();
     f(entry);
     true
-}
-
-// ── sched_get_priority_max / min + getparam / setparam ────────────
-//
-// Linux exposes a small policy-shaped surface: each scheduling
-// policy has a (min, max) priority range, and each task has a
-// `sched_param { int sched_priority }` slot. NARF's scheduler
-// uses the cap-gated CpuBudget surface for actual routing; the
-// POSIX surface here is structural only — it round-trips so a
-// libc consumer that asserts `sched_get_priority_min(SCHED_RR) <=
-// param.sched_priority <= sched_get_priority_max(SCHED_RR)` sees
-// a coherent answer.
-
-const SCHED_OTHER: i32 = 0;
-const SCHED_FIFO: i32 = 1;
-const SCHED_RR: i32 = 2;
-const SCHED_BATCH: i32 = 3;
-const SCHED_IDLE: i32 = 5;
-/// `include/uapi/linux/sched.h`. Neither policy is admissible through
-/// `sched_setscheduler` (Linux routes SCHED_DEADLINE via `sched_setattr`,
-/// SCHED_EXT via a loaded BPF scheduler), but both are still *recognised*
-/// policy numbers for the priority-range query below.
-const SCHED_DEADLINE: i32 = 6;
-const SCHED_EXT: i32 = 7;
-
-/// `kernel/sched/syscalls.c::SYSCALL_DEFINE1(sched_get_priority_max)`.
-///
-/// ```text
-/// int ret = -EINVAL;
-/// switch (policy) {
-/// case SCHED_FIFO: case SCHED_RR:  ret = MAX_RT_PRIO-1; break;   /* 99 */
-/// case SCHED_DEADLINE: case SCHED_NORMAL: case SCHED_BATCH:
-/// case SCHED_IDLE: case SCHED_EXT: ret = 0; break;
-/// }
-/// return ret;
-/// ```
-///
-/// Linux's version is a bare switch with NO capability or admission check,
-/// so SCHED_DEADLINE/SCHED_EXT report a range here even though
-/// `sched_setscheduler` refuses them. Reporting EINVAL for those two made
-/// a libc probing the range before choosing a policy conclude the kernel
-/// was too old to know the constant at all.
-fn priority_max_for_policy(policy: i32) -> Option<i64> {
-    match policy {
-        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => Some(0),
-        SCHED_FIFO | SCHED_RR => Some(99),
-        _ => None,
-    }
-}
-
-/// `kernel/sched/syscalls.c::SYSCALL_DEFINE1(sched_get_priority_min)` — the
-/// same switch, returning 1 for the two real-time policies.
-fn priority_min_for_policy(policy: i32) -> Option<i64> {
-    match policy {
-        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => Some(0),
-        SCHED_FIFO | SCHED_RR => Some(1),
-        _ => None,
-    }
-}
-
-// Per-task sched_param slot. Single i32 (sched_priority).
-static SCHED_PARAM_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
-pub fn sched_param_init() {
-    *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
-}
-
-#[doc(hidden)]
-/// Test-only: seed a task's stored `sched_priority` directly.
-///
-/// `sched_setparam` only accepts 0 for a SCHED_OTHER task (Linux's
-/// `rt_policy(policy) != (attr->sched_priority != 0)` rule), so a test that
-/// needs a DISTINGUISHABLE value — to prove which task's slot was written,
-/// say — cannot get one through the syscall. Seeding here keeps those
-/// tests testing what they are about (pid-namespace translation) instead
-/// of the priority validation.
-#[doc(hidden)]
-pub fn __test_set_sched_param(task: u64, val: i32) {
-    let mut g = SCHED_PARAM_TABLE.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    m.insert(task, val);
-}
-
-pub fn __test_sched_param_reset() {
-    *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
 }
 
 // ── Sched_get/setaffinity — CPU bitmap ─────────────────────────────

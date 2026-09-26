@@ -10,20 +10,20 @@ use super::*;
 ///         if (pid < 0)                            return -EINVAL;
 ///         struct task_struct *p = find_process_by_pid(pid);
 ///         if (!p)                                 return -ESRCH;
-///         ...
+///         if (p->sched_class->get_rr_interval)
+///                 time_slice = p->sched_class->get_rr_interval(rq, p);
+///         jiffies_to_timespec64(time_slice, t);
 /// }
 /// /* then */
 /// if (retval == 0)
 ///         retval = put_timespec64(&t, interval);   /* -EFAULT */
 /// ```
 ///
-/// `pid` was read and discarded. The cooperative policy has no round-robin
-/// quantum, so the VALUE reported is `{0, 0}` either way — but that is not
-/// a licence to skip resolving the argument, because the value is not the
-/// only thing the call communicates. `sched_rr_get_interval(-1, buf)` and
-/// `sched_rr_get_interval(<dead pid>, buf)` are how a caller discovers that
-/// its argument is wrong or its target has exited; answering 0 to both
-/// tells it the process is alive and running with no quantum.
+/// The quantum is per class: SCHED_RR reports `sched_rr_timeslice`
+/// (100 ms), SCHED_FIFO 0, SCHED_DEADLINE 0 (the class has no
+/// `get_rr_interval`), and the fair class `NS_TO_JIFFIES(se.slice)` — which
+/// at this model's HZ truncates the default sub-10 ms slice to 0 and only a
+/// larger custom `sched_setattr` slice shows through.
 ///
 /// The destination is written only after the pid resolves, per the
 /// `if (retval == 0)` guard above.
@@ -36,27 +36,24 @@ pub(crate) fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    // `find_process_by_pid(pid)` resolves in the CALLER's pid namespace;
-    // pid == 0 is the caller itself and always exists.
-    let caller = current_task_id();
-    if pid != 0 {
-        let Some(outer) = accept_pid_from(caller, pid as u64) else {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        };
-        let resolved = proc_pid_to_tid(outer);
-        // `proc_pid_to_tid` falls back to the identity mapping for an
-        // unregistered pid, so an existence check is what actually
-        // implements `if (!p) return -ESRCH;`.
-        if resolved != caller && crate::task::task_get(resolved).is_none() {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        }
-    }
-    // `put_timespec64(&t, interval)` — only reached once the pid resolved.
-    // A NULL destination fails range validation here, which is Linux's
-    // path: there is no separate null check.
-    let kbuf = [0u8; 16]; // tv_sec = 0, tv_nsec = 0
+    let Some(task) = find_process_by_pid(pid) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
+    };
+    let st = read_sched_state(task);
+    const NSEC_PER_JIFFY: u64 = 1_000_000_000 / SCHED_HZ;
+    let slice_ns = match st.policy {
+        SCHED_RR => SCHED_RR_TIMESLICE_NS,
+        SCHED_FIFO | SCHED_DEADLINE => 0,
+        // `get_rr_interval_fair`: whole jiffies of `se.slice`.
+        _ => task_slice_ns(&st) / NSEC_PER_JIFFY * NSEC_PER_JIFFY,
+    };
+    let mut kbuf = [0u8; 16];
+    kbuf[..8].copy_from_slice(&((slice_ns / 1_000_000_000) as i64).to_ne_bytes());
+    kbuf[8..].copy_from_slice(&((slice_ns % 1_000_000_000) as i64).to_ne_bytes());
+    // `put_timespec64(&t, interval)`. A NULL destination fails range
+    // validation here, which is Linux's path: there is no separate null
+    // check.
     // SAFETY: copy_to_user range-validates `buf` (including the null case)
     // and SMAP-brackets the 16-byte write.
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {

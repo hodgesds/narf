@@ -38,12 +38,21 @@ use super::*;
 /// now shared with getpriority and the ioprio pair.
 ///
 /// Across a set, Linux threads the error through `set_one_prio(p, niceval,
-/// error)`: it starts at -ESRCH and a task that IS renicable clears it to
-/// 0, while a task that is not overwrites it with -EPERM/-EACCES. So a
-/// partially-permitted group reports whichever task was visited last, and
-/// an empty set reports -ESRCH. That is faithfully odd, and reproduced
-/// rather than tidied — a caller that renices a group it partly owns sees
-/// success on Linux, and "tidying" it into an error would break that.
+/// error)`:
+///
+/// ```text
+/// if (!set_one_prio_perm(p)) { error = -EPERM;  goto out; }
+/// if (... !can_nice(...))    { error = -EACCES; goto out; }
+/// if (error == -ESRCH) error = 0;
+/// set_user_nice(p, niceval);
+/// ```
+///
+/// A success clears ONLY the initial -ESRCH; it never clears a failure
+/// recorded against an earlier task. So the answer for a set is the LAST
+/// failure if any task failed, else 0, else (empty set) -ESRCH — while
+/// every permitted member is still reniced. This used to set 0 on every
+/// success, so a group whose last member happened to be renicable reported
+/// success even though earlier members were refused.
 pub(crate) fn sys_setpriority(ctx: &mut dyn TrapContext) {
     const PRIO_PROCESS: i64 = 0;
     const PRIO_PGRP: i64 = 1;
@@ -91,14 +100,19 @@ pub(crate) fn sys_setpriority(ctx: &mut dyn TrapContext) {
         if prio < current {
             let nice_rlim = (20 - prio) as u64;
             let ceiling = read_rlimit(task, RLIMIT_NICE).map(|l| l.cur).unwrap_or(0);
-            if nice_rlim > ceiling && !capable_over_task(task, CAP_SYS_NICE) {
+            // `can_nice`: `is_nice_reduction(p, nice) || capable(CAP_SYS_NICE)`
+            // — plain `capable()`, the INITIAL user namespace. Unlike the
+            // ownership test above, a container root may not lower nice.
+            if nice_rlim > ceiling && !capable(CAP_SYS_NICE) {
                 result = -EACCES;
                 continue;
             }
         }
 
         if write_nice(task, prio as i32) {
-            result = 0;
+            if result == -ESRCH {
+                result = 0;
+            }
         } else {
             // Internal: the nice table is uninitialized (unreachable for a
             // live task). -EPERM is set_one_prio's failure errno.

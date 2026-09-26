@@ -174,10 +174,10 @@ kernel_test_in!(
 // ── #18 sched_setparam(pid) — Linux kernel/sched/syscalls.c ──
 //
 // `let task = if pid == 0 { current } else { pid };` used the caller-namespace
-// pid directly as the SCHED_PARAM_TABLE key. The fix mirrors sched_setaffinity.
+// pid directly as the sched-state table key. The fix mirrors sched_setaffinity.
 // The manager sets the worker's param by inner pid 2, then the worker reads its
-// OWN param (self arm): the fix routed the write to the worker (99), the bug
-// wrote the raw-`2` slot, leaving the worker's entry at the default (0).
+// OWN param (self arm): the fix routes the write to the worker (40), the bug
+// wrote the raw-`2` slot, leaving the worker's entry at its seed (50).
 fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
     with_setup(|| {
         const MANAGER_TASK: u64 = 0xE100;
@@ -191,19 +191,19 @@ fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
             register(WORKER_TASK, WORKER_PID);
             build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
 
-            // Seed the worker's slot with a sentinel, then have the manager
-            // write 0 to it by INNER pid. If the translation resolves, the
-            // sentinel is overwritten; if setparam keyed the raw inner pid
-            // instead, the sentinel survives.
+            // Make the worker SCHED_FIFO at 50, then have the manager lower
+            // it to 40 by INNER pid. If the translation resolves, the worker
+            // reads 40; if setparam keyed the raw inner pid instead, the
+            // worker still reads 50 (or the call fails outright, because the
+            // raw slot is a SCHED_OTHER task that only accepts 0).
             //
-            // The value written has to be 0 — `sched_setparam` accepts only
-            // 0 for a SCHED_OTHER task — so the discriminator is the
-            // sentinel's disappearance rather than a distinctive value
-            // arriving. (This test used to write 99, which Linux rejects
-            // outright on SCHED_OTHER.)
-            const SENTINEL: i32 = 0x5A5A;
-            crate::handlers::__test_set_sched_param(WORKER_TASK, SENTINEL);
-            let prio = 0i32;
+            // LOWERING keeps the case about translation: raising an RT
+            // priority past RLIMIT_RTPRIO is a separate, privileged question
+            // (`user_check_sched_setscheduler`).
+            const SEEDED: i32 = 50;
+            const WRITTEN: i32 = 40;
+            crate::handlers::__test_set_sched_param(WORKER_TASK, SEEDED);
+            let prio = WRITTEN;
             set_task(MANAGER_TASK);
             if call(
                 Syscall::SchedSetparam.raw(),
@@ -222,7 +222,7 @@ fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
             {
                 return Err("reading the worker's sched param failed");
             }
-            if out == 0 {
+            if out == WRITTEN {
                 Ok(())
             } else {
                 Err("sched_setparam wrote the raw inner pid's TaskId slot, not the worker's — accept_pid_from -> pid_to_task_raw missing")
@@ -499,7 +499,9 @@ fn smoke_abi_pidns_ioprio_set_resolves_in_caller_pid_ns() -> TestResult {
         const WORKER_PID: u64 = 0xA011;
         const IOPRIO_WHO_PROCESS: u64 = 1;
         const IOPRIO_DEFAULT: u64 = (2u64 << 13) | 4;
-        const WORKER_PRIO: u64 = 0x0AAA;
+        // IOPRIO_CLASS_IDLE — valid and distinct from the BE/4 default. (A
+        // CLASS_NONE word with a level set is -EINVAL in `ioprio_check_cap`.)
+        const WORKER_PRIO: u64 = 3u64 << 13;
 
         crate::pid_ns::__test_reset();
         let result = (|| {
@@ -547,7 +549,8 @@ fn smoke_abi_pidns_ioprio_get_resolves_in_caller_pid_ns() -> TestResult {
         const WORKER_PID: u64 = 0xA021;
         const IOPRIO_WHO_PROCESS: u64 = 1;
         const IOPRIO_DEFAULT: u64 = (2u64 << 13) | 4;
-        const WORKER_PRIO: u64 = 0x0246;
+        // IOPRIO_CLASS_BE level 1 — valid and distinct from the BE/4 default.
+        const WORKER_PRIO: u64 = (2u64 << 13) | 1;
 
         crate::pid_ns::__test_reset();
         let result = (|| {
