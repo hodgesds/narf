@@ -7046,6 +7046,11 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
 /// interrupts disabled from the trap handler. The raised signal is then
 /// delivered by `signal_delivery_hook` on the same trap's return to user.
 pub fn timer_tick_raise_due_signals() {
+    // CPU itimers (ITIMER_VIRTUAL → SIGVTALRM, ITIMER_PROF → SIGPROF) for
+    // the interrupted/current task. Checked ahead of the REAL scan because
+    // the REAL fast gate below returns from the whole function; both paths
+    // are alloc-free and one-atomic-load cheap when unused.
+    crate::posix_timer::itimer_cpu_tick();
     {
         let Some(now) = crate::posix_timer::itimer_real_due_now() else {
             return;

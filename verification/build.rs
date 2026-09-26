@@ -611,6 +611,7 @@ fn main() {
         "consoletty_smoke",
         "alarmloop_smoke",
         "fifoeintr_smoke",
+        "profloop_smoke",
         "preemptsched_smoke",
         "fpu_preempt_smoke",
         "procfs2_smoke",

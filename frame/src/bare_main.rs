@@ -5547,6 +5547,12 @@ fn boot_userspace_init() {
                     "fifoeintr_smoke",
                     narf_verification::NARF_FIFOEINTR_SMOKE_ELF,
                 ),
+                // CPU itimers: SIGPROF/SIGVTALRM fire preemptively into a
+                // CPU-bound spin once enough CPU time is consumed.
+                (
+                    "profloop_smoke",
+                    narf_verification::NARF_PROFLOOP_SMOKE_ELF,
+                ),
                 // (b) Preemptive scheduling: a CPU-bound child is time-
                 // sliced so the parent's timed sleep returns on time.
                 (
