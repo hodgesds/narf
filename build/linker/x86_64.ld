@@ -200,12 +200,6 @@ SECTIONS
         __data_end = .;
     } :data
 
-    .bss : AT(ADDR(.bss) - KERNEL_VIRT_BASE) ALIGN(4K) {
-        __bss_start = .;
-        *(.bss .bss.*)
-        *(COMMON)
-        __bss_end = .;
-    } :data
 
 
     /* Physical bounds of the loaded image, as VALUES in a high-half word.
@@ -251,6 +245,28 @@ SECTIONS
         *(.got.plt)
         *(.data.rel.ro .data.rel.ro.*)
         __got_end = .;
+    } :data
+
+    /* `.bss` is LAST in this segment, deliberately.
+     *
+     * It is NOBITS, so it costs no file bytes — but only while nothing with file
+     * bytes follows it in the same PT_LOAD. A segment's file image has to be
+     * contiguous, so a PROGBITS section after `.bss` forces the ELF to pad
+     * across the whole hole and `p_filesz` comes out equal to `p_memsz`.
+     *
+     * That is not cosmetic: it disables the UEFI loader's headroom strategy,
+     * which only allocates up to `file_backed_end` and claims the `.bss` tail
+     * after ExitBootServices so the image can outgrow the conventional-memory
+     * block it loads into. The aarch64 script had `.kernel_bounds` and
+     * `.ap_boot_syms` after `.bss` and its UEFI boot died with `Allocation`
+     * once the padded span reached a BOOT_SERVICES_DATA block (fixed in
+     * 57ecddee). x86_64 had the same ordering and was dormant only because its
+     * firmware happens to lay memory out differently. */
+    .bss : AT(ADDR(.bss) - KERNEL_VIRT_BASE) ALIGN(4K) {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        __bss_end = .;
     } :data
 
     /* Physical aliases of the GOT, for the 32-bit slide pass.

@@ -1451,6 +1451,34 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             //    physical in-image address already gets the delta, as do the
             //    `.ap_boot_syms` entries, so it is likely on the Rust side.
             //
+            // Narrowed further since, by bisecting the reserved span against the
+            // btrfs cases (which reproduce it in ~2 s on their own):
+            //
+            //  * only EIGHT PAGES actually matter — `[__kernel_start + 0x1000,
+            //    + 0x9000)` of the OLD image, which is exactly the stub's page
+            //    tables, `l0_lo` through `l2_img`. Reserving just those is enough;
+            //    the other ~68 MiB can be freed.
+            //  * that is specific, not allocator luck: reserving the SAME number
+            //    of pages at +0x20000, +0x40000 and +0x89000 (the old stack) all
+            //    still crash.
+            //  * and yet the MMU is NOT using them. TTBR0/TTBR1 read back as
+            //    `l0_lo + delta` and `l0_hi + delta` — the copy's tables — and a
+            //    walk of the live L0/L1 tables finds no descriptor whose output
+            //    lands in the old range. So this is not a stale root or a stale
+            //    table link.
+            //
+            // Which leaves a stray WRITE to those fixed physical addresses,
+            // clobbering whatever the buddy put there — consistent with the
+            // symptom, a call through a function pointer that reads back as 0.
+            // Catching it wants those pages mapped read-only, and `map_4kb`
+            // refuses because the linear map covers them with a 2 MiB block, so
+            // the next step is demoting that block first.
+            //
+            // The span stays at the whole image rather than the eight pages: a
+            // 32 KiB window is only known-sufficient for the configurations
+            // tested, and narrowing it on an unexplained mechanism trades 68 MiB
+            // of RAM for a much sharper edge.
+            //
             // Reserving it costs the image's size (~68 MiB) and makes the delta
             // safe to randomize, where the old over-wide bound starved a 1 GiB
             // machine outright ("memory allocation of 16777216 bytes failed") for
