@@ -1705,7 +1705,7 @@ type ExecOpen = (
 /// whichever segments are copied eagerly. Reading through the file supplies
 /// exactly those. Linux never reads the image whole either; `load_elf_phdrs`
 /// reads the phdr table and `elf_map` mmaps the rest.
-pub(crate) enum ExecSource {
+pub enum ExecSource {
     /// An image already in memory with no file behind it: the fexecve/memfd
     /// arm, where the caller's fd is the only thing that ever held the bytes.
     Mem(alloc::vec::Vec<u8>),
@@ -1717,6 +1717,23 @@ pub(crate) enum ExecSource {
         /// than silently parsing zeros.
         size: u64,
     },
+}
+
+impl core::fmt::Debug for ExecSource {
+    /// `FileOps` is a trait object with no `Debug` bound, so report the shape
+    /// and size rather than the contents — and the contents are an executable
+    /// image, which no diagnostic wants inline.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ExecSource::Mem(bytes) => f
+                .debug_struct("ExecSource::Mem")
+                .field("len", &bytes.len())
+                .finish(),
+            ExecSource::File { size, .. } => {
+                f.debug_struct("ExecSource::File").field("size", size).finish()
+            }
+        }
+    }
 }
 
 impl crate::elf::ExecBytes for ExecSource {

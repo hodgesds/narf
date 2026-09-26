@@ -5096,3 +5096,113 @@ kernel_test_in!(
     "userspace/elf",
     smoke_userspace_coredump_notes_are_well_formed
 );
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_boot_path_load_demand_pages() -> TestResult {
+    // Boot-init used to slurp its PID 1 into a `Vec` (`read_path_from_vfs`) and
+    // hand the loader a byte slice, so the one process on the system guaranteed
+    // to be large — systemd is tens of megabytes — was the only one that paid the
+    // full read and the full resident cost, while every process it went on to
+    // exec got demand paging. The asymmetry was an accident of which function
+    // boot happened to call.
+    //
+    // `load_user_process_from_path` is the fix, and it is tested HERE rather than
+    // through boot because the systemd path needs a `systemd_pid1` flag and a
+    // real rootfs that CI does not have — the same "wired but never executed"
+    // trap that this loader's demand paging fell into once already. Driving the
+    // function directly is what makes the change verified rather than plausible.
+    use crate::process::{load_user_process_from_path, resolve_exec_file};
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+    use narf_memory::{RegionPerms, VirtAddr};
+
+    // 64 pages of congruent, page-aligned text: over the loader's demand floor,
+    // and large enough that eager copying would be unmistakable in the resident
+    // count.
+    const TEXT_PAGES: u64 = 64;
+    const TEXT_BYTES: u64 = TEXT_PAGES * 4096;
+    const SEG_FOFF: u64 = 0x1000;
+
+    let mut elf = alloc::vec![0u8; (SEG_FOFF + TEXT_BYTES) as usize];
+    elf[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    elf[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    elf[0x12..0x14].copy_from_slice(&EM_NATIVE_TEST.to_le_bytes());
+    elf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    elf[0x18..0x20].copy_from_slice(&(SEG_FOFF + 0x40).to_le_bytes());
+    elf[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    elf[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    elf[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    elf[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    elf[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    elf[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    elf[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    elf[ph + 0x20..ph + 0x28].copy_from_slice(&TEXT_BYTES.to_le_bytes());
+    elf[ph + 0x28..ph + 0x30].copy_from_slice(&TEXT_BYTES.to_le_bytes());
+    elf[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    for k in 0..TEXT_PAGES {
+        let start = (SEG_FOFF + k * 4096) as usize;
+        elf[start..start + 4096].fill(0x51u8.wrapping_add(k as u8));
+    }
+
+    let auth = bootstrap_mount_authority();
+    let mount = registry()
+        .mount(
+            &auth,
+            "/boot-path-load",
+            MemFs::with_seeds("boot-path-load", &[("pid1", elf.as_slice())]),
+        )
+        .ok();
+    let path = "/boot-path-load/pid1";
+
+    let verdict = (|| -> Result<(), &'static str> {
+        // The resolver boot uses for its "is it there?" check must agree with the
+        // file the loader then opens.
+        let (_, size) =
+            resolve_exec_file(path).ok_or("resolve_exec_file did not find the image")?;
+        if size != elf.len() as u64 {
+            return Err("resolve_exec_file reported the wrong size");
+        }
+
+        // SAFETY: the harness keeps the kernel direct map live and the frame
+        // allocator initialised — the loader's `# Safety` contract.
+        let proc = match unsafe {
+            load_user_process_from_path(path, &["pid1"], &[], &[], None, crate::alloc_pid())
+        } {
+            Ok(p) => p,
+            Err(_) => return Err("load_user_process_from_path failed"),
+        };
+        let resident = proc.address_space.memory_stats().resident_pages;
+        let text_va = proc.program_bias.wrapping_add(SEG_FOFF);
+        let demand = proc
+            .address_space
+            .lookup(VirtAddr::new(text_va))
+            .is_some_and(|region| {
+                region.perms.contains(RegionPerms::FILE_DEMAND) && region.phys.is_empty()
+            });
+        let pid = proc.pid;
+        drop(proc);
+        crate::release_pid(pid);
+
+        if !demand {
+            return Err("a path-loaded image was copied eagerly");
+        }
+        // 64 pages of text must not be resident. The stack and the auxv pages are,
+        // so this is a ceiling rather than zero.
+        if resident >= TEXT_PAGES {
+            return Err("a path-loaded image left its text resident");
+        }
+        Ok(())
+    })();
+
+    if let Some(h) = &mount {
+        let _ = registry().unmount(h, "/boot-path-load");
+    }
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("userspace/elf", smoke_userspace_boot_path_load_demand_pages);
