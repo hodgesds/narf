@@ -123,6 +123,27 @@ fn migrate_frame_multi(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
         return Err(MigrateError::Raced);
     }
 
+    // Refuse to migrate a frame ANY owner maps SHARED (MAP_SHARED, SysV/native
+    // shmem, device buffers, the vvar page): those frames are owned by an external
+    // registry, not the COW refcount, so `free_frame(src)` below would dec_ref an
+    // unregistered frame straight to the buddy while the registry still owns it —
+    // a cross-owner double-free and use-after-free — and repointing a SHARED owner
+    // to a private copy silently breaks MAP_SHARED coherence. The single-owner
+    // path (`relocate_page_inner`) refuses SHARED for the same reason; the
+    // multi-owner path must too. Refuse the WHOLE migration (not per owner) so a
+    // mixed owner set never leaves a SHARED owner mapping a freed `src`. The
+    // compactor treats this as an unmovable block and moves on.
+    for owner in &owners {
+        if let Some(aspace) = resolve_address_space(owner.root) {
+            if aspace
+                .perms_covering(owner.va, 1)
+                .is_some_and(|p| p.contains(crate::address_space::RegionPerms::SHARED))
+            {
+                return Err(MigrateError::Failed);
+            }
+        }
+    }
+
     // Allocate `dst` on `src`'s node and copy the contents.
     // SAFETY: `src` is a live frame naming its node.
     let node = unsafe { crate::frame::narf_phys_node(src.raw()) };
@@ -716,6 +737,81 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_migrate_frame_relocates);
+
+    // A frame mapped SHARED by multiple owners (SysV/native shmem, wl_shm, a device
+    // buffer, the vvar page) must NOT be migrated: it is owned by an external
+    // registry, not the COW refcount, so freeing it during migration would return a
+    // registry-owned frame to the buddy — a cross-owner double-free / use-after-free
+    // — and repointing a SHARED owner to a private copy breaks MAP_SHARED coherence.
+    // The multi-owner path must refuse it, just as the single-owner path refuses a
+    // SHARED region.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_migrate_multi_refuses_shared_owner() -> TestResult {
+        use super::migrate_frame;
+        use crate::{Region, RegionPerms, VirtAddr};
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let p = match crate::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // Two SHARED regions backing the SAME borrowed frame (one segment attached
+        // at two addresses) → two rmap owners → migrate_frame routes to the
+        // multi-owner path.
+        let va1 = VirtAddr::new(0x0000_0080_00B0_0000);
+        let va2 = VirtAddr::new(0x0000_0080_00B1_0000);
+        for va in [va1, va2] {
+            if aspace
+                .map_region(Region {
+                    base: va,
+                    len: 4096,
+                    perms: RegionPerms::READ | RegionPerms::SHARED,
+                    phys: alloc::vec![p],
+                })
+                .is_err()
+            {
+                crate::frame::free_frame(crate::frame::PhysFrame::new(p));
+                return TestResult::Fail("map_region(SHARED) failed");
+            }
+        }
+        crate::rmap::add(p, aspace.root, va1);
+        crate::rmap::add(p, aspace.root, va2);
+        *TEST_AS.lock() = Some(aspace.clone());
+        register_address_space_resolver(&SINGLE_AS_RESOLVER);
+
+        let result = (|| {
+            // owner_count == 2 → migrate_frame_multi, which must refuse a SHARED frame.
+            if migrate_frame(p).is_ok() {
+                return TestResult::Fail(
+                    "migrate_frame migrated a SHARED frame (double-free / UAF risk)",
+                );
+            }
+            // Refused before any copy/repoint/free: both owners still map `p`.
+            if crate::rmap::owner_count(p) != 2 {
+                return TestResult::Fail("SHARED refusal must leave the frame's owners intact");
+            }
+            TestResult::Pass
+        })();
+
+        // Cleanup: drop the rmap owners, then leak the AS (its SHARED regions borrow
+        // `p`, so its teardown must not touch `p`) and free the frame exactly once.
+        crate::rmap::remove(p, aspace.root, va1);
+        crate::rmap::remove(p, aspace.root, va2);
+        *TEST_AS.lock() = None;
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        core::mem::forget(aspace);
+        crate::frame::free_frame(crate::frame::PhysFrame::new(p));
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_migrate_multi_refuses_shared_owner);
 
     // A user store that lands right as the migration invalidates the page must
     // survive the move: the leaf teardown + cross-CPU flush has to PRECEDE the
