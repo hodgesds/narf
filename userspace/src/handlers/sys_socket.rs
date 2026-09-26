@@ -155,6 +155,13 @@ pub(super) fn validate_socket_create(
     }
     let domain = family as u16;
     let protocol = raw_proto as i32;
+    // `__sock_create`: PF_INET + SOCK_PACKET is redirected to PF_PACKET, which
+    // is not registered here → EAFNOSUPPORT (not inet_create's
+    // ESOCKTNOSUPPORT).
+    const SOCK_PACKET: u32 = 10;
+    if domain == AF_INET && kind == SOCK_PACKET {
+        return Err(EAFNOSUPPORT);
+    }
     match domain {
         AF_UNIX => {
             if protocol != 0 && protocol != AF_UNIX as i32 {

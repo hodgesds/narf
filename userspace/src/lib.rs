@@ -111,6 +111,7 @@ mod abi_proc2_tests;
 mod abi_proc_tests;
 mod abi_sched_tests;
 mod abi_signal_tests;
+mod abi_socket_errno_tests;
 mod abi_socket_tests;
 mod abi_test_support;
 mod abi_tests;

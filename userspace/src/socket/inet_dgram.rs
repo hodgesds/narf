@@ -401,13 +401,15 @@ impl SocketFile {
         // A non-local address is EADDRNOTAVAIL (`inet_addr_valid_or_nonlocal`,
         // `net/ipv4/af_inet.c:500`); INADDR_ANY, local unicast, broadcast and
         // multicast are all bindable.
-        let ipb = ip.to_be_bytes();
-        let bindable = ip == INADDR_ANY
-            || (224..=239).contains(&ipb[0])
-            || narf_net::iface::is_local_addr_in(ns, ipb)
-            || narf_net::iface::is_broadcast_in(ns, ipb);
-        if !bindable {
+        // IP_FREEBIND / IP_TRANSPARENT lift the check.
+        let freebind = self.options.lock().ip_freebind;
+        if !super::inet4_bindable(ns, ip, freebind) {
             return SocketOpResult::Err(SockError::AddrNotAvail);
+        }
+        // A port below `ip_unprivileged_port_start` without
+        // CAP_NET_BIND_SERVICE → EACCES (`net/ipv4/af_inet.c:503-507`).
+        if super::inet_port_denied(port) {
+            return SocketOpResult::Err(SockError::Access);
         }
         let mut bound = INET_DGRAM_BOUND.lock();
         let map = bound.get_or_insert_with(BTreeMap::new);

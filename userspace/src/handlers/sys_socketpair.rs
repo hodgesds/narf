@@ -34,6 +34,15 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     // -EPROTONOSUPPORT, -EPERM) come from the same validation as socket(2).
     // Only AF_UNIX implements `->socketpair`; any other family that creates
     // successfully is -EOPNOTSUPP (`sock_no_socketpair`).
+    // `__sys_socketpair` stores the two reserved descriptors to `usockvec`
+    // (put_user → EFAULT) BEFORE `sock_create`, so a bad `sv` pointer beats
+    // every family / type / protocol error. Probe it the same way; the real
+    // descriptors overwrite this placeholder on success.
+    // SAFETY: copy_to_user range-validates the 8-byte destination.
+    if unsafe { copy_to_user(sv_ptr, &[0xffu8; 8]) }.is_err() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
     let (domain, kind, _protocol) = match handler_sys_socket::validate_socket_create(
         args.arg0,
         raw_type & SOCK_TYPE_MASK,
