@@ -52,7 +52,12 @@ unsafe extern "C" {
 #[inline]
 fn ap_entry_phys() -> u64 {
     // SAFETY: a linker-populated word inside the image, read-only.
-    unsafe { core::ptr::addr_of!(__ap_boot_syms).read()[0] }
+    let link_phys = unsafe { core::ptr::addr_of!(__ap_boot_syms).read()[0] };
+    // The linker recorded where `_ap_start` was LINKED. If the image was
+    // physically relocated, the copy is what runs and the original is still
+    // sitting there looking valid, so an AP sent to the link-time address boots
+    // against stale page tables and never checks in.
+    narf_memory::kaslr::image_link_phys(link_phys)
 }
 
 /// Physical address of the per-CPU stack-top table (`AP_STACKS`,
@@ -60,7 +65,12 @@ fn ap_entry_phys() -> u64 {
 #[inline]
 fn ap_stacks_phys() -> u64 {
     // SAFETY: a linker-populated word inside the image, read-only.
-    unsafe { core::ptr::addr_of!(__ap_boot_syms).read()[1] }
+    let link_phys = unsafe { core::ptr::addr_of!(__ap_boot_syms).read()[1] };
+    // Same conversion as the entry point, and it has to match: the BSP fills
+    // this table through its kernel VA (so, the copy) while the AP reads it by
+    // physical address. Converting only one of the two would have them
+    // disagreeing about where the stacks are.
+    narf_memory::kaslr::image_link_phys(link_phys)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

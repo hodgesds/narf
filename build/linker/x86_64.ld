@@ -62,17 +62,10 @@ KASLR_SLIDE_FIXED = 0x00000000;
  *     clear of anything the loader marked reserved — which is why choosing it
  *     needs the memory map, and why this is pinned until the stub can parse
  *     one. */
-/* DISABLED pending a fix: a target above ~1 GiB hangs the boot during the MMU
- * handoff, intermittently, because the delta is drawn per boot. It was verified
- * only on a 1 GiB test VM, where the selector cannot draw a delta that large —
- * `NARF_QEMU_MEM_MB=4096` reproduces it in a couple of boots, and
- * KASLR_PHYS_FIXED=0x54800000 reproduces it every time. Re-enable once that is
- * fixed and tested at 4 GiB.
- *
- * Master switch for physical relocation. The target is chosen from the
+/* Master switch for physical relocation. The target is chosen from the
  * bootloader's memory map at boot (see `.Lphys_pick` in boot.S); only the Xen
  * PVH handoff is parsed, so a multiboot2 boot simply does not relocate. */
-KASLR_PHYS_ENABLE = 0;
+KASLR_PHYS_ENABLE = 1;
 
 /* Pin the delta to a specific value for reproducing a layout. Unvalidated, like
  * KASLR_SLIDE_FIXED. 0 = choose one from the memory map. */

@@ -9,6 +9,54 @@ _start:
     /* Save the incoming DTB pointer. */
     mov x19, x0
 
+    /* ── Physical relocation ────────────────────────────────────────────
+     *
+     * Copy the image `KASLR_PHYS_FIXED` bytes up and continue from the copy, so
+     * the image's PHYSICAL address is randomized too and not just the VA it
+     * appears at. x21 carries the delta from here on; 0 means no relocation.
+     *
+     * Done first, before anything else touches an address, because
+     * `code-model=small` makes almost all of this free: every `adrp`/`add` pair
+     * below resolves relative to the PC, so once we are executing the copy the
+     * stack, the page tables and their descriptors all name the copy without a
+     * single adjustment. x86_64 needs sixteen of them for exactly this reason —
+     * `code-model=kernel` addresses its own data absolutely.
+     *
+     * What is NOT free is `ldr xN, =symbol`: the load is PC-relative but the
+     * VALUE in the literal is a link-time address, so every one naming a
+     * PHYSICAL address in the image needs the delta added. Those are marked
+     * below. Literals holding kernel-half VAs (`stack_top_virt`, `_start_rust`)
+     * need nothing: a VA does not move when the image does, and the window
+     * built below maps it to the copy.
+     */
+    ldr  x21, =KASLR_PHYS_FIXED
+    cbz  x21, .Lphys_done
+
+    ldr  x0, =__kernel_start            /* link-time phys: NOT slid, the value */
+    ldr  x1, =__kernel_end              /* is low-half so the table skips it   */
+    add  x1, x1, #15                    /* round up for the 16-byte copy */
+    and  x1, x1, #0xFFFFFFFFFFFFFFF0
+    add  x2, x0, x21                    /* destination */
+1:  ldp  x3, x4, [x0], #16
+    stp  x3, x4, [x2], #16
+    cmp  x0, x1
+    b.lo 1b
+
+    /* The MMU is off, so those stores went to memory rather than a cache, but
+     * the I-cache may still hold lines speculatively fetched for the
+     * destination. Invalidate before executing there. */
+    dsb  sy
+    ic   iallu
+    dsb  sy
+    isb
+
+    /* Continue in the copy. `adr` gives this label's address in the image we
+     * are running now — the original — so the delta reaches the copy's. */
+    adr  x0, .Lphys_done
+    add  x0, x0, x21
+    br   x0
+.Lphys_done:
+
     /* Enable FP/SIMD access at EL1 (CPACR_EL1.FPEN = 0b11, bits 21:20).
      *
      * Without this, any SIMD or floating-point instruction the Rust
@@ -99,7 +147,14 @@ _start:
 
     /* Record it for the Rust conversions (`kaslr::KERNEL_SLIDE`). */
     ldr  x0, =__kernel_slide_phys
+    add  x0, x0, x21                    /* the copy's word, not the original's */
     str  x20, [x0]
+
+    /* Record the physical delta for `kaslr::image_virt_to_phys` and
+     * `image_phys_bounds`. The frame allocator reserves those bounds, so a
+     * missing delta leaves the running image unreserved and hands it to the
+     * buddy. Recorded inside the slide branch is NOT good enough — a zero slide
+     * skips to `.Lkaslr_done` — so it is written unconditionally below. */
 
     /* Apply the table. Header: magic, n_abs64, n_abs32s, n_pcrel32,
      * n_abs64_low, then the site lists as u32 offsets.
@@ -111,6 +166,7 @@ _start:
      * `abs32s` and `pcrel32` are x86_64 classes and are always 0 here.
      */
     ldr  x0, =__kaslr_relocs_phys
+    add  x0, x0, x21                    /* the copy's table */
     ldr  w1, [x0]
     mov  w2, #0x534C                    /* "KASL" = 0x4B41534C */
     movk w2, #0x4B41, lsl #16
@@ -133,6 +189,7 @@ _start:
 .Lkaslr_apply:
     cbz  x3, .Lkaslr_done
     ldr  w6, [x5], #4                   /* site offset == physical addr */
+    add  x6, x6, x21                    /* patch the copy, which is what runs */
     ldr  x7, [x6]
     add  x7, x7, x20
     str  x7, [x6]
@@ -147,6 +204,13 @@ _start:
     b    .Lkaslr_bad
 
 .Lkaslr_done:
+
+    /* Record the delta unconditionally: every path above can reach here,
+     * including "mask is 0" and "drew a zero slide", and Rust's physical
+     * conversions need the delta whether or not the image also slid. */
+    ldr  x0, =__image_phys_delta_phys
+    add  x0, x0, x21
+    str  x21, [x0]
 
     /* --- Build temporary 4-level page tables ---
      * lo_L0 -> lo_L1 -> Blocks
@@ -253,8 +317,14 @@ _start:
      */
     adrp x0, l2_lo_1
     add  x0, x0, #:lo12:l2_lo_1
+    /* The executable range is where `.boot` ACTUALLY runs, which after a
+     * physical relocation is the copy — this map is the identity one, so the
+     * range has to move with the bytes. Leaving it link-time would mark the
+     * running `.boot` PXN and fault on the first post-MMU instruction fetch. */
     ldr  x1, =__kernel_start
+    add  x1, x1, x21
     ldr  x2, =__boot_end
+    add  x2, x2, x21
     bl   build_ram_l2
     adrp x3, l1_lo
     add  x3, x3, #:lo12:l1_lo
@@ -312,6 +382,7 @@ _start:
     ldr  x2, =__text_end_phys
     ldr  x4, =__kernel_end          /* image end, physical                */
     mov  x3, x20                    /* slide                             */
+    mov  x10, x21                   /* physical relocation delta         */
     bl   build_image_l2
 
     dsb sy
@@ -371,8 +442,15 @@ _start:
     dsb  sy
     isb
 
-    /* Jump to Virtual */
+    /* Jump to Virtual.
+     *
+     * `_start_rust_entry` is in `.boot`, so this literal holds a low link-time
+     * address: without the delta it branches back into the ORIGINAL image,
+     * which still exists and still looks valid. (x86_64 had the same bug in its
+     * far return into long mode, where it cost a boot that faulted on the first
+     * call into Rust.) */
     ldr  x0, =_start_rust_entry
+    add  x0, x0, x21
     br   x0
 
 _start_rust_entry:
@@ -422,15 +500,25 @@ _start_rust_entry:
  *   x1 = exec_start (physical, inclusive)
  *   x2 = exec_end   (physical, exclusive)
  *
- * Clobbers x3-x7. Runs pre-MMU at a low PA, so it must stay in `.boot`.
+ * Clobbers x3-x9, and x11 in `build_image_l2`. Runs pre-MMU at a low PA, so it
+ * must stay in `.boot`.
  */
 /* Fill `l2_img` for the kernel image.
  *
  * x0 = &l2_img, x1 = exec_start (phys), x2 = exec_end (phys),
- * x3 = slide, x4 = image end (phys).
+ * x3 = slide, x4 = image end (phys), x10 = physical relocation delta.
  *
  * Entry index is `(slide >> 21) + i` and the output PA is
- * `0x4000_0000 + i*2MiB`, for i covering 0x4000_0000 .. page_up_2M(x4). The
+ * `0x4000_0000 + i*2MiB + delta`, for i covering 0x4000_0000 .. page_up_2M(x4).
+ *
+ * The loop counter, the bound and the exec range all stay in LINK-TIME space
+ * and only the descriptor's output address gets the delta. Keeping the delta
+ * out of the bound is deliberate: it is the VA extent that decides how many
+ * entries this window needs, and folding a relocation into it would inflate the
+ * count by the delta — the same confusion that, on x86_64, grew the window from
+ * 49 leaves to 176 and overran the PD the slide has to fit inside.
+ *
+ * The
  * image starts at `KERNEL_LOAD_BASE` (0x4008_0000), part-way into the first
  * block, so that block is mapped too — it also holds `.boot`, which is
  * harmless here: this window is never used to execute `.boot`, and the block
@@ -452,7 +540,8 @@ build_image_l2:
     mov  x9, #0x60
     orr  x7, x7, x9, lsl #48    /* PXN (53) | UXN (54) */
 3:
-    orr  x7, x7, x6             /* | output PA */
+    add  x11, x6, x10           /* output PA = link-time PA + delta */
+    orr  x7, x7, x11            /* | output PA */
     add  x9, x5, x3             /* entry index = i + (slide >> 21) */
     str  x7, [x0, x9, lsl #3]
     mov  x6, x8

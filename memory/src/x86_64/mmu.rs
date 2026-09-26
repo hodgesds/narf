@@ -178,17 +178,31 @@ unsafe extern "C" {
 /// bootstrap heap arena), `.got` — and every frame the buddy ever hands out is
 /// outside this range and is therefore NX in every kernel mapping.
 fn kernel_exec_phys_range() -> (u64, u64) {
-    let start = crate::kaslr::image_phys_bounds().0;
+    let (img_start, img_end) = crate::kaslr::image_phys_bounds();
     let end = crate::kaslr::image_virt_to_phys(core::ptr::addr_of!(__text_end) as u64);
-    // Defensive: a linker-script edit that inverted these, or moved the image
-    // out of the first GiB, would otherwise silently produce an unbootable
-    // (or silently over-permissive) map. Clamp to "whole first GiB
-    // executable" — that boots, and `smoke_kernel_text_executable_bss_is_not`
-    // goes red so the regression is visible rather than latent.
-    if end <= start || end > (1u64 << 30) {
-        return (0, 1u64 << 30);
+    // Defensive, but bounded by where the image actually IS rather than by an
+    // absolute address.
+    //
+    // This read `end > (1 << 30)`, using "above 1 GiB" as a proxy for "the image
+    // moved somewhere unexpected", and fell back to `(0, 1 GiB)` — whole first
+    // GiB executable. Physical relocation broke both halves at once: a delta
+    // over 1 GiB is now a perfectly legitimate place for the image, so the guard
+    // fired on a valid configuration; and the fallback only ever booted while
+    // this window mapped phys 0..1 GiB, which it no longer does — it maps
+    // `[delta, delta + extent)`. The result was every leaf holding kernel text
+    // coming back NX and the first instruction fetch after the CR3 load
+    // faulting, with the fault handler's own fetch faulting in turn. It hung
+    // after "mmu: handoff..." for any target above ~1 GiB, which only a machine
+    // with more than ~1 GiB of RAM can draw.
+    //
+    // The image's own bounds are the real invariant, and they move with it.
+    if end <= img_start || end > img_end {
+        // Whole image executable: over-permissive, but it boots, and
+        // `smoke_kernel_text_executable_bss_is_not` goes red so the regression
+        // is visible rather than latent.
+        return (img_start, img_end);
     }
-    (start, end)
+    (img_start, end)
 }
 
 /// Does `[base, base + len)` overlap `[lo, hi)`?

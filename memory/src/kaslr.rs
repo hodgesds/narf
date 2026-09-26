@@ -204,6 +204,20 @@ pub fn image_link_bounds() -> (u64, u64) {
     (b[0], b[1])
 }
 
+/// Runtime physical address of an in-image object whose LINK-TIME physical
+/// address is known.
+///
+/// For linker-populated words that already hold physical values — the image
+/// bounds, `.ap_boot_syms` — rather than kernel-virtual ones. Those need no
+/// slide (a physical address does not move when the VA window does) but they DO
+/// need the relocation delta, because the object they name was copied. Getting
+/// this wrong sends an AP to the pre-relocation image, which still exists and
+/// still looks valid: on aarch64 it presented as "AP CPU 1 didn't come online".
+#[inline]
+pub fn image_link_phys(link_phys: u64) -> u64 {
+    link_phys.wrapping_add(image_phys_delta())
+}
+
 /// Physical address of an in-image kernel-virtual address.
 ///
 /// Use this instead of subtracting a hardcoded base: the constant is right
