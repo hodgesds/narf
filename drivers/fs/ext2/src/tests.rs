@@ -410,11 +410,44 @@ fn smoke_ext2_inode_parse_block_pointers() -> TestResult {
     TestResult::Pass
 }
 
+/// A file's on-disk `i_mtime` must survive to `stat`: the node builds
+/// `Stat.mtime_cycles` from it via `ns_to_cycles`, and statx decodes that back
+/// with `cycles_to_ns`. Regression guard for the bug where `stat_from_inode`
+/// hardcoded `mtime_cycles: 0`, so every ext2 file reported mtime 1970.
+fn smoke_ext2_stat_reports_real_mtime() -> TestResult {
+    let mut buf = vec![0u8; 128];
+    buf[0..2].copy_from_slice(&0x81A4u16.to_le_bytes()); // S_IFREG | 0644
+    buf[4..8].copy_from_slice(&512u32.to_le_bytes()); // size
+    let mtime_secs: u32 = 1_700_000_000; // a real (2023) timestamp, not 0
+    buf[16..20].copy_from_slice(&mtime_secs.to_le_bytes()); // i_mtime
+    let inode = match Inode::parse(&buf) {
+        Some(i) => i,
+        None => return TestResult::Fail("inode parse failed"),
+    };
+    if inode.mtime != mtime_secs {
+        return TestResult::Fail("i_mtime not parsed from the inode");
+    }
+    // The exact encode the stat path uses…
+    let cycles = narf_time::ns_to_cycles((inode.mtime as u64) * 1_000_000_000);
+    if cycles == 0 {
+        return TestResult::Fail("a real mtime encoded to 0 (the pre-fix bug)");
+    }
+    // …decoded the way statx does; whole-second inputs must round-trip to the
+    // same second (allow sub-second conversion rounding).
+    let decoded_ns = narf_time::cycles_to_ns(cycles);
+    let expected_ns = (mtime_secs as u64) * 1_000_000_000;
+    if decoded_ns.abs_diff(expected_ns) >= 1_000_000_000 {
+        return TestResult::Fail("mtime did not round-trip through statx's cycles<->ns");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_superblock_magic_and_block_size
 );
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_dirent_walk_two_entries);
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_stat_reports_real_mtime);
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_inode_group_index_math);
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_group_desc_parse);
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_inode_parse_block_pointers);
