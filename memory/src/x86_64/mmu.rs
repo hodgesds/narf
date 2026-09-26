@@ -148,6 +148,9 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
 /// leaves for the higher half. Those fetches walk the low identity map, so
 /// this window — and nothing else below 1 GiB outside the kernel image — must
 /// stay executable.
+/// Physical address the image window maps from, before the delta.
+pub const KERNEL_WINDOW_PHYS_BASE: u64 = 0;
+
 pub const AP_TRAMPOLINE_EXEC_BASE: u64 = 0x8000;
 
 /// Bytes of the AP-trampoline executable window. Two 4-KiB pages; the blob is

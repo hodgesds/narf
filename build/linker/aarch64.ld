@@ -90,7 +90,11 @@ KASLR_SLIDE_FIXED = 0x00000000;
  * (the DTB lands at 0x4f00_0000, just under the 0x5000_0000 mark), so starting
  * above that clears every one of them; it also still fits inside boot-smoke's
  * 512 MiB, not just the suite's 1 GiB. */
-KASLR_PHYS_FIXED = 0x10000000;
+/* Master switch for physical relocation. With it on and KASLR_PHYS_FIXED at 0,
+ * `.Lfdt_pick` in boot.S chooses the target from the DTB at boot. */
+KASLR_PHYS_ENABLE = 1;
+
+KASLR_PHYS_FIXED = 0;
 
 PHDRS
 {
