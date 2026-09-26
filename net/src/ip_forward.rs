@@ -88,10 +88,33 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
     if packet.len() < MIN_HDR {
         return false;
     }
+    // RFC 1812 §5.2.2: a router MUST validate the version, header length,
+    // header checksum and total length before forwarding. The receive path
+    // above us checks none of them, and this function recomputes the header
+    // checksum on the way out — so a header corrupted on the wire would be
+    // re-emitted with a fresh, VALID checksum, laundering the corruption to
+    // every downstream hop.
+    if packet[0] >> 4 != 4 {
+        return false;
+    }
     let ihl = ((packet[0] & 0x0F) as usize) * 4;
     if ihl < MIN_HDR || packet.len() < ihl {
         return false;
     }
+    if ip_checksum(&packet[..ihl]) != 0 {
+        return false;
+    }
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len < ihl || total_len > packet.len() {
+        return false;
+    }
+    // Anything past Total Length is link-layer padding (a short IPv4 packet
+    // in a minimum-size 60-byte Ethernet frame). Linux trims it in
+    // `ip_rcv_core` (`pskb_trim_rcsum`); forwarding it would carry the pad
+    // onto the next link, count it against the egress MTU, and — once
+    // fragmented — splice it into the datagram as payload.
+    let packet = &packet[..total_len];
+    let icmp_ok = icmp_error_permitted(packet, ihl);
     let src = Ipv4Addr([packet[12], packet[13], packet[14], packet[15]]);
     let dst = Ipv4Addr([packet[16], packet[17], packet[18], packet[19]]);
 
@@ -102,11 +125,13 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
     // nowhere reachable. The ICMP reply carries the original header plus 8
     // bytes, which is what identifies the probe to traceroute.
     if packet[TTL_OFF] <= 1 {
-        send_icmp_error(
-            net_ns_id,
-            src,
-            build_time_exceeded(TE_TTL_EXCEEDED_IN_TRANSIT, packet),
-        );
+        if icmp_ok {
+            send_icmp_error(
+                net_ns_id,
+                src,
+                build_time_exceeded(TE_TTL_EXCEEDED_IN_TRANSIT, packet),
+            );
+        }
         return true;
     }
 
@@ -114,11 +139,13 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
     let route = match route::route_lookup_in(net_ns_id, dst) {
         Some(r) => r,
         None => {
-            send_icmp_error(
-                net_ns_id,
-                src,
-                build_error(ICMP_DEST_UNREACHABLE, DUR_NET_UNREACHABLE, 0, packet),
-            );
+            if icmp_ok {
+                send_icmp_error(
+                    net_ns_id,
+                    src,
+                    build_error(ICMP_DEST_UNREACHABLE, DUR_NET_UNREACHABLE, 0, packet),
+                );
+            }
             return true;
         }
     };
@@ -136,11 +163,13 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
     // Without DF the packet is fragmented at send time instead.
     let df = u16::from_be_bytes([packet[FRAG_OFF], packet[FRAG_OFF + 1]]) & IP_DF != 0;
     if packet.len() > egress.mtu as usize && df {
-        send_icmp_error(
-            net_ns_id,
-            src,
-            build_fragmentation_needed(egress.mtu as u16, packet),
-        );
+        if icmp_ok {
+            send_icmp_error(
+                net_ns_id,
+                src,
+                build_fragmentation_needed(egress.mtu as u16, packet),
+            );
+        }
         return true;
     }
 
@@ -160,7 +189,9 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
     // the wrong first hop. Tell it — after the decrement and before the
     // FORWARD hook, where `ip_forward()` does it — and forward the packet
     // anyway, as Linux does.
-    maybe_send_redirect(net_ns_id, iface_in, &egress, src, route.nexthop, &owned);
+    if icmp_ok {
+        maybe_send_redirect(net_ns_id, iface_in, &egress, src, route.nexthop, &owned);
+    }
 
     {
         let mut ctx = crate::netfilter::PktCtx::new_ipv4(
@@ -211,6 +242,43 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
         Err(_) => return true,
     };
     send_ipv4(&egress, dst_mac, &owned);
+    true
+}
+
+/// True iff an ICMP error may be sent about `packet` (header length `ihl`).
+///
+/// RFC 1122 §3.2.2 / RFC 1812 §4.3.2.7: an ICMP error MUST NOT be sent in
+/// response to another ICMP error, to a fragment other than the first, or to
+/// a datagram whose source does not name a single host (unspecified,
+/// loopback, limited broadcast, multicast or class E). The first rule stops
+/// two routers bouncing errors about errors forever; the second, one error
+/// per fragment of a single datagram; the last, an error aimed at an address
+/// that is either nobody or everybody. Linux's `__icmp_send` applies the same
+/// set.
+fn icmp_error_permitted(packet: &[u8], ihl: usize) -> bool {
+    let frag = u16::from_be_bytes([packet[FRAG_OFF], packet[FRAG_OFF + 1]]);
+    if frag & FRAG_OFF_MASK != 0 {
+        return false;
+    }
+    let src0 = packet[12];
+    if src0 == 0 || src0 == 127 || src0 >= 224 {
+        return false;
+    }
+    if packet[9] == IP_PROTO_ICMP && packet.len() > ihl {
+        use crate::pkt_icmp_extra::{
+            ICMP_PARAMETER_PROBLEM, ICMP_REDIRECT, ICMP_SOURCE_QUENCH, ICMP_TIME_EXCEEDED,
+        };
+        if matches!(
+            packet[ihl],
+            ICMP_DEST_UNREACHABLE
+                | ICMP_SOURCE_QUENCH
+                | ICMP_REDIRECT
+                | ICMP_TIME_EXCEEDED
+                | ICMP_PARAMETER_PROBLEM
+        ) {
+            return false;
+        }
+    }
     true
 }
 

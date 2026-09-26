@@ -36,6 +36,9 @@ pub enum QuicError {
     NonMinimalVarInt,
     /// Long header packet has an unrecognised packet type.
     BadPacketType,
+    /// A version-1 long header carries a connection ID longer than 20
+    /// bytes, which RFC 9000 §17.2 says MUST be dropped.
+    BadConnectionIdLength,
 }
 
 // ── Variable-length integer (RFC 9000 §16) ────────────────────────
@@ -157,6 +160,12 @@ pub fn decode_long_header(buf: &[u8]) -> Result<(LongHeader, usize), QuicError> 
     let scid_len = buf[scid_off] as usize;
     if buf.len() < scid_off + 1 + scid_len {
         return Err(QuicError::Short);
+    }
+    // RFC 9000 §17.2: "Endpoints that receive a version 1 long header with
+    // a value larger than 20 MUST drop the packet." Other versions (notably
+    // Version Negotiation, version 0) may carry longer IDs (RFC 8999 §5.1).
+    if version == 1 && (dcid_len > 20 || scid_len > 20) {
+        return Err(QuicError::BadConnectionIdLength);
     }
     let src_cid = buf[scid_off + 1..scid_off + 1 + scid_len].to_vec();
     let total = scid_off + 1 + scid_len;

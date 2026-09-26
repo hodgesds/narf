@@ -209,7 +209,11 @@ pub fn parse_ipv4(buf: &[u8]) -> Option<(Ipv4Header, &[u8])> {
         return None;
     }
     let total_len = u16::from_be_bytes([buf[2], buf[3]]);
-    if total_len as usize > buf.len() {
+    // RFC 791: Total Length counts the header too, so it can never be
+    // smaller than IHL. Without the lower bound a hostile `total_len`
+    // below `ihl` made the payload slice `buf[ihl..total_len]` panic —
+    // a remote kernel panic from a single malformed frame.
+    if (total_len as usize) < ihl || total_len as usize > buf.len() {
         return None;
     }
     let protocol = buf[9];

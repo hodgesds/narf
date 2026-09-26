@@ -486,9 +486,10 @@ pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
     // Update state.
     match L4Proto::from_u8(tuple.proto) {
         L4Proto::Tcp => {
-            // TCP flags live at IPv4 + 13.
-            let flags_off = super::IPV4_MIN_HDR_LEN + 13;
-            if ctx.packet().len() > flags_off {
+            // TCP flags are byte 13 of the TCP header, which starts after
+            // IHL words — and a later fragment carries no TCP header at all.
+            let flags_off = super::ipv4_l4_offset(ctx.packet()).map_or(usize::MAX, |o| o + 13);
+            if !super::ipv4_is_later_fragment(ctx.packet()) && ctx.packet().len() > flags_off {
                 let flags = ctx.packet()[flags_off];
                 tcp_advance(&entry, flags, is_reply, now);
             }

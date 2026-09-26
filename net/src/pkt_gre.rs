@@ -49,6 +49,9 @@ pub enum GreError {
     Short,
     BadVersion(u8),
     BadChecksum,
+    /// A reserved RFC 1701 flag (Routing, strict source route, recursion
+    /// control) is set — RFC 2784 §2.3 says discard.
+    ReservedFlags,
 }
 
 // ── Flag bits ──────────────────────────────────────────────────────
@@ -110,6 +113,16 @@ impl GreHeader {
         let version = (flags_version & 0x07) as u8;
         if version != 0 {
             return Err(GreError::BadVersion(version));
+        }
+        // RFC 2784 §2.3: a receiver MUST discard a packet where any of bits
+        // 1-5 are set, unless it implements RFC 1701. Bits 2 and 3 are Key
+        // and Sequence, which RFC 2890 gives back meaning; the rest (Routing,
+        // strict source route, recursion control) are not handled here, and a
+        // set Routing bit implies an optional field this decoder would
+        // otherwise read as the key, sequence or payload.
+        const RESERVED_1701: u16 = FLAG_ROUTING | FLAG_STRICT_SOURCE | 0x0400;
+        if flags_version & RESERVED_1701 != 0 {
+            return Err(GreError::ReservedFlags);
         }
         let protocol_type = u16::from_be_bytes([buf[2], buf[3]]);
         let mut p = 4usize;

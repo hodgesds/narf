@@ -656,7 +656,14 @@ fn extract_flow_key(frame: &[u8]) -> Option<FlowKey> {
         return None;
     }
     let (ip, l4) = parse_ipv4(body)?;
-    let (src_port, dst_port) = if ip.protocol == IP_PROTO_TCP || ip.protocol == IP_PROTO_UDP {
+    // A non-first fragment carries no L4 header: the bytes after its IP
+    // header are the middle of the datagram. Reading "ports" there let a
+    // crafted payload steer a fragment into another application's bypass
+    // socket, so such a fragment is keyed with zero ports (RFC 791).
+    let later_fragment = u16::from_be_bytes([body[6], body[7]]) & 0x1FFF != 0;
+    let (src_port, dst_port) = if later_fragment {
+        (0, 0)
+    } else if ip.protocol == IP_PROTO_TCP || ip.protocol == IP_PROTO_UDP {
         if l4.len() < 4 {
             (0, 0)
         } else {
