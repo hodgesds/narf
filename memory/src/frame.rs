@@ -1131,6 +1131,29 @@ pub fn alloc_user_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocEr
 pub(crate) static EARLY_PHYS_CEILING: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(4u64 << 30);
 
+/// Upper bound a physical address handed out by the frame allocator must stay
+/// under, for the CURRENT stage of boot.
+///
+/// [`EARLY_PHYS_CEILING`] while it is in force, and the top of boot-donated RAM
+/// once [`release_early_ceiling`] has lifted it. Both answer the same question —
+/// "is this address one the kernel can actually reach?" — and which one applies
+/// changes when the direct map comes up.
+///
+/// Exists because several tests hardcoded `4 GiB`, which was only ever the
+/// ceiling's DEFAULT value. Once the direct map covers all RAM the ceiling is
+/// deliberately cleared and frames above 4 GiB are both legal and reachable, so
+/// those tests failed on any host with more than 4 GiB of RAM while the code was
+/// behaving correctly. A count-derived bound (`total_frames * PAGE_SIZE`) is not
+/// a substitute: RAM is not contiguous from 0, so a frame legitimately above
+/// that size still sits in usable RAM.
+pub fn phys_alloc_ceiling() -> u64 {
+    let early = EARLY_PHYS_CEILING.load(core::sync::atomic::Ordering::Acquire);
+    if early != 0 {
+        return early;
+    }
+    managed_phys_end()
+}
+
 /// Allow the allocator to return frames at any physical address.
 /// Call once a kernel direct map covers all installed RAM.
 pub fn release_early_ceiling() {

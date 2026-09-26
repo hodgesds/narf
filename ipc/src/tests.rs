@@ -1401,11 +1401,16 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
     // inner Arc<Ring> was allocated at that address.
     //
     // This smoke creates + drops `narf_ipc::channel::<u64, 4>()`
-    // 256 times and asserts the inner Ring address falls inside
-    // the kernel heap range: > the kernel text/data sections,
-    // < 4 GiB (the early identity-map ceiling). Any escape into
-    // the 0x4000_0000+ region would reproduce the bug shape
-    // here.
+    // 256 times and asserts the inner Ring address falls inside RAM the frame
+    // allocator manages. Any escape into the reserved gap above RAM would
+    // reproduce the bug shape here — 0x4000_0000 was past the end of RAM on the
+    // 1 GiB machine that found it, which is the property that matters, not the
+    // constant.
+    //
+    // The bound comes from `phys_alloc_ceiling` rather than a hardcoded 4 GiB:
+    // that figure is `EARLY_PHYS_CEILING`'s default, and it is deliberately
+    // cleared once the direct map covers all RAM, so on a host with more than
+    // 4 GiB of RAM the old check failed on perfectly ordinary heap addresses.
     let mut bad_count = 0u32;
     let mut sample_bad: u64 = 0;
     for _ in 0..256 {
@@ -1415,12 +1420,12 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
         // the physical address the RAM-range check is really about; the
         // canary is about *which frame* the Ring landed in, not which VA.
         let ptr = narf_memory::PhysAddr::from_kernel_ptr(p.__ring_ptr_for_test()).raw();
-        // Heap allocations land below the 4 GiB ceiling on x86_64, and
-        // above 0 (Arc::as_ptr is never null on a live Arc).
-        #[cfg(target_arch = "x86_64")]
-        let is_bad = ptr == 0 || ptr >= (4u64 << 30);
-        #[cfg(not(target_arch = "x86_64"))]
-        let is_bad = ptr == 0;
+        // Heap allocations land inside reachable RAM, and above 0 (`Arc::as_ptr`
+        // is never null on a live Arc). Now checked on both arches: with a real
+        // RAM bound instead of an x86-shaped constant there is nothing
+        // arch-specific left about the assertion.
+        let ceiling = narf_memory::phys_alloc_ceiling();
+        let is_bad = ptr == 0 || (ceiling != 0 && ptr >= ceiling);
 
         if is_bad {
             bad_count += 1;
