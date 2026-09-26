@@ -2630,6 +2630,9 @@ pub struct StatBuf {
 // top. pread / pwrite skip the cursor mutation — POSIX guarantees
 // the per-fd offset is unchanged after these calls.
 
+// ── Fallocate — preallocate file space ─────────────────────────────
+//
+
 // ── CopyFileRange — chunked file→file copy ─────────────────────────
 //
 // Linux copy_file_range(2): in-kernel copy without bouncing the

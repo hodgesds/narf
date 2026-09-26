@@ -526,6 +526,25 @@ pub unsafe extern "C" fn setjmp(jmp: *mut JmpBuf) -> u64 {
 #[unsafe(naked)]
 pub unsafe extern "C" fn longjmp(jmp: *const JmpBuf, val: u64) -> ! {
     naked_asm!(
+        // Kernel code resumed through a `longjmp` must run with MTE tag checks
+        // live. The architecture SETS `PSTATE.TCO` on exception entry so a
+        // handler cannot trip a tag fault on its own accesses, and only `eret`
+        // restores it — but the user-task yield/exit/execve hooks longjmp out
+        // of the trap context and never `eret`, so TCO stayed set for every
+        // later kernel access on this CPU. That silently disabled every tag
+        // check, and with it MTE domain isolation, for the rest of the boot.
+        //
+        // Clearing it here covers each of those hooks and any future one,
+        // rather than needing the clear repeated at every divert. TCO is
+        // S3_3_C4_C2_7, spelled by encoding because the mnemonic needs `+mte`
+        // enabled on the assembler; gated on ID_AA64PFR1_EL1.MTE >= 2 because
+        // the register does not exist below that.
+        "mrs  x9, id_aa64pfr1_el1",
+        "ubfx x9, x9, #8, #4",
+        "cmp  x9, #2",
+        "b.lo 91f",
+        "msr  S3_3_C4_C2_7, xzr",
+        "91:",
         // AAPCS64: jmp in x0, val in x1.
         "ldp  x19, x20, [x0, #0]",
         "ldp  x21, x22, [x0, #16]",

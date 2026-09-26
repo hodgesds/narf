@@ -7583,16 +7583,25 @@ impl AddressSpace {
         // flush completed before this call, so the allocator may now drop all
         // owners while locking each touched COW shard once per window.
         let phys = &region.phys[..pages.min(region.phys.len())];
-        if region.perms.contains(RegionPerms::COW) {
-            crate::frame::free_phys_batch(phys);
-        } else {
-            // A private region acquires COW provenance before fork publishes a
-            // second frame owner. Without that bit every resident frame is
-            // unique after its leaf and reverse-map owner have been retired.
-            // SAFETY: SHARED returned above; the VMA provenance and teardown
-            // ordering establish the unique-frame contract.
-            unsafe { crate::frame::free_unique_phys_batch(phys) };
-        }
+        // Always release through the COW-aware batch, which decrements each
+        // frame's refcount and returns it to the buddy only at zero.
+        //
+        // The old fast path took the ABSENCE of the COW provenance bit as proof
+        // that every resident frame was uniquely owned and freed them outright
+        // (`free_unique_phys_batch`, no refcount decrement). That proof does not
+        // hold: a frame can be shared (COW refcount > 1) in a region whose perms
+        // never carried the COW bit, and freeing it outright returns a frame
+        // another owner still maps straight to the buddy — a cross-owner
+        // double-free and use-after-free. The surviving owner's `phys[idx]` then
+        // dangles; its own later teardown re-frees the recycled frame, and any
+        // demand-fault self-heal in between re-maps freed memory (a desktop app's
+        // heap silently zeroed under it). Linux never bypasses the refcount here:
+        // `zap_pte_range` always `folio_put`s and frees only at zero.
+        //
+        // `dec_ref` treats an unregistered frame as the implicit sole owner, so a
+        // genuinely unique page still frees in a single decrement — the fast
+        // path only ever saved a per-frame COW-registry probe, never correctness.
+        crate::frame::free_phys_batch(phys);
     }
 
     /// Retire a live range's complete reverse-map ownership, then release its
@@ -7851,7 +7860,14 @@ impl AddressSpace {
         let mut out = Vec::new();
         {
             let huge = self.huge_regions.lock();
-            out.reserve(huge.len());
+            // Fallible: this snapshot is taken on the fatal-fault diagnostic path,
+            // where the kernel heap may already be exhausted. A failed reserve
+            // degrades to a partial (or empty) snapshot rather than aborting the
+            // whole kernel — a userspace fault must never panic the kernel via a
+            // diagnostic allocation. Callers already tolerate a short list.
+            if out.try_reserve(huge.len()).is_err() {
+                return out;
+            }
             for region in huge.iter() {
                 let page_bytes = match region.size {
                     crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
@@ -7882,7 +7898,10 @@ impl AddressSpace {
         }
         {
             let regions = self.regions.lock();
-            out.reserve(regions.len());
+            // Fallible (see the huge-region reserve above): never abort on OOM.
+            if out.try_reserve(regions.len()).is_err() {
+                return out;
+            }
             for region in regions.iter() {
                 let mut node_pages = [0u64; crate::frame::MAX_NUMA_NODES];
                 let mut resident_pages = 0u64;
@@ -8539,6 +8558,26 @@ impl AddressSpace {
             //     the stress-ng --vma SMP wedge. Self-heal instead:
             //     install the leaf for the frame the region owns.
             let va = VirtAddr::new(v);
+            // HUNT: the self-heal is about to install a leaf + rmap owner for
+            // region.phys[idx]. If that frame has already been returned to the
+            // buddy, this is the stale-backing use-after-free. Panic and name
+            // the op that leaked it (freed the frame without clearing phys[idx]).
+            #[cfg(feature = "frame-alloc-audit")]
+            if let Some((allocated, (pf, pl), (af, al))) = crate::buddy::frame_audit_state(phys) {
+                if !allocated {
+                    panic!(
+                        "demand self-heal about to re-map FREED phys {:?} at va={:#x} \
+                         (root={:#x}): stale phys[idx]. leaked-free @ {}:{}; last-alloc @ {}:{}",
+                        phys,
+                        v,
+                        self.root.raw(),
+                        pf,
+                        pl,
+                        af,
+                        al
+                    );
+                }
+            }
             let mut flags = PtFlags::USER;
             if user_page_writable(perms, phys) {
                 flags |= PtFlags::WRITABLE;
@@ -13402,6 +13441,56 @@ fn smoke_memory_demand_publish_registers_rmap() -> TestResult {
     }
 }
 kernel_test_in!("memory", smoke_memory_demand_publish_registers_rmap);
+
+/// Releasing a region that never carried the COW provenance bit must still
+/// respect a frame's COW refcount: a frame can be shared (refcount > 1) in a
+/// non-COW region, and freeing it outright — the old `free_unique_phys_batch`
+/// fast path — returned a frame a co-owner still mapped straight to the buddy,
+/// a cross-owner double-free and use-after-free. `release_region_frames` must
+/// DECREMENT and withhold the still-shared frame instead. (Linux `zap_pte_range`
+/// always `folio_put`s; it never bypasses the refcount.)
+fn smoke_memory_release_non_cow_region_withholds_shared_frame() -> TestResult {
+    let frame = match crate::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Skip("no frame for shared-release smoke"),
+    };
+    let phys = frame.start_address();
+    // Fresh frame: implicit sole owner, unregistered (count 0). Share it with a
+    // second (synthetic) owner so it MUST survive this region's teardown.
+    crate::frame::cow::inc_ref(phys); // implicit 1 -> 2 (this region + co-owner)
+    if crate::frame::cow::count(phys) != 2 {
+        crate::frame::free_frame(frame);
+        return TestResult::Fail("inc_ref did not promote the frame to shared (count 2)");
+    }
+    // A private region WITHOUT the COW bit that nonetheless backs the shared
+    // frame — the exact shape release_region_frames used to free outright.
+    let region = Region {
+        base: VirtAddr::new(0x0000_0080_00A0_0000),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![phys],
+    };
+    let a = AddressSpace::empty();
+    a.release_region_frames(&region);
+    // Correct: the shared frame was DECREMENTED (2 -> 1) and WITHHELD from the
+    // buddy — the co-owner still holds it (count stays registered at 1). The old
+    // fast path left the entry at 2 and returned the still-shared frame to the
+    // allocator outright.
+    let after = crate::frame::cow::count(phys);
+    core::mem::forget(a);
+    if after != 1 {
+        // Buggy path leaves count == 2 (freed outright, refcount untouched). Do
+        // NOT free again here — it is already (wrongly) on the free list.
+        return TestResult::Fail("release of a non-COW region did not decrement a shared frame");
+    }
+    // Surviving owner drops its reference: this final decrement (1 -> 0) frees it.
+    crate::frame::free_frame(frame);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_release_non_cow_region_withholds_shared_frame
+);
 
 /// The inline table is a performance fast path, not a correctness capacity.
 /// One claim beyond it must enter overflow, dedupe normally, and be cancelled

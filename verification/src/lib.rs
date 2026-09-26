@@ -3048,6 +3048,31 @@ mod aarch64_el0_preemption_e2e {
         // load/CBZ loop and this call times out at the QEMU harness. There is
         // deliberately no cooperative escape hatch in the user program.
         narf_scheduler::run_until_empty();
+
+        // PSTATE.TCO must be clear now. The architecture sets it on exception
+        // entry so a handler cannot trip a tag fault on its own accesses, and
+        // only `eret` restores it from SPSR. This test is the tree's only EL0
+        // excursion, so it is where a divert that skips `eret` shows up: a
+        // leaked TCO silently disables EVERY MTE tag check for the rest of the
+        // boot, which is domain isolation gone with no diagnostic. Asserted
+        // here rather than in the domain smokes because those enter a domain
+        // scope, and `domain::enter` now clears TCO itself — so they can no
+        // longer see the leak.
+        // SAFETY: MRS TCO is legal at EL1 when MTE is implemented.
+        // PSTATE.TCO must be clear now. The architecture sets it on exception
+        // entry so a handler cannot trip a tag fault on its own accesses, and
+        // only `eret` restores it from SPSR. This test is the tree's only EL0
+        // excursion, so it is where a divert that skips `eret` shows up — and
+        // a leaked TCO silently disables EVERY MTE tag check for the rest of
+        // the boot, which is domain isolation gone with no diagnostic.
+        //
+        // Asserted here rather than in the domain smokes because those enter a
+        // domain scope and `domain::enter` now clears TCO itself, so they can
+        // no longer see the leak at all.
+        // SAFETY: MRS TCO is legal at EL1 when MTE is implemented.
+        if narf_arch::aarch64::mte::supported() && unsafe { narf_arch::aarch64::mte::tco() } {
+            return TestResult::Fail("PSTATE.TCO leaked out of the EL0 excursion");
+        }
         let ticks_after = narf_interrupts::aarch64::timer::timer_ticks_for(0);
 
         // SAFETY: this test exclusively armed the BSP timer above. Restore the

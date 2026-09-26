@@ -4271,6 +4271,37 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
         resched_remote(home);
         return;
     }
+    // Home is awake, but "not halted" is NOT the same as "backlogged": an
+    // executor spinning on an empty queue picks a kicked wake up immediately
+    // and cache-hot, while migration pays a cross-queue move plus — for a
+    // halted destination — a full HLT wakeup. Migrate only when home has a
+    // REAL backlog. The fresh wakee's awake flag is already set (the waker
+    // swaps it before placement), so a runnable count of 1 means "only this
+    // wake": kick home. Early-exit scan; the count is a heuristic, not a
+    // barrier. Without this gate the futexbench5 cold-wake chain regressed
+    // 3.7 -> 9.5 µs/wake — every wake whose home happened to be polling was
+    // pushed to a HALTED sibling and paid its HLT latency — while the
+    // exit-storm case this placement exists for (wakes arriving faster than
+    // dispatch) still crosses the threshold on the second queued wake.
+    let backlog = {
+        let q = READY[home as usize].lock();
+        q.as_ref().map_or(0usize, |dq| {
+            let mut runnable = 0usize;
+            for slot in dq.iter() {
+                if slot.awake.executor_runnable() {
+                    runnable += 1;
+                    if runnable >= 2 {
+                        break;
+                    }
+                }
+            }
+            runnable
+        })
+    };
+    if backlog < 2 {
+        resched_remote(home);
+        return;
+    }
     // Affinity predicate for CPU selection (lock-free registry read). `None`
     // (task not registered) permits any CPU; the migrate's own
     // `direct_handoff_slot_eligible` affinity check is the authoritative gate.

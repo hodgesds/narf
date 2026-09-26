@@ -1403,28 +1403,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let want_1g = narf_boot::args()
                 .parse_value::<usize>("hugepages_1g")
                 .unwrap_or(0);
-            // The kernel window maps `[delta, delta + window bytes)`, but only
-            // the image inside that span IS the image. Once the image is
-            // physically relocated, the leaves below it alias ordinary RAM
-            // under a writable higher-half alias — exactly what
-            // `smoke_kernel_window_does_not_alias_buddy_frames` forbids.
+            // The kernel window maps whole 2 MiB leaves over
+            // `[delta, delta + window bytes)`, but only `[kstart, kend)`
+            // inside that span IS the image. Every other window-mapped frame
+            // — the pre-image leaves when the image is physically relocated,
+            // the low-RAM span below a non-relocated image's 1 MiB load
+            // address, and the 2 MiB rounding tail past `kend` — aliases
+            // ordinary RAM under a writable higher-half VA. Handing any of
+            // them to the buddy is exactly what
+            // `smoke_kernel_window_does_not_alias_buddy_frames` forbids: a
+            // frame later given to user memory would stay reachable through
+            // a second kernel mapping. (The non-relocated low-RAM case was
+            // the one this exclusion used to miss — the window covers
+            // phys 0 upward, the sub-1 MiB usable chunk went to the buddy,
+            // and the smoke failed on every boot.)
             //
             // Reserve those frames rather than declining to map them:
-            // `text_poke` relies on the window aliasing low RAM, and dropping
-            // those leaves costs ~50 tests (BPF pack sealing, module loading).
-            // See the window loop in `x86_64/mmu.rs`.
-            //
-            // Empty when the image runs where the loader put it, so this is
-            // inert unless physical relocation is on. The window's 2 MiB
-            // rounding tail past `kend` is a separate, pre-existing alias that
-            // relocation does not change.
+            // `text_poke` relies on the window aliasing this span, and
+            // dropping the leaves costs ~50 tests (BPF pack sealing, module
+            // loading). See the window loop in `x86_64/mmu.rs`. Cost: the
+            // sub-image span (≤ 1 MiB unrelocated) plus the rounding tail
+            // (< 2 MiB).
             let phys_delta = narf_memory::kaslr::image_phys_delta();
-            let exclude_buf = [(kstart, kend), (phys_delta, kstart)];
-            let kernel_exclude: &[(u64, u64)] = if phys_delta != 0 {
-                &exclude_buf
-            } else {
-                &exclude_buf[..1]
-            };
+            #[cfg(target_arch = "x86_64")]
+            let window_end = phys_delta
+                .saturating_add(narf_memory::x86_64::mmu::kernel_window_leaves() << 21)
+                .max(kend);
+            #[cfg(not(target_arch = "x86_64"))]
+            let window_end = kend;
+            let exclude_buf = [(phys_delta.min(kstart), window_end)];
+            let kernel_exclude: &[(u64, u64)] = &exclude_buf;
             let huge_excludes = if want_2m > 0 || want_1g > 0 {
                 // SAFETY: `regions` is the bootloader's usable-RAM map, the
                 // loaded kernel is explicitly protected, and this one-shot

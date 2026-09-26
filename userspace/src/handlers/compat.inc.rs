@@ -6176,7 +6176,16 @@ pub fn proc_task_info(
     let mut vmas = alloc::vec::Vec::new();
     if query == TaskInfoQuery::Vmas {
         if let Some(as_arc) = as_arc {
-            for r in as_arc.numa_regions_snapshot() {
+            let mut snapshot = as_arc.numa_regions_snapshot();
+            // Fallible: this runs on the fatal-fault diagnostic path, where the
+            // kernel heap may be exhausted. If the output can't be reserved, drop
+            // the VMA list (empty snapshot => the loop is a no-op) rather than
+            // abort the whole kernel — a userspace fault must never panic it via a
+            // diagnostic allocation.
+            if vmas.try_reserve(snapshot.len()).is_err() {
+                snapshot.clear();
+            }
+            for r in snapshot {
                 let base = r.base.as_u64();
                 let end = base + r.len;
                 let prot = r.perms.prot_only();
@@ -9103,6 +9112,24 @@ pub fn default_sync_signal_delivery(
                 // pin whether the fault is a slightly-off pointer (adjacent
                 // overwrite / stale TLB) or a wild value (deeper corruption).
                 ctx.dump_gprs();
+                // Faulting instruction bytes. Decoding the exact deref (e.g.
+                // `mov rax,[reg+off]`) pins WHICH register held the NULL base
+                // and at WHAT offset — the GPR file above then names the
+                // syscall/library return that came back NULL, without an
+                // offline symbolize against the (per-boot-biased) app binary.
+                {
+                    let rip = ctx.rip();
+                    let mut ibytes = [0u8; 16];
+                    // SAFETY: copy_from_user range-validates the source VA and
+                    // SMAP-brackets the read; a bad/partial read just errors.
+                    if unsafe { copy_from_user(&mut ibytes, rip) }.is_ok() {
+                        let _ =
+                            writeln!(narf_console::Writer, "  insn@{:x}={:02x?}", rip, ibytes);
+                    } else {
+                        let _ =
+                            writeln!(narf_console::Writer, "  insn@{:x}=<unreadable>", rip);
+                    }
+                }
                 #[cfg(target_arch = "x86_64")]
                 dump_fatal_x86_address_space(info.addr);
                 // Dump plausible return addresses off the faulting stack so

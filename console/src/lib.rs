@@ -513,14 +513,27 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
         }
         let _ = writeln!(buf, "    rbp={:#x} rsp={:#x}", rbp, rsp);
         for depth in 0..16 {
-            // Accept either kernel high-half (post-stack-switch) or
-            // boot low-half (pre-Wave-2 stack swap) RBP values.
-            // Reject only the bogus ones: null, unaligned, or
-            // canonical-hole [0x0001_0000_0000_0000 .. 0xffff_0000_0000_0000].
-            if rbp == 0
-                || rbp & 0x7 != 0
-                || (0x0000_8000_0000_0000..0xffff_8000_0000_0000).contains(&rbp)
-            {
+            // Require a kernel HIGH-HALF rbp before dereferencing it.
+            //
+            // This also accepted low-half values, for "pre-Wave-2 stack swap"
+            // frames. That allowance is both obsolete and actively harmful:
+            //
+            //   * obsolete, because `boot.S` switches rsp to the slid high-half
+            //     alias (`add rsp, KERNEL_VIRT_BASE + slide`) BEFORE it calls
+            //     `_start_rust`, so no Rust frame ever runs on a low stack; and
+            //   * harmful, because `init_mmu` unmaps the low identity window
+            //     apart from the AP trampoline. A stale low value that happens
+            //     to be 8-aligned and outside the canonical hole — 0x400040, say
+            //     — then passes every check here and faults when read. That
+            //     fault happens INSIDE the panic handler, so it replaces the
+            //     panic message with a bare #PF report and the original reason
+            //     for the panic is lost entirely. It cost a boot-failure
+            //     diagnosis on a 32 GiB machine, where the real panic was never
+            //     printed.
+            //
+            // The stack scan below starts from rsp and is unaffected, so a panic
+            // that reaches here with an unusable rbp still gets a backtrace.
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_8000_0000_0000 {
                 break;
             }
             // SAFETY: rbp validated above; reading [rbp + 8] is the
