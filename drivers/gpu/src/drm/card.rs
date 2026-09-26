@@ -635,9 +635,29 @@ impl Card {
         if b.refcount > 0 {
             return None;
         }
-        let b = self.dumb_backings.swap_remove(pos);
+        // The refcount reached zero, but the buffer's pages may still be mapped
+        // into a userspace address space — an mmap-lifetime reference can be
+        // dropped (GEM_CLOSE/DESTROY_DUMB/RMFB) before the mapping is torn down.
+        // Returning still-mapped frames to the buddy is a use-after-free: they
+        // recycle into unrelated allocations (a filesystem page cache was the
+        // observed victim) while a live user PTE keeps writing to them. Match
+        // Linux, which frees a folio only once its mapcount/refcount is zero: if
+        // any backing page still has a reverse-map owner, DEFER — keep the
+        // backing registered (refcount stays 0) and free nothing now. The mmap
+        // teardown's lifetime drop calls back here after the mapping and its
+        // rmap are gone, and the free then proceeds.
+        let phys = b.phys;
+        let order = b.order;
+        let pages = 1u64 << order;
+        let still_mapped = (0..pages).any(|i| {
+            narf_memory::rmap::owner_count(narf_memory::PhysAddr::new(phys + i * 4096)) != 0
+        });
+        if still_mapped {
+            return None;
+        }
+        let removed = self.dumb_backings.swap_remove(pos);
         let _ = self.gem.free(gem_handle);
-        Some((b.phys, b.order))
+        Some((removed.phys, removed.order))
     }
 
     // ── ADDFB2 / RMFB ────────────────────────────────────────────────
@@ -719,4 +739,75 @@ impl Card {
             .find(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)
     }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// A dumb buffer whose last GEM/fb reference is dropped (GEM_CLOSE /
+    /// DESTROY_DUMB / RMFB) while a userspace mmap of it is STILL live must not
+    /// return its frames to the buddy: `free_pages` bypasses the rmap check, so a
+    /// still-mapped frame recycles into an unrelated allocation (a filesystem
+    /// page cache was the observed victim) and corrupts the desktop. Freeing must
+    /// be DEFERRED until no reverse-map owner remains.
+    fn smoke_dumb_backing_defers_free_while_mapped() -> TestResult {
+        narf_memory::rmap::__reset_for_test();
+        let mut card = Card::new("test", "test", (1, 0, 0));
+        let phys = 0x40_000u64; // synthetic, page-aligned, nonzero
+        let order = 2u8; // 16 KiB — cursor-sized
+        let byte_len = (1usize << order) * 4096;
+        let handle = match card.register_dumb_backing(phys, byte_len, order) {
+            Ok(h) => h,
+            Err(_) => return TestResult::Fail("register_dumb_backing failed"),
+        };
+        // Simulate a live userspace mapping of the first backing page.
+        let root = narf_memory::PhysAddr::new(0x1000);
+        let va = narf_memory::VirtAddr::new(0x4000_0000);
+        narf_memory::rmap::add(narf_memory::PhysAddr::new(phys), root, va);
+        // GEM_CLOSE / DESTROY_DUMB while mapped: must DEFER (no frames returned).
+        if card.remove_dumb_backing(handle).is_some() {
+            narf_memory::rmap::remove(narf_memory::PhysAddr::new(phys), root, va);
+            narf_memory::rmap::__reset_for_test();
+            return TestResult::Fail("freed a dumb buffer while a user PTE still mapped it");
+        }
+        // The mapping is torn down (munmap): the deferred free must now proceed
+        // on the next drop (the mmap lifetime's release calls back in here).
+        narf_memory::rmap::remove(narf_memory::PhysAddr::new(phys), root, va);
+        let out = card.remove_dumb_backing(handle);
+        narf_memory::rmap::__reset_for_test();
+        match out {
+            Some((p, o)) if p == phys && o == order => TestResult::Pass,
+            Some(_) => TestResult::Fail("deferred free returned the wrong phys/order"),
+            None => TestResult::Fail("deferred free never proceeded after unmap"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        smoke_dumb_backing_defers_free_while_mapped
+    );
+
+    /// Baseline: an UNMAPPED dumb buffer frees immediately when its last
+    /// reference drops — the defer guard must not withhold a genuinely free
+    /// buffer.
+    fn smoke_dumb_backing_frees_when_unmapped() -> TestResult {
+        narf_memory::rmap::__reset_for_test();
+        let mut card = Card::new("test", "test", (1, 0, 0));
+        let phys = 0x50_000u64;
+        let order = 0u8;
+        let handle = match card.register_dumb_backing(phys, 4096, order) {
+            Ok(h) => h,
+            Err(_) => return TestResult::Fail("register_dumb_backing failed"),
+        };
+        // No rmap owner → the last-ref drop frees immediately.
+        match card.remove_dumb_backing(handle) {
+            Some((p, o)) if p == phys && o == order => TestResult::Pass,
+            _ => TestResult::Fail("unmapped dumb buffer did not free on last ref"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        smoke_dumb_backing_frees_when_unmapped
+    );
 }
