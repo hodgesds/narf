@@ -29,6 +29,27 @@ _start:
      * need nothing: a VA does not move when the image does, and the window
      * built below maps it to the copy.
      */
+    /* Not while someone else's page tables are live.
+     *
+     * The Linux arm64 boot protocol enters with the MMU off, which is the state
+     * the QEMU `-kernel` path gives us and what everything below assumes. A UEFI
+     * boot does NOT: after ExitBootServices the firmware's tables are still
+     * installed, and memory the loader did not allocate as code is mapped XN. So
+     * branching into a copy the firmware knows nothing about takes an
+     * instruction abort — "Permission fault, second level" at the copy's first
+     * byte, which is exactly how the aarch64 UEFI smoke failed.
+     *
+     * Relocating would mean tearing down the firmware's mappings first, with
+     * its stack and data still in use. Declining is the honest answer: the image
+     * still gets the VA slide, and only the physical randomization is lost on
+     * this path. */
+    mov  x21, #0                        /* delta, and the value `.Lphys_done`
+                                         * records — every path reaching it must
+                                         * have x21 set, including the two that
+                                         * decline below */
+    mrs  x0, sctlr_el1
+    tbnz x0, #0, .Lphys_done            /* SCTLR_EL1.M: MMU already on */
+
     ldr  x21, =KASLR_PHYS_FIXED
     cbnz x21, .Lphys_go                 /* pinned: use it verbatim */
     ldr  x0, =KASLR_PHYS_ENABLE
