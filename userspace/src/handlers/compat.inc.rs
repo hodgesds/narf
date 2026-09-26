@@ -2109,6 +2109,11 @@ fn do_execve_resolved(
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
             exec_file.as_ref(),
+            // AT_EXECFN — the path this exec resolved, which is what glibc
+            // expands `$ORIGIN` against. `cur_path` and not `argv_refs[0]`:
+            // after a `#!` line it names the interpreter actually being mapped,
+            // and a caller's argv[0] may be anything at all.
+            Some(cur_path.as_str()),
         )
     } {
         Ok(p) => p,
@@ -2263,6 +2268,14 @@ fn do_execve_resolved(
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(new_as);
         drop(prev_slot_as);
+        // The resolved binary's `FileOps`. Added with demand-paged exec and
+        // missed by both divergence drop lists: because this jump abandons the
+        // frame, a missing hand-drop leaks the Arc for the life of the kernel,
+        // and with demand paging that Arc is what the mapping-owner registry
+        // holds the file alive by — so every diverging exec pinned a file and
+        // its cached pages. The mapping the new image needs keeps its own
+        // reference, so dropping this one here is safe.
+        drop(exec_file);
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
@@ -2341,6 +2354,14 @@ fn do_execve_resolved(
         drop(envp_strs);
         drop(path_owned);
         drop(prev_slot_as);
+        // The resolved binary's `FileOps`. Added with demand-paged exec and
+        // missed by both divergence drop lists: because this jump abandons the
+        // frame, a missing hand-drop leaks the Arc for the life of the kernel,
+        // and with demand paging that Arc is what the mapping-owner registry
+        // holds the file alive by — so every diverging exec pinned a file and
+        // its cached pages. The mapping the new image needs keeps its own
+        // reference, so dropping this one here is safe.
+        drop(exec_file);
         // SAFETY: hook is a fn ptr installed at boot; uctx is live.
         unsafe { h(uctx_ptr) };
         // longjmp doesn't return; if it does (no jmp buf installed),

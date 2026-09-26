@@ -27,7 +27,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{DynEntry, ExecImage, ExecKind, Segment, SegmentFlags, TlsTemplate};
+use crate::{DynEntry, ElfProperties, ExecImage, ExecKind, Segment, SegmentFlags, TlsTemplate};
 
 // ── Wire constants (ELF spec) ───────────────────────────────────────
 
@@ -71,6 +71,25 @@ const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PT_TLS: u32 = 7;
 const PT_GNU_STACK: u32 = 0x6474e551;
+const PT_GNU_PROPERTY: u32 = 0x6474e553;
+
+/// `NT_GNU_PROPERTY_TYPE_0` — the only note type `PT_GNU_PROPERTY` carries.
+const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
+/// Property records and the note descriptor are 8-byte aligned in ELF64
+/// (`ELF_GNU_PROPERTY_ALIGN`).
+const GNU_PROPERTY_ALIGN: usize = 8;
+/// A `PT_GNU_PROPERTY` segment is a handful of records; anything beyond this is
+/// a malformed or hostile image, and the cap keeps the read bounded without an
+/// allocation that tracks the file.
+const MAX_PROPERTY_BYTES: u64 = 1024;
+
+const GNU_PROPERTY_AARCH64_FEATURE_1_AND: u32 = 0xc000_0000;
+const GNU_PROPERTY_AARCH64_FEATURE_1_BTI: u32 = 1 << 0;
+const GNU_PROPERTY_AARCH64_FEATURE_1_PAC: u32 = 1 << 1;
+const GNU_PROPERTY_AARCH64_FEATURE_1_MTE: u32 = 1 << 2;
+const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
+const GNU_PROPERTY_X86_FEATURE_1_IBT: u32 = 1 << 0;
+const GNU_PROPERTY_X86_FEATURE_1_SHSTK: u32 = 1 << 1;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
@@ -104,6 +123,14 @@ pub enum ElfError {
     /// Only a file-backed [`ExecBytes`] can raise it; an in-memory slice fails
     /// its bounds check as `TooShort` instead.
     ImageReadFailed,
+    /// The `PT_GNU_PROPERTY` segment is not a well-formed
+    /// `NT_GNU_PROPERTY_TYPE_0` note: a record claiming data past the end of
+    /// the note, records out of order or duplicated, a misaligned record, a
+    /// feature word too short to hold its bitmap, or a segment too small or
+    /// implausibly large to be a property note. Linux's `parse_elf_property`
+    /// rejects the same shapes with `-ENOEXEC`; guessing would mean silently
+    /// reading "no features" and disabling an enforcement the binary asked for.
+    BadGnuProperty,
     /// A PT_LOAD claims more file bytes than memory bytes
     /// (`p_filesz > p_memsz`), which cannot be mapped coherently.
     /// Linux's `binfmt_elf` rejects this with EINVAL.
@@ -267,6 +294,9 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
     let mut tls: Option<TlsTemplate> = None;
     let mut stack_flags: Option<SegmentFlags> = None;
     let mut phdr_vaddr: Option<u64> = None;
+    let mut property_span: Option<(u64, u64)> = None;
+    // Largest power-of-two PT_LOAD alignment, floored at the page size.
+    let mut max_align: u64 = 4096;
 
     for i in 0..phnum {
         let off = i * entsize;
@@ -285,6 +315,13 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 // silently truncated the copy instead.
                 if p_filesz > p_memsz {
                     return Err(ElfError::SegmentFileSizeExceedsMemSize);
+                }
+                // `maximum_alignment()` in `fs/binfmt_elf.c`: take the largest
+                // alignment any PT_LOAD asks for, skipping non-powers-of-two as
+                // malformed rather than rejecting the image over them.
+                let seg_align = read_u64(&phtab, off + 0x30);
+                if seg_align > max_align && seg_align.is_power_of_two() {
+                    max_align = seg_align;
                 }
                 let mut flags = SegmentFlags::default();
                 if p_flags & PF_R != 0 {
@@ -415,11 +452,21 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
                 phdr_vaddr = Some(p_vaddr);
             }
             PT_NOTE => {
-                // Not fully implemented, just parsed.
+                // Not fully implemented, just parsed. Linux consults PT_NOTE
+                // for nothing during load either: properties come from
+                // PT_GNU_PROPERTY, which is a separate header.
+            }
+            PT_GNU_PROPERTY => {
+                property_span = Some((p_offset, p_filesz));
             }
             _ => { /* other PT_* ignored at this tier */ }
         }
     }
+
+    let properties = match property_span {
+        Some((off, size)) => read_gnu_property_segment(src, off, size)?,
+        None => ElfProperties::default(),
+    };
 
     Ok(ExecImage {
         kind,
@@ -430,10 +477,136 @@ pub fn parse_from<S: ExecBytes + ?Sized>(src: &S) -> Result<ExecImage, ElfError>
         tls,
         stack_flags,
         phdr_vaddr,
+        properties,
+        max_align,
         argv: Vec::new(),
         envp: Vec::new(),
         aux: Vec::new(),
     })
+}
+
+/// Decode an `NT_GNU_PROPERTY_TYPE_0` note descriptor into [`ElfProperties`].
+///
+/// Mirrors `parse_elf_property` in `fs/binfmt_elf.c`, including the checks that
+/// make a malformed note an error rather than a guess:
+///
+/// - each record is `pr_type: u32, pr_datasz: u32` followed by `pr_datasz`
+///   bytes padded to an 8-byte boundary;
+/// - `pr_datasz` must fit the bytes that remain, and so must the padded step,
+///   so a record cannot claim data past the end of the note;
+/// - records are required to be unique and sorted ascending on `pr_type`
+///   ("Properties are supposed to be unique and sorted on pr_type"), which is
+///   what stops a second record silently overriding the first.
+///
+/// Unknown `pr_type`s are skipped, as Linux does — a newer toolchain emitting a
+/// property this kernel has no opinion on must not fail the exec.
+fn parse_gnu_properties(desc: &[u8]) -> Result<ElfProperties, ElfError> {
+    let mut props = ElfProperties::default();
+    let mut off = 0usize;
+    let mut prev_type: Option<u32> = None;
+    while off < desc.len() {
+        if off % GNU_PROPERTY_ALIGN != 0 {
+            return Err(ElfError::BadGnuProperty);
+        }
+        let remaining = desc.len() - off;
+        if remaining < 8 {
+            return Err(ElfError::BadGnuProperty);
+        }
+        let pr_type = read_u32(desc, off);
+        let pr_datasz = read_u32(desc, off + 4) as usize;
+        let data_start = off + 8;
+        let avail = desc.len() - data_start;
+        if pr_datasz > avail {
+            return Err(ElfError::BadGnuProperty);
+        }
+        // Padded stride to the next record; it must also fit, so a final
+        // record cannot imply a record past the end.
+        let step = pr_datasz.next_multiple_of(GNU_PROPERTY_ALIGN);
+        if step > avail {
+            return Err(ElfError::BadGnuProperty);
+        }
+        if prev_type.is_some_and(|prev| pr_type <= prev) {
+            return Err(ElfError::BadGnuProperty);
+        }
+        prev_type = Some(pr_type);
+
+        // Both feature words are `u32` bitmaps. A record with the right type
+        // but the wrong size is malformed, not ignorable: it would otherwise
+        // read as "no features" and silently disable enforcement.
+        let data = &desc[data_start..data_start + pr_datasz];
+        match pr_type {
+            GNU_PROPERTY_AARCH64_FEATURE_1_AND => {
+                if data.len() < 4 {
+                    return Err(ElfError::BadGnuProperty);
+                }
+                let bits = read_u32(data, 0);
+                props.aarch64_bti = bits & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
+                props.aarch64_pac = bits & GNU_PROPERTY_AARCH64_FEATURE_1_PAC != 0;
+                props.aarch64_mte = bits & GNU_PROPERTY_AARCH64_FEATURE_1_MTE != 0;
+            }
+            GNU_PROPERTY_X86_FEATURE_1_AND => {
+                if data.len() < 4 {
+                    return Err(ElfError::BadGnuProperty);
+                }
+                let bits = read_u32(data, 0);
+                props.x86_ibt = bits & GNU_PROPERTY_X86_FEATURE_1_IBT != 0;
+                props.x86_shstk = bits & GNU_PROPERTY_X86_FEATURE_1_SHSTK != 0;
+            }
+            // A property this kernel has no opinion on. Skipping rather than
+            // failing keeps a newer toolchain's binaries runnable.
+            _ => {}
+        }
+        off = data_start + step;
+    }
+    Ok(props)
+}
+
+/// Read the `PT_GNU_PROPERTY` segment and decode the one note it may carry.
+///
+/// The segment holds a standard ELF note: `n_namesz, n_descsz, n_type`, the
+/// name padded to 4 bytes, then the descriptor padded to 4. Linux accepts only
+/// name `"GNU\0"` with `n_type == NT_GNU_PROPERTY_TYPE_0` and requires the
+/// descriptor to be 8-byte aligned for ELF64; anything else is not a property
+/// note and yields no properties rather than an error.
+fn read_gnu_property_segment<S: ExecBytes + ?Sized>(
+    src: &S,
+    file_off: u64,
+    file_size: u64,
+) -> Result<ElfProperties, ElfError> {
+    if !(16..=MAX_PROPERTY_BYTES).contains(&file_size) {
+        return Err(ElfError::BadGnuProperty);
+    }
+    let end = file_off
+        .checked_add(file_size)
+        .ok_or(ElfError::BadGnuProperty)?;
+    if end > src.size() {
+        return Err(ElfError::BadGnuProperty);
+    }
+    let mut note = alloc::vec::Vec::new();
+    note.try_reserve_exact(file_size as usize)
+        .map_err(|_| ElfError::BadGnuProperty)?;
+    note.resize(file_size as usize, 0u8);
+    src.read_exact_at(file_off, &mut note)?;
+
+    let n_namesz = read_u32(&note, 0) as usize;
+    let n_descsz = read_u32(&note, 4) as usize;
+    let n_type = read_u32(&note, 8);
+    if n_type != NT_GNU_PROPERTY_TYPE_0 || n_namesz != 4 {
+        return Ok(ElfProperties::default());
+    }
+    if note.get(12..16) != Some(b"GNU\0") {
+        return Ok(ElfProperties::default());
+    }
+    // Name is 4 bytes, already 4-aligned; the ELF64 descriptor then starts at
+    // an 8-aligned offset, which for this layout is exactly 16.
+    let desc_start = 16usize;
+    let desc_end = desc_start
+        .checked_add(n_descsz)
+        .ok_or(ElfError::BadGnuProperty)?;
+    if desc_end > note.len() {
+        return Err(ElfError::BadGnuProperty);
+    }
+    parse_gnu_properties(&note[desc_start..desc_end])
 }
 
 // ── Little-endian readers ───────────────────────────────────────────

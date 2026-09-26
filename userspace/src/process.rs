@@ -204,7 +204,7 @@ pub unsafe fn load_user_process_with_root(
     pid: crate::ProcessId,
 ) -> Result<UserProcess, ProcessLoadError> {
     // SAFETY: forwarding this fn's contract; `None` keeps the eager path.
-    unsafe { load_user_process_with_root_file(bytes, argv, envp, aux, root, pid, None) }
+    unsafe { load_user_process_with_root_file(bytes, argv, envp, aux, root, pid, None, None) }
 }
 
 /// [`load_user_process_with_root`], demand-paging the program image from
@@ -222,6 +222,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     root: Option<&str>,
     pid: crate::ProcessId,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+    execfn: Option<&str>,
 ) -> Result<UserProcess, ProcessLoadError> {
     // SAFETY: caller upholds this fn's `# Safety` contract (live low-4-GiB
     // identity map + initialised frame allocator), which is precisely what
@@ -650,6 +651,11 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             .unwrap_or(0),
     };
 
+    // AT_HWCAP / AT_HWCAP2 — what the hardware can actually do. Emitted from
+    // probed state rather than as zero words: libc reads these before it may
+    // execute a feature-dependent instruction, and on aarch64 `HWCAP2_MTE` is
+    // the only way a program learns Memory Tagging is available at all.
+    let (hwcap, hwcap2) = crate::hwcap::hwcaps();
     let mut final_aux = aux.to_vec();
     if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
         for default in [
@@ -676,7 +682,8 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // always-present zero words.
             AuxEntry::Flags(0),
             AuxEntry::Clktck(crate::handlers::CLK_TCK_HZ),
-            AuxEntry::Hwcap2(0),
+            AuxEntry::Hwcap(hwcap),
+            AuxEntry::Hwcap2(hwcap2),
             AuxEntry::MinSigStkSz(crate::handlers::MIN_SIGSTKSZ),
             AuxEntry::Uid(0),
             AuxEntry::Euid(0),
@@ -728,6 +735,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                 argv,
                 envp,
                 &final_aux,
+                execfn,
             )
         }
         .map_err(|_| ProcessLoadError::StackOverflow)?
@@ -902,11 +910,22 @@ pub unsafe fn init_sysv_stack(
     argv: &[&str],
     envp: &[&str],
     aux: &[AuxEntry],
+    execfn: Option<&str>,
 ) -> Result<u64, SysVStackError> {
     // 1. Compute total string bytes (each str + a NUL).
+    //
+    // `execfn` is the path `execve` was given, which becomes `AT_EXECFN`. It is
+    // NOT `argv[0]`: a caller chooses argv[0] freely (a login shell passes
+    // "-bash", a multi-call binary like busybox passes the applet name), while
+    // glibc expands `$ORIGIN` in an RPATH from `AT_EXECFN`'s directory — so
+    // substituting argv[0] would resolve a bundled application's libraries
+    // relative to the wrong place.
     let mut strings_bytes: u64 = 0;
     for s in argv.iter().chain(envp.iter()) {
         strings_bytes = strings_bytes.saturating_add(s.len() as u64 + 1);
+    }
+    if let Some(name) = execfn {
+        strings_bytes = strings_bytes.saturating_add(name.len() as u64 + 1);
     }
     // Round up to 8-byte alignment so the aux/env/argv arrays below
     // sit aligned; SysV doesn't require it for correctness but it
@@ -915,7 +934,7 @@ pub unsafe fn init_sysv_stack(
 
     // 2. Aux array: each AuxEntry occupies 16 bytes (key u64 + val u64).
     //    Add a final AT_NULL terminator.
-    let aux_bytes = ((aux.len() as u64) + 1) * 16;
+    let aux_bytes = ((aux.len() as u64) + u64::from(execfn.is_some()) + 1) * 16;
 
     // 3. envp pointer array: one u64 per entry + NULL terminator.
     let envp_bytes = ((envp.len() as u64) + 1) * 8;
@@ -992,6 +1011,23 @@ pub unsafe fn init_sysv_stack(
         cursor_vaddr += s.len() as u64 + 1;
     }
 
+    // Placed ABOVE the env strings deliberately: process-title helpers compute
+    // `last_env_end - argv[0]` and expect that span to cover argv+envp only, so
+    // the exec filename goes after it rather than inside it.
+    let execfn_ptr = match execfn {
+        Some(name) => {
+            for (i, &b) in name.as_bytes().iter().enumerate() {
+                write_u8(cursor_vaddr + i as u64, b)?;
+            }
+            write_u8(cursor_vaddr + name.len() as u64, 0)?;
+            let at = cursor_vaddr;
+            cursor_vaddr += name.len() as u64 + 1;
+            Some(at)
+        }
+        None => None,
+    };
+    let _ = cursor_vaddr;
+
     // The bottom of the layout (lowest addr, the user RSP) sits
     // `total` bytes below the top. From there going up: argc,
     // argv*, envp*, aux*, then strings.
@@ -1017,6 +1053,12 @@ pub unsafe fn init_sysv_stack(
 
     for e in aux.iter() {
         let (key, val) = aux_pair(e);
+        write_u64(wv, key as u64)?;
+        write_u64(wv + 8, val)?;
+        wv += 16;
+    }
+    if let Some(at) = execfn_ptr {
+        let (key, val) = aux_pair(&AuxEntry::ExecFn(at));
         write_u64(wv, key as u64)?;
         write_u64(wv + 8, val)?;
         wv += 16;

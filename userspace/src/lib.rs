@@ -52,6 +52,7 @@ pub mod epoll;
 pub mod errno;
 pub mod fd;
 pub mod handlers;
+pub mod hwcap;
 pub mod init;
 pub mod interp;
 pub mod io_mux;
@@ -446,6 +447,39 @@ pub struct DynEntry {
 }
 
 /// In-memory description of a loaded program.
+/// Hardware-security features a binary declares it was built for, from its
+/// `PT_GNU_PROPERTY` note (`NT_GNU_PROPERTY_TYPE_0`).
+///
+/// These are opt-INs: the toolchain emits them only when every input object
+/// carried the matching property, because enforcement breaks code that was not
+/// compiled for it. Branch Target Identification faults an indirect branch to
+/// an instruction that is not a `BTI` landing pad, so enabling it on a binary
+/// built without the landing pads kills it on its first PLT call; the same
+/// applies to x86 IBT. A kernel therefore cannot turn these on by policy — it
+/// has to read what the binary asked for, which is what this carries.
+///
+/// Linux reaches the same place through `arch_parse_elf_property` recording
+/// into `struct arch_elf_state`, then `arch_elf_adjust_prot` applying it to the
+/// binary's executable mappings.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ElfProperties {
+    /// aarch64 `GNU_PROPERTY_AARCH64_FEATURE_1_BTI`: the binary's indirect
+    /// branch targets carry `BTI` landing pads, so its executable pages may be
+    /// mapped with the guarded (`GP`) attribute.
+    pub aarch64_bti: bool,
+    /// aarch64 `..._FEATURE_1_PAC`: built with pointer authentication.
+    /// Recorded for `/proc` and for a future PAC enablement pass; the kernel
+    /// does not gate anything on it today.
+    pub aarch64_pac: bool,
+    /// aarch64 `..._FEATURE_1_MTE`: built for Memory Tagging.
+    pub aarch64_mte: bool,
+    /// x86 `GNU_PROPERTY_X86_FEATURE_1_IBT`: built for Indirect Branch
+    /// Tracking (part of CET).
+    pub x86_ibt: bool,
+    /// x86 `GNU_PROPERTY_X86_FEATURE_1_SHSTK`: built for the shadow stack.
+    pub x86_shstk: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecImage {
     pub kind: ExecKind,
@@ -474,6 +508,19 @@ pub struct ExecImage {
     /// bias (`l_addr = AT_PHDR - PT_PHDR.p_vaddr`). See the AT_PHDR
     /// construction in `process::load_user_process_with`.
     pub phdr_vaddr: Option<u64>,
+    /// Parsed `PT_GNU_PROPERTY` contents. All-false when the binary carries no
+    /// property note, which is the common case for anything not built with the
+    /// relevant `-z` flags.
+    pub properties: ElfProperties,
+    /// The largest power-of-two `p_align` across the image's `PT_LOAD` headers,
+    /// never below the page size.
+    ///
+    /// A toolchain asks for 2 MiB here when it wants the segment eligible for a
+    /// huge mapping; honouring it is what lets program text land on a boundary
+    /// the hardware can back with one entry. Linux computes the same value in
+    /// `maximum_alignment()` and aligns the ET_DYN base to it, skipping
+    /// non-power-of-two values as malformed.
+    pub max_align: u64,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
     pub aux: Vec<AuxEntry>,
@@ -490,6 +537,9 @@ impl ExecImage {
             tls: None,
             stack_flags: None,
             phdr_vaddr: None,
+            properties: ElfProperties::default(),
+            // An empty image declares no alignment beyond the page size.
+            max_align: 4096,
             argv: Vec::new(),
             envp: Vec::new(),
             aux: Vec::new(),

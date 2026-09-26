@@ -588,12 +588,14 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
                 seg.vaddr.checked_add(seg.mem_size).map(|end| acc.max(end))
             })
             .ok_or(LoadBytesError::ImageWindowOverflow)?;
-        let usable = PROGRAM_WINDOW_BYTES - (1u64 << narf_memory::kaslr::USER_ELF_RANDOM_BITS);
+        let usable = PROGRAM_WINDOW_BYTES
+            - (1u64 << narf_memory::kaslr::USER_ELF_RANDOM_BITS)
+            - image.max_align;
         if span > usable {
             return Err(LoadBytesError::ImageWindowOverflow);
         }
     }
-    let bias = program_load_bias(image.kind);
+    let bias = program_load_bias(image.kind, image.max_align);
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
     // SAFETY: Valid memory or trusted environment
@@ -660,9 +662,32 @@ pub const PROGRAM_WINDOW_BYTES: u64 = 512u64 << 30;
 /// base turns from a maintenance note into a bug, since two draws
 /// disagree. `load_elf_bytes` now returns the bias it used and callers
 /// consume that.
-pub fn program_load_bias(kind: crate::ExecKind) -> u64 {
+pub fn program_load_bias(kind: crate::ExecKind, max_align: u64) -> u64 {
     match kind {
-        crate::ExecKind::Elf64Dyn => narf_memory::kaslr::user_elf_slot(PROGRAM_DYN_BASE),
+        crate::ExecKind::Elf64Dyn => {
+            let slot = narf_memory::kaslr::user_elf_slot(PROGRAM_DYN_BASE);
+            if max_align <= 4096 {
+                return slot;
+            }
+            // `binfmt_elf`: `load_bias &= ~(alignment - 1)` — the randomised
+            // base is rounded DOWN to the alignment the image asked for, so a
+            // 2 MiB-aligned text segment lands where hardware can back it with
+            // one entry. Rounding up instead would push the image toward the
+            // top of its window for no benefit.
+            let aligned = slot & !(max_align - 1);
+            // One NARF-specific guard. `PROGRAM_DYN_BASE` is itself 2 MiB
+            // aligned, so rounding down can land exactly on it — and the
+            // nominal base must stay unmapped, because several ABI tests use it
+            // as a known-bad user pointer and `user_elf_slot` never returns it.
+            // Only nudge up when randomisation actually moved the base: with
+            // ASLR pinned off the slot IS the nominal base and the canonical
+            // layout must be preserved exactly.
+            if slot > PROGRAM_DYN_BASE && aligned <= PROGRAM_DYN_BASE {
+                aligned + max_align
+            } else {
+                aligned
+            }
+        }
         _ => 0,
     }
 }

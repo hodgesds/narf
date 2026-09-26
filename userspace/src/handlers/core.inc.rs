@@ -10473,6 +10473,31 @@ pub fn __test_clone_parent_link(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// The architecture TLS register (`FS_BASE` / `TPIDR_EL0`) a clone's child
+/// starts with.
+///
+/// `CLONE_SETTLS` means "use exactly this value", including zero: libc passes a
+/// real thread pointer for a new thread, and a child asked to start with a null
+/// TLS pointer must get null rather than silently inheriting its parent's —
+/// inheriting would give two threads the same TLS block, which is corruption
+/// that surfaces far from here. Without the flag the child inherits the live
+/// register, which the user-task poller restores before EL0 entry.
+fn child_tls_base(flags: u64, tls: u64) -> Option<u64> {
+    if (flags & CLONE_SETTLS) != 0 {
+        Some(tls)
+    } else {
+        current_user_tls_base()
+    }
+}
+
+/// Test hook for [`child_tls_base`]: `CLONE_SETTLS` is implemented but was
+/// covered by nothing, so a regression in it would have stayed silent until a
+/// threaded program ran.
+#[doc(hidden)]
+pub fn __test_clone_tls_base(flags: u64, tls: u64) -> Option<u64> {
+    child_tls_base(flags, tls)
+}
+
 fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_tids: &[i32]) {
     use crate::process::DEFAULT_USER_STACK_BYTES;
     let flags = ca.flags;
@@ -10871,13 +10896,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         address_space: child_as.clone(),
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(rsp),
-        fs_base: if (flags & CLONE_SETTLS) != 0 {
-            Some(ca.tls)
-        } else {
-            // Inherit the live architecture TLS register (FS_BASE or
-            // TPIDR_EL0); the user-task poller restores it before EL0 entry.
-            current_user_tls_base()
-        },
+        fs_base: child_tls_base(flags, ca.tls),
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         // Zero sentinel, like `entry` above: a cloned task resumes from
