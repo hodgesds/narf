@@ -575,7 +575,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     base: VirtAddr::new(base),
                     len,
                     perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
-                    phys,
+                    phys: match narf_memory::region_backing::RegionBacking::try_from_slice(&phys) {
+                        Ok(backing) => backing,
+                        Err(_) => {
+                            ctx.set_return(errno_ret(ENOMEM));
+                            return;
+                        }
+                    },
                 };
                 let mapped = as_ref.with_vma_transaction(|| {
                     narf_memory::with_address_space_shared_mapping_transaction(
@@ -679,7 +685,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         | RegionPerms::SHARED
                         | RegionPerms::FILE_DEMAND
                         | RegionPerms::LOCK_EXEMPT,
-                    phys: alloc::vec![narf_memory::PhysAddr::new(0); pages],
+                    phys: {
+                        let mut backing = narf_memory::region_backing::RegionBacking::new();
+                        backing.resize(pages, narf_memory::PhysAddr::new(0));
+                        backing
+                    },
                 };
                 let mapped = as_ref.with_vma_transaction(|| {
                     narf_memory::with_address_space_shared_mapping_transaction(
@@ -1020,6 +1030,17 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         phys_list = canonical;
         shared_publication = Some(publication);
     }
+    let backing = match narf_memory::region_backing::RegionBacking::try_from_slice(&phys_list) {
+        Ok(backing) => backing,
+        Err(_) => {
+            if shared_file_ops.is_none() {
+                narf_memory::frame::free_phys_batch(&phys_list);
+            }
+            drop(shared_publication);
+            ctx.set_return(errno_ret(ENOMEM));
+            return;
+        }
+    };
     let writeback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
     let region = Region {
         base: VirtAddr::new(base),
@@ -1041,7 +1062,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         } else {
             perms
         },
-        phys: phys_list,
+        phys: backing,
     };
     let mut eager_file_population = false;
     let map_result = if let Some(ops) = shared_file_ops.as_ref() {
@@ -1597,7 +1618,7 @@ mod tests {
             base: VirtAddr::new(BASE),
             len: 4096,
             perms: RegionPerms::READ,
-            phys: vec![PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0)].into(),
         };
         let receipt = match aspace.map_region_limited_receipt(first, false, u64::MAX, false) {
             Ok(receipt) => receipt,
@@ -1607,7 +1628,7 @@ mod tests {
             base: VirtAddr::new(BASE),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: vec![PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0)].into(),
         };
         if aspace
             .replace_region_limited_receipt(successor, false, u64::MAX, false)
@@ -1666,7 +1687,7 @@ mod tests {
                 base: conflict,
                 len: 4096,
                 perms: narf_memory::RegionPerms::READ,
-                phys: vec![low_frame],
+                phys: vec![low_frame].into(),
             })
             .is_err()
         {

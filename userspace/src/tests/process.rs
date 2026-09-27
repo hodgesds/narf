@@ -963,7 +963,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
             base: VirtAddr::new(SENTINEL_VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![frame],
+            phys: alloc::vec![frame].into(),
         })
         .is_err()
     {

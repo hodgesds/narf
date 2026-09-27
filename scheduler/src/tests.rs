@@ -866,7 +866,7 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC,
-        phys: alloc::vec![PhysAddr::new(0x2_0000)],
+        phys: alloc::vec![PhysAddr::new(0x2_0000)].into(),
     })
     .expect("map");
     let arc_a = Arc::new(a);

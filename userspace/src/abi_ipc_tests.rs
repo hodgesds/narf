@@ -3811,7 +3811,7 @@ fn smoke_abi_ipc_mremap_fixed_detaches_destination_shm() -> TestResult {
                     base: VirtAddr::new(SOURCE),
                     len: 4096,
                     perms: RegionPerms::READ | RegionPerms::WRITE,
-                    phys: alloc::vec![PhysAddr::new(0)],
+                    phys: alloc::vec![PhysAddr::new(0)].into(),
                 })
                 .is_err()
             {

@@ -336,7 +336,7 @@ mod tests {
                 base,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![narf_memory::PhysAddr::new(0)],
+                phys: alloc::vec![narf_memory::PhysAddr::new(0)].into(),
             })
             .is_err()
         {
@@ -365,7 +365,7 @@ mod tests {
                 base: foreign,
                 len: 0x2000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![narf_memory::PhysAddr::new(0); 2],
+                phys: alloc::vec![narf_memory::PhysAddr::new(0); 2].into(),
             })
             .is_err()
         {
@@ -429,7 +429,7 @@ mod tests {
                 base: ordinary,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![narf_memory::PhysAddr::new(0)],
+                phys: alloc::vec![narf_memory::PhysAddr::new(0)].into(),
             })
             .is_err()
             || as_as
@@ -437,7 +437,7 @@ mod tests {
                     base: guard,
                     len: 0x1000,
                     perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                    phys: alloc::vec![narf_memory::PhysAddr::new(0)],
+                    phys: alloc::vec![narf_memory::PhysAddr::new(0)].into(),
                 })
                 .is_err()
         {

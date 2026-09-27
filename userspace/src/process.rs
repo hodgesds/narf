@@ -490,7 +490,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             base: VirtAddr::new(DEFAULT_USER_STACK_BASE),
             len: DEFAULT_USER_STACK_RESERVED,
             perms: stack_perms,
-            phys: stack_phys_list,
+            phys: stack_phys_list.into(),
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
     loaded_mappings.push(LoadedMapping {
@@ -522,7 +522,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             base: VirtAddr::new(guard_base),
             len: 0x1000,
             perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
 

@@ -27,21 +27,15 @@ fn mremap_memory_errno(error: narf_memory::AddressSpaceError) -> i64 {
     }
 }
 
-fn shm_mremap_prepare_error(
-    error: ShmMremapPrepareError,
-) -> narf_memory::AddressSpaceError {
+fn shm_mremap_prepare_error(error: ShmMremapPrepareError) -> narf_memory::AddressSpaceError {
     match error {
-        ShmMremapPrepareError::InvalidRange => {
-            narf_memory::AddressSpaceError::AlignmentMismatch
-        }
+        ShmMremapPrepareError::InvalidRange => narf_memory::AddressSpaceError::AlignmentMismatch,
         ShmMremapPrepareError::PartialSysvSource
         | ShmMremapPrepareError::AmbiguousSysvSource
         | ShmMremapPrepareError::SegmentMissing => narf_memory::AddressSpaceError::Unmapped,
         ShmMremapPrepareError::PreparationConflict
         | ShmMremapPrepareError::AllocationFailed
-        | ShmMremapPrepareError::TokenExhausted => {
-            narf_memory::AddressSpaceError::AllocationFailed
-        }
+        | ShmMremapPrepareError::TokenExhausted => narf_memory::AddressSpaceError::AllocationFailed,
     }
 }
 
@@ -82,18 +76,12 @@ unsafe fn publish_shared_mremap_alias_locked(
         let as_key = shm_as_key_ref(as_ref);
         // SAFETY: the caller holds shm_mapping_transaction(as_key) through
         // plan consumption and the VMA transaction keeps both ranges stable.
-        unsafe {
-            shm_prepare_mremap_shared_alias_locked(as_key, old_addr, len, new_addr, lpid)
-        }
-        .map_err(|error| early(shm_mremap_prepare_error(error)))?
+        unsafe { shm_prepare_mremap_shared_alias_locked(as_key, old_addr, len, new_addr, lpid) }
+            .map_err(|error| early(shm_mremap_prepare_error(error)))?
     };
 
-    let result = crate::mapped_file::publish_current_owner_alias(
-        old_addr,
-        new_addr,
-        len,
-        fixed,
-        || {
+    let result =
+        crate::mapped_file::publish_current_owner_alias(old_addr, new_addr, len, fixed, || {
             if fixed {
                 // SAFETY: caller holds the VMA and shared-owner transactions;
                 // file/SysV metadata has been prepared for the same ranges.
@@ -121,8 +109,7 @@ unsafe fn publish_shared_mremap_alias_locked(
                 }
                 .map_err(early)
             }
-        },
-    );
+        });
 
     match &result {
         Ok(_) => shm_plan.commit(fixed),
@@ -307,10 +294,9 @@ fn mremap_core_limited(
             // zero old length identifies the containing shared VMA for
             // Linux's legacy duplication mode; private DONTUNMAP still needs
             // an exact source until its retained-source split is implemented.
-            let covering_perms = unsafe {
-                as_ref.region_perms_covering_locked(VirtAddr::new(old_addr), old_len)
-            }
-            .ok_or(EFAULT)?;
+            let covering_perms =
+                unsafe { as_ref.region_perms_covering_locked(VirtAddr::new(old_addr), old_len) }
+                    .ok_or(EFAULT)?;
             let source_perms = if old_len == 0
                 || covering_perms.contains(RegionPerms::SHARED)
                 || flags & MREMAP_DONTUNMAP == 0
@@ -351,14 +337,14 @@ fn mremap_core_limited(
                     let result = narf_memory::with_address_space_shared_mapping_transaction(
                         as_ref.identity(),
                         || {
-                        // SAFETY: SysV -> VMA -> shared transactions are held;
-                        // the helper prepares file/SysV owner transfer before
-                        // invoking the destructive fixed memory operation.
-                        unsafe {
-                            publish_shared_mremap_relocation_locked(
-                                as_ref, old_addr, old_len, new_addr, new_len, true, limits,
-                            )
-                        }
+                            // SAFETY: SysV -> VMA -> shared transactions are held;
+                            // the helper prepares file/SysV owner transfer before
+                            // invoking the destructive fixed memory operation.
+                            unsafe {
+                                publish_shared_mremap_relocation_locked(
+                                    as_ref, old_addr, old_len, new_addr, new_len, true, limits,
+                                )
+                            }
                         },
                     );
                     return result.map_err(|failure| mremap_memory_errno(failure.error));
@@ -372,19 +358,13 @@ fn mremap_core_limited(
                 let result = narf_memory::with_address_space_shared_mapping_transaction(
                     as_ref.identity(),
                     || {
-                    // SAFETY: SysV -> VMA -> shared-owner lock order is held;
-                    // the helper adds file-owner preparation before memory.
-                    unsafe {
-                        publish_shared_mremap_alias_locked(
-                            as_ref,
-                            old_addr,
-                            alias_len,
-                            new_addr,
-                            mode,
-                            true,
-                            limits,
-                        )
-                    }
+                        // SAFETY: SysV -> VMA -> shared-owner lock order is held;
+                        // the helper adds file-owner preparation before memory.
+                        unsafe {
+                            publish_shared_mremap_alias_locked(
+                                as_ref, old_addr, alias_len, new_addr, mode, true, limits,
+                            )
+                        }
                     },
                 );
                 return result.map_err(|failure| mremap_memory_errno(failure.error));
@@ -439,8 +419,7 @@ fn mremap_core_limited(
             } else {
                 relocate()
             };
-            result
-            .map_err(|failure| {
+            result.map_err(|failure| {
                 if failure.target_punched {
                     shm_record_fixed_punch(as_key, new_addr, new_addr + new_len, lpid);
                 }
@@ -477,10 +456,9 @@ fn mremap_core_limited(
         // SAFETY: the enclosing closure holds the VMA transaction. Shared
         // aliases and ordinary private remaps may cover a subrange, while
         // old_len==0 identifies the VMA at old_addr.
-        let covering_perms = unsafe {
-            as_ref.region_perms_covering_locked(VirtAddr::new(old_addr), old_len)
-        }
-        .ok_or(EFAULT)?;
+        let covering_perms =
+            unsafe { as_ref.region_perms_covering_locked(VirtAddr::new(old_addr), old_len) }
+                .ok_or(EFAULT)?;
         if old_end > AddressSpace::USER_HALF_END {
             return Err(EFAULT);
         }
@@ -488,10 +466,7 @@ fn mremap_core_limited(
         if old_len == 0 && !source_shared {
             return Err(EINVAL);
         }
-        let source_perms = if old_len == 0
-            || source_shared
-            || flags & MREMAP_DONTUNMAP == 0
-        {
+        let source_perms = if old_len == 0 || source_shared || flags & MREMAP_DONTUNMAP == 0 {
             covering_perms
         } else {
             // SAFETY: the enclosing closure holds the VMA transaction. An
@@ -521,36 +496,29 @@ fn mremap_core_limited(
                         // SAFETY: the per-AS SysV mapping transaction and VMA
                         // transaction are held through plan consumption.
                         unsafe {
-                            shm_prepare_mremap_punch_locked(
-                                as_key,
-                                tail,
-                                old_len - new_len,
-                                lpid,
-                            )
+                            shm_prepare_mremap_punch_locked(as_key, tail, old_len - new_len, lpid)
                         }
-                        .map_err(|error| {
-                            mremap_memory_errno(shm_mremap_prepare_error(error))
-                        })?
+                        .map_err(|error| mremap_memory_errno(shm_mremap_prepare_error(error)))?
                     };
                     let result = narf_memory::with_address_space_shared_mapping_transaction(
                         as_ref.identity(),
                         || {
-                        crate::mapped_file::publish_current_punch(
-                            as_ref.identity(),
-                            tail,
-                            old_len - new_len,
-                            || {
-                                // SAFETY: VMA and shared-owner transactions
-                                // are held, and file/SysV punches were prepared.
-                                unsafe {
-                                    as_ref.punch_fixed_locked_for_syscall_with_shared(
-                                        VirtAddr::new(tail),
-                                        old_len - new_len,
-                                        true,
-                                    )
-                                }
-                            },
-                        )
+                            crate::mapped_file::publish_current_punch(
+                                as_ref.identity(),
+                                tail,
+                                old_len - new_len,
+                                || {
+                                    // SAFETY: VMA and shared-owner transactions
+                                    // are held, and file/SysV punches were prepared.
+                                    unsafe {
+                                        as_ref.punch_fixed_locked_for_syscall_with_shared(
+                                            VirtAddr::new(tail),
+                                            old_len - new_len,
+                                            true,
+                                        )
+                                    }
+                                },
+                            )
                         },
                     );
                     if result.is_ok() {
@@ -568,23 +536,23 @@ fn mremap_core_limited(
                 let in_place = narf_memory::with_address_space_shared_mapping_transaction(
                     as_ref.identity(),
                     || {
-                    crate::mapped_file::publish_current_owner_resize(
-                        old_addr,
-                        old_len,
-                        new_len,
-                        || {
-                            // SAFETY: source validation and VMA/shared/file
-                            // owner transactions remain held through growth.
-                            unsafe {
-                                as_ref.grow_region_locked_limited(
-                                    VirtAddr::new(old_addr),
-                                    old_len,
-                                    new_len,
-                                    limits,
-                                )
-                            }
-                        },
-                    )
+                        crate::mapped_file::publish_current_owner_resize(
+                            old_addr,
+                            old_len,
+                            new_len,
+                            || {
+                                // SAFETY: source validation and VMA/shared/file
+                                // owner transactions remain held through growth.
+                                unsafe {
+                                    as_ref.grow_region_locked_limited(
+                                        VirtAddr::new(old_addr),
+                                        old_len,
+                                        new_len,
+                                        limits,
+                                    )
+                                }
+                            },
+                        )
                     },
                 );
                 match in_place {
@@ -610,19 +578,19 @@ fn mremap_core_limited(
                 let result = narf_memory::with_address_space_shared_mapping_transaction(
                     as_ref.identity(),
                     || {
-                    // SAFETY: SysV/VMA/shared transactions remain held and the
-                    // helper prepares all external owners before memory.
-                    unsafe {
-                        publish_shared_mremap_relocation_locked(
-                            as_ref,
-                            old_addr,
-                            old_len,
-                            destination,
-                            new_len,
-                            false,
-                            limits,
-                        )
-                    }
+                        // SAFETY: SysV/VMA/shared transactions remain held and the
+                        // helper prepares all external owners before memory.
+                        unsafe {
+                            publish_shared_mremap_relocation_locked(
+                                as_ref,
+                                old_addr,
+                                old_len,
+                                destination,
+                                new_len,
+                                false,
+                                limits,
+                            )
+                        }
                     },
                 );
                 return result
@@ -648,10 +616,40 @@ fn mremap_core_limited(
             let result = narf_memory::with_address_space_shared_mapping_transaction(
                 as_ref.identity(),
                 || {
-                if let Some(destination) = preferred {
-                    // SAFETY: SysV/VMA/shared transactions and the live root
-                    // are held continuously through prepared metadata commit.
-                    let attempted = unsafe {
+                    if let Some(destination) = preferred {
+                        // SAFETY: SysV/VMA/shared transactions and the live root
+                        // are held continuously through prepared metadata commit.
+                        let attempted = unsafe {
+                            publish_shared_mremap_alias_locked(
+                                as_ref,
+                                old_addr,
+                                alias_len,
+                                destination,
+                                mode,
+                                false,
+                                limits,
+                            )
+                        };
+                        match attempted {
+                            Ok(eager) => return Ok((destination, eager)),
+                            Err(failure)
+                                if !failure.target_punched
+                                    && failure.error == narf_memory::AddressSpaceError::Overlap => {
+                            }
+                            Err(failure) => return Err(failure),
+                        }
+                    }
+                    // SAFETY: the VMA transaction makes this candidate stable and
+                    // successful alias publication advances the cursor itself.
+                    let destination = unsafe { as_ref.mmap_cursor_candidate_locked(alias_len) }
+                        .map_err(|error| narf_memory::FixedRelocationError {
+                            error,
+                            target_punched: false,
+                            source_shrunk: false,
+                        })?
+                        .as_u64();
+                    // SAFETY: same transaction/live-root contract as above.
+                    let eager = unsafe {
                         publish_shared_mremap_alias_locked(
                             as_ref,
                             old_addr,
@@ -661,38 +659,8 @@ fn mremap_core_limited(
                             false,
                             limits,
                         )
-                    };
-                    match attempted {
-                        Ok(eager) => return Ok((destination, eager)),
-                        Err(failure)
-                            if !failure.target_punched
-                                && failure.error
-                                    == narf_memory::AddressSpaceError::Overlap => {}
-                        Err(failure) => return Err(failure),
-                    }
-                }
-                // SAFETY: the VMA transaction makes this candidate stable and
-                // successful alias publication advances the cursor itself.
-                let destination = unsafe { as_ref.mmap_cursor_candidate_locked(alias_len) }
-                    .map_err(|error| narf_memory::FixedRelocationError {
-                        error,
-                        target_punched: false,
-                        source_shrunk: false,
-                    })?
-                    .as_u64();
-                // SAFETY: same transaction/live-root contract as above.
-                let eager = unsafe {
-                    publish_shared_mremap_alias_locked(
-                        as_ref,
-                        old_addr,
-                        alias_len,
-                        destination,
-                        mode,
-                        false,
-                        limits,
-                    )
-                }?;
-                Ok((destination, eager))
+                    }?;
+                    Ok((destination, eager))
                 },
             );
             return result.map_err(|failure| mremap_memory_errno(failure.error));
@@ -735,13 +703,11 @@ fn mremap_core_limited(
                 tail,
                 old_len - new_len,
                 || {
-                // SAFETY: the enclosing closure holds the VMA transaction.
-                unsafe {
-                    as_ref.punch_fixed_locked_for_syscall(
-                        VirtAddr::new(tail),
-                        old_len - new_len,
-                    )
-                }
+                    // SAFETY: the enclosing closure holds the VMA transaction.
+                    unsafe {
+                        as_ref
+                            .punch_fixed_locked_for_syscall(VirtAddr::new(tail), old_len - new_len)
+                    }
                 },
             )
             .map_err(|_| EFAULT)?;
@@ -750,12 +716,7 @@ fn mremap_core_limited(
         // SAFETY: the VMA transaction is held and `old_len` was validated
         // against the exact source mapping above.
         match unsafe {
-            as_ref.grow_region_locked_limited(
-                VirtAddr::new(old_addr),
-                old_len,
-                new_len,
-                limits,
-            )
+            as_ref.grow_region_locked_limited(VirtAddr::new(old_addr), old_len, new_len, limits)
         } {
             Ok(eager_range) => return Ok((old_addr, eager_range)),
             Err(narf_memory::AddressSpaceError::LockLimit) => return Err(EAGAIN),
@@ -831,13 +792,7 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
         bypass_memlock: authority.bypass_limit,
     };
     match mremap_core_limited(
-        &as_ref,
-        args.arg0,
-        args.arg1,
-        args.arg2,
-        args.arg3,
-        args.arg4,
-        limits,
+        &as_ref, args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, limits,
     ) {
         Ok(address) => ctx.set_return(SyscallReturn::ok(address)),
         Err(errno) => ctx.set_return(errno_ret(errno)),
@@ -894,9 +849,9 @@ mod tests {
         const DESTINATION: u64 = BASE + 0x40_0000;
         let aspace = AddressSpace::empty();
         let original = lazy_region(BASE, 6);
-        let expected_head = original.phys[..2].to_vec();
-        let expected_moved = original.phys[2..4].to_vec();
-        let expected_tail = original.phys[4..].to_vec();
+        let expected_head = original.phys.try_window(0, 2).unwrap();
+        let expected_moved = original.phys.try_window(2, 2).unwrap();
+        let expected_tail = original.phys.try_window(4, usize::MAX).unwrap();
         if aspace.map_region(original).is_err() {
             return TestResult::Fail("private interval setup failed");
         }
@@ -917,9 +872,11 @@ mod tests {
         let moved = aspace.lookup(VirtAddr::new(DESTINATION));
         if !head.is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_head)
             || hole.is_some()
-            || !tail.is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_tail)
-            || !moved
-                .is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_moved)
+            || !tail
+                .is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_tail)
+            || !moved.is_some_and(|region| {
+                region.len == 2 * 4096 && region.phys == expected_moved
+            })
         {
             return TestResult::Fail("contained move lost source neighbours or backing offsets");
         }
@@ -942,18 +899,11 @@ mod tests {
         const PREFIX: u64 = BASE + 0xc0_0000;
         let original = lazy_region(PREFIX, 3);
         let first_phys = original.phys[0];
-        let suffix_phys = original.phys[1..].to_vec();
+        let suffix_phys = original.phys.try_window(1, usize::MAX).unwrap();
         if aspace.map_region(original).is_err() {
             return TestResult::Fail("contained prefix setup failed");
         }
-        let destination = match mremap_core(
-            &aspace,
-            PREFIX,
-            4096,
-            2 * 4096,
-            MREMAP_MAYMOVE,
-            0,
-        ) {
+        let destination = match mremap_core(&aspace, PREFIX, 4096, 2 * 4096, MREMAP_MAYMOVE, 0) {
             Ok(destination) if destination != PREFIX => destination,
             _ => return TestResult::Fail("contained prefix MAYMOVE did not relocate"),
         };
@@ -961,11 +911,13 @@ mod tests {
             || !aspace
                 .lookup(VirtAddr::new(PREFIX + 4096))
                 .is_some_and(|region| region.len == 2 * 4096 && region.phys == suffix_phys)
-            || !aspace.lookup(VirtAddr::new(destination)).is_some_and(|region| {
-                region.len == 2 * 4096
-                    && region.phys.first() == Some(&first_phys)
-                    && region.phys.get(1) == Some(&PhysAddr::new(0))
-            })
+            || !aspace
+                .lookup(VirtAddr::new(destination))
+                .is_some_and(|region| {
+                    region.len == 2 * 4096
+                        && region.phys.first() == Some(&first_phys)
+                        && region.phys.get(1) == Some(&PhysAddr::new(0))
+                })
         {
             return TestResult::Fail("contained prefix relocation lost suffix or backing");
         }
@@ -984,7 +936,7 @@ mod tests {
             base: VirtAddr::new(base),
             len: pages * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-            phys: alloc::vec![PhysAddr::new(0); pages as usize],
+            phys: alloc::vec![PhysAddr::new(0); pages as usize].into(),
         };
         if aspace.map_region(shared(BASE, 3)).is_err() {
             return TestResult::Fail("ordinary shared setup failed");
@@ -1006,14 +958,7 @@ mod tests {
         if aspace.map_region(lazy_region(BASE + 0x3000, 1)).is_err() {
             return TestResult::Fail("ordinary shared grow blocker setup failed");
         }
-        let moved = match mremap_core(
-            &aspace,
-            BASE,
-            0x3000,
-            0x4000,
-            MREMAP_MAYMOVE,
-            0,
-        ) {
+        let moved = match mremap_core(&aspace, BASE, 0x3000, 0x4000, MREMAP_MAYMOVE, 0) {
             Ok(address) if address != BASE => address,
             _ => return TestResult::Fail("ordinary shared MAYMOVE did not relocate"),
         };
@@ -1027,20 +972,15 @@ mod tests {
                 FIXED,
             ) != Ok(FIXED)
             || aspace.lookup(VirtAddr::new(moved)).is_some()
-            || !aspace
-                .lookup(VirtAddr::new(FIXED))
-                .is_some_and(|region| {
-                    region.len == 0x4000 && region.perms.contains(RegionPerms::SHARED)
-                })
+            || !aspace.lookup(VirtAddr::new(FIXED)).is_some_and(|region| {
+                region.len == 0x4000 && region.perms.contains(RegionPerms::SHARED)
+            })
         {
             return TestResult::Fail("equal-length shared FIXED did not move/replace");
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "userspace",
-        smoke_mremap_ordinary_shared_resize_and_move
-    );
+    kernel_test_in!("userspace", smoke_mremap_ordinary_shared_resize_and_move);
 
     fn smoke_mremap_maymove_preserves_backing_and_grows_lazily() -> TestResult {
         let aspace = AddressSpace::empty();
@@ -1068,8 +1008,8 @@ mod tests {
         };
         if aspace.lookup(VirtAddr::new(base)).is_some()
             || region.len != 4 * 4096
-            || region.phys[..2] != expected
-            || region.phys[2..].iter().any(|phys| phys.raw() != 0)
+            || !region.phys.iter().take(2).eq(expected.iter())
+            || region.phys.iter().skip(2).any(|phys| phys.raw() != 0)
         {
             return TestResult::Fail("MAYMOVE lost backing or did not create a lazy tail");
         }
@@ -1101,8 +1041,8 @@ mod tests {
             return TestResult::Fail("moved subrange region missing");
         };
         if region.len != 4 * 4096
-            || region.phys[..2] != expected[..2]
-            || region.phys[2..].iter().any(|phys| phys.raw() != 0)
+            || !region.phys.iter().take(2).eq(expected.iter().take(2))
+            || region.phys.iter().skip(2).any(|phys| phys.raw() != 0)
         {
             return TestResult::Fail("moved subrange lost backing or its lazy tail");
         }
@@ -1111,7 +1051,7 @@ mod tests {
         };
         if rest.base.as_u64() != BASE + 2 * 4096
             || rest.len != 2 * 4096
-            || rest.phys[..] != expected[2..]
+            || !rest.phys.iter().eq(expected.iter().skip(2))
             || aspace.lookup(VirtAddr::new(BASE)).is_some()
         {
             return TestResult::Fail("remainder changed shape or backing");
@@ -1143,10 +1083,7 @@ mod tests {
             TestResult::Fail("user-ceiling relocation published the wrong VMA state")
         }
     }
-    kernel_test_in!(
-        "userspace",
-        smoke_mremap_maymove_at_user_ceiling_relocates
-    );
+    kernel_test_in!("userspace", smoke_mremap_maymove_at_user_ceiling_relocates);
 
     fn smoke_mremap_stack_rejection_preserves_guard() -> TestResult {
         const GUARD: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x40_0000;
@@ -1157,26 +1094,24 @@ mod tests {
                 base: VirtAddr::new(GUARD),
                 len: 0x1000,
                 perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
             || aspace
                 .map_region(Region {
                     base: VirtAddr::new(STACK),
                     len: 0x1000,
-                    perms: RegionPerms::READ
-                        | RegionPerms::WRITE
-                        | RegionPerms::STACK_SEGMENT,
-                    phys: alloc::vec![PhysAddr::new(0)],
+                    perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT,
+                    phys: alloc::vec![PhysAddr::new(0)].into(),
                 })
                 .is_err()
         {
             return TestResult::Fail("stack mremap setup failed");
         }
         if mremap_core(&aspace, STACK, 0x1000, 0x2000, MREMAP_MAYMOVE, 0) == Err(EFAULT)
-            && aspace.lookup(VirtAddr::new(GUARD)).is_some_and(|region| {
-                region.perms.contains(RegionPerms::STACK_GUARD)
-            })
+            && aspace
+                .lookup(VirtAddr::new(GUARD))
+                .is_some_and(|region| region.perms.contains(RegionPerms::STACK_GUARD))
             && aspace.lookup(VirtAddr::new(STACK)).is_some_and(|region| {
                 region.len == 0x1000 && region.perms.contains(RegionPerms::STACK_SEGMENT)
             })
@@ -1186,10 +1121,7 @@ mod tests {
             TestResult::Fail("unsupported stack remap changed the stack/guard pair")
         }
     }
-    kernel_test_in!(
-        "userspace",
-        smoke_mremap_stack_rejection_preserves_guard
-    );
+    kernel_test_in!("userspace", smoke_mremap_stack_rejection_preserves_guard);
 
     fn smoke_mremap_dontunmap_moves_backing_and_lazies_source() -> TestResult {
         const SOURCE: u64 = AddressSpace::MMAP_CURSOR_BASE;
@@ -1279,14 +1211,8 @@ mod tests {
         if mremap_core(&aspace, SOURCE + 0x1000, 0, 0x1000, 0, 0) != Err(ENOMEM) {
             return TestResult::Fail("zero-old-len duplication omitted MAYMOVE");
         }
-        let destination = match mremap_core(
-            &aspace,
-            SOURCE + 0x1000,
-            0,
-            0x1000,
-            MREMAP_MAYMOVE,
-            0,
-        ) {
+        let destination = match mremap_core(&aspace, SOURCE + 0x1000, 0, 0x1000, MREMAP_MAYMOVE, 0)
+        {
             Ok(destination) => destination,
             Err(_) => return TestResult::Fail("shared zero-old-len duplication failed"),
         };
@@ -1295,7 +1221,7 @@ mod tests {
             .is_some_and(|region| {
                 region.len == 0x1000
                     && region.perms.contains(RegionPerms::SHARED)
-                    && region.phys == alloc::vec![expected]
+                    && region.phys == alloc::vec![expected].into()
             })
             && aspace
                 .lookup(VirtAddr::new(SOURCE + 0x1000))
@@ -1393,8 +1319,7 @@ mod tests {
         let aspace = AddressSpace::empty();
         let source = lazy_region(SOURCE, 1);
         let expected = source.phys.clone();
-        if aspace.map_region(source).is_err()
-            || aspace.map_region(lazy_region(TARGET, 2)).is_err()
+        if aspace.map_region(source).is_err() || aspace.map_region(lazy_region(TARGET, 2)).is_err()
         {
             return TestResult::Fail("fixed DONTUNMAP setup failed");
         }
@@ -1406,9 +1331,9 @@ mod tests {
             MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
             TARGET,
         );
-        let source_ok = aspace.lookup(VirtAddr::new(SOURCE)).is_some_and(|region| {
-            region.len == 0x1000 && region.phys[0].raw() == 0
-        });
+        let source_ok = aspace
+            .lookup(VirtAddr::new(SOURCE))
+            .is_some_and(|region| region.len == 0x1000 && region.phys[0].raw() == 0);
         let target_ok = aspace
             .lookup(VirtAddr::new(TARGET))
             .is_some_and(|region| region.len == 0x1000 && region.phys == expected);
@@ -1453,7 +1378,7 @@ mod tests {
         if result != Ok(TARGET)
             || aspace.lookup(VirtAddr::new(SOURCE)).is_some()
             || region.len != 3 * 4096
-            || region.phys[..2] != expected
+            || !region.phys.iter().take(2).eq(expected.iter())
             || region.phys[2].raw() != 0
         {
             return TestResult::Fail("MREMAP_FIXED did not replace target correctly");

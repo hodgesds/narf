@@ -1904,7 +1904,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
             base: VirtAddr::new(user_base),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![frame],
+            phys: alloc::vec![frame].into(),
         })
         .is_err()
     {
@@ -4374,13 +4374,9 @@ fn smoke_userspace_exec_loads_multi_gigabyte_binary() -> TestResult {
             }
         }
 
-        // What those two faults cost in region metadata. A `Region` carries a
-        // dense prefix of backing slots, so a fault at page `i` grows it to
-        // `i + 1` entries — eight bytes per page of the OFFSET, not of the pages
-        // in use. Two touched pages here, one of them 4 GiB in, so the prefix is
-        // ~1M slots (~8 MiB) for 8 KiB of resident data. Printed rather than
-        // asserted: it is a property of the representation, and the number is the
-        // oracle for making that representation sparse.
+        // Two touched pages, one 4 GiB into the mapping, must consume at most
+        // two 64-slot backing blocks. This bounds slot payload, excluding the
+        // block directory and its spare capacity; it is not a timing claim.
         {
             use core::fmt::Write as _;
             let slots = proc
@@ -4394,6 +4390,9 @@ fn smoke_userspace_exec_loads_multi_gigabyte_binary() -> TestResult {
                 slots,
                 slots * core::mem::size_of::<narf_memory::PhysAddr>()
             );
+            if !(2..=128).contains(&slots) {
+                return Err("two distant faults allocated offset-sized backing metadata");
+            }
         }
         Ok(())
     };

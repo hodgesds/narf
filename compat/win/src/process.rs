@@ -377,7 +377,7 @@ pub unsafe fn load_pe(
                 base: VirtAddr::new(chosen_base.wrapping_add(s.virt_addr as u64)),
                 len: (pages as u64) << 12,
                 perms,
-                phys: frames_committed,
+                phys: frames_committed.into(),
             })
             .map_err(|_| {
                 // map_region failed: the AS doesn't own the frames yet,
@@ -460,7 +460,7 @@ pub unsafe fn load_pe(
             base: VirtAddr::new(layout.peb_va),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![peb_frame],
+            phys: alloc::vec![peb_frame].into(),
         })
         .map_err(|_| LoadError::AddressSpace)?;
     address_space
@@ -468,7 +468,7 @@ pub unsafe fn load_pe(
             base: VirtAddr::new(layout.teb_va),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![teb_frame],
+            phys: alloc::vec![teb_frame].into(),
         })
         .map_err(|_| LoadError::AddressSpace)?;
 
@@ -496,7 +496,7 @@ pub unsafe fn load_pe(
             base: VirtAddr::new(layout.stack_base),
             len: layout.stack_top - layout.stack_base,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: stack_frames,
+            phys: stack_frames.into(),
         })
         .map_err(|_| LoadError::AddressSpace)?;
 

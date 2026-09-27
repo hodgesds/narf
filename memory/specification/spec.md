@@ -337,15 +337,57 @@ pub struct HugeRegion {
     pub frames: Vec<HugeFrame>,
 }
 
-/// Ordinary base-page VMA metadata. `phys[i]` is page `i`'s backing, with
-/// zero denoting an unbacked demand-zero page. BRK_HEAP, STACK_SEGMENT,
-/// FILE_DEMAND, and ANON_MERGEABLE regions may omit a trailing run of zero
-/// entries; all other region kinds retain one entry per virtual page.
+/// Ordinary base-page VMA metadata. Backing is indexed by virtual page offset
+/// in sparse 64-slot blocks; absent blocks and explicit zero both mean unbacked.
+/// BRK_HEAP, STACK_SEGMENT, FILE_DEMAND, and ANON_MERGEABLE may have a logical
+/// backing length shorter than the VMA; other kinds retain an exact logical
+/// length. Neither logical length nor the highest touched offset allocates holes.
 pub struct Region {
     pub base: VirtAddr,
     pub len: u64,
     pub perms: RegionPerms,
-    pub phys: Vec<PhysAddr>,
+    pub phys: RegionBacking,
+}
+impl Region {
+    pub fn backing_at(&self, index: usize) -> PhysAddr;
+    pub fn has_backing(&self, index: usize) -> bool;
+    /// Allocated block slots, including zeros, NOT the logical prefix length.
+    pub fn materialized_pages(&self) -> usize;
+    /// Values in allocated blocks; enumeration does not recover page offsets.
+    pub fn backing_iter(&self) -> impl Iterator<Item = PhysAddr> + '_;
+}
+
+/// Metadata only: cloning does not retain frames; dropping does not free them.
+/// A sorted block directory provides logarithmic lookup and amortized
+/// sequential growth. Insertion before existing blocks shifts directory entries.
+/// Existing dense builders can convert Vec<PhysAddr> with Into; fault and
+/// transaction paths use fallible reservation/copy before publishing ownership.
+pub struct RegionBacking { /* private block directory and logical length */ }
+pub struct BackingAllocError;
+impl RegionBacking {
+    pub const fn new() -> Self;
+    pub fn try_from_slice(phys: &[PhysAddr]) -> Result<Self, BackingAllocError>;
+    pub fn len(&self) -> usize; // logical prefix, not allocated storage
+    pub fn is_empty(&self) -> bool;
+    pub fn allocated_slots(&self) -> usize;
+    pub fn metadata_bytes(&self) -> usize; // directory payload + spare capacity
+    pub fn get(&self, index: usize) -> Option<&PhysAddr>;
+    /// Prepare one block fallibly before entering allocators/filesystems.
+    pub fn reserve_slot(&mut self, index: usize) -> Result<(), BackingAllocError>;
+    /// Allocation-free; None means no explicit slot was reserved.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut PhysAddr>;
+    pub fn indexed(&self) -> impl Iterator<Item = (usize, &PhysAddr)> + '_;
+    pub fn indexed_range(&self, first: usize, end: usize)
+        -> impl Iterator<Item = (usize, &PhysAddr)> + '_;
+    /// Slice windows retain absolute region offsets, including across holes.
+    pub fn chunks(&self, first: usize, end: usize)
+        -> impl Iterator<Item = (usize, &[PhysAddr])> + '_;
+    pub fn try_window(&self, first: usize, pages: usize)
+        -> Result<Self, BackingAllocError>;
+    pub fn try_clone(&self) -> Result<Self, BackingAllocError>;
+    pub fn truncate(&mut self, len: usize);
+    /// Logical iteration includes holes; ownership/PTE walks use indexed/chunks.
+    pub fn iter(&self) -> impl Iterator<Item = &PhysAddr> + '_;
 }
 
 /// POSIX protection bits plus internal address-space state. COW preserves the
@@ -1034,21 +1076,20 @@ x86_64 is rejected at runtime.
   cached frames are visible in the zone; alternative allocators use the
   scalar default.
 - Ordinary private anonymous mmap regions, including MAP_FIXED replacements,
-  carry explicit provenance and represent an omitted trailing run of unbacked
-  pages without allocating one `Region.phys` entry per virtual page. A demand
-  fault grows the materialized prefix fallibly through its exact page before
-  leaf/rmap publication, using amortized spare vector capacity so sequential
-  faults do not reallocate the complete prefix per page; allocation failure
-  retires the page ticket and leaves frame ownership with the fault path.
-  Teardown, split, mincore, madvise,
-  reclaim, migration, fork, and mremap clamp backing work to that prefix while
-  retaining full virtual coverage. Exact-adjacent compatible VMAs may coalesce:
-  a fully lazy source appends no metadata, while a materialized source first
-  fallibly zero-pads a short destination prefix so every resident frame keeps
-  its virtual-page offset. Reserve failure leaves the VMAs separate.
+  carry explicit provenance. All base-page backing uses sparse 64-slot blocks;
+  holes and untouched tails consume no slots. A demand fault reserves its block
+  fallibly before leaf/rmap publication or filesystem entry. Allocation failure
+  retires the ticket and leaves frame ownership with the fault path. Logical
+  prefix length is separate from storage: a distant offset cannot force dense
+  metadata allocation. Ownership, split, fork, and relocation walks visit
+  allocated blocks with explicit page offsets. Exact-adjacent compatible VMAs
+  with complete logical prefixes may coalesce; shorter-prefix VMAs remain
+  separate. Merge preparation reserves by source block counts, and preserves
+  every frame's page offset without allocating the gap. Reserve failure leaves
+  the VMAs separate.
   File, shared, heap, stack, guard, and special mappings never carry ordinary
   anonymous provenance. A region-wide COW marker is ignored only for
-  compatibility and ORed into a full-vector merge; virtual addresses, PTEs,
+  compatibility and ORed into a complete-logical-prefix merge; virtual addresses, PTEs,
   backing order, per-page COW refcounts, and lock accounting are unchanged.
   Fixed replacement completes external-owner retirement in the same
   transaction and exposes no receipt invalidated by coalescing. If merge
@@ -1133,9 +1174,9 @@ x86_64 is rejected at runtime.
   stack VMA in place, matching Linux fault semantics.
 - Anonymous and file-backed demand faults reserve a page-scoped ticket before
   leaving the address-space region lock. Demand-grown heap/stack and
-  FILE_DEMAND backing vectors contain only the materialized prefix; an omitted
-  tail entry is equivalent to a zero sentinel. The claim fallibly grows that
-  prefix through the faulting page before filesystem code can retain external
+  FILE_DEMAND backing maps treat absent blocks and omitted tail entries as zero
+  sentinels. The claim fallibly reserves the faulting page's block, including
+  a hole inside the logical prefix, before filesystem code can retain external
   backing, making the later publication allocation-free. Frame allocation,
   page zeroing, and filesystem callbacks run without the IRQ-disabling region
   lock, so faults on distinct pages of one shared address space may progress

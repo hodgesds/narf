@@ -48,6 +48,7 @@ pub mod oom;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
+pub mod region_backing;
 pub mod rmap;
 pub mod ro_after_init;
 // The slab writes intrusive free-list links + per-block canaries INTO freed

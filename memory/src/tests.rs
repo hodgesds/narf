@@ -18,7 +18,7 @@ fn smoke_mapping_receipts_reject_replaced_vma() -> TestResult {
             base,
             len: 4096,
             perms: RegionPerms::READ,
-            phys: vec![PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0)].into(),
         },
         false,
         u64::MAX,
@@ -32,7 +32,7 @@ fn smoke_mapping_receipts_reject_replaced_vma() -> TestResult {
             base,
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: vec![PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0)].into(),
         },
         false,
         u64::MAX,
@@ -74,7 +74,7 @@ fn smoke_mapping_receipts_reject_another_address_space() -> TestResult {
         base,
         len: 4096,
         perms: RegionPerms::READ,
-        phys: vec![PhysAddr::new(0)],
+        phys: vec![PhysAddr::new(0)].into(),
     };
     let receipt = match first.map_region_limited_receipt(region(), false, u64::MAX, false) {
         Ok(receipt) => receipt,
@@ -118,7 +118,7 @@ fn smoke_memory_adjacent_anonymous_mmaps_coalesce() -> TestResult {
             base: VirtAddr::new(base),
             len: 4096,
             perms: first_perms,
-            phys: vec![PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || aspace
@@ -126,7 +126,7 @@ fn smoke_memory_adjacent_anonymous_mmaps_coalesce() -> TestResult {
                 base: VirtAddr::new(base + 8192),
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE,
-                phys: vec![PhysAddr::new(0)],
+                phys: vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -138,7 +138,7 @@ fn smoke_memory_adjacent_anonymous_mmaps_coalesce() -> TestResult {
                 base: VirtAddr::new(base + 4096),
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: vec![PhysAddr::new(0)],
+                phys: vec![PhysAddr::new(0)].into(),
             },
             false,
             u64::MAX,
@@ -180,7 +180,7 @@ fn smoke_memory_sparse_anonymous_metadata_preserves_offsets() -> TestResult {
                 base: VirtAddr::new(base),
                 len: 2 * 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: Vec::new(),
+                phys: Vec::new().into(),
             },
             false,
             u64::MAX,
@@ -193,7 +193,7 @@ fn smoke_memory_sparse_anonymous_metadata_preserves_offsets() -> TestResult {
                     base: VirtAddr::new(base + 2 * 4096),
                     len: 4096,
                     perms: RegionPerms::READ | RegionPerms::WRITE,
-                    phys: Vec::new(),
+                    phys: Vec::new().into(),
                 },
                 false,
                 u64::MAX,
@@ -263,7 +263,7 @@ fn smoke_memory_fixed_anonymous_mmaps_coalesce() -> TestResult {
                         base: VirtAddr::new(base + page * 4096),
                         len: 4096,
                         perms: RegionPerms::READ | RegionPerms::WRITE,
-                        phys: vec![PhysAddr::new(0)],
+                        phys: vec![PhysAddr::new(0)].into(),
                     },
                     false,
                     u64::MAX,
@@ -297,7 +297,7 @@ fn smoke_memory_fixed_anonymous_mmaps_coalesce() -> TestResult {
                     base: VirtAddr::new(base + 2 * 4096),
                     len: 4096,
                     perms: RegionPerms::READ,
-                    phys: vec![PhysAddr::new(0)],
+                    phys: vec![PhysAddr::new(0)].into(),
                 },
                 false,
                 u64::MAX,
@@ -344,7 +344,8 @@ fn smoke_memory_carve_exact_private_region_splits_coalesced_vma() -> TestResult 
                 PhysAddr::new(0x11_000),
                 PhysAddr::new(0x12_000),
                 PhysAddr::new(0),
-            ],
+            ]
+            .into(),
         })
         .is_err()
     {
@@ -366,21 +367,22 @@ fn smoke_memory_carve_exact_private_region_splits_coalesced_vma() -> TestResult 
     let tail = &regions[2];
     if head.base.as_u64() != base
         || head.len != 4096
-        || head.phys[..] != [PhysAddr::new(0x10_000)]
+        || head.phys.iter().copied().collect::<alloc::vec::Vec<_>>() != [PhysAddr::new(0x10_000)]
         || head.perms != perms
     {
         return TestResult::Fail("carve head lost shape or backing");
     }
     if mid.base.as_u64() != base + 4096
         || mid.len != 2 * 4096
-        || mid.phys[..] != [PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)]
+        || mid.phys.iter().copied().collect::<alloc::vec::Vec<_>>()
+            != [PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)]
         || mid.perms != perms
     {
         return TestResult::Fail("carved interval lost shape or backing");
     }
     if tail.base.as_u64() != base + 3 * 4096
         || tail.len != 4096
-        || tail.phys[..] != [PhysAddr::new(0)]
+        || tail.phys.iter().copied().collect::<alloc::vec::Vec<_>>() != [PhysAddr::new(0)]
     {
         return TestResult::Fail("carve tail must stay demand-zero");
     }
@@ -400,7 +402,7 @@ fn smoke_memory_carve_exact_private_region_splits_coalesced_vma() -> TestResult 
             base: VirtAddr::new(special),
             len: 2 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: vec![PhysAddr::new(0), PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0), PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -433,7 +435,7 @@ fn smoke_memory_anonymous_merge_respects_provenance() -> TestResult {
             base: VirtAddr::new(base),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: vec![PhysAddr::new(0)],
+            phys: vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || aspace
@@ -442,7 +444,7 @@ fn smoke_memory_anonymous_merge_respects_provenance() -> TestResult {
                     base: VirtAddr::new(base + 4096),
                     len: 4096,
                     perms: RegionPerms::READ | RegionPerms::WRITE,
-                    phys: vec![PhysAddr::new(0)],
+                    phys: vec![PhysAddr::new(0)].into(),
                 },
                 false,
                 u64::MAX,
@@ -2763,7 +2765,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map region");
     if a.mapped_page_size(VirtAddr::new(vbase)) != Some(4096)
@@ -2949,7 +2951,7 @@ fn smoke_memory_as_drop_then_materialize() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3002,7 +3004,7 @@ fn smoke_memory_as_drop_then_map_multiple_pages() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x4000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys,
+        phys: phys.into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3071,7 +3073,7 @@ fn smoke_memory_as_with_regions_drop_then_realloc() -> TestResult {
             base: VirtAddr::new(0x0000_0080_0000_0000),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![target],
+            phys: alloc::vec![target].into(),
         })
         .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3094,7 +3096,7 @@ fn smoke_memory_as_with_regions_drop_then_realloc() -> TestResult {
             base: VirtAddr::new(0x0000_0080_0000_0000),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![target2],
+            phys: alloc::vec![target2].into(),
         })
         .expect("map_region (second)");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3186,7 +3188,7 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
                 base: VirtAddr::new(base),
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![backing],
+                phys: alloc::vec![backing].into(),
             })
             .is_err()
         {
@@ -3318,14 +3320,14 @@ fn smoke_memory_mapped_bytes_counts_lazy_regions() -> TestResult {
         base: VirtAddr::new(base),
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); 3],
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
     })
     .expect("map first lazy region");
     a.map_region(Region {
         base: VirtAddr::new(base + 0x10_0000),
         len: 0x5000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0); 5],
+        phys: alloc::vec![PhysAddr::new(0); 5].into(),
     })
     .expect("map second lazy region");
 
@@ -3376,7 +3378,7 @@ fn smoke_memory_materialize_is_idempotent() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3427,7 +3429,7 @@ fn smoke_memory_prot_none_region_has_no_pte() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms(0),
-        phys: alloc::vec![crate::PhysAddr::new(0)],
+        phys: alloc::vec![crate::PhysAddr::new(0)].into(),
     })
     .expect("map_region (PROT_NONE)");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3473,7 +3475,7 @@ fn smoke_memory_lazy_phys_zero_skipped() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x2000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0), backed],
+        phys: alloc::vec![PhysAddr::new(0), backed].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3510,7 +3512,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         perms: RegionPerms::READ,
         // Metadata-only sentinels below LOW_RESERVED_BYTES cannot be mistaken
         // for allocator-owned backing when this rootless address space drops.
-        phys: alloc::vec![PhysAddr::new(0x10_000), PhysAddr::new(0x11_000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000), PhysAddr::new(0x11_000)].into(),
     })
     .expect("first map");
     // Overlapping at the same base.
@@ -3518,7 +3520,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000)].into(),
     }) {
         Err(AddressSpaceError::Overlap) => {}
         _ => return TestResult::Fail("identical base overlap not rejected"),
@@ -3528,7 +3530,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase + 0x1000),
         len: 0x1000,
         perms: RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000)].into(),
     }) {
         Err(AddressSpaceError::Overlap) => {}
         _ => return TestResult::Fail("interior overlap not rejected"),
@@ -3538,7 +3540,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase + 0x2000),
         len: 0x1000,
         perms: RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000)].into(),
     }) {
         Ok(()) => {}
         _ => return TestResult::Fail("adjacent region was rejected"),
@@ -3560,7 +3562,7 @@ fn smoke_memory_phys_len_mismatch_rejected() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x2000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)].into(),
     }) {
         Err(AddressSpaceError::AlignmentMismatch) => {}
         _ => return TestResult::Fail("phys-len mismatch not rejected"),
@@ -3570,7 +3572,7 @@ fn smoke_memory_phys_len_mismatch_rejected() -> TestResult {
         base: VirtAddr::new(0x4001),
         len: 0x1000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+        phys: alloc::vec![PhysAddr::new(0x10_0000)].into(),
     }) {
         Err(AddressSpaceError::AlignmentMismatch) => {}
         _ => return TestResult::Fail("unaligned base not rejected"),
@@ -3580,7 +3582,7 @@ fn smoke_memory_phys_len_mismatch_rejected() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0xFFF,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+        phys: alloc::vec![PhysAddr::new(0x10_0000)].into(),
     }) {
         Err(AddressSpaceError::AlignmentMismatch) => {}
         _ => return TestResult::Fail("unaligned len not rejected"),
@@ -3706,14 +3708,14 @@ fn smoke_memory_two_as_isolation() -> TestResult {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target_a],
+        phys: alloc::vec![target_a].into(),
     })
     .expect("a.map_region");
     b.map_region(Region {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target_b],
+        phys: alloc::vec![target_b].into(),
     })
     .expect("b.map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3768,7 +3770,7 @@ fn smoke_memory_change_perms_updates_region() -> TestResult {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3835,7 +3837,7 @@ fn smoke_memory_flags_at_roundtrip() -> TestResult {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -3983,21 +3985,21 @@ fn smoke_memory_multiple_regions_in_one_as() -> TestResult {
         base: VirtAddr::new(0x1000),
         len: 0x1000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)].into(),
     })
     .expect("map 1");
     a.map_region(Region {
         base: VirtAddr::new(0x3000),
         len: 0x2000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_000), PhysAddr::new(0x21_000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000), PhysAddr::new(0x21_000)].into(),
     })
     .expect("map 2");
     a.map_region(Region {
         base: VirtAddr::new(0x10000),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC,
-        phys: alloc::vec![PhysAddr::new(0x30_000)],
+        phys: alloc::vec![PhysAddr::new(0x30_000)].into(),
     })
     .expect("map 3");
 
@@ -4036,7 +4038,7 @@ fn smoke_memory_map_region_owns_its_phys_vec() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x1000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)].into(),
     })
     .expect("map");
     let snap = a.regions_snapshot();
@@ -4103,7 +4105,7 @@ fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
         base: VirtAddr::new(0),
         len: LEN,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); (LEN / 4096) as usize],
+        phys: alloc::vec![PhysAddr::new(0); (LEN / 4096) as usize].into(),
     };
     let first = match aspace.map_private_anonymous_region_anywhere_limited(
         lazy_region(),
@@ -4238,7 +4240,7 @@ fn smoke_memory_grow_region_bumps_mmap_cursor() -> TestResult {
         base: VirtAddr::new(base),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![crate::PhysAddr::new(0)],
+        phys: alloc::vec![crate::PhysAddr::new(0)].into(),
     })
     .is_err()
     {
@@ -4262,7 +4264,7 @@ fn smoke_memory_grow_region_bumps_mmap_cursor() -> TestResult {
         base: VirtAddr::new(next),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![crate::PhysAddr::new(0)],
+        phys: alloc::vec![crate::PhysAddr::new(0)].into(),
     })
     .is_err()
     {
@@ -4306,7 +4308,7 @@ fn smoke_memory_relocate_region_moves_live_leaves() -> TestResult {
             base: VirtAddr::new(OLD),
             len: 8192,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![first, second],
+            phys: alloc::vec![first, second].into(),
         })
         .is_err()
     {
@@ -4352,7 +4354,7 @@ fn smoke_memory_relocate_region_moves_live_leaves() -> TestResult {
         || !region.is_some_and(|region| {
             region.base == VirtAddr::new(NEW)
                 && region.len == 12288
-                && region.phys == alloc::vec![first, second, crate::PhysAddr::new(0)]
+                && region.phys == alloc::vec![first, second, crate::PhysAddr::new(0)].into()
         })
     {
         return TestResult::Fail("relocation did not move leaves/backing/rmap atomically");
@@ -4436,7 +4438,7 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x1000,
         perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x10_000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)].into(),
     };
     if a.map_region(r1).is_err() {
         return TestResult::Fail("first map failed");
@@ -4447,7 +4449,7 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         base: VirtAddr::new(0x5000),
         len: 0x2000,
         perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)],
+        phys: alloc::vec![PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)].into(),
     };
     if a.map_region(r2).is_err() {
         return TestResult::Fail("second non-overlap map failed");
@@ -4458,7 +4460,7 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         base: VirtAddr::new(0x6000),
         len: 0x2000,
         perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x12_0000), PhysAddr::new(0x12_1000)],
+        phys: alloc::vec![PhysAddr::new(0x12_0000), PhysAddr::new(0x12_1000)].into(),
     };
     match a.map_region(r_over) {
         Err(AddressSpaceError::Overlap) => {}
@@ -4470,7 +4472,7 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         base: VirtAddr::new(0x4123),
         len: 0x1000,
         perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x13_0000)],
+        phys: alloc::vec![PhysAddr::new(0x13_0000)].into(),
     };
     match a.map_region(r_unaligned) {
         Err(AddressSpaceError::AlignmentMismatch) => {}
@@ -4655,7 +4657,7 @@ fn smoke_memory_failed_fork_rolls_back_unpublished_cow_refs() -> TestResult {
             base: first_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![first_phys],
+            phys: alloc::vec![first_phys].into(),
         })
         .is_err()
     {
@@ -4668,7 +4670,7 @@ fn smoke_memory_failed_fork_rolls_back_unpublished_cow_refs() -> TestResult {
             base: second_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![second_phys],
+            phys: alloc::vec![second_phys].into(),
         })
         .is_err()
     {
@@ -4684,11 +4686,11 @@ fn smoke_memory_failed_fork_rolls_back_unpublished_cow_refs() -> TestResult {
         return TestResult::Fail("fork index failure did not surface AllocationFailed");
     }
     let parent_intact = parent.lookup(first_base).is_some_and(|region| {
-        region.phys == alloc::vec![first_phys]
+        region.phys == alloc::vec![first_phys].into()
             && region.perms.contains(RegionPerms::WRITE)
             && region.perms.contains(RegionPerms::COW)
     }) && parent.lookup(second_base).is_some_and(|region| {
-        region.phys == alloc::vec![second_phys]
+        region.phys == alloc::vec![second_phys].into()
             && region.perms.contains(RegionPerms::WRITE)
             && region.perms.contains(RegionPerms::COW)
     });
@@ -4776,7 +4778,7 @@ fn smoke_memory_repeated_fork_skips_settled_cow_pages() -> TestResult {
             base: VirtAddr::new(0x0000_0080_3b00_0000),
             len: 3 * 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![first_phys, crate::PhysAddr::new(0), second_phys],
+            phys: alloc::vec![first_phys, crate::PhysAddr::new(0), second_phys].into(),
         })
         .is_err()
     {
@@ -4855,7 +4857,7 @@ fn smoke_memory_failed_fork_first_reservation_retains_nothing() -> TestResult {
             base,
             len: 2 * 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![phys, crate::PhysAddr::new(0)],
+            phys: alloc::vec![phys, crate::PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -4874,7 +4876,8 @@ fn smoke_memory_failed_fork_first_reservation_retains_nothing() -> TestResult {
         return TestResult::Fail("empty-prefix fork failure leaked a COW owner");
     }
     let parent_intact = parent.lookup(base).is_some_and(|region| {
-        region.phys[..] == [phys, crate::PhysAddr::new(0)]
+        region.phys.iter().copied().collect::<alloc::vec::Vec<_>>()
+            == [phys, crate::PhysAddr::new(0)]
             && region.perms.contains(RegionPerms::WRITE)
             && region.perms.contains(RegionPerms::COW)
     });
@@ -4890,7 +4893,8 @@ fn smoke_memory_failed_fork_first_reservation_retains_nothing() -> TestResult {
     let child_faithful = child.lookup(base).is_some_and(|region| {
         region.base == base
             && region.len == 2 * 0x1000
-            && region.phys[..] == [phys, crate::PhysAddr::new(0)]
+            && region.phys.iter().copied().collect::<alloc::vec::Vec<_>>()
+                == [phys, crate::PhysAddr::new(0)]
             && region.perms.contains(RegionPerms::WRITE)
             && region.perms.contains(RegionPerms::COW)
     });
@@ -4947,7 +4951,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
             base: VirtAddr::new(VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![frame],
+            phys: alloc::vec![frame].into(),
         })
         .is_err()
     {
@@ -5073,7 +5077,7 @@ fn smoke_memory_fork_child_demand_faults_lazily() -> TestResult {
             base: VirtAddr::new(VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![frame],
+            phys: alloc::vec![frame].into(),
         })
         .is_err()
     {
@@ -5191,7 +5195,7 @@ fn smoke_memory_cow_split_survives_reserve_watermark() -> TestResult {
                 base: VirtAddr::new(VADDR),
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![frame],
+                phys: alloc::vec![frame].into(),
             })
             .map_err(|_| "map_region")?;
         // SAFETY: upholds clone_for_fork's documented invariant.
@@ -5283,7 +5287,7 @@ fn smoke_memory_nested_fork_teardown_preserves_allocator_progress() -> TestResul
             base: VirtAddr::new(BASE),
             len: (PAGES as u64) << 12,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: phys.clone(),
+            phys: phys.clone().into(),
         })
         .is_err()
     {
@@ -5410,7 +5414,7 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
             base: VirtAddr::new(VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC | RegionPerms::COW,
-            phys: alloc::vec![master],
+            phys: alloc::vec![master].into(),
         })
         .is_err()
     {
@@ -5511,7 +5515,7 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
         base: VirtAddr::new(VADDR),
         len: 4096,
         perms: RegionPerms::READ,
-        phys: alloc::vec![f1],
+        phys: alloc::vec![f1].into(),
     })
     .is_err()
     {
@@ -5553,7 +5557,7 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
             base: VirtAddr::new(VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![f2],
+            phys: alloc::vec![f2].into(),
         })
         .is_err()
         {
@@ -7032,7 +7036,7 @@ fn smoke_memory_demand_alloc_installs_pte() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -7098,7 +7102,7 @@ fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
             base,
             len: N as u64 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys: phys.into(),
         })
         .is_err()
     {
@@ -7184,7 +7188,7 @@ fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
             base: lock_base,
             len: 8192,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: lock_phys,
+            phys: lock_phys.into(),
         })
         .is_err()
     {
@@ -7234,7 +7238,7 @@ fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
                 base: discard_base,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![frame],
+                phys: alloc::vec![frame].into(),
             })
             .is_err()
         {
@@ -7308,7 +7312,7 @@ fn smoke_memory_collect_anon_reclaim_candidates() -> TestResult {
             base: base_a,
             len: 4 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: phys_a,
+            phys: phys_a.into(),
         })
         .is_err()
     {
@@ -7327,7 +7331,7 @@ fn smoke_memory_collect_anon_reclaim_candidates() -> TestResult {
             base: base_b,
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-            phys: phys_b,
+            phys: phys_b.into(),
         })
         .is_err()
     {
@@ -7407,7 +7411,7 @@ fn smoke_memory_anon_reclaim_cursor_rotates() -> TestResult {
             base,
             len: N as u64 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys: phys.into(),
         })
         .is_err()
     {
@@ -7482,7 +7486,7 @@ fn smoke_memory_anon_reclaim_scan_drives_swap() -> TestResult {
             base,
             len: N as u64 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys: phys.into(),
         })
         .is_err()
     {
@@ -7551,7 +7555,7 @@ fn smoke_memory_anon_reclaim_clock_second_chance() -> TestResult {
             base,
             len: N as u64 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys: phys.into(),
         })
         .is_err()
     {
@@ -7677,7 +7681,7 @@ fn smoke_memory_private_anonymous_reservation_is_sparse() -> TestResult {
                 base,
                 len: PAGES as u64 * 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: Vec::new(),
+                phys: Vec::new().into(),
             },
             false,
             u64::MAX,
@@ -7702,7 +7706,7 @@ fn smoke_memory_private_anonymous_reservation_is_sparse() -> TestResult {
     }
     let faulted = aspace.lookup(base).expect("faulted VMA missing");
     if faulted.phys.len() != 11
-        || faulted.phys[..10].iter().any(|phys| phys.raw() != 0)
+        || faulted.phys.iter().take(10).any(|phys| phys.raw() != 0)
         || faulted.phys[10].raw() == 0
     {
         return TestResult::Fail("demand fault did not preserve sparse slot identity");
@@ -7810,7 +7814,7 @@ fn smoke_memory_rmap_tracks_materialized_region() -> TestResult {
             base,
             len: N as u64 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys: phys.into(),
         })
         .is_err()
     {
@@ -7880,7 +7884,7 @@ fn smoke_memory_rmap_fork_and_cow_split() -> TestResult {
             base: va,
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![p_frame],
+            phys: alloc::vec![p_frame].into(),
         })
         .is_err()
     {
@@ -7986,7 +7990,7 @@ fn smoke_memory_rmap_swap_roundtrip() -> TestResult {
             base,
             len: N as u64 * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys: phys.into(),
         })
         .is_err()
     {
@@ -8071,7 +8075,7 @@ fn smoke_memory_relocate_page_moves_frame() -> TestResult {
             base: va,
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![p],
+            phys: alloc::vec![p].into(),
         })
         .is_err()
     {
@@ -8147,7 +8151,7 @@ fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![frame],
+        phys: alloc::vec![frame].into(),
     })
     .expect("map_region");
     // SAFETY: the test owns this live root and the recorded backing frame.
@@ -8197,7 +8201,7 @@ fn smoke_memory_demand_alloc_prot_none_is_unmapped() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms(0),
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -8251,7 +8255,7 @@ fn smoke_memory_demand_alloc_multi_page_distinct_frames() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); 3],
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
     })
     .expect("map_region");
     for i in 0..3 {
@@ -8299,7 +8303,7 @@ fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -8358,7 +8362,7 @@ fn smoke_memory_try_grow_stack_promotes_and_installs_new_guard() -> TestResult {
         base: VirtAddr::new(guard),
         len: 0x1000,
         perms: RegionPerms::STACK_GUARD,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region guard");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -8431,7 +8435,7 @@ fn smoke_memory_stack_growth_skipped_gap_is_demand_paged() -> TestResult {
             base: VirtAddr::new(guard),
             len: 0x1000,
             perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .expect("map stack guard");
 
@@ -8497,7 +8501,7 @@ fn smoke_memory_stack_growth_preserves_eager_and_onfault_lock_modes() -> TestRes
                 base: VirtAddr::new(guard),
                 len: 0x1000,
                 perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .expect("map stack guard");
         address_space
@@ -8508,7 +8512,7 @@ fn smoke_memory_stack_growth_preserves_eager_and_onfault_lock_modes() -> TestRes
                     | RegionPerms::WRITE
                     | RegionPerms::STACK_SEGMENT
                     | lock_bits,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .expect("map locked stack");
 
@@ -8573,7 +8577,7 @@ fn smoke_memory_lazy_stack_survives_lock_and_protection_splits() -> TestResult {
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT,
             // This is the representation produced after one page faults in a
             // Linux-style metadata-only stack expansion.
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .expect("map lazy stack fixture");
 
@@ -8657,7 +8661,7 @@ fn smoke_memory_try_grow_stack_non_guard_is_unmapped() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms(0), // PROT_NONE, not STACK_GUARD
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -8714,14 +8718,14 @@ fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
         base: VirtAddr::new(guard - 0x1000),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region neighbour");
     a.map_region(Region {
         base: VirtAddr::new(guard),
         len: 0x1000,
         perms: RegionPerms::STACK_GUARD,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region guard");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -8753,7 +8757,7 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
         base: VirtAddr::new(guard0),
         len: 0x1000,
         perms: RegionPerms::STACK_GUARD,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region guard");
     // Walk three guards down.
@@ -8832,7 +8836,7 @@ fn smoke_memory_try_grow_stack_preserves_exec_without_annexing() -> TestResult {
         base: VirtAddr::new(stack_base),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC,
-        phys: alloc::vec![stack_frame],
+        phys: alloc::vec![stack_frame].into(),
     })
     .expect("map_region stack");
     let guard0 = stack_base - 0x1000;
@@ -8840,7 +8844,7 @@ fn smoke_memory_try_grow_stack_preserves_exec_without_annexing() -> TestResult {
         base: VirtAddr::new(guard0),
         len: 0x1000,
         perms: RegionPerms::STACK_GUARD,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .expect("map_region guard");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -8968,7 +8972,7 @@ fn smoke_memory_stack_growth_limits_preserve_guard() -> TestResult {
                 base: VirtAddr::new(guard),
                 len: 0x1000,
                 perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .expect("map stack guard");
 
@@ -9011,7 +9015,7 @@ fn smoke_memory_locked_stack_growth_honours_memlock_limit() -> TestResult {
             base: VirtAddr::new(guard),
             len: 0x1000,
             perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .expect("map stack guard");
     address_space
@@ -9022,7 +9026,7 @@ fn smoke_memory_locked_stack_growth_honours_memlock_limit() -> TestResult {
                 | RegionPerms::WRITE
                 | RegionPerms::STACK_SEGMENT
                 | RegionPerms::LOCKED,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .expect("map locked stack");
 
@@ -9071,7 +9075,7 @@ fn smoke_memory_stack_growth_rejects_existing_leaf_without_unmapping_it() -> Tes
             base: VirtAddr::new(guard),
             len: 0x1000,
             perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .expect("map stack guard");
     let rogue_frame = match crate::frame::alloc_user_frame() {
@@ -9189,7 +9193,7 @@ fn smoke_memory_unmap_region_returns_frames() -> TestResult {
         base: VirtAddr::new(vbase),
         len: (pages as u64) * 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: phys_list,
+        phys: phys_list.into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -9229,7 +9233,7 @@ fn smoke_memory_unmap_region_lazy_is_noop_on_free_count() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); 3],
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
     })
     .expect("map_region");
     let before = crate::frame::stats().free;
@@ -9273,7 +9277,7 @@ fn smoke_memory_unmap_region_mixed_lazy_and_backed() -> TestResult {
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
         // page 0: lazy, page 1: backed, page 2: lazy
-        phys: alloc::vec![PhysAddr::new(0), backed, PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0), backed, PhysAddr::new(0)].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -9333,7 +9337,7 @@ fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
             base: VirtAddr::new(vbase),
             len: (pages as u64) * 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: phys_list,
+            phys: phys_list.into(),
         })
         .expect("map_region");
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -9388,7 +9392,7 @@ fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
         base: VirtAddr::new(vbase),
         len: (pages as u64) * 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: phys_list,
+        phys: phys_list.into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -9459,7 +9463,7 @@ fn build_reapable_as(vbase: u64, pages: usize) -> Option<alloc::sync::Arc<crate:
         base: VirtAddr::new(vbase),
         len: (pages as u64) * 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: phys_list,
+        phys: phys_list.into(),
     })
     .is_err()
     {
@@ -9765,7 +9769,7 @@ fn smoke_memory_unmap_region_clears_ptes() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![frame],
+        phys: alloc::vec![frame].into(),
     })
     .expect("map_region");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -10538,7 +10542,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
             base: VirtAddr::new(VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![p_frame],
+            phys: alloc::vec![p_frame].into(),
         })
         .is_err()
     {
@@ -10670,7 +10674,7 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
             base: VirtAddr::new(VADDR),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![orig_frame],
+            phys: alloc::vec![orig_frame].into(),
         })
         .is_err()
     {
@@ -10768,7 +10772,7 @@ fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
         base: VirtAddr::new(REGION_VADDR),
         len: 4096,
         perms: RegionPerms::READ,
-        phys: alloc::vec![f],
+        phys: alloc::vec![f].into(),
     })
     .is_err()
     {
@@ -10966,7 +10970,7 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
         base: v,
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: frames.clone(),
+        phys: frames.clone().into(),
     })
     .expect("map");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -11042,7 +11046,7 @@ fn smoke_memory_mprotect_keeps_lazy_page_unmapped() -> TestResult {
         base: va,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .is_err()
         || a.mprotect_range(va, 0x1000, RegionPerms::READ).is_err()
@@ -11060,7 +11064,7 @@ fn smoke_memory_mprotect_keeps_lazy_page_unmapped() -> TestResult {
         .regions_snapshot()
         .iter()
         .find(|region| region.base == va)
-        .is_some_and(|region| region.phys == alloc::vec![PhysAddr::new(0)]);
+        .is_some_and(|region| region.phys == alloc::vec![PhysAddr::new(0)].into());
     core::mem::forget(a);
     if translated.is_none() && still_lazy {
         TestResult::Pass
@@ -11091,7 +11095,7 @@ fn smoke_memory_mprotect_hole_is_atomic_and_len_rounds() -> TestResult {
             base: VirtAddr::new(base + offset),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         {
@@ -11162,7 +11166,7 @@ fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -11201,7 +11205,7 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
+        phys: alloc::vec![target].into(),
     })
     .expect("map");
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -11268,7 +11272,7 @@ fn smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole() -> TestResult 
         base: v,
         len: 0x4000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![frames[0], PhysAddr::new(0), frames[1], frames[2]],
+        phys: alloc::vec![frames[0], PhysAddr::new(0), frames[1], frames[2]].into(),
     })
     .is_err()
     {
@@ -11321,14 +11325,14 @@ fn smoke_memory_user_page_writable_gates_readonly() -> TestResult {
         len: 0x1000,
         perms: RegionPerms::READ,
         // Metadata-only backing stays below the allocator's reserved floor.
-        phys: alloc::vec![PhysAddr::new(0x30_000)],
+        phys: alloc::vec![PhysAddr::new(0x30_000)].into(),
     })
     .is_err()
         || a.map_region(Region {
             base: rw,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0x31_000)],
+            phys: alloc::vec![PhysAddr::new(0x31_000)].into(),
         })
         .is_err()
     {
@@ -11379,7 +11383,7 @@ fn smoke_memory_madvise_hole_is_atomic_and_len_rounds() -> TestResult {
         base: VirtAddr::new(base),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![first],
+        phys: alloc::vec![first].into(),
     })
     .is_err()
     {
@@ -11391,7 +11395,7 @@ fn smoke_memory_madvise_hole_is_atomic_and_len_rounds() -> TestResult {
         base: VirtAddr::new(base + 0x2000),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![second],
+        phys: alloc::vec![second].into(),
     })
     .is_err()
     {
@@ -11440,7 +11444,8 @@ fn smoke_memory_residency_range_is_coherent() -> TestResult {
             PhysAddr::new(0x21_000),
             PhysAddr::new(0),
             PhysAddr::new(0x22_000),
-        ],
+        ]
+        .into(),
     })
     .is_err()
     {
@@ -11748,7 +11753,7 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
             base: VirtAddr::new(b),
             len: SPAN,
             perms: RegionPerms(0),
-            phys: alloc::vec![PhysAddr::new(0); (SPAN >> 12) as usize],
+            phys: alloc::vec![PhysAddr::new(0); (SPAN >> 12) as usize].into(),
         })
         .is_err()
         {
@@ -11773,7 +11778,7 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
                 base: VirtAddr::new(va),
                 len: 0x1000,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![frame],
+                phys: alloc::vec![frame].into(),
             })
             .is_err()
             {
@@ -11830,7 +11835,7 @@ fn smoke_memory_regions_stay_sorted_for_fixed_churn() -> TestResult {
             base: VirtAddr::new(base + page * 4096),
             len: 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         {
@@ -11851,7 +11856,7 @@ fn smoke_memory_regions_stay_sorted_for_fixed_churn() -> TestResult {
         base: VirtAddr::new(base + 512 * 4096),
         len: 4096,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     }) != Err(crate::AddressSpaceError::Overlap)
     {
         return TestResult::Fail("tree admitted an equal-base overlap");
@@ -11920,7 +11925,7 @@ fn smoke_materialize_range_installs_only_intersection() -> TestResult {
         base,
         len: 3 * 4096,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: frames.clone(),
+        phys: frames.clone().into(),
     })
     .is_err()
     {
@@ -12048,7 +12053,7 @@ fn smoke_memory_shmat_shared_attach_range_materialize() -> TestResult {
                         base,
                         len: SEG_LEN,
                         perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-                        phys: alloc::vec![seg],
+                        phys: alloc::vec![seg].into(),
                     })?;
                     as_ref.materialize_range(base, SEG_LEN)
                 }
@@ -12168,7 +12173,7 @@ fn smoke_materialize_range_skips_unrelated_invalid_region() -> TestResult {
         base: conflict,
         len: 4096,
         perms: RegionPerms::READ,
-        phys: alloc::vec![low_frame],
+        phys: alloc::vec![low_frame].into(),
     })
     .is_err()
     {
@@ -12179,7 +12184,7 @@ fn smoke_materialize_range_skips_unrelated_invalid_region() -> TestResult {
         base: good,
         len: 4096,
         perms: RegionPerms::READ,
-        phys: alloc::vec![good_frame],
+        phys: alloc::vec![good_frame].into(),
     })
     .is_err()
     {
@@ -12238,7 +12243,7 @@ fn smoke_demand_fault_heals_absent_leaf_pte() -> TestResult {
         base: va,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![frame],
+        phys: alloc::vec![frame].into(),
     })
     .is_err()
     {
@@ -12301,7 +12306,7 @@ fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
         base: va,
         len: 4096,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![old],
+        phys: alloc::vec![old].into(),
     })
     .is_err()
     {
@@ -12359,7 +12364,7 @@ fn smoke_numa_hint_fault_round_trip() -> TestResult {
         base: va,
         len: 4096,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![frame],
+        phys: alloc::vec![frame].into(),
     });
     // SAFETY: a owns a fresh valid root and the registered frame.
     let materialized = unsafe { a.materialize() };
@@ -12479,7 +12484,7 @@ fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-                phys: alloc::vec![old],
+                phys: alloc::vec![old].into(),
             })
             .expect("register shared alias");
         // SAFETY: fresh valid root and registered live frame.
@@ -12586,7 +12591,7 @@ fn smoke_memory_mlock_force_backs_lazy_pages() -> TestResult {
         base: v,
         len: 0x2000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![backed, PhysAddr::new(0)],
+        phys: alloc::vec![backed, PhysAddr::new(0)].into(),
     })
     .is_err()
     {
@@ -12687,7 +12692,7 @@ fn smoke_memory_mlock_splits_exact_subrange() -> TestResult {
         base: VirtAddr::new(base),
         len: 0x4000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); 4],
+        phys: alloc::vec![PhysAddr::new(0); 4].into(),
     })
     .is_err()
     {
@@ -12709,7 +12714,7 @@ fn smoke_memory_mlock_splits_exact_subrange() -> TestResult {
         && regions[0].base.as_u64() == base
         && regions[0].len == 0x1000
         && !regions[0].perms.contains(RegionPerms::LOCKED)
-        && regions[0].phys == alloc::vec![PhysAddr::new(0)]
+        && regions[0].phys == alloc::vec![PhysAddr::new(0)].into()
         && regions[1].base.as_u64() == base + 0x1000
         && regions[1].len == 0x2000
         && regions[1].perms.contains(RegionPerms::LOCKED)
@@ -12717,7 +12722,7 @@ fn smoke_memory_mlock_splits_exact_subrange() -> TestResult {
         && regions[2].base.as_u64() == base + 0x3000
         && regions[2].len == 0x1000
         && !regions[2].perms.contains(RegionPerms::LOCKED)
-        && regions[2].phys == alloc::vec![PhysAddr::new(0)];
+        && regions[2].phys == alloc::vec![PhysAddr::new(0)].into();
     if !exact_lock {
         core::mem::forget(a);
         return TestResult::Fail("mlock populated or locked outside its subrange");
@@ -12764,7 +12769,7 @@ fn smoke_memory_mlock_onfault_stays_lazy_until_fault() -> TestResult {
         base,
         len: 0x2000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); 2],
+        phys: alloc::vec![PhysAddr::new(0); 2].into(),
     })
     .is_err()
         || a.mlock_range_onfault(base, 0x2000).is_err()
@@ -12835,7 +12840,7 @@ fn smoke_memory_mlock_spans_multiple_regions() -> TestResult {
             base: VirtAddr::new(base + (i as u64) * 0x1000),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![f],
+            phys: alloc::vec![f].into(),
         })
         .is_err()
         {
@@ -12882,7 +12887,7 @@ fn smoke_memory_mlock_hole_preserves_linux_prefix_effect() -> TestResult {
             base: VirtAddr::new(base + offset),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         {
@@ -12934,7 +12939,7 @@ fn smoke_memory_mlock_prot_none_locks_without_population() -> TestResult {
         base: VirtAddr::new(base),
         len: 0x1000,
         perms: RegionPerms::default(),
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .is_err()
     {
@@ -13039,7 +13044,7 @@ fn smoke_memory_mlock_survives_mprotect() -> TestResult {
         base: v,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![f],
+        phys: alloc::vec![f].into(),
     })
     .is_err()
     {
@@ -13143,7 +13148,7 @@ fn smoke_memory_mprotect_mixed_huge_index_oom_is_preflight() -> TestResult {
             base: regular_base,
             len: 0x3000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0); 3],
+            phys: alloc::vec![PhysAddr::new(0); 3].into(),
         })
         .is_err()
     {
@@ -13473,7 +13478,7 @@ fn smoke_memory_huge_intersects_sees_hugetlb_mappings() -> TestResult {
             base: regular_base,
             len: 0x1000,
             perms: RegionPerms::READ,
-            phys: alloc::vec![PhysAddr::new(0); 1],
+            phys: alloc::vec![PhysAddr::new(0); 1].into(),
         })
         .is_err()
     {
@@ -13595,7 +13600,7 @@ fn smoke_memory_range_fully_mapped_spans_regular_and_huge() -> TestResult {
             base: regular_base,
             len: 0x2000,
             perms: RegionPerms::READ,
-            phys: alloc::vec![PhysAddr::new(0); 2],
+            phys: alloc::vec![PhysAddr::new(0); 2].into(),
         })
         .is_err()
     {
@@ -13667,7 +13672,7 @@ fn smoke_memory_perms_intersecting_reports_locked() -> TestResult {
             base: unlocked_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0); 1],
+            phys: alloc::vec![PhysAddr::new(0); 1].into(),
         })
         .is_err()
         || address_space
@@ -13675,7 +13680,7 @@ fn smoke_memory_perms_intersecting_reports_locked() -> TestResult {
                 base: locked_base,
                 len: 0x1000,
                 perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
-                phys: alloc::vec![PhysAddr::new(0); 1],
+                phys: alloc::vec![PhysAddr::new(0); 1].into(),
             })
             .is_err()
     {
@@ -13766,7 +13771,7 @@ fn smoke_memory_future_lock_policy_applies_to_new_mappings() -> TestResult {
             base: eager_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -13816,7 +13821,7 @@ fn smoke_memory_future_lock_policy_applies_to_new_mappings() -> TestResult {
             base: onfault_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -13868,7 +13873,7 @@ fn smoke_memory_munlock_all_clears_current_and_future_locking() -> TestResult {
             base: locked_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![resident],
+            phys: alloc::vec![resident].into(),
         })
         .is_err()
     {
@@ -13890,7 +13895,7 @@ fn smoke_memory_munlock_all_clears_current_and_future_locking() -> TestResult {
             base: later_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_ok()
         && a.lookup(later_base).is_some_and(|region| {
@@ -13935,7 +13940,7 @@ fn smoke_memory_fork_clears_current_and_future_locking() -> TestResult {
                 base,
                 len: 0x1000,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -13990,7 +13995,7 @@ fn smoke_memory_mlock_limit_subtracts_locked_overlap() -> TestResult {
         base: VirtAddr::new(base),
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0); 3],
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
     })
     .is_err()
     {
@@ -14048,7 +14053,7 @@ fn smoke_memory_mlockall_limit_failure_preserves_state() -> TestResult {
         base: plain,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .is_err()
         || a.update_mlockall(None, FutureLockPolicy::OnFault).is_err()
@@ -14056,7 +14061,7 @@ fn smoke_memory_mlockall_limit_failure_preserves_state() -> TestResult {
             base: inherited,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14106,14 +14111,14 @@ fn smoke_memory_mlockall_limit_excludes_stack_guard() -> TestResult {
         base: plain,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .is_err()
         || a.map_region(Region {
             base: guard,
             len: 0x1000,
             perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14163,7 +14168,7 @@ fn smoke_memory_lock_exempt_prot_none_ignores_mlockall() -> TestResult {
             base,
             len: 0x1000,
             perms: RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || a.update_mlockall(Some(FutureLockPolicy::Eager), FutureLockPolicy::Eager)
@@ -14215,7 +14220,7 @@ fn smoke_memory_eager_locked_grow_populates_tail() -> TestResult {
         base,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
-        phys: alloc::vec![resident],
+        phys: alloc::vec![resident].into(),
     })
     .is_err()
         || a.grow_region(base, 0x2000).is_err()
@@ -14241,13 +14246,9 @@ fn smoke_memory_eager_locked_grow_populates_tail() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_eager_locked_grow_populates_tail);
 
-/// A user-half-valid but allocator-impossible mremap grow must report a typed
-/// allocation failure instead of entering the kernel allocator's abort path.
-/// The failed reservation is made before `Region::len` or its backing vector
-/// changes, so the original mapping remains authoritative.
-fn smoke_memory_grow_metadata_allocation_is_fallible() -> TestResult {
-    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
-
+/// Even the largest valid lazy grow changes only logical backing length.
+fn smoke_memory_grow_metadata_stays_sparse() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
     let address_space = AddressSpace::empty();
     let base = VirtAddr::new(AddressSpace::MMAP_CURSOR_BASE);
     if address_space
@@ -14255,26 +14256,28 @@ fn smoke_memory_grow_metadata_allocation_is_fallible() -> TestResult {
             base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
-        return TestResult::Fail("metadata-allocation setup failed");
+        return TestResult::Fail("sparse grow setup failed");
     }
-    let impossible_len = AddressSpace::USER_HALF_END - base.as_u64();
-    if address_space.grow_region(base, impossible_len) != Err(AddressSpaceError::AllocationFailed) {
-        return TestResult::Fail("impossible metadata grow did not fail cleanly");
+    let len = AddressSpace::USER_HALF_END - base.as_u64();
+    if address_space.grow_region(base, len).is_err() {
+        return TestResult::Fail("valid lazy grow tried to allocate offset-sized metadata");
     }
-    if address_space
-        .lookup(base)
-        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![PhysAddr::new(0)])
-    {
+    if address_space.lookup(base).is_some_and(|region| {
+        region.len == len
+            && region.phys.len() == (len >> 12) as usize
+            && region.materialized_pages() == 0
+            && region.phys.metadata_bytes() == 0
+    }) {
         TestResult::Pass
     } else {
-        TestResult::Fail("failed metadata reservation changed the source VMA")
+        TestResult::Fail("lazy grow allocated backing blocks")
     }
 }
-kernel_test_in!("memory", smoke_memory_grow_metadata_allocation_is_fallible);
+kernel_test_in!("memory", smoke_memory_grow_metadata_stays_sparse);
 
 /// mremap growth follows Linux's MEMLOCK -> AS -> DATA admission order and
 /// implements the RLIMIT_DATA soft-zero/hard-limit compatibility exception.
@@ -14290,7 +14293,7 @@ fn smoke_memory_mremap_growth_limit_order_and_data_compat() -> TestResult {
             base: locked_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14334,7 +14337,7 @@ fn smoke_memory_mremap_growth_limit_order_and_data_compat() -> TestResult {
             base: soft_zero_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14359,7 +14362,7 @@ fn smoke_memory_mremap_growth_limit_order_and_data_compat() -> TestResult {
             base: hard_base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14417,7 +14420,7 @@ fn smoke_memory_shared_mremap_interval_and_limit_modes() -> TestResult {
                 | RegionPerms::WRITE
                 | RegionPerms::SHARED
                 | RegionPerms::LOCKED,
-            phys: alloc::vec![PhysAddr::new(0); 3],
+            phys: alloc::vec![PhysAddr::new(0); 3].into(),
         })
         .is_err()
     {
@@ -14561,7 +14564,7 @@ fn smoke_memory_shared_mremap_lock_exempt_eligibility() -> TestResult {
                 | RegionPerms::SHARED
                 | RegionPerms::FILE_DEMAND
                 | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14590,7 +14593,7 @@ fn smoke_memory_shared_mremap_lock_exempt_eligibility() -> TestResult {
             base: device_source,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {
@@ -14648,7 +14651,7 @@ fn smoke_memory_file_demand_sparse_shared_remap() -> TestResult {
             base: source,
             len: 0x4000,
             perms,
-            phys: alloc::vec::Vec::new(),
+            phys: alloc::vec::Vec::new().into(),
         })
         .is_err()
     {
@@ -14718,7 +14721,7 @@ fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
             base: duplicate_source,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || duplicate_as
@@ -14726,7 +14729,7 @@ fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
                 base: duplicate_target,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -14768,7 +14771,7 @@ fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
             base: dontunmap_source,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || dontunmap_as
@@ -14776,7 +14779,7 @@ fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
                 base: dontunmap_target,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -14862,7 +14865,7 @@ fn smoke_memory_shared_mremap_installs_destination_rmap() -> TestResult {
                         | RegionPerms::WRITE
                         | RegionPerms::SHARED
                         | RegionPerms::LOCKED,
-                    phys: alloc::vec![frame],
+                    phys: alloc::vec![frame].into(),
                 })?;
                 address_space.materialize_range(source, 0x1000)
             }
@@ -14923,10 +14926,10 @@ fn smoke_memory_shared_mremap_installs_destination_rmap() -> TestResult {
         && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![0])
         && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1])
         && address_space.lookup(source).is_some_and(|region| {
-            !region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame]
+            !region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame].into()
         })
         && address_space.lookup(destination).is_some_and(|region| {
-            region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame]
+            region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame].into()
         });
     if !moved {
         return TestResult::Fail("shared DONTUNMAP did not move residency/rmap authority");
@@ -15011,7 +15014,7 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
                     base: source,
                     len: 0x1000,
                     perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-                    phys: alloc::vec![frame],
+                    phys: alloc::vec![frame].into(),
                 })?;
                 address_space.materialize_range(source, 0x1000)
             }
@@ -15110,7 +15113,7 @@ fn smoke_memory_shared_relocation_splits_and_grows() -> TestResult {
                 | RegionPerms::WRITE
                 | RegionPerms::SHARED
                 | RegionPerms::LOCKED,
-            phys: backing.clone(),
+            phys: backing.clone().into(),
         })
         .is_err()
     {
@@ -15134,19 +15137,21 @@ fn smoke_memory_shared_relocation_splits_and_grows() -> TestResult {
             },
         )
     };
-    let head = address_space
-        .lookup(source)
-        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![backing[0]]);
+    let head = address_space.lookup(source).is_some_and(|region| {
+        region.len == 0x1000 && region.phys == alloc::vec![backing[0]].into()
+    });
     let removed = address_space
         .lookup(VirtAddr::new(source.as_u64() + 0x1000))
         .is_none();
     let tail = address_space
         .lookup(VirtAddr::new(source.as_u64() + 0x3000))
-        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![backing[3]]);
+        .is_some_and(|region| {
+            region.len == 0x1000 && region.phys == alloc::vec![backing[3]].into()
+        });
     let destination_correct = address_space.lookup(destination).is_some_and(|region| {
         region.len == 0x3000
             && region.perms.contains(RegionPerms::LOCKED)
-            && region.phys == alloc::vec![backing[1], backing[2], PhysAddr::new(0)]
+            && region.phys == alloc::vec![backing[1], backing[2], PhysAddr::new(0)].into()
     });
     if moved.is_ok() && head && removed && tail && destination_correct {
         TestResult::Pass
@@ -15176,7 +15181,7 @@ fn smoke_memory_shared_relocation_index_oom_is_preflight() -> TestResult {
             base: source,
             len: 0x3000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-            phys: source_phys.clone(),
+            phys: source_phys.clone().into(),
         })
         .is_err()
         || address_space
@@ -15184,7 +15189,7 @@ fn smoke_memory_shared_relocation_index_oom_is_preflight() -> TestResult {
                 base: target,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -15207,7 +15212,7 @@ fn smoke_memory_shared_relocation_index_oom_is_preflight() -> TestResult {
         || address_space.lookup(destination).is_some()
         || !address_space
             .lookup(source)
-            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys)
+            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys.clone().into())
     {
         return TestResult::Fail("ordinary shared index OOM mutated VMA state");
     }
@@ -15233,7 +15238,7 @@ fn smoke_memory_shared_relocation_index_oom_is_preflight() -> TestResult {
         && address_space.lookup(target).is_some()
         && address_space
             .lookup(source)
-            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys)
+            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys.into())
     {
         TestResult::Pass
     } else {
@@ -15297,7 +15302,7 @@ fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
                     base: source,
                     len: 0x2000,
                     perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-                    phys: alloc::vec![first, second],
+                    phys: alloc::vec![first, second].into(),
                 })?;
                 address_space.materialize_range(source, 0x2000)
             }
@@ -15371,7 +15376,7 @@ fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
         && address_space.lookup(source).is_none()
         && address_space
             .lookup(destination)
-            .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![first]);
+            .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![first].into());
     drop(address_space);
     crate::free_frame(PhysFrame::new(first));
     crate::free_frame(PhysFrame::new(second));
@@ -15387,6 +15392,7 @@ kernel_test_in!("memory", smoke_memory_shared_relocation_moves_residency);
 /// Ordinary shared fixed moves admit locked growth before target retirement
 /// and expose every later failure as destructive, matching Linux's ownership
 /// handoff boundary.
+#[cfg(feature = "kernel-test")]
 fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
     use crate::{
         AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
@@ -15401,7 +15407,7 @@ fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
             base: source,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || address_space
@@ -15409,7 +15415,7 @@ fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
                 base: target,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -15444,15 +15450,16 @@ fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
         return TestResult::Fail("shared fixed preflight retired its target");
     }
 
-    let impossible_len = source.as_u64() - target.as_u64();
-    // SAFETY: same metadata-only fixed transaction. Proportional preparation
-    // fails only after the one-page target has been punched.
+    let new_len = 0x2000;
+    crate::address_space::__test_fail_next_fixed_relocation_after_punch();
+    // SAFETY: same metadata-only fixed transaction. Inject a preparation
+    // failure after the target punch, independently of backing representation.
     let late = unsafe {
         address_space.relocate_shared_region_fixed_limited(
             source,
             0x1000,
             target,
-            impossible_len,
+            new_len,
             MremapLimits::UNLIMITED,
         )
     };
@@ -15470,6 +15477,7 @@ fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
         TestResult::Fail("shared fixed relocation hid its destructive failure")
     }
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!("memory", smoke_memory_shared_relocation_fixed_order);
 
 /// Linux fixed-shrink ordering retires the destination, truncates the source,
@@ -15490,7 +15498,7 @@ fn smoke_memory_shared_fixed_shrink_reports_source_state() -> TestResult {
             base: source,
             len: 0x2000,
             perms: RegionPerms::READ | RegionPerms::SHARED,
-            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)].into(),
         })
         .is_err()
         || address_space
@@ -15498,7 +15506,7 @@ fn smoke_memory_shared_fixed_shrink_reports_source_state() -> TestResult {
                 base: target,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -15557,7 +15565,7 @@ fn smoke_memory_private_fixed_shrink_reports_source_state() -> TestResult {
             base: source,
             len: 0x2000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)].into(),
         })
         .is_err()
         || address_space
@@ -15565,7 +15573,7 @@ fn smoke_memory_private_fixed_shrink_reports_source_state() -> TestResult {
                 base: target,
                 len: 0x1000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
@@ -15669,7 +15677,7 @@ fn smoke_memory_eager_locked_relocate_growth_populates_tail() -> TestResult {
         base: old,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
-        phys: alloc::vec![resident],
+        phys: alloc::vec![resident].into(),
     })
     .is_err()
     {
@@ -15721,7 +15729,7 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
             base: source,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
-            phys: alloc::vec![source_phys],
+            phys: alloc::vec![source_phys].into(),
         })
         .is_err()
         || address_space
@@ -15729,7 +15737,7 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
                 base: target,
                 len: 0x2000,
                 perms: RegionPerms::READ,
-                phys: alloc::vec![target_phys, PhysAddr::new(target_phys.raw() + 0x1000)],
+                phys: alloc::vec![target_phys, PhysAddr::new(target_phys.raw() + 0x1000)].into(),
             })
             .is_err()
     {
@@ -15802,12 +15810,13 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
     let target_preserved = address_space.lookup(target).is_some_and(|region| {
         region.len == 0x2000
             && region.perms.prot_only() == RegionPerms::READ
-            && region.phys == alloc::vec![target_phys, PhysAddr::new(target_phys.raw() + 0x1000)]
+            && region.phys
+                == alloc::vec![target_phys, PhysAddr::new(target_phys.raw() + 0x1000)].into()
     });
     let source_preserved = address_space.lookup(source).is_some_and(|region| {
         region.len == 0x1000
             && region.perms.contains(RegionPerms::LOCKED)
-            && region.phys == alloc::vec![source_phys]
+            && region.phys == alloc::vec![source_phys].into()
     });
     let early = |error| {
         Err(crate::FixedRelocationError {
@@ -15836,6 +15845,7 @@ kernel_test_in!(
 /// Once MAP_FIXED has retired its target, a later fallible relocation failure
 /// must report that destructive state so filesystem/SysV owner tables mirror
 /// memory instead of retaining stale backing references.
+#[cfg(feature = "kernel-test")]
 fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -15847,7 +15857,7 @@ fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
             base: target,
             len: 0x1000,
             perms: RegionPerms::READ,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
         || address_space
@@ -15855,13 +15865,14 @@ fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
                 base: source,
                 len: 0x1000,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![PhysAddr::new(0)],
+                phys: alloc::vec![PhysAddr::new(0)].into(),
             })
             .is_err()
     {
         return TestResult::Fail("post-punch failure setup failed");
     }
-    let impossible_len = source.as_u64() - target.as_u64();
+    let new_len = 0x2000;
+    crate::address_space::__test_fail_next_fixed_relocation_after_punch();
     let outcome = address_space.with_vma_transaction(|| {
         crate::with_shared_mapping_transaction(|| {
             // SAFETY: metadata-only AddressSpace::empty has no live root and
@@ -15871,7 +15882,7 @@ fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
                     source,
                     0x1000,
                     target,
-                    impossible_len,
+                    new_len,
                     crate::MremapLimits::UNLIMITED,
                     false,
                 )
@@ -15892,6 +15903,7 @@ fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
         TestResult::Fail("fixed relocation did not report its destructive failure state")
     }
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "memory",
     smoke_memory_fixed_relocate_reports_post_punch_failure
@@ -15919,7 +15931,7 @@ fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
         base: foreign,
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     })
     .is_err()
     {
@@ -15934,7 +15946,7 @@ fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
     let untouched = a.lookup(foreign).is_some_and(|region| {
         region.len == 0x1000
             && !region.perms.contains(RegionPerms::BRK_HEAP)
-            && region.phys == alloc::vec![PhysAddr::new(0)]
+            && region.phys == alloc::vec![PhysAddr::new(0)].into()
     });
     if !untouched {
         return TestResult::Fail("rejected brk growth mutated the foreign root");
@@ -16493,3 +16505,139 @@ fn smoke_bootstrap_arena_covers_reservation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_bootstrap_arena_covers_reservation);
+
+/// Sparse offsets must survive the ownership and VMA transformations together,
+/// including a fault into a missing block below an already-faulted far page.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_sparse_backing_fork_split_move_discard() -> TestResult {
+    use crate::region_backing::RegionBacking;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    const FAR: usize = (1 << 20) + 3;
+    const PAGES: usize = FAR + 8;
+    let base = VirtAddr::new(0x0000_0100_0000_0000);
+    let target = VirtAddr::new(0x0000_0200_0000_0000);
+    // SAFETY: the kernel harness has initialized paging and the allocator.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("user root allocation failed"),
+    };
+    let checks = || -> Result<(), &'static str> {
+        parent
+            .map_private_anonymous_region_limited(
+                Region {
+                    base,
+                    len: PAGES as u64 * 4096,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: RegionBacking::new(),
+                },
+                false,
+                u64::MAX,
+                false,
+            )
+            .map_err(|_| "sparse map failed")?;
+        for index in [FAR, 5, 64] {
+            let va = VirtAddr::new(base.raw() + index as u64 * 4096);
+            // SAFETY: va is inside the live parent's anonymous VMA.
+            unsafe { parent.demand_alloc_page(va) }.map_err(|_| "sparse fault failed")?;
+            let phys = parent
+                .lookup(va)
+                .ok_or("faulted VMA missing")?
+                .backing_at(index);
+            // SAFETY: this is the exclusive live frame just demand-allocated.
+            unsafe {
+                phys.kernel_mut_ptr::<u64>().write(index as u64);
+            }
+        }
+        let original = parent.lookup(base).ok_or("parent VMA missing")?;
+        if original.materialized_pages() > 192 || parent.memory_stats().resident_pages != 3 {
+            return Err("three sparse faults used proportional metadata or incorrect RSS");
+        }
+        // SAFETY: the inactive parent and all its regions are exclusively owned.
+        let child = unsafe { parent.clone_for_fork() }.map_err(|_| "sparse fork failed")?;
+        // SAFETY: the child owns a live root and its COW backing.
+        unsafe { child.materialize() }.map_err(|_| "sparse child materialize failed")?;
+        for index in [5, 64, FAR] {
+            let va = VirtAddr::new(base.raw() + index as u64 * 4096);
+            // SAFETY: child owns the live root and translation tables.
+            if unsafe { crate::paging::translate(child.root, va) }
+                != Some(original.backing_at(index))
+            {
+                return Err("fork shifted a sparse frame");
+            }
+        }
+        let far_va = VirtAddr::new(base.raw() + FAR as u64 * 4096);
+        // SAFETY: this is a writable COW mapping owned by the child.
+        unsafe { child.cow_split_on_write(far_va) }.map_err(|_| "sparse COW split failed")?;
+        // SAFETY: publish the child's newly private frame into its live leaf.
+        unsafe { child.remap_page(far_va) }.map_err(|_| "sparse COW remap failed")?;
+        let private = child
+            .lookup(far_va)
+            .ok_or("COW VMA missing")?
+            .backing_at(FAR);
+        if private == original.backing_at(FAR) {
+            return Err("COW kept the shared far frame");
+        }
+        // SAFETY: the private frame is live and exclusively owned by the child.
+        unsafe {
+            private.kernel_mut_ptr::<u64>().write(0xCAFE);
+        }
+        let middle = VirtAddr::new(base.raw() + 4096);
+        let middle_len = (FAR as u64 + 4) * 4096;
+        child
+            .change_perms_range(middle, middle_len, RegionPerms::READ)
+            .map_err(|_| "unaligned sparse protection split failed")?;
+        child
+            .change_perms_range(middle, middle_len, RegionPerms::READ | RegionPerms::WRITE)
+            .map_err(|_| "sparse protection restore failed")?;
+        // SAFETY: the inactive child owns both source metadata and a live root;
+        // the destination is disjoint and no concurrent VMA transaction exists.
+        unsafe { child.relocate_region(middle, middle_len, target, middle_len + 4096) }
+            .map_err(|_| "sparse relocation/growth failed")?;
+        let moved_va = VirtAddr::new(target.raw() + (FAR as u64 - 1) * 4096);
+        // SAFETY: the child owns this live relocated root.
+        if unsafe { crate::paging::translate(child.root, moved_va) } != Some(private) {
+            return Err("relocation shifted far backing");
+        }
+        if !crate::rmap::contains_owner(private, child.root, moved_va) {
+            return Err("relocation lost far reverse-map ownership");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            child
+                .madvise_free(moved_va, 4096)
+                .map_err(|_| "sparse lazy-free mark failed")?;
+            if child.discard_lazyfree_pages(1) != 1
+                || child.memory_stats().resident_pages != 2
+                || crate::rmap::contains_owner(private, child.root, moved_va)
+            {
+                return Err("sparse lazy-free lost its page offset or ownership");
+            }
+        }
+        child
+            .madvise_dontneed(target, middle_len + 4096)
+            .map_err(|_| "sparse discard failed")?;
+        if child.memory_stats().resident_pages != 0 || parent.memory_stats().resident_pages != 3 {
+            return Err("discard changed the wrong owner's RSS");
+        }
+        for index in [5, 64, FAR] {
+            let phys = original.backing_at(index);
+            // SAFETY: the parent still owns this resident frame after child discard.
+            if unsafe { phys.kernel_ptr::<u64>().read() } != index as u64 {
+                return Err("child transformation corrupted parent contents");
+            }
+            if crate::frame::cow::count(phys) > 1 {
+                return Err("sparse child discard leaked a COW owner");
+            }
+        }
+        Ok(())
+    };
+    match checks() {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_sparse_backing_fork_split_move_discard
+);

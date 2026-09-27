@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
-agent = "OpenAI Codex GPT-5"
-prompt_hash = "3a766ac1ed4f30a34907fc8d2d907aa0a026c4fbd749627511c74ba3a6e51ad8"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "313140fbb2960353e454ab43dfa4f5ebd5fd251f0d46506b7279dc6a07a4e076"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1183,3 +1183,17 @@ argument = "Saturated fork locality remains inside the existing scheduler execut
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The fork selector still considers only allowed online CPUs and still derives its decision from scheduler-owned queue, wake-inbox, and current-task state. The current CPU wins only when every sampled candidate is occupied and it is tied for the minimum load; an idle CPU always wins, and an affinity-excluded current CPU has no load entry and cannot be selected. Admission and dispatch retain the existing affinity, lifecycle, address-space, TLS, domain-state, and FP/SIMD validation and restore paths."
+
+# Sparse region backing, Stage 2. Human security review is pending; the user
+# explicitly authorized unsigned commits for this branch.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "RegionBacking changes base-page ownership metadata without adding a trusted subsystem or moving a domain boundary. Logical page offsets remain distinct from block-directory positions. Backing clones copy metadata only; AddressSpace remains responsible for every COW/shared retain, reverse-map transfer, and frame release. Sparse chunks preserve absolute virtual offsets through split, fork, protection rewrite, relocation, and teardown."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "VMA admission, W^X and capability/domain checks are unchanged. A demand claim reserves its exact backing block fallibly before dropping the region lock or entering a filesystem. Missing blocks read as unbacked, and mutable publication cannot allocate. Fork and relocation prepare bounded sparse copies before transferring owners; allocation-free teardown preserves the existing local and remote invalidation-before-free ordering. The new cross-architecture regression checks far-page COW, split/relocation coordinates, reverse-map ownership, RSS, and unchanged parent contents."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L44"
+argument = "A userspace-controlled high virtual offset reserves one fixed-size backing block rather than an offset-sized vector. Holes remain implicit through cloning and windowing. Shared frames still use external-owner hooks; private frames retain COW-aware release. No missing-block lookup fabricates physical backing or grants access to another mapping."

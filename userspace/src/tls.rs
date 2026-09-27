@@ -243,7 +243,7 @@ pub unsafe fn stage_tls<S: crate::elf::ExecBytes + ?Sized>(
             // glibc patches the TCB at runtime, so we don't get away
             // with read-only here even if the initial image were const.
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: phys_list,
+            phys: phys_list.into(),
         })
         .map_err(TlsError::Map)?;
 
