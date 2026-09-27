@@ -396,14 +396,15 @@ impl SocketFile {
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
-        let hop_limit = self.options.lock().ipv6_unicast_hops;
+        let options = self.options.lock().clone();
+        let hop_limit = options.ipv6_unicast_hops;
         let is_local =
             dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local_in(self.net_ns_id(), &dest.0);
         if !is_local {
             let bound_ifindex = if dest.2 != 0 {
                 dest.2
             } else {
-                self.options.lock().bindtodevice_index
+                options.bindtodevice_index
             };
             return match narf_net::ipv6_stack::send_udp(
                 self.net_ns_id(),
@@ -414,6 +415,9 @@ impl SocketFile {
                 buf,
                 bound_ifindex,
                 if hop_limit < 0 { 64 } else { hop_limit as u8 },
+                options.ipv6_mtu_set.then_some(options.ipv6_mtu),
+                options.ipv6_mtu_discover,
+                options.ipv6_dontfrag,
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(narf_net::ipv6_stack::Udp6SendError::MessageTooLong) => {

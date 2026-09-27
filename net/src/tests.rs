@@ -5029,6 +5029,42 @@ fn smoke_ipv6_fragment_reassembly_two_pieces() -> TestResult {
 }
 kernel_test_in!("net/ipv6", smoke_ipv6_fragment_reassembly_two_pieces);
 
+fn smoke_ipv6_udp_source_fragment_layout() -> TestResult {
+    use crate::ipv6_stack::__fragment_udp6_for_test;
+    use crate::pkt_ipv6::NEXT_HEADER_UDP;
+
+    let udp = alloc::vec![0x5a; 2000];
+    let Some(fragments) = __fragment_udp6_for_test(&udp, 1280, 0x1234_5678) else {
+        return TestResult::Fail("UDP6 source fragmentation failed");
+    };
+    if fragments.len() != 2
+        || fragments[0].len() != 1240
+        || fragments[1].len() != 776
+        || fragments
+            .iter()
+            .any(|fragment| fragment[0] != NEXT_HEADER_UDP)
+    {
+        return TestResult::Fail("UDP6 fragments do not respect the path MTU");
+    }
+    let first_flags = u16::from_be_bytes(fragments[0][2..4].try_into().unwrap());
+    let second_flags = u16::from_be_bytes(fragments[1][2..4].try_into().unwrap());
+    if first_flags != 1 || second_flags != 1232 {
+        return TestResult::Fail("UDP6 fragment offsets or M flag are wrong");
+    }
+    if fragments[0][4..8] != 0x1234_5678u32.to_be_bytes()
+        || fragments[1][4..8] != 0x1234_5678u32.to_be_bytes()
+        || fragments[0][8..]
+            .iter()
+            .chain(fragments[1][8..].iter())
+            .copied()
+            .ne(udp.iter().copied())
+    {
+        return TestResult::Fail("UDP6 fragmentation changed payload or identification");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6", smoke_ipv6_udp_source_fragment_layout);
+
 /// EUI-64 builder flips the U/L bit and inserts FFFE.
 fn smoke_ipv6_eui64_construction() -> TestResult {
     use crate::ipv6::addrs::eui64_from_mac;

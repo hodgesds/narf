@@ -481,6 +481,10 @@ impl Tcb {
         t.is_ipv6 = true;
         t.local_addr6 = local_addr;
         t.remote_addr6 = remote_addr;
+        // IPv6 has a 40-byte base header (rather than IPv4's 20), so the
+        // minimum-route MSS advertised before a more specific PMTU is known
+        // is 1500 - 40 - 20 = 1440.
+        t.opts.our_mss = 1440;
         t
     }
 
@@ -2092,7 +2096,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         Some(i) => i,
         None => return,
     };
-    let (our_iss, ack, mss, our_wscale, our_ts, peer_tsval, negotiated) = {
+    let (our_iss, ack, mut mss, our_wscale, our_ts, peer_tsval, negotiated) = {
         let t = arc.lock();
         let our_ts = tsval_now();
         (
@@ -2105,6 +2109,9 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
             SynOptionPolicy::for_synack(&t.opts),
         )
     };
+    if arc.lock().is_ipv6 {
+        mss = mss.min(iface.mtu.saturating_sub(60).max(MIN_MSS as u32) as u16);
+    }
     // For a SYN-ACK the TSecr must echo the peer's most recent TSval
     // (captured into `ts_recent` from the incoming SYN), NOT the ACK
     // sequence number. A wrong TSecr makes a strict peer (a real Linux

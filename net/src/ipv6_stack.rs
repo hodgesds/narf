@@ -24,6 +24,7 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -31,8 +32,8 @@ use crate::ipv6::{icmp6_sock, ndp, slaac};
 use crate::pkt::{ip_checksum, write_eth_header, ETHERTYPE_IPV6, ETH_HDR_LEN};
 use crate::pkt_ipv6::{
     pseudo_checksum, Icmpv6Header, Ipv6Header, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST,
-    ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION, ICMPV6_REDIRECT,
-    ICMPV6_ROUTER_ADVERTISEMENT, ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN,
+    ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION, ICMPV6_PACKET_TOO_BIG,
+    ICMPV6_REDIRECT, ICMPV6_ROUTER_ADVERTISEMENT, ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN,
     NEXT_HEADER_DESTINATION_OPTIONS, NEXT_HEADER_FRAGMENT, NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6,
     NEXT_HEADER_ROUTING, NEXT_HEADER_TCP, NEXT_HEADER_UDP,
 };
@@ -110,6 +111,9 @@ struct FragBuf {
 }
 
 static FRAGS: IrqSafeSpinLock<BTreeMap<FragKey, FragBuf>> = IrqSafeSpinLock::new(BTreeMap::new());
+static PMTU: IrqSafeSpinLock<BTreeMap<(u64, [u8; 16]), u32>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+static NEXT_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 
 /// RFC 8200 §4.5: reassembly not complete within 60 seconds of the
 /// first-arriving fragment must be abandoned.
@@ -296,6 +300,8 @@ struct PendingUdp6 {
     destination: [u8; 16],
     hop_limit: u8,
     udp: Vec<u8>,
+    mtu: u32,
+    may_fragment: bool,
 }
 
 const MAX_PENDING_UDP6_PACKETS: usize = 256;
@@ -335,20 +341,16 @@ pub fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8; 16], m
         return;
     };
     for packet in ready {
-        let mut frame = Vec::new();
-        build_frame(
-            &mut frame,
-            Ipv6FrameSpec {
-                src_mac: iface.mac,
-                dst_mac: mac,
-                src_ip: packet.source,
-                dst_ip: packet.destination,
-                next_header: NEXT_HEADER_UDP,
-                hop_limit: packet.hop_limit,
-                body: &packet.udp,
-            },
+        let _ = emit_udp6(
+            &iface,
+            mac,
+            packet.source,
+            packet.destination,
+            packet.hop_limit,
+            &packet.udp,
+            packet.mtu,
+            packet.may_fragment,
         );
-        let _ = (iface.send)(&frame);
     }
 }
 
@@ -356,6 +358,7 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
     PENDING_UDP6
         .lock()
         .retain(|packet| packet.net_ns_id != net_ns_id);
+    PMTU.lock().retain(|(ns, _), _| *ns != net_ns_id);
 }
 
 #[doc(hidden)]
@@ -368,6 +371,8 @@ pub fn __pending_udp6_test_insert(net_ns_id: u64, iface: &str, neighbor: [u8; 16
         destination: neighbor,
         hop_limit: 64,
         udp: alloc::vec![0; 8],
+        mtu: 1280,
+        may_fragment: false,
     })
     .is_ok()
 }
@@ -418,6 +423,9 @@ pub fn send_udp(
     payload: &[u8],
     bound_ifindex: u32,
     hop_limit: u8,
+    socket_mtu: Option<u32>,
+    mtu_discover: u32,
+    dontfrag: bool,
 ) -> Result<usize, Udp6SendError> {
     let scoped_iface = if bound_ifindex == 0 {
         None
@@ -453,6 +461,17 @@ pub fn send_udp(
             .ok_or(Udp6SendError::NoSourceAddress)?,
     };
     let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
+    let path_mtu = PMTU
+        .lock()
+        .get(&(net_ns_id, destination))
+        .copied()
+        .unwrap_or(iface.mtu)
+        .min(iface.mtu)
+        .min(socket_mtu.unwrap_or(u32::MAX).max(1280));
+    let may_fragment = !dontfrag && (mtu_discover < 2 || mtu_discover == 5);
+    if IPV6_HDR_LEN + udp.len() > path_mtu as usize && !may_fragment {
+        return Err(Udp6SendError::MessageTooLong);
+    }
     let destination_mac = if destination[0] == 0xff {
         [
             0x33,
@@ -475,26 +494,102 @@ pub fn send_udp(
             destination,
             hop_limit: if hop_limit == 0 { 64 } else { hop_limit },
             udp,
+            mtu: path_mtu,
+            may_fragment,
         })?;
         start_neighbor_resolution(net_ns_id, &iface_name, &iface, source, neighbor_ip);
         return Ok(payload.len());
     };
 
-    let mut frame = Vec::new();
-    build_frame(
-        &mut frame,
-        Ipv6FrameSpec {
-            src_mac: iface.mac,
-            dst_mac: destination_mac,
-            src_ip: source,
-            dst_ip: destination,
-            next_header: NEXT_HEADER_UDP,
-            hop_limit: if hop_limit == 0 { 64 } else { hop_limit },
-            body: &udp,
-        },
-    );
-    (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure)?;
+    emit_udp6(
+        &iface,
+        destination_mac,
+        source,
+        destination,
+        if hop_limit == 0 { 64 } else { hop_limit },
+        &udp,
+        path_mtu,
+        may_fragment,
+    )?;
     Ok(payload.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_udp6(
+    iface: &crate::iface::NetIfaceSnapshot,
+    destination_mac: [u8; 6],
+    source: [u8; 16],
+    destination: [u8; 16],
+    hop_limit: u8,
+    udp: &[u8],
+    mtu: u32,
+    may_fragment: bool,
+) -> Result<(), Udp6SendError> {
+    if IPV6_HDR_LEN + udp.len() <= mtu as usize {
+        let mut frame = Vec::new();
+        build_frame(
+            &mut frame,
+            Ipv6FrameSpec {
+                src_mac: iface.mac,
+                dst_mac: destination_mac,
+                src_ip: source,
+                dst_ip: destination,
+                next_header: NEXT_HEADER_UDP,
+                hop_limit,
+                body: udp,
+            },
+        );
+        return (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure);
+    }
+    if !may_fragment || mtu as usize <= IPV6_HDR_LEN + 8 {
+        return Err(Udp6SendError::MessageTooLong);
+    }
+    let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed);
+    for fragment in fragment_udp6(udp, mtu, id)? {
+        let mut frame = Vec::new();
+        build_frame(
+            &mut frame,
+            Ipv6FrameSpec {
+                src_mac: iface.mac,
+                dst_mac: destination_mac,
+                src_ip: source,
+                dst_ip: destination,
+                next_header: NEXT_HEADER_FRAGMENT,
+                hop_limit,
+                body: &fragment,
+            },
+        );
+        (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure)?;
+    }
+    Ok(())
+}
+
+fn fragment_udp6(udp: &[u8], mtu: u32, id: u32) -> Result<Vec<Vec<u8>>, Udp6SendError> {
+    let chunk_len = ((mtu as usize - IPV6_HDR_LEN - 8) / 8) * 8;
+    if chunk_len == 0 {
+        return Err(Udp6SendError::MessageTooLong);
+    }
+    let mut fragments = Vec::new();
+    let mut offset = 0usize;
+    while offset < udp.len() {
+        let end = (offset + chunk_len).min(udp.len());
+        let more = end < udp.len();
+        let mut fragment = Vec::with_capacity(8 + end - offset);
+        fragment.push(NEXT_HEADER_UDP);
+        fragment.push(0);
+        let offset_flags = ((offset / 8) as u16) << 3 | u16::from(more);
+        fragment.extend_from_slice(&offset_flags.to_be_bytes());
+        fragment.extend_from_slice(&id.to_be_bytes());
+        fragment.extend_from_slice(&udp[offset..end]);
+        fragments.push(fragment);
+        offset = end;
+    }
+    Ok(fragments)
+}
+
+#[doc(hidden)]
+pub fn __fragment_udp6_for_test(udp: &[u8], mtu: u32, id: u32) -> Option<Vec<Vec<u8>>> {
+    fragment_udp6(udp, mtu, id).ok()
 }
 
 fn start_neighbor_resolution(
@@ -727,6 +822,25 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
         return true;
     }
     match hdr.typ {
+        ICMPV6_PACKET_TOO_BIG => {
+            // ICMPv6 error body: type/code/checksum, 32-bit MTU, then the
+            // invoking packet. The quoted IPv6 destination identifies the
+            // route cache entry whose PMTU is reduced.
+            if body.len() < 48 || body[8] >> 4 != 6 {
+                return true;
+            }
+            let advertised = u32::from_be_bytes(body[4..8].try_into().unwrap()).max(1280);
+            let destination: [u8; 16] = body[32..48].try_into().unwrap();
+            if let Some(net_ns_id) = crate::iface::lookup(iface).map(|entry| entry.net_ns_id) {
+                let mut cache = PMTU.lock();
+                cache
+                    .entry((net_ns_id, destination))
+                    .and_modify(|mtu| *mtu = (*mtu).min(advertised))
+                    .or_insert(advertised);
+            }
+            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            true
+        }
         ICMPV6_ECHO_REQUEST => {
             // Build a matching Echo Reply.
             if body.len() < 8 {
@@ -816,4 +930,5 @@ pub fn raw_checksum(buf: &[u8]) -> u16 {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     FRAGS.lock().clear();
+    PMTU.lock().clear();
 }

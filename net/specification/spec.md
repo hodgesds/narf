@@ -297,6 +297,16 @@ them, from the shared `tcp::core::ICMP_UNREACH_ERRNO` /
 payloads above `icmp_sock::ICMP_ECHO_MAX_PAYLOAD` fail
 `IcmpError2::MsgTooLong` (Linux `EMSGSIZE`).
 
+Native IPv6 UDP transmission enforces the minimum of the interface MTU,
+socket `IPV6_MTU`, and learned destination PMTU. ICMPv6 Packet Too Big
+messages monotonically reduce the namespace-scoped destination cache.
+Datagrams exceeding that MTU return `EMSGSIZE` when `IPV6_DONTFRAG` is set
+or the discovery mode preserves DF semantics; modes for which Linux
+`ip6_sk_ignore_df` permits source fragmentation emit RFC 8200 Fragment
+headers with one identification and eight-byte-aligned non-final payloads.
+Packets retained during neighbor discovery preserve the MTU decision and are
+fragmented only after resolution, before device transmission.
+
 Linux `/proc/net/{tcp,tcp6,udp,udp6,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.

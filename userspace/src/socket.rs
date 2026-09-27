@@ -954,6 +954,7 @@ pub struct SockOptions {
     pub ipv6_unicast_hops: i32,
     pub ipv6_mtu_discover: u32,
     pub ipv6_mtu: u32,
+    pub ipv6_mtu_set: bool,
     pub ipv6_recverr: bool,
     pub ipv6_recvpktinfo: bool,
     pub ipv6_recvhoplimit: bool,
@@ -1009,6 +1010,7 @@ impl Default for SockOptions {
             ipv6_unicast_hops: -1,
             ipv6_mtu_discover: 1,
             ipv6_mtu: 1280,
+            ipv6_mtu_set: false,
             ipv6_recverr: false,
             ipv6_recvpktinfo: false,
             ipv6_recvhoplimit: false,
@@ -4960,6 +4962,7 @@ impl SocketFile {
             (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => match read_u32(value) {
                 Ok(value) if value >= 1280 => {
                     opts.ipv6_mtu = value;
+                    opts.ipv6_mtu_set = true;
                     SocketOpResult::Ok(0)
                 }
                 _ => SocketOpResult::Err(SockError::InvalidArg),
