@@ -37,7 +37,7 @@ pub(crate) fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
                 | RegionPerms::WRITE
                 | RegionPerms::SHARED
                 | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![narf_memory::PhysAddr::new(phys)],
+            phys: alloc::vec![narf_memory::PhysAddr::new(phys)].into(),
         })
         .is_err()
     {

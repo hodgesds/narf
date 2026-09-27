@@ -1074,7 +1074,7 @@ unsafe fn mint_shared_ring_pair(
             base: VirtAddr::new(sq_vaddr),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![sq_phys],
+            phys: alloc::vec![sq_phys].into(),
         })
         .map_err(|_| ())?;
     as_ref
@@ -1082,7 +1082,7 @@ unsafe fn mint_shared_ring_pair(
             base: VirtAddr::new(cq_vaddr),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![cq_phys],
+            phys: alloc::vec![cq_phys].into(),
         })
         .map_err(|_| ())?;
     // SAFETY: `as_ref` has a valid root and the two SharedRing regions were just

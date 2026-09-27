@@ -34,7 +34,7 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
             // page to R-only after the kernel populates it; the user
             // ring builders read from it but don't write.
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![phys],
+            phys: alloc::vec![phys].into(),
         })
         .is_err()
     {

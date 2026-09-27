@@ -182,7 +182,7 @@ mod tests {
                 base: VirtAddr::new(BASE),
                 len: PAGES * 4096,
                 perms: RegionPerms(0),
-                phys: alloc::vec![PhysAddr::new(0); PAGES as usize],
+                phys: alloc::vec![PhysAddr::new(0); PAGES as usize].into(),
             })
             .is_err()
         {

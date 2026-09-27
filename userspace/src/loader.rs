@@ -131,7 +131,7 @@ where
             base: VirtAddr::new(seg.vaddr),
             len: pages << 12,
             perms: perms_of(seg.flags) | guarded,
-            phys,
+            phys: phys.into(),
         })?;
     }
 
@@ -431,7 +431,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
                     base: VirtAddr::new(region_base),
                     len,
                     perms: perms | RegionPerms::FILE_DEMAND,
-                    phys,
+                    phys: phys.into(),
                 };
                 // The owner has to become visible atomically with the mapping,
                 // or a fault could reach a FILE_DEMAND region with no owner to
@@ -496,7 +496,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
                         base: VirtAddr::new(region_base),
                         len: (file_pages as u64) << 12,
                         perms,
-                        phys,
+                        phys: phys.into(),
                     })
                     .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
             }
@@ -512,7 +512,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
                     // vector and preserves anonymous VMA semantics for later
                     // mprotect/mremap operations.
                     perms: perms | RegionPerms::ANON_MERGEABLE,
-                    phys: alloc::vec::Vec::new(),
+                    phys: alloc::vec::Vec::new().into(),
                 })
                 .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
         }

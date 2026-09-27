@@ -156,7 +156,7 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
             base: VirtAddr::new(VVAR_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
-            phys: alloc::vec![img.vvar_frame],
+            phys: alloc::vec![img.vvar_frame].into(),
         })
         .ok()?;
     // Map the vDSO code+dynamic as a PRIVATE copy-on-write region backed
@@ -191,7 +191,7 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
             base: VirtAddr::new(VDSO_VADDR),
             len: vdso_len,
             perms: VDSO_CODE_PERMS,
-            phys: img.vdso_frames.clone(),
+            phys: img.vdso_frames.clone().into(),
         })
         .ok()?;
     Some(VDSO_VADDR)

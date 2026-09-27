@@ -2912,7 +2912,7 @@ mod aarch64_el0_preemption_e2e {
                 base: VirtAddr::new(CODE_VADDR),
                 len: PAGE_BYTES,
                 perms: RegionPerms::READ | RegionPerms::EXEC,
-                phys: alloc::vec![code_phys],
+                phys: alloc::vec![code_phys].into(),
             })
             .map_err(|_| "map code")?;
         address_space
@@ -2920,7 +2920,7 @@ mod aarch64_el0_preemption_e2e {
                 base: VirtAddr::new(STACK_VADDR),
                 len: PAGE_BYTES,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![stack_phys],
+                phys: alloc::vec![stack_phys].into(),
             })
             .map_err(|_| "map stack")?;
         address_space
@@ -2928,7 +2928,7 @@ mod aarch64_el0_preemption_e2e {
                 base: VirtAddr::new(SHARED_VADDR),
                 len: PAGE_BYTES,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![shared_phys],
+                phys: alloc::vec![shared_phys].into(),
             })
             .map_err(|_| "map shared")?;
 
@@ -3251,7 +3251,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
             base: VirtAddr::new(CODE_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-            phys: alloc::vec![code_frame],
+            phys: alloc::vec![code_frame].into(),
         })
         .ok();
     addr_space
@@ -3259,7 +3259,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
             base: VirtAddr::new(STACK_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![stack_frame],
+            phys: alloc::vec![stack_frame].into(),
         })
         .ok();
 
@@ -3488,7 +3488,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
             base: VirtAddr::new(CODE_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-            phys: alloc::vec![code_frame],
+            phys: alloc::vec![code_frame].into(),
         })
         .ok();
     addr_space
@@ -3496,7 +3496,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
             base: VirtAddr::new(STACK_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![stack_frame],
+            phys: alloc::vec![stack_frame].into(),
         })
         .ok();
 
@@ -3645,7 +3645,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
             base: VirtAddr::new(CODE_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-            phys: alloc::vec![code_frame],
+            phys: alloc::vec![code_frame].into(),
         })
         .ok();
     addr_space
@@ -3653,7 +3653,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
             base: VirtAddr::new(STACK_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![stack_frame],
+            phys: alloc::vec![stack_frame].into(),
         })
         .ok();
     let yield_n = Syscall::Yield.raw().to_le_bytes();
@@ -3806,7 +3806,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
             base: VirtAddr::new(CODE_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-            phys: alloc::vec![code_frame],
+            phys: alloc::vec![code_frame].into(),
         })
         .ok();
     addr_space
@@ -3814,7 +3814,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
             base: VirtAddr::new(STACK_VADDR),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![stack_frame],
+            phys: alloc::vec![stack_frame].into(),
         })
         .ok();
     // mov rax, 104 ; int 0x80 ; mov rax, 103 ; int 0x80 ; jmp $

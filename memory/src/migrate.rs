@@ -687,7 +687,7 @@ mod tests {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![p],
+                phys: alloc::vec![p].into(),
             })
             .is_err()
         {
@@ -772,7 +772,7 @@ mod tests {
                     base: va,
                     len: 4096,
                     perms: RegionPerms::READ | RegionPerms::SHARED,
-                    phys: alloc::vec![p],
+                    phys: alloc::vec![p].into(),
                 })
                 .is_err()
             {
@@ -872,7 +872,7 @@ mod tests {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![p],
+                phys: alloc::vec![p].into(),
             })
             .is_err()
         {
@@ -976,7 +976,7 @@ mod tests {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![p],
+                phys: alloc::vec![p].into(),
             })
             .is_err()
         {
@@ -1080,7 +1080,7 @@ mod tests {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![f],
+                phys: alloc::vec![f].into(),
             })
             .is_err()
         {
@@ -1190,7 +1190,7 @@ mod tests {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![f0],
+                phys: alloc::vec![f0].into(),
             })
             .is_err()
         {
@@ -1317,7 +1317,7 @@ mod tests {
                 base: va,
                 len: 4096,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![blk],
+                phys: alloc::vec![blk].into(),
             })
             .is_err()
         {

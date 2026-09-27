@@ -518,7 +518,7 @@ fn smoke_wx_jit_mprotect_refuses_x_to_wx() -> TestResult {
             perms: RegionPerms::READ | RegionPerms::EXEC,
             // Unbacked (demand-paged) slots: this test only exercises the
             // permission classifier, which never touches the backing.
-            phys: alloc_crate::vec![crate::PhysAddr::new(0); 2],
+            phys: alloc_crate::vec![crate::PhysAddr::new(0); 2].into(),
         })
         .is_err()
     {

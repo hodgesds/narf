@@ -1128,7 +1128,7 @@ fn smoke_robust_walk_gate_is_page_presence_not_vma() -> TestResult {
         base: VirtAddr::new(POISON),
         len: 0x1000,
         perms: RegionPerms(0),
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: alloc::vec![PhysAddr::new(0)].into(),
     };
     if as_.map_region(region).is_err() {
         return TestResult::Fail("map_region(PROT_NONE) rejected");
@@ -6241,7 +6241,7 @@ fn smoke_process_mprotect_deny_wx() -> TestResult {
             base,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0)],
+            phys: alloc::vec![PhysAddr::new(0)].into(),
         })
         .is_err()
     {

@@ -115,6 +115,9 @@ see [`docs/PERSONAS.md`](docs/PERSONAS.md).
 - `drivers/usb/` — xHCI host controller + HID keyboard/mouse class
   + USB hub class; first USB device flows IRQ → BYTE_RING → fd 0.
 - `verification/` — expanded fuzzing + integration matrix.
+- `memory/` — base-page Region backing uses sparse 64-slot blocks; distant
+  faults, fork, and VMA splits preserve offsets without dense hole metadata
+  (see `memory/specification/spec.md` §3).
 - `tracing/` — HW trace integration (Intel PT / CoreSight ETM), userspace tracer tooling.
 - `observability/` — GDB remote stub, live-peek API, core-dump parser tooling, FB status-panel for
   bare-metal diagnostics.
