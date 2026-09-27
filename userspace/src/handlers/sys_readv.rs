@@ -1,18 +1,23 @@
 #[allow(unused_imports)]
 use super::*;
 
-fn scatter_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> Result<(), u64> {
+fn scatter_to_iovecs(iovecs: &[ImportedRwIovec], mut offset: usize, mut bytes: &[u8]) -> Result<(), u64> {
     for iovec in iovecs {
+        if offset >= iovec.len {
+            offset -= iovec.len;
+            continue;
+        }
         if bytes.is_empty() {
             break;
         }
-        let n = core::cmp::min(iovec.len, bytes.len());
+        let n = core::cmp::min(iovec.len - offset, bytes.len());
         if n != 0 {
             // SAFETY: import_rw_iovecs validated every full destination range;
             // guarded copy catches a racing unmap.
-            unsafe { copy_to_user(iovec.base, &bytes[..n]) }?;
+            unsafe { copy_to_user(iovec.base + offset as u64, &bytes[..n]) }?;
             bytes = &bytes[n..];
         }
+        offset = 0;
     }
     if bytes.is_empty() {
         Ok(())
@@ -76,6 +81,24 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
+        read_pipe_user(ctx, &endpoint, count, |mut offset, mut src, mut len| {
+            for iov in &iovecs {
+                if offset >= iov.len { offset -= iov.len; continue; }
+                let n = len.min(iov.len - offset);
+                // SAFETY: retained source fragment and imported destination;
+                // no Rust reference is formed over a mutable user-page pin.
+                unsafe { copy_raw_to_user(iov.base + offset as u64, src, n) }?;
+                len -= n;
+                if len == 0 { return Ok(()); }
+                // SAFETY: n bytes were consumed from this retained fragment.
+                src = unsafe { src.add(n) };
+                offset = 0;
+            }
+            Err(EFAULT as u64)
+        });
+        return;
+    }
     // Past `if (!tot_len) goto out;`, a directory reaches
     // do_loop_readv_writev -> generic_read_dir: -EISDIR.
     if endpoint.ops.as_dir().is_some() {
@@ -107,9 +130,12 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
 
     // Anonymous pipes and named FIFOs hold their queue prefix until every
     // vector destination copy succeeds, closing the validate→unmap race.
+    let mut copied = 0usize;
     if let Some(outcome) =
         handler_sys_read::transactional_stream_read(endpoint.ops.as_ref(), count, |bytes| {
-            scatter_to_iovecs(&iovecs, bytes)
+            scatter_to_iovecs(&iovecs, copied, bytes)?;
+            copied += bytes.len();
+            Ok(())
         })
     {
         match outcome {

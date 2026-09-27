@@ -89,6 +89,10 @@ pub(crate) unsafe fn free_unique_frame_batch(frames: &[PhysFrame]);
 pub fn cow::inc_ref_batch(frames: &[PhysAddr]);
 /// Return counts in input order while locking each touched shard once.
 pub fn cow::count_batch(frames: &[PhysAddr]) -> Vec<u32>;
+/// Internal physical lifetime holds, separate from fork's COW transition.
+pub(crate) fn cow::pin_ref(phys: PhysAddr);
+pub(crate) fn cow::unpin_ref(phys: PhysAddr);
+pub(crate) fn cow::is_pinned(phys: PhysAddr) -> bool;
 /// Drop one owner per input and return frames whose final owner was removed.
 pub fn cow::dec_ref_batch(frames: &[PhysAddr]) -> Vec<PhysAddr>;
 /// Install scatter backing under one root lock; the callback index preserves
@@ -357,6 +361,25 @@ impl Region {
     pub fn backing_iter(&self) -> impl Iterator<Item = PhysAddr> + '_;
 }
 
+/// A physical lifetime hold, not an immutable borrow of user bytes.
+pub struct UserPagePin { /* private backing owner */ }
+impl UserPagePin {
+    /// Caller must retain live allocator RAM under its owning object's lock;
+    /// the original owner must release it through free_frame. Never device RAM.
+    pub unsafe fn retain_ram(phys: PhysAddr) -> Self;
+    /// Raw alias, valid only while the pin lives. No Rust reference may be
+    /// formed over concurrently mutable user bytes.
+    pub fn kernel_pointer(&self) -> *const u8;
+    pub fn copy_into(&self, offset: usize, dst: &mut [u8]);
+}
+
+/// Pin acquisition is serialized with authoritative mapping changes. External
+/// RAM mappings require PINNABLE_RAM in addition to LOCK_EXEMPT; device PFNs
+/// cannot be pinned. Base-page pin references are tracked separately so fork
+/// still write-protects a writable parent which was only shared with a pipe.
+/// Physical migration to another node rejects pinned backing with
+/// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
+
 /// Metadata only: cloning does not retain frames; dropping does not free them.
 /// A sorted block directory provides logarithmic lookup and amortized
 /// sequential growth. Insertion before existing blocks shifts directory entries.
@@ -540,6 +563,10 @@ impl AddressSpace {
     /// Copy resident bytes through owned physical backing without user faults.
     pub fn copy_user_bytes_nofault(&self, vaddr: VirtAddr, dst: &mut [u8])
         -> usize;
+    /// Retain resident readable RAM under its mapping lock. Returns None for
+    /// holes, lazy pages, unreadable mappings and special/device mappings.
+    /// The caller faults lazy pages through guarded user access first.
+    pub fn pin_user_page(&self, vaddr: VirtAddr) -> Option<UserPagePin>;
     /// Non-owning per-region resident-page counts grouped by SRAT node.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
     /// One mincore-shaped residency byte per rounded base page; holes fail.
@@ -1484,6 +1511,10 @@ x86_64 is rejected at runtime.
     which `narf-memory` publishes once the direct map is live.
   - `text_poke` closes the *writable aliases* of a physical page. The
     identity VA is no longer one of them; see `alias_vas`.
+    Permission changes invalidate global range entries and every non-global
+    PCID context on all CPUs before publishing executable text or releasing
+    its backing. A kernel alias may be cached under an inactive userspace
+    PCID; invalidating only the current context is insufficient.
 
 ### aarch64
 - Paging: 4-level, 4 KiB granule (default) or 16 KiB / 64 KiB granules

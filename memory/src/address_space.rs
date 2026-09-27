@@ -415,6 +415,10 @@ impl RegionPerms {
     /// shadow stack rather than a page attribute.
     pub const GUARDED: RegionPerms = RegionPerms(1 << 19);
 
+    /// Externally owned file backing is ordinary frame-allocator RAM. Allows
+    /// independent pins even when LOCK_EXEMPT excludes generic mlock handling.
+    pub const PINNABLE_RAM: RegionPerms = RegionPerms(1 << 20);
+
     pub const PROT_MASK: RegionPerms = RegionPerms(0b111);
 
     #[inline]
@@ -1609,6 +1613,70 @@ pub struct HugeRegion {
     pub frames: Vec<crate::hugepage::HugeFrame>,
 }
 
+/// A retained base-page view of resident user RAM. This is a lifetime hold,
+/// not an immutable Rust borrow: userspace may continue modifying the page.
+#[derive(Debug)]
+pub struct UserPagePin {
+    phys: PhysAddr,
+    owner: UserPageOwner,
+}
+
+#[derive(Debug)]
+enum UserPageOwner {
+    Base,
+    Huge(crate::hugepage::HugeFrame),
+}
+
+impl UserPagePin {
+    /// Retain an ordinary allocator page independently of a file or mapping.
+    ///
+    /// # Safety
+    /// The caller owns a live, page-aligned allocator frame at `phys` and must
+    /// exclude its final release until this retain completes. Its owner must
+    /// retire the allocation via free_frame; device/PFN addresses are invalid.
+    pub unsafe fn retain_ram(phys: PhysAddr) -> Self {
+        assert_eq!(phys.raw() & 4095, 0);
+        crate::frame::cow::pin_ref(phys);
+        Self {
+            phys,
+            owner: UserPageOwner::Base,
+        }
+    }
+
+    /// Raw kernel alias of retained RAM. Valid while this pin is alive; the
+    /// contents may change concurrently. Do not form Rust references to it.
+    pub fn kernel_pointer(&self) -> *const u8 {
+        self.phys.kernel_ptr()
+    }
+
+    /// Copy through the guarded assembly path without creating a Rust slice
+    /// over concurrently writable user memory.
+    pub fn copy_into(&self, offset: usize, dst: &mut [u8]) {
+        assert!(offset <= 4096 && dst.len() <= 4096 - offset);
+        let source = PhysAddr::new(self.phys.raw() + offset as u64).kernel_ptr::<u8>();
+        // SAFETY: the pin retains the backing RAM independently of the VMA;
+        // dst is exclusively borrowed and disjoint kernel staging storage.
+        #[cfg(target_arch = "x86_64")]
+        unsafe { narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), source, dst.len()) }
+            .expect("retained RAM is accessible through the kernel map");
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the pin retains the source RAM; dst is disjoint live storage.
+        unsafe {
+            narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), source, dst.len())
+        }
+        .expect("retained RAM is accessible through the kernel map");
+    }
+}
+
+impl Drop for UserPagePin {
+    fn drop(&mut self) {
+        match self.owner {
+            UserPageOwner::Base => crate::frame::cow::unpin_ref(self.phys),
+            UserPageOwner::Huge(frame) => crate::hugepage::free_hugepage(frame),
+        }
+    }
+}
+
 /// Non-owning NUMA residency summary for one registered virtual region.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NumaRegionSnapshot {
@@ -1808,6 +1876,8 @@ pub enum AddressSpaceError {
     InvalidNode,
     /// The mapping borrows externally-owned backing and cannot be migrated.
     SharedMapping,
+    /// An external physical-page pin prevents migration of the backing.
+    Pinned,
     /// No online, allowed node exists in a strictly slower memory tier.
     NoDemotionTarget,
 }
@@ -3820,6 +3890,9 @@ impl AddressSpace {
         new_phys: PhysAddr,
     ) -> Result<usize, AddressSpaceError> {
         let mut regions = self.regions.lock();
+        if crate::frame::cow::is_pinned(old_phys) {
+            return Err(AddressSpaceError::Pinned);
+        }
         let aliases: Vec<(u64, usize, VirtAddr, RegionPerms)> = regions
             .iter()
             .flat_map(|region| {
@@ -10596,7 +10669,12 @@ impl AddressSpace {
                         let selected = if page.raw() == 0 {
                             false
                         } else {
-                            retain.retain(*page) && writable
+                            // Read pins retain RAM without restricting the
+                            // original PTE. Sample before retain: pin release
+                            // publishes its owner decrement before clearing
+                            // this marker, so no unprotected mapping is missed.
+                            let pinned = crate::frame::cow::is_pinned(*page);
+                            (retain.retain(*page) || pinned) && writable
                         };
                         if selected {
                             run_start.get_or_insert(page_index);
@@ -11582,6 +11660,10 @@ impl AddressSpace {
             return Ok(old_node);
         }
 
+        if crate::frame::cow::is_pinned(old_phys) {
+            return Err(AddressSpaceError::Pinned);
+        }
+
         let new_frame = crate::frame::alloc_user_frame_on_strict(target_node)
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
@@ -12030,6 +12112,9 @@ impl AddressSpace {
         if old_node == target_node {
             return Some(Ok(old_node));
         }
+        if crate::hugepage::hugepage_refs(old) > 1 {
+            return Some(Err(AddressSpaceError::Pinned));
+        }
         let new = match crate::hugepage::alloc_hugepage_on(size, target_node) {
             Ok(frame) => frame,
             Err(_) => return Some(Err(AddressSpaceError::OutOfRange)),
@@ -12449,6 +12534,57 @@ impl AddressSpace {
             .cloned()
     }
 
+    /// Retain the resident RAM page covering `vaddr` while its authoritative
+    /// mapping lock still excludes unmap, replacement, COW and reclaim.
+    /// Lazy pages must first be faulted in by the caller's guarded user access.
+    /// Device/PFN and other special mappings cannot become pipe-owned RAM.
+    pub fn pin_user_page(&self, vaddr: VirtAddr) -> Option<UserPagePin> {
+        // A shared-page migration locks all transaction shards. Exclude pin
+        // acquisition until its complete cross-address-space move commits.
+        let _shared = lock_address_space_shared_mapping_transaction(self.identity());
+        let address = vaddr.raw();
+        let regions = self.regions.lock();
+        if let Some(region) = regions.containing(address) {
+            if !region.perms.contains(RegionPerms::READ)
+                || (region.perms.contains(RegionPerms::LOCK_EXEMPT)
+                    && !region.perms.contains(RegionPerms::PINNABLE_RAM))
+            {
+                return None;
+            }
+            let index = ((address - region.base.raw()) / 4096) as usize;
+            let phys = *region.phys.get(index)?;
+            if phys.raw() == 0 {
+                return None;
+            }
+            // Shared-memory/file owners also retire RAM via free_frame. Hold
+            // the physical allocation itself, independent of their mapping
+            // registries (which may disappear after close + munmap).
+            crate::frame::cow::pin_ref(phys);
+            return Some(UserPagePin {
+                phys,
+                owner: UserPageOwner::Base,
+            });
+        }
+        drop(regions);
+        let huge = self.huge_regions.lock();
+        let region = huge.iter().find(|region| {
+            address >= region.base.raw() && address - region.base.raw() < region.len
+        })?;
+        if !region.perms.contains(RegionPerms::READ)
+            || region.perms.contains(RegionPerms::LOCK_EXEMPT)
+        {
+            return None;
+        }
+        let offset = address - region.base.raw();
+        let size = region.frames.first()?.size_bytes();
+        let frame = *region.frames.get((offset / size) as usize)?;
+        crate::hugepage::retain_hugepage(frame);
+        Some(UserPagePin {
+            phys: PhysAddr::new(frame.phys() + ((offset % size) & !4095)),
+            owner: UserPageOwner::Huge(frame),
+        })
+    }
+
     /// Make this address-space the active one. On x86_64, a nonzero lifetime
     /// PCID uses CR3.NOFLUSH; on aarch64 the lifetime ASID is encoded in TTBR0.
     /// Tag-0 exhaustion and unsupported-hardware fallbacks flush on root
@@ -12766,6 +12902,87 @@ impl Drop for AddressSpace {
 // x86_64-only, so without these the aarch64 arm would ship unrun.
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_user_page_pin_lifetime_and_special_mapping_rejection() -> TestResult {
+    let base = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    for special in [false, true] {
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame,
+            Err(_) => return TestResult::Fail("pin fixture allocation"),
+        };
+        let phys = frame.start_address();
+        // SAFETY: exclusive allocator-owned frame, initialized before mapping.
+        unsafe {
+            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0x5a, 4096);
+        }
+        // SAFETY: kernel-test runs after paging initialization; the root stays
+        // inactive and the migration rejection below precedes any PTE change.
+        let space = match unsafe { AddressSpace::new_for_user() } {
+            Ok(space) => space,
+            Err(_) => {
+                crate::free_frame(frame);
+                return TestResult::Fail("pin fixture root");
+            }
+        };
+        let perms = if special {
+            RegionPerms::READ | RegionPerms::LOCK_EXEMPT
+        } else {
+            RegionPerms::READ
+        };
+        if space
+            .map_region(Region {
+                base,
+                len: 4096,
+                perms,
+                phys: alloc::vec![phys].into(),
+            })
+            .is_err()
+        {
+            crate::free_frame(frame);
+            return TestResult::Fail("pin fixture mapping");
+        }
+        let pin = space.pin_user_page(base);
+        if special {
+            if pin.is_some() {
+                return TestResult::Fail("special mapping was pinnable");
+            }
+            drop(space);
+            continue;
+        }
+        let Some(pin) = pin else {
+            return TestResult::Fail("ordinary RAM pin refused");
+        };
+        if crate::frame::cow::count(phys) != 2 || !crate::frame::cow::is_pinned(phys) {
+            return TestResult::Fail("pin was not independently retained");
+        }
+        // SAFETY: the inactive root is live. Choose a different valid node
+        // index; the pin must reject migration before any target allocation.
+        let source_node = unsafe { crate::frame::narf_phys_node(phys.raw()) };
+        let target_node = (source_node + 1) % crate::frame::MAX_NUMA_NODES;
+        if !matches!(
+            // SAFETY: live inactive root; pinned backing is rejected before remap.
+            unsafe { space.migrate_page_to_node(base, target_node) },
+            Err(AddressSpaceError::Pinned)
+        ) {
+            return TestResult::Fail("pinned page migration was not refused");
+        }
+        drop(space);
+        let mut bytes = [0u8; 16];
+        pin.copy_into(4080, &mut bytes);
+        if bytes != [0x5a; 16] || crate::frame::cow::count(phys) != 1 {
+            return TestResult::Fail("pin did not survive address-space teardown");
+        }
+        drop(pin);
+        if crate::frame::cow::is_pinned(phys) {
+            return TestResult::Fail("pin marker leaked");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_user_page_pin_lifetime_and_special_mapping_rejection
+);
 
 /// Chained behind the test hook so a real demand mapping faulting while a test
 /// holds the slot is still served.

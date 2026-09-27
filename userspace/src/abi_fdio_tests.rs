@@ -2151,14 +2151,12 @@ fn smoke_abi_fdio_pipe_buf_atomicity() -> TestResult {
         if call(Syscall::Write.raw(), a2(wr, chunk.as_ptr() as u64, 100)) != Some(EAGAIN) {
             return Err("write to a full pipe was not -EAGAIN");
         }
-        // Drain 50 bytes → 50 bytes of room.
+        // Draining part of a buffer does not release its page slot.
         let mut small = [0u8; 50];
         if call(Syscall::Read.raw(), a2(rd, small.as_mut_ptr() as u64, 50)) != Some(50) {
             return Err("draining 50 bytes failed");
         }
-        // 100 ≤ PIPE_BUF with only 50 bytes of room: ATOMIC → -EAGAIN,
-        // not a 50-byte partial. (This is the arm the old truncating
-        // write failed.)
+        // With every slot still occupied, a small atomic write is EAGAIN.
         if call(Syscall::Write.raw(), a2(wr, chunk.as_ptr() as u64, 100)) != Some(EAGAIN) {
             return Err("short-room write of ≤ PIPE_BUF was split, not atomic");
         }
@@ -2172,14 +2170,28 @@ fn smoke_abi_fdio_pipe_buf_atomicity() -> TestResult {
         {
             return Err("atomic refusal still queued bytes");
         }
-        // A > PIPE_BUF write MAY be partial: 8192 into 50 bytes of room
-        // lands exactly the 50-byte prefix (fs/pipe.c: only "atomic" for
-        // small writes).
+        // Large writes also need a free page slot; an offset at the head
+        // cannot be reused as tail space (Linux fs/pipe.c::pipe_write).
         let big = [0xA5u8; 8192];
         if call(
             Syscall::Write.raw(),
             a2(wr, big.as_ptr() as u64, big.len() as u64),
-        ) != Some(50)
+        ) != Some(EAGAIN)
+        {
+            return Err("large write reused an occupied head slot");
+        }
+        let mut rest = [0u8; 4096 - 50];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd, rest.as_mut_ptr() as u64, rest.len() as u64),
+        ) != Some(rest.len() as i64)
+        {
+            return Err("failed to release one complete pipe slot");
+        }
+        if call(
+            Syscall::Write.raw(),
+            a2(wr, big.as_ptr() as u64, big.len() as u64),
+        ) != Some(4096)
         {
             return Err("> PIPE_BUF write did not land the partial prefix");
         }
@@ -2663,7 +2675,7 @@ fn smoke_abi_fdio_sendfile_partial_pipe_preserves_tail() -> TestResult {
     with_memfs("/abi", "abi", &[("src", &payload)], || {
         let src = open_fd(b"/abi/src\0")?;
         let (rd, wr) = make_pipe()?;
-        let filler = alloc::vec![0xA6u8; 65536 - 32];
+        let filler = alloc::vec![0xA6u8; 65536 - 4096];
         if call(
             Syscall::Write.raw(),
             a2(wr as u64, filler.as_ptr() as u64, filler.len() as u64),
@@ -2674,7 +2686,7 @@ fn smoke_abi_fdio_sendfile_partial_pipe_preserves_tail() -> TestResult {
         if call(
             Syscall::Sendfile.raw(),
             a3(wr as u64, src as u64, 0, payload.len() as u64),
-        ) != Some(32)
+        ) != Some(4096)
         {
             return Err("sendfile did not return the accepted pipe prefix");
         }
@@ -2683,14 +2695,14 @@ fn smoke_abi_fdio_sendfile_partial_pipe_preserves_tail() -> TestResult {
             Syscall::Read.raw(),
             a2(rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
         ) != Some(first.len() as i64)
-            || first[filler.len()..] != payload[..32]
+            || first[filler.len()..] != payload[..4096]
         {
             return Err("sendfile partial prefix was corrupted");
         }
         if call(
             Syscall::Sendfile.raw(),
             a3(wr as u64, src as u64, 0, payload.len() as u64),
-        ) != Some((payload.len() - 32) as i64)
+        ) != Some((payload.len() - 4096) as i64)
         {
             return Err("sendfile skipped or lost the staged source tail");
         }
@@ -3028,13 +3040,13 @@ fn smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail() -> TestResult {
     with_memfs("/abi", "abi", &[("src", &payload)], || {
         let src = open_fd(b"/abi/src\0")?;
         let (dst_rd, dst_wr) = make_pipe()?;
-        let filler = alloc::vec![0xA5u8; 65536 - 32];
+        let filler = alloc::vec![0xA5u8; 65536 - 4096];
         if call(
             Syscall::Write.raw(),
             a2(dst_wr as u64, filler.as_ptr() as u64, filler.len() as u64),
         ) != Some(filler.len() as i64)
         {
-            return Err("failed to leave a 32-byte destination-pipe tail");
+            return Err("failed to leave a free destination-pipe page slot");
         }
         let splice = |len: usize| {
             call(
@@ -3049,7 +3061,7 @@ fn smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail() -> TestResult {
                 },
             )
         };
-        if splice(payload.len()) != Some(32) {
+        if splice(payload.len()) != Some(4096) {
             return Err("file splice did not report the accepted pipe prefix");
         }
         let mut first = alloc::vec![0u8; 65536];
@@ -3058,19 +3070,19 @@ fn smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail() -> TestResult {
             a2(dst_rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
         ) != Some(first.len() as i64)
             || first[..filler.len()] != filler
-            || first[filler.len()..] != payload[..32]
+            || first[filler.len()..] != payload[..4096]
         {
             return Err("first file splice corrupted the destination prefix");
         }
-        if splice(payload.len()) != Some((payload.len() - 32) as i64) {
+        if splice(payload.len()) != Some((payload.len() - 4096) as i64) {
             return Err("file splice skipped the tail after a short write");
         }
-        let mut tail = alloc::vec![0u8; payload.len() - 32];
+        let mut tail = alloc::vec![0u8; payload.len() - 4096];
         if call(
             Syscall::Read.raw(),
             a2(dst_rd as u64, tail.as_mut_ptr() as u64, tail.len() as u64),
         ) != Some(tail.len() as i64)
-            || tail != payload[32..]
+            || tail != payload[4096..]
         {
             return Err("file splice lost or reordered its unwritten tail");
         }
@@ -3083,14 +3095,14 @@ kernel_test_in!(
 );
 
 /// Pipe-to-pipe splice needs an atomic source-consume/destination-append
-/// transaction: a 32-byte destination vacancy must leave the rest queued in
+/// transaction: one free destination page slot must leave the rest queued in
 /// the source for the next call.
 fn smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail() -> TestResult {
     with_setup(|| {
         let (src_rd, src_wr) = make_pipe()?;
         let (dst_rd, dst_wr) = make_pipe()?;
         let payload = alloc::vec![0x3Cu8; 8192];
-        let filler = alloc::vec![0xC3u8; 65536 - 32];
+        let filler = alloc::vec![0xC3u8; 65536 - 4096];
         if call(
             Syscall::Write.raw(),
             a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
@@ -3115,7 +3127,7 @@ fn smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail() -> TestResult {
                 },
             )
         };
-        if splice(payload.len()) != Some(32) {
+        if splice(payload.len()) != Some(4096) {
             return Err("pipe splice did not stop at destination capacity");
         }
         let mut first = alloc::vec![0u8; 65536];
@@ -3124,19 +3136,19 @@ fn smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail() -> TestResult {
             a2(dst_rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
         ) != Some(first.len() as i64)
             || first[..filler.len()] != filler
-            || first[filler.len()..] != payload[..32]
+            || first[filler.len()..] != payload[..4096]
         {
             return Err("partial pipe splice corrupted the destination");
         }
-        if splice(payload.len()) != Some((payload.len() - 32) as i64) {
+        if splice(payload.len()) != Some((payload.len() - 4096) as i64) {
             return Err("partial pipe splice did not retain the source tail");
         }
-        let mut tail = alloc::vec![0u8; payload.len() - 32];
+        let mut tail = alloc::vec![0u8; payload.len() - 4096];
         if call(
             Syscall::Read.raw(),
             a2(dst_rd as u64, tail.as_mut_ptr() as u64, tail.len() as u64),
         ) != Some(tail.len() as i64)
-            || tail != payload[32..]
+            || tail != payload[4096..]
         {
             return Err("partial pipe splice lost or reordered the source tail");
         }
@@ -4111,12 +4123,12 @@ fn smoke_abi_fdio_fifo_write_errno_order_and_rollback() -> TestResult {
             return Err("full named FIFO did not prioritize EAGAIN over EFAULT");
         }
 
-        let mut drain = [0u8; 8];
+        let mut drain = [0u8; 4096];
         if call(
             Syscall::Read.raw(),
             a2(rd as u64, drain.as_mut_ptr() as u64, drain.len() as u64),
         ) != Some(drain.len() as i64)
-            || drain != [0xA5; 8]
+            || drain != [0xA5; 4096]
         {
             return Err("failed to make FIFO room for fault transaction");
         }

@@ -313,7 +313,7 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -485,7 +485,7 @@ fn smoke_process_fork_return_values() -> TestResult {
 
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -1909,7 +1909,7 @@ fn smoke_wave35_fork_returns_nonzero_child_pid() -> TestResult {
 
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -2178,7 +2178,7 @@ fn smoke_wave35_getppid_differs_from_getpid() -> TestResult {
 
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -2743,7 +2743,7 @@ fn smoke_wave38_fork_registers_mapping() -> TestResult {
 
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -2848,7 +2848,7 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
 
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -4983,7 +4983,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     crate::task::release_task(child_task_raw);
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 
@@ -5309,7 +5309,7 @@ fn smoke_process_ptrace_syscall_stop() -> TestResult {
     crate::task::release_task(child_task_raw);
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 
@@ -5582,7 +5582,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     crate::task::release_task(child_task_raw);
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 

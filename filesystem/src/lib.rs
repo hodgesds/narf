@@ -55,6 +55,7 @@
 //!   bootloader's initramfs region (Stage 4 hands that in).
 
 #![no_std]
+#![feature(allocator_api)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
@@ -82,6 +83,10 @@ pub mod mqueuefs;
 pub mod ntty;
 pub mod overlayfs;
 pub mod page_cache;
+/// Shared page-buffer storage for Linux anonymous pipes and named FIFOs.
+pub mod pipe_buffer;
+/// Sleepable pipe ownership and lockless readiness snapshots.
+pub mod pipe_queue;
 pub mod posix_acl;
 pub mod procfs;
 pub mod root_mount;
@@ -733,6 +738,8 @@ pub enum FsError {
     Busy,
     ReadOnly,
     NoSpace,
+    /// Memory allocation failed, distinct from storage exhaustion (ENOMEM).
+    OutOfMemory,
     /// A filesystem quota or qgroup hard limit would be exceeded. Maps to
     /// Linux `EDQUOT`, distinct from exhausted backing storage (`ENOSPC`).
     QuotaExceeded,
@@ -1302,6 +1309,25 @@ pub trait FileOps: Send + Sync {
     /// device nodes whose memory is safe to alias into userspace
     /// override this.
     fn mmap_frames(&self, _offset: u64, _len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// True only when mmap_frames/mmap_fault return ordinary allocator RAM
+    /// retired via narf_memory::free_frame. Such backing supports independent
+    /// user-page pins; device/PFN mappings must retain the false default.
+    fn mmap_is_ram(&self) -> bool {
+        false
+    }
+
+    /// Retain at most max bytes from the file page containing offset.
+    /// None is EOF. Unsupported selects copy_splice_read-style buffered I/O.
+    /// Providers acquire the physical retain while their backing lock excludes
+    /// truncate/replacement, and must never return a fragment larger than max.
+    fn splice_read_page(
+        &self,
+        _offset: u64,
+        _max: usize,
+    ) -> Result<Option<pipe_buffer::SplicePage>, FsError> {
         Err(FsError::Unsupported)
     }
 

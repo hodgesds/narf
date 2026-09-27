@@ -1113,7 +1113,9 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
 
     *PARENT_AS.lock() = None;
     crate::syscall::__test_clear_global();
-    narf_memory::frame::cow::__test_clear();
+    // Live parent/child mappings still own COW references. Their normal
+    // teardown must release them; resetting the global table here lets a
+    // later scheduler reset free shared frames twice.
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -1823,7 +1825,8 @@ fn smoke_userspace_fork_multiple_distinct_address_spaces() -> TestResult {
     };
     *PARENT_AS.lock() = None;
     crate::syscall::__test_clear_global();
-    narf_memory::frame::cow::__test_clear();
+    // Child futures still retain their address spaces in the scheduler.
+    // Preserve the real refcounts until those futures are dropped.
     if pass {
         TestResult::Pass
     } else {

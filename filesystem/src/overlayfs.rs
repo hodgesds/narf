@@ -1277,6 +1277,18 @@ impl FileOps for OverlayFile {
         Box::pin(async move { self.active().ioctl_async(cmd, arg, input, out_size).await })
     }
 
+    fn mmap_is_ram(&self) -> bool {
+        self.active().mmap_is_ram()
+    }
+
+    fn splice_read_page(
+        &self,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<crate::pipe_buffer::SplicePage>, FsError> {
+        self.active().splice_read_page(offset, max)
+    }
+
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         self.active().mmap_frames(offset, len)
     }

@@ -71,6 +71,27 @@ fn main() {
     let boot_init_enabled = env::var_os("CARGO_FEATURE_BOOT_INIT").is_some();
     let testbin_dir = workspace.join("userspace").join("testbin");
 
+    println!("cargo:rerun-if-changed=../userspace/pipe-test/src/main.rs");
+    println!("cargo:rerun-if-changed=../userspace/pipe-test/Cargo.toml");
+    println!("cargo:rerun-if-changed=../userspace/pipe-test/pipe-test.ld");
+    if env::var_os("CARGO_FEATURE_USER_MODE_E2E").is_some() {
+        let fixture = workspace.join("userspace/pipe-test");
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+        build_arch(
+            &fixture,
+            &out_dir.join("pipe-test-target"),
+            &format!("{arch}-unknown-none"),
+            &fixture.join("pipe-test.ld"),
+            if arch == "x86_64" {
+                Some("code-model=large")
+            } else {
+                None
+            },
+            "NARF_PIPE_TEST_ELF",
+            "narf-pipe-test",
+        );
+    }
+
     // testbin: built only for the dedicated testbin runner.
     if testbin_enabled {
         build_arch(

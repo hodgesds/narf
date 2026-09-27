@@ -545,7 +545,8 @@ fn smoke_socket_so_bindtodevice_round_trip() -> TestResult {
         crate::socket::SocketOpResult::OptValue { n } => n,
         _ => return TestResult::Fail("SO_BINDTODEVICE get failed"),
     };
-    if &out[..n] != dev.as_bytes() {
+    // Linux sock_getbindtodevice includes the terminating NUL in optlen.
+    if n != dev.len() + 1 || &out[..dev.len()] != dev.as_bytes() || out[dev.len()] != 0 {
         return TestResult::Fail("SO_BINDTODEVICE round-trip mismatch");
     }
 

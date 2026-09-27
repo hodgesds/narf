@@ -190,6 +190,7 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // value placed in x0 (value) + x1 (status) so callers can
         // read both without a follow-up instruction.
         let num = frame.x8 as u32;
+        let entry_pc = frame.elr;
         let mut ctx = Aarch64TrapContext::from_svc(frame);
         narf_userspace::kernel_syscall_entry(num, &mut ctx);
         // Signal-delivery hook: mirrors the x86_64 int-0x80 path.
@@ -198,8 +199,20 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // `num` is forwarded for SA_RESTART's restartable-syscall
         // table check — `svc #0` is 4 bytes on AArch64, so the
         // arch rewinds ELR by 4 instead of 2.
-        if let Some(hook) = narf_userspace::signal_delivery_hook() {
-            hook(&mut ctx, num);
+        // A parked read already rewound SVC. Match the x86 syscall-return
+        // path: non-SA_RESTART handlers must complete that frame with EINTR,
+        // while a completed syscall must never be rewound by signal delivery.
+        let parked = narf_userspace::user_task::current_user_task().is_some_and(|u| {
+            // SAFETY: current task owns this live context; atomic access only.
+            unsafe {
+                (*u).syscall_parked_restarting
+                    .swap(false, core::sync::atomic::Ordering::AcqRel)
+            }
+        });
+        if parked && ctx.rip() == entry_pc.wrapping_sub(4) {
+            narf_userspace::handlers::default_signal_delivery_restart_pending(&mut ctx, num);
+        } else if let Some(hook) = narf_userspace::signal_delivery_hook() {
+            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
         }
         // Linux's exit-to-user reschedule check: timer preemption is gated to
         // EL0 for user tasks, so a syscall-dense thread must still yield once
@@ -469,6 +482,42 @@ impl<'a> Aarch64TrapContext<'a> {
         };
         Self { frame, args }
     }
+    fn restore_user_state(&mut self, state: &narf_arch::aarch64::user_mode::UserState) {
+        self.frame.x0 = state.x[0];
+        self.frame.x1 = state.x[1];
+        self.frame.x2 = state.x[2];
+        self.frame.x3 = state.x[3];
+        self.frame.x4 = state.x[4];
+        self.frame.x5 = state.x[5];
+        self.frame.x6 = state.x[6];
+        self.frame.x7 = state.x[7];
+        self.frame.x8 = state.x[8];
+        self.frame.x9 = state.x[9];
+        self.frame.x10 = state.x[10];
+        self.frame.x11 = state.x[11];
+        self.frame.x12 = state.x[12];
+        self.frame.x13 = state.x[13];
+        self.frame.x14 = state.x[14];
+        self.frame.x15 = state.x[15];
+        self.frame.x16 = state.x[16];
+        self.frame.x17 = state.x[17];
+        self.frame.x18 = state.x[18];
+        self.frame.x19 = state.x[19];
+        self.frame.x20 = state.x[20];
+        self.frame.x21 = state.x[21];
+        self.frame.x22 = state.x[22];
+        self.frame.x23 = state.x[23];
+        self.frame.x24 = state.x[24];
+        self.frame.x25 = state.x[25];
+        self.frame.x26 = state.x[26];
+        self.frame.x27 = state.x[27];
+        self.frame.x28 = state.x[28];
+        self.frame.x29 = state.x[29];
+        self.frame.x30 = state.x[30];
+        self.frame.elr = state.pc;
+        self.frame.spsr = state.spsr;
+        self.frame.sp_el0 = state.sp;
+    }
 }
 
 impl<'a> TrapContext for Aarch64TrapContext<'a> {
@@ -482,18 +531,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
     }
 
     fn user_rsp(&self) -> u64 {
-        // The user stack pointer lives in SP_EL0 (the EL1 trap path
-        // selected SP_EL1, so SP_EL0 still holds the user value).
-        let sp_el0: u64;
-        // SAFETY: reading SP_EL0 has no side effects.
-        unsafe {
-            core::arch::asm!(
-                "mrs {v}, SP_EL0",
-                v = out(reg) sp_el0,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        sp_el0
+        self.frame.sp_el0
     }
 
     fn rip(&self) -> u64 {
@@ -573,21 +611,9 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         // SPSR_EL1 carries the user-mode PSTATE (NZCV / DAIF /
         // mode bits) the resume path will restore.
         s.spsr = f.spsr;
-        // SP: at trap time we swapped to SP_EL1 (kernel stack);
-        // the user's SP_EL0 still holds the user-mode stack
-        // pointer untouched. Read it via MSR — legal at EL1.
-        let sp_el0: u64;
-        // SAFETY: reading SP_EL0 at EL1 is unconditionally
-        // defined; it has no side effects on EL1 state.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            core::arch::asm!(
-                "mrs {v}, SP_EL0",
-                v = out(reg) sp_el0,
-                options(nostack, preserves_flags),
-            );
-        }
-        s.sp = sp_el0;
+        // SP_EL0 is CPU-local: a blocking syscall may have run other tasks.
+        // The vector entry saved this task's value alongside its GPRs.
+        s.sp = f.sp_el0;
         s.valid = 1;
         true
     }
@@ -602,7 +628,31 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         (self.frame.spsr & 0xF) == 0
     }
 
+    fn perform_sigreturn(&mut self, frame: u64, is_rt: bool) -> bool {
+        if !is_rt {
+            return false;
+        }
+        let Some((state, fp)) = super::signal::restore(frame) else {
+            return false;
+        };
+        self.restore_user_state(&state);
+        self.frame.user_fp = fp;
+        true
+    }
+
     fn deliver_signal(&mut self, params: &SigDeliveryParams) -> bool {
+        if params.restorer != 0 {
+            let mut state = narf_arch::aarch64::user_mode::UserState::default();
+            // SAFETY: correctly aligned, writable UserState of the required size.
+            unsafe {
+                self.save_user_state(core::ptr::addr_of_mut!(state).cast());
+            }
+            if !super::signal::deliver(&mut state, &self.args, params, &self.frame.user_fp) {
+                return false;
+            }
+            self.restore_user_state(&state);
+            return true;
+        }
         // AArch64 signal delivery. Mirrors the x86_64 path; the frame
         // layouts are architecture-specific but the three SA_* flags
         // are honoured identically.
@@ -773,6 +823,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
                     options(nostack, preserves_flags),
                 );
             }
+            self.frame.sp_el0 = new_sp;
             self.frame.x0 = params.signum as u64;
             self.frame.x1 = siginfo_vaddr;
             self.frame.x2 = uctx_vaddr;
@@ -834,6 +885,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
             }
             // x0 = signum; x1 = &sigcontext (trampoline reads it for
             // sigreturn via sys_sigreturn on handler return).
+            self.frame.sp_el0 = new_sp;
             self.frame.x0 = params.signum as u64;
             self.frame.x1 = ctx_vaddr;
             self.frame.elr = params.handler;
@@ -927,7 +979,7 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
         domain_sctlr: 0,
         domain_gcr: 0,
         x30: 0x3030_3030_3030_3030,
-        _pad: 0,
+        sp_el0: SP_SENTINEL,
         elr: 0xE1E1_E1E1_E1E1_E1E1u64,
         spsr: 0x0000_0000_8000_0000, // arbitrary PSTATE
         x0: 0x0000_0000_0000_0000,
@@ -960,6 +1012,7 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
         x27: 0x1B1B_1B1B_1B1B_1B1B,
         x28: 0x1C1C_1C1C_1C1C_1C1C,
         x29: 0x1D1D_1D1D_1D1D_1D1D,
+        user_fp: narf_arch::aarch64::user_mode::UserFpState::zeroed(),
     };
 
     // Pre-load SP_EL0 with a sentinel and remember the prior
@@ -1075,7 +1128,7 @@ fn smoke_aarch64_trap_frame(elr: u64) -> TrapFrame {
         domain_sctlr: 0,
         domain_gcr: 0,
         x30: 0x3030_3030_3030_3030,
-        _pad: 0,
+        sp_el0: 0,
         elr,
         spsr: 0x0000_0000_0000_0000, // M[3:0] = 0 → EL0t
         x0: 0x0001,
@@ -1108,6 +1161,7 @@ fn smoke_aarch64_trap_frame(elr: u64) -> TrapFrame {
         x27: 0x001C,
         x28: 0x001D,
         x29: 0x001E,
+        user_fp: narf_arch::aarch64::user_mode::UserFpState::zeroed(),
     }
 }
 

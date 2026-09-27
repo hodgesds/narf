@@ -951,7 +951,7 @@ fn smoke_shell_fork_wait4_exit_status() -> TestResult {
 
     teardown_shell_fork_state();
     *SHELL_PARENT_AS.lock() = None;
-    narf_memory::frame::cow::__test_clear();
+    // Preserve COW references owned by live mappings and pending child futures.
     TestResult::Pass
 }
 

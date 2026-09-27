@@ -88,6 +88,8 @@ __narf_vector_table:
  *   [sp + 248] = saved zero-slot (unused)
  * ────────────────────────────────────────────────────────────── */
 .macro SAVE_ALL_GPRS
+    /* Reserve the FP tail before pushing GPRs: Rust sees an 816-byte frame. */
+    sub     sp, sp, #528
     stp     x28, x29, [sp, #-16]!
     stp     x26, x27, [sp, #-16]!
     stp     x24, x25, [sp, #-16]!
@@ -103,17 +105,18 @@ __narf_vector_table:
     stp     x4,  x5,  [sp, #-16]!
     stp     x2,  x3,  [sp, #-16]!
     stp     x0,  x1,  [sp, #-16]!
-    /* x30 (LR) and ELR/SPSR so the return path has them. Layout:
+    /* x30 (LR), user SP and ELR/SPSR before the domain prefix. Layout:
      *   [sp +  0] = x30
-     *   [sp +  8] = ELR_EL1 (return RIP)
-     *   [sp + 16] = SPSR_EL1 (return PSTATE incl. target EL)
-     *   [sp + 24] = unused
+     *   [sp +  8] = SP_EL0
+     *   [sp + 16] = ELR_EL1 (return PC)
+     *   [sp + 24] = SPSR_EL1 (return PSTATE incl. target EL)
      * ELR/SPSR are at fixed offsets so Rust handlers can rewrite
      * them via `TrapContext::redirect_to_kernel`. */
     mrs     x0,  elr_el1
     mrs     x1,  spsr_el1
     stp     x0,  x1,  [sp, #-16]!
-    str     x30,      [sp, #-16]!
+    mrs     x0, sp_el0
+    stp     x30, x0, [sp, #-16]!
 
     /* Domain prefix: save live SCTLR/GCR and suspend tag checks before any
      * Rust runs. ID_AA64PFR1_EL1.MTE >= 2 is required for GCR_EL1. ATA stays
@@ -134,9 +137,51 @@ __narf_vector_table:
 991:
     stp     xzr, xzr, [sp, #-16]!
 992:
+    /* Kernel Rust may use SIMD. Capture before its first instruction. */
+    stp     q0, q1, [sp, #288]
+    stp     q2, q3, [sp, #320]
+    stp     q4, q5, [sp, #352]
+    stp     q6, q7, [sp, #384]
+    stp     q8, q9, [sp, #416]
+    stp     q10, q11, [sp, #448]
+    stp     q12, q13, [sp, #480]
+    stp     q14, q15, [sp, #512]
+    stp     q16, q17, [sp, #544]
+    stp     q18, q19, [sp, #576]
+    stp     q20, q21, [sp, #608]
+    stp     q22, q23, [sp, #640]
+    stp     q24, q25, [sp, #672]
+    stp     q26, q27, [sp, #704]
+    stp     q28, q29, [sp, #736]
+    stp     q30, q31, [sp, #768]
+    mrs     x0, fpcr
+    mrs     x1, fpsr
+    str     x0, [sp, #800]
+    str     x1, [sp, #808]
 .endm
 
 .macro RESTORE_ALL_GPRS
+    /* No Rust runs after restoring the interrupted FP/SIMD image. */
+    ldr     x0, [sp, #800]
+    ldr     x1, [sp, #808]
+    msr     fpcr, x0
+    msr     fpsr, x1
+    ldp     q0, q1, [sp, #288]
+    ldp     q2, q3, [sp, #320]
+    ldp     q4, q5, [sp, #352]
+    ldp     q6, q7, [sp, #384]
+    ldp     q8, q9, [sp, #416]
+    ldp     q10, q11, [sp, #448]
+    ldp     q12, q13, [sp, #480]
+    ldp     q14, q15, [sp, #512]
+    ldp     q16, q17, [sp, #544]
+    ldp     q18, q19, [sp, #576]
+    ldp     q20, q21, [sp, #608]
+    ldp     q22, q23, [sp, #640]
+    ldp     q24, q25, [sp, #672]
+    ldp     q26, q27, [sp, #704]
+    ldp     q28, q29, [sp, #736]
+    ldp     q30, q31, [sp, #768]
     /* Restore domain state before the interrupted continuation. The remaining
      * stack accesses are FRAME accesses, which every admitted domain retains. */
     mrs     x0, id_aa64pfr1_el1
@@ -149,7 +194,8 @@ __narf_vector_table:
     isb
 993:
     add     sp, sp, #16
-    ldr     x30,      [sp], #16
+    ldp     x30, x0, [sp], #16
+    msr     sp_el0, x0
     ldp     x0,  x1,  [sp], #16
     msr     elr_el1,  x0
     msr     spsr_el1, x1
@@ -168,6 +214,7 @@ __narf_vector_table:
     ldp     x24, x25, [sp], #16
     ldp     x26, x27, [sp], #16
     ldp     x28, x29, [sp], #16
+    add     sp, sp, #528
 .endm
 
 .align 4

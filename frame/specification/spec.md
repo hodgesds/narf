@@ -55,8 +55,24 @@ pub fn panic(msg: &PanicInfo) -> !;
 
 Trap entry is written in arch assembly and materialises the architecture-owned
 `narf_arch::{x86_64,aarch64}::trap_frame::TrapFrame`. `frame` re-exports the
-selected type and fans out to a Rust dispatcher. The scheduler consumes that
+selected type and fans out to a Rust dispatcher. On aarch64 the former padding
+slot at offset 24 holds `SP_EL0`: vector entry saves it and vector return
+restores it, so a task that parks inside a syscall cannot inherit another
+task's user stack. Signal and fork snapshots use that saved value. The
+816-byte frame appends a 528-byte FP/SIMD image at offset 288. Assembly captures
+it before Rust executes and restores it after Rust completes; kernel Rust is
+allowed to use SIMD, so signal code edits this image instead of restoring
+hardware FP registers underneath compiler-held values. The scheduler consumes that
 shared type directly; it does not define or cast a mirror layout.
+
+On aarch64, restorer-based Linux signal handlers receive an `rt_sigframe`
+with Linux arm64 ucontext/GPR offsets and an FPSIMD context record. Delivery
+uses guarded user copies before publishing the handler's PC/SP/LR. `rt_sigreturn`
+snapshots the user frame once and validates user addresses, alignment, context
+records and EL0-only PSTATE before restoring GPR/FP state. It never restores
+kernel domain-control state from user memory. The existing NARF non-restorer
+signal entry remains separate. A syscall already rewound for a blocking park
+uses restart-pending signal delivery; completed syscalls are not restarted.
 
 The bare `zram` kernel-command-line flag explicitly installs memory's built-in
 compressed-RAM swap backend during userspace bootstrap. Without it, NARF boots

@@ -152,29 +152,14 @@ impl VmspliceReadEnd<'_> {
                     crate::pipe::VmspliceDrainError::WouldBlock => VmspliceReadError::WouldBlock,
                     crate::pipe::VmspliceDrainError::User(errno) => VmspliceReadError::User(errno),
                 }),
-            Self::Named(fifo) => {
-                let mut copied = 0usize;
-                fifo.vmsplice_to_user(max, |bytes| {
-                    // SAFETY: validate_vmsplice_iovecs accepted this complete
-                    // destination range. The guarded copy catches a racing
-                    // unmap/protection change while the FIFO transaction still
-                    // owns, but has not consumed, the queue prefix.
-                    let result = unsafe { copy_to_user(dst + copied as u64, bytes) };
-                    if result.is_ok() {
-                        copied += bytes.len();
-                    }
-                    result
-                })
-                .map_err(|error| match error {
-                    narf_filesystem::fifo::VmspliceDrainError::WouldBlock => {
-                        VmspliceReadError::WouldBlock
-                    }
-                    narf_filesystem::fifo::VmspliceDrainError::User(errno) => {
-                        VmspliceReadError::User(errno)
-                    }
-                    narf_filesystem::fifo::VmspliceDrainError::BadFd => VmspliceReadError::BadFd,
-                })
-            }
+            Self::Named(fifo) => crate::pipe::read_to_iter(fifo, max, false, |offset, src, len| {
+                // SAFETY: retained pipe source and imported vmsplice destination.
+                unsafe { copy_raw_to_user(dst + offset as u64, src, len) }
+            }).map_err(|errno| match errno as i64 {
+                EAGAIN => VmspliceReadError::WouldBlock,
+                EBADF => VmspliceReadError::BadFd,
+                _ => VmspliceReadError::User(errno),
+            }),
         }
     }
 }
@@ -239,9 +224,8 @@ fn vmsplice_to_pipe(
         }
         // Kernel-test context (no executor): fall through to a best-effort copy.
     }
-    let pipe_write = ops
-        .as_any()
-        .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>());
+    let native_pipe = crate::pipe::is_pipe(ops);
+    let address_space = current_address_space();
     let mut total: usize = 0;
     for i in 0..nr {
         let o = i * 16;
@@ -250,15 +234,12 @@ fn vmsplice_to_pipe(
         if len == 0 {
             continue;
         }
-        let w = if let Some(pipe) = pipe_write {
-            // sys_vmsplice already imported and validated every iovec. Copy
-            // directly into the pipe's uncommitted ring space so the common
-            // anonymous-pipe path avoids a heap allocation and bounce copy.
-            match pipe.vmsplice_from_user(base, len) {
+        let w = if native_pipe {
+            match crate::pipe::vmsplice_into(ops, address_space.as_deref(), base, len) {
                 Ok(outcome) => outcome,
-                Err(_) => {
+                Err(errno) => {
                     if total == 0 {
-                        ctx.set_return(errno_ret(EFAULT));
+                        ctx.set_return(errno_ret(errno as i64));
                         return;
                     }
                     break;

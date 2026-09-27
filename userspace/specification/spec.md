@@ -347,13 +347,11 @@ preserve exact filesystem errors before progress, return an accepted prefix
 after progress, and distinguish blocking, `O_NONBLOCK`/`EAGAIN`, interrupting
 signals/`EINTR`, and broken-pipe `SIGPIPE`/`EPIPE`. A writev no larger than
 `PIPE_BUF` reaches a pipe as one write transaction across iovec boundaries.
-Anonymous-pipe and named-FIFO reads hold their queue prefix until the complete
-guarded scalar or vector user copy succeeds, so a protection change racing
-validation cannot consume unread bytes. NARF's byte queues do not retain Linux
-pipe-buffer/write boundaries, so the selected prefix is one logical buffer:
-an iovec fault after an earlier copied fragment still leaves that whole prefix
-queued, matching Linux's rule that the currently faulting pipe buffer is not
-consumed. Fanotify removes a selected event on a copy fault as Linux does, but
+Anonymous-pipe and named-FIFO reads retain each page-buffer prefix until its
+complete guarded scalar/vector copy succeeds. A fault in the current buffer
+leaves that buffer queued; earlier completed buffers remain consumed and the
+syscall returns their byte count. Vector copies advance across iovecs without
+allocating a payload staging vector. Fanotify removes a selected event on a copy fault as Linux does, but
 reserves its object-fd numbers invisibly and publishes those fds only after the
 complete metadata copy succeeds; EFAULT therefore cannot leak an object fd.
 
@@ -414,6 +412,18 @@ accepted prefix and are written back after a nonnegative result. Endpoint
 `O_NONBLOCK` implies `SPLICE_F_NONBLOCK`; empty/full live pipes park or return
 `EAGAIN`, while a closed sink raises `SIGPIPE` and returns `EPIPE`. Pipe moves
 are transactional: a short sink consumes only the accepted source prefix.
+Anonymous pipes and named FIFOs share page-buffer storage. Capacity and
+`F_SETPIPE_SZ` admission count occupied buffer slots, including partially
+consumed pages; only a mergeable tail accepts the write's page remainder.
+`tee` duplicates page references and clears the destination merge flag.
+`splice` moves whole buffers or shares a partial buffer reference, preserving
+packet flags and leaving append rights with only the source of a split.
+Both operations acquire per-pipe sleepable mutexes in address order. Payload
+copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
+closure use atomic queue snapshots; a per-pipe short publication lock orders
+readiness updates. Descriptor-table locks are released before pipe resizing
+or transfers can wait. `splice` and `tee` flags use the low unsigned 32 bits.
+
 Linux `vmsplice(2)` preserves the kernel entry-point's observable validation
 order: unknown flags are rejected before descriptor lookup; descriptor and
 access-mode errors precede iovec import; a valid descriptor's iovec copy and
@@ -423,9 +433,14 @@ identity or readiness is sampled. A valid nonblocking transfer into a full
 pipe returns `EAGAIN` only after those validations have succeeded. `O_PATH`
 remains part of the stored open-file status and represents neither readable nor
 writable mode, so `vmsplice` returns `EBADF` before importing its iovec. Both
-anonymous-pipe and named-FIFO read ends copy then commit each destination
-segment: a failed user copy cannot consume that segment's queued prefix, and a
-failure after earlier segments returns only the already-copied byte count.
+anonymous-pipe and named-FIFO read ends commit each successfully copied page
+buffer. User-to-pipe vmsplice retains resident user pages, including their
+in-page offsets, rather than copying payload into owned buffers. Imported
+buffers are nonmergeable and do not inherit O_DIRECT packet mode. References
+survive source unmap and descriptor closure and use the backing owner's
+matching release operation; special/device mappings cannot be pinned as RAM.
+Kernel reads of pinned user memory use guarded assembly copies, never Rust
+references over concurrently writable user bytes.
 Native `getdents(2)` and `getdents64(2)` resolve the descriptor before touching
 the output range and distinguish `EBADF` from `ENOTDIR`. They snapshot a bounded
 directory batch per call, including the synchronous iterator fallback, so both

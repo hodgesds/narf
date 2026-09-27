@@ -29,6 +29,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "user-mode-e2e")]
+mod pipe_abi;
+
 // Force-link crates that contribute tests via the `narf.tests` link
 // section but whose public surface is not otherwise referenced from
 // this mega-lib. Without a load-bearing reference the rlib linker
@@ -2923,14 +2926,21 @@ mod aarch64_el0_preemption_e2e {
                 phys: alloc::vec![stack_phys].into(),
             })
             .map_err(|_| "map stack")?;
-        address_space
+        // Each address space needs its own owner reference. The harness also
+        // retains the page until it has checked both processes' results.
+        narf_memory::frame::cow::inc_ref(shared_phys);
+        if address_space
             .map_region(Region {
                 base: VirtAddr::new(SHARED_VADDR),
                 len: PAGE_BYTES,
                 perms: RegionPerms::READ | RegionPerms::WRITE,
                 phys: alloc::vec![shared_phys].into(),
             })
-            .map_err(|_| "map shared")?;
+            .is_err()
+        {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(shared_phys));
+            return Err("map shared");
+        }
 
         // SAFETY: all mapped physical frames above are live and the page-table
         // allocator is initialized by the kernel-test boot path.
@@ -2977,6 +2987,13 @@ mod aarch64_el0_preemption_e2e {
             Ok(phys) => phys,
             Err(reason) => return TestResult::Fail(reason),
         };
+        struct SharedOwner(PhysAddr);
+        impl Drop for SharedOwner {
+            fn drop(&mut self) {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(self.0));
+            }
+        }
+        let _shared_owner = SharedOwner(shared_phys);
         let code_a = match alloc_phys() {
             Ok(phys) => phys,
             Err(reason) => return TestResult::Fail(reason),

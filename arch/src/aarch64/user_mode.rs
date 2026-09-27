@@ -55,12 +55,11 @@ pub const USER_SPSR: u64 = 0;
 /// Complete architectural FP/SIMD state for one EL0 task.
 ///
 /// The 32 128-bit vector registers occupy the first 512 bytes, followed by
-/// FPCR and FPSR.  AArch64 kernel code is built without FP/SIMD use, so the
-/// scheduler only needs to save this state when an EL0 continuation is about
-/// to be switched out and restore it immediately before that continuation is
-/// switched back in.
+/// FPCR and FPSR. Vector entry saves this image before Rust can use SIMD;
+/// vector return restores it after Rust completes. The scheduler also uses
+/// it for initial EL0 entry and continuations outside a live trap frame.
 #[repr(C, align(16))]
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct UserFpState {
     bytes: [u8; 528],
 }

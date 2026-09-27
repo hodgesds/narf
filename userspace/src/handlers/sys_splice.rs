@@ -20,7 +20,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     let fd_out = a.arg2 as u32;
     let off_out_ptr = a.arg3;
     let requested = a.arg4 as usize;
-    let flags = a.arg5;
+    let flags = a.arg5 as u32 as u64;
     const SPLICE_F_NONBLOCK: u64 = 0x2;
     const SPLICE_F_ALL: u64 = 0xf; // MOVE | NONBLOCK | MORE | GIFT
 
@@ -165,11 +165,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
 
     // A non-pipe destructive stream source has no peek/commit transaction in
     // NARF.  Fail closed instead of consuming bytes a short sink cannot take.
-    let input_has_transactional_splice = input
-        .ops
-        .as_any()
-        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
-        .is_some();
+    let input_has_transactional_splice = crate::pipe::is_pipe(input.ops.as_ref());
     if input.ops.is_stream() && !input_has_transactional_splice {
         ctx.set_return(errno_ret(EINVAL));
         return;
@@ -205,7 +201,13 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     // accepted the bytes; a concurrent writer could refill that capacity and
     // the rollback then overfilled the pipe. A future zero-copy path needs an
     // explicit reservation/commit protocol before it can replace this path.
-    let outcome = copy_fd_to_fd(&input, &output, explicit_in, explicit_out, requested);
+    let outcome = if in_is_pipe && out_is_pipe {
+        crate::pipe::transfer(input.ops.as_ref(), output.ops.as_ref(), requested, false)
+            .map(|result| result.map_err(CopyFdError::Fs))
+            .unwrap_or_else(|| copy_fd_to_fd(&input, &output, explicit_in, explicit_out, requested))
+    } else {
+        copy_fd_to_fd(&input, &output, explicit_in, explicit_out, requested)
+    };
     match outcome {
         Err(CopyFdError::Fs(narf_filesystem::FsError::WouldBlock)) => {
             // Empty source or full sink with no progress consumes nothing, so

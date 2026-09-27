@@ -80,6 +80,13 @@ Example functional tests:
 - Assign domains 0..15, cross-write attempts fault as expected.
 - Narf-Ring round-trip: N producers, 1 consumer, count matches.
 
+The `verification/pipe-abi` subsystem (`user-mode-e2e` feature) executes the
+standalone `userspace/pipe-test` Linux syscall fixture in a real user process
+on both architectures. Its completion marker distinguishes success from an
+early exit or fault. The same source runs on Linux as a differential oracle;
+coverage, reference revision and design invariants are recorded in
+[`pipe-linux-parity.md`](../pipe-linux-parity.md).
+
 ## 7. Fuzz targets
 
 - `cargo-fuzz` (libFuzzer) or `cargo-bolero` (multi-engine) on host.

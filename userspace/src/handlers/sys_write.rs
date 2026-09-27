@@ -29,6 +29,14 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
+        write_pipe_user(ctx, &endpoint, count, |offset, bytes| {
+            // SAFETY: validated scalar range; copy commits one page at a time.
+            unsafe { copy_from_user(bytes, user_ptr + offset as u64) }
+        });
+        return;
+    }
+
     let _position_guard = if endpoint.ops.is_stream() {
         None
     } else {
@@ -120,12 +128,15 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                 Err(_) => break,
             }
         } else if let Some(fifo) = fifo_write {
-            let copied = fifo.write_from_user(want, |dst| {
+            let mut copied_bytes = 0usize;
+            let copied = poll_blocking(fifo.write_from_user(want, |dst| {
                 // SAFETY: the complete original range passed
                 // validate_rw_user_range; the guarded copy catches a racing
                 // unmap after FIFO peer/fullness checks, as Linux does.
-                unsafe { copy_from_user(dst, user_ptr + total as u64) }
-            });
+                unsafe { copy_from_user(dst, user_ptr + total as u64 + copied_bytes as u64) }?;
+                copied_bytes += dst.len();
+                Ok(())
+            })).unwrap_or(Err(narf_filesystem::fifo::FifoWriteError::WouldBlock));
             match copied {
                 Ok(written) => Ok(written),
                 Err(narf_filesystem::fifo::FifoWriteError::WouldBlock) => {

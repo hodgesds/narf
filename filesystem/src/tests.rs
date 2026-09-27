@@ -815,10 +815,11 @@ fn smoke_filesystem_fifo_pipe_buf_atomic_and_poll() -> TestResult {
     if !writer.write_should_block() {
         return TestResult::Fail("0-progress FIFO write with a live reader should block");
     }
-    // > PIPE_BUF may land the partial 50-byte prefix.
+    // Linux counts occupied pages, not free bytes. Consuming a prefix of a
+    // full page frees no buffer slot, even for a write larger than PIPE_BUF.
     let big = alloc::vec![0xA5u8; 8192];
-    if !matches!(fifo_poll_once(writer.write(0, &big)), Some(Ok(50))) {
-        return TestResult::Fail("> PIPE_BUF FIFO write did not land the partial prefix");
+    if !matches!(fifo_poll_once(writer.write(0, &big)), Some(Ok(0))) {
+        return TestResult::Fail("FIFO reused headroom from a still-occupied page");
     }
     // Full again: writer side has no room → no POLLOUT; readers alive → no
     // POLLERR; reader side has data → POLLIN, writers alive → no POLLHUP.

@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "313140fbb2960353e454ab43dfa4f5ebd5fd251f0d46506b7279dc6a07a4e076"
+prompt_hash = "41e6585e62132f466a7f5971f5be5a8258f58a5e88ee41215b4798538d5e85a8"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1205,3 +1205,29 @@ argument = "VMA admission, W^X and capability/domain checks are unchanged. A dem
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L44"
 argument = "A userspace-controlled high virtual offset reserves one fixed-size backing block rather than an offset-sized vector. Holes remain implicit through cloning and windowing. Shared frames still use external-owner hooks; private frames retain COW-aware release. No missing-block lookup fabricates physical backing or grants access to another mapping."
+
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Pipe payload queues use per-object sleepable mutexes, with ordered acquisition for two-pipe transfers. Readiness uses separate short per-object publication locks and atomic occupancy snapshots; no payload mutex or IRQ-safe lock is held when a handoff executes. Existing exact-waiter scheduler hints are reused without changing task/domain restoration or extending the trusted subsystem set."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "vmsplice retains resident readable RAM under authoritative mapping locks and the shared-mapping transaction shard. Device/special mappings are rejected unless an existing RAM provider explicitly marks allocator-owned backing. The physical reference outlives close, munmap and source-process exit. File-page imports retain under the provider lock. Imported bytes are copied through raw guarded access rather than immutable Rust references over user-mutable memory; tee and partial splice cannot grant append rights to imported/shared published ranges."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Base-page pin references are tracked independently from COW ownership. Fork write-protects a writable parent even when a pipe pin already elevated the physical reference count. NUMA migration rejects pinned backing before moving it; shared-map pin acquisition is excluded during a multi-address-space move. Pin release retires the allocator reference before clearing the pin marker, so a racing fork may only conservatively write-protect, never infer unshared writable ownership prematurely."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The aarch64 Linux restorer path copies complete initialized signal-frame bytes through guarded, bounded user access before changing the live trap context. Sigreturn reads a single kernel snapshot, validates user PC/SP and EL0-only PSTATE plus bounded FPSIMD records, and commits registers only after validation. User data never supplies domain_sctlr, domain_gcr, kernel stack pointers or an exception-level selector. Existing domain save/restore and guarded-copy fault recovery remain authoritative."
+
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The aarch64 vector now preserves SP_EL0 in the prior padding slot at offset 24 without changing domain-prefix or GPR offsets. A 528-byte FP/SIMD image is appended at offset 288 and is saved/restored only at the assembly boundary, before/after kernel Rust may use SIMD. A parked syscall resumes with its own saved user stack, and signal/fork snapshots read that owned trap image instead of a CPU register another task may have changed. The vector restores the existing MTE domain prefix before returning; no user-supplied frame can alter the saved kernel domain controls."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Executable-memory kernel-alias permission changes now invalidate inactive non-global PCID translations on every CPU, in addition to the existing global range invalidation. The permission store precedes both synchronous invalidations; backing cannot be reused with a stale read-only alias and sealed text cannot retain a stale writable alias. The regression switches between two live address spaces and checks the restored alias with guarded fault recovery. Fatal-only page-table diagnostics add no trap hot-path work."

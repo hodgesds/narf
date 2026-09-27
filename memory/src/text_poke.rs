@@ -57,7 +57,8 @@
 //!
 //! Changing an attribute needs its own invalidation too, and that one is *not*
 //! the split's: [`set_range_writable`] ends with a synchronous
-//! `invlpg_global_range` over the range it rewrote. The split's flush happens
+//! `invlpg_global_range` over the range it rewrote plus an all-PCID flush for
+//! non-global RAM aliases cached under inactive address spaces. The split's flush happens
 //! before the permission store, and when no split was needed it does not happen
 //! at all — which left the protection correct in the page tables and inert in
 //! the TLB. `smoke_text_poke_protect_round_trip` is what found that.
@@ -433,6 +434,12 @@ unsafe fn set_range_writable(
     // legal at CPL=0.
     unsafe {
         crate::x86_64::paging::invlpg_global_range(VirtAddr::new(va_base), len.div_ceil(FOUR_KB));
+        // Kernel RAM aliases are shared across roots but are not GLOBAL PTEs.
+        // INVLPG only retires their current-PCID entries. An inactive PCID
+        // could otherwise retain RW after sealing, or RO after reclamation,
+        // and resurrect that permission on the next CR3.NOFLUSH switch.
+        // Keep the range invalidation above for any global aliases as well.
+        crate::x86_64::paging::flush_user_tlb_all_cpus();
     }
     Ok(())
 }
@@ -1116,6 +1123,79 @@ fn smoke_text_poke_protect_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_text_poke_protect_round_trip);
+
+/// A kernel alias can be cached under an inactive userspace PCID. Restoring
+/// its permission under another PCID must retire that old translation too.
+#[cfg(target_arch = "x86_64")]
+fn smoke_text_poke_restore_retires_inactive_pcid() -> TestResult {
+    use narf_arch::x86_64::{cr, pcid, probe};
+    if !pcid::pcide_enabled() || !pcid::invpcid_supported() {
+        return TestResult::Skip("requires PCID and INVPCID");
+    }
+    if crate::bpf_text::kernel_root_for_mapping().is_none() {
+        return TestResult::Skip("BPF kernel VA slots not reserved");
+    }
+    // SAFETY: boot initialized paging; both fresh roots share the live kernel
+    // half. The harness root is restored before either address space drops.
+    let (first, second, original) = unsafe {
+        let Ok(first) = crate::AddressSpace::new_for_user() else {
+            return TestResult::Fail("first PCID address space allocation failed");
+        };
+        let Ok(second) = crate::AddressSpace::new_for_user() else {
+            return TestResult::Fail("second PCID address space allocation failed");
+        };
+        (first, second, cr::read_cr3())
+    };
+    let Ok(frame) = crate::frame::alloc_frame() else {
+        return TestResult::Fail("alias frame allocation failed");
+    };
+    let phys = frame.start_address();
+    let ptr = phys.kernel_mut_ptr::<u8>();
+    let result = (|| {
+        first.activate().map_err(|_| "first activation failed")?;
+        // SAFETY: initialize the exclusively owned frame byte before reading.
+        unsafe { core::ptr::write_volatile(ptr, 0x11) };
+        // SAFETY: this test exclusively owns the live frame.
+        unsafe { protect_ro(phys.raw(), 4096) }.map_err(|_| "protect_ro failed")?;
+        // SAFETY: a volatile read populates a read-only translation under the
+        // first PCID; the frame remains mapped and readable throughout.
+        unsafe { core::ptr::read_volatile(ptr) };
+        second.activate().map_err(|_| "second activation failed")?;
+        // SAFETY: exactly the owned range protected above.
+        unsafe { protect_rw(phys.raw(), 4096) }.map_err(|_| "protect_rw failed")?;
+        first.activate().map_err(|_| "PCID reactivation failed")?;
+        let recovery: u64;
+        // SAFETY: probe recovery label in this function, CPL0.
+        unsafe {
+            core::arch::asm!("lea {r}, [46f + rip]", r = out(reg) recovery,
+                options(nostack, preserves_flags));
+        }
+        probe::arm(recovery);
+        // SAFETY: owned RAM with restored writable PTE; probe catches a stale
+        // read-only TLB entry so this regression reports failure, not a crash.
+        unsafe {
+            core::arch::asm!("mov byte ptr [{p}], 0x5a", "46:", p = in(reg) ptr,
+                options(nostack));
+        }
+        if probe::disarm().vector.is_some() {
+            return Err("inactive PCID retained a read-only kernel alias");
+        }
+        Ok(())
+    })();
+    // SAFETY: restore the still-live harness root before destroying test roots.
+    unsafe { cr::write_cr3(original) };
+    // SAFETY: retire protections and all cached translations before freeing.
+    if unsafe { protect_rw(phys.raw(), 4096) }.is_err() {
+        return TestResult::Fail("alias cleanup failed; frame retained");
+    }
+    crate::frame::free_frame(frame);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_text_poke_restore_retires_inactive_pcid);
 
 /// aarch64 twin of the round trip. No fault probe on this arch, so the check
 /// is the reported permission plus an actual store landing after the restore —

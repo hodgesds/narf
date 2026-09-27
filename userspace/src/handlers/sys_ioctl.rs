@@ -27,6 +27,23 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if cmd == 0x541B {
+        if let Some(fifo) = ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+        {
+            let bytes = (fifo.shared().unread_bytes() as i32).to_ne_bytes();
+            // SAFETY: FIONREAD's output is one Linux int; the guarded copy
+            // validates user memory and reports a protection fault as EFAULT.
+            let result = unsafe { copy_to_user(arg as u64, &bytes) };
+            ctx.set_return(if result.is_ok() {
+                SyscallReturn::ok(0)
+            } else {
+                errno_ret(EFAULT)
+            });
+            return;
+        }
+    }
     // ── FIONBIO (0x5421) — generic O_NONBLOCK toggle ──────────────────
     //
     // `fs/ioctl.c::ioctl_fionbio`: read the `int` at `argp`; a non-zero value

@@ -27,9 +27,8 @@
 //! kernel.
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Poll, Waker};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -38,15 +37,7 @@ use crate::{
     FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT,
 };
 
-/// FIFO ring capacity, matching the anonymous-pipe buffer and Linux's
-/// default pipe size (`include/linux/pipe_fs_i.h`: 16 pages × 4 KiB —
-/// FIFOs use the same `pipe_inode_info` as anonymous pipes).
-const FIFO_BUF_BYTES: usize = 65536;
-
-/// POSIX `PIPE_BUF` (Linux `include/linux/limits.h`): writes of at most
-/// this many bytes are atomic — `fs/pipe.c::pipe_write` writes nothing
-/// rather than splitting them across a partial buffer.
-const PIPE_BUF: usize = 4096;
+/// Presence bit in each directional open-rendezvous readiness cell.
 const PEER_PRESENT: u32 = 1;
 
 /// Result classes for a named FIFO's transactional vmsplice-to-user drain.
@@ -77,7 +68,7 @@ pub enum FifoWriteError {
 /// `readers == 0` is a broken pipe.
 #[derive(Debug)]
 pub struct FifoShared {
-    queue: IrqSafeSpinLock<VecDeque<u8>>,
+    queue: crate::pipe_queue::Queue,
     /// Serializes opener-count transitions and publication of the derived
     /// readiness levels. Without this, two open/close paths can snapshot in
     /// one order and publish in the opposite order, leaving a stale peer level.
@@ -98,9 +89,25 @@ pub struct FifoShared {
 }
 
 impl FifoShared {
+    /// Common pipe-buffer queue, also used by cross-pipe splice/tee.
+    pub fn queue(&self) -> &crate::pipe_queue::Queue {
+        &self.queue
+    }
+
+    /// Publish a completed transfer after releasing the payload mutex.
+    pub fn notify_transfer(&self, event: u32, transferred: usize) {
+        let _publish = self.publish.lock();
+        self.sync_readiness_locked(event, false, transferred != 0 && transferred < 4096);
+    }
+
+    /// Shared unread byte count for FIONREAD on either open direction.
+    pub fn unread_bytes(&self) -> usize {
+        self.queue.snapshot().0
+    }
+
     fn new() -> Self {
         FifoShared {
-            queue: IrqSafeSpinLock::new(VecDeque::with_capacity(FIFO_BUF_BYTES)),
+            queue: crate::pipe_queue::Queue::new(crate::pipe_buffer::PipeBufs::new()),
             publish: IrqSafeSpinLock::new(()),
             readers: AtomicU32::new(0),
             writers: AtomicU32::new(0),
@@ -110,20 +117,15 @@ impl FifoShared {
         }
     }
 
-    fn sync_readiness(&self) {
-        let _publish = self.publish.lock();
-        self.sync_readiness_locked();
-    }
-
     /// Publish levels while `publish` is held. Open/close use this form so the
     /// count transition and its derived presence edge are one ordered action.
-    fn sync_readiness_locked(&self) {
-        let q = self.queue.lock();
+    fn sync_readiness_locked(&self, event: u32, wake_all: bool, urgent_handoff: bool) {
+        let (len, full) = self.queue.snapshot();
         let mut mask = 0;
-        if !q.is_empty() {
+        if len != 0 {
             mask |= POLL_IN;
         }
-        if q.len() < FIFO_BUF_BYTES {
+        if !full {
             mask |= POLL_OUT;
         }
         if self.writers.load(Ordering::Acquire) == 0 {
@@ -132,9 +134,34 @@ impl FifoShared {
         if self.readers.load(Ordering::Acquire) == 0 {
             mask |= POLL_ERR;
         }
-        drop(q);
-        self.readiness
-            .set(mask, (POLL_IN | POLL_OUT | POLL_HUP | POLL_ERR) & !mask);
+        let clear = (POLL_IN | POLL_OUT | POLL_HUP | POLL_ERR) & !mask;
+        if wake_all {
+            self.readiness.set_wake_all(mask, clear);
+        } else {
+            let continuation = if event == 0 {
+                0
+            } else {
+                (POLL_IN | POLL_OUT) & !event
+            };
+            let selected = self.readiness.set_event_with_continuation(
+                mask,
+                clear,
+                event,
+                continuation,
+                |task_id, waker| {
+                    if urgent_handoff {
+                        narf_scheduler::wake_urgent_task(waker, task_id);
+                    } else {
+                        waker.wake_by_ref();
+                    }
+                },
+            );
+            if urgent_handoff {
+                if let Some(task_id) = selected {
+                    narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+                }
+            }
+        }
         let readers = self.readers.load(Ordering::Acquire);
         let writers = self.writers.load(Ordering::Acquire);
         self.reader_presence.set(
@@ -275,6 +302,7 @@ pub struct FifoHandle {
     gid: u32,
     can_read: bool,
     can_write: bool,
+    packetized: AtomicBool,
     /// Counterpart-presence edge observed before this handle published its own
     /// direction. A changed edge completes a blocking open even if the peer
     /// opened and closed before this task was scheduled.
@@ -356,7 +384,7 @@ impl FifoHandle {
         if can_write {
             shared.writers.fetch_add(1, Ordering::AcqRel);
         }
-        shared.sync_readiness_locked();
+        shared.sync_readiness_locked(0, true, false);
         drop(publish);
         FifoHandle {
             shared,
@@ -367,6 +395,7 @@ impl FifoHandle {
             gid,
             can_read,
             can_write,
+            packetized: AtomicBool::new(false),
             peer_seq_at_open,
         }
     }
@@ -432,16 +461,33 @@ impl FifoHandle {
     /// FIFO stores bytes rather than per-write pipe_buffer boundaries, so the
     /// selected prefix is conservatively one logical buffer and commits
     /// all-or-none across a vector copy.
-    pub fn vmsplice_to_user(
+    pub async fn vmsplice_to_user(
         &self,
         max: usize,
+        copy: impl FnMut(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
+        self.drain_to_user(max, false, copy).await
+    }
+
+    pub async fn read_to_user(
+        &self,
+        max: usize,
+        copy: impl FnMut(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
+        self.drain_to_user(max, true, copy).await
+    }
+
+    async fn drain_to_user(
+        &self,
+        max: usize,
+        discard_packets: bool,
         mut copy: impl FnMut(&[u8]) -> Result<(), u64>,
     ) -> Result<usize, VmspliceDrainError> {
         if !self.can_read {
             return Err(VmspliceDrainError::BadFd);
         }
 
-        let mut q = self.shared.queue.lock();
+        let mut q = self.shared.queue.lock_async().await;
         let avail = q.len();
         if avail == 0 {
             return if self.shared.writers.load(Ordering::Acquire) == 0 {
@@ -450,27 +496,30 @@ impl FifoHandle {
                 Err(VmspliceDrainError::WouldBlock)
             };
         }
-        let n = core::cmp::min(max, avail);
-        // VecDeque exposes its logical prefix as at most two physical slices.
-        // Copy those slices directly while the prefix is stable instead of
-        // allocating and bouncing every read through a temporary Vec.  If
-        // either guarded copy faults, no byte is consumed; user memory may
-        // contain a copied prefix, matching Linux copy_page_to_iter semantics.
-        {
-            let (first, second) = q.as_slices();
-            let first_n = core::cmp::min(n, first.len());
-            if first_n != 0 {
-                copy(&first[..first_n]).map_err(VmspliceDrainError::User)?;
+        let mut n = 0;
+        while n < max && !q.is_empty() {
+            let packet = q.front_info().unwrap().1;
+            let count = q.front_len(max - n);
+            if let Err(errno) = q.with_front(count, &mut copy) {
+                if n == 0 {
+                    return Err(VmspliceDrainError::User(errno));
+                }
+                break;
             }
-            let second_n = n - first_n;
-            if second_n != 0 {
-                copy(&second[..second_n]).map_err(VmspliceDrainError::User)?;
+            let consumed = if packet && discard_packets {
+                q.front_info().unwrap().0
+            } else {
+                count
+            };
+            q.commit(consumed);
+            n += count;
+            if packet && discard_packets {
+                break;
             }
         }
-        q.drain(..n);
         drop(q);
         if n != 0 {
-            self.shared.sync_readiness();
+            self.shared.notify_transfer(POLL_OUT, n);
         }
         Ok(n)
     }
@@ -483,37 +532,94 @@ impl FifoHandle {
     /// named FIFO the same ordering without a heap allocation or boxed async
     /// future on the syscall hot path. A failed copy truncates the reservation,
     /// leaving the queue unchanged.
-    pub fn write_from_user(
+    pub async fn write_from_user(
         &self,
         max: usize,
-        copy: impl FnOnce(&mut [u8]) -> Result<(), u64>,
+        mut copy: impl FnMut(&mut [u8]) -> Result<(), u64>,
     ) -> Result<usize, FifoWriteError> {
         if !self.can_write {
             return Err(FifoWriteError::BadFd);
         }
 
-        let mut q = self.shared.queue.lock();
+        let mut q = self.shared.queue.lock_async().await;
         if self.shared.readers.load(Ordering::Acquire) == 0 {
             return Err(FifoWriteError::BrokenPipe);
         }
-        let room = FIFO_BUF_BYTES.saturating_sub(q.len());
-        if room == 0 || (max <= PIPE_BUF && room < max) {
+        let n = q
+            .write_with(max, self.packetized.load(Ordering::Acquire), |_, dst| {
+                copy(dst)
+            })
+            .map_err(FifoWriteError::User)?;
+        drop(q);
+        if n == 0 && max != 0 {
             return Err(FifoWriteError::WouldBlock);
         }
-        let n = core::cmp::min(max, room);
-        let old_len = q.len();
-        q.resize(old_len + n, 0);
-        let copied = {
-            let contiguous = q.make_contiguous();
-            copy(&mut contiguous[old_len..old_len + n])
-        };
-        if let Err(errno) = copied {
-            q.truncate(old_len);
-            return Err(FifoWriteError::User(errno));
-        }
-        drop(q);
-        self.shared.sync_readiness();
+        self.shared.notify_transfer(POLL_IN, n);
         Ok(n)
+    }
+
+    pub fn set_packetized(&self, packetized: bool) {
+        self.packetized.store(packetized, Ordering::Release);
+    }
+
+    fn arm_data(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &Waker,
+        exclusive: bool,
+    ) -> Option<Poll<u32>> {
+        // The shared cell is the union of both endpoint views.  Restrict the
+        // interest to bits this open description can actually observe, or a
+        // read-only fd polling POLLOUT (for example) would spin on the shared
+        // buffer's write readiness.
+        let mut local_interest = 0;
+        if self.can_read {
+            local_interest |= interest & (POLL_IN | POLL_HUP);
+        }
+        if self.can_write {
+            local_interest |= interest & (POLL_OUT | POLL_ERR);
+        }
+
+        let suppress_initial_hup = self.can_read
+            && !self.can_write
+            && self.shared.writers.load(Ordering::Acquire) == 0
+            && self.shared.writer_presence.seq() == self.peer_seq_at_open;
+        let first_interest = if suppress_initial_hup {
+            local_interest & !POLL_HUP
+        } else {
+            local_interest
+        };
+
+        let arm = |bits| {
+            if exclusive {
+                self.shared.readiness.arm_exclusive(task_id, bits, waker)
+            } else {
+                self.shared.readiness.arm(task_id, bits, waker)
+            }
+        };
+        let first = arm(first_interest);
+        if first.is_ready() || !suppress_initial_hup {
+            self.disarm_peer(task_id);
+            return Some(first);
+        }
+
+        // A writer appearing is not itself POLLIN, but it changes whether a
+        // later writer close is a visible HUP.  Arm the presence edge after
+        // the data cell, then re-arm the data cell with HUP enabled if that
+        // edge already raced us.  The two register-then-check operations make
+        // both writer-open and writer-open+close races lossless.
+        match self.arm_peer(task_id, waker) {
+            Poll::Pending => Some(Poll::Pending),
+            Poll::Ready(()) => {
+                self.shared.readiness.disarm(task_id);
+                Some(arm(local_interest))
+            }
+        }
+    }
+
+    pub fn packetized(&self) -> bool {
+        self.packetized.load(Ordering::Acquire)
     }
 
     /// Linux suppresses `POLLHUP` on a read-only FIFO opened with no writer
@@ -540,7 +646,17 @@ impl Drop for FifoHandle {
         if self.can_write {
             self.shared.writers.fetch_sub(1, Ordering::AcqRel);
         }
-        self.shared.sync_readiness_locked();
+        if self.shared.reader_count() == 0 && self.shared.writer_count() == 0 {
+            // No live handle can still be executing an operation: its borrow
+            // would retain an open description and therefore an opener count.
+            // Reset before another open passes the publication lock.
+            self.shared
+                .queue
+                .try_lock()
+                .expect("last FIFO handle owns no active I/O")
+                .reset();
+        }
+        self.shared.sync_readiness_locked(0, true, false);
         drop(publish);
     }
 }
@@ -558,7 +674,7 @@ impl FileOps for FifoHandle {
                 // Ok(0) masqueraded as a clean EOF.
                 return Err(FsError::BadFd);
             }
-            let mut q = self.shared.queue.lock();
+            let mut q = self.shared.queue.lock_async().await;
             let avail = q.len();
             if avail == 0 {
                 // Empty: EOF only once every writer has closed; otherwise
@@ -572,12 +688,11 @@ impl FileOps for FifoHandle {
                     Err(FsError::WouldBlock)
                 };
             }
-            let n = core::cmp::min(buf.len(), avail);
-            for (slot, byte) in buf.iter_mut().zip(q.drain(..n)) {
-                *slot = byte;
-            }
+            let (n, consumed) = q.read_span(buf.len());
+            q.copy_out(0, &mut buf[..n]);
+            q.commit(consumed);
             drop(q);
-            self.shared.sync_readiness();
+            self.shared.notify_transfer(POLL_OUT, n);
             Ok(n)
         })
     }
@@ -596,19 +711,20 @@ impl FileOps for FifoHandle {
             if self.shared.readers.load(Ordering::Acquire) == 0 {
                 return Err(FsError::BrokenPipe);
             }
-            let mut q = self.shared.queue.lock();
-            let room = FIFO_BUF_BYTES.saturating_sub(q.len());
-            // POSIX PIPE_BUF atomicity (`fs/pipe.c::pipe_write`): a write of
-            // ≤ PIPE_BUF bytes is all-or-nothing; the 0-progress result makes
-            // the syscall layer park (blocking) or EAGAIN (O_NONBLOCK).
-            if buf.len() <= PIPE_BUF && room < buf.len() {
-                return Ok(0);
-            }
-            let n = core::cmp::min(buf.len(), room);
-            q.extend(buf[..n].iter().copied());
+            let mut q = self.shared.queue.lock_async().await;
+            let n = q
+                .write_with(
+                    buf.len(),
+                    self.packetized.load(Ordering::Acquire),
+                    |offset, dst| {
+                        dst.copy_from_slice(&buf[offset..offset + dst.len()]);
+                        Ok(())
+                    },
+                )
+                .map_err(|_| FsError::OutOfMemory)?;
             drop(q);
             if n != 0 {
-                self.shared.sync_readiness();
+                self.shared.notify_transfer(POLL_IN, n);
             }
             Ok(n)
         })
@@ -638,9 +754,9 @@ impl FileOps for FifoHandle {
         // write side gets EPOLLOUT while there is room and EPOLLERR once
         // the readers are gone.
         let mut mask = 0;
-        let q = self.shared.queue.lock();
+        let (len, full) = self.shared.queue.snapshot();
         if self.can_read {
-            if !q.is_empty() {
+            if len != 0 {
                 mask |= POLL_IN;
             }
             if self.read_hangup_visible() {
@@ -648,7 +764,7 @@ impl FileOps for FifoHandle {
             }
         }
         if self.can_write {
-            if q.len() < FIFO_BUF_BYTES {
+            if !full {
                 mask |= POLL_OUT;
             }
             if self.shared.readers.load(Ordering::Acquire) == 0 {
@@ -667,46 +783,16 @@ impl FileOps for FifoHandle {
     }
 
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker) -> Option<Poll<u32>> {
-        // The shared cell is the union of both endpoint views.  Restrict the
-        // interest to bits this open description can actually observe, or a
-        // read-only fd polling POLLOUT (for example) would spin on the shared
-        // buffer's write readiness.
-        let mut local_interest = 0;
-        if self.can_read {
-            local_interest |= interest & (POLL_IN | POLL_HUP);
-        }
-        if self.can_write {
-            local_interest |= interest & (POLL_OUT | POLL_ERR);
-        }
+        self.arm_data(task_id, interest, waker, false)
+    }
 
-        let suppress_initial_hup = self.can_read
-            && !self.can_write
-            && self.shared.writers.load(Ordering::Acquire) == 0
-            && self.shared.writer_presence.seq() == self.peer_seq_at_open;
-        let first_interest = if suppress_initial_hup {
-            local_interest & !POLL_HUP
-        } else {
-            local_interest
-        };
-
-        let first = self.shared.readiness.arm(task_id, first_interest, waker);
-        if first.is_ready() || !suppress_initial_hup {
-            self.disarm_peer(task_id);
-            return Some(first);
-        }
-
-        // A writer appearing is not itself POLLIN, but it changes whether a
-        // later writer close is a visible HUP.  Arm the presence edge after
-        // the data cell, then re-arm the data cell with HUP enabled if that
-        // edge already raced us.  The two register-then-check operations make
-        // both writer-open and writer-open+close races lossless.
-        match self.arm_peer(task_id, waker) {
-            Poll::Pending => Some(Poll::Pending),
-            Poll::Ready(()) => {
-                self.shared.readiness.disarm(task_id);
-                Some(self.shared.readiness.arm(task_id, local_interest, waker))
-            }
-        }
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &Waker,
+    ) -> Option<Poll<u32>> {
+        self.arm_data(task_id, interest, waker, true)
     }
 
     fn disarm_readiness(&self, task_id: u64) -> bool {
@@ -733,16 +819,18 @@ impl FileOps for FifoHandle {
     fn pipe_capacity(&self) -> Option<usize> {
         // `fcntl(F_GETPIPE_SZ)` works on FIFOs exactly as on anonymous
         // pipes (both are `pipe_inode_info` buffers on Linux).
-        Some(FIFO_BUF_BYTES)
+        Some(self.shared.queue.capacity())
     }
 
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
         if !self.can_read {
             return None;
         }
-        let q = self.shared.queue.lock();
-        let n = core::cmp::min(max, q.len());
-        Some(q.iter().copied().take(n).collect())
+        let q = self.shared.queue.try_lock()?;
+        let (n, _) = q.read_span(max);
+        let mut bytes = alloc::vec![0; n];
+        q.copy_out(0, &mut bytes);
+        Some(bytes)
     }
 
     fn fifo_shared(&self) -> Option<Arc<FifoShared>> {
