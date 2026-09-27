@@ -52,14 +52,19 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::{bootstrap_mount_authority, registry, resolve, FileType, FsError, Initramfs, MemFs};
+use crate::{
+    bootstrap_mount_authority, registry, resolve, DirOps, FileType, FsError, FsInstance, Initramfs,
+    MemFs,
+};
 
 static MOUNT_CHANGE_HOOK_HITS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1725,6 +1730,274 @@ fn smoke_vfs_resolve_parent_absolute_lock_released_in_closure() -> TestResult {
 kernel_test_in!(
     "filesystem/e2e/mount",
     smoke_vfs_resolve_parent_absolute_lock_released_in_closure
+);
+
+// `root()` and `lookup_dir()` are filesystem callbacks too. In particular,
+// ext2's synchronous lookup enters `block_on_spin`, whose nested pumps may run
+// unrelated work. Keeping the registry's IRQ-safe lock across either callback
+// can strand its owner and leave every CPU spinning in path resolution. These
+// wrappers deliberately re-enter the registry from both callback sites.
+struct ReentrantLookupDir {
+    inner: Arc<dyn DirOps>,
+}
+
+impl DirOps for ReentrantLookupDir {
+    fn lookup(&self, name: &str) -> Option<Arc<dyn crate::FileOps>> {
+        self.inner.lookup(name)
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        let _ = registry().len();
+        self.inner.lookup_dir(name)
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = crate::DirEntry> + 'a> {
+        self.inner.iter()
+    }
+}
+
+struct ReentrantRootFs {
+    root: Arc<dyn DirOps>,
+}
+
+impl FsInstance for ReentrantRootFs {
+    fn root(&self) -> Arc<dyn DirOps> {
+        let _ = registry().len();
+        self.root.clone()
+    }
+
+    fn name(&self) -> &str {
+        "reentrant-root"
+    }
+}
+
+fn smoke_vfs_mount_and_parent_callbacks_run_unlocked() -> TestResult {
+    const PATH: &str = "/fme11-root";
+    let backing = MemFs::new("fme11-root-backing");
+    let backing_root = FsInstance::root(&backing);
+    if !matches!(poll_once(backing_root.mkdir("dir")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir failed");
+    }
+    let fs = ReentrantRootFs {
+        root: Arc::new(ReentrantLookupDir {
+            inner: backing_root,
+        }),
+    };
+    let auth = bootstrap_mount_authority();
+    let handle = match registry().mount(&auth, PATH, fs) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("mount failed"),
+    };
+
+    let resolved = registry()
+        .resolve_parent_absolute("/fme11-root/dir/child", |_fs, _parent, leaf| {
+            leaf == "child"
+        });
+    let _ = registry().unmount(&handle, PATH);
+
+    if resolved == Some(true) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mount/root or parent walk callback ran under the table lock")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_mount_and_parent_callbacks_run_unlocked
+);
+
+static REENTRANT_DROP_RAN: AtomicUsize = AtomicUsize::new(0);
+
+struct ReentrantDropFs {
+    root: Arc<dyn DirOps>,
+}
+
+impl FsInstance for ReentrantDropFs {
+    fn root(&self) -> Arc<dyn DirOps> {
+        self.root.clone()
+    }
+
+    fn name(&self) -> &str {
+        "reentrant-drop"
+    }
+}
+
+impl Drop for ReentrantDropFs {
+    fn drop(&mut self) {
+        let _ = registry().len();
+        REENTRANT_DROP_RAN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct CountingDir {
+    inner: Arc<dyn DirOps>,
+    callbacks: Arc<AtomicUsize>,
+}
+
+impl DirOps for CountingDir {
+    fn dcache_identity(&self) -> (usize, u64, u64) {
+        self.inner.dcache_identity()
+    }
+
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn crate::FileOps>> {
+        self.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.inner.lookup(name)
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        self.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.inner.lookup_dir(name).map(|inner| {
+            Arc::new(Self {
+                inner,
+                callbacks: self.callbacks.clone(),
+            }) as Arc<dyn DirOps>
+        })
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = crate::DirEntry> + 'a> {
+        self.inner.iter()
+    }
+
+    fn create<'a>(&'a self, name: &'a str) -> crate::FsFuture<'a, Arc<dyn crate::FileOps>> {
+        Box::pin(async move {
+            let _path_mutation = crate::begin_path_mutation(self, &[name]);
+            self.inner.create(name).await
+        })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> crate::FsFuture<'a, ()> {
+        Box::pin(async move {
+            let _path_mutation = crate::begin_path_mutation(self, &[old_name, new_name]);
+            self.inner.rename(old_name, new_name).await
+        })
+    }
+}
+
+struct CountingFs {
+    root: Arc<dyn DirOps>,
+}
+
+impl FsInstance for CountingFs {
+    fn root(&self) -> Arc<dyn DirOps> {
+        self.root.clone()
+    }
+
+    fn name(&self) -> &str {
+        "counting-rcu"
+    }
+}
+
+fn smoke_mount_namespace_unmount_drops_after_unlock() -> TestResult {
+    const PATH: &str = "/fme11-drop";
+    REENTRANT_DROP_RAN.store(0, Ordering::Relaxed);
+    let backing = MemFs::new("fme11-drop-backing");
+    let fs = Arc::new(ReentrantDropFs {
+        root: FsInstance::root(&backing),
+    }) as Arc<dyn FsInstance>;
+    let auth = bootstrap_mount_authority();
+    let ns = crate::initial_mount_ns();
+    if ns.mount_arc(&auth, PATH, fs).is_err() {
+        return TestResult::Fail("namespace mount failed");
+    }
+    if ns.unmount(PATH).is_err() {
+        return TestResult::Fail("namespace unmount failed");
+    }
+    if REENTRANT_DROP_RAN.load(Ordering::Relaxed) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("filesystem destructor did not run after detach")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_mount_namespace_unmount_drops_after_unlock
+);
+
+fn smoke_vfs_rcu_walk_hits_and_invalidates_on_rename() -> TestResult {
+    const PATH: &str = "/fme11-rcu";
+    let fs = MemFs::new("fme11-rcu");
+    let root = FsInstance::root(&fs);
+    let dir = match poll_once(root.mkdir("dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    if !matches!(poll_once(dir.create("old")), Some(Ok(_))) {
+        return TestResult::Fail("create failed");
+    }
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let fs = CountingFs {
+        root: Arc::new(CountingDir {
+            inner: root,
+            callbacks: callbacks.clone(),
+        }),
+    };
+
+    let auth = bootstrap_mount_authority();
+    let handle = match registry().mount(&auth, PATH, fs) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("mount failed"),
+    };
+    let resolves = |name: &str| {
+        registry().resolve_absolute_with_root(PATH, |_fs, root, _| {
+            crate::resolve_dentry(root, name).is_ok()
+        }) == Some(true)
+    };
+
+    if !resolves("dir/old") {
+        let _ = registry().unmount(&handle, PATH);
+        return TestResult::Fail("reference walk did not warm the dentry cache");
+    }
+    let callbacks_after_warm = callbacks.load(Ordering::Relaxed);
+    if !resolves("dir/old") || callbacks.load(Ordering::Relaxed) != callbacks_after_warm {
+        let _ = registry().unmount(&handle, PATH);
+        return TestResult::Fail("second lookup did not complete through RCU walk");
+    }
+
+    // Mutate through a freshly manufactured wrapper for the same directory,
+    // not through the canonical dentry's DirOps. Stable filesystem/inode
+    // identity must still invalidate every alias of `old`.
+    let renamed = registry().resolve_absolute_with_root(PATH, |_fs, root, _| {
+        let parent = root.directory()?.lookup_dir("dir")?;
+        poll_once(parent.rename("old", "new"))
+    });
+    if !matches!(renamed, Some(Some(Ok(())))) {
+        let _ = registry().unmount(&handle, PATH);
+        return TestResult::Fail("rename failed");
+    }
+    if resolves("dir/old") || !resolves("dir/new") {
+        let _ = registry().unmount(&handle, PATH);
+        return TestResult::Fail("rename did not invalidate cached dentries");
+    }
+    let callbacks_before_unrelated = callbacks.load(Ordering::Relaxed);
+    let created = registry().resolve_parent_absolute(
+        &alloc::format!("{PATH}/dir/sibling"),
+        |_fs, parent, name| poll_once(parent.create(name)),
+    );
+    if !matches!(created, Some(Some(Ok(_))))
+        || !resolves("dir/new")
+        || callbacks.load(Ordering::Relaxed) != callbacks_before_unrelated
+    {
+        let _ = registry().unmount(&handle, PATH);
+        return TestResult::Fail("unrelated mutation flushed a cached dentry");
+    }
+    // The first miss installs a negative dentry; the second miss must be
+    // answered without invoking the backing directory.
+    let callbacks_after_negative = callbacks.load(Ordering::Relaxed);
+    if resolves("dir/old") || callbacks.load(Ordering::Relaxed) != callbacks_after_negative {
+        let _ = registry().unmount(&handle, PATH);
+        return TestResult::Fail("negative dentry did not hit through RCU walk");
+    }
+
+    let _ = registry().unmount(&handle, PATH);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_rcu_walk_hits_and_invalidates_on_rename
 );
 
 // ── Smoke 12: longest-prefix mount matching ──────────────────────────

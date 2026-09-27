@@ -225,10 +225,10 @@ fn smoke_memfs_nested_dirs_lookup() -> TestResult {
 }
 kernel_test_in!("filesystem/memfs", smoke_memfs_nested_dirs_lookup);
 
-/// Successful subdirectory lookups enter the per-CPU read cache. Warm each
-/// name before mutating it so this test proves rename/rmdir generations reject
-/// stale cache entries rather than merely exercising the BTreeMap slow path.
-fn smoke_memfs_dir_cache_invalidates_mutations() -> TestResult {
+/// Directory rename/removal/recreation must update the authoritative map. The
+/// mount e2e suite separately exercises VFS RCU-cache invalidation around the
+/// same operations.
+fn smoke_memfs_dir_mutations_update_lookup() -> TestResult {
     let fs = MemFs::new("memfs-dir-cache");
     let root = fs.root();
 
@@ -270,10 +270,7 @@ fn smoke_memfs_dir_cache_invalidates_mutations() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "filesystem/memfs",
-    smoke_memfs_dir_cache_invalidates_mutations
-);
+kernel_test_in!("filesystem/memfs", smoke_memfs_dir_mutations_update_lookup);
 
 // ── Smoke 4: directory listing via DirOps::enumerate ──────────────────
 //

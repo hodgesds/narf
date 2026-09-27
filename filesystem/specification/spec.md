@@ -65,10 +65,57 @@ pub fn resolve(
     cap:   &Cap<Traverse, _>,
 ) -> impl Future<Output = Result<NodeRef, FsError>>;
 
+pub struct Dentry { /* opaque VFS parent/name + positive/negative inode state */ }
+
+pub fn resolve_dentry(
+    root: Arc<Dentry>,
+    path: &str,
+) -> Result<Arc<dyn FileOps>, FsError>;
+
+pub fn resolve_cached_dentry(
+    root: Arc<Dentry>,
+    path: &str,
+) -> Option<Result<Arc<dyn FileOps>, FsError>>; // None => reference walk
+
+pub fn resolve_async_dentry(
+    root: Arc<Dentry>,
+    path: &str,
+) -> FsFuture<'_, Arc<dyn FileOps>>;
+
+pub fn resolve_directory_dentry_async(
+    root: Arc<Dentry>,
+    path: &str,
+) -> FsFuture<'_, Arc<Dentry>>;
+
 pub fn resolve_absolute_single_mount(
     abs: &str,
     f: impl FnOnce(&dyn FsInstance, &str, u64) -> R,
 ) -> Option<R>; // filesystem-relative path + covering mount id
+
+pub fn resolve_absolute_single_mount_with_root(
+    abs: &str,
+    f: impl FnOnce(&dyn FsInstance, Arc<Dentry>, &str, u64) -> R,
+) -> Option<R>; // canonical root + relative path + covering mount id
+
+pub fn resolve_absolute_with_root(
+    abs: &str,
+    f: impl FnOnce(&dyn FsInstance, Arc<Dentry>, &str) -> R,
+) -> Option<R>; // canonical mount root + filesystem-relative path
+
+pub fn with_mount_root(
+    path: &str,
+    f: impl FnOnce(&dyn FsInstance, Arc<Dentry>) -> R,
+) -> Option<R>; // exact mount + canonical root
+
+pub trait DirOps {
+    fn dcache_identity(&self) -> (usize, u64, u64); // superblock, inode namespace, inode
+    fn rcu_walkable(&self) -> bool;
+}
+
+pub fn begin_path_mutation(
+    parent: &dyn DirOps,
+    names: &[&str],
+) -> PathMutationGuard; // empty names invalidates every child
 ```
 
 - Resolution is **always scoped to `root`**. There is no path escape.
@@ -79,11 +126,59 @@ pub fn resolve_absolute_single_mount(
 - Path strings are UTF-8; NARF does not emulate byte-pathname
   filesystems transparently (a compat FS in `drivers/fs/` may do so).
 - `resolve_absolute_single_mount` returns `None` when `abs` is a synthetic
-  ancestor of a deeper mount; otherwise its callback runs after the mount-table
-  lock is released and may walk the returned filesystem without rechecking the
-  mount table between components. Global descendant-free mounts use bounded
-  generation-tagged per-CPU lookup entries; mount, overmount, move, and unmount
-  invalidate those entries before publishing the change notification.
+  ancestor of a deeper mount; otherwise its callback may walk the returned
+  filesystem without rechecking the mount table between components.
+- Every mount namespace publishes an immutable routing snapshot through QSBR.
+  A mount attachment owns one canonical root dentry; a reader selects one
+  coherent snapshot, upgrades its weak filesystem and root references, and
+  leaves the read section before calling `DirOps` or a caller closure. Attach,
+  overmount, move, and detach remain serialized by the namespace writer lock.
+  `FsInstance::root` runs before that lock when attaching, and a detached
+  filesystem, root, or replaced snapshot is never destroyed under the lock.
+  Path walkers use `resolve_absolute_with_root`; metadata-only callers may use
+  `resolve_absolute` without receiving the canonical root.
+- `Dentry` is the VFS name object, not a synonym for `DirOps` or `FileOps`.
+  It has stable parent/name identity while hashed, carries either positive
+  inode-operation references or an explicit negative state, and has a
+  per-dentry sequence. A mount owns its root dentry. Child dentries retain a
+  referenced parent, while the bounded global hash is the lookup index.
+  Replacing, renaming, or unlinking a name first unhashes its dentry and
+  advances that sequence; old bucket snapshots and their objects are reclaimed
+  only after a QSBR grace period.
+- Path resolution first attempts an RCU dentry walk. Hash buckets are immutable
+  QSBR publications keyed by directory identity and component name. Each step
+  samples the child sequence and then validates the parent sequence, forming
+  the same interlocking validation chain as `__d_lookup_rcu`; the final child
+  is converted to owned `Arc` references only after its sequence validates.
+  Intermediate dentries stay borrowed from the pinned hash snapshots, so the
+  fast walk performs no per-component reference-count stores.
+  A miss, symlink, non-directory component, concurrent mutation, or `DirOps`
+  implementation that returns `false` from `rcu_walkable` restarts through
+  ordinary reference walk. No RCU guard spans `.await`, and no filesystem
+  lookup callback runs inside the RCU fast path.
+- `rcu_walkable` defaults to `false` and must itself be wait-free and free of
+  filesystem callbacks when overridden. Immutable implementations may opt in.
+  Mutable implementations may opt in only when every insertion, removal, link,
+  and rename holds `PathMutationGuard` from before the first visible change
+  through final publication. Guard construction unhashes every alias of each
+  named dentry (or every child when `names` is empty); unrelated hash chains
+  survive. The guard holds no lock and may cross `.await`; per-chain active
+  writer counts and generations close the no-existing-dentry race and make
+  overlapping readers retry. Reference walk publishes merged file/directory
+  positive dentries and negative dentries only when its pre/post chain token
+  validates.
+  Local initramfs, memfs, ext2, btrfs, FAT, MINIX, exFAT, UDF, SquashFS, and
+  ISO 9660 participate. Remote, synthetic-dynamic, and externally revalidated
+  filesystems retain reference walk until they provide an equivalent validity
+  contract; this is the NARF equivalent of Linux returning `-ECHILD` from an
+  RCU lookup that cannot safely complete locklessly.
+- `dcache_identity` is the inode-alias key used by the dcache and must be
+  wait-free. Its default object address is valid for filesystems that retain
+  one `DirOps` object per inode. A participating backend that creates fresh
+  wrappers on lookup returns a stable `(superblock identity, inode namespace,
+  inode identity)` triple instead, so mutation through any wrapper unhashes
+  every cached alias. The namespace is zero for ordinary filesystems and
+  distinguishes inode-number domains such as btrfs subvolumes.
 
 ### 3.3 File operations (async)
 
@@ -475,10 +570,14 @@ punch/zero-range/preallocation, and regular-file `user.*`, `trusted.*`, and
 `security.*` xattrs. Inodes and allocated pages remain charged until the last
 directory entry/open reference drops.
 
-Successful in-memory subdirectory lookups use a bounded per-CPU weak cache
-keyed by parent inode, entry-generation, and name. Directory insertion,
-removal, and rename advance the generation while the authoritative entry map
-is locked; weak entries never extend inode or quota lifetime.
+In-memory directories participate in the VFS RCU dentry cache. Their
+authoritative entry maps remain writer-locked, while every name-set mutation is
+announced by `PathMutationGuard`; therefore a warmed read takes neither that
+map lock nor a mount-table lock. Cache buckets are bounded, dentries hold their
+parent name objects and inode-operation references, overlapping mutations are
+rejected, named mutations invalidate only affected aliases, and retained child
+references obey the same open-after-unlink lifetime rule as ordinary node
+handles.
 
 Linux-compat mount namespaces hold a private snapshot of the mount table.
 Mount, bind-mount, and unmount operations after `CLONE_NEWNS` mutate that
@@ -1009,8 +1108,10 @@ Arch-neutral at the spec level. Two arch-touches:
 - **Consumes:** `block/` (storage), `capabilities/`, `memory/` (cache
   + working mem), `ipc/` (driver transport), `crypto/` (integrity,
   Stage 4+), `time/` (mtime/ctime/atime), `tracing/` (per-op timing),
-  `scheduler/`, `rcu/` (**Sleepable** RCU for dentry-equivalent cache
-  and mount-tree walks that may await I/O mid-traversal).
+  `scheduler/`, `rcu/` (QSBR for immutable mount-routing snapshots and the
+  non-sleeping dentry fast path). A walk that may await leaves QSBR first and
+  continues through owned references; sleepable RCU is not held across
+  filesystem I/O.
 - **Provides to:** `userspace/` (the file-shaped ABI), `process/` (log
   storage for audit trails), future daemons (package manager,
   session manager, etc.).

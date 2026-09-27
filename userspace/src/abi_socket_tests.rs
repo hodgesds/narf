@@ -3509,13 +3509,14 @@ fn smoke_abi_socket_notify_sendmsg_through_stacked_file_bind() -> TestResult {
                 false,
             )
             .ok_or("manager notify socket has no VFS identity")?;
-            let source_inode = crate::handlers::current_resolve_absolute(SOURCE_PATH, |fs, rel| {
-                narf_filesystem::resolve(fs.root(), rel)
-                    .ok()
-                    .map(|file| (fs.backing_identity(), file.ino()))
-            })
-            .flatten()
-            .ok_or("manager bind did not materialise its socket inode")?;
+            let source_inode =
+                crate::handlers::current_resolve_absolute(SOURCE_PATH, |fs, root, rel| {
+                    narf_filesystem::resolve_dentry(root, rel)
+                        .ok()
+                        .map(|file| (fs.backing_identity(), file.ino()))
+                })
+                .flatten()
+                .ok_or("manager bind did not materialise its socket inode")?;
             let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create failed")?;
             let mut interest = [0u8; 12];
             interest[..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -3569,15 +3570,16 @@ fn smoke_abi_socket_notify_sendmsg_through_stacked_file_bind() -> TestResult {
                 false,
             )
             .ok_or("private notify file bind has no VFS identity")?;
-            let target_inode = crate::handlers::current_resolve_absolute(TARGET_PATH, |fs, rel| {
-                if !rel.is_empty() {
-                    return None;
-                }
-                fs.root_file()
-                    .map(|file| (fs.backing_identity(), file.ino()))
-            })
-            .flatten()
-            .ok_or("private notify bind did not install a file-rooted mount")?;
+            let target_inode =
+                crate::handlers::current_resolve_absolute(TARGET_PATH, |fs, _root, rel| {
+                    if !rel.is_empty() {
+                        return None;
+                    }
+                    fs.root_file()
+                        .map(|file| (fs.backing_identity(), file.ino()))
+                })
+                .flatten()
+                .ok_or("private notify bind did not install a file-rooted mount")?;
             if target_inode.0 != source_inode.0 {
                 return Err("file bind changed the notify socket backing filesystem");
             }

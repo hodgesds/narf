@@ -1137,10 +1137,9 @@ pub fn resolve_exec_file(
     abs_path: &str,
 ) -> Option<(alloc::sync::Arc<dyn narf_filesystem::FileOps>, u64)> {
     use crate::handlers::poll_io_to_completion;
-    use narf_filesystem::resolve_async;
 
-    let file = crate::handlers::current_resolve_absolute(abs_path, |fs, rel| {
-        poll_io_to_completion(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+    let file = crate::handlers::current_resolve_absolute(abs_path, |_fs, root, rel| {
+        poll_io_to_completion(narf_filesystem::resolve_async_dentry(root, rel)).and_then(|r| r.ok())
     })
     .flatten()?;
     let stat = poll_io_to_completion(file.stat_async()).and_then(|r| r.ok())?;

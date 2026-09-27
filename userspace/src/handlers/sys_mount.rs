@@ -2,12 +2,12 @@
 use super::*;
 
 fn current_file_exists(path: &str) -> bool {
-    current_resolve_absolute(path, |fs, rel| {
+    current_resolve_absolute(path, |_fs, root, rel| {
         if rel.is_empty() {
             return false;
         }
         matches!(
-            poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel)),
+            poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel)),
             Some(Ok(_))
         )
     })

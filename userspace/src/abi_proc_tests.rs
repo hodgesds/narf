@@ -2176,10 +2176,10 @@ fn smoke_abi_proc_namespace_open_mints_setns_fd() -> TestResult {
             return Err("basic proc task snapshot eagerly materialised VMAs");
         }
         let link_path = alloc::format!("/proc/{visible_pid}/ns/uts\0");
-        let mounted_proc =
-            crate::handlers::current_resolve_absolute(link_path.trim_end_matches('\0'), |fs, _| {
-                fs.name() == "proc"
-            });
+        let mounted_proc = crate::handlers::current_resolve_absolute(
+            link_path.trim_end_matches('\0'),
+            |fs, _root, _rel| fs.name() == "proc",
+        );
         if mounted_proc != Some(true) {
             return Err("ABI harness path did not resolve through the proc mount");
         }

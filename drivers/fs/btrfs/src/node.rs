@@ -318,6 +318,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                         .ok_or(FsError::InvalidData)?;
                     let name =
                         core::str::from_utf8(&raw_name[..end]).map_err(|_| FsError::InvalidData)?;
+                    let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
                     autogrow!(
                         vol,
                         crate::write::create_subvolume_with_qgroup(
@@ -355,6 +356,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                         }
                     } else {
                         (Some(parse_subvol_name(&input[8..])?), None)
+                    };
+                    let _path_mutation = match name.as_deref() {
+                        Some(name) => narf_filesystem::begin_path_mutation(self, &[name]),
+                        None => narf_filesystem::begin_path_mutation(self, &[]),
                     };
                     autogrow!(
                         vol,
@@ -490,6 +495,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             if !Arc::ptr_eq(&vol, &source_vol) {
                 return Err(FsError::CrossDevice);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let (source_root, source_id) = match (source.tree_root, source.tree_id) {
                 (Some(root), Some(id)) => (root, id),
                 (None, None) => (vol.fs_tree_root().0, vol.fs_tree_id()),
@@ -765,6 +771,18 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         self.ino
     }
 
+    fn dcache_identity(&self) -> (usize, u64, u64) {
+        (
+            self.vol.as_ptr() as *const () as usize,
+            self.tree_id.unwrap_or(0),
+            self.ino,
+        )
+    }
+
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         None
     }
@@ -859,6 +877,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
             let (ino, inode) =
                 autogrow!(vol, crate::write::create_file(&vol, self.ino, name).await)?;
@@ -871,6 +890,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
             autogrow!(vol, crate::write::unlink_file(&vol, self.ino, name).await)
         })
@@ -881,6 +901,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
             let (ino, inode) = autogrow!(vol, crate::write::mkdir_dir(&vol, self.ino, name).await)?;
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn DirOps>)
@@ -892,6 +913,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
             autogrow!(vol, crate::write::rmdir_dir(&vol, self.ino, name).await)
         })
@@ -902,6 +924,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[old_name, new_name]);
             let vol = self.volume()?;
             autogrow!(
                 vol,
@@ -938,6 +961,9 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if !Arc::ptr_eq(&vol, &dest_vol) {
                 return Err(FsError::CrossDevice);
             }
+            let _source_path_mutation = narf_filesystem::begin_path_mutation(self, &[old_name]);
+            let _destination_path_mutation =
+                narf_filesystem::begin_path_mutation(dest, &[new_name]);
             if dest.ino == self.ino {
                 autogrow!(
                     vol,
@@ -958,6 +984,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[new_name]);
             let vol = self.volume()?;
             autogrow!(
                 vol,
@@ -988,6 +1015,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if !Arc::ptr_eq(&vol, &dest_vol) {
                 return Err(FsError::CrossDevice);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(dest, &[new_name]);
             autogrow!(
                 vol,
                 crate::write::link_node(&vol, self.ino, dest.ino, old_name, new_name).await
@@ -1004,6 +1032,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
             let (ino, inode) = autogrow!(
                 vol,
@@ -1032,6 +1061,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 FileType::Fifo => (0o010644, format::FT_FIFO),      // S_IFIFO
                 _ => return Err(FsError::Unsupported),
             };
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             // `rdev` arrives as the packed userspace `dev_t`; btrfs stores the raw
             // kernel `dev_t`. FIFOs carry no device number.
             let kdev = if rdev == 0 {
@@ -1053,6 +1083,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
             // S_IFSOCK | perms; no device number.
             let mode = 0o140000 | u32::from(perms & 0o7777);

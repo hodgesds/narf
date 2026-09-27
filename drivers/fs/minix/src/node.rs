@@ -231,6 +231,18 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
+    fn dcache_identity(&self) -> (usize, u64, u64) {
+        (
+            Arc::as_ptr(&self.volume) as *const () as usize,
+            0,
+            u64::from(self.ino),
+        )
+    }
+
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // MINIX lookups are inherently async (block reads). VFS
         // prefers `lookup_async` automatically.
@@ -320,6 +332,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             if name.is_empty() || name.contains('/') || name == "." || name == ".." {
                 return Err(FsError::InvalidPath);
             }
@@ -351,6 +364,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             if name.is_empty() || name.contains('/') || name == "." || name == ".." {
                 return Err(FsError::InvalidPath);
             }
@@ -402,6 +416,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             if name == "." || name == ".." || name.is_empty() {
                 return Err(FsError::InvalidPath);
             }
@@ -434,6 +449,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             if name == "." || name == ".." || name.is_empty() {
                 return Err(FsError::InvalidPath);
             }
@@ -469,6 +485,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             if name.is_empty() || name.contains('/') || name == "." || name == ".." {
                 return Err(FsError::InvalidPath);
             }
@@ -501,6 +518,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[old_name, new_name]);
             if old_name.is_empty()
                 || new_name.is_empty()
                 || old_name == "."
