@@ -27,7 +27,7 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
     let fd_in = a.arg0 as u32;
     let fd_out = a.arg1 as u32;
     let len = a.arg2 as usize;
-    let flags = a.arg3;
+    let flags = a.arg3 as u32 as u64;
     const SPLICE_F_NONBLOCK: u64 = 0x2;
     const SPLICE_F_ALL: u64 = 0xf; // MOVE | NONBLOCK | MORE | GIFT
     let task = current_task_id();
@@ -93,18 +93,8 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
     // the payload to the destination's OWN framing: teeing a packet pipe ran
     // every record together, and teeing into a packet pipe invented record
     // boundaries the source never had.
-    let paired = input
-        .ops
-        .as_any()
-        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
-        .zip(
-            output
-                .ops
-                .as_any()
-                .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>()),
-        );
-    if let Some((pipe_in, pipe_out)) = paired {
-        match pipe_in.tee_to(pipe_out, len) {
+    if let Some(outcome) = crate::pipe::transfer(input.ops.as_ref(), output.ops.as_ref(), len, true) {
+        match outcome {
             // 0 reaches here only from `ipipe_prep`'s end-of-stream arm — an
             // empty source whose last writer is gone. Every other empty-source
             // case is WouldBlock below, so a caller never reads a transient

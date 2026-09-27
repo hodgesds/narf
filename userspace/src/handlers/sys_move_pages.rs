@@ -203,6 +203,10 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
                     Err(narf_memory::AddressSpaceError::SharedMapping) => {
                         match migrate_registry_shared_page(&as_ref, va, target as usize) {
                             Ok(()) => target,
+                            Err(narf_memory::AddressSpaceError::Pinned) => {
+                                not_moved += 1;
+                                -EBUSY as i32
+                            }
                             Err(_) => {
                                 not_moved += 1;
                                 -EACCES as i32
@@ -212,6 +216,10 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
                     Err(narf_memory::AddressSpaceError::InvalidNode) => {
                         not_moved += 1;
                         -EINVAL as i32
+                    }
+                    Err(narf_memory::AddressSpaceError::Pinned) => {
+                        not_moved += 1;
+                        -EBUSY as i32
                     }
                     Err(_) => {
                         not_moved += 1;

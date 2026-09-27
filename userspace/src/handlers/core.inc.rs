@@ -1781,6 +1781,7 @@ fn open_impl(
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::NoSpace => 28,
+                        narf_filesystem::FsError::OutOfMemory => 12,
                         narf_filesystem::FsError::QuotaExceeded => 122,
                         // ENOTCONN. No `open` path produces it today — it is
                         // the qgroup ioctls' answer for "quotas are off" — but
@@ -2103,7 +2104,6 @@ fn open_impl(
         let node_ino = ops.ino();
         let perms = ops.stat().mode.perms;
         let (fifo_uid, fifo_gid) = ops.owners();
-        let nonblock = flags & (crate::fd::O_NONBLOCK as u64) != 0;
         open_fifo(
             ctx,
             shared,
@@ -2112,8 +2112,7 @@ fn open_impl(
             perms,
             fifo_uid,
             fifo_gid,
-            access_mode,
-            nonblock,
+            open_status_flags,
             path,
             reservation,
         );
@@ -2175,11 +2174,12 @@ fn open_fifo(
     perms: u16,
     uid: u32,
     gid: u32,
-    access_mode: u64,
-    nonblock: bool,
+    status_flags: u32,
     _path: &str,
     reservation: fd::FdReservation,
 ) {
+    let access_mode = status_flags & crate::fd::O_ACCMODE;
+    let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
     let task = current_task_id();
     let can_read = access_mode == 0 || access_mode == 2; // O_RDONLY | O_RDWR
     let can_write = access_mode == 1 || access_mode == 2; // O_WRONLY | O_RDWR
@@ -2204,8 +2204,8 @@ fn open_fifo(
         gid,
         can_read,
         can_write,
-    )) as Arc<dyn narf_filesystem::FileOps>;
-    let status_flags = access_mode as u32 | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
+    ));
+    handle.set_packetized(status_flags & crate::fd::O_DIRECT != 0);
     let new_fd = match reservation.install(crate::fd::FdEntry {
             ops: handle,
             offset: 0,
@@ -4567,6 +4567,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::Busy => 16,
         narf_filesystem::FsError::ReadOnly => 30,
         narf_filesystem::FsError::NoSpace => 28,
+        narf_filesystem::FsError::OutOfMemory => 12,
         narf_filesystem::FsError::QuotaExceeded => 122,
         // ENOTCONN — see `FsError::NotConnected`.
         narf_filesystem::FsError::NotConnected => 107,
@@ -4578,6 +4579,88 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
 
 const LINUX_MAX_RW_COUNT: usize = 0x7fff_f000;
 const LINUX_IOV_MAX: usize = 1024;
+
+fn read_pipe_user(
+    ctx: &mut dyn TrapContext,
+    endpoint: &CopyFdEndpoint,
+    count: usize,
+    copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+) {
+    match crate::pipe::read_to_iter(endpoint.ops.as_ref(), count, true, copy) {
+        Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        Err(errno) if errno == EAGAIN as u64 && !endpoint.nonblocking() => {
+            if has_interrupting_signal(current_task_id()) {
+                ctx.set_return(errno_ret(EINTR));
+            } else if !park_reexecute_on_fd(ctx, endpoint.ops.as_ref(), narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP) {
+                ctx.set_return(errno_ret(EAGAIN));
+            }
+        }
+        Err(errno) => ctx.set_return(errno_ret(errno as i64)),
+    }
+}
+
+/// Native pipes consume scalar/vector iterators directly under their payload
+/// mutex. A blocked large write retains its accepted prefix on the task's
+/// kernel stack instead of restarting and duplicating bytes already sent.
+fn write_pipe_user(
+    ctx: &mut dyn TrapContext,
+    endpoint: &CopyFdEndpoint,
+    count: usize,
+    mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
+) {
+    let task = current_task_id();
+    let mut total = 0;
+    loop {
+        match crate::pipe::write_from_iter(endpoint.ops.as_ref(), count - total, |offset, bytes| copy(total + offset, bytes)) {
+            Ok((n, full)) => {
+                total += n;
+                if total == count || (n != 0 && !full) { break; }
+            }
+            Err(errno) => {
+                if errno == EPIPE as u64 { raise_signal_pending(task, 13); }
+                if total == 0 { ctx.set_return(errno_ret(errno as i64)); return; }
+                break;
+            }
+        }
+        if endpoint.nonblocking() {
+            if total == 0 { ctx.set_return(errno_ret(EAGAIN)); return; }
+            break;
+        }
+        // With no committed bytes the syscall can safely re-execute. Preserve
+        // its original arguments and restart-pending marker so signal delivery
+        // can distinguish SA_RESTART from EINTR. Once a prefix is committed,
+        // keep it on this stack and return it rather than replaying the write.
+        if total == 0 && park_reexecute_on_fd(ctx, endpoint.ops.as_ref(), narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR) {
+            return;
+        }
+        if has_interrupting_signal(task) {
+            if total == 0 { ctx.set_return(errno_ret(EINTR)); return; }
+            break;
+        }
+        if narf_scheduler::stackful::current_stackful_waker().is_none() {
+            break;
+        }
+        let ready = poll_blocking(core::future::poll_fn(|cx| {
+            // Register before checking pending signals: a signal racing this
+            // check must leave the task runnable before it parks on pipe space.
+            register_signal_waker(task, cx.waker().clone());
+            if has_interrupting_signal(task) { return Poll::Ready(false); }
+            match endpoint.ops.arm_readiness_exclusive(task, narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR, cx.waker()) {
+                Some(Poll::Ready(_)) => Poll::Ready(true),
+                Some(Poll::Pending) => Poll::Pending,
+                None => Poll::Ready(false),
+            }
+        }));
+        drop_signal_waker(task);
+        endpoint.ops.disarm_readiness(task);
+        if ready != Some(true) {
+            if total == 0 { ctx.set_return(errno_ret(EINTR)); return; }
+            break;
+        }
+    }
+    if total != 0 { wake_fifo_io_waiters(endpoint.ops.as_ref()); }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
 
 /// Linux `access_ok()` shape for read/write buffers, without NARF's generic
 /// 16-MiB single-copy allocation cap. Large I/O is staged in bounded chunks;
@@ -4812,21 +4895,15 @@ fn copy_fd_to_fd(
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
         let step_out_off = out_off;
-        let moved = if let Some(pipe_in) = input_ops
-            .as_any()
-            .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
-        {
-            if let Some(pipe_out) = output_ops
-                .as_any()
-                .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
-            {
-                pipe_in.splice_to_pipe(pipe_out, want)
+        let moved = if crate::pipe::is_pipe(input_ops.as_ref()) {
+            if let Some(result) = crate::pipe::transfer(input_ops.as_ref(), output_ops.as_ref(), want, false) {
+                result
             } else {
                 let mut sink_off = step_out_off;
-                pipe_in.splice_to_sink(want, |bytes| {
-                    // The source queue is locked until the accepted prefix is
-                    // committed. Never park while its IRQ-safe lock is held.
-                    let result = poll_once(output_ops.write(sink_off, bytes))
+                crate::pipe::splice_to_sink(input_ops.as_ref(), want, |bytes| {
+                    // The payload mutex is sleepable. Keep the source prefix
+                    // until the sink accepts it, including an asynchronous sink.
+                    let result = poll_blocking(output_ops.write(sink_off, bytes))
                         .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
                     if let Ok(written) = result {
                         sink_off = sink_off.saturating_add(written as u64);
@@ -4834,6 +4911,8 @@ fn copy_fd_to_fd(
                     result
                 })
             }
+        } else if crate::pipe::is_pipe(output_ops.as_ref()) {
+            crate::pipe::splice_from_source(input_ops.as_ref(), in_off, output_ops.as_ref(), want)
         } else {
             let mut kbuf = alloc::vec![0u8; want];
             let n = match poll_blocking(input_ops.read(in_off, &mut kbuf))

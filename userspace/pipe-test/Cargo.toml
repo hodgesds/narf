@@ -1,0 +1,11 @@
+[package]
+name = "narf-pipe-test"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"

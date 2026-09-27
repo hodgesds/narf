@@ -12,8 +12,8 @@ pub struct TrapFrame {
     pub domain_sctlr: u64,
     pub domain_gcr: u64,
     pub x30: u64,
-    /// Forced by the 16-byte stack allocation used to save `x30`.
-    pub _pad: u64,
+    /// User stack pointer saved at vector entry; survives kernel-stack parks.
+    pub sp_el0: u64,
     pub elr: u64,
     pub spsr: u64,
     pub x0: u64,
@@ -46,11 +46,15 @@ pub struct TrapFrame {
     pub x27: u64,
     pub x28: u64,
     pub x29: u64,
+    /// FP/SIMD image captured before Rust, restored only by vector assembly.
+    pub user_fp: super::user_mode::UserFpState,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<TrapFrame>() == 36 * 8);
+    assert!(core::mem::size_of::<TrapFrame>() == 36 * 8 + 528);
+    assert!(core::mem::offset_of!(TrapFrame, user_fp) == 288);
     assert!(core::mem::offset_of!(TrapFrame, x30) == 16);
+    assert!(core::mem::offset_of!(TrapFrame, sp_el0) == 24);
     assert!(core::mem::offset_of!(TrapFrame, elr) == 32);
     assert!(core::mem::offset_of!(TrapFrame, x0) == 48);
     assert!(core::mem::offset_of!(TrapFrame, x29) == 35 * 8);

@@ -98,6 +98,10 @@ impl Inner {
             }
         }
 
+        self.wake_exclusive(bits, wake_exclusive)
+    }
+
+    fn wake_exclusive(&mut self, bits: u32, wake: impl FnOnce(u64, &Waker)) -> Option<u64> {
         // Rotate non-matching exclusive waiters without exceeding the FIFO's
         // existing length/capacity, so this path cannot allocate in IRQ
         // context. Stale entries are discarded defensively.
@@ -113,7 +117,7 @@ impl Inner {
                 continue;
             }
             if waiter.interest & bits != 0 {
-                wake_exclusive(id, &waiter.waker);
+                wake(id, &waiter.waker);
                 return Some(id);
             }
             self.exclusive_order.push_back(id);
@@ -258,6 +262,40 @@ impl Readiness {
         //   exclusive waiter is removed only from the u64 FIFO, leaving its
         //   waker stored until task-context re-arm/disarm.
         g.wake_waiters(if rising != 0 { new } else { ready_event }, wake_exclusive)
+    }
+
+    /// Publish a directed provider event, then relay available work to one
+    /// exclusive waiter in the other direction. Pipe readers use OUT as the
+    /// event and IN as the continuation; writers do the reverse. Continuations
+    /// do not synthesize poll edges, and each direction selects at most one
+    /// exclusive waiter. The callback must obey set_event_with_exclusive_wake's
+    /// under-lock, allocation-free wake contract.
+    pub fn set_event_with_continuation(
+        &self,
+        add: u32,
+        clear: u32,
+        event: u32,
+        continuation: u32,
+        mut wake: impl FnMut(u64, &Waker),
+    ) -> Option<u64> {
+        let mut g = self.inner.lock();
+        let old = g.mask;
+        let new = (old & !clear) | add;
+        g.mask = new;
+        let changed = (new & !old) | (event & new);
+        let first = if changed != 0 {
+            g.seq = g.seq.wrapping_add(1);
+            g.wake_waiters(changed, &mut wake)
+        } else {
+            None
+        };
+        let relay = continuation & new & !changed;
+        let second = if relay != 0 {
+            g.wake_exclusive(relay, wake)
+        } else {
+            None
+        };
+        first.or(second)
     }
 
     /// Publish a level transition and wake every matching waiter on a rising
@@ -592,6 +630,33 @@ mod tests {
             3,
             "IRQ-safe wake must retain every stored waker"
         );
+    }
+
+    #[test]
+    fn pipe_continuation_relays_readers_without_fabricating_poll_edges() {
+        const OUT: u32 = 4;
+        let r = Readiness::new(OUT);
+        let first = Arc::new(AtomicU32::new(0));
+        let second = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(AtomicU32::new(0));
+        assert_eq!(
+            r.arm_exclusive(1, IN, &counting_waker(&first)),
+            Poll::Pending
+        );
+        assert_eq!(
+            r.arm_exclusive(2, IN, &counting_waker(&second)),
+            Poll::Pending
+        );
+        r.arm_persistent(3, IN, &counting_waker(&observer));
+        r.set_event_with_continuation(IN | OUT, 0, IN, OUT, |_, w| w.wake_by_ref());
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.load(Ordering::SeqCst), 1);
+        // The selected reader consumes only part of the data. OUT was already
+        // ready; the remaining reader still needs an explicit exclusive relay.
+        r.set_event_with_continuation(IN | OUT, 0, OUT, IN, |_, w| w.wake_by_ref());
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! Anonymous pipe(2) file-ops.
 //!
-//! Backs a pair of fd-table entries with a shared byte ring buffer.
+//! Backs a pair of fd-table entries with a shared ring of page buffers.
 //! The file-op futures expose try-style results; the syscall layer parks a
 //! blocking caller on the shared durable readiness cell and re-executes the
 //! syscall when its peer changes the pipe state.
 //!
 //! Why not `narf-ipc::Ring<u8, N>`? `Ring`'s `Producer`/`Consumer`
 //! halves are `!Sync`, but `FileOps: Send + Sync` — and the same
-//! pipe-half is shared between parent and child after a future
-//! `fork`. The shared queue therefore uses an IRQ-safe lock.
+//! pipe-half is shared between parent and child after `fork`. A per-pipe
+//! sleepable mutex serializes payload ownership; a short publication lock
+//! serializes readiness updates without covering payload copies or I/O.
 //!
 //! Closure semantics: the read-side `FileOps::read` returns 0 (EOF)
 //! when the buffer is empty AND the writer side has been dropped;
@@ -20,18 +21,11 @@
 
 use crate::errno::*;
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
-
-/// Pipe ring capacity. Matches Linux's default pipe buffer
-/// (`include/linux/pipe_fs_i.h`: 16 pages × 4 KiB = 65536), which is
-/// what `fcntl(F_GETPIPE_SZ)` reports on a fresh pipe.
-const PIPE_DEFAULT_BYTES: usize = 65_536;
 
 /// POSIX `PIPE_BUF` (Linux `include/linux/limits.h`): writes of at most
 /// this many bytes are ATOMIC — `fs/pipe.c::pipe_write` refuses to split
@@ -40,451 +34,363 @@ const PIPE_DEFAULT_BYTES: usize = 65_536;
 /// short-on-room write of ≤ PIPE_BUF bytes writes NOTHING and blocks
 /// (or EAGAINs for O_NONBLOCK) until the whole payload fits.
 const PIPE_BUF: usize = 4096;
-/// Stack staging cutoff for an atomic pipe write/read. This matches Linux's
-/// page-sized PIPE_BUF and stress-ng's transfer size, avoiding heap allocation
-/// while keeping the transactional user-copy buffer tightly bounded.
-pub(crate) const PIPE_FAST_BYTES: usize = PIPE_BUF;
 
 /// Linux `FIONREAD` / `TIOCINQ`: write the immediately readable byte
 /// count as an `int` through the ioctl argument pointer.
 const FIONREAD: u32 = 0x541B;
 
-/// Linux `PIPE_DEF_BUFFERS` (`include/linux/pipe_fs_i.h`): a fresh pipe holds
-/// at most 16 `struct pipe_buffer`s. `pipe_full()` compares the BUFFER count
-/// against this limit, not a byte count:
-///
-///     return pipe_occupancy(head, tail) >= limit;
-///
-/// so sixteen one-byte packets fill a 64 KiB pipe. That only matters in packet
-/// mode: ordinary writes merge into the tail buffer, so a byte-stream pipe
-/// never accumulates buffers and only ever hits the byte limit.
-/// One queued `struct pipe_buffer`'s framing metadata.
-#[derive(Debug)]
-struct PipeFrame {
+use narf_filesystem::{pipe_buffer::PipeBufs, pipe_queue as queue};
+
+fn lock_queue(queue: &queue::Queue) -> queue::Guard<'_> {
+    crate::handlers::poll_blocking(queue.lock_async())
+        .expect("pipe mutex acquisition requires a runnable task context")
+}
+
+enum Endpoint<'a> {
+    Read(&'a PipeRead),
+    Write(&'a PipeWrite),
+    Named(&'a narf_filesystem::fifo::FifoHandle),
+}
+
+impl<'a> Endpoint<'a> {
+    fn from_file(ops: &'a dyn FileOps) -> Option<Self> {
+        let any = ops.as_any()?;
+        if let Some(read) = any.downcast_ref::<PipeRead>() {
+            return Some(Self::Read(read));
+        }
+        if let Some(write) = any.downcast_ref::<PipeWrite>() {
+            return Some(Self::Write(write));
+        }
+        any.downcast_ref::<narf_filesystem::fifo::FifoHandle>()
+            .map(Self::Named)
+    }
+    fn queue(&self) -> &queue::Queue {
+        match self {
+            Self::Read(read) => &read.shared.queue,
+            Self::Write(write) => &write.shared.queue,
+            Self::Named(fifo) => fifo.shared().queue(),
+        }
+    }
+    fn writer_closed(&self) -> bool {
+        match self {
+            Self::Read(read) => read.shared.writer_closed.load(Ordering::Acquire),
+            Self::Write(write) => write.shared.writer_closed.load(Ordering::Acquire),
+            Self::Named(fifo) => fifo.shared().writer_count() == 0,
+        }
+    }
+    fn reader_closed(&self) -> bool {
+        match self {
+            Self::Read(read) => read.shared.reader_closed.load(Ordering::Acquire),
+            Self::Write(write) => write.shared.reader_closed.load(Ordering::Acquire),
+            Self::Named(fifo) => fifo.shared().reader_count() == 0,
+        }
+    }
+    fn notify(&self, event: u32, transferred: usize) {
+        match self {
+            Self::Read(read) => {
+                read.shared
+                    .sync_readiness_after_transfer(event, 0, false, transferred)
+            }
+            Self::Write(write) => {
+                write
+                    .shared
+                    .sync_readiness_after_transfer(event, 0, false, transferred)
+            }
+            Self::Named(fifo) => fifo.shared().notify_transfer(event, transferred),
+        }
+    }
+    fn packetized(&self) -> bool {
+        match self {
+            Self::Read(_) => false,
+            Self::Write(write) => write.packetized.load(Ordering::Acquire),
+            Self::Named(fifo) => fifo.packetized(),
+        }
+    }
+}
+
+/// One transactional iterator write, including capacity/fault distinction for
+/// a blocking syscall which must retain its accepted prefix while sleeping.
+pub(crate) fn write_from_iter(
+    ops: &dyn FileOps,
     len: usize,
-    /// `PIPE_BUF_FLAG_PACKET` — set by `pipe_write` when the writing file has
-    /// O_DIRECT (`fs/pipe.c::is_packetized`). A packet is one record: a read
-    /// never returns more than one, and never returns part of one and keeps
-    /// the rest.
-    packet: bool,
+    copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
+) -> Result<(usize, bool), u64> {
+    let output = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
+    let mut q = lock_queue(output.queue());
+    if output.reader_closed() {
+        return Err(EPIPE as u64);
+    }
+    let n = q.write_with(len, output.packetized(), copy)?;
+    let full = q.is_full();
+    drop(q);
+    if n != 0 {
+        output.notify(narf_filesystem::POLL_IN, n);
+    }
+    Ok((n, full))
 }
 
-/// Fixed-capacity byte ring backing a pipe. Unlike `VecDeque<u8>`, this exposes
-/// the one or two contiguous writable regions at the tail, allowing guarded
-/// user copies to land directly in pipe storage before the new length is
-/// committed.
-#[derive(Debug)]
-struct PipeBytes {
-    storage: Box<[u8]>,
-    head: usize,
+pub(crate) fn read_to_iter(
+    ops: &dyn FileOps,
     len: usize,
-}
-
-impl PipeBytes {
-    fn new() -> Self {
-        Self {
-            storage: alloc::vec![0; PIPE_DEFAULT_BYTES].into_boxed_slice(),
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn capacity(&self) -> usize {
-        self.storage.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn prefix_slices(&self, n: usize) -> (&[u8], &[u8]) {
-        debug_assert!(n <= self.len);
-        let first = core::cmp::min(n, self.capacity() - self.head);
-        (
-            &self.storage[self.head..self.head + first],
-            &self.storage[..n - first],
-        )
-    }
-
-    fn spare_slices_mut(&mut self, n: usize) -> (&mut [u8], &mut [u8]) {
-        let capacity = self.capacity();
-        debug_assert!(n <= capacity - self.len);
-        let tail = (self.head + self.len) % capacity;
-        let first = core::cmp::min(n, capacity - tail);
-        let (before, after) = self.storage.split_at_mut(tail);
-        (&mut after[..first], &mut before[..n - first])
-    }
-
-    fn commit_write(&mut self, n: usize) {
-        debug_assert!(n <= self.capacity() - self.len);
-        self.len += n;
-    }
-
-    fn push(&mut self, data: &[u8]) {
-        let n = data.len();
-        {
-            let (first, wrapped) = self.spare_slices_mut(n);
-            let split = first.len();
-            first.copy_from_slice(&data[..split]);
-            wrapped.copy_from_slice(&data[split..]);
-        }
-        self.commit_write(n);
-    }
-
-    /// Append a logical span from another pipe ring directly into this one.
-    /// The source and destination may each wrap independently, so advance by
-    /// the shorter contiguous span instead of bouncing every page through an
-    /// intermediate stack buffer.
-    fn append_from(&mut self, source: &Self, source_offset: usize, n: usize) {
-        debug_assert!(source_offset.saturating_add(n) <= source.len);
-        debug_assert!(n <= self.capacity() - self.len);
-        let source_capacity = source.capacity();
-        let destination_capacity = self.capacity();
-        let mut copied = 0usize;
-        let mut destination = (self.head + self.len) % destination_capacity;
-        while copied < n {
-            let source_index = (source.head + source_offset + copied) % source_capacity;
-            let chunk = core::cmp::min(
-                n - copied,
-                core::cmp::min(
-                    source_capacity - source_index,
-                    destination_capacity - destination,
-                ),
-            );
-            self.storage[destination..destination + chunk]
-                .copy_from_slice(&source.storage[source_index..source_index + chunk]);
-            copied += chunk;
-            destination = (destination + chunk) % destination_capacity;
-        }
-        self.commit_write(n);
-    }
-
-    fn copy_out(&self, offset: usize, dst: &mut [u8]) {
-        debug_assert!(offset + dst.len() <= self.len);
-        let len = dst.len();
-        let capacity = self.capacity();
-        let start = (self.head + offset) % capacity;
-        let first = core::cmp::min(len, capacity - start);
-        dst[..first].copy_from_slice(&self.storage[start..start + first]);
-        dst[first..].copy_from_slice(&self.storage[..len - first]);
-    }
-
-    fn consume(&mut self, n: usize) {
-        debug_assert!(n <= self.len);
-        self.head = (self.head + n) % self.capacity();
-        self.len -= n;
-        if self.len == 0 {
-            self.head = 0;
-        }
-    }
-
-    /// Replace the backing ring while preserving its logical byte order.
-    /// The caller preallocates `storage` before taking the pipe's IRQ-safe
-    /// queue lock and verifies that the live prefix fits.
-    fn replace_storage(&mut self, mut storage: Box<[u8]>) {
-        debug_assert!(storage.len() >= self.len);
-        let (front, wrapped) = self.prefix_slices(self.len);
-        storage[..front.len()].copy_from_slice(front);
-        storage[front.len()..self.len].copy_from_slice(wrapped);
-        self.storage = storage;
-        self.head = 0;
-    }
-}
-
-/// The pipe's buffer list: a flat byte queue with the write boundaries laid
-/// over it. `frames` covers `bytes` exactly — the frame lengths always sum to
-/// `bytes.len()`.
-///
-/// Linux keeps a ring of `struct pipe_buffer`, each owning a page. Flattening
-/// the payload and carrying only the boundaries keeps every existing
-/// byte-stream path (splice, tee, FIONREAD, poll) working on one contiguous
-/// queue while still answering the only question packet mode asks: where does
-/// this record end?
-///
-/// The merge rule below is what makes that safe. Consecutive non-packet writes
-/// coalesce into a single frame, so a pipe that never sees O_DIRECT holds at
-/// most one frame and every query here degenerates to the byte arithmetic it
-/// replaced. Linux instead merges only up to a page boundary
-/// (`offset + chars <= PAGE_SIZE`), but that limit is invisible to a
-/// non-packet reader — `pipe_read` walks buffers without reporting where one
-/// ended — so coalescing further changes nothing a caller can observe.
-#[derive(Debug)]
-struct PipeBufs {
-    bytes: PipeBytes,
-    frames: VecDeque<PipeFrame>,
-}
-
-impl PipeBufs {
-    fn new() -> Self {
-        Self {
-            bytes: PipeBytes::new(),
-            frames: VecDeque::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    fn capacity(&self) -> usize {
-        self.bytes.capacity()
-    }
-
-    fn max_frames(&self) -> usize {
-        self.capacity() / PIPE_BUF
-    }
-
-    /// Conservative Linux pipe-buffer occupancy for resize admission. Packet
-    /// frames consume one slot each; coalesced stream frames account for every
-    /// page they span even though their boundaries are invisible to readers.
-    fn occupied_frames(&self) -> usize {
-        self.frames
-            .iter()
-            .map(|frame| frame.len.div_ceil(PIPE_BUF))
-            .sum()
-    }
-
-    /// Would `pipe_full()` stop a writer here? Either limit can bind: bytes
-    /// for a stream pipe, buffers for a packet pipe.
-    fn is_full(&self) -> bool {
-        self.bytes.len() >= self.capacity() || self.frames.len() >= self.max_frames()
-    }
-
-    /// Bytes a write of this kind can still deposit.
-    ///
-    /// A non-packet write that can merge into the tail buffer needs no new
-    /// buffer, so it is bounded by bytes alone — which is why a stream pipe
-    /// never notices the frame limit. A packet write always needs a fresh
-    /// buffer per page, so it is bounded by both.
-    fn room(&self, packet: bool) -> usize {
-        let byte_room = self.capacity().saturating_sub(self.bytes.len());
-        let free_frames = self.max_frames().saturating_sub(self.frames.len());
-        if packet {
-            core::cmp::min(byte_room, free_frames.saturating_mul(PIPE_BUF))
-        } else if self.frames.back().is_some_and(|frame| !frame.packet) || free_frames > 0 {
-            byte_room
+    discard_packets: bool,
+    mut copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+) -> Result<usize, u64> {
+    let input = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
+    let mut q = lock_queue(input.queue());
+    if q.is_empty() {
+        return if input.writer_closed() {
+            Ok(0)
         } else {
-            0
-        }
+            Err(EAGAIN as u64)
+        };
     }
-
-    /// Record a frame boundary for `len` bytes already appended to `bytes`.
-    fn push_frame(&mut self, len: usize, packet: bool) {
-        if len == 0 {
-            return;
-        }
-        match self.frames.back_mut() {
-            Some(tail) if !packet && !tail.packet => tail.len += len,
-            _ => self.frames.push_back(PipeFrame { len, packet }),
-        }
-    }
-
-    fn push(&mut self, data: &[u8], packet: bool) {
-        if data.is_empty() {
-            return;
-        }
-        self.bytes.push(data);
-        if packet {
-            // `pipe_write` copies at most one page into each buffer
-            // (`copy_page_from_iter(page, 0, PAGE_SIZE, from)`) and loops, so a
-            // packet write larger than a page arrives as SEVERAL packets — not
-            // one oversized record. A reader that assumed otherwise would treat
-            // the split as a lost boundary.
-            for chunk in data.chunks(PIPE_BUF) {
-                self.push_frame(chunk.len(), true);
+    let mut total = 0;
+    while total < len && !q.is_empty() {
+        let (buffer_len, packet) = q.front_info().unwrap();
+        let n = buffer_len.min(len - total);
+        if let Err(errno) = q.with_front_raw(n, |ptr, count| copy(total, ptr, count)) {
+            if total == 0 {
+                return Err(errno);
             }
+            break;
+        }
+        q.commit(if packet && discard_packets {
+            buffer_len
         } else {
-            self.push_frame(data.len(), false);
+            n
+        });
+        total += n;
+        if packet && discard_packets {
+            break;
         }
     }
-
-    /// What a read of `max` bytes takes: `(copied, consumed)`.
-    ///
-    /// `fs/pipe.c::pipe_read` walks buffers until the request is satisfied, but
-    /// stops at the first packet buffer and drops whatever is left in it:
-    ///
-    ///     if (chars > total_len) {
-    ///             ...
-    ///             chars = total_len;
-    ///     }
-    ///     ...
-    ///     /* Was it a packet buffer? Clean up and exit */
-    ///     if (buf->flags & PIPE_BUF_FLAG_PACKET) {
-    ///             total_len = chars;
-    ///             buf->len = 0;
-    ///     }
-    ///
-    /// `buf->len = 0` retires the whole buffer however little was copied, and
-    /// `total_len = chars` ends the read. That is why the two counts differ: a
-    /// short read of a packet returns the truncated prefix and DISCARDS the
-    /// remainder. Reporting `consumed` separately is what lets each read path
-    /// perform that discard without folding it into the byte count it returns
-    /// to the caller — conflating them would report bytes that were never
-    /// copied.
-    ///
-    /// `PIPE_BUF_FLAG_WHOLE` (the -ENOBUFS "entire buffer or error" rule) is a
-    /// watch-queue flag, not a packet one; O_DIRECT truncates rather than
-    /// failing, so it is deliberately not modelled here.
-    fn read_span(&self, max: usize) -> (usize, usize) {
-        let mut copied = 0;
-        let mut consumed = 0;
-        let mut left = max;
-        for frame in self.frames.iter() {
-            if left == 0 {
-                break;
-            }
-            let take = core::cmp::min(left, frame.len);
-            copied += take;
-            left -= take;
-            if frame.packet {
-                consumed += frame.len;
-                break;
-            }
-            consumed += take;
-        }
-        (copied, consumed)
+    drop(q);
+    if total != 0 {
+        input.notify(narf_filesystem::POLL_OUT, total);
     }
+    Ok(total)
+}
 
-    /// Drop `consumed` bytes from the front, keeping `frames` covering `bytes`.
-    fn commit(&mut self, consumed: usize) {
-        self.bytes.consume(consumed);
-        self.retire_frames(consumed);
+/// All anonymous/named combinations use the same ordered two-queue operation.
+pub(crate) fn transfer(
+    input: &dyn FileOps,
+    output: &dyn FileOps,
+    max: usize,
+    duplicate: bool,
+) -> Option<Result<usize, narf_filesystem::FsError>> {
+    use narf_filesystem::FsError;
+    let input = Endpoint::from_file(input)?;
+    let output = Endpoint::from_file(output)?;
+    let source = input.queue();
+    let destination = output.queue();
+    if core::ptr::eq(source, destination) {
+        return Some(Err(FsError::InvalidData));
     }
+    let (mut src, mut dst) = if (source as *const _ as usize) < (destination as *const _ as usize) {
+        let src = lock_queue(source);
+        (src, lock_queue(destination))
+    } else {
+        let dst = lock_queue(destination);
+        (lock_queue(source), dst)
+    };
+    if src.is_empty() && !input.writer_closed() {
+        return Some(Err(FsError::WouldBlock));
+    }
+    if output.reader_closed() {
+        return Some(Err(FsError::BrokenPipe));
+    }
+    if dst.is_full() {
+        return Some(Err(FsError::WouldBlock));
+    }
+    let n = if duplicate {
+        src.copy_prefix_to(&mut dst, max)
+    } else {
+        src.move_prefix_to(&mut dst, max)
+    };
+    drop(dst);
+    drop(src);
+    if n != 0 {
+        if !duplicate {
+            input.notify(narf_filesystem::POLL_OUT, n);
+        }
+        output.notify(narf_filesystem::POLL_IN, n);
+    }
+    Some(Ok(n))
+}
 
-    /// The frame half of [`Self::commit`], for callers that already moved the
-    /// bytes out of `bytes` themselves.
-    fn retire_frames(&mut self, consumed: usize) {
-        let mut left = consumed;
-        while left > 0 {
-            let Some(front) = self.frames.front_mut() else {
-                break;
-            };
-            if front.len > left {
-                front.len -= left;
-                break;
+pub(crate) fn resize(ops: &dyn FileOps, arg: u32) -> Option<Result<usize, u64>> {
+    let endpoint = Endpoint::from_file(ops)?;
+    Some((|| {
+        if arg > 1u32 << 31 {
+            return Err(EINVAL as u64);
+        }
+        let requested = (arg as usize).max(PIPE_BUF).next_power_of_two();
+        if requested > narf_filesystem::procfs::sys_fs::pipe_max_size() as usize {
+            return Err(EPERM as u64);
+        }
+        lock_queue(endpoint.queue()).resize(requested / PIPE_BUF)?;
+        endpoint.notify(narf_filesystem::POLL_OUT, PIPE_BUF);
+        Ok(requested)
+    })())
+}
+
+pub(crate) fn is_pipe(ops: &dyn FileOps) -> bool {
+    Endpoint::from_file(ops).is_some()
+}
+
+pub(crate) fn vmsplice_into(
+    ops: &dyn FileOps,
+    address_space: Option<&narf_memory::AddressSpace>,
+    base: u64,
+    len: usize,
+) -> Result<Result<usize, narf_filesystem::FsError>, u64> {
+    let endpoint = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
+    let mut q = lock_queue(endpoint.queue());
+    if endpoint.reader_closed() {
+        return Ok(Err(narf_filesystem::FsError::BrokenPipe));
+    }
+    #[cfg(feature = "kernel-test")]
+    if crate::handlers::kernel_buf_scope::active() {
+        let n = q.write_unmerged(len, |offset, dst| {
+            // SAFETY: explicitly scoped kernel-test scratch buffers only.
+            unsafe { crate::handlers::copy_from_user(dst, base + offset as u64) }
+        })?;
+        drop(q);
+        if n != 0 {
+            endpoint.notify(narf_filesystem::POLL_IN, n);
+        }
+        return Ok(Ok(n));
+    }
+    let address_space = address_space.ok_or(EFAULT as u64)?;
+    let mut total = 0;
+    while total < len && !q.is_full() {
+        let address = base + total as u64;
+        let offset = (address & 4095) as usize;
+        let count = (len - total).min(4096 - offset);
+        let result = (|| {
+            // Fault in the page before looking up and retaining its current
+            // backing under the memory subsystem's ownership lock. A racing
+            // unmap is revalidated by pin_user_page, never by stale metadata.
+            let mut probe = [0u8];
+            // SAFETY: the complete iovec passed access_ok; guarded touch may
+            // return EFAULT after a concurrent protection/mapping change.
+            unsafe { crate::handlers::copy_from_user(&mut probe, address) }?;
+            let pin = address_space
+                .pin_user_page(narf_memory::VirtAddr::new(address))
+                .ok_or(EFAULT as u64)?;
+            q.push_pinned(pin, offset, count)
+        })();
+        if let Err(errno) = result {
+            if total == 0 {
+                return Err(errno);
             }
-            left -= front.len;
-            self.frames.pop_front();
+            break;
+        }
+        total += count;
+    }
+    drop(q);
+    if total != 0 {
+        endpoint.notify(narf_filesystem::POLL_IN, total);
+    }
+    Ok(Ok(total))
+}
+
+pub(crate) fn splice_to_sink(
+    input: &dyn FileOps,
+    max: usize,
+    mut write: impl FnMut(&[u8]) -> Result<usize, narf_filesystem::FsError>,
+) -> Result<usize, narf_filesystem::FsError> {
+    use narf_filesystem::FsError;
+    let input = Endpoint::from_file(input).ok_or(FsError::InvalidData)?;
+    let mut q = lock_queue(input.queue());
+    if q.is_empty() {
+        return if input.writer_closed() {
+            Ok(0)
+        } else {
+            Err(FsError::WouldBlock)
+        };
+    }
+    let mut total = 0;
+    while total < max && !q.is_empty() {
+        let offered = q.front_len(max - total);
+        let n = match q.with_front(offered, &mut write) {
+            Ok(n) if n <= offered => n,
+            Ok(_) if total == 0 => return Err(FsError::InvalidData),
+            Err(error) if total == 0 => return Err(error),
+            _ => break,
+        };
+        q.commit(n);
+        total += n;
+        if n < offered {
+            break;
         }
     }
-
-    /// Duplicate up to `max` bytes into `dst` WITHOUT consuming them, carrying
-    /// each frame's packet flag — the tee(2) counterpart of
-    /// [`Self::move_prefix_to`].
-    ///
-    /// `fs/splice.c::link_pipe` copies whole `struct pipe_buffer`s and keeps
-    /// their flags:
-    ///
-    ///     *obuf = *ibuf;
-    ///     obuf->flags &= ~PIPE_BUF_FLAG_GIFT;
-    ///     obuf->flags &= ~PIPE_BUF_FLAG_CAN_MERGE;
-    ///     if (obuf->len > len)
-    ///             obuf->len = len;
-    ///
-    /// so PIPE_BUF_FLAG_PACKET survives a tee and the destination reads back
-    /// the same records the source holds. The final buffer may be TRUNCATED to
-    /// the caller's remaining length and still keeps its flag — a short tee of
-    /// a packet yields a shorter packet, not a stream fragment.
-    ///
-    /// Its loop stops on `pipe_full(o_head, o_tail, opipe->max_usage)`, a
-    /// buffer-count test, which is what `dst.room` reproduces.
-    ///
-    /// The one flag not modelled is CAN_MERGE: Linux clears it so a later
-    /// write on the destination cannot extend a teed buffer, whereas
-    /// [`Self::push_frame`] will merge into it. That is unobservable to a
-    /// reader — non-packet boundaries are invisible to `pipe_read` — and it
-    /// only shifts the destination's buffer COUNT, which already diverges
-    /// because this queue merges past the page boundary Linux stops at.
-    /// Modelling half of the merge rule would make that divergence less
-    /// predictable, not more.
-    fn copy_prefix_to(&self, dst: &mut PipeBufs, max: usize) -> usize {
-        let mut copied = 0;
-        let mut offset = 0;
-        for frame in self.frames.iter() {
-            if copied >= max {
-                break;
-            }
-            let room = dst.room(frame.packet);
-            let n = core::cmp::min(core::cmp::min(max - copied, frame.len), room);
-            if n == 0 {
-                break;
-            }
-            dst.bytes.append_from(&self.bytes, offset, n);
-            dst.push_frame(n, frame.packet);
-            copied += n;
-            if n < frame.len {
-                // Truncated tail buffer — nothing after it can be copied.
-                break;
-            }
-            offset += frame.len;
-        }
-        copied
+    drop(q);
+    if total != 0 {
+        input.notify(narf_filesystem::POLL_OUT, total);
     }
+    Ok(total)
+}
 
-    /// Move up to `max` bytes into `dst`, carrying each frame's packet flag.
-    ///
-    /// `fs/splice.c` moves whole `struct pipe_buffer`s between pipes rather
-    /// than bytes, so the flags travel with the payload and a packet is never
-    /// split across the transfer. Hence the all-or-nothing step for a packet
-    /// frame: a destination without room for the whole record stops the move
-    /// instead of tearing it. A trailing NON-packet frame may still move
-    /// partially, because its boundary is invisible to any reader.
-    fn move_prefix_to(&mut self, dst: &mut PipeBufs, max: usize) -> usize {
-        // The dominant splice shape is a complete transfer into an empty pipe
-        // of the same capacity. Exchange the two backing rings and frame lists
-        // in O(1): the source receives the destination's empty allocation and
-        // the destination takes the complete queued payload. This is the flat
-        // ring equivalent of Linux moving `pipe_buffer` page references rather
-        // than copying their contents. Equal capacities are required because
-        // F_SETPIPE_SZ belongs to the pipe, not to whichever payload it holds.
-        if !self.is_empty()
-            && dst.is_empty()
-            && max >= self.len()
-            && self.capacity() == dst.capacity()
-        {
-            debug_assert!(dst.frames.is_empty());
-            let moved = self.len();
-            core::mem::swap(&mut self.bytes, &mut dst.bytes);
-            core::mem::swap(&mut self.frames, &mut dst.frames);
-            return moved;
-        }
-
-        let mut moved = 0;
-        while moved < max {
-            let Some(&PipeFrame { len, packet }) = self.frames.front() else {
-                break;
-            };
-            let room = dst.room(packet);
-            if room == 0 {
-                break;
-            }
-            let n = if packet {
-                if len > core::cmp::min(max - moved, room) {
-                    break;
-                }
-                len
-            } else {
-                core::cmp::min(core::cmp::min(max - moved, room), len)
-            };
-            if n == 0 {
-                break;
-            }
-            dst.bytes.append_from(&self.bytes, 0, n);
-            self.bytes.consume(n);
-            dst.push_frame(n, packet);
-            self.retire_frames(n);
-            moved += n;
-        }
-        moved
+/// Retain native file pages, or read a buffered provider directly into fresh
+/// nonmergeable pipe pages (Linux's copy_splice_read fallback).
+pub(crate) fn splice_from_source(
+    input: &dyn FileOps,
+    offset: u64,
+    output: &dyn FileOps,
+    max: usize,
+) -> Result<usize, narf_filesystem::FsError> {
+    use narf_filesystem::FsError;
+    let output = Endpoint::from_file(output).ok_or(FsError::InvalidData)?;
+    let mut q = lock_queue(output.queue());
+    if output.reader_closed() {
+        return Err(FsError::BrokenPipe);
     }
+    if q.is_full() {
+        return Err(FsError::WouldBlock);
+    }
+    let mut total = 0;
+    while total < max && !q.is_full() {
+        let result = match input.splice_read_page(offset + total as u64, max - total) {
+            Ok(Some(page)) if page.byte_len() <= max - total => {
+                q.push_file_page(page).map_err(|_| FsError::OutOfMemory)
+            }
+            Ok(Some(_)) => Err(FsError::InvalidData),
+            Ok(None) => break,
+            Err(FsError::Unsupported) => {
+                let mut actor_error = None;
+                let result = q.fill_from(max - total, |within, bytes| {
+                    crate::handlers::poll_blocking(
+                        input.read(offset + total as u64 + within as u64, bytes),
+                    )
+                    .unwrap_or(Err(FsError::WouldBlock))
+                    .map_err(|error| {
+                        actor_error = Some(error);
+                        5
+                    })
+                });
+                result.map_err(|errno| {
+                    actor_error.unwrap_or(if errno == 12 {
+                        FsError::OutOfMemory
+                    } else {
+                        FsError::InvalidData
+                    })
+                })
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(error) if total == 0 => return Err(error),
+            Err(_) => break,
+        }
+    }
+    drop(q);
+    if total != 0 {
+        output.notify(narf_filesystem::POLL_IN, total);
+    }
+    Ok(total)
 }
 
 /// Shared mutable state between the read+write halves: the byte
@@ -493,7 +399,8 @@ impl PipeBufs {
 /// future without holding the queue lock.
 #[derive(Debug)]
 struct PipeShared {
-    queue: IrqSafeSpinLock<PipeBufs>,
+    queue: queue::Queue,
+    publish: IrqSafeSpinLock<()>,
     /// Set when the write half is dropped. The read half observes
     /// this to flip empty-read from "try again" to EOF.
     writer_closed: AtomicBool,
@@ -506,13 +413,13 @@ struct PipeShared {
     /// POLL_ERR (reader gone). The read fd arms POLL_IN|POLL_HUP, the write fd
     /// arms POLL_OUT|POLL_ERR (the poll/epoll layer folds ERR|HUP into every arm
     /// interest); `set` wakes each waiter on its own rising bits, and `notify`
-    /// (see [`PipeShared::sync_readiness`]) fires the wait-queue for the changed
+    /// (see [`PipeShared::sync_readiness_after_transfer`]) fires the wait-queue for the changed
     /// direction so an EPOLLET consumer re-fires even at the same level.
     readiness: narf_lib::readiness::Readiness,
     /// Readiness publication is lazy. An untouched pipe has no possible
     /// waiter, so taking the readiness spinlock on every empty/full edge only
     /// maintains state nobody can observe. The first readiness accessor sets
-    /// this while holding `queue`, publishes an exact snapshot, and leaves it
+    /// this while holding `publish`, publishes a current snapshot, and leaves it
     /// set forever; subsequent queue mutations then maintain and wake the
     /// durable cell normally.
     readiness_active: AtomicBool,
@@ -523,70 +430,21 @@ struct PipeShared {
 
 impl PipeShared {
     fn capacity(&self) -> usize {
-        self.queue.lock().capacity()
-    }
-
-    /// Linux `pipe_set_size` semantics for an unprivileged caller. Sizes are
-    /// rounded to a page-sized power of two, values above 2 GiB are EINVAL,
-    /// growth above the system ceiling is EPERM, a shrink below live buffer
-    /// occupancy is EBUSY, and backing-allocation failure is ENOMEM.
-    fn set_capacity(&self, arg: u32) -> Result<usize, u64> {
-        if arg > (1u32 << 31) {
-            return Err(EINVAL as u64);
-        }
-        let requested = (arg as usize).max(PIPE_BUF).next_power_of_two();
-        // `fs.pipe-max-size`. Linux answers EPERM for a request above it
-        // unless the caller holds CAP_SYS_RESOURCE; NARF has no such bypass,
-        // so the knob is the whole of the limit. This used to compare against
-        // a local constant holding the same 1 MiB the knob advertises, so the
-        // two agreed by coincidence and writing /proc changed nothing.
-        if requested > narf_filesystem::procfs::sys_fs::pipe_max_size() as usize {
-            return Err(EPERM as u64); // no CAP_SYS_RESOURCE/root bypass in NARF
-        }
-        if requested == self.capacity() {
-            return Ok(requested);
-        }
-
-        // Allocate before disabling IRQs through the queue lock. `try_reserve`
-        // preserves Linux's recoverable ENOMEM rather than turning pressure
-        // into an allocator panic.
-        let mut replacement = Vec::new();
-        replacement
-            .try_reserve_exact(requested)
-            .map_err(|_| 12u64)?; // ENOMEM
-        replacement.resize(requested, 0);
-        let replacement = replacement.into_boxed_slice();
-
-        let mut q = self.queue.lock();
-        let requested_frames = requested / PIPE_BUF;
-        if q.len() > requested || q.occupied_frames() > requested_frames {
-            return Err(EBUSY as u64);
-        }
-        if q.capacity() != requested {
-            q.bytes.replace_storage(replacement);
-        }
-        let len = q.len();
-        let full = q.is_full();
-        drop(q);
-        // Growing a full pipe makes POLLOUT rise and must wake a blocked writer.
-        self.sync_readiness_state(narf_filesystem::POLL_OUT, len, full);
-        Ok(requested)
+        self.queue.capacity()
     }
 
     /// Start maintaining the durable readiness cell on first use. Taking the
-    /// queue lock before publishing `readiness_active` closes both races:
-    ///
-    /// * an earlier mutation that observed `false` is included in this queue
-    ///   snapshot;
-    /// * a later mutation cannot change the queue until `true` is visible and
-    ///   the snapshot has been published.
+    /// publication lock orders activation against transfer/close publication.
+    /// Earlier completed mutations are included in the atomic queue snapshot;
+    /// a mutation completing later sees the active flag and republishes.
     fn activate_readiness(&self) {
         if self.readiness_active.load(Ordering::Acquire) {
             return;
         }
-        let q = self.queue.lock();
+        let _publish = self.publish.lock();
         if !self.readiness_active.swap(true, Ordering::AcqRel) {
-            self.publish_readiness_state_with_policy(0, q.len(), q.is_full(), false, true);
+            let (len, full) = self.queue.snapshot();
+            self.publish_readiness_state_with_policy(0, len, full, false, true);
         }
     }
 
@@ -600,19 +458,6 @@ impl PipeShared {
     /// the event argument also fires same-level events, matching Linux's
     /// `pipe->poll_usage` gate without a second exclusive wake. `event` is the
     /// direction the caller changed: POLL_IN on a write, POLL_OUT on a read.
-    fn sync_readiness(&self, event: u32) {
-        let (len, full) = {
-            let q = self.queue.lock();
-            (q.len(), q.is_full())
-        };
-        self.sync_readiness_state(event, len, full);
-    }
-
-    #[inline]
-    fn sync_readiness_state(&self, event: u32, len: usize, full: bool) {
-        self.sync_readiness_state_with_policy(event, len, full, false, true);
-    }
-
     /// Keep direct handoff for token-sized traffic. Page-sized and bulk pipe
     /// traffic still gets an exact-waiter wake, but lets the running endpoint
     /// fill or drain the ring before it naturally blocks.
@@ -636,14 +481,18 @@ impl PipeShared {
     fn sync_readiness_state_with_policy(
         &self,
         event: u32,
-        len: usize,
-        full: bool,
+        _len: usize,
+        _full: bool,
         wake_all: bool,
         urgent_handoff: bool,
     ) {
         if !self.readiness_active.load(Ordering::Acquire) {
             return;
         }
+        // Re-sample under the publication lock so a delayed older writer
+        // cannot overwrite a newer state or a final-close notification.
+        let _publish = self.publish.lock();
+        let (len, full) = self.queue.snapshot();
         self.publish_readiness_state_with_policy(event, len, full, wake_all, urgent_handoff);
     }
 
@@ -693,10 +542,16 @@ impl PipeShared {
             } else {
                 0
             };
-            let selected = self.readiness.set_event_with_exclusive_wake(
+            let continuation = if event == 0 {
+                0
+            } else {
+                (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT) & !event
+            };
+            let selected = self.readiness.set_event_with_continuation(
                 add,
                 clear,
                 notify,
+                continuation,
                 |task_id, waker| {
                     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                     if urgent_handoff {
@@ -774,7 +629,8 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
 /// (`pipe2(O_DIRECT)`).
 pub fn pipe_pair_flags(packetized: bool) -> (Arc<PipeRead>, Arc<PipeWrite>) {
     let shared = Arc::new(PipeShared {
-        queue: IrqSafeSpinLock::new(PipeBufs::new()),
+        queue: queue::Queue::new(PipeBufs::new()),
+        publish: IrqSafeSpinLock::new(()),
         writer_closed: AtomicBool::new(false),
         reader_closed: AtomicBool::new(false),
         // Fresh pipe: empty (not readable), has room (writable), both ends open.
@@ -801,10 +657,6 @@ impl PipeWrite {
         self.packetized.store(packetized, Ordering::Release);
     }
 
-    pub(crate) fn set_capacity(&self, arg: u32) -> Result<usize, u64> {
-        self.shared.set_capacity(arg)
-    }
-
     /// Linux-shaped `write(2)` path. Reader/room checks precede user access,
     /// and writes larger than `PIPE_BUF` are copied and committed one page at
     /// a time. Thus a closed reader wins over a bad source (`EPIPE`), a full
@@ -820,18 +672,6 @@ impl PipeWrite {
         self.copy_from_user_into_pipe(src_uptr, len, packet)
     }
 
-    /// Linux `vmsplice(2)` inserts user-backed pipe buffers without applying
-    /// the destination file's `O_DIRECT` packet mode. `iter_to_pipe` carries
-    /// only splice flags such as `PIPE_BUF_FLAG_GIFT`; packet framing belongs
-    /// to `pipe_write` alone.
-    pub(crate) fn vmsplice_from_user(
-        &self,
-        src_uptr: u64,
-        len: usize,
-    ) -> Result<Result<usize, narf_filesystem::FsError>, u64> {
-        self.copy_from_user_into_pipe(src_uptr, len, false)
-    }
-
     fn copy_from_user_into_pipe(
         &self,
         src_uptr: u64,
@@ -841,53 +681,18 @@ impl PipeWrite {
         if self.shared.reader_closed.load(Ordering::Acquire) {
             return Ok(Err(narf_filesystem::FsError::BrokenPipe));
         }
-        let mut q = self.shared.queue.lock();
-        // Pipe endpoint closure is serialized by this same lock, mirroring
-        // Linux's pipe->mutex around both pipe_release and pipe_write.
+        let mut q = lock_queue(&self.shared.queue);
+        // Recheck the durable close flag after waiting for the payload mutex.
+        // A later close may linearize after this write's peer check.
         if self.shared.reader_closed.load(Ordering::Acquire) {
             return Ok(Err(narf_filesystem::FsError::BrokenPipe));
         }
-        let room = q.room(packet);
-        if len <= PIPE_BUF && room < len {
-            return Ok(Ok(0));
-        }
-        let target = core::cmp::min(len, room);
-        if target == 0 {
-            return Ok(Ok(0));
-        }
         let was_empty = q.is_empty();
-        let mut written = 0usize;
-        let mut first_error = None;
-        while written < target {
-            let chunk = core::cmp::min(PIPE_BUF, target - written);
-            let copy_result = {
-                let (first, wrapped) = q.bytes.spare_slices_mut(chunk);
-                let split = first.len();
-                // SAFETY: the syscall layer validated the complete range.
-                // Logical pipe length is committed only after every guarded
-                // copy making up this Linux-sized pipe buffer succeeds.
-                let first_result =
-                    unsafe { crate::handlers::copy_from_user(first, src_uptr + written as u64) };
-                if first_result.is_ok() && !wrapped.is_empty() {
-                    // SAFETY: continuation of the same validated user range.
-                    unsafe {
-                        crate::handlers::copy_from_user(
-                            wrapped,
-                            src_uptr + written as u64 + split as u64,
-                        )
-                    }
-                } else {
-                    first_result
-                }
-            };
-            if let Err(errno) = copy_result {
-                first_error = Some(errno);
-                break;
-            }
-            q.bytes.commit_write(chunk);
-            q.push_frame(chunk, packet);
-            written += chunk;
-        }
+        let written = q.write_with(len, packet, |offset, dst| {
+            // SAFETY: guarded user copy; the buffer is published only after
+            // the complete page fragment has been copied successfully.
+            unsafe { crate::handlers::copy_from_user(dst, src_uptr + offset as u64) }
+        })?;
         let new_len = q.len();
         let new_full = q.is_full();
         drop(q);
@@ -900,34 +705,28 @@ impl PipeWrite {
                 written,
             );
         }
-        if written == 0 {
-            if let Some(errno) = first_error {
-                return Err(errno);
-            }
-        }
         Ok(Ok(written))
     }
 
-    fn try_write(&self, buf: &[u8]) -> Result<usize, narf_filesystem::FsError> {
+    async fn try_write(&self, buf: &[u8]) -> Result<usize, narf_filesystem::FsError> {
         // The syscall layer turns this into SIGPIPE plus -EPIPE.
         if self.shared.reader_closed.load(Ordering::Acquire) {
             return Err(narf_filesystem::FsError::BrokenPipe);
         }
-        let mut q = self.shared.queue.lock();
-        // PipeRead::drop publishes closure while holding this lock. Recheck
-        // after acquiring it so a writer that lost that race returns EPIPE
-        // instead of appending bytes after the final reader disappeared.
+        let mut q = self.shared.queue.lock_async().await;
+        // Close does not need the payload mutex. Recheck its durable flag
+        // after acquiring the mutex, before accepting any bytes.
         if self.shared.reader_closed.load(Ordering::Acquire) {
             return Err(narf_filesystem::FsError::BrokenPipe);
         }
         let packet = self.packetized.load(Ordering::Acquire);
-        let room = q.room(packet);
-        if buf.len() <= PIPE_BUF && room < buf.len() {
-            return Ok(0);
-        }
-        let n = core::cmp::min(buf.len(), room);
         let was_empty = q.is_empty();
-        q.push(&buf[..n], packet);
+        let n = q
+            .write_with(buf.len(), packet, |offset, dst| {
+                dst.copy_from_slice(&buf[offset..offset + dst.len()]);
+                Ok(())
+            })
+            .map_err(|_| narf_filesystem::FsError::OutOfMemory)?;
         let new_len = q.len();
         let new_full = q.is_full();
         drop(q);
@@ -945,10 +744,6 @@ impl PipeWrite {
 }
 
 impl PipeRead {
-    pub(crate) fn set_capacity(&self, arg: u32) -> Result<usize, u64> {
-        self.shared.set_capacity(arg)
-    }
-
     pub(crate) fn shares_pipe_with(&self, write: &PipeWrite) -> bool {
         Arc::ptr_eq(&self.shared, &write.shared)
     }
@@ -977,7 +772,65 @@ impl PipeRead {
         max: usize,
         discard_packets: bool,
     ) -> Result<usize, VmspliceDrainError> {
-        let mut q = self.shared.queue.lock();
+        let mut copied = 0usize;
+        self.drain_to_user(max, discard_packets, |bytes| {
+            // SAFETY: caller validated the range; guarded copy handles a
+            // protection change while the immutable page is retained.
+            unsafe { crate::handlers::copy_to_user(dst + copied as u64, bytes) }?;
+            copied += bytes.len();
+            Ok(())
+        })
+    }
+
+    /// Copy the current pipe prefix to `dst`, consuming it only after the
+    /// guarded user copy succeeds.  Keeping the queue lock across the copy is
+    /// deliberate: another reader must not consume or reorder the prefix
+    /// between observation and commit.  A failed copy leaves every byte in
+    /// the pipe, matching Linux's pipe-to-user splice actor.
+    pub(crate) fn vmsplice_to_user(
+        &self,
+        dst: u64,
+        max: usize,
+    ) -> Result<usize, VmspliceDrainError> {
+        // sys_vmsplice imported and validated the complete destination before
+        // pipe lookup, preserving Linux's errno order. The direct copies still
+        // catch a racing unmap before committing the affected pipe buffer.
+        read_to_iter(self, max, false, |offset, src, len| {
+            // SAFETY: the pipe retains this source; vmsplice imported dst.
+            unsafe { crate::handlers::copy_raw_to_user(dst + offset as u64, src, len) }
+        })
+        .map_err(|errno| {
+            if errno == EAGAIN as u64 {
+                VmspliceDrainError::WouldBlock
+            } else {
+                VmspliceDrainError::User(errno)
+            }
+        })
+    }
+
+    /// Transactional pipe read used by read/readv/vmsplice: copy a stable
+    /// prefix through `copy`, and consume it only after the complete guarded
+    /// user-copy succeeds for each page buffer. A fault in a later iovec
+    /// retains the currently faulting buffer; earlier complete buffers remain
+    /// consumed and are reported as partial progress.
+    pub(crate) fn read_to_user(
+        &self,
+        max: usize,
+        copy: impl FnMut(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
+        self.drain_to_user(max, true, copy)
+    }
+
+    /// [`Self::read_to_user`] with the packet-retire rule made explicit:
+    /// `discard_packets` is read(2)'s `buf->len = 0`, which drops the tail of a
+    /// packet too large for the caller's buffer. Splice actors clear it.
+    fn drain_to_user(
+        &self,
+        max: usize,
+        discard_packets: bool,
+        mut copy: impl FnMut(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
+        let mut q = lock_queue(&self.shared.queue);
         if q.is_empty() {
             return if self.shared.writer_closed.load(Ordering::Acquire) {
                 Ok(0)
@@ -986,39 +839,22 @@ impl PipeRead {
             };
         }
         let was_full = q.is_full();
-        let mut copied = 0usize;
-        let mut first_error = None;
+        let mut copied = 0;
         while copied < max && !q.is_empty() {
-            let packet = q.frames.front().is_some_and(|frame| frame.packet);
-            let (n, consumed) = q.read_span(core::cmp::min(PIPE_BUF, max - copied));
-            if n == 0 {
-                break;
-            }
-            let copy_result = {
-                let (front, wrapped) = q.bytes.prefix_slices(n);
-                let first = front.len();
-                // SAFETY: read(2) validated the complete destination before
-                // reaching this path; the guarded copy catches a racing
-                // mapping change.
-                let first_result =
-                    unsafe { crate::handlers::copy_to_user(dst + copied as u64, &front[..first]) };
-                if first_result.is_ok() && first != n {
-                    // SAFETY: continuation of the same validated destination.
-                    unsafe {
-                        crate::handlers::copy_to_user(
-                            dst + copied as u64 + first as u64,
-                            &wrapped[..n - first],
-                        )
-                    }
-                } else {
-                    first_result
+            let packet = q.front_info().unwrap().1;
+            let n = q.front_len(max - copied);
+            if let Err(errno) = q.with_front(n, &mut copy) {
+                if copied == 0 {
+                    return Err(VmspliceDrainError::User(errno));
                 }
-            };
-            if let Err(errno) = copy_result {
-                first_error = Some(errno);
                 break;
             }
-            q.commit(if discard_packets { consumed } else { n });
+            let consumed = if discard_packets && packet {
+                q.front_info().unwrap().0
+            } else {
+                n
+            };
+            q.commit(consumed);
             copied += n;
             if discard_packets && packet {
                 break;
@@ -1037,351 +873,8 @@ impl PipeRead {
                 copied,
             );
         }
-        if copied == 0 {
-            if let Some(errno) = first_error {
-                return Err(VmspliceDrainError::User(errno));
-            }
-        }
         Ok(copied)
     }
-
-    /// Move a pipe prefix into a non-pipe sink and consume only the prefix the
-    /// sink accepted. The source queue stays locked across one non-blocking
-    /// sink poll, making the observation+commit indivisible with respect to
-    /// other readers. The caller must not park or await while that poll runs.
-    /// Pipe to pipe uses [`Self::splice_to_pipe`] instead so two queue locks are
-    /// always acquired in address order.
-    pub(crate) fn splice_to_sink(
-        &self,
-        max: usize,
-        mut write: impl FnMut(&[u8]) -> Result<usize, narf_filesystem::FsError>,
-    ) -> Result<usize, narf_filesystem::FsError> {
-        let mut q = self.shared.queue.lock();
-        let avail = q.len();
-        if avail == 0 {
-            return if self.shared.writer_closed.load(Ordering::Acquire) {
-                Ok(0)
-            } else {
-                Err(narf_filesystem::FsError::WouldBlock)
-            };
-        }
-        // `splice_from_pipe` hands the actor ONE buffer at a time, so the
-        // offered span stops at a packet boundary of its own accord.
-        let was_full = q.is_full();
-        let (n, _) = q.read_span(core::cmp::min(max, avail));
-        // The queue stays locked until the sink has accepted its prefix, so
-        // its one or two ring slices are stable and can be offered directly.
-        // This removes the allocation and full payload memcpy from the common
-        // pipe -> /dev/null splice. A wrapped ring needs a second sink call;
-        // advance only after the first slice was accepted completely.
-        let (front, wrapped) = q.bytes.prefix_slices(n);
-        let first = write(front)?;
-        if first > front.len() {
-            return Err(narf_filesystem::FsError::InvalidData);
-        }
-        let mut written = first;
-        if first == front.len() && !wrapped.is_empty() {
-            match write(wrapped) {
-                Ok(second) if second <= wrapped.len() => written += second,
-                Ok(_) | Err(_) if written != 0 => {}
-                Err(error) => return Err(error),
-                Ok(_) => return Err(narf_filesystem::FsError::InvalidData),
-            }
-        }
-        // No packet discard here: a short actor write advances the buffer
-        // (`buf->offset += ret; buf->len -= ret;`) and leaves the remainder
-        // queued. Only `pipe_read` retires a partially-copied packet.
-        q.commit(written);
-        let new_len = q.len();
-        let new_full = q.is_full();
-        drop(q);
-
-        if written != 0
-            && (was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire))
-        {
-            self.shared
-                .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
-        }
-        Ok(written)
-    }
-
-    /// Move bytes directly between two pipe queues. Locking both queues in
-    /// stable address order prevents opposing concurrent splices from
-    /// deadlocking, while consuming exactly the number appended prevents a
-    /// partially full destination from dropping the source tail.
-    pub(crate) fn splice_to_pipe(
-        &self,
-        dst: &PipeWrite,
-        max: usize,
-    ) -> Result<usize, narf_filesystem::FsError> {
-        if Arc::ptr_eq(&self.shared, &dst.shared) {
-            return Err(narf_filesystem::FsError::InvalidData);
-        }
-        if dst.shared.reader_closed.load(Ordering::Acquire) {
-            return Err(narf_filesystem::FsError::BrokenPipe);
-        }
-
-        let src_addr = Arc::as_ptr(&self.shared) as usize;
-        let dst_addr = Arc::as_ptr(&dst.shared) as usize;
-        let (moved, src_was_full, dst_was_empty, src_len, src_full, dst_len, dst_full) =
-            if src_addr < dst_addr {
-                let mut src = self.shared.queue.lock();
-                let mut dstq = dst.shared.queue.lock();
-                if dst.shared.reader_closed.load(Ordering::Acquire) {
-                    return Err(narf_filesystem::FsError::BrokenPipe);
-                }
-                let (moved, src_was_full, dst_was_empty) = move_pipe_prefix(
-                    &mut src,
-                    &mut dstq,
-                    max,
-                    self.shared.writer_closed.load(Ordering::Acquire),
-                )?;
-                (
-                    moved,
-                    src_was_full,
-                    dst_was_empty,
-                    src.len(),
-                    src.is_full(),
-                    dstq.len(),
-                    dstq.is_full(),
-                )
-            } else {
-                let mut dstq = dst.shared.queue.lock();
-                let mut src = self.shared.queue.lock();
-                if dst.shared.reader_closed.load(Ordering::Acquire) {
-                    return Err(narf_filesystem::FsError::BrokenPipe);
-                }
-                let (moved, src_was_full, dst_was_empty) = move_pipe_prefix(
-                    &mut src,
-                    &mut dstq,
-                    max,
-                    self.shared.writer_closed.load(Ordering::Acquire),
-                )?;
-                (
-                    moved,
-                    src_was_full,
-                    dst_was_empty,
-                    src.len(),
-                    src.is_full(),
-                    dstq.len(),
-                    dstq.is_full(),
-                )
-            };
-
-        if moved != 0 {
-            if src_was_full || src_len == 0 || self.shared.poll_usage.load(Ordering::Acquire) {
-                self.shared
-                    .sync_readiness_state(narf_filesystem::POLL_OUT, src_len, src_full);
-            }
-            if dst_was_empty || dst_full || dst.shared.poll_usage.load(Ordering::Acquire) {
-                dst.shared
-                    .sync_readiness_state(narf_filesystem::POLL_IN, dst_len, dst_full);
-            }
-        }
-        Ok(moved)
-    }
-
-    /// Duplicate a prefix into another pipe without consuming it — tee(2).
-    ///
-    /// Locking both queues in stable address order is the same ABBA guard
-    /// `fs/splice.c::link_pipe` documents ("two different processes could
-    /// deadlock (one doing tee from A -> B, the other from B -> A)") and that
-    /// [`Self::splice_to_pipe`] already uses.
-    pub(crate) fn tee_to(
-        &self,
-        dst: &PipeWrite,
-        max: usize,
-    ) -> Result<usize, narf_filesystem::FsError> {
-        if Arc::ptr_eq(&self.shared, &dst.shared) {
-            // `if (!ipipe || !opipe || ipipe == opipe) return -EINVAL;`
-            return Err(narf_filesystem::FsError::InvalidData);
-        }
-        if dst.shared.reader_closed.load(Ordering::Acquire) {
-            // `if (!opipe->readers) { send_sig(SIGPIPE, ...); ret = -EPIPE; }`
-            return Err(narf_filesystem::FsError::BrokenPipe);
-        }
-        let writer_closed = self.shared.writer_closed.load(Ordering::Acquire);
-        let src_addr = Arc::as_ptr(&self.shared) as usize;
-        let dst_addr = Arc::as_ptr(&dst.shared) as usize;
-        let (copied, dst_was_empty, dst_len, dst_full) = if src_addr < dst_addr {
-            let src = self.shared.queue.lock();
-            let mut dstq = dst.shared.queue.lock();
-            if dst.shared.reader_closed.load(Ordering::Acquire) {
-                return Err(narf_filesystem::FsError::BrokenPipe);
-            }
-            let (copied, dst_was_empty) = copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?;
-            (copied, dst_was_empty, dstq.len(), dstq.is_full())
-        } else {
-            let mut dstq = dst.shared.queue.lock();
-            let src = self.shared.queue.lock();
-            if dst.shared.reader_closed.load(Ordering::Acquire) {
-                return Err(narf_filesystem::FsError::BrokenPipe);
-            }
-            let (copied, dst_was_empty) = copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?;
-            (copied, dst_was_empty, dstq.len(), dstq.is_full())
-        };
-
-        if copied != 0 {
-            // Only the destination changed: tee leaves the source queue intact,
-            // so the source's readiness is unchanged and must not be
-            // republished as an edge.
-            if dst_was_empty || dst_full || dst.shared.poll_usage.load(Ordering::Acquire) {
-                dst.shared
-                    .sync_readiness_state(narf_filesystem::POLL_IN, dst_len, dst_full);
-            }
-            narf_net::readiness::bump_generation();
-        }
-        Ok(copied)
-    }
-
-    /// Copy the current pipe prefix to `dst`, consuming it only after the
-    /// guarded user copy succeeds.  Keeping the queue lock across the copy is
-    /// deliberate: another reader must not consume or reorder the prefix
-    /// between observation and commit.  A failed copy leaves every byte in
-    /// the pipe, matching Linux's pipe-to-user splice actor.
-    pub(crate) fn vmsplice_to_user(
-        &self,
-        dst: u64,
-        max: usize,
-    ) -> Result<usize, VmspliceDrainError> {
-        // sys_vmsplice imported and validated the complete destination before
-        // pipe lookup, preserving Linux's errno order. The direct copies still
-        // catch a racing unmap before committing the affected pipe buffer.
-        self.copy_direct_to_user(dst, max, false)
-    }
-
-    /// Transactional pipe read used by read/readv/vmsplice: copy a stable
-    /// prefix through `copy`, and consume it only after the complete guarded
-    /// user-copy succeeds. The byte queue does not preserve Linux pipe_buffer
-    /// boundaries, so this selected prefix is one logical buffer: a fault in a
-    /// later iovec retains even an earlier copied fragment rather than wrongly
-    /// consuming part of the currently faulting buffer.
-    pub(crate) fn read_to_user(
-        &self,
-        max: usize,
-        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
-    ) -> Result<usize, VmspliceDrainError> {
-        self.drain_to_user(max, true, copy)
-    }
-
-    /// [`Self::read_to_user`] with the packet-retire rule made explicit:
-    /// `discard_packets` is read(2)'s `buf->len = 0`, which drops the tail of a
-    /// packet too large for the caller's buffer. Splice actors clear it.
-    fn drain_to_user(
-        &self,
-        max: usize,
-        discard_packets: bool,
-        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
-    ) -> Result<usize, VmspliceDrainError> {
-        if max <= PIPE_FAST_BYTES {
-            let mut staging = [0u8; PIPE_FAST_BYTES];
-            let mut q = self.shared.queue.lock();
-            let avail = q.len();
-            if avail == 0 {
-                return if self.shared.writer_closed.load(Ordering::Acquire) {
-                    Ok(0)
-                } else {
-                    Err(VmspliceDrainError::WouldBlock)
-                };
-            }
-            let was_full = q.is_full();
-            let (n, packet_consumed) = q.read_span(max);
-            let (front, wrapped) = q.bytes.prefix_slices(n);
-            let first = front.len();
-            staging[..first].copy_from_slice(&front[..first]);
-            staging[first..n].copy_from_slice(&wrapped[..n - first]);
-            copy(&staging[..n]).map_err(VmspliceDrainError::User)?;
-            q.commit(if discard_packets { packet_consumed } else { n });
-            let new_len = q.len();
-            let new_full = q.is_full();
-            drop(q);
-            if was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire) {
-                self.shared
-                    .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
-            }
-            narf_net::readiness::bump_generation();
-            return Ok(n);
-        }
-
-        // Allocate before disabling IRQs on the queue lock. A pipe can never
-        // supply more than its current capacity, even if the iovec is larger.
-        let mut staging =
-            alloc::vec::Vec::with_capacity(core::cmp::min(max, self.shared.capacity()));
-        let mut q = self.shared.queue.lock();
-        let avail = q.len();
-        if avail == 0 {
-            return if self.shared.writer_closed.load(Ordering::Acquire) {
-                Ok(0)
-            } else {
-                Err(VmspliceDrainError::WouldBlock)
-            };
-        }
-        let was_full = q.is_full();
-        let (n, packet_consumed) = q.read_span(max);
-        staging.resize(n, 0);
-        q.bytes.copy_out(0, &mut staging);
-
-        copy(&staging).map_err(VmspliceDrainError::User)?;
-        q.commit(if discard_packets { packet_consumed } else { n });
-        let new_len = q.len();
-        let new_full = q.is_full();
-        drop(q);
-
-        if was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire) {
-            self.shared
-                .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
-        }
-        narf_net::readiness::bump_generation();
-        Ok(n)
-    }
-}
-
-fn copy_pipe_prefix(
-    src: &PipeBufs,
-    dst: &mut PipeBufs,
-    max: usize,
-    writer_closed: bool,
-) -> Result<(usize, bool), narf_filesystem::FsError> {
-    if src.is_empty() {
-        // `ipipe_prep`: an empty source is end-of-stream only once the last
-        // writer is gone; otherwise the caller waits or takes -EAGAIN.
-        return if writer_closed {
-            Ok((0, dst.is_empty()))
-        } else {
-            Err(narf_filesystem::FsError::WouldBlock)
-        };
-    }
-    let dst_was_empty = dst.is_empty();
-    let copied = src.copy_prefix_to(dst, max);
-    if copied == 0 {
-        // The destination could not take even the head buffer.
-        return Err(narf_filesystem::FsError::WouldBlock);
-    }
-    Ok((copied, dst_was_empty))
-}
-
-fn move_pipe_prefix(
-    src: &mut PipeBufs,
-    dst: &mut PipeBufs,
-    max: usize,
-    writer_closed: bool,
-) -> Result<(usize, bool, bool), narf_filesystem::FsError> {
-    if src.is_empty() {
-        return if writer_closed {
-            Ok((0, false, dst.is_empty()))
-        } else {
-            Err(narf_filesystem::FsError::WouldBlock)
-        };
-    }
-    let src_was_full = src.is_full();
-    let dst_was_empty = dst.is_empty();
-    let n = src.move_prefix_to(dst, max);
-    if n == 0 {
-        // The destination could not take even the head frame — full, or short
-        // of room for a whole packet. Either way the caller must retry.
-        return Err(narf_filesystem::FsError::WouldBlock);
-    }
-    Ok((n, src_was_full, dst_was_empty))
 }
 
 impl Drop for PipeRead {
@@ -1391,11 +884,8 @@ impl Drop for PipeRead {
         // every dup'd fd in every task) goes away — at that point
         // there are no readers left and the writer should observe
         // EOF on its side.
-        let q = self.shared.queue.lock();
         self.shared.reader_closed.store(true, Ordering::Release);
-        let len = q.len();
-        let full = q.is_full();
-        drop(q);
+        let (len, full) = self.shared.queue.snapshot();
         // Latch POLL_ERR into the durable cell after publishing closure — wakes
         // a writer parked on POLL_OUT|POLL_ERR, even on a full pipe.
         self.shared
@@ -1408,11 +898,8 @@ impl Drop for PipeWrite {
     fn drop(&mut self) {
         // Same Arc-counted reasoning as PipeRead::drop — only flips
         // when every writer fd has been closed.
-        let q = self.shared.queue.lock();
         self.shared.writer_closed.store(true, Ordering::Release);
-        let len = q.len();
-        let full = q.is_full();
-        drop(q);
+        let (len, full) = self.shared.queue.snapshot();
         // Latch POLL_HUP into the durable cell after publishing closure — wakes
         // a reader parked on POLL_IN|POLL_HUP so it runs read()→0=EOF.
         self.shared
@@ -1424,7 +911,7 @@ impl Drop for PipeWrite {
 impl FileOps for PipeRead {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let mut q = self.shared.queue.lock();
+            let mut q = self.shared.queue.lock_async().await;
             let avail = q.len();
             if avail == 0 {
                 // Empty: "writer still open" is would-block, "writer gone" is
@@ -1444,9 +931,8 @@ impl FileOps for PipeRead {
                 };
             }
             let (n, consumed) = q.read_span(buf.len());
-            q.bytes.copy_out(0, &mut buf[..n]);
-            q.bytes.consume(consumed);
-            q.retire_frames(consumed);
+            q.copy_out(0, &mut buf[..n]);
+            q.commit(consumed);
             drop(q);
             if n != 0 {
                 // Draining can clear POLL_IN (queue now empty) and set POLL_OUT
@@ -1455,7 +941,8 @@ impl FileOps for PipeRead {
                 // a writer parked via `park_reexecute_on_io` (armed on that
                 // generation, not the cell) re-runs instead of sleeping out its
                 // deadline.
-                self.shared.sync_readiness(narf_filesystem::POLL_OUT);
+                self.shared
+                    .sync_readiness_after_transfer(narf_filesystem::POLL_OUT, 0, false, n);
                 narf_net::readiness::bump_generation();
             }
             Ok(n)
@@ -1495,7 +982,7 @@ impl FileOps for PipeRead {
         if cmd != FIONREAD {
             return Err(narf_filesystem::FsError::Unsupported);
         }
-        let bytes = (self.shared.queue.lock().len() as i32).to_le_bytes();
+        let bytes = (self.shared.queue.snapshot().0 as i32).to_le_bytes();
         // SAFETY: `copy_to_user` validates the destination through the SMAP
         // window; FIONREAD writes one Linux `int`.
         if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
@@ -1513,8 +1000,7 @@ impl FileOps for PipeRead {
         // select(2)/epoll all deliver HUP regardless of the requested
         // event set, so an EOF still terminates a POLLIN wait.
         let mut mask = 0;
-        let q = self.shared.queue.lock();
-        if !q.is_empty() {
+        if self.shared.queue.snapshot().0 != 0 {
             mask |= narf_filesystem::POLL_IN;
         }
         if self.shared.writer_closed.load(Ordering::Acquire) {
@@ -1594,7 +1080,7 @@ impl FileOps for PipeRead {
     }
 
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
-        let q = self.shared.queue.lock();
+        let q = lock_queue(&self.shared.queue);
         // Copy the front bytes without consuming them — tee(2) duplicates pipe
         // data, leaving the source readable. `read_span` bounds the copy to one
         // record, matching `fs/splice.c::tee` duplicating whole buffers.
@@ -1608,7 +1094,7 @@ impl FileOps for PipeRead {
         // only the flag that marks them as records is lost.
         let (n, _) = q.read_span(max);
         let mut bytes = alloc::vec![0; n];
-        q.bytes.copy_out(0, &mut bytes);
+        q.copy_out(0, &mut bytes);
         Some(bytes)
     }
 
@@ -1630,7 +1116,7 @@ impl FileOps for PipeWrite {
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { self.try_write(buf) })
+        Box::pin(async move { self.try_write(buf).await })
     }
 
     fn stat(&self) -> Stat {
@@ -1651,7 +1137,7 @@ impl FileOps for PipeWrite {
         if cmd != FIONREAD {
             return Err(narf_filesystem::FsError::Unsupported);
         }
-        let bytes = (self.shared.queue.lock().len() as i32).to_le_bytes();
+        let bytes = (self.shared.queue.snapshot().0 as i32).to_le_bytes();
         // Linux accepts FIONREAD on either pipe end and reports the shared
         // unread-byte count.
         // SAFETY: `copy_to_user` validates the destination through the SMAP
@@ -1668,8 +1154,7 @@ impl FileOps for PipeWrite {
         // POLLOUT on reader-close (instead of POLLERR), so a poller never
         // saw the error condition Linux reports.
         let mut mask = 0;
-        let q = self.shared.queue.lock();
-        if !q.is_full() {
+        if !self.shared.queue.snapshot().1 {
             mask |= narf_filesystem::POLL_OUT;
         }
         if self.shared.reader_closed.load(Ordering::Acquire) {

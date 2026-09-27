@@ -66,7 +66,8 @@ pub(super) fn transactional_stream_read(
         .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
     {
         return Some(
-            fifo.vmsplice_to_user(max, copy)
+            poll_blocking(fifo.read_to_user(max, copy))
+                .unwrap_or(Err(narf_filesystem::fifo::VmspliceDrainError::WouldBlock))
                 .map_err(|error| match error {
                     narf_filesystem::fifo::VmspliceDrainError::WouldBlock => {
                         TransactionalReadError::WouldBlock
@@ -113,6 +114,15 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
     if count == 0 {
         ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
+        read_pipe_user(ctx, &endpoint, count, |offset, src, len| {
+            // SAFETY: the queue retains this raw source and the scalar
+            // destination range was validated before pipe lookup.
+            unsafe { copy_raw_to_user(user_ptr + offset as u64, src, len) }
+        });
         return;
     }
 

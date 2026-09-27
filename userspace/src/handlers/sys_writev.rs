@@ -30,6 +30,23 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
+        write_pipe_user(ctx, &endpoint, count, |mut offset, mut bytes| {
+            for iov in &iovecs {
+                if offset >= iov.len { offset -= iov.len; continue; }
+                let n = bytes.len().min(iov.len - offset);
+                // SAFETY: imported iovecs passed access_ok; guarded copies
+                // catch mapping changes and faults before buffer publication.
+                unsafe { copy_from_user(&mut bytes[..n], iov.base + offset as u64) }?;
+                bytes = &mut bytes[n..];
+                offset = 0;
+                if bytes.is_empty() { return Ok(()); }
+            }
+            Err(EFAULT as u64)
+        });
+        return;
+    }
+
     let _position_guard = if endpoint.ops.is_stream() {
         None
     } else {

@@ -1755,6 +1755,22 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             options(nostack, preserves_flags));
         }
         let _ = writeln!(TrapWriter, "  cr2:    {:#018x}", cr2);
+        if cr2 >> 63 != 0 {
+            use narf_memory::x86_64::paging::{PageTable, PtFlags, WalkIndices};
+            let indices = WalkIndices::from_virt(narf_memory::VirtAddr::new(cr2));
+            // SAFETY: the fatal exception handler runs at CPL0.
+            let mut table = unsafe { narf_memory::x86_64::paging::read_cr3() };
+            for index in [indices.pml4, indices.pdpt, indices.pd, indices.pt] {
+                // SAFETY: fatal-path read of the active kernel page-table walk;
+                // stop at an absent entry or large leaf before dereferencing.
+                let entry = unsafe { (&*table.kernel_ptr::<PageTable>()).entries[index] };
+                let _ = writeln!(TrapWriter, "  fault-pte: {:#018x}", entry.raw());
+                if !entry.is_present() || entry.flags().contains(PtFlags::HUGE_PAGE) {
+                    break;
+                }
+                table = entry.addr();
+            }
+        }
     }
     {
         let cr3: u64;

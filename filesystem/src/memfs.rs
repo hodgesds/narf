@@ -2172,6 +2172,43 @@ impl fmt::Debug for MemFile {
 }
 
 impl FileOps for MemFile {
+    fn splice_read_page(
+        &self,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<crate::pipe_buffer::SplicePage>, FsError> {
+        let mut data = self.data.lock();
+        if offset >= data.len || max == 0 {
+            return Ok(None);
+        }
+        let index = offset / PAGE_SIZE;
+        let within = (offset % PAGE_SIZE) as usize;
+        let len = max
+            .min(PAGE_SIZE as usize - within)
+            .min((data.len - offset) as usize);
+        if let alloc::collections::btree_map::Entry::Vacant(entry) = data.pages.entry(index) {
+            let uid = self.uid.load(Ordering::Relaxed);
+            let gid = self.gid.load(Ordering::Relaxed);
+            let superblock = &self._inode_lease.superblock;
+            superblock.reserve_blocks(uid, gid, 1)?;
+            let page = match FilePage::new_zeroed() {
+                Ok(page) => page,
+                Err(error) => {
+                    superblock.release_blocks(uid, gid, 1);
+                    return Err(error);
+                }
+            };
+            entry.insert(page);
+        }
+        let phys = narf_memory::PhysAddr::new(data.pages[&index].phys());
+        // SAFETY: the data lock retains this allocator page through the
+        // physical retain and excludes truncate, hole punch and replacement.
+        let pin = unsafe { narf_memory::address_space::UserPagePin::retain_ram(phys) };
+        drop(data);
+        self.times.touch_atime();
+        Ok(Some(crate::pipe_buffer::SplicePage::new(pin, within, len)))
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -2546,6 +2583,10 @@ impl FileOps for MemFile {
             nr_evicted: 0,
             nr_recently_evicted: 0,
         })
+    }
+
+    fn mmap_is_ram(&self) -> bool {
+        true
     }
 
     fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {

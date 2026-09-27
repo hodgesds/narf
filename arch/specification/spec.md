@@ -72,7 +72,7 @@ pub enum DomainBackend { Pks, Mte }
 #[cfg(target_arch = "x86_64")]
 pub struct x86_64::trap_frame::TrapFrame { /* domain prefix, GPRs, return frame */ }
 #[cfg(target_arch = "aarch64")]
-pub struct aarch64::trap_frame::TrapFrame { /* MTE prefix, GPRs, ELR/SPSR */ }
+pub struct aarch64::trap_frame::TrapFrame { /* MTE prefix, GPRs, SP_EL0, ELR/SPSR, FP/SIMD image */ }
 
 /// Architecture-owned continuation state used only by the executor core.
 /// Domain state is an opaque tail saved/restored by `kernel_switch`, before

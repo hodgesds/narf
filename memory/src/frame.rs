@@ -2668,6 +2668,9 @@ pub mod cow {
     #[repr(align(64))]
     struct FlatCowSlot {
         state: AtomicU64,
+        // Lifetime holds such as vmsplice do not write-protect the original
+        // mapping. Fork must distinguish them from existing COW mappings.
+        pins: AtomicU32,
     }
     const _: () = assert!(core::mem::size_of::<FlatCowSlot>() == 64);
     const _: () = assert!(core::mem::align_of::<FlatCowSlot>() == 64);
@@ -2677,6 +2680,64 @@ pub mod cow {
     static FLAT_EPOCH: AtomicU32 = AtomicU32::new(0);
 
     const FLAT_COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+    type PinMap = alloc::collections::BTreeMap<u64, u32>;
+    static SPILL_PINS: [IrqSafeSpinLock<Option<PinMap>>; REFCOUNT_SHARDS] =
+        [const { IrqSafeSpinLock::new(None) }; REFCOUNT_SHARDS];
+
+    fn flat_pins(key: u64) -> Option<&'static AtomicU32> {
+        let ptr = FLAT.load(Ordering::Acquire);
+        let index = (key >> super::PAGE_SHIFT) as usize;
+        if ptr.is_null() || index >= FLAT_FRAMES.load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: the published PFN array is permanent and bounds-checked.
+        Some(&unsafe { &*ptr.add(index) }.pins)
+    }
+
+    /// Retain RAM independently of its mappings. The caller holds the mapping
+    /// lock so fork cannot observe the count increment before pin publication.
+    pub(crate) fn pin_ref(phys: PhysAddr) {
+        inc_ref(phys);
+        if let Some(pins) = flat_pins(phys.raw()) {
+            pins.fetch_add(1, Ordering::Release);
+        } else {
+            let mut guard = SPILL_PINS[ref_shard(phys.raw())].lock();
+            *guard
+                .get_or_insert_with(PinMap::new)
+                .entry(phys.raw())
+                .or_default() += 1;
+        }
+    }
+
+    /// Release the physical owner before withdrawing the pin marker. A fork
+    /// which sees no marker must also see the completed owner decrement;
+    /// otherwise it could mistake a remaining pin for an already-COW mapping.
+    pub(crate) fn unpin_ref(phys: PhysAddr) {
+        super::free_frame(super::PhysFrame::new(phys));
+        if let Some(pins) = flat_pins(phys.raw()) {
+            let previous = pins.fetch_sub(1, Ordering::AcqRel);
+            assert_ne!(previous, 0, "unbalanced user-page pin");
+        } else {
+            let mut guard = SPILL_PINS[ref_shard(phys.raw())].lock();
+            let map = guard.as_mut().expect("registered user-page pin");
+            let count = map.get_mut(&phys.raw()).expect("registered user-page pin");
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&phys.raw());
+            }
+        }
+    }
+
+    pub(crate) fn is_pinned(phys: PhysAddr) -> bool {
+        match flat_pins(phys.raw()) {
+            Some(pins) => pins.load(Ordering::Acquire) != 0,
+            None => SPILL_PINS[ref_shard(phys.raw())]
+                .lock()
+                .as_ref()
+                .is_some_and(|map| map.contains_key(&phys.raw())),
+        }
+    }
 
     #[inline]
     fn flat_slot(key: u64) -> Option<&'static AtomicU64> {

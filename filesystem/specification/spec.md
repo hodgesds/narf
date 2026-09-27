@@ -174,19 +174,50 @@ clone node is mode 0666 so unprivileged filesystem and desktop-portal daemons
 can open it, matching Linux distribution tmpfiles/udev policy.
 
 Named FIFO handles share durable data-readiness state and direction-specific
-peer-presence cells. `FifoHandle::arm_peer`/`disarm_peer` key waiters by task;
+peer-presence cells. `FifoShared::unread_bytes()` snapshots the shared queue
+length for `FIONREAD` on either end; the syscall layer performs the guarded
+four-byte user copy and reports `EFAULT` on failure. `FifoHandle::arm_peer`/`disarm_peer` key waiters by task;
 the handle snapshots the counterpart edge before publishing its own open count,
 so a peer that opens and closes before the waiter runs still completes the
 blocking `open`. A read-only handle opened before any writer suppresses
 `POLLHUP` until its own writer-presence snapshot changes, matching Linux's
-per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the ordinary per-file
-readiness cell. `FifoHandle::vmsplice_to_user` holds the observed queue prefix
-through one or two direct copy callbacks and consumes it only after every copy
-succeeds, so a failed user copy neither discards nor reorders named-FIFO data.
-`FifoHandle::write_from_user` likewise performs peer/fullness checks before its
-direct copy callback and rolls back reserved queue space on a copy fault. This
-preserves Linux's EPIPE/EAGAIN-before-EFAULT ordering without per-I/O heap or
-boxed-future allocation on the named-FIFO syscall path.
+per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the per-file readiness cell. Anonymous pipes and named
+FIFOs use `pipe_buffer::PipeBufs` and `pipe_queue::Queue`: a bounded buffer-slot
+ring with retained page references and a sleepable mutex. Queue guards publish
+atomic length/fullness/capacity snapshots before releasing the mutex. Pipe
+payload copies never hold the readiness publication spinlock.
+`FifoHandle::{read_to_user,vmsplice_to_user,write_from_user}` are async operations
+whose guarded-copy callbacks run under the payload mutex and commit one page
+buffer at a time. Reads discard a truncated packet tail; splice actors retain
+it. Errors after a committed prefix return its length. Allocation failure is
+`FsError::OutOfMemory` (`ENOMEM`), distinct from `NoSpace` (`ENOSPC`). The last
+FIFO handle discards queued data and restores the default capacity before a
+new opener can observe the inode. `FifoShared::queue` and `notify_transfer`
+allow anonymous/named transfers to use one ordered transaction.
+
+`PipeBufs` owns a bounded descriptor ring; owned payloads use allocator pages
+with reference-counted descriptors and one reusable drained page. Imported
+buffers carry `UserPagePin` references and cannot acquire append rights.
+`fill_from` implements the single-copy buffered-provider fallback into fresh
+pipe pages. `with_front_raw` exposes a retained pointer only for a callback's
+duration, avoiding Rust references over externally mutable imported pages.
+`FifoHandle::packetized`/`set_packetized` reflect O_DIRECT on an open description.
+`notify_transfer(event, transferred)` publishes the changed direction and relays
+exclusive waiters when work remains. Nonzero transfers smaller than `PIPE_BUF`
+also request a revalidated scheduler handoff to the selected peer at syscall
+exit; page-sized/bulk transfers use ordinary targeted wakes. Final close wakes
+every affected blocker.
+
+`FileOps::splice_read_page(offset, max)` returns a retained `SplicePage`, EOF
+(`Ok(None)`), or an error. `Unsupported` selects buffered I/O directly into
+nonmergeable pipe pages. Memfd and tmpfs retain their actual RAM pages under
+the backing object's lock; overlay forwards the operation to its active file.
+`FileOps::mmap_is_ram()` defaults to false. A true implementation promises
+that both mmap backing methods expose ordinary allocator frames retired via
+`free_frame`, permitting independent page pins. Device/PFN providers must
+retain the false default; the syscall layer records this distinction in
+`RegionPerms::PINNABLE_RAM`.
+
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`

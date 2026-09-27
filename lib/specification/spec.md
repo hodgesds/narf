@@ -196,6 +196,10 @@ impl Readiness {
         &self, add: u32, clear: u32, event: u32
     ) -> Option<u64>;
     pub fn set_wake_all(&self, add: u32, clear: u32);
+    pub fn set_event_with_continuation(
+        &self, add: u32, clear: u32, event: u32, continuation: u32,
+        wake: impl FnMut(u64, &Waker),
+    ) -> Option<u64>;
     pub fn notify(&self, bits: u32);
     pub fn disarm(&self, id: u64);
 }
@@ -218,6 +222,13 @@ ordinary observers fired or the event made no waiter eligible. `set_wake_all` is
 the terminal-state form: it
 wakes and logically dequeues all exclusive waiters without dropping their
 wakers.
+
+`set_event_with_continuation` publishes directed provider events and relays
+remaining work to one exclusive waiter in the other direction. Pipes use OUT
+events with IN continuation after a read, and the reverse after a write.
+Continuation alone does not create a poll edge. The callback can run once per
+direction under the readiness lock and must neither allocate nor drop wakers.
+This prevents available data/space from stranding other exclusive blockers.
 
 ## 4. Invariants & safety properties
 

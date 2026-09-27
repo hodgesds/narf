@@ -18,6 +18,7 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
         | narf_memory::AddressSpaceError::NotImplemented
         | narf_memory::AddressSpaceError::Overlap
         | narf_memory::AddressSpaceError::InvalidNode
+        | narf_memory::AddressSpaceError::Pinned
         | narf_memory::AddressSpaceError::SharedMapping
         | narf_memory::AddressSpaceError::NoDemotionTarget => EAGAIN,
     }

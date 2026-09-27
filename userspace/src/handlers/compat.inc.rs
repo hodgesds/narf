@@ -3021,7 +3021,18 @@ pub(crate) unsafe fn copy_from_user_vec(
 /// # Safety
 /// Same as `copy_from_user`.
 pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> {
-    validate_user_range(dst_uptr, src.len())?;
+    // SAFETY: the borrowed source remains live for the complete guarded copy.
+    unsafe { copy_raw_to_user(dst_uptr, src.as_ptr(), src.len()) }
+}
+
+/// Guarded copy from retained RAM which may be externally modified.
+///
+/// # Safety
+/// `src` must retain at least `len` readable bytes for the duration of the
+/// copy. Destination must obey copy_to_user's user-access contract. No Rust
+/// reference may alias externally mutable source bytes during the copy.
+pub(crate) unsafe fn copy_raw_to_user(dst_uptr: u64, src: *const u8, len: usize) -> Result<(), u64> {
+    validate_user_range(dst_uptr, len)?;
     let dst = dst_uptr as *mut u8;
     // SAFETY: src is a live kernel slice; dst is range-validated; the
     // guarded copy opens the SMAP bracket itself and catches any
@@ -3029,7 +3040,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
+        narf_arch::x86_64::smap::copy_user_guarded(dst, src, len)
             .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: src is a live kernel slice; dst is range-validated; the
@@ -3038,7 +3049,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     #[cfg(target_arch = "aarch64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::aarch64::uaccess::copy_user_guarded(dst, src.as_ptr(), src.len())
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst, src, len)
             .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile write of each in-range user
@@ -3046,8 +3057,8 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        for (i, b) in src.iter().enumerate() {
-            core::ptr::write_volatile(dst.add(i), *b);
+        for i in 0..len {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
         }
     }
     Ok(())

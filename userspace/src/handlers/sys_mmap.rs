@@ -574,7 +574,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 let region = Region {
                     base: VirtAddr::new(base),
                     len,
-                    perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
+                    perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT
+                        | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) },
                     phys: match narf_memory::region_backing::RegionBacking::try_from_slice(&phys) {
                         Ok(backing) => backing,
                         Err(_) => {
@@ -684,7 +685,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     perms: perms
                         | RegionPerms::SHARED
                         | RegionPerms::FILE_DEMAND
-                        | RegionPerms::LOCK_EXEMPT,
+                        | RegionPerms::LOCK_EXEMPT
+                        | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) },
                     phys: {
                         let mut backing = narf_memory::region_backing::RegionBacking::new();
                         backing.resize(pages, narf_memory::PhysAddr::new(0));

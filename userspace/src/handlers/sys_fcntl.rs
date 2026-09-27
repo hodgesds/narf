@@ -468,6 +468,9 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         {
             pipe.set_packetized(new & crate::fd::O_DIRECT != 0);
         }
+        if let Some(fifo) = ops.as_any().and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>()) {
+            fifo.set_packetized(new & crate::fd::O_DIRECT != 0);
+        }
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -1165,6 +1168,23 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // Resizing takes a sleepable pipe mutex; release the fd table first.
+    if cmd == 1031 {
+        let Some(ops) = fd::with_table(task, |table| table.get(fd).map(|entry| entry.ops.clone())).flatten() else {
+            ctx.set_return(errno_ret(EBADF));
+            return;
+        };
+        let answer = {
+            match crate::pipe::resize(ops.as_ref(), arg as u32) {
+                Some(Ok(cap)) => SyscallReturn::ok(cap as u64),
+                Some(Err(errno)) => errno_ret(errno as i64),
+                None => errno_ret(EBADF),
+            }
+        };
+        ctx.set_return(answer);
+        return;
+    }
+
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         Some(match cmd {
@@ -1183,34 +1203,6 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 Some(cap) => SyscallReturn::ok(cap as u64),
                 None => errno_ret(EBADF),
             },
-            1031 => {
-                // fcntl truncates arg through `int argi`; pipe_fcntl receives
-                // that low 32-bit value as unsigned int.
-                let size_arg = arg as u32;
-                let resized = entry.ops.as_any().and_then(|any| {
-                    if let Some(pipe) = any.downcast_ref::<crate::pipe::PipeRead>() {
-                        Some(pipe.set_capacity(size_arg))
-                    } else {
-                        any.downcast_ref::<crate::pipe::PipeWrite>()
-                            .map(|pipe| pipe.set_capacity(size_arg))
-                    }
-                });
-                match resized {
-                    Some(Ok(cap)) => SyscallReturn::ok(cap as u64),
-                    Some(Err(errno)) => errno_ret(errno as i64),
-                    // FIFOs expose pipe_capacity too. Their fixed backing is a
-                    // compatibility implementation: validate Linux's global
-                    // size errors, then report the live capacity.
-                    None => match entry.ops.pipe_capacity() {
-                        None => errno_ret(EBADF),
-                        Some(_) if size_arg > (1u32 << 31) => errno_ret(EINVAL),
-                        Some(_) if (size_arg as usize).max(4096).next_power_of_two() > 1_048_576 => {
-                            errno_ret(EPERM)
-                        }
-                        Some(cap) => SyscallReturn::ok(cap as u64),
-                    },
-                }
-            }
             // F_GETLEASE (1024+1). NARF has no lease machinery: there is no
             // lease break on a conflicting open, no `lease_break_time` timer
             // and no SIGIO to deliver the break. Linux ships an answer for

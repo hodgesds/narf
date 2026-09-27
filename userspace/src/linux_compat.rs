@@ -373,6 +373,26 @@ fn store_copy(store: &MemfdStore, off: usize, buf: &mut [u8], to_store: bool) {
 }
 
 impl FileOps for MemFdFile {
+    fn splice_read_page(
+        &self,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<narf_filesystem::pipe_buffer::SplicePage>, FsError> {
+        let store = self.store.lock();
+        if offset >= store.len as u64 || max == 0 {
+            return Ok(None);
+        }
+        let within = (offset & 4095) as usize;
+        let len = max.min(4096 - within).min(store.len - offset as usize);
+        let phys = store.frames[offset as usize / 4096].start_address();
+        // SAFETY: the store owns this allocator frame and its lock excludes
+        // replacement/drop until the independent physical retain completes.
+        let pin = unsafe { narf_memory::address_space::UserPagePin::retain_ram(phys) };
+        Ok(Some(narf_filesystem::pipe_buffer::SplicePage::new(
+            pin, within, len,
+        )))
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let g = self.store.lock();
@@ -454,6 +474,10 @@ impl FileOps for MemFdFile {
     /// `MAP_SHARED` backing — return the physical frames for the byte range
     /// `[offset, offset+len)` so both mappers alias the same memory. This is
     /// what makes wl_shm work: the compositor sees the client's pixels.
+    fn mmap_is_ram(&self) -> bool {
+        true
+    }
+
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
         if offset & 0xFFF != 0 {
             return Err(FsError::InvalidData);
