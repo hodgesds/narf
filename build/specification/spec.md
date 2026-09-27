@@ -9,9 +9,10 @@
 ## 1. Purpose & scope
 
 **Owns:** Cargo workspace layout, `build-std` configuration, linker scripts
-per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
+per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config,
+and CI compiler-cache integration.
 
-**Does NOT own:** Release management, CI (yet), debian-style packaging.
+**Does NOT own:** Release management, CI test policy, debian-style packaging.
 
 ## 2. Assumptions
 
@@ -36,6 +37,11 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run one exact
   in-kernel subsystem, then perform the normal whole-kernel boot smoke.
+- `cargo xtask test --arch=x86_64 --subsystem userspace --kernel-tests-only`
+  — run only the selected in-kernel tests. This is for secondary CI
+  configuration shards after a primary invocation for that architecture has
+  already completed the production-init boot and host-side btrfs
+  interoperability postflight; the default remains the full two-phase gate.
 - Successful kernel-test and boot-smoke QEMU phases keep serial output
   captured and print concise summaries. A failure or timeout emits a bounded
   64-KiB diagnostic tail. Child timeouts use polling rather than process-wide
@@ -95,6 +101,12 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `panic = "abort"`; no unwinding in the kernel.
 - Reproducibility: identical inputs produce identical binaries
   (`-Z remap-path-prefix`, `SOURCE_DATE_EPOCH`).
+- CI keeps Cargo target directories job-local and shares content-addressed
+  rustc outputs through `sccache`. Cargo incremental compilation is disabled
+  while the wrapper is active; registry and git sources are cached separately.
+  This avoids restoring large immutable target snapshots across jobs while
+  still reusing objects whose source, target, toolchain, features, and flags
+  match.
 - **Fat LTO + domain switches is a correctness hazard.** With whole-
   program LTO, LLVM sees the inline asm / intrinsic that writes PKRS
   (x86_64) or `SCTLR_EL1.TCF` (aarch64) as just another memory-barrier-

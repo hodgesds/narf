@@ -80,7 +80,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
-      - run: rustup component add rust-src llvm-tools-preview
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask build --arch=x86_64
       - uses: actions/upload-artifact@v4
         with:
@@ -102,7 +105,10 @@ jobs:
             cpio mtools dosfstools e2fsprogs
       - name: Install Limine
         uses: ./.github/actions/setup-limine
-      - run: rustup component add rust-src llvm-tools-preview
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
       # Exercise the removable-media path through OVMF first. This
       # verification build has boot-smoke enabled and must emit its
       # serial success marker before exiting through isa-debug-exit.
