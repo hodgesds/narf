@@ -430,6 +430,15 @@ struct TestArgs {
     /// `filesystem/page_cache`). Empty/absent runs the whole suite.
     #[arg(long)]
     subsystem: Option<String>,
+
+    /// Run only the in-kernel test phase. Skip the production-init boot and
+    /// host-side btrfs interoperability postflight that normally follow it.
+    ///
+    /// This is intended for secondary CI configuration shards after another
+    /// invocation in the same architecture job has already run the complete
+    /// postflight. Local and primary CI runs retain the safer default.
+    #[arg(long, default_value_t = false)]
+    kernel_tests_only: bool,
 }
 
 /// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
@@ -7409,6 +7418,23 @@ fn ensure_feature(features: &mut String, feature: &str) {
     features.push_str(feature);
 }
 
+fn validate_test_subsystems(subsystems: &str) -> Result<()> {
+    let parts: Vec<&str> = subsystems
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty()
+        || parts.iter().any(|part| {
+            !part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+        })
+    {
+        bail!("--subsystem parts must contain only letters, digits, '/', '_', '-', or '.'");
+    }
+    Ok(())
+}
+
 /// Remove features whose contract is to select the in-kernel test runner.
 /// `xtask test` reuses the caller's feature list for its second, production
 /// boot-smoke phase, where retaining any of these would transitively re-enable
@@ -7430,7 +7456,8 @@ fn without_kernel_test_features(features: &str) -> String {
 
 #[cfg(test)]
 mod kernel_test_feature_tests {
-    use super::without_kernel_test_features;
+    use super::{validate_test_subsystems, without_kernel_test_features, Cli, Cmd};
+    use clap::Parser;
 
     #[test]
     fn boot_smoke_drops_direct_and_transitive_kernel_test_features() {
@@ -7444,6 +7471,31 @@ mod kernel_test_feature_tests {
             without_kernel_test_features("mte, boot-init"),
             "mte,boot-init"
         );
+    }
+
+    #[test]
+    fn kernel_test_only_is_opt_in() {
+        let cli = Cli::try_parse_from(["xtask", "test"]).expect("default test CLI must parse");
+        let Cmd::Test(args) = cli.cmd else {
+            panic!("test subcommand parsed as another variant");
+        };
+        assert!(!args.kernel_tests_only);
+
+        let cli = Cli::try_parse_from(["xtask", "test", "--kernel-tests-only"])
+            .expect("kernel-tests-only CLI must parse");
+        let Cmd::Test(args) = cli.cmd else {
+            panic!("test subcommand parsed as another variant");
+        };
+        assert!(args.kernel_tests_only);
+    }
+
+    #[test]
+    fn subsystem_filter_validation_covers_lists_and_metacharacters() {
+        assert!(validate_test_subsystems("userspace,net/ipv6,memory/kaslr.foo-bar").is_ok());
+        assert!(validate_test_subsystems("").is_err());
+        assert!(validate_test_subsystems(",,").is_err());
+        assert!(validate_test_subsystems("userspace net").is_err());
+        assert!(validate_test_subsystems("userspace=all").is_err());
     }
 }
 
@@ -9475,24 +9527,17 @@ fn main() -> Result<()> {
         }
         Cmd::Run(args) => run_cmd(&args),
         Cmd::Test(test) => {
-            let mut args = test.build;
+            let TestArgs {
+                build: mut args,
+                subsystem,
+                kernel_tests_only,
+            } = test;
             let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
-            if let Some(subsystem) = &test.subsystem {
+            if let Some(subsystem) = &subsystem {
                 // Comma-separated list of subsystem filters (prefix-matched
                 // in-kernel). Each part is validated; the whole list is
                 // threaded onto the cmdline as `test_subsystem=a,b,c`.
-                let parts: Vec<&str> = subsystem.split(',').filter(|s| !s.is_empty()).collect();
-                if parts.is_empty()
-                    || parts.iter().any(|part| {
-                        !part
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
-                    })
-                {
-                    bail!(
-                        "--subsystem parts must contain only letters, digits, '/', '_', '-', or '.'"
-                    );
-                }
+                validate_test_subsystems(subsystem)?;
                 let mut append = prior_append
                     .as_ref()
                     .map(|value| value.to_string_lossy().into_owned())
@@ -9515,6 +9560,9 @@ fn main() -> Result<()> {
                 // Gate on the kernel-test runner's exit status: a failing
                 // smoke makes the runner exit_kernel(1), which this fails on.
                 run_cmd_inner(&smoke_args, true)?;
+                if kernel_tests_only {
+                    return Ok(());
+                }
                 // Phase 2: boot-smoke without kernel-test. Catches
                 // regressions that smokes miss because they exercise modules
                 // in isolation, not the full init flow. Strip the

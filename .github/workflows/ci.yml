@@ -56,17 +56,8 @@ jobs:
           # is against the merge-base, not the base tip).
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
 
       - name: Compute affected jobs + subsystems
         id: affected
@@ -104,13 +95,13 @@ jobs:
 
   host-tests:
     name: host unit tests
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
 
       - name: Host unit-test gate
         run: cargo xtask host-test
@@ -129,26 +120,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview clippy
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-clippy-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-clippy-${{ matrix.arch }}-
+          components: rust-src llvm-tools-preview clippy
 
       # Lint the kernel binary on the bare-metal target, matching the build-std
       # invocation `cargo xtask boot-smoke` uses. This is the only pass that
@@ -221,6 +196,14 @@ jobs:
             --features user-mode-e2e \
             -- -D warnings
 
+      # The functional jobs build optimized kernels. Link a real debug kernel
+      # too so the documented dual-profile merge gate covers debug-only cfgs,
+      # assertions, and linker layout on both architectures. On warm runs,
+      # shared sccache can reuse matching library objects; the final link
+      # remains fresh.
+      - name: cargo xtask build (debug / ${{ matrix.arch }})
+        run: cargo xtask build --arch=${{ matrix.arch }} --debug
+
       - name: aarch64 UEFI loader tests + clippy
         if: matrix.arch == 'aarch64'
         run: |
@@ -247,12 +230,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        # rust-toolchain.toml pins nightly-2025-09-14 with rust-src + llvm-tools
-        # + clippy + rustfmt; rustup honors it automatically on first cargo invocation.
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview clippy rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
 
       - name: Install host build deps
         run: |
@@ -278,22 +259,6 @@ jobs:
 
       - name: Install Limine
         uses: ./.github/actions/setup-limine
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-${{ matrix.arch }}-
 
       - name: cargo xtask boot-smoke
         run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
@@ -331,10 +296,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
 
       - name: Install host build deps
         # musl-tools + clang/lld + linux-libc-dev so verification/build.rs can
@@ -345,22 +310,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cpio mtools dosfstools e2fsprogs ovmf \
             musl-tools clang lld linux-libc-dev
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-x86_64-musl-demo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-x86_64-
 
       # Build the same kernel image `xtask musl-demo` would boot (boot-init +
       # firmware-allow-unsigned, with the demo binaries embedded).
@@ -392,9 +341,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
 
       # apt's qemu is shadowed by the newer build below, but installing it
       # pulls the shared runtime libs (libslirp0, pixman, glib) the built
@@ -410,15 +358,6 @@ jobs:
       # one so the guest matches local behaviour. Cached after first build.
       - name: Set up newer QEMU (past the 8.2 instability)
         uses: ./.github/actions/setup-qemu
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
 
       - name: Download kernel artifact
         uses: actions/download-artifact@v4
@@ -447,10 +386,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
 
       - name: Install host build deps
         run: |
@@ -472,22 +411,6 @@ jobs:
       # the fix) so net-smoke can run under real MTTCG. Cached after first build.
       - name: Set up newer QEMU (past the 8.2 MTTCG BQL bug)
         uses: ./.github/actions/setup-qemu
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-x86_64-net-smoke-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-x86_64-
 
       # Off-box network serving: boot with the `qemu-net` static config +
       # a QEMU user-mode `hostfwd`, then connect a REAL host TCP socket to
@@ -556,35 +479,21 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
-    # Generous: a cold-cache kernel build + several slow MTTCG boots must finish
+    # Generous: a kernel build + several slow MTTCG boots must finish
     # so the `if: always()` upload step can publish a captured core.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
       - name: Install host build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 cpio mtools dosfstools e2fsprogs ovmf \
             musl-tools clang lld linux-libc-dev
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-x86_64-task87-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-x86_64-
       - name: redis-smoke repro loop (multi-vCPU MTTCG)
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
@@ -631,30 +540,16 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
       - name: Install host build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 cpio mtools dosfstools e2fsprogs ovmf \
             musl-tools clang lld linux-libc-dev curl
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-x86_64-stressng-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-x86_64-
       - name: Build stress-ng Alpine rootfs
         run: sh verification/data/musl-demo/REGEN_stress_rootfs.sh
       - name: mmapfork completion regression
@@ -717,16 +612,17 @@ jobs:
         # to the affected subsystems below.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     # The full in-kernel smoke suite (~5100 tests) runs in one QEMU boot
-    # under TCG (no KVM on GHA), plus a cold build of the kernel +
-    # verification crates and the phase-2 boot-smoke pass. Generous.
+    # under TCG (no KVM on GHA), plus the primary invocation's production
+    # boot + btrfs postflight. Secondary hardware/feature shards use
+    # --kernel-tests-only so they do not repeat that same postflight.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
 
       - name: Install host build deps
         # Same set as the musl-demo build job: `cargo xtask test` builds the
@@ -751,22 +647,6 @@ jobs:
       - name: Set up newer QEMU (past the 8.2 instability)
         if: matrix.arch == 'x86_64'
         uses: ./.github/actions/setup-qemu
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-${{ matrix.arch }}-kernel-test-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-${{ matrix.arch }}-
 
       # Phase 1 boots the kernel-test image and FAILS the job if any
       # smoke fails (the runner exit_kernel(1)s on failure; xtask test
@@ -819,11 +699,10 @@ jobs:
         if: matrix.arch == 'aarch64'
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
-          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
           NARF_QEMU_EXTRA: "-device virtio-rng-device -global virtio-mmio.force-legacy=false"
         run: |
           cargo xtask test --arch=aarch64 --features cgroup-all,container \
-            --subsystem verification
+            --subsystem verification --kernel-tests-only
 
       # Large-memory arm. Everything about frame placement — the bootstrap
       # arena carve-out, the buddy's per-zone reservation, KASLR's physical
@@ -843,11 +722,10 @@ jobs:
       - name: cargo xtask test — large-memory frame placement
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
-          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
           NARF_QEMU_MEM_MB: "8192"
         run: |
           cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container \
-            --subsystem memory,memory/kaslr
+            --subsystem memory,memory/kaslr --kernel-tests-only
 
       # Same shape, same reason, x86_64 side: the xAPIC fallback (no x2APIC)
       # is the path real Renoir/Phoenix firmware puts us on when it refuses
@@ -877,12 +755,11 @@ jobs:
         timeout-minutes: 15
         env:
           XTASK_QEMU_TIMEOUT_SECS: "600"
-          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "600"
           NARF_QEMU_CPU: "max,-x2apic"
           NARF_QEMU_SMP: "4"
         run: |
           cargo xtask test --arch=x86_64 --features cgroup-all,container \
-            --subsystem interrupts
+            --subsystem interrupts --kernel-tests-only
 
       # Run the tests the `user-mode-e2e` feature gates. The clippy pass in
       # `clippy-kernel` proves they COMPILE on both arches; this proves they
@@ -911,10 +788,9 @@ jobs:
         timeout-minutes: 20
         env:
           XTASK_QEMU_TIMEOUT_SECS: "1200"
-          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "600"
         run: |
           cargo xtask test --arch=${{ matrix.arch }} --features user-mode-e2e \
-            --subsystem verification,userspace
+            --subsystem verification,userspace --kernel-tests-only
 
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
@@ -932,20 +808,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: featurecheck-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: featurecheck-${{ runner.os }}-
+          components: rust-src
 
       - name: cargo check (features = "${{ matrix.features }}")
         run: |

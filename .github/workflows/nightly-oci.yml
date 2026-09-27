@@ -42,16 +42,16 @@ jobs:
   oci-container:
     name: oci container (x86_64)
     runs-on: ubuntu-latest
-    # Cold build of the kernel + verification crates (~10-15 min on
-    # GHA's free runners) plus a TCG QEMU boot.
+    # Kernel + verification-crate build (the first compiler-cache fill can
+    # take ~10-15 min on GHA's free runners) plus a TCG QEMU boot.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
 
       - name: Install host build deps
         # Same set as the musl-demo job: the verification crate's
@@ -71,22 +71,6 @@ jobs:
             clang \
             lld \
             linux-libc-dev
-
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache build target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-x86_64-oci-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-x86_64-
 
       # Boot real init with the `container` feature, type `oci_smoke` at
       # the shell, and assert the STRONGER `oci-uts-isolated` token: the

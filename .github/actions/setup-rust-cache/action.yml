@@ -1,0 +1,50 @@
+name: Set up Rust and shared compiler cache
+description: Install the pinned toolchain, cache Cargo sources, and enable sccache.
+
+inputs:
+  components:
+    description: Space-separated rustup components required by the job.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      env:
+        RUST_COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -eu
+        rustup show active-toolchain || rustup toolchain install
+        if [ -n "$RUST_COMPONENTS" ]; then
+          # Inputs are fixed strings from in-tree workflows.
+          # shellcheck disable=SC2086
+          rustup component add $RUST_COMPONENTS
+        fi
+
+    - name: Cache Cargo registry and git sources
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-sources-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-sources-${{ runner.os }}-
+
+    # Unlike archived target/ directories, sccache keys each rustc result by
+    # source, target, toolchain, cfg/features, and compiler flags. That lets
+    # independent jobs and architectures share safe hits without restoring a
+    # large, increasingly stale Cargo target tree.
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.11
+      with:
+        version: v0.16.0
+
+    - name: Enable shared Rust compilation cache
+      shell: bash
+      run: |
+        echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+        echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
+        echo 'SCCACHE_GHA_ENABLED=true' >> "$GITHUB_ENV"
+        echo 'SCCACHE_GHA_VERSION=narf-ci-v1' >> "$GITHUB_ENV"

@@ -22,6 +22,10 @@ build orchestration (`build/`), release sign-off (`process/`).
   structured exit codes + instrumentation output.
 - `cargo xtask test --subsystem NAME` selects one exact registered subsystem
   for fast local iteration; the unfiltered command remains the merge gate.
+- `cargo xtask test --kernel-tests-only` is restricted to secondary CI
+  configuration shards after that architecture's primary invocation has run
+  the production boot and host interoperability postflight. It does not
+  replace the complete merge gate.
 - `console/` provides a deterministic log sink we can parse.
 - CI runners have dedicated (not shared) cores, with frequency scaling
   and turbo disabled for perf jobs.
