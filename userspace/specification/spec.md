@@ -1236,12 +1236,17 @@ while a V6ONLY reservation remains independent. NARF's family demux lock may
 nest the reservation lock, but the reservation layer never enters either
 family table, providing a fixed lock order without an IPv4/IPv6 ABBA path.
 
-Internet sockets implement the legacy read-only network-device ioctl ABI for
+Internet sockets implement the legacy network-device ioctl ABI for
 `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
 `SIOCGIFHWADDR`, and `SIOCGIFINDEX`. Each consumes and returns the native
 64-bit 40-byte `struct ifreq`, resolves the interface in the socket's network
 namespace, returns `ENODEV` for an unknown name and `EFAULT` for an invalid
 ifreq pointer, and reports the same registry fields used by rtnetlink.
+`SIOCSIFFLAGS`, `SIOCSIFMTU`, and `SIOCSIFHWADDR` invoke the same typed
+interface-control operations as rtnetlink. They require a live, namespace-
+and-interface-matched `AdminHandle`; no uid or Linux capability bit supplies
+ambient authority. Missing or mismatched authority returns `EPERM`, while
+invalid MTU, hardware type, or address values return `EINVAL`.
 
 ### 3.3 BPF XDP program compatibility
 

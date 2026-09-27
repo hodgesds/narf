@@ -1424,6 +1424,16 @@ pub fn udp6_snapshot_in(net_ns_id: u64) -> Vec<Udp6SocketSnapshot> {
     inet6_dgram::snapshot_in(net_ns_id)
 }
 
+fn map_admin_ioctl_error(error: narf_net::AdminError) -> FsError {
+    match error {
+        narf_net::AdminError::AuthorityRevoked => FsError::OperationNotPermitted,
+        narf_net::AdminError::NoIface => FsError::NotFound,
+        narf_net::AdminError::InvalidMtu
+        | narf_net::AdminError::InvalidMac
+        | narf_net::AdminError::InvalidPrefix => FsError::InvalidPath,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DgramPacket6 {
     peer_addr: [u8; 16],
@@ -2855,14 +2865,25 @@ impl FileOps for SocketFile {
     /// succeed or dbus-broker treats the ENOTTY as fatal.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         const SIOCGIFFLAGS: u32 = 0x8913;
+        const SIOCSIFFLAGS: u32 = 0x8914;
         const SIOCGIFADDR: u32 = 0x8915;
         const SIOCGIFNETMASK: u32 = 0x891b;
         const SIOCGIFMTU: u32 = 0x8921;
+        const SIOCSIFMTU: u32 = 0x8922;
+        const SIOCSIFHWADDR: u32 = 0x8924;
         const SIOCGIFHWADDR: u32 = 0x8927;
         const SIOCGIFINDEX: u32 = 0x8933;
         if matches!(
             cmd,
-            SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX
+            SIOCGIFFLAGS
+                | SIOCSIFFLAGS
+                | SIOCGIFADDR
+                | SIOCGIFNETMASK
+                | SIOCGIFMTU
+                | SIOCSIFMTU
+                | SIOCSIFHWADDR
+                | SIOCGIFHWADDR
+                | SIOCGIFINDEX
         ) {
             let mut ifreq = [0u8; 40];
             // SAFETY: Linux's 64-bit `struct ifreq` is 40 bytes. The common
@@ -2924,6 +2945,44 @@ impl FileOps for SocketFile {
                 SIOCGIFINDEX => {
                     let index = narf_net::iface::ifindex_of(&name).ok_or(FsError::NotFound)?;
                     ifreq[16..20].copy_from_slice(&(index as i32).to_ne_bytes());
+                }
+                SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR => {
+                    let admin = self
+                        .netlink_admin
+                        .lock()
+                        .clone()
+                        .ok_or(FsError::OperationNotPermitted)?;
+                    if admin.iface_name() != name
+                        || admin.net_ns_id().map_err(map_admin_ioctl_error)? != self.net_ns_id()
+                    {
+                        return Err(FsError::OperationNotPermitted);
+                    }
+                    match cmd {
+                        SIOCSIFFLAGS => {
+                            const IFF_UP: i16 = 0x1;
+                            let flags = i16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+                            admin
+                                .set_link(flags & IFF_UP != 0)
+                                .map_err(map_admin_ioctl_error)?;
+                        }
+                        SIOCSIFMTU => {
+                            let mtu = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+                            let mtu = u32::try_from(mtu).map_err(|_| FsError::InvalidPath)?;
+                            admin.set_mtu(mtu).map_err(map_admin_ioctl_error)?;
+                        }
+                        SIOCSIFHWADDR => {
+                            const ARPHRD_ETHER: u16 = 1;
+                            let family = u16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+                            if family != ARPHRD_ETHER {
+                                return Err(FsError::InvalidPath);
+                            }
+                            admin
+                                .set_mac(ifreq[18..24].try_into().unwrap())
+                                .map_err(map_admin_ioctl_error)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    return Ok(0);
                 }
                 _ => unreachable!(),
             }
@@ -8462,6 +8521,38 @@ fn smoke_socket_ioctl_reports_network_interface() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_socket_ioctl_reports_network_interface
+);
+
+fn smoke_socket_mutation_ioctl_requires_delegated_admin() -> TestResult {
+    let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+    const SIOCSIFFLAGS: u32 = 0x8914;
+    let mut ifreq = [0u8; 40];
+    ifreq[..2].copy_from_slice(b"lo");
+    ifreq[16..18].copy_from_slice(&1i16.to_ne_bytes());
+
+    let plain = SocketFile::new(AF_INET, SOCK_DGRAM);
+    if !matches!(
+        plain.ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize),
+        Err(FsError::OperationNotPermitted)
+    ) {
+        return TestResult::Fail("SIOCSIFFLAGS accepted ambient authority");
+    }
+
+    let route = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if route
+        .delegate_netlink_admin(narf_net::initial_loopback_admin())
+        .is_err()
+        || route
+            .ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize)
+            .is_err()
+    {
+        return TestResult::Fail("delegated SIOCSIFFLAGS failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_socket_mutation_ioctl_requires_delegated_admin
 );
 
 fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
