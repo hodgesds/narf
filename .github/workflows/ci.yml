@@ -124,7 +124,8 @@ jobs:
       fail-fast: false
       matrix:
         # x86_64 always; aarch64 only when the diff touches arch-sensitive
-        # paths (arch/**, drivers/**, *aarch64*, asm) — see `xtask affected`.
+        # paths (arch/**, drivers/**, userspace/**, *aarch64*, asm) — see
+        # `xtask affected`.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     steps:
       - uses: actions/checkout@v4
