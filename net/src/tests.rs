@@ -831,6 +831,28 @@ fn smoke_tcp6_listener_uses_native_tcb() -> TestResult {
 }
 kernel_test_in!("net/ipv6", smoke_tcp6_listener_uses_native_tcb);
 
+fn smoke_udp6_neighbor_queue_is_namespace_scoped_and_drained() -> TestResult {
+    let neighbor = [0x20, 1, 0x0d, 0xb8, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    crate::ipv6_stack::remove_namespace(7008);
+    crate::ipv6_stack::remove_namespace(7009);
+    if !crate::ipv6_stack::__pending_udp6_test_insert(7008, "ns6-queue", neighbor) {
+        return TestResult::Fail("UDP6 neighbor queue rejected a packet below its bound");
+    }
+    let isolated = crate::ipv6_stack::__pending_udp6_test_count(7008) == 1
+        && crate::ipv6_stack::__pending_udp6_test_count(7009) == 0;
+    crate::ipv6_stack::neighbor_resolved(7008, "ns6-queue", neighbor, [2, 0, 0, 0, 0, 8]);
+    let drained = crate::ipv6_stack::__pending_udp6_test_count(7008) == 0;
+    if isolated && drained {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("UDP6 neighbor queue leaked namespaces or did not drain")
+    }
+}
+kernel_test_in!(
+    "net/ipv6",
+    smoke_udp6_neighbor_queue_is_namespace_scoped_and_drained
+);
+
 fn smoke_icmpv6_router_solicitation_layout() -> TestResult {
     use crate::pkt_ipv6::{router_solicitation, ICMPV6_ROUTER_SOLICITATION};
     let body = router_solicitation(&[]);

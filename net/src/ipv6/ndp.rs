@@ -360,6 +360,7 @@ pub fn on_na_in(net_ns_id: u64, iface: &str, body: &[u8]) -> NdRxResult {
                 deadline_ns: 0,
             },
         );
+        crate::ipv6_stack::neighbor_resolved(net_ns_id, iface, target, m);
         return NdRxResult::Updated;
     }
     NdRxResult::Ignored

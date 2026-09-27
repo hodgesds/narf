@@ -426,6 +426,9 @@ impl SocketFile {
                 Err(narf_net::ipv6_stack::Udp6SendError::NoSourceAddress) => {
                     SocketOpResult::Err(SockError::AddrNotAvail)
                 }
+                Err(narf_net::ipv6_stack::Udp6SendError::QueueFull) => {
+                    SocketOpResult::Err(SockError::NoBufs)
+                }
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }

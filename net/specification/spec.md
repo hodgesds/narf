@@ -784,7 +784,10 @@ References (public-only, all IETF documents):
   A unicast cache miss installs an `Incomplete` NDP entry and emits a Neighbor
   Solicitation to the target's solicited-node multicast address with IPv6 hop
   limit 255; repeated sends do not flood duplicate solicitations while that
-  resolution is pending.
+  resolution is pending. The complete UDP segment is retained in a bounded,
+  namespace-keyed queue and emitted when the Neighbor Advertisement updates
+  the cache; queue exhaustion returns `ENOBUFS` rather than reporting a
+  datagram as sent and dropping it.
 - Native TCP6 RX validates the IPv6 pseudo-header checksum before entering the
   shared TCP state machine. Active and passive opens use IPv6 FIB/source
   selection and NDP, emit Ethernet+IPv6+TCP frames, and retain native IPv6

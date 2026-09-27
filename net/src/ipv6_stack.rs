@@ -21,7 +21,8 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -283,6 +284,101 @@ pub enum Udp6SendError {
     NeighborPending,
     NoSourceAddress,
     DeviceFailure,
+    QueueFull,
+}
+
+#[derive(Debug)]
+struct PendingUdp6 {
+    net_ns_id: u64,
+    iface: String,
+    neighbor: [u8; 16],
+    source: [u8; 16],
+    destination: [u8; 16],
+    hop_limit: u8,
+    udp: Vec<u8>,
+}
+
+const MAX_PENDING_UDP6_PACKETS: usize = 256;
+const MAX_PENDING_UDP6_BYTES: usize = 1024 * 1024;
+static PENDING_UDP6: IrqSafeSpinLock<VecDeque<PendingUdp6>> = IrqSafeSpinLock::new(VecDeque::new());
+
+fn queue_udp6(packet: PendingUdp6) -> Result<(), Udp6SendError> {
+    let mut queue = PENDING_UDP6.lock();
+    let bytes: usize = queue.iter().map(|entry| entry.udp.len()).sum();
+    if queue.len() >= MAX_PENDING_UDP6_PACKETS
+        || bytes.saturating_add(packet.udp.len()) > MAX_PENDING_UDP6_BYTES
+    {
+        return Err(Udp6SendError::QueueFull);
+    }
+    queue.push_back(packet);
+    Ok(())
+}
+
+pub fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8; 16], mac: [u8; 6]) {
+    let mut ready = Vec::new();
+    {
+        let mut queue = PENDING_UDP6.lock();
+        let mut retained = VecDeque::new();
+        while let Some(packet) = queue.pop_front() {
+            if packet.net_ns_id == net_ns_id
+                && packet.iface == iface_name
+                && packet.neighbor == neighbor
+            {
+                ready.push(packet);
+            } else {
+                retained.push_back(packet);
+            }
+        }
+        *queue = retained;
+    }
+    let Some(iface) = crate::iface::lookup_in(net_ns_id, iface_name) else {
+        return;
+    };
+    for packet in ready {
+        let mut frame = Vec::new();
+        build_frame(
+            &mut frame,
+            Ipv6FrameSpec {
+                src_mac: iface.mac,
+                dst_mac: mac,
+                src_ip: packet.source,
+                dst_ip: packet.destination,
+                next_header: NEXT_HEADER_UDP,
+                hop_limit: packet.hop_limit,
+                body: &packet.udp,
+            },
+        );
+        let _ = (iface.send)(&frame);
+    }
+}
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    PENDING_UDP6
+        .lock()
+        .retain(|packet| packet.net_ns_id != net_ns_id);
+}
+
+#[doc(hidden)]
+pub fn __pending_udp6_test_insert(net_ns_id: u64, iface: &str, neighbor: [u8; 16]) -> bool {
+    queue_udp6(PendingUdp6 {
+        net_ns_id,
+        iface: String::from(iface),
+        neighbor,
+        source: [0; 16],
+        destination: neighbor,
+        hop_limit: 64,
+        udp: alloc::vec![0; 8],
+    })
+    .is_ok()
+}
+
+#[doc(hidden)]
+pub fn __pending_udp6_test_count(net_ns_id: u64) -> usize {
+    PENDING_UDP6
+        .lock()
+        .iter()
+        .filter(|packet| packet.net_ns_id == net_ns_id)
+        .count()
 }
 
 /// Build an IPv6 UDP segment, including its mandatory pseudo-header checksum.
@@ -310,9 +406,8 @@ pub fn build_udp_segment(
     Ok(udp)
 }
 
-/// Route and emit one IPv6 UDP datagram. A missing NDP entry is reported as
-/// `NeighborPending`: the compatibility caller treats that like Linux's
-/// queued-neighbour success while the NDP machinery resolves the next hop.
+/// Route and emit one IPv6 UDP datagram. A missing NDP entry queues the
+/// complete UDP segment until a Neighbor Advertisement supplies the MAC.
 #[allow(clippy::too_many_arguments)]
 pub fn send_udp(
     net_ns_id: u64,
@@ -357,6 +452,7 @@ pub fn send_udp(
             .map(|entry| entry.addr)
             .ok_or(Udp6SendError::NoSourceAddress)?,
     };
+    let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
     let destination_mac = if destination[0] == 0xff {
         [
             0x33,
@@ -371,10 +467,18 @@ pub fn send_udp(
     {
         mac
     } else {
+        queue_udp6(PendingUdp6 {
+            net_ns_id,
+            iface: iface_name.clone(),
+            neighbor: neighbor_ip,
+            source,
+            destination,
+            hop_limit: if hop_limit == 0 { 64 } else { hop_limit },
+            udp,
+        })?;
         start_neighbor_resolution(net_ns_id, &iface_name, &iface, source, neighbor_ip);
-        return Err(Udp6SendError::NeighborPending);
+        return Ok(payload.len());
     };
-    let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
 
     let mut frame = Vec::new();
     build_frame(
