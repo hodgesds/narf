@@ -490,6 +490,12 @@ _start_rust_entry:
      * KERNEL_VIRT_BASE` and resolves to a high-VA address
      * pointing at the same physical bytes as the boot stack. */
     ldr  x0, =stack_top_virt
+    /* `stack_top_virt` is the linear-map alias of the link-time physical
+     * stack.  The image copy moved its backing by x21, so apply the physical
+     * delta before abandoning the identity-mapped stack.  Without this the
+     * BSP keeps running on the old image; donating that range to the buddy
+     * eventually zeroes a live return address and branches to ELR 0. */
+    add  x0, x0, x21
     mov  sp, x0
 
     mov x0, #0xfeed

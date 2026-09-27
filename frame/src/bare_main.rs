@@ -631,6 +631,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     {
         // PL011 at QEMU virt's MMIO base.
         console::early_init(PhysAddr::new(0x0900_0000), UartKind::Pl011);
+
+        // Physical relocation must move the active BSP stack with the image.
+        // Catch a stale direct-map alias before the source image is donated to
+        // the buddy and turns the failure into a much later ELR=0 crash.
+        let sp: u64;
+        // SAFETY: reading SP at EL1 has no side effects.
+        unsafe {
+            core::arch::asm!("mov {sp}, sp", sp = out(reg) sp, options(nomem, nostack));
+        }
+        let stack_phys = sp
+            .checked_sub(narf_memory::KERNEL_PHYS_OFFSET)
+            .expect("aarch64 BSP stack is outside the direct map");
+        let (image_start, image_end) = narf_memory::kaslr::image_phys_bounds();
+        assert!(
+            (image_start..image_end).contains(&stack_phys),
+            "aarch64 BSP stack was not physically relocated"
+        );
     }
 
     let _ = writeln!(
@@ -1432,76 +1449,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(not(target_arch = "x86_64"))]
             let window_end = kend;
             let window_start = narf_memory::mmu::KERNEL_WINDOW_PHYS_BASE.saturating_add(phys_delta);
-            // Keep the PRE-relocation image reserved as well.
-            //
-            // Something on aarch64 still reads the image at its link-time
-            // physical address after the stub has copied it, and I have not
-            // identified what. The evidence, in case it helps whoever does:
-            //
-            //  * bisected to this exclude's low bound. With the bound at the bare
-            //    delta (below the RAM base, so effectively the whole low end of
-            //    RAM stayed reserved) the btrfs tests pass; tightening it to the
-            //    window's real start frees the old image and they die on a call
-            //    through a NULL pointer — instruction abort, ELR_EL1 = 0.
-            //  * excluding the DTB and the borrowed initramfs instead does NOT
-            //    fix it; excluding exactly the old image range does.
-            //  * x86_64 frees its old image and is fine at every delta up to
-            //    1 TiB, so the dangling reference is arch-specific.
-            //  * every `ldr xN, =symbol` in the aarch64 stub that names a
-            //    physical in-image address already gets the delta, as do the
-            //    `.ap_boot_syms` entries, so it is likely on the Rust side.
-            //
-            // Narrowed further since, by bisecting the reserved span against the
-            // btrfs cases (which reproduce it in ~2 s on their own):
-            //
-            //  * only EIGHT PAGES actually matter — `[__kernel_start + 0x1000,
-            //    + 0x9000)` of the OLD image, which is exactly the stub's page
-            //    tables, `l0_lo` through `l2_img`. Reserving just those is enough;
-            //    the other ~68 MiB can be freed.
-            //  * that is specific, not allocator luck: reserving the SAME number
-            //    of pages at +0x20000, +0x40000 and +0x89000 (the old stack) all
-            //    still crash.
-            //  * and yet the MMU is NOT using them. TTBR0/TTBR1 read back as
-            //    `l0_lo + delta` and `l0_hi + delta` — the copy's tables — and a
-            //    walk of the live L0/L1 tables finds no descriptor whose output
-            //    lands in the old range. So this is not a stale root or a stale
-            //    table link.
-            //
-            // Which leaves a stray WRITE to those fixed physical addresses,
-            // clobbering whatever the buddy put there — consistent with the
-            // symptom, a call through a function pointer that reads back as 0.
-            // Catching it wants those pages mapped read-only, and `map_4kb`
-            // refuses because the linear map covers them with a 2 MiB block, so
-            // the next step is demoting that block first.
-            //
-            // The span stays at the whole image rather than the eight pages: a
-            // 32 KiB window is only known-sufficient for the configurations
-            // tested, and narrowing it on an unexplained mechanism trades 68 MiB
-            // of RAM for a much sharper edge.
-            //
-            // Reserving it costs the image's size (~68 MiB) and makes the delta
-            // safe to randomize, where the old over-wide bound starved a 1 GiB
-            // machine outright ("memory allocation of 16777216 bytes failed") for
-            // any delta past ~300 MiB. Worth revisiting once the reference is
-            // found: this is a workaround with a measurement behind it, not an
-            // explanation.
-            // aarch64 only: x86_64 frees its old image at every delta up to
-            // 1 TiB with no ill effect, so reserving it there would cost ~98 MiB
-            // to work around a problem that arch does not have.
+            // The relocation stub rebases the BSP's direct-map stack alias by
+            // the physical delta before entering Rust, so no execution state
+            // remains in the source image.  Only the relocated image/window is
+            // excluded; the source copy is ordinary reclaimable RAM.
             #[cfg(target_arch = "aarch64")]
-            let exclude_buf = [
-                (window_start.min(kstart), window_end),
-                (
-                    kstart.saturating_sub(phys_delta),
-                    kend.saturating_sub(phys_delta),
-                ),
-            ];
+            let exclude_buf = [(window_start.min(kstart), window_end)];
             #[cfg(target_arch = "aarch64")]
-            let kernel_exclude: &[(u64, u64)] = if phys_delta != 0 {
-                &exclude_buf
-            } else {
-                &exclude_buf[..1]
-            };
+            let kernel_exclude: &[(u64, u64)] = &exclude_buf;
             #[cfg(not(target_arch = "aarch64"))]
             let exclude_buf = [(window_start.min(kstart), window_end)];
             #[cfg(not(target_arch = "aarch64"))]

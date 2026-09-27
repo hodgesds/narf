@@ -221,6 +221,14 @@ argument = "Post-poll requeue keeps the CPU that just executed the continuation 
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The aarch64 relocation stub keeps the BSP stack inside the existing frame TCB and changes only its physical backing from the abandoned source image to the byte-identical relocated image before Rust runs. The source image is donated only after an early assertion proves the active stack lies within the authoritative relocated image bounds."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Rebasing the direct-map stack alias by the already-recorded physical relocation delta preserves the same stack bytes, virtual access permissions, Frame domain, and execution context. It grants no capability or domain right and prevents allocator ownership from overlapping the live BSP stack."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The BPF memory work stays inside the existing frame/ + memory/ TCB and adds no new trusted subsystem. `bpf_text::reserve_kernel_slots` runs as a direct call from bare_main after the MMU handoff and before the first `new_user_pml4`, because `new_user_pml4_on` snapshot-copies PML4[256..511] by value with no propagation; a slot first populated after a user address space exists would leave that CR3 holding a zero entry and triple-fault. A `debug_assert` in `new_user_pml4_on` makes a future reordering fail loudly, and an in-kernel smoke reads the live root to assert both entries are present and both arena guard slots are absent."
 
 [[invariants_preserved]]
