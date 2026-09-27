@@ -335,7 +335,7 @@ pub fn send_udp(
     if bound_ifindex != 0 && scoped_iface.is_none() {
         return Err(Udp6SendError::NetworkUnreachable);
     }
-    let next_hop = crate::ipv6::route::lookup(&destination, scoped_iface.as_deref());
+    let next_hop = crate::ipv6::route::lookup_in(net_ns_id, &destination, scoped_iface.as_deref());
     let (iface_name, neighbor_ip) = match next_hop {
         crate::ipv6::route::NextHop::Direct(iface) => (iface, destination),
         crate::ipv6::route::NextHop::Gateway { iface, gateway } => (iface, gateway),
@@ -345,7 +345,7 @@ pub fn send_udp(
         crate::iface::lookup_in(net_ns_id, &iface_name).ok_or(Udp6SendError::NetworkUnreachable)?;
     let source = match source {
         Some(addr) if addr != [0; 16] => addr,
-        _ => crate::ipv6::addrs::list_iface(&iface_name)
+        _ => crate::ipv6::addrs::list_iface_in(net_ns_id, &iface_name)
             .into_iter()
             .find(|entry| {
                 matches!(
@@ -366,10 +366,12 @@ pub fn send_udp(
             destination[14],
             destination[15],
         ]
-    } else if let Some(mac) = crate::ipv6::ndp::neigh_lookup(&iface_name, &neighbor_ip) {
+    } else if let Some(mac) =
+        crate::ipv6::ndp::neigh_lookup_in(net_ns_id, &iface_name, &neighbor_ip)
+    {
         mac
     } else {
-        start_neighbor_resolution(&iface_name, &iface, source, neighbor_ip);
+        start_neighbor_resolution(net_ns_id, &iface_name, &iface, source, neighbor_ip);
         return Err(Udp6SendError::NeighborPending);
     };
     let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
@@ -392,29 +394,33 @@ pub fn send_udp(
 }
 
 fn start_neighbor_resolution(
+    net_ns_id: u64,
     iface_name: &str,
     iface: &crate::iface::NetIfaceSnapshot,
     source: [u8; 16],
     target: [u8; 16],
 ) {
     let now = narf_scheduler::narf_time::monotonic_ns();
-    if let Some(existing) = crate::ipv6::ndp::neigh_list()
+    if let Some(existing) = crate::ipv6::ndp::neigh_list_in(net_ns_id)
         .into_iter()
         .find(|entry| entry.iface == iface_name && entry.ip == target)
     {
         if existing.mac.is_some() || existing.deadline_ns == 0 || now < existing.deadline_ns {
             return;
         }
-        crate::ipv6::ndp::neigh_remove(iface_name, &target);
+        crate::ipv6::ndp::neigh_remove_in(net_ns_id, iface_name, &target);
     }
-    crate::ipv6::ndp::neigh_upsert(crate::ipv6::ndp::Neigh {
-        iface: alloc::string::String::from(iface_name),
-        ip: target,
-        mac: None,
-        state: crate::ipv6::ndp::NeighState::Incomplete,
-        is_router: false,
-        deadline_ns: now.saturating_add(1_000_000_000),
-    });
+    crate::ipv6::ndp::neigh_upsert_in(
+        net_ns_id,
+        crate::ipv6::ndp::Neigh {
+            iface: alloc::string::String::from(iface_name),
+            ip: target,
+            mac: None,
+            state: crate::ipv6::ndp::NeighState::Incomplete,
+            is_router: false,
+            deadline_ns: now.saturating_add(1_000_000_000),
+        },
+    );
     let destination = crate::ipv6::addrs::solicited_node_multicast(&target);
     let destination_mac = [
         0x33,

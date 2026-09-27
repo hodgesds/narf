@@ -203,7 +203,11 @@ impl SocketFile {
         }
         let bindable = match mapped {
             Some(v4) => inet4_bindable(self.net_ns_id(), u32::from_be_bytes(v4), false),
-            None => ip == UNSPEC || ip == LOOPBACK || narf_net::ipv6::addrs::is_local(&ip),
+            None => {
+                ip == UNSPEC
+                    || ip == LOOPBACK
+                    || narf_net::ipv6::addrs::is_local_in(self.net_ns_id(), &ip)
+            }
         };
         if !bindable {
             return SocketOpResult::Err(SockError::AddrNotAvail);
@@ -392,7 +396,8 @@ impl SocketFile {
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
-        let is_local = dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local(&dest.0);
+        let is_local =
+            dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local_in(self.net_ns_id(), &dest.0);
         if !is_local {
             let bound_ifindex = if dest.2 != 0 {
                 dest.2

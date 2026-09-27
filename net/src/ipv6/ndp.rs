@@ -64,43 +64,75 @@ pub struct Neigh {
     pub deadline_ns: u64,
 }
 
-static NEIGH: IrqSafeSpinLock<Vec<Neigh>> = IrqSafeSpinLock::new(Vec::new());
+#[derive(Clone, Debug)]
+struct NamespacedNeigh {
+    net_ns_id: u64,
+    neigh: Neigh,
+}
+
+static NEIGH: IrqSafeSpinLock<Vec<NamespacedNeigh>> = IrqSafeSpinLock::new(Vec::new());
+
+fn iface_namespace(iface: &str) -> u64 {
+    crate::iface::lookup(iface)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0)
+}
 
 /// Insert / update a neighbor entry.
 pub fn neigh_upsert(entry: Neigh) {
+    neigh_upsert_in(iface_namespace(&entry.iface), entry);
+}
+
+pub fn neigh_upsert_in(net_ns_id: u64, entry: Neigh) {
     let mut g = NEIGH.lock();
-    if let Some(e) = g
-        .iter_mut()
-        .find(|e| e.iface == entry.iface && e.ip == entry.ip)
-    {
-        e.mac = entry.mac;
-        e.state = entry.state;
-        e.is_router = entry.is_router;
-        e.deadline_ns = entry.deadline_ns;
+    if let Some(e) = g.iter_mut().find(|e| {
+        e.net_ns_id == net_ns_id && e.neigh.iface == entry.iface && e.neigh.ip == entry.ip
+    }) {
+        e.neigh = entry;
     } else {
-        g.push(entry);
+        g.push(NamespacedNeigh {
+            net_ns_id,
+            neigh: entry,
+        });
     }
 }
 
 /// Look up the MAC for `(iface, ip)`. Returns `None` if no entry or
 /// the entry is still `Incomplete`.
 pub fn neigh_lookup(iface: &str, ip: &[u8; 16]) -> Option<[u8; 6]> {
+    neigh_lookup_in(iface_namespace(iface), iface, ip)
+}
+
+pub fn neigh_lookup_in(net_ns_id: u64, iface: &str, ip: &[u8; 16]) -> Option<[u8; 6]> {
     let g = NEIGH.lock();
     g.iter()
-        .find(|e| e.iface == iface && &e.ip == ip)
-        .and_then(|e| e.mac)
+        .find(|e| e.net_ns_id == net_ns_id && e.neigh.iface == iface && &e.neigh.ip == ip)
+        .and_then(|e| e.neigh.mac)
 }
 
 /// Snapshot the cache.
 pub fn neigh_list() -> Vec<Neigh> {
-    NEIGH.lock().clone()
+    neigh_list_in(0)
+}
+
+pub fn neigh_list_in(net_ns_id: u64) -> Vec<Neigh> {
+    NEIGH
+        .lock()
+        .iter()
+        .filter(|e| e.net_ns_id == net_ns_id)
+        .map(|e| e.neigh.clone())
+        .collect()
 }
 
 /// Remove an entry by `(iface, ip)`.
 pub fn neigh_remove(iface: &str, ip: &[u8; 16]) -> bool {
+    neigh_remove_in(iface_namespace(iface), iface, ip)
+}
+
+pub fn neigh_remove_in(net_ns_id: u64, iface: &str, ip: &[u8; 16]) -> bool {
     let mut g = NEIGH.lock();
     let before = g.len();
-    g.retain(|e| !(e.iface == iface && &e.ip == ip));
+    g.retain(|e| !(e.net_ns_id == net_ns_id && e.neigh.iface == iface && &e.neigh.ip == ip));
     g.len() != before
 }
 
@@ -109,8 +141,8 @@ pub fn neigh_remove(iface: &str, ip: &[u8; 16]) -> bool {
 pub fn age_tick(now_ns: u64) {
     let mut g = NEIGH.lock();
     for e in g.iter_mut() {
-        if e.deadline_ns != 0 && now_ns >= e.deadline_ns {
-            e.state = match e.state {
+        if e.neigh.deadline_ns != 0 && now_ns >= e.neigh.deadline_ns {
+            e.neigh.state = match e.neigh.state {
                 NeighState::Reachable => NeighState::Stale,
                 NeighState::Delay => NeighState::Probe,
                 s => s,
@@ -128,21 +160,39 @@ pub struct DefaultRouter {
     pub deadline_ns: u64,
 }
 
-static ROUTERS: IrqSafeSpinLock<Vec<DefaultRouter>> = IrqSafeSpinLock::new(Vec::new());
-
-pub fn routers() -> Vec<DefaultRouter> {
-    ROUTERS.lock().clone()
+#[derive(Clone, Debug)]
+struct NamespacedRouter {
+    net_ns_id: u64,
+    router: DefaultRouter,
 }
 
-fn router_upsert(r: DefaultRouter) {
+static ROUTERS: IrqSafeSpinLock<Vec<NamespacedRouter>> = IrqSafeSpinLock::new(Vec::new());
+
+pub fn routers() -> Vec<DefaultRouter> {
+    routers_in(0)
+}
+
+pub fn routers_in(net_ns_id: u64) -> Vec<DefaultRouter> {
+    ROUTERS
+        .lock()
+        .iter()
+        .filter(|e| e.net_ns_id == net_ns_id)
+        .map(|e| e.router.clone())
+        .collect()
+}
+
+fn router_upsert_in(net_ns_id: u64, r: DefaultRouter) {
     let mut g = ROUTERS.lock();
     if let Some(e) = g
         .iter_mut()
-        .find(|e| e.iface == r.iface && e.addr == r.addr)
+        .find(|e| e.net_ns_id == net_ns_id && e.router.iface == r.iface && e.router.addr == r.addr)
     {
-        e.deadline_ns = r.deadline_ns;
+        e.router.deadline_ns = r.deadline_ns;
     } else {
-        g.push(r);
+        g.push(NamespacedRouter {
+            net_ns_id,
+            router: r,
+        });
     }
 }
 
@@ -211,6 +261,15 @@ pub enum NdRxResult {
 /// Process an inbound Neighbor Solicitation. If the `target` matches
 /// one of *our* iface addresses, emit a Neighbor Advertisement.
 pub fn on_ns(iface: &str, src_mac_opt: Option<[u8; 6]>, body: &[u8]) -> NdRxResult {
+    on_ns_in(iface_namespace(iface), iface, src_mac_opt, body)
+}
+
+pub fn on_ns_in(
+    net_ns_id: u64,
+    iface: &str,
+    src_mac_opt: Option<[u8; 6]>,
+    body: &[u8],
+) -> NdRxResult {
     // RFC 4861 §7.1.1: ICMP Code must be 0 and the Target Address must not
     // be multicast.
     if body.len() < 24 || body[0] != ICMPV6_NEIGHBOR_SOLICITATION || body[1] != 0 {
@@ -240,7 +299,7 @@ pub fn on_ns(iface: &str, src_mac_opt: Option<[u8; 6]>, body: &[u8]) -> NdRxResu
     }
     // Is `target` one of our tentative addresses? Then this is a DAD
     // probe from a peer claiming the same address — conflict.
-    let addrs = addrs::list_iface(iface);
+    let addrs = addrs::list_iface_in(net_ns_id, iface);
     if let Some(local) = addrs.iter().find(|a| a.addr == target) {
         use super::addrs::AddrState;
         if local.state == AddrState::Tentative {
@@ -256,6 +315,10 @@ pub fn on_ns(iface: &str, src_mac_opt: Option<[u8; 6]>, body: &[u8]) -> NdRxResu
 /// Process an inbound Neighbor Advertisement. Update the neighbor
 /// cache; if the target was tentative-DAD, signal `DadConflict`.
 pub fn on_na(iface: &str, body: &[u8]) -> NdRxResult {
+    on_na_in(iface_namespace(iface), iface, body)
+}
+
+pub fn on_na_in(net_ns_id: u64, iface: &str, body: &[u8]) -> NdRxResult {
     // RFC 4861 §7.1.2: ICMP Code must be 0 and the Target Address must not
     // be multicast.
     if body.len() < 24 || body[0] != ICMPV6_NEIGHBOR_ADVERTISEMENT || body[1] != 0 {
@@ -277,7 +340,7 @@ pub fn on_na(iface: &str, body: &[u8]) -> NdRxResult {
     }
     // DAD: if target is one of our Tentative addresses, the peer
     // already owns it — drop our claim.
-    let addrs = addrs::list_iface(iface);
+    let addrs = addrs::list_iface_in(net_ns_id, iface);
     if let Some(local) = addrs.iter().find(|a| a.addr == target) {
         use super::addrs::AddrState;
         if local.state == AddrState::Tentative {
@@ -286,14 +349,17 @@ pub fn on_na(iface: &str, body: &[u8]) -> NdRxResult {
     }
     if let Some(m) = tll {
         let is_router = (flags & pkt_ipv6::NA_FLAG_ROUTER) != 0;
-        neigh_upsert(Neigh {
-            iface: String::from(iface),
-            ip: target,
-            mac: Some(m),
-            state: NeighState::Reachable,
-            is_router,
-            deadline_ns: 0,
-        });
+        neigh_upsert_in(
+            net_ns_id,
+            Neigh {
+                iface: String::from(iface),
+                ip: target,
+                mac: Some(m),
+                state: NeighState::Reachable,
+                is_router,
+                deadline_ns: 0,
+            },
+        );
         return NdRxResult::Updated;
     }
     NdRxResult::Ignored
@@ -325,6 +391,16 @@ pub struct RaPrefix {
 /// list and the prefix list; returns the parsed info so SLAAC can
 /// run against it.
 pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Option<RaInfo> {
+    on_ra_in(iface_namespace(iface), iface, src_addr, body, now_ns)
+}
+
+pub fn on_ra_in(
+    net_ns_id: u64,
+    iface: &str,
+    src_addr: [u8; 16],
+    body: &[u8],
+    now_ns: u64,
+) -> Option<RaInfo> {
     // RFC 4861 §6.1.2: ICMP Code must be 0, and the source must be a
     // link-local address — routers are identified by their link-local
     // address, and anything else is either off-link or forged.
@@ -340,20 +416,27 @@ pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Optio
     let router_lifetime_s = u16::from_be_bytes([body[6], body[7]]);
     // Default router update.
     if router_lifetime_s > 0 {
-        router_upsert(DefaultRouter {
-            iface: String::from(iface),
-            addr: src_addr,
-            deadline_ns: now_ns.saturating_add((router_lifetime_s as u64) * 1_000_000_000),
-        });
+        router_upsert_in(
+            net_ns_id,
+            DefaultRouter {
+                iface: String::from(iface),
+                addr: src_addr,
+                deadline_ns: now_ns.saturating_add((router_lifetime_s as u64) * 1_000_000_000),
+            },
+        );
         // Install a default route via the RA source.
-        route::add(Route {
-            prefix: [0u8; 16],
-            prefix_len: 0,
-            gateway: Some(src_addr),
-            iface: String::from(iface),
-            metric: 1024,
-            valid_deadline_ns: now_ns.saturating_add((router_lifetime_s as u64) * 1_000_000_000),
-        });
+        route::add_in(
+            net_ns_id,
+            Route {
+                prefix: [0u8; 16],
+                prefix_len: 0,
+                gateway: Some(src_addr),
+                iface: String::from(iface),
+                metric: 1024,
+                valid_deadline_ns: now_ns
+                    .saturating_add((router_lifetime_s as u64) * 1_000_000_000),
+            },
+        );
     }
     let mut prefixes = Vec::new();
     let mut rdnss = Vec::new();
@@ -383,15 +466,18 @@ pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Optio
                         preferred_lifetime_s,
                     });
                     if on_link && valid_lifetime_s > 0 {
-                        route::add(Route {
-                            prefix,
-                            prefix_len,
-                            gateway: None,
-                            iface: String::from(iface),
-                            metric: 256,
-                            valid_deadline_ns: now_ns
-                                .saturating_add((valid_lifetime_s as u64) * 1_000_000_000),
-                        });
+                        route::add_in(
+                            net_ns_id,
+                            Route {
+                                prefix,
+                                prefix_len,
+                                gateway: None,
+                                iface: String::from(iface),
+                                metric: 256,
+                                valid_deadline_ns: now_ns
+                                    .saturating_add((valid_lifetime_s as u64) * 1_000_000_000),
+                            },
+                        );
                     }
                 }
             }
@@ -433,6 +519,10 @@ pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Optio
 /// Process an inbound Redirect (RFC 4861 §8). The body layout is:
 /// 4 bytes reserved + 16 bytes target + 16 bytes destination.
 pub fn on_redirect(iface: &str, body: &[u8]) -> NdRxResult {
+    on_redirect_in(iface_namespace(iface), iface, body)
+}
+
+pub fn on_redirect_in(net_ns_id: u64, iface: &str, body: &[u8]) -> NdRxResult {
     // RFC 4861 §8.1: ICMP Code must be 0.
     if body.len() < 40 || body[0] != ICMPV6_REDIRECT || body[1] != 0 {
         return NdRxResult::Ignored;
@@ -442,14 +532,17 @@ pub fn on_redirect(iface: &str, body: &[u8]) -> NdRxResult {
     target.copy_from_slice(&body[8..24]);
     dest.copy_from_slice(&body[24..40]);
     // Install a /128 host route via the new target.
-    route::add(Route {
-        prefix: dest,
-        prefix_len: 128,
-        gateway: Some(target),
-        iface: String::from(iface),
-        metric: 200,
-        valid_deadline_ns: 0,
-    });
+    route::add_in(
+        net_ns_id,
+        Route {
+            prefix: dest,
+            prefix_len: 128,
+            gateway: Some(target),
+            iface: String::from(iface),
+            metric: 200,
+            valid_deadline_ns: 0,
+        },
+    );
     NdRxResult::Updated
 }
 
@@ -463,4 +556,9 @@ pub fn snm(target: &[u8; 16]) -> [u8; 16] {
 pub fn __reset_for_test() {
     NEIGH.lock().clear();
     ROUTERS.lock().clear();
+}
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    NEIGH.lock().retain(|entry| entry.net_ns_id != net_ns_id);
+    ROUTERS.lock().retain(|entry| entry.net_ns_id != net_ns_id);
 }

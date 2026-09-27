@@ -754,6 +754,64 @@ kernel_test_in!(
     smoke_ipv6_udp_segment_has_mandatory_valid_checksum
 );
 
+fn smoke_ipv6_namespace_address_and_route_isolation() -> TestResult {
+    use crate::ipv6::addrs::{AddrScope, AddrState, Ipv6IfAddr};
+    use crate::ipv6::ndp::{Neigh, NeighState};
+    use crate::ipv6::route::{NextHop, Route};
+    let addr = [0x20, 1, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    crate::ipv6::addrs::add_in(
+        7001,
+        Ipv6IfAddr {
+            iface: alloc::string::String::from("ns6-test"),
+            addr,
+            prefix_len: 64,
+            state: AddrState::Preferred,
+            scope: AddrScope::Global,
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        },
+    );
+    crate::ipv6::route::add_in(
+        7001,
+        Route {
+            prefix: [0; 16],
+            prefix_len: 0,
+            gateway: None,
+            iface: alloc::string::String::from("ns6-test"),
+            metric: 1,
+            valid_deadline_ns: 0,
+        },
+    );
+    crate::ipv6::ndp::neigh_upsert_in(
+        7001,
+        Neigh {
+            iface: alloc::string::String::from("ns6-test"),
+            ip: addr,
+            mac: Some([2, 0, 0, 0, 0, 1]),
+            state: NeighState::Reachable,
+            is_router: false,
+            deadline_ns: 0,
+        },
+    );
+    let isolated = !crate::ipv6::addrs::is_local_in(7002, &addr)
+        && matches!(
+            crate::ipv6::route::lookup_in(7002, &addr, None),
+            NextHop::Unreachable
+        )
+        && crate::ipv6::ndp::neigh_lookup_in(7002, "ns6-test", &addr).is_none()
+        && crate::ipv6::ndp::neigh_lookup_in(7001, "ns6-test", &addr).is_some();
+    crate::ipv6::addrs::remove_namespace(7001);
+    crate::ipv6::route::remove_namespace(7001);
+    crate::ipv6::ndp::remove_namespace(7001);
+    if isolated {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IPv6 address or route leaked across network namespaces")
+    }
+}
+kernel_test_in!("net/ipv6", smoke_ipv6_namespace_address_and_route_isolation);
+
 fn smoke_icmpv6_router_solicitation_layout() -> TestResult {
     use crate::pkt_ipv6::{router_solicitation, ICMPV6_ROUTER_SOLICITATION};
     let body = router_solicitation(&[]);

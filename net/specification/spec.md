@@ -774,6 +774,11 @@ References (public-only, all IETF documents):
   Solicitation to the target's solicited-node multicast address with IPv6 hop
   limit 255; repeated sends do not flood duplicate solicitations while that
   resolution is pending.
+- IPv6 address and route registries are keyed by immutable network-namespace
+  ID internally. Source selection, local-address tests, route lookup,
+  rtnetlink/proc snapshots, and final namespace teardown use the caller's
+  namespace; identical interface/address/prefix values may coexist without
+  cross-namespace visibility.
 
 ### DNS (`pkt_dns`)
 - **RFC 1035** — Domain Names — Implementation and Specification
