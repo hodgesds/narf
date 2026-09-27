@@ -363,6 +363,15 @@ pub const IP_RECVTTL: u32 = 12;
 pub const IP_MTU: u32 = 14;
 pub const IP_MULTICAST_TTL: u32 = 33;
 pub const IPV6_V6ONLY: u32 = 26;
+pub const IPV6_UNICAST_HOPS: u32 = 16;
+pub const IPV6_MTU_DISCOVER: u32 = 23;
+pub const IPV6_MTU: u32 = 24;
+pub const IPV6_RECVERR: u32 = 25;
+pub const IPV6_RECVPKTINFO: u32 = 49;
+pub const IPV6_PKTINFO: u32 = 50;
+pub const IPV6_RECVHOPLIMIT: u32 = 51;
+pub const IPV6_HOPLIMIT: u32 = 52;
+pub const IPV6_DONTFRAG: u32 = 62;
 
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
@@ -777,6 +786,7 @@ pub struct SocketFile {
     /// they are dropped with the entry. A plain `read(2)` wants neither and
     /// calls `discard_dgram_recv_ancillary`.
     dgram_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, DgramRecvAncillary>>,
+    inet6_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, Inet6RecvAncillary>>,
     /// Durable per-fd readiness cell for a connectionless datagram inbox
     /// (AF_UNIX/AF_INET SOCK_DGRAM). The inbox lives INSIDE the `state` enum
     /// behind the lock, so — unlike a `RingBuf` Arc — the cell can't be a field
@@ -941,6 +951,13 @@ pub struct SockOptions {
     pub tcp_inq: bool,
     pub tcp_tx_delay: u32,
     pub ipv6_v6only: bool,
+    pub ipv6_unicast_hops: i32,
+    pub ipv6_mtu_discover: u32,
+    pub ipv6_mtu: u32,
+    pub ipv6_recverr: bool,
+    pub ipv6_recvpktinfo: bool,
+    pub ipv6_recvhoplimit: bool,
+    pub ipv6_dontfrag: bool,
     // IP
     pub ip_ttl: u32,
     pub ip_tos: u32,
@@ -989,6 +1006,13 @@ impl Default for SockOptions {
             tcp_inq: false,
             tcp_tx_delay: 0,
             ipv6_v6only: false,
+            ipv6_unicast_hops: -1,
+            ipv6_mtu_discover: 1,
+            ipv6_mtu: 1280,
+            ipv6_recverr: false,
+            ipv6_recvpktinfo: false,
+            ipv6_recvhoplimit: false,
+            ipv6_dontfrag: false,
             ip_ttl: 64,
             ip_tos: 0,
             ip_pktinfo: false,
@@ -1340,7 +1364,16 @@ pub fn deliver_wire_datagram(
             let mut dst = [0u8; 16];
             src.copy_from_slice(src_ip);
             dst.copy_from_slice(dst_ip);
-            inet6_dgram::deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
+            inet6_dgram::deliver_wire(
+                net_ns_id,
+                src,
+                src_port,
+                dst,
+                dst_port,
+                payload,
+                in_ifindex,
+                narf_net::udp_sock::current_user_delivery_hop_limit(),
+            )
         }
         _ => false,
     }
@@ -1381,7 +1414,16 @@ struct DgramPacket6 {
     peer_addr: [u8; 16],
     peer_port: u16,
     scope_id: u32,
+    destination: [u8; 16],
+    hop_limit: i32,
     payload: Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Inet6RecvAncillary {
+    pub destination: [u8; 16],
+    pub ifindex: u32,
+    pub hop_limit: i32,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -1583,6 +1625,7 @@ impl SocketFile {
             peer_groups: IrqSafeSpinLock::new(Vec::new()),
             passcred: AtomicBool::new(false),
             dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            inet6_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             // A fresh dgram socket is always sendable, not yet readable; a fresh
             // listener has no pending connection; a fresh netlink queue is empty
             // (readable only once a reply/monitor message is enqueued) but always
@@ -2127,6 +2170,23 @@ impl SocketFile {
     /// Whether `SO_PASSCRED` is enabled — recvmsg attaches SCM_CREDENTIALS.
     pub fn passcred(&self) -> bool {
         self.passcred.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stash_inet6_recv_ancillary(&self, ancillary: Inet6RecvAncillary) {
+        self.inet6_recv_ancillary
+            .lock()
+            .insert(crate::handlers::current_task_id(), ancillary);
+    }
+
+    pub(crate) fn take_inet6_recv_ancillary(&self) -> Option<Inet6RecvAncillary> {
+        self.inet6_recv_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool) {
+        let options = self.options.lock();
+        (options.ipv6_recvpktinfo, options.ipv6_recvhoplimit)
     }
 
     /// Credentials to attach to the current recvmsg's `SCM_CREDENTIALS`
@@ -4792,6 +4852,57 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) if self.domain == AF_INET6 => {
+                match read_ip_int(value) {
+                    Some(value) if value == -1 || (0..=255).contains(&value) => {
+                        opts.ipv6_unicast_hops = value;
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) if value <= 5 => {
+                    opts.ipv6_mtu_discover = value;
+                    SocketOpResult::Ok(0)
+                }
+                _ => SocketOpResult::Err(SockError::InvalidArg),
+            },
+            (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) if value >= 1280 => {
+                    opts.ipv6_mtu = value;
+                    SocketOpResult::Ok(0)
+                }
+                _ => SocketOpResult::Err(SockError::InvalidArg),
+            },
+            (IPPROTO_IPV6, IPV6_RECVERR) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_recverr = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
+            (IPPROTO_IPV6, IPV6_RECVPKTINFO) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_recvpktinfo = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
+            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_recvhoplimit = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
+            (IPPROTO_IPV6, IPV6_DONTFRAG) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_dontfrag = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
             // Linux's protocol option handlers return ENOPROTOOPT from their
             // default arm. Never claim an unknown feature was enabled: doing
             // so is especially dangerous for transport/security offloads.
@@ -5074,6 +5185,36 @@ impl SocketFile {
             }
             (IPPROTO_IPV6, IPV6_V6ONLY) if self.domain == AF_INET6 => {
                 write_bool(buf, opts.ipv6_v6only)
+            }
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) if self.domain == AF_INET6 => {
+                write_u32(buf, opts.ipv6_unicast_hops as u32)
+            }
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER) if self.domain == AF_INET6 => {
+                write_u32(buf, opts.ipv6_mtu_discover)
+            }
+            (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => {
+                let connected = matches!(
+                    &*self.state.lock(),
+                    SocketState::Inet6Connected { .. }
+                        | SocketState::Inet6Wired { .. }
+                        | SocketState::Inet6Dgram { peer: Some(_), .. }
+                );
+                if !connected {
+                    return SocketOpResult::Err(SockError::NotConnected);
+                }
+                write_u32(buf, opts.ipv6_mtu)
+            }
+            (IPPROTO_IPV6, IPV6_RECVERR) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_recverr)
+            }
+            (IPPROTO_IPV6, IPV6_RECVPKTINFO) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_recvpktinfo)
+            }
+            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_recvhoplimit)
+            }
+            (IPPROTO_IPV6, IPV6_DONTFRAG) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_dontfrag)
             }
             (SOL_NETLINK, NETLINK_PKTINFO) => {
                 write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
@@ -8997,4 +9138,48 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_unix_stream_multiple_rights_batches_preserve_order
+);
+
+fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
+    let socket = SocketFile::new(AF_INET6, SOCK_DGRAM);
+    for (name, value) in [
+        (IPV6_RECVPKTINFO, 1u32),
+        (IPV6_RECVHOPLIMIT, 1),
+        (IPV6_RECVERR, 1),
+        (IPV6_DONTFRAG, 1),
+        (IPV6_UNICAST_HOPS, 37),
+        (IPV6_MTU_DISCOVER, 2),
+        (IPV6_MTU, 1400),
+    ] {
+        if !matches!(
+            socket.handle_setsockopt(IPPROTO_IPV6, name, &value.to_ne_bytes()),
+            SocketOpResult::Ok(0)
+        ) {
+            return TestResult::Fail("IPv6 socket option rejected a valid value");
+        }
+    }
+    let (pktinfo, hoplimit) = socket.inet6_ancillary_options();
+    let ancillary = Inet6RecvAncillary {
+        destination: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        ifindex: 9,
+        hop_limit: 37,
+    };
+    socket.stash_inet6_recv_ancillary(ancillary);
+    if pktinfo
+        && hoplimit
+        && socket.take_inet6_recv_ancillary().is_some_and(|value| {
+            value.destination == ancillary.destination
+                && value.ifindex == 9
+                && value.hop_limit == 37
+        })
+        && socket.take_inet6_recv_ancillary().is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IPv6 ancillary metadata was missing, stale, or duplicated")
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_ipv6_socket_options_and_ancillary_are_per_datagram
 );

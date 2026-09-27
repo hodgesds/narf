@@ -10227,6 +10227,55 @@ fn install_netlink_ancillary(msg_ptr: u64, pktinfo_group: Option<u32>) {
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
 }
 
+fn install_ipv6_ancillary(
+    msg_ptr: u64,
+    ancillary: Option<crate::socket::Inet6RecvAncillary>,
+    pktinfo: bool,
+    hoplimit: bool,
+) -> bool {
+    const IPPROTO_IPV6: i32 = 41;
+    const IPV6_PKTINFO: i32 = 50;
+    const IPV6_HOPLIMIT: i32 = 52;
+    let ctrl_ptr = read_user_u64(msg_ptr + 32);
+    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
+    let Some(ancillary) = ancillary else {
+        // SAFETY: copy_to_user validates the user range and brackets SMAP.
+        let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_ne_bytes()) };
+        return false;
+    };
+    let mut records = alloc::vec::Vec::new();
+    if pktinfo {
+        let mut payload = [0u8; 20];
+        payload[..16].copy_from_slice(&ancillary.destination);
+        payload[16..20].copy_from_slice(&ancillary.ifindex.to_ne_bytes());
+        records.push((IPV6_PKTINFO, payload.to_vec()));
+    }
+    if hoplimit {
+        records.push((IPV6_HOPLIMIT, ancillary.hop_limit.to_ne_bytes().to_vec()));
+    }
+    let mut ctrl = alloc::vec::Vec::new();
+    let mut truncated = false;
+    for (kind, payload) in records {
+        let record_len = (16 + payload.len() + 7) & !7;
+        if ctrl_ptr == 0 || ctrl.len().saturating_add(record_len) > ctrl_len {
+            truncated = true;
+            continue;
+        }
+        ctrl.extend_from_slice(&((16 + payload.len()) as u64).to_ne_bytes());
+        ctrl.extend_from_slice(&IPPROTO_IPV6.to_ne_bytes());
+        ctrl.extend_from_slice(&kind.to_ne_bytes());
+        ctrl.extend_from_slice(&payload);
+        ctrl.resize(ctrl.len().next_multiple_of(8), 0);
+    }
+    if ctrl_ptr != 0 && !ctrl.is_empty() {
+        // SAFETY: copy_to_user validates the user control-buffer range.
+        let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
+    }
+    // SAFETY: copy_to_user validates the msghdr field before writing it.
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_ne_bytes()) };
+    truncated
+}
+
 /// Install received AF_UNIX ancillary data into the calling task's
 /// `msg_control` buffer: an `SCM_RIGHTS` control message (any passed fds,
 /// each dup'd into a fresh fd in this task's table) and, when

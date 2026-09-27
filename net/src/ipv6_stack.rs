@@ -620,19 +620,33 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
             Some(t) => t,
             None => return true, // got the fragment, waiting for more
         };
-        return dispatch_l4(iface, ip.src_ip, ip.dst_ip, next_nh, &body);
+        return dispatch_l4(iface, ip.src_ip, ip.dst_ip, ip.hop_limit, next_nh, &body);
     }
     let l4 = match skip_extension_headers(nh, payload) {
         Some(l) => l,
         None => return false,
     };
-    dispatch_l4(iface, ip.src_ip, ip.dst_ip, l4.proto, &payload[l4.offset..])
+    dispatch_l4(
+        iface,
+        ip.src_ip,
+        ip.dst_ip,
+        ip.hop_limit,
+        l4.proto,
+        &payload[l4.offset..],
+    )
 }
 
-fn dispatch_l4(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], proto: u8, l4: &[u8]) -> bool {
+fn dispatch_l4(
+    iface: &str,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    hop_limit: u8,
+    proto: u8,
+    l4: &[u8],
+) -> bool {
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
-        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, l4),
+        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, hop_limit, l4),
         NEXT_HEADER_TCP => handle_tcp6(iface, src_ip, dst_ip, l4),
         _ => false,
     }
@@ -652,7 +666,13 @@ fn handle_tcp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], segment: &[u8]) 
     true
 }
 
-fn handle_udp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], datagram: &[u8]) -> bool {
+fn handle_udp6(
+    iface: &str,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    hop_limit: u8,
+    datagram: &[u8],
+) -> bool {
     const UDP_HDR_LEN: usize = 8;
     if datagram.len() < UDP_HDR_LEN {
         return true;
@@ -679,7 +699,7 @@ fn handle_udp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], datagram: &[u8])
             )
         })
         .unwrap_or((0, 0));
-    crate::udp_sock::user_deliver(
+    crate::udp_sock::user_deliver_with_hop_limit(
         net_ns_id,
         &src_ip,
         src_port,
@@ -687,6 +707,7 @@ fn handle_udp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], datagram: &[u8])
         dst_port,
         &datagram[UDP_HDR_LEN..],
         ifindex,
+        hop_limit,
     );
     true
 }

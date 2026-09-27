@@ -396,6 +396,7 @@ impl SocketFile {
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
+        let hop_limit = self.options.lock().ipv6_unicast_hops;
         let is_local =
             dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local_in(self.net_ns_id(), &dest.0);
         if !is_local {
@@ -412,7 +413,7 @@ impl SocketFile {
                 dest.1,
                 buf,
                 bound_ifindex,
-                64,
+                if hop_limit < 0 { 64 } else { hop_limit as u8 },
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(narf_net::ipv6_stack::Udp6SendError::MessageTooLong) => {
@@ -456,6 +457,8 @@ impl SocketFile {
                         peer_addr: source,
                         peer_port: local_port,
                         scope_id: dest.2,
+                        destination: dest.0,
+                        hop_limit: if hop_limit < 0 { 64 } else { hop_limit },
                         payload: buf.to_vec(),
                     });
                     *rmem += charge;
@@ -488,6 +491,11 @@ impl SocketFile {
                     packet.peer_port,
                     packet.scope_id,
                 ));
+                self.stash_inet6_recv_ancillary(super::Inet6RecvAncillary {
+                    destination: packet.destination,
+                    ifindex: packet.scope_id,
+                    hop_limit: packet.hop_limit,
+                });
                 if !peek {
                     inbox.pop_front();
                     *rmem = rmem.saturating_sub(full_len + DGRAM_TRUESIZE_OVERHEAD);
@@ -536,6 +544,7 @@ pub(super) fn deliver_wire(
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
+    hop_limit: u8,
 ) -> bool {
     let target = {
         let guard = INET6_DGRAM_BOUND.lock();
@@ -560,6 +569,8 @@ pub(super) fn deliver_wire(
         peer_addr: src_ip,
         peer_port: src_port,
         scope_id: in_ifindex,
+        destination: dst_ip,
+        hop_limit: hop_limit as i32,
         payload: payload.to_vec(),
     });
     *rmem += charge;
@@ -584,5 +595,7 @@ pub(super) fn deliver_wire_v4_mapped(
     dst[10..12].copy_from_slice(&[0xff, 0xff]);
     src[12..].copy_from_slice(&src_ip);
     dst[12..].copy_from_slice(&dst_ip);
-    deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
+    deliver_wire(
+        net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, 0,
+    )
 }
