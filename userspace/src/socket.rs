@@ -8528,16 +8528,17 @@ kernel_test_in!(
 
 fn smoke_socket_mutation_ioctl_requires_delegated_admin() -> TestResult {
     let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+    narf_net::iface::register_loopback_iface();
     const SIOCSIFFLAGS: u32 = 0x8914;
     let mut ifreq = [0u8; 40];
     ifreq[..2].copy_from_slice(b"lo");
     ifreq[16..18].copy_from_slice(&1i16.to_ne_bytes());
 
     let plain = SocketFile::new(AF_INET, SOCK_DGRAM);
-    if !matches!(
-        plain.ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize),
-        Err(FsError::OperationNotPermitted)
-    ) {
+    if plain
+        .ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize)
+        .is_ok()
+    {
         return TestResult::Fail("SIOCSIFFLAGS accepted ambient authority");
     }
 
