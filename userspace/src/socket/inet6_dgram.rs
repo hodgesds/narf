@@ -148,6 +148,20 @@ impl SocketFile {
             return Ok(());
         }
         let port = alloc_port(map, self.net_ns_id(), self).ok_or(SockError::WouldBlock)?;
+        let v6only = self.options.lock().ipv6_v6only;
+        if inet_port::reserve(
+            self,
+            port,
+            inet_port::BindAddr::V6 {
+                addr: UNSPEC,
+                v6only,
+            },
+        )
+        .is_err()
+        {
+            crate::ephemeral_port::free(AF_INET6, 0, crate::ephemeral_port::SocketProto::Udp, port);
+            return Err(SockError::WouldBlock);
+        }
         self.install_inet6_binding(UNSPEC, port, 0, false);
         map.entry((self.net_ns_id(), port))
             .or_default()
@@ -208,6 +222,18 @@ impl SocketFile {
             }
             requested_port
         };
+        if let Err(e) = inet_port::reserve(self, port, inet_port::BindAddr::V6 { addr: ip, v6only })
+        {
+            if requested_port == 0 {
+                crate::ephemeral_port::free(
+                    AF_INET6,
+                    0,
+                    crate::ephemeral_port::SocketProto::Udp,
+                    port,
+                );
+            }
+            return SocketOpResult::Err(e);
+        }
         self.install_inet6_binding(ip, port, effective_scope, requested_port != 0);
         if scope_id != 0 {
             self.options.lock().bindtodevice_index = scope_id;
@@ -218,9 +244,7 @@ impl SocketFile {
 
     fn inet6_dgram_connect(self: &Arc<Self>, addr: &SockAddr) -> SocketOpResult {
         if addr.family == AF_UNSPEC {
-            if let SocketState::Inet6Dgram { peer, .. } = &mut *self.state.lock() {
-                *peer = None;
-            }
+            self.inet6_dgram_disconnect();
             return SocketOpResult::Ok(0);
         }
         let peer = match inet6_sockaddr_scoped(addr) {
@@ -242,6 +266,53 @@ impl SocketFile {
             *slot = Some(peer);
         }
         SocketOpResult::Ok(0)
+    }
+
+    fn inet6_dgram_disconnect(self: &Arc<Self>) {
+        let ns = self.net_ns_id();
+        let mut bound = INET6_DGRAM_BOUND.lock();
+        let freed = {
+            let mut state = self.state.lock();
+            if let SocketState::Inet6Dgram {
+                local_addr,
+                local_port,
+                local_scope_id,
+                peer,
+                port_locked,
+                ..
+            } = &mut *state
+            {
+                *peer = None;
+                if !*port_locked && *local_port != 0 {
+                    let port = *local_port;
+                    *local_addr = UNSPEC;
+                    *local_port = 0;
+                    *local_scope_id = 0;
+                    Some(port)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        {
+            let mut options = self.options.lock();
+            options.bindtodevice_index = 0;
+            options.bindtodevice = None;
+        }
+        if let Some(port) = freed {
+            if let Some(map) = bound.as_mut() {
+                if let Some(sockets) = map.get_mut(&(ns, port)) {
+                    sockets.retain(|socket| !Arc::ptr_eq(socket, self));
+                    if sockets.is_empty() {
+                        map.remove(&(ns, port));
+                    }
+                }
+            }
+            crate::ephemeral_port::free(AF_INET6, 0, crate::ephemeral_port::SocketProto::Udp, port);
+            inet_port::release(self, port);
+        }
     }
 
     fn inet6_dgram_send(
@@ -444,6 +515,7 @@ impl SocketFile {
         if port != 0 && !port_locked {
             crate::ephemeral_port::free(AF_INET6, 0, crate::ephemeral_port::SocketProto::Udp, port);
         }
+        inet_port::release(self, port);
     }
 }
 

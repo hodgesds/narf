@@ -1021,6 +1021,49 @@ kernel_test_in!(
     smoke_socket_dual_stack_udp_receives_v4_as_mapped
 );
 
+fn smoke_socket_udp_cross_family_bind_arbitration() -> TestResult {
+    const PORT: u16 = 8126;
+    let v4 = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
+    let dual = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let only = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    if !matches!(
+        v4.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: build_sockaddr_in(0, PORT),
+        }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("IPv4 wildcard bind failed");
+    }
+    if !matches!(
+        dual.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::make_sockaddr_in6([0; 16], PORT),
+        }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AddrInUse)
+    ) {
+        v4.unregister();
+        dual.unregister();
+        return TestResult::Fail("dual-stack UDP6 wildcard did not conflict with IPv4");
+    }
+    let one = 1u32.to_ne_bytes();
+    let _ = only.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IPV6,
+        name: crate::socket::IPV6_V6ONLY,
+        value: &one,
+    });
+    let result = only.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: crate::socket::make_sockaddr_in6([0; 16], PORT),
+    });
+    v4.unregister();
+    dual.unregister();
+    only.unregister();
+    if matches!(result, crate::socket::SocketOpResult::Ok(0)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("V6ONLY UDP bind incorrectly conflicted with IPv4")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_udp_cross_family_bind_arbitration);
+
 /// SO_REUSEADDR + double-bind: the second bind to the same
 /// (addr, port) succeeds when SO_REUSEADDR is set on the second
 /// socket. Without it, the second bind returns EADDRINUSE.

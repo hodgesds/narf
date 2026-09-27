@@ -1075,6 +1075,18 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
             ctx.set_return(errno_ret(EPERM));
         }
+        Err(narf_filesystem::FsError::NotFound)
+            if matches!(cmd, 0x8913 | 0x8915 | 0x891b | 0x8921 | 0x8927 | 0x8933) =>
+        {
+            // `dev_ioctl` resolves the ifreq name with `__dev_get_by_name`;
+            // an absent network device is ENODEV, never pathname ENOENT.
+            ctx.set_return(errno_ret(ENODEV));
+        }
+        Err(narf_filesystem::FsError::InvalidData)
+            if matches!(cmd, 0x8913 | 0x8915 | 0x891b | 0x8921 | 0x8927 | 0x8933) =>
+        {
+            ctx.set_return(errno_ret(EFAULT));
+        }
         Err(narf_filesystem::FsError::InvalidData)
             if cmd == 0x541B
                 && ops.stat().mode.file_type == narf_filesystem::FileType::Fifo =>

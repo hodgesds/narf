@@ -1168,7 +1168,7 @@ The TCP socket-option compatibility surface validates and round-trips Linux
 zero for `TCP_IS_MPTCP`. Unsupported options return Linux's option-specific
 errno rather than succeeding silently.
 
-AF_INET `SOCK_DGRAM` (UDP) follows Linux v6.12 `net/ipv4/{af_inet,udp,
+AF_INET `SOCK_DGRAM` (UDP) follows Linux `net/ipv4/{af_inet,udp,
 datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
 - `bind` requires a 16-byte `sockaddr_in` (`EINVAL`), `AF_INET` or
   `AF_UNSPEC`+`INADDR_ANY` (`EAFNOSUPPORT`), and a local, broadcast,
@@ -1228,6 +1228,20 @@ guard. With V6ONLY disabled, IPv4-mapped destinations use the canonical IPv4
 UDP route/ARP/checksum path and IPv4 receive fallback reports the peer as
 `::ffff:a.b.c.d`; V6ONLY rejects a mapped bind with `EINVAL` and mapped
 connect/send with `ENETUNREACH`.
+IPv4 and dual-stack IPv6 UDP bindings share one atomic cross-family port
+reservation space. This mirrors Linux's `udp_v4_get_port` and
+`udp_v6_get_port` convergence on `udp_lib_get_port` and its primary
+`udp_hslot::lock`: an IPv4 wildcard conflicts with a non-V6ONLY IPv6 wildcard,
+while a V6ONLY reservation remains independent. NARF's family demux lock may
+nest the reservation lock, but the reservation layer never enters either
+family table, providing a fixed lock order without an IPv4/IPv6 ABBA path.
+
+Internet sockets implement the legacy read-only network-device ioctl ABI for
+`SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
+`SIOCGIFHWADDR`, and `SIOCGIFINDEX`. Each consumes and returns the native
+64-bit 40-byte `struct ifreq`, resolves the interface in the socket's network
+namespace, returns `ENODEV` for an unknown name and `EFAULT` for an invalid
+ifreq pointer, and reports the same registry fields used by rtnetlink.
 
 ### 3.3 BPF XDP program compatibility
 

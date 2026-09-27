@@ -35,6 +35,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 mod inet6_dgram;
 mod inet_dgram;
+mod inet_port;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 
 // ── POSIX-numbered constants ────────────────────────────────────
@@ -2752,6 +2753,85 @@ impl FileOps for SocketFile {
     /// `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket; SIOCOUTQ must likewise
     /// succeed or dbus-broker treats the ENOTTY as fatal.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        const SIOCGIFFLAGS: u32 = 0x8913;
+        const SIOCGIFADDR: u32 = 0x8915;
+        const SIOCGIFNETMASK: u32 = 0x891b;
+        const SIOCGIFMTU: u32 = 0x8921;
+        const SIOCGIFHWADDR: u32 = 0x8927;
+        const SIOCGIFINDEX: u32 = 0x8933;
+        if matches!(
+            cmd,
+            SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX
+        ) {
+            let mut ifreq = [0u8; 40];
+            // SAFETY: Linux's 64-bit `struct ifreq` is 40 bytes. The common
+            // name field is input and the selected union member is output.
+            if unsafe { crate::handlers::copy_from_user(&mut ifreq, arg as u64) }.is_err() {
+                return Err(FsError::InvalidData);
+            }
+            let name_len = ifreq[..16].iter().position(|byte| *byte == 0).unwrap_or(16);
+            let name = String::from(
+                core::str::from_utf8(&ifreq[..name_len]).map_err(|_| FsError::NotFound)?,
+            );
+            let iface =
+                narf_net::iface::lookup_in(self.net_ns_id(), &name).ok_or(FsError::NotFound)?;
+            match cmd {
+                SIOCGIFFLAGS => {
+                    const IFF_UP: i16 = 0x1;
+                    const IFF_BROADCAST: i16 = 0x2;
+                    const IFF_LOOPBACK: i16 = 0x8;
+                    const IFF_RUNNING: i16 = 0x40;
+                    const IFF_MULTICAST: i16 = 0x1000;
+                    let mut flags = IFF_MULTICAST;
+                    if iface.link_up {
+                        flags |= IFF_UP | IFF_RUNNING;
+                    }
+                    flags |= if name == "lo" {
+                        IFF_LOOPBACK
+                    } else {
+                        IFF_BROADCAST
+                    };
+                    ifreq[16..18].copy_from_slice(&flags.to_ne_bytes());
+                }
+                SIOCGIFADDR | SIOCGIFNETMASK => {
+                    ifreq[16..40].fill(0);
+                    ifreq[16..18].copy_from_slice(&AF_INET.to_ne_bytes());
+                    let addr = if cmd == SIOCGIFADDR {
+                        iface.ipv4
+                    } else if name == "lo" {
+                        [255, 0, 0, 0]
+                    } else {
+                        [255, 255, 255, 0]
+                    };
+                    ifreq[20..24].copy_from_slice(&addr);
+                }
+                SIOCGIFMTU => {
+                    ifreq[16..20].copy_from_slice(&(iface.mtu as i32).to_ne_bytes());
+                }
+                SIOCGIFHWADDR => {
+                    const ARPHRD_ETHER: u16 = 1;
+                    const ARPHRD_LOOPBACK: u16 = 772;
+                    ifreq[16..40].fill(0);
+                    let hardware = if name == "lo" {
+                        ARPHRD_LOOPBACK
+                    } else {
+                        ARPHRD_ETHER
+                    };
+                    ifreq[16..18].copy_from_slice(&hardware.to_ne_bytes());
+                    ifreq[18..24].copy_from_slice(&iface.mac);
+                }
+                SIOCGIFINDEX => {
+                    let index = narf_net::iface::ifindex_of(&name).ok_or(FsError::NotFound)?;
+                    ifreq[16..20].copy_from_slice(&(index as i32).to_ne_bytes());
+                }
+                _ => unreachable!(),
+            }
+            // SAFETY: the same validated fixed-size ifreq is copied back.
+            if unsafe { crate::handlers::copy_to_user(arg as u64, &ifreq) }.is_err() {
+                return Err(FsError::InvalidData);
+            }
+            return Ok(0);
+        }
         // SIOCINQ = bytes immediately readable; SIOCOUTQ = bytes still queued
         // in the send buffer (always 0 here — synchronous delivery, no local
         // send queue). Any other request is unknown → ENOTTY (Linux
@@ -8025,6 +8105,37 @@ fn smoke_socket_ioctl_siocoutq_is_zero() -> TestResult {
     }
 }
 kernel_test_in!("userspace/socket", smoke_socket_ioctl_siocoutq_is_zero);
+
+fn smoke_socket_ioctl_reports_network_interface() -> TestResult {
+    let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+    const NAME: &str = "nioctl0";
+    const SIOCGIFADDR: u32 = 0x8915;
+    const SIOCGIFMTU: u32 = 0x8921;
+    narf_net::iface::register(NAME, [0x02, 1, 2, 3, 4, 5], |_| Ok(()));
+    narf_net::iface::set_iface_ipv4(NAME, [192, 0, 2, 9], [192, 0, 2, 1]);
+    let sock = SocketFile::new(AF_INET, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[..NAME.len()].copy_from_slice(NAME.as_bytes());
+    if sock
+        .ioctl(SIOCGIFADDR, ifreq.as_mut_ptr() as usize)
+        .is_err()
+        || ifreq[16..18] != AF_INET.to_ne_bytes()
+        || ifreq[20..24] != [192, 0, 2, 9]
+    {
+        return TestResult::Fail("SIOCGIFADDR did not return sockaddr_in address");
+    }
+    ifreq[16..].fill(0);
+    if sock.ioctl(SIOCGIFMTU, ifreq.as_mut_ptr() as usize).is_err()
+        || i32::from_ne_bytes(ifreq[16..20].try_into().unwrap()) != 1500
+    {
+        return TestResult::Fail("SIOCGIFMTU did not return interface MTU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_socket_ioctl_reports_network_interface
+);
 
 fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
     let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);
