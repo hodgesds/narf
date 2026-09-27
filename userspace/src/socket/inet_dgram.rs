@@ -577,7 +577,7 @@ impl SocketFile {
         let mut bound = INET_DGRAM_BOUND.lock();
         let freed_port = {
             let mut st = self.state.lock();
-            let SocketState::InetDgram {
+            if let SocketState::InetDgram {
                 local_addr,
                 local_port,
                 peer,
@@ -585,21 +585,24 @@ impl SocketFile {
                 port_locked,
                 ..
             } = &mut *st
-            else {
-                return;
-            };
-            *peer = None;
-            if !*addr_locked {
-                *local_addr = INADDR_ANY;
-            }
-            if *port_locked || *local_port == 0 {
-                None
+            {
+                *peer = None;
+                if !*addr_locked {
+                    *local_addr = INADDR_ANY;
+                }
+                if *port_locked || *local_port == 0 {
+                    None
+                } else {
+                    let p = *local_port;
+                    *local_port = 0;
+                    Some(p)
+                }
             } else {
-                let p = *local_port;
-                *local_port = 0;
-                Some(p)
+                None
             }
         };
+        // Linux clears sk_bound_dev_if unconditionally, including when an
+        // AF_UNSPEC connect disconnects a fresh (not yet autobound) socket.
         {
             let mut o = self.options.lock();
             o.bindtodevice_index = 0;

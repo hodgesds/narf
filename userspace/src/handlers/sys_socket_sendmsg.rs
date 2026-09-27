@@ -221,13 +221,13 @@ fn import_sendmsg_addr(ptr: u64, signed_len: i32) -> Result<Option<crate::socket
     if len == 0 {
         return Ok(None);
     }
-    if len < 2 {
-        return Err(EINVAL);
-    }
     let mut bytes = alloc::vec![0u8; len];
     // SAFETY: guarded import of the clamped sockaddr_storage prefix.
     if unsafe { copy_from_user(&mut bytes, ptr) }.is_err() {
         return Err(EFAULT);
+    }
+    if len < 2 {
+        return Err(EINVAL);
     }
     Ok(Some(crate::socket::SockAddr {
         family: u16::from_ne_bytes([bytes[0], bytes[1]]),

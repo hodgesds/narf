@@ -384,6 +384,12 @@ unrepresentable ancillary length returns `ENOBUFS`. `sendmmsg` resolves its
 socket even when `vlen` is zero, caps `vlen` to 1024, returns the exact first
 message or `msg_len` write-back error when no message completed, and suppresses
 a later error only in favor of the number of already-completed messages.
+`sendto(2)` retains a non-null address with length zero so the protocol returns
+`EINVAL`; `sendmsg(2)` instead treats a zero `msg_namelen` as no address. A
+nonzero short sockaddr is copied before its protocol length check, so an
+unreadable byte returns `EFAULT` rather than `EINVAL`. `recvfrom(2)` imports a
+non-empty destination buffer before descriptor lookup, making `EFAULT` precede
+`EBADF` when both arguments are invalid.
 `sendfile(2)` imports and later writes back its optional 64-bit offset even
 when the transfer result is an error. It validates the readable input fd and
 explicit-offset seekability before resolving the writable output fd, rejects
@@ -1115,7 +1121,13 @@ datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
   `connect` fixes an unbound local address to the route's source and makes
   the socket receive only from its peer; datagrams already queued stay
   queued. `connect(AF_UNSPEC)` disconnects, releasing an autobound port and a
-  route-chosen address and clearing `SO_BINDTODEVICE`.
+  route-chosen address and clearing `SO_BINDTODEVICE`, including on a fresh
+  socket with no binding to release. A bound `getsockopt(SO_BINDTODEVICE)`
+  requires an `IFNAMSIZ` output buffer (`EINVAL` when short), returns the
+  NUL-terminated name, and reports length zero once unbound.
+  `setsockopt(SO_BINDTODEVICE)` truncates to `IFNAMSIZ - 1`, stops at the
+  first NUL, resolves synthetic `lo` as ifindex 1, and returns `ENODEV` for
+  any other name that cannot be resolved.
 - `sendto` errors, in order: `EMSGSIZE` (`len > 0xFFFF`), `EOPNOTSUPP`
   (`MSG_OOB`), `EINVAL` (short address or port 0), `EAFNOSUPPORT`,
   `EDESTADDRREQ` (no destination, unconnected), `ENETUNREACH`, `EACCES`

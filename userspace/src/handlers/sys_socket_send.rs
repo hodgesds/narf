@@ -95,15 +95,21 @@ fn import_sendto_addr(ptr: u64, raw_len: u64) -> Result<Option<crate::socket::So
         return Err(EINVAL);
     }
     if len == 0 {
-        return Ok(None);
-    }
-    if len < 2 {
-        return Err(EINVAL); // no complete sa_family_t
+        // A non-NULL address is still present when `addrlen == 0`.
+        // `move_addr_to_kernel` imports an empty sockaddr and UDP rejects its
+        // short length with EINVAL; it must not become a connected send.
+        return Ok(Some(crate::socket::SockAddr {
+            family: crate::socket::AF_UNSPEC,
+            body: alloc::vec::Vec::new(),
+        }));
     }
     let mut bytes = alloc::vec![0u8; len as usize];
     // SAFETY: copy_from_user validates the complete address range and opens the
     // architecture user-access window.
     unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| EFAULT)?;
+    if len < 2 {
+        return Err(EINVAL); // no complete sa_family_t
+    }
     Ok(Some(crate::socket::SockAddr {
         family: u16::from_ne_bytes([bytes[0], bytes[1]]),
         body: bytes[2..].to_vec(),
