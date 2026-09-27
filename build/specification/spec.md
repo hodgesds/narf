@@ -36,6 +36,10 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run one exact
   in-kernel subsystem, then perform the normal whole-kernel boot smoke.
+- Successful kernel-test and boot-smoke QEMU phases keep serial output
+  captured and print concise summaries. A failure or timeout emits the full
+  captured transcript. Child timeouts use polling rather than process-wide
+  signal handlers, so sandboxed runners remain supported.
 - The second, whole-kernel phase of `cargo xtask test` strips both
   `kernel-test` and features that transitively select that harness
   (`user-mode-e2e`, `user-mode-testbin`, and `narf-libc-validate`) so it

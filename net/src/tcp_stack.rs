@@ -41,8 +41,9 @@ pub use crate::tcp::core::{
     accept, close, connect, connect_errno_in, connect_in, getsockopt_cong, getsockopt_int, listen,
     listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, release, remove_tcb,
     send, send_errno, setsockopt_int, setsockopt_str, shutdown, shutdown_errno, take_sock_error,
-    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
-    TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
+    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_DEFER_ACCEPT, TCP_KEEPALIVE, TCP_KEEPCNT,
+    TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_NOTSENT_LOWAT, TCP_QUICKACK,
+    TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 
@@ -555,6 +556,22 @@ pub fn init() {
 /// MTU we plan on per outbound frame. Kept at the legacy surface;
 /// the tcp::core path computes its own per-MSS budget.
 pub const TCP_MTU: usize = 1500;
+
+pub use crate::tcp::core::ConnectOptions;
+pub use crate::tcp::core::TcpInfoSnapshot;
+
+pub fn tcp_info(id: u32) -> Option<TcpInfoSnapshot> {
+    crate::tcp::core::tcp_info(id)
+}
+
+pub fn connect_errno_with_options_in(
+    net_ns_id: u64,
+    addr: [u8; 4],
+    port: u16,
+    options: ConnectOptions,
+) -> Result<u32, i32> {
+    crate::tcp::core::connect_errno_with_options_in(net_ns_id, addr, port, options)
+}
 
 /// Run the netfilter LOCAL_OUT + POST_ROUTING hooks against an
 /// outbound L3 packet. Callers building outbound IPv4 frames (TCP

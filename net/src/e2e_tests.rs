@@ -269,6 +269,13 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
         Ok(id) => id,
         Err(_) => return TestResult::Fail("listen failed"),
     };
+    let info = match core::tcp_info(listen_id) {
+        Some(info) => info,
+        None => return TestResult::Fail("TCP_INFO snapshot missing for listener"),
+    };
+    if info.state != 0x0A || info.snd_mss == 0 || info.rcv_mss == 0 || info.snd_cwnd == 0 {
+        return TestResult::Fail("TCP_INFO listener fields are not Linux-shaped");
+    }
 
     // ── Client: build & inject SYN ──
     let client_iss: u32 = 0x2000_0000;

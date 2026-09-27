@@ -59,8 +59,9 @@ use crate::pkt::{ETHERTYPE_IPV4, ETH_HDR_LEN, IP_PROTO_TCP};
 use crate::pkt_tcp::{FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::route;
 use crate::tcp::core::{
-    self as tcp_core, __with_tcb, __with_tcb_mut, accept, close, connect, listen, lookup_tcb, recv,
-    send, shutdown, tick_retransmit,
+    self as tcp_core, __with_tcb, __with_tcb_mut, accept, close, connect,
+    connect_errno_with_options_in, listen, lookup_tcb, recv, send, setsockopt_int, shutdown,
+    tick_retransmit, ConnectOptions, TCP_DEFER_ACCEPT,
 };
 use crate::tcp::state_machine::{Shutdown, TcpState};
 
@@ -875,10 +876,69 @@ fn tcp_e2e_handshake() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn tcp_e2e_defer_accept_waits_for_data() -> Result<(), &'static str> {
+    reset();
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    setsockopt_int(listener, TCP_DEFER_ACCEPT, 3).map_err(|_| "set defer accept failed")?;
+    let client =
+        connect_errno_with_options_in(0, SERVER_IP, SERVER_PORT, ConnectOptions { syn_retries: 2 })
+            .map_err(|_| "connect failed")?;
+    if __with_tcb(client, |t| t.syn_retries) != Some(2) {
+        return Err("TCP_SYNCNT was not installed before active open");
+    }
+    if accept(listener).map_err(|_| "accept failed")?.is_some() {
+        return Err("TCP_DEFER_ACCEPT exposed an ACK-only child");
+    }
+    send(client, b"x").map_err(|_| "send failed")?;
+    let mut child = None;
+    if !run_until(BUDGET_SMALL, || {
+        child = accept(listener).ok().flatten();
+        child.is_some()
+    }) {
+        return Err("TCP_DEFER_ACCEPT did not release child when data arrived");
+    }
+    Ok(())
+}
+
+fn tcp_e2e_defer_accept_timeout_releases_child() -> Result<(), &'static str> {
+    reset();
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    setsockopt_int(listener, TCP_DEFER_ACCEPT, 3).map_err(|_| "set defer accept failed")?;
+    let client = connect(SERVER_IP, SERVER_PORT).map_err(|_| "connect failed")?;
+    if accept(listener).map_err(|_| "accept failed")?.is_some() {
+        return Err("TCP_DEFER_ACCEPT exposed an ACK-only child");
+    }
+    let passive = live_ids()
+        .into_iter()
+        .find(|&id| id != listener && id != client && state_of(id) == Some(TcpState::Established))
+        .ok_or("deferred child not found")?;
+    __with_tcb_mut(passive, |t| t.defer_accept_deadline_cycles = 1)
+        .ok_or("deferred child disappeared")?;
+    let arc = lookup_tcb(passive).ok_or("deferred child disappeared")?;
+    tick_retransmit(&arc);
+    if accept(listener).map_err(|_| "accept failed")? != Some(passive) {
+        return Err("TCP_DEFER_ACCEPT timeout did not release child");
+    }
+    Ok(())
+}
+
 fn smoke_tcp_e2e_handshake() -> TestResult {
     finish(tcp_e2e_handshake())
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_handshake);
+
+fn smoke_tcp_e2e_defer_accept_waits_for_data() -> TestResult {
+    finish(tcp_e2e_defer_accept_waits_for_data())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_defer_accept_waits_for_data);
+
+fn smoke_tcp_e2e_defer_accept_timeout_releases_child() -> TestResult {
+    finish(tcp_e2e_defer_accept_timeout_releases_child())
+}
+kernel_test_in!(
+    "net/tcp_e2e",
+    smoke_tcp_e2e_defer_accept_timeout_releases_child
+);
 
 // ── 2. Request / response ping-pong ─────────────────────────────────────────
 //
