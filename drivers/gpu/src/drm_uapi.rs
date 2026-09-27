@@ -131,23 +131,23 @@ pub const DRM_COMMAND_BASE: u32 = 0x40;
 
 pub const SZ_DRM_VERSION: u32 = 64; // drm_version
 pub const SZ_DRM_GET_CAP: u32 = 16; // drm_get_cap
-pub const SZ_DRM_PRIME_HANDLE: u32 = 16; // drm_prime_handle
+pub const SZ_DRM_PRIME_HANDLE: u32 = 12; // drm_prime_handle
 pub const SZ_DRM_MODE_CARD_RES: u32 = 64; // drm_mode_card_res
 pub const SZ_DRM_MODE_CRTC: u32 = 104; // drm_mode_crtc
-pub const SZ_DRM_MODE_GET_PLANE: u32 = 48; // drm_mode_get_plane
+pub const SZ_DRM_MODE_GET_PLANE: u32 = 32; // drm_mode_get_plane
 pub const SZ_DRM_MODE_GET_PLANE_RES: u32 = 16; // drm_mode_get_plane_res
 pub const SZ_DRM_MODE_GET_ENCODER: u32 = 20; // drm_mode_get_encoder
 pub const SZ_DRM_MODE_GET_CONNECTOR: u32 = 80; // drm_mode_get_connector
 pub const SZ_DRM_MODE_GET_PROPERTY: u32 = 64; // drm_mode_get_property
-pub const SZ_DRM_MODE_FB_CMD2: u32 = 80; // drm_mode_fb_cmd2
+pub const SZ_DRM_MODE_FB_CMD2: u32 = 104; // drm_mode_fb_cmd2
 pub const SZ_DRM_MODE_RMFB: u32 = 4; // drm_mode_rmfb
 pub const SZ_DRM_MODE_ATOMIC: u32 = 56; // drm_mode_atomic
-pub const SZ_DRM_MODE_CREATE_BLOB: u32 = 32; // drm_mode_create_blob
+pub const SZ_DRM_MODE_CREATE_BLOB: u32 = 16; // drm_mode_create_blob
 pub const SZ_DRM_MODE_DESTROY_BLOB: u32 = 4; // drm_mode_destroy_blob
-pub const SZ_DRM_GEM_CLOSE: u32 = 16; // drm_gem_close
+pub const SZ_DRM_GEM_CLOSE: u32 = 8; // drm_gem_close
 pub const SZ_DRM_SYNCOBJ_CREATE: u32 = 8; // drm_syncobj_create
 pub const SZ_DRM_SYNCOBJ_DESTROY: u32 = 8; // drm_syncobj_destroy
-pub const SZ_DRM_SYNCOBJ_WAIT: u32 = 32; // drm_syncobj_wait
+pub const SZ_DRM_SYNCOBJ_WAIT: u32 = 40; // drm_syncobj_wait
 pub const SZ_DRM_SYNCOBJ_HANDLE: u32 = 24; // drm_syncobj_handle
 
 // ── Dumb-buffer / modesetting struct sizes ─────────────────────────────
@@ -262,8 +262,11 @@ pub const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BAS
 pub const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 =
     iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x04, 56);
 pub const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x05, 16);
+pub const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 =
+    iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x06, 44);
 pub const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 =
-    iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x07, 48);
+    iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x07, 44);
+pub const DRM_IOCTL_VIRTGPU_WAIT: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x08, 8);
 pub const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x09, 24);
 pub const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x0b, 16);
 
@@ -350,8 +353,8 @@ pub struct DrmVirtGpuResourceCreateBlobUapi {
     pub cmd: u64,
     pub blob_id: u64,
 }
-/// `struct drm_virtgpu_execbuffer` (fence and syncobj fields are rejected in
-/// v1; command and BO handle pointers are copied before transport submission).
+/// `struct drm_virtgpu_execbuffer` (command and BO handle pointers are copied
+/// before transport submission).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DrmVirtGpuExecBufferUapi {
@@ -368,7 +371,7 @@ pub struct DrmVirtGpuExecBufferUapi {
     pub in_syncobjs: u64,
     pub out_syncobjs: u64,
 }
-/// `struct drm_virtgpu_3d_transfer_to_host`.
+/// Shared layout of `drm_virtgpu_3d_transfer_{to,from}_host`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DrmVirtGpuTransferToHostUapi {
@@ -384,6 +387,13 @@ pub struct DrmVirtGpuTransferToHostUapi {
     pub stride: u32,
     pub layer_stride: u32,
 }
+/// `struct drm_virtgpu_3d_wait`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuWaitUapi {
+    pub handle: u32,
+    pub flags: u32,
+}
 /// `struct drm_virtgpu_get_caps`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -394,6 +404,17 @@ pub struct DrmVirtGpuGetCapsUapi {
     pub size: u32,
     pub pad: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuMapUapi>() == 16);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuGetParamUapi>() == 16);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuResourceCreateUapi>() == 56);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuResourceInfoUapi>() == 16);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuContextInitUapi>() == 16);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuResourceCreateBlobUapi>() == 48);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuExecBufferUapi>() == 64);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuTransferToHostUapi>() == 44);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuWaitUapi>() == 8);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuGetCapsUapi>() == 24);
 
 // ── DRM_IOCTL_* wire-format struct mirrors ─────────────────────────────
 //
@@ -463,6 +484,8 @@ pub struct DrmGemCloseUapi {
     pub handle: u32,
     pub pad: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<DrmGemCloseUapi>() == SZ_DRM_GEM_CLOSE as usize);
 
 /// `struct drm_syncobj_create` from `include/uapi/drm/drm.h`.
 #[repr(C)]

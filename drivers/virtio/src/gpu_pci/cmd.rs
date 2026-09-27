@@ -183,12 +183,40 @@ pub struct AttachBacking {
 }
 
 pub fn build_resource_attach_backing(out: &mut [u8], a: AttachBacking) {
+    let written = build_resource_attach_backing_entries(
+        out,
+        a.resource_id,
+        &[MemEntry {
+            addr: a.addr,
+            length: a.length,
+        }],
+    );
+    assert_eq!(written, 48);
+}
+
+/// Build `RESOURCE_ATTACH_BACKING` with the VirtIO-GPU scatter/gather list.
+///
+/// Linux supplies one entry per shmem scatterlist segment. Keeping the entry
+/// array on the wire avoids requiring every render target to fit in one
+/// physically-contiguous DMA allocation.
+pub fn build_resource_attach_backing_entries(
+    out: &mut [u8],
+    resource_id: u32,
+    entries: &[MemEntry],
+) -> usize {
+    let total = HDR_LEN + 8 + entries.len() * 16;
+    assert!(!entries.is_empty());
+    assert!(out.len() >= total);
     put_hdr(out, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0, 0, 0);
-    out[24..28].copy_from_slice(&a.resource_id.to_le_bytes());
-    out[28..32].copy_from_slice(&1u32.to_le_bytes()); // nr_entries
-    out[32..40].copy_from_slice(&a.addr.to_le_bytes());
-    out[40..44].copy_from_slice(&a.length.to_le_bytes());
-    out[44..48].copy_from_slice(&0u32.to_le_bytes()); // padding
+    out[24..28].copy_from_slice(&resource_id.to_le_bytes());
+    out[28..32].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (index, entry) in entries.iter().enumerate() {
+        let base = 32 + index * 16;
+        out[base..base + 8].copy_from_slice(&entry.addr.to_le_bytes());
+        out[base + 8..base + 12].copy_from_slice(&entry.length.to_le_bytes());
+        out[base + 12..base + 16].copy_from_slice(&0u32.to_le_bytes());
+    }
+    total
 }
 
 pub fn decode_resource_attach_backing(buf: &[u8]) -> AttachBacking {
@@ -374,8 +402,10 @@ pub struct ResourceCreate3D {
 
 pub const RESOURCE_CREATE_3D_LEN: usize = HDR_LEN + 48;
 
-pub fn build_resource_create_3d(out: &mut [u8], ctx_id: u32, r: ResourceCreate3D) {
-    put_hdr(out, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, 0, 0, ctx_id);
+pub fn build_resource_create_3d(out: &mut [u8], r: ResourceCreate3D) {
+    // Linux leaves hdr.ctx_id zero for RESOURCE_CREATE_3D. Resource ownership
+    // is established by the following CTX_ATTACH_RESOURCE command.
+    put_hdr(out, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, 0, 0, 0);
     let fields = [
         r.resource_id,
         r.target,

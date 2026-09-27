@@ -1763,6 +1763,9 @@ fn open_impl(
                         narf_filesystem::FsError::NoSuchProcess => 3,     // ESRCH
                         narf_filesystem::FsError::PermissionDenied => 13, // EACCES
                         narf_filesystem::FsError::OperationNotPermitted => 1, // EPERM
+                        narf_filesystem::FsError::BadAddress => 14,       // EFAULT
+                        narf_filesystem::FsError::NotImplemented => 38,   // ENOSYS
+                        narf_filesystem::FsError::AlreadyExists => 17,    // EEXIST
                         narf_filesystem::FsError::Io(_) => 5,             // EIO
                         narf_filesystem::FsError::InvalidPath
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
@@ -4554,6 +4557,9 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::NoSuchProcess => 3, // ESRCH
         narf_filesystem::FsError::PermissionDenied => 13,
         narf_filesystem::FsError::OperationNotPermitted => 1,
+        narf_filesystem::FsError::BadAddress => 14,
+        narf_filesystem::FsError::NotImplemented => 38,
+        narf_filesystem::FsError::AlreadyExists => 17,
         narf_filesystem::FsError::Io(_) => 5,
         narf_filesystem::FsError::InvalidPath
         | narf_filesystem::FsError::InvalidData

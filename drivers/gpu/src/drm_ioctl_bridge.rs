@@ -26,7 +26,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use narf_filesystem::FsError;
 use narf_io::DmaBuffer;
 
@@ -58,11 +58,98 @@ const IOCTL_MAX_BUF: usize = 1024 * 1024;
 pub(crate) const VIRTGPU_EXECBUFFER_MAX_BYTES: usize =
     64 * 1024 - narf_drivers_virtio::gpu_pci::cmd::SUBMIT_3D_PREFIX_LEN;
 
+/// Keep one userspace allocation bounded while allowing it to span the I/O
+/// layer's 4 MiB maximum coherent segment. This was the existing intended
+/// per-resource limit; the old single-segment implementation accidentally
+/// made the effective limit 4 MiB instead.
+const VIRTGPU_RESOURCE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const VIRTGPU_DMA_SEGMENT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Per-open DRM client capability state (`struct drm_file` in Linux).
+///
+/// Atomic and cursor-hotspot negotiation is ordered: Linux returns `EINVAL`
+/// for HOTSPOT unless that same file has already enabled ATOMIC.  Keep this
+/// on the open file rather than the card so independent clients cannot grant
+/// capabilities to one another.
+#[derive(Debug)]
+pub struct DrmClientCaps {
+    atomic: AtomicBool,
+}
+
+impl DrmClientCaps {
+    pub const fn new() -> Self {
+        Self {
+            atomic: AtomicBool::new(false),
+        }
+    }
+
+    fn atomic(&self) -> bool {
+        self.atomic.load(Ordering::Acquire)
+    }
+
+    fn set_atomic(&self, enabled: bool) {
+        self.atomic.store(enabled, Ordering::Release);
+    }
+}
+
+impl Default for DrmClientCaps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct GuestBacking {
+    segments: Vec<DmaBuffer>,
+    /// Linux reports the GEM object's requested (page-rounded) size, not the
+    /// sum of allocator power-of-two padding across its scatterlist entries.
+    size: usize,
+}
+
+impl GuestBacking {
+    fn entries(&self) -> Vec<narf_drivers_virtio::gpu_pci::cmd::MemEntry> {
+        self.segments
+            .iter()
+            .map(|segment| narf_drivers_virtio::gpu_pci::cmd::MemEntry {
+                addr: segment.dma_addr().raw(),
+                length: segment.len() as u32,
+            })
+            .collect()
+    }
+
+    fn page_phys(&self, mut page: usize) -> u64 {
+        for segment in &self.segments {
+            let pages = segment.len() / 4096;
+            if page < pages {
+                return segment.dma_addr().raw() + page as u64 * 4096;
+            }
+            page -= pages;
+        }
+        0
+    }
+}
+
+fn alloc_guest_backing(size: usize) -> Result<GuestBacking, FsError> {
+    if size == 0 || size > VIRTGPU_RESOURCE_MAX_BYTES {
+        return Err(FsError::OutOfMemory);
+    }
+    let size = size.div_ceil(4096) * 4096;
+    let mut remaining = size;
+    let mut segments = Vec::new();
+    while remaining != 0 {
+        let chunk = remaining.min(VIRTGPU_DMA_SEGMENT_MAX_BYTES);
+        let segment = narf_io::alloc_coherent(chunk, narf_lib::id::DomainId::DRIVER_0)
+            .map_err(|_| FsError::OutOfMemory)?;
+        remaining = remaining.saturating_sub(segment.len());
+        segments.push(segment);
+    }
+    Ok(GuestBacking { segments, size })
+}
+
 /// Where a resource's mappable memory lives.
 enum ResourceBacking {
     /// Guest-physical coherent DMA pages (classic 3D resources and guest
     /// blobs). The host attaches these pages as the resource backing.
-    Guest(DmaBuffer),
+    Guest(GuestBacking),
     /// A slice of the host-visible PCI window (host3d mappable blobs). The
     /// host owns the memory; the guest maps `[window_phys+offset, +size)`.
     HostVisible {
@@ -79,31 +166,78 @@ enum ResourceBacking {
 /// owned by an open file, not the global DRM card: a process cannot submit or
 /// map another process's handle merely by guessing its integer value.
 pub(crate) struct VirtGpuResource {
-    handle: u32,
     pub(crate) resource_id: u32,
-    backing: ResourceBacking,
+    backing: Option<ResourceBacking>,
+    /// Linux exposes the blob memory class through RESOURCE_INFO. `None`
+    /// identifies a classic RESOURCE_CREATE object.
+    blob_mem: Option<u32>,
+    /// Host3D blobs accept explicit transfer strides; classic resources do
+    /// not, and pure guest blobs reject 3D transfers entirely.
+    host3d_blob: bool,
+    /// False only for synthetic lifecycle tests that never created a host
+    /// resource and therefore require no RESOURCE_UNREF command.
+    host_owned: bool,
+}
+
+impl core::fmt::Debug for VirtGpuResource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtGpuResource")
+            .field("resource_id", &self.resource_id)
+            .field("len", &self.len())
+            .field("blob_mem", &self.blob_mem)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for VirtGpuResource {
+    fn drop(&mut self) {
+        let Some(backing) = self.backing.take() else {
+            return;
+        };
+        if !self.host_owned {
+            drop(backing);
+            return;
+        }
+        let released = narf_drivers_virtio::gpu_pci::probed_device()
+            .map(|dev| dev.unref_virgl_resource(self.resource_id).is_ok())
+            .unwrap_or(false);
+        if released {
+            drop(backing);
+        } else {
+            // The host may still DMA through its resource backing. Leaking is
+            // bounded to the failed object and is safer than recycling pages.
+            core::mem::forget(backing);
+        }
+    }
 }
 
 impl VirtGpuResource {
     /// Mappable byte length of the resource's backing.
-    fn len(&self) -> usize {
-        match &self.backing {
-            ResourceBacking::Guest(b) => b.len(),
+    pub(crate) fn len(&self) -> usize {
+        match self.backing.as_ref().expect("live VirtGpuResource backing") {
+            ResourceBacking::Guest(backing) => backing.size,
             ResourceBacking::HostVisible { size, .. } => *size as usize,
             ResourceBacking::HostOnly { size } => *size as usize,
         }
     }
 
     /// Whether this resource is CPU-mmappable by the guest.
-    fn is_cpu_mappable(&self) -> bool {
-        !matches!(self.backing, ResourceBacking::HostOnly { .. })
+    pub(crate) fn is_cpu_mappable(&self) -> bool {
+        !matches!(
+            self.backing.as_ref(),
+            Some(ResourceBacking::HostOnly { .. })
+        )
+    }
+
+    fn is_guest_only_blob(&self) -> bool {
+        self.blob_mem.is_some() && !self.host3d_blob
     }
 
     /// Guest-physical address of the `page`-th 4 KiB page of the backing.
     /// Only valid for CPU-mappable backings (`is_cpu_mappable`).
-    fn page_phys(&self, page: usize) -> u64 {
-        match &self.backing {
-            ResourceBacking::Guest(b) => b.dma_addr().raw() + page as u64 * 4096,
+    pub(crate) fn page_phys(&self, page: usize) -> u64 {
+        match self.backing.as_ref().expect("live VirtGpuResource backing") {
+            ResourceBacking::Guest(backing) => backing.page_phys(page),
             ResourceBacking::HostVisible {
                 window_phys,
                 offset,
@@ -114,21 +248,47 @@ impl VirtGpuResource {
     }
 }
 
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+pub(crate) fn test_virtgpu_resource(resource_id: u32, size: usize) -> Arc<VirtGpuResource> {
+    Arc::new(VirtGpuResource {
+        resource_id,
+        backing: Some(ResourceBacking::HostOnly { size: size as u64 }),
+        blob_mem: None,
+        host3d_blob: false,
+        host_owned: false,
+    })
+}
+
+struct VirtGpuHandle {
+    handle: u32,
+    resource: Arc<VirtGpuResource>,
+    /// Classic resources and PRIME imports were explicitly CTX_ATTACHed;
+    /// blob creation associates ownership in its header and is not detached
+    /// through CTX_DETACH on handle close.
+    attached: bool,
+}
+
 /// Per-open state for `/dev/dri/renderD<N+128>` on the virtio_gpu card.
 ///
 /// The state belongs to `DriRenderFile`; it is never shared across opens.
 /// All mutable state is behind a lock because ioctl and mmap can arrive from
 /// different threads sharing the same fd.
 pub struct VirtGpuRenderState {
-    resources: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<VirtGpuResource>>>,
+    resources: narf_lib::sync::IrqSafeSpinLock<Vec<VirtGpuHandle>>,
     next_handle: AtomicU32,
     /// This open's virtio-gpu render context id (unique per open).
     ctx_id: u32,
     /// Capset this open's context binds (0 = classic VirGL; 6 = DRM native).
     /// Set by CONTEXT_INIT before the context is created.
     context_capset: AtomicU32,
+    /// Ring configuration supplied by CONTEXT_INIT. Classic VirGL normally
+    /// leaves both zero; EXECBUFFER ring selection is valid only when the
+    /// selected bit is within this configured set, matching Linux.
+    context_num_rings: AtomicU32,
+    context_ring_mask: AtomicU64,
+    context_explicit_debug_name: AtomicBool,
     /// Whether this open's context has been created on the device yet.
-    context_ready: core::sync::atomic::AtomicBool,
+    context_ready: AtomicBool,
     /// Per-open DRM syncobj table (like Linux's per-DRM-file syncobj IDR). The
     /// DRM native context creates syncobjs during device init and rendering.
     syncobjs: narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
@@ -147,7 +307,10 @@ impl VirtGpuRenderState {
             next_handle: AtomicU32::new(1),
             ctx_id: NEXT_VIRTGPU_CTX_ID.fetch_add(1, Ordering::Relaxed),
             context_capset: AtomicU32::new(0),
-            context_ready: core::sync::atomic::AtomicBool::new(false),
+            context_num_rings: AtomicU32::new(0),
+            context_ring_mask: AtomicU64::new(0),
+            context_explicit_debug_name: AtomicBool::new(false),
+            context_ready: AtomicBool::new(false),
             syncobjs: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
         }
     }
@@ -164,7 +327,7 @@ impl VirtGpuRenderState {
         }
         let capset = self.context_capset.load(Ordering::Acquire);
         dev.create_context(self.ctx_id, capset)
-            .map_err(|_| FsError::Unsupported)?;
+            .map_err(map_gpu_transport_error)?;
         self.context_ready.store(true, Ordering::Release);
         Ok(())
     }
@@ -173,16 +336,138 @@ impl VirtGpuRenderState {
         self.resources
             .lock()
             .iter()
-            .find(|r| r.handle == handle)
-            .cloned()
+            .find(|binding| binding.handle == handle)
+            .map(|binding| Arc::clone(&binding.resource))
     }
 
-    pub(crate) fn insert(&self, handle: u32, resource_id: u32, buffer: DmaBuffer) {
-        self.resources.lock().push(Arc::new(VirtGpuResource {
+    pub(crate) fn allocate_handle(&self) -> u32 {
+        loop {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed).max(1);
+            if self.find(handle).is_none() {
+                return handle;
+            }
+        }
+    }
+
+    pub(crate) fn export_resource(&self, handle: u32) -> Option<Arc<VirtGpuResource>> {
+        self.find(handle)
+    }
+
+    pub(crate) fn handle_for_resource(&self, resource: &Arc<VirtGpuResource>) -> Option<u32> {
+        self.resources
+            .lock()
+            .iter()
+            .find(|binding| Arc::ptr_eq(&binding.resource, resource))
+            .map(|binding| binding.handle)
+    }
+
+    fn rename_handle(&self, old_handle: u32, new_handle: u32) -> Result<(), FsError> {
+        let mut resources = self.resources.lock();
+        if resources.iter().any(|binding| binding.handle == new_handle) {
+            return Err(FsError::AlreadyExists);
+        }
+        let binding = resources
+            .iter_mut()
+            .find(|binding| binding.handle == old_handle)
+            .ok_or(FsError::NotFound)?;
+        binding.handle = new_handle;
+        Ok(())
+    }
+
+    fn bind(&self, handle: u32, resource: Arc<VirtGpuResource>, attached: bool) {
+        self.resources.lock().push(VirtGpuHandle {
             handle,
-            resource_id,
-            backing: ResourceBacking::Guest(buffer),
-        }));
+            resource,
+            attached,
+        });
+    }
+
+    pub(crate) fn import_resource(
+        &self,
+        handle: u32,
+        resource: Arc<VirtGpuResource>,
+    ) -> Result<(), FsError> {
+        if self.find(handle).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+        self.ensure_context(dev)?;
+        dev.attach_virgl_resource(self.ctx_id, resource.resource_id)
+            .map_err(map_gpu_transport_error)?;
+        self.bind(handle, resource, true);
+        Ok(())
+    }
+
+    pub(crate) fn import_resource_new_handle(
+        &self,
+        resource: Arc<VirtGpuResource>,
+    ) -> Result<u32, FsError> {
+        if let Some(binding) = self
+            .resources
+            .lock()
+            .iter()
+            .find(|binding| Arc::ptr_eq(&binding.resource, &resource))
+        {
+            return Ok(binding.handle);
+        }
+        let handle = self.allocate_handle();
+        self.import_resource(handle, resource)?;
+        Ok(handle)
+    }
+
+    /// Test/small-resource helper retaining the historical single-buffer path.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn insert(&self, handle: u32, resource_id: u32, buffer: DmaBuffer) {
+        let size = buffer.len();
+        self.bind(
+            handle,
+            Arc::new(VirtGpuResource {
+                resource_id,
+                backing: Some(ResourceBacking::Guest(GuestBacking {
+                    segments: vec![buffer],
+                    size,
+                })),
+                blob_mem: None,
+                host3d_blob: false,
+                host_owned: false,
+            }),
+            true,
+        );
+    }
+
+    fn insert_backing(&self, handle: u32, resource_id: u32, backing: GuestBacking) {
+        self.bind(
+            handle,
+            Arc::new(VirtGpuResource {
+                resource_id,
+                backing: Some(ResourceBacking::Guest(backing)),
+                blob_mem: None,
+                host3d_blob: false,
+                host_owned: true,
+            }),
+            true,
+        );
+    }
+
+    fn insert_guest_blob(
+        &self,
+        handle: u32,
+        resource_id: u32,
+        backing: GuestBacking,
+        blob_mem: u32,
+        host3d_blob: bool,
+    ) {
+        self.bind(
+            handle,
+            Arc::new(VirtGpuResource {
+                resource_id,
+                backing: Some(ResourceBacking::Guest(backing)),
+                blob_mem: Some(blob_mem),
+                host3d_blob,
+                host_owned: true,
+            }),
+            false,
+        );
     }
 
     /// Record a host3d mappable blob backed by a slice of the host-visible
@@ -195,30 +480,45 @@ impl VirtGpuRenderState {
         offset: u64,
         size: u64,
     ) {
-        self.resources.lock().push(Arc::new(VirtGpuResource {
+        self.bind(
             handle,
-            resource_id,
-            backing: ResourceBacking::HostVisible {
-                window_phys,
-                offset,
-                size,
-            },
-        }));
+            Arc::new(VirtGpuResource {
+                resource_id,
+                backing: Some(ResourceBacking::HostVisible {
+                    window_phys,
+                    offset,
+                    size,
+                }),
+                blob_mem: Some(narf_drivers_virtio::gpu_pci::BLOB_MEM_HOST3D),
+                host3d_blob: true,
+                host_owned: true,
+            }),
+            false,
+        );
     }
 
     /// Record a host-only blob (e.g. non-mappable VRAM) — no CPU mapping.
     pub(crate) fn insert_host_only(&self, handle: u32, resource_id: u32, size: u64) {
-        self.resources.lock().push(Arc::new(VirtGpuResource {
+        self.bind(
             handle,
-            resource_id,
-            backing: ResourceBacking::HostOnly { size },
-        }));
+            Arc::new(VirtGpuResource {
+                resource_id,
+                backing: Some(ResourceBacking::HostOnly { size }),
+                blob_mem: Some(narf_drivers_virtio::gpu_pci::BLOB_MEM_HOST3D),
+                host3d_blob: true,
+                host_owned: true,
+            }),
+            false,
+        );
     }
 
-    pub(crate) fn take(&self, handle: u32) -> Option<Arc<VirtGpuResource>> {
+    pub(crate) fn take(&self, handle: u32) -> Option<(Arc<VirtGpuResource>, bool)> {
         let mut resources = self.resources.lock();
-        let pos = resources.iter().position(|r| r.handle == handle)?;
-        Some(resources.swap_remove(pos))
+        let pos = resources
+            .iter()
+            .position(|binding| binding.handle == handle)?;
+        let binding = resources.swap_remove(pos);
+        Some((binding.resource, binding.attached))
     }
 
     pub(crate) fn mapping_resource(&self, offset: u64, len: usize) -> Option<Arc<VirtGpuResource>> {
@@ -234,8 +534,11 @@ impl VirtGpuRenderState {
         self.ctx_id
     }
 
-    pub(crate) fn drain_resources(&self) -> Vec<Arc<VirtGpuResource>> {
+    pub(crate) fn drain_resources(&self) -> Vec<(u32, Arc<VirtGpuResource>, bool)> {
         core::mem::take(&mut *self.resources.lock())
+            .into_iter()
+            .map(|binding| (binding.handle, binding.resource, binding.attached))
+            .collect()
     }
 }
 
@@ -253,6 +556,13 @@ static NEXT_VIRTGPU_RESOURCE_ID: AtomicU32 = AtomicU32::new(2);
 /// the second client's shmem blob fail ("there can be only one"). Context 0 is
 /// reserved (no context / pure guest blobs); real contexts start at 1.
 static NEXT_VIRTGPU_CTX_ID: AtomicU32 = AtomicU32::new(1);
+
+fn map_gpu_transport_error(error: narf_drivers_virtio::pci::VirtioPciError) -> FsError {
+    match error {
+        narf_drivers_virtio::pci::VirtioPciError::CompletionTimeout => FsError::Busy,
+        _ => FsError::InvalidData,
+    }
+}
 
 fn read_uapi<T: Copy>(arg: usize) -> Result<T, FsError> {
     // SAFETY: the ioctl caller supplied `arg`; copy_in constrains the exact
@@ -276,44 +586,60 @@ fn write_uapi<T: Copy>(arg: usize, value: T) -> Result<(), FsError> {
 /// `DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB` — allocate a guest-page-backed blob
 /// resource. Used by the DRM native context (capset 6): guest Mesa allocates
 /// its buffer objects as blobs. GUEST(1) and HOST3D_GUEST(3) are guest-backed
-/// and fully handled here; HOST3D(2) (host-only VRAM) needs the not-yet-wired
-/// host-visible mapping window and is rejected with EINVAL, matching a host
-/// that does not offer that memory type.
+/// and fully handled here; HOST3D(2) is either host-visible and CPU-mappable or
+/// host-only, according to its blob flags.
 fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result<u64, FsError> {
     use crate::drm_uapi::DrmVirtGpuResourceCreateBlobUapi;
     use narf_drivers_virtio::gpu_pci::{BLOB_MEM_GUEST, BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST};
     let mut req: DrmVirtGpuResourceCreateBlobUapi = read_uapi(arg)?;
-    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
-    if req.size == 0 {
+    const BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
+    const BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
+    const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
+    const BLOB_FLAG_USE_MASK: u32 =
+        BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_SHAREABLE | BLOB_FLAG_USE_CROSS_DEVICE;
+
+    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+    if !dev.resource_blob_enabled()
+        || req.size == 0
+        || req.blob_flags & !BLOB_FLAG_USE_MASK != 0
+        // RESOURCE_ASSIGN_UUID is not implemented or advertised by NARF.
+        || req.blob_flags & BLOB_FLAG_USE_CROSS_DEVICE != 0
+    {
         return Err(FsError::InvalidData);
     }
-    // Ensure this open's render context exists (host3d blobs are owned by it).
-    state.ensure_context(dev)?;
+    let host3d_blob = matches!(req.blob_mem, BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST);
+    if !matches!(
+        req.blob_mem,
+        BLOB_MEM_GUEST | BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST
+    ) || (host3d_blob && !dev.virgl_enabled())
+        || (!host3d_blob && (req.blob_id != 0 || req.cmd_size != 0))
+        || (host3d_blob && req.cmd_size % 4 != 0)
+    {
+        return Err(FsError::InvalidData);
+    }
+    // Linux creates a context only when VirGL is active. Pure guest blobs do
+    // not need one; HOST3D variants were feature-checked above.
+    if dev.virgl_enabled() {
+        state.ensure_context(dev)?;
+    }
     // A host3d(_guest) blob may carry a ccmd describing the host object; Linux
     // submits it via SUBMIT_3D on the context before creating the resource
     // (verify_blob requires cmd_size dword-aligned).
-    if req.cmd_size != 0 && req.cmd != 0 {
-        if req.cmd_size % 4 != 0 {
-            return Err(FsError::InvalidData);
-        }
+    if req.cmd_size != 0 {
         // SAFETY: `req.cmd` is the user pointer libdrm passed; copy_in
         // SMAP-brackets the read and bounds cmd_size.
         let cmd_bytes = unsafe { copy_in(req.cmd as usize, req.cmd_size as usize)? };
         dev.submit_virgl(state.ctx_id, None, &cmd_bytes)
             .map_err(|_| FsError::InvalidData)?;
     }
-    let handle = state.next_handle.fetch_add(1, Ordering::Relaxed);
+    let handle = state.allocate_handle();
     let resource_id = NEXT_VIRTGPU_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
     match req.blob_mem {
         // Guest-page backed: allocate coherent DMA and attach it as the backing.
         BLOB_MEM_GUEST | BLOB_MEM_HOST3D_GUEST => {
             let size = req.size as usize;
-            // The contiguous DMA provider currently guarantees at most 16 MiB.
-            if size > 16 * 1024 * 1024 {
-                return Err(FsError::InvalidData);
-            }
-            let buffer = narf_io::alloc_coherent(size, narf_lib::id::DomainId::DRIVER_0)
-                .map_err(|_| FsError::InvalidData)?;
+            let backing = alloc_guest_backing(size)?;
+            let entries = backing.entries();
             dev.create_blob_resource(
                 state.ctx_id,
                 resource_id,
@@ -321,11 +647,16 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
                 req.blob_flags,
                 req.blob_id,
                 req.size,
-                buffer.dma_addr().raw(),
-                buffer.len() as u32,
+                &entries,
             )
             .map_err(|_| FsError::InvalidData)?;
-            state.insert(handle, resource_id, buffer);
+            state.insert_guest_blob(
+                handle,
+                resource_id,
+                backing,
+                req.blob_mem,
+                req.blob_mem == BLOB_MEM_HOST3D_GUEST,
+            );
         }
         // Host-allocated (host3d). Create the host resource; only USE_MAPPABLE
         // blobs get a slot in the host-visible window + a RESOURCE_MAP_BLOB.
@@ -333,7 +664,6 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
         // the GPU references them by resource id and they are never CPU-mapped —
         // trying to map one fails ("failed to map virgl resource").
         BLOB_MEM_HOST3D => {
-            const BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
             dev.create_blob_host3d(
                 state.ctx_id,
                 resource_id,
@@ -346,7 +676,7 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
                 let base = dev.host_visible_base().ok_or(FsError::InvalidData)?;
                 let offset = dev
                     .alloc_host_visible(req.size)
-                    .ok_or(FsError::InvalidData)?;
+                    .ok_or(FsError::OutOfMemory)?;
                 dev.map_blob(resource_id, offset)
                     .map_err(|_| FsError::InvalidData)?;
                 state.insert_host_visible(handle, resource_id, base, offset, req.size);
@@ -362,6 +692,55 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
     // Writes back the leading 48 bytes (bo_handle/res_handle at offsets 8/12);
     // any Mesa-appended trailing bytes are left untouched.
     write_uapi(arg, req)?;
+    Ok(0)
+}
+
+fn handle_transfer_3d(
+    arg: usize,
+    state: &VirtGpuRenderState,
+    from_host: bool,
+) -> Result<u64, FsError> {
+    use crate::drm_uapi::DrmVirtGpuTransferToHostUapi;
+
+    let req: DrmVirtGpuTransferToHostUapi = read_uapi(arg)?;
+    let dev = narf_drivers_virtio::gpu_pci::probed_device();
+    // Linux checks the VirGL feature before looking up the handle for the
+    // host-to-guest ioctl. Its guest-to-host ioctl has a separate 2D fallback;
+    // NARF does not advertise that private render path, so report ENOSYS when
+    // no 3D transport exists.
+    if from_host && !dev.map(|d| d.virgl_enabled()).unwrap_or(false) {
+        return Err(FsError::NotImplemented);
+    }
+
+    let resource = state.find(req.bo_handle).ok_or(FsError::NotFound)?;
+    if resource.is_guest_only_blob()
+        || (!resource.host3d_blob && (req.stride != 0 || req.layer_stride != 0))
+    {
+        return Err(FsError::InvalidData);
+    }
+    let dev = dev
+        .filter(|d| d.virgl_enabled())
+        .ok_or(FsError::NotImplemented)?;
+    state.ensure_context(dev)?;
+    let transfer = narf_drivers_virtio::gpu_pci::cmd::Transfer3D {
+        resource_id: resource.resource_id,
+        x: req.x,
+        y: req.y,
+        z: req.z,
+        width: req.w,
+        height: req.h,
+        depth: req.d,
+        offset: req.offset as u64,
+        level: req.level,
+        stride: req.stride,
+        layer_stride: req.layer_stride,
+    };
+    if from_host {
+        dev.transfer_from_host_virgl(state.ctx_id, transfer)
+    } else {
+        dev.transfer_to_host_virgl(state.ctx_id, transfer)
+    }
+    .map_err(map_gpu_transport_error)?;
     Ok(0)
 }
 
@@ -469,6 +848,90 @@ pub fn dispatch_virtgpu_render(
     arg: usize,
     state: &VirtGpuRenderState,
 ) -> Result<u64, FsError> {
+    dispatch_virtgpu_render_inner(cmd, arg, state, None)
+}
+
+/// Primary-node variant: GEM_CLOSE must also drop the imported KMS GEM-handle
+/// reference held in the card's global mode state.
+pub fn dispatch_virtgpu_render_for_card(
+    card_index: u32,
+    cmd: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+) -> Result<u64, FsError> {
+    let result = dispatch_virtgpu_render_inner(cmd, arg, state, Some(card_index))?;
+    let nr = drm_uapi::ioc_nr(cmd);
+    if cmd == drm_uapi::DRM_IOCTL_VIRTGPU_RESOURCE_CREATE
+        || nr == drm_uapi::DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB
+    {
+        register_card_virtgpu_resource(card_index, arg, state, nr)?;
+    }
+    Ok(result)
+}
+
+/// A primary-node `drm_file` has one GEM handle namespace in Linux: a handle
+/// returned by VIRTGPU_RESOURCE_CREATE is immediately valid for ADDFB2 on the
+/// same fd. NARF's render state and generic KMS table are separate structures,
+/// so mirror the new binding into the card table before returning to userspace.
+fn register_card_virtgpu_resource(
+    card_index: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+    nr: u32,
+) -> Result<(), FsError> {
+    let (old_handle, is_blob) = if nr == drm_uapi::DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB {
+        let req: drm_uapi::DrmVirtGpuResourceCreateBlobUapi = read_uapi(arg)?;
+        (req.bo_handle, true)
+    } else {
+        let req: drm_uapi::DrmVirtGpuResourceCreateUapi = read_uapi(arg)?;
+        (req.bo_handle, false)
+    };
+    let resource = state.find(old_handle).ok_or(FsError::NotFound)?;
+    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::InvalidData)?;
+    let handle = {
+        let card = mode_state.lock();
+        if card.gem.lookup(old_handle).is_none() {
+            old_handle
+        } else {
+            drop(card);
+            loop {
+                let candidate = state.allocate_handle();
+                if mode_state.lock().gem.lookup(candidate).is_none() {
+                    break candidate;
+                }
+            }
+        }
+    };
+    if handle != old_handle {
+        state.rename_handle(old_handle, handle)?;
+    }
+    if let Err(_error) = mode_state
+        .lock()
+        .register_virtgpu_import(handle, Arc::clone(&resource))
+    {
+        if let Some((resource, attached)) = state.take(handle) {
+            release_virtgpu_resource(state.ctx_id, resource, attached);
+        }
+        return Err(FsError::OutOfMemory);
+    }
+    if is_blob {
+        let mut req: drm_uapi::DrmVirtGpuResourceCreateBlobUapi = read_uapi(arg)?;
+        req.bo_handle = handle;
+        write_uapi(arg, req)?;
+    } else {
+        let mut req: drm_uapi::DrmVirtGpuResourceCreateUapi = read_uapi(arg)?;
+        req.bo_handle = handle;
+        write_uapi(arg, req)?;
+    }
+    Ok(())
+}
+
+fn dispatch_virtgpu_render_inner(
+    cmd: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+    card_index: Option<u32>,
+) -> Result<u64, FsError> {
     use crate::drm_uapi::*;
     // RESOURCE_CREATE_BLOB is dispatched by command *number*: the DRM native
     // context's Mesa build sends a struct larger than libdrm's canonical 48
@@ -543,50 +1006,100 @@ pub fn dispatch_virtgpu_render(
         }
         DRM_IOCTL_VIRTGPU_CONTEXT_INIT => {
             let req: DrmVirtGpuContextInitUapi = read_uapi(arg)?;
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
-            // Parse the ctx_set_params array for the capset selector. Linux's
-            // virtio_gpu_context_init_ioctl reads {param,value} pairs from
-            // `ctx_set_params`; a native-context client passes CAPSET_ID (and
-            // typically NUM_RINGS). The capset id (low byte) becomes CTX_CREATE's
-            // `context_init`. NUM_RINGS/POLL_RINGS_MASK/DEBUG_NAME are accepted
-            // but not acted on (NARF exposes a single ring, fixed debug name).
-            let mut capset: u32 = 0;
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+            if !dev.context_init_enabled() || !dev.virgl_enabled() || req.num_params > 4 {
+                return Err(FsError::InvalidData);
+            }
+            if state.context_ready.load(Ordering::Acquire) {
+                return Err(FsError::AlreadyExists);
+            }
+
+            // Linux accepts at most one of each parameter, validates capset
+            // and ring values before CTX_CREATE, and reports every malformed
+            // case as EINVAL (bad parameter-array pointers remain EFAULT).
+            let mut capset = state.context_capset.load(Ordering::Acquire);
+            let mut num_rings = state.context_num_rings.load(Ordering::Acquire);
+            let mut ring_mask = state.context_ring_mask.load(Ordering::Acquire);
+            let mut explicit_debug_name = state.context_explicit_debug_name.load(Ordering::Acquire);
             let n = req.num_params as usize;
-            if n != 0 && n <= 16 && req.ctx_set_params != 0 {
+            if n != 0 {
                 // SAFETY: `ctx_set_params` is the user pointer libdrm passed;
                 // copy_in SMAP-brackets the read and bounds n*16.
                 let bytes = unsafe { copy_in(req.ctx_set_params as usize, n * 16)? };
                 for i in 0..n {
                     let p = u64::from_le_bytes(bytes[i * 16..i * 16 + 8].try_into().unwrap());
                     let v = u64::from_le_bytes(bytes[i * 16 + 8..i * 16 + 16].try_into().unwrap());
-                    if p == VIRTGPU_CONTEXT_PARAM_CAPSET_ID {
-                        capset = (v & 0xff) as u32;
+                    match p {
+                        VIRTGPU_CONTEXT_PARAM_CAPSET_ID => {
+                            if v > 63
+                                || dev.capsets().iter().all(|c| c.capset_id != v as u32)
+                                || capset != 0
+                            {
+                                return Err(FsError::InvalidData);
+                            }
+                            capset = v as u32;
+                        }
+                        VIRTGPU_CONTEXT_PARAM_NUM_RINGS => {
+                            if num_rings != 0 || v > 64 {
+                                return Err(FsError::InvalidData);
+                            }
+                            num_rings = v as u32;
+                        }
+                        VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK => {
+                            if ring_mask != 0 {
+                                return Err(FsError::InvalidData);
+                            }
+                            ring_mask = v;
+                        }
+                        VIRTGPU_CONTEXT_PARAM_DEBUG_NAME => {
+                            if explicit_debug_name {
+                                return Err(FsError::InvalidData);
+                            }
+                            if v == 0 {
+                                return Err(FsError::BadAddress);
+                            }
+                            // The transport uses a fixed kernel debug name,
+                            // but pointer presence and one-shot semantics are
+                            // the Linux-visible contract.
+                            explicit_debug_name = true;
+                        }
+                        _ => return Err(FsError::InvalidData),
                     }
                 }
             }
+            let valid_ring_mask = match num_rings {
+                0 => 0,
+                64 => u64::MAX,
+                count => (1u64 << count) - 1,
+            };
+            if ring_mask & !valid_ring_mask != 0 {
+                return Err(FsError::InvalidData);
+            }
             // Record the capset for this open and create its context now.
             state.context_capset.store(capset, Ordering::Release);
+            state.context_num_rings.store(num_rings, Ordering::Release);
+            state.context_ring_mask.store(ring_mask, Ordering::Release);
+            state
+                .context_explicit_debug_name
+                .store(explicit_debug_name, Ordering::Release);
             state.ensure_context(dev)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => {
             let mut req: DrmVirtGpuResourceCreateUapi = read_uapi(arg)?;
-            let bytes = if req.size != 0 {
-                req.size as usize
+            // Linux allocates one page when userspace passes size=0; it does
+            // not derive allocation size from width/height.
+            let bytes = if req.size == 0 {
+                4096
             } else {
-                (req.width as usize)
-                    .checked_mul(req.height as usize)
-                    .and_then(|n| n.checked_mul(4))
-                    .ok_or(FsError::InvalidData)?
+                req.size as usize
             };
-            // The contiguous DMA provider currently guarantees at most 4 MiB.
-            if bytes == 0 || bytes > 4 * 1024 * 1024 {
-                return Err(FsError::InvalidData);
-            }
-            let buffer = narf_io::alloc_coherent(bytes, narf_lib::id::DomainId::DRIVER_0)
-                .map_err(|_| FsError::InvalidData)?;
+            let backing = alloc_guest_backing(bytes)?;
+            let entries = backing.entries();
             let resource_id = NEXT_VIRTGPU_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            let dev = narf_drivers_virtio::gpu_pci::probed_device()
+                .filter(|d| d.virgl_enabled())
+                .ok_or(FsError::NotImplemented)?;
             state.ensure_context(dev)?;
             dev.create_virgl_resource(
                 state.ctx_id,
@@ -603,72 +1116,55 @@ pub fn dispatch_virtgpu_render(
                     nr_samples: req.nr_samples,
                     flags: req.flags,
                 },
-                buffer.dma_addr().raw(),
-                buffer.len() as u32,
+                &entries,
             )
             .map_err(|_| FsError::InvalidData)?;
-            let handle = state.next_handle.fetch_add(1, Ordering::Relaxed);
-            state.insert(handle, resource_id, buffer);
+            let handle = state.allocate_handle();
+            state.insert_backing(handle, resource_id, backing);
             req.bo_handle = handle;
             req.res_handle = resource_id;
-            req.size = bytes as u32;
             write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
             let mut req: DrmVirtGpuResourceInfoUapi = read_uapi(arg)?;
-            let resource = state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            let resource = state.find(req.bo_handle).ok_or(FsError::NotFound)?;
             req.res_handle = resource.resource_id;
             req.size = resource.len() as u32;
-            req.blob_mem = 0;
+            req.blob_mem = resource.blob_mem.unwrap_or(0);
             write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_MAP => {
             let mut req: DrmVirtGpuMapUapi = read_uapi(arg)?;
-            let _resource = state.find(req.handle).ok_or(FsError::InvalidData)?;
+            let _resource = state.find(req.handle).ok_or(FsError::NotFound)?;
             req.offset = (req.handle as u64) << 12;
             write_uapi(arg, req)?;
             Ok(0)
         }
-        DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => {
-            let req: DrmVirtGpuTransferToHostUapi = read_uapi(arg)?;
-            let resource = state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
-            let bytes = resource.len();
-            let end =
-                (req.offset as usize).saturating_add(req.layer_stride.max(req.stride) as usize);
-            if end > bytes || req.w == 0 || req.h == 0 || req.d == 0 {
-                return Err(FsError::InvalidData);
-            }
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
-            state.ensure_context(dev)?;
-            dev.transfer_to_host_virgl(
-                state.ctx_id,
-                narf_drivers_virtio::gpu_pci::cmd::Transfer3D {
-                    resource_id: resource.resource_id,
-                    x: req.x,
-                    y: req.y,
-                    z: req.z,
-                    width: req.w,
-                    height: req.h,
-                    depth: req.d,
-                    offset: req.offset as u64,
-                    level: req.level,
-                    stride: req.stride,
-                    layer_stride: req.layer_stride,
-                },
-            )
-            .map_err(|_| FsError::InvalidData)?;
+        DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => handle_transfer_3d(arg, state, true),
+        DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => handle_transfer_3d(arg, state, false),
+        DRM_IOCTL_VIRTGPU_WAIT => {
+            let req: DrmVirtGpuWaitUapi = read_uapi(arg)?;
+            let _resource = state.find(req.handle).ok_or(FsError::NotFound)?;
+            // ControlQ submissions are synchronous, so every surviving handle
+            // is already idle. Linux likewise returns success when its GEM
+            // reservation is signalled, regardless of unrelated flag bits.
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_GET_CAPS => {
-            let mut req: DrmVirtGpuGetCapsUapi = read_uapi(arg)?;
-            // Linux `virtio_gpu_get_caps_ioctl`: a zero size or missing address
-            // is -EINVAL (a malformed request), not ENOTTY.
-            if req.size == 0 || req.addr == 0 {
+            let req: DrmVirtGpuGetCapsUapi = read_uapi(arg)?;
+            // Linux rejects a zero transfer size with EINVAL. A null or bad
+            // destination instead fails copy_to_user with EFAULT below.
+            if req.size == 0 {
                 return Err(FsError::InvalidData);
             }
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            let dev =
+                narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::NotImplemented)?;
+            let capsets = dev.capsets();
+            if capsets.is_empty() {
+                return Err(FsError::NotImplemented);
+            }
             // Validate the requested capset against the host's enumerated list,
             // exactly as Linux's `virtio_gpu_get_caps_ioctl` does: a capset the
             // host did not enumerate (or backs with zero size) is EINVAL. Mesa's
@@ -678,23 +1174,32 @@ pub fn dispatch_virtgpu_render(
             // capset) makes Mesa fall back to classic VirGL (capset 2) rather
             // than dropping to llvmpipe — whose dmabuf EGLImage path then throws
             // EGL_BAD_ALLOC in kwin (blank screen).
-            if !dev.capset_supported(req.cap_set_id) {
-                return Err(FsError::InvalidData); // -> EINVAL
-            }
+            let capset = capsets
+                .iter()
+                .find(|capset| {
+                    capset.capset_id == req.cap_set_id
+                        && capset.capset_max_version >= req.cap_set_ver
+                        && capset.capset_max_size != 0
+                })
+                .ok_or(FsError::InvalidData)?;
             let caps = dev
                 .virgl_capset(req.cap_set_id, req.cap_set_ver)
-                .map_err(|_| FsError::Unsupported)?;
-            let n = caps.len().min(req.size as usize);
-            // SAFETY: `req.addr` is non-zero, `n` is bounded by both the
-            // returned capset and the caller's declared buffer size, and
-            // copy_out validates the complete userspace destination range.
+                .map_err(map_gpu_transport_error)?;
+            let n = caps
+                .len()
+                .min(req.size as usize)
+                .min(capset.capset_max_size as usize);
+            // SAFETY: `n` is bounded by both the returned capset and the
+            // caller's declared buffer size. copy_out rejects a null pointer
+            // as EFAULT and SMAP-brackets the destination write.
             unsafe { copy_out(req.addr as usize, &caps[..n])? };
-            req.size = n as u32;
-            write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_EXECBUFFER => {
             let req: DrmVirtGpuExecBufferUapi = read_uapi(arg)?;
+            let dev = narf_drivers_virtio::gpu_pci::probed_device()
+                .filter(|d| d.virgl_enabled())
+                .ok_or(FsError::NotImplemented)?;
             // libdrm VIRTGPU_EXECBUF_* flags.
             const EXECBUF_FENCE_FD_IN: u32 = 0x01;
             const EXECBUF_FENCE_FD_OUT: u32 = 0x02;
@@ -702,10 +1207,10 @@ pub fn dispatch_virtgpu_render(
             const EXECBUF_KNOWN: u32 =
                 EXECBUF_FENCE_FD_IN | EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX;
             // The DRM native context submits on a per-context ring
-            // (VIRTGPU_EXECBUF_RING_IDX). Fences are accepted but not produced:
-            // NARF's submit is synchronous, so the command is complete when the
-            // ioctl returns and an out-fence would already be signalled — Mesa's
-            // sync path reads the shmem seqno rather than the fence for ccmds.
+            // (VIRTGPU_EXECBUF_RING_IDX). NARF's submit is synchronous, so the
+            // syscall layer represents FENCE_FD_OUT with an already-signalled
+            // sync-file fd and validates FENCE_FD_IN before dispatch reaches
+            // this driver-owned portion of the ioctl.
             // Syncobj timelines have distinct fd-lifetime rules; reject those.
             // syncobj_stride is only meaningful when in/out syncobjs are used;
             // reject those (distinct fd-lifetime rules) but ignore a stray
@@ -713,12 +1218,17 @@ pub fn dispatch_virtgpu_render(
             if req.flags & !EXECBUF_KNOWN != 0
                 || req.num_in_syncobjs != 0
                 || req.num_out_syncobjs != 0
-                || req.size as usize > VIRTGPU_EXECBUFFER_MAX_BYTES
-                || req.num_bo_handles > 256
             {
-                return Err(FsError::Unsupported);
+                return Err(FsError::InvalidData);
+            }
+            if req.size as usize > VIRTGPU_EXECBUFFER_MAX_BYTES || req.num_bo_handles > 256 {
+                return Err(FsError::OutOfMemory);
             }
             let ring_idx = if req.flags & EXECBUF_RING_IDX != 0 {
+                let num_rings = state.context_num_rings.load(Ordering::Acquire);
+                if num_rings == 0 || req.ring_idx >= num_rings {
+                    return Err(FsError::InvalidData);
+                }
                 Some(req.ring_idx as u8)
             } else {
                 None
@@ -736,7 +1246,7 @@ pub fn dispatch_virtgpu_render(
                 for (index, chunk) in bytes.chunks_exact(4).enumerate() {
                     let handle =
                         u32::from_le_bytes(chunk.try_into().map_err(|_| FsError::InvalidData)?);
-                    _referenced[index] = Some(state.find(handle).ok_or(FsError::PermissionDenied)?);
+                    _referenced[index] = Some(state.find(handle).ok_or(FsError::NotFound)?);
                 }
             }
             // A size-0 execbuf is a valid ring "kick" for the native context
@@ -750,10 +1260,9 @@ pub fn dispatch_virtgpu_render(
             } else {
                 Vec::new()
             };
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
             state.ensure_context(dev)?;
             dev.submit_virgl(state.ctx_id, ring_idx, &commands)
-                .map_err(|_| FsError::InvalidData)?;
+                .map_err(map_gpu_transport_error)?;
             Ok(0)
         }
         DRM_IOCTL_GEM_CLOSE => {
@@ -765,8 +1274,20 @@ pub fn dispatch_virtgpu_render(
             let bytes = unsafe { copy_in(arg, 8)? };
             let handle =
                 u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| FsError::InvalidData)?);
-            let resource = state.take(handle).ok_or(FsError::InvalidData)?;
-            release_virtgpu_resource(state.ctx_id, resource);
+            // The primary node also owns dumb GEM handles, which live in the
+            // generic card table rather than this VirtGPU per-open table.
+            // Let the caller fall through to that path when the handle is not
+            // a VirtGPU resource. The generic close returns Linux's EINVAL if
+            // neither table owns it.
+            let Some((resource, attached)) = state.take(handle) else {
+                return Err(FsError::Unsupported);
+            };
+            release_virtgpu_resource(state.ctx_id, resource, attached);
+            if let Some(index) = card_index {
+                if let Some(mode_state) = crate::drm_registry::mode_state(index) {
+                    mode_state.lock().remove_virtgpu_import(handle);
+                }
+            }
             Ok(0)
         }
         _ => Err(FsError::Unsupported),
@@ -777,16 +1298,24 @@ pub fn dispatch_virtgpu_render(
 /// fails, intentionally retain this Arc: freeing the backing would let a live
 /// host resource DMA into recycled kernel or userspace memory. `ctx_id` is the
 /// owning open's render context (used to detach context-owned resources).
-pub(crate) fn release_virtgpu_resource(ctx_id: u32, resource: Arc<VirtGpuResource>) {
-    let released = narf_drivers_virtio::gpu_pci::probed_device()
-        .map(|dev| {
-            dev.destroy_virgl_resource(ctx_id, resource.resource_id)
-                .is_ok()
-        })
-        .unwrap_or(false);
-    if !released {
-        core::mem::forget(resource);
+pub(crate) fn release_virtgpu_resource(
+    ctx_id: u32,
+    resource: Arc<VirtGpuResource>,
+    attached: bool,
+) {
+    if attached {
+        let detached = narf_drivers_virtio::gpu_pci::probed_device()
+            .map(|dev| {
+                dev.detach_virgl_resource(ctx_id, resource.resource_id)
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        if !detached {
+            core::mem::forget(resource);
+            return;
+        }
     }
+    drop(resource);
 }
 
 /// Resolve a per-open VirtIO-GPU map offset for `sys_mmap`.
@@ -818,7 +1347,7 @@ pub fn dispatch_virtgpu_mmap(
 /// trap context (no IRQ context, AS still active).
 pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
     if uptr == 0 {
-        return Err(FsError::InvalidData);
+        return Err(FsError::BadAddress);
     }
     if len > IOCTL_MAX_BUF {
         return Err(FsError::InvalidData);
@@ -835,7 +1364,7 @@ pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError
 /// Write a kernel slice back into a user-pointer.
 pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
     if uptr == 0 {
-        return Err(FsError::InvalidData);
+        return Err(FsError::BadAddress);
     }
     // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
     // SMAP-brackets the write.
@@ -899,6 +1428,22 @@ pub fn dispatch_card(
     arg: usize,
     render: bool,
 ) -> Result<u64, FsError> {
+    // Compatibility entry point for in-kernel one-shot callers and smokes.
+    // Real file objects call `dispatch_card_for_file` so client-cap state is
+    // retained across ioctls on that open.
+    let client_caps = DrmClientCaps::new();
+    dispatch_card_for_file(card_index, open_id, cmd, arg, render, &client_caps)
+}
+
+/// Stateful card dispatcher used by a real DRM open file.
+pub fn dispatch_card_for_file(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    render: bool,
+    client_caps: &DrmClientCaps,
+) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
     let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::Unsupported)?;
@@ -927,7 +1472,7 @@ pub fn dispatch_card(
         // Atomic commit decodes into AtomicState directly — handled
         // here rather than through the generic dispatcher because the
         // dispatcher only carries the wire-format word.
-        IoctlCmd::ModeAtomic => handle_atomic(&mode_state, arg, &ctx),
+        IoctlCmd::ModeAtomic => handle_atomic(card_index, &mode_state, arg, &ctx),
         // GETRESOURCES is special because the response has pointer
         // arrays the user supplied; we must write IDs into those.
         IoctlCmd::ModeGetResources => handle_getresources(&mode_state, arg, &ctx),
@@ -993,7 +1538,10 @@ pub fn dispatch_card(
         // primary plane through the universal-planes UAPI) but reject
         // ATOMIC so weston falls back to legacy SETCRTC modeset, which
         // narf-drm implements (full atomic-commit is not wired yet).
-        IoctlCmd::SetClientCap => handle_set_client_cap(arg),
+        IoctlCmd::SetClientCap => handle_set_client_cap(&mode_state, arg, client_caps),
+        IoctlCmd::ModeCreatePropBlob => handle_create_property_blob(&mode_state, arg, &ctx),
+        IoctlCmd::ModeDestroyPropBlob => handle_destroy_property_blob(&mode_state, arg, &ctx),
+        IoctlCmd::ModeListLessees => handle_list_lessees(arg, &ctx),
         // Dumb-buffer ioctls — new in Rung 3.
         IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
         IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),
@@ -1291,18 +1839,28 @@ fn handle_getconnector(
         unsafe { copy_out(encoders_ptr as usize, &info.encoder_id.to_le_bytes())? };
     }
 
-    // One connector property: the immutable "EDID" blob. libdrm runs the same
+    // Connector properties: immutable EDID plus atomic CRTC_ID. libdrm runs the same
     // two-pass count protocol as modes/encoders, so fill the id (u32) + value
     // (u64 blob id) arrays only once the caller has sized them.
-    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props >= 1 {
-        // SAFETY: both are user out-pointers the caller sized for >= 1 entry
+    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props >= 2 {
+        let crtc_id = {
+            let card = mode_state.lock();
+            card.encoder(info.encoder_id)
+                .ok()
+                .and_then(|encoder| encoder.crtc_id)
+                .unwrap_or(0)
+        };
+        let mut prop_ids = [0u8; 8];
+        prop_ids[0..4].copy_from_slice(&EDID_PROP_ID.to_le_bytes());
+        prop_ids[4..8].copy_from_slice(&CONNECTOR_CRTC_ID_PROP_ID.to_le_bytes());
+        let mut prop_values = [0u8; 16];
+        prop_values[0..8].copy_from_slice(&(edid_blob_id(info.connector_id) as u64).to_le_bytes());
+        prop_values[8..16].copy_from_slice(&(crtc_id as u64).to_le_bytes());
+        // SAFETY: both are user out-pointers the caller sized for >= 2 entries
         // after the counting pass; the id array is u32, the value array u64.
         unsafe {
-            copy_out(props_ptr as usize, &EDID_PROP_ID.to_le_bytes())?;
-            copy_out(
-                prop_values_ptr as usize,
-                &(edid_blob_id(info.connector_id) as u64).to_le_bytes(),
-            )?;
+            copy_out(props_ptr as usize, &prop_ids)?;
+            copy_out(prop_values_ptr as usize, &prop_values)?;
         }
     }
 
@@ -1310,7 +1868,7 @@ fn handle_getconnector(
     // bytes) and updating counts + connector fields (offsets 32..76).
     let mut out = in_bytes;
     out[32..36].copy_from_slice(&info.count_modes.to_le_bytes());
-    out[36..40].copy_from_slice(&1u32.to_le_bytes()); // count_props = EDID
+    out[36..40].copy_from_slice(&2u32.to_le_bytes()); // EDID + CRTC_ID
     out[40..44].copy_from_slice(&info.count_encoders.to_le_bytes());
     out[44..48].copy_from_slice(&info.encoder_id.to_le_bytes());
     out[48..52].copy_from_slice(&info.connector_id.to_le_bytes());
@@ -1401,11 +1959,19 @@ fn handle_getcrtc(
 /// one weston hard-requires (it enumerates the primary plane through it).
 ///
 /// Linux ref: `drivers/gpu/drm/drm_ioctl.c::drm_setclientcap`.
-fn handle_set_client_cap(arg: usize) -> Result<u64, FsError> {
+fn handle_set_client_cap(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    client_caps: &DrmClientCaps,
+) -> Result<u64, FsError> {
     // include/uapi/drm/drm.h DRM_CLIENT_CAP_*.
     const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
     const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+    const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
     const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
+    const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
+    const DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT: u64 = 6;
+    const DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE: u64 = 7;
     // SAFETY: `arg` is the validated 16-byte ioctl argument pointer.
     let bytes = unsafe { copy_in(arg, 16)? };
     let cap = u64::from_le_bytes([
@@ -1425,9 +1991,40 @@ fn handle_set_client_cap(arg: usize) -> Result<u64, FsError> {
                 Ok(0)
             }
         }
-        // ATOMIC, WRITEBACK_CONNECTORS, and every other cap need atomic
-        // modeset (absent here) → EINVAL. A non-zero return tells the client
-        // the cap isn't available; weston falls back to the legacy path.
+        DRM_CLIENT_CAP_ATOMIC => {
+            if mode_state.lock().driver_name != "virtio_gpu" {
+                // Linux returns EOPNOTSUPP when DRIVER_ATOMIC is absent.
+                return Err(FsError::Unsupported);
+            }
+            if value > 2 {
+                Err(FsError::InvalidData)
+            } else {
+                client_caps.set_atomic(value != 0);
+                Ok(0)
+            }
+        }
+        DRM_CLIENT_CAP_WRITEBACK_CONNECTORS | DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE => {
+            if !client_caps.atomic() {
+                return Err(FsError::InvalidData);
+            }
+            if value > 1 {
+                Err(FsError::InvalidData)
+            } else {
+                Ok(0)
+            }
+        }
+        DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT => {
+            // Linux virtio-gpu advertises DRIVER_CURSOR_HOTSPOT. The feature
+            // check precedes the per-file ATOMIC/value checks, fixing the
+            // exact EOPNOTSUPP/EINVAL ordering in drm_setclientcap().
+            if mode_state.lock().driver_name != "virtio_gpu" {
+                return Err(FsError::Unsupported);
+            }
+            if !client_caps.atomic() || value > 1 {
+                return Err(FsError::InvalidData);
+            }
+            Ok(0)
+        }
         _ => Err(FsError::InvalidData),
     }
 }
@@ -1443,10 +2040,27 @@ fn handle_set_client_cap(arg: usize) -> Result<u64, FsError> {
 const PLANE_ID_BASE: u32 = 0x40;
 /// Property id of the plane "type" enum (a separate id space from objects).
 const PLANE_TYPE_PROP_ID: u32 = 0x50;
+const CRTC_ACTIVE_PROP_ID: u32 = 0x52;
+const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
+const CONNECTOR_CRTC_ID_PROP_ID: u32 = 0x54;
+const PLANE_FB_ID_PROP_ID: u32 = 0x55;
+const PLANE_CRTC_ID_PROP_ID: u32 = 0x56;
+const PLANE_SRC_X_PROP_ID: u32 = 0x57;
+const PLANE_SRC_Y_PROP_ID: u32 = 0x58;
+const PLANE_SRC_W_PROP_ID: u32 = 0x59;
+const PLANE_SRC_H_PROP_ID: u32 = 0x5a;
+const PLANE_CRTC_X_PROP_ID: u32 = 0x5b;
+const PLANE_CRTC_Y_PROP_ID: u32 = 0x5c;
+const PLANE_CRTC_W_PROP_ID: u32 = 0x5d;
+const PLANE_CRTC_H_PROP_ID: u32 = 0x5e;
 const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
 const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
+const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 /// Property id of the connector "EDID" immutable blob (own id space, distinct
 /// from `PLANE_TYPE_PROP_ID`). Compositors read this to fetch the display's
 /// EDID via GETPROPBLOB; a synthetic connector otherwise reports none and kwin
@@ -1455,6 +2069,8 @@ const EDID_PROP_ID: u32 = 0x51;
 /// `DRM_MODE_OBJECT_CONNECTOR` — object-type tag OBJ_GETPROPERTIES passes for a
 /// connector (`include/uapi/drm/drm_mode.h`).
 const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 
 /// Stable blob id carrying a connector's EDID. One blob per connector, derived
 /// from the connector id so GETPROPBLOB can regenerate it statelessly.
@@ -1594,6 +2210,111 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
     }
+
+    fn write_simple_property(
+        out: &mut [u8],
+        name: &[u8],
+        flags: u32,
+        values: &[u64],
+    ) -> Result<(), FsError> {
+        out[20..24].copy_from_slice(&flags.to_le_bytes());
+        out[24..56].fill(0);
+        out[24..24 + name.len().min(31)].copy_from_slice(&name[..name.len().min(31)]);
+        let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
+        let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
+        if values_ptr != 0 && user_values_count as usize >= values.len() && !values.is_empty() {
+            let mut bytes = Vec::with_capacity(values.len() * 8);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            // SAFETY: the caller's value array advertises at least
+            // `values.len()` u64 slots.
+            unsafe { copy_out(values_ptr as usize, &bytes)? };
+        }
+        out[56..60].copy_from_slice(&(values.len() as u32).to_le_bytes());
+        out[60..64].copy_from_slice(&0u32.to_le_bytes());
+        Ok(())
+    }
+
+    let simple = match prop_id {
+        CRTC_ACTIVE_PROP_ID => Some((
+            b"ACTIVE".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, 1],
+        )),
+        CRTC_MODE_ID_PROP_ID => Some((
+            b"MODE_ID".as_slice(),
+            DRM_MODE_PROP_BLOB | DRM_MODE_PROP_ATOMIC,
+            [0, 0],
+        )),
+        CONNECTOR_CRTC_ID_PROP_ID | PLANE_CRTC_ID_PROP_ID => Some((
+            b"CRTC_ID".as_slice(),
+            DRM_MODE_PROP_OBJECT | DRM_MODE_PROP_ATOMIC,
+            [DRM_MODE_OBJECT_CRTC as u64, 0],
+        )),
+        PLANE_FB_ID_PROP_ID => Some((
+            b"FB_ID".as_slice(),
+            DRM_MODE_PROP_OBJECT | DRM_MODE_PROP_ATOMIC,
+            [0xfbfb_fbfb, 0],
+        )),
+        PLANE_SRC_X_PROP_ID => Some((
+            b"SRC_X".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u32::MAX as u64],
+        )),
+        PLANE_SRC_Y_PROP_ID => Some((
+            b"SRC_Y".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u32::MAX as u64],
+        )),
+        PLANE_SRC_W_PROP_ID => Some((
+            b"SRC_W".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u32::MAX as u64],
+        )),
+        PLANE_SRC_H_PROP_ID => Some((
+            b"SRC_H".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u32::MAX as u64],
+        )),
+        PLANE_CRTC_X_PROP_ID => Some((
+            b"CRTC_X".as_slice(),
+            DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
+            [i32::MIN as i64 as u64, i32::MAX as u64],
+        )),
+        PLANE_CRTC_Y_PROP_ID => Some((
+            b"CRTC_Y".as_slice(),
+            DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
+            [i32::MIN as i64 as u64, i32::MAX as u64],
+        )),
+        PLANE_CRTC_W_PROP_ID => Some((
+            b"CRTC_W".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u32::MAX as u64],
+        )),
+        PLANE_CRTC_H_PROP_ID => Some((
+            b"CRTC_H".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u32::MAX as u64],
+        )),
+        _ => None,
+    };
+    if let Some((name, flags, values)) = simple {
+        // Linux object properties expose one value: the accepted DRM object
+        // type.  The property's current object ID lives in
+        // DRM_IOCTL_MODE_OBJ_GETPROPERTIES, not in this metadata array.
+        let values = if flags & DRM_MODE_PROP_BLOB != 0 {
+            &values[..0]
+        } else if flags & DRM_MODE_PROP_OBJECT != 0 {
+            &values[..1]
+        } else {
+            &values[..]
+        };
+        write_simple_property(&mut out, name, flags, values)?;
+        // SAFETY: `arg` is the validated 64-byte out-pointer.
+        unsafe { copy_out(arg, &out)? };
+        return Ok(0);
+    }
     if prop_id != PLANE_TYPE_PROP_ID {
         return Err(FsError::InvalidData);
     }
@@ -1698,41 +2419,166 @@ fn handle_obj_getproperties(
     let obj_id = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
     let obj_type = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
 
-    let is_plane = synth_planes(&mode_state.lock())
-        .iter()
-        .any(|(id, _)| *id == obj_id);
-    let is_connector =
-        obj_type == DRM_MODE_OBJECT_CONNECTOR && mode_state.lock().connector(obj_id).is_ok();
-    if is_plane {
-        if props_ptr != 0 && values_ptr != 0 && user_count >= 1 {
-            // props_ptr is a u32 array (property ids); prop_values_ptr is a
-            // u64 array (values).
-            // SAFETY: both are user out-pointers with room for >=1 entry.
-            unsafe {
-                copy_out(props_ptr as usize, &PLANE_TYPE_PROP_ID.to_le_bytes())?;
-                copy_out(values_ptr as usize, &DRM_PLANE_TYPE_PRIMARY.to_le_bytes())?;
-            }
+    let (props, values): (Vec<u32>, Vec<u64>) = {
+        let card = mode_state.lock();
+        if obj_type == DRM_MODE_OBJECT_PLANE {
+            let Some((_, crtc_idx)) = synth_planes(&card)
+                .into_iter()
+                .find(|(id, _)| *id == obj_id)
+            else {
+                return Err(FsError::InvalidData);
+            };
+            let crtc = &card.crtcs[crtc_idx as usize];
+            let fb = crtc.primary_fb.and_then(|id| card.framebuffer(id).ok());
+            let width = fb
+                .map(|f| f.width)
+                .or_else(|| crtc.mode.map(|m| m.width))
+                .unwrap_or(0);
+            let height = fb
+                .map(|f| f.height)
+                .or_else(|| crtc.mode.map(|m| m.height))
+                .unwrap_or(0);
+            (
+                vec![
+                    PLANE_TYPE_PROP_ID,
+                    PLANE_FB_ID_PROP_ID,
+                    PLANE_CRTC_ID_PROP_ID,
+                    PLANE_SRC_X_PROP_ID,
+                    PLANE_SRC_Y_PROP_ID,
+                    PLANE_SRC_W_PROP_ID,
+                    PLANE_SRC_H_PROP_ID,
+                    PLANE_CRTC_X_PROP_ID,
+                    PLANE_CRTC_Y_PROP_ID,
+                    PLANE_CRTC_W_PROP_ID,
+                    PLANE_CRTC_H_PROP_ID,
+                ],
+                vec![
+                    DRM_PLANE_TYPE_PRIMARY,
+                    crtc.primary_fb.unwrap_or(0) as u64,
+                    if crtc.primary_fb.is_some() {
+                        crtc.id as u64
+                    } else {
+                        0
+                    },
+                    (crtc.x as u64) << 16,
+                    (crtc.y as u64) << 16,
+                    (width as u64) << 16,
+                    (height as u64) << 16,
+                    crtc.x as u64,
+                    crtc.y as u64,
+                    width as u64,
+                    height as u64,
+                ],
+            )
+        } else if obj_type == DRM_MODE_OBJECT_CRTC {
+            let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
+            (
+                vec![CRTC_ACTIVE_PROP_ID, CRTC_MODE_ID_PROP_ID],
+                vec![crtc.enabled as u64, 0],
+            )
+        } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
+            let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;
+            let crtc_id = connector
+                .encoder_id
+                .and_then(|id| card.encoder(id).ok())
+                .and_then(|encoder| encoder.crtc_id)
+                .unwrap_or(0);
+            (
+                vec![EDID_PROP_ID, CONNECTOR_CRTC_ID_PROP_ID],
+                vec![edid_blob_id(obj_id) as u64, crtc_id as u64],
+            )
+        } else {
+            return Err(FsError::InvalidData);
         }
-        bytes[16..20].copy_from_slice(&1u32.to_le_bytes()); // count_props = 1
-    } else if is_connector {
-        // A connector carries the immutable "EDID" blob property; its value is
-        // the blob id the client passes to GETPROPBLOB.
-        if props_ptr != 0 && values_ptr != 0 && user_count >= 1 {
-            // SAFETY: both are user out-pointers with room for >=1 entry; the
-            // id array is u32, the value array u64.
-            unsafe {
-                copy_out(props_ptr as usize, &EDID_PROP_ID.to_le_bytes())?;
-                copy_out(
-                    values_ptr as usize,
-                    &(edid_blob_id(obj_id) as u64).to_le_bytes(),
-                )?;
-            }
+    };
+    if props_ptr != 0 && values_ptr != 0 && user_count as usize >= props.len() {
+        let mut prop_bytes = Vec::with_capacity(props.len() * 4);
+        let mut value_bytes = Vec::with_capacity(values.len() * 8);
+        for prop in &props {
+            prop_bytes.extend_from_slice(&prop.to_le_bytes());
         }
-        bytes[16..20].copy_from_slice(&1u32.to_le_bytes()); // count_props = 1
-    } else {
-        bytes[16..20].copy_from_slice(&0u32.to_le_bytes()); // no properties
+        for value in &values {
+            value_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        // SAFETY: both arrays were advertised with at least `props.len()`
+        // entries; property ids are u32 and values are u64.
+        unsafe {
+            copy_out(props_ptr as usize, &prop_bytes)?;
+            copy_out(values_ptr as usize, &value_bytes)?;
+        }
     }
+    bytes[16..20].copy_from_slice(&(props.len() as u32).to_le_bytes());
     // SAFETY: `arg` is the validated 28-byte out-pointer.
+    unsafe { copy_out(arg, &bytes)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_CREATEPROPBLOB — copy an opaque userspace payload into a
+/// per-card blob and return its id. Atomic modesets use a 68-byte modeinfo.
+fn handle_create_property_blob(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
+    // struct drm_mode_create_blob { u64 data; u32 length; u32 blob_id }.
+    // SAFETY: `arg` is the ioctl's fixed 16-byte in/out structure; `copy_in`
+    // validates the complete userspace range before returning owned bytes.
+    let mut bytes = unsafe { copy_in(arg, 16)? };
+    let data_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if len == 0 || len > IOCTL_MAX_BUF {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: length is non-zero and capped; copy_in returns EFAULT for NULL.
+    let data = unsafe { copy_in(data_ptr as usize, len)? };
+    let blob_id = mode_state
+        .lock()
+        .create_property_blob(data)
+        .map_err(|_| FsError::OutOfMemory)?;
+    bytes[12..16].copy_from_slice(&blob_id.to_le_bytes());
+    // SAFETY: fixed 16-byte in/out structure.
+    unsafe { copy_out(arg, &bytes)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_DESTROYPROPBLOB — unknown ids are ENOENT, matching Linux.
+fn handle_destroy_property_blob(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the fixed four-byte destroy-blob request; `copy_in`
+    // validates the complete userspace range.
+    let bytes = unsafe { copy_in(arg, 4)? };
+    let blob_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if mode_state.lock().destroy_property_blob(blob_id) {
+        Ok(0)
+    } else {
+        Err(FsError::NotFound)
+    }
+}
+
+/// DRM_IOCTL_MODE_LIST_LESSEES — NARF has no DRM leases, so a master sees an
+/// empty list. `pad != 0` is EINVAL before any output, as in drm_lease.c.
+fn handle_list_lessees(arg: usize, ctx: &DrmFileCtx) -> Result<u64, FsError> {
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    // struct drm_mode_list_lessees { u32 count_lessees; u32 pad; u64 ptr }.
+    // SAFETY: `arg` is the ioctl's fixed 16-byte in/out structure; `copy_in`
+    // validates the complete userspace range before returning owned bytes.
+    let mut bytes = unsafe { copy_in(arg, 16)? };
+    if u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 0 {
+        return Err(FsError::InvalidData);
+    }
+    bytes[0..4].copy_from_slice(&0u32.to_le_bytes());
+    // SAFETY: write back the same validated fixed-size request buffer.
     unsafe { copy_out(arg, &bytes)? };
     Ok(0)
 }
@@ -1742,6 +2588,7 @@ fn handle_obj_getproperties(
 ///
 /// Linux ref: `drivers/gpu/drm/drm_atomic_uapi.c::drm_mode_atomic_ioctl`.
 fn handle_atomic(
+    card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
@@ -1766,38 +2613,280 @@ fn handle_atomic(
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeAtomicUapi) };
 
-    // Wave-36 minimum-viable: we accept the call shape, build an
-    // empty `AtomicState`, and run `core_check` + `core_commit` so
-    // a Mesa caller observing this surface sees a success on a no-op
-    // commit. Full property-array decoding (objs/props/values) lands
-    // alongside the per-driver atomic_ops table that Wave-35 added —
-    // the wire-format decode is deferred because it requires a per-
-    // driver property table that doesn't ship yet for any backend.
+    if mode_state.lock().driver_name != "virtio_gpu" {
+        return Err(FsError::Unsupported);
+    }
+    const PAGE_FLIP_EVENT: u32 = 0x0001;
+    const PAGE_FLIP_ASYNC: u32 = 0x0002;
+    const TEST_ONLY: u32 = 0x0100;
+    const NONBLOCK: u32 = 0x0200;
+    const ALLOW_MODESET: u32 = 0x0400;
+    const VALID_FLAGS: u32 =
+        PAGE_FLIP_EVENT | PAGE_FLIP_ASYNC | TEST_ONLY | NONBLOCK | ALLOW_MODESET;
+    if req.reserved != 0
+        || req.flags & !VALID_FLAGS != 0
+        || (req.flags & TEST_ONLY != 0 && req.flags & PAGE_FLIP_EVENT != 0)
+        || req.count_objs > 256
+    {
+        return Err(FsError::InvalidData);
+    }
+    if req.count_objs != 0
+        && (req.objs_ptr == 0
+            || req.count_props_ptr == 0
+            || req.props_ptr == 0
+            || req.prop_values_ptr == 0)
+    {
+        return Err(FsError::BadAddress);
+    }
+
+    let count = req.count_objs as usize;
+    let (obj_bytes, count_bytes) = if count == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        // SAFETY: non-zero object arrays were validated above and their
+        // bounded lengths cannot overflow `usize`.
+        unsafe {
+            (
+                copy_in(req.objs_ptr as usize, count * 4)?,
+                copy_in(req.count_props_ptr as usize, count * 4)?,
+            )
+        }
+    };
+    let objects: Vec<u32> = obj_bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let prop_counts: Vec<u32> = count_bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let total_props = prop_counts.iter().try_fold(0usize, |sum, count| {
+        sum.checked_add(*count as usize)
+            .filter(|total| *total <= 4096)
+    });
+    let total_props = total_props.ok_or(FsError::OutOfMemory)?;
+    let (prop_bytes, value_bytes) = if total_props == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        // SAFETY: non-zero property arrays were validated above and capped
+        // at 4096 entries.
+        unsafe {
+            (
+                copy_in(req.props_ptr as usize, total_props * 4)?,
+                copy_in(req.prop_values_ptr as usize, total_props * 8)?,
+            )
+        }
+    };
+    let props: Vec<u32> = prop_bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let values: Vec<u64> = value_bytes
+        .chunks_exact(8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+
     let mut state = crate::drm::atomic::AtomicState {
-        allow_modeset: (req.flags & crate::drm::atomic::DRM_MODE_ATOMIC_ALLOW_MODESET) != 0,
+        allow_modeset: req.flags & ALLOW_MODESET != 0,
         ..Default::default()
     };
     let policy = crate::drm::atomic::AtomicCheckPolicy::default();
+    let test_only = req.flags & TEST_ONLY != 0;
+    let mut prop_index = 0usize;
+    let presentation = {
+        let mut card = mode_state.lock();
+        for (object_index, object_id) in objects.iter().copied().enumerate() {
+            let object_prop_count = prop_counts[object_index] as usize;
+            let end = prop_index
+                .checked_add(object_prop_count)
+                .filter(|end| *end <= props.len())
+                .ok_or(FsError::InvalidData)?;
+            let object_props = &props[prop_index..end];
+            let object_values = &values[prop_index..end];
+            prop_index = end;
 
-    // Loud on purpose: this handler commits an EMPTY state, so a client
-    // driving its frames through here presents nothing at all. If these
-    // lines appear while the screen stays blank, the property-array decode
-    // — not the blit path — is what is missing.
+            if let Some((_, crtc_index)) = synth_planes(&card)
+                .into_iter()
+                .find(|(id, _)| *id == object_id)
+            {
+                let crtc = &card.crtcs[crtc_index as usize];
+                let fb = crtc.primary_fb.and_then(|id| card.framebuffer(id).ok());
+                let width = fb
+                    .map(|fb| fb.width)
+                    .or_else(|| crtc.mode.map(|mode| mode.width))
+                    .unwrap_or(0);
+                let height = fb
+                    .map(|fb| fb.height)
+                    .or_else(|| crtc.mode.map(|mode| mode.height))
+                    .unwrap_or(0);
+                let mut plane = crate::drm::atomic::PlaneState {
+                    id: object_id,
+                    crtc_id: crtc.primary_fb.map(|_| crtc.id),
+                    fb_id: crtc.primary_fb,
+                    crtc_x: crtc.x as i32,
+                    crtc_y: crtc.y as i32,
+                    crtc_w: width,
+                    crtc_h: height,
+                    src_x: crtc.x,
+                    src_y: crtc.y,
+                    src_w: width,
+                    src_h: height,
+                };
+                for (&prop, &value) in object_props.iter().zip(object_values) {
+                    match prop {
+                        PLANE_FB_ID_PROP_ID => plane.fb_id = (value != 0).then_some(value as u32),
+                        PLANE_CRTC_ID_PROP_ID => {
+                            plane.crtc_id = (value != 0).then_some(value as u32)
+                        }
+                        PLANE_SRC_X_PROP_ID => plane.src_x = (value >> 16) as u32,
+                        PLANE_SRC_Y_PROP_ID => plane.src_y = (value >> 16) as u32,
+                        PLANE_SRC_W_PROP_ID => plane.src_w = (value >> 16) as u32,
+                        PLANE_SRC_H_PROP_ID => plane.src_h = (value >> 16) as u32,
+                        PLANE_CRTC_X_PROP_ID => plane.crtc_x = value as i64 as i32,
+                        PLANE_CRTC_Y_PROP_ID => plane.crtc_y = value as i64 as i32,
+                        PLANE_CRTC_W_PROP_ID => plane.crtc_w = value as u32,
+                        PLANE_CRTC_H_PROP_ID => plane.crtc_h = value as u32,
+                        _ => return Err(FsError::InvalidData),
+                    }
+                }
+                state.planes.push(plane);
+            } else if let Ok(crtc) = card.crtc(object_id) {
+                let old_mode = crtc.mode;
+                let old_active = crtc.enabled;
+                let mut crtc_state = crate::drm::atomic::CrtcState {
+                    id: object_id,
+                    enable: old_active,
+                    active: old_active,
+                    mode: old_mode,
+                    ..Default::default()
+                };
+                for (&prop, &value) in object_props.iter().zip(object_values) {
+                    match prop {
+                        CRTC_ACTIVE_PROP_ID => {
+                            if value > 1 {
+                                return Err(FsError::InvalidData);
+                            }
+                            crtc_state.enable = value != 0;
+                            crtc_state.active = value != 0;
+                        }
+                        CRTC_MODE_ID_PROP_ID => {
+                            crtc_state.mode = if value == 0 {
+                                None
+                            } else {
+                                let mode = card
+                                    .property_blob(value as u32)
+                                    .filter(|blob| blob.len() == 68)
+                                    .ok_or(FsError::InvalidData)?;
+                                Some(crate::Mode {
+                                    width: u16::from_le_bytes(mode[4..6].try_into().unwrap())
+                                        as u32,
+                                    height: u16::from_le_bytes(mode[14..16].try_into().unwrap())
+                                        as u32,
+                                    refresh_hz: u32::from_le_bytes(mode[24..28].try_into().unwrap())
+                                        .max(1)
+                                        as u16,
+                                    bpp: 32,
+                                })
+                            };
+                        }
+                        _ => return Err(FsError::InvalidData),
+                    }
+                }
+                // Linux's drm_atomic_helper_check_modeset compares the
+                // completed old/new CRTC states; merely including MODE_ID or
+                // ACTIVE in an atomic request does not require ALLOW_MODESET.
+                // KWin relies on this for its TEST_ONLY no-modeset probe.
+                crtc_state.mode_changed = crtc_state.mode != old_mode;
+                crtc_state.active_changed = crtc_state.active != old_active;
+                state.crtcs.push(crtc_state);
+            } else if card.connector(object_id).is_ok() {
+                let connector = card
+                    .connector(object_id)
+                    .map_err(|_| FsError::InvalidData)?;
+                let mut connector_state = crate::drm::atomic::ConnectorState {
+                    id: object_id,
+                    crtc_id: connector
+                        .encoder_id
+                        .and_then(|id| card.encoder(id).ok())
+                        .and_then(|encoder| encoder.crtc_id),
+                };
+                for (&prop, &value) in object_props.iter().zip(object_values) {
+                    match prop {
+                        CONNECTOR_CRTC_ID_PROP_ID => {
+                            connector_state.crtc_id = (value != 0).then_some(value as u32)
+                        }
+                        _ => return Err(FsError::InvalidData),
+                    }
+                }
+                state.connectors.push(connector_state);
+            } else {
+                return Err(FsError::InvalidData);
+            }
+        }
+
+        if let Err(error) = state.core_check(&card, &policy) {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: ATOMIC check failed: {error:?}"
+            );
+            return Err(FsError::InvalidData);
+        }
+        if test_only {
+            None
+        } else {
+            if let Err(error) = state.core_commit(&mut card) {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  drm: ATOMIC commit failed: {error:?}"
+                );
+                return Err(FsError::InvalidData);
+            }
+            let active_plane = state
+                .planes
+                .iter()
+                .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
+            if req.flags & PAGE_FLIP_EVENT != 0 {
+                if let Some((crtc_id, _)) = active_plane {
+                    card.queue_flip_event(req.user_data, crtc_id);
+                }
+            }
+            active_plane.and_then(|(_, fb_id)| {
+                let fb = card.framebuffer(fb_id).ok()?;
+                let gem_handle = fb.gem_handle;
+                Some((
+                    card.virtgpu_import(gem_handle)
+                        .map(|resource| resource.resource_id),
+                    card.dumb_backing(gem_handle).map(|backing| backing.phys),
+                    fb.pitch,
+                    fb.width,
+                    fb.height,
+                    fb_id,
+                ))
+            })
+        }
+    };
+
     let (log, n) = should_log(&ATOMIC_N);
     if log {
         let _ = writeln!(
             narf_console::Writer,
-            "  drm: ATOMIC #{n} objs={} flags={:#x} — committed as EMPTY state, no pixels presented",
+            "  drm: ATOMIC #{n} objs={} props={} flags={:#x} present={}",
             req.count_objs,
-            req.flags
+            total_props,
+            req.flags,
+            presentation.is_some(),
         );
     }
-
-    let mut card = mode_state.lock();
-    match crate::drm::atomic::atomic_check_and_commit(&mut card, &mut state, &policy, None) {
-        Ok(()) => Ok(0),
-        Err(_) => Err(FsError::InvalidData),
+    if let Some((resource_id, src_phys, pitch, width, height, fb_id)) = presentation {
+        if let Some(resource_id) = resource_id {
+            present_virgl_frame(resource_id, width, height)?;
+        } else if let Some(src_phys) = src_phys {
+            present_frame(card_index, src_phys, pitch, width, height);
+        } else {
+            note_missing_backing("ATOMIC", fb_id);
+        }
     }
+    Ok(0)
 }
 
 /// DRM_IOCTL_MODE_CURSOR / CURSOR2 — set the pointer sprite + position.
@@ -1986,8 +3075,13 @@ fn handle_destroy_dumb(
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeDestroyDumbUapi) };
 
-    free_dumb_backing(mode_state, req.handle);
-    Ok(0)
+    if free_dumb_backing(mode_state, req.handle) {
+        Ok(0)
+    } else {
+        // drm_mode_destroy_dumb() delegates to drm_gem_handle_delete(), which
+        // returns EINVAL when the per-file handle does not exist.
+        Err(FsError::InvalidData)
+    }
 }
 
 /// GEM_CLOSE — close a GEM handle and free its backing if it's a dumb buffer.
@@ -2004,23 +3098,31 @@ fn handle_gem_close(
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let bytes = unsafe { copy_in(arg, 8)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    free_dumb_backing(mode_state, handle);
-    Ok(0)
+    let removed_import = mode_state.lock().remove_virtgpu_import(handle);
+    if removed_import || free_dumb_backing(mode_state, handle) {
+        Ok(0)
+    } else {
+        // Linux drm_gem_handle_delete() reports EINVAL for an unknown or
+        // already-closed handle.
+        Err(FsError::InvalidData)
+    }
 }
 
 /// Free a dumb buffer's physical backing pages (helper shared by DESTROY_DUMB + GEM_CLOSE).
 fn free_dumb_backing(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     gem_handle: u32,
-) {
-    let phys_order = {
+) -> bool {
+    let (known, phys_order) = {
         let mut card = mode_state.lock();
-        card.remove_dumb_backing(gem_handle)
+        let known = card.dumb_backing(gem_handle).is_some();
+        (known, card.remove_dumb_backing(gem_handle))
     };
     if let Some((phys, order)) = phys_order {
         let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
         narf_memory::frame::free_pages(frame, order);
     }
+    known
 }
 
 /// Release one fd/mapping reference to a dumb backing. The registry owns the
@@ -2028,7 +3130,7 @@ fn free_dumb_backing(
 /// framebuffer, dma-buf, and mmap reference is gone.
 pub(crate) fn release_dumb_backing_ref(card_index: u32, gem_handle: u32) {
     if let Some(mode_state) = crate::drm_registry::mode_state(card_index) {
-        free_dumb_backing(&mode_state, gem_handle);
+        let _ = free_dumb_backing(&mode_state, gem_handle);
     }
 }
 
@@ -2042,8 +3144,6 @@ pub(crate) fn release_dumb_backing_ref(card_index: u32, gem_handle: u32) {
 //
 // Kept quiet after the opening frames — the first four of each event, then
 // every 512th — so a steady 60 fps costs a line every ~8 seconds.
-
-use core::sync::atomic::AtomicU64;
 
 static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
 static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
@@ -2089,6 +3189,7 @@ fn handle_setcrtc(
 
     // Look up the framebuffer → GEM handle → dumb backing phys.
     let src_phys: Option<u64>;
+    let virgl_resource_id: Option<u32>;
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
@@ -2117,6 +3218,9 @@ fn handle_setcrtc(
         src_h = fb.height;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+        virgl_resource_id = card
+            .virtgpu_import(gem_handle)
+            .map(|resource| resource.resource_id);
     }
 
     let (log, n) = should_log(&SETCRTC_N);
@@ -2134,7 +3238,9 @@ fn handle_setcrtc(
     }
 
     // Perform the blit if we have a valid source and a live scanout.
-    if let Some(src) = src_phys {
+    if let Some(resource_id) = virgl_resource_id {
+        present_virgl_frame(resource_id, src_w, src_h)?;
+    } else if let Some(src) = src_phys {
         present_frame(card_index, src, src_pitch, src_w, src_h);
     } else {
         note_missing_backing("SETCRTC", req.fb_id);
@@ -2183,6 +3289,7 @@ fn handle_page_flip(
     const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 
     let src_phys: Option<u64>;
+    let virgl_resource_id: Option<u32>;
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
@@ -2206,6 +3313,9 @@ fn handle_page_flip(
         src_h = fb.height;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+        virgl_resource_id = card
+            .virtgpu_import(gem_handle)
+            .map(|resource| resource.resource_id);
 
         // Deliver the completion event immediately — we blit synchronously,
         // so the new scanout is live by the time the client wakes. A real
@@ -2229,12 +3339,23 @@ fn handle_page_flip(
         );
     }
 
-    if let Some(src) = src_phys {
+    if let Some(resource_id) = virgl_resource_id {
+        present_virgl_frame(resource_id, src_w, src_h)?;
+    } else if let Some(src) = src_phys {
         present_frame(card_index, src, src_pitch, src_w, src_h);
     } else {
         note_missing_backing("PAGE_FLIP", req.fb_id);
     }
     Ok(0)
+}
+
+/// Present a PRIME-imported VirGL GEM object directly, matching Linux's
+/// virtio-gpu primary-plane update (`SET_SCANOUT` + `RESOURCE_FLUSH`).
+fn present_virgl_frame(resource_id: u32, width: u32, height: u32) -> Result<(), FsError> {
+    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+    narf_console::fb_take_for_user();
+    dev.present_virgl_resource(resource_id, width, height)
+        .map_err(map_gpu_transport_error)
 }
 
 /// Present a dumb buffer on the card that accepted the KMS ioctl.

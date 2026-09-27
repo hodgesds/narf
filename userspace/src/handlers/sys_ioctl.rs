@@ -1,5 +1,51 @@
 #[allow(unused_imports)]
 use super::*;
+use alloc::boxed::Box;
+
+/// A completed VirtIO-GPU dma-fence exposed through Linux's `sync_file` fd
+/// ABI.  NARF's control-queue submission is synchronous, so every fence is
+/// already signalled when EXECBUFFER returns; it is nevertheless a distinct
+/// file type so a later `VIRTGPU_EXECBUF_FENCE_FD_IN` can reject arbitrary
+/// descriptors exactly like `sync_file_get_fence()` does on Linux.
+struct DrmSyncFile;
+
+impl narf_filesystem::FileOps for DrmSyncFile {
+    fn read<'a>(
+        &'a self,
+        _offset: u64,
+        _buf: &'a mut [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
+    }
+
+    fn write<'a>(
+        &'a self,
+        _offset: u64,
+        _buf: &'a [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
+    }
+
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        narf_filesystem::POLL_IN
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
 
 // `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
 // `FD_PREPARE` + `fd_publish` over `get_unused_fd_flags`: a descriptor table
@@ -545,19 +591,47 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         if let Some(card_idx) = ops.as_drm_card_index().or_else(|| ops.as_drm_render_index()) {
             // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
             let handle = read_user_u32(arg as u64);
-            let dmabuf = match narf_filesystem::drm_prime_export(card_idx, handle) {
-                Some(o) => o,
-                None => {
+            // UAPI drm.h aliases DRM_CLOEXEC to O_CLOEXEC (0x80000) and
+            // DRM_RDWR to O_RDWR (0x2); they are open(2) flags, not compact
+            // DRM-private bits.
+            let prime_flags = read_user_u32(arg as u64 + 4);
+            // Linux validates flags before looking up the GEM handle.
+            const DRM_CLOEXEC: u32 = 0x80000;
+            const DRM_RDWR: u32 = 0x2;
+            if prime_flags & !(DRM_CLOEXEC | DRM_RDWR) != 0 {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
+            let dmabuf = match ops.drm_prime_export_file(handle) {
+                Ok(file) => file,
+                // Non-VirtIO cards and dumb buffers retain the legacy
+                // card-global export hook.
+                Err(narf_filesystem::FsError::Unsupported) => {
+                    match narf_filesystem::drm_prime_export(card_idx, handle) {
+                        Some(file) => file,
+                        None => {
+                            ctx.set_return(errno_ret(ENOENT));
+                            return;
+                        }
+                    }
+                }
+                Err(narf_filesystem::FsError::NotFound) => {
                     ctx.set_return(errno_ret(ENOENT));
                     return;
                 }
+                Err(narf_filesystem::FsError::OutOfMemory) => {
+                    ctx.set_return(errno_ret(ENOMEM));
+                    return;
+                }
+                Err(_) => {
+                    ctx.set_return(errno_ret(EINVAL));
+                    return;
+                }
             };
-            // DRM passes DRM_CLOEXEC (0x1) / DRM_RDWR (0x2) in `flags`.
-            let prime_flags = read_user_u32(arg as u64 + 4);
             let new_fd = fd::install(task, fd::FdEntry {
                     ops: dmabuf,
                     offset: 0,
-                    flags: if prime_flags & 0x1 != 0 { 1 } else { 0 }, // CLOEXEC
+                    flags: if prime_flags & DRM_CLOEXEC != 0 { 1 } else { 0 },
                     status_flags: 0,
                 });
             match new_fd {
@@ -593,13 +667,30 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     {
         // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
         let dmabuf_fd = read_user_u32(arg as u64 + 8);
-        let buf_ops = fd::with_table(task, |t| t.get(dmabuf_fd).map(|e| e.ops.clone())).flatten();
-        match buf_ops.and_then(|o| o.as_prime_gem_handle()) {
-            Some(h) => {
+        let Some(buf_ops) =
+            fd::with_table(task, |t| t.get(dmabuf_fd).map(|e| e.ops.clone())).flatten()
+        else {
+            // dma_buf_get() returns EBADF when the descriptor is not open.
+            ctx.set_return(errno_ret(EBADF));
+            return;
+        };
+        let imported = match ops.drm_prime_import_file(&buf_ops) {
+            Ok(handle) => Ok(handle),
+            Err(narf_filesystem::FsError::Unsupported) => {
+                buf_ops.as_prime_gem_handle().ok_or(())
+            }
+            Err(narf_filesystem::FsError::OutOfMemory) => {
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
+            }
+            Err(_) => Err(()),
+        };
+        match imported {
+            Ok(h) => {
                 write_user_u32(arg as u64, h); // drm_prime_handle.handle
                 ctx.set_return(SyscallReturn::ok(0));
             }
-            None => {
+            Err(()) => {
                 ctx.set_return(errno_ret(EINVAL));
             }
         }
@@ -717,9 +808,102 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // default file_operations dispatch, which the generic arm below
         // reproduces (FsError::Unsupported → ENOTTY).
     }
-    match ops.ioctl(cmd, arg) {
+    // `virtio_gpu_execbuffer_ioctl()` creates an optional sync_file, while fd
+    // allocation belongs to the syscall layer in NARF.  Reserve the output fd
+    // before submitting, matching Linux's get_unused_fd_flags(O_CLOEXEC): an
+    // exhausted descriptor table returns EMFILE and no GPU work is queued.
+    const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0xc040_6442;
+    const VIRTGPU_EXECBUF_FENCE_FD_IN: u32 = 0x01;
+    const VIRTGPU_EXECBUF_FENCE_FD_OUT: u32 = 0x02;
+    const VIRTGPU_EXECBUF_RING_IDX: u32 = 0x04;
+    let is_virtgpu_execbuffer = cmd == DRM_IOCTL_VIRTGPU_EXECBUFFER
+        && (ops.as_drm_card_index().is_some() || ops.as_drm_render_index().is_some());
+    let mut out_fence = None;
+    if is_virtgpu_execbuffer {
+        let mut execbuf = [0u8; 64];
+        // SAFETY: the ioctl encoding fixes the payload at 64 bytes and the
+        // uaccess helper validates that complete input range.
+        if unsafe { copy_from_user(&mut execbuf, arg as u64) }.is_err() {
+            ctx.set_return(errno_ret(EFAULT));
+            return;
+        }
+        let flags = u32::from_ne_bytes(execbuf[0..4].try_into().unwrap());
+        let known_flags = VIRTGPU_EXECBUF_FENCE_FD_IN
+            | VIRTGPU_EXECBUF_FENCE_FD_OUT
+            | VIRTGPU_EXECBUF_RING_IDX;
+        if flags & !known_flags != 0 {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        }
+        if flags & VIRTGPU_EXECBUF_FENCE_FD_OUT != 0 {
+            let Some(reservation) = fd::reserve(task) else {
+                ctx.set_return(errno_ret(EMFILE));
+                return;
+            };
+            out_fence = Some(reservation);
+        }
+        if flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0 {
+            let in_fence = i32::from_ne_bytes(execbuf[28..32].try_into().unwrap());
+            let valid_sync_file = u32::try_from(in_fence)
+                .ok()
+                .and_then(|fence_fd| {
+                    fd::with_table(task, |table| {
+                        table.get(fence_fd).map(|entry| entry.ops.clone())
+                    })
+                    .flatten()
+                })
+                .and_then(|fence_ops| {
+                    fence_ops
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<DrmSyncFile>())
+                        .map(|_| ())
+                })
+                .is_some();
+            if !valid_sync_file {
+                // Linux's sync_file_get_fence() deliberately folds both a bad
+                // fd and a non-sync-file fd into EINVAL for this ioctl.
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            }
+        }
+    }
+
+    let ioctl_result = ops.ioctl(cmd, arg);
+    if ioctl_result.is_ok() {
+        if let Some(reservation) = out_fence {
+            let fence_fd = reservation
+                .install(fd::FdEntry {
+                    ops: Arc::new(DrmSyncFile),
+                    offset: 0,
+                    flags: fd::FD_CLOEXEC,
+                    status_flags: 0,
+                })
+                .expect("reserved VirtIO-GPU fence fd disappeared");
+            // Linux installs the sync_file before drm_ioctl_kernel copies the
+            // modified struct back.  Preserve that order (including the
+            // installed-but-unreported fd if this final copy faults).
+            let fence_bytes = (fence_fd as i32).to_ne_bytes();
+            // SAFETY: fence_fd is the 32-bit field at byte offset 28 in the
+            // already-validated 64-byte EXECBUFFER payload.
+            if unsafe { copy_to_user(arg as u64 + 28, &fence_bytes) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+        }
+    }
+
+    match ioctl_result {
         Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
         Err(narf_filesystem::FsError::Unsupported) => {
+            // Recognised DRM feature ioctls use EOPNOTSUPP when the driver
+            // lacks the advertised feature. They must not fall through to
+            // the generic unknown-ioctl ENOTTY translation.
+            const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640d;
+            const DRM_IOCTL_MODE_ATOMIC: u32 = 0xc038_64bc;
+            if cmd == DRM_IOCTL_SET_CLIENT_CAP || cmd == DRM_IOCTL_MODE_ATOMIC {
+                ctx.set_return(errno_ret(EOPNOTSUPP));
+                return;
+            }
             if ops.stat().mode.file_type == narf_filesystem::FileType::Fifo {
                 // pipe_ioctl's -ENOIOCTLCMD is translated by vfs_ioctl to
                 // ENOTTY. Do this before the generic filesystem-ioctl relay:
@@ -872,6 +1056,21 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::NoSuchProcess) => {
             // ESRCH — TIOCSPGRP for a process group that does not exist.
             ctx.set_return(errno_ret(ESRCH));
+        }
+        Err(narf_filesystem::FsError::BadAddress) => {
+            ctx.set_return(errno_ret(EFAULT));
+        }
+        Err(narf_filesystem::FsError::OutOfMemory) => {
+            ctx.set_return(errno_ret(ENOMEM));
+        }
+        Err(narf_filesystem::FsError::NotImplemented) => {
+            ctx.set_return(errno_ret(ENOSYS));
+        }
+        Err(narf_filesystem::FsError::AlreadyExists) => {
+            ctx.set_return(errno_ret(EEXIST));
+        }
+        Err(narf_filesystem::FsError::NotFound) => {
+            ctx.set_return(errno_ret(ENOENT));
         }
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
             ctx.set_return(errno_ret(EPERM));

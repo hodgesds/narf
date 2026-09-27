@@ -1053,6 +1053,16 @@ The adapter must not synthesize plausible values for an unavailable hardware
 event. The audited command matrix and remaining gaps live in
 `observability/PERF_LINUX_COMPAT_AUDIT.md`.
 
+DRM ioctl handling that creates process descriptors remains in the syscall
+layer even when request validation and submission are driver-owned. VirtIO-GPU
+`EXECBUFFER(FENCE_FD_OUT)` reserves a descriptor before submission, installs
+an already-signalled sync-file description with `FD_CLOEXEC` after synchronous
+completion, and then copies the descriptor number to the ioctl structure.
+`FENCE_FD_IN` resolves and type-checks the supplied description first;
+negative or non-sync-file descriptors return `EINVAL`, and descriptor-table
+exhaustion returns `EMFILE` without submitting work. Installation precedes the
+final user copy, matching Linux's observable lifetime if that copy faults.
+
 Linux perf wire definitions are owned by the separate
 `narf-linux-perf-uapi` crate, transcribed through `PERF_ATTR_SIZE_VER9` from
 Linux `include/uapi/linux/perf_event.h`. Defining a UAPI value does not admit

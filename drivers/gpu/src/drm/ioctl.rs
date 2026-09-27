@@ -64,10 +64,13 @@ pub enum IoctlCmd {
     ModeGetPlane = 0xB6,
     ModeCursor2 = 0xBB,
     ModeAtomic = 0xBC,
+    ModeCreatePropBlob = 0xBD,
+    ModeDestroyPropBlob = 0xBE,
     SyncobjCreate = 0xBF,
     SyncobjDestroy = 0xC0,
     SyncobjWait = 0xC3,
     SyncobjSignal = 0xC5,
+    ModeListLessees = 0xC7,
     /// Unrecognised ioctl — returned as an error.
     Unknown = 0xFF,
 }
@@ -106,10 +109,13 @@ impl IoctlCmd {
             0xB5 => IoctlCmd::ModeGetPlaneRes,
             0xBB => IoctlCmd::ModeCursor2,
             0xBC => IoctlCmd::ModeAtomic,
+            0xBD => IoctlCmd::ModeCreatePropBlob,
+            0xBE => IoctlCmd::ModeDestroyPropBlob,
             0xBF => IoctlCmd::SyncobjCreate,
             0xC0 => IoctlCmd::SyncobjDestroy,
             0xC3 => IoctlCmd::SyncobjWait,
             0xC5 => IoctlCmd::SyncobjSignal,
+            0xC7 => IoctlCmd::ModeListLessees,
             _ => IoctlCmd::Unknown,
         }
     }
@@ -360,6 +366,9 @@ pub fn dispatch(
         // tables don't live on `Card`); the dispatcher just returns
         // UnknownCmd for now so callers route them explicitly.
         IoctlCmd::ModeAtomic
+        | IoctlCmd::ModeCreatePropBlob
+        | IoctlCmd::ModeDestroyPropBlob
+        | IoctlCmd::ModeListLessees
         | IoctlCmd::SyncobjCreate
         | IoctlCmd::SyncobjDestroy
         | IoctlCmd::SyncobjWait

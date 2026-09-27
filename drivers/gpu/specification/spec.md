@@ -52,14 +52,31 @@ virtgpu userspace ABI:
   `RESOURCE_INFO`, `TRANSFER_{TO,FROM}_HOST`, bounded `EXECBUFFER`, and
   `GEM_CLOSE`. Handles are per-open, context creation is lazy, and opaque
   command streams are passed to a host only after size and ownership
-  validation. `GEM_CLOSE` removes the handle, detaches and unreferences the
-  host resource, then releases its DMA pages; failed host teardown retains the
-  backing rather than permitting DMA into recycled memory.
+  validation. Guest-backed resources up to the advertised per-resource bound
+  may span multiple coherent DMA segments; mmap resolves pages across that
+  ordered backing list. PRIME export retains the shared host resource;
+  importing into another DRM open creates a new local handle and attaches the
+  same resource to that open's context, as Linux's
+  `virtio_gpu_gem_object_open` does. `GEM_CLOSE` removes and detaches only that
+  handle. The host resource is unreferenced after its final GEM, framebuffer,
+  dma-buf, and mmap reference; failed host teardown retains the backing rather
+  than permitting DMA into recycled memory. A KMS framebuffer backed by such
+  an import is presented directly with VirtIO-GPU `SET_SCANOUT` plus
+  `RESOURCE_FLUSH` rather than copied through the boot 2D resource. On a
+  primary-node open, VIRTGPU-created handles are registered in the same GEM
+  namespace consumed by ADDFB2; render and KMS handles on one `drm_file` must
+  never diverge. DRM command words use the exact Linux UAPI structure sizes;
+  in particular `GEM_CLOSE` is the 8-byte `0x40086409` request so it reaches
+  that per-open teardown path before generic KMS cleanup.
 - Primary-node inbound: the existing framebuffer / modeset ioctls; an
   accelerated buffer may be presented only after it is also registered as a
   KMS framebuffer.
-- Outbound: completion is synchronous for v1; the transport must not claim
-  explicit-fence support until fence-fd and syncobj lifetime are implemented.
+- Outbound: completion is synchronous for v1. `EXECBUFFER` with
+  `FENCE_FD_OUT` returns a close-on-exec, already-signalled sync-file fd;
+  `FENCE_FD_IN` accepts only one of those sync-file descriptions and otherwise
+  returns `EINVAL`. Descriptor exhaustion returns `EMFILE` before submission.
+  Timeline-syncobj arrays remain unsupported because their distinct lifetime
+  and ordering semantics are not implemented.
 - Linux-compatible DRM devfs nodes have stable metadata shared across
   lookups. Primary and render nodes start at the conservative devtmpfs policy
   `0600 root:root`; `set_owners`/`set_perms` persist the distribution policy

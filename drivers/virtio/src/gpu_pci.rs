@@ -97,7 +97,6 @@ const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
-const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 
 // Response codes.
 const RESP_OK_NODATA: u32 = 0x1100;
@@ -544,10 +543,9 @@ impl VirtioGpuPci {
     }
 
     /// Allocate a host-side blob resource id and create it with `blob_mem`
-    /// backed by the guest-physical range `[backing_phys, backing_phys+size)`
-    /// (a single contiguous mem entry, as `alloc_coherent` provides). Used by
-    /// the DRM native context for guest / host3d-guest blob objects. The caller
-    /// keeps the backing alive for the resource's lifetime.
+    /// backed by an ordered guest-physical scatter/gather list. Used by the DRM
+    /// native context for guest / host3d-guest blob objects. The caller keeps
+    /// every backing segment alive for the resource's lifetime.
     // The blob-create request genuinely carries this many independent fields.
     #[allow(clippy::too_many_arguments)]
     pub fn create_blob_resource(
@@ -558,8 +556,7 @@ impl VirtioGpuPci {
         blob_flags: u32,
         blob_id: u64,
         size: u64,
-        backing_phys: u64,
-        backing_len: u32,
+        entries: &[cmd::MemEntry],
     ) -> Result<(), VirtioPciError> {
         if !self.resource_blob_enabled {
             return Err(VirtioPciError::DeviceRejectedFeatures);
@@ -572,15 +569,15 @@ impl VirtioGpuPci {
         } else {
             ctx_id
         };
-        let entries = if backing_phys != 0 && backing_len != 0 {
-            [cmd::MemEntry {
-                addr: backing_phys,
-                length: backing_len,
-            }]
-        } else {
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| entry.addr == 0 || entry.length == 0)
+            || cmd::RESOURCE_CREATE_BLOB_HDR_LEN + entries.len() * 16 > CONTROL_REQUEST_BYTES
+        {
             return Err(VirtioPciError::DeviceRejectedFeatures);
-        };
-        let mut request = [0u8; cmd::RESOURCE_CREATE_BLOB_HDR_LEN + 16];
+        }
+        let mut request = alloc::vec![0u8; cmd::RESOURCE_CREATE_BLOB_HDR_LEN + entries.len() * 16];
         let n = cmd::build_resource_create_blob(
             &mut request,
             ctx_id,
@@ -589,7 +586,7 @@ impl VirtioGpuPci {
             blob_flags,
             blob_id,
             size,
-            &entries,
+            entries,
         );
         self.write_raw_request(&request[..n]);
         // SAFETY: gate held; req/resp DMA prepared at bring-up.
@@ -698,25 +695,29 @@ impl VirtioGpuPci {
 
     /// Create and attach one 3D resource to the render context.
     ///
-    /// `backing_phys..backing_phys+backing_len` must remain allocated and
-    /// DMA-owned by the caller until it has detached and unref'd the returned
-    /// resource. The DRM render bridge enforces that lifetime with its
-    /// per-open GEM table; this transport layer intentionally has no user
-    /// pointer or handle-table policy.
+    /// Every `entries` range must remain allocated and DMA-owned by the caller
+    /// until it has detached and unref'd the returned resource. The DRM render
+    /// bridge enforces that lifetime with its per-open GEM table; this
+    /// transport layer intentionally has no user pointer or handle-table
+    /// policy.
     pub fn create_virgl_resource(
         &self,
         ctx_id: u32,
         resource: cmd::ResourceCreate3D,
-        backing_phys: u64,
-        backing_len: u32,
+        entries: &[cmd::MemEntry],
     ) -> Result<(), VirtioPciError> {
-        if !self.virgl_enabled() || backing_phys == 0 || backing_len == 0 {
+        if !self.virgl_enabled()
+            || entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| entry.addr == 0 || entry.length == 0)
+        {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let _gate = ReqGate::acquire(&self.req_gate);
 
         let mut create = [0u8; cmd::RESOURCE_CREATE_3D_LEN];
-        cmd::build_resource_create_3d(&mut create, ctx_id, resource);
+        cmd::build_resource_create_3d(&mut create, resource);
         self.write_raw_request(&create);
         // SAFETY: the request gate serialises controlQ + request DMA use.
         unsafe { self.submit(create.len(), HDR_LEN)? };
@@ -725,10 +726,10 @@ impl VirtioGpuPci {
         }
         // A 3D resource uses the normal, context-free backing attach
         // command, then becomes visible to the context through ATTACH.
-        // SAFETY: the request gate remains held, the physical range is
+        // SAFETY: the request gate remains held, every physical range is
         // non-zero and length-checked above, and the caller's documented GEM
-        // ownership keeps the coherent backing alive until resource teardown.
-        unsafe { self.resource_attach_backing(resource.resource_id, backing_phys, backing_len)? };
+        // ownership keeps all coherent backing alive until resource teardown.
+        unsafe { self.resource_attach_backing_entries(resource.resource_id, entries)? };
         let mut attach = [0u8; cmd::CTX_RESOURCE_LEN];
         cmd::build_ctx_resource(
             &mut attach,
@@ -745,9 +746,37 @@ impl VirtioGpuPci {
         Ok(())
     }
 
+    /// Attach an existing host resource to another render context. PRIME
+    /// import calls this from the target `drm_file`, mirroring Linux's
+    /// `virtio_gpu_gem_object_open` callback.
+    pub fn attach_virgl_resource(
+        &self,
+        ctx_id: u32,
+        resource_id: u32,
+    ) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() || ctx_id == 0 || resource_id == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut request = [0u8; cmd::CTX_RESOURCE_LEN];
+        cmd::build_ctx_resource(
+            &mut request,
+            cmd::VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+            ctx_id,
+            resource_id,
+        );
+        self.write_raw_request(&request);
+        // SAFETY: the request gate protects the shared controlQ buffers.
+        unsafe { self.submit(request.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
     /// Submit one opaque virgl command stream to the render context.
     ///
-    /// The stream is bounded by the pre-allocated controlQ request DMA page.
+    /// The stream is bounded by the pre-allocated controlQ request DMA buffer.
     /// It is copied before the virtqueue notify, so callers may reuse their
     /// source buffer as soon as this synchronous method returns.
     pub fn submit_virgl(
@@ -804,35 +833,66 @@ impl VirtioGpuPci {
         Ok(())
     }
 
-    /// Detach and unref a render resource before its DMA backing is freed.
-    /// A failed teardown leaves the caller responsible for retaining the
-    /// backing; freeing it would let the host DMA into recycled memory.
-    pub fn destroy_virgl_resource(
+    /// Synchronise a resource's host VirGL contents into its guest backing.
+    pub fn transfer_from_host_virgl(
         &self,
         ctx_id: u32,
-        resource_id: u32,
+        transfer: cmd::Transfer3D,
     ) -> Result<(), VirtioPciError> {
         if !self.virgl_enabled() {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let _gate = ReqGate::acquire(&self.req_gate);
-        // Detach from the owning context first — best effort: a blob created
-        // with its ctx in the header is not necessarily CTX_ATTACHed, and a
-        // pure guest blob (ctx 0) has no owning context, so a non-OK detach
-        // response must not abort the UNREF that frees the host resource.
-        if ctx_id != 0 {
-            let mut detach = [0u8; cmd::CTX_RESOURCE_LEN];
-            cmd::build_ctx_resource(
-                &mut detach,
-                cmd::VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
-                ctx_id,
-                resource_id,
-            );
-            self.write_raw_request(&detach);
-            // SAFETY: gate protects the shared controlQ buffers.
-            unsafe { self.submit(detach.len(), HDR_LEN)? };
-            let _ = self.response_type();
+        let mut request = [0u8; cmd::TRANSFER_3D_LEN];
+        cmd::build_transfer_3d(
+            &mut request,
+            cmd::VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
+            ctx_id,
+            transfer,
+        );
+        self.write_raw_request(&request);
+        // SAFETY: gate protects the shared controlQ buffers.
+        unsafe { self.submit(request.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
         }
+        Ok(())
+    }
+
+    /// Detach an imported GEM handle from one render context. The resource
+    /// itself remains alive until its final GEM/dma-buf reference is dropped.
+    pub fn detach_virgl_resource(
+        &self,
+        ctx_id: u32,
+        resource_id: u32,
+    ) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() || ctx_id == 0 || resource_id == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut request = [0u8; cmd::CTX_RESOURCE_LEN];
+        cmd::build_ctx_resource(
+            &mut request,
+            cmd::VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+            ctx_id,
+            resource_id,
+        );
+        self.write_raw_request(&request);
+        // SAFETY: gate protects the shared controlQ buffers.
+        unsafe { self.submit(request.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Drop the host's final resource reference. Callers must keep every DMA
+    /// backing segment alive if this command fails.
+    pub fn unref_virgl_resource(&self, resource_id: u32) -> Result<(), VirtioPciError> {
+        if resource_id == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
         // struct virtio_gpu_resource_unref = { hdr, u32 resource_id, u32 pad }
         // — the body is 8 bytes (QEMU rejects a 4-byte body: "command size
         // incorrect 28 vs 32").
@@ -843,6 +903,41 @@ impl VirtioGpuPci {
         unsafe { self.submit(HDR_LEN + unref_body.len(), HDR_LEN)? };
         if self.response_type() != RESP_OK_NODATA {
             return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Compatibility helper for callers that still own one context-local
+    /// handle and the final host reference.
+    pub fn destroy_virgl_resource(
+        &self,
+        ctx_id: u32,
+        resource_id: u32,
+    ) -> Result<(), VirtioPciError> {
+        if ctx_id != 0 {
+            self.detach_virgl_resource(ctx_id, resource_id)?;
+        }
+        self.unref_virgl_resource(resource_id)
+    }
+
+    /// Put an existing VirGL resource directly on scanout 0 and flush it.
+    /// This is Linux virtio-gpu's plane update path for a PRIME-imported GEM
+    /// object; unlike the dumb-buffer path it performs no CPU copy.
+    pub fn present_virgl_resource(
+        &self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() || resource_id == 0 || width == 0 || height == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        // SAFETY: the gate excludes every other controlQ user and the resource
+        // id was created by this device.
+        unsafe {
+            self.set_scanout(0, resource_id, width, height)?;
+            self.resource_flush(resource_id, 0, 0, width, height)?;
         }
         Ok(())
     }
@@ -1278,18 +1373,41 @@ impl VirtioGpuPci {
         phys: u64,
         len: u32,
     ) -> Result<(), VirtioPciError> {
-        // body: u32 resource_id, u32 nr_entries, then 1 mem entry
-        // (u64 addr, u32 length, u32 padding).
-        let mut body = [0u8; 8 + 16];
-        body[0..4].copy_from_slice(&resource_id.to_le_bytes());
-        body[4..8].copy_from_slice(&1u32.to_le_bytes()); // nr_entries
-        body[8..16].copy_from_slice(&phys.to_le_bytes());
-        body[16..20].copy_from_slice(&len.to_le_bytes());
-        // padding is zeroed by default
-        self.write_request(CMD_RESOURCE_ATTACH_BACKING, &body);
+        let entries = [cmd::MemEntry {
+            addr: phys,
+            length: len,
+        }];
+        // SAFETY: caller holds the request gate and the one-entry slice is
+        // valid for this synchronous submission.
+        unsafe { self.resource_attach_backing_entries(resource_id, &entries) }
+    }
+
+    /// Attach one or more guest-physical backing segments to a resource.
+    ///
+    /// # Safety
+    /// Caller holds `req_gate`; every entry remains DMA-owned until the
+    /// resource is detached and unreferenced.
+    unsafe fn resource_attach_backing_entries(
+        &self,
+        resource_id: u32,
+        entries: &[cmd::MemEntry],
+    ) -> Result<(), VirtioPciError> {
+        let request_len = HDR_LEN + 8 + entries.len() * 16;
+        if entries.is_empty()
+            || request_len > CONTROL_REQUEST_BYTES
+            || entries
+                .iter()
+                .any(|entry| entry.addr == 0 || entry.length == 0)
+        {
+            return Err(VirtioPciError::RequestTooLarge);
+        }
+        let mut request = alloc::vec![0u8; request_len];
+        let written =
+            cmd::build_resource_attach_backing_entries(&mut request, resource_id, entries);
+        self.write_raw_request(&request);
         // SAFETY: req/resp prepared.
         unsafe {
-            self.submit(HDR_LEN + body.len(), HDR_LEN)?;
+            self.submit(written, HDR_LEN)?;
         }
         let response = self.response_type();
         if response != RESP_OK_NODATA {

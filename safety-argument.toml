@@ -1214,7 +1214,6 @@ argument = "VMA admission, W^X and capability/domain checks are unchanged. A dem
 ref = "security-model/specification/spec.md#L44"
 argument = "A userspace-controlled high virtual offset reserves one fixed-size backing block rather than an offset-sized vector. Holes remain implicit through cloning and windowing. Shared frames still use external-owner hooks; private frames retain COW-aware release. No missing-block lookup fabricates physical backing or grants access to another mapping."
 
-
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Pipe payload queues use per-object sleepable mutexes, with ordered acquisition for two-pipe transfers. Readiness uses separate short per-object publication locks and atomic occupancy snapshots; no payload mutex or IRQ-safe lock is held when a handoff executes. Existing exact-waiter scheduler hints are reused without changing task/domain restoration or extending the trusted subsystem set."
@@ -1239,3 +1238,7 @@ argument = "The aarch64 vector now preserves SP_EL0 in the prior padding slot at
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Executable-memory kernel-alias permission changes now invalidate inactive non-global PCID translations on every CPU, in addition to the existing global range invalidation. The permission store precedes both synchronous invalidations; backing cannot be reused with a stale read-only alias and sealed text cannot retain a stale writable alias. The regression switches between two live address spaces and checks the restored alias with guarded fault recovery. Fatal-only page-table diagnostics add no trap hot-path work."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit removes one unused userspace-loader import and changes no executable code, trusted authority, capability check, mapping, domain transition, scheduler state, or runtime behavior. It exists only to keep the container-feature clippy gate warning-free."

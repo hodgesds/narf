@@ -118,6 +118,34 @@ impl GemTable {
         Ok(handle)
     }
 
+    /// Register an object under a caller-selected handle. VirtIO-GPU PRIME
+    /// import uses this to keep the per-open render handle and the KMS GEM
+    /// handle identical, as Linux's single `drm_file` handle namespace does.
+    pub fn alloc_at(
+        &mut self,
+        handle: GemHandle,
+        phys: u64,
+        size: usize,
+    ) -> Result<GemHandle, GemError> {
+        if handle == 0 || size == 0 {
+            return Err(GemError::ZeroSize);
+        }
+        if self.objects.len() >= GEM_TABLE_MAX {
+            return Err(GemError::TableFull);
+        }
+        if self.lookup(handle).is_some() {
+            return Err(GemError::TableFull);
+        }
+        self.objects.push(GemObject {
+            handle,
+            phys,
+            size,
+            exported: false,
+            driver_priv: 0,
+        });
+        Ok(handle)
+    }
+
     /// Free a GEM object by handle.
     ///
     /// Linux equivalent: `drm_gem_handle_delete` + `drm_gem_object_put`.
