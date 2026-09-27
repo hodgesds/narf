@@ -46,8 +46,14 @@ blk/net/console/rng.
   operations for context creation/destruction, resource attachment, 3D
   resource creation, and bounded `SUBMIT_3D` command streams. The DRM
   render-node bridge owns per-open resource lifetime and validates all
-  user-provided command sizes before it calls this surface. A 2D-only host
-  remains supported with the feature clear.
+  user-provided command sizes before it calls this surface. Resource and blob
+  creation accept a bounded `MemEntry` scatter/gather list, matching Linux's
+  shmem scatterlist translation; callers retain every segment until detach +
+  unref completes. Context attach/detach and resource unref are separate
+  operations so PRIME-imported resources can be shared across DRM opens, and
+  an imported 3D resource can be placed directly on scanout with
+  `SET_SCANOUT` + `RESOURCE_FLUSH`. A 2D-only host remains supported with the
+  feature clear.
 - Virtio block request futures register the caller's waker in their in-flight
   request slot and completion wakes it after removing the request from the
   used ring. Unsupported/no-op flush, discard, and cancel paths resolve

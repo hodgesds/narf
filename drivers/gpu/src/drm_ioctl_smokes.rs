@@ -124,7 +124,11 @@ fn register_test_card_unmastered() -> u32 {
 fn register_test_virtio_card() -> u32 {
     let name = format!("card{}", crate::drm_registry::count());
     let card = Arc::new(crate::drm_devfs_bridge::VirtioGpuCard::new(name));
-    let idx = crate::drm_registry::register_drm_card_with_state(card, make_test_card());
+    let mut state = make_test_card();
+    state.driver_name = "virtio_gpu";
+    state.driver_desc = "NARF VirtIO GPU driver";
+    state.version = (0, 1, 0);
+    let idx = crate::drm_registry::register_drm_card_with_state(card, state);
     if let Some(ms) = crate::drm_registry::mode_state(idx) {
         ms.lock().master_open(SMOKE_MASTER_ID);
     }
@@ -160,10 +164,24 @@ fn smoke_drm_ioc_macro_roundtrip() -> TestResult {
     if ioc_size(DRM_IOCTL_MODE_GETRESOURCES) != core::mem::size_of::<DrmModeCardResUapi>() as u32 {
         return TestResult::Fail("ioc_size(GETRESOURCES) != sizeof");
     }
-    // _IOW / _IOR shapes also distinguish themselves.
-    let w_only = iow(b'd' as u32, 0x09, 16);
+    // Linux's drm_gem_close is exactly `{ u32 handle; u32 pad; }`. Encoding
+    // it as 16 bytes makes Mesa's real 0x40086409 call miss the VirtGPU
+    // per-open close path and leaves a stale handle after the card GEM entry
+    // is removed.
+    let w_only = iow(b'd' as u32, 0x09, 8);
     if ioc_dir(w_only) != IOC_WRITE {
         return TestResult::Fail("iow direction bits not WRITE-only");
+    }
+    if DRM_IOCTL_GEM_CLOSE != 0x4008_6409 || ioc_size(DRM_IOCTL_GEM_CLOSE) != 8 {
+        return TestResult::Fail("GEM_CLOSE does not match Linux's 8-byte ioctl word");
+    }
+    if crate::drm_uapi::DRM_IOCTL_MODE_ADDFB2 != 0xc068_64b8
+        || crate::drm_uapi::DRM_IOCTL_MODE_GETPLANE != 0xc020_64b6
+        || crate::drm_uapi::DRM_IOCTL_MODE_CREATEPROPBLOB != 0xc010_64bd
+        || crate::drm_uapi::DRM_IOCTL_SYNCOBJ_WAIT != 0xc028_64c3
+        || crate::drm_uapi::DRM_IOCTL_PRIME_HANDLE_TO_FD != 0xc00c_642d
+    {
+        return TestResult::Fail("DRM ioctl sizes drifted from Linux UAPI");
     }
     let rw = iowr(b'd' as u32, 0xBC, 56);
     if ioc_dir(rw) != (IOC_READ | IOC_WRITE) {
@@ -439,14 +457,17 @@ fn smoke_drm_ioctl_planes_synth_primary() -> TestResult {
         return TestResult::Fail("plane has empty possible_crtcs");
     }
     // OBJ_GETPROPERTIES(plane) → the "type" property reads PRIMARY (1).
-    let mut props = [0u32; 1];
-    let mut vals = [0u64; 1];
-    let mut og = [0u8; 28];
+    // The object exposes the complete atomic property set, so provide room
+    // for all eleven entries just as libdrm's two-pass allocation does.
+    let mut props = [0u32; 11];
+    let mut vals = [0u64; 11];
+    let mut og = [0u8; 32];
     og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
     og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
-    og[16..20].copy_from_slice(&1u32.to_le_bytes()); // count_props (room)
+    og[16..20].copy_from_slice(&11u32.to_le_bytes()); // count_props (room)
     og[20..24].copy_from_slice(&0x40u32.to_le_bytes()); // obj_id = plane
-    let obj_getprops = iowr(DRM_IOCTL_BASE, 0xB9, 28);
+    og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes()); // PLANE
+    let obj_getprops = iowr(DRM_IOCTL_BASE, 0xB9, 32);
     if dispatch_card(idx, obj_getprops, og.as_mut_ptr() as usize, false) != Ok(0) {
         return TestResult::Fail("OBJ_GETPROPERTIES failed");
     }
@@ -488,17 +509,10 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_render_fd_rejects_setcrtc);
 #[allow(dead_code)]
 fn smoke_drm_render_fd_accepts_gem_close() -> TestResult {
     let idx = register_test_card();
-    let mut buf = [0u8; 16];
-    // GEM_CLOSE has nr=0x09 — the generic dispatcher routes it via
-    // its UnknownCmd path (we haven't wired gem close through the
-    // generic dispatcher's IoctlCmd match). The permission gate
-    // should still pass for a render fd because GEM_CLOSE is
-    // RENDER_ALLOW per Linux. The current implementation routes it
-    // through handle_generic which returns Unsupported because the
-    // dispatcher's IoctlCmd::Unknown branch fires for nr=0x09 —
-    // i.e. permission gate passed but the cmd is not wired yet.
-    // We accept either Ok(_) or Err(Unsupported) — both prove the
-    // permission gate didn't reject.
+    let mut buf = [0u8; 8];
+    // GEM_CLOSE is RENDER_ALLOW in Linux. The permission gate must admit the
+    // call, then the unknown zero handle must produce drm_gem_handle_delete's
+    // EINVAL rather than EACCES or ENOTTY.
     let r = dispatch_card(
         idx,
         DRM_IOCTL_GEM_CLOSE,
@@ -506,11 +520,11 @@ fn smoke_drm_render_fd_accepts_gem_close() -> TestResult {
         /*render*/ true,
     );
     match r {
-        Ok(_) | Err(FsError::Unsupported) => TestResult::Pass,
+        Err(FsError::InvalidData) => TestResult::Pass,
         Err(FsError::PermissionDenied) => {
             TestResult::Fail("GEM_CLOSE rejected on render fd — should be RENDER_ALLOW")
         }
-        Err(_) => TestResult::Fail("GEM_CLOSE returned unexpected error"),
+        _ => TestResult::Fail("unknown GEM_CLOSE handle did not return EINVAL"),
     }
 }
 kernel_test_in!(
@@ -522,7 +536,9 @@ kernel_test_in!(
 
 #[allow(dead_code)]
 fn smoke_drm_ioctl_atomic_empty_commit_succeeds() -> TestResult {
-    let idx = register_test_card();
+    // The implemented atomic backend is VirtIO-GPU-specific; other drivers
+    // correctly return EOPNOTSUPP rather than pretending to commit state.
+    let idx = register_test_virtio_card();
     let mut req = DrmModeAtomicUapi {
         flags: 0x0400, // DRM_MODE_ATOMIC_ALLOW_MODESET.
         ..Default::default()
@@ -653,6 +669,135 @@ kernel_test_in!(
 // the fix `DriCardFile::ioctl` went straight to the card/KMS dispatcher, so a
 // VIRTGPU ioctl fell through to `handle_generic` → ENOTTY (Unsupported) and
 // Mesa dropped every GL client to llvmpipe.
+
+/// Linux advertises virtio_gpu version 0.1.0. Mesa's classic-VirGL winsys
+/// rejects the device when the major version is non-zero.
+fn smoke_dri_card_virtgpu_version_matches_linux() -> TestResult {
+    let idx = register_test_virtio_card();
+    use narf_filesystem::DirOps;
+    let dir = crate::drm_devfs_bridge::DriDir;
+    let name = format!("card{}", idx);
+    let f = match dir.lookup(&name) {
+        Some(f) => f,
+        None => return TestResult::Fail("DriDir::lookup(card) failed"),
+    };
+    let mut req = DrmVersionUapi::default();
+    if f.ioctl(DRM_IOCTL_VERSION, &mut req as *mut _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("virtio_gpu DRM_IOCTL_VERSION failed");
+    }
+    if (req.version_major, req.version_minor, req.version_patchlevel) != (0, 1, 0) {
+        return TestResult::Fail("virtio_gpu DRM version differs from Linux 0.1.0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_dri_card_virtgpu_version_matches_linux
+);
+
+/// The ioctl gate must admit the multi-page command streams Mesa submits
+/// while creating a classic-VirGL screen, while retaining a finite cap.
+fn smoke_virtgpu_execbuffer_capacity_covers_mesa_init() -> TestResult {
+    for size in [4_136, 9_504, 18_412] {
+        if size > crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES {
+            return TestResult::Fail("Mesa VirGL initialization execbuffer is rejected");
+        }
+    }
+    if crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES >= 1024 * 1024 {
+        return TestResult::Fail("VirtGPU execbuffer bound is not meaningfully constrained");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_virtgpu_execbuffer_capacity_covers_mesa_init
+);
+
+/// Linux's virtgpu private ABI distinguishes malformed requests from missing
+/// GEM handles and bad nested pointers. Keep those distinctions at the bridge
+/// so `sys_ioctl` can return EINVAL, ENOENT, and EFAULT respectively.
+fn smoke_virtgpu_ioctl_linux_error_classes() -> TestResult {
+    use crate::drm_ioctl_bridge::{copy_in, dispatch_virtgpu_render, VirtGpuRenderState};
+    use crate::drm_uapi::{
+        DrmVirtGpuGetCapsUapi, DrmVirtGpuMapUapi, DrmVirtGpuResourceCreateBlobUapi,
+        DrmVirtGpuResourceInfoUapi, DrmVirtGpuWaitUapi, DRM_IOCTL_VIRTGPU_GET_CAPS,
+        DRM_IOCTL_VIRTGPU_MAP, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, DRM_IOCTL_VIRTGPU_WAIT,
+        DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB,
+    };
+
+    let state = VirtGpuRenderState::new();
+    let mut info = DrmVirtGpuResourceInfoUapi {
+        bo_handle: 0xfeed,
+        ..Default::default()
+    };
+    if dispatch_virtgpu_render(
+        DRM_IOCTL_VIRTGPU_RESOURCE_INFO,
+        &mut info as *mut _ as usize,
+        &state,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("RESOURCE_INFO unknown handle is not ENOENT-class");
+    }
+
+    let mut map = DrmVirtGpuMapUapi {
+        handle: 0xfeed,
+        ..Default::default()
+    };
+    if dispatch_virtgpu_render(DRM_IOCTL_VIRTGPU_MAP, &mut map as *mut _ as usize, &state)
+        != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("MAP unknown handle is not ENOENT-class");
+    }
+
+    let mut wait = DrmVirtGpuWaitUapi {
+        handle: 0xfeed,
+        flags: u32::MAX,
+    };
+    if dispatch_virtgpu_render(DRM_IOCTL_VIRTGPU_WAIT, &mut wait as *mut _ as usize, &state)
+        != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("WAIT unknown handle is not ENOENT-class");
+    }
+
+    let mut caps = DrmVirtGpuGetCapsUapi::default();
+    if dispatch_virtgpu_render(
+        DRM_IOCTL_VIRTGPU_GET_CAPS,
+        &mut caps as *mut _ as usize,
+        &state,
+    ) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("GET_CAPS size=0 is not EINVAL-class");
+    }
+
+    let mut blob = DrmVirtGpuResourceCreateBlobUapi {
+        blob_flags: u32::MAX,
+        size: 4096,
+        ..Default::default()
+    };
+    let blob_cmd = crate::drm_uapi::iowr(
+        crate::drm_uapi::DRM_IOCTL_BASE,
+        DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB,
+        core::mem::size_of::<DrmVirtGpuResourceCreateBlobUapi>() as u32,
+    );
+    if dispatch_virtgpu_render(blob_cmd, &mut blob as *mut _ as usize, &state)
+        != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("RESOURCE_CREATE_BLOB bad flags are not EINVAL-class");
+    }
+
+    // SAFETY: null is intentionally supplied to exercise the helper's Linux
+    // copy_from_user failure class; the helper rejects it before dereference.
+    if unsafe { copy_in(0, 4) } != Err(FsError::BadAddress) {
+        return TestResult::Fail("nested null pointer is not EFAULT-class");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_virtgpu_ioctl_linux_error_classes
+);
 
 /// POSITIVE: a VIRTGPU ioctl on the virtio_gpu card node is routed to the
 /// per-open virtio-gpu dispatcher (GETPARAM(3D_FEATURES) → Ok), NOT ENOTTY.
@@ -950,6 +1095,35 @@ fn smoke_drm_prime_export_aliases_dumb_frames() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_prime_export_aliases_dumb_frames
+);
+
+/// A PRIME-imported VirGL GEM object follows Linux's split handle/object
+/// lifetime: GEM_CLOSE drops the handle reference, while an ADDFB2 framebuffer
+/// keeps the shared host resource alive until RMFB.
+fn smoke_drm_virtgpu_prime_import_survives_handle_close() -> TestResult {
+    let mut card = make_test_card();
+    let resource = crate::drm_ioctl_bridge::test_virtgpu_resource(0x44, 4 * 4096);
+    if card
+        .register_virtgpu_import(7, Arc::clone(&resource))
+        .is_err()
+    {
+        return TestResult::Fail("failed to register VirtGPU PRIME import");
+    }
+    let fb = match card.addfb2(64, 64, 0x3432_5258, 256, 7) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("ADDFB2 rejected imported VirtGPU GEM handle"),
+    };
+    if !card.remove_virtgpu_import(7) || card.virtgpu_import(7).is_none() {
+        return TestResult::Fail("GEM_CLOSE dropped framebuffer-held VirtGPU resource");
+    }
+    if card.rmfb(fb).is_err() || card.virtgpu_import(7).is_some() || card.gem.lookup(7).is_some() {
+        return TestResult::Fail("RMFB did not release final VirtGPU import reference");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_virtgpu_prime_import_survives_handle_close
 );
 
 // ── 15bb. A primary-node mmap pins its dumb backing ──────────────────

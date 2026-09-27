@@ -757,6 +757,18 @@ caller can distinguish policy exhaustion from exhausted backing storage.
 state and maps to Linux `EPERM`; it remains distinct from access-mode or
 credential denial (`PermissionDenied`/`EACCES`) and a read-only filesystem
 (`ReadOnly`/`EROFS`). Memfd seal violations use this variant.
+Device ioctl implementations may also return `BadAddress` (`EFAULT`),
+`OutOfMemory` (`ENOMEM`), `NotImplemented` (`ENOSYS`), and `AlreadyExists`
+(`EEXIST`). These remain distinct from `InvalidData` (`EINVAL`) and
+`Unsupported`, whose direct-ioctl meaning is an unknown command (`ENOTTY`), so
+Linux UAPI error precedence survives the `FileOps` boundary.
+
+`FileOps::drm_prime_export_file(handle)` and
+`FileOps::drm_prime_import_file(dma_buf)` are the type-erased VFS handoff for
+per-open DRM GEM namespaces. The syscall layer owns descriptor allocation;
+the DRM file owns handle lookup/import and may recover its driver-specific
+dma-buf through `FileOps::as_any`. Drivers without a per-open implementation
+return `Unsupported` and retain the card-global compatibility hook.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

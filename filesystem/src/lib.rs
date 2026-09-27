@@ -759,6 +759,18 @@ pub enum FsError {
     /// for a process group that does not exist and EPERM for one that
     /// exists in another session (`drivers/tty/tty_jobctrl.c:518-521`).
     NoSuchProcess,
+    /// A userspace address supplied to an operation could not be accessed.
+    /// Device ioctl bridges use this to preserve Linux's `EFAULT` instead of
+    /// collapsing a bad pointer into `EINVAL`.
+    BadAddress,
+    /// The requested operation is known but unavailable in this
+    /// implementation or device configuration. Maps to Linux `ENOSYS`, while
+    /// [`FsError::Unsupported`] remains the VFS-level `ENOTTY`/`EOPNOTSUPP`
+    /// dispatch signal.
+    NotImplemented,
+    /// The requested object or one-shot initialization already exists. Maps
+    /// to Linux `EEXIST`.
+    AlreadyExists,
     /// The backing FS doesn't implement this op (e.g. virtiofs skeleton
     /// pre-Stage-4).
     Unsupported,
@@ -1429,6 +1441,28 @@ pub trait FileOps: Send + Sync {
     /// PRIME dma-buf.
     fn as_prime_gem_handle(&self) -> Option<u32> {
         None
+    }
+
+    /// Export one DRM GEM handle as a dma-buf-like file. DRM drivers whose
+    /// GEM namespace is per-open override this instead of using the legacy
+    /// card-global export hook below. Linux routes
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` through the calling `drm_file` for the
+    /// same reason: an integer handle is meaningful only in that open.
+    fn drm_prime_export_file(
+        &self,
+        _gem_handle: u32,
+    ) -> Result<alloc::sync::Arc<dyn FileOps>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Import a PRIME dma-buf file into this DRM open and return its local GEM
+    /// handle. The source stays type-erased at the VFS boundary; a driver can
+    /// recover its own dma-buf implementation through [`FileOps::as_any`].
+    fn drm_prime_import_file(
+        &self,
+        _dmabuf: &alloc::sync::Arc<dyn FileOps>,
+    ) -> Result<u32, FsError> {
+        Err(FsError::Unsupported)
     }
 
     /// If this fd is a terminal a process can have as its controlling tty,

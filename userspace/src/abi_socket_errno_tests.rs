@@ -25,7 +25,16 @@ const IPPROTO_IPV6: u64 = 41;
 const IPPROTO_IP: u64 = 0;
 const SOL_SOCKET: u64 = 1;
 const SO_REUSEADDR: u64 = 2;
+const SO_SNDBUF: u64 = 7;
+const SO_RCVBUF: u64 = 8;
+const SO_ATTACH_FILTER: u64 = 26;
+const SO_TIMESTAMP_OLD: u64 = 29;
 const SO_ACCEPTCONN: u64 = 30;
+const SO_SNDBUFFORCE: u64 = 32;
+const SO_RCVBUFFORCE: u64 = 33;
+const SO_TIMESTAMPNS_OLD: u64 = 35;
+const SO_TIMESTAMP_NEW: u64 = 63;
+const SO_TIMESTAMPNS_NEW: u64 = 64;
 const IP_TOS: u64 = 1;
 const IP_TTL: u64 = 2;
 const IP_MTU: u64 = 14;
@@ -955,6 +964,133 @@ fn smoke_abi_socket_errno_setsockopt_unknown_is_enoprotoopt() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_errno_setsockopt_unknown_is_enoprotoopt
+);
+
+/// Linux `net/core/sock.c::{sk_setsockopt,sk_getsockopt}` accepts all four
+/// receive-timestamp ABI names on every socket family.  Enabling one selects
+/// the same SOCK_RCVTSTAMP/SOCK_RCVTSTAMPNS/SOCK_TSTAMP_NEW state; disabling
+/// any one clears SOCK_RCVTSTAMP, and a short set value is EINVAL before
+/// option dispatch. Linux's compatibility quirk makes SO_TIMESTAMP_NEW read
+/// true for the SO_TIMESTAMPNS_NEW state as well.
+fn smoke_abi_socket_timestamp_options_match_linux() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_UNIX, SOCK_DGRAM, 0)?;
+        let variants = [
+            SO_TIMESTAMP_OLD,
+            SO_TIMESTAMPNS_OLD,
+            SO_TIMESTAMP_NEW,
+            SO_TIMESTAMPNS_NEW,
+        ];
+        let mut out = [0u8; 4];
+        for &selected in &variants {
+            if set_int(fd, SOL_SOCKET, selected, 1) != Some(0) {
+                return Err("Linux SO_TIMESTAMP variant must be accepted");
+            }
+            for &name in &variants {
+                out.fill(0);
+                let (result, len) = getsockopt(fd, SOL_SOCKET, name, &mut out);
+                let expected = u32::from(
+                    name == selected
+                        || (selected == SO_TIMESTAMPNS_NEW && name == SO_TIMESTAMP_NEW),
+                );
+                if result != Some(0) || len != 4 || u32::from_ne_bytes(out) != expected {
+                    return Err("SO_TIMESTAMP variants did not expose Linux's state mapping");
+                }
+            }
+        }
+        if setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP_OLD, &[1, 0, 0]) != Some(EINVAL) {
+            return Err("short SO_TIMESTAMP optval must be EINVAL");
+        }
+        if set_int(fd, SOL_SOCKET, SO_TIMESTAMP_OLD, 0) != Some(0) {
+            return Err("disabling SO_TIMESTAMP must succeed");
+        }
+        for &name in &variants {
+            out.fill(0xA5);
+            if getsockopt(fd, SOL_SOCKET, name, &mut out).0 != Some(0)
+                || u32::from_ne_bytes(out) != 0
+            {
+                return Err("disabling one timestamp variant must clear receive timestamping");
+            }
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_timestamp_options_match_linux
+);
+
+/// `sk_setsockopt` gives CAP_NET_ADMIN holders the forced buffer variants,
+/// doubles their signed-int request exactly as Linux does, and validates a
+/// native `sock_fprog` before attaching SO_ATTACH_FILTER. These are the three
+/// options systemd-logind installs while bringing up its uevent monitors.
+fn smoke_abi_socket_logind_sockopts_match_linux() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_UNIX, SOCK_DGRAM, 0)?;
+
+        if set_int(fd, SOL_SOCKET, SO_SNDBUFFORCE, 65_536) != Some(0)
+            || set_int(fd, SOL_SOCKET, SO_RCVBUFFORCE, 32_768) != Some(0)
+        {
+            return Err("privileged forced socket buffers must be accepted");
+        }
+        let mut out = [0u8; 4];
+        if getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &mut out).0 != Some(0)
+            || u32::from_ne_bytes(out) != 131_072
+        {
+            return Err("SO_SNDBUFFORCE must use Linux's doubled value");
+        }
+        out.fill(0);
+        if getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &mut out).0 != Some(0)
+            || u32::from_ne_bytes(out) != 65_536
+        {
+            return Err("SO_RCVBUFFORCE must use Linux's doubled value");
+        }
+
+        // BPF_RET | BPF_K, return all bytes.
+        let mut filter = [0u8; 8];
+        filter[0..2].copy_from_slice(&0x06u16.to_ne_bytes());
+        filter[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let mut fprog = [0u8; 16];
+        fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        fprog[8..16].copy_from_slice(&(filter.as_ptr() as u64).to_ne_bytes());
+        if setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &fprog) != Some(0) {
+            return Err("valid one-instruction classic filter must attach");
+        }
+        if setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &fprog[..15]) != Some(EINVAL) {
+            return Err("non-native sock_fprog size must be EINVAL");
+        }
+        fprog[0..2].copy_from_slice(&0u16.to_ne_bytes());
+        if setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &fprog) != Some(EINVAL) {
+            return Err("zero-length classic filter must be EINVAL");
+        }
+        let invalid_filter = [0u8; 8]; // BPF_LD | BPF_IMM, not a final RET.
+        fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        fprog[8..16].copy_from_slice(&(invalid_filter.as_ptr() as u64).to_ne_bytes());
+        if setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &fprog) != Some(EINVAL) {
+            return Err("invalid classic-filter image must be EINVAL");
+        }
+        fprog[8..16].copy_from_slice(&0u64.to_ne_bytes());
+        if setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &fprog) != Some(EFAULT) {
+            return Err("unreadable classic-filter image must be EFAULT");
+        }
+
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        if set_int(fd, SOL_SOCKET, SO_SNDBUFFORCE, 4096) != Some(EPERM)
+            || set_int(fd, SOL_SOCKET, SO_RCVBUFFORCE, 4096) != Some(EPERM)
+        {
+            return Err("unprivileged forced socket buffer must be EPERM");
+        }
+        if setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &[0; 3]) != Some(EINVAL) {
+            return Err("short forced-buffer value must be EINVAL before capability check");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_logind_sockopts_match_linux
 );
 
 fn smoke_abi_socket_errno_ipv6_v6only_is_explicitly_supported() -> TestResult {

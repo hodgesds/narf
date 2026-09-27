@@ -1763,6 +1763,9 @@ fn open_impl(
                         narf_filesystem::FsError::NoSuchProcess => 3,     // ESRCH
                         narf_filesystem::FsError::PermissionDenied => 13, // EACCES
                         narf_filesystem::FsError::OperationNotPermitted => 1, // EPERM
+                        narf_filesystem::FsError::BadAddress => 14,       // EFAULT
+                        narf_filesystem::FsError::NotImplemented => 38,   // ENOSYS
+                        narf_filesystem::FsError::AlreadyExists => 17,    // EEXIST
                         narf_filesystem::FsError::Io(_) => 5,             // EIO
                         narf_filesystem::FsError::InvalidPath
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
@@ -4554,6 +4557,9 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::NoSuchProcess => 3, // ESRCH
         narf_filesystem::FsError::PermissionDenied => 13,
         narf_filesystem::FsError::OperationNotPermitted => 1,
+        narf_filesystem::FsError::BadAddress => 14,
+        narf_filesystem::FsError::NotImplemented => 38,
+        narf_filesystem::FsError::AlreadyExists => 17,
         narf_filesystem::FsError::Io(_) => 5,
         narf_filesystem::FsError::InvalidPath
         | narf_filesystem::FsError::InvalidData
@@ -5165,6 +5171,9 @@ pub(crate) const CAP_DAC_OVERRIDE: u32 = 1;
 pub(crate) const CAP_DAC_READ_SEARCH: u32 = 2;
 pub(crate) const CAP_SETGID: u32 = 6;
 pub(crate) const CAP_SETUID: u32 = 7;
+/// `CAP_NET_ADMIN` (`include/uapi/linux/capability.h`) — forced socket-buffer
+/// sizing and other host-network administration operations.
+pub(crate) const CAP_NET_ADMIN: u32 = 12;
 /// `CAP_NET_RAW` (`include/uapi/linux/capability.h`) — raw sockets, and
 /// re-binding a socket that is already pinned to an interface.
 pub(crate) const CAP_NET_RAW: u32 = 13;

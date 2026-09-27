@@ -357,6 +357,7 @@ fn smoke_atomic_add_crtc_update_active() -> TestResult {
         active: true,
         mode: Some(Mode::XGA_60),
         mode_changed: true,
+        active_changed: true,
         connectors_changed: false,
     });
 
@@ -459,6 +460,7 @@ fn smoke_atomic_check_only_happy_path() -> TestResult {
         active: true,
         mode: Some(Mode::XGA_60),
         mode_changed: true,
+        active_changed: true,
         connectors_changed: false,
     });
     state.connectors.push(ConnectorState {
@@ -523,6 +525,7 @@ fn smoke_atomic_check_only_rejects_invalid_mode() -> TestResult {
             bpp: 32,
         }),
         mode_changed: true,
+        active_changed: true,
         connectors_changed: false,
     });
     state.planes.push(PlaneState {
@@ -620,6 +623,7 @@ fn smoke_atomic_commit_applies_crtc_mode() -> TestResult {
             bpp: 32,
         }),
         mode_changed: true,
+        active_changed: true,
         connectors_changed: false,
     });
     state.connectors.push(ConnectorState {
@@ -710,6 +714,7 @@ fn smoke_atomic_commit_page_flip_updates_primary_fb() -> TestResult {
             active: true,
             mode: Some(Mode::FHD_60),
             mode_changed: true,
+            active_changed: true,
             connectors_changed: false,
         });
         state.connectors.push(ConnectorState {
@@ -969,6 +974,7 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
             bpp: 32,
         }),
         mode_changed: true,
+        active_changed: true,
         connectors_changed: false,
     });
     state.connectors.push(ConnectorState {

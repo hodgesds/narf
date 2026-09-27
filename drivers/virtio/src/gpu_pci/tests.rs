@@ -34,13 +34,32 @@ kernel_test_in!(
     smoke_virtio_gpu_virgl_offer_detection
 );
 
+fn smoke_virtio_gpu_virgl_command_capacity() -> TestResult {
+    // Direct Linux/CachyOS traces show these pre-resource screen-init streams;
+    // NARF's former one-page staging buffer rejected all three.
+    for size in [4_136, 9_504, 18_412] {
+        if !super::virgl_command_fits(size) {
+            return TestResult::Fail("Mesa VirGL initialization command does not fit");
+        }
+    }
+    if super::virgl_command_fits(super::MAX_VIRGL_COMMAND_BYTES + 1) {
+        return TestResult::Fail("VirGL command capacity has no upper bound");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_virgl_command_capacity
+);
+
 fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
     use super::cmd::{
         build_ctx_create, build_resource_create_3d, build_resource_create_blob, build_submit_3d,
-        read_hdr, MemEntry, ResourceCreate3D, CTX_CREATE_LEN, RESOURCE_CREATE_3D_LEN,
-        RESOURCE_CREATE_BLOB_HDR_LEN, SUBMIT_3D_PREFIX_LEN, VIRTIO_GPU_CMD_CTX_CREATE,
-        VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
-        VIRTIO_GPU_CMD_SUBMIT_3D,
+        build_transfer_3d, read_hdr, MemEntry, ResourceCreate3D, Transfer3D, CTX_CREATE_LEN,
+        RESOURCE_CREATE_3D_LEN, RESOURCE_CREATE_BLOB_HDR_LEN, SUBMIT_3D_PREFIX_LEN,
+        TRANSFER_3D_LEN, VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+        VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_SUBMIT_3D,
+        VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
     };
 
     let mut ctx = [0u8; CTX_CREATE_LEN];
@@ -59,7 +78,6 @@ fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
     let mut resource = [0u8; RESOURCE_CREATE_3D_LEN];
     build_resource_create_3d(
         &mut resource,
-        7,
         ResourceCreate3D {
             resource_id: 9,
             target: 2,
@@ -75,6 +93,7 @@ fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
         },
     );
     if read_hdr(&resource).cmd_type != VIRTIO_GPU_CMD_RESOURCE_CREATE_3D
+        || read_hdr(&resource).ctx_id != 0
         || u32::from_le_bytes(resource[24..28].try_into().unwrap()) != 9
         || u32::from_le_bytes(resource[40..44].try_into().unwrap()) != 640
     {
@@ -89,6 +108,34 @@ fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
         || submit[SUBMIT_3D_PREFIX_LEN..] != commands
     {
         return TestResult::Fail("SUBMIT_3D wire shape");
+    }
+
+    let mut transfer = [0u8; TRANSFER_3D_LEN];
+    build_transfer_3d(
+        &mut transfer,
+        VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
+        7,
+        Transfer3D {
+            resource_id: 9,
+            x: 1,
+            y: 2,
+            z: 3,
+            width: 4,
+            height: 5,
+            depth: 6,
+            offset: 0x1122_3344_5566_7788,
+            level: 8,
+            stride: 256,
+            layer_stride: 4096,
+        },
+    );
+    if read_hdr(&transfer).cmd_type != VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D
+        || read_hdr(&transfer).ctx_id != 7
+        || u64::from_le_bytes(transfer[48..56].try_into().unwrap()) != 0x1122_3344_5566_7788
+        || u32::from_le_bytes(transfer[56..60].try_into().unwrap()) != 9
+        || u32::from_le_bytes(transfer[68..72].try_into().unwrap()) != 4096
+    {
+        return TestResult::Fail("TRANSFER_FROM_HOST_3D wire shape");
     }
 
     // RESOURCE_CREATE_BLOB with one guest mem entry. Wire layout after the
@@ -286,6 +333,49 @@ fn smoke_virtio_gpu_pci_attach_backing_round_trip() -> TestResult {
 kernel_test_in!(
     "drivers/virtio/gpu_pci",
     smoke_virtio_gpu_pci_attach_backing_round_trip
+);
+
+fn smoke_virtio_gpu_pci_attach_scatter_backing() -> TestResult {
+    use super::cmd::{build_resource_attach_backing_entries, MemEntry};
+
+    let entries = [
+        MemEntry {
+            addr: 0x1000,
+            length: 4 * 1024 * 1024,
+        },
+        MemEntry {
+            addr: 0x8000_0000,
+            length: 4 * 1024 * 1024,
+        },
+        MemEntry {
+            addr: 0x9000_0000,
+            length: 512 * 1024,
+        },
+    ];
+    let mut buf = [0u8; 24 + 8 + 3 * 16];
+    let written = build_resource_attach_backing_entries(&mut buf, 0x44, &entries);
+    if written != buf.len() {
+        return TestResult::Fail("scatter attach length mismatch");
+    }
+    if u32::from_le_bytes(buf[24..28].try_into().unwrap_or_default()) != 0x44
+        || u32::from_le_bytes(buf[28..32].try_into().unwrap_or_default()) != 3
+    {
+        return TestResult::Fail("scatter attach header mismatch");
+    }
+    for (index, expected) in entries.iter().enumerate() {
+        let base = 32 + index * 16;
+        let addr = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap_or_default());
+        let len = u32::from_le_bytes(buf[base + 8..base + 12].try_into().unwrap_or_default());
+        let pad = u32::from_le_bytes(buf[base + 12..base + 16].try_into().unwrap_or_default());
+        if addr != expected.addr || len != expected.length || pad != 0 {
+            return TestResult::Fail("scatter attach entry mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_attach_scatter_backing
 );
 
 fn smoke_virtio_gpu_pci_set_scanout_round_trip() -> TestResult {

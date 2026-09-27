@@ -275,7 +275,13 @@ pub fn register_initcalls() {
             let count = drm_registry::count() as u32;
             let card_name = alloc::format!("card{}", count);
             let card = drm_devfs_bridge::VirtioGpuCard::new(card_name);
-            let mut kms = Card::new("virtio_gpu", "NARF VirtIO GPU driver", (1, 0, 0));
+            // DRM driver version MUST match Linux's virtio_gpu exactly: major=0,
+            // minor=1, patchlevel=0 (drivers/gpu/drm/virtio/virtgpu_drv.h
+            // DRIVER_MAJOR/MINOR/PATCHLEVEL). Mesa's virgl DRM winsys gates on
+            // version_major == 0; reporting major=1 makes it reject the device as
+            // "not a virtio_gpu it understands" and drop to llvmpipe instead of
+            // taking the classic-VirGL path.
+            let mut kms = Card::new("virtio_gpu", "NARF VirtIO GPU driver", (0, 1, 0));
             kms.crtcs.push(Crtc {
                 id: 1,
                 mode: Some(Mode {

@@ -20,6 +20,7 @@
 //! - `struct drm_crtc` in `include/drm/drm_crtc.h`.
 
 use super::gem::GemTable;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 // ── Connector ──────────────────────────────────────────────────────────
@@ -226,6 +227,24 @@ pub struct DumbBacking {
     pub refcount: u32,
 }
 
+/// A VirGL object imported through PRIME into the primary node's GEM
+/// namespace. The GEM handle contributes one reference and every framebuffer
+/// created from it contributes another, matching Linux GEM ownership.
+#[derive(Debug)]
+pub(crate) struct VirtGpuImport {
+    pub(crate) gem_handle: u32,
+    pub(crate) resource: Arc<crate::drm_ioctl_bridge::VirtGpuResource>,
+    pub(crate) refcount: u32,
+}
+
+/// Userspace-created KMS property blob. Atomic modesets use these to pass a
+/// `drm_mode_modeinfo` through the CRTC `MODE_ID` property.
+#[derive(Debug)]
+pub(crate) struct PropertyBlob {
+    pub(crate) id: u32,
+    pub(crate) data: Vec<u8>,
+}
+
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
 ///
 /// Linux analogue: `struct drm_device` + `drm_mode_config`.
@@ -256,6 +275,12 @@ pub struct Card {
     /// Dumb-buffer physical backings. Kept alive here so the memory
     /// is freed when the GEM handle is destroyed (DESTROY_DUMB / GEM_CLOSE).
     pub dumb_backings: Vec<DumbBacking>,
+    /// VirGL resources imported from a render-node dma-buf for KMS scanout.
+    pub(crate) virtgpu_imports: Vec<VirtGpuImport>,
+    /// KMS property blobs created through MODE_CREATEPROPBLOB.
+    pub(crate) property_blobs: Vec<PropertyBlob>,
+    /// Next non-zero property-blob id.
+    pub(crate) next_property_blob_id: u32,
     /// Pending DRM events (`drm_event_vblank` for PAGE_FLIP completion),
     /// drained by `read(/dev/dri/cardN)`. A compositor render loop
     /// PAGE_FLIPs with DRM_MODE_PAGE_FLIP_EVENT, then poll/read()s these.
@@ -344,6 +369,9 @@ impl Card {
             next_fb_id: 1,
             gem: GemTable::new(),
             dumb_backings: Vec::new(),
+            virtgpu_imports: Vec::new(),
+            property_blobs: Vec::new(),
+            next_property_blob_id: 1,
             events: alloc::collections::VecDeque::new(),
             vblank_seq: 0,
             next_vblank_ns: 0,
@@ -559,6 +587,87 @@ impl Card {
             .find(|b| b.gem_handle == gem_handle)
     }
 
+    /// Look up a PRIME-imported VirGL resource by its local GEM handle.
+    pub(crate) fn virtgpu_import(
+        &self,
+        gem_handle: u32,
+    ) -> Option<&Arc<crate::drm_ioctl_bridge::VirtGpuResource>> {
+        self.virtgpu_imports
+            .iter()
+            .find(|entry| entry.gem_handle == gem_handle)
+            .map(|entry| &entry.resource)
+    }
+
+    /// Register a shared VirGL object under an exact per-open handle.
+    pub(crate) fn register_virtgpu_import(
+        &mut self,
+        handle: u32,
+        resource: Arc<crate::drm_ioctl_bridge::VirtGpuResource>,
+    ) -> Result<(), CardError> {
+        self.gem
+            .alloc_at(handle, 0, resource.len())
+            .map_err(|_| CardError::BadGemHandle)?;
+        self.virtgpu_imports.push(VirtGpuImport {
+            gem_handle: handle,
+            resource,
+            refcount: 1,
+        });
+        Ok(())
+    }
+
+    /// Drop one GEM/framebuffer reference to an imported VirGL object.
+    pub(crate) fn remove_virtgpu_import(&mut self, handle: u32) -> bool {
+        let Some(pos) = self
+            .virtgpu_imports
+            .iter()
+            .position(|entry| entry.gem_handle == handle)
+        else {
+            return false;
+        };
+        let entry = &mut self.virtgpu_imports[pos];
+        entry.refcount = entry.refcount.saturating_sub(1);
+        if entry.refcount != 0 {
+            return true;
+        }
+        self.virtgpu_imports.swap_remove(pos);
+        let _ = self.gem.free(handle);
+        true
+    }
+
+    /// Register a userspace KMS property blob and return its object id.
+    pub(crate) fn create_property_blob(&mut self, data: Vec<u8>) -> Result<u32, CardError> {
+        if data.is_empty() {
+            return Err(CardError::InvalidDimensions);
+        }
+        if self.property_blobs.len() >= 4096 {
+            return Err(CardError::TooManyFbs);
+        }
+        let mut id = self.next_property_blob_id.max(1);
+        while self.property_blobs.iter().any(|blob| blob.id == id) {
+            id = id.wrapping_add(1).max(1);
+        }
+        self.next_property_blob_id = id.wrapping_add(1).max(1);
+        self.property_blobs.push(PropertyBlob { id, data });
+        Ok(id)
+    }
+
+    /// Look up a KMS property blob by id.
+    pub(crate) fn property_blob(&self, id: u32) -> Option<&[u8]> {
+        self.property_blobs
+            .iter()
+            .find(|blob| blob.id == id)
+            .map(|blob| blob.data.as_slice())
+    }
+
+    /// Destroy a KMS property blob. Returns false for an unknown id.
+    pub(crate) fn destroy_property_blob(&mut self, id: u32) -> bool {
+        let Some(pos) = self.property_blobs.iter().position(|blob| blob.id == id) else {
+            return false;
+        };
+        self.property_blobs.swap_remove(pos);
+        true
+    }
+
     /// Look up a dumb backing by mmap offset.
     pub fn dumb_backing_by_offset(&self, mmap_offset: u64) -> Option<&DumbBacking> {
         self.dumb_backings
@@ -704,6 +813,12 @@ impl Card {
             .find(|b| b.gem_handle == gem_handle)
         {
             b.refcount = b.refcount.saturating_add(1);
+        } else if let Some(imported) = self
+            .virtgpu_imports
+            .iter_mut()
+            .find(|entry| entry.gem_handle == gem_handle)
+        {
+            imported.refcount = imported.refcount.saturating_add(1);
         }
         self.framebuffers.push(Framebuffer {
             id,
@@ -729,7 +844,11 @@ impl Card {
             .position(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)?;
         let fb = self.framebuffers.swap_remove(pos);
-        Ok(self.remove_dumb_backing(fb.gem_handle))
+        let freed = self.remove_dumb_backing(fb.gem_handle);
+        if freed.is_none() {
+            self.remove_virtgpu_import(fb.gem_handle);
+        }
+        Ok(freed)
     }
 
     /// Look up a framebuffer by id.

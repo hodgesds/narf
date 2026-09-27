@@ -102,6 +102,9 @@ pub struct CrtcState {
     /// Was the mode changed in this commit?  Tracked so the dispatcher
     /// can reject page-flip-only commits that try to switch modes.
     pub mode_changed: bool,
+    /// Did the CRTC active state change? Linux includes this in
+    /// `drm_atomic_crtc_needs_modeset` independently of the mode.
+    pub active_changed: bool,
     /// Was the connector binding changed?
     pub connectors_changed: bool,
 }
@@ -110,7 +113,7 @@ impl CrtcState {
     /// Did this commit ask for a full modeset?  Linux uses
     /// `drm_atomic_crtc_needs_modeset` for the same predicate.
     pub fn needs_modeset(&self) -> bool {
-        self.mode_changed || self.connectors_changed
+        self.mode_changed || self.active_changed || self.connectors_changed
     }
 }
 
@@ -383,8 +386,8 @@ pub struct DrmModeAtomic {
 /// `DRM_MODE_ATOMIC_ALLOW_MODESET` — caller permits modeset.
 pub const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 /// `DRM_MODE_ATOMIC_TEST_ONLY` — run `atomic_check` only, don't commit.
-pub const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0200;
+pub const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
 /// `DRM_MODE_ATOMIC_NONBLOCK` — return without waiting for pageflip.
-pub const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0100;
+pub const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
 /// `DRM_MODE_PAGE_FLIP_EVENT` — emit a flip-complete event.
 pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x0001;

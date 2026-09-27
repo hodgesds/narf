@@ -124,6 +124,8 @@ pub struct DriCardFile {
     /// GETPARAM/GET_CAPS/CONTEXT_INIT there. Kept even for a non-virtio card;
     /// the dispatcher is gated on the card's advertised driver name.
     virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
+    /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
+    client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -155,6 +157,7 @@ impl DriCardFile {
             open_id,
             metadata,
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
+            client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
         })
     }
 }
@@ -167,8 +170,11 @@ impl Drop for DriCardFile {
         // if teardown fails, `release_virtgpu_resource` retains the backing
         // rather than free pages a live host resource may still DMA into.
         let ctx_id = self.virtgpu.ctx_id();
-        for resource in self.virtgpu.drain_resources() {
-            crate::drm_ioctl_bridge::release_virtgpu_resource(ctx_id, resource);
+        for (handle, resource, attached) in self.virtgpu.drain_resources() {
+            crate::drm_ioctl_bridge::release_virtgpu_resource(ctx_id, resource, attached);
+            if let Some(mode_state) = crate::drm_registry::mode_state(self.index) {
+                mode_state.lock().remove_virtgpu_import(handle);
+            }
         }
         // drm_master_release: if this fd held DRM master, drop it so the device
         // is free for the next session's SET_MASTER (greeter→user handoff).
@@ -323,17 +329,23 @@ impl FileOps for DriCardFile {
         // `Unsupported` for non-VIRTGPU cmds). Without this the card-node
         // probe returned ENOTTY and Mesa dropped every GL client to llvmpipe.
         if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
-            match crate::drm_ioctl_bridge::dispatch_virtgpu_render(cmd, arg, &self.virtgpu) {
+            match crate::drm_ioctl_bridge::dispatch_virtgpu_render_for_card(
+                self.index,
+                cmd,
+                arg,
+                &self.virtgpu,
+            ) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
         }
-        crate::drm_ioctl_bridge::dispatch_card(
+        crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
             self.open_id,
             cmd,
             arg,
             /*render*/ false,
+            &self.client_caps,
         )
     }
 
@@ -356,6 +368,42 @@ impl FileOps for DriCardFile {
     /// on this card as a fresh dma-buf fd.
     fn as_drm_card_index(&self) -> Option<u32> {
         Some(self.index)
+    }
+
+    fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
+            return Err(FsError::Unsupported);
+        };
+        Ok(Arc::new(VirtGpuPrimeDmaBufFile { resource }))
+    }
+
+    fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        let prime = dmabuf
+            .as_any()
+            .and_then(|any| any.downcast_ref::<VirtGpuPrimeDmaBufFile>())
+            .ok_or(FsError::InvalidData)?;
+        if let Some(handle) = self.virtgpu.handle_for_resource(&prime.resource) {
+            return Ok(handle);
+        }
+        let mode_state = crate::drm_registry::mode_state(self.index).ok_or(FsError::InvalidData)?;
+        let handle = loop {
+            let candidate = self.virtgpu.allocate_handle();
+            if mode_state.lock().gem.lookup(candidate).is_none() {
+                break candidate;
+            }
+        };
+        mode_state
+            .lock()
+            .register_virtgpu_import(handle, Arc::clone(&prime.resource))
+            .map_err(|_| FsError::OutOfMemory)?;
+        if let Err(error) = self
+            .virtgpu
+            .import_resource(handle, Arc::clone(&prime.resource))
+        {
+            mode_state.lock().remove_virtgpu_import(handle);
+            return Err(error);
+        }
+        Ok(handle)
     }
 }
 
@@ -460,6 +508,60 @@ impl FileOps for PrimeDmaBufFile {
     }
 }
 
+/// A dma-buf exporting a real VirtIO-GPU resource. Unlike the legacy dumb
+/// buffer wrapper above, this carries the shared host resource identity so an
+/// importing DRM open can attach that exact object to its own VirGL context.
+#[derive(Debug)]
+struct VirtGpuPrimeDmaBufFile {
+    resource: Arc<crate::drm_ioctl_bridge::VirtGpuResource>,
+}
+
+impl FileOps for VirtGpuPrimeDmaBufFile {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::InvalidData) })
+    }
+
+    fn stat(&self) -> Stat {
+        let size = self.resource.len() as u64;
+        Stat {
+            size,
+            blocks: size.div_ceil(512),
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if !self.resource.is_cpu_mappable()
+            || offset & 0xfff != 0
+            || len == 0
+            || len & 0xfff != 0
+            || (offset as usize).saturating_add(len) > self.resource.len()
+        {
+            return Err(FsError::InvalidData);
+        }
+        let first = offset as usize / 4096;
+        Ok((0..len / 4096)
+            .map(|page| self.resource.page_phys(first + page))
+            .collect())
+    }
+
+    fn mmap_lifetime(&self, _offset: u64, _len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        Some(Arc::clone(&self.resource) as Arc<dyn MmapLifetime>)
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+
 /// Export the dumb buffer named by `gem_handle` on card `card_index` as an
 /// mmap-able dma-buf `FileOps` (the `DRM_IOCTL_PRIME_HANDLE_TO_FD` export
 /// side). Registered as `narf_filesystem`'s DRM PRIME hook so the syscall
@@ -495,6 +597,8 @@ pub struct DriRenderFile {
     /// Per-open virtio-gpu resource namespace. Kept even for a non-virtio
     /// card; its dispatcher is selected by the DRM driver's advertised name.
     virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
+    /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
+    client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
 
 impl Drop for DriRenderFile {
@@ -504,8 +608,8 @@ impl Drop for DriRenderFile {
         // the backing instead: a bounded process-exit leak is preferable to a
         // host DMA use-after-free into another process's pages.
         let ctx_id = self.virtgpu.ctx_id();
-        for resource in self.virtgpu.drain_resources() {
-            crate::drm_ioctl_bridge::release_virtgpu_resource(ctx_id, resource);
+        for (_handle, resource, attached) in self.virtgpu.drain_resources() {
+            crate::drm_ioctl_bridge::release_virtgpu_resource(ctx_id, resource, attached);
         }
     }
 }
@@ -588,12 +692,13 @@ impl FileOps for DriRenderFile {
                 result => return result,
             }
         }
-        crate::drm_ioctl_bridge::dispatch_card(
+        crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
             NO_MASTER_OPEN_ID,
             cmd,
             arg,
             /*render*/ true,
+            &self.client_caps,
         )
     }
 
@@ -602,6 +707,22 @@ impl FileOps for DriRenderFile {
     /// node, not the card node, for its GBM/EGL context).
     fn as_drm_render_index(&self) -> Option<u32> {
         Some(self.index)
+    }
+
+    fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
+            return Err(FsError::NotFound);
+        };
+        Ok(Arc::new(VirtGpuPrimeDmaBufFile { resource }))
+    }
+
+    fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        let prime = dmabuf
+            .as_any()
+            .and_then(|any| any.downcast_ref::<VirtGpuPrimeDmaBufFile>())
+            .ok_or(FsError::InvalidData)?;
+        self.virtgpu
+            .import_resource_new_handle(Arc::clone(&prime.resource))
     }
 
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
@@ -655,6 +776,7 @@ impl DirOps for DriDir {
                             index: idx,
                             metadata,
                             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
+                            client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
                     }
                 }
