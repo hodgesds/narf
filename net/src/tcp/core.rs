@@ -198,9 +198,14 @@ pub const TCP_NOTSENT_LOWAT: i32 = 25;
 pub struct Tcb {
     pub id: u32,
     pub net_ns_id: u64,
+    /// Address family discriminator. IPv4 addresses remain in the compact
+    /// fields below; IPv6 TCBs use `local_addr6` / `remote_addr6`.
+    pub is_ipv6: bool,
     pub local_addr: [u8; 4],
     pub local_port: u16,
     pub remote_addr: [u8; 4],
+    pub local_addr6: [u8; 16],
+    pub remote_addr6: [u8; 16],
     pub remote_port: u16,
     pub remote_mac: [u8; 6],
     pub state: TcpState,
@@ -344,15 +349,19 @@ fn emit_tcb_frame(
     send: iface::SendFn,
     mut frame: Vec<u8>,
 ) {
-    let net_ns_id = arc.lock().net_ns_id;
+    let (net_ns_id, is_ipv6) = {
+        let tcb = arc.lock();
+        (tcb.net_ns_id, tcb.is_ipv6)
+    };
     if frame.len() < crate::pkt::ETH_HDR_LEN {
         return;
     }
-    if crate::tcp_stack::nf_tx_filter_in(
-        net_ns_id,
-        iface_name,
-        &mut frame[crate::pkt::ETH_HDR_LEN..],
-    ) == crate::netfilter::Verdict::Accept
+    if is_ipv6
+        || crate::tcp_stack::nf_tx_filter_in(
+            net_ns_id,
+            iface_name,
+            &mut frame[crate::pkt::ETH_HDR_LEN..],
+        ) == crate::netfilter::Verdict::Accept
     {
         let _ = send(&frame);
     }
@@ -387,9 +396,12 @@ impl Tcb {
         Self {
             id,
             net_ns_id: 0,
+            is_ipv6: false,
             local_addr,
             local_port,
             remote_addr,
+            local_addr6: [0; 16],
+            remote_addr6: [0; 16],
             remote_port,
             remote_mac,
             state: TcpState::Closed,
@@ -451,6 +463,29 @@ impl Tcb {
 
     pub fn new_listener(id: u32, local_addr: [u8; 4], local_port: u16, backlog: usize) -> Self {
         let mut t = Self::new_active(id, local_addr, local_port, [0; 4], 0, [0; 6], 0);
+        t.state = TcpState::Listen;
+        t.backlog = backlog.max(1);
+        t
+    }
+
+    pub fn new_active6(
+        id: u32,
+        local_addr: [u8; 16],
+        local_port: u16,
+        remote_addr: [u8; 16],
+        remote_port: u16,
+        remote_mac: [u8; 6],
+        iss: u32,
+    ) -> Self {
+        let mut t = Self::new_active(id, [0; 4], local_port, [0; 4], remote_port, remote_mac, iss);
+        t.is_ipv6 = true;
+        t.local_addr6 = local_addr;
+        t.remote_addr6 = remote_addr;
+        t
+    }
+
+    pub fn new_listener6(id: u32, local_addr: [u8; 16], local_port: u16, backlog: usize) -> Self {
+        let mut t = Self::new_active6(id, local_addr, local_port, [0; 16], 0, [0; 6], 0);
         t.state = TcpState::Listen;
         t.backlog = backlog.max(1);
         t
@@ -545,6 +580,7 @@ const CONN_SHARDS: usize = 32;
 /// Connected-TCB key: (remote_ip, remote_port, local_ip, local_port),
 /// IPs packed big-endian. Uniquely identifies a non-LISTEN TCB.
 type ConnKey = (u64, u32, u16, u32, u16);
+type ConnKey6 = (u64, [u8; 16], u16, [u8; 16], u16);
 
 #[inline]
 fn conn_key(
@@ -585,6 +621,10 @@ fn conn_shard(k: &ConnKey) -> usize {
 static CONN_INDEX: [IrqSafeSpinLock<Option<BTreeMap<ConnKey, Arc<IrqSafeSpinLock<Tcb>>>>>;
     CONN_SHARDS] = [const { IrqSafeSpinLock::new(None) }; CONN_SHARDS];
 
+#[allow(clippy::type_complexity)]
+static CONN_INDEX6: IrqSafeSpinLock<Option<BTreeMap<ConnKey6, Arc<IrqSafeSpinLock<Tcb>>>>> =
+    IrqSafeSpinLock::new(None);
+
 /// Listener index: (local_ip, local_port) → SO_REUSEPORT group. Far
 /// lower frequency than the connected path (per-SYN, not per-segment),
 /// so a single lock is fine.
@@ -592,6 +632,84 @@ static CONN_INDEX: [IrqSafeSpinLock<Option<BTreeMap<ConnKey, Arc<IrqSafeSpinLock
 static LISTEN_INDEX: IrqSafeSpinLock<
     Option<BTreeMap<(u64, u32, u16), alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>>>>,
 > = IrqSafeSpinLock::new(None);
+
+#[allow(clippy::type_complexity)]
+static LISTEN_INDEX6: IrqSafeSpinLock<
+    Option<BTreeMap<(u64, [u8; 16], u16), alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>>>>,
+> = IrqSafeSpinLock::new(None);
+
+fn conn_index6_insert(key: ConnKey6, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    CONN_INDEX6
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(key, arc.clone());
+}
+
+fn conn_index6_remove(key: ConnKey6) {
+    if let Some(map) = CONN_INDEX6.lock().as_mut() {
+        map.remove(&key);
+    }
+}
+
+fn conn_index6_lookup(key: ConnKey6) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
+    CONN_INDEX6
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&key).cloned())
+}
+
+fn listen_index6_insert(
+    net_ns_id: u64,
+    local: [u8; 16],
+    local_port: u16,
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+) {
+    LISTEN_INDEX6
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .entry((net_ns_id, local, local_port))
+        .or_default()
+        .push(arc.clone());
+}
+
+fn listen_index6_remove(
+    net_ns_id: u64,
+    local: [u8; 16],
+    local_port: u16,
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+) {
+    let key = (net_ns_id, local, local_port);
+    let mut index = LISTEN_INDEX6.lock();
+    if let Some(map) = index.as_mut() {
+        if let Some(group) = map.get_mut(&key) {
+            group.retain(|entry| !Arc::ptr_eq(entry, arc));
+            if group.is_empty() {
+                map.remove(&key);
+            }
+        }
+    }
+}
+
+fn listen_index6_group(
+    net_ns_id: u64,
+    dst: [u8; 16],
+    port: u16,
+) -> alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>> {
+    let mut out = Vec::new();
+    let index = LISTEN_INDEX6.lock();
+    let Some(map) = index.as_ref() else {
+        return out;
+    };
+    if let Some(group) = map.get(&(net_ns_id, dst, port)) {
+        out.extend(group.iter().cloned());
+    }
+    if dst != [0; 16] {
+        if let Some(group) = map.get(&(net_ns_id, [0; 16], port)) {
+            out.extend(group.iter().cloned());
+        }
+    }
+    out
+}
 
 fn conn_index_insert(key: ConnKey, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let mut g = CONN_INDEX[conn_shard(&key)].lock();
@@ -676,7 +794,7 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
     let id = tcb.id;
     // Compute the index key from immutable fields BEFORE moving `tcb`.
     let is_listen = tcb.state == TcpState::Listen;
-    let conn_k = (!is_listen).then(|| {
+    let conn_k = (!is_listen && !tcb.is_ipv6).then(|| {
         conn_key(
             tcb.net_ns_id,
             tcb.remote_addr,
@@ -685,7 +803,17 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
             tcb.local_port,
         )
     });
-    let listen_k = is_listen.then_some((tcb.net_ns_id, tcb.local_addr, tcb.local_port));
+    let conn_k6 = (!is_listen && tcb.is_ipv6).then_some((
+        tcb.net_ns_id,
+        tcb.remote_addr6,
+        tcb.remote_port,
+        tcb.local_addr6,
+        tcb.local_port,
+    ));
+    let listen_k =
+        (is_listen && !tcb.is_ipv6).then_some((tcb.net_ns_id, tcb.local_addr, tcb.local_port));
+    let listen_k6 =
+        (is_listen && tcb.is_ipv6).then_some((tcb.net_ns_id, tcb.local_addr6, tcb.local_port));
     let arc = Arc::new(IrqSafeSpinLock::new(tcb));
     {
         let mut g = TCB_TABLE[tcb_shard(id)].lock();
@@ -696,8 +824,14 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
     if let Some(k) = conn_k {
         conn_index_insert(k, &arc);
     }
+    if let Some(k) = conn_k6 {
+        conn_index6_insert(k, &arc);
+    }
     if let Some((ns, la, lp)) = listen_k {
         listen_index_insert(ns, la, lp, &arc);
+    }
+    if let Some((ns, la, lp)) = listen_k6 {
+        listen_index6_insert(ns, la, lp, &arc);
     }
     (id, arc)
 }
@@ -716,25 +850,43 @@ pub fn lookup_tcb(id: u32) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
     g.as_ref().and_then(|m| m.get(&id).cloned())
 }
 
+pub fn endpoints6(id: u32) -> Option<([u8; 16], u16, [u8; 16], u16)> {
+    let tcb = lookup_tcb(id)?;
+    let tcb = tcb.lock();
+    tcb.is_ipv6.then_some((
+        tcb.local_addr6,
+        tcb.local_port,
+        tcb.remote_addr6,
+        tcb.remote_port,
+    ))
+}
+
 /// Remove a TCB from the table (and its fast-lookup index entry).
 pub fn remove_tcb(id: u32) {
     // Resolve the TCB first so we can drop its index entry by its
     // (immutable) key. Read fields under the per-TCB lock, then DROP
     // that lock before touching the indexes (no nested locking).
     if let Some(arc) = lookup_tcb(id) {
-        let (ns, is_listen, la, lp, ra, rp) = {
+        let (ns, ipv6, is_listen, la, la6, lp, ra, ra6, rp) = {
             let t = arc.lock();
             (
                 t.net_ns_id,
+                t.is_ipv6,
                 t.state == TcpState::Listen,
                 t.local_addr,
+                t.local_addr6,
                 t.local_port,
                 t.remote_addr,
+                t.remote_addr6,
                 t.remote_port,
             )
         };
-        if is_listen {
+        if is_listen && ipv6 {
+            listen_index6_remove(ns, la6, lp, &arc);
+        } else if is_listen {
             listen_index_remove(ns, la, lp, &arc);
+        } else if ipv6 {
+            conn_index6_remove((ns, ra6, rp, la6, lp));
         } else {
             conn_index_remove(conn_key(ns, ra, rp, la, lp));
         }
@@ -1098,6 +1250,18 @@ pub fn listen_in(
     Ok(id)
 }
 
+pub fn listen6_in(
+    net_ns_id: u64,
+    local_addr: [u8; 16],
+    local_port: u16,
+    backlog: usize,
+) -> Result<u32, ()> {
+    let id = fresh_tcb_id();
+    let backlog = narf_lib::sysctl::ipv4::clamp_backlog(backlog);
+    let tcb = Tcb::new_listener6(id, local_addr, local_port, backlog).with_net_ns(net_ns_id);
+    Ok(install_tcb(tcb).0)
+}
+
 /// Non-blocking accept. Returns Ok(Some(child_id)) when a new
 /// connection is ready, Ok(None) if the queue is empty.
 pub fn accept(listen_id: u32) -> Result<Option<u32>, ()> {
@@ -1257,6 +1421,90 @@ pub fn connect_errno_with_options_in(
             })
         }
     }
+}
+
+pub fn connect6_errno_with_options_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 16],
+    remote_port: u16,
+    options: ConnectOptions,
+) -> Result<u32, i32> {
+    let next_hop = crate::ipv6::route::lookup_in(net_ns_id, &remote_addr, None);
+    let (iface_name, neighbor) = match next_hop {
+        crate::ipv6::route::NextHop::Direct(iface) => (iface, remote_addr),
+        crate::ipv6::route::NextHop::Gateway { iface, gateway } => (iface, gateway),
+        crate::ipv6::route::NextHop::Unreachable => return Err(errno::ENETUNREACH as i32),
+    };
+    if iface::lookup_in(net_ns_id, &iface_name).is_none() {
+        return Err(errno::ENETUNREACH as i32);
+    }
+    let local_addr = crate::ipv6::addrs::pick_source_in(net_ns_id, &iface_name, &remote_addr)
+        .ok_or(errno::EADDRNOTAVAIL as i32)?;
+    let mac = crate::ipv6::ndp::neigh_lookup_in(net_ns_id, &iface_name, &neighbor)
+        .ok_or(errno::EHOSTUNREACH as i32)?;
+    let id = fresh_tcb_id();
+    let iss = compute_isn();
+    let mut tcb = Tcb::new_active6(
+        id,
+        local_addr,
+        fresh_local_port(),
+        remote_addr,
+        remote_port,
+        mac,
+        iss,
+    )
+    .with_net_ns(net_ns_id);
+    tcb.state = TcpState::SynSent;
+    tcb.syn_retries = options.syn_retries.clamp(1, 127);
+    let (id, arc) = install_tcb(tcb);
+    send_syn(&arc, false);
+
+    let mut timeout_secs = 1u64;
+    let mut rto_secs = 1u64;
+    for _ in 0..options.syn_retries {
+        rto_secs = rto_secs.saturating_mul(2).min(60);
+        timeout_secs = timeout_secs.saturating_add(rto_secs);
+    }
+    let deadline =
+        narf_scheduler::narf_time::Deadline::after_ns(timeout_secs.saturating_mul(1_000_000_000));
+    let _ = narf_scheduler::responsive_spin_until(
+        || {
+            while iface::drain_pump() {}
+            tick_retransmit(&arc);
+            !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
+        },
+        deadline,
+    );
+    let (state, hard, soft) = {
+        let tcb = arc.lock();
+        (tcb.state, tcb.sk_err, tcb.sk_err_soft)
+    };
+    if state == TcpState::Established {
+        Ok(id)
+    } else {
+        remove_tcb(id);
+        release(id);
+        Err(if hard != 0 {
+            hard
+        } else if soft != 0 {
+            soft
+        } else {
+            errno::ETIMEDOUT as i32
+        })
+    }
+}
+
+pub fn connect6_errno_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 16],
+    remote_port: u16,
+) -> Result<u32, i32> {
+    connect6_errno_with_options_in(
+        net_ns_id,
+        remote_addr,
+        remote_port,
+        ConnectOptions::default(),
+    )
 }
 
 fn compute_isn() -> u32 {
@@ -1690,39 +1938,127 @@ fn build_frame(
     frame
 }
 
-fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
-    let (net_ns_id, dst_for_iface) = {
-        let t = arc.lock();
-        (t.net_ns_id, t.remote_addr)
-    };
-    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
-        Some(i) => i,
-        None => return,
-    };
-    let (
-        src_ip,
-        dst_ip,
+#[allow(clippy::too_many_arguments)]
+fn build_frame6(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: Vec<u8>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let tcp_hdr_len = TCP_HDR_MIN + options.len();
+    let hdr = TcpHeader {
         src_port,
         dst_port,
-        our_iss,
-        ack,
-        peer_dst_mac,
-        mss,
-        our_wscale,
-        our_ts,
-        peer_tsval,
-        negotiated,
-    ) = {
-        let t = arc.lock();
-        let our_ts = tsval_now();
-        (
+        sequence: seq,
+        acknowledgement: ack,
+        header_len: tcp_hdr_len as u8,
+        flags,
+        window,
+        checksum: 0,
+        urgent_ptr: 0,
+        options,
+    };
+    let mut segment = hdr.encode();
+    segment.extend_from_slice(payload);
+    let checksum = crate::pkt_ipv6::pseudo_checksum(
+        src_ip,
+        dst_ip,
+        crate::pkt_ipv6::NEXT_HEADER_TCP,
+        &segment,
+    );
+    segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+    let mut frame = Vec::new();
+    crate::ipv6_stack::build_frame(
+        &mut frame,
+        crate::ipv6_stack::Ipv6FrameSpec {
+            src_mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            next_header: crate::pkt_ipv6::NEXT_HEADER_TCP,
+            hop_limit: 64,
+            body: &segment,
+        },
+    );
+    frame
+}
+
+fn iface_for_tcb(t: &Tcb) -> Option<crate::iface::NetIfaceSnapshot> {
+    if !t.is_ipv6 {
+        return iface::for_dst_in(t.net_ns_id, t.remote_addr);
+    }
+    let next_hop = crate::ipv6::route::lookup_in(t.net_ns_id, &t.remote_addr6, None);
+    let name = match next_hop {
+        crate::ipv6::route::NextHop::Direct(name)
+        | crate::ipv6::route::NextHop::Gateway { iface: name, .. } => name,
+        crate::ipv6::route::NextHop::Unreachable => return None,
+    };
+    iface::lookup_in(t.net_ns_id, &name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tcb_frame(
+    t: &Tcb,
+    src_mac: [u8; 6],
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: Vec<u8>,
+    payload: &[u8],
+) -> Vec<u8> {
+    if t.is_ipv6 {
+        build_frame6(
+            src_mac,
+            t.remote_mac,
+            t.local_addr6,
+            t.remote_addr6,
+            t.local_port,
+            t.remote_port,
+            seq,
+            ack,
+            flags,
+            window,
+            options,
+            payload,
+        )
+    } else {
+        build_frame(
+            src_mac,
+            t.remote_mac,
             t.local_addr,
             t.remote_addr,
             t.local_port,
             t.remote_port,
+            seq,
+            ack,
+            flags,
+            window,
+            options,
+            payload,
+        )
+    }
+}
+
+fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
+    let iface = match iface_for_tcb(&arc.lock()) {
+        Some(i) => i,
+        None => return,
+    };
+    let (our_iss, ack, mss, our_wscale, our_ts, peer_tsval, negotiated) = {
+        let t = arc.lock();
+        let our_ts = tsval_now();
+        (
             t.iss,
             t.rcv_nxt,
-            t.remote_mac,
             t.opts.our_mss,
             DEFAULT_WSCALE,
             our_ts,
@@ -1755,13 +2091,9 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
     } else {
         FLAG_SYN
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         iface.mac,
-        peer_dst_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         our_iss,
         if ack_too { ack } else { 0 },
         flags,
@@ -1780,15 +2112,11 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
 }
 
 fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
-    let (net_ns_id, dst_for_iface) = {
-        let t = arc.lock();
-        (t.net_ns_id, t.remote_addr)
-    };
-    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
+    let iface = match iface_for_tcb(&arc.lock()) {
         Some(i) => i,
         None => return,
     };
-    let (src_ip, dst_ip, src_port, dst_port, seq, ack, peer_mac, window, opt_bytes) = {
+    let (seq, ack, window, opt_bytes) = {
         let mut t = arc.lock();
         let window = effective_advertised_window(&t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
@@ -1796,25 +2124,11 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         // Clear pending delayed-ACK + count.
         t.delayed_ack_deadline_cycles = 0;
         t.unacked_data_segments = 0;
-        (
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            t.snd_nxt,
-            t.rcv_nxt,
-            t.remote_mac,
-            window,
-            opts,
-        )
+        (t.snd_nxt, t.rcv_nxt, window, opts)
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         seq,
         ack,
         FLAG_ACK | extra_flags,
@@ -1826,43 +2140,16 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
-    let (net_ns_id, dst_for_iface) = {
-        let t = arc.lock();
-        (t.net_ns_id, t.remote_addr)
-    };
-    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
+    let iface = match iface_for_tcb(&arc.lock()) {
         Some(i) => i,
         None => return,
-    };
-    let (src_ip, dst_ip, src_port, dst_port, peer_mac) = {
-        let t = arc.lock();
-        (
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            t.remote_mac,
-        )
     };
     let flags = if ack_flag {
         FLAG_RST | FLAG_ACK
     } else {
         FLAG_RST
     };
-    let frame = build_frame(
-        iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        flags,
-        0,
-        Vec::new(),
-        &[],
-    );
+    let frame = build_tcb_frame(&arc.lock(), iface.mac, seq, ack, flags, 0, Vec::new(), &[]);
     emit_tcb_frame(arc, &iface.name, iface.send, frame);
 }
 
@@ -1887,11 +2174,7 @@ fn send_data(
         match cached {
             Some(e) => e,
             None => {
-                let (net_ns_id, dst_for_iface) = {
-                    let t = arc.lock();
-                    (t.net_ns_id, t.remote_addr)
-                };
-                let snap = match iface::for_dst_in(net_ns_id, dst_for_iface) {
+                let snap = match iface_for_tcb(&arc.lock()) {
                     Some(i) => i,
                     None => return,
                 };
@@ -1905,31 +2188,18 @@ fn send_data(
             }
         }
     };
-    let (src_ip, dst_ip, src_port, dst_port, ack, peer_mac, window, opt_bytes) = {
+    let (ack, window, opt_bytes) = {
         let mut t = arc.lock();
         let window = effective_advertised_window(&t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         t.delayed_ack_deadline_cycles = 0;
         t.unacked_data_segments = 0;
-        (
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            t.rcv_nxt,
-            t.remote_mac,
-            window,
-            opts,
-        )
+        (t.rcv_nxt, window, opts)
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         egress.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         seq,
         ack,
         FLAG_ACK | extra_flags,
@@ -2138,54 +2408,24 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     }
     // Otherwise it's data (possibly with FIN): resend the head of the
     // unacknowledged range.
-    let (
-        net_ns_id,
-        seq,
-        payload,
-        fin,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        ack,
-        window,
-        opt_bytes,
-    ) = {
+    let (seq, payload, fin, ack, window, opt_bytes) = {
         let t = arc.lock();
         let (seq, payload, fin) = retransmit_head(&t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let window = effective_advertised_window(&t);
-        (
-            t.net_ns_id,
-            seq,
-            payload,
-            fin,
-            t.remote_mac,
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            t.rcv_nxt,
-            window,
-            opts,
-        )
+        (seq, payload, fin, t.rcv_nxt, window, opts)
     };
     if payload.is_empty() && fin == 0 {
         return;
     }
-    let iface = match iface::for_dst_in(net_ns_id, dst_ip) {
+    let iface = match iface_for_tcb(&arc.lock()) {
         Some(i) => i,
         None => return,
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         seq,
         ack,
         FLAG_ACK | FLAG_PSH | fin,
@@ -2229,15 +2469,11 @@ fn tick_persist(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 }
 
 fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
-    let (net_ns_id, dst_for_iface) = {
-        let t = arc.lock();
-        (t.net_ns_id, t.remote_addr)
-    };
-    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
+    let iface = match iface_for_tcb(&arc.lock()) {
         Some(i) => i,
         None => return,
     };
-    let (seq, src_ip, dst_ip, src_port, dst_port, peer_mac, window, opt_bytes, ack) = {
+    let (seq, window, opt_bytes, ack) = {
         let mut t = arc.lock();
         let window = effective_advertised_window(&t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
@@ -2253,25 +2489,11 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles().wrapping_add(
             narf_scheduler::narf_time::ns_to_cycles(t.persist_backoff_ns),
         );
-        (
-            seq,
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            t.remote_mac,
-            window,
-            opts,
-            t.rcv_nxt,
-        )
+        (seq, window, opts, t.rcv_nxt)
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         seq,
         ack,
         FLAG_ACK,
@@ -2318,39 +2540,21 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         return;
     }
     // Send empty segment with seq = snd_una - 1 (RFC 9293 §3.8.4).
-    let (net_ns_id, dst_for_iface) = {
-        let t = arc.lock();
-        (t.net_ns_id, t.remote_addr)
-    };
-    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
+    let iface = match iface_for_tcb(&arc.lock()) {
         Some(i) => i,
         None => return,
     };
-    let (seq, src_ip, dst_ip, src_port, dst_port, peer_mac, window, opt_bytes, ack) = {
+    let (seq, window, opt_bytes, ack) = {
         let mut t = arc.lock();
         t.keepalive_probes_sent = t.keepalive_probes_sent.saturating_add(1);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let window = effective_advertised_window(&t);
-        (
-            t.snd_una.wrapping_sub(1),
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            t.remote_mac,
-            window,
-            opts,
-            t.rcv_nxt,
-        )
+        (t.snd_una.wrapping_sub(1), window, opts, t.rcv_nxt)
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         seq,
         ack,
         FLAG_ACK,
@@ -2512,6 +2716,79 @@ pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[
     send_stateless_rst(net_ns_id, src, dst, &hdr, payload_len);
 }
 
+pub fn handle_segment6_in(net_ns_id: u64, src: [u8; 16], dst: [u8; 16], segment: &[u8]) {
+    let (hdr, _) = match TcpHeader::decode(segment) {
+        Ok(header) => header,
+        Err(_) => return,
+    };
+    let key = (net_ns_id, src, hdr.src_port, dst, hdr.dst_port);
+    if let Some(arc) = conn_index6_lookup(key) {
+        process_in_state(&arc, [0; 4], [0; 4], &hdr, segment);
+        return;
+    }
+    if let Some(listener) = listen_index6_group(net_ns_id, dst, hdr.dst_port)
+        .into_iter()
+        .next()
+    {
+        accept_into_listen6(&listener, src, dst, &hdr, segment);
+        return;
+    }
+    send_stateless_rst6(
+        net_ns_id,
+        src,
+        dst,
+        &hdr,
+        segment.len().saturating_sub(hdr.header_len as usize),
+    );
+}
+
+fn send_stateless_rst6(
+    net_ns_id: u64,
+    src: [u8; 16],
+    dst: [u8; 16],
+    hdr: &TcpHeader,
+    payload_len: usize,
+) {
+    if hdr.flags & FLAG_RST != 0 || src[0] == 0xff || dst[0] == 0xff {
+        return;
+    }
+    let (seq, ack, flags) = if hdr.flags & FLAG_ACK != 0 {
+        (hdr.acknowledgement, 0, FLAG_RST)
+    } else {
+        let len = payload_len as u32
+            + (hdr.flags & FLAG_SYN != 0) as u32
+            + (hdr.flags & FLAG_FIN != 0) as u32;
+        (0, hdr.sequence.wrapping_add(len), FLAG_RST | FLAG_ACK)
+    };
+    let next_hop = crate::ipv6::route::lookup_in(net_ns_id, &src, None);
+    let (iface_name, neighbor) = match next_hop {
+        crate::ipv6::route::NextHop::Direct(iface) => (iface, src),
+        crate::ipv6::route::NextHop::Gateway { iface, gateway } => (iface, gateway),
+        crate::ipv6::route::NextHop::Unreachable => return,
+    };
+    let Some(iface) = iface::lookup_in(net_ns_id, &iface_name) else {
+        return;
+    };
+    let Some(mac) = crate::ipv6::ndp::neigh_lookup_in(net_ns_id, &iface_name, &neighbor) else {
+        return;
+    };
+    let frame = build_frame6(
+        iface.mac,
+        mac,
+        dst,
+        src,
+        hdr.dst_port,
+        hdr.src_port,
+        seq,
+        ack,
+        flags,
+        0,
+        Vec::new(),
+        &[],
+    );
+    let _ = (iface.send)(&frame);
+}
+
 /// Answer a segment that matches no connection with a reset, per RFC 9293
 /// §3.10.7.1 (CLOSED) and §3.10.7.2 (LISTEN, bad ACK): if the segment
 /// carried an ACK, `<SEQ=SEG.ACK><CTL=RST>`; otherwise
@@ -2642,6 +2919,61 @@ fn accept_into_listen(
     // ACK lands — RFC 9293 allows enqueueing once ESTABLISHED;
     // we enqueue early so a non-blocking accept can pick it up).
     let _ = cid;
+}
+
+fn accept_into_listen6(
+    listen_arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    src: [u8; 16],
+    dst: [u8; 16],
+    hdr: &TcpHeader,
+    segment: &[u8],
+) {
+    if hdr.flags & FLAG_SYN == 0 {
+        if hdr.flags & FLAG_ACK != 0 {
+            send_stateless_rst6(
+                listen_arc.lock().net_ns_id,
+                src,
+                dst,
+                hdr,
+                segment.len().saturating_sub(hdr.header_len as usize),
+            );
+        }
+        return;
+    }
+    let opts = if hdr.header_len as usize > TCP_HDR_MIN {
+        &segment[TCP_HDR_MIN..hdr.header_len as usize]
+    } else {
+        &[]
+    };
+    let parsed = ParsedOptions::parse(opts);
+    let net_ns_id = listen_arc.lock().net_ns_id;
+    let next_hop = crate::ipv6::route::lookup_in(net_ns_id, &src, None);
+    let (iface_name, neighbor) = match next_hop {
+        crate::ipv6::route::NextHop::Direct(iface) => (iface, src),
+        crate::ipv6::route::NextHop::Gateway { iface, gateway } => (iface, gateway),
+        crate::ipv6::route::NextHop::Unreachable => return,
+    };
+    let Some(mac) = crate::ipv6::ndp::neigh_lookup_in(net_ns_id, &iface_name, &neighbor) else {
+        return;
+    };
+    let id = fresh_tcb_id();
+    let mut child = Tcb::new_active6(id, dst, hdr.dst_port, src, hdr.src_port, mac, compute_isn())
+        .with_net_ns(net_ns_id);
+    child.state = TcpState::SynReceived;
+    child.irs = hdr.sequence;
+    child.rcv_nxt = hdr.sequence.wrapping_add(1);
+    child.snd_wnd = parsed
+        .wscale
+        .map(|shift| (hdr.window as u32) << shift as u32)
+        .unwrap_or(hdr.window as u32);
+    child.opts.negotiate(&parsed, DEFAULT_WSCALE);
+    if let Some((timestamp, _)) = parsed.timestamps {
+        child.opts.ts_recent = timestamp;
+        child.opts.ts_recent_at_cycles = narf_scheduler::narf_time::now_cycles();
+    }
+    child.cong.set_mss(child.opts.peer_mss as u32);
+    let (_, child) = install_tcb(child);
+    send_syn(&child, true);
 }
 
 /// State-aware processing of an arrived segment.
@@ -2872,16 +3204,41 @@ fn reuseport_flow_hash(remote_addr: [u8; 4], remote_port: u16, local_port: u16) 
     h
 }
 
+fn reuseport_flow_hash6(remote_addr: [u8; 16], remote_port: u16, local_port: u16) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in remote_addr
+        .into_iter()
+        .chain(remote_port.to_be_bytes())
+        .chain(local_port.to_be_bytes())
+    {
+        hash = (hash ^ byte as u32).wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 /// Steer a completed passive-open onto a listener's accept queue and
 /// return that listener's TCB id (for the targeted accept-ready wake).
 fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>, has_data: bool) -> Option<u32> {
-    let (net_ns_id, local_addr, local_port, remote_addr, remote_port, id) = {
+    let (
+        net_ns_id,
+        ipv6,
+        local_addr,
+        local_addr6,
+        local_port,
+        remote_addr,
+        remote_addr6,
+        remote_port,
+        id,
+    ) = {
         let t = arc.lock();
         (
             t.net_ns_id,
+            t.is_ipv6,
             t.local_addr,
+            t.local_addr6,
             t.local_port,
             t.remote_addr,
+            t.remote_addr6,
             t.remote_port,
             t.id,
         )
@@ -2891,7 +3248,11 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>, has_data: bool)
     // with one listener per worker thread, each its own kernel TCB)
     // installs several distinct Listen TCBs on the same port. The index
     // returns them in a deterministic order for a stable listener set.
-    let group = listen_index_group(net_ns_id, local_addr, local_port);
+    let group = if ipv6 {
+        listen_index6_group(net_ns_id, local_addr6, local_port)
+    } else {
+        listen_index_group(net_ns_id, local_addr, local_port)
+    };
     let listen_arc = match group.len() {
         0 => return None,
         // Single listener: the common, non-REUSEPORT case — no steering.
@@ -2900,7 +3261,11 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>, has_data: bool)
         // them by hashing its remote endpoint, so distinct flows land on
         // distinct listeners/workers/cores in parallel.
         n => {
-            let h = reuseport_flow_hash(remote_addr, remote_port, local_port);
+            let h = if ipv6 {
+                reuseport_flow_hash6(remote_addr6, remote_port, local_port)
+            } else {
+                reuseport_flow_hash(remote_addr, remote_port, local_port)
+            };
             group[(h as usize) % n].clone()
         }
     };
@@ -3230,20 +3595,7 @@ fn handle_ack(
 fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Retransmit the head of the unacknowledged range unless the peer
     // already SACKed it. This is the RFC 6675 selective-retx path.
-    let (
-        net_ns_id,
-        seq,
-        payload,
-        fin,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        window,
-        ack,
-        opt_bytes,
-    ) = {
+    let (seq, payload, fin, window, ack, opt_bytes) = {
         let t = arc.lock();
         if t.retx_queue.is_empty() || t.scoreboard.is_sacked(t.snd_una) {
             return;
@@ -3252,35 +3604,18 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let window = effective_advertised_window(&t);
-        (
-            t.net_ns_id,
-            seq,
-            payload,
-            fin,
-            t.remote_mac,
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            window,
-            t.rcv_nxt,
-            opts,
-        )
+        (seq, payload, fin, window, t.rcv_nxt, opts)
     };
     if payload.is_empty() && fin == 0 {
         return;
     }
-    let iface = match iface::for_dst_in(net_ns_id, dst_ip) {
+    let iface = match iface_for_tcb(&arc.lock()) {
         Some(i) => i,
         None => return,
     };
-    let frame = build_frame(
+    let frame = build_tcb_frame(
+        &arc.lock(),
         iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
         seq,
         ack,
         FLAG_ACK | FLAG_PSH | fin,

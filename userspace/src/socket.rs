@@ -1245,12 +1245,18 @@ enum SocketState {
         port: u16,
         backlog: u32,
         pending: VecDeque<Arc<SocketFile>>,
+        listen_id: Option<u32>,
         /// TCP_LISTEN vs bound-only, as for `InetListener`.
         listening: bool,
     },
     Inet6Connected {
         tx: Arc<RingBuf>,
         rx: Arc<RingBuf>,
+        peer_addr: [u8; 16],
+        peer_port: u16,
+    },
+    Inet6Wired {
+        tcb_id: u32,
         peer_addr: [u8; 16],
         peer_port: u16,
     },
@@ -2324,6 +2330,8 @@ impl SocketFile {
                 let _ = (peer_addr, peer_port);
                 Some(make_sockaddr_in6([0u8; 16], 0))
             }
+            SocketState::Inet6Wired { tcb_id, .. } => narf_net::tcp_stack::endpoints6(*tcb_id)
+                .map(|(local, port, _, _)| make_sockaddr_in6(local, port)),
             _ => None,
         }
     }
@@ -2369,6 +2377,11 @@ impl SocketFile {
                 peer_port,
                 ..
             } => Some(make_sockaddr_in6(*peer_addr, *peer_port)),
+            SocketState::Inet6Wired {
+                peer_addr,
+                peer_port,
+                ..
+            } => Some(make_sockaddr_in6(*peer_addr, *peer_port)),
             _ => None,
         }
     }
@@ -2394,6 +2407,7 @@ impl SocketFile {
                 | SocketState::InetDgram { .. }
                 | SocketState::Inet6Dgram { .. }
                 | SocketState::InetWired { .. }
+                | SocketState::Inet6Wired { .. }
         )
     }
 
@@ -2448,7 +2462,16 @@ impl SocketFile {
                     self.inet_tcp_release_port();
                     Reg::Inet(*addr, *port)
                 }
-                SocketState::Inet6Listener { addr, port, .. } => {
+                SocketState::Inet6Listener {
+                    addr,
+                    port,
+                    listen_id,
+                    ..
+                } => {
+                    if let Some(id) = listen_id {
+                        narf_net::tcp_stack::remove_tcb(*id);
+                        crate::handlers::clear_tcb_owner(*id);
+                    }
                     self.inet6_release_port();
                     Reg::Inet6(*addr, *port)
                 }
@@ -2471,7 +2494,9 @@ impl SocketFile {
                     port_locked,
                     ..
                 } => Reg::Inet6Dgram(*local_port, *port_locked),
-                SocketState::InetWired { tcb_id, .. } => Reg::Tcb(*tcb_id),
+                SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                    Reg::Tcb(*tcb_id)
+                }
                 _ => Reg::None,
             }
         };
@@ -2506,11 +2531,12 @@ impl SocketFile {
             }
             Reg::Inet6(a, p) => {
                 if let Some(map) = INET6_LISTENERS.lock().as_mut() {
+                    let key = (self.net_ns_id(), a, p);
                     if map
-                        .get(&(a, p))
+                        .get(&key)
                         .is_some_and(|l| core::ptr::eq(Arc::as_ptr(l), self))
                     {
-                        map.remove(&(a, p));
+                        map.remove(&key);
                     }
                 }
             }
@@ -2916,7 +2942,9 @@ impl FileOps for SocketFile {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
             | SocketState::Inet6Connected { rx, tx, .. } => D::Connected(rx.clone(), tx.clone()),
-            SocketState::InetWired { tcb_id, .. } => D::Wired(*tcb_id),
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                D::Wired(*tcb_id)
+            }
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => D::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
@@ -3012,7 +3040,9 @@ impl SocketFile {
             // Kernel-TCP-over-NIC (off-box redis/servers): a durable per-TCB
             // cell, fed POLL_IN by the stack's RX wake and reconciled to the
             // live level below. Off the state lock (the cell is keyed by id).
-            SocketState::InetWired { tcb_id, .. } => Arm::Wired(*tcb_id),
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Arm::Wired(*tcb_id)
+            }
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
@@ -3166,8 +3196,24 @@ impl SocketFile {
                     0
                 }
             }
-            SocketState::UnixListener { pending, .. }
-            | SocketState::Inet6Listener { pending, .. } => {
+            SocketState::Inet6Listener {
+                pending, listen_id, ..
+            } => {
+                let ready = !pending.is_empty()
+                    || listen_id
+                        .map(narf_net::tcp_stack::listen_has_pending)
+                        .unwrap_or(false);
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
+                if ready {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }
+            }
+            SocketState::UnixListener { pending, .. } => {
                 let ready = !pending.is_empty();
                 self.listener_readiness.set(
                     if ready { narf_filesystem::POLL_IN } else { 0 },
@@ -3228,7 +3274,7 @@ impl SocketFile {
                 );
                 bits
             }
-            SocketState::InetWired { tcb_id, .. } => {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                 // Kernel-TCP-over-NIC: always writable (the stack
                 // queues + flow-controls send), and POLL_IN when the
                 // TCB has buffered RX data or the peer has closed
@@ -4141,7 +4187,9 @@ impl SocketFile {
         if level == IPPROTO_TCP {
             let tcb_id = {
                 let state = self.state.lock();
-                if let SocketState::InetWired { tcb_id, .. } = &*state {
+                if let SocketState::InetWired { tcb_id, .. }
+                | SocketState::Inet6Wired { tcb_id, .. } = &*state
+                {
                     Some(*tcb_id)
                 } else {
                     None
@@ -4189,7 +4237,9 @@ impl SocketFile {
         if level == SOL_SOCKET && name == SO_KEEPALIVE {
             let tcb_id = {
                 let state = self.state.lock();
-                if let SocketState::InetWired { tcb_id, .. } = &*state {
+                if let SocketState::InetWired { tcb_id, .. }
+                | SocketState::Inet6Wired { tcb_id, .. } = &*state
+                {
                     Some(*tcb_id)
                 } else {
                     None
@@ -4800,7 +4850,8 @@ impl SocketFile {
             let mut val = self.take_pending_error().map_or(0, |e| e.errno());
             if val == 0 {
                 let tcb = match &*self.state.lock() {
-                    SocketState::InetWired { tcb_id, .. } => Some(*tcb_id),
+                    SocketState::InetWired { tcb_id, .. }
+                    | SocketState::Inet6Wired { tcb_id, .. } => Some(*tcb_id),
                     _ => None,
                 };
                 if let Some(id) = tcb {
@@ -4926,7 +4977,10 @@ impl SocketFile {
                     dst[off..off + 4].copy_from_slice(&value.to_ne_bytes());
                 };
                 let wired = match &*self.state.lock() {
-                    SocketState::InetWired { tcb_id, .. } => narf_net::tcp_stack::tcp_info(*tcb_id),
+                    SocketState::InetWired { tcb_id, .. }
+                    | SocketState::Inet6Wired { tcb_id, .. } => {
+                        narf_net::tcp_stack::tcp_info(*tcb_id)
+                    }
                     SocketState::InetListener {
                         listening: true, ..
                     }
@@ -5005,6 +5059,7 @@ impl SocketFile {
                     &*self.state.lock(),
                     SocketState::InetConnected { .. }
                         | SocketState::InetWired { .. }
+                        | SocketState::Inet6Wired { .. }
                         | SocketState::InetDgram { peer: Some(_), .. }
                         | SocketState::InetRaw { peer: Some(_), .. }
                 );
@@ -6094,7 +6149,7 @@ impl SocketFile {
                 drop(state);
                 narf_net::readiness::notify(0);
             }
-            SocketState::InetWired { tcb_id, .. } => {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                 let id = *tcb_id;
                 *state = SocketState::Fresh;
                 drop(state);
@@ -6141,12 +6196,17 @@ impl SocketFile {
                 addr,
                 port,
                 pending,
+                listen_id,
                 listening,
                 ..
             } => {
+                if let Some(id) = listen_id.take() {
+                    narf_net::tcp_stack::remove_tcb(id);
+                    crate::handlers::clear_tcb_owner(id);
+                }
                 pending.clear();
                 *listening = false;
-                let key = (*addr, *port);
+                let key = (self.net_ns_id(), *addr, *port);
                 if let Some(map) = INET6_LISTENERS.lock().as_mut() {
                     if map.get(&key).is_some_and(|l| Arc::ptr_eq(l, self)) {
                         map.remove(&key);
@@ -6676,6 +6736,7 @@ impl SocketFile {
                         port,
                         backlog: 0,
                         pending: VecDeque::new(),
+                        listen_id: None,
                         listening: false,
                     };
                     return SocketOpResult::Ok(0);
@@ -6696,6 +6757,7 @@ impl SocketFile {
                         port,
                         backlog: 0,
                         pending: VecDeque::new(),
+                        listen_id: None,
                         listening: false,
                     };
                 }
@@ -6703,13 +6765,26 @@ impl SocketFile {
                     addr,
                     port,
                     backlog: b,
+                    listen_id,
                     listening,
                     ..
                 } = &mut *state
                 {
                     *b = backlog;
                     *listening = true;
-                    let key = (*addr, *port);
+                    if listen_id.is_none() {
+                        if let Ok(id) = narf_net::tcp_stack::listen6_in(
+                            self.net_ns_id(),
+                            *addr,
+                            *port,
+                            backlog.max(1) as usize,
+                        ) {
+                            self.apply_tcp_options_to_tcb(id);
+                            *listen_id = Some(id);
+                            crate::handlers::set_tcb_owner(id, crate::handlers::current_task_id());
+                        }
+                    }
+                    let key = (self.net_ns_id(), *addr, *port);
                     drop(state);
                     let mut listeners = INET6_LISTENERS.lock();
                     let map = listeners.get_or_insert_with(BTreeMap::new);
@@ -6721,6 +6796,38 @@ impl SocketFile {
                 }
             }
             SocketOp::Accept => {
+                let listen_id = match &*self.state.lock() {
+                    SocketState::Inet6Listener {
+                        listening: true,
+                        listen_id,
+                        ..
+                    } => *listen_id,
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                if let Some(listen_id) = listen_id {
+                    if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(listen_id) {
+                        let child = SocketFile::new(AF_INET6, SOCK_STREAM);
+                        child.set_net_ns_id(self.net_ns_id());
+                        *child.options.lock() = self.options.lock().clone();
+                        child.apply_tcp_options_to_tcb(child_id);
+                        let (_, _, peer_addr, peer_port) =
+                            narf_net::tcp_stack::endpoints6(child_id)
+                                .unwrap_or(([0; 16], 0, [0; 16], 0));
+                        *child.state.lock() = SocketState::Inet6Wired {
+                            tcb_id: child_id,
+                            peer_addr,
+                            peer_port,
+                        };
+                        crate::handlers::set_tcb_owner(
+                            child_id,
+                            crate::handlers::current_task_id(),
+                        );
+                        return SocketOpResult::Accepted {
+                            socket: child,
+                            peer: None,
+                        };
+                    }
+                }
                 let mut state = self.state.lock();
                 // `inet_csk_accept`: not TCP_LISTEN → EINVAL.
                 if let SocketState::Inet6Listener {
@@ -6760,15 +6867,43 @@ impl SocketFile {
                     let listeners = INET6_LISTENERS.lock();
                     let m = listeners.as_ref();
                     let unspecified = [0u8; 16];
+                    let net_ns_id = self.net_ns_id();
                     m.and_then(|m| {
-                        m.get(&(ip, port))
-                            .or_else(|| m.get(&(unspecified, port)))
+                        m.get(&(net_ns_id, ip, port))
+                            .or_else(|| m.get(&(net_ns_id, unspecified, port)))
                             .cloned()
                     })
                 };
                 let listener = match listener {
                     Some(l) => l,
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    None => {
+                        let syn_retries = self.options.lock().tcp_syncnt as u8;
+                        match narf_net::tcp_stack::connect6_errno_with_options_in(
+                            self.net_ns_id(),
+                            ip,
+                            port,
+                            narf_net::tcp_stack::ConnectOptions { syn_retries },
+                        ) {
+                            Ok(tcb_id) => {
+                                self.apply_tcp_options_to_tcb(tcb_id);
+                                let mut state = self.state.lock();
+                                if Self::inet_stream_connectable(&state) {
+                                    *state = SocketState::Inet6Wired {
+                                        tcb_id,
+                                        peer_addr: ip,
+                                        peer_port: port,
+                                    };
+                                    drop(state);
+                                    self.inet6_release_port();
+                                    return SocketOpResult::Ok(0);
+                                }
+                                return SocketOpResult::Err(SockError::AlreadyConnected);
+                            }
+                            Err(errno) => {
+                                return SocketOpResult::Err(SockError::from_stack(errno));
+                            }
+                        }
+                    }
                 };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
@@ -6852,6 +6987,19 @@ impl SocketFile {
                         narf_net::readiness::notify(0);
                         SocketOpResult::Ok(0)
                     }
+                    SocketState::Inet6Wired { tcb_id, .. } => {
+                        let id = *tcb_id;
+                        let how = match how {
+                            SHUT_RD => narf_net::tcp_stack::Shutdown::Read,
+                            SHUT_WR => narf_net::tcp_stack::Shutdown::Write,
+                            _ => narf_net::tcp_stack::Shutdown::Both,
+                        };
+                        drop(state);
+                        match narf_net::tcp_stack::shutdown_errno(id, how) {
+                            Ok(()) => SocketOpResult::Ok(0),
+                            Err(errno) => SocketOpResult::Err(SockError::from_stack(errno)),
+                        }
+                    }
                     SocketState::Inet6Listener {
                         listening: true, ..
                     } => {
@@ -6873,6 +7021,7 @@ impl SocketFile {
     /// SO_REUSEPORT (a simplified `inet_bind_conflict`).
     fn inet6_claim_port(self: &Arc<Self>, ip: [u8; 16], port: u16) -> Result<u16, SockError> {
         let reuseport = self.options.lock().reuseport;
+        let net_ns_id = self.net_ns_id();
         let mut binds = INET6_TCP_BINDS.lock();
         binds.retain(|b| b.owner.strong_count() != 0);
         let (port, ephemeral) = if port == 0 {
@@ -6885,6 +7034,7 @@ impl SocketFile {
             let me = Arc::as_ptr(self);
             if binds.iter().any(|b| {
                 b.port == port
+                    && b.ns == net_ns_id
                     && Weak::as_ptr(&b.owner) != me
                     && (b.ip == ip || b.ip == unspecified || ip == unspecified)
                     && !(reuseport && b.reuseport)
@@ -6895,6 +7045,7 @@ impl SocketFile {
         };
         binds.push(Inet6TcpBind {
             owner: Arc::downgrade(self),
+            ns: net_ns_id,
             ip,
             port,
             reuseport,
@@ -6928,7 +7079,9 @@ impl SocketFile {
         }
         let state = self.state.lock();
         // InetWired sockets route through the kernel TCP-over-NIC stack.
-        if let SocketState::InetWired { tcb_id, .. } = &*state {
+        if let SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } =
+            &*state
+        {
             let id = *tcb_id;
             drop(state);
             // EAGAIN when the send buffer is full (was Ok(0), which a
@@ -6993,7 +7146,9 @@ impl SocketFile {
 
     fn do_recv(&self, buf: &mut [u8], flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
-        if let SocketState::InetWired { tcb_id, .. } = &*state {
+        if let SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } =
+            &*state
+        {
             let id = *tcb_id;
             drop(state);
             // Ok(0) is EOF (peer FIN, or a shut-down / torn-down socket);
@@ -7593,7 +7748,7 @@ impl RingBuf {
 /// own ns id, so in-process datagrams never cross a netns boundary.
 type Inet4Map = BTreeMap<(u64, u32, u16), Arc<SocketFile>>;
 /// Registry map keyed by AF_INET6 (ipv6, port).
-type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
+type Inet6Map = BTreeMap<(u64, [u8; 16], u16), Arc<SocketFile>>;
 
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
@@ -7816,6 +7971,7 @@ static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new
 /// One AF_INET6 stream port reservation — see `InetTcpBind`.
 struct Inet6TcpBind {
     owner: Weak<SocketFile>,
+    ns: u64,
     ip: [u8; 16],
     port: u16,
     reuseport: bool,

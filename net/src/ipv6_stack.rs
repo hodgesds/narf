@@ -529,8 +529,23 @@ fn dispatch_l4(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], proto: u8, l4: &
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
         NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, l4),
+        NEXT_HEADER_TCP => handle_tcp6(iface, src_ip, dst_ip, l4),
         _ => false,
     }
+}
+
+fn handle_tcp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], segment: &[u8]) -> bool {
+    if segment.len() < crate::pkt_tcp::TCP_HDR_MIN {
+        return true;
+    }
+    if pseudo_checksum(src_ip, dst_ip, NEXT_HEADER_TCP, segment) != 0 {
+        return true;
+    }
+    let net_ns_id = crate::iface::lookup(iface)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    crate::tcp::core::handle_segment6_in(net_ns_id, src_ip, dst_ip, segment);
+    true
 }
 
 fn handle_udp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], datagram: &[u8]) -> bool {

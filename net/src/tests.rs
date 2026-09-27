@@ -812,6 +812,25 @@ fn smoke_ipv6_namespace_address_and_route_isolation() -> TestResult {
 }
 kernel_test_in!("net/ipv6", smoke_ipv6_namespace_address_and_route_isolation);
 
+fn smoke_tcp6_listener_uses_native_tcb() -> TestResult {
+    let local = [0x20, 1, 0x0d, 0xb8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let id = match crate::tcp::core::listen6_in(7007, local, 4242, 8) {
+        Ok(id) => id,
+        Err(()) => return TestResult::Fail("TCP6 listen did not allocate a TCB"),
+    };
+    let endpoints = crate::tcp::core::endpoints6(id);
+    let state = crate::tcp::core::lookup_tcb(id).map(|tcb| tcb.lock().state);
+    crate::tcp::core::remove_tcb(id);
+    if endpoints == Some((local, 4242, [0; 16], 0))
+        && state == Some(crate::tcp::state_machine::TcpState::Listen)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TCP6 listener did not retain native IPv6 endpoints")
+    }
+}
+kernel_test_in!("net/ipv6", smoke_tcp6_listener_uses_native_tcb);
+
 fn smoke_icmpv6_router_solicitation_layout() -> TestResult {
     use crate::pkt_ipv6::{router_solicitation, ICMPV6_ROUTER_SOLICITATION};
     let body = router_solicitation(&[]);
