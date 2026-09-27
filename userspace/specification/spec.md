@@ -625,6 +625,14 @@ respectively without delivery. `pidfd_send_signal` rejects unsupported flags
 before fd resolution, validates non-null `si_signo`, checks that the pidfd still
 names a live target (including signal 0 probes), and never queues a payload or
 pending bit after a failed import or validation.
+Job-control stop and continue transitions remain waitable through
+`wait4(WUNTRACED|WCONTINUED)` and `waitid` even when the parent installs
+`SA_NOCLDSTOP` or ignores `SIGCHLD`. As in Linux `do_notify_parent_cldstop`,
+those dispositions suppress only generation of the stop/continue `SIGCHLD`;
+they do not suppress the child-state publication or wake a blocked waiter less
+promptly. Taking a default stop preserves the interrupted user register file
+verbatim, including when delivery occurs on an interrupt return rather than at
+a syscall boundary.
 Explicit stream shutdown publishes the same readiness notification as final
 descriptor close; a peer parked in an infinite poll/epoll wait wakes to
 `POLL_IN|POLL_HUP` and can consume EOF.

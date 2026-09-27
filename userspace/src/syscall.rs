@@ -3902,23 +3902,29 @@ pub fn kernel_syscall_entry_plain_with_state(
         // timer IRQs keep landing at CPL=0. The no-timer common path is one
         // atomic load; the locked all-task scan runs only after a deadline.
         crate::handlers::timer_tick_raise_due_signals();
-        let restart_pending = ctx.rip() != entry_rip
-            && crate::user_task::current_user_task().is_some_and(|u| {
+        let restart_pending = syscall_frame_is_restart_pending(
+            entry_rip,
+            ctx.rip(),
+            crate::user_task::current_user_task().is_some_and(|u| {
                 // SAFETY: the in-flight task's poller-pinned ctx; atomic load.
                 unsafe {
                     (*u).syscall_parked_restarting
                         .load(core::sync::atomic::Ordering::Acquire)
                 }
-            });
+            }),
+            2,
+        );
         if restart_pending {
             crate::handlers::default_signal_delivery_restart_pending(&mut ctx, num);
         } else {
             crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
         }
-        if ctx.rip() == entry_rip {
-            // Completed (or a delivery just converted the restart to -EINTR):
-            // drop the marker so a later RIP-moving syscall (execve,
-            // sigreturn) can't be mistaken for a restart-pending park.
+        if ctx.rip() != entry_rip.wrapping_sub(2) {
+            // Completed, signal-directed, exec, or sigreturn frame: drop the
+            // marker so a later legitimate RIP change cannot be mistaken for
+            // a restart-pending park. In particular, wait4 parks without a RIP
+            // rewind; retaining its marker across rt_sigreturn used to add two
+            // bytes to the restored PC and enter a handler mid-instruction.
             if let Some(u) = crate::user_task::current_user_task() {
                 // SAFETY: as above; atomic store only.
                 unsafe {
@@ -3947,6 +3953,20 @@ pub fn kernel_syscall_entry_plain_with_state(
         }
     }
     ctx.ret
+}
+
+/// A restart-pending frame is identified by both the explicit park marker and
+/// the exact architecture-width rewind. execve, signal delivery, and
+/// rt_sigreturn also change the return PC; treating an arbitrary change as a
+/// rewind corrupts that PC when EINTR/SA_RESTART fixups are applied.
+#[inline]
+const fn syscall_frame_is_restart_pending(
+    entry_rip: u64,
+    return_rip: u64,
+    marked: bool,
+    instruction_len: u64,
+) -> bool {
+    marked && return_rip == entry_rip.wrapping_sub(instruction_len)
 }
 
 struct ArgsOnlyCtx {
@@ -4824,7 +4844,7 @@ pub fn __test_clear_global() {
 
 #[cfg(feature = "kernel-test")]
 mod from_raw_tests {
-    use super::{Syscall, LINUX_TABLE, NARF_EXTENSION_TABLE};
+    use super::{syscall_frame_is_restart_pending, Syscall, LINUX_TABLE, NARF_EXTENSION_TABLE};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     /// The O(1) direct-indexed `from_raw` must agree with the source tables for
@@ -4870,4 +4890,25 @@ mod from_raw_tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace/syscall", smoke_syscall_from_raw_matches_tables);
+
+    fn smoke_restart_pending_requires_exact_rewind() -> TestResult {
+        const ENTRY: u64 = 0x0042_05a4;
+        if !syscall_frame_is_restart_pending(ENTRY, ENTRY - 2, true, 2) {
+            return TestResult::Fail("marked exact syscall rewind was not recognized");
+        }
+        if syscall_frame_is_restart_pending(ENTRY, ENTRY, true, 2) {
+            return TestResult::Fail("completed syscall was treated as restart-pending");
+        }
+        if syscall_frame_is_restart_pending(ENTRY, 0x0042_05a0, true, 2) {
+            return TestResult::Fail("signal-restored RIP was treated as a syscall rewind");
+        }
+        if syscall_frame_is_restart_pending(ENTRY, ENTRY - 2, false, 2) {
+            return TestResult::Fail("unmarked RIP change was treated as restart-pending");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/syscall",
+        smoke_restart_pending_requires_exact_rewind
+    );
 }

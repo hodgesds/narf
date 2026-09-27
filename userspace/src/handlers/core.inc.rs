@@ -11689,28 +11689,16 @@ fn pending_exits_init() {
 // stopped task parked — never re-entering user mode — until SIGCONT
 // clears the entry and wakes it (SIGKILL also breaks through).
 //
-// `TASK_STOPPED`: TaskId → stop signum (for WSTOPSIG in the parent's
-// wait4 status word). Per-task sharding keeps independent stress-ng workers
-// from serializing every SIGSTOP/SIGCONT transition on one global lock.
+// The current stop signum lives directly in `Task::job_stop_signal`, matching
+// Linux's embedded task/signal state. This avoids an allocation and a shared
+// map lock on every SIGSTOP/SIGCONT transition.
 const JOB_CONTROL_SHARDS: usize = 64;
 
-#[repr(align(64))]
-struct JobStoppedShard {
-    map: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>,
-    count: AtomicUsize,
-}
-
-impl JobStoppedShard {
-    const fn new() -> Self {
-        Self {
-            map: narf_lib::sync::IrqSafeSpinLock::new(None),
-            count: AtomicUsize::new(0),
-        }
-    }
-}
-
-static TASK_STOPPED: [JobStoppedShard; JOB_CONTROL_SHARDS] =
-    [const { JobStoppedShard::new() }; JOB_CONTROL_SHARDS];
+/// Synthetic-test/non-executor fallback. Production tasks always have an
+/// embedded `job_stop_signal`; keeping the fallback separate prevents test tids
+/// from weakening the allocation-free runtime path.
+static TASK_STOPPED_FALLBACK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 #[inline]
 fn job_control_shard(id: u64) -> usize {
@@ -11767,10 +11755,7 @@ static PENDING_STOPCONT: [StopContShard; JOB_CONTROL_SHARDS] =
     [const { StopContShard::new() }; JOB_CONTROL_SHARDS];
 
 fn job_control_init() {
-    for shard in &TASK_STOPPED {
-        *shard.map.lock() = Some(BTreeMap::new());
-        shard.count.store(0, Ordering::Release);
-    }
+    *TASK_STOPPED_FALLBACK.lock() = Some(BTreeMap::new());
     for shard in &PENDING_STOPCONT {
         *shard.map.lock() = Some(BTreeMap::new());
     }
@@ -11789,38 +11774,41 @@ const SIGCHLD: u8 = 17;
 
 /// True if `task` is currently job-control stopped.
 pub fn is_task_stopped(task: u64) -> bool {
-    let shard = &TASK_STOPPED[job_control_shard(task)];
-    let job_stopped = shard.count.load(Ordering::Acquire) != 0
-        && shard
-            .map
+    let job_stopped = crate::task::with_task_local(task, |task| {
+        task.job_stop_signal.load(Ordering::Acquire) != 0
+    })
+    .unwrap_or_else(|| {
+        TASK_STOPPED_FALLBACK
             .lock()
             .as_ref()
-            .is_some_and(|m| m.contains_key(&task));
+            .is_some_and(|stopped| stopped.contains_key(&task))
+    });
     let ptrace_stopped = crate::ptrace::is_task_ptrace_stopped(task);
     job_stopped || ptrace_stopped
 }
 
-fn remove_task_stopped(task: u64) -> Option<u32> {
-    let shard = &TASK_STOPPED[job_control_shard(task)];
-    let removed = shard.map.lock().as_mut().and_then(|m| m.remove(&task));
-    if removed.is_some() {
-        let previous = shard.count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous != 0, "stopped-task shard count underflow");
+fn clear_task_stopped(task: u64) -> Option<u32> {
+    if let Some(old) = crate::task::with_task_local(task, |task| {
+        task.job_stop_signal.swap(0, Ordering::AcqRel)
+    }) {
+        return (old != 0).then_some(old);
     }
-    removed
+    TASK_STOPPED_FALLBACK
+        .lock()
+        .as_mut()
+        .and_then(|stopped| stopped.remove(&task))
 }
 
 fn insert_task_stopped(task: u64, signum: u32) -> bool {
-    let shard = &TASK_STOPPED[job_control_shard(task)];
-    let inserted = shard
-        .map
+    if let Some(inserted) = crate::task::with_task_local(task, |task| {
+        task.job_stop_signal.swap(signum, Ordering::AcqRel) == 0
+    }) {
+        return inserted;
+    }
+    TASK_STOPPED_FALLBACK
         .lock()
         .as_mut()
-        .is_some_and(|m| m.insert(task, signum).is_none());
-    if inserted {
-        shard.count.fetch_add(1, Ordering::Release);
-    }
-    inserted
+        .is_some_and(|stopped| stopped.insert(task, signum).is_none())
 }
 
 #[inline]
@@ -11894,23 +11882,38 @@ fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
             false
         }
     };
-    // Linux notifies the parent with SIGCHLD on stop/continue too. Route it
-    // through the canonical raise-notify (not a bare pending-bit set) so a
-    // signalfd-watching parent's epoll readiness EDGE fires — the same lost-reap
-    // class fixed in `on_child_exit` (a cell-backed signalfd only enters epoll's
-    // fast-pass ready-list when its per-fd waker is fired by `wake_signalfds`).
-    if let Some((was_empty, was_new)) = pending_signal_bits_update(parent, |slot| {
-        let was_empty = *slot == 0;
-        let was_new = *slot & sig_bit(17) == 0;
-        *slot |= sig_bit(17);
-        (was_empty, was_new)
-    }) {
-        // Standard SIGCHLD instances coalesce. Linux's legacy_queue() stops
-        // before complete_signal() when SIGCHLD is already pending, so it does
-        // not repeat the signal wake/generation work. The wait queue below is
-        // still fired for every newly-published child state.
-        if was_new {
-            signal_raise_notify(parent, was_empty);
+    // Linux do_notify_parent_cldstop() always publishes the waitable state and
+    // wakes wait4, but suppresses the SIGCHLD instance when the parent ignores
+    // SIGCHLD or selected SA_NOCLDSTOP. send_signal_locked() also drops an
+    // unblocked default-ignored SIGCHLD in prepare_signal(); retain it only
+    // when blocked (so sigpending/signalfd can observe it) or when a tracer may
+    // consume it. Avoiding a synthetic pending bit here is both observable
+    // Linux behavior and the common job-control fast path.
+    let action = sigaction_lookup_full(parent, SIGCHLD as usize);
+    let explicitly_suppressed = action.is_some_and(|action| {
+        action.handler == 1 || action.flags & SA_NOCLDSTOP != 0
+    });
+    let default_ignored = action.is_none_or(|action| action.handler == 0);
+    let default_must_queue = default_ignored
+        && (signal_mask_of(parent) & sig_bit(u32::from(SIGCHLD)) != 0
+            || crate::ptrace::is_task_traced(task_to_pid_raw(parent).unwrap_or(parent)));
+    let notify_sigchld = !explicitly_suppressed && (!default_ignored || default_must_queue);
+    if notify_sigchld {
+        // Route through the canonical raise-notify (not a bare pending-bit set)
+        // so a signalfd-watching parent's epoll readiness EDGE fires.
+        if let Some((was_empty, was_new)) = pending_signal_bits_update(parent, |slot| {
+            let was_empty = *slot == 0;
+            let was_new = *slot & sig_bit(17) == 0;
+            *slot |= sig_bit(17);
+            (was_empty, was_new)
+        }) {
+            // Standard SIGCHLD instances coalesce. Linux's legacy_queue()
+            // stops before complete_signal() when SIGCHLD is already pending,
+            // so it does not repeat the signal wake/generation work. The wait
+            // queue below is still fired for every child-state publication.
+            if was_new {
+                signal_raise_notify(parent, was_empty);
+            }
         }
     }
     // The producer has lapped the waiter's single Linux-style state slot.
@@ -12115,7 +12118,7 @@ fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
     if signum != 18 {
         return false;
     }
-    let was_stopped = remove_task_stopped(task).is_some();
+    let was_stopped = clear_task_stopped(task).is_some();
     if was_stopped {
         push_stopcont_report(task, CONTINUED_WSTATUS, true);
     }
@@ -12125,8 +12128,11 @@ fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
 /// Put the current task into the job-control stopped state and park it
 /// until SIGCONT. Records the stop signum (for WSTOPSIG), cancels any
 /// pending SIGCONT, notifies the parent (wait4 WUNTRACED + SIGCHLD),
-/// then — mirroring sys_pause — stashes an infinite deadline, saves the
-/// user frame, and longjmps back to the executor via the yield hook.
+/// then stashes an infinite deadline, saves the user frame, and longjmps back
+/// to the executor via the yield hook. The interrupted register file is
+/// preserved verbatim: a stop can be taken on any kernel-to-user return, not
+/// only at a syscall boundary, so manufacturing a return value here would
+/// corrupt a live user register (Linux's `do_signal_stop` does not do so).
 /// The poll loop keeps the task parked (is_task_stopped) until SIGCONT
 /// clears the entry and wakes it; the interrupted syscall then resumes
 /// returning 0. With no executor wired (kernel-test context) it returns
@@ -12146,7 +12152,6 @@ fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
         // task to the executor (never returns).
         unsafe {
             let uc = &*uctx;
-            ctx.set_return(SyscallReturn::ok(0));
             uc.sleep_deadline_ns
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -14152,10 +14157,9 @@ fn on_thread_exit(_pid: u64, tid: u64) {
     // flips and a reader (a shell's `$(...)` capture) never sees EOF.
     // Also frees file/socket handles so they don't leak.
     crate::fd::detach(tid);
-    // Job control: a task that dies while stopped (e.g. SIGKILL'd) must
-    // not leave a stale TASK_STOPPED entry — the TaskId could later be
-    // recycled.
-    let _ = remove_task_stopped(tid);
+    // Job control: clear the task-local state before the zombie can be reaped
+    // and its refcounted Task storage released.
+    let _ = clear_task_stopped(tid);
 }
 
 /// Translate an outer ProcessId into `observer_task`'s PID-namespace view for

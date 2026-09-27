@@ -11,7 +11,8 @@ use super::*;
 /// arg2 = old_out_ptr (optional, may be 0; receives prior handler
 ///        vaddr — 8 bytes — for Linux's `oldact->sa_handler`),
 /// arg3 = `sa_flags` (SA_*). Honoured: SA_SIGINFO, SA_RESTART,
-///        SA_ONSTACK, SA_NODEFER, SA_RESETHAND. Unknown bits stored
+///        SA_ONSTACK, SA_NODEFER, SA_RESETHAND, and SA_NOCLDSTOP for SIGCHLD.
+///        Unknown bits stored
 ///        but no action taken.
 ///
 /// Older 3-arg callers (arg3 = 0) get flags = 0 as before — the

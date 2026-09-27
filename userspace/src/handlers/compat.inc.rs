@@ -6817,7 +6817,43 @@ pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
     let _ = store_sigqueue_info(target, signum, SI_USER, 0, si_pid);
 }
 
-pub fn raise_signal_pending(task: u64, signum: u32) {
+/// Linux `sig_ignored()`: an unblocked signal with SIG_IGN or an implicit
+/// ignore/continue default is discarded at generation time. Blocked signals
+/// remain pending because the disposition can change before unblocking, and a
+/// tracer gets to observe otherwise-ignored signals.
+fn signal_ignored_at_generation(task: u64, signum: u32) -> bool {
+    // These forced-default signals cannot be blocked, caught, or ignored.
+    // Linux's masks and rt_sigaction path enforce those invariants at write
+    // time, so prepare_signal does not need any disposition lookup here.
+    if matches!(signum, 9 | 19) {
+        return false;
+    }
+    if signal_mask_of(task) & sig_bit(signum) != 0 {
+        return false;
+    }
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    if signum != 9 && crate::ptrace::is_task_traced(pid) {
+        return false;
+    }
+    match sigaction_lookup_full(task, signum as usize) {
+        Some(action) if action.handler == 1 => true,
+        Some(action) if action.handler == 0 => matches!(
+            default_signal_action(signum),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+        Some(_) => false,
+        None => matches!(
+            default_signal_action(signum),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+    }
+}
+
+fn raise_signal_pending_inner(
+    task: u64,
+    signum: u32,
+    with_sender_siginfo: bool,
+) {
     // Reject signal 0: it's the POSIX null signal (existence probe), never a
     // real signal. Setting pending bit 0 would later be taken by the delivery
     // loop as a Terminate-default "signal 0". Bit-N-=-signal-N caps the
@@ -6860,6 +6896,22 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
     // mutual cancellation) runs before the pending bit is set.
     let resumed_stopped_task = signal_stopcont_interaction(task, signum);
+    if signal_ignored_at_generation(task, signum) {
+        // prepare_signal(SIGCONT) resumes stopped threads even when the signal
+        // itself is then discarded. The ordinary notify path would have fired
+        // this wake after setting the pending bit; preserve just the wake.
+        if resumed_stopped_task {
+            wake_signal(task);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits()) {
+                narf_scheduler::stackful::note_urgent_wake_preempt(task);
+            }
+        }
+        return;
+    }
+    if with_sender_siginfo {
+        queue_sender_siginfo(task, signum);
+    }
     let Some(was_empty) = pending_signal_bits_update(task, |slot| {
         let was_empty = *slot == 0;
         set_pending_signal_bit(slot, signum);
@@ -6878,6 +6930,14 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     {
         narf_scheduler::stackful::note_urgent_wake_preempt(task);
     }
+}
+
+pub fn raise_signal_pending(task: u64, signum: u32) {
+    raise_signal_pending_inner(task, signum, false);
+}
+
+pub(crate) fn raise_user_signal_pending(task: u64, signum: u32) {
+    raise_signal_pending_inner(task, signum, true);
 }
 
 /// Apply Linux's stop/continue pending-set cancellation and enqueue `signum`
@@ -7305,8 +7365,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     // member. Prefer the live leader without even consulting group metadata.
     // This is the fork-child fast path used by SIGSTOP/SIGCONT workloads.
     if signum != 9 && leader_state == crate::task::TASK_RUNNING {
-        queue_sender_siginfo(leader_tid, signum);
-        raise_signal_pending(leader_tid, signum);
+        raise_user_signal_pending(leader_tid, signum);
         return true;
     }
 
@@ -7322,10 +7381,9 @@ fn kill_process(pid: u64, signum: u32) -> bool {
         if leader_state != crate::task::TASK_RUNNING {
             return false;
         }
-        queue_sender_siginfo(leader_tid, signum);
-        // The canonical raise performs stop/continue interaction and exactly
-        // one targeted wake. Calling either around it duplicated both jobs.
-        raise_signal_pending(leader_tid, signum);
+        // The canonical raise performs stop/continue interaction, sender
+        // siginfo publication, and exactly one targeted wake.
+        raise_user_signal_pending(leader_tid, signum);
         return true;
     }
 
@@ -7340,8 +7398,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
             if crate::task::task_get(t)
                 .is_some_and(|task| task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
             {
-                queue_sender_siginfo(t, signum);
-                raise_signal_pending(t, signum);
+                raise_user_signal_pending(t, signum);
                 any = true;
             }
         }
@@ -7362,8 +7419,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     let Some(target) = target else {
         return leader_state == crate::task::TASK_ZOMBIE;
     };
-    queue_sender_siginfo(target, signum);
-    raise_signal_pending(target, signum);
+    raise_user_signal_pending(target, signum);
     true
 }
 
@@ -9588,6 +9644,7 @@ pub fn default_sync_signal_delivery(
 const NSIG: usize = 65;
 
 /// Linux `sa_flags` bits NARF honours.
+pub const SA_NOCLDSTOP: u32 = 0x00_00_00_01;
 pub const SA_NODEFER: u32 = 0x40_00_00_00;
 pub const SA_RESTART: u32 = 0x10_00_00_00;
 pub const SA_SIGINFO: u32 = 0x00_00_00_04;

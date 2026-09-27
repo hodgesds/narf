@@ -76,6 +76,13 @@ pub struct Task {
     process_group_pid: AtomicU64,
     /// [`TASK_RUNNING`] | [`TASK_ZOMBIE`].
     pub state: AtomicU32,
+    /// Current job-control stop signal, or zero while not stopped.
+    ///
+    /// Linux keeps this state in `signal_struct`; keeping it on the refcounted
+    /// task likewise makes STOP/CONT an allocation-free atomic transition and
+    /// avoids bouncing a sharded B-tree lock between the signalling and target
+    /// CPUs on every stress-ng `wait` iteration.
+    pub(crate) job_stop_signal: AtomicU32,
     /// Raw wstatus staged at exit (also mirrored in the pending-
     /// termination table until the reap plumbing migrates here).
     pub exit_code: AtomicI32,
@@ -152,6 +159,7 @@ impl Task {
             process_group_id: AtomicU64::new(tid),
             process_group_pid: AtomicU64::new(pid),
             state: AtomicU32::new(TASK_RUNNING),
+            job_stop_signal: AtomicU32::new(0),
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
             kernel_cpu_ns: AtomicU64::new(0),
@@ -216,6 +224,27 @@ pub fn task_get_local(tid: u64) -> Option<Arc<Task>> {
         }
     }
     task_get(tid)
+}
+
+/// Apply `f` to the current task without cloning its owning `Arc`, falling
+/// back to the refcounted registry for a cross-task lookup.
+///
+/// This is the read-side shape of Linux's `current`: the scheduler-published
+/// raw pointer is valid while the in-flight future retains its `Arc<Task>`.
+/// Keeping the fallback inside the helper also prevents callers from holding a
+/// borrowed registry entry after its owning `Arc` has been dropped.
+#[inline]
+pub(crate) fn with_task_local<R>(tid: u64, f: impl FnOnce(&Task) -> R) -> Option<R> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if !ptr.is_null() {
+        // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+        // in-flight `UserTaskFuture` retains that Arc for this complete access.
+        let task = unsafe { &*ptr };
+        if task.tid == tid {
+            return Some(f(task));
+        }
+    }
+    task_get(tid).map(|task| f(&task))
 }
 
 /// Read the current stackful task's process-group cache without cloning its

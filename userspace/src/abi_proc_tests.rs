@@ -1368,6 +1368,129 @@ kernel_test_in!(
     smoke_abi_proc_wait_job_control_replaces_state
 );
 
+fn smoke_abi_proc_job_control_nocldstop_suppresses_only_signal() -> TestResult {
+    with_setup(|| {
+        const CHILD: u64 = 0x6a34;
+        const SIGCHLD: usize = 17;
+        const SIGCHLD_BIT: u64 = 1 << (SIGCHLD - 1);
+        const WNOHANG: u64 = 1;
+        const WUNTRACED: u64 = 2;
+        const WCONTINUED: u64 = 8;
+        const STOPPED: i32 = (19 << 8) | 0x7f;
+        const CONTINUED: i32 = 0xffff;
+
+        crate::handlers::register_pid_task_mapping(CHILD, CHILD);
+
+        // SIGCHLD's default disposition is Ignore. Linux's prepare_signal()
+        // therefore drops an unblocked default SIGCHLD while leaving the
+        // stopped state waitable.
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, STOPPED, false);
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGCHLD_BIT != 0 {
+            return Err("default-ignored child stop left SIGCHLD pending");
+        }
+        let mut status = 0i32;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WUNTRACED,
+                0,
+            ),
+        ) != Some(CHILD as i64)
+            || status != STOPPED
+        {
+            return Err("default-ignored SIGCHLD suppressed the stopped state");
+        }
+
+        // A blocked default-ignored signal is retained in Linux because its
+        // disposition may change before it is unblocked (and signalfd can
+        // consume it while blocked).
+        crate::handlers::set_signal_mask_for_task(FAKE_TASK, SIGCHLD_BIT);
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, CONTINUED, true);
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGCHLD_BIT == 0 {
+            return Err("blocked default SIGCHLD was not retained");
+        }
+        crate::handlers::clear_signal_pending(FAKE_TASK, SIGCHLD as u32);
+        crate::handlers::set_signal_mask_for_task(FAKE_TASK, 0);
+        status = 0;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WCONTINUED,
+                0,
+            ),
+        ) != Some(CHILD as i64)
+            || status != CONTINUED
+        {
+            return Err("blocked default SIGCHLD suppressed the continued state");
+        }
+
+        crate::handlers::__test_set_sigaction_flags(
+            FAKE_TASK,
+            SIGCHLD,
+            0x4000,
+            crate::handlers::SA_NOCLDSTOP,
+        );
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, STOPPED, false);
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGCHLD_BIT != 0 {
+            return Err("SA_NOCLDSTOP generated SIGCHLD for a child stop");
+        }
+
+        status = 0;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WUNTRACED,
+                0,
+            ),
+        ) != Some(CHILD as i64)
+            || status != STOPPED
+        {
+            return Err("SA_NOCLDSTOP suppressed the waitable stopped state");
+        }
+
+        // Linux applies the same signal suppression when SIGCHLD is ignored,
+        // while the continued state remains consumable by wait4.
+        crate::handlers::__test_set_sigaction(FAKE_TASK, SIGCHLD, 1);
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, CONTINUED, true);
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGCHLD_BIT != 0 {
+            return Err("SIG_IGN generated SIGCHLD for a child continue");
+        }
+        status = 0;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WCONTINUED,
+                0,
+            ),
+        ) != Some(CHILD as i64)
+            || status != CONTINUED
+        {
+            return Err("SIG_IGN suppressed the waitable continued state");
+        }
+
+        // A caught SIGCHLD without SA_NOCLDSTOP still receives the ordinary
+        // coalesced signal in addition to the waitable state.
+        crate::handlers::__test_set_sigaction(FAKE_TASK, SIGCHLD, 0x4000);
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, STOPPED, false);
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGCHLD_BIT == 0 {
+            return Err("caught SIGCHLD missed the child-stop notification");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_job_control_nocldstop_suppresses_only_signal
+);
+
 fn smoke_abi_proc_job_control_resume_handoff_policy() -> TestResult {
     with_setup(|| {
         const CHILD: u64 = 0x6a35;
