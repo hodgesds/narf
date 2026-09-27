@@ -1069,9 +1069,6 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::AlreadyExists) => {
             ctx.set_return(errno_ret(EEXIST));
         }
-        Err(narf_filesystem::FsError::NotFound) => {
-            ctx.set_return(errno_ret(ENOENT));
-        }
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
             ctx.set_return(errno_ret(EPERM));
         }
@@ -1092,6 +1089,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // `dev_ioctl` resolves the ifreq name with `__dev_get_by_name`;
             // an absent network device is ENODEV, never pathname ENOENT.
             ctx.set_return(errno_ret(ENODEV));
+        }
+        Err(narf_filesystem::FsError::NotFound) => {
+            ctx.set_return(errno_ret(ENOENT));
         }
         Err(narf_filesystem::FsError::InvalidData)
             if matches!(
