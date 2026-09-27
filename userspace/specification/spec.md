@@ -1224,7 +1224,10 @@ not arise from truncating an IPv6 address into the IPv4 table. The
 reported on received datagrams, and used as the outbound interface selector.
 `IPV6_V6ONLY` requires a full integer option and may be changed only before
 the socket owns a local port, matching `do_ipv6_setsockopt`'s `inet_num`
-guard.
+guard. With V6ONLY disabled, IPv4-mapped destinations use the canonical IPv4
+UDP route/ARP/checksum path and IPv4 receive fallback reports the peer as
+`::ffff:a.b.c.d`; V6ONLY rejects a mapped bind with `EINVAL` and mapped
+connect/send with `ENETUNREACH`.
 
 ### 3.3 BPF XDP program compatibility
 

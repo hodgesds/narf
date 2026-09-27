@@ -1324,6 +1324,9 @@ pub fn deliver_wire_datagram(
     match (src_ip.try_into(), dst_ip.try_into()) {
         (Ok(src), Ok(dst)) => {
             inet_dgram::deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
+                || inet6_dgram::deliver_wire_v4_mapped(
+                    net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex,
+                )
         }
         _ if src_ip.len() == 16 && dst_ip.len() == 16 => {
             let mut src = [0u8; 16];

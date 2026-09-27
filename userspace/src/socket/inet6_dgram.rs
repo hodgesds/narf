@@ -10,6 +10,14 @@ const UNSPEC: [u8; 16] = [0; 16];
 const LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const DGRAM_TRUESIZE_OVERHEAD: usize = 576;
 
+fn mapped_v4(addr: &[u8; 16]) -> Option<[u8; 4]> {
+    if addr[..10] == [0; 10] && addr[10..12] == [0xff, 0xff] {
+        Some([addr[12], addr[13], addr[14], addr[15]])
+    } else {
+        None
+    }
+}
+
 type Inet6DgramMap = BTreeMap<(u64, u16), Vec<Arc<SocketFile>>>;
 static INET6_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet6DgramMap>> = IrqSafeSpinLock::new(None);
 
@@ -82,8 +90,10 @@ fn lookup(
     let socks = map.get(&(ns, dport))?;
     for wanted in [dst, UNSPEC] {
         if let Some(found) = socks.iter().find(|sock| {
-            let bound_dev = sock.options.lock().bindtodevice_index;
+            let options = sock.options.lock();
+            let bound_dev = options.bindtodevice_index;
             (bound_dev == 0 || dif == 0 || bound_dev == dif)
+                && !(mapped_v4(&dst).is_some() && options.ipv6_v6only)
                 && state_view(sock).is_some_and(|(local, scope, peer)| {
                     local == wanted
                         && (scope == 0 || dif == 0 || scope == dif)
@@ -156,7 +166,32 @@ impl SocketFile {
         if inet_port_denied(requested_port) {
             return SocketOpResult::Err(SockError::Access);
         }
-        if ip != UNSPEC && ip != LOOPBACK && !narf_net::ipv6::addrs::is_local(&ip) {
+        let (v6only, bound_dev) = {
+            let options = self.options.lock();
+            (options.ipv6_v6only, options.bindtodevice_index)
+        };
+        let mapped = mapped_v4(&ip);
+        if mapped.is_some() && v6only {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let link_local =
+            narf_net::ipv6::addrs::scope_of(&ip) == narf_net::ipv6::addrs::AddrScope::LinkLocal;
+        let effective_scope = if scope_id != 0 { scope_id } else { bound_dev };
+        if link_local && effective_scope == 0 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        if effective_scope != 0
+            && !narf_net::iface::snapshot_all_in(self.net_ns_id())
+                .iter()
+                .any(|entry| narf_net::iface::ifindex_of(&entry.name) == Some(effective_scope))
+        {
+            return SocketOpResult::Err(SockError::NoDevice);
+        }
+        let bindable = match mapped {
+            Some(v4) => inet4_bindable(self.net_ns_id(), u32::from_be_bytes(v4), false),
+            None => ip == UNSPEC || ip == LOOPBACK || narf_net::ipv6::addrs::is_local(&ip),
+        };
+        if !bindable {
             return SocketOpResult::Err(SockError::AddrNotAvail);
         }
         let ns = self.net_ns_id();
@@ -173,7 +208,10 @@ impl SocketFile {
             }
             requested_port
         };
-        self.install_inet6_binding(ip, port, scope_id, requested_port != 0);
+        self.install_inet6_binding(ip, port, effective_scope, requested_port != 0);
+        if scope_id != 0 {
+            self.options.lock().bindtodevice_index = scope_id;
+        }
         map.entry((ns, port)).or_default().insert(0, self.clone());
         SocketOpResult::Ok(0)
     }
@@ -190,6 +228,9 @@ impl SocketFile {
             Ok(v) => v,
             Err(e) => return SocketOpResult::Err(e),
         };
+        if mapped_v4(&peer.0).is_some() && self.options.lock().ipv6_v6only {
+            return SocketOpResult::Err(SockError::NetUnreach);
+        }
         {
             let mut guard = INET6_DGRAM_BOUND.lock();
             let map = guard.get_or_insert_with(BTreeMap::new);
@@ -244,6 +285,41 @@ impl SocketFile {
         };
         if self.sk_shutdown() & inet_dgram::SEND_SHUTDOWN != 0 {
             return SocketOpResult::Err(SockError::Pipe);
+        }
+        if let Some(v4) = mapped_v4(&dest.0) {
+            let options = self.options.lock().clone();
+            if options.ipv6_v6only {
+                return SocketOpResult::Err(SockError::NetUnreach);
+            }
+            let udp_options = narf_net::udp_sock::UdpOptions {
+                broadcast: options.broadcast,
+                bind_to_device: options.bindtodevice_index,
+                ip_ttl: options.ip_ttl.min(255) as u8,
+                ip_tos: options.ip_tos.min(255) as u8,
+                sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
+                ..Default::default()
+            };
+            let destination = narf_net::udp_sock::SocketAddrV4::new(v4, dest.1);
+            return match narf_net::udp_sock::udp_send_from(
+                self.net_ns_id(),
+                local_port,
+                destination,
+                buf,
+                &udp_options,
+                0,
+            ) {
+                Ok(n) => SocketOpResult::Ok(n as u64),
+                Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
+                    SocketOpResult::Err(SockError::MsgSize)
+                }
+                Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {
+                    SocketOpResult::Err(SockError::Access)
+                }
+                Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
+                    SocketOpResult::Ok(buf.len() as u64)
+                }
+                Err(_) => SocketOpResult::Err(SockError::NetUnreach),
+            };
         }
         let is_local = dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local(&dest.0);
         if !is_local {
@@ -410,4 +486,23 @@ pub(super) fn deliver_wire(
     target.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
     target.dgram_readiness.notify(narf_filesystem::POLL_IN);
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn deliver_wire_v4_mapped(
+    net_ns_id: u64,
+    src_ip: [u8; 4],
+    src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    payload: &[u8],
+    in_ifindex: u32,
+) -> bool {
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    src[10..12].copy_from_slice(&[0xff, 0xff]);
+    dst[10..12].copy_from_slice(&[0xff, 0xff]);
+    src[12..].copy_from_slice(&src_ip);
+    dst[12..].copy_from_slice(&dst_ip);
+    deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
 }

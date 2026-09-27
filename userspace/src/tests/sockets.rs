@@ -974,6 +974,53 @@ kernel_test_in!(
     smoke_socket_inet6_v6only_rejects_change_after_bind
 );
 
+fn smoke_socket_dual_stack_udp_receives_v4_as_mapped() -> TestResult {
+    const PORT: u16 = 8125;
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::make_sockaddr_in6([0; 16], PORT),
+        }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("dual-stack UDP6 wildcard bind failed");
+    }
+    if !crate::socket::deliver_wire_datagram(
+        sock.net_ns_id(),
+        &[192, 0, 2, 1],
+        9000,
+        &[127, 0, 0, 1],
+        PORT,
+        b"mapped",
+        1,
+    ) {
+        sock.unregister();
+        return TestResult::Fail("IPv4 datagram did not enter dual-stack UDP6 socket");
+    }
+    let mut out = [0u8; 16];
+    let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    });
+    sock.unregister();
+    match result {
+        crate::socket::SocketOpResult::Received {
+            n: 6,
+            peer: Some(peer),
+        } if &out[..6] == b"mapped"
+            && peer.body[6..18] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+            && peer.body[18..22] == [192, 0, 2, 1] =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("dual-stack UDP6 recvfrom address was not IPv4-mapped"),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_dual_stack_udp_receives_v4_as_mapped
+);
+
 /// SO_REUSEADDR + double-bind: the second bind to the same
 /// (addr, port) succeeds when SO_REUSEADDR is set on the second
 /// socket. Without it, the second bind returns EADDRINUSE.
