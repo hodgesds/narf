@@ -1,6 +1,7 @@
 //! AF_INET `SOCK_DGRAM` (UDP) for userspace sockets.
 //!
-//! Every errno below is taken from Linux v6.12, cited `file:line`:
+//! Every errno below is traced to the Linux implementation, cited by file
+//! and function:
 //!
 //! - `net/ipv4/af_inet.c` — `__inet_bind`, `inet_dgram_connect`,
 //!   `inet_autobind`, `inet_send_prepare`, `inet_shutdown`, `inet_getname`.
@@ -440,6 +441,17 @@ impl SocketFile {
             port
         };
         let explicit_port = sin_of(addr).1 != 0;
+        if let Err(e) = super::inet_port::reserve(self, port, super::inet_port::BindAddr::V4(ip)) {
+            if !explicit_port {
+                crate::ephemeral_port::free(
+                    AF_INET,
+                    0,
+                    crate::ephemeral_port::SocketProto::Udp,
+                    port,
+                );
+            }
+            return SocketOpResult::Err(e);
+        }
         self.install_binding(ip, port, ip != INADDR_ANY, explicit_port);
         hash(map, ns, port, self);
         SocketOpResult::Ok(0)
@@ -507,6 +519,10 @@ impl SocketFile {
             }
         };
         let port = alloc_port(map, ns, &me, self).ok_or(SockError::WouldBlock)?;
+        if super::inet_port::reserve(self, port, super::inet_port::BindAddr::V4(addr)).is_err() {
+            crate::ephemeral_port::free(AF_INET, 0, crate::ephemeral_port::SocketProto::Udp, port);
+            return Err(SockError::WouldBlock);
+        }
         self.install_binding(addr, port, addr_locked, false);
         hash(map, ns, port, self);
         Ok(())
@@ -613,6 +629,7 @@ impl SocketFile {
                 unhash(map, ns, p, self);
             }
             crate::ephemeral_port::free(AF_INET, 0, crate::ephemeral_port::SocketProto::Udp, p);
+            super::inet_port::release(self, p);
         }
     }
 
@@ -914,5 +931,6 @@ impl SocketFile {
         if !port_locked {
             crate::ephemeral_port::free(AF_INET, 0, crate::ephemeral_port::SocketProto::Udp, port);
         }
+        super::inet_port::release(self, port);
     }
 }

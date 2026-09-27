@@ -58,37 +58,75 @@ pub struct Route {
     pub valid_deadline_ns: u64,
 }
 
-static ROUTES: IrqSafeSpinLock<Vec<Route>> = IrqSafeSpinLock::new(Vec::new());
+#[derive(Clone, Debug)]
+struct NamespacedRoute {
+    net_ns_id: u64,
+    route: Route,
+}
+
+static ROUTES: IrqSafeSpinLock<Vec<NamespacedRoute>> = IrqSafeSpinLock::new(Vec::new());
+
+fn iface_namespace(iface: &str) -> u64 {
+    crate::iface::lookup(iface)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0)
+}
 
 /// Install a route, replacing any existing entry with the same
 /// `(prefix, prefix_len, iface)`.
 pub fn add(route: Route) {
+    add_in(iface_namespace(&route.iface), route);
+}
+
+pub fn add_in(net_ns_id: u64, route: Route) {
     let mut g = ROUTES.lock();
     g.retain(|r| {
-        !(r.prefix == route.prefix && r.prefix_len == route.prefix_len && r.iface == route.iface)
+        !(r.net_ns_id == net_ns_id
+            && r.route.prefix == route.prefix
+            && r.route.prefix_len == route.prefix_len
+            && r.route.iface == route.iface)
     });
-    g.push(route);
+    g.push(NamespacedRoute { net_ns_id, route });
     // Keep the table sorted longest-prefix-first so lookup is a
     // straight forward scan.
     g.sort_by(|a, b| {
-        b.prefix_len
-            .cmp(&a.prefix_len)
-            .then(a.metric.cmp(&b.metric))
+        b.route
+            .prefix_len
+            .cmp(&a.route.prefix_len)
+            .then(a.route.metric.cmp(&b.route.metric))
     });
 }
 
 /// Remove a route by `(prefix, prefix_len, iface)`. Returns true iff a
 /// matching entry existed.
 pub fn remove(prefix: &[u8; 16], prefix_len: u8, iface: &str) -> bool {
+    remove_in(iface_namespace(iface), prefix, prefix_len, iface)
+}
+
+pub fn remove_in(net_ns_id: u64, prefix: &[u8; 16], prefix_len: u8, iface: &str) -> bool {
     let mut g = ROUTES.lock();
     let before = g.len();
-    g.retain(|r| !(&r.prefix == prefix && r.prefix_len == prefix_len && r.iface == iface));
+    g.retain(|r| {
+        !(r.net_ns_id == net_ns_id
+            && &r.route.prefix == prefix
+            && r.route.prefix_len == prefix_len
+            && r.route.iface == iface)
+    });
     g.len() != before
 }
 
 /// Snapshot every route. Diagnostic use.
 pub fn list_all() -> Vec<Route> {
-    ROUTES.lock().clone()
+    list_all_in(0)
+}
+
+pub fn list_all_in(net_ns_id: u64) -> Vec<Route> {
+    ROUTES
+        .lock()
+        .iter()
+        .filter(|entry| entry.net_ns_id == net_ns_id)
+        .map(|entry| entry.route.clone())
+        .collect()
 }
 
 /// Snapshot for `/proc/net/ipv6_route`. Linux's format:
@@ -110,9 +148,17 @@ pub struct Ipv6RouteSnapshot {
 
 /// Snapshot every IPv6 route.
 pub fn snapshot() -> Vec<Ipv6RouteSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> Vec<Ipv6RouteSnapshot> {
     let g = ROUTES.lock();
     let mut out = Vec::with_capacity(g.len());
-    for r in g.iter() {
+    for r in g
+        .iter()
+        .filter(|entry| entry.net_ns_id == net_ns_id)
+        .map(|entry| &entry.route)
+    {
         let gateway = r.gateway.unwrap_or([0u8; 16]);
         let mut flags: u32 = 0x0001; // RTF_UP
         if r.gateway.is_some() {
@@ -137,7 +183,7 @@ pub fn snapshot() -> Vec<Ipv6RouteSnapshot> {
 /// Walk routes and drop any whose deadline has elapsed.
 pub fn age_tick(now_ns: u64) {
     let mut g = ROUTES.lock();
-    g.retain(|r| r.valid_deadline_ns == 0 || now_ns < r.valid_deadline_ns);
+    g.retain(|r| r.route.valid_deadline_ns == 0 || now_ns < r.route.valid_deadline_ns);
 }
 
 /// Test whether the first `prefix_len` bits of `addr` match `prefix`.
@@ -167,6 +213,10 @@ pub fn match_prefix(addr: &[u8; 16], prefix: &[u8; 16], prefix_len: u8) -> bool 
 /// even without a matching entry in the table — the iface is taken
 /// from `scope_iface`. Multicast is similarly direct.
 pub fn lookup(dst: &[u8; 16], scope_iface: Option<&str>) -> NextHop {
+    lookup_in(0, dst, scope_iface)
+}
+
+pub fn lookup_in(net_ns_id: u64, dst: &[u8; 16], scope_iface: Option<&str>) -> NextHop {
     // Link-local — always direct, scope required.
     if super::addrs::scope_of(dst) == AddrScope::LinkLocal {
         return match scope_iface {
@@ -181,8 +231,8 @@ pub fn lookup(dst: &[u8; 16], scope_iface: Option<&str>) -> NextHop {
             None => {
                 // Default: try to pick the first iface from the table.
                 let g = ROUTES.lock();
-                match g.first() {
-                    Some(r) => NextHop::Direct(r.iface.clone()),
+                match g.iter().find(|route| route.net_ns_id == net_ns_id) {
+                    Some(r) => NextHop::Direct(r.route.iface.clone()),
                     None => NextHop::Unreachable,
                 }
             }
@@ -190,7 +240,11 @@ pub fn lookup(dst: &[u8; 16], scope_iface: Option<&str>) -> NextHop {
     }
     // Normal LPM lookup.
     let g = ROUTES.lock();
-    for r in g.iter() {
+    for r in g
+        .iter()
+        .filter(|route| route.net_ns_id == net_ns_id)
+        .map(|route| &route.route)
+    {
         if match_prefix(dst, &r.prefix, r.prefix_len) {
             return match r.gateway {
                 None => NextHop::Direct(r.iface.clone()),
@@ -202,6 +256,10 @@ pub fn lookup(dst: &[u8; 16], scope_iface: Option<&str>) -> NextHop {
         }
     }
     NextHop::Unreachable
+}
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    ROUTES.lock().retain(|route| route.net_ns_id != net_ns_id);
 }
 
 /// Reset the table. Test-only.

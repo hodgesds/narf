@@ -614,9 +614,11 @@ pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
 /// `in_ifindex` is the arrival interface, so that layer can apply the same
 /// SO_BINDTODEVICE rule; without it the check would hold for in-kernel
 /// sockets and silently not for userspace ones.
-type UserDeliverHook = fn(u64, [u8; 4], u16, [u8; 4], u16, &[u8], u32) -> bool;
+type UserDeliverHook = fn(u64, &[u8], u16, &[u8], u16, &[u8], u32) -> bool;
 
 static USER_DELIVER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static USER_DELIVER_CONTEXT: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+static USER_DELIVER_HOP_LIMIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Install the userspace-socket delivery hook.
 ///
@@ -628,14 +630,30 @@ pub fn install_user_deliver_hook(hook: UserDeliverHook) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn user_deliver(
+pub(crate) fn user_deliver(
     net_ns_id: u64,
-    src_ip: [u8; 4],
+    src_ip: &[u8],
     src_port: u16,
-    dst_ip: [u8; 4],
+    dst_ip: &[u8],
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
+) -> bool {
+    user_deliver_with_hop_limit(
+        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex, 0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn user_deliver_with_hop_limit(
+    net_ns_id: u64,
+    src_ip: &[u8],
+    src_port: u16,
+    dst_ip: &[u8],
+    dst_port: u16,
+    payload: &[u8],
+    in_ifindex: u32,
+    hop_limit: u8,
 ) -> bool {
     let raw = USER_DELIVER_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if raw == 0 {
@@ -645,9 +663,18 @@ fn user_deliver(
     // `UserDeliverHook`, the only writer of this slot, and function
     // pointers are never unmapped.
     let hook: UserDeliverHook = unsafe { core::mem::transmute(raw) };
-    hook(
+    let _context = USER_DELIVER_CONTEXT.lock();
+    USER_DELIVER_HOP_LIMIT.store(hop_limit, core::sync::atomic::Ordering::Release);
+    let consumed = hook(
         net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
-    )
+    );
+    USER_DELIVER_HOP_LIMIT.store(0, core::sync::atomic::Ordering::Release);
+    consumed
+}
+
+/// Hop limit attached to the synchronous userspace-delivery callback.
+pub fn current_user_delivery_hop_limit() -> u8 {
+    USER_DELIVER_HOP_LIMIT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Demultiplex a received UDP datagram to the sockets bound for it.
@@ -727,7 +754,7 @@ pub fn deliver_in(
         // before the datagram is dropped — that table is the only place a
         // userspace `bind()` is recorded.
         user_deliver(
-            net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
+            net_ns_id, &src_ip, src_port, &dst_ip, dst_port, payload, in_ifindex,
         );
         return;
     }

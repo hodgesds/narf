@@ -57,6 +57,10 @@ pub fn release_network_namespace(net_ns_id: u64) {
     tcp_stack::remove_namespace(net_ns_id);
     dhcp::remove_namespace(net_ns_id);
     route::remove_namespace(net_ns_id);
+    ipv6::addrs::remove_namespace(net_ns_id);
+    ipv6::route::remove_namespace(net_ns_id);
+    ipv6::ndp::remove_namespace(net_ns_id);
+    ipv6_stack::remove_namespace(net_ns_id);
     netfilter::namespace::remove(net_ns_id);
     iface::release_namespace(net_ns_id);
 }

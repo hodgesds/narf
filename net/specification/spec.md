@@ -225,7 +225,7 @@ Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
-`inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
+`inet_diag_req_v2` dumps for IPv4 and IPv6 TCP and UDP. It filters by the requested
 Linux socket-state mask and emits `inet_diag_msg` records from
 namespace-scoped transport snapshots, followed by
 `NLMSG_DONE`. Aligned requests may be batched, their sequences remain
@@ -297,7 +297,17 @@ them, from the shared `tcp::core::ICMP_UNREACH_ERRNO` /
 payloads above `icmp_sock::ICMP_ECHO_MAX_PAYLOAD` fail
 `IcmpError2::MsgTooLong` (Linux `EMSGSIZE`).
 
-Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
+Native IPv6 UDP transmission enforces the minimum of the interface MTU,
+socket `IPV6_MTU`, and learned destination PMTU. ICMPv6 Packet Too Big
+messages monotonically reduce the namespace-scoped destination cache.
+Datagrams exceeding that MTU return `EMSGSIZE` when `IPV6_DONTFRAG` is set
+or the discovery mode preserves DF semantics; modes for which Linux
+`ip6_sk_ignore_df` permits source fragmentation emit RFC 8200 Fragment
+headers with one identification and eight-byte-aligned non-final payloads.
+Packets retained during neighbor discovery preserve the MTU decision and are
+fragmented only after resolution, before device transmission.
+
+Linux `/proc/net/{tcp,tcp6,udp,udp6,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
 TCP snapshots expose Linux `get_tcp4_sock` transport fields rather than
@@ -359,7 +369,8 @@ returns the complete datagram length; `recvmsg` also sets its output
 
 ### 3.7 In-kernel TCP socket calls and errno (`tcp_stack`)
 
-The kernel-TCP socket path (`SocketState::InetWired`) calls the
+The kernel-TCP socket paths (`SocketState::InetWired` and
+`SocketState::Inet6Wired`) call the
 errno-returning entry points below. Errors are positive Linux errnos from
 `narf_lib::errno`; each call returns what Linux returns for the same state.
 All are non-blocking: where Linux would sleep, they return `EAGAIN` and the
@@ -367,6 +378,8 @@ socket layer parks the task.
 
 ```rust
 pub fn connect_errno_in(ns: u64, addr: [u8; 4], port: u16) -> Result<u32, i32>;
+pub fn connect6_errno_in(ns: u64, addr: [u8; 16], port: u16) -> Result<u32, i32>;
+pub fn listen6_in(ns: u64, addr: [u8; 16], port: u16, backlog: usize) -> Result<u32, ()>;
 pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32>;
 pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>; // Ok(0) = EOF
 pub fn shutdown_errno(id: u32, how: Shutdown) -> Result<(), i32>;
@@ -378,6 +391,14 @@ pub fn signal_icmp_error_in(ns, local, lport, remote, rport,
 
 The legacy `connect_in` / `send` / `recv` / `shutdown` (`Result<_, ()>`)
 remain for in-kernel callers that do not report errors.
+
+IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
+socket buffers, and errno path. Family-specific connected and listener
+indexes retain full-width addresses and include the network-namespace ID.
+The lookup/index locks are never held while taking a TCB lock; this mirrors
+the lock separation in `tcp_v4_rcv`/`tcp_v6_rcv` and
+`inet_csk_get_port`, where hash-bucket locking protects membership and the
+socket lock protects protocol state.
 
 | Condition | Result | Linux source |
 | --- | --- | --- |
@@ -764,6 +785,36 @@ References (public-only, all IETF documents):
   `Icmpv6Header`, ND option iterator + appender, message builders
   for RS / NS / NA (with R/S/O flags) / RA (with M/O flags +
   CurHopLimit + Router Lifetime + Reachable / Retrans timers).
+- `ipv6_stack::build_udp_segment` constructs the mandatory non-zero IPv6 UDP
+  checksum. `ipv6_stack::send_udp` performs IPv6 longest-prefix route lookup,
+  preferred/deprecated source selection, gateway-aware NDP lookup or RFC 2464
+  multicast MAC mapping, and emits the complete Ethernet frame. RX validates
+  the IPv6 pseudo-header checksum and UDP length before forwarding the exact
+  payload and ingress ifindex through the registered userspace datagram hook.
+  A unicast cache miss installs an `Incomplete` NDP entry and emits a Neighbor
+  Solicitation to the target's solicited-node multicast address with IPv6 hop
+  limit 255; repeated sends do not flood duplicate solicitations while that
+  resolution is pending. The complete UDP segment is retained in a bounded,
+  namespace-keyed queue and emitted when the Neighbor Advertisement updates
+  the cache; queue exhaustion returns `ENOBUFS` rather than reporting a
+  datagram as sent and dropping it.
+- Native TCP6 RX validates the IPv6 pseudo-header checksum before entering the
+  shared TCP state machine. Active and passive opens use IPv6 FIB/source
+  selection and NDP, emit Ethernet+IPv6+TCP frames, and retain native IPv6
+  endpoints for `getsockname`, `getpeername`, and accept.
+- AF_INET6 sockets implement `IPV6_UNICAST_HOPS`, `IPV6_MTU_DISCOVER`,
+  `IPV6_MTU`, `IPV6_RECVERR`, `IPV6_RECVPKTINFO`, `IPV6_RECVHOPLIMIT`,
+  `IPV6_DONTFRAG`, and `IPV6_V6ONLY` with Linux argument validation and
+  `ENOTCONN` for an unconnected `IPV6_MTU` query. UDP6 receive records retain
+  destination address, ingress ifindex, and received hop limit per datagram;
+  `recvmsg` emits `IPV6_PKTINFO` and `IPV6_HOPLIMIT` control messages when the
+  corresponding receive options are enabled and reports `MSG_CTRUNC` when a
+  complete requested record does not fit.
+- IPv6 address and route registries are keyed by immutable network-namespace
+  ID internally. Source selection, local-address tests, route lookup,
+  rtnetlink/proc snapshots, and final namespace teardown use the caller's
+  namespace; identical interface/address/prefix values may coexist without
+  cross-namespace visibility.
 
 ### DNS (`pkt_dns`)
 - **RFC 1035** — Domain Names — Implementation and Specification

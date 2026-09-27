@@ -1168,7 +1168,7 @@ The TCP socket-option compatibility surface validates and round-trips Linux
 zero for `TCP_IS_MPTCP`. Unsupported options return Linux's option-specific
 errno rather than succeeding silently.
 
-AF_INET `SOCK_DGRAM` (UDP) follows Linux v6.12 `net/ipv4/{af_inet,udp,
+AF_INET `SOCK_DGRAM` (UDP) follows Linux `net/ipv4/{af_inet,udp,
 datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
 - `bind` requires a 16-byte `sockaddr_in` (`EINVAL`), `AF_INET` or
   `AF_UNSPEC`+`INADDR_ANY` (`EAFNOSUPPORT`), and a local, broadcast,
@@ -1210,6 +1210,43 @@ datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
   `getsockname` on an unbound socket is `0.0.0.0:0`. Addresses are returned
   as full 16-byte `sockaddr_in`. `SO_PROTOCOL` for protocol 0 is
   `IPPROTO_UDP`.
+
+AF_INET6 registers `SOCK_DGRAM` with protocol zero or `IPPROTO_UDP`; opening
+one must not return `EAFNOSUPPORT` and thereby falsely advertise an IPv4-only
+host to libc resolver probes. Native IPv6 datagram endpoints retain 128-bit
+local and peer addresses, namespace-scoped bind tables, wildcard/exact
+receive selection, connected-peer filtering, message boundaries,
+`MSG_PEEK`/`MSG_TRUNC`, shutdown state, and Linux bind/connect/send address
+validation. `::1` delivery uses this same endpoint table. IPv4-mapped address
+and wildcard arbitration is controlled explicitly by `IPV6_V6ONLY`; it must
+not arise from truncating an IPv6 address into the IPv4 table. The
+`sin6_scope_id` supplied for a scoped peer is retained by connect/getpeername,
+reported on received datagrams, and used as the outbound interface selector.
+`IPV6_V6ONLY` requires a full integer option and may be changed only before
+the socket owns a local port, matching `do_ipv6_setsockopt`'s `inet_num`
+guard. With V6ONLY disabled, IPv4-mapped destinations use the canonical IPv4
+UDP route/ARP/checksum path and IPv4 receive fallback reports the peer as
+`::ffff:a.b.c.d`; V6ONLY rejects a mapped bind with `EINVAL` and mapped
+connect/send with `ENETUNREACH`.
+IPv4 and dual-stack IPv6 UDP bindings share one atomic cross-family port
+reservation space. This mirrors Linux's `udp_v4_get_port` and
+`udp_v6_get_port` convergence on `udp_lib_get_port` and its primary
+`udp_hslot::lock`: an IPv4 wildcard conflicts with a non-V6ONLY IPv6 wildcard,
+while a V6ONLY reservation remains independent. NARF's family demux lock may
+nest the reservation lock, but the reservation layer never enters either
+family table, providing a fixed lock order without an IPv4/IPv6 ABBA path.
+
+Internet sockets implement the legacy network-device ioctl ABI for
+`SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
+`SIOCGIFHWADDR`, and `SIOCGIFINDEX`. Each consumes and returns the native
+64-bit 40-byte `struct ifreq`, resolves the interface in the socket's network
+namespace, returns `ENODEV` for an unknown name and `EFAULT` for an invalid
+ifreq pointer, and reports the same registry fields used by rtnetlink.
+`SIOCSIFFLAGS`, `SIOCSIFMTU`, and `SIOCSIFHWADDR` invoke the same typed
+interface-control operations as rtnetlink. They require a live, namespace-
+and-interface-matched `AdminHandle`; no uid or Linux capability bit supplies
+ambient authority. Missing or mismatched authority returns `EPERM`, while
+invalid MTU, hardware type, or address values return `EINVAL`.
 
 ### 3.3 BPF XDP program compatibility
 

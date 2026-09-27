@@ -38,7 +38,8 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, connect_errno_in, connect_in, getsockopt_cong, getsockopt_int, listen,
+    accept, close, connect, connect6_errno_in, connect6_errno_with_options_in, connect_errno_in,
+    connect_in, endpoints6, getsockopt_cong, getsockopt_int, listen, listen6_in,
     listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, release, remove_tcb,
     send, send_errno, setsockopt_int, setsockopt_str, shutdown, shutdown_errno, take_sock_error,
     tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_DEFER_ACCEPT, TCP_KEEPALIVE, TCP_KEEPCNT,

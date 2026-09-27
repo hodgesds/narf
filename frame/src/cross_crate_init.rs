@@ -540,13 +540,39 @@ fn igmp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Igmp6Snapsho
 }
 
 fn tcp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
-    // IPv6 TCP sockets ride the same tcp::core table today; the
-    // stack maps IPv4 + IPv6 onto separate TCBs once that lands.
-    alloc::vec::Vec::new()
+    narf_net::tcp::core::snapshot6_in(current_net_ns_id())
+        .into_iter()
+        .map(|t| narf_filesystem::procfs::net::Tcb6Snapshot {
+            local_addr: t.local_addr,
+            local_port: t.local_port,
+            remote_addr: t.remote_addr,
+            remote_port: t.remote_port,
+            state_code: t.state_code,
+            tx_queue: t.tx_queue,
+            rx_queue: t.rx_queue,
+            retrnsmt: t.retrnsmt,
+            uid: 0,
+            timeout: 0,
+            inode: 0,
+        })
+        .collect()
 }
 
 fn udp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSnapshot> {
-    alloc::vec::Vec::new()
+    narf_userspace::socket::udp6_snapshot_in(current_net_ns_id())
+        .into_iter()
+        .map(|u| narf_filesystem::procfs::net::Udp6SocketSnapshot {
+            local_addr: u.local_addr,
+            local_port: u.local_port,
+            remote_addr: u.remote_addr,
+            remote_port: u.remote_port,
+            state_code: u.state_code,
+            tx_queue: u.tx_queue,
+            rx_queue: u.rx_queue,
+            uid: 0,
+            inode: 0,
+        })
+        .collect()
 }
 
 fn raw6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Raw6SocketSnapshot> {

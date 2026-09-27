@@ -864,6 +864,206 @@ fn smoke_socket_inet_udp_16_concurrent() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet_udp_16_concurrent);
 
+fn smoke_socket_inet6_udp_loopback_round_trip() -> TestResult {
+    let rx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let tx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let addr = crate::socket::make_sockaddr_in6(loopback, 8123);
+    if !matches!(
+        rx.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("AF_INET6 UDP bind(::1) failed");
+    }
+    let payload = b"udp6";
+    if !matches!(
+        tx.dispatch_op(crate::socket::SocketOp::Send {
+            buf: payload,
+            flags: 0,
+            addr: Some(addr),
+        }),
+        crate::socket::SocketOpResult::Ok(4)
+    ) {
+        rx.unregister();
+        tx.unregister();
+        return TestResult::Fail("AF_INET6 UDP sendto(::1) failed");
+    }
+    let mut out = [0u8; 8];
+    let result = rx.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    });
+    rx.unregister();
+    tx.unregister();
+    if matches!(result, crate::socket::SocketOpResult::Received { n: 4, .. })
+        && &out[..4] == payload
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("AF_INET6 UDP loopback payload mismatch")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet6_udp_loopback_round_trip);
+
+fn smoke_socket_inet6_udp_preserves_scope_id() -> TestResult {
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let mut body = alloc::vec::Vec::new();
+    body.extend_from_slice(&9000u16.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    body.extend_from_slice(&7u32.to_ne_bytes());
+    let addr = crate::socket::SockAddr {
+        family: crate::socket::AF_INET6,
+        body,
+    };
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        sock.unregister();
+        return TestResult::Fail("scoped UDP6 connect failed");
+    }
+    let peer = sock.peer_addr();
+    sock.unregister();
+    match peer {
+        Some(peer)
+            if peer.body.len() == 26
+                && u32::from_ne_bytes([
+                    peer.body[22],
+                    peer.body[23],
+                    peer.body[24],
+                    peer.body[25],
+                ]) == 7 =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("UDP6 getpeername lost sin6_scope_id"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet6_udp_preserves_scope_id);
+
+fn smoke_socket_inet6_v6only_rejects_change_after_bind() -> TestResult {
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::make_sockaddr_in6(loopback, 8124),
+        }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("UDP6 bind for V6ONLY test failed");
+    }
+    let one = 1u32.to_ne_bytes();
+    let result = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IPV6,
+        name: crate::socket::IPV6_V6ONLY,
+        value: &one,
+    });
+    sock.unregister();
+    if matches!(
+        result,
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+    ) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IPV6_V6ONLY changed after UDP6 bind")
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_inet6_v6only_rejects_change_after_bind
+);
+
+fn smoke_socket_dual_stack_udp_receives_v4_as_mapped() -> TestResult {
+    const PORT: u16 = 8125;
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::make_sockaddr_in6([0; 16], PORT),
+        }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("dual-stack UDP6 wildcard bind failed");
+    }
+    if !crate::socket::deliver_wire_datagram(
+        sock.net_ns_id(),
+        &[192, 0, 2, 1],
+        9000,
+        &[127, 0, 0, 1],
+        PORT,
+        b"mapped",
+        1,
+    ) {
+        sock.unregister();
+        return TestResult::Fail("IPv4 datagram did not enter dual-stack UDP6 socket");
+    }
+    let mut out = [0u8; 16];
+    let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    });
+    sock.unregister();
+    match result {
+        crate::socket::SocketOpResult::Received {
+            n: 6,
+            peer: Some(peer),
+        } if &out[..6] == b"mapped"
+            && peer.body[6..18] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+            && peer.body[18..22] == [192, 0, 2, 1] =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("dual-stack UDP6 recvfrom address was not IPv4-mapped"),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_dual_stack_udp_receives_v4_as_mapped
+);
+
+fn smoke_socket_udp_cross_family_bind_arbitration() -> TestResult {
+    const PORT: u16 = 8126;
+    let v4 = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
+    let dual = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let only = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    if !matches!(
+        v4.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: build_sockaddr_in(0, PORT),
+        }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("IPv4 wildcard bind failed");
+    }
+    if !matches!(
+        dual.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::make_sockaddr_in6([0; 16], PORT),
+        }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AddrInUse)
+    ) {
+        v4.unregister();
+        dual.unregister();
+        return TestResult::Fail("dual-stack UDP6 wildcard did not conflict with IPv4");
+    }
+    let one = 1u32.to_ne_bytes();
+    let _ = only.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IPV6,
+        name: crate::socket::IPV6_V6ONLY,
+        value: &one,
+    });
+    let result = only.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: crate::socket::make_sockaddr_in6([0; 16], PORT),
+    });
+    v4.unregister();
+    dual.unregister();
+    only.unregister();
+    if matches!(result, crate::socket::SocketOpResult::Ok(0)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("V6ONLY UDP bind incorrectly conflicted with IPv4")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_udp_cross_family_bind_arbitration);
+
 /// SO_REUSEADDR + double-bind: the second bind to the same
 /// (addr, port) succeeds when SO_REUSEADDR is set on the second
 /// socket. Without it, the second bind returns EADDRINUSE.
@@ -1299,9 +1499,9 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
     // ── RX: a datagram from the wire must reach the socket ──
     if !crate::socket::deliver_wire_datagram(
         sock.net_ns_id(),
-        PEER,
+        &PEER,
         PEER_PORT,
-        LOCAL,
+        &LOCAL,
         LOCAL_PORT,
         b"pong",
         0, // arrival interface unknown: matches any binding
@@ -1321,9 +1521,9 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
     // fall through to its own handling rather than silently swallowing it.
     if crate::socket::deliver_wire_datagram(
         sock.net_ns_id(),
-        PEER,
+        &PEER,
         PEER_PORT,
-        LOCAL,
+        &LOCAL,
         LOCAL_PORT + 1,
         b"nobody",
         0,
@@ -1398,15 +1598,15 @@ fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
 
     let ns = sock.net_ns_id();
     // Arriving on the WRONG interface: refused.
-    if crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"wrong", idx_b) {
+    if crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"wrong", idx_b) {
         return TestResult::Fail("a datagram from another interface must not be delivered");
     }
     // Arriving on the RIGHT interface: delivered.
-    if !crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"right", idx_a) {
+    if !crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"right", idx_a) {
         return TestResult::Fail("a datagram from the bound interface must be delivered");
     }
     // An unknown arrival interface cannot contradict the binding.
-    if !crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"any", 0) {
+    if !crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"any", 0) {
         return TestResult::Fail("an unknown arrival interface must still be delivered");
     }
 

@@ -33,7 +33,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
+mod inet6_dgram;
 mod inet_dgram;
+mod inet_port;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 
 // ── POSIX-numbered constants ────────────────────────────────────
@@ -361,6 +363,15 @@ pub const IP_RECVTTL: u32 = 12;
 pub const IP_MTU: u32 = 14;
 pub const IP_MULTICAST_TTL: u32 = 33;
 pub const IPV6_V6ONLY: u32 = 26;
+pub const IPV6_UNICAST_HOPS: u32 = 16;
+pub const IPV6_MTU_DISCOVER: u32 = 23;
+pub const IPV6_MTU: u32 = 24;
+pub const IPV6_RECVERR: u32 = 25;
+pub const IPV6_RECVPKTINFO: u32 = 49;
+pub const IPV6_PKTINFO: u32 = 50;
+pub const IPV6_RECVHOPLIMIT: u32 = 51;
+pub const IPV6_HOPLIMIT: u32 = 52;
+pub const IPV6_DONTFRAG: u32 = 62;
 
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
@@ -775,6 +786,7 @@ pub struct SocketFile {
     /// they are dropped with the entry. A plain `read(2)` wants neither and
     /// calls `discard_dgram_recv_ancillary`.
     dgram_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, DgramRecvAncillary>>,
+    inet6_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, Inet6RecvAncillary>>,
     /// Durable per-fd readiness cell for a connectionless datagram inbox
     /// (AF_UNIX/AF_INET SOCK_DGRAM). The inbox lives INSIDE the `state` enum
     /// behind the lock, so — unlike a `RingBuf` Arc — the cell can't be a field
@@ -939,6 +951,14 @@ pub struct SockOptions {
     pub tcp_inq: bool,
     pub tcp_tx_delay: u32,
     pub ipv6_v6only: bool,
+    pub ipv6_unicast_hops: i32,
+    pub ipv6_mtu_discover: u32,
+    pub ipv6_mtu: u32,
+    pub ipv6_mtu_set: bool,
+    pub ipv6_recverr: bool,
+    pub ipv6_recvpktinfo: bool,
+    pub ipv6_recvhoplimit: bool,
+    pub ipv6_dontfrag: bool,
     // IP
     pub ip_ttl: u32,
     pub ip_tos: u32,
@@ -987,6 +1007,14 @@ impl Default for SockOptions {
             tcp_inq: false,
             tcp_tx_delay: 0,
             ipv6_v6only: false,
+            ipv6_unicast_hops: -1,
+            ipv6_mtu_discover: 1,
+            ipv6_mtu: 1280,
+            ipv6_mtu_set: false,
+            ipv6_recverr: false,
+            ipv6_recvpktinfo: false,
+            ipv6_recvhoplimit: false,
+            ipv6_dontfrag: false,
             ip_ttl: 64,
             ip_tos: 0,
             ip_pktinfo: false,
@@ -1217,6 +1245,18 @@ enum SocketState {
         /// (`sk_rmem_alloc`).
         rmem: usize,
     },
+    /// AF_INET6 SOCK_DGRAM endpoint. Native IPv6 bindings remain separate
+    /// from IPv4; dual-stack wildcard arbitration is explicit rather than
+    /// relying on address truncation or aliases.
+    Inet6Dgram {
+        local_addr: [u8; 16],
+        local_port: u16,
+        local_scope_id: u32,
+        inbox: VecDeque<DgramPacket6>,
+        peer: Option<([u8; 16], u16, u32)>,
+        port_locked: bool,
+        rmem: usize,
+    },
     /// AF_UNIX SOCK_DGRAM endpoint. Same shape as InetDgram but keyed by
     /// a unix address (pathname or abstract name).
     UnixDgram {
@@ -1231,12 +1271,18 @@ enum SocketState {
         port: u16,
         backlog: u32,
         pending: VecDeque<Arc<SocketFile>>,
+        listen_id: Option<u32>,
         /// TCP_LISTEN vs bound-only, as for `InetListener`.
         listening: bool,
     },
     Inet6Connected {
         tx: Arc<RingBuf>,
         rx: Arc<RingBuf>,
+        peer_addr: [u8; 16],
+        peer_port: u16,
+    },
+    Inet6Wired {
+        tcb_id: u32,
         peer_addr: [u8; 16],
         peer_port: u16,
     },
@@ -1287,8 +1333,8 @@ enum SocketState {
     NetlinkNetfilter { replies: VecDeque<Vec<u8>> },
 }
 
-/// Deliver a UDP datagram that arrived from the WIRE to a bound AF_INET
-/// datagram socket. Returns whether one took it.
+/// Deliver a UDP datagram that arrived from the wire to a bound AF_INET or
+/// AF_INET6 datagram socket. Address slices are exactly 4 or 16 bytes.
 ///
 /// Installed into `narf_net::udp_sock` at boot, because the RX demux there
 /// cannot see this crate's port table. In-kernel sockets are matched first
@@ -1301,16 +1347,38 @@ enum SocketState {
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_wire_datagram(
     net_ns_id: u64,
-    src_ip: [u8; 4],
+    src_ip: &[u8],
     src_port: u16,
-    dst_ip: [u8; 4],
+    dst_ip: &[u8],
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
 ) -> bool {
-    inet_dgram::deliver_wire(
-        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
-    )
+    match (src_ip.try_into(), dst_ip.try_into()) {
+        (Ok(src), Ok(dst)) => {
+            inet_dgram::deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
+                || inet6_dgram::deliver_wire_v4_mapped(
+                    net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex,
+                )
+        }
+        _ if src_ip.len() == 16 && dst_ip.len() == 16 => {
+            let mut src = [0u8; 16];
+            let mut dst = [0u8; 16];
+            src.copy_from_slice(src_ip);
+            dst.copy_from_slice(dst_ip);
+            inet6_dgram::deliver_wire(
+                net_ns_id,
+                src,
+                src_port,
+                dst,
+                dst_port,
+                payload,
+                in_ifindex,
+                narf_net::udp_sock::current_user_delivery_hop_limit(),
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Open-file state transported by `SCM_RIGHTS`.
@@ -1341,6 +1409,48 @@ pub struct DgramPacket {
     /// Per-datagram SCM_RIGHTS payload. AF_UNIX datagrams preserve message
     /// boundaries, so these descriptors must not share the stream ring.
     pub(crate) fds: Vec<ScmRightsFile>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Udp6SocketSnapshot {
+    pub local_addr: [u8; 16],
+    pub local_port: u16,
+    pub remote_addr: [u8; 16],
+    pub remote_port: u16,
+    pub state_code: u8,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
+}
+
+pub fn udp6_snapshot_in(net_ns_id: u64) -> Vec<Udp6SocketSnapshot> {
+    inet6_dgram::snapshot_in(net_ns_id)
+}
+
+fn map_admin_ioctl_error(error: narf_net::AdminError) -> FsError {
+    match error {
+        narf_net::AdminError::AuthorityRevoked => FsError::OperationNotPermitted,
+        narf_net::AdminError::NoIface => FsError::NotFound,
+        narf_net::AdminError::InvalidMtu
+        | narf_net::AdminError::InvalidMac
+        | narf_net::AdminError::InvalidPrefix => FsError::InvalidPath,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DgramPacket6 {
+    peer_addr: [u8; 16],
+    peer_port: u16,
+    scope_id: u32,
+    destination: [u8; 16],
+    hop_limit: i32,
+    payload: Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Inet6RecvAncillary {
+    pub destination: [u8; 16],
+    pub ifindex: u32,
+    pub hop_limit: i32,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -1542,6 +1652,7 @@ impl SocketFile {
             peer_groups: IrqSafeSpinLock::new(Vec::new()),
             passcred: AtomicBool::new(false),
             dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            inet6_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             // A fresh dgram socket is always sendable, not yet readable; a fresh
             // listener has no pending connection; a fresh netlink queue is empty
             // (readable only once a reply/monitor message is enqueued) but always
@@ -2088,6 +2199,23 @@ impl SocketFile {
         self.passcred.load(Ordering::Acquire)
     }
 
+    pub(crate) fn stash_inet6_recv_ancillary(&self, ancillary: Inet6RecvAncillary) {
+        self.inet6_recv_ancillary
+            .lock()
+            .insert(crate::handlers::current_task_id(), ancillary);
+    }
+
+    pub(crate) fn take_inet6_recv_ancillary(&self) -> Option<Inet6RecvAncillary> {
+        self.inet6_recv_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool) {
+        let options = self.options.lock();
+        (options.ipv6_recvpktinfo, options.ipv6_recvhoplimit)
+    }
+
     /// Credentials to attach to the current recvmsg's `SCM_CREDENTIALS`
     /// ancillary message. DGRAM sockets report the sender of the most
     /// recently received datagram; connected (stream) sockets report the
@@ -2192,9 +2320,9 @@ impl SocketFile {
         self.nonblock.store(on, Ordering::Release);
     }
 
-    /// An AF_INET `SOCK_DGRAM` (UDP) socket.
+    /// An Internet-family `SOCK_DGRAM` (UDP) socket.
     pub fn is_inet_dgram(&self) -> bool {
-        self.domain == AF_INET && self.kind == SOCK_DGRAM
+        matches!(self.domain, AF_INET | AF_INET6) && self.kind == SOCK_DGRAM
     }
 
     /// Whether an EPIPE from a send raises SIGPIPE (absent MSG_NOSIGNAL).
@@ -2252,6 +2380,16 @@ impl SocketFile {
                 local_port,
                 ..
             } => Some(make_sockaddr_in(*local_addr, *local_port)),
+            SocketState::Inet6Dgram {
+                local_addr,
+                local_port,
+                local_scope_id,
+                ..
+            } => Some(make_sockaddr_in6_scoped(
+                *local_addr,
+                *local_port,
+                *local_scope_id,
+            )),
             SocketState::InetRaw { local_addr, .. } => Some(make_sockaddr_in(*local_addr, 0)),
             SocketState::UnixBound { addr } | SocketState::UnixListener { addr, .. } => {
                 Some(SockAddr {
@@ -2279,6 +2417,8 @@ impl SocketFile {
                 let _ = (peer_addr, peer_port);
                 Some(make_sockaddr_in6([0u8; 16], 0))
             }
+            SocketState::Inet6Wired { tcb_id, .. } => narf_net::tcp_stack::endpoints6(*tcb_id)
+                .map(|(local, port, _, _)| make_sockaddr_in6(local, port)),
             _ => None,
         }
     }
@@ -2300,6 +2440,10 @@ impl SocketFile {
             SocketState::InetDgram {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
+            SocketState::Inet6Dgram {
+                peer: Some((a, p, scope)),
+                ..
+            } => Some(make_sockaddr_in6_scoped(*a, *p, *scope)),
             SocketState::InetRaw {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
@@ -2316,6 +2460,11 @@ impl SocketFile {
                 body: alloc::vec::Vec::new(),
             }),
             SocketState::Inet6Connected {
+                peer_addr,
+                peer_port,
+                ..
+            } => Some(make_sockaddr_in6(*peer_addr, *peer_port)),
+            SocketState::Inet6Wired {
                 peer_addr,
                 peer_port,
                 ..
@@ -2343,7 +2492,9 @@ impl SocketFile {
                 | SocketState::Inet6Listener { .. }
                 | SocketState::UnixDgram { addr: Some(_), .. }
                 | SocketState::InetDgram { .. }
+                | SocketState::Inet6Dgram { .. }
                 | SocketState::InetWired { .. }
+                | SocketState::Inet6Wired { .. }
         )
     }
 
@@ -2360,6 +2511,7 @@ impl SocketFile {
             UnixDgram(UnixPathKey),
             AbstractDgram((u64, Vec<u8>)),
             InetDgram(u16, bool),
+            Inet6Dgram(u16, bool),
             Tcb(u32),
             None,
         }
@@ -2397,7 +2549,16 @@ impl SocketFile {
                     self.inet_tcp_release_port();
                     Reg::Inet(*addr, *port)
                 }
-                SocketState::Inet6Listener { addr, port, .. } => {
+                SocketState::Inet6Listener {
+                    addr,
+                    port,
+                    listen_id,
+                    ..
+                } => {
+                    if let Some(id) = listen_id {
+                        narf_net::tcp_stack::remove_tcb(*id);
+                        crate::handlers::clear_tcb_owner(*id);
+                    }
                     self.inet6_release_port();
                     Reg::Inet6(*addr, *port)
                 }
@@ -2415,7 +2576,14 @@ impl SocketFile {
                     port_locked,
                     ..
                 } => Reg::InetDgram(*local_port, *port_locked),
-                SocketState::InetWired { tcb_id, .. } => Reg::Tcb(*tcb_id),
+                SocketState::Inet6Dgram {
+                    local_port,
+                    port_locked,
+                    ..
+                } => Reg::Inet6Dgram(*local_port, *port_locked),
+                SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                    Reg::Tcb(*tcb_id)
+                }
                 _ => Reg::None,
             }
         };
@@ -2450,11 +2618,12 @@ impl SocketFile {
             }
             Reg::Inet6(a, p) => {
                 if let Some(map) = INET6_LISTENERS.lock().as_mut() {
+                    let key = (self.net_ns_id(), a, p);
                     if map
-                        .get(&(a, p))
+                        .get(&key)
                         .is_some_and(|l| core::ptr::eq(Arc::as_ptr(l), self))
                     {
-                        map.remove(&(a, p));
+                        map.remove(&key);
                     }
                 }
             }
@@ -2465,6 +2634,9 @@ impl SocketFile {
             }
             Reg::InetDgram(port, port_locked) => {
                 self.inet_dgram_unregister(port, port_locked);
+            }
+            Reg::Inet6Dgram(port, port_locked) => {
+                self.inet6_dgram_unregister(port, port_locked);
             }
             Reg::Tcb(id) => {
                 let _ = narf_net::tcp_stack::close(id);
@@ -2505,11 +2677,15 @@ pub fn make_sockaddr_in(addr: u32, port: u16) -> SockAddr {
 /// so the reported length is `sizeof(struct sockaddr_in6)` (28), as
 /// `inet6_getname` returns.
 pub fn make_sockaddr_in6(addr: [u8; 16], port: u16) -> SockAddr {
+    make_sockaddr_in6_scoped(addr, port, 0)
+}
+
+fn make_sockaddr_in6_scoped(addr: [u8; 16], port: u16, scope_id: u32) -> SockAddr {
     let mut body = Vec::with_capacity(SOCKADDR_IN6_BODY_LEN);
     body.extend_from_slice(&port.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes()); // flowinfo
     body.extend_from_slice(&addr);
-    body.extend_from_slice(&0u32.to_ne_bytes()); // sin6_scope_id
+    body.extend_from_slice(&scope_id.to_ne_bytes());
     SockAddr {
         family: AF_INET6,
         body,
@@ -2563,6 +2739,10 @@ fn read_ip_int(value: &[u8]) -> Option<i32> {
 /// Validate an AF_INET6 sockaddr (`inet6_bind_sk` / `tcp_v6_connect`):
 /// shorter than SIN6_LEN_RFC2133 is EINVAL, a foreign family EAFNOSUPPORT.
 fn inet6_sockaddr(addr: &SockAddr) -> Result<([u8; 16], u16), SockError> {
+    inet6_sockaddr_scoped(addr).map(|(ip, port, _)| (ip, port))
+}
+
+fn inet6_sockaddr_scoped(addr: &SockAddr) -> Result<([u8; 16], u16, u32), SockError> {
     if addr.body.len() < SOCKADDR_IN6_MIN_BODY_LEN {
         return Err(SockError::InvalidArg);
     }
@@ -2572,7 +2752,12 @@ fn inet6_sockaddr(addr: &SockAddr) -> Result<([u8; 16], u16), SockError> {
     let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
     let mut ip = [0u8; 16];
     ip.copy_from_slice(&addr.body[6..22]);
-    Ok((ip, port))
+    let scope_id = if addr.body.len() >= SOCKADDR_IN6_BODY_LEN {
+        u32::from_ne_bytes([addr.body[22], addr.body[23], addr.body[24], addr.body[25]])
+    } else {
+        0
+    };
+    Ok((ip, port, scope_id))
 }
 
 /// Parse a `sockaddr_in`-shaped body into (ip, port) in host byte
@@ -2681,6 +2866,134 @@ impl FileOps for SocketFile {
     /// `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket; SIOCOUTQ must likewise
     /// succeed or dbus-broker treats the ENOTTY as fatal.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        const SIOCGIFFLAGS: u32 = 0x8913;
+        const SIOCSIFFLAGS: u32 = 0x8914;
+        const SIOCGIFADDR: u32 = 0x8915;
+        const SIOCGIFNETMASK: u32 = 0x891b;
+        const SIOCGIFMTU: u32 = 0x8921;
+        const SIOCSIFMTU: u32 = 0x8922;
+        const SIOCSIFHWADDR: u32 = 0x8924;
+        const SIOCGIFHWADDR: u32 = 0x8927;
+        const SIOCGIFINDEX: u32 = 0x8933;
+        if matches!(
+            cmd,
+            SIOCGIFFLAGS
+                | SIOCSIFFLAGS
+                | SIOCGIFADDR
+                | SIOCGIFNETMASK
+                | SIOCGIFMTU
+                | SIOCSIFMTU
+                | SIOCSIFHWADDR
+                | SIOCGIFHWADDR
+                | SIOCGIFINDEX
+        ) {
+            let mut ifreq = [0u8; 40];
+            // SAFETY: Linux's 64-bit `struct ifreq` is 40 bytes. The common
+            // name field is input and the selected union member is output.
+            if unsafe { crate::handlers::copy_from_user(&mut ifreq, arg as u64) }.is_err() {
+                return Err(FsError::InvalidData);
+            }
+            let name_len = ifreq[..16].iter().position(|byte| *byte == 0).unwrap_or(16);
+            let name = String::from(
+                core::str::from_utf8(&ifreq[..name_len]).map_err(|_| FsError::NotFound)?,
+            );
+            let iface =
+                narf_net::iface::lookup_in(self.net_ns_id(), &name).ok_or(FsError::NotFound)?;
+            match cmd {
+                SIOCGIFFLAGS => {
+                    const IFF_UP: i16 = 0x1;
+                    const IFF_BROADCAST: i16 = 0x2;
+                    const IFF_LOOPBACK: i16 = 0x8;
+                    const IFF_RUNNING: i16 = 0x40;
+                    const IFF_MULTICAST: i16 = 0x1000;
+                    let mut flags = IFF_MULTICAST;
+                    if iface.link_up {
+                        flags |= IFF_UP | IFF_RUNNING;
+                    }
+                    flags |= if name == "lo" {
+                        IFF_LOOPBACK
+                    } else {
+                        IFF_BROADCAST
+                    };
+                    ifreq[16..18].copy_from_slice(&flags.to_ne_bytes());
+                }
+                SIOCGIFADDR | SIOCGIFNETMASK => {
+                    ifreq[16..40].fill(0);
+                    ifreq[16..18].copy_from_slice(&AF_INET.to_ne_bytes());
+                    let addr = if cmd == SIOCGIFADDR {
+                        iface.ipv4
+                    } else if name == "lo" {
+                        [255, 0, 0, 0]
+                    } else {
+                        [255, 255, 255, 0]
+                    };
+                    ifreq[20..24].copy_from_slice(&addr);
+                }
+                SIOCGIFMTU => {
+                    ifreq[16..20].copy_from_slice(&(iface.mtu as i32).to_ne_bytes());
+                }
+                SIOCGIFHWADDR => {
+                    const ARPHRD_ETHER: u16 = 1;
+                    const ARPHRD_LOOPBACK: u16 = 772;
+                    ifreq[16..40].fill(0);
+                    let hardware = if name == "lo" {
+                        ARPHRD_LOOPBACK
+                    } else {
+                        ARPHRD_ETHER
+                    };
+                    ifreq[16..18].copy_from_slice(&hardware.to_ne_bytes());
+                    ifreq[18..24].copy_from_slice(&iface.mac);
+                }
+                SIOCGIFINDEX => {
+                    let index = narf_net::iface::ifindex_of(&name).ok_or(FsError::NotFound)?;
+                    ifreq[16..20].copy_from_slice(&(index as i32).to_ne_bytes());
+                }
+                SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR => {
+                    let admin = self
+                        .netlink_admin
+                        .lock()
+                        .clone()
+                        .ok_or(FsError::OperationNotPermitted)?;
+                    if admin.iface_name() != name
+                        || admin.net_ns_id().map_err(map_admin_ioctl_error)? != self.net_ns_id()
+                    {
+                        return Err(FsError::OperationNotPermitted);
+                    }
+                    match cmd {
+                        SIOCSIFFLAGS => {
+                            const IFF_UP: i16 = 0x1;
+                            let flags = i16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+                            admin
+                                .set_link(flags & IFF_UP != 0)
+                                .map_err(map_admin_ioctl_error)?;
+                        }
+                        SIOCSIFMTU => {
+                            let mtu = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+                            let mtu = u32::try_from(mtu).map_err(|_| FsError::InvalidPath)?;
+                            admin.set_mtu(mtu).map_err(map_admin_ioctl_error)?;
+                        }
+                        SIOCSIFHWADDR => {
+                            const ARPHRD_ETHER: u16 = 1;
+                            let family = u16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+                            if family != ARPHRD_ETHER {
+                                return Err(FsError::InvalidPath);
+                            }
+                            admin
+                                .set_mac(ifreq[18..24].try_into().unwrap())
+                                .map_err(map_admin_ioctl_error)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    return Ok(0);
+                }
+                _ => unreachable!(),
+            }
+            // SAFETY: the same validated fixed-size ifreq is copied back.
+            if unsafe { crate::handlers::copy_to_user(arg as u64, &ifreq) }.is_err() {
+                return Err(FsError::InvalidData);
+            }
+            return Ok(0);
+        }
         // SIOCINQ = bytes immediately readable; SIOCOUTQ = bytes still queued
         // in the send buffer (always 0 here — synchronous delivery, no local
         // send queue). Any other request is unknown → ENOTTY (Linux
@@ -2765,7 +3078,9 @@ impl FileOps for SocketFile {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
             | SocketState::Inet6Connected { rx, tx, .. } => D::Connected(rx.clone(), tx.clone()),
-            SocketState::InetWired { tcb_id, .. } => D::Wired(*tcb_id),
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                D::Wired(*tcb_id)
+            }
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => D::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
@@ -2861,7 +3176,9 @@ impl SocketFile {
             // Kernel-TCP-over-NIC (off-box redis/servers): a durable per-TCB
             // cell, fed POLL_IN by the stack's RX wake and reconciled to the
             // live level below. Off the state lock (the cell is keyed by id).
-            SocketState::InetWired { tcb_id, .. } => Arm::Wired(*tcb_id),
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                Arm::Wired(*tcb_id)
+            }
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
@@ -2983,7 +3300,9 @@ impl SocketFile {
         match state {
             // A fresh UDP socket is already writable (`datagram_poll`,
             // `net/core/datagram.c:919-921`).
-            SocketState::Fresh if self.domain == AF_INET && self.kind == SOCK_DGRAM => {
+            SocketState::Fresh
+                if matches!(self.domain, AF_INET | AF_INET6) && self.kind == SOCK_DGRAM =>
+            {
                 self.inet_dgram_poll_bits(false)
             }
             SocketState::Fresh | SocketState::UnixBound { .. } => 0,
@@ -3013,8 +3332,24 @@ impl SocketFile {
                     0
                 }
             }
-            SocketState::UnixListener { pending, .. }
-            | SocketState::Inet6Listener { pending, .. } => {
+            SocketState::Inet6Listener {
+                pending, listen_id, ..
+            } => {
+                let ready = !pending.is_empty()
+                    || listen_id
+                        .map(narf_net::tcp_stack::listen_has_pending)
+                        .unwrap_or(false);
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
+                if ready {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }
+            }
+            SocketState::UnixListener { pending, .. } => {
                 let ready = !pending.is_empty();
                 self.listener_readiness.set(
                     if ready { narf_filesystem::POLL_IN } else { 0 },
@@ -3067,7 +3402,15 @@ impl SocketFile {
                 );
                 bits
             }
-            SocketState::InetWired { tcb_id, .. } => {
+            SocketState::Inet6Dgram { inbox, .. } => {
+                let bits = self.inet_dgram_poll_bits(!inbox.is_empty());
+                self.dgram_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
+                bits
+            }
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                 // Kernel-TCP-over-NIC: always writable (the stack
                 // queues + flow-controls send), and POLL_IN when the
                 // TCB has buffered RX data or the peer has closed
@@ -3298,6 +3641,7 @@ impl SocketFile {
             (AF_INET, SOCK_RAW) => self.dispatch_inet_raw(op),
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
+            (AF_INET6, SOCK_DGRAM) => self.dispatch_inet6_dgram(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_GENERIC => {
@@ -3498,11 +3842,26 @@ impl SocketFile {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
-                let mut replies =
-                    match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf) {
-                        Ok(replies) => replies,
-                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                    };
+                let udp6: Vec<_> = udp6_snapshot_in(self.net_ns_id())
+                    .into_iter()
+                    .map(|socket| narf_net::netlink_diag::Udp6DiagRecord {
+                        state: socket.state_code,
+                        local_addr: socket.local_addr,
+                        local_port: socket.local_port,
+                        remote_addr: socket.remote_addr,
+                        remote_port: socket.remote_port,
+                        tx_queue: socket.tx_queue,
+                        rx_queue: socket.rx_queue,
+                    })
+                    .collect();
+                let mut replies = match narf_net::netlink_diag::build_replies_in_with_udp6(
+                    self.net_ns_id(),
+                    buf,
+                    &udp6,
+                ) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
                 Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
@@ -3979,7 +4338,9 @@ impl SocketFile {
         if level == IPPROTO_TCP {
             let tcb_id = {
                 let state = self.state.lock();
-                if let SocketState::InetWired { tcb_id, .. } = &*state {
+                if let SocketState::InetWired { tcb_id, .. }
+                | SocketState::Inet6Wired { tcb_id, .. } = &*state
+                {
                     Some(*tcb_id)
                 } else {
                     None
@@ -4027,7 +4388,9 @@ impl SocketFile {
         if level == SOL_SOCKET && name == SO_KEEPALIVE {
             let tcb_id = {
                 let state = self.state.lock();
-                if let SocketState::InetWired { tcb_id, .. } = &*state {
+                if let SocketState::InetWired { tcb_id, .. }
+                | SocketState::Inet6Wired { tcb_id, .. } = &*state
+                {
                     Some(*tcb_id)
                 } else {
                     None
@@ -4071,6 +4434,24 @@ impl SocketFile {
             }
             self.options.lock().classic_filter = Some(program);
             return SocketOpResult::Ok(0);
+        }
+        // `do_ipv6_setsockopt(IPV6_V6ONLY)` rejects a short integer and any
+        // socket that already owns a local port (`inet->inet_num`). Check
+        // before taking `options`: datagram bind lookup takes state before
+        // options, so reversing that order here would deadlock concurrent
+        // bind/setsockopt calls.
+        if level == IPPROTO_IPV6 && name == IPV6_V6ONLY && self.domain == AF_INET6 {
+            if value.len() < 4 {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            let bound = match &*self.state.lock() {
+                SocketState::Inet6Dgram { local_port, .. } => *local_port != 0,
+                SocketState::Inet6Listener { port, .. } => *port != 0,
+                _ => false,
+            };
+            if bound {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
         }
         let mut opts = self.options.lock();
         match (level, name) {
@@ -4562,6 +4943,58 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) if self.domain == AF_INET6 => {
+                match read_ip_int(value) {
+                    Some(value) if value == -1 || (0..=255).contains(&value) => {
+                        opts.ipv6_unicast_hops = value;
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) if value <= 5 => {
+                    opts.ipv6_mtu_discover = value;
+                    SocketOpResult::Ok(0)
+                }
+                _ => SocketOpResult::Err(SockError::InvalidArg),
+            },
+            (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) if value >= 1280 => {
+                    opts.ipv6_mtu = value;
+                    opts.ipv6_mtu_set = true;
+                    SocketOpResult::Ok(0)
+                }
+                _ => SocketOpResult::Err(SockError::InvalidArg),
+            },
+            (IPPROTO_IPV6, IPV6_RECVERR) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_recverr = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
+            (IPPROTO_IPV6, IPV6_RECVPKTINFO) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_recvpktinfo = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
+            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_recvhoplimit = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
+            (IPPROTO_IPV6, IPV6_DONTFRAG) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(value) => {
+                    opts.ipv6_dontfrag = value != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(error) => SocketOpResult::Err(error),
+            },
             // Linux's protocol option handlers return ENOPROTOOPT from their
             // default arm. Never claim an unknown feature was enabled: doing
             // so is especially dangerous for transport/security offloads.
@@ -4620,7 +5053,8 @@ impl SocketFile {
             let mut val = self.take_pending_error().map_or(0, |e| e.errno());
             if val == 0 {
                 let tcb = match &*self.state.lock() {
-                    SocketState::InetWired { tcb_id, .. } => Some(*tcb_id),
+                    SocketState::InetWired { tcb_id, .. }
+                    | SocketState::Inet6Wired { tcb_id, .. } => Some(*tcb_id),
                     _ => None,
                 };
                 if let Some(id) = tcb {
@@ -4746,7 +5180,10 @@ impl SocketFile {
                     dst[off..off + 4].copy_from_slice(&value.to_ne_bytes());
                 };
                 let wired = match &*self.state.lock() {
-                    SocketState::InetWired { tcb_id, .. } => narf_net::tcp_stack::tcp_info(*tcb_id),
+                    SocketState::InetWired { tcb_id, .. }
+                    | SocketState::Inet6Wired { tcb_id, .. } => {
+                        narf_net::tcp_stack::tcp_info(*tcb_id)
+                    }
                     SocketState::InetListener {
                         listening: true, ..
                     }
@@ -4825,6 +5262,7 @@ impl SocketFile {
                     &*self.state.lock(),
                     SocketState::InetConnected { .. }
                         | SocketState::InetWired { .. }
+                        | SocketState::Inet6Wired { .. }
                         | SocketState::InetDgram { peer: Some(_), .. }
                         | SocketState::InetRaw { peer: Some(_), .. }
                 );
@@ -4839,6 +5277,36 @@ impl SocketFile {
             }
             (IPPROTO_IPV6, IPV6_V6ONLY) if self.domain == AF_INET6 => {
                 write_bool(buf, opts.ipv6_v6only)
+            }
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) if self.domain == AF_INET6 => {
+                write_u32(buf, opts.ipv6_unicast_hops as u32)
+            }
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER) if self.domain == AF_INET6 => {
+                write_u32(buf, opts.ipv6_mtu_discover)
+            }
+            (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => {
+                let connected = matches!(
+                    &*self.state.lock(),
+                    SocketState::Inet6Connected { .. }
+                        | SocketState::Inet6Wired { .. }
+                        | SocketState::Inet6Dgram { peer: Some(_), .. }
+                );
+                if !connected {
+                    return SocketOpResult::Err(SockError::NotConnected);
+                }
+                write_u32(buf, opts.ipv6_mtu)
+            }
+            (IPPROTO_IPV6, IPV6_RECVERR) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_recverr)
+            }
+            (IPPROTO_IPV6, IPV6_RECVPKTINFO) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_recvpktinfo)
+            }
+            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_recvhoplimit)
+            }
+            (IPPROTO_IPV6, IPV6_DONTFRAG) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_dontfrag)
             }
             (SOL_NETLINK, NETLINK_PKTINFO) => {
                 write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
@@ -5914,7 +6382,7 @@ impl SocketFile {
                 drop(state);
                 narf_net::readiness::notify(0);
             }
-            SocketState::InetWired { tcb_id, .. } => {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                 let id = *tcb_id;
                 *state = SocketState::Fresh;
                 drop(state);
@@ -5961,12 +6429,17 @@ impl SocketFile {
                 addr,
                 port,
                 pending,
+                listen_id,
                 listening,
                 ..
             } => {
+                if let Some(id) = listen_id.take() {
+                    narf_net::tcp_stack::remove_tcb(id);
+                    crate::handlers::clear_tcb_owner(id);
+                }
                 pending.clear();
                 *listening = false;
-                let key = (*addr, *port);
+                let key = (self.net_ns_id(), *addr, *port);
                 if let Some(map) = INET6_LISTENERS.lock().as_mut() {
                     if map.get(&key).is_some_and(|l| Arc::ptr_eq(l, self)) {
                         map.remove(&key);
@@ -6496,6 +6969,7 @@ impl SocketFile {
                         port,
                         backlog: 0,
                         pending: VecDeque::new(),
+                        listen_id: None,
                         listening: false,
                     };
                     return SocketOpResult::Ok(0);
@@ -6516,6 +6990,7 @@ impl SocketFile {
                         port,
                         backlog: 0,
                         pending: VecDeque::new(),
+                        listen_id: None,
                         listening: false,
                     };
                 }
@@ -6523,13 +6998,26 @@ impl SocketFile {
                     addr,
                     port,
                     backlog: b,
+                    listen_id,
                     listening,
                     ..
                 } = &mut *state
                 {
                     *b = backlog;
                     *listening = true;
-                    let key = (*addr, *port);
+                    if listen_id.is_none() {
+                        if let Ok(id) = narf_net::tcp_stack::listen6_in(
+                            self.net_ns_id(),
+                            *addr,
+                            *port,
+                            backlog.max(1) as usize,
+                        ) {
+                            self.apply_tcp_options_to_tcb(id);
+                            *listen_id = Some(id);
+                            crate::handlers::set_tcb_owner(id, crate::handlers::current_task_id());
+                        }
+                    }
+                    let key = (self.net_ns_id(), *addr, *port);
                     drop(state);
                     let mut listeners = INET6_LISTENERS.lock();
                     let map = listeners.get_or_insert_with(BTreeMap::new);
@@ -6541,6 +7029,38 @@ impl SocketFile {
                 }
             }
             SocketOp::Accept => {
+                let listen_id = match &*self.state.lock() {
+                    SocketState::Inet6Listener {
+                        listening: true,
+                        listen_id,
+                        ..
+                    } => *listen_id,
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                if let Some(listen_id) = listen_id {
+                    if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(listen_id) {
+                        let child = SocketFile::new(AF_INET6, SOCK_STREAM);
+                        child.set_net_ns_id(self.net_ns_id());
+                        *child.options.lock() = self.options.lock().clone();
+                        child.apply_tcp_options_to_tcb(child_id);
+                        let (_, _, peer_addr, peer_port) =
+                            narf_net::tcp_stack::endpoints6(child_id)
+                                .unwrap_or(([0; 16], 0, [0; 16], 0));
+                        *child.state.lock() = SocketState::Inet6Wired {
+                            tcb_id: child_id,
+                            peer_addr,
+                            peer_port,
+                        };
+                        crate::handlers::set_tcb_owner(
+                            child_id,
+                            crate::handlers::current_task_id(),
+                        );
+                        return SocketOpResult::Accepted {
+                            socket: child,
+                            peer: None,
+                        };
+                    }
+                }
                 let mut state = self.state.lock();
                 // `inet_csk_accept`: not TCP_LISTEN → EINVAL.
                 if let SocketState::Inet6Listener {
@@ -6580,15 +7100,43 @@ impl SocketFile {
                     let listeners = INET6_LISTENERS.lock();
                     let m = listeners.as_ref();
                     let unspecified = [0u8; 16];
+                    let net_ns_id = self.net_ns_id();
                     m.and_then(|m| {
-                        m.get(&(ip, port))
-                            .or_else(|| m.get(&(unspecified, port)))
+                        m.get(&(net_ns_id, ip, port))
+                            .or_else(|| m.get(&(net_ns_id, unspecified, port)))
                             .cloned()
                     })
                 };
                 let listener = match listener {
                     Some(l) => l,
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    None => {
+                        let syn_retries = self.options.lock().tcp_syncnt as u8;
+                        match narf_net::tcp_stack::connect6_errno_with_options_in(
+                            self.net_ns_id(),
+                            ip,
+                            port,
+                            narf_net::tcp_stack::ConnectOptions { syn_retries },
+                        ) {
+                            Ok(tcb_id) => {
+                                self.apply_tcp_options_to_tcb(tcb_id);
+                                let mut state = self.state.lock();
+                                if Self::inet_stream_connectable(&state) {
+                                    *state = SocketState::Inet6Wired {
+                                        tcb_id,
+                                        peer_addr: ip,
+                                        peer_port: port,
+                                    };
+                                    drop(state);
+                                    self.inet6_release_port();
+                                    return SocketOpResult::Ok(0);
+                                }
+                                return SocketOpResult::Err(SockError::AlreadyConnected);
+                            }
+                            Err(errno) => {
+                                return SocketOpResult::Err(SockError::from_stack(errno));
+                            }
+                        }
+                    }
                 };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
@@ -6672,6 +7220,19 @@ impl SocketFile {
                         narf_net::readiness::notify(0);
                         SocketOpResult::Ok(0)
                     }
+                    SocketState::Inet6Wired { tcb_id, .. } => {
+                        let id = *tcb_id;
+                        let how = match how {
+                            SHUT_RD => narf_net::tcp_stack::Shutdown::Read,
+                            SHUT_WR => narf_net::tcp_stack::Shutdown::Write,
+                            _ => narf_net::tcp_stack::Shutdown::Both,
+                        };
+                        drop(state);
+                        match narf_net::tcp_stack::shutdown_errno(id, how) {
+                            Ok(()) => SocketOpResult::Ok(0),
+                            Err(errno) => SocketOpResult::Err(SockError::from_stack(errno)),
+                        }
+                    }
                     SocketState::Inet6Listener {
                         listening: true, ..
                     } => {
@@ -6693,6 +7254,7 @@ impl SocketFile {
     /// SO_REUSEPORT (a simplified `inet_bind_conflict`).
     fn inet6_claim_port(self: &Arc<Self>, ip: [u8; 16], port: u16) -> Result<u16, SockError> {
         let reuseport = self.options.lock().reuseport;
+        let net_ns_id = self.net_ns_id();
         let mut binds = INET6_TCP_BINDS.lock();
         binds.retain(|b| b.owner.strong_count() != 0);
         let (port, ephemeral) = if port == 0 {
@@ -6705,6 +7267,7 @@ impl SocketFile {
             let me = Arc::as_ptr(self);
             if binds.iter().any(|b| {
                 b.port == port
+                    && b.ns == net_ns_id
                     && Weak::as_ptr(&b.owner) != me
                     && (b.ip == ip || b.ip == unspecified || ip == unspecified)
                     && !(reuseport && b.reuseport)
@@ -6715,6 +7278,7 @@ impl SocketFile {
         };
         binds.push(Inet6TcpBind {
             owner: Arc::downgrade(self),
+            ns: net_ns_id,
             ip,
             port,
             reuseport,
@@ -6748,7 +7312,9 @@ impl SocketFile {
         }
         let state = self.state.lock();
         // InetWired sockets route through the kernel TCP-over-NIC stack.
-        if let SocketState::InetWired { tcb_id, .. } = &*state {
+        if let SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } =
+            &*state
+        {
             let id = *tcb_id;
             drop(state);
             // EAGAIN when the send buffer is full (was Ok(0), which a
@@ -6813,7 +7379,9 @@ impl SocketFile {
 
     fn do_recv(&self, buf: &mut [u8], flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
-        if let SocketState::InetWired { tcb_id, .. } = &*state {
+        if let SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } =
+            &*state
+        {
             let id = *tcb_id;
             drop(state);
             // Ok(0) is EOF (peer FIN, or a shut-down / torn-down socket);
@@ -7413,7 +7981,7 @@ impl RingBuf {
 /// own ns id, so in-process datagrams never cross a netns boundary.
 type Inet4Map = BTreeMap<(u64, u32, u16), Arc<SocketFile>>;
 /// Registry map keyed by AF_INET6 (ipv6, port).
-type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
+type Inet6Map = BTreeMap<(u64, [u8; 16], u16), Arc<SocketFile>>;
 
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
@@ -7636,6 +8204,7 @@ static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new
 /// One AF_INET6 stream port reservation — see `InetTcpBind`.
 struct Inet6TcpBind {
     owner: Weak<SocketFile>,
+    ns: u64,
     ip: [u8; 16],
     port: u16,
     reuseport: bool,
@@ -7925,6 +8494,70 @@ fn smoke_socket_ioctl_siocoutq_is_zero() -> TestResult {
     }
 }
 kernel_test_in!("userspace/socket", smoke_socket_ioctl_siocoutq_is_zero);
+
+fn smoke_socket_ioctl_reports_network_interface() -> TestResult {
+    let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+    const NAME: &str = "nioctl0";
+    const SIOCGIFADDR: u32 = 0x8915;
+    const SIOCGIFMTU: u32 = 0x8921;
+    narf_net::iface::register(NAME, [0x02, 1, 2, 3, 4, 5], |_| Ok(()));
+    narf_net::iface::set_iface_ipv4(NAME, [192, 0, 2, 9], [192, 0, 2, 1]);
+    let sock = SocketFile::new(AF_INET, SOCK_DGRAM);
+    let mut ifreq = [0u8; 40];
+    ifreq[..NAME.len()].copy_from_slice(NAME.as_bytes());
+    if sock
+        .ioctl(SIOCGIFADDR, ifreq.as_mut_ptr() as usize)
+        .is_err()
+        || ifreq[16..18] != AF_INET.to_ne_bytes()
+        || ifreq[20..24] != [192, 0, 2, 9]
+    {
+        return TestResult::Fail("SIOCGIFADDR did not return sockaddr_in address");
+    }
+    ifreq[16..].fill(0);
+    if sock.ioctl(SIOCGIFMTU, ifreq.as_mut_ptr() as usize).is_err()
+        || i32::from_ne_bytes(ifreq[16..20].try_into().unwrap()) != 1500
+    {
+        return TestResult::Fail("SIOCGIFMTU did not return interface MTU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_socket_ioctl_reports_network_interface
+);
+
+fn smoke_socket_mutation_ioctl_requires_delegated_admin() -> TestResult {
+    let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+    narf_net::iface::register_loopback_iface();
+    const SIOCSIFFLAGS: u32 = 0x8914;
+    let mut ifreq = [0u8; 40];
+    ifreq[..2].copy_from_slice(b"lo");
+    ifreq[16..18].copy_from_slice(&1i16.to_ne_bytes());
+
+    let plain = SocketFile::new(AF_INET, SOCK_DGRAM);
+    if plain
+        .ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize)
+        .is_ok()
+    {
+        return TestResult::Fail("SIOCSIFFLAGS accepted ambient authority");
+    }
+
+    let route = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if route
+        .delegate_netlink_admin(narf_net::initial_loopback_admin())
+        .is_err()
+        || route
+            .ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize)
+            .is_err()
+    {
+        return TestResult::Fail("delegated SIOCSIFFLAGS failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_socket_mutation_ioctl_requires_delegated_admin
+);
 
 fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
     let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);
@@ -8630,4 +9263,48 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_unix_stream_multiple_rights_batches_preserve_order
+);
+
+fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
+    let socket = SocketFile::new(AF_INET6, SOCK_DGRAM);
+    for (name, value) in [
+        (IPV6_RECVPKTINFO, 1u32),
+        (IPV6_RECVHOPLIMIT, 1),
+        (IPV6_RECVERR, 1),
+        (IPV6_DONTFRAG, 1),
+        (IPV6_UNICAST_HOPS, 37),
+        (IPV6_MTU_DISCOVER, 2),
+        (IPV6_MTU, 1400),
+    ] {
+        if !matches!(
+            socket.handle_setsockopt(IPPROTO_IPV6, name, &value.to_ne_bytes()),
+            SocketOpResult::Ok(0)
+        ) {
+            return TestResult::Fail("IPv6 socket option rejected a valid value");
+        }
+    }
+    let (pktinfo, hoplimit) = socket.inet6_ancillary_options();
+    let ancillary = Inet6RecvAncillary {
+        destination: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        ifindex: 9,
+        hop_limit: 37,
+    };
+    socket.stash_inet6_recv_ancillary(ancillary);
+    if pktinfo
+        && hoplimit
+        && socket.take_inet6_recv_ancillary().is_some_and(|value| {
+            value.destination == ancillary.destination
+                && value.ifindex == 9
+                && value.hop_limit == 37
+        })
+        && socket.take_inet6_recv_ancillary().is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IPv6 ancillary metadata was missing, stale, or duplicated")
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_ipv6_socket_options_and_ancillary_are_per_datagram
 );

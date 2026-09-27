@@ -732,6 +732,127 @@ fn smoke_icmpv6_pseudo_checksum_round_trip() -> TestResult {
 }
 kernel_test_in!("net/ipv6", smoke_icmpv6_pseudo_checksum_round_trip);
 
+fn smoke_ipv6_udp_segment_has_mandatory_valid_checksum() -> TestResult {
+    use crate::pkt_ipv6::{pseudo_checksum, NEXT_HEADER_UDP};
+    let src = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let dst = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let segment = match crate::ipv6_stack::build_udp_segment(src, dst, 1234, 5678, b"udp6") {
+        Ok(segment) => segment,
+        Err(_) => return TestResult::Fail("UDP6 segment construction failed"),
+    };
+    if segment.len() != 12
+        || segment[6..8] == [0, 0]
+        || pseudo_checksum(src, dst, NEXT_HEADER_UDP, &segment) != 0
+    {
+        TestResult::Fail("UDP6 checksum or length is invalid")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "net/ipv6",
+    smoke_ipv6_udp_segment_has_mandatory_valid_checksum
+);
+
+fn smoke_ipv6_namespace_address_and_route_isolation() -> TestResult {
+    use crate::ipv6::addrs::{AddrScope, AddrState, Ipv6IfAddr};
+    use crate::ipv6::ndp::{Neigh, NeighState};
+    use crate::ipv6::route::{NextHop, Route};
+    let addr = [0x20, 1, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    crate::ipv6::addrs::add_in(
+        7001,
+        Ipv6IfAddr {
+            iface: alloc::string::String::from("ns6-test"),
+            addr,
+            prefix_len: 64,
+            state: AddrState::Preferred,
+            scope: AddrScope::Global,
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        },
+    );
+    crate::ipv6::route::add_in(
+        7001,
+        Route {
+            prefix: [0; 16],
+            prefix_len: 0,
+            gateway: None,
+            iface: alloc::string::String::from("ns6-test"),
+            metric: 1,
+            valid_deadline_ns: 0,
+        },
+    );
+    crate::ipv6::ndp::neigh_upsert_in(
+        7001,
+        Neigh {
+            iface: alloc::string::String::from("ns6-test"),
+            ip: addr,
+            mac: Some([2, 0, 0, 0, 0, 1]),
+            state: NeighState::Reachable,
+            is_router: false,
+            deadline_ns: 0,
+        },
+    );
+    let isolated = !crate::ipv6::addrs::is_local_in(7002, &addr)
+        && matches!(
+            crate::ipv6::route::lookup_in(7002, &addr, None),
+            NextHop::Unreachable
+        )
+        && crate::ipv6::ndp::neigh_lookup_in(7002, "ns6-test", &addr).is_none()
+        && crate::ipv6::ndp::neigh_lookup_in(7001, "ns6-test", &addr).is_some();
+    crate::ipv6::addrs::remove_namespace(7001);
+    crate::ipv6::route::remove_namespace(7001);
+    crate::ipv6::ndp::remove_namespace(7001);
+    if isolated {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IPv6 address or route leaked across network namespaces")
+    }
+}
+kernel_test_in!("net/ipv6", smoke_ipv6_namespace_address_and_route_isolation);
+
+fn smoke_tcp6_listener_uses_native_tcb() -> TestResult {
+    let local = [0x20, 1, 0x0d, 0xb8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let id = match crate::tcp::core::listen6_in(7007, local, 4242, 8) {
+        Ok(id) => id,
+        Err(()) => return TestResult::Fail("TCP6 listen did not allocate a TCB"),
+    };
+    let endpoints = crate::tcp::core::endpoints6(id);
+    let state = crate::tcp::core::lookup_tcb(id).map(|tcb| tcb.lock().state);
+    crate::tcp::core::remove_tcb(id);
+    if endpoints == Some((local, 4242, [0; 16], 0))
+        && state == Some(crate::tcp::state_machine::TcpState::Listen)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TCP6 listener did not retain native IPv6 endpoints")
+    }
+}
+kernel_test_in!("net/ipv6", smoke_tcp6_listener_uses_native_tcb);
+
+fn smoke_udp6_neighbor_queue_is_namespace_scoped_and_drained() -> TestResult {
+    let neighbor = [0x20, 1, 0x0d, 0xb8, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    crate::ipv6_stack::remove_namespace(7008);
+    crate::ipv6_stack::remove_namespace(7009);
+    if !crate::ipv6_stack::__pending_udp6_test_insert(7008, "ns6-queue", neighbor) {
+        return TestResult::Fail("UDP6 neighbor queue rejected a packet below its bound");
+    }
+    let isolated = crate::ipv6_stack::__pending_udp6_test_count(7008) == 1
+        && crate::ipv6_stack::__pending_udp6_test_count(7009) == 0;
+    crate::ipv6_stack::neighbor_resolved(7008, "ns6-queue", neighbor, [2, 0, 0, 0, 0, 8]);
+    let drained = crate::ipv6_stack::__pending_udp6_test_count(7008) == 0;
+    if isolated && drained {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("UDP6 neighbor queue leaked namespaces or did not drain")
+    }
+}
+kernel_test_in!(
+    "net/ipv6",
+    smoke_udp6_neighbor_queue_is_namespace_scoped_and_drained
+);
+
 fn smoke_icmpv6_router_solicitation_layout() -> TestResult {
     use crate::pkt_ipv6::{router_solicitation, ICMPV6_ROUTER_SOLICITATION};
     let body = router_solicitation(&[]);
@@ -4907,6 +5028,42 @@ fn smoke_ipv6_fragment_reassembly_two_pieces() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6", smoke_ipv6_fragment_reassembly_two_pieces);
+
+fn smoke_ipv6_udp_source_fragment_layout() -> TestResult {
+    use crate::ipv6_stack::__fragment_udp6_for_test;
+    use crate::pkt_ipv6::NEXT_HEADER_UDP;
+
+    let udp = alloc::vec![0x5a; 2000];
+    let Some(fragments) = __fragment_udp6_for_test(&udp, 1280, 0x1234_5678) else {
+        return TestResult::Fail("UDP6 source fragmentation failed");
+    };
+    if fragments.len() != 2
+        || fragments[0].len() != 1240
+        || fragments[1].len() != 776
+        || fragments
+            .iter()
+            .any(|fragment| fragment[0] != NEXT_HEADER_UDP)
+    {
+        return TestResult::Fail("UDP6 fragments do not respect the path MTU");
+    }
+    let first_flags = u16::from_be_bytes(fragments[0][2..4].try_into().unwrap());
+    let second_flags = u16::from_be_bytes(fragments[1][2..4].try_into().unwrap());
+    if first_flags != 1 || second_flags != 1232 {
+        return TestResult::Fail("UDP6 fragment offsets or M flag are wrong");
+    }
+    if fragments[0][4..8] != 0x1234_5678u32.to_be_bytes()
+        || fragments[1][4..8] != 0x1234_5678u32.to_be_bytes()
+        || fragments[0][8..]
+            .iter()
+            .chain(fragments[1][8..].iter())
+            .copied()
+            .ne(udp.iter().copied())
+    {
+        return TestResult::Fail("UDP6 fragmentation changed payload or identification");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6", smoke_ipv6_udp_source_fragment_layout);
 
 /// EUI-64 builder flips the U/L bit and inserts FFFE.
 fn smoke_ipv6_eui64_construction() -> TestResult {

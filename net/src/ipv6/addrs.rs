@@ -71,29 +71,58 @@ pub struct Ipv6IfAddr {
     pub temporary: bool,
 }
 
-static ADDRS: IrqSafeSpinLock<Vec<Ipv6IfAddr>> = IrqSafeSpinLock::new(Vec::new());
+#[derive(Clone, Debug)]
+struct NamespacedAddr {
+    net_ns_id: u64,
+    addr: Ipv6IfAddr,
+}
+
+static ADDRS: IrqSafeSpinLock<Vec<NamespacedAddr>> = IrqSafeSpinLock::new(Vec::new());
+
+fn iface_namespace(iface: &str) -> u64 {
+    crate::iface::lookup(iface)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0)
+}
 
 /// Add an IPv6 address binding (RFC 4862 §5.5.3).
 pub fn add(addr: Ipv6IfAddr) {
+    add_in(iface_namespace(&addr.iface), addr);
+}
+
+pub fn add_in(net_ns_id: u64, addr: Ipv6IfAddr) {
     let mut g = ADDRS.lock();
-    g.retain(|e| !(e.iface == addr.iface && e.addr == addr.addr));
-    g.push(addr);
+    g.retain(|e| {
+        !(e.net_ns_id == net_ns_id && e.addr.iface == addr.iface && e.addr.addr == addr.addr)
+    });
+    g.push(NamespacedAddr { net_ns_id, addr });
 }
 
 /// Remove an address by `(iface, addr)`.
 pub fn remove(iface: &str, addr: &[u8; 16]) -> bool {
+    remove_in(iface_namespace(iface), iface, addr)
+}
+
+pub fn remove_in(net_ns_id: u64, iface: &str, addr: &[u8; 16]) -> bool {
     let mut g = ADDRS.lock();
     let before = g.len();
-    g.retain(|e| !(e.iface == iface && &e.addr == addr));
+    g.retain(|e| !(e.net_ns_id == net_ns_id && e.addr.iface == iface && &e.addr.addr == addr));
     g.len() != before
 }
 
 /// Transition an address to a new state (e.g. Tentative → Preferred
 /// after DAD passes, or Tentative → Invalid on DAD conflict).
 pub fn set_state(iface: &str, addr: &[u8; 16], state: AddrState) -> bool {
+    set_state_in(iface_namespace(iface), iface, addr, state)
+}
+
+pub fn set_state_in(net_ns_id: u64, iface: &str, addr: &[u8; 16], state: AddrState) -> bool {
     let mut g = ADDRS.lock();
-    if let Some(e) = g.iter_mut().find(|e| e.iface == iface && &e.addr == addr) {
-        e.state = state;
+    if let Some(e) = g
+        .iter_mut()
+        .find(|e| e.net_ns_id == net_ns_id && e.addr.iface == iface && &e.addr.addr == addr)
+    {
+        e.addr.state = state;
         true
     } else {
         false
@@ -103,13 +132,29 @@ pub fn set_state(iface: &str, addr: &[u8; 16], state: AddrState) -> bool {
 /// List addresses on an interface. Returns a clone to avoid holding
 /// the lock during render.
 pub fn list_iface(iface: &str) -> Vec<Ipv6IfAddr> {
+    list_iface_in(iface_namespace(iface), iface)
+}
+
+pub fn list_iface_in(net_ns_id: u64, iface: &str) -> Vec<Ipv6IfAddr> {
     let g = ADDRS.lock();
-    g.iter().filter(|e| e.iface == iface).cloned().collect()
+    g.iter()
+        .filter(|e| e.net_ns_id == net_ns_id && e.addr.iface == iface)
+        .map(|e| e.addr.clone())
+        .collect()
 }
 
 /// List every address in every interface. Boot-time / diagnostic.
 pub fn list_all() -> Vec<Ipv6IfAddr> {
-    ADDRS.lock().clone()
+    list_all_in(0)
+}
+
+pub fn list_all_in(net_ns_id: u64) -> Vec<Ipv6IfAddr> {
+    ADDRS
+        .lock()
+        .iter()
+        .filter(|entry| entry.net_ns_id == net_ns_id)
+        .map(|entry| entry.addr.clone())
+        .collect()
 }
 
 /// Snapshot for `/proc/net/if_inet6`. The Linux format is one
@@ -129,6 +174,10 @@ pub struct Ipv6IfAddrSnapshot {
 
 /// Snapshot every IPv6 address bound to any interface.
 pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> Vec<Ipv6IfAddrSnapshot> {
     let g = ADDRS.lock();
     let mut out = Vec::with_capacity(g.len());
     // Assign a per-iface index starting at 1. Real ifindex
@@ -137,7 +186,11 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
     let mut idx_for_iface: alloc::collections::BTreeMap<&str, u32> =
         alloc::collections::BTreeMap::new();
     let mut next_idx: u32 = 1;
-    for e in g.iter() {
+    for e in g
+        .iter()
+        .filter(|entry| entry.net_ns_id == net_ns_id)
+        .map(|entry| &entry.addr)
+    {
         let ifindex = *idx_for_iface.entry(e.iface.as_str()).or_insert_with(|| {
             let i = next_idx;
             next_idx += 1;
@@ -173,30 +226,43 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
 
 /// True iff `addr` is bound to *any* interface.
 pub fn is_local(addr: &[u8; 16]) -> bool {
+    is_local_in(0, addr)
+}
+
+pub fn is_local_in(net_ns_id: u64, addr: &[u8; 16]) -> bool {
     let g = ADDRS.lock();
-    g.iter()
-        .any(|e| &e.addr == addr && e.state != AddrState::Invalid)
+    g.iter().any(|e| {
+        e.net_ns_id == net_ns_id && &e.addr.addr == addr && e.addr.state != AddrState::Invalid
+    })
 }
 
 /// True iff `addr` is bound to a specific interface.
 pub fn is_local_on(iface: &str, addr: &[u8; 16]) -> bool {
+    is_local_on_in(iface_namespace(iface), iface, addr)
+}
+
+pub fn is_local_on_in(net_ns_id: u64, iface: &str, addr: &[u8; 16]) -> bool {
     let g = ADDRS.lock();
-    g.iter()
-        .any(|e| e.iface == iface && &e.addr == addr && e.state != AddrState::Invalid)
+    g.iter().any(|e| {
+        e.net_ns_id == net_ns_id
+            && e.addr.iface == iface
+            && &e.addr.addr == addr
+            && e.addr.state != AddrState::Invalid
+    })
 }
 
 /// Walk every address and demote/expire per the current time.
 pub fn age_tick(now_ns: u64) {
     let mut g = ADDRS.lock();
     for e in g.iter_mut() {
-        if e.state == AddrState::Preferred && now_ns >= e.preferred_deadline_ns {
-            e.state = AddrState::Deprecated;
+        if e.addr.state == AddrState::Preferred && now_ns >= e.addr.preferred_deadline_ns {
+            e.addr.state = AddrState::Deprecated;
         }
-        if e.state != AddrState::Invalid && now_ns >= e.valid_deadline_ns {
-            e.state = AddrState::Invalid;
+        if e.addr.state != AddrState::Invalid && now_ns >= e.addr.valid_deadline_ns {
+            e.addr.state = AddrState::Invalid;
         }
     }
-    g.retain(|e| e.state != AddrState::Invalid);
+    g.retain(|e| e.addr.state != AddrState::Invalid);
 }
 
 /// Pick a source address for sending to `dst` on `iface`. Returns the
@@ -204,26 +270,37 @@ pub fn age_tick(now_ns: u64) {
 /// scope. RFC 6724 §5 has the full algorithm; this is the minimal
 /// "same scope first, then any non-link-local" subset.
 pub fn pick_source(iface: &str, dst: &[u8; 16]) -> Option<[u8; 16]> {
+    pick_source_in(iface_namespace(iface), iface, dst)
+}
+
+pub fn pick_source_in(net_ns_id: u64, iface: &str, dst: &[u8; 16]) -> Option<[u8; 16]> {
     let dst_scope = scope_of(dst);
     let g = ADDRS.lock();
     // First pass: state == Preferred and scopes match.
-    if let Some(e) = g
-        .iter()
-        .find(|e| e.iface == iface && e.state == AddrState::Preferred && e.scope == dst_scope)
-    {
-        return Some(e.addr);
+    if let Some(e) = g.iter().find(|e| {
+        e.net_ns_id == net_ns_id
+            && e.addr.iface == iface
+            && e.addr.state == AddrState::Preferred
+            && e.addr.scope == dst_scope
+    }) {
+        return Some(e.addr.addr);
     }
     // Second pass: any Preferred address.
-    if let Some(e) = g
-        .iter()
-        .find(|e| e.iface == iface && e.state == AddrState::Preferred)
-    {
-        return Some(e.addr);
+    if let Some(e) = g.iter().find(|e| {
+        e.net_ns_id == net_ns_id && e.addr.iface == iface && e.addr.state == AddrState::Preferred
+    }) {
+        return Some(e.addr.addr);
     }
     // Third pass: any non-Invalid.
     g.iter()
-        .find(|e| e.iface == iface && e.state != AddrState::Invalid)
-        .map(|e| e.addr)
+        .find(|e| {
+            e.net_ns_id == net_ns_id && e.addr.iface == iface && e.addr.state != AddrState::Invalid
+        })
+        .map(|e| e.addr.addr)
+}
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    ADDRS.lock().retain(|entry| entry.net_ns_id != net_ns_id);
 }
 
 /// Classify an address by its scope (RFC 4291).

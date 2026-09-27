@@ -7424,9 +7424,41 @@ fn smoke_abi_netlink_sock_diag_tcp_dump() -> TestResult {
                 return Err("NETLINK_SOCK_DIAG did not preserve request sequence");
             }
         }
-        let _ = call(Syscall::Close.raw(), a0(fd));
         if !saw_done {
             return Err("NETLINK_SOCK_DIAG dump omitted NLMSG_DONE");
+        }
+
+        // The same inet_diag wire format carries the full 128-bit socket id
+        // for IPv6. Exercise UDP6 through the syscall dispatcher as well as
+        // the pure encoder test in narf-net.
+        request[8..12].copy_from_slice(&315u32.to_ne_bytes());
+        request[16] = 10; // AF_INET6
+        request[17] = 17; // IPPROTO_UDP
+        if netlink_send(fd, &request).ok_or("sock_diag UDP6 send status")? != request.len() as i64 {
+            return Err("send(NETLINK_SOCK_DIAG UDP6) did not consume request");
+        }
+        let mut saw_udp6_done = false;
+        for _ in 0..256 {
+            let mut reply = [0u8; 256];
+            let n = netlink_recv(fd, &mut reply).ok_or("sock_diag UDP6 recv status")?;
+            if n < 16 {
+                return Err("short NETLINK_SOCK_DIAG UDP6 reply");
+            }
+            let kind = nlmsg_type_of(&reply);
+            if kind == 3 {
+                saw_udp6_done = true;
+                break;
+            }
+            if kind != 20 || n < 88 || reply[16] != 10 {
+                return Err("NETLINK_SOCK_DIAG returned a malformed UDP6 record");
+            }
+            if u32::from_ne_bytes(reply[8..12].try_into().unwrap_or([0; 4])) != 315 {
+                return Err("NETLINK_SOCK_DIAG UDP6 did not preserve request sequence");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if !saw_udp6_done {
+            return Err("UDP6 dump omitted NLMSG_DONE");
         }
         Ok(())
     })
@@ -7623,10 +7655,11 @@ fn smoke_abi_socket_create_type_protocol_errnos() -> TestResult {
         if socket_errno(AF_NETLINK, SOCK_RAW, 32)? != EPROTONOSUPPORT {
             return Err("socket(AF_NETLINK, SOCK_RAW, 32) is not -EPROTONOSUPPORT");
         }
-        // No IPv6 datagram support: refused at creation so resolvers fall
-        // back to IPv4, instead of a socket whose every op is -EOPNOTSUPP.
-        if socket_errno(AF_INET6, SOCK_DGRAM, 0)? != EAFNOSUPPORT {
-            return Err("socket(AF_INET6, SOCK_DGRAM) is not -EAFNOSUPPORT");
+        // The registered IPv6 family exposes UDP just as inet6_create does.
+        // In particular, resolvers must no longer mistake NARF for an
+        // IPv4-only host after probing an AF_INET6 datagram socket.
+        if socket_errno(AF_INET6, SOCK_DGRAM, 0)? < 0 {
+            return Err("socket(AF_INET6, SOCK_DGRAM) failed");
         }
         // AF_UNIX SOCK_RAW is remapped to SOCK_DGRAM by `unix_create`.
         let fd = socket_errno(AF_UNIX, SOCK_RAW, 0)?;

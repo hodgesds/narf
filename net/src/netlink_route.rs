@@ -834,7 +834,7 @@ pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
                 }
             }
             if requested_family == 0 || requested_family == AF_INET6 {
-                for entry in crate::ipv6::ndp::neigh_list() {
+                for entry in crate::ipv6::ndp::neigh_list_in(net_ns_id) {
                     if let Some(link) = links.iter().find(|link| link.name == entry.iface) {
                         if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
                             continue;
@@ -1325,9 +1325,11 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 AF_INET if dst.len() == 4 => crate::arp::snapshot()
                     .iter()
                     .any(|(iface, entry)| iface == admin.iface_name() && entry.ip == dst),
-                AF_INET6 if dst.len() == 16 => crate::ipv6::ndp::neigh_list()
-                    .iter()
-                    .any(|entry| entry.iface == admin.iface_name() && entry.ip == dst),
+                AF_INET6 if dst.len() == 16 => {
+                    crate::ipv6::ndp::neigh_list_in(admin.net_ns_id().map_err(admin_errno)?)
+                        .iter()
+                        .any(|entry| entry.iface == admin.iface_name() && entry.ip == dst)
+                }
                 // Short NDA_DST for a known table: "Invalid network address".
                 AF_INET | AF_INET6 => return Err(EINVAL),
                 // `neigh_find_table()` found no table for this family.

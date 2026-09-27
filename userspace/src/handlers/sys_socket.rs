@@ -126,12 +126,9 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
 ///   - `netlink_create`: a type other than RAW/DGRAM → -ESOCKTNOSUPPORT;
 ///     protocol outside `[0, MAX_LINKS)` → -EPROTONOSUPPORT.
 ///
-/// NARF implements AF_INET6 only for SOCK_STREAM. Datagram and raw IPv6
-/// sockets are refused at creation with -EAFNOSUPPORT — the answer a Linux
-/// kernel without that IPv6 support gives — rather than handing back a socket
-/// whose every operation fails with -EOPNOTSUPP. Resolvers probe exactly this
-/// (musl/glibc `getaddrinfo(AI_ADDRCONFIG)` open an AF_INET6 datagram socket
-/// and treat EAFNOSUPPORT, and only a few such errnos, as "no IPv6").
+/// AF_INET6 registers TCP and UDP. Raw IPv6 remains unavailable until its
+/// checksum and ICMPv6 filtering ABI is implemented; unlike UDP, it must not
+/// be advertised as a socket whose operations cannot work.
 pub(super) fn validate_socket_create(
     raw_domain: u64,
     kind: u32,
@@ -184,7 +181,11 @@ pub(super) fn validate_socket_create(
                     0 | IPPROTO_TCP => Ok((domain, kind, IPPROTO_TCP)),
                     _ => Err(EPROTONOSUPPORT),
                 },
-                SOCK_DGRAM | SOCK_RAW if domain == AF_INET6 => Err(EAFNOSUPPORT),
+                SOCK_DGRAM if domain == AF_INET6 => match protocol {
+                    0 | IPPROTO_UDP => Ok((domain, kind, IPPROTO_UDP)),
+                    _ => Err(EPROTONOSUPPORT),
+                },
+                SOCK_RAW if domain == AF_INET6 => Err(EAFNOSUPPORT),
                 SOCK_DGRAM => match protocol {
                     0 | IPPROTO_UDP => Ok((domain, kind, IPPROTO_UDP)),
                     IPPROTO_ICMP => Ok((domain, kind, protocol)),
