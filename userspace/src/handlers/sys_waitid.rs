@@ -1,6 +1,30 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Linux's waitid syscall wrapper writes a zero-result siginfo even when the
+/// internal wait returns an error. Consequently a faulting `infop` overrides
+/// EINVAL/EBADF/ECHILD/EAGAIN with EFAULT; wait4 does not have this behavior.
+fn waitid_set_error(ctx: &mut dyn TrapContext, infop: u64, errno: i64) {
+    if infop != 0 {
+        let empty = [0u8; 128];
+        // SAFETY: copy_to_user validates the complete siginfo range.
+        if unsafe { copy_to_user(infop, &empty) }.is_err() {
+            ctx.set_return(errno_ret(EFAULT));
+            return;
+        }
+    }
+    ctx.set_return(errno_ret(errno));
+}
+
+fn waitid_write_empty_infop(infop: u64) -> Result<(), u64> {
+    if infop == 0 {
+        return Ok(());
+    }
+    let empty = [0u8; 128];
+    // SAFETY: copy_to_user validates the complete siginfo range.
+    unsafe { copy_to_user(infop, &empty) }
+}
+
 /// `waitid(idtype, id, infop, options, rusage)` — wait for a child and
 /// report its state via a `siginfo_t`. Reuses the wait4 reap machinery;
 /// the blocking path is driven by `UserTaskCtx::wait_child_is_waitid`
@@ -8,7 +32,8 @@ use super::*;
 pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let idtype = args.arg0 as u32;
-    let id = args.arg1 as i64;
+    // The kernel ABI declares `id` as pid_t: signed 32-bit even on LP64.
+    let id = args.arg1 as i32 as i64;
     let infop = args.arg2;
     let options = args.arg3 as u32;
     let rusage_ptr = args.arg4; // Linux waitid's 5th arg — glibc's wait4 shim uses it
@@ -32,7 +57,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         | __WCLONE
         | __WALL;
     if options & !VALID_WAIT_OPTIONS != 0 || options & (WUNTRACED | WEXITED | WCONTINUED) == 0 {
-        ctx.set_return(errno_ret(EINVAL));
+        waitid_set_error(ctx, infop, EINVAL);
         return;
     }
 
@@ -40,6 +65,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // (any child), P_PID → the pid. P_PGID sets a process-group filter
     // (`want_pgid`) and waits on "any child" in that group (#29).
     let mut want_pgid = 0u64;
+    let mut pidfd_nonblock = false;
     let want_pid: i64 = match idtype {
         P_ALL => -1,
         // `id` is a pid in the caller's namespace; the reap machinery keys on
@@ -47,25 +73,35 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         // names no child of this caller → ECHILD. Keeping the raw inner risked
         // reaping a ROOT-namespace child at a colliding outer number (#30).
         // Identity in the root ns.
-        P_PID => match accept_pid_from(current_task_id(), id as u64) {
-            Some(o) => o as i64,
-            None => {
-                ctx.set_return(errno_ret(ECHILD));
+        P_PID => {
+            if id <= 0 {
+                waitid_set_error(ctx, infop, EINVAL);
                 return;
             }
-        },
+            match accept_pid_from(current_task_id(), id as u64) {
+                Some(o) => o as i64,
+                None => {
+                    waitid_set_error(ctx, infop, ECHILD);
+                    return;
+                }
+            }
+        }
         // `id` is a pgid in the caller's ns; id == 0 means the caller's OWN
         // process group. Resolve to the TASK-space group id the reap filters
         // on; a group that resolves to nothing is ECHILD. Then wait on any
         // child (want_pid = -1) — the pgid filter selects the member. (#29)
         P_PGID => {
+            if id < 0 {
+                waitid_set_error(ctx, infop, EINVAL);
+                return;
+            }
             want_pgid = if id == 0 {
                 read_pgid(current_task_id())
             } else {
                 pgid_from_user(id as u64)
             };
             if want_pgid == 0 {
-                ctx.set_return(errno_ret(ECHILD));
+                waitid_set_error(ctx, infop, ECHILD);
                 return;
             }
             -1
@@ -80,43 +116,70 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         // with "Failed to spawn executor: Function not implemented".
         // Linux ref: `kernel/exit.c::kernel_waitid` → `pidfd_get_pid`.
         P_PIDFD => {
-            let target = if (0..=u32::MAX as i64).contains(&id) {
+            if id < 0 {
+                waitid_set_error(ctx, infop, EINVAL);
+                return;
+            }
+            let target = if id <= u32::MAX as i64 {
                 fd::with_table(current_task_id(), |t| {
-                    t.get(id as u32).and_then(|e| e.ops.pidfd_target_pid())
+                    let fd = id as u32;
+                    t.get(fd).and_then(|e| {
+                        e.ops
+                            .pidfd_target_pid()
+                            .map(|pid| (pid, t.status_flags(fd).unwrap_or(0)))
+                    })
                 })
                 .flatten()
             } else {
                 None
             };
             match target {
-                Some(p) => p as i64,
+                Some((p, status_flags)) => {
+                    pidfd_nonblock = status_flags & fd::O_NONBLOCK != 0;
+                    p as i64
+                }
                 // Bad fd, or an fd that isn't a pidfd: EBADF (Linux).
                 None => {
-                    ctx.set_return(errno_ret(EBADF));
+                    waitid_set_error(ctx, infop, EBADF);
                     return;
                 }
             }
         }
         _ => {
-            ctx.set_return(errno_ret(EINVAL));
+            waitid_set_error(ctx, infop, EINVAL);
             return;
         }
     };
 
     let parent = current_task_id();
+    let parents = wait_parent_ids(parent, options);
 
     // Job-control stop/continue FIRST (WUNTRACED/WCONTINUED) — a state
     // change is reported before the child's later exit, in order, matching
     // Linux. Only matches when the option + a queued report are present, so
     // a plain wait falls through to the exit reap. No PID release.
-    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, want_pgid, options) {
+    if let Some((child_pid, status)) = reap_stopcont(&parents, want_pid, want_pgid, options) {
+        // Linux copies the optional rusage before siginfo for waitid. The
+        // state-change has already been consumed (unless WNOWAIT), so EFAULT
+        // affects only the return value, not event visibility.
+        if rusage_ptr != 0 {
+            let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
+            let ns = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
+            if write_rusage_utime(rusage_ptr, ns, task_rss_bytes(child_tid) / 1024).is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+        }
         if infop != 0 {
             // Report the child in the CALLER's namespace view, exactly like
             // the exit-reap arm below; the raw child_pid leaked an outer pid
             // to a containerized waiter (Linux pid_vnr on wo_stat).
             let si = encode_waitid_siginfo(report_pid_to(parent, child_pid) as i64, status);
             // SAFETY: `infop` non-zero; copy_to_user range-validates the write.
-            let _ = unsafe { copy_to_user(infop, &si) };
+            if unsafe { copy_to_user(infop, &si) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
         }
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -126,38 +189,57 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // only PEEKS the entry: the child stays queued (and its Task/pid
     // tables intact) so a later wait4/waitid can still reap it.
     let peek = options & WNOWAIT != 0;
-    let reaped = reap_pending_exit(parent, want_pid, want_pgid, options, peek);
+    let reaped = reap_pending_exit(&parents, want_pid, want_pgid, options, peek);
     if let Some(entry) = reaped {
         let child_pid = entry.child_pid;
         let status = entry.status;
-        if infop != 0 {
+        // WNOWAIT reads but does not consume the saved usage. A real reap
+        // charges the parent and removes the snapshot even if a later user
+        // copy faults, matching Linux's consume-before-copy ordering.
+        let (ns, kb) = if peek {
+            let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
+            peek_exit_rusage(child_pid).unwrap_or_else(|| {
+                (
+                    cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid)),
+                    task_rss_bytes(child_tid) / 1024,
+                )
+            })
+        } else {
+            let child_cpu_ns = account_reaped_child(parent, child_pid);
+            take_exit_rusage(child_pid).unwrap_or((child_cpu_ns, 0))
+        };
+        let mut copy_errno = None;
+        if rusage_ptr != 0 {
+            if let Err(errno) = write_rusage_utime(rusage_ptr, ns, kb) {
+                copy_errno = Some(errno);
+            }
+        }
+        if copy_errno.is_none() && infop != 0 {
             // Report the child in the caller's namespace view (si_pid).
             let si = encode_waitid_siginfo(report_pid_to(parent, child_pid) as i64, status);
             // SAFETY: `infop` is the user `siginfo_t*` (non-zero); copy_to_user
             // range-validates the 128-byte write.
-            let _ = unsafe { copy_to_user(infop, &si) };
+            if let Err(errno) = unsafe { copy_to_user(infop, &si) } {
+                copy_errno = Some(errno);
+            }
         }
         if peek {
-            // WNOWAIT: status reported, nothing consumed. Accounting,
-            // rusage and the pid/task release all belong to the eventual
-            // real reap.
-            ctx.set_return(SyscallReturn::ok(0));
+            // WNOWAIT: status reported, nothing consumed. Accounting and the
+            // pid/task release belong to the eventual real reap.
+            ctx.set_return(match copy_errno {
+                Some(errno) => errno_ret(errno as i64),
+                None => SyscallReturn::ok(0),
+            });
             return;
-        }
-        // Charge the child's CPU to the parent (this path skipped the
-        // fold wait4 does — RUSAGE_CHILDREN never saw waitid-reaped
-        // children) and fill the 5th-arg rusage like wait4.
-        let child_cpu_ns = account_reaped_child(parent, child_pid);
-        let snap = take_exit_rusage(child_pid);
-        if rusage_ptr != 0 {
-            let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
-            write_rusage_utime(rusage_ptr, ns, kb);
         }
         release_reaped_task(child_pid);
         crate::release_pid(crate::ProcessId(child_pid));
         // Reaped — drop the parent record so wait4's ECHILD check is accurate.
         parent_of_remove(child_pid);
-        ctx.set_return(SyscallReturn::ok(0));
+        ctx.set_return(match copy_errno {
+            Some(errno) => errno_ret(errno as i64),
+            None => SyscallReturn::ok(0),
+        });
         return;
     }
 
@@ -174,15 +256,26 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // re-float the task after a wake that can never come — the strand is
     // unbounded, and invisible to the park-check heuristic because that path
     // does not tick `dbg_park_checks` either.
-    if !has_living_child(parent, want_pid, want_pgid, options) {
-        ctx.set_return(errno_ret(ECHILD));
+    if !has_living_child(&parents, want_pid, want_pgid, options) {
+        waitid_set_error(ctx, infop, ECHILD);
         return;
     }
 
     if options & WNOHANG != 0 {
-        // No child ready: POSIX leaves infop's si_signo as 0 (the
-        // caller pre-zeros it). Return success.
-        ctx.set_return(SyscallReturn::ok(0));
+        // Linux writes a zeroed no-event siginfo; it does not require the
+        // caller to pre-zero it. A bad output range is therefore EFAULT.
+        ctx.set_return(if waitid_write_empty_infop(infop).is_err() {
+            errno_ret(EFAULT)
+        } else {
+            SyscallReturn::ok(0)
+        });
+        return;
+    }
+
+    // Linux folds O_NONBLOCK on a pidfd into the internal WNOHANG walk, then
+    // distinguishes it from an explicit WNOHANG request with EAGAIN.
+    if pidfd_nonblock {
+        waitid_set_error(ctx, infop, EAGAIN);
         return;
     }
 
@@ -229,5 +322,5 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // A blocking waitid with no task context cannot safely park. It must not
     // masquerade as a successful reap: Linux reports ECHILD when there is no
     // eligible child, while a successful waitid must fill siginfo_t.
-    ctx.set_return(errno_ret(ECHILD));
+    waitid_set_error(ctx, infop, ECHILD);
 }

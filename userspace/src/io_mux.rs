@@ -8,7 +8,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat, POLL_IN, POLL_OUT};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -380,15 +380,18 @@ static SIGNALFD_CELLS: IrqSafeSpinLock<
     >,
 > = IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
 
+/// Number of weak cell rows currently registered. The overwhelmingly common
+/// process has no signalfd, so signal delivery can bypass the global registry
+/// lock entirely. Dead weak rows are subtracted lazily by `wake_signalfds`.
+static SIGNALFD_CELL_ROWS: AtomicUsize = AtomicUsize::new(0);
+
 /// Register a signalfd's readiness cell for `task` so [`wake_signalfds`] fires it
 /// on every signal raised for that task. Used by both the io_mux `SignalFd` and
 /// the linux-compat `SignalFdFile`.
 pub fn register_signalfd_cell(task: u64, cell: &Arc<narf_lib::readiness::Readiness>) {
-    SIGNALFD_CELLS
-        .lock()
-        .entry(task)
-        .or_default()
-        .push(Arc::downgrade(cell));
+    let mut cells = SIGNALFD_CELLS.lock();
+    cells.entry(task).or_default().push(Arc::downgrade(cell));
+    SIGNALFD_CELL_ROWS.fetch_add(1, Ordering::Release);
 }
 
 /// Fire the readiness wait-queue of every signalfd owned by `task` — called from
@@ -397,12 +400,20 @@ pub fn register_signalfd_cell(task: u64, cell: &Arc<narf_lib::readiness::Readine
 /// `poll_readiness` still gates actual delivery on `pending_in_mask`, so firing
 /// on a signal outside the fd's mask is a harmless spurious wake.
 pub fn wake_signalfds(task: u64) {
+    if SIGNALFD_CELL_ROWS.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let cells: alloc::vec::Vec<Arc<narf_lib::readiness::Readiness>> = {
         let mut map = SIGNALFD_CELLS.lock();
         let Some(list) = map.get_mut(&task) else {
             return;
         };
+        let old_len = list.len();
         list.retain(|w| w.strong_count() != 0);
+        let removed = old_len - list.len();
+        if removed != 0 {
+            SIGNALFD_CELL_ROWS.fetch_sub(removed, Ordering::Release);
+        }
         if list.is_empty() {
             map.remove(&task);
             return;

@@ -38,17 +38,11 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
                     }
                 }
             }
-            // Existence check FIRST so `kill(pid, 0)` (the POSIX
-            // liveness probe) reports ESRCH for a vanished target and
-            // queues NOTHING for a live one.
-            let Some(target_tid) = pid_to_task_raw(target) else {
-                ctx.set_return(esrch);
-                return;
-            };
-            if !signal_target_exists(target_tid) {
-                false
-            } else if signum == 0 {
-                true
+            // A null signal is only an existence probe. Real signals let
+            // kill_process perform the lookup once; the old preflight repeated
+            // both pid→task and task-registry locks on every send.
+            if signum == 0 {
+                pid_to_task_raw(target).is_some_and(signal_target_exists)
             } else {
                 kill_process(target, signum)
             }

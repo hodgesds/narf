@@ -3,7 +3,10 @@ use super::*;
 
 pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let mut want_pid = args.arg0 as i64;
+    // pid_t is a signed 32-bit ABI type. Truncate before sign extension so a
+    // raw caller cannot hide INT_MIN/a negative pgid in the register's high
+    // half and change Linux's errno or selector semantics.
+    let mut want_pid = args.arg0 as i32 as i64;
     let status_ptr = args.arg1;
     let options = args.arg2 as u32;
     let rusage_ptr = args.arg3; // filled with the reaped child's CPU time
@@ -12,6 +15,12 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WCLONE | __WALL;
     if options & !VALID_WAIT_OPTIONS != 0 {
         ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    // Linux checks this before selecting a pid type: negating INT_MIN is not
+    // defined for the pid_t ABI, so kernel_wait4 returns ESRCH (not ECHILD).
+    if want_pid == i32::MIN as i64 {
+        ctx.set_return(errno_ret(ESRCH));
         return;
     }
 
@@ -44,7 +53,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // |want_pid| resolved in the caller's ns (`pgid_from_user`). `want_pgid` is
     // the TASK-space group id the reap/ECHILD checks filter on; 0 = specific-pid
     // or any-child wait. A `< -1` pgid that resolves to no group is ECHILD.
-    let want_pgid: u64 = match args.arg0 as i64 {
+    let want_pgid: u64 = match args.arg0 as i32 as i64 {
         0 => read_pgid(parent),
         raw if raw < -1 => {
             let g = pgid_from_user((-raw) as u64);
@@ -56,12 +65,14 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         }
         _ => 0,
     };
+    let parents = wait_parent_ids(parent, options);
 
     // Try-reap closure: pops the first matching (child_pid, status) from the
     // parent's queue. Matching is by specific pid, process group, or any child
     // per `wait_child_matches`.
     let try_reap = |parent: u64, want: i64, want_pgid: u64| -> Option<(u64, i32)> {
-        let entry = reap_pending_exit(parent, want, want_pgid, options, false)?;
+        debug_assert_eq!(parent, parents.waiter);
+        let entry = reap_pending_exit(&parents, want, want_pgid, options, false)?;
         Some((entry.child_pid, entry.status))
     };
 
@@ -72,23 +83,40 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // the option + a queued report are present; a plain wait falls straight
     // through to the exit reap. Does NOT release the PID — child lives (or
     // its exit stays queued for the next wait).
-    if let Some((child, status)) = reap_stopcont(parent, want_pid, want_pgid, options) {
+    if let Some((child, status)) = reap_stopcont(&parents, want_pid, want_pgid, options) {
         if status_ptr != 0 {
             // SAFETY: `status_ptr` non-zero; copy_to_user range-validates
             // and SMAP-brackets the 4-byte write.
-            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+            if unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+        }
+        if rusage_ptr != 0 {
+            let child_tid = pid_to_task_raw(child).unwrap_or(child);
+            let ns = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
+            if write_rusage_utime(rusage_ptr, ns, task_rss_bytes(child_tid) / 1024).is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
         }
         ctx.set_return(SyscallReturn::ok(report_pid_to(parent, child)));
         return;
     }
 
     if let Some((reaped, status)) = try_reap(parent, want_pid, want_pgid) {
+        // Resolve the caller-visible PID while the zombie's namespace binding
+        // is still live. `release_reaped_task` removes that binding.
+        let reaped_visible = report_pid_to(parent, reaped);
+        let mut copy_errno = None;
         if status_ptr != 0 {
             // Write i32 status under the SMAP bracket.
             // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
             // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
             // SAFETY: Valid memory or trusted environment
-            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+            if let Err(errno) = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) } {
+                copy_errno = Some(errno);
+            }
         }
         // Charge the reaped child's CPU time to the parent's children
         // accumulator (RUSAGE_CHILDREN / tms.cutime) and, if the caller
@@ -97,9 +125,11 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         // Consume the child's exit-time snapshot even when the caller
         // passed no rusage* — the entry must not outlive the reap.
         let snap = take_exit_rusage(reaped);
-        if rusage_ptr != 0 {
+        if copy_errno.is_none() && rusage_ptr != 0 {
             let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
-            write_rusage_utime(rusage_ptr, ns, kb);
+            if let Err(errno) = write_rusage_utime(rusage_ptr, ns, kb) {
+                copy_errno = Some(errno);
+            }
         }
         // Reaped — release the refcounted Task, then return the PID to
         // the free pool.
@@ -109,7 +139,10 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         // it's no longer a child (otherwise the ECHILD check below stays
         // blind to the reap and the parent blocks forever).
         parent_of_remove(reaped);
-        ctx.set_return(SyscallReturn::ok(report_pid_to(parent, reaped)));
+        ctx.set_return(match copy_errno {
+            Some(errno) => errno_ret(errno as i64),
+            None => SyscallReturn::ok(reaped_visible),
+        });
         return;
     }
 
@@ -118,7 +151,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // semantics. Without this, a parent that has already reaped its last child
     // blocks forever (observed: stress-ng's parent `wait4(-1)` hanging after
     // its only worker exited, so the whole run never completes).
-    if !has_living_child(parent, want_pid, want_pgid, options) {
+    if !has_living_child(&parents, want_pid, want_pgid, options) {
         ctx.set_return(errno_ret(ECHILD));
         return;
     }
@@ -208,13 +241,32 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     }
     match reaped {
         Some((child, status)) => {
+            // Translate before reap cleanup removes the namespace binding.
+            let child_visible = report_pid_to(parent, child);
+            let mut copy_errno = None;
             if status_ptr != 0 {
                 // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
                 // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
                 // SAFETY: Valid memory or trusted environment
-                let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+                if let Err(errno) = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) } {
+                    copy_errno = Some(errno);
+                }
             }
-            ctx.set_return(SyscallReturn::ok(report_pid_to(parent, child)));
+            let child_cpu_ns = account_reaped_child(parent, child);
+            let snap = take_exit_rusage(child);
+            if copy_errno.is_none() && rusage_ptr != 0 {
+                let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
+                if let Err(errno) = write_rusage_utime(rusage_ptr, ns, kb) {
+                    copy_errno = Some(errno);
+                }
+            }
+            release_reaped_task(child);
+            crate::release_pid(crate::ProcessId(child));
+            parent_of_remove(child);
+            ctx.set_return(match copy_errno {
+                Some(errno) => errno_ret(errno as i64),
+                None => SyscallReturn::ok(child_visible),
+            });
         }
         // Use u64::MAX as the "error" sentinel since 0 is the
         // legitimate WNOHANG-with-no-exited-child return value

@@ -100,6 +100,7 @@ fn is_ignorable_path(rel: &str) -> bool {
 fn is_arch_sensitive(rel: &str) -> bool {
     rel.starts_with("arch/")
         || rel.starts_with("drivers/")
+        || rel.starts_with("userspace/")
         || rel.contains("aarch64")
         || rel.ends_with(".S")
         || rel.ends_with(".s")
@@ -853,6 +854,24 @@ mod tests {
         assert!(!p.run_net_smoke, "gpu change must skip net-smoke");
         assert!(p.subsystems.contains("drivers/gpu"));
         // drivers/ is arch-sensitive ⇒ both clippy arches.
+        assert_eq!(
+            p.clippy_arches,
+            vec!["x86_64".to_string(), "aarch64".to_string()]
+        );
+    }
+
+    #[test]
+    fn userspace_change_lints_both_kernel_arches() {
+        let cr = fixture();
+        let p = plan(
+            &["userspace/src/syscall.rs".to_string()],
+            &cr,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert!(p.run_clippy);
         assert_eq!(
             p.clippy_arches,
             vec!["x86_64".to_string(), "aarch64".to_string()]

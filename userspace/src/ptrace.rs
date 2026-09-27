@@ -285,6 +285,9 @@ pub fn is_task_traced(child_pid: u64) -> bool {
 }
 
 pub fn is_task_ptrace_stopped(task_id: u64) -> bool {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
     let g = PTRACE_STATE.lock();
     let pid = tid_to_pid(task_id);
     g.as_ref()

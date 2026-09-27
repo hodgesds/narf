@@ -52,6 +52,113 @@ fn smoke_abi_signal_kill_null_signal() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
 
+fn smoke_abi_signal_stop_continue_pending_cancellation() -> TestResult {
+    with_setup(|| {
+        const SIGCONT: u64 = 18;
+        const SIGSTOP: u64 = 19;
+        let cont_bit = crate::handlers::sig_bit(SIGCONT as u32);
+        let stop_bit = crate::handlers::sig_bit(SIGSTOP as u32);
+
+        // Linux discards default-action SIGCONT when it is unblocked, after
+        // applying its resume/cancellation side effects. Block it here so the
+        // pending-set cancellation itself remains observable.
+        crate::handlers::set_signal_mask_for_task(FAKE_TASK, cont_bit);
+
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGCONT)) != Some(0)
+            || call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGSTOP)) != Some(0)
+        {
+            return Err("kill(self, SIGCONT/SIGSTOP) failed");
+        }
+        let after_stop = crate::handlers::signal_pending_of(FAKE_TASK);
+        if after_stop & stop_bit == 0 || after_stop & cont_bit != 0 {
+            return Err("pending SIGSTOP did not atomically cancel SIGCONT");
+        }
+
+        crate::handlers::clear_signal_pending(FAKE_TASK, SIGSTOP as u32);
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGSTOP)) != Some(0)
+            || call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGCONT)) != Some(0)
+        {
+            return Err("kill(self, SIGSTOP/SIGCONT) failed");
+        }
+        let after_cont = crate::handlers::signal_pending_of(FAKE_TASK);
+        if after_cont & cont_bit == 0 || after_cont & stop_bit != 0 {
+            return Err("pending SIGCONT did not atomically cancel stop signals");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_stop_continue_pending_cancellation
+);
+
+/// A default STOP can be delivered from a timer return at any user RIP. Linux
+/// preserves the complete interrupted register file; it does not synthesize a
+/// syscall result. Clobbering RAX here turns a perfectly valid pointer held
+/// across the interrupt into NULL (musl's `__syscall_ret` then faults while
+/// storing errno after a repeatedly stopped `pause`).
+fn smoke_abi_signal_job_stop_preserves_interrupted_return_register() -> TestResult {
+    struct StopCtx {
+        args: SyscallArgs,
+        ret: SyscallReturn,
+    }
+
+    impl TrapContext for StopCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.ret = ret;
+        }
+
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+
+        fn rip(&self) -> u64 {
+            0x1234_5678
+        }
+
+        fn set_rip(&mut self, _rip: u64) {}
+
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+
+        fn returning_to_user(&self) -> bool {
+            true
+        }
+    }
+
+    with_setup(|| {
+        const INTERRUPTED_RAX: u64 = 0xfeed_face_cafe_beef;
+        let mut ctx = StopCtx {
+            args: SyscallArgs::default(),
+            ret: SyscallReturn::ok(INTERRUPTED_RAX),
+        };
+
+        crate::handlers::raise_signal_pending(FAKE_TASK, 19);
+        if !crate::handlers::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE) {
+            return Err("default SIGSTOP was not consumed");
+        }
+        if ctx.ret != SyscallReturn::ok(INTERRUPTED_RAX) {
+            return Err("job-control stop clobbered the interrupted return register");
+        }
+        if !crate::handlers::is_task_stopped(FAKE_TASK) {
+            return Err("default SIGSTOP did not publish stopped state");
+        }
+        if !crate::handlers::__test_continue_stopped_task(FAKE_TASK) {
+            return Err("test cleanup could not resume stopped task");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_job_stop_preserves_interrupted_return_register
+);
+
 fn smoke_abi_signal_pending_task_count_tracks_transitions() -> TestResult {
     with_setup(|| {
         const OTHER_TASK: u64 = FAKE_TASK + 1;
@@ -1320,26 +1427,31 @@ fn smoke_abi_signal_rt_kill_pending() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_kill_pending);
 
-// A default-ignored SIGCHLD remains pending until the return-to-user delivery
-// path consumes it, but it must not interrupt wait4 with EINTR. A real handler
-// for the same signal does make it actionable, while SIG_IGN suppresses it.
+// Linux drops an unblocked, default-ignored SIGCHLD at generation time. A real
+// handler makes the same signal actionable, while SIG_IGN also discards it.
 fn smoke_abi_signal_default_ignored_does_not_interrupt_wait() -> TestResult {
     with_setup(|| {
         const SIGCHLD: u32 = 17;
         crate::handlers::raise_signal_pending(FAKE_TASK, SIGCHLD);
-        if !crate::handlers::is_signal_pending(FAKE_TASK) {
-            return Err("SIGCHLD should remain visible as pending");
+        if crate::handlers::is_signal_pending(FAKE_TASK) {
+            return Err("default-ignored unblocked SIGCHLD should be discarded");
         }
         if crate::handlers::has_interrupting_signal(FAKE_TASK) {
             return Err("default-ignored SIGCHLD must not interrupt wait4");
         }
 
         crate::handlers::__test_set_sigaction(FAKE_TASK, SIGCHLD as usize, 0x4000);
+        crate::handlers::raise_signal_pending(FAKE_TASK, SIGCHLD);
         if !crate::handlers::has_interrupting_signal(FAKE_TASK) {
             return Err("caught SIGCHLD must wake an interruptible wait");
         }
+        crate::handlers::clear_signal_pending(FAKE_TASK, SIGCHLD);
 
         crate::handlers::__test_set_sigaction(FAKE_TASK, SIGCHLD as usize, 1);
+        crate::handlers::raise_signal_pending(FAKE_TASK, SIGCHLD);
+        if crate::handlers::is_signal_pending(FAKE_TASK) {
+            return Err("SIG_IGN SIGCHLD should be discarded");
+        }
         if crate::handlers::has_interrupting_signal(FAKE_TASK) {
             return Err("SIG_IGN SIGCHLD must not interrupt wait4");
         }

@@ -11591,13 +11591,47 @@ struct ChildLink {
 
 static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ChildLink>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
-/// Number of unreaped children owned by each parent TaskId. Linux keeps an
-/// intrusive children list on every task; this compact companion index gives
-/// NARF the same O(1) "no children" exit test without duplicating ChildLink.
-/// It is updated under PARENT_OF's lock, so a published child link and its
-/// parent count become visible as one transaction.
-static PARENT_CHILD_COUNTS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Counts needed to answer Linux wait-class eligibility without walking every
+/// live process. `sigchld` is the ordinary-child subset; `total - sigchld` is
+/// the clone-child subset selected by `__WCLONE`.
+#[derive(Copy, Clone, Default)]
+struct ParentChildCounts {
+    total: u32,
+    sigchld: u32,
+}
+
+/// Number and class of unreaped children owned by each parent TaskId. Linux
+/// keeps intrusive per-task children lists; this compact companion index gives
+/// NARF an O(log parents) eligibility check instead of an O(all live tasks)
+/// `PARENT_OF` scan on every no-event wait call.
+const PARENT_CHILD_COUNT_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct ParentChildCountShard {
+    counts: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ParentChildCounts>>>,
+}
+
+impl ParentChildCountShard {
+    const fn new() -> Self {
+        Self {
+            counts: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static PARENT_CHILD_COUNTS: [ParentChildCountShard; PARENT_CHILD_COUNT_SHARDS] =
+    [const { ParentChildCountShard::new() }; PARENT_CHILD_COUNT_SHARDS];
+
+#[inline]
+fn parent_child_count_shard(parent: u64) -> usize {
+    parent as usize & (PARENT_CHILD_COUNT_SHARDS - 1)
+}
+
+fn parent_child_counts_init() {
+    for shard in &PARENT_CHILD_COUNTS {
+        *shard.counts.lock() = Some(BTreeMap::new());
+    }
+}
 
 /// parent_pid → list of (child_pid, status) pairs not yet reaped.
 /// status is the POSIX-shaped 32-bit value:
@@ -11655,20 +11689,77 @@ fn pending_exits_init() {
 // stopped task parked — never re-entering user mode — until SIGCONT
 // clears the entry and wakes it (SIGKILL also breaks through).
 //
-// `TASK_STOPPED`: TaskId → stop signum (for WSTOPSIG in the parent's
-// wait4 status word).
-static TASK_STOPPED: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+// The current stop signum lives directly in `Task::job_stop_signal`, matching
+// Linux's embedded task/signal state. This avoids an allocation and a shared
+// map lock on every SIGSTOP/SIGCONT transition.
+const JOB_CONTROL_SHARDS: usize = 64;
+
+/// Synthetic-test/non-executor fallback. Production tasks always have an
+/// embedded `job_stop_signal`; keeping the fallback separate prevents test tids
+/// from weakening the allocation-free runtime path.
+static TASK_STOPPED_FALLBACK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// parent_pid → queued job-control notifications consumed by
-/// `wait4`/`waitid` when WUNTRACED/WCONTINUED is set. Unlike
-/// PENDING_EXITS these do NOT release the child PID — the child is
-/// alive, merely stopped or continued. Entries: `(child_pid, wstatus,
-/// is_continued)`; `wstatus` is `(sig << 8) | 0x7f` for a stop
-/// (WIFSTOPPED) or `0xffff` for a continue (WIFCONTINUED).
-type StopContMap = BTreeMap<u64, alloc::vec::Vec<(u64, i32, bool)>>;
-static PENDING_STOPCONT: narf_lib::sync::IrqSafeSpinLock<Option<StopContMap>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+#[inline]
+fn job_control_shard(id: u64) -> usize {
+    id as usize & (JOB_CONTROL_SHARDS - 1)
+}
+
+/// One consumable job-control state. Linux stores stopped/continued state on
+/// the child (`group_exit_code` plus `SIGNAL_STOP_{STOPPED,CONTINUED}`), not in
+/// an event log: another transition before wait consumes the old state replaces
+/// it. Cache the wait-eligibility metadata at publication time so every
+/// wait4/waitid probe does not re-lock the ptrace and parent tables.
+#[derive(Copy, Clone)]
+struct StopContEvent {
+    child_pid: u64,
+    wstatus: i32,
+    is_continued: bool,
+    exit_signal: u8,
+    ptraced: bool,
+}
+
+/// Persistent per-child storage, analogous to Linux's fields embedded in
+/// `signal_struct`. Consuming an event clears the payload but retains the map
+/// node, so the next stop/continue does not allocate in the hot path.
+#[derive(Default)]
+struct StopContSlot {
+    event: Option<StopContEvent>,
+}
+
+/// parent_pid → child_pid → current consumable job-control state.
+/// Unlike PENDING_EXITS these do NOT release the child PID — the child is
+/// alive, merely stopped or continued. `wstatus` is `(sig << 8) | 0x7f`
+/// for a stop (WIFSTOPPED) or `0xffff` for a continue (WIFCONTINUED).
+///
+/// Bounding this at one entry per child is both Linux-compatible and
+/// load-bearing for a fast producer such as stress-ng `wait`: an unbounded
+/// FIFO allocates on every transition and makes the waiter drain stale states
+/// which Linux would have overwritten.
+type StopContMap = BTreeMap<u64, BTreeMap<u64, StopContSlot>>;
+
+#[repr(align(64))]
+struct StopContShard {
+    map: narf_lib::sync::IrqSafeSpinLock<Option<StopContMap>>,
+}
+
+impl StopContShard {
+    const fn new() -> Self {
+        Self {
+            map: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static PENDING_STOPCONT: [StopContShard; JOB_CONTROL_SHARDS] =
+    [const { StopContShard::new() }; JOB_CONTROL_SHARDS];
+
+fn job_control_init() {
+    *TASK_STOPPED_FALLBACK.lock() = Some(BTreeMap::new());
+    for shard in &PENDING_STOPCONT {
+        *shard.map.lock() = Some(BTreeMap::new());
+    }
+}
 
 /// wait4/waitid `options` bits (Linux uapi).
 const WUNTRACED: u32 = 2;
@@ -11683,13 +11774,46 @@ const SIGCHLD: u8 = 17;
 
 /// True if `task` is currently job-control stopped.
 pub fn is_task_stopped(task: u64) -> bool {
-    let job_stopped = TASK_STOPPED
-        .lock()
-        .as_ref()
-        .map(|m| m.contains_key(&task))
-        .unwrap_or(false);
+    let job_stopped = crate::task::with_task_local(task, |task| {
+        task.job_stop_signal.load(Ordering::Acquire) != 0
+    })
+    .unwrap_or_else(|| {
+        TASK_STOPPED_FALLBACK
+            .lock()
+            .as_ref()
+            .is_some_and(|stopped| stopped.contains_key(&task))
+    });
     let ptrace_stopped = crate::ptrace::is_task_ptrace_stopped(task);
     job_stopped || ptrace_stopped
+}
+
+fn clear_task_stopped(task: u64) -> Option<u32> {
+    if let Some(old) = crate::task::with_task_local(task, |task| {
+        task.job_stop_signal.swap(0, Ordering::AcqRel)
+    }) {
+        return (old != 0).then_some(old);
+    }
+    TASK_STOPPED_FALLBACK
+        .lock()
+        .as_mut()
+        .and_then(|stopped| stopped.remove(&task))
+}
+
+fn insert_task_stopped(task: u64, signum: u32) -> bool {
+    if let Some(inserted) = crate::task::with_task_local(task, |task| {
+        task.job_stop_signal.swap(signum, Ordering::AcqRel) == 0
+    }) {
+        return inserted;
+    }
+    TASK_STOPPED_FALLBACK
+        .lock()
+        .as_mut()
+        .is_some_and(|stopped| stopped.insert(task, signum).is_none())
+}
+
+#[inline]
+fn prefer_resumed_child_handoff(online_cpu_bits: u64) -> bool {
+    online_cpu_bits.count_ones() > 1
 }
 
 /// Raw pending-signal bitmask for `task` (no mask applied). Used by
@@ -11712,9 +11836,15 @@ fn stopped_wstatus(sig: u32) -> i32 {
 const CONTINUED_WSTATUS: i32 = 0xffff;
 
 #[inline]
-fn get_wait_recipient(child_pid: u64) -> Option<u64> {
-    {
-        crate::ptrace::get_wait_recipient(child_pid)
+fn get_wait_recipient(child_pid: u64) -> Option<(u64, bool, u8)> {
+    if let Some(tracer_pid) = crate::ptrace::get_task_tracer(child_pid) {
+        let tracer_task = linux_tid_to_task_raw(tracer_pid)
+            .or_else(|| pid_to_task_raw(tracer_pid))
+            .unwrap_or(tracer_pid);
+        let exit_signal = child_link_get(child_pid).map_or(SIGCHLD, |link| link.exit_signal);
+        Some((tracer_task, true, exit_signal))
+    } else {
+        child_link_get(child_pid).map(|link| (link.parent, false, link.exit_signal))
     }
 }
 
@@ -11727,33 +11857,83 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
 }
 
 fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
-    let parent = match get_wait_recipient(child_pid) {
-        Some(p) => p,
+    let (parent, ptraced, exit_signal) = match get_wait_recipient(child_pid) {
+        Some(recipient) => recipient,
         None => return,
     };
-    {
-        let mut g = PENDING_STOPCONT.lock();
+    let replaced = {
+        let mut g = PENDING_STOPCONT[job_control_shard(parent)].map.lock();
         if let Some(m) = g.as_mut() {
-            m.entry(parent).or_insert_with(alloc::vec::Vec::new).push((
-                child_pid,
-                wstatus,
-                is_continued,
-            ));
+            let slot = m
+                .entry(parent)
+                .or_default()
+                .entry(child_pid)
+                .or_default();
+            let replaced = slot.event.is_some();
+            slot.event = Some(StopContEvent {
+                    child_pid,
+                    wstatus,
+                    is_continued,
+                    exit_signal,
+                    ptraced,
+                });
+            replaced
+        } else {
+            false
+        }
+    };
+    // Linux do_notify_parent_cldstop() always publishes the waitable state and
+    // wakes wait4, but suppresses the SIGCHLD instance when the parent ignores
+    // SIGCHLD or selected SA_NOCLDSTOP. send_signal_locked() also drops an
+    // unblocked default-ignored SIGCHLD in prepare_signal(); retain it only
+    // when blocked (so sigpending/signalfd can observe it) or when a tracer may
+    // consume it. Avoiding a synthetic pending bit here is both observable
+    // Linux behavior and the common job-control fast path.
+    let action = sigaction_lookup_full(parent, SIGCHLD as usize);
+    let explicitly_suppressed = action.is_some_and(|action| {
+        action.handler == 1 || action.flags & SA_NOCLDSTOP != 0
+    });
+    let default_ignored = action.is_none_or(|action| action.handler == 0);
+    let default_must_queue = default_ignored
+        && (signal_mask_of(parent) & sig_bit(u32::from(SIGCHLD)) != 0
+            || crate::ptrace::is_task_traced(task_to_pid_raw(parent).unwrap_or(parent)));
+    let notify_sigchld = !explicitly_suppressed && (!default_ignored || default_must_queue);
+    if notify_sigchld {
+        // Route through the canonical raise-notify (not a bare pending-bit set)
+        // so a signalfd-watching parent's epoll readiness EDGE fires.
+        if let Some((was_empty, was_new)) = pending_signal_bits_update(parent, |slot| {
+            let was_empty = *slot == 0;
+            let was_new = *slot & sig_bit(17) == 0;
+            *slot |= sig_bit(17);
+            (was_empty, was_new)
+        }) {
+            // Standard SIGCHLD instances coalesce. Linux's legacy_queue()
+            // stops before complete_signal() when SIGCHLD is already pending,
+            // so it does not repeat the signal wake/generation work. The wait
+            // queue below is still fired for every child-state publication.
+            if was_new {
+                signal_raise_notify(parent, was_empty);
+            }
         }
     }
-    // Linux notifies the parent with SIGCHLD on stop/continue too. Route it
-    // through the canonical raise-notify (not a bare pending-bit set) so a
-    // signalfd-watching parent's epoll readiness EDGE fires — the same lost-reap
-    // class fixed in `on_child_exit` (a cell-backed signalfd only enters epoll's
-    // fast-pass ready-list when its per-fd waker is fired by `wake_signalfds`).
-    if let Some(was_empty) = pending_signal_bits_update(parent, |slot| {
-        let was_empty = *slot == 0;
-        *slot |= sig_bit(17);
-        was_empty
-    }) {
-        signal_raise_notify(parent, was_empty);
+    // The producer has lapped the waiter's single Linux-style state slot.
+    // Ask the ordinary executor path to cede at syscall exit so the consumer
+    // can drain it before another transition overwrites it. This is the same
+    // bounded cooperative backpressure used for full realtime-signal queues;
+    // unlike a direct handoff it never resumes another task inside this signal
+    // path and is therefore safe for both local and remote waiters.
+    if replaced {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        narf_scheduler::stackful::request_syscall_backpressure_yield();
     }
     wake_wait_child_group(parent);
+    // A stop/continue publication is a synchronous producer→waiter handoff.
+    // If the parent is runnable on this CPU, select it at this syscall exit
+    // instead of merely yielding to an arbitrary peer. This is Linux's
+    // wakeup-preemption shape and prevents a SIGCONT/SIGSTOP producer from
+    // repeatedly overwriting the one-slot child state before wait consumes it.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    narf_scheduler::stackful::note_urgent_wake_preempt(parent);
 }
 
 /// Pop a matching stop/continue notification for `parent`, honouring
@@ -11795,27 +11975,49 @@ fn wait_child_matches(
 
 /// Task IDs whose child lists are visible to the waiter. Linux walks every
 /// thread in the caller's thread group unless __WNOTHREAD is set.
-fn wait_parent_ids(waiter: u64, options: u32) -> alloc::vec::Vec<u64> {
-    let mut parents = alloc::vec![waiter];
-    if options & __WNOTHREAD != 0 {
-        return parents;
+///
+/// Keep the caller separate from the optional group snapshot. An empty `Vec`
+/// owns no allocation, so the dominant single-threaded wait/wake path does not
+/// allocate merely to yield one TaskId. This matters for job-control workloads:
+/// stress-ng `wait` executes this path for every SIGSTOP/SIGCONT transition.
+struct WaitParentIds {
+    waiter: u64,
+    members: alloc::vec::Vec<u64>,
+}
+
+impl WaitParentIds {
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        core::iter::once(self.waiter).chain(
+            self.members
+                .iter()
+                .copied()
+                .filter(|&task| task != self.waiter),
+        )
     }
-    let waiter_tgid = task_to_pid_raw(waiter).unwrap_or(waiter);
-    // Single-threaded parents are overwhelmingly common (including the
-    // stress-ng fork/clone workers); keep their reap path O(1).
-    if thread_group_live_count(waiter_tgid) <= 1 {
-        return parents;
+
+    #[inline]
+    fn contains(&self, task: u64) -> bool {
+        task == self.waiter || self.members.contains(&task)
     }
-    for task in thread_group_members(waiter_tgid) {
-        if task != waiter {
-            parents.push(task);
+}
+
+fn wait_parent_ids(waiter: u64, options: u32) -> WaitParentIds {
+    let members = if options & __WNOTHREAD == 0 && has_multithreaded_groups() {
+        let waiter_tgid = task_to_pid_raw(waiter).unwrap_or(waiter);
+        if thread_group_live_count(waiter_tgid) > 1 {
+            thread_group_members(waiter_tgid)
+        } else {
+            alloc::vec::Vec::new()
         }
-    }
-    parents
+    } else {
+        alloc::vec::Vec::new()
+    };
+    WaitParentIds { waiter, members }
 }
 /// Wake every thread that may legally consume this parent's child event.
 fn wake_wait_child_group(parent: u64) {
-    for waiter in wait_parent_ids(parent, 0) {
+    for waiter in wait_parent_ids(parent, 0).iter() {
         crate::user_task::wake_wait_child(waiter);
     }
 }
@@ -11825,14 +12027,13 @@ fn wake_wait_child_group(parent: u64) {
 /// exact __WNOTHREAD behavior while the default path matches Linux's
 /// group-wide wait.
 fn reap_pending_exit(
-    waiter: u64,
+    parents: &WaitParentIds,
     want_pid: i64,
     want_pgid: u64,
     options: u32,
     peek: bool,
 ) -> Option<PendingExit> {
-    let parents = wait_parent_ids(waiter, options);
-    for parent in parents {
+    for parent in parents.iter() {
         let mut shard = PENDING_EXITS[pending_exit_shard(parent)].map.lock();
         let Some(m) = shard.as_mut() else {
             continue;
@@ -11857,33 +12058,49 @@ fn reap_pending_exit(
     None
 }
 
-fn reap_stopcont(parent: u64, want: i64, want_pgid: u64, options: u32) -> Option<(u64, i32)> {
+fn reap_stopcont(
+    parents: &WaitParentIds,
+    want: i64,
+    want_pgid: u64,
+    options: u32,
+) -> Option<(u64, i32)> {
     let want_stop = options & WUNTRACED != 0;
     let want_cont = options & WCONTINUED != 0;
-    let parents = wait_parent_ids(parent, options);
-    let mut g = PENDING_STOPCONT.lock();
-    let m = g.as_mut()?;
-    for owner in parents {
-        let Some(q) = m.get_mut(&owner) else {
+    for owner in parents.iter() {
+        let mut shard = PENDING_STOPCONT[job_control_shard(owner)].map.lock();
+        let Some(m) = shard.as_mut() else {
             continue;
         };
-        let Some(idx) = q.iter().position(|&(p, _w, cont)| {
-            let ptraced = crate::ptrace::is_ptrace_stop_recipient(owner, p);
-            let exit_signal = child_link_get(p).map_or(SIGCHLD, |link| link.exit_signal);
-            if !wait_child_matches(p, want, want_pgid, exit_signal, ptraced, options) {
-                return false;
+        let Some(states) = m.get_mut(&owner) else {
+            continue;
+        };
+        let Some(child_pid) = states.iter().find_map(|(&child_pid, slot)| {
+            let event = slot.event.as_ref()?;
+            if !wait_child_matches(
+                event.child_pid,
+                want,
+                want_pgid,
+                event.exit_signal,
+                event.ptraced,
+                options,
+            ) {
+                return None;
             }
-            if cont {
-                return want_cont;
+            if event.is_continued {
+                return want_cont.then_some(child_pid);
             }
             // A ptrace-stop is reported to the tracer's wait4
             // unconditionally; WUNTRACED gates ordinary job-control stops.
-            want_stop || ptraced
+            (want_stop || event.ptraced).then_some(child_pid)
         }) else {
             continue;
         };
-        let (pid, w, _) = q.remove(idx);
-        return Some((pid, w));
+        let event = if options & WNOWAIT != 0 {
+            states.get(&child_pid)?.event?
+        } else {
+            states.get_mut(&child_pid)?.event.take()?
+        };
+        return Some((event.child_pid, event.wstatus));
     }
     None
 }
@@ -11891,51 +12108,38 @@ fn reap_stopcont(parent: u64, want: i64, want_pgid: u64, options: u32) -> Option
 /// Stop/continue mutual-cancellation and SIGCONT resume. Call
 /// whenever `signum` is about to become pending on `task`.
 ///
-/// - SIGCONT (18): discards any pending stop signals, and if `task`
-///   is currently stopped, clears the stopped state, reports
-///   WIFCONTINUED to the parent, and un-parks the task.
-/// - A stop signal (19..=22): discards a pending SIGCONT.
-fn signal_stopcont_interaction(task: u64, signum: u32) {
-    match signum {
-        18 => {
-            // SIGCONT cancels pending stops (19..=22).
-            clear_pending_signal_bits(task, 0b1111u64 << 18); // stop signals 19-22
-            let was_stopped = TASK_STOPPED
-                .lock()
-                .as_mut()
-                .and_then(|m| m.remove(&task))
-                .is_some();
-            if was_stopped {
-                push_stopcont_report(task, CONTINUED_WSTATUS, true);
-                // Un-park the stopped UserTaskFuture: wake_signal clears
-                // a u64::MAX deadline and fires the registered waker, so
-                // the poll loop re-runs, sees the task no longer stopped,
-                // and re-enters user mode.
-                wake_signal(task);
-            }
-        }
-        19..=22 => {
-            // A stop signal cancels a pending SIGCONT.
-            clear_pending_signal_bits(task, sig_bit(18)); // SIGCONT
-        }
-        _ => {}
+/// - SIGCONT (18): if `task` is currently stopped, clears the stopped state
+///   and reports WIFCONTINUED to the parent.
+///
+/// Pending-set mutual cancellation is folded into the same locked update that
+/// enqueues the new signal (`set_pending_signal_bit`), and the subsequent
+/// canonical raise-notify performs the one required wake.
+fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
+    if signum != 18 {
+        return false;
     }
+    let was_stopped = clear_task_stopped(task).is_some();
+    if was_stopped {
+        push_stopcont_report(task, CONTINUED_WSTATUS, true);
+    }
+    was_stopped
 }
 
 /// Put the current task into the job-control stopped state and park it
 /// until SIGCONT. Records the stop signum (for WSTOPSIG), cancels any
 /// pending SIGCONT, notifies the parent (wait4 WUNTRACED + SIGCHLD),
-/// then — mirroring sys_pause — stashes an infinite deadline, saves the
-/// user frame, and longjmps back to the executor via the yield hook.
+/// then stashes an infinite deadline, saves the user frame, and longjmps back
+/// to the executor via the yield hook. The interrupted register file is
+/// preserved verbatim: a stop can be taken on any kernel-to-user return, not
+/// only at a syscall boundary, so manufacturing a return value here would
+/// corrupt a live user register (Linux's `do_signal_stop` does not do so).
 /// The poll loop keeps the task parked (is_task_stopped) until SIGCONT
 /// clears the entry and wakes it; the interrupted syscall then resumes
 /// returning 0. With no executor wired (kernel-test context) it returns
 /// without parking so the caller can consume the signal.
 fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
     clear_pending_signal_bits(task, sig_bit(signum));
-    if let Some(m) = TASK_STOPPED.lock().as_mut() {
-        m.insert(task, signum);
-    }
+    insert_task_stopped(task, signum);
     clear_pending_signal_bits(task, sig_bit(18)); // SIGCONT
     push_stopcont_report(task, stopped_wstatus(signum), false);
     if let (Some(uctx), Some(hook)) = (
@@ -11948,7 +12152,6 @@ fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
         // task to the executor (never returns).
         unsafe {
             let uc = &*uctx;
-            ctx.set_return(SyscallReturn::ok(0));
             uc.sleep_deadline_ns
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -12009,11 +12212,10 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
 
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
-    *PARENT_CHILD_COUNTS.lock() = Some(BTreeMap::new());
+    parent_child_counts_init();
     crate::ptrace::ptrace_init();
     pending_exits_init();
-    *TASK_STOPPED.lock() = Some(BTreeMap::new());
-    *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
+    job_control_init();
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     // THREAD-scoped (every thread exit): release this thread's fd-table
@@ -12128,10 +12330,9 @@ fn cgroup_freeze_hook(pid: u64, freeze: bool) {
 #[doc(hidden)]
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
-    *PARENT_CHILD_COUNTS.lock() = Some(BTreeMap::new());
+    parent_child_counts_init();
     pending_exits_init();
-    *TASK_STOPPED.lock() = Some(BTreeMap::new());
-    *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
+    job_control_init();
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::__test_wait_child_waker_reset();
@@ -12208,7 +12409,8 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
     // and a report is queued, so a plain wait falls straight through to the
     // exit reap below. These do NOT release the PID: the child is alive (or
     // its exit is still queued for the next wait).
-    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, want_pgid, options) {
+    let parents = wait_parent_ids(parent_id, options);
+    if let Some((child_pid, status)) = reap_stopcont(&parents, want_pid, want_pgid, options) {
         if !out_status.is_null() {
             // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
             // poll routine's stack frame for the duration of this call.
@@ -12222,7 +12424,7 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
     // asked WNOWAIT, which only PEEKS: the entry stays queued so a later
     // real wait can reap it (same semantics as the sys_waitid fast path).
     let peek = options & WNOWAIT != 0;
-    let entry = reap_pending_exit(parent_id, want_pid, want_pgid, options, peek);
+    let entry = reap_pending_exit(&parents, want_pid, want_pgid, options, peek);
     if let Some(entry) = entry {
         let child_pid = entry.child_pid;
         let status = entry.status;
@@ -12245,12 +12447,8 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         // / tms.cutime). Same fold as the synchronous reap path in sys_wait4;
         // this covers the blocking wait4 + waitid path.
         let _ = account_reaped_child(parent_id, child_pid);
-        // Reaped — release the refcounted Task, return the PID to the
-        // free pool, and drop the parent record so wait4's ECHILD check
-        // is accurate.
-        release_reaped_task(child_pid);
-        crate::release_pid(crate::ProcessId(child_pid));
-        parent_of_remove(child_pid);
+        // Cleanup is deferred to `finish_wait_child`: it must first translate
+        // this outer PID through the waiter's still-live namespace binding.
         return child_pid as i64;
     }
     0
@@ -12262,7 +12460,13 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
 /// returns the reaped pid; for `waitid` it writes a `siginfo_t` and
 /// returns 0. Called from the poll routine (which owns the saved
 /// register frame) for the blocking path.
-pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, status: i32) -> u64 {
+pub(crate) fn finish_wait_child(
+    status_ptr: u64,
+    is_waitid: bool,
+    options: u32,
+    reaped: i64,
+    status: i32,
+) -> u64 {
     // Blocking wait4's rusage out-param: this runs AS THE PARENT on both
     // reap routes (the UserTaskFuture poll and own_stack_wait_child), so
     // the staged pointer + the child's exit-time snapshot meet here.
@@ -12272,25 +12476,77 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
     // `reaped` is the outer ProcessId — keep it for the ProcessId-keyed rusage
     // snapshot, but report the child in the PARENT's namespace view to
     // userspace (si_pid / wait4 rax).
-    let snap = take_exit_rusage(reaped as u64);
+    let child_pid = reaped as u64;
+    let is_terminal = status != CONTINUED_WSTATUS && status & 0xff != 0x7f;
+    let peek = options & WNOWAIT != 0;
+    let snap = if is_terminal && peek {
+        let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
+        Some(peek_exit_rusage(child_pid).unwrap_or_else(|| {
+            (
+                cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid)),
+                task_rss_bytes(child_tid) / 1024,
+            )
+        }))
+    } else if is_terminal {
+        // A terminal reap must always consume the saved snapshot, even when
+        // this particular wait did not request rusage.
+        take_exit_rusage(child_pid)
+    } else if rusage_ptr != 0 {
+        let child_tid = pid_to_task_raw(child_pid).unwrap_or(child_pid);
+        Some((
+            cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid)),
+            task_rss_bytes(child_tid) / 1024,
+        ))
+    } else {
+        // Stop/continue is not a reap and has no snapshot to clean up. Most
+        // waitpid calls pass no rusage pointer, so avoid three cold accounting
+        // lookups on this job-control hot path.
+        None
+    };
     let reaped_visible = report_pid_to(parent, reaped as u64) as i64;
-    if rusage_ptr != 0 {
-        let (ns, kb) = snap.unwrap_or((0, 0));
-        write_rusage_utime(rusage_ptr, ns, kb);
-    }
-    if status_ptr != 0 {
-        if is_waitid {
+    let (ns, kb) = snap.unwrap_or((0, 0));
+    let result = if is_waitid {
+        // Linux waitid copies rusage before siginfo.
+        if rusage_ptr != 0 && write_rusage_utime(rusage_ptr, ns, kb).is_err() {
+            errno_ret(EFAULT).value
+        } else if status_ptr != 0 {
             let si = encode_waitid_siginfo(reaped_visible, status);
             // SAFETY: `status_ptr` is the user `siginfo_t*` (non-zero);
             // copy_to_user range-validates the 128-byte write.
-            let _ = unsafe { copy_to_user(status_ptr, &si) };
+            if unsafe { copy_to_user(status_ptr, &si) }.is_err() {
+                errno_ret(EFAULT).value
+            } else {
+                0
+            }
         } else {
+            0
+        }
+    } else {
+        // Linux wait4 copies wstatus before rusage.
+        let status_fault = if status_ptr != 0 {
             // SAFETY: `status_ptr` is the user wstatus `int*` (non-zero);
             // copy_to_user range-validates the 4-byte write.
-            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+            unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) }.is_err()
+        } else {
+            false
+        };
+        let rusage_fault = !status_fault
+            && rusage_ptr != 0
+            && write_rusage_utime(rusage_ptr, ns, kb).is_err();
+        if status_fault || rusage_fault {
+            errno_ret(EFAULT).value
+        } else {
+            reaped_visible as u64
         }
+    };
+    if is_terminal && !peek {
+        // The exit was consumed before the user copies. Always finish the reap,
+        // including on EFAULT, but only after namespace-visible PID reporting.
+        release_reaped_task(child_pid);
+        crate::release_pid(crate::ProcessId(child_pid));
+        parent_of_remove(child_pid);
     }
-    if is_waitid { 0 } else { reaped_visible as u64 }
+    result
 }
 
 /// Per-task-own-stack blocking wait4/waitid: reap-or-park loop that returns the
@@ -12332,7 +12588,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         let reaped =
             crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status);
         if reaped > 0 {
-            let rax = finish_wait_child(status_ptr, is_waitid, reaped, status);
+            let rax = finish_wait_child(status_ptr, is_waitid, options, reaped, status);
             uc.wait_child_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             ctx.set_return(SyscallReturn::ok(rax));
@@ -12372,7 +12628,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
             crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status2);
         if reaped2 > 0 {
             crate::user_task::drop_wait_child_waker(parent);
-            let rax = finish_wait_child(status_ptr, is_waitid, reaped2, status2);
+            let rax = finish_wait_child(status_ptr, is_waitid, options, reaped2, status2);
             uc.wait_child_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             ctx.set_return(SyscallReturn::ok(rax));
@@ -12671,40 +12927,135 @@ pub fn __test_clear_pending_exits(parent: u64) {
     }
 }
 
-fn adjust_parent_child_count(old_parent: Option<u64>, new_parent: Option<u64>) {
-    if old_parent == new_parent {
+/// Stage the current waitable stopped/continued state for a synthetic child.
+/// This uses the production publication path so ABI tests cover Linux-style
+/// replacement rather than manipulating the backing map directly.
+#[doc(hidden)]
+pub fn __test_stage_stopcont(
+    parent: u64,
+    child: u64,
+    wstatus: i32,
+    is_continued: bool,
+) {
+    parent_of_set(child, parent);
+    push_stopcont_report_as(child, wstatus, is_continued);
+}
+
+/// Number of children with an unconsumed job-control state for `parent`.
+#[doc(hidden)]
+pub fn __test_stopcont_state_count(parent: u64) -> usize {
+    PENDING_STOPCONT[job_control_shard(parent)]
+        .map
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&parent))
+        .map_or(0, |states| {
+            states.values().filter(|slot| slot.event.is_some()).count()
+        })
+}
+
+/// Exercise the production stopped-state transition without entering the
+/// scheduler park path. Returns true only for the first insertion.
+#[doc(hidden)]
+pub fn __test_mark_task_stopped(task: u64, signum: u32) -> bool {
+    insert_task_stopped(task, signum)
+}
+
+/// Apply the production SIGCONT state transition. Returns true only when the
+/// task was actually stopped and a continued report was published.
+#[doc(hidden)]
+pub fn __test_continue_stopped_task(task: u64) -> bool {
+    signal_stopcont_interaction(task, 18)
+}
+
+/// Pure topology half of the resumed-child handoff policy.
+#[doc(hidden)]
+pub fn __test_prefer_resumed_child_handoff(online_cpu_bits: u64) -> bool {
+    prefer_resumed_child_handoff(online_cpu_bits)
+}
+
+fn adjust_parent_child_count(old: Option<ChildLink>, new: Option<ChildLink>) {
+    if old == new {
         return;
     }
-    let mut counts = PARENT_CHILD_COUNTS.lock();
-    let m = counts.get_or_insert_with(BTreeMap::new);
-    if let Some(parent) = old_parent {
-        let remove = if let Some(count) = m.get_mut(&parent) {
-            if *count <= 1 {
+
+    // Reclassifying a child without reparenting changes only the SIGCHLD
+    // subset and can be committed under one shard lock.
+    if let (Some(old), Some(new)) = (old, new) {
+        if old.parent == new.parent {
+            if old.exit_signal != new.exit_signal {
+                let mut shard = PARENT_CHILD_COUNTS[parent_child_count_shard(old.parent)]
+                    .counts
+                    .lock();
+                if let Some(counts) = shard
+                    .get_or_insert_with(BTreeMap::new)
+                    .get_mut(&old.parent)
+                {
+                    if old.exit_signal == SIGCHLD {
+                        counts.sigchld = counts.sigchld.saturating_sub(1);
+                    }
+                    if new.exit_signal == SIGCHLD {
+                        counts.sigchld = counts.sigchld.saturating_add(1);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    if let Some(old) = old {
+        let mut shard = PARENT_CHILD_COUNTS[parent_child_count_shard(old.parent)]
+            .counts
+            .lock();
+        let m = shard.get_or_insert_with(BTreeMap::new);
+        let remove = if let Some(counts) = m.get_mut(&old.parent) {
+            if counts.total <= 1 {
                 true
             } else {
-                *count -= 1;
+                counts.total -= 1;
+                if old.exit_signal == SIGCHLD {
+                    counts.sigchld = counts.sigchld.saturating_sub(1);
+                }
                 false
             }
         } else {
             false
         };
         if remove {
-            m.remove(&parent);
+            m.remove(&old.parent);
         }
     }
-    if let Some(parent) = new_parent {
-        let count = m.entry(parent).or_insert(0);
-        *count = count.saturating_add(1);
+    if let Some(new) = new {
+        let mut shard = PARENT_CHILD_COUNTS[parent_child_count_shard(new.parent)]
+            .counts
+            .lock();
+        let m = shard.get_or_insert_with(BTreeMap::new);
+        let counts = m.entry(new.parent).or_default();
+        counts.total = counts.total.saturating_add(1);
+        if new.exit_signal == SIGCHLD {
+            counts.sigchld = counts.sigchld.saturating_add(1);
+        }
     }
 }
 
 #[inline]
 fn parent_child_count(parent: u64) -> u32 {
-    PARENT_CHILD_COUNTS
+    PARENT_CHILD_COUNTS[parent_child_count_shard(parent)]
+        .counts
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&parent).map(|counts| counts.total))
+        .unwrap_or(0)
+}
+
+#[inline]
+fn parent_child_counts(parent: u64) -> ParentChildCounts {
+    PARENT_CHILD_COUNTS[parent_child_count_shard(parent)]
+        .counts
         .lock()
         .as_ref()
         .and_then(|m| m.get(&parent).copied())
-        .unwrap_or(0)
+        .unwrap_or_default()
 }
 fn parent_of_set(child: u64, parent: u64) {
     parent_of_set_with_signal(child, parent, SIGCHLD);
@@ -12713,14 +13064,12 @@ fn parent_of_set(child: u64, parent: u64) {
 fn parent_of_set_with_signal(child: u64, parent: u64, exit_signal: u8) {
     let mut links = PARENT_OF.lock();
     if let Some(m) = links.as_mut() {
-        let old = m.insert(
-            child,
-            ChildLink {
-                parent,
-                exit_signal,
-            },
-        );
-        adjust_parent_child_count(old.map(|link| link.parent), Some(parent));
+        let new = ChildLink {
+            parent,
+            exit_signal,
+        };
+        let old = m.insert(child, new);
+        adjust_parent_child_count(old, Some(new));
     }
 }
 
@@ -12764,7 +13113,7 @@ fn parent_of_remove(child: u64) {
     let mut links = PARENT_OF.lock();
     if let Some(m) = links.as_mut() {
         if let Some(old) = m.remove(&child) {
-            adjust_parent_child_count(Some(old.parent), None);
+            adjust_parent_child_count(Some(old), None);
         }
     }
 }
@@ -13146,14 +13495,15 @@ fn orphanize_children_of(parent_tid: u64) {
     }
 
     // Preserve queued stop/continue reports across reparenting too.
-    let stopcont = PENDING_STOPCONT
+    let stopcont = PENDING_STOPCONT[job_control_shard(parent_tid)]
+        .map
         .lock()
         .as_mut()
         .and_then(|m| m.remove(&parent_tid))
         .unwrap_or_default();
     if let Some(r) = reaper {
         if !stopcont.is_empty() {
-            if let Some(m) = PENDING_STOPCONT.lock().as_mut() {
+            if let Some(m) = PENDING_STOPCONT[job_control_shard(r)].map.lock().as_mut() {
                 m.entry(r).or_default().extend(stopcont);
             }
             wake_wait_child_group(r);
@@ -13267,7 +13617,8 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
         1 << 8,
     );
     r |= has(
-        PENDING_STOPCONT
+        PENDING_STOPCONT[job_control_shard(tid)]
+            .map
             .lock()
             .as_ref()
             .is_some_and(|m| m.contains_key(&tid)),
@@ -13323,28 +13674,65 @@ pub fn __test_set_foreground_task(tid: u64) {
 /// by the `PENDING_EXITS` reap path, so this only gates the block-vs-ECHILD
 /// decision once no matching exit is queued: a true result means "a child is
 /// still running, block for it"; false means "no such child — return ECHILD".
-fn has_living_child(parent: u64, want: i64, want_pgid: u64, options: u32) -> bool {
-    let parents = wait_parent_ids(parent, options);
-    let g = PARENT_OF.lock();
-    let is_parent = g.as_ref().is_some_and(|m| {
-        m.iter().any(|(&child, link)| {
-            parents.contains(&link.parent)
+fn has_living_child(
+    parents: &WaitParentIds,
+    want: i64,
+    want_pgid: u64,
+    options: u32,
+) -> bool {
+    let is_parent = if want_pgid == 0 && want > 0 {
+        // A specific-pid wait needs one direct child-link lookup, not a scan of
+        // every process in the system.
+        child_link_get(want as u64).is_some_and(|link| {
+            parents.contains(link.parent)
                 && wait_child_matches(
-                    child,
+                    want as u64,
                     want,
-                    want_pgid,
+                    0,
                     link.exit_signal,
                     false,
                     options,
                 )
         })
-    });
+    } else if want_pgid == 0 {
+        // Any-child waits are the stress-ng steady state. The publication-time
+        // class counts make this proportional to the waiter's thread group,
+        // matching Linux's per-parent child lists rather than O(all tasks).
+        parents.iter().any(|parent| {
+            let counts = parent_child_counts(parent);
+            if options & __WALL != 0 {
+                counts.total != 0
+            } else if options & __WCLONE != 0 {
+                counts.total != counts.sigchld
+            } else {
+                counts.sigchld != 0
+            }
+        })
+    } else {
+        // Process-group selection still needs each child's PGID. This is not
+        // the hot path and retains the exact Linux filter semantics.
+        let links = PARENT_OF.lock();
+        links.as_ref().is_some_and(|map| {
+            map.iter().any(|(&child, link)| {
+                parents.contains(link.parent)
+                    && wait_child_matches(
+                        child,
+                        want,
+                        want_pgid,
+                        link.exit_signal,
+                        false,
+                        options,
+                    )
+            })
+        })
+    };
     if is_parent {
         return true;
     }
-    parents
-        .into_iter()
-        .any(|candidate| crate::ptrace::is_tracer_of_any(candidate, want))
+    let traced_child = parents
+        .iter()
+        .any(|candidate| crate::ptrace::is_tracer_of_any(candidate, want));
+    traced_child
 }
 
 // ── ProcessId ↔ TaskId translation ────────────────────────────────
@@ -13635,14 +14023,30 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
 static THREAD_GROUP_LIVE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Number of keys in [`THREAD_GROUP_LIVE`]. Most workloads, including the
+/// stress-ng wait workers, contain only single-threaded fork children. Let
+/// those paths prove that no group expansion is possible with one atomic load
+/// instead of taking the global live-group lock and the pid↔task map lock on
+/// every wait/wake operation.
+static MULTITHREADED_GROUPS: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn has_multithreaded_groups() -> bool {
+    MULTITHREADED_GROUPS.load(Ordering::Acquire) != 0
+}
+
 /// A `CLONE_THREAD` child joined thread-group `pid`. The group's
 /// implicit main thread counts as 1, so the first extra thread makes
 /// the tracked count 2; each subsequent thread adds one.
 pub fn thread_group_live_inc(pid: u64) {
     let mut g = THREAD_GROUP_LIVE.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
+    let new_group = !m.contains_key(&pid);
     let e = m.entry(pid).or_insert(1);
     *e = e.saturating_add(1);
+    if new_group {
+        MULTITHREADED_GROUPS.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// A thread of group `pid` exited. Returns `true` iff it was the LAST
@@ -13661,6 +14065,8 @@ pub(crate) fn thread_group_live_dec_state(pid: u64) -> (bool, bool) {
         None => (true, false),
         Some(n) if *n <= 1 => {
             m.remove(&pid);
+            let previous = MULTITHREADED_GROUPS.fetch_sub(1, Ordering::Release);
+            debug_assert!(previous != 0, "multi-threaded group count underflow");
             (true, true)
         }
         Some(n) => {
@@ -13678,6 +14084,9 @@ pub fn thread_group_live_dec(pid: u64) -> bool {
 /// never tracked (their implicit count is 1), so an absent entry reads as
 /// 1. Backs /proc/[pid]/status `Threads:` and stat field 20.
 pub fn thread_group_live_count(pid: u64) -> u64 {
+    if !has_multithreaded_groups() {
+        return 1;
+    }
     let g = THREAD_GROUP_LIVE.lock();
     g.as_ref()
         .and_then(|m| m.get(&pid).copied())
@@ -13690,6 +14099,7 @@ pub fn thread_group_live_count(pid: u64) -> u64 {
 #[doc(hidden)]
 pub fn __test_thread_group_live_reset() {
     *THREAD_GROUP_LIVE.lock() = Some(BTreeMap::new());
+    MULTITHREADED_GROUPS.store(0, Ordering::Release);
 }
 
 /// Translate a user-visible ProcessId to the scheduler TaskId. Returns
@@ -13707,6 +14117,9 @@ pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
 /// at fork/spawn time. Returns `None` when the task has no registered
 /// ProcessId (kernel-only tasks, test stubs).
 pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
+    if let Some((pid, _uid, _gid)) = crate::task::current_cached_identity(task_raw) {
+        return Some(pid);
+    }
     TASK_TO_PID[pid_task_shard(task_raw)]
         .map
         .lock()
@@ -13744,12 +14157,9 @@ fn on_thread_exit(_pid: u64, tid: u64) {
     // flips and a reader (a shell's `$(...)` capture) never sees EOF.
     // Also frees file/socket handles so they don't leak.
     crate::fd::detach(tid);
-    // Job control: a task that dies while stopped (e.g. SIGKILL'd) must
-    // not leave a stale TASK_STOPPED entry — the TaskId could later be
-    // recycled.
-    if let Some(m) = TASK_STOPPED.lock().as_mut() {
-        m.remove(&tid);
-    }
+    // Job control: clear the task-local state before the zombie can be reaped
+    // and its refcounted Task storage released.
+    let _ = clear_task_stopped(tid);
 }
 
 /// Translate an outer ProcessId into `observer_task`'s PID-namespace view for
@@ -13815,8 +14225,6 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Capture ptrace routing before release_process removes the tracee row.
     // Linux reports a traced zombie to its tracer first, irrespective of its
     // clone-child exit-signal class.
-    let natural_link = child_link_get(child_pid);
-    let ptraced = crate::ptrace::is_task_traced(child_pid);
     let wait_recipient = get_wait_recipient(child_pid);
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
@@ -13835,8 +14243,8 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // disarmed, with a now-present reap entry). Only reachable with working
     // cross-CPU IPIs (x2APIC), where the notify's resched runs the reaper on
     // another CPU inside the notify→push window.
-    let parent = match wait_recipient {
-        Some(p) => p,
+    let (parent, ptraced, natural_exit_signal) = match wait_recipient {
+        Some(recipient) => recipient,
         None => {
             // No registered parent — orphan. No reap entry will ever be pushed,
             // so there is nothing to order the pidfd notify against: notify any
@@ -13855,7 +14263,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     let exit_signal = if ptraced {
         SIGCHLD
     } else {
-        natural_link.map_or(SIGCHLD, |link| link.exit_signal)
+        natural_exit_signal
     };
     let status = take_pending_termination(child_pid).unwrap_or(0);
     // (1) Reap entry — for wait4.

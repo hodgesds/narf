@@ -91,8 +91,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         // fills SI_USER with the sender's pid in the receiver's namespace
         // (do_pidfd_send_signal). Record it so the receiver's signalfd names
         // the sender, matching kill/tkill/tgkill.
-        queue_sender_siginfo(target, signum);
-        raise_signal_pending(target, signum);
+        raise_user_signal_pending(target, signum);
     }
     ctx.set_return(SyscallReturn::ok(0));
 }

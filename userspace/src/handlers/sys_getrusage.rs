@@ -40,7 +40,7 @@ pub(crate) fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let maxrss_kb: i64 = if who == RUSAGE_CHILDREN {
         0
     } else {
-        (task_vm_bytes(task) / 1024) as i64
+        (task_rss_bytes(task) / 1024) as i64
     };
     // Build the rusage struct (RUSAGE_TOTAL_I64S i64s) in kernel
     // memory, then copy to user under the SMAP bracket.

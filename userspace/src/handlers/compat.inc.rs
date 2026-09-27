@@ -4942,7 +4942,7 @@ fn child_cpu_time_ns_of(task: u64) -> u64 {
 // task's own context — the only point where its address space is still
 // resolvable (`current_address_space`); by reap time the scheduler slot
 // that owned the AS Arc is long dropped, so a reap-time
-// `task_vm_bytes(child)` reads 0. Consumed (removed) at reap by both
+// `task_rss_bytes(child)` reads 0. Consumed (removed) at reap by both
 // the synchronous wait4 path and `finish_wait_child`; an orphan that is
 // never reaped leaks one small entry, same lifetime class as its
 // PENDING_EXITS record.
@@ -4960,16 +4960,11 @@ pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
     let cpu = cpu_time_ns_of(tid)
         .saturating_add(child_cpu_time_ns_of(tid))
         .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
-    // CPU time only — NO vm snapshot here. `task_vm_bytes` walks every
-    // region (and every page slot) of the address space under the regions
-    // lock; for a CLONE_THREAD sibling that walk is pure waste (the entry
-    // is keyed by the SHARED pid and each sibling overwrites it — wait4
-    // only reads it at process reap) and it was measured as 99% of the
-    // per-exit cost in a 1000-thread exit storm (~600k cycles/exit: 14
-    // concurrent exiters convoying on one shared-AS regions lock, each
-    // holder walking ~1000 thread-stack regions). The vm half is filled
-    // in ONCE, at the group-dead transition, by `finalize_exit_rusage_vm`
-    // — still in the last thread's context, AS still alive.
+    // CPU time only — NO RSS snapshot here. A CLONE_THREAD sibling shares its
+    // address space and every sibling overwrites the same pid-keyed entry, so
+    // repeating even the O(1) address-space accounting locks is pure waste.
+    // Fill the RSS half ONCE, at the group-dead transition, while the final
+    // thread's address space is still alive.
     let mut g = EXIT_RUSAGE.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
     let vm_kb = m.get(&pid).map_or(0, |&(_, vm)| vm);
@@ -4981,7 +4976,7 @@ pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
 /// `notify_task_exited`, while the last thread's address space is still
 /// resolvable. Keeps the (already recorded) cpu time.
 pub(crate) fn finalize_exit_rusage_vm(pid: u64, tid: u64) {
-    let vm_kb = task_vm_bytes(tid) / 1024;
+    let vm_kb = task_rss_bytes(tid) / 1024;
     let mut g = EXIT_RUSAGE.lock();
     if let Some(e) = g.get_or_insert_with(BTreeMap::new).get_mut(&pid) {
         e.1 = vm_kb;
@@ -4993,22 +4988,43 @@ fn take_exit_rusage(tid: u64) -> Option<(u64, u64)> {
     g.as_mut().and_then(|m| m.remove(&tid))
 }
 
-// The user `struct rusage*` of the parent's IN-FLIGHT blocking wait4,
-// keyed by parent tid. `finish_wait_child` runs as the parent (both the
-// poll route and own_stack_wait_child) but only receives the status
-// pointer, so the rusage pointer travels through this table. Every
-// blocking wait entry (wait4 AND waitid) overwrites its slot — waitid
-// with 0 — so a stale pointer from an aborted wait can never be written
-// through by a later one.
+fn peek_exit_rusage(tid: u64) -> Option<(u64, u64)> {
+    EXIT_RUSAGE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&tid).copied())
+}
+
+// Compatibility fallback for synthetic/non-executor waiters. Real tasks keep
+// this pointer in `UserTaskCtx` beside the other in-flight wait arguments,
+// avoiding one global ordered-map insert/remove on every blocking wait.
 static WAIT_RUSAGE_PTR: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn set_wait_rusage_ptr(parent: u64, ptr: u64) {
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        if current_task_id() == parent {
+            // SAFETY: the current task owns its pinned UserTaskCtx throughout
+            // this syscall and the field is atomic for resume-side access.
+            unsafe { &*uctx }
+                .wait_child_rusage_ptr
+                .store(ptr, Ordering::Release);
+            return;
+        }
+    }
     let mut g = WAIT_RUSAGE_PTR.lock();
     g.get_or_insert_with(BTreeMap::new).insert(parent, ptr);
 }
 
 fn take_wait_rusage_ptr(parent: u64) -> u64 {
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        if current_task_id() == parent {
+            // SAFETY: same current-task lifetime contract as the setter.
+            return unsafe { &*uctx }
+                .wait_child_rusage_ptr
+                .swap(0, Ordering::AcqRel);
+        }
+    }
     let mut g = WAIT_RUSAGE_PTR.lock();
     g.as_mut().and_then(|m| m.remove(&parent)).unwrap_or(0)
 }
@@ -5041,10 +5057,10 @@ pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
 }
 
 /// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory
-/// with `ru_utime` set from `ns` and every other field zero. Best-effort
-/// (a failed copy is swallowed — wait4 still succeeds). Shared by wait4's
-/// rusage out-param.
-fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) {
+/// with `ru_utime` set from `ns` and every other field zero. Linux reports a
+/// failed wait4/waitid rusage copy as `EFAULT` after consuming the wait event,
+/// so callers must propagate this result rather than treating it as best-effort.
+fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) -> Result<(), u64> {
     let mut kbuf = [0u8; 18 * 8];
     let sec = (ns / 1_000_000_000) as i64;
     let usec = ((ns % 1_000_000_000) / 1_000) as i64;
@@ -5055,15 +5071,15 @@ fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) {
                                                                      // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
                                                                      // checked by the caller); copy_to_user range-validates and
                                                                      // SMAP-brackets the 144-byte write.
-    let _ = unsafe { copy_to_user(out_ptr, &kbuf) };
+    // SAFETY: range validation and the SMAP/PAN bracket are in copy_to_user.
+    unsafe { copy_to_user(out_ptr, &kbuf) }
 }
 
-/// Total mapped bytes of `pid`'s address space (region-span sum) —
-/// the `ru_maxrss` source. NARF has no per-page RSS or peak tracking,
-/// so this reports the CURRENT (for a zombie: final) VM footprint,
-/// an honest lower-noise stand-in for "peak resident" that gives
-/// `time -v`-style consumers a real number instead of 0.
-fn task_vm_bytes(pid: u64) -> u64 {
+/// Current resident bytes of `pid`'s address space — the `ru_maxrss` source.
+/// NARF does not yet retain a peak-RSS watermark, but the maintained resident
+/// page counter matches Linux's RSS units and is O(1); mapped virtual span is
+/// neither resident nor a valid approximation for `ru_maxrss`.
+fn task_rss_bytes(pid: u64) -> u64 {
     let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).or_else(|| {
         if pid == current_task_id() {
             narf_scheduler::current_address_space()
@@ -5072,7 +5088,7 @@ fn task_vm_bytes(pid: u64) -> u64 {
         }
     });
     match as_arc {
-        Some(a) => a.mapped_bytes(),
+        Some(a) => a.memory_stats().resident_pages.saturating_mul(4096),
         None => 0,
     }
 }
@@ -5307,7 +5323,7 @@ fn sigqueue_store_payload_and_raise_bit(
     // Set the pending bit while STILL holding the bucket lock (nested).
     let was_empty = pending_signal_bits_update_or_init(task, |slot| {
         let was_empty = *slot == 0;
-        *slot |= sig_bit(signum);
+        set_pending_signal_bit(slot, signum);
         was_empty
     });
     Some((depth, was_empty))
@@ -6786,6 +6802,14 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
 /// udevd's signalfd dispatchers reject or misattribute. Standard signals
 /// coalesce, so this overwrites any prior queued instance (Linux does too).
 pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
+    // SIGKILL and SIGSTOP cannot be caught, blocked, consumed by sigwait, or
+    // read through signalfd, so their sender payload is unobservable. Linux's
+    // SEND_SIG_NOINFO path likewise avoids allocating a queued siginfo for
+    // these forced default actions. Skipping it also prevents the permanent
+    // stale SIGSTOP payload that the default-stop arm cannot consume.
+    if matches!(signum, 9 | 19) {
+        return;
+    }
     const SI_USER: i32 = 0;
     let sender = current_task_id();
     let sender_outer = task_to_pid_raw(sender).unwrap_or(sender);
@@ -6793,7 +6817,43 @@ pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
     let _ = store_sigqueue_info(target, signum, SI_USER, 0, si_pid);
 }
 
-pub fn raise_signal_pending(task: u64, signum: u32) {
+/// Linux `sig_ignored()`: an unblocked signal with SIG_IGN or an implicit
+/// ignore/continue default is discarded at generation time. Blocked signals
+/// remain pending because the disposition can change before unblocking, and a
+/// tracer gets to observe otherwise-ignored signals.
+fn signal_ignored_at_generation(task: u64, signum: u32) -> bool {
+    // These forced-default signals cannot be blocked, caught, or ignored.
+    // Linux's masks and rt_sigaction path enforce those invariants at write
+    // time, so prepare_signal does not need any disposition lookup here.
+    if matches!(signum, 9 | 19) {
+        return false;
+    }
+    if signal_mask_of(task) & sig_bit(signum) != 0 {
+        return false;
+    }
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    if signum != 9 && crate::ptrace::is_task_traced(pid) {
+        return false;
+    }
+    match sigaction_lookup_full(task, signum as usize) {
+        Some(action) if action.handler == 1 => true,
+        Some(action) if action.handler == 0 => matches!(
+            default_signal_action(signum),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+        Some(_) => false,
+        None => matches!(
+            default_signal_action(signum),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+    }
+}
+
+fn raise_signal_pending_inner(
+    task: u64,
+    signum: u32,
+    with_sender_siginfo: bool,
+) {
     // Reject signal 0: it's the POSIX null signal (existence probe), never a
     // real signal. Setting pending bit 0 would later be taken by the delivery
     // loop as a Terminate-default "signal 0". Bit-N-=-signal-N caps the
@@ -6835,15 +6895,61 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     }
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
     // mutual cancellation) runs before the pending bit is set.
-    signal_stopcont_interaction(task, signum);
+    let resumed_stopped_task = signal_stopcont_interaction(task, signum);
+    if signal_ignored_at_generation(task, signum) {
+        // prepare_signal(SIGCONT) resumes stopped threads even when the signal
+        // itself is then discarded. The ordinary notify path would have fired
+        // this wake after setting the pending bit; preserve just the wake.
+        if resumed_stopped_task {
+            wake_signal(task);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits()) {
+                narf_scheduler::stackful::note_urgent_wake_preempt(task);
+            }
+        }
+        return;
+    }
+    if with_sender_siginfo {
+        queue_sender_siginfo(task, signum);
+    }
     let Some(was_empty) = pending_signal_bits_update(task, |slot| {
         let was_empty = *slot == 0;
-        *slot |= sig_bit(signum);
+        set_pending_signal_bit(slot, signum);
         was_empty
     }) else {
         return;
     };
     signal_raise_notify(task, was_empty);
+    // On SMP the parent consuming CLD_CONTINUED and the resumed child can run
+    // concurrently, so prefer the child on the sender's CPU when it is local.
+    // On UP this would overwrite push_stopcont_report's waiter-first hint and
+    // let the following stop replace the unconsumed continued state.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if resumed_stopped_task
+        && prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits())
+    {
+        narf_scheduler::stackful::note_urgent_wake_preempt(task);
+    }
+}
+
+pub fn raise_signal_pending(task: u64, signum: u32) {
+    raise_signal_pending_inner(task, signum, false);
+}
+
+pub(crate) fn raise_user_signal_pending(task: u64, signum: u32) {
+    raise_signal_pending_inner(task, signum, true);
+}
+
+/// Apply Linux's stop/continue pending-set cancellation and enqueue `signum`
+/// in one update under the signal-pending shard lock.
+#[inline]
+fn set_pending_signal_bit(slot: &mut u64, signum: u32) {
+    match signum {
+        18 => *slot &= !(0b1111u64 << 18), // SIGCONT discards pending stops.
+        19..=22 => *slot &= !sig_bit(18),  // A stop discards pending SIGCONT.
+        _ => {}
+    }
+    *slot |= sig_bit(signum);
 }
 
 /// The post-bit-set bookkeeping every raise path performs: bump the
@@ -6887,11 +6993,7 @@ pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
         return false;
     }
     for t in targets {
-        signal_stopcont_interaction(t, signum);
         raise_signal_pending(t, signum);
-        // Kick parked targets — without the wake a pgrp SIGTERM to a
-        // blocked task waits out its wheel-fallback deadline.
-        wake_signal(t);
     }
     true
 }
@@ -7257,45 +7359,67 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     let Some(leader) = crate::task::task_get(leader_tid) else {
         return false;
     };
-    // Collect group member tids (leader + CLONE_THREAD tids mapping to
-    // the same visible pid) under the TASK_TO_PID lock, THEN filter by
-    // liveness — `task_get` takes the TASKS lock, which must never be
-    // acquired while holding TASK_TO_PID (lock-order discipline).
-    let candidates: alloc::vec::Vec<u64> = thread_group_members(pid);
-    let members: alloc::vec::Vec<u64> = candidates
-        .into_iter()
-        .filter(|&t| {
-            crate::task::task_get(t)
-                .is_some_and(|t| t.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
-        })
-        .collect();
-    if members.is_empty() {
-        // Whole group already exited (zombie awaiting reap): success,
-        // signal discarded.
-        return leader.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE;
+    let leader_state = leader.state.load(Ordering::Acquire);
+
+    // A non-fatal process-directed signal may be delivered to any eligible
+    // member. Prefer the live leader without even consulting group metadata.
+    // This is the fork-child fast path used by SIGSTOP/SIGCONT workloads.
+    if signum != 9 && leader_state == crate::task::TASK_RUNNING {
+        raise_user_signal_pending(leader_tid, signum);
+        return true;
     }
+
+    // The ordinary fork child is a one-thread group. Linux can address its
+    // task_struct directly; do the same instead of allocating two temporary
+    // member vectors for every kill(2). stress-ng `wait` sends SIGSTOP then
+    // SIGCONT on this path for every bogo operation.
+    if thread_group_live_count(pid) <= 1 {
+        if leader_state == crate::task::TASK_ZOMBIE {
+            // Signalling a zombie is a no-op success.
+            return true;
+        }
+        if leader_state != crate::task::TASK_RUNNING {
+            return false;
+        }
+        // The canonical raise performs stop/continue interaction, sender
+        // siginfo publication, and exactly one targeted wake.
+        raise_user_signal_pending(leader_tid, signum);
+        return true;
+    }
+
+    // Multi-thread groups are uncommon for process-directed kill. Snapshot
+    // once, then filter while walking; a second collected Vec used to add an
+    // allocation even though non-SIGKILL delivery needs only one target.
+    let members = thread_group_members(pid);
     if signum == 9 {
         // Fatal group kill: every live thread dies.
+        let mut any = false;
         for t in members {
-            queue_sender_siginfo(t, signum);
-            signal_stopcont_interaction(t, signum);
-            raise_signal_pending(t, signum);
-            wake_signal(t);
+            if crate::task::task_get(t)
+                .is_some_and(|task| task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
+            {
+                raise_user_signal_pending(t, signum);
+                any = true;
+            }
         }
-        return true;
+        return any || leader_state == crate::task::TASK_ZOMBIE;
     }
     // Process-directed: deliver to the leader if alive, else the first
     // live sibling. (Full shared-pending "any thread with it unblocked
     // may dequeue" semantics are a follow-up; see the redesign doc.)
-    let target = if members.contains(&leader_tid) {
-        leader_tid
+    let target = if leader_state == crate::task::TASK_RUNNING {
+        Some(leader_tid)
     } else {
-        members[0]
+        members.into_iter().find(|&tid| {
+            crate::task::task_get(tid).is_some_and(|task| {
+                task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING
+            })
+        })
     };
-    queue_sender_siginfo(target, signum);
-    signal_stopcont_interaction(target, signum);
-    raise_signal_pending(target, signum);
-    wake_signal(target);
+    let Some(target) = target else {
+        return leader_state == crate::task::TASK_ZOMBIE;
+    };
+    raise_user_signal_pending(target, signum);
     true
 }
 
@@ -7418,10 +7542,16 @@ fn import_queued_siginfo(info_ptr: u64) -> Result<ImportedSiginfo, u64> {
 fn sigqueue_deliver_imported(target: u64, sig: u32, info: ImportedSiginfo) -> Option<usize> {
     // Stop/cont mutual cancellation runs before the pending bit is set, exactly
     // as in `raise_signal_pending` (a sigqueue may carry SIGSTOP/SIGCONT).
-    signal_stopcont_interaction(target, sig);
+    let resumed_stopped_task = signal_stopcont_interaction(target, sig);
     let (depth, was_empty) =
         sigqueue_store_and_raise_bit(target, sig, info.code, info.value, info.pid)?;
     signal_raise_notify(target, was_empty);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if resumed_stopped_task
+        && prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits())
+    {
+        narf_scheduler::stackful::note_urgent_wake_preempt(target);
+    }
     Some(depth)
 }
 
@@ -9514,6 +9644,7 @@ pub fn default_sync_signal_delivery(
 const NSIG: usize = 65;
 
 /// Linux `sa_flags` bits NARF honours.
+pub const SA_NOCLDSTOP: u32 = 0x00_00_00_01;
 pub const SA_NODEFER: u32 = 0x40_00_00_00;
 pub const SA_RESTART: u32 = 0x10_00_00_00;
 pub const SA_SIGINFO: u32 = 0x00_00_00_04;
