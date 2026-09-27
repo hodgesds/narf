@@ -25,6 +25,7 @@ const SO_ERROR: u64 = 4;
 const SO_BROADCAST: u64 = 6;
 const SO_RCVBUF: u64 = 8;
 const SO_REUSEPORT: u64 = 15;
+const SO_BINDTODEVICE: u64 = 25;
 const SO_PROTOCOL: u64 = 38;
 const SO_DOMAIN: u64 = 39;
 const MSG_OOB: u64 = 0x1;
@@ -41,6 +42,8 @@ const POLLERR: u16 = 0x8;
 const POLLHUP: u16 = 0x10;
 const SIOCINQ: u64 = 0x541B;
 const SIGPIPE: u64 = 13;
+const BAD_USER_PTR: u64 = 1 << 47;
+const BAD_FD: u64 = 4096;
 
 const LO: [u8; 4] = [127, 0, 0, 1];
 const ANY: [u8; 4] = [0, 0, 0, 0];
@@ -603,6 +606,82 @@ fn smoke_abi_udp_sendto_address_validation() -> TestResult {
 }
 kernel_test_in!("syscall_abi/udp", smoke_abi_udp_sendto_address_validation);
 
+/// Sockaddr import follows Linux `move_addr_to_kernel` / `__copy_msghdr`:
+/// a nonzero short address is copied before the protocol rejects its length,
+/// so an unreadable byte is EFAULT; `sendto` preserves a non-NULL zero-length
+/// name (UDP rejects it with EINVAL), while `sendmsg` treats zero namelen as no
+/// destination (EDESTADDRREQ). `__sys_recvfrom` imports its data iterator
+/// before fd lookup, so a bad buffer beats EBADF.
+fn smoke_abi_udp_sockaddr_and_recv_import_errno_order() -> TestResult {
+    with_setup(|| {
+        let s = udp()?;
+        if call(Syscall::SocketBind.raw(), a2(s.0, BAD_USER_PTR, 1)) != Some(EFAULT) {
+            return Err("bind did not copy a one-byte sockaddr before EINVAL");
+        }
+        if call(Syscall::SocketConnect.raw(), a2(s.0, BAD_USER_PTR, 1)) != Some(EFAULT) {
+            return Err("connect did not copy a one-byte sockaddr before EINVAL");
+        }
+
+        let payload = b"x";
+        if call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: s.0,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: BAD_USER_PTR,
+                arg5: 1,
+                ..SyscallArgs::default()
+            },
+        ) != Some(EFAULT)
+        {
+            return Err("sendto did not copy a one-byte sockaddr before EINVAL");
+        }
+        let present = sa(LO, 41034);
+        if sendto_raw(&s, payload, 0, Some(&present), 0)? != EINVAL {
+            return Err("sendto with a non-NULL zero-length address is not EINVAL");
+        }
+
+        let mut msg = [0u8; 56];
+        msg[0..8].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+        msg[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(s.0, msg.as_ptr() as u64, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("sendmsg did not copy a one-byte sockaddr before EINVAL");
+        }
+        msg[0..8].copy_from_slice(&(present.as_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&0u32.to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(s.0, msg.as_ptr() as u64, 0),
+        ) != Some(EDESTADDRREQ)
+        {
+            return Err("sendmsg with zero msg_namelen did not omit the destination");
+        }
+
+        if call(
+            Syscall::SocketRecv.raw(),
+            SyscallArgs {
+                arg0: BAD_FD,
+                arg1: BAD_USER_PTR,
+                arg2: 1,
+                ..SyscallArgs::default()
+            },
+        ) != Some(EFAULT)
+        {
+            return Err("recvfrom did not import its bad buffer before fd lookup");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/udp",
+    smoke_abi_udp_sockaddr_and_recv_import_errno_order
+);
+
 /// The size limits: `len > 0xFFFF` (`net/ipv4/udp.c:1081`) and more than
 /// 65535 - 20 - 8 = 65507 payload bytes (`__ip_append_data`,
 /// `net/ipv4/ip_output.c:992-995`) are EMSGSIZE; exactly 65507 arrives whole.
@@ -1108,6 +1187,112 @@ fn smoke_abi_udp_connect_af_unspec_disconnects() -> TestResult {
 kernel_test_in!(
     "syscall_abi/udp",
     smoke_abi_udp_connect_af_unspec_disconnects
+);
+
+/// `__udp_disconnect` clears `sk_bound_dev_if` even when the socket was never
+/// bound or connected. `sock_getbindtodevice` requires IFNAMSIZ bytes for a
+/// bound name (EINVAL when short), includes its NUL, and reports length zero
+/// after disconnect. `sock_setbindtodevice` treats the first NUL as the end of
+/// the name and a non-UTF-8/nonexistent name as ENODEV.
+fn smoke_abi_udp_disconnect_clears_bindtodevice() -> TestResult {
+    with_setup(|| {
+        let s = udp()?;
+        let bind_name = b"lo\0ignored";
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: s.0,
+                arg1: SOL_SOCKET,
+                arg2: SO_BINDTODEVICE,
+                arg3: bind_name.as_ptr() as u64,
+                arg4: bind_name.len() as u64,
+                ..SyscallArgs::default()
+            },
+        ) != Some(0)
+        {
+            return Err("SO_BINDTODEVICE did not stop at the first NUL");
+        }
+
+        let mut short = [0u8; 15];
+        let mut short_len = short.len() as u32;
+        if call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: s.0,
+                arg1: SOL_SOCKET,
+                arg2: SO_BINDTODEVICE,
+                arg3: short.as_mut_ptr() as u64,
+                arg4: &mut short_len as *mut u32 as u64,
+                ..SyscallArgs::default()
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("bound SO_BINDTODEVICE with optlen < IFNAMSIZ is not EINVAL");
+        }
+
+        let mut name = [0u8; 16];
+        let mut name_len = name.len() as u32;
+        if call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: s.0,
+                arg1: SOL_SOCKET,
+                arg2: SO_BINDTODEVICE,
+                arg3: name.as_mut_ptr() as u64,
+                arg4: &mut name_len as *mut u32 as u64,
+                ..SyscallArgs::default()
+            },
+        ) != Some(0)
+            || name_len != 3
+            || &name[..3] != b"lo\0"
+        {
+            return Err("getsockopt(SO_BINDTODEVICE) did not return the NUL-terminated name");
+        }
+
+        let unspec = sa_fam(AF_UNSPEC, ANY, 0);
+        if connect_len(&s, &unspec, 16)? != 0 {
+            return Err("connect(AF_UNSPEC) on a fresh socket failed");
+        }
+        name.fill(0xAA);
+        name_len = name.len() as u32;
+        if call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: s.0,
+                arg1: SOL_SOCKET,
+                arg2: SO_BINDTODEVICE,
+                arg3: name.as_mut_ptr() as u64,
+                arg4: &mut name_len as *mut u32 as u64,
+                ..SyscallArgs::default()
+            },
+        ) != Some(0)
+            || name_len != 0
+        {
+            return Err("connect(AF_UNSPEC) did not clear SO_BINDTODEVICE");
+        }
+
+        let other = udp()?;
+        let invalid_name = [0xFFu8];
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: other.0,
+                arg1: SOL_SOCKET,
+                arg2: SO_BINDTODEVICE,
+                arg3: invalid_name.as_ptr() as u64,
+                arg4: invalid_name.len() as u64,
+                ..SyscallArgs::default()
+            },
+        ) != Some(ENODEV)
+        {
+            return Err("a non-UTF-8 SO_BINDTODEVICE name is not ENODEV");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/udp",
+    smoke_abi_udp_disconnect_clears_bindtodevice
 );
 
 /// A connected socket whose datagram hits a port nobody owns gets

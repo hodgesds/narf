@@ -3865,9 +3865,11 @@ impl SocketFile {
                 // too, not EINVAL.
                 const IFNAMSIZ: usize = 16;
                 let raw = &value[..value.len().min(IFNAMSIZ - 1)];
-                let name = core::str::from_utf8(raw)
-                    .unwrap_or("")
-                    .trim_end_matches('\0');
+                let raw = &raw[..raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len())];
+                let name = match core::str::from_utf8(raw) {
+                    Ok(name) => name,
+                    Err(_) => return SocketOpResult::Err(SockError::NoDevice),
+                };
 
                 // `sock_bindtoindex_locked` (`net/core/sock.c:648`):
                 //
@@ -3895,7 +3897,15 @@ impl SocketFile {
                     opts.bindtodevice_index = 0;
                     return SocketOpResult::Ok(0);
                 }
-                match narf_net::iface::ifindex_of(name) {
+                // The loopback link owns the Linux-reserved ifindex 1 even
+                // when it is represented only by the synthetic route/link
+                // entries rather than the driver interface registry.
+                let ifindex = if name == "lo" {
+                    Some(1)
+                } else {
+                    narf_net::iface::ifindex_of(name)
+                };
+                match ifindex {
                     Some(idx) => {
                         opts.bindtodevice = Some(String::from(name));
                         opts.bindtodevice_index = idx;
@@ -4189,11 +4199,17 @@ impl SocketFile {
             (SOL_SOCKET, SO_RCVBUF) => write_u32(buf, opts.rcvbuf),
             (SOL_SOCKET, SO_SNDBUF) => write_u32(buf, opts.sndbuf),
             (SOL_SOCKET, SO_BINDTODEVICE) => {
-                let s = opts.bindtodevice.as_deref().unwrap_or("");
-                let bytes = s.as_bytes();
-                let n = core::cmp::min(buf.len(), bytes.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
-                SocketOpResult::OptValue { n }
+                let Some(name) = opts.bindtodevice.as_deref() else {
+                    return SocketOpResult::OptValue { n: 0 };
+                };
+                const IFNAMSIZ: usize = 16;
+                if buf.len() < IFNAMSIZ {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let bytes = name.as_bytes();
+                buf[..bytes.len()].copy_from_slice(bytes);
+                buf[bytes.len()] = 0;
+                SocketOpResult::OptValue { n: bytes.len() + 1 }
             }
             (SOL_SOCKET, SO_TYPE) => write_u32(buf, self.kind),
             (SOL_SOCKET, SO_PASSCRED) => write_bool(buf, self.passcred.load(Ordering::Acquire)),

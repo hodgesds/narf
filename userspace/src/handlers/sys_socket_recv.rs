@@ -9,9 +9,12 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
     // failing; NARF's staging bound is MAX_USER_COPY.
     let buf_len = core::cmp::min(args.arg2 as usize, MAX_USER_COPY);
     let flags = args.arg3 as u32;
-    // Linux __sys_recvfrom: sockfd_lookup_light gives -EBADF / -ENOTSOCK; a
-    // faulting destination buffer is -EFAULT; the family recv op surfaces
-    // -EAGAIN / -ENOTCONN / -ECONNREFUSED / …
+    // Linux __sys_recvfrom imports the destination iterator before fd lookup,
+    // so a faulting non-empty buffer wins over EBADF/ENOTSOCK.
+    if buf_len > 0 && validate_user_range(buf_ptr, buf_len).is_err() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
     let sock = match current_socket_result(fd) {
         Ok(s) => s,
         Err(errno) => {
@@ -19,11 +22,6 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Validate destination range before issuing the Recv op.
-    if buf_len > 0 && validate_user_range(buf_ptr, buf_len).is_err() {
-        ctx.set_return(errno_ret(EFAULT));
-        return;
-    }
     // A recv is non-blocking if the fd is O_NONBLOCK or the call carries
     // MSG_DONTWAIT (0x40). Such a recv must return EAGAIN the instant the ring
     // is empty-but-open — NEVER park. GLib's GSocket does exactly non-blocking

@@ -9851,13 +9851,18 @@ fn arc_shard_get<T>(table: &ArcShardTable<T>, key: usize) -> Option<alloc::sync:
 fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAddr, i64> {
     let len = raw_len as i32;
     // move_addr_to_kernel: ulen < 0 || ulen > sizeof(sockaddr_storage) → EINVAL.
-    if !(0..=128).contains(&len) || len < 2 {
-        return Err(EINVAL); // no room for a complete sa_family_t
+    if !(0..=128).contains(&len) {
+        return Err(EINVAL);
     }
     let mut buf = alloc::vec![0u8; len as usize];
-    // SAFETY: copy_from_user range-validates the whole address (catching a NULL
-    // or faulting ptr) and SMAP-brackets the read.
-    unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| EFAULT)?;
+    if len != 0 {
+        // SAFETY: copy_from_user range-validates the whole address (catching a
+        // NULL or faulting ptr) and SMAP-brackets the read.
+        unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| EFAULT)?;
+    }
+    if len < 2 {
+        return Err(EINVAL); // no room for a complete sa_family_t
+    }
     Ok(crate::socket::SockAddr {
         family: u16::from_le_bytes([buf[0], buf[1]]),
         body: buf[2..].to_vec(),
