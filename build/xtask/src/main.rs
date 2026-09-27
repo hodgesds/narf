@@ -2621,6 +2621,21 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     run_cmd_inner(args, false)
 }
 
+/// Emit enough serial context to diagnose a failed gate without flooding the
+/// terminal with an entire multi-thousand-line boot transcript.
+fn emit_serial_tail(serial: &[u8]) {
+    const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+    let start = serial.len().saturating_sub(MAX_DIAGNOSTIC_BYTES);
+    let mut stderr = std::io::stderr().lock();
+    if start != 0 {
+        let _ = writeln!(stderr, "[... {} serial bytes omitted ...]", start);
+    }
+    let _ = stderr.write_all(&serial[start..]);
+    if serial.last().is_some_and(|byte| *byte != b'\n') {
+        let _ = writeln!(stderr);
+    }
+}
+
 /// Boot the kernel under QEMU. When `gate_exit` is set (the `test`
 /// subcommand's kernel-test phase), the QEMU exit status is checked
 /// against the all-pass status: the kernel-test runner calls
@@ -2692,7 +2707,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
     );
     // Kernel-test boots are extremely verbose. Capture their serial stream so
-    // a passing gate prints only its summary; retain the complete transcript
+    // a passing gate prints only its summary; retain a bounded diagnostic tail
     // for failures and timeouts. Interactive `run` keeps streaming normally.
     if gate_exit {
         cmd.stdout(Stdio::piped());
@@ -2724,7 +2739,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             let serial = serial_reader
                 .and_then(|reader| reader.join().ok())
                 .unwrap_or_default();
-            eprint!("{}", String::from_utf8_lossy(&serial));
+            emit_serial_tail(&serial);
             bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -2752,7 +2767,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             Arch::Aarch64 => Some(0),
         };
         if status.code() != expected {
-            eprint!("{}", String::from_utf8_lossy(&serial));
+            emit_serial_tail(&serial);
             bail!(
                 "xtask test: kernel-test suite reported failures — QEMU exited \
                  {:?} (all-pass is {:?} on {}). See the `── summary` / `── failing \
@@ -2895,29 +2910,17 @@ fn wait_for_boot_smoke(
         "unsafe precondition",
     ];
 
-    // Capture stdout and accumulate panic/success markers. Successful gates
-    // stay concise; failures print the complete transcript below.
+    // Capture stdout. Successful gates stay concise; failures print a bounded
+    // tail through the common diagnostic helper.
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
-    let reader_handle = std::thread::spawn(move || -> (Vec<String>, Option<String>, bool) {
-        let reader = BufReader::new(stdout);
+    let reader_handle = std::thread::spawn(move || {
+        let mut stdout = stdout;
         let mut transcript = Vec::new();
-        let mut panic_line = None;
-        let mut clean_exit_seen = false;
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            clean_exit_seen |= line.contains("boot-smoke: clean exit");
-            if panic_line.is_none() && panic_markers.iter().any(|m| line.contains(m)) {
-                panic_line = Some(line.clone());
-            }
-            transcript.push(line);
-        }
-        (transcript, panic_line, clean_exit_seen)
+        let _ = stdout.read_to_end(&mut transcript);
+        transcript
     });
 
     // Wait for QEMU to exit naturally (kernel calls exit_kernel),
@@ -2933,28 +2936,28 @@ fn wait_for_boot_smoke(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let (transcript, panic_line, clean_exit_seen) = reader_handle
+    let transcript = reader_handle
         .join()
         .map_err(|_| anyhow!("xtask {label}: serial-reader thread panicked"))?;
-    let print_transcript = || {
-        for line in &transcript {
-            eprintln!("{line}");
-        }
-    };
+    let transcript_text = String::from_utf8_lossy(&transcript);
+    let panic_line = transcript_text
+        .lines()
+        .find(|line| panic_markers.iter().any(|marker| line.contains(marker)));
+    let clean_exit_seen = transcript_text.contains("boot-smoke: clean exit");
 
     if let Some(p) = panic_line {
-        print_transcript();
+        emit_serial_tail(&transcript);
         bail!("xtask {label}: kernel panic during boot — '{}'", p);
     }
     if timed_out {
-        print_transcript();
+        emit_serial_tail(&transcript);
         bail!(
             "xtask {label}: kernel did not call exit_kernel within {}s — possible boot hang",
             timeout_secs
         );
     }
     if !clean_exit_seen {
-        print_transcript();
+        emit_serial_tail(&transcript);
         bail!("xtask {label}: QEMU exited without the kernel clean-exit marker");
     }
     // Clean-exit status is arch-dependent:
@@ -2969,7 +2972,7 @@ fn wait_for_boot_smoke(
         Arch::Aarch64 => Some(0),
     };
     if status.code() != expected {
-        print_transcript();
+        emit_serial_tail(&transcript);
         bail!(
             "xtask {label}: QEMU exited with non-success status {:?} (expected {:?} on {})",
             status.code(),

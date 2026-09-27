@@ -125,11 +125,25 @@ pub fn remap_to_virtual(virt: VirtAddr) {
 /// prevent interleaved output across CPUs (harmless on Stage 1's single CPU,
 /// correct when AP bring-up lands in Stage 2).
 pub fn write_str(s: &str) {
+    write_str_level(klog::DEFAULT_MESSAGE_LOGLEVEL, s);
+}
+
+/// Write a priority-tagged kernel message. The klog ring always receives the
+/// bytes; only physical console fan-out is filtered by `console_loglevel`.
+pub fn write_str_level(level: u32, s: &str) {
     // Mirror to the kernel log ring *first*, before taking the
     // console lock. klog uses its own IrqSafe lock so panic-time
     // writes (which may already hold the console lock via the
     // panic_sink path) still capture without a deadlock risk.
     klog::record(s);
+
+    // Existing unlevelled Writer/klog call sites are INFO-equivalent. The
+    // ring above always receives them; quiet/loglevel only controls physical
+    // UART and framebuffer-console emission. Panic and trap sinks bypass this
+    // path and therefore remain visible at every log level.
+    if !klog::console_allows(level) {
+        return;
+    }
 
     let _g = CONSOLE.lock.lock();
     let kind = match CONSOLE.kind.get() {
@@ -662,6 +676,24 @@ pub struct Writer;
 impl fmt::Debug for Writer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Writer").finish()
+    }
+}
+
+/// Formatter adapter for an explicitly prioritised kernel message.
+pub struct PriorityWriter<const LEVEL: u32>;
+
+impl<const LEVEL: u32> fmt::Debug for PriorityWriter<LEVEL> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PriorityWriter")
+            .field("level", &LEVEL)
+            .finish()
+    }
+}
+
+impl<const LEVEL: u32> fmt::Write for PriorityWriter<LEVEL> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        write_str_level(LEVEL, s);
+        Ok(())
     }
 }
 

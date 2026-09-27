@@ -39,9 +39,19 @@ pub fn early_init(base: PhysAddr, uart: UartKind);
 pub fn remap_to_virtual(virt: VirtAddr);
 
 pub fn write_str(s: &str);
+pub fn write_str_level(level: u32, s: &str);
+pub fn klog::set_console_loglevel(level: u32);
 pub fn panic_sink(info: &PanicInfo) -> !;
 #[macro_export] macro_rules! klog { (...) => { ... } }
 ```
+
+`write_str` always records into the bounded klog ring, then applies Linux's
+`message_level < console_loglevel` rule to physical UART/framebuffer output.
+Legacy unlevelled `Writer` calls have `DEFAULT_MESSAGE_LOGLEVEL` priority.
+The `quiet` boot token selects that threshold, suppressing routine boot and
+runtime chatter; `debug` selects level 10, and `loglevel=N` selects an explicit
+1..15 threshold in command-line order. Panic and fatal-trap sinks bypass this
+filter and remain visible.
 
 ### 3.1 MMU-enable handoff protocol
 

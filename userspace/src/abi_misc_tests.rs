@@ -1539,6 +1539,9 @@ fn smoke_abi_syslog_console_level() -> TestResult {
         if level() != 5 {
             return Err("CONSOLE_LEVEL did not set the console loglevel");
         }
+        if !narf_console::klog::console_allows(narf_console::klog::DEFAULT_MESSAGE_LOGLEVEL) {
+            return Err("CONSOLE_LEVEL 5 did not expose default-priority output");
+        }
 
         // OFF drops to the minimum and remembers 5.
         if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_OFF, 0, 0)) != Some(0) {
@@ -1546,6 +1549,9 @@ fn smoke_abi_syslog_console_level() -> TestResult {
         }
         if level() != min {
             return Err("CONSOLE_OFF did not drop to the minimum loglevel");
+        }
+        if narf_console::klog::console_allows(narf_console::klog::DEFAULT_MESSAGE_LOGLEVEL) {
+            return Err("CONSOLE_OFF did not suppress default-priority output");
         }
         // A second OFF must not overwrite the saved level with the minimum.
         if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_OFF, 0, 0)) != Some(0) {
@@ -1567,7 +1573,7 @@ fn smoke_abi_syslog_console_level() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_syslog_console_level);
+kernel_test_in!("syscall_abi/syslog", smoke_abi_syslog_console_level);
 
 /// Every syslog action needs CAP_SYSLOG, and the check happens BEFORE the
 /// action is looked at.

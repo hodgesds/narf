@@ -242,13 +242,6 @@ pub fn __reset_for_test() {
 /// `SYSLOG_ACTION_CONSOLE_{OFF,ON,LEVEL}` read and write it, and
 /// `/proc/sys/kernel/printk` reports it as its first field.
 ///
-/// NARF's console has no per-message level: `record()` takes a `&str` and
-/// every caller's output goes to the same place, so this value is carried
-/// and reported faithfully but does not yet FILTER anything. That is a gap
-/// in the console subsystem, not in `syslog(2)` — closing it means giving
-/// every kernel print a level, which is a far wider change than the syscall
-/// that reads the knob. Stated here rather than at each caller so the
-/// limitation is not discovered by surprise.
 static CONSOLE_LOGLEVEL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(7);
 
 /// `minimum_console_loglevel` — `CONSOLE_LEVEL` is clamped up to this, so
@@ -266,4 +259,11 @@ pub fn console_loglevel() -> u32 {
 
 pub fn set_console_loglevel(level: u32) {
     CONSOLE_LOGLEVEL.store(level, Ordering::Relaxed);
+}
+
+/// Linux printk rule: a message reaches the physical console when its
+/// numeric priority is lower than `console_loglevel`. The klog ring records
+/// it regardless, so quiet boots retain complete diagnostics for dmesg.
+pub fn console_allows(message_level: u32) -> bool {
+    message_level < console_loglevel()
 }

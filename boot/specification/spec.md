@@ -46,6 +46,10 @@ pub fn validate_memory_map(map: &[MemRegion]) -> Result<(), BootError>;
 #[no_mangle] pub extern "C" fn _start() -> !; // per-arch entry
 ```
 
+`KernelCmdline::console_loglevel()` evaluates `quiet` (4), `debug` (10), and
+`loglevel=N` (clamped to 1..15) in command-line order and returns the final
+explicit threshold, or `None` when no verbosity token was supplied.
+
 **Handoff validation checks (binding):**
 
 1. Every retained memory-map region is non-empty, its end address does
