@@ -366,9 +366,11 @@ pub fn send_udp(
             destination[14],
             destination[15],
         ]
+    } else if let Some(mac) = crate::ipv6::ndp::neigh_lookup(&iface_name, &neighbor_ip) {
+        mac
     } else {
-        crate::ipv6::ndp::neigh_lookup(&iface_name, &neighbor_ip)
-            .ok_or(Udp6SendError::NeighborPending)?
+        start_neighbor_resolution(&iface_name, &iface, source, neighbor_ip);
+        return Err(Udp6SendError::NeighborPending);
     };
     let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
 
@@ -387,6 +389,56 @@ pub fn send_udp(
     );
     (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure)?;
     Ok(payload.len())
+}
+
+fn start_neighbor_resolution(
+    iface_name: &str,
+    iface: &crate::iface::NetIfaceSnapshot,
+    source: [u8; 16],
+    target: [u8; 16],
+) {
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    if let Some(existing) = crate::ipv6::ndp::neigh_list()
+        .into_iter()
+        .find(|entry| entry.iface == iface_name && entry.ip == target)
+    {
+        if existing.mac.is_some() || existing.deadline_ns == 0 || now < existing.deadline_ns {
+            return;
+        }
+        crate::ipv6::ndp::neigh_remove(iface_name, &target);
+    }
+    crate::ipv6::ndp::neigh_upsert(crate::ipv6::ndp::Neigh {
+        iface: alloc::string::String::from(iface_name),
+        ip: target,
+        mac: None,
+        state: crate::ipv6::ndp::NeighState::Incomplete,
+        is_router: false,
+        deadline_ns: now.saturating_add(1_000_000_000),
+    });
+    let destination = crate::ipv6::addrs::solicited_node_multicast(&target);
+    let destination_mac = [
+        0x33,
+        0x33,
+        destination[12],
+        destination[13],
+        destination[14],
+        destination[15],
+    ];
+    let body = build_ns_packet(source, destination, target, iface.mac);
+    let mut frame = Vec::new();
+    build_frame(
+        &mut frame,
+        Ipv6FrameSpec {
+            src_mac: iface.mac,
+            dst_mac: destination_mac,
+            src_ip: source,
+            dst_ip: destination,
+            next_header: NEXT_HEADER_ICMPV6,
+            hop_limit: 255,
+            body: &body,
+        },
+    );
+    let _ = (iface.send)(&frame);
 }
 
 /// Build an ICMPv6 Echo Request, set the checksum, return the body.

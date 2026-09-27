@@ -1219,7 +1219,12 @@ receive selection, connected-peer filtering, message boundaries,
 `MSG_PEEK`/`MSG_TRUNC`, shutdown state, and Linux bind/connect/send address
 validation. `::1` delivery uses this same endpoint table. IPv4-mapped address
 and wildcard arbitration is controlled explicitly by `IPV6_V6ONLY`; it must
-not arise from truncating an IPv6 address into the IPv4 table.
+not arise from truncating an IPv6 address into the IPv4 table. The
+`sin6_scope_id` supplied for a scoped peer is retained by connect/getpeername,
+reported on received datagrams, and used as the outbound interface selector.
+`IPV6_V6ONLY` requires a full integer option and may be changed only before
+the socket owns a local port, matching `do_ipv6_setsockopt`'s `inet_num`
+guard.
 
 ### 3.3 BPF XDP program compatibility
 

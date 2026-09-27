@@ -905,6 +905,75 @@ fn smoke_socket_inet6_udp_loopback_round_trip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet6_udp_loopback_round_trip);
 
+fn smoke_socket_inet6_udp_preserves_scope_id() -> TestResult {
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let mut body = alloc::vec::Vec::new();
+    body.extend_from_slice(&9000u16.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    body.extend_from_slice(&7u32.to_ne_bytes());
+    let addr = crate::socket::SockAddr {
+        family: crate::socket::AF_INET6,
+        body,
+    };
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        sock.unregister();
+        return TestResult::Fail("scoped UDP6 connect failed");
+    }
+    let peer = sock.peer_addr();
+    sock.unregister();
+    match peer {
+        Some(peer)
+            if peer.body.len() == 26
+                && u32::from_ne_bytes([
+                    peer.body[22],
+                    peer.body[23],
+                    peer.body[24],
+                    peer.body[25],
+                ]) == 7 =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("UDP6 getpeername lost sin6_scope_id"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet6_udp_preserves_scope_id);
+
+fn smoke_socket_inet6_v6only_rejects_change_after_bind() -> TestResult {
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::make_sockaddr_in6(loopback, 8124),
+        }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("UDP6 bind for V6ONLY test failed");
+    }
+    let one = 1u32.to_ne_bytes();
+    let result = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IPV6,
+        name: crate::socket::IPV6_V6ONLY,
+        value: &one,
+    });
+    sock.unregister();
+    if matches!(
+        result,
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+    ) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IPV6_V6ONLY changed after UDP6 bind")
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_inet6_v6only_rejects_change_after_bind
+);
+
 /// SO_REUSEADDR + double-bind: the second bind to the same
 /// (addr, port) succeeds when SO_REUSEADDR is set on the second
 /// socket. Without it, the second bind returns EADDRINUSE.

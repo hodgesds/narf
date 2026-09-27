@@ -13,11 +13,16 @@ const DGRAM_TRUESIZE_OVERHEAD: usize = 576;
 type Inet6DgramMap = BTreeMap<(u64, u16), Vec<Arc<SocketFile>>>;
 static INET6_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet6DgramMap>> = IrqSafeSpinLock::new(None);
 
-fn state_view(sock: &SocketFile) -> Option<([u8; 16], Option<([u8; 16], u16)>)> {
+type Inet6Peer = ([u8; 16], u16, u32);
+
+fn state_view(sock: &SocketFile) -> Option<([u8; 16], u32, Option<Inet6Peer>)> {
     match &*sock.state.lock() {
         SocketState::Inet6Dgram {
-            local_addr, peer, ..
-        } => Some((*local_addr, *peer)),
+            local_addr,
+            local_scope_id,
+            peer,
+            ..
+        } => Some((*local_addr, *local_scope_id, *peer)),
         _ => None,
     }
 }
@@ -32,7 +37,7 @@ fn conflicts(map: &Inet6DgramMap, ns: u64, port: u16, addr: [u8; 16], me: &Socke
             if core::ptr::eq(Arc::as_ptr(other), me) {
                 return false;
             }
-            let Some((other_addr, _)) = state_view(other) else {
+            let Some((other_addr, _, _)) = state_view(other) else {
                 return false;
             };
             let o = other.options.lock();
@@ -79,8 +84,12 @@ fn lookup(
         if let Some(found) = socks.iter().find(|sock| {
             let bound_dev = sock.options.lock().bindtodevice_index;
             (bound_dev == 0 || dif == 0 || bound_dev == dif)
-                && state_view(sock).is_some_and(|(local, peer)| {
-                    local == wanted && peer.is_none_or(|p| p == (src, sport))
+                && state_view(sock).is_some_and(|(local, scope, peer)| {
+                    local == wanted
+                        && (scope == 0 || dif == 0 || scope == dif)
+                        && peer.is_none_or(|p| {
+                            p.0 == src && p.1 == sport && (p.2 == 0 || dif == 0 || p.2 == dif)
+                        })
                 })
         }) {
             return Some(found.clone());
@@ -107,7 +116,7 @@ impl SocketFile {
         }
     }
 
-    fn install_inet6_binding(&self, addr: [u8; 16], port: u16, port_locked: bool) {
+    fn install_inet6_binding(&self, addr: [u8; 16], port: u16, scope_id: u32, port_locked: bool) {
         let old_peer = match &*self.state.lock() {
             SocketState::Inet6Dgram { peer, .. } => *peer,
             _ => None,
@@ -115,6 +124,7 @@ impl SocketFile {
         *self.state.lock() = SocketState::Inet6Dgram {
             local_addr: addr,
             local_port: port,
+            local_scope_id: scope_id,
             inbox: VecDeque::new(),
             peer: old_peer,
             port_locked,
@@ -128,7 +138,7 @@ impl SocketFile {
             return Ok(());
         }
         let port = alloc_port(map, self.net_ns_id(), self).ok_or(SockError::WouldBlock)?;
-        self.install_inet6_binding(UNSPEC, port, false);
+        self.install_inet6_binding(UNSPEC, port, 0, false);
         map.entry((self.net_ns_id(), port))
             .or_default()
             .insert(0, self.clone());
@@ -136,7 +146,7 @@ impl SocketFile {
     }
 
     fn inet6_dgram_bind(self: &Arc<Self>, addr: &SockAddr) -> SocketOpResult {
-        let (ip, requested_port) = match inet6_sockaddr(addr) {
+        let (ip, requested_port, scope_id) = match inet6_sockaddr_scoped(addr) {
             Ok(v) => v,
             Err(e) => return SocketOpResult::Err(e),
         };
@@ -163,7 +173,7 @@ impl SocketFile {
             }
             requested_port
         };
-        self.install_inet6_binding(ip, port, requested_port != 0);
+        self.install_inet6_binding(ip, port, scope_id, requested_port != 0);
         map.entry((ns, port)).or_default().insert(0, self.clone());
         SocketOpResult::Ok(0)
     }
@@ -175,8 +185,8 @@ impl SocketFile {
             }
             return SocketOpResult::Ok(0);
         }
-        let peer = match inet6_sockaddr(addr) {
-            Ok((_, 0)) => return SocketOpResult::Err(SockError::InvalidArg),
+        let peer = match inet6_sockaddr_scoped(addr) {
+            Ok((_, 0, _)) => return SocketOpResult::Err(SockError::InvalidArg),
             Ok(v) => v,
             Err(e) => return SocketOpResult::Err(e),
         };
@@ -222,8 +232,8 @@ impl SocketFile {
             _ => return SocketOpResult::Err(SockError::InvalidArg),
         };
         let dest = match addr {
-            Some(a) => match inet6_sockaddr(a) {
-                Ok((_, 0)) => return SocketOpResult::Err(SockError::InvalidArg),
+            Some(a) => match inet6_sockaddr_scoped(a) {
+                Ok((_, 0, _)) => return SocketOpResult::Err(SockError::InvalidArg),
                 Ok(v) => v,
                 Err(e) => return SocketOpResult::Err(e),
             },
@@ -237,7 +247,11 @@ impl SocketFile {
         }
         let is_local = dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local(&dest.0);
         if !is_local {
-            let bound_ifindex = self.options.lock().bindtodevice_index;
+            let bound_ifindex = if dest.2 != 0 {
+                dest.2
+            } else {
+                self.options.lock().bindtodevice_index
+            };
             return match narf_net::ipv6_stack::send_udp(
                 self.net_ns_id(),
                 (local != UNSPEC).then_some(local),
@@ -266,9 +280,17 @@ impl SocketFile {
         let source = if local == UNSPEC { LOOPBACK } else { local };
         let target = {
             let guard = INET6_DGRAM_BOUND.lock();
-            guard
-                .as_ref()
-                .and_then(|m| lookup(m, self.net_ns_id(), source, local_port, dest.0, dest.1, 0))
+            guard.as_ref().and_then(|m| {
+                lookup(
+                    m,
+                    self.net_ns_id(),
+                    source,
+                    local_port,
+                    dest.0,
+                    dest.1,
+                    dest.2,
+                )
+            })
         };
         if let Some(target) = target {
             let mut state = target.state.lock();
@@ -278,6 +300,7 @@ impl SocketFile {
                     inbox.push_back(DgramPacket6 {
                         peer_addr: source,
                         peer_port: local_port,
+                        scope_id: dest.2,
                         payload: buf.to_vec(),
                     });
                     *rmem += charge;
@@ -305,7 +328,11 @@ impl SocketFile {
                 let full_len = packet.payload.len();
                 let n = buf.len().min(full_len);
                 buf[..n].copy_from_slice(&packet.payload[..n]);
-                let peer = Some(make_sockaddr_in6(packet.peer_addr, packet.peer_port));
+                let peer = Some(make_sockaddr_in6_scoped(
+                    packet.peer_addr,
+                    packet.peer_port,
+                    packet.scope_id,
+                ));
                 if !peek {
                     inbox.pop_front();
                     *rmem = rmem.saturating_sub(full_len + DGRAM_TRUESIZE_OVERHEAD);
@@ -376,6 +403,7 @@ pub(super) fn deliver_wire(
     inbox.push_back(DgramPacket6 {
         peer_addr: src_ip,
         peer_port: src_port,
+        scope_id: in_ifindex,
         payload: payload.to_vec(),
     });
     *rmem += charge;

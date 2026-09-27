@@ -770,6 +770,10 @@ References (public-only, all IETF documents):
   multicast MAC mapping, and emits the complete Ethernet frame. RX validates
   the IPv6 pseudo-header checksum and UDP length before forwarding the exact
   payload and ingress ifindex through the registered userspace datagram hook.
+  A unicast cache miss installs an `Incomplete` NDP entry and emits a Neighbor
+  Solicitation to the target's solicited-node multicast address with IPv6 hop
+  limit 255; repeated sends do not flood duplicate solicitations while that
+  resolution is pending.
 
 ### DNS (`pkt_dns`)
 - **RFC 1035** — Domain Names — Implementation and Specification

@@ -1224,8 +1224,9 @@ enum SocketState {
     Inet6Dgram {
         local_addr: [u8; 16],
         local_port: u16,
+        local_scope_id: u32,
         inbox: VecDeque<DgramPacket6>,
-        peer: Option<([u8; 16], u16)>,
+        peer: Option<([u8; 16], u16, u32)>,
         port_locked: bool,
         rmem: usize,
     },
@@ -1369,6 +1370,7 @@ pub struct DgramPacket {
 struct DgramPacket6 {
     peer_addr: [u8; 16],
     peer_port: u16,
+    scope_id: u32,
     payload: Vec<u8>,
 }
 
@@ -2284,8 +2286,13 @@ impl SocketFile {
             SocketState::Inet6Dgram {
                 local_addr,
                 local_port,
+                local_scope_id,
                 ..
-            } => Some(make_sockaddr_in6(*local_addr, *local_port)),
+            } => Some(make_sockaddr_in6_scoped(
+                *local_addr,
+                *local_port,
+                *local_scope_id,
+            )),
             SocketState::InetRaw { local_addr, .. } => Some(make_sockaddr_in(*local_addr, 0)),
             SocketState::UnixBound { addr } | SocketState::UnixListener { addr, .. } => {
                 Some(SockAddr {
@@ -2335,8 +2342,9 @@ impl SocketFile {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
             SocketState::Inet6Dgram {
-                peer: Some((a, p)), ..
-            } => Some(make_sockaddr_in6(*a, *p)),
+                peer: Some((a, p, scope)),
+                ..
+            } => Some(make_sockaddr_in6_scoped(*a, *p, *scope)),
             SocketState::InetRaw {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
@@ -2552,11 +2560,15 @@ pub fn make_sockaddr_in(addr: u32, port: u16) -> SockAddr {
 /// so the reported length is `sizeof(struct sockaddr_in6)` (28), as
 /// `inet6_getname` returns.
 pub fn make_sockaddr_in6(addr: [u8; 16], port: u16) -> SockAddr {
+    make_sockaddr_in6_scoped(addr, port, 0)
+}
+
+fn make_sockaddr_in6_scoped(addr: [u8; 16], port: u16, scope_id: u32) -> SockAddr {
     let mut body = Vec::with_capacity(SOCKADDR_IN6_BODY_LEN);
     body.extend_from_slice(&port.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes()); // flowinfo
     body.extend_from_slice(&addr);
-    body.extend_from_slice(&0u32.to_ne_bytes()); // sin6_scope_id
+    body.extend_from_slice(&scope_id.to_ne_bytes());
     SockAddr {
         family: AF_INET6,
         body,
@@ -2610,6 +2622,10 @@ fn read_ip_int(value: &[u8]) -> Option<i32> {
 /// Validate an AF_INET6 sockaddr (`inet6_bind_sk` / `tcp_v6_connect`):
 /// shorter than SIN6_LEN_RFC2133 is EINVAL, a foreign family EAFNOSUPPORT.
 fn inet6_sockaddr(addr: &SockAddr) -> Result<([u8; 16], u16), SockError> {
+    inet6_sockaddr_scoped(addr).map(|(ip, port, _)| (ip, port))
+}
+
+fn inet6_sockaddr_scoped(addr: &SockAddr) -> Result<([u8; 16], u16, u32), SockError> {
     if addr.body.len() < SOCKADDR_IN6_MIN_BODY_LEN {
         return Err(SockError::InvalidArg);
     }
@@ -2619,7 +2635,12 @@ fn inet6_sockaddr(addr: &SockAddr) -> Result<([u8; 16], u16), SockError> {
     let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
     let mut ip = [0u8; 16];
     ip.copy_from_slice(&addr.body[6..22]);
-    Ok((ip, port))
+    let scope_id = if addr.body.len() >= SOCKADDR_IN6_BODY_LEN {
+        u32::from_ne_bytes([addr.body[22], addr.body[23], addr.body[24], addr.body[25]])
+    } else {
+        0
+    };
+    Ok((ip, port, scope_id))
 }
 
 /// Parse a `sockaddr_in`-shaped body into (ip, port) in host byte
@@ -4129,6 +4150,24 @@ impl SocketFile {
             }
             self.options.lock().classic_filter = Some(program);
             return SocketOpResult::Ok(0);
+        }
+        // `do_ipv6_setsockopt(IPV6_V6ONLY)` rejects a short integer and any
+        // socket that already owns a local port (`inet->inet_num`). Check
+        // before taking `options`: datagram bind lookup takes state before
+        // options, so reversing that order here would deadlock concurrent
+        // bind/setsockopt calls.
+        if level == IPPROTO_IPV6 && name == IPV6_V6ONLY && self.domain == AF_INET6 {
+            if value.len() < 4 {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            let bound = match &*self.state.lock() {
+                SocketState::Inet6Dgram { local_port, .. } => *local_port != 0,
+                SocketState::Inet6Listener { port, .. } => *port != 0,
+                _ => false,
+            };
+            if bound {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
         }
         let mut opts = self.options.lock();
         match (level, name) {
