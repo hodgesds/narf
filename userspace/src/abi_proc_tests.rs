@@ -1260,10 +1260,376 @@ fn smoke_abi_proc_wait_rejects_invalid_options() -> TestResult {
         if call(Syscall::Waitid.raw(), a3(0, 0, 0, 1)) != Some(EINVAL) {
             return Err("waitid without an event class did not return -EINVAL");
         }
+        // Unlike wait4, Linux's waitid syscall wrapper writes siginfo even
+        // when preparation fails, so a bad infop overrides that EINVAL.
+        if call(Syscall::Waitid.raw(), a3(0, 0, u64::MAX, 1)) != Some(EFAULT) {
+            return Err("waitid bad infop did not override -EINVAL with -EFAULT");
+        }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_wait_rejects_invalid_options);
+
+fn smoke_abi_proc_wait_linux_pid_validation_errno() -> TestResult {
+    with_setup(|| {
+        // Deliberately zero-extend the low 32 bits: syscall arguments occupy a
+        // 64-bit register, but Linux truncates this pid_t before interpreting
+        // its sign.
+        let int_min = i32::MIN as u32 as u64;
+        // kernel_wait4 rejects unknown options before its special INT_MIN
+        // guard, then returns ESRCH when the options are otherwise valid.
+        if call(Syscall::Wait4.raw(), a3(int_min, 0, 0x10, 0)) != Some(EINVAL) {
+            return Err("wait4(INT_MIN, bad options) must prefer -EINVAL");
+        }
+        if call(Syscall::Wait4.raw(), a3(int_min, 0, 1, 0)) != Some(ESRCH) {
+            return Err("wait4(INT_MIN) must return -ESRCH");
+        }
+
+        const P_PID: u64 = 1;
+        const P_PGID: u64 = 2;
+        const P_PIDFD: u64 = 3;
+        const WEXITED: u64 = 4;
+        // Linux kernel_waitid_prepare rejects these signed-id domains before
+        // attempting a pid or fd lookup. They are EINVAL, not ECHILD/EBADF.
+        for (which, id) in [
+            (P_PID, 0),
+            (P_PID, (-1i32) as u32 as u64),
+            (P_PGID, (-1i32) as u32 as u64),
+            (P_PIDFD, (-1i32) as u32 as u64),
+        ] {
+            if call(Syscall::Waitid.raw(), a3(which, id, 0, WEXITED)) != Some(EINVAL) {
+                return Err("waitid accepted an invalid signed id");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_wait_linux_pid_validation_errno
+);
+
+fn smoke_abi_proc_wait_job_control_replaces_state() -> TestResult {
+    with_setup(|| {
+        const CHILD: u64 = 0x6a31;
+        const WNOHANG: u64 = 1;
+        const WUNTRACED: u64 = 2;
+        const WCONTINUED: u64 = 8;
+        const STOPPED: i32 = (19 << 8) | 0x7f;
+        const CONTINUED: i32 = 0xffff;
+
+        crate::handlers::register_pid_task_mapping(CHILD, CHILD);
+        // Linux stores one consumable job-control state on the child. A
+        // completed continue therefore replaces an unconsumed stopped state;
+        // it does not append a second event to a FIFO.
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, STOPPED, false);
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, CONTINUED, true);
+        if crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 1 {
+            return Err("stop/continue transitions did not coalesce per child");
+        }
+
+        let mut status = 0i32;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WUNTRACED | WCONTINUED,
+                0,
+            ),
+        ) != Some(CHILD as i64)
+            || status != CONTINUED
+        {
+            return Err("wait4 did not report the latest continued state");
+        }
+        if crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 0 {
+            return Err("wait4 did not consume the job-control state");
+        }
+
+        status = 0x1234_5678;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WUNTRACED | WCONTINUED,
+                0,
+            ),
+        ) != Some(0)
+            || status != 0x1234_5678
+        {
+            return Err("consumed job-control state was reported twice");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_wait_job_control_replaces_state
+);
+
+fn smoke_abi_proc_job_control_resume_handoff_policy() -> TestResult {
+    with_setup(|| {
+        const CHILD: u64 = 0x6a35;
+        crate::handlers::register_pid_task_mapping(CHILD, CHILD);
+        crate::handlers::__test_parent_of_set(CHILD, FAKE_TASK);
+
+        if !crate::handlers::__test_mark_task_stopped(CHILD, 19)
+            || crate::handlers::__test_mark_task_stopped(CHILD, 19)
+            || !crate::handlers::is_task_stopped(CHILD)
+        {
+            return Err("stopped-state insertion was not idempotent");
+        }
+        if !crate::handlers::__test_continue_stopped_task(CHILD)
+            || crate::handlers::__test_continue_stopped_task(CHILD)
+            || crate::handlers::is_task_stopped(CHILD)
+        {
+            return Err("SIGCONT did not perform exactly one stopped-to-running transition");
+        }
+        if crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 1 {
+            return Err("stopped-to-running transition did not publish one continued state");
+        }
+
+        // One CPU must preserve the waiter's exact CLD_CONTINUED handoff. On
+        // SMP the waiter can run concurrently, so the resumed child may also
+        // receive a prompt-wake preference. Sparse CPU masks count correctly.
+        if crate::handlers::__test_prefer_resumed_child_handoff(0)
+            || crate::handlers::__test_prefer_resumed_child_handoff(1 << 5)
+            || !crate::handlers::__test_prefer_resumed_child_handoff((1 << 2) | (1 << 9))
+        {
+            return Err("resumed-child handoff policy did not distinguish UP from SMP");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_job_control_resume_handoff_policy
+);
+
+fn smoke_abi_proc_waitid_job_control_wnowait() -> TestResult {
+    with_setup(|| {
+        const CHILD: u64 = 0x6a32;
+        const P_ALL: u64 = 0;
+        const WNOHANG: u64 = 1;
+        const WCONTINUED: u64 = 8;
+        const WNOWAIT: u64 = 0x0100_0000;
+        const CONTINUED: i32 = 0xffff;
+
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD, CONTINUED, true);
+        let mut si = [0u8; 128];
+        for _ in 0..2 {
+            if call(
+                Syscall::Waitid.raw(),
+                a3(
+                    P_ALL,
+                    0,
+                    si.as_mut_ptr() as u64,
+                    WNOHANG | WCONTINUED | WNOWAIT,
+                ),
+            ) != Some(0)
+            {
+                return Err("waitid WNOWAIT failed to peek continued state");
+            }
+            let code = i32::from_ne_bytes(si[8..12].try_into().unwrap());
+            let pid = i32::from_ne_bytes(si[16..20].try_into().unwrap()) as u64;
+            let signal = i32::from_ne_bytes(si[24..28].try_into().unwrap());
+            if code != 6 || pid != CHILD || signal != 18 {
+                return Err("waitid encoded continued siginfo incorrectly");
+            }
+        }
+        if crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 1 {
+            return Err("waitid WNOWAIT consumed the continued state");
+        }
+
+        if call(
+            Syscall::Waitid.raw(),
+            a3(P_ALL, 0, si.as_mut_ptr() as u64, WNOHANG | WCONTINUED),
+        ) != Some(0)
+            || crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 0
+        {
+            return Err("ordinary waitid did not consume continued state");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_job_control_wnowait);
+
+fn smoke_abi_proc_wait_job_control_selectors_and_efault() -> TestResult {
+    with_setup(|| {
+        const CHILD_A: u64 = 0x6a33;
+        const CHILD_B: u64 = 0x6a34;
+        const P_ALL: u64 = 0;
+        const WNOHANG: u64 = 1;
+        const WUNTRACED: u64 = 2;
+        const WCONTINUED: u64 = 8;
+        const WNOWAIT: u64 = 0x0100_0000;
+        const STOPPED: i32 = (19 << 8) | 0x7f;
+        const CONTINUED: i32 = 0xffff;
+
+        crate::handlers::register_pid_task_mapping(CHILD_A, CHILD_A);
+        crate::handlers::register_pid_task_mapping(CHILD_B, CHILD_B);
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD_A, CONTINUED, true);
+        // The inverse transition also replaces state: B must report stopped,
+        // while selecting B must leave A's independent state untouched.
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD_B, CONTINUED, true);
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD_B, STOPPED, false);
+        if crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 2 {
+            return Err("job-control state was not bounded per child");
+        }
+
+        let mut status = 0i32;
+        if call(
+            Syscall::Wait4.raw(),
+            a3(
+                CHILD_B,
+                (&mut status as *mut i32) as u64,
+                WNOHANG | WUNTRACED,
+                0,
+            ),
+        ) != Some(CHILD_B as i64)
+            || status != STOPPED
+            || crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 1
+        {
+            return Err("specific-child wait selected or consumed the wrong state");
+        }
+
+        // wait4 consumes a selected state before copying wstatus, so EFAULT
+        // wins as the errno but the event is gone (Linux wait_task_stopped).
+        if call(
+            Syscall::Wait4.raw(),
+            a3(CHILD_A, u64::MAX, WNOHANG | WCONTINUED, 0),
+        ) != Some(EFAULT)
+            || crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 0
+        {
+            return Err("wait4 job-control EFAULT did not consume the state");
+        }
+
+        // WNOWAIT is the exception: a copy fault must leave the state visible
+        // for a later successful waitid.
+        crate::handlers::__test_stage_stopcont(FAKE_TASK, CHILD_A, CONTINUED, true);
+        if call(
+            Syscall::Waitid.raw(),
+            a3(P_ALL, 0, u64::MAX, WNOHANG | WCONTINUED | WNOWAIT),
+        ) != Some(EFAULT)
+            || crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 1
+        {
+            return Err("waitid WNOWAIT EFAULT consumed job-control state");
+        }
+        let mut si = [0u8; 128];
+        if call(
+            Syscall::Waitid.raw(),
+            a3(P_ALL, 0, si.as_mut_ptr() as u64, WNOHANG | WCONTINUED),
+        ) != Some(0)
+            || crate::handlers::__test_stopcont_state_count(FAKE_TASK) != 0
+        {
+            return Err("waitid could not consume state after WNOWAIT EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_wait_job_control_selectors_and_efault
+);
+
+fn smoke_abi_proc_wait_output_efault_consumption() -> TestResult {
+    with_setup(|| {
+        const WNOHANG: u64 = 1;
+        const WEXITED: u64 = 4;
+        const P_ALL: u64 = 0;
+        const CHILD_STATUS: i32 = 7 << 8;
+        const CHILD1: u64 = 0x6a21;
+        const CHILD2: u64 = 0x6a22;
+        const CHILD3: u64 = 0x6a23;
+        const CHILD4: u64 = 0x6a24;
+
+        let result = (|| {
+            // A successful wait4 consumes the zombie before put_user(status).
+            // A fault therefore returns EFAULT, and a retry sees ECHILD.
+            crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD1, CHILD_STATUS);
+            if call(
+                Syscall::Wait4.raw(),
+                a3((-1i64) as u64, u64::MAX, WNOHANG, 0),
+            ) != Some(EFAULT)
+            {
+                return Err("wait4 faulting status pointer must return -EFAULT");
+            }
+            if call(Syscall::Wait4.raw(), a3((-1i64) as u64, 0, WNOHANG, 0)) != Some(ECHILD) {
+                return Err("wait4 status EFAULT did not consume the child");
+            }
+
+            // wait4 copies status first and rusage second. The status write is
+            // visible even when the later rusage copy faults; the child is gone.
+            crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD2, CHILD_STATUS);
+            let mut status = -1i32;
+            if call(
+                Syscall::Wait4.raw(),
+                a3(
+                    (-1i64) as u64,
+                    &mut status as *mut i32 as u64,
+                    WNOHANG,
+                    u64::MAX,
+                ),
+            ) != Some(EFAULT)
+            {
+                return Err("wait4 faulting rusage pointer must return -EFAULT");
+            }
+            if status != CHILD_STATUS {
+                return Err("wait4 did not copy status before the rusage EFAULT");
+            }
+
+            // waitid does the reverse: rusage is copied before siginfo. A bad
+            // rusage consumes the event but leaves siginfo untouched.
+            crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD3, CHILD_STATUS);
+            let mut si = [0xa5u8; 128];
+            if call(
+                Syscall::Waitid.raw(),
+                a4(
+                    P_ALL,
+                    0,
+                    si.as_mut_ptr() as u64,
+                    WNOHANG | WEXITED,
+                    u64::MAX,
+                ),
+            ) != Some(EFAULT)
+            {
+                return Err("waitid faulting rusage pointer must return -EFAULT");
+            }
+            if si != [0xa5u8; 128] {
+                return Err("waitid copied siginfo after the earlier rusage EFAULT");
+            }
+
+            // A fault during WNOWAIT reports EFAULT but must not consume the
+            // child. A subsequent ordinary waitid can still reap it.
+            crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD4, CHILD_STATUS);
+            const WNOWAIT: u64 = 0x0100_0000;
+            if call(
+                Syscall::Waitid.raw(),
+                a3(P_ALL, 0, u64::MAX, WNOHANG | WEXITED | WNOWAIT),
+            ) != Some(EFAULT)
+            {
+                return Err("waitid WNOWAIT faulting siginfo must return -EFAULT");
+            }
+            let mut retry_si = [0u8; 128];
+            if call(
+                Syscall::Waitid.raw(),
+                a3(P_ALL, 0, retry_si.as_mut_ptr() as u64, WNOHANG | WEXITED),
+            ) != Some(0)
+            {
+                return Err("waitid WNOWAIT EFAULT consumed the child");
+            }
+            let retry_pid = u32::from_ne_bytes(retry_si[16..20].try_into().unwrap()) as u64;
+            if retry_pid != CHILD4 {
+                return Err("waitid retry reaped the wrong child after WNOWAIT EFAULT");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_clear_pending_exits(FAKE_TASK);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_wait_output_efault_consumption);
 
 fn smoke_abi_proc_wait_clone_child_classes() -> TestResult {
     fn peek_pid(options: u64) -> Result<u64, &'static str> {
@@ -1402,6 +1768,65 @@ fn smoke_abi_proc_waitid_pidfd_badfd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_pidfd_badfd);
+
+fn smoke_abi_proc_waitid_pidfd_nonblock_eagain() -> TestResult {
+    with_setup(|| {
+        const CHILD_TASK: u64 = 0x6a30;
+        const CHILD_PID: u64 = 0x6a31;
+        const P_PIDFD: u64 = 3;
+        const WNOHANG: u64 = 1;
+        const WEXITED: u64 = 4;
+        const PIDFD_NONBLOCK: u64 = 0o4000;
+
+        crate::task::release_task(CHILD_TASK);
+        let _ = crate::task::Task::new_registered(CHILD_TASK, CHILD_PID);
+        crate::handlers::register_task_to_pid(CHILD_TASK, CHILD_PID);
+        crate::handlers::register_pid_task_mapping(CHILD_PID, CHILD_TASK);
+        crate::handlers::__test_parent_of_set(CHILD_PID, FAKE_TASK);
+
+        let result = (|| {
+            let pidfd = match call(Syscall::PidfdOpen.raw(), a1(CHILD_PID, PIDFD_NONBLOCK)) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("pidfd_open(child, PIDFD_NONBLOCK) failed"),
+            };
+
+            // An explicit WNOHANG request keeps waitid's ordinary successful
+            // zero result. O_NONBLOCK by itself instead reports EAGAIN.
+            if call(
+                Syscall::Waitid.raw(),
+                a3(P_PIDFD, pidfd, 0, WEXITED | WNOHANG),
+            ) != Some(0)
+            {
+                return Err("waitid(nonblocking pidfd, WNOHANG) did not return 0");
+            }
+            if call(
+                Syscall::Waitid.raw(),
+                a3(P_PIDFD, pidfd, u64::MAX, WEXITED | WNOHANG),
+            ) != Some(EFAULT)
+            {
+                return Err("waitid WNOHANG no-event write must fault bad infop");
+            }
+            if call(Syscall::Waitid.raw(), a3(P_PIDFD, pidfd, 0, WEXITED)) != Some(EAGAIN) {
+                return Err("waitid(nonblocking pidfd) must return -EAGAIN");
+            }
+            if call(Syscall::Waitid.raw(), a3(P_PIDFD, pidfd, u64::MAX, WEXITED)) != Some(EFAULT) {
+                return Err("waitid bad infop did not override pidfd -EAGAIN");
+            }
+
+            // Readiness wins over O_NONBLOCK: once the child is waitable the
+            // same call succeeds and consumes it.
+            crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD_PID, 0);
+            if call(Syscall::Waitid.raw(), a3(P_PIDFD, pidfd, 0, WEXITED)) != Some(0) {
+                return Err("waitid(nonblocking pidfd) missed a ready child");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_clear_pending_exits(FAKE_TASK);
+        crate::task::release_task(CHILD_TASK);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_pidfd_nonblock_eagain);
 
 // ── #29 pgid-filtered wait: wait4(pid<-1), wait4(0), waitid(P_PGID) ──
 //

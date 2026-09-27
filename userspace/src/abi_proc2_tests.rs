@@ -447,9 +447,10 @@ fn smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie() -> TestResult {
             return Err("WNOWAIT peek consumed the exit — child not reapable");
         }
         // Fully reaped now: the child no longer exists, so another peek is
-        // -ECHILD and must leave infop untouched. (Linux: the reaped pid has
-        // no task, so notask_error stays -ECHILD.) This asserted 0 before
-        // waitid grew wait4's no-eligible-child gate.
+        // -ECHILD. Linux's waitid wrapper still writes a zero-result siginfo
+        // on the error path. (The reaped pid has no task, so notask_error
+        // stays -ECHILD.) This asserted 0 before waitid grew wait4's
+        // no-eligible-child gate.
         let mut si3 = [0u8; 128];
         let args = a3(
             P_PID,

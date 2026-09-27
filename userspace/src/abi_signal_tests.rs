@@ -52,6 +52,41 @@ fn smoke_abi_signal_kill_null_signal() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
 
+fn smoke_abi_signal_stop_continue_pending_cancellation() -> TestResult {
+    with_setup(|| {
+        const SIGCONT: u64 = 18;
+        const SIGSTOP: u64 = 19;
+        let cont_bit = crate::handlers::sig_bit(SIGCONT as u32);
+        let stop_bit = crate::handlers::sig_bit(SIGSTOP as u32);
+
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGCONT)) != Some(0)
+            || call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGSTOP)) != Some(0)
+        {
+            return Err("kill(self, SIGCONT/SIGSTOP) failed");
+        }
+        let after_stop = crate::handlers::signal_pending_of(FAKE_TASK);
+        if after_stop & stop_bit == 0 || after_stop & cont_bit != 0 {
+            return Err("pending SIGSTOP did not atomically cancel SIGCONT");
+        }
+
+        crate::handlers::clear_signal_pending(FAKE_TASK, SIGSTOP as u32);
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGSTOP)) != Some(0)
+            || call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGCONT)) != Some(0)
+        {
+            return Err("kill(self, SIGSTOP/SIGCONT) failed");
+        }
+        let after_cont = crate::handlers::signal_pending_of(FAKE_TASK);
+        if after_cont & cont_bit == 0 || after_cont & stop_bit != 0 {
+            return Err("pending SIGCONT did not atomically cancel stop signals");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_stop_continue_pending_cancellation
+);
+
 fn smoke_abi_signal_pending_task_count_tracks_transitions() -> TestResult {
     with_setup(|| {
         const OTHER_TASK: u64 = FAKE_TASK + 1;

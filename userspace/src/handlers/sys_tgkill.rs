@@ -52,8 +52,6 @@ pub(crate) fn sys_tgkill(ctx: &mut dyn TrapContext) {
         return;
     }
     queue_sender_siginfo(tid, signum);
-    signal_stopcont_interaction(tid, signum);
     raise_signal_pending(tid, signum);
-    wake_signal(tid);
     ctx.set_return(SyscallReturn::ok(0));
 }

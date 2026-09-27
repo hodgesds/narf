@@ -2382,6 +2382,7 @@ fn smoke_wave37_wait_child_check_fn_contract() -> TestResult {
         teardown_process_state();
         return TestResult::Fail("check_fn should return child pid after exit");
     }
+    let _ = crate::handlers::finish_wait_child(0, false, 0, r1, 0);
 
     // (C) Queue was drained → second call returns 0.
     let r2 = crate::user_task::call_wait_child_check(PARENT, -1, 0, core::ptr::null_mut());
@@ -2809,13 +2810,12 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
     crate::user_task::notify_task_exited(child_pid, child_pid);
 
     // wait4 by the parent should return the child's ProcessId.
-    let mut status: i32 = -1;
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: (-1i64) as u64, // any child
-            arg1: &mut status as *mut i32 as u64,
-            arg2: 1, // WNOHANG
+            arg1: 0,              // this smoke checks the returned ProcessId, not wstatus
+            arg2: 1,              // WNOHANG
             arg3: 0,
             arg4: 0,
             arg5: 0,
@@ -2913,7 +2913,6 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     LOOKUP_TASK.store(PARENT_TASK, Ordering::Relaxed);
     install_task_id_lookup(lookup_task_shim);
 
-    let mut status: i32 = -1;
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
@@ -2921,7 +2920,7 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: (-1i64) as u64,
-            arg1: &mut status as *mut i32 as u64,
+            arg1: 0, // this smoke checks PID/TaskId separation only
             arg2: 1, // WNOHANG
             arg3: 0,
             arg4: 0,
@@ -3487,13 +3486,18 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
         return TestResult::Fail("pids released on exit, before reap");
     }
 
-    // Reap them via the wait_child_check_fn path.
+    // Reap them via the same check + finish pair used by a parked wait.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    install_task_id_lookup(lookup_task_shim);
     let r1 =
         crate::user_task::call_wait_child_check(PARENT, c1.raw() as i64, 0, core::ptr::null_mut());
+    let _ = crate::handlers::finish_wait_child(0, false, 0, r1, 0);
     let r2 =
         crate::user_task::call_wait_child_check(PARENT, c2.raw() as i64, 0, core::ptr::null_mut());
+    let _ = crate::handlers::finish_wait_child(0, false, 0, r2, 0);
     let r3 =
         crate::user_task::call_wait_child_check(PARENT, c3.raw() as i64, 0, core::ptr::null_mut());
+    let _ = crate::handlers::finish_wait_child(0, false, 0, r3, 0);
 
     if r1 as u64 != c1.raw() || r2 as u64 != c2.raw() || r3 as u64 != c3.raw() {
         crate::__test_reset_pid_pool();

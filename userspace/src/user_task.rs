@@ -252,6 +252,10 @@ pub struct UserTaskCtx {
     /// on a successful reap. `0` = caller passed NULL (discard).
     /// For a `waitid(2)` wait this instead holds the `siginfo_t*`.
     pub wait_child_status_ptr: AtomicU64,
+    /// Optional `struct rusage *` for the in-flight wait4/waitid. Kept beside
+    /// the rest of the parked wait state so the hot block/resume path does not
+    /// serialize every waiter through a global pointer table.
+    pub wait_child_rusage_ptr: AtomicU64,
     /// True when this task parked (own-stack kernel_switch yield) at
     /// some point inside the CURRENT syscall. Under own-stack a parked
     /// syscall RETURNS through `kernel_syscall_entry`'s kernel-time
@@ -532,6 +536,7 @@ impl UserTaskCtx {
             wait_child_want_pid: AtomicI64::new(0),
             wait_child_want_pgid: AtomicU64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
+            wait_child_rusage_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
@@ -1575,29 +1580,56 @@ pub fn call_wait_child_check(
 /// `UserTaskFuture::poll` when it finds `wait_child_pending = true`
 /// and no reap is immediately available; it is consumed (wake called)
 /// by `on_child_exit` in handlers.rs.
-static WAIT_CHILD_WAKERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+const WAIT_CHILD_WAKER_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct WaitChildWakerShard {
+    wakers: narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
+    >,
+}
+
+impl WaitChildWakerShard {
+    const fn new() -> Self {
+        Self {
+            wakers: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static WAIT_CHILD_WAKERS: [WaitChildWakerShard; WAIT_CHILD_WAKER_SHARDS] =
+    [const { WaitChildWakerShard::new() }; WAIT_CHILD_WAKER_SHARDS];
+
+#[inline]
+fn wait_child_waker_shard(parent_id: u64) -> usize {
+    parent_id as usize & (WAIT_CHILD_WAKER_SHARDS - 1)
+}
 
 /// Initialise the waker table (called once at boot alongside `wait_init`).
 pub fn wait_child_waker_init() {
-    *WAIT_CHILD_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+    for shard in &WAIT_CHILD_WAKERS {
+        *shard.wakers.lock() = Some(alloc::collections::BTreeMap::new());
+    }
 }
 
 /// Store a waker for `parent_id`.  The waker fires when the parent's
 /// child exits and `on_child_exit` is invoked.
 pub fn register_wait_child_waker(parent_id: u64, waker: core::task::Waker) {
-    let mut g = WAIT_CHILD_WAKERS.lock();
+    let mut g = WAIT_CHILD_WAKERS[wait_child_waker_shard(parent_id)]
+        .wakers
+        .lock();
     if let Some(m) = g.as_mut() {
         m.insert(parent_id, waker);
     }
 }
 
-/// Take and wake the stored waker for `parent_id`, if any.  Called by
+/// Take and wake the stored waker for `parent_id`, if any. Called by
 /// `on_child_exit` after pushing to the pending-exits queue.
 pub fn wake_wait_child(parent_id: u64) {
     let waker = {
-        let mut g = WAIT_CHILD_WAKERS.lock();
+        let mut g = WAIT_CHILD_WAKERS[wait_child_waker_shard(parent_id)]
+            .wakers
+            .lock();
         g.as_mut().and_then(|m| m.remove(&parent_id))
     };
     if let Some(w) = waker {
@@ -1610,7 +1642,9 @@ pub fn wake_wait_child(parent_id: u64) {
 /// registering the waker finds a result — we clear the table slot
 /// without scheduling a spurious re-poll.
 pub fn drop_wait_child_waker(parent_id: u64) {
-    let mut g = WAIT_CHILD_WAKERS.lock();
+    let mut g = WAIT_CHILD_WAKERS[wait_child_waker_shard(parent_id)]
+        .wakers
+        .lock();
     if let Some(m) = g.as_mut() {
         m.remove(&parent_id);
     }
@@ -1619,7 +1653,7 @@ pub fn drop_wait_child_waker(parent_id: u64) {
 /// Test-only: drain the waker table.
 #[doc(hidden)]
 pub fn __test_wait_child_waker_reset() {
-    *WAIT_CHILD_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+    wait_child_waker_init();
 }
 
 #[inline]
@@ -2460,8 +2494,13 @@ impl core::future::Future for UserTaskFuture {
                 // syscall result (reaped pid for wait4, 0 for waitid)
                 // into the saved RAX, then clear the pending flags.
                 let is_waitid = this.task.uctx.wait_child_is_waitid.load(Ordering::Acquire);
-                let rax =
-                    crate::handlers::finish_wait_child(status_ptr, is_waitid, reaped, child_status);
+                let rax = crate::handlers::finish_wait_child(
+                    status_ptr,
+                    is_waitid,
+                    wait_options,
+                    reaped,
+                    child_status,
+                );
                 // SAFETY: `state.get()` is the `*mut UserState` (== `*mut
                 // narf_scheduler::UserState`) backing this future's saved
                 // frame; we own it (Pin-stable) and no other handle
@@ -2500,6 +2539,7 @@ impl core::future::Future for UserTaskFuture {
                     let rax = crate::handlers::finish_wait_child(
                         status_ptr,
                         is_waitid,
+                        wait_options,
                         reaped2,
                         child_status2,
                     );
@@ -3113,8 +3153,13 @@ impl core::future::Future for UserTaskFuture {
             let reaped = call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status);
             if reaped > 0 {
                 let is_waitid = this.task.uctx.wait_child_is_waitid.load(Ordering::Acquire);
-                let rax =
-                    crate::handlers::finish_wait_child(status_ptr, is_waitid, reaped, child_status);
+                let rax = crate::handlers::finish_wait_child(
+                    status_ptr,
+                    is_waitid,
+                    wait_options,
+                    reaped,
+                    child_status,
+                );
                 // SAFETY: `state.get()` is the `*mut UserState`
                 // (== `*mut narf_scheduler::UserState`) backing this
                 // future's saved frame; we own it (Pin-stable) and no
@@ -3147,6 +3192,7 @@ impl core::future::Future for UserTaskFuture {
                     let rax = crate::handlers::finish_wait_child(
                         status_ptr,
                         is_waitid,
+                        wait_options,
                         reaped2,
                         child_status2,
                     );
