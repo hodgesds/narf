@@ -124,7 +124,11 @@ fn register_test_card_unmastered() -> u32 {
 fn register_test_virtio_card() -> u32 {
     let name = format!("card{}", crate::drm_registry::count());
     let card = Arc::new(crate::drm_devfs_bridge::VirtioGpuCard::new(name));
-    let idx = crate::drm_registry::register_drm_card_with_state(card, make_test_card());
+    let mut state = make_test_card();
+    state.driver_name = "virtio_gpu";
+    state.driver_desc = "NARF VirtIO GPU driver";
+    state.version = (0, 1, 0);
+    let idx = crate::drm_registry::register_drm_card_with_state(card, state);
     if let Some(ms) = crate::drm_registry::mode_state(idx) {
         ms.lock().master_open(SMOKE_MASTER_ID);
     }
@@ -653,6 +657,51 @@ kernel_test_in!(
 // the fix `DriCardFile::ioctl` went straight to the card/KMS dispatcher, so a
 // VIRTGPU ioctl fell through to `handle_generic` → ENOTTY (Unsupported) and
 // Mesa dropped every GL client to llvmpipe.
+
+/// Linux advertises virtio_gpu version 0.1.0. Mesa's classic-VirGL winsys
+/// rejects the device when the major version is non-zero.
+fn smoke_dri_card_virtgpu_version_matches_linux() -> TestResult {
+    let idx = register_test_virtio_card();
+    use narf_filesystem::DirOps;
+    let dir = crate::drm_devfs_bridge::DriDir;
+    let name = format!("card{}", idx);
+    let f = match dir.lookup(&name) {
+        Some(f) => f,
+        None => return TestResult::Fail("DriDir::lookup(card) failed"),
+    };
+    let mut req = DrmVersionUapi::default();
+    if f.ioctl(DRM_IOCTL_VERSION, &mut req as *mut _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("virtio_gpu DRM_IOCTL_VERSION failed");
+    }
+    if (req.version_major, req.version_minor, req.version_patchlevel) != (0, 1, 0) {
+        return TestResult::Fail("virtio_gpu DRM version differs from Linux 0.1.0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_dri_card_virtgpu_version_matches_linux
+);
+
+/// The ioctl gate must admit the multi-page command streams Mesa submits
+/// while creating a classic-VirGL screen, while retaining a finite cap.
+fn smoke_virtgpu_execbuffer_capacity_covers_mesa_init() -> TestResult {
+    for size in [4_136, 9_504, 18_412] {
+        if size > crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES {
+            return TestResult::Fail("Mesa VirGL initialization execbuffer is rejected");
+        }
+    }
+    if crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES >= 1024 * 1024 {
+        return TestResult::Fail("VirtGPU execbuffer bound is not meaningfully constrained");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_virtgpu_execbuffer_capacity_covers_mesa_init
+);
 
 /// POSITIVE: a VIRTGPU ioctl on the virtio_gpu card node is routed to the
 /// per-open virtio-gpu dispatcher (GETPARAM(3D_FEATURES) → Ok), NOT ENOTTY.

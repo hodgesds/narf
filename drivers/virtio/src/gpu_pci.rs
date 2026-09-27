@@ -118,6 +118,19 @@ const FMT_B8G8R8X8_UNORM: u32 = 1;
 const MAX_SCANOUTS: usize = 16;
 const HDR_LEN: usize = 24;
 
+/// DMA staging capacity for one VirtIO-GPU control request.
+///
+/// Classic-VirGL Mesa sends multi-page initialization command streams before
+/// creating its first resource (up to 18,412 bytes in the CachyOS guest), so a
+/// single 4 KiB page is not sufficient. Keep the allocation bounded while
+/// leaving room for normal shader/capability initialization batches.
+const CONTROL_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_VIRGL_COMMAND_BYTES: usize = CONTROL_REQUEST_BYTES - cmd::SUBMIT_3D_PREFIX_LEN;
+
+const fn virgl_command_fits(len: usize) -> bool {
+    len <= MAX_VIRGL_COMMAND_BYTES
+}
+
 /// Maximum primary scanout size. A 4 MiB contiguous DMA allocation covers
 /// QEMU GTK's normal 1280×800 mode; a larger host mode is safely capped to
 /// this size rather than creating a resource whose backing cannot cover it.
@@ -334,10 +347,11 @@ impl VirtioGpuPci {
             );
         }
 
-        // Buffers for the request/response pair. virtio-gpu commands
-        // are small; one 4 KiB page each is generous.
-        let req_buf =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+        // Buffers for the request/response pair. Mesa's opaque VirGL command
+        // streams can span multiple pages; responses remain bounded to one
+        // page (the largest enumerated capset currently fits in 1,408 bytes).
+        let req_buf = alloc_coherent(CONTROL_REQUEST_BYTES, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
         let resp_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
 
@@ -745,16 +759,17 @@ impl VirtioGpuPci {
         if !self.virgl_enabled() {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        if commands.len() > self.req_buf.len() - cmd::SUBMIT_3D_PREFIX_LEN {
+        if !virgl_command_fits(commands.len()) {
             return Err(VirtioPciError::RequestTooLarge);
         }
         let _gate = ReqGate::acquire(&self.req_gate);
         let request_len = cmd::SUBMIT_3D_PREFIX_LEN + commands.len();
-        // The bound above proves this dynamic-sized slice fits in the fixed
-        // 4 KiB staging buffer without a heap allocation in the hot path.
-        let mut request = [0u8; 4096];
-        cmd::build_submit_3d(&mut request[..request_len], ctx_id, ring_idx, commands);
-        self.write_raw_request(&request[..request_len]);
+        // The bound above proves this dynamic-sized request fits in the fixed
+        // coherent staging buffer. Build it in temporary owned memory, then
+        // copy it to DMA; a large fixed array would overflow a kernel stack.
+        let mut request = alloc::vec![0u8; request_len];
+        cmd::build_submit_3d(&mut request, ctx_id, ring_idx, commands);
+        self.write_raw_request(&request);
         // SAFETY: gate protects the shared request/response buffers.
         unsafe { self.submit(request_len, HDR_LEN)? };
         if self.response_type() != RESP_OK_NODATA {

@@ -49,6 +49,15 @@ use crate::drm_uapi::{
 /// `count_objs` field can't be used to force a huge allocation.
 const IOCTL_MAX_BUF: usize = 1024 * 1024;
 
+/// Maximum opaque VirGL command stream accepted from one EXECBUFFER ioctl.
+///
+/// The control request staging buffer in `narf-drivers-virtio` is 64 KiB and
+/// also carries the VirtIO-GPU submit header. Mesa's classic-VirGL screen
+/// initialization sends streams larger than one page (4,136, 9,504, and
+/// 18,412 bytes have all been observed), before it creates its first resource.
+pub(crate) const VIRTGPU_EXECBUFFER_MAX_BYTES: usize =
+    64 * 1024 - narf_drivers_virtio::gpu_pci::cmd::SUBMIT_3D_PREFIX_LEN;
+
 /// Where a resource's mappable memory lives.
 enum ResourceBacking {
     /// Guest-physical coherent DMA pages (classic 3D resources and guest
@@ -704,8 +713,7 @@ pub fn dispatch_virtgpu_render(
             if req.flags & !EXECBUF_KNOWN != 0
                 || req.num_in_syncobjs != 0
                 || req.num_out_syncobjs != 0
-                || req.size as usize
-                    > 4096 - narf_drivers_virtio::gpu_pci::cmd::SUBMIT_3D_PREFIX_LEN
+                || req.size as usize > VIRTGPU_EXECBUFFER_MAX_BYTES
                 || req.num_bo_handles > 256
             {
                 return Err(FsError::Unsupported);
@@ -736,7 +744,7 @@ pub fn dispatch_virtgpu_render(
             // only copy a command payload when one is present.
             let commands = if req.size != 0 {
                 // SAFETY: `req.command` is the user command pointer; size is
-                // bounded to the controlQ request page above, and copy_in
+                // bounded to the controlQ request buffer above, and copy_in
                 // validates the complete source range and returns owned bytes.
                 unsafe { copy_in(req.command as usize, req.size as usize)? }
             } else {

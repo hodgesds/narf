@@ -34,6 +34,24 @@ kernel_test_in!(
     smoke_virtio_gpu_virgl_offer_detection
 );
 
+fn smoke_virtio_gpu_virgl_command_capacity() -> TestResult {
+    // Direct Linux/CachyOS traces show these pre-resource screen-init streams;
+    // NARF's former one-page staging buffer rejected all three.
+    for size in [4_136, 9_504, 18_412] {
+        if !super::virgl_command_fits(size) {
+            return TestResult::Fail("Mesa VirGL initialization command does not fit");
+        }
+    }
+    if super::virgl_command_fits(super::MAX_VIRGL_COMMAND_BYTES + 1) {
+        return TestResult::Fail("VirGL command capacity has no upper bound");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_virgl_command_capacity
+);
+
 fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
     use super::cmd::{
         build_ctx_create, build_resource_create_3d, build_resource_create_blob, build_submit_3d,
