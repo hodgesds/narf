@@ -309,14 +309,21 @@ pub const SO_REUSEPORT: u32 = 15;
 pub const SO_PASSCRED: u32 = 16;
 pub const SO_PEERCRED: u32 = 17;
 pub const SO_BINDTODEVICE: u32 = 25;
+pub const SO_ATTACH_FILTER: u32 = 26;
+pub const SO_TIMESTAMP_OLD: u32 = 29;
 pub const SO_ACCEPTCONN: u32 = 30;
+pub const SO_SNDBUFFORCE: u32 = 32;
+pub const SO_RCVBUFFORCE: u32 = 33;
 /// Linux Security Module peer label. NARF has no LSM label namespace, so
 /// getsockopt reports ENOPROTOOPT rather than fabricating an authority label.
 pub const SO_PEERSEC: u32 = 31;
+pub const SO_TIMESTAMPNS_OLD: u32 = 35;
 pub const SO_PROTOCOL: u32 = 38;
 pub const SO_DOMAIN: u32 = 39;
 /// Supplementary groups captured from a Unix peer at connection time.
 pub const SO_PEERGROUPS: u32 = 59;
+pub const SO_TIMESTAMP_NEW: u32 = 63;
+pub const SO_TIMESTAMPNS_NEW: u32 = 64;
 /// pidfd naming the Unix peer. Socket peer credentials currently carry a PID
 /// value but not a retained pidfd object, so getsockopt reports ENOPROTOOPT.
 pub const SO_PEERPIDFD: u32 = 77;
@@ -901,6 +908,17 @@ pub struct SockOptions {
     /// name, and resolves it back for getsockopt — an index survives a
     /// rename, which a stored string would not.
     pub bindtodevice_index: u32,
+    /// Linux's SOCK_RCVTSTAMP / SOCK_RCVTSTAMPNS / SOCK_TSTAMP_NEW state.
+    /// The four SO_TIMESTAMP{,NS}_{OLD,NEW} names select the same three Linux
+    /// state bits; disabling any variant clears receive timestamping.
+    pub timestamp_enabled: bool,
+    pub timestamp_ns: bool,
+    pub timestamp_new: bool,
+    /// Validated Linux classic-BPF image supplied through SO_ATTACH_FILTER.
+    /// Synthetic uevent delivery is already kernel-source/group restricted;
+    /// retaining the image preserves attachment lifetime and rejects malformed
+    /// programs instead of silently accepting arbitrary data.
+    pub classic_filter: Option<Vec<u8>>,
     // TCP
     pub tcp_nodelay: bool,
     pub tcp_keepidle: u32,
@@ -946,6 +964,10 @@ impl Default for SockOptions {
             sndbuf: 212_992,
             bindtodevice: None,
             bindtodevice_index: 0,
+            timestamp_enabled: false,
+            timestamp_ns: false,
+            timestamp_new: false,
+            classic_filter: None,
             tcp_nodelay: false,
             tcp_keepidle: 7200,
             tcp_keepintvl: 75,
@@ -974,6 +996,146 @@ impl Default for SockOptions {
             ip_freebind: false,
         }
     }
+}
+
+/// Validate the structural rules Linux's classic socket-filter verifier
+/// applies before attaching a `sock_fprog`. Instructions use the fixed
+/// 8-byte `struct sock_filter` UAPI shape.
+fn classic_filter_is_valid(program: &[u8]) -> bool {
+    const INSNS_MAX: usize = 4096;
+    const MEMWORDS: u32 = 16;
+    const SKF_AD_OFF: u32 = 0xffff_f000;
+    if program.is_empty() || program.len() % 8 != 0 {
+        return false;
+    }
+    let count = program.len() / 8;
+    if count > INSNS_MAX {
+        return false;
+    }
+    // Linux's `check_load_and_stores`: each target accumulates the scratch
+    // slots initialized on every path that can reach it.
+    let mut masks = alloc::vec![u16::MAX; count];
+    let mut mem_valid = 0u16;
+    for (pc, insn) in program.chunks_exact(8).enumerate() {
+        mem_valid &= masks[pc];
+        let code = u16::from_ne_bytes([insn[0], insn[1]]);
+        let jt = usize::from(insn[2]);
+        let jf = usize::from(insn[3]);
+        let k = u32::from_ne_bytes(insn[4..8].try_into().unwrap_or([0; 4]));
+        // Exact port of `chk_code_allowed`: unused size/mode/source bits are
+        // not accepted merely because the instruction class is recognized.
+        let allowed = matches!(
+            code,
+            // ALU K/X, plus NEG.
+            0x04 | 0x0c
+                | 0x14
+                | 0x1c
+                | 0x24
+                | 0x2c
+                | 0x34
+                | 0x3c
+                | 0x44
+                | 0x4c
+                | 0x54
+                | 0x5c
+                | 0x64
+                | 0x6c
+                | 0x74
+                | 0x7c
+                | 0x84
+                | 0x94
+                | 0x9c
+                | 0xa4
+                | 0xac
+                // LD/LDX.
+                | 0x20
+                | 0x28
+                | 0x30
+                | 0x80
+                | 0x40
+                | 0x48
+                | 0x50
+                | 0x00
+                | 0x60
+                | 0x81
+                | 0xb1
+                | 0x01
+                | 0x61
+                // ST/STX, RET, MISC.
+                | 0x02
+                | 0x03
+                | 0x06
+                | 0x16
+                | 0x07
+                | 0x87
+                // JMP K/X and JA.
+                | 0x05
+                | 0x15
+                | 0x1d
+                | 0x25
+                | 0x2d
+                | 0x35
+                | 0x3d
+                | 0x45
+                | 0x4d
+        );
+        if !allowed {
+            return false;
+        }
+
+        match code {
+            // Immediate division/modulo by zero and oversized immediate
+            // shifts are rejected by `bpf_check_classic`.
+            0x34 | 0x94 if k == 0 => return false,
+            0x64 | 0x74 if k >= 32 => return false,
+            // Scratch loads/stores stay within M[0..16); a load must be
+            // initialized on every control-flow path that reaches it.
+            0x60 | 0x61 if k >= MEMWORDS => return false,
+            0x60 | 0x61 if mem_valid & (1u16 << k) == 0 => return false,
+            0x02 | 0x03 if k >= MEMWORDS => return false,
+            0x02 | 0x03 => mem_valid |= 1u16 << k,
+            // BPF_JA.
+            0x05 => {
+                let Some(target) = pc
+                    .checked_add(1)
+                    .and_then(|next| next.checked_add(k as usize))
+                else {
+                    return false;
+                };
+                if target >= count {
+                    return false;
+                }
+                masks[target] &= mem_valid;
+                mem_valid = u16::MAX;
+            }
+            // Conditional jumps.
+            0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d => {
+                let next = pc + 1;
+                let (Some(true_target), Some(false_target)) =
+                    (next.checked_add(jt), next.checked_add(jf))
+                else {
+                    return false;
+                };
+                if true_target >= count || false_target >= count {
+                    return false;
+                }
+                masks[true_target] &= mem_valid;
+                masks[false_target] &= mem_valid;
+                mem_valid = u16::MAX;
+            }
+            // Linux recognizes only the enumerated negative ancillary-data
+            // offsets for absolute packet loads.
+            0x20 | 0x28 | 0x30 if k >= SKF_AD_OFF => {
+                let ancillary = k.wrapping_sub(SKF_AD_OFF);
+                if ancillary > 60 || ancillary % 4 != 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let last = &program[program.len() - 8..];
+    matches!(u16::from_ne_bytes([last[0], last[1]]), 0x06 | 0x16)
 }
 
 enum SocketState {
@@ -3883,6 +4045,33 @@ impl SocketFile {
                 );
             }
         }
+        if level == SOL_SOCKET && name == SO_ATTACH_FILTER {
+            // Linux `copy_bpf_fprog_from_user` requires the native 16-byte
+            // sock_fprog exactly: u16 len, six bytes padding, u64 filter.
+            if value.len() != 16 {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            let count = usize::from(u16::from_ne_bytes([value[0], value[1]]));
+            if count == 0 || count > 4096 {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            let filter_ptr = u64::from_ne_bytes(value[8..16].try_into().unwrap_or([0; 8]));
+            let Some(bytes_len) = count.checked_mul(8) else {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            };
+            let mut program = alloc::vec![0u8; bytes_len];
+            // SAFETY: `filter_ptr` came from the userspace sock_fprog. The
+            // guarded copy validates the entire instruction image and maps a
+            // bad/null pointer to Linux's EFAULT.
+            if unsafe { crate::handlers::copy_from_user(&mut program, filter_ptr) }.is_err() {
+                return SocketOpResult::Err(SockError::Stack(errno::EFAULT as i32));
+            }
+            if !classic_filter_is_valid(&program) {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            self.options.lock().classic_filter = Some(program);
+            return SocketOpResult::Ok(0);
+        }
         let mut opts = self.options.lock();
         match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => match read_u32(value) {
@@ -3920,6 +4109,22 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            (
+                SOL_SOCKET,
+                name @ (SO_TIMESTAMP_OLD | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_OLD
+                | SO_TIMESTAMPNS_NEW),
+            ) => match read_u32(value) {
+                Ok(v) => {
+                    opts.timestamp_enabled = v != 0;
+                    opts.timestamp_ns =
+                        v != 0 && matches!(name, SO_TIMESTAMPNS_OLD | SO_TIMESTAMPNS_NEW);
+                    if v != 0 {
+                        opts.timestamp_new = matches!(name, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW);
+                    }
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
             (SOL_SOCKET, SO_LINGER) => {
                 if value.len() < 8 {
                     return SocketOpResult::Err(SockError::InvalidArg);
@@ -3937,6 +4142,25 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            (SOL_SOCKET, SO_RCVBUFFORCE) => {
+                if !crate::handlers::task_capable(
+                    crate::handlers::current_task_id(),
+                    crate::handlers::CAP_NET_ADMIN,
+                ) {
+                    return SocketOpResult::Err(SockError::PermDenied);
+                }
+                match read_u32(value) {
+                    Ok(v) => {
+                        let requested = (v as i32).max(0) as u32;
+                        opts.rcvbuf = requested
+                            .min((i32::MAX / 2) as u32)
+                            .saturating_mul(2)
+                            .max(2_048);
+                        SocketOpResult::Ok(0)
+                    }
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
             (SOL_SOCKET, SO_SNDBUF) => match read_u32(value) {
                 Ok(v) => {
                     opts.sndbuf = v.max(2_048);
@@ -3944,6 +4168,25 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            (SOL_SOCKET, SO_SNDBUFFORCE) => {
+                if !crate::handlers::task_capable(
+                    crate::handlers::current_task_id(),
+                    crate::handlers::CAP_NET_ADMIN,
+                ) {
+                    return SocketOpResult::Err(SockError::PermDenied);
+                }
+                match read_u32(value) {
+                    Ok(v) => {
+                        let requested = (v as i32).max(0) as u32;
+                        opts.sndbuf = requested
+                            .min((i32::MAX / 2) as u32)
+                            .saturating_mul(2)
+                            .max(2_048);
+                        SocketOpResult::Ok(0)
+                    }
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
             (SOL_SOCKET, SO_BINDTODEVICE) => {
                 // `sock_setbindtodevice` (`net/core/sock.c:685`): the name
                 // is truncated to IFNAMSIZ-1, an empty name (or zero
@@ -4442,6 +4685,21 @@ impl SocketFile {
             }
             (SOL_SOCKET, SO_TYPE) => write_u32(buf, self.kind),
             (SOL_SOCKET, SO_PASSCRED) => write_bool(buf, self.passcred.load(Ordering::Acquire)),
+            (SOL_SOCKET, SO_TIMESTAMP_OLD) => write_bool(
+                buf,
+                opts.timestamp_enabled && !opts.timestamp_new && !opts.timestamp_ns,
+            ),
+            (SOL_SOCKET, SO_TIMESTAMPNS_OLD) => write_bool(
+                buf,
+                opts.timestamp_enabled && !opts.timestamp_new && opts.timestamp_ns,
+            ),
+            (SOL_SOCKET, SO_TIMESTAMP_NEW) => {
+                write_bool(buf, opts.timestamp_enabled && opts.timestamp_new)
+            }
+            (SOL_SOCKET, SO_TIMESTAMPNS_NEW) => write_bool(
+                buf,
+                opts.timestamp_enabled && opts.timestamp_new && opts.timestamp_ns,
+            ),
             // SO_PEERCRED → struct ucred { pid_t pid; uid_t uid; gid_t gid; }
             // (12 bytes). Reports the connected peer's real credentials,
             // captured at connect()/accept()/socketpair() time. systemd's

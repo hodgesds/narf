@@ -255,6 +255,16 @@ inherited across fork/clone, replaced and queried by `setgroups(2)` and
 `getgroups(2)`, and captured on Unix endpoints at listen/connect/socketpair
 time. `SO_PEERGROUPS` returns that immutable peer snapshot, translated into
 the reader's user namespace; an undersized option buffer returns `ERANGE`.
+The `SO_TIMESTAMP{,NS}_{OLD,NEW}` receive-timestamp selectors follow Linux's
+`sk_setsockopt` state transitions and round-trip through `getsockopt`; values
+shorter than an `int` return `EINVAL`, and disabling any selector clears
+receive timestamping. `SO_SNDBUFFORCE` and `SO_RCVBUFFORCE` require
+`CAP_NET_ADMIN` (`EPERM` otherwise), bypass normal maxima, and use Linux's
+signed, doubled buffer accounting. `SO_ATTACH_FILTER` requires the native
+16-byte `sock_fprog` shape and returns Linux-compatible `EINVAL`/`EFAULT` for
+invalid descriptors or instruction images; NARF validates and retains the
+classic-BPF image while its synthetic uevent delivery remains independently
+restricted to kernel-originated group-1 records.
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
 stream receive operations honor `MSG_PEEK` without consuming queued bytes.
