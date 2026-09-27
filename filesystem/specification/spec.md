@@ -834,6 +834,17 @@ link target plus live offset, status flags, mount ID, and inode identity, so
 memory fields are derived from VMA extents and resident page counts. Procfs
 values that have no authoritative NARF provider remain absent rather than
 fabricated measurements.
+`/proc/net/tcp` rows follow Linux `get_tcp4_sock` column order through the
+congestion-window and slow-start-threshold tail. Timer, probe, RTO, delayed-ACK,
+and congestion values come from the TCP snapshot hook; identity values remain
+zero until an authoritative socket-owner provider is installed.
+`/proc/net/sockstat` and `sockstat6` expose Linux's line and field names and
+derive protocol in-use, TIME-WAIT, and allocation counts from the same
+namespace-scoped socket snapshots as the protocol tables.
+`/proc/net/netstat` emits positionally paired `TcpExt`, `IpExt`, and
+`MPTcpExt` header/value rows. `/proc/net/snmp6` uses Linux's one-counter-per-line
+format. Both consume the namespace-scoped SNMP snapshot and leave unavailable
+extended statistics at zero.
 The supported surface and known partial projections are tracked in
 `filesystem/PROCFS_LINUX_COMPAT_AUDIT.md`.
 

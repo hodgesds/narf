@@ -133,6 +133,14 @@ argument = "The procfs adapters read only the scheduler-published current task i
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
+argument = "The frame procfs adapter copies only scalar TCP timer, queue, and congestion snapshots already owned by the network stack into filesystem display records. It grants no capability, changes no domain or scheduler state, exposes no physical address, and performs no userspace-memory access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Early frame boot now copies only parsed command-line verbosity scalars into the console's atomic display threshold. All messages still enter the bounded kernel log, and panic/trap sinks bypass filtering; no domain state, capability, mapping, scheduler state, or userspace memory is accessed or changed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
 argument = "Network namespace lifetime is retained by typed Arc ownership in tasks, namespace fds, and sockets. Final-reference teardown removes only state keyed by that immutable namespace id, returns physical interfaces to namespace zero after releasing registry locks, and does not alter memory domains, frame ownership, capability epochs, or scheduler state."
 
 [[invariants_preserved]]

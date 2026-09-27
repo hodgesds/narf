@@ -72,6 +72,27 @@ impl<'a> KernelCmdline<'a> {
         self.raw.split_ascii_whitespace()
     }
 
+    /// Effective Linux-style console threshold requested by `quiet`, `debug`,
+    /// and `loglevel=N`, evaluated in command-line order. `None` leaves the
+    /// console subsystem's default unchanged.
+    pub fn console_loglevel(&self) -> Option<u32> {
+        let mut level = None;
+        for token in self.tokens() {
+            match token {
+                "quiet" => level = Some(4),
+                "debug" => level = Some(10),
+                _ => {
+                    if let Some(raw) = token.strip_prefix("loglevel=") {
+                        if let Ok(parsed) = raw.parse::<u32>() {
+                            level = Some(parsed.clamp(1, 15));
+                        }
+                    }
+                }
+            }
+        }
+        level
+    }
+
     /// True iff a token is exactly `name` — a bare flag with no `=`.
     ///
     /// Use this for boolean switches like `nosmp`, `systemd_pid1`,
@@ -190,6 +211,25 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("boot/args", smoke_recognizes_flags_and_values);
+
+    fn smoke_console_loglevel_obeys_order_and_bounds() -> TestResult {
+        for (raw, expected) in [
+            ("", None),
+            ("quiet", Some(4)),
+            ("quiet debug", Some(10)),
+            ("debug quiet", Some(4)),
+            ("quiet loglevel=6", Some(6)),
+            ("loglevel=0", Some(1)),
+            ("loglevel=99", Some(15)),
+            ("loglevel=no quiet", Some(4)),
+        ] {
+            if KernelCmdline::new(raw).console_loglevel() != expected {
+                return TestResult::Fail("console loglevel parsing mismatch");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/args", smoke_console_loglevel_obeys_order_and_bounds);
 
     fn smoke_negative_absent_tokens() -> TestResult {
         let a = KernelCmdline::new(REAL);

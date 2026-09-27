@@ -300,6 +300,20 @@ payloads above `icmp_sock::ICMP_ECHO_MAX_PAYLOAD` fail
 Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
+TCP snapshots expose Linux `get_tcp4_sock` transport fields rather than
+placeholders: the active timer and USER_HZ deadline, retransmit/probe counts,
+RTO and delayed-ACK deadline, congestion window, and slow-start threshold.
+`tcp_info(id)` snapshots the authoritative live TCB fields used by Linux
+`TCP_INFO`: state, congestion state, negotiated options/scales, timer and RTT
+metrics, MSS/window values, queue depth, and retransmission state. Metrics the
+stack does not track are omitted and the socket ABI reports them as zero.
+Per-TCB transport controls are effective, not passive metadata:
+`TCP_SYNCNT` selects the SYN retransmit limit and blocking-connect deadline;
+`TCP_NOTSENT_LOWAT` backpressures writes at the unsent-byte threshold;
+`TCP_THIN_LINEAR_TIMEOUTS` suppresses exponential RTO growth for thin flights;
+`TCP_THIN_DUPACK` is retained as Linux's accepted no-op (and reads back zero);
+and `TCP_DEFER_ACCEPT` holds ACK-only children off the accept queue until
+data arrives or the configured deadline expires.
 DHCP reply and DNS side channels are keyed by the ingress interface's network
 namespace. The final namespace reference reclaims its TCP, UDP, raw, ICMP,
 ARP-resolution, DHCP, route, and netfilter state; physical interfaces return

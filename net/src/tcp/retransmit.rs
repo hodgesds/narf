@@ -140,12 +140,19 @@ impl RttEstimator {
     /// 60 s cap). Returns true if the caller may retry; false if
     /// the back-off counter exceeded `MAX_RETRANSMITS`.
     pub fn back_off(&mut self) -> bool {
+        self.back_off_with_limit(MAX_RETRANSMITS, false)
+    }
+
+    /// Per-socket retry limit and Linux thin-stream linear-timeout mode.
+    pub fn back_off_with_limit(&mut self, limit: u32, linear: bool) -> bool {
         self.backoff_count = self.backoff_count.saturating_add(1);
-        if self.backoff_count > MAX_RETRANSMITS {
+        if self.backoff_count > limit {
             return false;
         }
-        let doubled = self.rto_ns.saturating_mul(2);
-        self.rto_ns = doubled.clamp(RTO_MIN_NS, RTO_MAX_NS);
+        if !linear {
+            let doubled = self.rto_ns.saturating_mul(2);
+            self.rto_ns = doubled.clamp(RTO_MIN_NS, RTO_MAX_NS);
+        }
         true
     }
 
@@ -227,5 +234,15 @@ mod tests {
         }
         // One more should return false.
         assert!(!e.back_off());
+    }
+
+    #[test]
+    fn thin_linear_timeout_counts_without_exponential_backoff() {
+        let mut e = RttEstimator::new();
+        let initial = e.current_rto();
+        assert!(e.back_off_with_limit(2, true));
+        assert_eq!(e.current_rto(), initial);
+        assert!(e.back_off_with_limit(2, true));
+        assert!(!e.back_off_with_limit(2, true));
     }
 }

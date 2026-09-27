@@ -174,7 +174,9 @@ pub const MAX_OUTSTANDING: usize = 256;
 // stack agree on numeric values out of this module.
 
 pub const TCP_NODELAY: i32 = 1;
-pub const TCP_KEEPALIVE: i32 = 9;
+/// Internal key for SOL_SOCKET/SO_KEEPALIVE; kept outside TCP optname space
+/// because Linux TCP_DEFER_ACCEPT also has numeric value 9 at IPPROTO_TCP.
+pub const TCP_KEEPALIVE: i32 = 0x1_0009;
 pub const TCP_KEEPIDLE: i32 = 4;
 pub const TCP_KEEPINTVL: i32 = 5;
 pub const TCP_KEEPCNT: i32 = 6;
@@ -183,6 +185,11 @@ pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_QUICKACK: i32 = 12;
 pub const TCP_MAXSEG: i32 = 2;
 pub const TCP_CORK: i32 = 3;
+pub const TCP_SYNCNT: i32 = 7;
+pub const TCP_DEFER_ACCEPT: i32 = 9;
+pub const TCP_THIN_LINEAR_TIMEOUTS: i32 = 16;
+pub const TCP_THIN_DUPACK: i32 = 17;
+pub const TCP_NOTSENT_LOWAT: i32 = 25;
 
 // ── TCB ─────────────────────────────────────────────────────────────
 
@@ -268,6 +275,12 @@ pub struct Tcb {
     pub cork_enabled: bool,
     pub quickack_left: u8,
     pub user_timeout_ns: u64,
+    pub syn_retries: u8,
+    pub notsent_lowat: u32,
+    pub thin_linear_timeouts: bool,
+    pub defer_accept_secs: u32,
+    pub defer_accept_listener: Option<u32>,
+    pub defer_accept_deadline_cycles: u64,
 
     // ── TIME-WAIT timer ──
     pub time_wait_deadline_cycles: u64,
@@ -415,6 +428,12 @@ impl Tcb {
             cork_enabled: false,
             quickack_left: 0,
             user_timeout_ns: 0,
+            syn_retries: 6,
+            notsent_lowat: u32::MAX,
+            thin_linear_timeouts: false,
+            defer_accept_secs: 0,
+            defer_accept_listener: None,
+            defer_accept_deadline_cycles: 0,
             time_wait_deadline_cycles: 0,
             fin_sent: false,
             fin_seq: 0,
@@ -849,6 +868,114 @@ pub struct TcbSnapshot {
     pub tx_queue: u32,
     pub rx_queue: u32,
     pub retrnsmt: u32,
+    /// Linux `/proc/net/tcp` timer selector: 1=retransmit, 2=keepalive,
+    /// 3=TIME_WAIT, 4=zero-window probe, 0=no active timer.
+    pub timer_active: u8,
+    /// Time until the active timer expires, in Linux USER_HZ (centiseconds).
+    pub timer_expires: u32,
+    pub probes_out: u32,
+    /// Retransmission timeout and delayed-ACK timeout in USER_HZ.
+    pub rto: u32,
+    pub ack_timeout: u32,
+    /// Congestion window and slow-start threshold in segments.
+    pub snd_cwnd: u32,
+    pub snd_ssthresh: i32,
+}
+
+/// Authoritative subset of Linux `struct tcp_info`. Fields absent here are
+/// deliberately reported as zero by the socket ABI rather than fabricated.
+#[derive(Copy, Clone, Debug)]
+pub struct TcpInfoSnapshot {
+    pub state: u8,
+    pub ca_state: u8,
+    pub retransmits: u8,
+    pub probes: u8,
+    pub backoff: u8,
+    pub options: u8,
+    pub snd_wscale: u8,
+    pub rcv_wscale: u8,
+    pub rto_us: u32,
+    pub ato_us: u32,
+    pub snd_mss: u32,
+    pub rcv_mss: u32,
+    pub unacked: u32,
+    pub pmtu: u32,
+    pub rtt_us: u32,
+    pub rttvar_us: u32,
+    pub snd_ssthresh: u32,
+    pub snd_cwnd: u32,
+    pub advmss: u32,
+    pub reordering: u32,
+    pub rcv_space: u32,
+    pub total_retrans: u32,
+    pub notsent_bytes: u32,
+    pub snd_wnd: u32,
+    pub rcv_wnd: u32,
+}
+
+pub fn tcp_info(id: u32) -> Option<TcpInfoSnapshot> {
+    let arc = lookup_tcb(id)?;
+    let t = arc.lock();
+    let mss = t.cong.mss.max(1);
+    let mut options = 0u8;
+    if t.opts.timestamps_active {
+        options |= 1;
+    }
+    if t.opts.sack_active {
+        options |= 2;
+    }
+    if t.opts.wscale_active {
+        options |= 4;
+    }
+    Some(TcpInfoSnapshot {
+        state: tcp_state_code(t.state),
+        ca_state: if t.rto_count > 0 {
+            4
+        } else if t.cong.in_recovery {
+            3
+        } else {
+            0
+        },
+        retransmits: t.rto_count.min(u8::MAX as u32) as u8,
+        probes: t.keepalive_probes_sent,
+        backoff: t.rtt.backoff_count.min(u8::MAX as u32) as u8,
+        options,
+        snd_wscale: if t.opts.wscale_active {
+            t.opts.peer_wscale
+        } else {
+            0
+        },
+        rcv_wscale: if t.opts.wscale_active {
+            t.opts.our_wscale
+        } else {
+            0
+        },
+        rto_us: (t.rtt.current_rto() / 1_000).min(u32::MAX as u64) as u32,
+        ato_us: if t.delayed_ack_deadline_cycles == 0 {
+            0
+        } else {
+            40_000
+        },
+        snd_mss: t.opts.peer_mss as u32,
+        rcv_mss: t.opts.our_mss as u32,
+        unacked: t.retx_queue.len().min(u32::MAX as usize) as u32,
+        pmtu: 1500,
+        rtt_us: (t.rtt.srtt_ns / 1_000).min(u32::MAX as u64) as u32,
+        rttvar_us: (t.rtt.rttvar_ns / 1_000).min(u32::MAX as u64) as u32,
+        snd_ssthresh: if t.cong.ssthresh == u32::MAX {
+            u32::MAX
+        } else {
+            t.cong.ssthresh / mss
+        },
+        snd_cwnd: t.cong.cwnd / mss,
+        advmss: t.opts.our_mss as u32,
+        reordering: 3,
+        rcv_space: t.recv_buf.limit.min(u32::MAX as usize) as u32,
+        total_retrans: t.rto_count,
+        notsent_bytes: t.send_buf.len().min(u32::MAX as usize) as u32,
+        snd_wnd: t.snd_wnd,
+        rcv_wnd: t.rcv_wnd,
+    })
 }
 
 /// Snapshot every TCB in the table. Cheap: a few cycles per entry
@@ -859,6 +986,7 @@ pub fn snapshot() -> alloc::vec::Vec<TcbSnapshot> {
 
 pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
     let mut out = alloc::vec::Vec::new();
+    let now = narf_scheduler::narf_time::now_cycles();
     for shard in TCB_TABLE.iter() {
         let g = shard.lock();
         let m = match g.as_ref() {
@@ -870,6 +998,23 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
             if t.net_ns_id != net_ns_id {
                 continue;
             }
+            let (timer_active, deadline) = if t.retx_deadline_cycles != 0 {
+                (1, t.retx_deadline_cycles)
+            } else if t.persist_deadline_cycles != 0 {
+                (4, t.persist_deadline_cycles)
+            } else if t.keepalive_enabled {
+                let idle = narf_scheduler::narf_time::ns_to_cycles(t.keepalive_idle_ns);
+                (2, t.last_progress_cycles.wrapping_add(idle))
+            } else if t.time_wait_deadline_cycles != 0 {
+                (3, t.time_wait_deadline_cycles)
+            } else {
+                (0, 0)
+            };
+            let to_user_hz = |cycles: u64| -> u32 {
+                (narf_scheduler::narf_time::cycles_to_ns(cycles) / 10_000_000).min(u32::MAX as u64)
+                    as u32
+            };
+            let mss = t.cong.mss.max(1);
             out.push(TcbSnapshot {
                 local_addr: t.local_addr,
                 local_port: t.local_port,
@@ -881,6 +1026,31 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
                 // bytes waiting for the user, i.e. limit - free_window.
                 rx_queue: (t.recv_buf.limit as u32).saturating_sub(t.recv_buf.free_window()),
                 retrnsmt: t.rto_count,
+                timer_active,
+                timer_expires: if deadline == 0 {
+                    0
+                } else {
+                    to_user_hz(deadline.saturating_sub(now))
+                },
+                probes_out: if timer_active == 4 {
+                    t.rto_count
+                } else if timer_active == 2 {
+                    t.keepalive_probes_sent as u32
+                } else {
+                    0
+                },
+                rto: (t.rtt.current_rto() / 10_000_000).min(u32::MAX as u64) as u32,
+                ack_timeout: if t.delayed_ack_deadline_cycles == 0 {
+                    0
+                } else {
+                    to_user_hz(t.delayed_ack_deadline_cycles.saturating_sub(now))
+                },
+                snd_cwnd: t.cong.cwnd / mss,
+                snd_ssthresh: if t.cong.ssthresh == u32::MAX {
+                    -1
+                } else {
+                    (t.cong.ssthresh / mss).min(i32::MAX as u32) as i32
+                },
             });
         }
     }
@@ -963,6 +1133,17 @@ pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Res
     connect_errno_in(net_ns_id, remote_addr, remote_port).map_err(|_| ())
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct ConnectOptions {
+    pub syn_retries: u8,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self { syn_retries: 6 }
+    }
+}
+
 /// Active open. On failure returns the errno Linux's `connect(2)` reports
 /// for the same cause:
 ///
@@ -979,6 +1160,20 @@ pub fn connect_errno_in(
     net_ns_id: u64,
     remote_addr: [u8; 4],
     remote_port: u16,
+) -> Result<u32, i32> {
+    connect_errno_with_options_in(
+        net_ns_id,
+        remote_addr,
+        remote_port,
+        ConnectOptions::default(),
+    )
+}
+
+pub fn connect_errno_with_options_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+    options: ConnectOptions,
 ) -> Result<u32, i32> {
     let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(errno::ENETUNREACH as i32)?;
     // Resolve the ROUTE's next hop, not the interface's `gateway` field.
@@ -1015,14 +1210,23 @@ pub fn connect_errno_in(
     )
     .with_net_ns(net_ns_id);
     tcb.state = TcpState::SynSent;
+    tcb.syn_retries = options.syn_retries.clamp(1, 127);
     let (id, arc) = install_tcb(tcb);
 
     // Emit the SYN with our negotiation options.
     send_syn(&arc, false);
 
-    // Active-spin until the FSM advances out of SYN-SENT or the
-    // deadline expires.
-    let deadline = narf_scheduler::narf_time::Deadline::after_ns(5_000_000_000);
+    // Linux TCP_SYNCNT counts SYN retransmits. Derive the blocking-connect
+    // deadline from the same exponentially backed-off 1s initial RTO rather
+    // than imposing the old fixed five-second ceiling.
+    let mut timeout_secs = 1u64;
+    let mut rto_secs = 1u64;
+    for _ in 0..options.syn_retries {
+        rto_secs = rto_secs.saturating_mul(2).min(60);
+        timeout_secs = timeout_secs.saturating_add(rto_secs);
+    }
+    let deadline =
+        narf_scheduler::narf_time::Deadline::after_ns(timeout_secs.saturating_mul(1_000_000_000));
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
@@ -1139,7 +1343,12 @@ pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32> {
         if buf.is_empty() {
             return Ok(0);
         }
-        t.send_buf.write(buf)
+        let queued = t.send_buf.unsent_len().min(u32::MAX as usize) as u32;
+        if queued >= t.notsent_lowat {
+            return Err(errno::EAGAIN as i32);
+        }
+        let room = t.notsent_lowat.saturating_sub(queued) as usize;
+        t.send_buf.write(&buf[..buf.len().min(room)])
     };
     if n == 0 {
         return Err(errno::EAGAIN as i32);
@@ -1343,6 +1552,12 @@ pub fn setsockopt_int(id: u32, opt: i32, val: i32) -> Result<(), ()> {
         TCP_CORK => {
             t.cork_enabled = val != 0;
         }
+        TCP_SYNCNT => t.syn_retries = val.clamp(1, 127) as u8,
+        TCP_DEFER_ACCEPT => t.defer_accept_secs = val.max(0) as u32,
+        TCP_THIN_LINEAR_TIMEOUTS => t.thin_linear_timeouts = val != 0,
+        // Current Linux retains this legacy option as an accepted no-op.
+        TCP_THIN_DUPACK => {}
+        TCP_NOTSENT_LOWAT => t.notsent_lowat = val as u32,
         _ => return Err(()),
     }
     Ok(())
@@ -1384,6 +1599,11 @@ pub fn getsockopt_int(id: u32, opt: i32) -> Result<i32, ()> {
         TCP_MAXSEG => t.opts.our_mss as i32,
         TCP_QUICKACK => (t.quickack_left > 0) as i32,
         TCP_CORK => t.cork_enabled as i32,
+        TCP_SYNCNT => t.syn_retries as i32,
+        TCP_DEFER_ACCEPT => t.defer_accept_secs as i32,
+        TCP_THIN_LINEAR_TIMEOUTS => t.thin_linear_timeouts as i32,
+        TCP_THIN_DUPACK => 0,
+        TCP_NOTSENT_LOWAT => t.notsent_lowat as i32,
         _ => return Err(()),
     };
     Ok(v)
@@ -1843,6 +2063,7 @@ pub fn tick_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     tick_persist(arc);
     // Keepalive timer.
     tick_keepalive(arc);
+    tick_deferred_accept(arc);
     // TIME-WAIT reaper.
     tick_time_wait(arc);
 }
@@ -1857,7 +2078,13 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Back-off; tear down if exceeded.
     let backoff_ok = {
         let mut t = arc.lock();
-        let ok = t.rtt.back_off();
+        let limit = if matches!(t.state, TcpState::SynSent | TcpState::SynReceived) {
+            t.syn_retries as u32
+        } else {
+            super::retransmit::MAX_RETRANSMITS
+        };
+        let thin = t.thin_linear_timeouts && t.flightsize <= t.cong.mss.saturating_mul(4);
+        let ok = t.rtt.back_off_with_limit(limit, thin);
         if ok {
             t.rto_count = t.rto_count.saturating_add(1);
             let now = narf_scheduler::narf_time::now_cycles();
@@ -2607,13 +2834,6 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
         t.retx_deadline_cycles = 0;
         t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
     }
-    // Look for a parent LISTEN TCB to push this onto; it returns the
-    // listener it steered the connection to.
-    let listener_id = add_to_listener_accept_queue(arc);
-    // A connection just became accept-ready — wake the worker parked in
-    // epoll_wait/poll on THAT listener (keyed by the listener's TCB id so
-    // only the steered worker wakes, not the whole REUSEPORT group).
-    crate::readiness::notify(listener_id.map(|i| i as u64).unwrap_or(0));
     let win = rcv_window(arc);
     let mut advanced = false;
     if !payload.is_empty() {
@@ -2624,6 +2844,11 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     }
     if !payload.is_empty() || hdr.flags & FLAG_FIN != 0 {
         schedule_ack(arc, ack_need(hdr, payload.len(), advanced, win));
+    }
+    // TCP_DEFER_ACCEPT holds an ACK-only handshake off the accept queue until
+    // data arrives or its timeout expires.
+    if let Some(listener_id) = add_to_listener_accept_queue(arc, !payload.is_empty()) {
+        crate::readiness::notify(listener_id as u64);
     }
 }
 
@@ -2649,7 +2874,7 @@ fn reuseport_flow_hash(remote_addr: [u8; 4], remote_port: u16, local_port: u16) 
 
 /// Steer a completed passive-open onto a listener's accept queue and
 /// return that listener's TCB id (for the targeted accept-ready wake).
-fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<u32> {
+fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>, has_data: bool) -> Option<u32> {
     let (net_ns_id, local_addr, local_port, remote_addr, remote_port, id) = {
         let t = arc.lock();
         (
@@ -2680,10 +2905,51 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<u32> 
         }
     };
     let mut l = listen_arc.lock();
+    if l.defer_accept_secs != 0 && !has_data {
+        let timeout = narf_scheduler::narf_time::ns_to_cycles(
+            (l.defer_accept_secs as u64).saturating_mul(1_000_000_000),
+        );
+        let mut child = arc.lock();
+        child.defer_accept_listener = Some(l.id);
+        child.defer_accept_deadline_cycles =
+            narf_scheduler::narf_time::now_cycles().wrapping_add(timeout);
+        return None;
+    }
     if l.accept_queue.len() < l.backlog {
         l.accept_queue.push_back(id);
     }
     Some(l.id)
+}
+
+fn complete_deferred_accept(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let (listener_id, child_id) = {
+        let mut child = arc.lock();
+        let Some(listener_id) = child.defer_accept_listener.take() else {
+            return;
+        };
+        child.defer_accept_deadline_cycles = 0;
+        (listener_id, child.id)
+    };
+    let Some(listener) = lookup_tcb(listener_id) else {
+        return;
+    };
+    let mut listener = listener.lock();
+    if listener.state == TcpState::Listen && listener.accept_queue.len() < listener.backlog {
+        listener.accept_queue.push_back(child_id);
+        drop(listener);
+        crate::readiness::notify(listener_id as u64);
+    }
+}
+
+fn tick_deferred_accept(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let due = {
+        let t = arc.lock();
+        t.defer_accept_deadline_cycles != 0
+            && narf_scheduler::narf_time::now_cycles() >= t.defer_accept_deadline_cycles
+    };
+    if due {
+        complete_deferred_accept(arc);
+    }
 }
 
 fn handle_in_established(
@@ -2698,6 +2964,9 @@ fn handle_in_established(
     if !payload.is_empty() {
         rxtx_note_rx();
         advanced = enqueue_recv(arc, hdr.sequence, payload);
+    }
+    if !payload.is_empty() {
+        complete_deferred_accept(arc);
     }
     if hdr.flags & FLAG_FIN != 0 {
         process_fin(arc, hdr, payload.len());
@@ -2929,7 +3198,8 @@ fn handle_ack(
         t.scoreboard.prune_below(ack);
     } else if dup_candidate && ack == t.snd_una && !t.retx_queue.is_empty() {
         // Duplicate ACK — fast retransmit machinery.
-        if t.cong.on_dup_ack() {
+        let fast_retransmit_now = t.cong.on_dup_ack();
+        if fast_retransmit_now {
             // Fast retransmit + enter fast recovery.
             let now = narf_scheduler::narf_time::now_cycles();
             let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;

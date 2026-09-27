@@ -7273,6 +7273,43 @@ fn smoke_tcp_setsockopt_maxseg_floor() -> TestResult {
 }
 kernel_test_in!("net/tcp", smoke_tcp_setsockopt_maxseg_floor);
 
+fn smoke_tcp_transport_options_reach_live_tcb() -> TestResult {
+    use crate::tcp::core::{
+        __install_test_tcb, __with_tcb_mut, getsockopt_int, send_errno, setsockopt_int,
+        TCP_DEFER_ACCEPT, TCP_NOTSENT_LOWAT, TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS,
+    };
+    use crate::tcp::state_machine::TcpState;
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        2470,
+        [10, 0, 2, 2],
+        80,
+        TcpState::Established,
+    );
+    for (name, value) in [
+        (TCP_SYNCNT, 2),
+        (TCP_DEFER_ACCEPT, 3),
+        (TCP_THIN_LINEAR_TIMEOUTS, 1),
+        (TCP_THIN_DUPACK, 0),
+        (TCP_NOTSENT_LOWAT, 4),
+    ] {
+        setsockopt_int(id, name, value).expect("transport option set");
+        if getsockopt_int(id, name).ok() != Some(value) {
+            return TestResult::Fail("transport option did not reach live TCB");
+        }
+    }
+    // Keep the first write in the unsent queue: with a zero peer window the
+    // interface pump cannot turn this into in-flight data behind the test.
+    __with_tcb_mut(id, |t| t.snd_wnd = 0).expect("installed TCB");
+    if send_errno(id, b"abcd") != Ok(4)
+        || send_errno(id, b"e") != Err(narf_lib::errno::EAGAIN as i32)
+    {
+        return TestResult::Fail("TCP_NOTSENT_LOWAT did not apply backpressure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_transport_options_reach_live_tcb);
+
 fn smoke_tcp_sendbuf_full_slices() -> TestResult {
     use crate::tcp::socket_buf::SendBuf;
     let mut s = SendBuf::new(1024, 0);

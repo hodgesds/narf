@@ -1108,6 +1108,31 @@ reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
 
+The TCP socket-option compatibility surface validates and round-trips Linux
+`TCP_SYNCNT`, `TCP_LINGER2`, `TCP_DEFER_ACCEPT`, `TCP_WINDOW_CLAMP`,
+`TCP_THIN_LINEAR_TIMEOUTS`, `TCP_THIN_DUPACK`, `TCP_FASTOPEN_NO_COOKIE`,
+`TCP_NOTSENT_LOWAT`, `TCP_INQ`, and `TCP_TX_DELAY`; ordinary TCP sockets report
+zero for `TCP_IS_MPTCP`. Unknown protocol options return `ENOPROTOOPT` and are
+never accepted without effect.
+`getsockopt(TCP_INFO)` returns the current Linux UAPI `struct tcp_info` size,
+honors short-buffer truncation, and fills transport metrics from the live TCB;
+untracked statistics are zero.
+TCP options configured before a wired `connect` or `listen` are applied when
+the TCB is created. Accepted sockets inherit the listener's option state and
+apply the transport-effective values to the accepted child TCB.
+The pre-connect `TCP_SYNCNT` value is passed into active-open TCB creation.
+`TCP_NOTSENT_LOWAT`, `TCP_DEFER_ACCEPT`, and `TCP_THIN_LINEAR_TIMEOUTS` are
+forwarded to live TCBs and control write backpressure, accept readiness, and
+RTO backoff respectively. `TCP_THIN_DUPACK` matches current Linux as an
+accepted no-op that reads back zero.
+
+The TCP socket-option compatibility surface validates and round-trips Linux
+`TCP_SYNCNT`, `TCP_LINGER2`, `TCP_DEFER_ACCEPT`, `TCP_WINDOW_CLAMP`,
+`TCP_THIN_LINEAR_TIMEOUTS`, `TCP_THIN_DUPACK`, `TCP_FASTOPEN_NO_COOKIE`,
+`TCP_NOTSENT_LOWAT`, `TCP_INQ`, and `TCP_TX_DELAY`; ordinary TCP sockets report
+zero for `TCP_IS_MPTCP`. Unsupported options return Linux's option-specific
+errno rather than succeeding silently.
+
 AF_INET `SOCK_DGRAM` (UDP) follows Linux v6.12 `net/ipv4/{af_inet,udp,
 datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
 - `bind` requires a 16-byte `sockaddr_in` (`EINVAL`), `AF_INET` or

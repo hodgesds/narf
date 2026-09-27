@@ -650,6 +650,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         );
     }
 
+    if let Some(level) = narf_boot::args().console_loglevel() {
+        console::klog::set_console_loglevel(level);
+    }
+
     let _ = writeln!(
         console::Writer,
         "NARF Stage 1 Wave 1 — hello from a bare kernel."
@@ -4319,7 +4323,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // at ~2 seconds so the boot log is fully emitted.
         let deadline = narf_time::Deadline::after_ms(2_000);
         narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
-        let _ = writeln!(console::Writer, "  boot-smoke: clean exit");
+        let _ = writeln!(console::PriorityWriter::<3>, "  boot-smoke: clean exit");
         // SAFETY: exit_kernel never returns; this is the only post-
         // boot action we're authorised to take.
         // SAFETY: Valid memory or trusted environment

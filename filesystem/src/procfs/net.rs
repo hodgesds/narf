@@ -59,6 +59,13 @@ pub struct TcbSnapshot {
     pub tx_queue: u32,
     pub rx_queue: u32,
     pub retrnsmt: u32,
+    pub timer_active: u8,
+    pub timer_expires: u32,
+    pub probes_out: u32,
+    pub rto: u32,
+    pub ack_timeout: u32,
+    pub snd_cwnd: u32,
+    pub snd_ssthresh: i32,
     pub uid: u32,
     pub timeout: u32,
     pub inode: u32,
@@ -638,18 +645,23 @@ impl ProcFile for TcpFile {
             let remote = fmt_ipv4_port(tcb.remote_addr, tcb.remote_port);
             let _ = writeln!(
                 s,
-                "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} ",
+                "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {} 2 0000000000000000 {:>8} {:>8} 0 {:>5} {:>5}",
                 i,
                 local,
                 remote,
                 tcb.state_code,
                 tcb.tx_queue,
                 tcb.rx_queue,
-                0u8,
-                0u32,
+                tcb.timer_active,
+                tcb.timer_expires,
                 tcb.retrnsmt,
                 tcb.uid,
+                tcb.probes_out,
                 tcb.inode,
+                tcb.rto,
+                tcb.ack_timeout,
+                tcb.snd_cwnd,
+                tcb.snd_ssthresh,
             );
         }
         s.into_bytes()
@@ -770,6 +782,123 @@ impl ProcFile for Raw6File {
             );
         }
         s.into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct SockstatFile;
+
+impl ProcFile for SockstatFile {
+    fn read(&self) -> Vec<u8> {
+        use core::fmt::Write as _;
+        let tcp = tcp_snapshot();
+        let udp = udp_snapshot();
+        let raw = raw_snapshot();
+        let tcp_inuse = tcp.iter().filter(|t| t.state_code != 0x06).count();
+        let tcp_tw = tcp.len().saturating_sub(tcp_inuse);
+        let used = tcp
+            .len()
+            .saturating_add(udp.len())
+            .saturating_add(raw.len());
+        let mut s = String::new();
+        let _ = writeln!(s, "sockets: used {used}");
+        let _ = writeln!(
+            s,
+            "TCP: inuse {tcp_inuse} orphan 0 tw {tcp_tw} alloc {} mem 0",
+            tcp.len()
+        );
+        let _ = writeln!(s, "UDP: inuse {} mem 0", udp.len());
+        let _ = writeln!(s, "UDPLITE: inuse 0");
+        let _ = writeln!(s, "RAW: inuse {}", raw.len());
+        let _ = writeln!(s, "FRAG: inuse 0 memory 0");
+        s.into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct Sockstat6File;
+
+impl ProcFile for Sockstat6File {
+    fn read(&self) -> Vec<u8> {
+        use core::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "TCP6: inuse {}", tcp6_snapshot().len());
+        let _ = writeln!(s, "UDP6: inuse {}", udp6_snapshot().len());
+        let _ = writeln!(s, "UDPLITE6: inuse 0");
+        let _ = writeln!(s, "RAW6: inuse {}", raw6_snapshot().len());
+        let _ = writeln!(s, "FRAG6: inuse 0 memory 0");
+        s.into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct NetstatFile;
+
+impl ProcFile for NetstatFile {
+    fn read(&self) -> Vec<u8> {
+        let m = snmp_snapshot();
+        // Linux emits each MIB family as a header row followed by a value row.
+        // Keep the two lists positionally identical: iproute2 and procps parse
+        // them by zipping fields rather than by accepting ad-hoc key/value text.
+        alloc::format!(
+            "TcpExt: SyncookiesSent SyncookiesRecv SyncookiesFailed EmbryonicRsts PruneCalled RcvPruned OfoPruned OutOfWindowIcmps LockDroppedIcmps TW TWRecycled TWKilled PAWSActive PAWSEstab DelayedACKs DelayedACKLocked DelayedACKLost ListenOverflows ListenDrops TCPTimeouts TCPRetransFail\n\
+TcpExt: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0\n\
+IpExt: InNoRoutes InTruncatedPkts InMcastPkts OutMcastPkts InBcastPkts OutBcastPkts InOctets OutOctets InNoECTPkts InECT1Pkts InECT0Pkts InCEPkts\n\
+IpExt: {} 0 0 0 0 0 0 0 0 0 0 0\n\
+MPTcpExt: MPCapableSYNRX MPCapableSYNTX MPCapableSYNACKRX MPCapableACKRX\n\
+MPTcpExt: 0 0 0 0\n",
+            m.tcp_attempt_fails,
+            m.ip_out_no_routes,
+        )
+        .into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct Snmp6File;
+
+impl ProcFile for Snmp6File {
+    fn read(&self) -> Vec<u8> {
+        let m = snmp_snapshot();
+        alloc::format!(
+            "Ip6InReceives                  {}\n\
+Ip6InHdrErrors                 {}\n\
+Ip6InAddrErrors                {}\n\
+Ip6InUnknownProtos             {}\n\
+Ip6InDiscards                  {}\n\
+Ip6InDelivers                  {}\n\
+Ip6OutForwDatagrams            {}\n\
+Ip6OutRequests                 {}\n\
+Ip6OutDiscards                 {}\n\
+Ip6OutNoRoutes                 {}\n\
+Icmp6InMsgs                    {}\n\
+Icmp6InErrors                  {}\n\
+Icmp6OutMsgs                   {}\n\
+Icmp6OutErrors                 {}\n\
+Udp6InDatagrams                {}\n\
+Udp6NoPorts                    {}\n\
+Udp6InErrors                   {}\n\
+Udp6OutDatagrams               {}\n",
+            m.ip_in_receives,
+            m.ip_in_hdr_errors,
+            m.ip_in_addr_errors,
+            m.ip_in_unknown_protos,
+            m.ip_in_discards,
+            m.ip_in_delivers,
+            m.ip_forwd_datagrams,
+            m.ip_out_requests,
+            m.ip_out_discards,
+            m.ip_out_no_routes,
+            m.icmp_in_msgs,
+            m.icmp_in_errors,
+            m.icmp_out_msgs,
+            m.icmp_out_errors,
+            m.udp_in_datagrams,
+            m.udp_no_ports,
+            m.udp_in_errors,
+            m.udp_out_datagrams,
+        )
+        .into_bytes()
     }
 }
 
@@ -1140,6 +1269,10 @@ pub fn register_all() {
     register_proc("net/igmp", Arc::new(IgmpFile));
     register_proc("net/igmp6", Arc::new(Igmp6File));
     register_proc("net/snmp", Arc::new(SnmpFile));
+    register_proc("net/netstat", Arc::new(NetstatFile));
+    register_proc("net/snmp6", Arc::new(Snmp6File));
+    register_proc("net/sockstat", Arc::new(SockstatFile));
+    register_proc("net/sockstat6", Arc::new(Sockstat6File));
     register_proc("net/nf_conntrack", Arc::new(NfConntrackFile));
 }
 
@@ -1177,6 +1310,13 @@ fn smoke_tcp_one_socket_emits_one_line() -> TestResult {
         tx_queue: 0,
         rx_queue: 0,
         retrnsmt: 0,
+        timer_active: 0,
+        timer_expires: 0,
+        probes_out: 0,
+        rto: 100,
+        ack_timeout: 0,
+        snd_cwnd: 10,
+        snd_ssthresh: -1,
         uid: 0,
         timeout: 0,
         inode: 0,
@@ -1194,6 +1334,49 @@ fn smoke_tcp_one_socket_emits_one_line() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs/net", smoke_tcp_one_socket_emits_one_line);
 
+fn smoke_tcp_linux_timer_and_tail_columns() -> TestResult {
+    let snap = alloc::vec![TcbSnapshot {
+        local_addr: [10, 0, 0, 1],
+        local_port: 0x1234,
+        remote_addr: [10, 0, 0, 2],
+        remote_port: 0x5678,
+        state_code: 0x01,
+        tx_queue: 0x11,
+        rx_queue: 0x22,
+        retrnsmt: 3,
+        timer_active: 1,
+        timer_expires: 0x44,
+        probes_out: 5,
+        rto: 100,
+        ack_timeout: 4,
+        snd_cwnd: 10,
+        snd_ssthresh: 7,
+        uid: 42,
+        timeout: 5,
+        inode: 99,
+    }];
+    let ok = install_tcp_then(snap, || {
+        let body = TcpFile.read();
+        let row = core::str::from_utf8(&body)
+            .unwrap_or("")
+            .lines()
+            .nth(1)
+            .unwrap_or("");
+        row.contains("0100000A:1234 0200000A:5678 01 00000011:00000022 01:00000044 00000003")
+            && row.contains("   42        5 99 2 0000000000000000")
+            && row.ends_with("     100        4 0    10     7")
+    });
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("tcp Linux timer/tail columns mismatch")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_tcp_linux_timer_and_tail_columns
+);
+
 fn smoke_tcp_address_hex_little_endian() -> TestResult {
     // 127.0.0.1:80 should render as 0100007F:0050.
     let s = fmt_ipv4_port([127, 0, 0, 1], 80);
@@ -1204,6 +1387,84 @@ fn smoke_tcp_address_hex_little_endian() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/net", smoke_tcp_address_hex_little_endian);
+
+fn smoke_sockstat_linux_shape_and_counts() -> TestResult {
+    let snap = alloc::vec![TcbSnapshot {
+        local_addr: [0; 4],
+        local_port: 80,
+        remote_addr: [0; 4],
+        remote_port: 0,
+        state_code: 0x0A,
+        tx_queue: 0,
+        rx_queue: 0,
+        retrnsmt: 0,
+        timer_active: 0,
+        timer_expires: 0,
+        probes_out: 0,
+        rto: 100,
+        ack_timeout: 0,
+        snd_cwnd: 10,
+        snd_ssthresh: -1,
+        uid: 0,
+        timeout: 0,
+        inode: 0,
+    }];
+    let ok = install_tcp_then(snap, || {
+        let body = SockstatFile.read();
+        let text = core::str::from_utf8(&body).unwrap_or("");
+        text.starts_with("sockets: used ")
+            && text.contains("TCP: inuse 1 orphan 0 tw 0 alloc 1 mem 0\n")
+            && text.contains("UDPLITE: inuse 0\n")
+            && text.ends_with("FRAG: inuse 0 memory 0\n")
+    });
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("sockstat Linux shape/count mismatch")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_sockstat_linux_shape_and_counts
+);
+
+fn smoke_netstat_has_paired_linux_mib_rows() -> TestResult {
+    let body = NetstatFile.read();
+    let text = core::str::from_utf8(&body).unwrap_or("");
+    let lines: Vec<&str> = text.lines().collect();
+    let paired = lines.chunks_exact(2).all(|pair| {
+        pair[0].split_whitespace().count() == pair[1].split_whitespace().count()
+            && pair[0].split(':').next() == pair[1].split(':').next()
+    });
+    if lines.len() == 6 && paired {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("netstat MIB header/value rows are not positional pairs")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_netstat_has_paired_linux_mib_rows
+);
+
+fn smoke_snmp6_uses_one_counter_per_line() -> TestResult {
+    let body = Snmp6File.read();
+    let text = core::str::from_utf8(&body).unwrap_or("");
+    if text
+        .lines()
+        .all(|line| line.split_whitespace().count() == 2)
+        && text.contains("Ip6InReceives")
+        && text.contains("Udp6OutDatagrams")
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("snmp6 counter layout mismatch")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_snmp6_uses_one_counter_per_line
+);
 
 fn smoke_tcp6_address_is_32_hex_digits() -> TestResult {
     let mut addr = [0u8; 16];
@@ -1580,6 +1841,10 @@ fn smoke_proc_net_dir_lists_all_registered_files() -> TestResult {
         "igmp",
         "igmp6",
         "snmp",
+        "netstat",
+        "snmp6",
+        "sockstat",
+        "sockstat6",
         "nf_conntrack",
     ];
     let all_present = needed.iter().all(|n| names.iter().any(|m| m == n));

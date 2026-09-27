@@ -12,7 +12,7 @@
 // `cargo xtask host-test`                        — fast host unit-test gate
 // `cargo xtask image --arch=<arch>`              — bootable UEFI media
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -2616,10 +2616,24 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
 }
 
 use std::time::Duration;
-use wait_timeout::ChildExt;
 
 fn run_cmd(args: &BuildArgs) -> Result<()> {
     run_cmd_inner(args, false)
+}
+
+/// Emit enough serial context to diagnose a failed gate without flooding the
+/// terminal with an entire multi-thousand-line boot transcript.
+fn emit_serial_tail(serial: &[u8]) {
+    const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+    let start = serial.len().saturating_sub(MAX_DIAGNOSTIC_BYTES);
+    let mut stderr = std::io::stderr().lock();
+    if start != 0 {
+        let _ = writeln!(stderr, "[... {} serial bytes omitted ...]", start);
+    }
+    let _ = stderr.write_all(&serial[start..]);
+    if serial.last().is_some_and(|byte| *byte != b'\n') {
+        let _ = writeln!(stderr);
+    }
 }
 
 /// Boot the kernel under QEMU. When `gate_exit` is set (the `test`
@@ -2692,23 +2706,47 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         args.arch
             .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
     );
+    // Kernel-test boots are extremely verbose. Capture their serial stream so
+    // a passing gate prints only its summary; retain a bounded diagnostic tail
+    // for failures and timeouts. Interactive `run` keeps streaming normally.
+    if gate_exit {
+        cmd.stdout(Stdio::piped());
+    }
 
     println!("xtask: launching {} {}", qemu, kernel.display());
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
+    let serial_reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
 
     let secs = kernel_test_timeout_secs();
     let started = std::time::Instant::now();
-    let status = match child.wait_timeout(Duration::from_secs(secs))? {
-        Some(status) => status,
-        None => {
+    let deadline = started + Duration::from_secs(secs);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
             child.kill()?;
             child.wait()?;
+            let serial = serial_reader
+                .and_then(|reader| reader.join().ok())
+                .unwrap_or_default();
+            emit_serial_tail(&serial);
             bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
         }
+        std::thread::sleep(Duration::from_millis(10));
     };
+    let serial = serial_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
     // Report the phase duration, not just the exit status. The timeout below
     // is chosen from how long this actually takes, and the only way that stays
     // true is if every run says what it took.
@@ -2729,6 +2767,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             Arch::Aarch64 => Some(0),
         };
         if status.code() != expected {
+            emit_serial_tail(&serial);
             bail!(
                 "xtask test: kernel-test suite reported failures — QEMU exited \
                  {:?} (all-pass is {:?} on {}). See the `── summary` / `── failing \
@@ -2737,6 +2776,12 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 expected,
                 args.arch.triple(),
             );
+        }
+        if let Some(summary) = String::from_utf8_lossy(&serial)
+            .lines()
+            .find(|line| line.contains("── summary:"))
+        {
+            println!("{summary}");
         }
     }
     Ok(())
@@ -2865,54 +2910,54 @@ fn wait_for_boot_smoke(
         "unsafe precondition",
     ];
 
-    // Stream stdout to terminal and accumulate panic/success markers.
+    // Capture stdout. Successful gates stay concise; failures print a bounded
+    // tail through the common diagnostic helper.
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
-    let reader_handle = std::thread::spawn(move || -> (Option<String>, bool) {
-        let reader = BufReader::new(stdout);
-        let mut panic_line = None;
-        let mut clean_exit_seen = false;
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            println!("{line}");
-            clean_exit_seen |= line.contains("boot-smoke: clean exit");
-            if panic_line.is_none() && panic_markers.iter().any(|m| line.contains(m)) {
-                panic_line = Some(line);
-            }
-        }
-        (panic_line, clean_exit_seen)
+    let reader_handle = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut transcript = Vec::new();
+        let _ = stdout.read_to_end(&mut transcript);
+        transcript
     });
 
     // Wait for QEMU to exit naturally (kernel calls exit_kernel),
     // OR force-kill on timeout.
-    let exit = child.wait_timeout(Duration::from_secs(timeout_secs))?;
-    let timed_out = exit.is_none();
-    let status = match exit {
-        Some(s) => s,
-        None => {
-            child.kill()?;
-            child.wait()?
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
         }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(10));
     };
-    let (panic_line, clean_exit_seen) = reader_handle
+    let transcript = reader_handle
         .join()
         .map_err(|_| anyhow!("xtask {label}: serial-reader thread panicked"))?;
+    let transcript_text = String::from_utf8_lossy(&transcript);
+    let panic_line = transcript_text
+        .lines()
+        .find(|line| panic_markers.iter().any(|marker| line.contains(marker)));
+    let clean_exit_seen = transcript_text.contains("boot-smoke: clean exit");
 
     if let Some(p) = panic_line {
+        emit_serial_tail(&transcript);
         bail!("xtask {label}: kernel panic during boot — '{}'", p);
     }
     if timed_out {
+        emit_serial_tail(&transcript);
         bail!(
             "xtask {label}: kernel did not call exit_kernel within {}s — possible boot hang",
             timeout_secs
         );
     }
     if !clean_exit_seen {
+        emit_serial_tail(&transcript);
         bail!("xtask {label}: QEMU exited without the kernel clean-exit marker");
     }
     // Clean-exit status is arch-dependent:
@@ -2927,6 +2972,7 @@ fn wait_for_boot_smoke(
         Arch::Aarch64 => Some(0),
     };
     if status.code() != expected {
+        emit_serial_tail(&transcript);
         bail!(
             "xtask {label}: QEMU exited with non-success status {:?} (expected {:?} on {})",
             status.code(),

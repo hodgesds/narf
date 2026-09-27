@@ -63,6 +63,11 @@ compressed-RAM swap backend during userspace bootstrap. Without it, NARF boots
 with no swap area, matching Linux until a future `swapon(2)` path configures
 one.
 
+Early BSP setup applies Linux-style `quiet`, `debug`, and `loglevel=N` tokens
+to the console threshold before emitting the normal boot banner. This affects
+only physical console emission: the bounded klog remains complete, and panic
+plus fatal-trap sinks remain unconditional.
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.

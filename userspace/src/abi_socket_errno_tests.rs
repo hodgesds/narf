@@ -21,6 +21,7 @@ const SOCK_PACKET: u64 = 10;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const IPPROTO_ICMP: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
+const IPPROTO_IPV6: u64 = 41;
 const IPPROTO_IP: u64 = 0;
 const SOL_SOCKET: u64 = 1;
 const SO_REUSEADDR: u64 = 2;
@@ -34,8 +35,21 @@ const TCP_MAXSEG: u64 = 2;
 const TCP_KEEPIDLE: u64 = 4;
 const TCP_KEEPINTVL: u64 = 5;
 const TCP_KEEPCNT: u64 = 6;
+const TCP_SYNCNT: u64 = 7;
+const TCP_LINGER2: u64 = 8;
+const TCP_DEFER_ACCEPT: u64 = 9;
+const TCP_WINDOW_CLAMP: u64 = 10;
+const TCP_INFO: u64 = 11;
 const TCP_CONGESTION: u64 = 13;
+const TCP_THIN_LINEAR_TIMEOUTS: u64 = 16;
+const TCP_THIN_DUPACK: u64 = 17;
 const TCP_USER_TIMEOUT: u64 = 18;
+const TCP_NOTSENT_LOWAT: u64 = 25;
+const TCP_FASTOPEN_NO_COOKIE: u64 = 34;
+const TCP_INQ: u64 = 36;
+const TCP_TX_DELAY: u64 = 37;
+const TCP_IS_MPTCP: u64 = 43;
+const IPV6_V6ONLY: u64 = 26;
 const MSG_OOB: u64 = 0x1;
 const MSG_DONTWAIT: u64 = 0x40;
 const SHUT_WR: u64 = 1;
@@ -919,6 +933,56 @@ kernel_test_in!(
     smoke_abi_socket_errno_getsockopt_unknown_by_level
 );
 
+fn smoke_abi_socket_errno_setsockopt_unknown_is_enoprotoopt() -> TestResult {
+    with_setup(|| {
+        let tcp = open(AF_INET, SOCK_STREAM, 0)?;
+        let udp = open(AF_INET, SOCK_DGRAM, 0)?;
+        let value = 1i32.to_ne_bytes();
+        for &(fd, level, name) in &[
+            (tcp, IPPROTO_TCP, 9999),
+            (tcp, IPPROTO_IP, 9999),
+            (udp, IPPROTO_TCP, TCP_MAXSEG),
+        ] {
+            if setsockopt(fd, level, name, &value) != Some(ENOPROTOOPT_ERR) {
+                return Err("unknown setsockopt must return ENOPROTOOPT");
+            }
+        }
+        close(tcp);
+        close(udp);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_setsockopt_unknown_is_enoprotoopt
+);
+
+fn smoke_abi_socket_errno_ipv6_v6only_is_explicitly_supported() -> TestResult {
+    with_setup(|| {
+        let v6 = open(AF_INET6, SOCK_STREAM, 0)?;
+        let v4 = open(AF_INET, SOCK_STREAM, 0)?;
+        if set_int(v6, IPPROTO_IPV6, IPV6_V6ONLY, 1) != Some(0) {
+            return Err("IPV6_V6ONLY must be accepted on AF_INET6");
+        }
+        let mut out = [0u8; 4];
+        if getsockopt(v6, IPPROTO_IPV6, IPV6_V6ONLY, &mut out).0 != Some(0)
+            || u32::from_ne_bytes(out) != 1
+        {
+            return Err("IPV6_V6ONLY round-trip mismatch");
+        }
+        if set_int(v4, IPPROTO_IPV6, IPV6_V6ONLY, 1) != Some(ENOPROTOOPT_ERR) {
+            return Err("IPV6_V6ONLY on AF_INET must be ENOPROTOOPT");
+        }
+        close(v6);
+        close(v4);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_ipv6_v6only_is_explicitly_supported
+);
+
 /// `do_tcp_setsockopt` value ranges: TCP_MAXSEG 0 or 88..=32767
 /// (`tcp_sock_set_maxseg`), TCP_KEEPIDLE / TCP_KEEPINTVL 1..=32767, TCP_KEEPCNT
 /// 1..=127, TCP_USER_TIMEOUT >= 0; an unregistered TCP_CONGESTION algorithm is
@@ -956,6 +1020,88 @@ fn smoke_abi_socket_errno_setsockopt_tcp_ranges() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_errno_setsockopt_tcp_ranges
+);
+
+fn smoke_abi_socket_errno_tcp_extended_options() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_INET, SOCK_STREAM, 0)?;
+        let invalid: &[(u64, i32)] = &[
+            (TCP_SYNCNT, 0),
+            (TCP_SYNCNT, 128),
+            (TCP_THIN_LINEAR_TIMEOUTS, -1),
+            (TCP_THIN_LINEAR_TIMEOUTS, 2),
+            (TCP_THIN_DUPACK, -1),
+            (TCP_INQ, 2),
+            (TCP_FASTOPEN_NO_COOKIE, -1),
+            (TCP_TX_DELAY, 1 << 28),
+        ];
+        for &(name, value) in invalid {
+            if set_int(fd, IPPROTO_TCP, name, value) != Some(EINVAL) {
+                return Err("extended TCP option range errno mismatch");
+            }
+        }
+        let accepted: &[(u64, i32, u32)] = &[
+            (TCP_SYNCNT, 127, 127),
+            (TCP_LINGER2, 999, 120),
+            (TCP_LINGER2, -1, u32::MAX),
+            (TCP_DEFER_ACCEPT, 2, 3),
+            (TCP_WINDOW_CLAMP, 1, 1152),
+            (TCP_THIN_LINEAR_TIMEOUTS, 1, 1),
+            // Current Linux accepts this legacy knob as a no-op.
+            (TCP_THIN_DUPACK, 1, 0),
+            (TCP_NOTSENT_LOWAT, 4096, 4096),
+            (TCP_FASTOPEN_NO_COOKIE, 1, 1),
+            (TCP_INQ, 1, 1),
+            (TCP_TX_DELAY, 999, 999),
+        ];
+        let mut out = [0u8; 4];
+        for &(name, value, want) in accepted {
+            if set_int(fd, IPPROTO_TCP, name, value) != Some(0)
+                || getsockopt(fd, IPPROTO_TCP, name, &mut out).0 != Some(0)
+                || u32::from_ne_bytes(out) != want
+            {
+                return Err("extended TCP option round-trip mismatch");
+            }
+        }
+        if getsockopt(fd, IPPROTO_TCP, TCP_IS_MPTCP, &mut out).0 != Some(0)
+            || u32::from_ne_bytes(out) != 0
+        {
+            return Err("ordinary TCP socket must report TCP_IS_MPTCP=0");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_tcp_extended_options
+);
+
+fn smoke_abi_socket_tcp_info_linux_layout() -> TestResult {
+    with_setup(|| {
+        let fresh = open(AF_INET, SOCK_STREAM, 0)?;
+        let listener = tcp_listener(31240)?;
+        let mut info = [0xA5u8; 288];
+        let (r, len) = getsockopt(fresh, IPPROTO_TCP, TCP_INFO, &mut info);
+        if r != Some(0) || len != 288 || info[0] != 0x07 {
+            return Err("fresh TCP_INFO must report TCP_CLOSE in full Linux layout");
+        }
+        if info[1..].iter().any(|&byte| byte != 0) {
+            return Err("unsupported fresh TCP_INFO metrics must be zero");
+        }
+        let mut short = [0u8; 8];
+        let (r, len) = getsockopt(listener, IPPROTO_TCP, TCP_INFO, &mut short);
+        if r != Some(0) || len != 8 || short[0] != 0x0A {
+            return Err("short TCP_INFO must truncate and report TCP_LISTEN");
+        }
+        close(fresh);
+        close(listener);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_tcp_info_linux_layout
 );
 
 /// `do_ip_setsockopt`: IP_TTL -1 restores the default (64), a 1-byte optval is

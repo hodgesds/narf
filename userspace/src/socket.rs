@@ -292,6 +292,7 @@ pub const IPPROTO_IP: u32 = 0;
 pub const IPPROTO_ICMP: u32 = 1;
 pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
+pub const IPPROTO_IPV6: u32 = 41;
 pub const IPPROTO_RAW: u32 = 255;
 
 pub const SO_REUSEADDR: u32 = 2;
@@ -326,13 +327,25 @@ pub const TCP_CORK: u32 = 3;
 pub const TCP_KEEPIDLE: u32 = 4;
 pub const TCP_KEEPINTVL: u32 = 5;
 pub const TCP_KEEPCNT: u32 = 6;
+pub const TCP_SYNCNT: u32 = 7;
+pub const TCP_LINGER2: u32 = 8;
+pub const TCP_DEFER_ACCEPT: u32 = 9;
+pub const TCP_WINDOW_CLAMP: u32 = 10;
+pub const TCP_INFO: u32 = 11;
 pub const TCP_QUICKACK: u32 = 12;
 pub const TCP_CONGESTION: u32 = 13;
+pub const TCP_THIN_LINEAR_TIMEOUTS: u32 = 16;
+pub const TCP_THIN_DUPACK: u32 = 17;
 /// `TCP_ULP` — attach an upper-layer protocol (kTLS). include/uapi/linux/tcp.h.
 pub const TCP_ULP: u32 = 31;
 /// `SOL_TLS` — kernel-TLS option level. include/linux/socket.h.
 pub const SOL_TLS: u32 = 282;
 pub const TCP_USER_TIMEOUT: u32 = 18;
+pub const TCP_FASTOPEN_NO_COOKIE: u32 = 34;
+pub const TCP_INQ: u32 = 36;
+pub const TCP_NOTSENT_LOWAT: u32 = 25;
+pub const TCP_TX_DELAY: u32 = 37;
+pub const TCP_IS_MPTCP: u32 = 43;
 
 pub const IP_TOS: u32 = 1;
 pub const IP_TTL: u32 = 2;
@@ -340,6 +353,7 @@ pub const IP_PKTINFO: u32 = 8;
 pub const IP_RECVTTL: u32 = 12;
 pub const IP_MTU: u32 = 14;
 pub const IP_MULTICAST_TTL: u32 = 33;
+pub const IPV6_V6ONLY: u32 = 26;
 
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
@@ -872,7 +886,7 @@ static NETLINK_SOCKETS: IrqSafeSpinLock<Vec<Weak<SocketFile>>> = IrqSafeSpinLock
 /// match Linux's documented defaults. Fields that affect packet
 /// shape get pushed down to the kernel stack when wired; the rest
 /// are passive storage faithful to setsockopt round-trips.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SockOptions {
     pub reuseaddr: bool,
     pub reuseport: bool,
@@ -892,11 +906,21 @@ pub struct SockOptions {
     pub tcp_keepidle: u32,
     pub tcp_keepintvl: u32,
     pub tcp_keepcnt: u32,
+    pub tcp_syncnt: u32,
+    pub tcp_linger2: i32,
+    pub tcp_defer_accept: u32,
+    pub tcp_window_clamp: u32,
+    pub tcp_thin_linear_timeouts: bool,
     pub tcp_user_timeout: u32,
     pub tcp_maxseg: u32,
     pub tcp_cork: bool,
     pub tcp_quickack: bool,
     pub tcp_congestion: String,
+    pub tcp_fastopen_no_cookie: bool,
+    pub tcp_notsent_lowat: u32,
+    pub tcp_inq: bool,
+    pub tcp_tx_delay: u32,
+    pub ipv6_v6only: bool,
     // IP
     pub ip_ttl: u32,
     pub ip_tos: u32,
@@ -926,11 +950,21 @@ impl Default for SockOptions {
             tcp_keepidle: 7200,
             tcp_keepintvl: 75,
             tcp_keepcnt: 9,
+            tcp_syncnt: 6,
+            tcp_linger2: 60,
+            tcp_defer_accept: 0,
+            tcp_window_clamp: 0,
+            tcp_thin_linear_timeouts: false,
             tcp_user_timeout: 0,
             tcp_maxseg: 1460,
             tcp_cork: false,
             tcp_quickack: false,
             tcp_congestion: String::from("cubic"),
+            tcp_fastopen_no_cookie: false,
+            tcp_notsent_lowat: u32::MAX,
+            tcp_inq: false,
+            tcp_tx_delay: 0,
+            ipv6_v6only: false,
             ip_ttl: 64,
             ip_tos: 0,
             ip_pktinfo: false,
@@ -1176,6 +1210,48 @@ struct NetlinkUserPacket {
 }
 
 impl SocketFile {
+    fn apply_tcp_options_to_tcb(&self, id: u32) {
+        let opts = self.options.lock();
+        let int_opts = [
+            (narf_net::tcp_stack::TCP_NODELAY, opts.tcp_nodelay as i32),
+            (narf_net::tcp_stack::TCP_KEEPALIVE, opts.keepalive as i32),
+            (narf_net::tcp_stack::TCP_KEEPIDLE, opts.tcp_keepidle as i32),
+            (
+                narf_net::tcp_stack::TCP_KEEPINTVL,
+                opts.tcp_keepintvl as i32,
+            ),
+            (narf_net::tcp_stack::TCP_KEEPCNT, opts.tcp_keepcnt as i32),
+            (
+                narf_net::tcp_stack::TCP_USER_TIMEOUT,
+                opts.tcp_user_timeout as i32,
+            ),
+            (narf_net::tcp_stack::TCP_MAXSEG, opts.tcp_maxseg as i32),
+            (narf_net::tcp_stack::TCP_CORK, opts.tcp_cork as i32),
+            (narf_net::tcp_stack::TCP_QUICKACK, opts.tcp_quickack as i32),
+            (narf_net::tcp_stack::TCP_SYNCNT, opts.tcp_syncnt as i32),
+            (
+                narf_net::tcp_stack::TCP_DEFER_ACCEPT,
+                opts.tcp_defer_accept as i32,
+            ),
+            (
+                narf_net::tcp_stack::TCP_THIN_LINEAR_TIMEOUTS,
+                opts.tcp_thin_linear_timeouts as i32,
+            ),
+            (
+                narf_net::tcp_stack::TCP_NOTSENT_LOWAT,
+                opts.tcp_notsent_lowat as i32,
+            ),
+        ];
+        for (name, value) in int_opts {
+            let _ = narf_net::tcp_stack::setsockopt_int(id, name, value);
+        }
+        let _ = narf_net::tcp_stack::setsockopt_str(
+            id,
+            narf_net::tcp_stack::TCP_CONGESTION,
+            &opts.tcp_congestion,
+        );
+    }
+
     pub fn new(domain: u16, kind: u32) -> Arc<Self> {
         Self::with_protocol(domain, kind, 0)
     }
@@ -3672,6 +3748,12 @@ impl SocketFile {
         if self.domain == AF_NETLINK && level != SOL_SOCKET && level != SOL_NETLINK {
             return SocketOpResult::Err(SockError::NoProtoOpt);
         }
+        // `inet_setsockopt`: only a TCP socket dispatches IPPROTO_TCP to
+        // `do_tcp_setsockopt`; UDP/raw pass the foreign level to IP, whose
+        // default is ENOPROTOOPT.
+        if level == IPPROTO_TCP && self.kind != SOCK_STREAM {
+            return SocketOpResult::Err(SockError::NoProtoOpt);
+        }
         // Kernel TLS offload is not implemented. Reporting success for
         // `TCP_ULP "tls"` / `SOL_TLS` would make OpenSSL/GnuTLS hand the kernel
         // plaintext records it never encrypts. Linux answers an unknown ULP
@@ -3765,6 +3847,13 @@ impl SocketFile {
                         TCP_MAXSEG => Some(narf_net::tcp_stack::TCP_MAXSEG),
                         TCP_CORK => Some(narf_net::tcp_stack::TCP_CORK),
                         TCP_QUICKACK => Some(narf_net::tcp_stack::TCP_QUICKACK),
+                        TCP_SYNCNT => Some(narf_net::tcp_stack::TCP_SYNCNT),
+                        TCP_DEFER_ACCEPT => Some(narf_net::tcp_stack::TCP_DEFER_ACCEPT),
+                        TCP_THIN_LINEAR_TIMEOUTS => {
+                            Some(narf_net::tcp_stack::TCP_THIN_LINEAR_TIMEOUTS)
+                        }
+                        TCP_THIN_DUPACK => Some(narf_net::tcp_stack::TCP_THIN_DUPACK),
+                        TCP_NOTSENT_LOWAT => Some(narf_net::tcp_stack::TCP_NOTSENT_LOWAT),
                         _ => None,
                     };
                     if let Some(opt) = kid {
@@ -3958,6 +4047,99 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            // Linux `tcp_sock_set_syncnt`: 1..=MAX_TCP_SYNCNT (127).
+            (IPPROTO_TCP, TCP_SYNCNT) => match read_u32(value) {
+                Ok(v) if !(1..=127).contains(&(v as i32)) => {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
+                Ok(v) => {
+                    opts.tcp_syncnt = v;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            // Negative disables linger2; Linux clamps positive values above
+            // TCP_FIN_TIMEOUT_MAX/HZ (120 seconds on the reference kernel).
+            (IPPROTO_TCP, TCP_LINGER2) => match read_u32(value) {
+                Ok(v) => {
+                    let v = v as i32;
+                    opts.tcp_linger2 = if v < 0 { -1 } else { v.min(120) };
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_DEFER_ACCEPT) => match read_u32(value) {
+                Ok(v) => {
+                    // Linux stores a retransmit count, then getsockopt converts
+                    // it back to the corresponding exponential-RTO period.
+                    let mut remaining = v;
+                    let mut timeout = 1u32;
+                    let mut period = u32::from(remaining > 0);
+                    let mut retrans = 0u8;
+                    if remaining > 0 {
+                        retrans = 1;
+                        while remaining > period && retrans < u8::MAX {
+                            retrans += 1;
+                            timeout = timeout.saturating_mul(2).min(120);
+                            period = period.saturating_add(timeout);
+                        }
+                    }
+                    remaining = 0;
+                    timeout = 1;
+                    if retrans > 0 {
+                        remaining = timeout;
+                        for _ in 1..retrans {
+                            timeout = timeout.saturating_mul(2).min(120);
+                            remaining = remaining.saturating_add(timeout);
+                        }
+                    }
+                    opts.tcp_defer_accept = remaining;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_WINDOW_CLAMP) => match read_u32(value) {
+                Ok(0) => {
+                    let is_close = matches!(
+                        &*self.state.lock(),
+                        SocketState::Fresh
+                            | SocketState::InetListener {
+                                listening: false,
+                                ..
+                            }
+                            | SocketState::Inet6Listener {
+                                listening: false,
+                                ..
+                            }
+                    );
+                    if !is_close {
+                        SocketOpResult::Err(SockError::InvalidArg)
+                    } else {
+                        opts.tcp_window_clamp = 0;
+                        SocketOpResult::Ok(0)
+                    }
+                }
+                Ok(v) => {
+                    // Linux uses max(SOCK_MIN_RCVBUF / 2, val). Its standard
+                    // 64-bit skb layout yields the user-visible floor 1152.
+                    opts.tcp_window_clamp = v.max(1152);
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS) => match read_u32(value) {
+                Ok(v) if v <= 1 => {
+                    opts.tcp_thin_linear_timeouts = v != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Ok(_) => SocketOpResult::Err(SockError::InvalidArg),
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_THIN_DUPACK) => match read_u32(value) {
+                Ok(v) if v <= 1 => SocketOpResult::Ok(0),
+                Ok(_) => SocketOpResult::Err(SockError::InvalidArg),
+                Err(e) => SocketOpResult::Err(e),
+            },
             // `tcp_sock_set_user_timeout`: negative → EINVAL.
             (IPPROTO_TCP, TCP_USER_TIMEOUT) => match read_u32(value) {
                 Ok(v) if (v as i32) < 0 => SocketOpResult::Err(SockError::InvalidArg),
@@ -3992,6 +4174,47 @@ impl SocketFile {
                     opts.tcp_quickack = v != 0;
                     SocketOpResult::Ok(0)
                 }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_FASTOPEN_NO_COOKIE) => match read_u32(value) {
+                Ok(v) if v <= 1 => {
+                    let valid_state = matches!(
+                        &*self.state.lock(),
+                        SocketState::Fresh
+                            | SocketState::InetListener { .. }
+                            | SocketState::Inet6Listener { .. }
+                    );
+                    if !valid_state {
+                        SocketOpResult::Err(SockError::InvalidArg)
+                    } else {
+                        opts.tcp_fastopen_no_cookie = v != 0;
+                        SocketOpResult::Ok(0)
+                    }
+                }
+                Ok(_) => SocketOpResult::Err(SockError::InvalidArg),
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_NOTSENT_LOWAT) => match read_u32(value) {
+                Ok(v) => {
+                    opts.tcp_notsent_lowat = v;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_INQ) => match read_u32(value) {
+                Ok(v) if v <= 1 => {
+                    opts.tcp_inq = v != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Ok(_) => SocketOpResult::Err(SockError::InvalidArg),
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_TX_DELAY) => match read_u32(value) {
+                Ok(v) if v < (1 << 28) => {
+                    opts.tcp_tx_delay = v;
+                    SocketOpResult::Ok(0)
+                }
+                Ok(_) => SocketOpResult::Err(SockError::InvalidArg),
                 Err(e) => SocketOpResult::Err(e),
             },
             // `tcp_set_congestion_control`: an algorithm that is not
@@ -4089,12 +4312,17 @@ impl SocketFile {
                     _ => SocketOpResult::Err(SockError::InvalidArg),
                 }
             }
-            // Accept-and-ignore any option NARF doesn't model, rather
-            // than failing it. Linux returns success (or ENOPROTOOPT) for
-            // benign unknown options; returning an error makes real
-            // daemons abort — redis treats a failed setsockopt(IPV6_V6ONLY)
-            // on its listener as fatal. The value is simply not applied.
-            _ => SocketOpResult::Ok(0),
+            (IPPROTO_IPV6, IPV6_V6ONLY) if self.domain == AF_INET6 => match read_u32(value) {
+                Ok(v) => {
+                    opts.ipv6_v6only = v != 0;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            // Linux's protocol option handlers return ENOPROTOOPT from their
+            // default arm. Never claim an unknown feature was enabled: doing
+            // so is especially dangerous for transport/security offloads.
+            _ => SocketOpResult::Err(SockError::NoProtoOpt),
         }
     }
 
@@ -4136,6 +4364,7 @@ impl SocketFile {
         if matches!(self.domain, AF_INET | AF_INET6)
             && level != SOL_SOCKET
             && level != IPPROTO_IP
+            && !(level == IPPROTO_IPV6 && self.domain == AF_INET6)
             && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
             && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
         {
@@ -4247,10 +4476,80 @@ impl SocketFile {
             (IPPROTO_TCP, TCP_KEEPIDLE) => write_u32(buf, opts.tcp_keepidle),
             (IPPROTO_TCP, TCP_KEEPINTVL) => write_u32(buf, opts.tcp_keepintvl),
             (IPPROTO_TCP, TCP_KEEPCNT) => write_u32(buf, opts.tcp_keepcnt),
+            (IPPROTO_TCP, TCP_SYNCNT) => write_u32(buf, opts.tcp_syncnt),
+            (IPPROTO_TCP, TCP_LINGER2) => write_u32(buf, opts.tcp_linger2 as u32),
+            (IPPROTO_TCP, TCP_DEFER_ACCEPT) => write_u32(buf, opts.tcp_defer_accept),
+            (IPPROTO_TCP, TCP_WINDOW_CLAMP) => write_u32(buf, opts.tcp_window_clamp),
+            (IPPROTO_TCP, TCP_INFO) => {
+                // Linux UAPI `struct tcp_info`; retain the current full size so
+                // newer callers can probe it, while unknown metrics stay zero.
+                let mut info = [0u8; 288];
+                let put32 = |dst: &mut [u8; 288], off: usize, value: u32| {
+                    dst[off..off + 4].copy_from_slice(&value.to_ne_bytes());
+                };
+                let wired = match &*self.state.lock() {
+                    SocketState::InetWired { tcb_id, .. } => narf_net::tcp_stack::tcp_info(*tcb_id),
+                    SocketState::InetListener {
+                        listening: true, ..
+                    }
+                    | SocketState::Inet6Listener {
+                        listening: true, ..
+                    } => {
+                        info[0] = 0x0A;
+                        None
+                    }
+                    SocketState::InetConnected { .. } | SocketState::Inet6Connected { .. } => {
+                        info[0] = 0x01;
+                        None
+                    }
+                    _ => {
+                        info[0] = 0x07;
+                        None
+                    }
+                };
+                if let Some(t) = wired {
+                    info[0] = t.state;
+                    info[1] = t.ca_state;
+                    info[2] = t.retransmits;
+                    info[3] = t.probes;
+                    info[4] = t.backoff;
+                    info[5] = t.options;
+                    info[6] = (t.snd_wscale & 0x0f) | ((t.rcv_wscale & 0x0f) << 4);
+                    put32(&mut info, 8, t.rto_us);
+                    put32(&mut info, 12, t.ato_us);
+                    put32(&mut info, 16, t.snd_mss);
+                    put32(&mut info, 20, t.rcv_mss);
+                    put32(&mut info, 24, t.unacked);
+                    put32(&mut info, 60, t.pmtu);
+                    put32(&mut info, 68, t.rtt_us);
+                    put32(&mut info, 72, t.rttvar_us);
+                    put32(&mut info, 76, t.snd_ssthresh);
+                    put32(&mut info, 80, t.snd_cwnd);
+                    put32(&mut info, 84, t.advmss);
+                    put32(&mut info, 88, t.reordering);
+                    put32(&mut info, 96, t.rcv_space);
+                    put32(&mut info, 100, t.total_retrans);
+                    put32(&mut info, 144, t.notsent_bytes);
+                    put32(&mut info, 228, t.snd_wnd);
+                    put32(&mut info, 232, t.rcv_wnd);
+                }
+                let n = core::cmp::min(buf.len(), info.len());
+                buf[..n].copy_from_slice(&info[..n]);
+                SocketOpResult::OptValue { n }
+            }
+            (IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS) => {
+                write_bool(buf, opts.tcp_thin_linear_timeouts)
+            }
+            (IPPROTO_TCP, TCP_THIN_DUPACK) => write_u32(buf, 0),
             (IPPROTO_TCP, TCP_USER_TIMEOUT) => write_u32(buf, opts.tcp_user_timeout),
             (IPPROTO_TCP, TCP_MAXSEG) => write_u32(buf, opts.tcp_maxseg),
             (IPPROTO_TCP, TCP_CORK) => write_bool(buf, opts.tcp_cork),
             (IPPROTO_TCP, TCP_QUICKACK) => write_bool(buf, opts.tcp_quickack),
+            (IPPROTO_TCP, TCP_FASTOPEN_NO_COOKIE) => write_bool(buf, opts.tcp_fastopen_no_cookie),
+            (IPPROTO_TCP, TCP_NOTSENT_LOWAT) => write_u32(buf, opts.tcp_notsent_lowat),
+            (IPPROTO_TCP, TCP_INQ) => write_bool(buf, opts.tcp_inq),
+            (IPPROTO_TCP, TCP_TX_DELAY) => write_u32(buf, opts.tcp_tx_delay),
+            (IPPROTO_TCP, TCP_IS_MPTCP) => write_u32(buf, 0),
             (IPPROTO_TCP, TCP_CONGESTION) => {
                 let bytes = opts.tcp_congestion.as_bytes();
                 let n = core::cmp::min(buf.len(), bytes.len());
@@ -4279,6 +4578,9 @@ impl SocketFile {
             (IPPROTO_IP, IP_MULTICAST_TTL) => write_ip(buf, opts.ip_multicast_ttl),
             (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IP, IP_TRANSPARENT) => {
                 write_ip(buf, opts.ip_freebind as u32)
+            }
+            (IPPROTO_IPV6, IPV6_V6ONLY) if self.domain == AF_INET6 => {
+                write_bool(buf, opts.ipv6_v6only)
             }
             (SOL_NETLINK, NETLINK_PKTINFO) => {
                 write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
@@ -5018,6 +5320,7 @@ impl SocketFile {
                                 port,
                                 backlog.max(1) as usize,
                             ) {
+                                self.apply_tcp_options_to_tcb(id);
                                 *listen_id = Some(id);
                                 // This task owns the listener — targeted
                                 // accept-ready wakes go only to it.
@@ -5061,6 +5364,8 @@ impl SocketFile {
                     if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(lid) {
                         let child = SocketFile::new(AF_INET, SOCK_STREAM);
                         child.set_net_ns_id(self.net_ns_id());
+                        *child.options.lock() = self.options.lock().clone();
+                        child.apply_tcp_options_to_tcb(child_id);
                         #[cfg(feature = "container")]
                         if let Some(namespace) = self.net_namespace.lock().clone() {
                             child.set_net_namespace(namespace);
@@ -5152,12 +5457,15 @@ impl SocketFile {
                         let is_loopback = (ip >> 24) == 127;
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
-                            match narf_net::tcp_stack::connect_errno_in(
+                            let syn_retries = self.options.lock().tcp_syncnt as u8;
+                            match narf_net::tcp_stack::connect_errno_with_options_in(
                                 self.net_ns_id(),
                                 ip_bytes,
                                 port,
+                                narf_net::tcp_stack::ConnectOptions { syn_retries },
                             ) {
                                 Ok(tcb_id) => {
+                                    self.apply_tcp_options_to_tcb(tcb_id);
                                     let mut state = self.state.lock();
                                     if Self::inet_stream_connectable(&state) {
                                         *state = SocketState::InetWired {
