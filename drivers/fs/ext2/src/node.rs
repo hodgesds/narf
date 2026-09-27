@@ -56,6 +56,7 @@ pub struct Ext2NodeState {
 #[derive(Debug)]
 pub struct Ext2Node<B: BlockDevice> {
     pub volume: Arc<Ext2Volume<B>>,
+    inode_no: u32,
     pub state: IrqSafeSpinLock<Ext2NodeState>,
 }
 
@@ -63,6 +64,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
     pub fn new(volume: Arc<Ext2Volume<B>>, inode_no: u32, stat: Stat) -> Self {
         Self {
             volume,
+            inode_no,
             state: IrqSafeSpinLock::new(Ext2NodeState {
                 inode_no,
                 stat,
@@ -73,6 +75,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
 
     pub(crate) fn from_inode(volume: Arc<Ext2Volume<B>>, inode_no: u32, inode: Inode) -> Self {
         Self {
+            inode_no,
             state: IrqSafeSpinLock::new(Ext2NodeState {
                 inode_no,
                 stat: Self::stat_from_inode(&volume, &inode),
@@ -374,6 +377,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         }
         Some(Arc::new(Ext2Node {
             volume: self.volume.clone(),
+            inode_no: st.inode_no,
             state: IrqSafeSpinLock::new(*st),
         }) as Arc<dyn DirOps>)
     }
@@ -382,6 +386,18 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     fn ino(&self) -> u64 {
         self.state.lock().inode_no as u64
+    }
+
+    fn dcache_identity(&self) -> (usize, u64, u64) {
+        (
+            Arc::as_ptr(&self.volume) as *const () as usize,
+            0,
+            u64::from(self.inode_no),
+        )
+    }
+
+    fn rcu_walkable(&self) -> bool {
+        true
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
@@ -562,6 +578,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     //   * returns a fresh handle for create/mkdir/symlink.
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let parent_ino = self.state.lock().inode_no;
             let new_ino = self
                 .volume
@@ -576,6 +593,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     }
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let parent_ino = self.state.lock().inode_no;
             let new_ino = self
                 .volume
@@ -590,18 +608,21 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     }
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let parent_ino = self.state.lock().inode_no;
             self.volume.dir_unlink(parent_ino, name.as_bytes()).await
         })
     }
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let parent_ino = self.state.lock().inode_no;
             self.volume.dir_rmdir(parent_ino, name.as_bytes()).await
         })
     }
     fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[old_name, new_name]);
             let parent_ino = self.state.lock().inode_no;
             self.volume
                 .dir_rename(
@@ -615,6 +636,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     }
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let parent_ino = self.state.lock().inode_no;
             let new_ino = self
                 .volume

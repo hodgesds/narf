@@ -294,6 +294,10 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
 // ── DirOps ──────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> DirOps for UdfNode<B> {
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // Disk-backed FS — synchronous lookup is unsupported. The
         // VFS prefers `lookup_async` automatically.

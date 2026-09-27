@@ -204,7 +204,7 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
 const SYMLOOP_MAX: usize = 40;
 
 /// True when every component of `path` is served by a SINGLE covering mount,
-/// so a per-component walk against that mount's `fs.root()` faithfully
+/// so a per-component walk against that mount's canonical root faithfully
 /// reproduces VFS resolution. Returns `false` (→ take the slow per-prefix
 /// path) when a proper prefix of `path` enters a deeper mount, or when
 /// `path` is an ancestor of a mount point (a component that has no real
@@ -213,18 +213,20 @@ const SYMLOOP_MAX: usize = 40;
 fn current_single_mount_root(
     path: &str,
 ) -> Option<(
-    alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    alloc::sync::Arc<narf_filesystem::Dentry>,
     &str,
     u64,
 )> {
     let (root, rel_start, mount_id) = if let Some(namespace) = current_mount_namespace() {
-        namespace.resolve_absolute_single_mount(path, |fs, rel, mount_id| {
-            (fs.root(), path.len() - rel.len(), mount_id)
-        })?
+        namespace.resolve_absolute_single_mount_with_root(
+            path,
+            |_fs, root, rel, mount_id| (root, path.len() - rel.len(), mount_id),
+        )?
     } else {
-        narf_filesystem::registry().resolve_absolute_single_mount(path, |fs, rel, mount_id| {
-            (fs.root(), path.len() - rel.len(), mount_id)
-        })?
+        narf_filesystem::registry().resolve_absolute_single_mount_with_root(
+            path,
+            |_fs, root, rel, mount_id| (root, path.len() - rel.len(), mount_id),
+        )?
     };
     Some((root, &path[rel_start..], mount_id))
 }
@@ -362,6 +364,15 @@ fn resolve_vfs_symlink_path_fast(
     // starts at `fs.root()` and steps through the in-mount components only.
     let (root, rel, _) = current_single_mount_root(expanded)?;
 
+    // A complete warmed RCU walk proves that no component requires symlink
+    // expansion: cached symlinks deliberately request reference walk. This
+    // removes the otherwise-duplicated per-component callback walk from the
+    // steady-state open/stat path; a cache miss continues through the existing
+    // mount-aware reference walk below and the real resolver warms the cache.
+    if narf_filesystem::resolve_cached_dentry(root.clone(), rel).is_some() {
+        return Some(alloc::string::String::from(expanded));
+    }
+
     let components: alloc::vec::Vec<&str> = rel
         .split('/')
         .filter(|component| !component.is_empty())
@@ -374,7 +385,7 @@ fn resolve_vfs_symlink_path_fast(
         return None;
     }
 
-    let mut current_dir = root;
+    let mut current_dir = root.directory()?;
     for (index, component) in components.iter().enumerate() {
         let is_final = index + 1 == components.len();
 
@@ -476,60 +487,56 @@ impl FastCreateResolution {
 /// resolver and retains all of its semantics.
 fn resolve_create_fast(expanded: &str) -> Option<FastCreateResolution> {
     let (root, rel, mount_id) = current_single_mount_root(expanded)?;
-    let mut components = rel
+    let components: alloc::vec::Vec<&str> = rel
         .split('/')
         .filter(|component| !component.is_empty())
-        .peekable();
-    let mut current_dir = root;
+        .collect();
+    let (leaf, parents) = components.split_last()?;
+    let parent_rel = if parents.is_empty() {
+        alloc::string::String::new()
+    } else {
+        parents.join("/")
+    };
+    let parent_dentry = poll_blocking(narf_filesystem::resolve_directory_dentry_async(
+        root,
+        &parent_rel,
+    ))
+    .and_then(Result::ok)?;
+    let parent = parent_dentry.directory()?;
 
-    while let Some(component) = components.next() {
-        if components.peek().is_some() {
-            current_dir = if let Some(dir) = current_dir.lookup_dir(component) {
-                dir
-            } else {
-                match poll_blocking(current_dir.lookup_dir_async(component)) {
-                    Some(Ok(dir)) => dir,
-                    _ => return None,
-                }
-            };
-            continue;
-        }
-
-        let leaf = if let Some(node) = current_dir.lookup(component) {
-            Some(Ok(node))
-        } else {
-            poll_blocking(current_dir.lookup_async(component))
-        };
-        match leaf {
-            Some(Ok(node)) => {
-                // Ordinary open follows a final symlink. Defer that case to
-                // the mount-aware resolver; only a proven non-symlink leaf is
-                // safe to carry directly into open_impl.
-                if node.stat().mode.file_type == narf_filesystem::FileType::Symlink {
-                    return None;
-                }
-                return Some(FastCreateResolution::Existing { node, mount_id });
+    let resolved = if let Some(node) = parent.lookup(leaf) {
+        Some(Ok(node))
+    } else {
+        poll_blocking(parent.lookup_async(leaf))
+    };
+    match resolved {
+        Some(Ok(node)) => {
+            // Ordinary open follows a final symlink. Defer that case to the
+            // mount-aware resolver; only a proven non-symlink leaf is safe to
+            // carry directly into open_impl.
+            if node.stat().mode.file_type == narf_filesystem::FileType::Symlink {
+                return None;
             }
-            Some(Err(narf_filesystem::FsError::NotFound)) => {}
-            _ => return None,
+            return Some(FastCreateResolution::Existing { node, mount_id });
         }
-
-        // Both file and directory namespaces must report a definite miss.
-        // A directory-only final leaf falls back so the ordinary directory
-        // open path can recover its DirOps shape.
-        if !matches!(
-            poll_blocking(current_dir.lookup_dir_async(component)),
-            Some(Err(narf_filesystem::FsError::NotFound))
-        ) {
-            return None;
-        }
-        return Some(FastCreateResolution::Missing {
-            parent: current_dir,
-            leaf: alloc::string::String::from(component),
-            mount_id,
-        });
+        Some(Err(narf_filesystem::FsError::NotFound)) => {}
+        _ => return None,
     }
-    None
+
+    // Both file and directory namespaces must report a definite miss. A
+    // directory-only final leaf falls back so ordinary directory open can
+    // recover its DirOps shape.
+    if !matches!(
+        poll_blocking(parent.lookup_dir_async(leaf)),
+        Some(Err(narf_filesystem::FsError::NotFound))
+    ) {
+        return None;
+    }
+    Some(FastCreateResolution::Missing {
+        parent,
+        leaf: alloc::string::String::from(*leaf),
+        mount_id,
+    })
 }
 
 /// Expand symlinks component-by-component through the current task's mount
@@ -645,11 +652,11 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
             prefix.push('/');
             prefix.push_str(component);
             let is_final = index + 1 == components.len();
-            let node = current_resolve_absolute(&prefix, |fs, rel| {
+            let node = current_resolve_absolute(&prefix, |fs, root, rel| {
                 if rel.is_empty() {
                     fs.root_file()
                 } else {
-                    poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                    poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel))
                         .and_then(|result| result.ok())
                 }
             })
@@ -908,17 +915,10 @@ pub(crate) fn inherit_acls_from_parent(
 }
 
 fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
-    current_resolve_absolute(path, |fs, rel| {
-        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-            fs.root()
-        } else {
-            let mut cur = fs.root();
-            for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
-            }
-            cur
-        };
-        Some(dir)
+    current_resolve_absolute(path, |_fs, root, rel| {
+        let dentry = poll_blocking(narf_filesystem::resolve_directory_dentry_async(root, rel))
+            .and_then(Result::ok)?;
+        dentry.directory()
     })
     .flatten()
 }
@@ -930,12 +930,12 @@ fn resolve_file_absolute_ext(
     path: &str,
     follow_final: bool,
 ) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
-    current_resolve_absolute(path, |fs, rel| {
+    current_resolve_absolute(path, |fs, root, rel| {
         if rel.is_empty() {
             fs.root_file()
         } else {
-            poll_blocking(narf_filesystem::resolve_async_ext(
-                fs.root(),
+            poll_blocking(narf_filesystem::resolve_async_dentry_ext(
+                root,
                 rel,
                 follow_final,
             ))
@@ -1175,7 +1175,9 @@ fn name_too_long_in(dir: &str, comp: &str) -> bool {
         return false;
     }
     let dir = if dir.is_empty() { "/" } else { dir };
-    !current_resolve_absolute(dir, |fs, _rel| matches!(fs.name(), "proc" | "sysfs"))
+    !current_resolve_absolute(dir, |fs, _root, _rel| {
+        matches!(fs.name(), "proc" | "sysfs")
+    })
         .unwrap_or(false)
 }
 
@@ -1265,11 +1267,11 @@ fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::Strin
 /// disagree with the first about what counts as a hop, and then the errno
 /// would depend on which one ran.
 fn path_symlink_loop(path: &str) -> bool {
-    current_resolve_absolute(path, |fs, rel| {
+    current_resolve_absolute(path, |_fs, root, rel| {
         // A mount root is a directory, never a symlink, so it cannot cycle.
         !rel.is_empty()
             && matches!(
-                poll_blocking(narf_filesystem::resolve_async_ext(fs.root(), rel, true)),
+                poll_blocking(narf_filesystem::resolve_async_dentry_ext(root, rel, true)),
                 Some(Err(narf_filesystem::FsError::SymlinkLoop))
             )
     })
@@ -1300,7 +1302,7 @@ type PathStat = (
 );
 
 fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathStat> {
-    let file = current_resolve_absolute(path, |fs, rel| {
+    let file = current_resolve_absolute(path, |fs, root, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
             // read-only /proc/sys/kernel/domainname protection) IS the file at
@@ -1319,8 +1321,8 @@ fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathSta
             // `open`/`execve` of the same path succeeded. That made every
             // PATH probe (busybox/ash search applets via stat) report
             // "not found" inside a mounted distro rootfs.
-            poll_blocking(narf_filesystem::resolve_async_ext(
-                fs.root(),
+            poll_blocking(narf_filesystem::resolve_async_dentry_ext(
+                root,
                 rel,
                 follow_final,
             ))
@@ -1922,8 +1924,8 @@ fn do_execve_resolved(
         // still DMA'ing into a scratch buffer Drop just returned to the pool
         // — the exact hazard poll_io_to_completion exists for, and which the
         // PT_INTERP read (read_path_from_vfs) already avoids the same way.
-        let ops = match current_resolve_absolute(&ep, |fs, rel| {
-            poll_io_to_completion(narf_filesystem::resolve_async(fs.root(), rel))
+        let ops = match current_resolve_absolute(&ep, |_fs, root, rel| {
+            poll_io_to_completion(narf_filesystem::resolve_async_dentry(root, rel))
         }) {
             Some(Some(Ok(o))) => o,
             // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
@@ -3269,12 +3271,16 @@ pub fn __test_mount_namespaces_reset() {
 
 pub(crate) fn current_resolve_absolute<R, F>(path: &str, resolve: F) -> Option<R>
 where
-    F: FnOnce(&dyn narf_filesystem::FsInstance, &str) -> R,
+    F: FnOnce(
+        &dyn narf_filesystem::FsInstance,
+        alloc::sync::Arc<narf_filesystem::Dentry>,
+        &str,
+    ) -> R,
 {
     if let Some(ns) = current_mount_namespace() {
-        ns.resolve_absolute(path, resolve)
+        ns.resolve_absolute_with_root(path, resolve)
     } else {
-        narf_filesystem::registry().resolve_absolute(path, resolve)
+        narf_filesystem::registry().resolve_absolute_with_root(path, resolve)
     }
 }
 

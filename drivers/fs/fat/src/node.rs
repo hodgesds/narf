@@ -43,6 +43,7 @@ pub struct FatNodeState {
 #[derive(Debug)]
 pub struct FatNode<B: BlockDevice> {
     pub volume: Arc<FatVolume<B>>,
+    dcache_cluster: u32,
     pub state: IrqSafeSpinLock<FatNodeState>,
     pub entry_location: Option<(u64, usize)>, // (LBA, offset in sector)
 }
@@ -280,6 +281,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     ) -> Self {
         Self {
             volume,
+            dcache_cluster: first_cluster,
             state: IrqSafeSpinLock::new(FatNodeState {
                 first_cluster,
                 stat,
@@ -877,6 +879,18 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
+    fn dcache_identity(&self) -> (usize, u64, u64) {
+        (
+            Arc::as_ptr(&self.volume) as *const () as usize,
+            0,
+            u64::from(self.dcache_cluster),
+        )
+    }
+
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // FAT lookups are inherently async (sector reads). The
         // sync API is unsupported here — the VFS prefers
@@ -972,6 +986,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
 
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let template = RawDirEntry {
                 name: [b' '; SFN_LEN],
                 attr: attr::ARCHIVE,
@@ -1014,6 +1029,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
 
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let new_clus = self.volume.allocate_cluster().await?;
             let template = RawDirEntry {
                 name: [b' '; SFN_LEN],
@@ -1104,6 +1120,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let mut scanner = DirectoryScanner::new(self.volume.clone(), {
                 let g = self.state.lock();
                 g.first_cluster
@@ -1127,6 +1144,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
 
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let mut scanner = DirectoryScanner::new(self.volume.clone(), {
                 let g = self.state.lock();
                 g.first_cluster
@@ -1156,6 +1174,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
 
     fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[old_name, new_name]);
             // Locate source.
             let mut scanner = DirectoryScanner::new(self.volume.clone(), {
                 let g = self.state.lock();

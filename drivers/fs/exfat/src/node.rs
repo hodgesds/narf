@@ -414,6 +414,10 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for ExfatNode<B> {
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // Disk-backed; sync API is unsupported. The VFS prefers
         // `lookup_async` automatically.

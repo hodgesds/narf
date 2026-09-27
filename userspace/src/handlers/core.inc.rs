@@ -1490,11 +1490,11 @@ fn open_impl(
             Some(FastCreateResolution::Existing { .. }) => true,
             Some(FastCreateResolution::Missing { .. }) => false,
             None => {
-                current_resolve_absolute(path, |fs, rel| {
+                current_resolve_absolute(path, |fs, root, rel| {
                     if rel.is_empty() {
                         fs.root_file()
                     } else {
-                        poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                        poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel))
                             .and_then(|r| r.ok())
                     }
                 })
@@ -1530,8 +1530,8 @@ fn open_impl(
         // `readlinkat()` each symlink — following the final component here
         // handed them the target instead of the link. `resolve_async_nofollow`
         // follows intermediate symlinks but returns a final symlink as-is.
-        let leaf = current_resolve_absolute(path, |fs, rel| {
-            poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+        let leaf = current_resolve_absolute(path, |_fs, root, rel| {
+            poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel))
                 .and_then(|r| r.ok())
         })
         .flatten();
@@ -1581,14 +1581,15 @@ fn open_impl(
     } else if fast_create.is_some() {
         None
     } else if mnt_len == 0 {
-        current_resolve_absolute(path, |fs, rel| {
+        current_resolve_absolute(path, |fs, root, rel| {
             if rel.is_empty() {
                 // A file-rooted mount (mount --bind of a file) resolves to the
                 // file at its own path; a directory-rooted mount yields None
                 // here and is handled by the directory branch below.
                 fs.root_file()
             } else {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+                poll_blocking(narf_filesystem::resolve_async_dentry(root, rel))
+                    .and_then(|r| r.ok())
             }
         })
         .flatten()
@@ -1601,8 +1602,9 @@ fn open_impl(
             }
         };
         narf_filesystem::registry()
-            .with_mount(&mount_owned, |fs| {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), path)).and_then(|r| r.ok())
+            .with_mount_root(&mount_owned, |_fs, root| {
+                poll_blocking(narf_filesystem::resolve_async_dentry(root, path))
+                    .and_then(|r| r.ok())
             })
             .flatten()
     };
@@ -3744,30 +3746,10 @@ pub(crate) fn resolve_parent_dir_async(
         return None;
     }
     let parent_path = if last == 0 { "/" } else { &abs[..last] };
-    let dir = current_resolve_absolute(parent_path, |fs, rel| {
-        // Walk `rel` segment-by-segment as DIRECTORIES. We can't use
-        // `resolve_async` here: it resolves to a FileOps and returns
-        // NotFound for a directory-only final component (e.g. a MemFs
-        // subdir, whose `lookup` yields None for Dir entries), so the
-        // parent of a nested create never resolved → EPERM. Prefer the
-        // async dir-lookup (ext2 needs block reads); fall back to the
-        // sync `lookup_dir` for filesystems that stub the async form.
-        let mut dir = fs.root();
-        for seg in rel.split('/') {
-            if seg.is_empty() || seg == "." {
-                continue;
-            }
-            if seg == ".." {
-                return None;
-            }
-            let next = match poll_blocking(dir.lookup_dir_async(seg)) {
-                Some(Ok(d)) => d,
-                Some(Err(narf_filesystem::FsError::Unsupported)) | None => dir.lookup_dir(seg)?,
-                Some(Err(_)) => return None,
-            };
-            dir = next;
-        }
-        Some(dir)
+    let dir = current_resolve_absolute(parent_path, |_fs, root, rel| {
+        let dentry = poll_blocking(narf_filesystem::resolve_directory_dentry_async(root, rel))
+            .and_then(Result::ok)?;
+        dentry.directory()
     })
     .flatten()?;
     Some((dir, alloc::string::String::from(leaf)))
@@ -3799,12 +3781,12 @@ pub(crate) fn unix_socket_path_key(
 /// fallback), then reads the link target. `None` if the final component is
 /// not a symlink or does not resolve.
 fn resolve_final_symlink_target(path_ref: &str) -> Option<alloc::string::String> {
-    current_resolve_absolute(path_ref, |fs, rel| {
+    current_resolve_absolute(path_ref, |fs, root, rel| {
         let file = if rel.is_empty() {
             fs.root_file()
         } else {
-            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
-                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+            narf_filesystem::resolve_dentry(root.clone(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel))
                     .and_then(|result| result.ok())
             })
         };
@@ -3866,7 +3848,7 @@ fn unix_socket_path_key_depth(
     // a file-rooted mount (`rel` is empty) whose `root_file()` is the original
     // socket node.  Do this before the parent fallback so a private overmount
     // cannot split a service's `$NOTIFY_SOCKET` from PID 1's endpoint.
-    if let Some(Some(key)) = current_resolve_absolute(path_ref, |fs, rel| {
+    if let Some(Some(key)) = current_resolve_absolute(path_ref, |fs, root, rel| {
         let file = if rel.is_empty() {
             fs.root_file()
         } else {
@@ -3876,8 +3858,8 @@ fn unix_socket_path_key_depth(
             // capability so this identity path never makes an in-memory
             // S_IFSOCK node disappear. (A final symlink was already followed by
             // the follow_final preamble above; here `rel` is the real node.)
-            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
-                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+            narf_filesystem::resolve_dentry(root.clone(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel))
                     .and_then(|result| result.ok())
             })
         };
@@ -3899,7 +3881,7 @@ fn unix_socket_path_key_depth(
     let parent_path = if last == 0 { "/" } else { &path_ref[..last] };
     let (parent, leaf) = resolve_parent_dir_async(path_ref)?;
     let name = leaf;
-    current_resolve_absolute(parent_path, |fs, rel| {
+    current_resolve_absolute(parent_path, |fs, _root, rel| {
         let parent_ino = parent.ino();
         let fallback_parent_path = (parent_ino == 0).then(|| alloc::string::String::from(rel));
         (
@@ -3943,12 +3925,12 @@ fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
     }
     // Resolve ONLY the final node (mirrors the primary block of
     // `unix_socket_path_key_depth`); a present node of any type → exists.
-    current_resolve_absolute(path_ref, |fs, rel| {
+    current_resolve_absolute(path_ref, |fs, root, rel| {
         let file = if rel.is_empty() {
             fs.root_file()
         } else {
-            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
-                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+            narf_filesystem::resolve_dentry(root.clone(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, rel))
                     .and_then(|result| result.ok())
             })
         };
@@ -4308,12 +4290,12 @@ fn readlink_impl(
     // open /dev/dri/card0 device (Invalid argument)". The open/stat path
     // already resolves namespace-aware (current_resolve_absolute); readlink
     // must match or a pivoted service cannot readlink its own /sys symlinks.
-    let root_rel = current_resolve_absolute(&path, |fs, rel| {
-        (fs.root(), alloc::string::String::from(rel))
+    let root_rel = current_resolve_absolute(&path, |_fs, root, rel| {
+        (root, alloc::string::String::from(rel))
     });
     let file = match root_rel {
         Some((root, rel)) => {
-            match poll_blocking(narf_filesystem::resolve_async_nofollow(root, &rel)) {
+            match poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, &rel)) {
                 Some(Ok(o)) => Some(o),
                 _ => None,
             }
@@ -7375,10 +7357,10 @@ fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOp
     // the setxattr fell through to the generic path-keyed xattr table instead of
     // the node's own store. current_resolve_absolute falls back to the global
     // registry for un-namespaced tasks, so this is a no-op for the common case.
-    let (root, rel) = current_resolve_absolute(path, |fs, rel| {
-        (fs.root(), alloc::string::String::from(rel))
+    let (root, rel) = current_resolve_absolute(path, |_fs, root, rel| {
+        (root, alloc::string::String::from(rel))
     })?;
-    match poll_blocking(narf_filesystem::resolve_async_nofollow(root, &rel)) {
+    match poll_blocking(narf_filesystem::resolve_async_dentry_nofollow(root, &rel)) {
         Some(Ok(file)) => Some(file),
         _ => None,
     }

@@ -183,6 +183,10 @@ impl<B: BlockDevice + 'static> DirOps for SquashfsNode<B> {
         u64::from(self.inode.inode_number)
     }
 
+    fn rcu_walkable(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         None
     }
