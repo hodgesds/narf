@@ -1,4 +1,4 @@
-//! Linux `NETLINK_SOCK_DIAG` responder for IPv4 TCP and UDP sockets.
+//! Linux `NETLINK_SOCK_DIAG` responder for IPv4 and IPv6 TCP/UDP sockets.
 //!
 //! `ss` sends `SOCK_DIAG_BY_FAMILY` / `inet_diag_req_v2` dump requests.
 //! Replies are standard `inet_diag_msg` records sourced from the same TCP
@@ -24,6 +24,7 @@ pub const SOCK_DESTROY: u16 = 21;
 /// `linux/socket.h` `AF_MAX` (one past `AF_MCTP`).
 const AF_MAX: u8 = 46;
 pub const AF_INET: u8 = 2;
+pub const AF_INET6: u8 = 10;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 
@@ -34,14 +35,28 @@ const INET_DIAG_NOCOOKIE: u32 = u32::MAX;
 
 #[derive(Copy, Clone)]
 struct DiagRecord {
+    family: u8,
     state: u8,
-    local_addr: [u8; 4],
+    local_addr: [u8; 16],
     local_port: u16,
-    remote_addr: [u8; 4],
+    remote_addr: [u8; 16],
     remote_port: u16,
     tx_queue: u32,
     rx_queue: u32,
     retransmits: u32,
+}
+
+/// UDP6 state is owned by the Linux socket compatibility layer, so callers
+/// provide its namespace-filtered snapshot when building diagnostic replies.
+#[derive(Copy, Clone, Debug)]
+pub struct Udp6DiagRecord {
+    pub state: u8,
+    pub local_addr: [u8; 16],
+    pub local_port: u16,
+    pub remote_addr: [u8; 16],
+    pub remote_port: u16,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
 }
 
 #[inline]
@@ -73,13 +88,16 @@ fn encode_record(record: DiagRecord, seq: u32, multipart: bool) -> Vec<u8> {
     // struct inet_diag_msg: family/state/timer/retrans + inet_diag_sockid,
     // then expires/rqueue/wqueue/uid/inode.
     let mut body = Vec::with_capacity(72);
-    body.extend_from_slice(&[AF_INET, record.state, 0, record.retransmits.min(255) as u8]);
+    body.extend_from_slice(&[
+        record.family,
+        record.state,
+        0,
+        record.retransmits.min(255) as u8,
+    ]);
     body.extend_from_slice(&record.local_port.to_be_bytes());
     body.extend_from_slice(&record.remote_port.to_be_bytes());
     body.extend_from_slice(&record.local_addr);
-    body.extend_from_slice(&[0; 12]);
     body.extend_from_slice(&record.remote_addr);
-    body.extend_from_slice(&[0; 12]);
     body.extend_from_slice(&0u32.to_ne_bytes()); // idiag_if
     body.extend_from_slice(&INET_DIAG_NOCOOKIE.to_ne_bytes());
     body.extend_from_slice(&INET_DIAG_NOCOOKIE.to_ne_bytes());
@@ -96,11 +114,40 @@ fn encode_record(record: DiagRecord, seq: u32, multipart: bool) -> Vec<u8> {
     )
 }
 
-fn records(net_ns_id: u64, protocol: u8) -> Vec<DiagRecord> {
-    match protocol {
-        IPPROTO_TCP => crate::tcp::core::snapshot_in(net_ns_id)
+fn records(net_ns_id: u64, family: u8, protocol: u8, udp6: &[Udp6DiagRecord]) -> Vec<DiagRecord> {
+    match (family, protocol) {
+        (AF_INET, IPPROTO_TCP) => crate::tcp::core::snapshot_in(net_ns_id)
             .into_iter()
             .map(|socket| DiagRecord {
+                family,
+                state: socket.state_code,
+                local_addr: v4_addr(socket.local_addr),
+                local_port: socket.local_port,
+                remote_addr: v4_addr(socket.remote_addr),
+                remote_port: socket.remote_port,
+                tx_queue: socket.tx_queue,
+                rx_queue: socket.rx_queue,
+                retransmits: socket.retrnsmt,
+            })
+            .collect(),
+        (AF_INET, IPPROTO_UDP) => crate::udp_sock::snapshot_in(net_ns_id)
+            .into_iter()
+            .map(|socket| DiagRecord {
+                family,
+                state: socket.state_code,
+                local_addr: v4_addr(socket.local_addr),
+                local_port: socket.local_port,
+                remote_addr: v4_addr(socket.remote_addr),
+                remote_port: socket.remote_port,
+                tx_queue: socket.tx_queue,
+                rx_queue: socket.rx_queue,
+                retransmits: 0,
+            })
+            .collect(),
+        (AF_INET6, IPPROTO_TCP) => crate::tcp::core::snapshot6_in(net_ns_id)
+            .into_iter()
+            .map(|socket| DiagRecord {
+                family,
                 state: socket.state_code,
                 local_addr: socket.local_addr,
                 local_port: socket.local_port,
@@ -111,10 +158,11 @@ fn records(net_ns_id: u64, protocol: u8) -> Vec<DiagRecord> {
                 retransmits: socket.retrnsmt,
             })
             .collect(),
-        IPPROTO_UDP => crate::udp_sock::snapshot_in(net_ns_id)
-            .into_iter()
+        (AF_INET6, IPPROTO_UDP) => udp6
+            .iter()
             .map(|socket| DiagRecord {
-                state: socket.state_code,
+                family,
+                state: socket.state,
                 local_addr: socket.local_addr,
                 local_port: socket.local_port,
                 remote_addr: socket.remote_addr,
@@ -128,7 +176,13 @@ fn records(net_ns_id: u64, protocol: u8) -> Vec<DiagRecord> {
     }
 }
 
-fn build_one(net_ns_id: u64, request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+fn v4_addr(addr: [u8; 4]) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[..4].copy_from_slice(&addr);
+    out
+}
+
+fn build_one(net_ns_id: u64, request: &[u8], udp6: &[Udp6DiagRecord]) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN {
         return Err(());
     }
@@ -164,7 +218,7 @@ fn build_one(net_ns_id: u64, request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     if family >= AF_MAX {
         return Ok(alloc::vec![error(EINVAL, seq, request)]);
     }
-    if family != AF_INET {
+    if !matches!(family, AF_INET | AF_INET6) {
         return Ok(alloc::vec![error(ENOENT, seq, request)]);
     }
     // `inet_diag_handler_cmd`: short `inet_diag_req_v2` → -EINVAL.
@@ -192,14 +246,14 @@ fn build_one(net_ns_id: u64, request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
             .try_into()
             .unwrap(),
     );
-    let requested_local_addr: [u8; 4] = request[NLMSG_HDRLEN + 12..NLMSG_HDRLEN + 16]
+    let requested_local_addr: [u8; 16] = request[NLMSG_HDRLEN + 12..NLMSG_HDRLEN + 28]
         .try_into()
         .unwrap();
-    let requested_remote_addr: [u8; 4] = request[NLMSG_HDRLEN + 28..NLMSG_HDRLEN + 32]
+    let requested_remote_addr: [u8; 16] = request[NLMSG_HDRLEN + 28..NLMSG_HDRLEN + 44]
         .try_into()
         .unwrap();
     let mut out = Vec::new();
-    for record in records(net_ns_id, protocol) {
+    for record in records(net_ns_id, family, protocol, udp6) {
         let state_bit = 1u32.checked_shl(record.state as u32).unwrap_or(0);
         let state_matches = requested_states == 0 || requested_states & state_bit != 0;
         let id_matches = dump
@@ -235,6 +289,14 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
 }
 
 pub fn build_replies_in(net_ns_id: u64, datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_in_with_udp6(net_ns_id, datagram, &[])
+}
+
+pub fn build_replies_in_with_udp6(
+    net_ns_id: u64,
+    datagram: &[u8],
+    udp6: &[Udp6DiagRecord],
+) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0;
     let mut replies = Vec::new();
     while offset < datagram.len() {
@@ -246,7 +308,7 @@ pub fn build_replies_in(net_ns_id: u64, datagram: &[u8]) -> Result<Vec<Vec<u8>>,
         if len < NLMSG_HDRLEN || len > remaining.len() {
             return Err(());
         }
-        replies.extend(build_one(net_ns_id, &remaining[..len])?);
+        replies.extend(build_one(net_ns_id, &remaining[..len], udp6)?);
         let step = align(len);
         if step > remaining.len() {
             if len == remaining.len() {
@@ -264,8 +326,12 @@ mod tests {
     use super::*;
 
     fn request(protocol: u8) -> Vec<u8> {
+        request_for(AF_INET, protocol)
+    }
+
+    fn request_for(family: u8, protocol: u8) -> Vec<u8> {
         let mut body = alloc::vec![0u8; 56];
-        body[0] = AF_INET;
+        body[0] = family;
         body[1] = protocol;
         body[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
         frame(SOCK_DIAG_BY_FAMILY, 1 | NLM_F_DUMP, 91, &body)
@@ -286,10 +352,11 @@ mod tests {
     fn diag_record_uses_network_order_ports_and_linux_layout() {
         let message = encode_record(
             DiagRecord {
+                family: AF_INET,
                 state: 10,
-                local_addr: [127, 0, 0, 1],
+                local_addr: v4_addr([127, 0, 0, 1]),
                 local_port: 8080,
-                remote_addr: [0; 4],
+                remote_addr: [0; 16],
                 remote_port: 0,
                 tx_queue: 3,
                 rx_queue: 4,
@@ -308,6 +375,28 @@ mod tests {
                     .unwrap()
             ),
             4
+        );
+    }
+
+    #[test]
+    fn udp6_dump_encodes_family_and_full_addresses() {
+        let local_addr = [0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let rows = [Udp6DiagRecord {
+            state: 7,
+            local_addr,
+            local_port: 5353,
+            remote_addr: [0; 16],
+            remote_port: 0,
+            tx_queue: 0,
+            rx_queue: 12,
+        }];
+        let replies =
+            build_replies_in_with_udp6(4, &request_for(AF_INET6, IPPROTO_UDP), &rows).unwrap();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0][NLMSG_HDRLEN], AF_INET6);
+        assert_eq!(
+            &replies[0][NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 24],
+            &local_addr
         );
     }
 

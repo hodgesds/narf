@@ -599,3 +599,48 @@ pub(super) fn deliver_wire_v4_mapped(
         net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, 0,
     )
 }
+
+pub(super) fn snapshot_in(net_ns_id: u64) -> Vec<super::Udp6SocketSnapshot> {
+    let sockets: Vec<Arc<SocketFile>> = INET6_DGRAM_BOUND
+        .lock()
+        .as_ref()
+        .map(|map| {
+            map.iter()
+                .filter(|((ns, _), _)| *ns == net_ns_id)
+                .flat_map(|(_, sockets)| sockets.iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+    sockets
+        .into_iter()
+        .filter_map(|socket| {
+            let state = socket.state.lock();
+            let SocketState::Inet6Dgram {
+                local_addr,
+                local_port,
+                inbox,
+                peer,
+                ..
+            } = &*state
+            else {
+                return None;
+            };
+            let (remote_addr, remote_port) = peer
+                .map(|(addr, port, _)| (addr, port))
+                .unwrap_or(([0; 16], 0));
+            Some(super::Udp6SocketSnapshot {
+                local_addr: *local_addr,
+                local_port: *local_port,
+                remote_addr,
+                remote_port,
+                state_code: if peer.is_some() { 0x01 } else { 0x07 },
+                tx_queue: 0,
+                rx_queue: inbox
+                    .iter()
+                    .map(|packet| packet.payload.len())
+                    .sum::<usize>()
+                    .min(u32::MAX as usize) as u32,
+            })
+        })
+        .collect()
+}

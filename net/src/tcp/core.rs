@@ -1034,6 +1034,18 @@ pub struct TcbSnapshot {
     pub snd_ssthresh: i32,
 }
 
+#[derive(Clone, Debug)]
+pub struct Tcb6Snapshot {
+    pub local_addr: [u8; 16],
+    pub local_port: u16,
+    pub remote_addr: [u8; 16],
+    pub remote_port: u16,
+    pub state_code: u8,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
+    pub retrnsmt: u32,
+}
+
 /// Authoritative subset of Linux `struct tcp_info`. Fields absent here are
 /// deliberately reported as zero by the socket ABI rather than fabricated.
 #[derive(Copy, Clone, Debug)]
@@ -1147,7 +1159,7 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
         };
         for arc in m.values() {
             let t = arc.lock();
-            if t.net_ns_id != net_ns_id {
+            if t.net_ns_id != net_ns_id || t.is_ipv6 {
                 continue;
             }
             let (timer_active, deadline) = if t.retx_deadline_cycles != 0 {
@@ -1203,6 +1215,33 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
                 } else {
                     (t.cong.ssthresh / mss).min(i32::MAX as u32) as i32
                 },
+            });
+        }
+    }
+    out
+}
+
+pub fn snapshot6_in(net_ns_id: u64) -> alloc::vec::Vec<Tcb6Snapshot> {
+    let mut out = Vec::new();
+    for shard in TCB_TABLE.iter() {
+        let table = shard.lock();
+        let Some(table) = table.as_ref() else {
+            continue;
+        };
+        for tcb in table.values() {
+            let tcb = tcb.lock();
+            if tcb.net_ns_id != net_ns_id || !tcb.is_ipv6 {
+                continue;
+            }
+            out.push(Tcb6Snapshot {
+                local_addr: tcb.local_addr6,
+                local_port: tcb.local_port,
+                remote_addr: tcb.remote_addr6,
+                remote_port: tcb.remote_port,
+                state_code: tcp_state_code(tcb.state),
+                tx_queue: tcb.send_buf.len().min(u32::MAX as usize) as u32,
+                rx_queue: (tcb.recv_buf.limit as u32).saturating_sub(tcb.recv_buf.free_window()),
+                retrnsmt: tcb.rto_count,
             });
         }
     }

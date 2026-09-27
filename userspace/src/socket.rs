@@ -1410,6 +1410,21 @@ pub struct DgramPacket {
 }
 
 #[derive(Clone, Debug)]
+pub struct Udp6SocketSnapshot {
+    pub local_addr: [u8; 16],
+    pub local_port: u16,
+    pub remote_addr: [u8; 16],
+    pub remote_port: u16,
+    pub state_code: u8,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
+}
+
+pub fn udp6_snapshot_in(net_ns_id: u64) -> Vec<Udp6SocketSnapshot> {
+    inet6_dgram::snapshot_in(net_ns_id)
+}
+
+#[derive(Clone, Debug)]
 struct DgramPacket6 {
     peer_addr: [u8; 16],
     peer_port: u16,
@@ -3766,11 +3781,26 @@ impl SocketFile {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
-                let mut replies =
-                    match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf) {
-                        Ok(replies) => replies,
-                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                    };
+                let udp6: Vec<_> = udp6_snapshot_in(self.net_ns_id())
+                    .into_iter()
+                    .map(|socket| narf_net::netlink_diag::Udp6DiagRecord {
+                        state: socket.state_code,
+                        local_addr: socket.local_addr,
+                        local_port: socket.local_port,
+                        remote_addr: socket.remote_addr,
+                        remote_port: socket.remote_port,
+                        tx_queue: socket.tx_queue,
+                        rx_queue: socket.rx_queue,
+                    })
+                    .collect();
+                let mut replies = match narf_net::netlink_diag::build_replies_in_with_udp6(
+                    self.net_ns_id(),
+                    buf,
+                    &udp6,
+                ) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
                 Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();

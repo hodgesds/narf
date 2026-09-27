@@ -133,6 +133,10 @@ argument = "The procfs adapters read only the scheduler-published current task i
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
+argument = "The IPv6 procfs adapters replace empty placeholders with read-only, namespace-filtered TCP6 and UDP6 scalar snapshots. They copy no packet payload, userspace pointer, physical address, capability, domain state, frame ownership, or scheduler authority, and take no action beyond formatting existing networking state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
 argument = "The frame procfs adapter copies only scalar TCP timer, queue, and congestion snapshots already owned by the network stack into filesystem display records. It grants no capability, changes no domain or scheduler state, exposes no physical address, and performs no userspace-memory access."
 
 [[invariants_preserved]]

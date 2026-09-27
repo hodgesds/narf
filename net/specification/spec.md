@@ -225,7 +225,7 @@ Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
-`inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
+`inet_diag_req_v2` dumps for IPv4 and IPv6 TCP and UDP. It filters by the requested
 Linux socket-state mask and emits `inet_diag_msg` records from
 namespace-scoped transport snapshots, followed by
 `NLMSG_DONE`. Aligned requests may be batched, their sequences remain
@@ -297,7 +297,7 @@ them, from the shared `tcp::core::ICMP_UNREACH_ERRNO` /
 payloads above `icmp_sock::ICMP_ECHO_MAX_PAYLOAD` fail
 `IcmpError2::MsgTooLong` (Linux `EMSGSIZE`).
 
-Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
+Linux `/proc/net/{tcp,tcp6,udp,udp6,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
 TCP snapshots expose Linux `get_tcp4_sock` transport fields rather than
