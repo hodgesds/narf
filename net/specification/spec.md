@@ -764,6 +764,12 @@ References (public-only, all IETF documents):
   `Icmpv6Header`, ND option iterator + appender, message builders
   for RS / NS / NA (with R/S/O flags) / RA (with M/O flags +
   CurHopLimit + Router Lifetime + Reachable / Retrans timers).
+- `ipv6_stack::build_udp_segment` constructs the mandatory non-zero IPv6 UDP
+  checksum. `ipv6_stack::send_udp` performs IPv6 longest-prefix route lookup,
+  preferred/deprecated source selection, gateway-aware NDP lookup or RFC 2464
+  multicast MAC mapping, and emits the complete Ethernet frame. RX validates
+  the IPv6 pseudo-header checksum and UDP length before forwarding the exact
+  payload and ingress ifindex through the registered userspace datagram hook.
 
 ### DNS (`pkt_dns`)
 - **RFC 1035** — Domain Names — Implementation and Specification

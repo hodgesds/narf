@@ -732,6 +732,28 @@ fn smoke_icmpv6_pseudo_checksum_round_trip() -> TestResult {
 }
 kernel_test_in!("net/ipv6", smoke_icmpv6_pseudo_checksum_round_trip);
 
+fn smoke_ipv6_udp_segment_has_mandatory_valid_checksum() -> TestResult {
+    use crate::pkt_ipv6::{pseudo_checksum, NEXT_HEADER_UDP};
+    let src = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let dst = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let segment = match crate::ipv6_stack::build_udp_segment(src, dst, 1234, 5678, b"udp6") {
+        Ok(segment) => segment,
+        Err(_) => return TestResult::Fail("UDP6 segment construction failed"),
+    };
+    if segment.len() != 12
+        || segment[6..8] == [0, 0]
+        || pseudo_checksum(src, dst, NEXT_HEADER_UDP, &segment) != 0
+    {
+        TestResult::Fail("UDP6 checksum or length is invalid")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "net/ipv6",
+    smoke_ipv6_udp_segment_has_mandatory_valid_checksum
+);
+
 fn smoke_icmpv6_router_solicitation_layout() -> TestResult {
     use crate::pkt_ipv6::{router_solicitation, ICMPV6_ROUTER_SOLICITATION};
     let body = router_solicitation(&[]);

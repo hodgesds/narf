@@ -864,6 +864,47 @@ fn smoke_socket_inet_udp_16_concurrent() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet_udp_16_concurrent);
 
+fn smoke_socket_inet6_udp_loopback_round_trip() -> TestResult {
+    let rx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let tx = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let addr = crate::socket::make_sockaddr_in6(loopback, 8123);
+    if !matches!(
+        rx.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() }),
+        crate::socket::SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("AF_INET6 UDP bind(::1) failed");
+    }
+    let payload = b"udp6";
+    if !matches!(
+        tx.dispatch_op(crate::socket::SocketOp::Send {
+            buf: payload,
+            flags: 0,
+            addr: Some(addr),
+        }),
+        crate::socket::SocketOpResult::Ok(4)
+    ) {
+        rx.unregister();
+        tx.unregister();
+        return TestResult::Fail("AF_INET6 UDP sendto(::1) failed");
+    }
+    let mut out = [0u8; 8];
+    let result = rx.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    });
+    rx.unregister();
+    tx.unregister();
+    if matches!(result, crate::socket::SocketOpResult::Received { n: 4, .. })
+        && &out[..4] == payload
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("AF_INET6 UDP loopback payload mismatch")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet6_udp_loopback_round_trip);
+
 /// SO_REUSEADDR + double-bind: the second bind to the same
 /// (addr, port) succeeds when SO_REUSEADDR is set on the second
 /// socket. Without it, the second bind returns EADDRINUSE.
@@ -1299,9 +1340,9 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
     // ── RX: a datagram from the wire must reach the socket ──
     if !crate::socket::deliver_wire_datagram(
         sock.net_ns_id(),
-        PEER,
+        &PEER,
         PEER_PORT,
-        LOCAL,
+        &LOCAL,
         LOCAL_PORT,
         b"pong",
         0, // arrival interface unknown: matches any binding
@@ -1321,9 +1362,9 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
     // fall through to its own handling rather than silently swallowing it.
     if crate::socket::deliver_wire_datagram(
         sock.net_ns_id(),
-        PEER,
+        &PEER,
         PEER_PORT,
-        LOCAL,
+        &LOCAL,
         LOCAL_PORT + 1,
         b"nobody",
         0,
@@ -1398,15 +1439,15 @@ fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
 
     let ns = sock.net_ns_id();
     // Arriving on the WRONG interface: refused.
-    if crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"wrong", idx_b) {
+    if crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"wrong", idx_b) {
         return TestResult::Fail("a datagram from another interface must not be delivered");
     }
     // Arriving on the RIGHT interface: delivered.
-    if !crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"right", idx_a) {
+    if !crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"right", idx_a) {
         return TestResult::Fail("a datagram from the bound interface must be delivered");
     }
     // An unknown arrival interface cannot contradict the binding.
-    if !crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"any", 0) {
+    if !crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"any", 0) {
         return TestResult::Fail("an unknown arrival interface must still be delivered");
     }
 

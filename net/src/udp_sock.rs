@@ -614,7 +614,7 @@ pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
 /// `in_ifindex` is the arrival interface, so that layer can apply the same
 /// SO_BINDTODEVICE rule; without it the check would hold for in-kernel
 /// sockets and silently not for userspace ones.
-type UserDeliverHook = fn(u64, [u8; 4], u16, [u8; 4], u16, &[u8], u32) -> bool;
+type UserDeliverHook = fn(u64, &[u8], u16, &[u8], u16, &[u8], u32) -> bool;
 
 static USER_DELIVER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -628,11 +628,11 @@ pub fn install_user_deliver_hook(hook: UserDeliverHook) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn user_deliver(
+pub(crate) fn user_deliver(
     net_ns_id: u64,
-    src_ip: [u8; 4],
+    src_ip: &[u8],
     src_port: u16,
-    dst_ip: [u8; 4],
+    dst_ip: &[u8],
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
@@ -727,7 +727,7 @@ pub fn deliver_in(
         // before the datagram is dropped — that table is the only place a
         // userspace `bind()` is recorded.
         user_deliver(
-            net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
+            net_ns_id, &src_ip, src_port, &dst_ip, dst_port, payload, in_ifindex,
         );
         return;
     }

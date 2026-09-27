@@ -1211,6 +1211,16 @@ datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
   as full 16-byte `sockaddr_in`. `SO_PROTOCOL` for protocol 0 is
   `IPPROTO_UDP`.
 
+AF_INET6 registers `SOCK_DGRAM` with protocol zero or `IPPROTO_UDP`; opening
+one must not return `EAFNOSUPPORT` and thereby falsely advertise an IPv4-only
+host to libc resolver probes. Native IPv6 datagram endpoints retain 128-bit
+local and peer addresses, namespace-scoped bind tables, wildcard/exact
+receive selection, connected-peer filtering, message boundaries,
+`MSG_PEEK`/`MSG_TRUNC`, shutdown state, and Linux bind/connect/send address
+validation. `::1` delivery uses this same endpoint table. IPv4-mapped address
+and wildcard arbitration is controlled explicitly by `IPV6_V6ONLY`; it must
+not arise from truncating an IPv6 address into the IPv4 table.
+
 ### 3.3 BPF XDP program compatibility
 
 `BPF_PROG_LOAD` accepts Linux program type 6 (`BPF_PROG_TYPE_XDP`) and records

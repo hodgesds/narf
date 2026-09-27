@@ -7623,10 +7623,11 @@ fn smoke_abi_socket_create_type_protocol_errnos() -> TestResult {
         if socket_errno(AF_NETLINK, SOCK_RAW, 32)? != EPROTONOSUPPORT {
             return Err("socket(AF_NETLINK, SOCK_RAW, 32) is not -EPROTONOSUPPORT");
         }
-        // No IPv6 datagram support: refused at creation so resolvers fall
-        // back to IPv4, instead of a socket whose every op is -EOPNOTSUPP.
-        if socket_errno(AF_INET6, SOCK_DGRAM, 0)? != EAFNOSUPPORT {
-            return Err("socket(AF_INET6, SOCK_DGRAM) is not -EAFNOSUPPORT");
+        // The registered IPv6 family exposes UDP just as inet6_create does.
+        // In particular, resolvers must no longer mistake NARF for an
+        // IPv4-only host after probing an AF_INET6 datagram socket.
+        if socket_errno(AF_INET6, SOCK_DGRAM, 0)? < 0 {
+            return Err("socket(AF_INET6, SOCK_DGRAM) failed");
         }
         // AF_UNIX SOCK_RAW is remapped to SOCK_DGRAM by `unix_create`.
         let fd = socket_errno(AF_UNIX, SOCK_RAW, 0)?;

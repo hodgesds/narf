@@ -33,6 +33,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
+mod inet6_dgram;
 mod inet_dgram;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 
@@ -1217,6 +1218,17 @@ enum SocketState {
         /// (`sk_rmem_alloc`).
         rmem: usize,
     },
+    /// AF_INET6 SOCK_DGRAM endpoint. Native IPv6 bindings remain separate
+    /// from IPv4; dual-stack wildcard arbitration is explicit rather than
+    /// relying on address truncation or aliases.
+    Inet6Dgram {
+        local_addr: [u8; 16],
+        local_port: u16,
+        inbox: VecDeque<DgramPacket6>,
+        peer: Option<([u8; 16], u16)>,
+        port_locked: bool,
+        rmem: usize,
+    },
     /// AF_UNIX SOCK_DGRAM endpoint. Same shape as InetDgram but keyed by
     /// a unix address (pathname or abstract name).
     UnixDgram {
@@ -1287,8 +1299,8 @@ enum SocketState {
     NetlinkNetfilter { replies: VecDeque<Vec<u8>> },
 }
 
-/// Deliver a UDP datagram that arrived from the WIRE to a bound AF_INET
-/// datagram socket. Returns whether one took it.
+/// Deliver a UDP datagram that arrived from the wire to a bound AF_INET or
+/// AF_INET6 datagram socket. Address slices are exactly 4 or 16 bytes.
 ///
 /// Installed into `narf_net::udp_sock` at boot, because the RX demux there
 /// cannot see this crate's port table. In-kernel sockets are matched first
@@ -1301,16 +1313,26 @@ enum SocketState {
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_wire_datagram(
     net_ns_id: u64,
-    src_ip: [u8; 4],
+    src_ip: &[u8],
     src_port: u16,
-    dst_ip: [u8; 4],
+    dst_ip: &[u8],
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
 ) -> bool {
-    inet_dgram::deliver_wire(
-        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
-    )
+    match (src_ip.try_into(), dst_ip.try_into()) {
+        (Ok(src), Ok(dst)) => {
+            inet_dgram::deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
+        }
+        _ if src_ip.len() == 16 && dst_ip.len() == 16 => {
+            let mut src = [0u8; 16];
+            let mut dst = [0u8; 16];
+            src.copy_from_slice(src_ip);
+            dst.copy_from_slice(dst_ip);
+            inet6_dgram::deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
+        }
+        _ => false,
+    }
 }
 
 /// Open-file state transported by `SCM_RIGHTS`.
@@ -1341,6 +1363,13 @@ pub struct DgramPacket {
     /// Per-datagram SCM_RIGHTS payload. AF_UNIX datagrams preserve message
     /// boundaries, so these descriptors must not share the stream ring.
     pub(crate) fds: Vec<ScmRightsFile>,
+}
+
+#[derive(Clone, Debug)]
+struct DgramPacket6 {
+    peer_addr: [u8; 16],
+    peer_port: u16,
+    payload: Vec<u8>,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -2192,9 +2221,9 @@ impl SocketFile {
         self.nonblock.store(on, Ordering::Release);
     }
 
-    /// An AF_INET `SOCK_DGRAM` (UDP) socket.
+    /// An Internet-family `SOCK_DGRAM` (UDP) socket.
     pub fn is_inet_dgram(&self) -> bool {
-        self.domain == AF_INET && self.kind == SOCK_DGRAM
+        matches!(self.domain, AF_INET | AF_INET6) && self.kind == SOCK_DGRAM
     }
 
     /// Whether an EPIPE from a send raises SIGPIPE (absent MSG_NOSIGNAL).
@@ -2252,6 +2281,11 @@ impl SocketFile {
                 local_port,
                 ..
             } => Some(make_sockaddr_in(*local_addr, *local_port)),
+            SocketState::Inet6Dgram {
+                local_addr,
+                local_port,
+                ..
+            } => Some(make_sockaddr_in6(*local_addr, *local_port)),
             SocketState::InetRaw { local_addr, .. } => Some(make_sockaddr_in(*local_addr, 0)),
             SocketState::UnixBound { addr } | SocketState::UnixListener { addr, .. } => {
                 Some(SockAddr {
@@ -2300,6 +2334,9 @@ impl SocketFile {
             SocketState::InetDgram {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
+            SocketState::Inet6Dgram {
+                peer: Some((a, p)), ..
+            } => Some(make_sockaddr_in6(*a, *p)),
             SocketState::InetRaw {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
@@ -2343,6 +2380,7 @@ impl SocketFile {
                 | SocketState::Inet6Listener { .. }
                 | SocketState::UnixDgram { addr: Some(_), .. }
                 | SocketState::InetDgram { .. }
+                | SocketState::Inet6Dgram { .. }
                 | SocketState::InetWired { .. }
         )
     }
@@ -2360,6 +2398,7 @@ impl SocketFile {
             UnixDgram(UnixPathKey),
             AbstractDgram((u64, Vec<u8>)),
             InetDgram(u16, bool),
+            Inet6Dgram(u16, bool),
             Tcb(u32),
             None,
         }
@@ -2415,6 +2454,11 @@ impl SocketFile {
                     port_locked,
                     ..
                 } => Reg::InetDgram(*local_port, *port_locked),
+                SocketState::Inet6Dgram {
+                    local_port,
+                    port_locked,
+                    ..
+                } => Reg::Inet6Dgram(*local_port, *port_locked),
                 SocketState::InetWired { tcb_id, .. } => Reg::Tcb(*tcb_id),
                 _ => Reg::None,
             }
@@ -2465,6 +2509,9 @@ impl SocketFile {
             }
             Reg::InetDgram(port, port_locked) => {
                 self.inet_dgram_unregister(port, port_locked);
+            }
+            Reg::Inet6Dgram(port, port_locked) => {
+                self.inet6_dgram_unregister(port, port_locked);
             }
             Reg::Tcb(id) => {
                 let _ = narf_net::tcp_stack::close(id);
@@ -2983,7 +3030,9 @@ impl SocketFile {
         match state {
             // A fresh UDP socket is already writable (`datagram_poll`,
             // `net/core/datagram.c:919-921`).
-            SocketState::Fresh if self.domain == AF_INET && self.kind == SOCK_DGRAM => {
+            SocketState::Fresh
+                if matches!(self.domain, AF_INET | AF_INET6) && self.kind == SOCK_DGRAM =>
+            {
                 self.inet_dgram_poll_bits(false)
             }
             SocketState::Fresh | SocketState::UnixBound { .. } => 0,
@@ -3061,6 +3110,14 @@ impl SocketFile {
                 // level so a recv that drained the inbox stops reporting
                 // readable in the cell (POLL_OUT stays — always sendable). The
                 // send enqueue set the rising POLL_IN edge that fired the reader.
+                self.dgram_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
+                bits
+            }
+            SocketState::Inet6Dgram { inbox, .. } => {
+                let bits = self.inet_dgram_poll_bits(!inbox.is_empty());
                 self.dgram_readiness.set(
                     bits & narf_filesystem::POLL_IN,
                     narf_filesystem::POLL_IN & !bits,
@@ -3298,6 +3355,7 @@ impl SocketFile {
             (AF_INET, SOCK_RAW) => self.dispatch_inet_raw(op),
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
+            (AF_INET6, SOCK_DGRAM) => self.dispatch_inet6_dgram(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_GENERIC => {

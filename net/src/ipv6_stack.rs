@@ -276,6 +276,119 @@ pub fn build_frame(out: &mut Vec<u8>, spec: Ipv6FrameSpec<'_>) -> usize {
     out.len()
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Udp6SendError {
+    MessageTooLong,
+    NetworkUnreachable,
+    NeighborPending,
+    NoSourceAddress,
+    DeviceFailure,
+}
+
+/// Build an IPv6 UDP segment, including its mandatory pseudo-header checksum.
+pub fn build_udp_segment(
+    source: [u8; 16],
+    destination: [u8; 16],
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, Udp6SendError> {
+    const UDP_HDR_LEN: usize = 8;
+    if payload.len() > u16::MAX as usize - UDP_HDR_LEN {
+        return Err(Udp6SendError::MessageTooLong);
+    }
+    let udp_len = UDP_HDR_LEN + payload.len();
+    let mut udp = Vec::with_capacity(udp_len);
+    udp.extend_from_slice(&source_port.to_be_bytes());
+    udp.extend_from_slice(&destination_port.to_be_bytes());
+    udp.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(payload);
+    let checksum = pseudo_checksum(source, destination, NEXT_HEADER_UDP, &udp);
+    let checksum = if checksum == 0 { 0xffff } else { checksum };
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+    Ok(udp)
+}
+
+/// Route and emit one IPv6 UDP datagram. A missing NDP entry is reported as
+/// `NeighborPending`: the compatibility caller treats that like Linux's
+/// queued-neighbour success while the NDP machinery resolves the next hop.
+#[allow(clippy::too_many_arguments)]
+pub fn send_udp(
+    net_ns_id: u64,
+    source: Option<[u8; 16]>,
+    source_port: u16,
+    destination: [u8; 16],
+    destination_port: u16,
+    payload: &[u8],
+    bound_ifindex: u32,
+    hop_limit: u8,
+) -> Result<usize, Udp6SendError> {
+    let scoped_iface = if bound_ifindex == 0 {
+        None
+    } else {
+        crate::iface::snapshot_all_in(net_ns_id)
+            .into_iter()
+            .find(|entry| crate::iface::ifindex_of(&entry.name) == Some(bound_ifindex))
+            .map(|entry| entry.name)
+    };
+    if bound_ifindex != 0 && scoped_iface.is_none() {
+        return Err(Udp6SendError::NetworkUnreachable);
+    }
+    let next_hop = crate::ipv6::route::lookup(&destination, scoped_iface.as_deref());
+    let (iface_name, neighbor_ip) = match next_hop {
+        crate::ipv6::route::NextHop::Direct(iface) => (iface, destination),
+        crate::ipv6::route::NextHop::Gateway { iface, gateway } => (iface, gateway),
+        crate::ipv6::route::NextHop::Unreachable => return Err(Udp6SendError::NetworkUnreachable),
+    };
+    let iface =
+        crate::iface::lookup_in(net_ns_id, &iface_name).ok_or(Udp6SendError::NetworkUnreachable)?;
+    let source = match source {
+        Some(addr) if addr != [0; 16] => addr,
+        _ => crate::ipv6::addrs::list_iface(&iface_name)
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    entry.state,
+                    crate::ipv6::addrs::AddrState::Preferred
+                        | crate::ipv6::addrs::AddrState::Deprecated
+                )
+            })
+            .map(|entry| entry.addr)
+            .ok_or(Udp6SendError::NoSourceAddress)?,
+    };
+    let destination_mac = if destination[0] == 0xff {
+        [
+            0x33,
+            0x33,
+            destination[12],
+            destination[13],
+            destination[14],
+            destination[15],
+        ]
+    } else {
+        crate::ipv6::ndp::neigh_lookup(&iface_name, &neighbor_ip)
+            .ok_or(Udp6SendError::NeighborPending)?
+    };
+    let udp = build_udp_segment(source, destination, source_port, destination_port, payload)?;
+
+    let mut frame = Vec::new();
+    build_frame(
+        &mut frame,
+        Ipv6FrameSpec {
+            src_mac: iface.mac,
+            dst_mac: destination_mac,
+            src_ip: source,
+            dst_ip: destination,
+            next_header: NEXT_HEADER_UDP,
+            hop_limit: if hop_limit == 0 { 64 } else { hop_limit },
+            body: &udp,
+        },
+    );
+    (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure)?;
+    Ok(payload.len())
+}
+
 /// Build an ICMPv6 Echo Request, set the checksum, return the body.
 pub fn build_echo_request(
     src_ip: [u8; 16],
@@ -357,8 +470,48 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
 fn dispatch_l4(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], proto: u8, l4: &[u8]) -> bool {
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
+        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, l4),
         _ => false,
     }
+}
+
+fn handle_udp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], datagram: &[u8]) -> bool {
+    const UDP_HDR_LEN: usize = 8;
+    if datagram.len() < UDP_HDR_LEN {
+        return true;
+    }
+    let length = u16::from_be_bytes([datagram[4], datagram[5]]) as usize;
+    // IPv6 UDP jumbograms use a zero length and require a Jumbo Payload
+    // option. That extension is not accepted by this stack yet, so zero and
+    // ordinary malformed lengths are silently discarded.
+    if length < UDP_HDR_LEN || length > datagram.len() {
+        return true;
+    }
+    let datagram = &datagram[..length];
+    // Unlike IPv4, a zero UDP checksum is forbidden for IPv6 (RFC 8200 §8.1).
+    if datagram[6..8] == [0, 0] || pseudo_checksum(src_ip, dst_ip, NEXT_HEADER_UDP, datagram) != 0 {
+        return true;
+    }
+    let src_port = u16::from_be_bytes([datagram[0], datagram[1]]);
+    let dst_port = u16::from_be_bytes([datagram[2], datagram[3]]);
+    let (net_ns_id, ifindex) = crate::iface::lookup(iface)
+        .map(|entry| {
+            (
+                entry.net_ns_id,
+                crate::iface::ifindex_of(iface).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    crate::udp_sock::user_deliver(
+        net_ns_id,
+        &src_ip,
+        src_port,
+        &dst_ip,
+        dst_port,
+        &datagram[UDP_HDR_LEN..],
+        ifindex,
+    );
+    true
 }
 
 fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) -> bool {
