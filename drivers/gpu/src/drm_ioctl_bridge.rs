@@ -2706,6 +2706,18 @@ fn handle_atomic(
     let mut prop_index = 0usize;
     let presentation = {
         let mut card = mode_state.lock();
+        // Linux's atomic state grows implicitly while properties are decoded:
+        // drm_atomic_get_plane_state() adds the plane's old CRTC and
+        // drm_atomic_set_crtc_for_plane() adds its new CRTC.  Keep the same
+        // effective set here even when userspace submits only a plane object.
+        // prepare_signaling() reserves one event for every CRTC in that
+        // completed state, which is the common KWin page-flip request shape.
+        let synthesized_planes = synth_planes(&card);
+        // TEST_ONLY is KWin's hottest probe path and never carries an event;
+        // avoid allocating its bookkeeping vector unless signaling was
+        // actually requested.
+        let mut event_crtc_ids =
+            (req.flags & PAGE_FLIP_EVENT != 0).then(|| Vec::with_capacity(card.crtcs.len()));
         for (object_index, object_id) in objects.iter().copied().enumerate() {
             let object_prop_count = prop_counts[object_index] as usize;
             let end = prop_index
@@ -2716,11 +2728,18 @@ fn handle_atomic(
             let object_values = &values[prop_index..end];
             prop_index = end;
 
-            if let Some((_, crtc_index)) = synth_planes(&card)
-                .into_iter()
+            if let Some((_, crtc_index)) = synthesized_planes
+                .iter()
+                .copied()
                 .find(|(id, _)| *id == object_id)
             {
                 let crtc = &card.crtcs[crtc_index as usize];
+                let old_crtc_id = crtc.primary_fb.map(|_| crtc.id);
+                if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), old_crtc_id) {
+                    if !crtc_ids.contains(&crtc_id) {
+                        crtc_ids.push(crtc_id);
+                    }
+                }
                 let fb = crtc.primary_fb.and_then(|id| card.framebuffer(id).ok());
                 let width = fb
                     .map(|fb| fb.width)
@@ -2758,6 +2777,11 @@ fn handle_atomic(
                         PLANE_CRTC_W_PROP_ID => plane.crtc_w = value as u32,
                         PLANE_CRTC_H_PROP_ID => plane.crtc_h = value as u32,
                         _ => return Err(FsError::InvalidData),
+                    }
+                }
+                if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
+                    if !crtc_ids.contains(&crtc_id) {
+                        crtc_ids.push(crtc_id);
                     }
                 }
                 state.planes.push(plane);
@@ -2809,6 +2833,11 @@ fn handle_atomic(
                 // KWin relies on this for its TEST_ONLY no-modeset probe.
                 crtc_state.mode_changed = crtc_state.mode != old_mode;
                 crtc_state.active_changed = crtc_state.active != old_active;
+                if let Some(crtc_ids) = event_crtc_ids.as_mut() {
+                    if !crtc_ids.contains(&crtc_state.id) {
+                        crtc_ids.push(crtc_state.id);
+                    }
+                }
                 state.crtcs.push(crtc_state);
             } else if card.connector(object_id).is_ok() {
                 let connector = card
@@ -2821,12 +2850,26 @@ fn handle_atomic(
                         .and_then(|id| card.encoder(id).ok())
                         .and_then(|encoder| encoder.crtc_id),
                 };
+                if let (Some(crtc_ids), Some(crtc_id)) =
+                    (event_crtc_ids.as_mut(), connector_state.crtc_id)
+                {
+                    if !crtc_ids.contains(&crtc_id) {
+                        crtc_ids.push(crtc_id);
+                    }
+                }
                 for (&prop, &value) in object_props.iter().zip(object_values) {
                     match prop {
                         CONNECTOR_CRTC_ID_PROP_ID => {
                             connector_state.crtc_id = (value != 0).then_some(value as u32)
                         }
                         _ => return Err(FsError::InvalidData),
+                    }
+                }
+                if let (Some(crtc_ids), Some(crtc_id)) =
+                    (event_crtc_ids.as_mut(), connector_state.crtc_id)
+                {
+                    if !crtc_ids.contains(&crtc_id) {
+                        crtc_ids.push(crtc_id);
                     }
                 }
                 state.connectors.push(connector_state);
@@ -2847,14 +2890,14 @@ fn handle_atomic(
         // state before committing. PAGE_FLIP_EVENT with no CRTC is EINVAL;
         // exhausting this drm_file's 4 KiB event budget is ENOMEM and must not
         // mutate display state.
-        let event_crtc_count = state.crtcs.len();
         let mut event_queue = if req.flags & PAGE_FLIP_EVENT != 0 {
-            if event_crtc_count == 0 {
+            let crtc_ids = event_crtc_ids.as_ref().ok_or(FsError::InvalidData)?;
+            if crtc_ids.is_empty() {
                 return Err(FsError::InvalidData);
             }
             let queue = events.ok_or(FsError::InvalidData)?.lock();
             queue
-                .ensure_flip_event_space(event_crtc_count)
+                .ensure_flip_event_space(crtc_ids.len())
                 .map_err(|_| FsError::OutOfMemory)?;
             Some(queue)
         } else {
@@ -2874,9 +2917,9 @@ fn handle_atomic(
                 .planes
                 .iter()
                 .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
-            if let Some(queue) = event_queue.as_mut() {
-                for crtc in &state.crtcs {
-                    card.queue_flip_event(queue, req.user_data, crtc.id)
+            if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
+                for crtc_id in crtc_ids {
+                    card.queue_flip_event(queue, req.user_data, crtc_id)
                         .map_err(|_| FsError::OutOfMemory)?;
                 }
             }

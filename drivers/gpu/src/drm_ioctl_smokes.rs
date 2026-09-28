@@ -559,6 +559,79 @@ kernel_test_in!(
     smoke_drm_ioctl_atomic_empty_commit_succeeds
 );
 
+/// KWin performs a plane-only TEST_ONLY commit, then submits the same plane
+/// update with NONBLOCK | PAGE_FLIP_EVENT. Linux implicitly adds both the
+/// plane's old and new CRTC states while decoding CRTC_ID, so the real commit
+/// has a CRTC on which to signal even though no CRTC object appeared in the
+/// userspace object array. Rejecting this shape with EINVAL makes KWin retry
+/// TEST_ONLY forever and never establish a scanout.
+#[allow(dead_code)]
+fn smoke_drm_atomic_plane_only_flip_event_tracks_implicit_crtc() -> TestResult {
+    use crate::drm_devfs_bridge::{DriCardFile, VirtioGpuCard};
+
+    let name = format!("card{}", crate::drm_registry::count());
+    let mut card = make_test_card();
+    card.driver_name = "virtio_gpu";
+    card.driver_desc = "NARF VirtIO GPU driver";
+    card.version = (0, 1, 0);
+    let handle = match card.gem.alloc(0x1000, 64 * 64 * 4) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("could not allocate atomic test GEM"),
+    };
+    let fb_id = match card.addfb2(64, 64, 0x3432_5258, 64 * 4, handle) {
+        Ok(fb_id) => fb_id,
+        Err(_) => return TestResult::Fail("could not create atomic test framebuffer"),
+    };
+    card.crtcs[0].primary_fb = Some(fb_id);
+    card.crtcs[0].enabled = true;
+
+    let idx =
+        crate::drm_registry::register_drm_card_with_state(Arc::new(VirtioGpuCard::new(name)), card);
+    let file = match DriCardFile::new(idx) {
+        Some(file) => file,
+        None => return TestResult::Fail("failed to open atomic test card"),
+    };
+
+    let objects = [0x40u32]; // synthetic primary plane for CRTC 11
+    let prop_counts = [10u32];
+    let props = [
+        0x55u32, // FB_ID
+        0x56,    // CRTC_ID
+        0x57,    // SRC_X
+        0x58,    // SRC_Y
+        0x59,    // SRC_W
+        0x5a,    // SRC_H
+        0x5b,    // CRTC_X
+        0x5c,    // CRTC_Y
+        0x5d,    // CRTC_W
+        0x5e,    // CRTC_H
+    ];
+    let values = [u64::from(fb_id), 11, 0, 0, 64 << 16, 64 << 16, 0, 0, 64, 64];
+    let mut req = DrmModeAtomicUapi {
+        flags: 0x0201, // NONBLOCK | PAGE_FLIP_EVENT
+        count_objs: objects.len() as u32,
+        objs_ptr: objects.as_ptr() as u64,
+        count_props_ptr: prop_counts.as_ptr() as u64,
+        props_ptr: props.as_ptr() as u64,
+        prop_values_ptr: values.as_ptr() as u64,
+        reserved: 0,
+        user_data: 0xCAFE_BABE,
+    };
+
+    if file.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut req as *mut _ as usize) != Ok(0) {
+        return TestResult::Fail("plane-only atomic flip event did not inherit its CRTC");
+    }
+    if file.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("plane-only atomic commit did not queue its flip event");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_plane_only_flip_event_tracks_implicit_crtc
+);
+
 // ── 9. ENOTTY on a registered card for an unknown 'd'-type ioctl ───────
 
 #[allow(dead_code)]
