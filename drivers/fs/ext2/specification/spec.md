@@ -85,6 +85,12 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 ## 5. Architecture notes
 
 - **Async-First:** All I/O is async on the `BlockDevice` trait.
+- **Folio-native reads:** 1/2/4 KiB filesystem blocks are retained as slices
+  of the unified 4 KiB page-cache folio. Directory lookup, enumeration, and
+  emptiness checks consume one retained block view at a time and stop early;
+  they never flatten `inode.size` into a slab allocation. If a folio cannot be
+  allocated under pressure, the same interface falls back to one fallibly
+  allocated filesystem-block buffer, bounded independently of directory size.
 - **Write scope.** Legacy direct/indirect block allocation, inode metadata,
   classic directory mutation, checksum-aware bitmaps/descriptors, and writes
   inside an already mapped extent persist. Extent-tree growth/truncation,

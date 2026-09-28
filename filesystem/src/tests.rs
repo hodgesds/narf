@@ -200,7 +200,7 @@ fn smoke_fs_fuse_opcode_constants() -> TestResult {
 kernel_test_in!("filesystem", smoke_fs_fuse_opcode_constants);
 
 fn smoke_fs_page_cache_dirty_drain() -> TestResult {
-    use crate::{Page, PageCache, PageKey};
+    use crate::{Folio, PageCache, PageKey};
 
     let pc = PageCache::new();
     let k = PageKey {
@@ -209,11 +209,11 @@ fn smoke_fs_page_cache_dirty_drain() -> TestResult {
         page_off: 0,
     };
 
-    if pc.lookup(k).is_some() {
+    if pc.lookup_folio(k).is_some() {
         return TestResult::Fail("empty cache should lookup None");
     }
-    let p = Page::zeroed();
-    pc.insert(k, p);
+    let folio = Folio::zeroed();
+    pc.insert_folio(k, folio);
     if pc.len() != 1 {
         return TestResult::Fail("insert did not grow cache");
     }
@@ -1617,7 +1617,7 @@ fn smoke_fs_page_cache_lookup_missing_is_none() -> TestResult {
         inode: 99,
         page_off: 99,
     };
-    if pc.lookup(k).is_some() {
+    if pc.lookup_folio(k).is_some() {
         return TestResult::Fail("lookup on absent key returned Some");
     }
     if !pc.is_empty() {
@@ -1636,32 +1636,32 @@ kernel_test_in!("filesystem", smoke_fs_page_cache_lookup_missing_is_none);
 fn smoke_fs_page_cache_generation_bumps_on_dirty() -> TestResult {
     // mark_dirty bumps the generation counter — readers use this
     // to detect they raced against a writer.
-    use crate::{Page, PageCache, PageKey};
+    use crate::{Folio, PageCache, PageKey};
     let pc = PageCache::new();
     let k = PageKey {
         fs_id: 1,
         inode: 1,
         page_off: 0,
     };
-    pc.insert(k, Page::zeroed());
-    let g0 = pc.lookup(k).unwrap().gen;
+    pc.insert_folio(k, Folio::zeroed());
+    let g0 = pc.lookup_folio(k).unwrap().generation();
     pc.mark_dirty(k);
-    let g1 = pc.lookup(k).unwrap().gen;
+    let g1 = pc.lookup_folio(k).unwrap().generation();
     if g1 != g0 + 1 {
         return TestResult::Fail("generation didn't bump by 1 on first dirty");
     }
     // drain_dirty clears `dirty` but does NOT reset the generation.
     let drained = pc.drain_dirty();
-    if drained.len() != 1 || !drained[0].1.dirty {
+    if drained.len() != 1 || !drained[0].1.is_dirty() {
         return TestResult::Fail("drained page shape wrong");
     }
-    let g2 = pc.lookup(k).unwrap().gen;
+    let g2 = pc.lookup_folio(k).unwrap().generation();
     if g2 != g1 {
         return TestResult::Fail("drain_dirty altered generation");
     }
     // Re-mark dirty → bumps again.
     pc.mark_dirty(k);
-    let g3 = pc.lookup(k).unwrap().gen;
+    let g3 = pc.lookup_folio(k).unwrap().generation();
     if g3 != g1 + 1 {
         return TestResult::Fail("second mark_dirty didn't bump generation");
     }
@@ -1671,25 +1671,25 @@ kernel_test_in!("filesystem", smoke_fs_page_cache_generation_bumps_on_dirty);
 
 fn smoke_fs_page_cache_insert_overwrites() -> TestResult {
     // Insert replaces in place — second insert with same key wins.
-    use crate::{Page, PageCache, PageKey};
+    use crate::{CacheFolio, Folio, PageCache, PageKey};
     let pc = PageCache::new();
     let k = PageKey {
         fs_id: 1,
         inode: 1,
         page_off: 0,
     };
-    pc.insert(k, Page::zeroed());
+    pc.insert_folio(k, Folio::zeroed());
     if pc.len() != 1 {
         return TestResult::Fail("first insert didn't grow to 1");
     }
-    let mut p2 = Page::zeroed();
-    p2.gen = 42;
-    pc.insert(k, p2);
+    let mut replacement = CacheFolio::alloc_zeroed().expect("replacement folio");
+    replacement[0] = 42;
+    pc.insert_folio(k, Folio::clean(replacement));
     if pc.len() != 1 {
         return TestResult::Fail("second insert grew length (should overwrite in place)");
     }
-    let got = pc.lookup(k).unwrap();
-    if got.gen != 42 {
+    let got = pc.lookup_folio(k).unwrap();
+    if got.page_bytes()[0] != 42 {
         return TestResult::Fail("second insert didn't replace value");
     }
     TestResult::Pass
@@ -1697,7 +1697,7 @@ fn smoke_fs_page_cache_insert_overwrites() -> TestResult {
 kernel_test_in!("filesystem", smoke_fs_page_cache_insert_overwrites);
 
 fn smoke_fs_page_cache_clear_invalidates_all_pages() -> TestResult {
-    use crate::{Page, PageCache, PageKey};
+    use crate::{Folio, PageCache, PageKey};
     let pc = PageCache::new();
     let first = PageKey {
         fs_id: 1,
@@ -1709,10 +1709,10 @@ fn smoke_fs_page_cache_clear_invalidates_all_pages() -> TestResult {
         inode: 2,
         page_off: 0,
     };
-    pc.insert(first, Page::zeroed());
-    pc.insert(second, Page::zeroed());
+    pc.insert_folio(first, Folio::zeroed());
+    pc.insert_folio(second, Folio::zeroed());
     pc.clear();
-    if !pc.is_empty() || pc.lookup(first).is_some() || pc.lookup(second).is_some() {
+    if !pc.is_empty() || pc.lookup_folio(first).is_some() || pc.lookup_folio(second).is_some() {
         return TestResult::Fail("clear left a resident page behind");
     }
     TestResult::Pass

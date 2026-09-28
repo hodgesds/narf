@@ -1,9 +1,9 @@
-//! Unified page cache — Stage-4 structural shape.
+//! Unified folio cache — Stage-4 structural shape.
 //!
 //! Spec: `filesystem/specification/spec.md` (Stage-4: unified page
-//! cache). A single tree of page-sized entries keyed by
+//! cache). A single tree of folio heads keyed by
 //! `(fs_instance, inode, page_offset)`; every read goes through the
-//! cache before hitting the backing store; writes mark pages dirty
+//! cache before hitting the backing store; writes mark folios dirty
 //! and a writeback worker flushes them to disk.
 //!
 //! Reclaim (Linux-shaped): the cache is not a fixed vector. Two
@@ -182,95 +182,260 @@ pub struct PageKey {
     pub page_off: u64,
 }
 
-/// A page-sized data frame the cache owns. The bytes live in a real
-/// buddy frame (reached through the kernel direct map), NOT the slab
-/// heap — so dropping a cached page returns memory DIRECTLY to the buddy
-/// allocator. That is what lets memory reclaim relieve large (multi-page)
-/// buddy allocations, and keeps hundreds of MiB of cached file data off
-/// the slab. The frame is node-local (`alloc_frame` prefers the current
-/// CPU's NUMA node) and freed to the buddy on drop.
-pub struct CachePage {
+/// A physically contiguous cache folio containing `2^order` pages.
+///
+/// The bytes live in buddy frames reached through the kernel direct map,
+/// never in the slab heap. Dropping the last reference therefore returns the
+/// complete run directly to the buddy allocator. Order zero is the normal
+/// base-page case; larger orders provide the page-cache plumbing for
+/// filesystem readahead and large sequential objects without changing the
+/// cache key or reclaim APIs again.
+pub struct CacheFolio {
     frame: narf_memory::PhysFrame,
+    order: u8,
 }
 
-impl CachePage {
-    /// Allocate a zeroed page frame, or `None` under memory pressure
-    /// (the caller then degrades — e.g. serves a read without caching).
+impl CacheFolio {
+    /// Allocate one zeroed base-page folio, or `None` under memory pressure.
+    /// Kept argument-free so existing order-zero cache fillers remain simple.
     pub fn alloc_zeroed() -> Option<Self> {
-        let frame = narf_memory::alloc_frame().ok()?;
-        // SAFETY: a freshly-allocated frame is exclusively owned here and is
-        // PAGE_SIZE bytes of RAM reachable via its kernel direct-map pointer.
+        Self::alloc_order_zeroed(0)
+    }
+
+    /// Allocate a zeroed folio containing `2^order` physically contiguous
+    /// pages. Higher-order failure is recoverable: callers may retry with a
+    /// smaller order or use an uncached bounded buffer.
+    pub fn alloc_order_zeroed(order: u8) -> Option<Self> {
+        let page_count = 1usize.checked_shl(u32::from(order))?;
+        let len = PAGE_SIZE.checked_mul(page_count)?;
+        let frame = if order == 0 {
+            narf_memory::alloc_frame().ok()?
+        } else {
+            narf_memory::alloc_pages_on(narf_memory::current_cpu_node(), order).ok()?
+        };
+        // SAFETY: the freshly-allocated contiguous run is exclusively owned
+        // here and all `len` bytes are reachable through the direct map.
         unsafe {
-            core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, PAGE_SIZE);
+            core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, len);
         }
-        Some(Self { frame })
+        Some(Self { frame, order })
+    }
+
+    pub const fn order(&self) -> u8 {
+        self.order
+    }
+
+    pub fn page_count(&self) -> usize {
+        1usize << self.order
+    }
+
+    pub fn len(&self) -> usize {
+        PAGE_SIZE * self.page_count()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 }
 
-impl core::ops::Deref for CachePage {
-    type Target = [u8; PAGE_SIZE];
+impl core::ops::Deref for CacheFolio {
+    type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        // SAFETY: the frame is owned for this CachePage's lifetime and is
-        // PAGE_SIZE bytes of RAM mapped in the kernel direct map.
-        unsafe { &*self.frame.start_address().kernel_ptr::<[u8; PAGE_SIZE]>() }
-    }
-}
-
-impl core::ops::DerefMut for CachePage {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: as `Deref`; `&mut self` proves exclusive access (only held
-        // during construction, before the page is shared via `Arc`).
+        // SAFETY: the contiguous frame run is owned for this folio's lifetime
+        // and is mapped contiguously in the kernel direct map.
         unsafe {
-            &mut *self
-                .frame
-                .start_address()
-                .kernel_mut_ptr::<[u8; PAGE_SIZE]>()
+            core::slice::from_raw_parts(self.frame.start_address().kernel_ptr::<u8>(), self.len())
         }
     }
 }
 
-impl Drop for CachePage {
-    fn drop(&mut self) {
-        narf_memory::free_frame(self.frame);
+impl core::ops::DerefMut for CacheFolio {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as `Deref`; `&mut self` proves exclusive access before the
+        // folio is shared through `Arc`.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.frame.start_address().kernel_mut_ptr::<u8>(),
+                self.len(),
+            )
+        }
     }
 }
 
-impl core::fmt::Debug for CachePage {
+impl Drop for CacheFolio {
+    fn drop(&mut self) {
+        if self.order == 0 {
+            narf_memory::free_frame(self.frame);
+        } else {
+            narf_memory::free_pages(self.frame, self.order);
+        }
+    }
+}
+
+impl core::fmt::Debug for CacheFolio {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CachePage")
+        f.debug_struct("CacheFolio")
             .field("frame", &self.frame.number())
+            .field("order", &self.order)
             .finish()
     }
 }
 
-/// Cached page entry. `data` is an `Arc<CachePage>` (a buddy frame) so
-/// readers share one copy and the frame returns to the buddy on last
-/// drop; dirty pages hold the reference until writeback commits.
+/// Cached folio entry. Readers share the same buddy-backed bytes and the
+/// complete frame run returns to the buddy on last drop. Dirty folios hold the
+/// cache reference until writeback commits.
 #[derive(Clone, Debug)]
-pub struct Page {
-    pub data: Arc<CachePage>,
-    pub dirty: bool,
+pub struct Folio {
+    data: Arc<CacheFolio>,
+    dirty: bool,
     /// Monotonic generation — bumps on every write so stale readers
     /// can detect they've raced.
-    pub gen: u64,
+    generation: u64,
 }
 
-impl Page {
-    /// A fresh zeroed cache page. Panics on frame-allocation failure —
-    /// a test/building-block constructor; production read paths use the
-    /// fallible [`CachePage::alloc_zeroed`] and degrade under pressure.
-    pub fn zeroed() -> Self {
+impl Folio {
+    /// Wrap an exclusively-filled cache allocation as a clean folio.
+    pub fn clean(data: CacheFolio) -> Self {
         Self {
-            data: Arc::new(CachePage::alloc_zeroed().expect("cache page frame")),
+            data: Arc::new(data),
             dirty: false,
-            gen: 0,
+            generation: 0,
         }
+    }
+
+    /// A fresh zeroed order-zero folio. Panics on frame-allocation failure;
+    /// production read paths use fallible [`CacheFolio`] allocation and
+    /// degrade to a bounded uncached read under pressure.
+    pub fn zeroed() -> Self {
+        Self::clean(CacheFolio::alloc_zeroed().expect("cache folio frame"))
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.data.page_count()
+    }
+
+    pub fn order(&self) -> u8 {
+        self.data.order()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Retain a bounded byte range from this folio without copying it.
+    pub fn slice(&self, offset: usize, len: usize) -> Option<FolioSlice> {
+        let end = offset.checked_add(len)?;
+        if end > self.data.len() {
+            return None;
+        }
+        Some(FolioSlice {
+            data: self.data.clone(),
+            generation: self.generation,
+            offset,
+            len,
+        })
+    }
+}
+
+/// A retained lookup result for the folio containing a requested page.
+/// `page_index` is relative to the folio head and makes lookup of tail pages
+/// unambiguous without splitting or copying the folio.
+#[derive(Clone, Debug)]
+pub struct FolioRef {
+    base: PageKey,
+    data: Arc<CacheFolio>,
+    generation: u64,
+    page_index: usize,
+}
+
+impl FolioRef {
+    pub const fn base_key(&self) -> PageKey {
+        self.base
+    }
+
+    pub const fn page_index(&self) -> usize {
+        self.page_index
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn order(&self) -> u8 {
+        self.data.order()
+    }
+
+    pub fn folio_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Bytes of the base page selected by the lookup key.
+    pub fn page_bytes(&self) -> &[u8] {
+        let start = self.page_index * PAGE_SIZE;
+        &self.data[start..start + PAGE_SIZE]
+    }
+
+    /// Retain a bounded byte range within the selected base page.
+    pub fn page_slice(&self, offset: usize, len: usize) -> Option<FolioSlice> {
+        let end = offset.checked_add(len)?;
+        if end > PAGE_SIZE {
+            return None;
+        }
+        Some(FolioSlice {
+            data: self.data.clone(),
+            generation: self.generation,
+            offset: self.page_index * PAGE_SIZE + offset,
+            len,
+        })
+    }
+}
+
+/// An owned, zero-copy byte view into a retained cache folio.
+#[derive(Clone, Debug)]
+pub struct FolioSlice {
+    data: Arc<CacheFolio>,
+    generation: u64,
+    offset: usize,
+    len: usize,
+}
+
+impl FolioSlice {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[self.offset..self.offset + self.len]
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl core::ops::Deref for FolioSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
     }
 }
 
 #[derive(Debug)]
 struct Slot {
-    page: Page,
+    folio: Folio,
     /// CLOCK reference bit: set on every cache hit, cleared when the
     /// clock hand sweeps past. An entry survives an eviction pass iff
     /// it was referenced since the last sweep (second chance).
@@ -279,7 +444,9 @@ struct Slot {
 
 #[derive(Debug)]
 struct Inner {
-    pages: BTreeMap<PageKey, Slot>,
+    folios: BTreeMap<PageKey, Slot>,
+    /// Resident base pages, not number of folio heads.
+    resident_pages: usize,
     /// CLOCK ring of resident keys. Eviction sweeps from the front,
     /// giving referenced pages a second chance (bit cleared + requeued)
     /// and evicting the first cold, clean page it meets.
@@ -297,14 +464,14 @@ struct Inner {
 /// the probe negligible.
 const WATERMARK_CHECK_INTERVAL: usize = 64;
 
-/// Unified page cache. A `BTreeMap` of page-sized entries under a
-/// single lock, reclaimed by CLOCK-LRU under a hard ceiling and a
-/// free-memory watermark.
+/// Unified page cache. A `BTreeMap` of folio heads under a single lock,
+/// reclaimed by CLOCK-LRU under a base-page ceiling and a free-memory
+/// watermark.
 #[derive(Debug)]
 pub struct PageCache {
     inner: IrqSafeSpinLock<Inner>,
-    /// Hard resident-page ceiling backstop. Clean pages are evicted
-    /// once `pages.len()` would exceed this.
+    /// Hard resident-page ceiling backstop. Clean folios are evicted once
+    /// their total constituent page count would exceed this.
     max_pages: usize,
 }
 
@@ -323,7 +490,8 @@ impl PageCache {
     pub const fn with_capacity(max_pages: usize) -> Self {
         Self {
             inner: IrqSafeSpinLock::new(Inner {
-                pages: BTreeMap::new(),
+                folios: BTreeMap::new(),
+                resident_pages: 0,
                 clock: VecDeque::new(),
                 since_watermark_check: 0,
             }),
@@ -331,39 +499,95 @@ impl PageCache {
         }
     }
 
-    /// Look up a page; returns `None` if not present. A hit sets the
-    /// CLOCK reference bit so the entry survives the next eviction
-    /// sweep (approximate-LRU recency).
-    pub fn lookup(&self, key: PageKey) -> Option<Page> {
-        let mut g = self.inner.lock();
-        if let Some(slot) = g.pages.get_mut(&key) {
-            slot.referenced = true;
-            Some(slot.page.clone())
-        } else {
-            None
+    fn containing_folio_key(inner: &Inner, key: PageKey) -> Option<PageKey> {
+        let (&base, slot) = inner.folios.range(..=key).next_back()?;
+        if base.fs_id != key.fs_id || base.inode != key.inode {
+            return None;
         }
+        let pages = u64::try_from(slot.folio.page_count()).ok()?;
+        (key.page_off < base.page_off.saturating_add(pages)).then_some(base)
     }
 
-    /// Insert `page` under `key`, replacing any prior page, then
-    /// reclaim: enforce the hard ceiling and, under memory pressure,
-    /// shed a batch of cold clean pages.
-    pub fn insert(&self, key: PageKey, page: Page) {
+    /// Look up the folio containing `key`; returns `None` if the requested
+    /// page is not resident. A hit sets the CLOCK reference bit.
+    pub fn lookup_folio(&self, key: PageKey) -> Option<FolioRef> {
         let mut g = self.inner.lock();
-        match g.pages.get_mut(&key) {
+        // Order zero is the overwhelmingly common case. Keep it to one tree
+        // lookup; only a possible higher-order tail pays the predecessor
+        // search plus head lookup.
+        if let Some(slot) = g.folios.get_mut(&key) {
+            slot.referenced = true;
+            return Some(FolioRef {
+                base: key,
+                data: slot.folio.data.clone(),
+                generation: slot.folio.generation,
+                page_index: 0,
+            });
+        }
+        let base = Self::containing_folio_key(&g, key)?;
+        let slot = g.folios.get_mut(&base)?;
+        slot.referenced = true;
+        Some(FolioRef {
+            base,
+            data: slot.folio.data.clone(),
+            generation: slot.folio.generation,
+            page_index: usize::try_from(key.page_off - base.page_off).ok()?,
+        })
+    }
+
+    /// Insert a folio whose first page is `key`. The key must be naturally
+    /// aligned to the folio's page count and must not overlap a different
+    /// resident folio. Returns `false` without mutation when either invariant
+    /// is violated; miss-fill callers may still use their private folio.
+    pub fn insert_folio(&self, key: PageKey, folio: Folio) -> bool {
+        let page_count = folio.page_count();
+        let Ok(page_count_u64) = u64::try_from(page_count) else {
+            return false;
+        };
+        if key.page_off % page_count_u64 != 0 {
+            return false;
+        }
+        let Some(end) = key.page_off.checked_add(page_count_u64) else {
+            return false;
+        };
+
+        let mut g = self.inner.lock();
+        let exact_head = g.folios.contains_key(&key);
+        if !exact_head && Self::containing_folio_key(&g, key).is_some() {
+            return false;
+        }
+        if page_count > 1 {
+            if let Some((&next, _)) = g
+                .folios
+                .range(key..)
+                .find(|(candidate, _)| **candidate != key)
+            {
+                if next.fs_id == key.fs_id && next.inode == key.inode && next.page_off < end {
+                    return false;
+                }
+            }
+        }
+
+        match g.folios.get_mut(&key) {
             Some(slot) => {
-                // Existing key: update contents, refresh recency.
-                slot.page = page;
+                let old_pages = slot.folio.page_count();
+                slot.folio = folio;
                 slot.referenced = true;
+                g.resident_pages = g
+                    .resident_pages
+                    .saturating_sub(old_pages)
+                    .saturating_add(page_count);
             }
             None => {
-                g.pages.insert(
+                g.folios.insert(
                     key,
                     Slot {
-                        page,
+                        folio,
                         referenced: false,
                     },
                 );
                 g.clock.push_back(key);
+                g.resident_pages = g.resident_pages.saturating_add(page_count);
             }
         }
 
@@ -375,8 +599,8 @@ impl PageCache {
             self.max_pages
         };
         if cap != 0 {
-            while g.pages.len() > cap {
-                if !Self::evict_one_cold_clean(&mut g) {
+            while g.resident_pages > cap {
+                if Self::evict_one_cold_clean(&mut g, usize::MAX) == 0 {
                     break; // nothing clean to shed
                 }
             }
@@ -387,27 +611,29 @@ impl PageCache {
         // free-memory probe is rate-limited (it locks the allocator), so
         // it never rides every 4 KiB read.
         let low = LOW_WATERMARK_PAGES.load(Ordering::Relaxed);
-        g.since_watermark_check += 1;
+        g.since_watermark_check = g.since_watermark_check.saturating_add(page_count);
         if low > 0 && g.since_watermark_check >= WATERMARK_CHECK_INTERVAL {
             g.since_watermark_check = 0;
             if let Some(free) = free_pages_available() {
                 if free < low {
                     let mut shed = 0;
-                    while shed < RECLAIM_BATCH_PAGES
-                        && g.pages.len() > RECLAIM_FLOOR_PAGES
-                        && Self::evict_one_cold_clean(&mut g)
-                    {
-                        shed += 1;
+                    while shed < RECLAIM_BATCH_PAGES && g.resident_pages > RECLAIM_FLOOR_PAGES {
+                        let freed = Self::evict_one_cold_clean(&mut g, RECLAIM_BATCH_PAGES - shed);
+                        if freed == 0 {
+                            break;
+                        }
+                        shed += freed;
                     }
                 }
             }
         }
+        true
     }
 
-    /// One CLOCK sweep step: evict a cold, clean page. Gives referenced
-    /// pages a second chance (clear bit + requeue) and skips dirty pages
-    /// (requeued — they still owe a writeback). Returns `true` if a page
-    /// was evicted.
+    /// One CLOCK sweep step: evict a cold, clean folio. Gives referenced
+    /// folios a second chance and skips dirty folios. Returns the number of
+    /// constituent pages evicted. A folio larger than `max_pages` is skipped
+    /// because reclaim must not split retained data.
     ///
     /// The scan is bounded to a small constant window so eviction stays
     /// O(1) regardless of cache size — a full-length CLOCK lap over a
@@ -416,7 +642,7 @@ impl PageCache {
     /// the window a cold clean page is preferred; failing that, the
     /// first clean page seen is evicted (recency-approximate, still
     /// correctness-preserving) so progress is guaranteed and cheap.
-    fn evict_one_cold_clean(inner: &mut Inner) -> bool {
+    fn evict_one_cold_clean(inner: &mut Inner, max_pages: usize) -> usize {
         const MAX_SCAN: usize = 128;
         let scan = inner.clock.len().min(MAX_SCAN);
         let mut fallback_clean: Option<PageKey> = None;
@@ -424,10 +650,10 @@ impl PageCache {
             let Some(k) = inner.clock.pop_front() else {
                 break;
             };
-            match inner.pages.get_mut(&k) {
+            match inner.folios.get_mut(&k) {
                 None => { /* stale queue entry — drop it */ }
-                Some(slot) if slot.page.dirty => {
-                    inner.clock.push_back(k); // owes a writeback — keep
+                Some(slot) if slot.folio.dirty || slot.folio.page_count() > max_pages => {
+                    inner.clock.push_back(k); // not currently evictable — keep
                 }
                 Some(slot) if slot.referenced => {
                     // Second chance: clear the bit, requeue, remember it
@@ -436,9 +662,11 @@ impl PageCache {
                     fallback_clean.get_or_insert(k);
                     inner.clock.push_back(k);
                 }
-                Some(_) => {
-                    inner.pages.remove(&k); // cold + clean → evict
-                    return true;
+                Some(slot) => {
+                    let pages = slot.folio.page_count();
+                    inner.folios.remove(&k); // cold + clean → evict
+                    inner.resident_pages = inner.resident_pages.saturating_sub(pages);
+                    return pages;
                 }
             }
         }
@@ -448,35 +676,47 @@ impl PageCache {
             if let Some(pos) = inner.clock.iter().position(|&q| q == k) {
                 inner.clock.remove(pos);
             }
-            inner.pages.remove(&k);
-            return true;
+            if let Some(slot) = inner.folios.remove(&k) {
+                let pages = slot.folio.page_count();
+                inner.resident_pages = inner.resident_pages.saturating_sub(pages);
+                return pages;
+            }
         }
-        false
+        0
     }
 
     /// Mark `key` dirty and bump the generation.
     pub fn mark_dirty(&self, key: PageKey) -> bool {
-        if let Some(slot) = self.inner.lock().pages.get_mut(&key) {
-            slot.page.dirty = true;
-            slot.page.gen = slot.page.gen.saturating_add(1);
+        let mut g = self.inner.lock();
+        if let Some(slot) = g.folios.get_mut(&key) {
+            slot.folio.dirty = true;
+            slot.folio.generation = slot.folio.generation.saturating_add(1);
+            return true;
+        }
+        let Some(base) = Self::containing_folio_key(&g, key) else {
+            return false;
+        };
+        if let Some(slot) = g.folios.get_mut(&base) {
+            slot.folio.dirty = true;
+            slot.folio.generation = slot.folio.generation.saturating_add(1);
             true
         } else {
             false
         }
     }
 
-    /// Drain dirty entries for writeback. Returns the (key, page)
+    /// Drain dirty entries for writeback. Returns the (key, folio)
     /// pairs the caller should flush; clears the `dirty` flag on
     /// each in-cache entry so concurrent writers can re-dirty without
     /// losing coverage. Stage-4 writeback worker awaits a block I/O
     /// per returned entry.
-    pub fn drain_dirty(&self) -> Vec<(PageKey, Page)> {
+    pub fn drain_dirty(&self) -> Vec<(PageKey, Folio)> {
         let mut out = Vec::new();
         let mut g = self.inner.lock();
-        for (k, slot) in g.pages.iter_mut() {
-            if slot.page.dirty {
-                out.push((*k, slot.page.clone()));
-                slot.page.dirty = false;
+        for (k, slot) in g.folios.iter_mut() {
+            if slot.folio.dirty {
+                out.push((*k, slot.folio.clone()));
+                slot.folio.dirty = false;
             }
         }
         out
@@ -484,19 +724,26 @@ impl PageCache {
 
     /// Total resident pages.
     pub fn len(&self) -> usize {
-        self.inner.lock().pages.len()
+        self.inner.lock().resident_pages
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().pages.is_empty()
+        self.inner.lock().resident_pages == 0
+    }
+
+    /// Number of resident folio heads. Unlike [`Self::len`], this does not
+    /// count constituent base pages.
+    pub fn folio_count(&self) -> usize {
+        self.inner.lock().folios.len()
     }
 
     /// Invalidate every resident page. Filesystems with direct block writes
     /// use this when they cannot identify the exact affected cache key.
     pub fn clear(&self) {
         let mut g = self.inner.lock();
-        g.pages.clear();
+        g.folios.clear();
         g.clock.clear();
+        g.resident_pages = 0;
     }
 
     /// Number of clean (evictable) resident pages — what this cache can
@@ -504,7 +751,11 @@ impl PageCache {
     /// owe a writeback and are excluded. This is the shrinker `count`.
     pub fn reclaimable(&self) -> usize {
         let g = self.inner.lock();
-        g.pages.values().filter(|slot| !slot.page.dirty).count()
+        g.folios
+            .values()
+            .filter(|slot| !slot.folio.dirty)
+            .map(|slot| slot.folio.page_count())
+            .sum()
     }
 
     /// Evict up to `nr` cold, clean pages in CLOCK order and return the
@@ -516,10 +767,11 @@ impl PageCache {
         let mut g = self.inner.lock();
         let mut freed = 0;
         while freed < nr {
-            if !Self::evict_one_cold_clean(&mut g) {
+            let pages = Self::evict_one_cold_clean(&mut g, nr - freed);
+            if pages == 0 {
                 break;
             }
-            freed += 1;
+            freed += pages;
         }
         freed
     }
