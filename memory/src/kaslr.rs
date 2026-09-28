@@ -16,12 +16,11 @@
 //!      "boot-time jitter," which is enough for ASLR slot picking
 //!      but not for crypto.
 //!
-//! The "more secure than Linux" framing for KASLR is per-AS: each
-//! new user-mode address space gets a fresh randomisation. Linux's
-//! per-process mmap randomisation drains entropy at exec; NARF re-
-//! seeds at every AS creation including kernel thread stacks
-//! (a kernel ROP target leaks address layout that's pure-noise to a
-//! second kernel thread).
+//! User layout randomization follows Linux process semantics: a fresh layout
+//! (exec/new process image) gets a new mmap base, while fork inherits the
+//! parent's base along with its VMAs. Redrawing during fork would both diverge
+//! from `dup_mm` and consume entropy for a value immediately replaced by the
+//! inherited layout.
 //!
 //! References:
 //!   * Linux `arch/x86/boot/compressed/kaslr.c` for the boot-time
@@ -42,6 +41,14 @@ const RAND_RETRIES: u32 = 32;
 /// randomise. 24 bits = 16 MiB of slack. 39-bit user VA gives plenty
 /// of headroom for both slack and arena.
 pub const USER_MMAP_RANDOM_BITS: u32 = 24;
+
+#[cfg(feature = "kernel-test")]
+static USER_MMAP_SLOT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_user_mmap_slot_calls() -> u64 {
+    USER_MMAP_SLOT_CALLS.load(Ordering::Relaxed)
+}
 
 /// Load-base randomisation slack for user ELF images — the ET_DYN
 /// program base and the PT_INTERP base. 24 bits = 16 MiB of slack at
@@ -407,6 +414,8 @@ pub fn random_u64() -> (u64, EntropySource) {
 /// [`USER_MMAP_RANDOM_BITS`] bits, aligned down to 4 KiB.
 #[inline]
 pub fn user_mmap_slot(base: u64) -> u64 {
+    #[cfg(feature = "kernel-test")]
+    USER_MMAP_SLOT_CALLS.fetch_add(1, Ordering::Relaxed);
     let (r, _) = random_u64();
     let mask = ((1u64 << USER_MMAP_RANDOM_BITS) - 1) & !0xFFF;
     base + (r & mask)

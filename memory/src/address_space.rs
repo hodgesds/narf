@@ -3009,13 +3009,30 @@ impl AddressSpace {
     /// AS is safe to build up and activate per the normal flow.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
+        // SAFETY: forwarded from this function's caller; `floor` is the fresh
+        // page-aligned layout selected for this address space.
+        unsafe { Self::new_for_user_with_mmap_floor(floor) }
+    }
+
+    /// Construct a fresh x86_64 user root with a caller-selected mmap floor.
+    /// Fork uses the parent's immutable floor, matching Linux `dup_mm`; exec
+    /// and other fresh-address-space callers go through [`Self::new_for_user`]
+    /// and receive a newly randomized layout.
+    ///
+    /// # Safety
+    /// Same paging contract as [`Self::new_for_user`]. `floor` must be a
+    /// page-aligned address in the ordinary mmap randomization window.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn new_for_user_with_mmap_floor(floor: u64) -> Result<Self, AddressSpaceError> {
+        debug_assert_eq!(floor & 0xFFF, 0);
+        debug_assert!((Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&floor));
         // Allocate fallible metadata before the paging root so ENOMEM cannot
         // strand an otherwise-unpublished page-table frame.
         let regions = RegionTable::try_new()?;
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
-        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -3042,6 +3059,21 @@ impl AddressSpace {
     /// `map_region` and install via `activate()`.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
+        // SAFETY: forwarded from this function's caller; `floor` is the fresh
+        // page-aligned layout selected for this address space.
+        unsafe { Self::new_for_user_with_mmap_floor(floor) }
+    }
+
+    /// AArch64 counterpart of the inherited-layout constructor above.
+    ///
+    /// # Safety
+    /// Same MMU contract as [`Self::new_for_user`]. `floor` must be a
+    /// page-aligned address in the ordinary mmap randomization window.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn new_for_user_with_mmap_floor(floor: u64) -> Result<Self, AddressSpaceError> {
+        debug_assert_eq!(floor & 0xFFF, 0);
+        debug_assert!((Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&floor));
         // Allocate fallible metadata before the paging root so ENOMEM cannot
         // strand an otherwise-unpublished page-table frame.
         let regions = RegionTable::try_new()?;
@@ -3051,7 +3083,6 @@ impl AddressSpace {
         // SAFETY: Valid memory or trusted environment
         let phys = unsafe { crate::aarch64::paging::new_user_ttbr0() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
-        let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -11226,8 +11257,16 @@ impl AddressSpace {
     ///   copied and installed eagerly by this function.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
-        // SAFETY: caller's contract — paging is live.
-        let child = unsafe { Self::new_for_user() }?;
+        // Linux `dup_mm` copies `mm_struct`, including `mmap_base`; ASLR is
+        // chosen for a fresh layout at exec, not redrawn at fork. Besides
+        // preserving that ABI-visible placement policy, passing the inherited
+        // floor into construction avoids consuming serialized entropy for a
+        // value that fork would immediately overwrite.
+        let parent_floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: caller's contract says paging is live. The parent's floor is
+        // immutable after address-space construction and satisfies the helper's
+        // mmap-window invariant.
+        let child = unsafe { Self::new_for_user_with_mmap_floor(parent_floor) }?;
         let fork_child_reserve_failure_injected = {
             #[cfg(feature = "kernel-test")]
             {
@@ -11446,10 +11485,10 @@ impl AddressSpace {
         // different floor would make the child's gap search disagree with the
         // layout it inherited. Linux's `dup_mm` copies `mmap_base` for the
         // same reason; re-randomizing belongs at exec, not fork.
-        let parent_floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
-        child
-            .mmap_floor
-            .store(parent_floor, core::sync::atomic::Ordering::Relaxed);
+        debug_assert_eq!(
+            child.mmap_floor.load(core::sync::atomic::Ordering::Relaxed),
+            parent_floor
+        );
         // A real fork inherits the parent's program break: the child clones the
         // heap regions, so its break must start where the parent's is (a fresh
         // `0` would let the first child brk mass-unmap the cloned heap on the

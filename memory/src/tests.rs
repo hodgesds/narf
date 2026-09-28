@@ -16455,6 +16455,8 @@ fn smoke_memory_fork_inherits_mmap_floor() -> TestResult {
         Err(_) => return TestResult::Fail("fork-floor parent creation failed"),
     };
     let parent_floor = parent.__test_mmap_floor();
+    #[cfg(feature = "kernel-test")]
+    let randomizations_before = crate::kaslr::__test_user_mmap_slot_calls();
 
     // SAFETY: the inactive parent is exclusively owned and paging is live.
     let child = match unsafe { parent.clone_for_fork() } {
@@ -16464,6 +16466,10 @@ fn smoke_memory_fork_inherits_mmap_floor() -> TestResult {
 
     if child.__test_mmap_floor() != parent_floor {
         return TestResult::Fail("fork did not inherit the parent's mmap floor");
+    }
+    #[cfg(feature = "kernel-test")]
+    if crate::kaslr::__test_user_mmap_slot_calls() != randomizations_before {
+        return TestResult::Fail("fork consumed fresh mmap-layout entropy");
     }
     // The cursor travels with it; a floor above the cursor would let the child
     // hand out an address inside a region it just cloned.
