@@ -101,11 +101,11 @@ fn drm_node_remove_xattr(meta: &DrmMeta, name: &str) -> Result<(), FsError> {
 
 // ── DriCardFile ────────────────────────────────────────────────────────────
 
-/// Placeholder file for `/dev/dri/card<N>` (DRM master node).
+/// Open file for `/dev/dri/card<N>` (DRM master node).
 ///
-/// Read returns 0 (EOF). Write returns `InvalidData` — real DRM
-/// operations go through ioctl (deferred). The node starts at the conservative
-/// devtmpfs default `0o600`; udev normally changes it to `root:video 0o660`.
+/// Flip-complete events are queued on this open file, matching Linux's
+/// `struct drm_file::event_list`. The node starts at the conservative devtmpfs
+/// default `0o600`; udev normally changes it to `root:video 0o660`.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_drv.c` + `include/uapi/linux/major.h`.
 #[derive(Debug)]
@@ -126,6 +126,10 @@ pub struct DriCardFile {
     virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
+    /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
+    /// this opener's address space, so it must never be visible to another
+    /// compositor across a greeter-to-session handoff.
+    events: narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -158,7 +162,22 @@ impl DriCardFile {
             metadata,
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
+            events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
         })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn queue_flip_event_for_test(
+        &self,
+        user_data: u64,
+        crtc_id: u32,
+    ) -> Result<(), FsError> {
+        let mode_state = crate::drm_registry::mode_state(self.index).ok_or(FsError::InvalidData)?;
+        let result = mode_state
+            .lock()
+            .queue_flip_event(&mut self.events.lock(), user_data, crtc_id)
+            .map_err(|_| FsError::OutOfMemory);
+        result
     }
 }
 
@@ -192,24 +211,18 @@ impl Drop for DriCardFile {
 impl FileOps for DriCardFile {
     /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
     /// compositor render loop poll/select()s the fd then read()s the
-    /// flip-complete event here. Returns 0 when no event is queued.
+    /// flip-complete event here. An empty queue is `WouldBlock`: `sys_read`
+    /// maps that to `EAGAIN` for `O_NONBLOCK`, while a blocking fd parks.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let index = self.index;
         Box::pin(async move {
             let now = narf_time::wall::monotonic_ns();
-            if let Some(ms) = crate::drm_registry::mode_state(index) {
-                let mut card = ms.lock();
-                // Only surface a flip-complete event once its simulated-vblank
-                // time has arrived — this is the read side of the refresh-rate
-                // pacing (see `Card::queue_flip_event`). An event queued but not
-                // yet due stays put; the poller re-parks until `poll_deadline`.
-                if let Some(ev) = card.pop_deliverable_event(now) {
-                    let n = ev.len().min(buf.len());
-                    buf[..n].copy_from_slice(&ev[..n]);
-                    return Ok(n);
-                }
+            // Only surface a flip-complete event once its simulated-vblank
+            // time has arrived. Linux returns 0 without consuming when `buf`
+            // cannot hold the whole event; DrmEventQueue preserves that rule.
+            if let Some(read) = self.events.lock().read_deliverable_event(now, buf) {
+                return Ok(read);
             }
-            Ok(0)
+            Err(FsError::WouldBlock)
         })
     }
 
@@ -219,9 +232,10 @@ impl FileOps for DriCardFile {
     /// parks the compositor between frames instead of spinning it.
     fn poll_readiness(&self) -> u32 {
         let now = narf_time::wall::monotonic_ns();
-        match crate::drm_registry::mode_state(self.index) {
-            Some(ms) if ms.lock().has_deliverable_event(now) => POLL_IN,
-            _ => 0,
+        if self.events.lock().has_deliverable_event(now) {
+            POLL_IN
+        } else {
+            0
         }
     }
 
@@ -233,8 +247,7 @@ impl FileOps for DriCardFile {
     /// event is pending or the front event is already due (reported readable).
     fn poll_deadline(&self) -> Option<u64> {
         let now = narf_time::wall::monotonic_ns();
-        crate::drm_registry::mode_state(self.index)
-            .and_then(|ms| ms.lock().next_event_deadline_ns(now))
+        self.events.lock().next_event_deadline_ns(now)
     }
 
     /// The DRM card fd is a PARKABLE readiness source: a poll/epoll set
@@ -346,6 +359,7 @@ impl FileOps for DriCardFile {
             arg,
             /*render*/ false,
             &self.client_caps,
+            Some(&self.events),
         )
     }
 
@@ -699,6 +713,7 @@ impl FileOps for DriRenderFile {
             arg,
             /*render*/ true,
             &self.client_caps,
+            None,
         )
     }
 

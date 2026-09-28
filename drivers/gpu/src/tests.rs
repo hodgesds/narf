@@ -4877,15 +4877,20 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_getconnector_decode);
 /// `drm_event_vblank` (FLIP_COMPLETE) carrying user_data + crtc_id, which
 /// `read(/dev/dri/cardN)` then drains for the compositor render loop.
 fn smoke_drm_flip_event_format() -> TestResult {
+    use crate::drm::card::DrmEventQueue;
     let mut card = make_test_card_for_ioctl();
-    if !card.events.is_empty() {
+    let mut events = DrmEventQueue::new();
+    if !events.is_empty() {
         return TestResult::Fail("fresh card has queued events");
     }
-    card.queue_flip_event(0xCAFE_F00D_1234_5678, 7);
-    let ev = match card.events.pop_front() {
-        // events are now (deliver_at_ns, bytes) — the format assertions below
-        // only care about the bytes.
-        Some((_deliver_at, e)) => e,
+    if card
+        .queue_flip_event(&mut events, 0xCAFE_F00D_1234_5678, 7)
+        .is_err()
+    {
+        return TestResult::Fail("flip event queue unexpectedly full");
+    }
+    let ev = match events.pop_deliverable_event(u64::MAX) {
+        Some(e) => e,
         None => return TestResult::Fail("flip event not queued"),
     };
     if ev.len() != 32 {
@@ -4920,7 +4925,9 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_format);
 /// the DRM-fd poll parks until then instead of spinning. The first flip after
 /// idle stays immediate (no added latency).
 fn smoke_drm_flip_event_vblank_paced() -> TestResult {
+    use crate::drm::card::DrmEventQueue;
     let mut card = make_test_card_for_ioctl();
+    let mut events = DrmEventQueue::new();
     let crtc_id = card.crtcs.first().map(|c| c.id).unwrap_or(0);
     let hz = card.crtc_refresh_hz(crtc_id);
     if hz == 0 {
@@ -4930,32 +4937,36 @@ fn smoke_drm_flip_event_vblank_paced() -> TestResult {
 
     // First flip after idle: deliverable immediately (deliver_at collapses to
     // ~now, not a full interval away).
-    card.queue_flip_event(0x1, crtc_id);
-    let first_at = match card.events.back() {
-        Some((d, _)) => *d,
+    if card.queue_flip_event(&mut events, 0x1, crtc_id).is_err() {
+        return TestResult::Fail("first flip event queue unexpectedly full");
+    }
+    let first_at = match events.back_delivery_ns() {
+        Some(d) => d,
         None => return TestResult::Fail("first flip event not queued"),
     };
     // Second flip: paced exactly one refresh interval past the first.
-    card.queue_flip_event(0x2, crtc_id);
-    let second_at = match card.events.back() {
-        Some((d, _)) => *d,
+    if card.queue_flip_event(&mut events, 0x2, crtc_id).is_err() {
+        return TestResult::Fail("second flip event queue unexpectedly full");
+    }
+    let second_at = match events.back_delivery_ns() {
+        Some(d) => d,
         None => return TestResult::Fail("second flip event not queued"),
     };
     if second_at < first_at.saturating_add(interval) {
         return TestResult::Fail("second flip not paced by one refresh interval");
     }
     // Evaluated at the first flip's vblank: only the first is deliverable.
-    if !card.has_deliverable_event(first_at) {
+    if !events.has_deliverable_event(first_at) {
         return TestResult::Fail("first flip not deliverable at its own vblank");
     }
-    if card.pop_deliverable_event(first_at).is_none() {
+    if events.pop_deliverable_event(first_at).is_none() {
         return TestResult::Fail("first flip did not pop at its vblank");
     }
-    if card.has_deliverable_event(first_at) {
+    if events.has_deliverable_event(first_at) {
         return TestResult::Fail("second flip deliverable too early — pacing broken");
     }
     // ...and poll_deadline points a parked poll at the second flip's vblank.
-    match card.next_event_deadline_ns(first_at) {
+    match events.next_event_deadline_ns(first_at) {
         Some(d) if d == second_at && d > first_at => {}
         _ => return TestResult::Fail("poll_deadline is not the paced second-flip vblank"),
     }
@@ -4969,7 +4980,7 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_vblank_paced);
 /// `next_vblank_ns - interval`) WITHOUT changing the frame RATE — successive
 /// flips stay one refresh interval apart. Default 0 is exact-vblank delivery.
 fn smoke_drm_flip_event_slack_offset() -> TestResult {
-    use crate::drm::card::{set_vblank_offset_ns, vblank_offset_ns};
+    use crate::drm::card::{set_vblank_offset_ns, vblank_offset_ns, DrmEventQueue};
     let saved = vblank_offset_ns();
 
     // The knob round-trips.
@@ -4982,19 +4993,26 @@ fn smoke_drm_flip_event_slack_offset() -> TestResult {
     let off = 2_000_000u64; // 2 ms of render slack
     set_vblank_offset_ns(off);
     let mut card = make_test_card_for_ioctl();
+    let mut events = DrmEventQueue::new();
     let crtc_id = card.crtcs.first().map(|c| c.id).unwrap_or(0);
     let hz = card.crtc_refresh_hz(crtc_id);
     let interval = 1_000_000_000u64 / hz.max(1) as u64;
 
-    card.queue_flip_event(0x1, crtc_id);
-    let d1 = card.events.back().map(|(d, _)| *d).unwrap_or(0);
+    if card.queue_flip_event(&mut events, 0x1, crtc_id).is_err() {
+        set_vblank_offset_ns(saved);
+        return TestResult::Fail("first flip event queue unexpectedly full");
+    }
+    let d1 = events.back_delivery_ns().unwrap_or(0);
     // True vblank of that flip = next_vblank_ns - interval (advance is from the
     // true vblank, not the earlier delivery time).
     let present_at = card.next_vblank_ns.saturating_sub(interval);
     let shift = present_at.saturating_sub(d1);
 
-    card.queue_flip_event(0x2, crtc_id);
-    let d2 = card.events.back().map(|(d, _)| *d).unwrap_or(0);
+    if card.queue_flip_event(&mut events, 0x2, crtc_id).is_err() {
+        set_vblank_offset_ns(saved);
+        return TestResult::Fail("second flip event queue unexpectedly full");
+    }
+    let d2 = events.back_delivery_ns().unwrap_or(0);
     let gap = d2.saturating_sub(d1);
 
     set_vblank_offset_ns(saved); // restore the global before any assertion returns
@@ -5049,31 +5067,58 @@ fn smoke_drm_card_file_delivers_flip_event() -> TestResult {
         alloc::sync::Arc::new(crate::drm_devfs_bridge::BochsCard::new("card0".into())),
         make_test_card_for_ioctl(),
     );
-    let file = match DriCardFile::new(index) {
+    let first = match DriCardFile::new(index) {
         Some(f) => f,
         None => return TestResult::Fail("could not open the registered card node"),
     };
+    let second = match DriCardFile::new(index) {
+        Some(f) => f,
+        None => return TestResult::Fail("could not open the card node a second time"),
+    };
 
     // Quiescent: no queued event, so nothing to report and nothing to read.
-    if file.poll_readiness() & POLL_IN != 0 {
+    if first.poll_readiness() & POLL_IN != 0 {
         return TestResult::Fail("idle card node reports POLL_IN with no queued event");
     }
     let mut buf = [0u8; 64];
-    match read_once(&file, &mut buf) {
-        Some(Ok(0)) => {}
-        _ => return TestResult::Fail("idle card node returned bytes with no queued event"),
+    match read_once(&first, &mut buf) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("empty card node did not return WouldBlock"),
     }
 
-    // Queue one flip completion, exactly as handle_page_flip does.
-    match crate::drm_registry::mode_state(index) {
-        Some(ms) => ms.lock().queue_flip_event(0x1122_3344_5566_7788, 3),
-        None => return TestResult::Fail("registered card has no mode state"),
+    // Queue one flip completion for the first open, exactly as
+    // handle_page_flip does. The second open must not observe it: the cookie is
+    // an address-space-local pointer in real compositors.
+    if first
+        .queue_flip_event_for_test(0x1122_3344_5566_7788, 3)
+        .is_err()
+    {
+        return TestResult::Fail("could not queue first open's flip event");
     }
 
-    if file.poll_readiness() & POLL_IN == 0 {
+    if first.poll_readiness() & POLL_IN == 0 {
         return TestResult::Fail("queued flip event does not make the card node readable");
     }
-    let n = match read_once(&file, &mut buf) {
+    if second.poll_readiness() & POLL_IN != 0 {
+        return TestResult::Fail("flip event leaked to a different DRM open");
+    }
+    match read_once(&second, &mut buf) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("second DRM open consumed the first open's event"),
+    }
+
+    // Linux never truncates drm_event_vblank: too-small read returns zero and
+    // leaves the event queued for a later sufficiently large read.
+    let mut tiny = [0u8; 16];
+    match read_once(&first, &mut tiny) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("too-small DRM read did not return zero"),
+    }
+    if first.poll_readiness() & POLL_IN == 0 {
+        return TestResult::Fail("too-small DRM read consumed the event");
+    }
+
+    let n = match read_once(&first, &mut buf) {
         Some(Ok(n)) => n,
         _ => return TestResult::Fail("read failed with an event queued"),
     };
@@ -5092,12 +5137,51 @@ fn smoke_drm_card_file_delivers_flip_event() -> TestResult {
 
     // Drained: the compositor must not see the same flip twice, or it
     // would credit a completion to a frame it has not submitted yet.
-    if file.poll_readiness() & POLL_IN != 0 {
+    if first.poll_readiness() & POLL_IN != 0 {
         return TestResult::Fail("card node still readable after its only event was drained");
     }
-    match read_once(&file, &mut buf) {
-        Some(Ok(0)) => {}
+    match read_once(&first, &mut buf) {
+        Some(Err(FsError::WouldBlock)) => {}
         _ => return TestResult::Fail("drained card node redelivered the flip event"),
+    }
+
+    // Closing an opener discards its unconsumed events, matching
+    // drm_events_release. A later session must start with an empty queue.
+    if first.queue_flip_event_for_test(0xDEAD_BEEF, 3).is_err() {
+        return TestResult::Fail("could not queue event before close");
+    }
+    drop(first);
+    if second.poll_readiness() & POLL_IN != 0 {
+        return TestResult::Fail("closed DRM open leaked an event to the survivor");
+    }
+    // Keep this assertion about ownership, not card-wide vblank pacing: the
+    // unconsumed first-open event legitimately advanced the card's next
+    // simulated vblank even though closing that file discarded its queue.
+    if let Some(mode_state) = crate::drm_registry::mode_state(index) {
+        mode_state.lock().next_vblank_ns = 0;
+    }
+    if second.queue_flip_event_for_test(0xAABB_CCDD, 3).is_err() {
+        return TestResult::Fail("could not queue second open's own event");
+    }
+    let n = match read_once(&second, &mut buf) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("second open could not read its own event"),
+    };
+    if n != 32 || u64::from_le_bytes(buf[8..16].try_into().unwrap()) != 0xAABB_CCDD {
+        return TestResult::Fail("second open received the wrong event cookie");
+    }
+
+    // Linux gives every drm_file 4096 bytes of event space. 128 32-byte flip
+    // events fit; reserving the 129th must fail with ENOMEM at the ioctl layer
+    // (represented as FsError::OutOfMemory by this bridge).
+    for cookie in 0..128u64 {
+        if second.queue_flip_event_for_test(cookie, 3).is_err() {
+            return TestResult::Fail("DRM event budget filled before 4096 bytes");
+        }
+    }
+    match second.queue_flip_event_for_test(128, 3) {
+        Err(FsError::OutOfMemory) => {}
+        _ => return TestResult::Fail("full DRM event queue did not return OutOfMemory"),
     }
 
     crate::drm_registry::__reset_for_test();

@@ -916,6 +916,101 @@ kernel_test_in!(
     smoke_dri_render_file_setcrtc_eacces
 );
 
+/// PAGE_FLIP validation and event-budget errors match Linux's
+/// `drm_mode_page_flip_ioctl`: unknown objects are ENOENT, an unbound primary
+/// plane is EBUSY, unsupported flags/sequence are EINVAL, and exhausted
+/// per-file event space is ENOMEM without changing the active framebuffer.
+#[allow(dead_code)]
+fn smoke_drm_page_flip_linux_errno_parity() -> TestResult {
+    use crate::drm_devfs_bridge::DriCardFile;
+    use crate::drm_uapi::{DrmModePageFlipUapi, DRM_IOCTL_MODE_PAGE_FLIP};
+
+    let name = format!("card{}", crate::drm_registry::count());
+    let mut card = make_test_card();
+    let first_handle = card.gem.alloc(0x1000, 64 * 64 * 4).unwrap();
+    let second_handle = card.gem.alloc(0x5000, 64 * 64 * 4).unwrap();
+    let first_fb = card
+        .addfb2(64, 64, 0x3432_5258, 64 * 4, first_handle)
+        .unwrap();
+    let second_fb = card
+        .addfb2(64, 64, 0x3432_5258, 64 * 4, second_handle)
+        .unwrap();
+    let idx =
+        crate::drm_registry::register_drm_card_with_state(Arc::new(BochsCard::new(name)), card);
+    let file = match DriCardFile::new(idx) {
+        Some(file) => file,
+        None => return TestResult::Fail("failed to open PAGE_FLIP test card"),
+    };
+
+    let mut req = DrmModePageFlipUapi {
+        crtc_id: 11,
+        fb_id: second_fb,
+        flags: 0,
+        reserved: 0,
+        user_data: 0,
+    };
+
+    // The primary plane starts unbound.
+    if file.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut req as *mut _ as usize) != Err(FsError::Busy) {
+        return TestResult::Fail("unbound PAGE_FLIP did not return Busy/EBUSY");
+    }
+
+    if let Some(mode_state) = crate::drm_registry::mode_state(idx) {
+        mode_state.lock().crtcs[0].primary_fb = Some(first_fb);
+    } else {
+        return TestResult::Fail("PAGE_FLIP test card lost mode state");
+    }
+
+    req.crtc_id = 0xFFFF_FFFF;
+    if file.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut req as *mut _ as usize) != Err(FsError::NotFound) {
+        return TestResult::Fail("unknown PAGE_FLIP CRTC did not return NotFound/ENOENT");
+    }
+    req.crtc_id = 11;
+    req.fb_id = 0xFFFF_FFFF;
+    if file.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut req as *mut _ as usize) != Err(FsError::NotFound) {
+        return TestResult::Fail("unknown PAGE_FLIP fb did not return NotFound/ENOENT");
+    }
+    req.fb_id = second_fb;
+    req.flags = 0x2; // ASYNC is not advertised by Linux virtio-gpu.
+    if file.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut req as *mut _ as usize)
+        != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("unsupported PAGE_FLIP flag did not return EINVAL");
+    }
+    req.flags = 0;
+    req.reserved = 1; // sequence without a target flag
+    if file.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut req as *mut _ as usize)
+        != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("PAGE_FLIP sequence without target did not return EINVAL");
+    }
+
+    // Fill exactly Linux's 4096-byte per-open event budget.
+    for cookie in 0..128u64 {
+        if file.queue_flip_event_for_test(cookie, 11).is_err() {
+            return TestResult::Fail("PAGE_FLIP event budget filled too early");
+        }
+    }
+    req.flags = 0x1; // DRM_MODE_PAGE_FLIP_EVENT
+    req.reserved = 0;
+    if file.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut req as *mut _ as usize)
+        != Err(FsError::OutOfMemory)
+    {
+        return TestResult::Fail("full PAGE_FLIP event budget did not return ENOMEM");
+    }
+    let active_fb = crate::drm_registry::mode_state(idx)
+        .and_then(|mode_state| mode_state.lock().crtcs[0].primary_fb);
+    if active_fb != Some(first_fb) {
+        return TestResult::Fail("ENOMEM PAGE_FLIP changed the active framebuffer");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_page_flip_linux_errno_parity
+);
+
 // ── 14. CREATE_DUMB returns sane handle/pitch/size ─────────────────────
 
 #[allow(dead_code)]

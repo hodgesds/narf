@@ -1432,17 +1432,27 @@ pub fn dispatch_card(
     // Real file objects call `dispatch_card_for_file` so client-cap state is
     // retained across ioctls on that open.
     let client_caps = DrmClientCaps::new();
-    dispatch_card_for_file(card_index, open_id, cmd, arg, render, &client_caps)
+    let events = narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new());
+    dispatch_card_for_file(
+        card_index,
+        open_id,
+        cmd,
+        arg,
+        render,
+        &client_caps,
+        (!render).then_some(&events),
+    )
 }
 
 /// Stateful card dispatcher used by a real DRM open file.
-pub fn dispatch_card_for_file(
+pub(crate) fn dispatch_card_for_file(
     card_index: u32,
     open_id: u64,
     cmd: u32,
     arg: usize,
     render: bool,
     client_caps: &DrmClientCaps,
+    events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
 ) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
@@ -1472,7 +1482,7 @@ pub fn dispatch_card_for_file(
         // Atomic commit decodes into AtomicState directly — handled
         // here rather than through the generic dispatcher because the
         // dispatcher only carries the wire-format word.
-        IoctlCmd::ModeAtomic => handle_atomic(card_index, &mode_state, arg, &ctx),
+        IoctlCmd::ModeAtomic => handle_atomic(card_index, &mode_state, arg, &ctx, events),
         // GETRESOURCES is special because the response has pointer
         // arrays the user supplied; we must write IDs into those.
         IoctlCmd::ModeGetResources => handle_getresources(&mode_state, arg, &ctx),
@@ -1548,7 +1558,7 @@ pub fn dispatch_card_for_file(
         IoctlCmd::ModeDestroyDumb => handle_destroy_dumb(&mode_state, arg, &ctx),
         // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
         IoctlCmd::ModeSetCrtc => handle_setcrtc(card_index, &mode_state, arg, &ctx),
-        IoctlCmd::ModePageFlip => handle_page_flip(card_index, &mode_state, arg, &ctx),
+        IoctlCmd::ModePageFlip => handle_page_flip(card_index, &mode_state, arg, &ctx, events),
         // CURSOR / CURSOR2 — no hardware cursor plane; funnel the pointer
         // position + visibility into narf_console so narf_fb's cursor
         // renderer composites a sprite onto the scanout. Without this the
@@ -2592,6 +2602,7 @@ fn handle_atomic(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
+    events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
 ) -> Result<u64, FsError> {
     // ATOMIC is a DRM_MASTER op (drm_ioctls[] marks DRM_MODE_ATOMIC
     // DRM_MASTER). Only the master may commit; reject render nodes and
@@ -2831,6 +2842,24 @@ fn handle_atomic(
             );
             return Err(FsError::InvalidData);
         }
+
+        // Linux reserves one event for every CRTC participating in the atomic
+        // state before committing. PAGE_FLIP_EVENT with no CRTC is EINVAL;
+        // exhausting this drm_file's 4 KiB event budget is ENOMEM and must not
+        // mutate display state.
+        let event_crtc_count = state.crtcs.len();
+        let mut event_queue = if req.flags & PAGE_FLIP_EVENT != 0 {
+            if event_crtc_count == 0 {
+                return Err(FsError::InvalidData);
+            }
+            let queue = events.ok_or(FsError::InvalidData)?.lock();
+            queue
+                .ensure_flip_event_space(event_crtc_count)
+                .map_err(|_| FsError::OutOfMemory)?;
+            Some(queue)
+        } else {
+            None
+        };
         if test_only {
             None
         } else {
@@ -2845,9 +2874,10 @@ fn handle_atomic(
                 .planes
                 .iter()
                 .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
-            if req.flags & PAGE_FLIP_EVENT != 0 {
-                if let Some((crtc_id, _)) = active_plane {
-                    card.queue_flip_event(req.user_data, crtc_id);
+            if let Some(queue) = event_queue.as_mut() {
+                for crtc in &state.crtcs {
+                    card.queue_flip_event(queue, req.user_data, crtc.id)
+                        .map_err(|_| FsError::OutOfMemory)?;
                 }
             }
             active_plane.and_then(|(_, fb_id)| {
@@ -3269,6 +3299,7 @@ fn handle_page_flip(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
+    events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
 ) -> Result<u64, FsError> {
     // Page flip is a DRM_MASTER op — only the master may flip (see
     // handle_setcrtc). Rejects render nodes and non-master primary fds.
@@ -3287,6 +3318,11 @@ fn handle_page_flip(
     // DRM_MODE_PAGE_FLIP_EVENT — queue a flip-complete event the client
     // reads off the DRM fd after poll/select (the compositor render loop).
     const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+    // Linux virtio-gpu does not advertise async flips and its CRTC exposes
+    // `page_flip`, not `page_flip_target`, so ASYNC/TARGET are EINVAL.
+    if req.flags & !DRM_MODE_PAGE_FLIP_EVENT != 0 || req.reserved != 0 {
+        return Err(FsError::InvalidData);
+    }
 
     let src_phys: Option<u64>;
     let virgl_resource_id: Option<u32>;
@@ -3295,19 +3331,21 @@ fn handle_page_flip(
     let src_h: u32;
     {
         let mut card = mode_state.lock();
-
-        // Update the crtc's active fb.
-        if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
-            crtc.primary_fb = if req.fb_id != 0 {
-                Some(req.fb_id)
-            } else {
-                None
-            };
+        // Linux resolves an unknown CRTC/fb as ENOENT and refuses a flip from
+        // an unbound primary plane with EBUSY. Validate before mutating state.
+        let old_fb_id = card
+            .crtc(req.crtc_id)
+            .map_err(|_| FsError::NotFound)?
+            .primary_fb
+            .ok_or(FsError::Busy)?;
+        let old_format = card
+            .framebuffer(old_fb_id)
+            .map_err(|_| FsError::Busy)?
+            .format;
+        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
+        if fb.format != old_format {
+            return Err(FsError::InvalidData);
         }
-
-        let fb = card
-            .framebuffer(req.fb_id)
-            .map_err(|_| FsError::InvalidData)?;
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
@@ -3317,11 +3355,27 @@ fn handle_page_flip(
             .virtgpu_import(gem_handle)
             .map(|resource| resource.resource_id);
 
-        // Deliver the completion event immediately — we blit synchronously,
-        // so the new scanout is live by the time the client wakes. A real
-        // vblank-paced delivery is a later refinement.
-        if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            card.queue_flip_event(req.user_data, req.crtc_id);
+        // Reserve Linux's per-file event space before changing the CRTC, so an
+        // ENOMEM failure leaves scanout state untouched.
+        let mut event_queue = if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            let queue = events.ok_or(FsError::InvalidData)?.lock();
+            queue
+                .ensure_flip_event_space(1)
+                .map_err(|_| FsError::OutOfMemory)?;
+            Some(queue)
+        } else {
+            None
+        };
+
+        card.crtc_mut(req.crtc_id)
+            .map_err(|_| FsError::NotFound)?
+            .primary_fb = Some(req.fb_id);
+
+        if let Some(queue) = event_queue.as_mut() {
+            // The blit is synchronous; completion is then exposed at the
+            // simulated-vblank deadline recorded by queue_flip_event.
+            card.queue_flip_event(queue, req.user_data, req.crtc_id)
+                .map_err(|_| FsError::OutOfMemory)?;
         }
     }
 

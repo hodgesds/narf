@@ -20,6 +20,7 @@
 //! - `struct drm_crtc` in `include/drm/drm_crtc.h`.
 
 use super::gem::GemTable;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -245,13 +246,125 @@ pub(crate) struct PropertyBlob {
     pub(crate) data: Vec<u8>,
 }
 
+/// Flip-complete events owned by one open DRM primary-node file.
+///
+/// Linux keeps `pending_event_list` and `event_list` on `struct drm_file`, not
+/// on `struct drm_device`. Keeping the queue per open is load-bearing: the
+/// event's `user_data` is an opaque pointer in the submitting process, so a
+/// later compositor must never consume an event left by the greeter.
+#[derive(Debug)]
+pub(crate) struct DrmEventQueue {
+    events: VecDeque<(u64, [u8; 32])>,
+    event_space: usize,
+}
+
+impl DrmEventQueue {
+    const EVENT_SPACE_BYTES: usize = 4096;
+    pub(crate) const FLIP_EVENT_BYTES: usize = 32;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            event_space: Self::EVENT_SPACE_BYTES,
+        }
+    }
+
+    fn push(&mut self, deliver_at_ns: u64, event: [u8; 32]) -> Result<(), DrmEventQueueFull> {
+        if event.len() > self.event_space {
+            return Err(DrmEventQueueFull);
+        }
+        self.event_space -= event.len();
+        self.events.push_back((deliver_at_ns, event));
+        Ok(())
+    }
+
+    pub(crate) fn ensure_flip_event_space(
+        &self,
+        event_count: usize,
+    ) -> Result<(), DrmEventQueueFull> {
+        let needed = event_count
+            .checked_mul(Self::FLIP_EVENT_BYTES)
+            .ok_or(DrmEventQueueFull)?;
+        if needed > self.event_space {
+            Err(DrmEventQueueFull)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn back_delivery_ns(&self) -> Option<u64> {
+        self.events.back().map(|(deliver_at, _)| *deliver_at)
+    }
+
+    /// Delivery time of the earliest queued event that is still in the future.
+    pub(crate) fn next_event_deadline_ns(&self, now: u64) -> Option<u64> {
+        self.events
+            .front()
+            .map(|(deliver_at, _)| *deliver_at)
+            .filter(|deliver_at| *deliver_at > now)
+    }
+
+    /// Whether the front event's simulated-vblank time has arrived.
+    pub(crate) fn has_deliverable_event(&self, now: u64) -> bool {
+        self.events
+            .front()
+            .map(|(deliver_at, _)| *deliver_at <= now)
+            .unwrap_or(false)
+    }
+
+    /// Pop the front event iff its simulated-vblank time has arrived.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn pop_deliverable_event(&mut self, now: u64) -> Option<[u8; 32]> {
+        if self.has_deliverable_event(now) {
+            self.events.pop_front().map(|(_, event)| {
+                self.event_space += event.len();
+                event
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Copy one complete deliverable event into `buf`.
+    ///
+    /// Linux `drm_read` never truncates an event. If the buffer is too small it
+    /// returns zero and puts the event back at the head of this `drm_file`'s
+    /// queue. `None` means no event is currently deliverable.
+    pub(crate) fn read_deliverable_event(&mut self, now: u64, buf: &mut [u8]) -> Option<usize> {
+        let event_len = self
+            .events
+            .front()
+            .filter(|(deliver_at, _)| *deliver_at <= now)
+            .map(|(_, event)| event.len())?;
+        if event_len > buf.len() {
+            return Some(0);
+        }
+        let (_, event) = self.events.pop_front()?;
+        self.event_space += event_len;
+        buf[..event_len].copy_from_slice(&event);
+        Some(event_len)
+    }
+}
+
+impl Default for DrmEventQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Linux reports `ENOMEM` when one `drm_file` exhausts its 4 KiB event space.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DrmEventQueueFull;
+
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
 ///
 /// Linux analogue: `struct drm_device` + `drm_mode_config`.
-///
-/// The `Card` is intentionally `Clone`-able (all fields are `Clone`)
-/// so it can live behind a spin-lock and be copied out for inspection
-/// without holding the lock.
 #[derive(Debug)]
 pub struct Card {
     /// Human-readable driver name (e.g. `"narf-i915"` or `"narf-amdgpu"`).
@@ -281,18 +394,6 @@ pub struct Card {
     pub(crate) property_blobs: Vec<PropertyBlob>,
     /// Next non-zero property-blob id.
     pub(crate) next_property_blob_id: u32,
-    /// Pending DRM events (`drm_event_vblank` for PAGE_FLIP completion),
-    /// drained by `read(/dev/dri/cardN)`. A compositor render loop
-    /// PAGE_FLIPs with DRM_MODE_PAGE_FLIP_EVENT, then poll/read()s these.
-    ///
-    /// Each entry is `(deliver_at_ns, bytes)`: the monotonic-ns simulated-vblank
-    /// time at/after which the event becomes visible to poll/read, and the raw
-    /// 32-byte `drm_event_vblank`. Gating delivery on the vblank time is what
-    /// paces the compositor's repaint loop to the refresh rate (see
-    /// `queue_flip_event` / `DriCardFile::poll_deadline`) instead of letting it
-    /// spin at 100% CPU on instantly-completed flips. Queued in nondecreasing
-    /// `deliver_at_ns` order.
-    pub events: alloc::collections::VecDeque<(u64, Vec<u8>)>,
     /// Monotonic vblank sequence reported in flip-complete events.
     pub vblank_seq: u32,
     /// Monotonic-ns time of the next simulated vblank at/after which a queued
@@ -372,7 +473,6 @@ impl Card {
             virtgpu_imports: Vec::new(),
             property_blobs: Vec::new(),
             next_property_blob_id: 1,
-            events: alloc::collections::VecDeque::new(),
             vblank_seq: 0,
             next_vblank_ns: 0,
             current_master: None,
@@ -462,8 +562,17 @@ impl Card {
     /// repaint loop at 100% CPU. This mirrors how Linux paces a *virtual* vblank
     /// (vkms arms an hrtimer at `drm_mode_vrefresh(mode)`); real hardware paces
     /// on the physical vblank IRQ.
-    pub fn queue_flip_event(&mut self, user_data: u64, crtc_id: u32) {
+    pub(crate) fn queue_flip_event(
+        &mut self,
+        events: &mut DrmEventQueue,
+        user_data: u64,
+        crtc_id: u32,
+    ) -> Result<(), DrmEventQueueFull> {
         const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+        const EVENT_LEN: usize = DrmEventQueue::FLIP_EVENT_BYTES;
+        if events.event_space < EVENT_LEN {
+            return Err(DrmEventQueueFull);
+        }
         let refresh_hz = self.crtc_refresh_hz(crtc_id);
         let interval_ns = 1_000_000_000u64 / refresh_hz as u64;
         let now = narf_time::wall::monotonic_ns();
@@ -488,47 +597,15 @@ impl Card {
         // wl_surface frame callbacks.
         let tv_sec = (present_at / 1_000_000_000) as u32;
         let tv_usec = ((present_at % 1_000_000_000) / 1_000) as u32;
-        let mut e = Vec::with_capacity(32);
-        e.extend_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_le_bytes()); // base.type
-        e.extend_from_slice(&32u32.to_le_bytes()); // base.length
-        e.extend_from_slice(&user_data.to_le_bytes());
-        e.extend_from_slice(&tv_sec.to_le_bytes()); // tv_sec
-        e.extend_from_slice(&tv_usec.to_le_bytes()); // tv_usec
-        e.extend_from_slice(&self.vblank_seq.to_le_bytes());
-        e.extend_from_slice(&crtc_id.to_le_bytes());
-        self.events.push_back((deliver_at, e));
-    }
-
-    /// Delivery time of the earliest queued flip event that is still in the
-    /// FUTURE, for `DriCardFile::poll_deadline` — a DRM-fd poll parks until this
-    /// simulated vblank and wakes to read the completion. Events are queued in
-    /// nondecreasing delivery order, so the front is the earliest. `None` when
-    /// the queue is empty or its front is already deliverable.
-    pub fn next_event_deadline_ns(&self, now: u64) -> Option<u64> {
-        self.events
-            .front()
-            .map(|(deliver_at, _)| *deliver_at)
-            .filter(|deliver_at| *deliver_at > now)
-    }
-
-    /// Whether the front flip event's simulated-vblank time has arrived, i.e.
-    /// poll should report POLL_IN and read should return it.
-    pub fn has_deliverable_event(&self, now: u64) -> bool {
-        self.events
-            .front()
-            .map(|(deliver_at, _)| *deliver_at <= now)
-            .unwrap_or(false)
-    }
-
-    /// Pop the front flip event iff its simulated-vblank time has arrived;
-    /// otherwise leave it queued (the reader sees "no event yet" and re-parks
-    /// until `next_event_deadline_ns`).
-    pub fn pop_deliverable_event(&mut self, now: u64) -> Option<Vec<u8>> {
-        if self.has_deliverable_event(now) {
-            self.events.pop_front().map(|(_, e)| e)
-        } else {
-            None
-        }
+        let mut e = [0u8; EVENT_LEN];
+        e[0..4].copy_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_le_bytes()); // base.type
+        e[4..8].copy_from_slice(&(EVENT_LEN as u32).to_le_bytes()); // base.length
+        e[8..16].copy_from_slice(&user_data.to_le_bytes());
+        e[16..20].copy_from_slice(&tv_sec.to_le_bytes());
+        e[20..24].copy_from_slice(&tv_usec.to_le_bytes());
+        e[24..28].copy_from_slice(&self.vblank_seq.to_le_bytes());
+        e[28..32].copy_from_slice(&crtc_id.to_le_bytes());
+        events.push(deliver_at, e)
     }
 
     // ── Connector / CRTC getters ──────────────────────────────────────
