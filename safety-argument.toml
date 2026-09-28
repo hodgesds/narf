@@ -1246,3 +1246,13 @@ argument = "Executable-memory kernel-alias permission changes now invalidate ina
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame edit removes one unused userspace-loader import and changes no executable code, trusted authority, capability check, mapping, domain transition, scheduler state, or runtime behavior. It exists only to keep the container-feature clippy gate warning-free."
+
+# Fork mmap-layout inheritance. Human security review is pending; the user
+# explicitly authorized an unsigned commit for this branch.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The fork constructor remains private to the existing memory TCB and changes only the source of an immutable userspace mmap-layout scalar: a fresh address space still draws a randomized floor, while a fork child receives its parent's already-validated floor. It adds no trusted subsystem, public authority, capability, domain assignment, mapping permission, or page-table operation."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Fork still allocates a fresh architecture page-table root and clones VMAs, COW ownership, permissions, reverse maps, and mmap cursor through the existing paths. Reusing the parent's floor removes a discarded entropy draw without exposing entropy or changing user-memory access; constructor failure and every later allocation failure retain the existing AddressSpaceError-to-ENOMEM propagation. The cross-architecture regression proves the child inherits both floor and cursor and consumes no fresh layout entropy."
