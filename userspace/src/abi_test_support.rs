@@ -28,7 +28,14 @@ pub use crate::{
 pub use crate::errno::wire::*;
 
 /// The pid every ABI test runs as (overridable per test via [`set_task`]).
-pub const FAKE_TASK: u64 = 99;
+///
+/// Keep the fixture near the top of NARF's valid Linux PID range. A low fixed
+/// TaskId eventually aliases a real scheduler task in the full kernel-test
+/// boot; on aarch64, TaskId 99 was a live CPU-pinned task, so the ABI
+/// fixture's SCHED_DEADLINE requests correctly failed Linux's full-root-domain
+/// affinity check with EPERM before reaching the errno under test. The ABI
+/// helpers use offsets through `FAKE_TASK + 42`, hence the 68-slot margin.
+pub const FAKE_TASK: u64 = crate::PID_MAX - 68;
 static TASK_SLOT: AtomicU64 = AtomicU64::new(FAKE_TASK);
 type TestAsLookupFn = fn() -> Option<Arc<AddressSpace>>;
 static SAVED_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TestAsLookupFn>> =
@@ -229,6 +236,12 @@ pub fn teardown() {
     // CAP_SYS_ADMIN, and only the aarch64 link order happened to put a
     // capability-dropping case before it.
     crate::handlers::__test_caps_reset();
+    // `install_task_id_lookup` is process-global. Leave bare kernel tests on
+    // the documented task-0 fallback instead of leaking FAKE_TASK into them;
+    // otherwise an unrelated later test observes whatever namespaces and
+    // credentials that synthetic task last held. The next ABI case installs
+    // its own lookup again in `setup`.
+    crate::handlers::__test_reset_task_id_lookup();
     __test_clear_global();
     fd::__test_reset();
     *TEST_AS.lock() = None;

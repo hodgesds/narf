@@ -446,11 +446,7 @@ pub struct SignalFd {
 impl SignalFd {
     pub fn new(mask: u64, owner: u64) -> Arc<Self> {
         let readiness = Arc::new(narf_lib::readiness::Readiness::new(0));
-        SIGNALFD_CELLS
-            .lock()
-            .entry(owner)
-            .or_default()
-            .push(Arc::downgrade(&readiness));
+        register_signalfd_cell(owner, &readiness);
         Arc::new(Self {
             mask: AtomicU64::new(mask),
             owner_task: owner,
