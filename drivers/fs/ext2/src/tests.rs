@@ -627,6 +627,34 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     img
 }
 
+/// Extend the minimal image's root directory across two cache folios. The
+/// first named entry remains in block 9; `late` is placed in block 15, with
+/// valid empty dirents in between. This lets the I/O-counting smoke prove that
+/// lookup stops at the matching folio instead of flattening the whole inode.
+fn build_ext2_multi_folio_directory_image() -> Vec<u8> {
+    const BS: usize = 1024;
+    const INODE_SIZE: usize = 128;
+    let mut img = build_ext2_image(b"folio directory");
+    let root_off = 5 * BS + INODE_SIZE;
+    put_u32(&mut img, root_off + 4, (6 * BS) as u32);
+    put_u32(&mut img, root_off + 28, (6 * BS / 512) as u32);
+    for (logical, physical) in [9u32, 11, 12, 13, 14, 15].into_iter().enumerate() {
+        put_u32(&mut img, root_off + 40 + logical * 4, physical);
+    }
+
+    for physical in [11usize, 12, 13, 14] {
+        let off = physical * BS;
+        put_u16(&mut img, off + 4, BS as u16);
+    }
+    let late = 15 * BS;
+    put_u32(&mut img, late, 12);
+    put_u16(&mut img, late + 4, BS as u16);
+    img[late + 6] = 4;
+    img[late + 7] = ftype::REGULAR;
+    img[late + 8..late + 12].copy_from_slice(b"late");
+    img
+}
+
 fn smoke_ext2_mount_ramblock_round_trip() -> TestResult {
     // End-to-end: build a minimal ext2 image, wrap it in
     // RamBlockDevice, mount via Ext2Volume::mount, enumerate the
@@ -771,6 +799,98 @@ fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_page_cache_reuses_1k_data_block
+);
+
+fn smoke_ext2_directory_lookup_stops_at_matching_folio() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_block::{
+        ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
+        CancelResult, LbaRange,
+    };
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    struct DirectoryCountingBlock {
+        inner: Arc<RamBlockDevice>,
+        reads: AtomicUsize,
+    }
+
+    impl BlockDevice for DirectoryCountingBlock {
+        fn logical_block_size(&self) -> u32 {
+            self.inner.logical_block_size()
+        }
+        fn physical_block_size(&self) -> u32 {
+            self.inner.physical_block_size()
+        }
+        fn capacity_blocks(&self) -> u64 {
+            self.inner.capacity_blocks()
+        }
+        fn supports(&self, feature: BlockFeature) -> bool {
+            self.inner.supports(feature)
+        }
+        fn submit(
+            &self,
+            request: BlockRequest,
+        ) -> impl core::future::Future<Output = BlockCompletion> + Send {
+            if matches!(request.op, BlockOp::Read) {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.submit(request)
+        }
+        fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.flush()
+        }
+        fn discard(&self, range: LbaRange) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.discard(range)
+        }
+        fn cancel(&self, tag: u64) -> impl core::future::Future<Output = CancelResult> + Send {
+            self.inner.cancel(tag)
+        }
+    }
+
+    let device = Arc::new(DirectoryCountingBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_multi_folio_directory_image()),
+        reads: AtomicUsize::new(0),
+    });
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root_inode = match poll_once(volume.read_inode(super::EXT2_ROOT_INO)) {
+        Some(Ok(inode)) => inode,
+        _ => return TestResult::Fail("root inode read failed"),
+    };
+    if !matches!(
+        poll_once(volume.dir_lookup(&root_inode, b"data")),
+        Some(Ok((12, _)))
+    ) {
+        return TestResult::Fail("first-folio directory lookup failed");
+    }
+    let reads_after_early = device.reads.load(Ordering::Relaxed);
+    if !matches!(
+        poll_once(volume.dir_lookup(&root_inode, b"late")),
+        Some(Ok((12, _)))
+    ) {
+        return TestResult::Fail("later-folio directory lookup failed");
+    }
+    let reads_after_late = device.reads.load(Ordering::Relaxed);
+    if reads_after_late <= reads_after_early {
+        return TestResult::Fail("early lookup had already read the later directory folio");
+    }
+    if !matches!(
+        poll_once(volume.dir_lookup(&root_inode, b"data")),
+        Some(Ok((12, _)))
+    ) || device.reads.load(Ordering::Relaxed) != reads_after_late
+    {
+        return TestResult::Fail("repeated lookup did not reuse the retained cache folio");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_directory_lookup_stops_at_matching_folio
 );
 
 /// Build a minimal EXT4 image: same block layout as `build_ext2_image`,

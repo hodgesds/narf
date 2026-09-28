@@ -23,7 +23,7 @@ use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{
-    CachePage, DirOps, FsError, FsInstance, Page, PageCache, PageKey, PAGE_SIZE,
+    CacheFolio, DirOps, Folio, FolioSlice, FsError, FsInstance, PageCache, PageKey, PAGE_SIZE,
 };
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::mutex::Mutex;
@@ -340,6 +340,26 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// bitmap, group-descriptor, and primary-superblock writers regenerate
     /// their dependent checksums before returning.
     read_only: bool,
+}
+
+/// One filesystem block retained either directly from the unified folio cache
+/// or, only when folio allocation is unavailable, in a bounded owned buffer.
+/// Consumers parse through the same slice interface and never need to flatten
+/// an inode-sized range.
+pub(crate) enum BlockView {
+    Folio(FolioSlice),
+    Owned(Vec<u8>),
+}
+
+impl core::ops::Deref for BlockView {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Folio(view) => view,
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -914,95 +934,107 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.block_size() / 4
     }
 
+    /// Return a retained, zero-copy view of one filesystem block when it can
+    /// be represented by the unified folio cache. The common ext-family
+    /// block sizes (1/2/4 KiB) share an order-zero 4 KiB folio; callers can
+    /// walk many blocks while keeping only the current folio alive.
+    pub(crate) async fn read_block_folio(
+        &self,
+        block_no: u64,
+    ) -> Result<Option<FolioSlice>, FsError> {
+        let bs = self.block_size();
+        if let Some(override_data) = self.journal_overrides.get(&block_no) {
+            if override_data.len() == bs {
+                let Some(mut allocation) = CacheFolio::alloc_zeroed() else {
+                    return Ok(None);
+                };
+                allocation[..bs].copy_from_slice(override_data);
+                return Ok(Folio::clean(allocation).slice(0, bs));
+            }
+        }
+        if bs > PAGE_SIZE || PAGE_SIZE % bs != 0 {
+            return Ok(None);
+        }
+
+        let blocks_per_page = PAGE_SIZE / bs;
+        let first_block = block_no / blocks_per_page as u64 * blocks_per_page as u64;
+        let in_page = (block_no - first_block) as usize * bs;
+        let key = PageKey {
+            fs_id: 0,
+            inode: 0,
+            page_off: first_block / blocks_per_page as u64,
+        };
+        // Hits never queue behind an unrelated device miss. lookup_folio()
+        // retains the allocation under the cache lock and returns immediately.
+        if let Some(found) = self.page_cache.lookup_folio(key) {
+            return Ok(found.page_slice(in_page, bs));
+        }
+
+        // Coalesce concurrent misses. This remains deliberately separate from
+        // the cache metadata lock, which must never be held across device I/O.
+        let _fill = self.fill_lock.lock().await;
+        if let Some(found) = self.page_cache.lookup_folio(key) {
+            return Ok(found.page_slice(in_page, bs));
+        }
+
+        let Some(mut allocation) = CacheFolio::alloc_zeroed() else {
+            return Ok(None);
+        };
+        self.read_byte_range(first_block * bs as u64, &mut allocation[..])
+            .await?;
+        let folio = Folio::clean(allocation);
+        let view = folio.slice(in_page, bs).ok_or(FsError::InvalidData)?;
+        // A future higher-order readahead fill may win an overlapping race.
+        // The private retained view is still valid even when publication loses.
+        self.page_cache.insert_folio(key, folio);
+        Ok(Some(view))
+    }
+
+    /// Read one block as a retained view. This is the preferred metadata and
+    /// directory iteration API: the normal path is zero-copy from the folio
+    /// cache, while allocation pressure uses at most one filesystem block of
+    /// fallible heap storage rather than allocating the whole inode.
+    pub(crate) async fn read_block_view(&self, block_no: u64) -> Result<BlockView, FsError> {
+        if let Some(view) = self.read_block_folio(block_no).await? {
+            return Ok(BlockView::Folio(view));
+        }
+
+        let bs = self.block_size();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(bs)
+            .map_err(|_| FsError::OutOfMemory)?;
+        bytes.resize(bs, 0);
+        if let Some(override_data) = self.journal_overrides.get(&block_no) {
+            if override_data.len() == bs {
+                bytes.copy_from_slice(override_data);
+                return Ok(BlockView::Owned(bytes));
+            }
+        }
+        self.read_byte_range(block_no * bs as u64, &mut bytes)
+            .await?;
+        Ok(BlockView::Owned(bytes))
+    }
+
     /// Read one filesystem block (`block_size()` bytes) into `dst`.
-    /// Internally this may cost multiple device-LBA reads if the
-    /// device's logical block size is smaller than the FS block
-    /// size, or one partial read if larger.
-    ///
-    /// JBD2 replay override: if `block_no` is in the
-    /// `journal_overrides` map (populated at mount for unclean
-    /// ext3+ volumes), serve from memory instead of going to disk.
-    /// This is the RO-replay path — every metadata block that the
-    /// journal said should be updated is read back as its
-    /// post-replay contents without ever writing to the device.
+    /// Normal reads copy from a retained folio; allocation pressure degrades
+    /// to a direct bounded read rather than failing or allocating on the slab.
     pub async fn read_block(&self, block_no: u64, dst: &mut [u8]) -> Result<(), FsError> {
         let bs = self.block_size();
         if dst.len() != bs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
+        if let Some(view) = self.read_block_folio(block_no).await? {
+            dst.copy_from_slice(&view);
+            return Ok(());
+        }
         if let Some(override_data) = self.journal_overrides.get(&block_no) {
-            // Override block size must match the FS block size; if
-            // a future journal carries a different blocksize we fall
-            // back to disk to avoid mis-serving truncated data.
             if override_data.len() == bs {
                 dst.copy_from_slice(override_data);
                 return Ok(());
             }
         }
-        // The unified cache is 4 KiB-page based while ext2 permits smaller
-        // block sizes. Fill the containing page of contiguous filesystem
-        // blocks, then return this block's slice. Holding the async mutex
-        // through the miss fill intentionally coalesces identical concurrent
-        // reads; dropping it between lookup and insert would let systemd's
-        // parallel generators stampede the same shared-library pages through
-        // the single virtio queue.
-        if bs <= PAGE_SIZE && PAGE_SIZE % bs == 0 {
-            let blocks_per_page = PAGE_SIZE / bs;
-            let first_block = block_no / blocks_per_page as u64 * blocks_per_page as u64;
-            let in_page = (block_no - first_block) as usize * bs;
-            let key = PageKey {
-                fs_id: 0,
-                inode: 0,
-                page_off: first_block / blocks_per_page as u64,
-            };
-            // Most desktop startup reads are shared-library pages that have
-            // already been populated by another process. Do not queue those
-            // hits behind an unrelated device miss: PageCache::lookup clones
-            // the page Arc under its own lock, so reclaim cannot invalidate
-            // the data after this returns.
-            if let Some(page) = self.page_cache.lookup(key) {
-                dst.copy_from_slice(&page.data[in_page..in_page + bs]);
-                return Ok(());
-            }
-            // Hold the fill lock across lookup→read→insert so parallel
-            // misses of the same block coalesce (first fills, rest hit).
-            // The cache itself is an Arc reachable without this lock (so the
-            // reclaimer can shrink it); its internal lock guards the map.
-            let _fill = self.fill_lock.lock().await;
-            // Double-check after waiting: another reader may have filled this
-            // page between the lock-free fast-path lookup and this guard.
-            if let Some(page) = self.page_cache.lookup(key) {
-                dst.copy_from_slice(&page.data[in_page..in_page + bs]);
-                return Ok(());
-            }
-            let byte_off = first_block * bs as u64;
-            // Read straight into a buddy-frame-backed cache page so cached
-            // data lives off the slab and returns to the buddy on reclaim.
-            // Under memory pressure the frame alloc fails — serve the read
-            // from a stack buffer without caching rather than error.
-            match CachePage::alloc_zeroed() {
-                Some(mut cp) => {
-                    self.read_byte_range(byte_off, &mut cp[..]).await?;
-                    dst.copy_from_slice(&cp[in_page..in_page + bs]);
-                    self.page_cache.insert(
-                        key,
-                        Page {
-                            data: Arc::new(cp),
-                            dirty: false,
-                            gen: 0,
-                        },
-                    );
-                }
-                None => {
-                    let mut data = [0u8; PAGE_SIZE];
-                    self.read_byte_range(byte_off, &mut data).await?;
-                    dst.copy_from_slice(&data[in_page..in_page + bs]);
-                }
-            }
-            return Ok(());
-        }
-        let byte_off = block_no * bs as u64;
-        self.read_byte_range(byte_off, dst).await
+        self.read_byte_range(block_no * bs as u64, dst).await
     }
 
     /// Number of journal-replay overrides installed at mount. Zero

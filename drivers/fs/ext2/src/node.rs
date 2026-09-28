@@ -129,20 +129,6 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         Ok(inode)
     }
 
-    /// Read the entire byte content of the inode into a heap
-    /// `Vec<u8>`. Used by directory enumeration; the caller is
-    /// responsible for never calling this on a regular file's full
-    /// size (file reads use the streaming `read` API instead).
-    async fn read_all_inode_bytes(&self, inode: &Inode) -> Result<Vec<u8>, FsError> {
-        let size = inode.size as usize;
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        let mut out = vec![0u8; size];
-        self.read_inode_at(inode, 0, &mut out).await?;
-        Ok(out)
-    }
-
     /// Read `dst.len()` bytes from `inode` starting at logical
     /// offset `offset`. Stops short of `dst.len()` only if EOF is
     /// reached. Holes (zero block-pointers) yield zero-bytes.
@@ -198,20 +184,34 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         inode: &Inode,
         mut f: F,
     ) -> Result<(), FsError> {
-        let bytes = self.read_all_inode_bytes(inode).await?;
+        let size = inode.size as usize;
+        if size == 0 {
+            return Ok(());
+        }
+        let block_size = self.volume.block_size();
         let mut continue_walk = true;
-        for_each_entry(&bytes, |entry| {
-            if !continue_walk {
-                return false;
+        let mut offset = 0usize;
+        while offset < size && continue_walk {
+            let logical = (offset / block_size) as u64;
+            let valid = core::cmp::min(block_size, size - offset);
+            let physical = self.volume.map_block(inode, logical).await?;
+            if physical != 0 {
+                let block = self.volume.read_block_view(physical).await?;
+                for_each_entry(&block[..valid], |entry| {
+                    if !continue_walk {
+                        return false;
+                    }
+                    let name = match core::str::from_utf8(entry.name) {
+                        Ok(s) => s,
+                        Err(_) => return true, // skip non-UTF8 entries
+                    };
+                    let keep = f(name, entry.inode, entry.file_type);
+                    continue_walk = keep;
+                    keep
+                });
             }
-            let name = match core::str::from_utf8(entry.name) {
-                Ok(s) => s,
-                Err(_) => return true, // skip non-UTF8 entries
-            };
-            let keep = f(name, entry.inode, entry.file_type);
-            continue_walk = keep;
-            keep
-        });
+            offset += valid;
+        }
         Ok(())
     }
 }
@@ -416,22 +416,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
-            let bytes = self.read_all_inode_bytes(&inode).await?;
-            let mut found_ino: u32 = 0;
-            for_each_entry(&bytes, |entry| {
-                let candidate = match core::str::from_utf8(entry.name) {
-                    Ok(s) => s,
-                    Err(_) => return true,
-                };
-                if candidate == name {
-                    found_ino = entry.inode;
-                    return false;
-                }
-                true
-            });
-            if found_ino == 0 {
-                return Err(FsError::NotFound);
-            }
+            let (found_ino, _) = self.volume.dir_lookup(&inode, name.as_bytes()).await?;
             let target = self.volume.read_inode(found_ino).await?;
             Ok(
                 Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
@@ -449,24 +434,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
-            let bytes = self.read_all_inode_bytes(&inode).await?;
-            let mut found_ino: u32 = 0;
-            let mut found_type: u8 = ftype::UNKNOWN;
-            for_each_entry(&bytes, |entry| {
-                let candidate = match core::str::from_utf8(entry.name) {
-                    Ok(s) => s,
-                    Err(_) => return true,
-                };
-                if candidate == name {
-                    found_ino = entry.inode;
-                    found_type = entry.file_type;
-                    return false;
-                }
-                true
-            });
-            if found_ino == 0 {
-                return Err(FsError::NotFound);
-            }
+            let (found_ino, found_type) = self.volume.dir_lookup(&inode, name.as_bytes()).await?;
             let target = self.volume.read_inode(found_ino).await?;
             // Honour the on-disk inode mode rather than the rev-0
             // dirent type byte, which is unreliable on rev-0 volumes

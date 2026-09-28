@@ -134,7 +134,7 @@ pub use memfs::{
 };
 pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
 pub use overlayfs::{OverlayFs, OPAQUE_MARKER, WHITEOUT_PREFIX};
-pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
+pub use page_cache::{CacheFolio, Folio, FolioRef, FolioSlice, PageCache, PageKey, PAGE_SIZE};
 pub use pathwalk::{begin_path_mutation, Dentry, PathMutationGuard};
 pub use posix_acl::{
     posix_acl_create, posix_acl_permission, posix_acl_update_mode, AclCreate, AclDecision,
@@ -2542,7 +2542,24 @@ pub fn resolve_directory_dentry_async<'a>(
                     directory.lookup_dir(component).ok_or(FsError::NotFound)?
                 }
                 Err(FsError::NotFound) => {
-                    if let Some(token) = token {
+                    // A miss from the directory-shaped hook does not prove
+                    // the name absent: it may be a regular file. Preserve
+                    // that positive dentry so failure classification can
+                    // distinguish ENOTDIR from ENOENT. This is the mirror of
+                    // the file resolver's final-directory handling below.
+                    let file = match directory.lookup_async(component).await {
+                        Ok(file) => Some(file),
+                        Err(FsError::Unsupported) => directory.lookup(component),
+                        Err(FsError::NotFound) => None,
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(file) = file {
+                        if let Some(token) = token {
+                            let file_type = file.stat_async().await?.mode.file_type;
+                            let _ =
+                                pathwalk::cache_file(&current, component, token, file, file_type);
+                        }
+                    } else if let Some(token) = token {
                         pathwalk::cache_negative(&current, component, token);
                     }
                     return Err(FsError::NotFound);
@@ -2723,7 +2740,25 @@ pub fn resolve_async_dentry_ext<'a>(
                     continue;
                 }
                 Err(FsError::NotFound) => {
-                    if let Some(token) = file_token {
+                    // `DirOps` has split file- and directory-shaped lookup
+                    // hooks, but the dcache has one Linux-shaped namespace.
+                    // A miss from `lookup_async` alone therefore does not
+                    // prove a negative dentry: the name may be a directory
+                    // reachable through `lookup_dir_async`.  Publish that
+                    // positive directory now so a caller's directory
+                    // fallback can consume it without repeating the walk.
+                    // Only cache Negative after both lookup shapes miss.
+                    let directory = match current_dir.lookup_dir_async(&seg).await {
+                        Ok(directory) => Some(directory),
+                        Err(FsError::Unsupported) => current_dir.lookup_dir(&seg),
+                        Err(FsError::NotFound) => None,
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(directory) = directory {
+                        if let Some(token) = file_token {
+                            let _ = pathwalk::cache_directory(&current, &seg, token, directory);
+                        }
+                    } else if let Some(token) = file_token {
                         pathwalk::cache_negative(&current, &seg, token);
                     }
                     return Err(FsError::NotFound);

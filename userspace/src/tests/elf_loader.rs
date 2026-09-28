@@ -3443,6 +3443,18 @@ fn smoke_userspace_execve_divergence_frees_address_space() -> TestResult {
     // Fedora-KDE 5-minute kernel-heap OOM.
     use crate::user_task::{clear_current, install_current, UserTaskCtx};
 
+    fn exec_leak_task_lookup() -> u64 {
+        crate::PID_MAX - 200
+    }
+    struct TaskLookupReset;
+    impl Drop for TaskLookupReset {
+        fn drop(&mut self) {
+            crate::handlers::__test_reset_task_id_lookup();
+        }
+    }
+    let _task_lookup_reset = TaskLookupReset;
+    crate::install_task_id_lookup(exec_leak_task_lookup);
+
     // The path pointer below is a kernel address; with a user ctx installed
     // the copy-in validators enforce the user half, so scope the kernel-
     // buffer opt-in the way every syscall-driving e2e fixture does.
@@ -3537,9 +3549,10 @@ fn smoke_userspace_execve_divergence_frees_address_space() -> TestResult {
         // only happens when CURRENT_TASK held this test's id, the assertion was
         // nondeterministic: it ambushed three unrelated changes before anyone
         // noticed it was measuring scheduler residue rather than exec cleanup.
-        narf_scheduler::__test_clear_published_address_space(narf_scheduler::TaskId(
-            crate::handlers::current_task_id(),
-        ));
+        let task = narf_scheduler::TaskId(crate::handlers::current_task_id());
+        if narf_scheduler::current_task_id() == task {
+            narf_scheduler::__test_clear_published_address_space(task);
+        }
     }
 
     crate::user_task::__test_clear_execve_hook();

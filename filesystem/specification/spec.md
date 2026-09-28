@@ -709,6 +709,20 @@ consumer can recognise aliases of the same `(filesystem, inode)` pair.
 
 - Default behaviour: read-modify-write path goes through a unified
   page cache sized by `memory/` policy.
+- The cache's native resident unit is `Folio`, backed by `CacheFolio`: a
+  physically contiguous, naturally aligned run of `2^order` base pages.
+  `PageKey` remains a base-page index. `PageCache::lookup_folio(key)` finds
+  the folio containing that index and returns a retained `FolioRef`; its
+  `FolioSlice` views keep the allocation alive without copying or holding the
+  cache lock. `PageCache::insert_folio` rejects misaligned or overlapping
+  heads rather than publishing two owners for one page-cache index.
+- Capacity, watermark reclaim, and shrinker counts are expressed in base
+  pages, not folio heads. CLOCK recency and dirty/writeback state are per
+  folio; reclaim never splits a folio and never evicts a dirty folio.
+- Order-zero allocation is the guaranteed fast path. Higher-order allocation
+  is opportunistic: callers must fall back to a smaller folio or a bounded
+  uncached read when contiguous memory is unavailable. Cache metadata locks
+  never span backing-store I/O or `.await`.
 - Opt-out: `MountOpts { direct: true }` bypasses the cache for that
   mount — useful for virtiofs-backed host passthrough where the host
   already caches.

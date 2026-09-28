@@ -802,6 +802,15 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
         fn set_rip(&mut self, _rip: u64) {}
     }
 
+    struct CredReset;
+    impl Drop for CredReset {
+        fn drop(&mut self) {
+            crate::handlers::__test_uidgid_reset();
+            crate::handlers::__test_caps_reset();
+        }
+    }
+    let _cred_reset = CredReset;
+
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -849,7 +858,6 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
         return TestResult::Fail("setuid did not stick");
     }
 
-    crate::handlers::__test_uidgid_reset();
     __test_clear_global();
     TestResult::Pass
 }

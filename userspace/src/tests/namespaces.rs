@@ -286,6 +286,13 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
     fn hostname_task_lookup() -> u64 {
         HOSTNAME_TASK.load(Ordering::Relaxed)
     }
+    struct TaskLookupReset;
+    impl Drop for TaskLookupReset {
+        fn drop(&mut self) {
+            crate::handlers::__test_reset_task_id_lookup();
+        }
+    }
+    let _task_lookup_reset = TaskLookupReset;
     crate::handlers::install_task_id_lookup(hostname_task_lookup);
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);

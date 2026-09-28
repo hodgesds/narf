@@ -70,7 +70,14 @@ virtgpu userspace ABI:
   that per-open teardown path before generic KMS cleanup.
 - Primary-node inbound: the existing framebuffer / modeset ioctls; an
   accelerated buffer may be presented only after it is also registered as a
-  KMS framebuffer.
+  KMS framebuffer. `PAGE_FLIP_EVENT` completions are bound to the submitting
+  primary-node open, matching Linux `struct drm_file::event_list`; an event's
+  opaque `user_data` must never cross to another opener, and close discards
+  that opener's unconsumed events. Reads return only complete 32-byte
+  `drm_event_vblank` records: an empty `O_NONBLOCK` read is `EAGAIN`, a blocking
+  read waits (or is interrupted with `EINTR`), and a too-small buffer returns
+  zero without consuming the event. Each open has Linux's 4 KiB event budget;
+  an ioctl that cannot reserve another completion returns `ENOMEM`.
 - Outbound: completion is synchronous for v1. `EXECBUFFER` with
   `FENCE_FD_OUT` returns a close-on-exec, already-signalled sync-file fd;
   `FENCE_FD_IN` accepts only one of those sync-file descriptions and otherwise

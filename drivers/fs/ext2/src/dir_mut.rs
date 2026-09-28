@@ -109,33 +109,28 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         }
     }
 
-    /// Read every directory data block of `parent_inode` into a
-    /// flat `Vec<u8>`. Length equals `parent_inode.size`.
-    pub(crate) async fn read_dir_bytes(&self, parent_inode: &Inode) -> Result<Vec<u8>, FsError> {
-        let size = parent_inode.size as usize;
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        let bs = self.block_size();
-        let mut out = vec![0u8; size];
-        let mut off = 0usize;
-        while off < size {
-            let logical = (off / bs) as u64;
-            let in_block = off % bs;
-            let want = core::cmp::min(size - off, bs - in_block);
-            let phys = self.map_block(parent_inode, logical).await?;
-            if phys == 0 {
-                for b in &mut out[off..off + want] {
-                    *b = 0;
-                }
-            } else {
-                let mut blockbuf = vec![0u8; bs];
-                self.read_block(phys, &mut blockbuf).await?;
-                out[off..off + want].copy_from_slice(&blockbuf[in_block..in_block + want]);
+    /// Check the `rmdir` emptiness invariant one retained folio-backed block
+    /// at a time. Directory entries never cross filesystem-block boundaries,
+    /// so flattening the entire inode is both unnecessary and harmful for
+    /// large desktop directories.
+    async fn dir_is_empty(&self, inode: &Inode) -> Result<bool, FsError> {
+        let size = inode.size as usize;
+        let block_size = self.block_size();
+        let mut base = 0usize;
+        while base < size {
+            let logical = (base / block_size) as u64;
+            let valid = core::cmp::min(block_size, size - base);
+            let physical = self.map_block(inode, logical).await?;
+            if physical == 0 {
+                return Ok(false);
             }
-            off += want;
+            let block = self.read_block_view(physical).await?;
+            if !splice::is_dir_empty(&block[..valid]) {
+                return Ok(false);
+            }
+            base += valid;
         }
-        Ok(out)
+        Ok(true)
     }
 
     /// Look up `name` in `parent_inode`, returning `(inode_no,
@@ -145,21 +140,42 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         parent_inode: &Inode,
         name: &[u8],
     ) -> Result<(u32, u8), FsError> {
-        let bytes = self.read_dir_bytes(parent_inode).await?;
-        let mut off = 0usize;
-        while off + 8 <= bytes.len() {
-            let inode =
-                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-            let rec_len = u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]) as usize;
-            let name_len = bytes[off + 6] as usize;
-            let file_type = bytes[off + 7];
-            if rec_len < 8 || off + rec_len > bytes.len() {
-                return Err(FsError::Io(narf_block::BlockError::IOError));
+        let size = parent_inode.size as usize;
+        let block_size = self.block_size();
+        let mut base = 0usize;
+        while base < size {
+            let logical = (base / block_size) as u64;
+            let valid = core::cmp::min(block_size, size - base);
+            let physical = self.map_block(parent_inode, logical).await?;
+            if physical == 0 {
+                base += valid;
+                continue;
             }
-            if inode != 0 && name_len == name.len() && &bytes[off + 8..off + 8 + name_len] == name {
-                return Ok((inode, file_type));
+            let block = self.read_block_view(physical).await?;
+
+            let mut off = 0usize;
+            while off + 8 <= valid {
+                let inode = u32::from_le_bytes([
+                    block[off],
+                    block[off + 1],
+                    block[off + 2],
+                    block[off + 3],
+                ]);
+                let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
+                let name_len = block[off + 6] as usize;
+                let file_type = block[off + 7];
+                if rec_len < 8 || off + rec_len > valid || name_len > rec_len.saturating_sub(8) {
+                    return Err(FsError::Io(narf_block::BlockError::IOError));
+                }
+                if inode != 0
+                    && name_len == name.len()
+                    && &block[off + 8..off + 8 + name_len] == name
+                {
+                    return Ok((inode, file_type));
+                }
+                off += rec_len;
             }
-            off += rec_len;
+            base += valid;
         }
         Err(FsError::NotFound)
     }
@@ -557,8 +573,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::InvalidPath);
         }
         // Empty check.
-        let body = self.read_dir_bytes(&target).await?;
-        if !splice::is_dir_empty(&body) {
+        if !self.dir_is_empty(&target).await? {
             return Err(FsError::Busy);
         }
         // Delete the dirent, free data blocks + inode, drop parent's
