@@ -8090,3 +8090,73 @@ fn smoke_abi_socket_recvmsg_header_errnos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_header_errnos);
+
+// ─────────────────────────── inode identity ───────────────────────────
+//
+// Linux `sock_alloc`: every socket is its own sockfs inode
+// (`new_inode_pseudo` + `get_next_ino`), so the two ends of a socketpair
+// and two independent sockets all differ, while all share sockfs's st_dev.
+
+fn socketpair_fds() -> Result<(u64, u64), &'static str> {
+    let mut sv = [0u8; 8];
+    let r = call(
+        Syscall::SocketPair.raw(),
+        a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+    );
+    if r != Some(0) {
+        return Err("socketpair failed");
+    }
+    let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+    let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+    Ok((fd0, fd1))
+}
+
+fn smoke_abi_socket_inode_per_socket_pos() -> TestResult {
+    with_setup(|| {
+        let (s0, s1) = socketpair_fds()?;
+        let a = crate::abi_fdio2_tests::fstat_id(s0)?;
+        let b = crate::abi_fdio2_tests::fstat_id(s1)?;
+        let c = crate::abi_fdio2_tests::fstat_id(open_unix_stream()?)?;
+        if a.0 == 0 || a.1 == 0 {
+            return Err("a socket reported st_dev or st_ino 0");
+        }
+        if a.1 == b.1 {
+            return Err("the two ends of a socketpair share an st_ino");
+        }
+        if a.1 == c.1 || b.1 == c.1 {
+            return Err("two sockets share an st_ino");
+        }
+        if a.0 != b.0 || a.0 != c.0 {
+            return Err("sockets are not all on the sockfs superblock");
+        }
+        // A dup is the same socket, so the same inode.
+        let d = call(Syscall::Dup.raw(), a0(s0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("dup failed")? as u64;
+        if crate::abi_fdio2_tests::fstat_id(d)? != a {
+            return Err("dup of a socket changed its inode");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_inode_per_socket_pos);
+
+/// sockfs is its own superblock: a socket is neither the shared anon inode
+/// nor on its superblock.
+fn smoke_abi_socket_inode_not_anon_inode_neg() -> TestResult {
+    with_setup(|| {
+        let s = crate::abi_fdio2_tests::fstat_id(open_unix_stream()?)?;
+        let ev = call(Syscall::Eventfd.raw(), a1(0, 0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("eventfd failed")? as u64;
+        let e = crate::abi_fdio2_tests::fstat_id(ev)?;
+        if s == e || s.0 == e.0 {
+            return Err("a socket reports the anon inode's st_dev");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_inode_not_anon_inode_neg
+);
