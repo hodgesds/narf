@@ -616,6 +616,7 @@ fn main() {
         "flock_release_smoke",
         "inode_identity_smoke",
         "tty_poll_timeout_smoke",
+        "pty_wake_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
@@ -711,6 +712,7 @@ fn main() {
         "flock_release_smoke",
         "inode_identity_smoke",
         "tty_poll_timeout_smoke",
+        "pty_wake_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
     ] {

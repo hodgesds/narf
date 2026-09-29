@@ -116,8 +116,12 @@ int main(void) {
     t.c_cc[VTIME] = 0;
     tcsetattr(slave, TCSANOW, &t);
 
+    // Watch a private empty directory: a shared one like /tmp gets events
+    // from unrelated processes, which would make the inotify fd readable.
+    char watch_dir[] = "/tmp/inowatch.XXXXXX";
     int ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (ino < 0 || inotify_add_watch(ino, "/tmp", IN_MODIFY | IN_MOVED_TO) < 0) {
+    if (ino < 0 || !mkdtemp(watch_dir) ||
+        inotify_add_watch(ino, watch_dir, IN_MODIFY | IN_MOVED_TO) < 0) {
         write(1, "tty-poll-timeout-fail: inotify\n", 31);
         return 1;
     }
@@ -152,6 +156,8 @@ int main(void) {
                 failed = 1;
             }
         }
+    close(ino);
+    rmdir(watch_dir);
     if (failed)
         return 1;
     write(1, "tty-poll-timeout-ok\n", 20);

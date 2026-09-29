@@ -5591,6 +5591,13 @@ fn boot_userspace_init() {
                     "tty_poll_timeout_glibc",
                     narf_verification::NARF_TTY_POLL_TIMEOUT_SMOKE_GLIBC_ELF,
                 ),
+                // A write to one side of a pty wakes a reader parked on the
+                // other (fish's query -> konsole's master poll), musl + glibc.
+                ("pty_wake_smoke", narf_verification::NARF_PTY_WAKE_SMOKE_ELF),
+                (
+                    "pty_wake_glibc",
+                    narf_verification::NARF_PTY_WAKE_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,
