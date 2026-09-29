@@ -75,6 +75,7 @@ pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
+pub(crate) mod devfs_vt;
 pub mod efivarfs;
 pub mod fifo;
 pub mod fs_registry;

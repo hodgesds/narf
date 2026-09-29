@@ -663,6 +663,7 @@ fn main() {
         "remount_smoke",
         "utmp_smoke",
         "thp_smoke",
+        "vconsole_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
@@ -721,6 +722,7 @@ fn main() {
         "remount_smoke",
         "utmp_smoke",
         "thp_smoke",
+        "vconsole_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

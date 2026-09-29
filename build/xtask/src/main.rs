@@ -3648,6 +3648,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // tmpfiles writes to /sys/kernel/mm/transparent_hugepage knobs.
         ("thp_smoke", "thp-ok"),
         ("thp_glibc", "thp-ok"),
+        // systemd-vconsole-setup: /dev/vcs1, KDGKBMODE, loadkeys' ioctls.
+        ("vconsole_smoke", "vconsole-ok"),
+        ("vconsole_glibc", "vconsole-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),

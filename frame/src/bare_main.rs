@@ -5612,6 +5612,12 @@ fn boot_userspace_init() {
                 // tmpfiles' `w!` writes to the THP sysfs knobs.
                 ("thp_smoke", narf_verification::NARF_THP_SMOKE_ELF),
                 ("thp_glibc", narf_verification::NARF_THP_SMOKE_GLIBC_ELF),
+                // systemd-vconsole-setup's VT probe + loadkeys' KD* ioctls.
+                ("vconsole_smoke", narf_verification::NARF_VCONSOLE_SMOKE_ELF),
+                (
+                    "vconsole_glibc",
+                    narf_verification::NARF_VCONSOLE_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

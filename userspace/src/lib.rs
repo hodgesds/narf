@@ -123,6 +123,7 @@ mod abi_time_tests;
 mod abi_uaccess_tests;
 mod abi_udev_protocol_tests;
 mod abi_udp_tests;
+mod abi_vconsole_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;
