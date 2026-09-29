@@ -62,7 +62,7 @@ Counts (approximate, from this tree):
   sockets, signals, credentials, VFS, poll/epoll, time).
 - **~50** handlers gated behind `linux-compat` (POSIX timers, full SysV IPC,
   inotify/fanotify, Landlock, LSM self-attr, keyrings, new mount API, xattrs,
-  `statx`, `ptrace`, `perf_event_open`).
+  `statx`, `perf_event_open`).
 - **3** gated behind `container` (SysV `*get` id-by-key when `linux-compat`
   is off; `pivot_root`).
 - **~5** intentional no-op stubs (`utime`/`utimes` timestamp write,
@@ -92,7 +92,7 @@ handler exists. Both directions are real; when in doubt, check both the table
 | `getpriority`/`setpriority`, `getrusage`, `times` | implemented | — | |
 | `prctl`, `arch_prctl` | implemented | `arch_prctl` x86_64-only | `handlers.rs:~21175` |
 | `personality` | implemented (returns flags) | — | |
-| `ptrace` | **stub → ENOSYS** when `linux-compat` off | `linux-compat` | `handlers.rs:~17581` documents the ENOSYS stub |
+| `ptrace` | implemented subset: TRACEME/ATTACH, wait stops, CONT/SYSCALL/SINGLESTEP, memory and register access, DETACH/KILL | — | `userspace/src/ptrace.rs`; optional requests such as SEIZE and GETSIGINFO return Linux-compatible `EIO` |
 | `rseq`, `set_tid_address` | implemented | `set_tid_address` under `linux-compat` | |
 | `kcmp` | implemented | `linux-compat` | |
 | `capget`/`capset` | implemented | `linux-compat` | |
@@ -468,20 +468,17 @@ FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
 >   `sys_exit_task`, which IS the installed `Syscall::ExitTask` handler, and
 >   sets `FUTEX_OWNER_DIED`. That walk is the whole point of the interface.
 > - `ptrace` was listed as `ENOSYS` unless `linux-compat` is on, citing
->   `handlers.rs:~17581`. No `linux-compat` feature exists — not in any
->   Cargo.toml, and no `cfg` refers to it — and `handlers` is a directory
->   now. `Syscall::Ptrace` installs `handlers/sys_ptrace.rs`, which forwards
->   to `crate::ptrace::sys_ptrace`: TRACEME/ATTACH/SEIZE with pid-namespace
->   translation, and EIO (as Linux does) for an unrecognised request.
+>   `handlers.rs:~17581`. That row was stale: no `linux-compat` feature
+>   exists, and `Syscall::Ptrace` installs `handlers/sys_ptrace.rs`, which
+>   forwards to `crate::ptrace::sys_ptrace`. The supported request subset is
+>   listed in §2.1; optional unsupported requests return EIO. The x86_64
+>   `strace_smoke` exercises TRACEME, wait, syscall stops, SETOPTIONS and
+>   GETREGS end to end.
 >
 > Verifying an entry means following the syscall table to the code that
-> actually runs. This one is easy to get wrong in BOTH directions, and this
-> audit managed both before landing: two functions are named `sys_ptrace`,
-> so "the implementation exists" does not establish it is reached, and the
-> shim that is reached carried a stale doc comment calling itself "a stub
-> returning ENOSYS" long after it began forwarding. That comment is now
-> corrected at the source. Entries here are claims about the code; check one
-> to the table before acting on it.
+> actually runs. Two functions are named `sys_ptrace`, so the implementation
+> and its forwarding shim must both be checked. The end-to-end smoke is
+> described above; rerun it when changing syscall wiring or ptrace behavior.
 
 - New mount API (`fsopen`/`fsconfig`/`fsmount`) is present but thin; `mount`
   fstype breadth is the real systemd gate. Mount propagation flags ARE
