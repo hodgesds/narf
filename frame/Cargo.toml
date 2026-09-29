@@ -44,6 +44,11 @@ narf-drivers-media = { path = "../drivers/media" }
 narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }
+# The PCH SPI flash controller and the class-matched PCI serial ports
+# live here. Both register Stage::Subsys PCI drivers, so the crates
+# have to be linked for those probes to exist at all.
+narf-drivers-serial  = { path = "../drivers/serial" }
+narf-drivers-spi     = { path = "../drivers/spi" }
 narf-drivers-fs-ext2  = { path = "../drivers/fs/ext2" }
 narf-drivers-fs-ext4  = { path = "../drivers/fs/ext4" }
 narf-drivers-fs-fat   = { path = "../drivers/fs/fat" }
@@ -270,6 +275,8 @@ kernel-test  = [
     "narf-drivers-gpu/kernel-test",
     "narf-drivers-nvidia/kernel-test",
     "narf-drivers-fingerprint/kernel-test",
+    "narf-drivers-serial/kernel-test",
+    "narf-drivers-spi/kernel-test",
     "narf-wireless/kernel-test",
     "narf-drivers-wireless/kernel-test",
     "narf-accel/kernel-test",

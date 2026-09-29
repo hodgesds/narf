@@ -1324,3 +1324,400 @@ kernel_test_in!(
     "drivers/platform/registry",
     smoke_registry_vendor_detect_from_mfr
 );
+
+// ── Intel MEI / HECI ────────────────────────────────────────────────
+
+fn smoke_mei_pci_match_table() -> TestResult {
+    use crate::mei;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    mei::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for did in mei::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let found = regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor: mei::MEI_VENDOR, device,
+            } if device == did)
+        });
+        if !found {
+            return TestResult::Fail("mei PCI match table missing a device id");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_pci_match_table);
+
+fn smoke_mei_claims_ms03_heci1_only() -> TestResult {
+    use crate::mei;
+    // 00:16.0 on the MS-03 is 8086:e370 (Panther Lake H), which
+    // Linux's mei_me_pci_tbl carries.
+    if !mei::is_supported_device(mei::MEI_DEV_PTL_H) || mei::MEI_DEV_PTL_H != 0xE370 {
+        return TestResult::Fail("mei does not claim the MS-03's HECI-1");
+    }
+    // 00:18.0 is 8086:e35d. It is a HECI-class function but is not in
+    // Linux's table and nothing binds it there; claiming it would be
+    // us inventing support we have not reasoned about.
+    if mei::is_supported_device(0xE35D) {
+        return TestResult::Fail("mei claimed 8086:e35d, which Linux does not");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_claims_ms03_heci1_only);
+
+fn smoke_mei_register_layout() -> TestResult {
+    use crate::mei;
+    if mei::REG_H_CB_WW != 0x00
+        || mei::REG_H_CSR != 0x04
+        || mei::REG_ME_CB_RW != 0x08
+        || mei::REG_ME_CSR_HA != 0x0C
+    {
+        return TestResult::Fail("HECI register offsets wrong");
+    }
+    if mei::H_RST != 0x10 || mei::H_RDY != 0x08 || mei::H_IG != 0x04 {
+        return TestResult::Fail("H_CSR control bits wrong");
+    }
+    if mei::ME_RDY_HRA != 0x08 || mei::ME_RST_HRA != 0x10 {
+        return TestResult::Fail("ME_CSR_HA bits wrong");
+    }
+    if mei::H_CSR_IE_MASK != (mei::H_IE | mei::H_D0I3C_IE) {
+        return TestResult::Fail("H_CSR_IE_MASK wrong");
+    }
+    if mei::PCI_CFG_HFS_1 != 0x40 || mei::PCI_CFG_HFS_2 != 0x48 {
+        return TestResult::Fail("firmware-status config offsets wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_register_layout);
+
+fn smoke_mei_filled_slots_wraps() -> TestResult {
+    use crate::mei;
+    // The circular-buffer pointers are free-running u8 counters.
+    // `write - read` must wrap, or every wrap of the write pointer
+    // past 0xFF reports a nonsense slot count.
+    //
+    // Depth 0x20, read pointer at 0xFE, write pointer at 0x02: four
+    // slots are filled.
+    let csr = (0x20u32 << 24) | (0x02u32 << 16) | (0xFEu32 << 8);
+    if mei::host_filled_slots(csr) != 4 {
+        return TestResult::Fail("filled_slots did not wrap across 0xFF");
+    }
+    if mei::host_buffer_depth(csr) != 0x20 {
+        return TestResult::Fail("buffer depth decoded wrong");
+    }
+    // Equal pointers mean empty, not full.
+    let empty = (0x20u32 << 24) | (0x11u32 << 16) | (0x11u32 << 8);
+    if mei::host_filled_slots(empty) != 0 {
+        return TestResult::Fail("equal pointers should read as empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_filled_slots_wraps);
+
+fn smoke_mei_msg_hdr_round_trip() -> TestResult {
+    use crate::mei::MeiMsgHdr;
+    let hdr = MeiMsgHdr {
+        me_addr: 0x07,
+        host_addr: 0x21,
+        length: 0x1F5,
+        extended: false,
+        dma_ring: false,
+        internal: true,
+        msg_complete: true,
+    };
+    let w = hdr.to_u32();
+    if MeiMsgHdr::from_u32(w) != hdr {
+        return TestResult::Fail("header did not round-trip");
+    }
+    // Field placement: me_addr in 7:0, host_addr in 15:8, length in
+    // 24:16, msg_complete in bit 31.
+    if w & 0xFF != 0x07 || (w >> 8) & 0xFF != 0x21 {
+        return TestResult::Fail("address fields in the wrong bits");
+    }
+    if (w >> 16) & 0x1FF != 0x1F5 {
+        return TestResult::Fail("length field in the wrong bits");
+    }
+    if w & (1 << 31) == 0 {
+        return TestResult::Fail("msg_complete is not bit 31");
+    }
+    // Length is 9 bits; anything wider must be truncated rather than
+    // bleeding into the flag bits above it.
+    let wide = MeiMsgHdr::bus_message(0xFFFF).to_u32();
+    if wide & 0xF000_0000 != (1u32 << 31) {
+        return TestResult::Fail("an over-long length corrupted the flag bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_msg_hdr_round_trip);
+
+fn smoke_mei_hbm_constants() -> TestResult {
+    use crate::mei;
+    if mei::HOST_START_REQ_CMD != 0x01 || mei::HOST_START_RES_CMD != 0x81 {
+        return TestResult::Fail("HOST_START command ids wrong");
+    }
+    if mei::HOST_ENUM_REQ_CMD != 0x04 || mei::HOST_ENUM_RES_CMD != 0x84 {
+        return TestResult::Fail("HOST_ENUM command ids wrong");
+    }
+    // A response is the request with bit 7 set.
+    if mei::HOST_START_RES_CMD != mei::HOST_START_REQ_CMD | mei::MEI_HBM_CMD_RES_MSK {
+        return TestResult::Fail("response mask does not relate req to res");
+    }
+    if mei::HBM_MAJOR_VERSION != 2 || mei::HBM_MINOR_VERSION != 2 {
+        return TestResult::Fail("HBM version wrong");
+    }
+    if mei::data_to_slots(0) != 0 || mei::data_to_slots(1) != 1 || mei::data_to_slots(4) != 1 {
+        return TestResult::Fail("data_to_slots does not round up");
+    }
+    if mei::data_to_slots(5) != 2 {
+        return TestResult::Fail("data_to_slots did not round 5 bytes up to 2 slots");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_hbm_constants);
+
+fn smoke_mei_version_response_decode() -> TestResult {
+    use crate::mei::{HbmVersionResponse, HOST_START_RES_CMD};
+    // struct hbm_version is { minor, major } — minor first.
+    let buf = [HOST_START_RES_CMD, 1, 2, 2];
+    let v = match HbmVersionResponse::parse(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("well-formed response rejected"),
+    };
+    if !v.host_version_supported || v.me_major != 2 || v.me_minor != 2 {
+        return TestResult::Fail("version response decoded wrong");
+    }
+    // A response carrying someone else's opcode is not ours.
+    if HbmVersionResponse::parse(&[0x84, 1, 2, 2]).is_some() {
+        return TestResult::Fail("accepted a response with the wrong opcode");
+    }
+    if HbmVersionResponse::parse(&[HOST_START_RES_CMD, 1, 2]).is_some() {
+        return TestResult::Fail("accepted a short response");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/mei", smoke_mei_version_response_decode);
+
+// ── Intel DTT (proc_thermal) ────────────────────────────────────────
+
+fn smoke_proc_thermal_pci_match_table() -> TestResult {
+    use crate::proc_thermal as pt;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    pt::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for did in pt::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let found = regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor: pt::DTT_VENDOR, device,
+            } if device == did)
+        });
+        if !found {
+            return TestResult::Fail("proc_thermal match table missing a device id");
+        }
+    }
+    // The MS-03's 00:04.0.
+    if !pt::is_supported_device(pt::DTT_DEV_PTL) || pt::DTT_DEV_PTL != 0xB01D {
+        return TestResult::Fail("proc_thermal does not claim the MS-03's DTT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/proc_thermal",
+    smoke_proc_thermal_pci_match_table
+);
+
+fn smoke_proc_thermal_device_ids_are_unique() -> TestResult {
+    use crate::proc_thermal as pt;
+    // Linux defines NVL_S_THERMAL and ARL_S_THERMAL as the same
+    // 0xAD03. Listing both would register two match entries for one
+    // device, so the table must carry each id once.
+    let ids = pt::SUPPORTED_DEVICE_IDS;
+    for (i, a) in ids.iter().enumerate() {
+        for b in ids.iter().skip(i + 1) {
+            if a == b {
+                return TestResult::Fail("duplicate device id in the DTT table");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/proc_thermal",
+    smoke_proc_thermal_device_ids_are_unique
+);
+
+fn smoke_proc_thermal_mmio_fields() -> TestResult {
+    use crate::proc_thermal as pt;
+    // Four fields share the dword at 0x5820 and are told apart only
+    // by shift and mask; a transposed shift silently reads the wrong
+    // one.
+    if pt::FIELD_THRES_0.reg != 0x5820 || pt::FIELD_THRES_0.shift != 8 {
+        return TestResult::Fail("THRES_0 field wrong");
+    }
+    if pt::FIELD_INT_ENABLE_0.reg != 0x5820 || pt::FIELD_INT_ENABLE_0.shift != 15 {
+        return TestResult::Fail("INT_ENABLE_0 field wrong");
+    }
+    if pt::FIELD_THRES_1.shift != 16 || pt::FIELD_INT_ENABLE_1.shift != 23 {
+        return TestResult::Fail("THRES_1 / INT_ENABLE_1 fields wrong");
+    }
+    // TjMax is bits 23:16 of 0x599c, not the whole register.
+    if pt::FIELD_TJMAX.reg != 0x599C || pt::FIELD_TJMAX.shift != 16 || pt::FIELD_TJMAX.mask != 0xFF
+    {
+        return TestResult::Fail("TJMAX field wrong");
+    }
+    if pt::FIELD_TJMAX.extract(0x0064_0000) != 100 {
+        return TestResult::Fail("TJMAX extraction wrong");
+    }
+    // PKG_TEMP is the low byte of a different register.
+    if pt::FIELD_PKG_TEMP.reg != 0x5978 || pt::FIELD_PKG_TEMP.shift != 0 {
+        return TestResult::Fail("PKG_TEMP field wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/proc_thermal",
+    smoke_proc_thermal_mmio_fields
+);
+
+fn smoke_proc_thermal_feature_masks() -> TestResult {
+    use crate::proc_thermal as pt;
+    // Panther Lake's mask from proc_thermal_pci_ids[].
+    let ptl = pt::features_for(pt::DTT_DEV_PTL);
+    let expect = pt::FEATURE_RAPL
+        | pt::FEATURE_DLVR
+        | pt::FEATURE_DVFS
+        | pt::FEATURE_MSI_SUPPORT
+        | pt::FEATURE_WT_HINT
+        | pt::FEATURE_POWER_FLOOR
+        | pt::FEATURE_PTC
+        | pt::FEATURE_SOC_POWER_SLIDER;
+    if ptl != expect {
+        return TestResult::Fail("Panther Lake feature mask wrong");
+    }
+    // Panther Lake has no FIVR — Alder Lake does. Confusing the two
+    // would have the driver look for an RFIM mailbox that isn't there.
+    if ptl & pt::FEATURE_FIVR != 0 {
+        return TestResult::Fail("Panther Lake should not advertise FIVR");
+    }
+    if pt::features_for(pt::DTT_DEV_ADL) & pt::FEATURE_FIVR == 0 {
+        return TestResult::Fail("Alder Lake should advertise FIVR");
+    }
+    if pt::features_for(0xFFFF) != 0 {
+        return TestResult::Fail("an unknown id should have no features");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/proc_thermal",
+    smoke_proc_thermal_feature_masks
+);
+
+// ── Intel VSEC / PMT ────────────────────────────────────────────────
+
+fn smoke_intel_vsec_pci_match_table() -> TestResult {
+    use crate::intel_vsec as vs;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    vs::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for did in vs::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let found = regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor: vs::VSEC_VENDOR, device,
+            } if device == did)
+        });
+        if !found {
+            return TestResult::Fail("intel_vsec match table missing a device id");
+        }
+    }
+    // The MS-03's 00:0a.0.
+    if !vs::is_supported_device(vs::VSEC_DEV_PTL) || vs::VSEC_DEV_PTL != 0xB07D {
+        return TestResult::Fail("intel_vsec does not claim the MS-03's PMT function");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel_vsec",
+    smoke_intel_vsec_pci_match_table
+);
+
+fn smoke_intel_vsec_header_decode() -> TestResult {
+    use crate::intel_vsec as vs;
+    // PCI_DVSEC_HEADER1: vid[15:0], rev[19:16], len[31:20].
+    let h1 = 0x0201_8086u32;
+    if vs::dvsec_header1_vid(h1) != 0x8086 {
+        return TestResult::Fail("DVSEC vendor id decoded wrong");
+    }
+    if vs::dvsec_header1_rev(h1) != 1 {
+        return TestResult::Fail("DVSEC revision decoded wrong");
+    }
+    if vs::dvsec_header1_len(h1) != 0x020 {
+        return TestResult::Fail("DVSEC length decoded wrong");
+    }
+    // VNDR header packs id/rev/len the same way, minus the vendor id.
+    let hv = 0x0301_0002u32;
+    if vs::vndr_header_id(hv) != 0x0002 || vs::vndr_header_rev(hv) != 1 {
+        return TestResult::Fail("VNDR header decoded wrong");
+    }
+    if vs::vndr_header_len(hv) != 0x030 {
+        return TestResult::Fail("VNDR length decoded wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel_vsec",
+    smoke_intel_vsec_header_decode
+);
+
+fn smoke_intel_vsec_table_offset_keeps_low_bits_clear() -> TestResult {
+    use crate::intel_vsec as vs;
+    // The table dword packs the BAR index into bits 2:0 and the byte
+    // offset into 31:3. The offset is *not* shifted down — it is the
+    // dword with the BAR index masked off — so an implementation that
+    // shifts would divide every offset by eight.
+    let table = 0x0001_2348u32; // offset 0x12348, BAR 0
+    if vs::table_bar(table) != 0 {
+        return TestResult::Fail("BAR index decoded wrong");
+    }
+    if vs::table_offset(table) != 0x0001_2348 {
+        return TestResult::Fail("table offset was shifted when it should not be");
+    }
+    let with_bar = 0x0001_2340u32 | 0x2; // offset 0x12340, BAR 2
+    if vs::table_bar(with_bar) != 2 {
+        return TestResult::Fail("BAR index 2 decoded wrong");
+    }
+    if vs::table_offset(with_bar) != 0x0001_2340 {
+        return TestResult::Fail("BAR index leaked into the offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel_vsec",
+    smoke_intel_vsec_table_offset_keeps_low_bits_clear
+);
+
+fn smoke_intel_vsec_feature_ids() -> TestResult {
+    use crate::intel_vsec as vs;
+    // Linux maps a feature id to its capability bit with BIT(id), so
+    // id 1 is telemetry and id 3 is crashlog.
+    if vs::cap_bit_for_id(1) != vs::VSEC_CAP_TELEMETRY {
+        return TestResult::Fail("feature id 1 is telemetry");
+    }
+    if vs::cap_bit_for_id(3) != vs::VSEC_CAP_CRASHLOG {
+        return TestResult::Fail("feature id 3 is crashlog");
+    }
+    if vs::feature_name(1) != "telemetry" || vs::feature_name(3) != "crashlog" {
+        return TestResult::Fail("feature names wrong");
+    }
+    // An id past the named range must not alias onto a real bit.
+    if vs::cap_bit_for_id(40) != 0 {
+        return TestResult::Fail("an out-of-range id should have no capability bit");
+    }
+    if vs::EXT_CAP_ID_DVSEC != 0x0023 || vs::EXT_CAP_ID_VNDR != 0x000B {
+        return TestResult::Fail("extended capability ids wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/intel_vsec", smoke_intel_vsec_feature_ids);

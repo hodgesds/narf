@@ -4318,3 +4318,121 @@ fn smoke_services_cccd_value_encoding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/services", smoke_services_cccd_value_encoding);
+
+// ── Intel PCIe Bluetooth ────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_match_table() -> TestResult {
+    use crate::btintel_pcie as bt;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    bt::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for did in bt::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let found = regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor: bt::BT_VENDOR, device,
+            } if device == did)
+        });
+        if !found {
+            return TestResult::Fail("btintel-pcie match table missing a device id");
+        }
+    }
+    // The MS-03's 00:14.7.
+    if !bt::is_supported_device(bt::BT_DEV_SCP_PTL_H484) || bt::BT_DEV_SCP_PTL_H484 != 0xE376 {
+        return TestResult::Fail("btintel-pcie does not claim the MS-03's controller");
+    }
+    // The Wi-Fi half of the same CNVi package is a different function
+    // with a different driver; claiming it would break both.
+    if bt::is_supported_device(0xE340) {
+        return TestResult::Fail("btintel-pcie claimed the CNVi Wi-Fi function");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_pcie_match_table);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_csr_layout() -> TestResult {
+    use crate::btintel_pcie as bt;
+    if bt::CSR_FUNC_CTRL != 0x024 || bt::CSR_HW_REV != 0x028 || bt::CSR_RF_ID != 0x09C {
+        return TestResult::Fail("identity register offsets wrong");
+    }
+    if bt::CSR_BOOT_STAGE != 0x108 || bt::CSR_HBUS_TARG_WRPTR != 0x460 {
+        return TestResult::Fail("boot-stage / doorbell offsets wrong");
+    }
+    // FUNC_CTRL bit positions. MAC_ACCESS_REQ (21) and
+    // MAC_ACCESS_STS (20) are adjacent and easy to transpose; asking
+    // on the status bit would wait forever.
+    if bt::FUNC_CTRL_MAC_ACCESS_STS != 1 << 20 || bt::FUNC_CTRL_MAC_ACCESS_REQ != 1 << 21 {
+        return TestResult::Fail("MAC access request/status bits transposed");
+    }
+    if bt::FUNC_CTRL_BUS_MASTER_STS != 1 << 28 || bt::FUNC_CTRL_BUS_MASTER_DISCON != 1 << 29 {
+        return TestResult::Fail("bus-master bits wrong");
+    }
+    if bt::FUNC_CTRL_SW_RESET != 1 << 31 {
+        return TestResult::Fail("SW_RESET is bit 31");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_pcie_csr_layout);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_cnvx_decode() -> TestResult {
+    use crate::btintel_pcie as bt;
+    // INTEL_CNVX_TOP_TYPE is bits 11:0, INTEL_CNVX_TOP_STEP is 27:24
+    // — not adjacent fields, and not a plain low/high split.
+    let cnvi = 0x0300_0A00u32; // Scorpius Peak, step 3
+    if bt::cnvx_top_type(cnvi) != bt::CNVI_SCP {
+        return TestResult::Fail("CNVi top type decoded wrong");
+    }
+    if bt::cnvx_top_step(cnvi) != 3 {
+        return TestResult::Fail("CNVi step decoded wrong");
+    }
+    if bt::cnvi_name(bt::CNVI_SCP) != "ScorpiusPeak" {
+        return TestResult::Fail("Panther Lake CNVi name wrong");
+    }
+    if bt::cnvi_name(bt::CNVI_BLAZARI) != "BlazarI" {
+        return TestResult::Fail("Lunar Lake CNVi name wrong");
+    }
+    // Bits between the two fields must not leak into either.
+    let noisy = 0x0FF0_FA00u32;
+    if bt::cnvx_top_type(noisy) != 0xA00 {
+        return TestResult::Fail("top type picked up bits above 11");
+    }
+    if bt::cnvx_top_step(noisy) != 0xF {
+        return TestResult::Fail("step picked up bits outside 27:24");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_pcie_cnvx_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_boot_stage_flags() -> TestResult {
+    use crate::btintel_pcie as bt;
+    // A clean shared hardware reset leaves BOOT_STAGE at exactly 0,
+    // which is how the reset is checked.
+    if bt::boot_stage_flags(0) != "none" {
+        return TestResult::Fail("zero boot stage should render as none");
+    }
+    let running = bt::BOOT_STAGE_OPFW | bt::BOOT_STAGE_ALIVE | bt::BOOT_STAGE_MAC_ACCESS_ON;
+    let s = bt::boot_stage_flags(running);
+    if !s.contains("opfw") || !s.contains("alive") || !s.contains("mac-access") {
+        return TestResult::Fail("running boot stage rendered wrong");
+    }
+    if s.contains("halted") {
+        return TestResult::Fail("rendered a flag that was not set");
+    }
+    if bt::BOOT_STAGE_ALIVE != 1 << 23 || bt::BOOT_STAGE_DEVICE_HALTED != 1 << 14 {
+        return TestResult::Fail("boot stage bit positions wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_boot_stage_flags
+);

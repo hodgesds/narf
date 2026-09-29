@@ -52,6 +52,8 @@ pub enum PciError {
     NotPcie,
     /// Device does not advertise the requested capability (e.g. PM).
     CapNotPresent,
+    /// Config-space offset was misaligned or outside the 4 KiB window.
+    BadOffset,
 }
 
 impl From<narf_capabilities::CapError> for PciError {
@@ -59,6 +61,40 @@ impl From<narf_capabilities::CapError> for PciError {
         PciError::AuthorityRevoked
     }
 }
+
+/// Read a dword from an arbitrary offset in the device's config
+/// space.
+///
+/// The standard type-0 header is covered by `save_config`, but every
+/// vendor puts device-specific state in the 0x40..0x100 window that
+/// is neither a header field nor a capability-list entry — Intel's
+/// HECI firmware-status words at 0x40 / 0x48 / 0x60, for instance.
+/// Rather than have each such driver hand-roll an ECAM accessor,
+/// they read through here.
+///
+/// `offset` must be dword-aligned and inside the 4 KiB config window.
+/// A read of a device that has fallen off the bus returns the usual
+/// all-ones, exactly as the raw ECAM read would — this helper does
+/// not try to distinguish that from a legitimate `0xFFFF_FFFF`.
+///
+/// Cap-gated; the cap's epoch is checked.
+pub fn read_config32(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    offset: u16,
+) -> Result<u32, PciError> {
+    cap.check_live()?;
+    if offset % 4 != 0 || offset as u64 + 4 > CFG_WINDOW_BYTES {
+        return Err(PciError::BadOffset);
+    }
+    let cfg = pcie_cfg_phys(device)?;
+    // SAFETY: `cfg` is this function's identity-mapped ECAM window
+    // and `offset` is dword-aligned and in range per the check above.
+    Ok(unsafe { cfg_read32(cfg, offset as u64) })
+}
+
+/// Size of one PCIe function's configuration window.
+pub const CFG_WINDOW_BYTES: u64 = 4096;
 
 /// Read the device's current Command-register value.
 ///

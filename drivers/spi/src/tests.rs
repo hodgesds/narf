@@ -35,13 +35,26 @@ use crate::{registry, SpiBus, SpiError, SpiMode};
 
 // ── Synthetic MMIO backing ────────────────────────────────────────
 //
-// 512-byte zeroed buffer — well above the AMD FIFO_BASE + FIFO_DEPTH
-// (0x80 + 64 = 0xC0) and the Intel SSDR offset (0x10).
+// One page of zeroed memory. It has to cover the *highest* register
+// any driver under test touches, not just the FIFOs:
+//
+//   AMD FCH   FIFO_BASE + FIFO_DEPTH  = 0x80 + 64 = 0x0C0
+//   Intel SSP SSDR                    =             0x010
+//   Intel LPSS private block          = 0x800 + 0x38 = 0x838
+//
+// The LPSS private block is the binding constraint. A region that
+// stops short of it makes `IntelLpssSpi::init` skip the clock-gate
+// write (it is guarded on `mmio_len`), and any test that then reads
+// 0x838 back is reading past the end of the allocation.
+const SYNTHETIC_MMIO_BYTES: usize = 4096;
 
 fn make_mmio() -> (PhysAddr, u64) {
-    let buf: Box<[u8; 512]> = Box::new([0u8; 512]);
+    let buf: Box<[u8; SYNTHETIC_MMIO_BYTES]> = Box::new([0u8; SYNTHETIC_MMIO_BYTES]);
     let raw = Box::leak(buf);
-    (PhysAddr::new(raw.as_ptr() as u64), 512)
+    (
+        PhysAddr::new(raw.as_ptr() as u64),
+        SYNTHETIC_MMIO_BYTES as u64,
+    )
 }
 
 // ── Fake echo-back SpiBus ─────────────────────────────────────────
@@ -379,3 +392,125 @@ fn smoke_spi_registry_dedupes_by_name() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/spi", smoke_spi_registry_dedupes_by_name);
+
+// ── Intel PCH SPI flash controller ──────────────────────────────────
+
+fn smoke_intel_spi_flash_pci_match_table() -> TestResult {
+    use crate::intel_spi_flash as isf;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    isf::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for did in isf::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let found = regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor: isf::SPI_VENDOR, device,
+            } if device == did)
+        });
+        if !found {
+            return TestResult::Fail("intel-spi match table missing a device id");
+        }
+    }
+    // The MS-03's 00:1f.5.
+    if !isf::is_supported_device(isf::SPI_DEV_PTL_H) || isf::SPI_DEV_PTL_H != 0xE323 {
+        return TestResult::Fail("intel-spi does not claim the MS-03's flash controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/spi/intel_spi_flash",
+    smoke_intel_spi_flash_pci_match_table
+);
+
+fn smoke_intel_spi_flash_register_layout() -> TestResult {
+    use crate::intel_spi_flash as isf;
+    if isf::REG_BFPREG != 0x00 || isf::REG_HSFSTS_CTL != 0x04 || isf::REG_FRACC != 0x50 {
+        return TestResult::Fail("core register offsets wrong");
+    }
+    // FREG(n) starts at 0x54 with a 4-byte stride.
+    if isf::reg_freg(0) != 0x54 || isf::reg_freg(5) != 0x54 + 20 {
+        return TestResult::Fail("FREG stride wrong");
+    }
+    // The PR block moved to 0x84 on Cannon Lake and later; using the
+    // older 0x74 would read the wrong registers entirely.
+    if isf::CNL_PR_BASE != 0x84 || isf::reg_pr(0) != 0x84 || isf::reg_pr(4) != 0x84 + 16 {
+        return TestResult::Fail("PR block base or stride wrong");
+    }
+    if isf::CNL_FREG_NUM != 6 || isf::CNL_PR_NUM != 5 {
+        return TestResult::Fail("CNL region / PR counts wrong");
+    }
+    if isf::HSFSTS_CTL_FLOCKDN != 1 << 15 || isf::HSFSTS_CTL_FDV != 1 << 14 {
+        return TestResult::Fail("HSFSTS_CTL status bits wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/spi/intel_spi_flash",
+    smoke_intel_spi_flash_register_layout
+);
+
+fn smoke_intel_spi_flash_region_decode() -> TestResult {
+    use crate::intel_spi_flash::FlashRegion;
+    // base = block 3 (0x3000), limit = block 0x1FF (0x1FFFFF).
+    // The limit is inclusive, so the length is (0x1FF - 3 + 1) blocks.
+    let raw = (0x01FFu32 << 16) | 0x0003;
+    let r = FlashRegion::decode(raw);
+    if !r.is_valid() {
+        return TestResult::Fail("a region with limit >= base must be valid");
+    }
+    if r.base_bytes() != 0x3000 {
+        return TestResult::Fail("base decoded wrong");
+    }
+    if r.len_bytes() != (0x1FF - 3 + 1) * 4096 {
+        return TestResult::Fail("length is not inclusive-of-limit");
+    }
+    if r.end_bytes() != 0x3000 + (0x1FF - 3 + 1) * 4096 {
+        return TestResult::Fail("end decoded wrong");
+    }
+    // A single-block region has length 4096, not 0.
+    let one = FlashRegion::decode((7u32 << 16) | 7);
+    if one.len_bytes() != 4096 {
+        return TestResult::Fail("a base == limit region is one block, not empty");
+    }
+    // The disabled encoding: limit below base.
+    let disabled = FlashRegion::decode(0x0000_7FFF);
+    if disabled.is_valid() || disabled.len_bytes() != 0 || disabled.end_bytes() != 0 {
+        return TestResult::Fail("a disabled region must decode as absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/spi/intel_spi_flash",
+    smoke_intel_spi_flash_region_decode
+);
+
+fn smoke_intel_spi_flash_protected_range_decode() -> TestResult {
+    use crate::intel_spi_flash::{ProtectedRange, PR_RPE, PR_WPE};
+    let raw = PR_WPE | (0x00FFu32 << 16) | 0x0010;
+    let p = ProtectedRange::decode(raw);
+    if !p.write_protected || p.read_protected {
+        return TestResult::Fail("PR enable bits decoded wrong");
+    }
+    if !p.is_armed() {
+        return TestResult::Fail("a WPE range over a valid span is armed");
+    }
+    if p.region.base_bytes() != 0x10 * 4096 {
+        return TestResult::Fail("PR base decoded wrong");
+    }
+    // A range with a sane span but neither enable bit is inert.
+    let inert = ProtectedRange::decode((0x00FFu32 << 16) | 0x0010);
+    if inert.is_armed() {
+        return TestResult::Fail("a range with no enable bit must not read as armed");
+    }
+    // Enable bits over a disabled span are also inert.
+    let empty = ProtectedRange::decode(PR_WPE | PR_RPE | 0x0000_7FFF);
+    if empty.is_armed() {
+        return TestResult::Fail("enable bits over a disabled span must not read as armed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/spi/intel_spi_flash",
+    smoke_intel_spi_flash_protected_range_decode
+);

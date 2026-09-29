@@ -6,6 +6,9 @@ use alloc::boxed::Box;
 use async_trait::async_trait;
 
 pub mod device;
+/// Intel NPU (VPU) — needs the PCIe bus, so x86_64 only.
+#[cfg(target_arch = "x86_64")]
+pub mod intel_npu;
 
 pub use device::{AccelDevice, AccelError, AccelInfo, ComputeJob, JobId};
 
@@ -54,8 +57,18 @@ pub mod registry {
     }
 }
 
-/// Force-link hook.
-pub fn register_initcalls() {}
+/// Register this crate's Stage::Subsys initcalls. Also acts as the
+/// force-link hook that keeps the crate in the final image.
+pub fn register_initcalls() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_init::{InitResult, Stage};
+        narf_init::register(Stage::Subsys, "intel-npu", || {
+            intel_npu::register_pci_driver();
+            InitResult::Ok
+        });
+    }
+}
 
 // ── Smoke Tests ───────────────────────────────────────────────────
 
@@ -231,4 +244,144 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("accel", smoke_accel_registry_register_and_list);
+
+    // ── Intel NPU ───────────────────────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_intel_npu_pci_match_table() -> TestResult {
+        use crate::intel_npu as npu;
+        use narf_bus::driver_match::__reset_for_test;
+        use narf_bus::{registered_pci_drivers, MatchKind};
+        __reset_for_test();
+        npu::register_pci_driver();
+        let regs = registered_pci_drivers();
+        for did in npu::SUPPORTED_DEVICE_IDS.iter().copied() {
+            let found = regs.iter().any(|m| {
+                matches!(m.kind, MatchKind::VendorDevice {
+                    vendor: npu::NPU_VENDOR, device,
+                } if device == did)
+            });
+            if !found {
+                return TestResult::Fail("intel-npu match table missing a device id");
+            }
+        }
+        // The MS-03's 00:0b.0.
+        if !npu::is_supported_device(npu::NPU_DEV_PTL_P) || npu::NPU_DEV_PTL_P != 0xB03E {
+            return TestResult::Fail("intel-npu does not claim the MS-03's NPU");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("accel/intel_npu", smoke_intel_npu_pci_match_table);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_intel_npu_generations_are_independent() -> TestResult {
+        use crate::intel_npu::{btrs_gen_for, ip_gen_for, BtrsGen, IpGen};
+        use crate::intel_npu::{NPU_DEV_LNL, NPU_DEV_MTL, NPU_DEV_PTL_P};
+        // The IP generation and the buttress generation do not split
+        // the same way: Lunar Lake is IP 40xx and Panther Lake is IP
+        // 50xx, but both use the LNL buttress. Driving the register
+        // map off IpGen would pick the wrong one for Panther Lake.
+        if ip_gen_for(NPU_DEV_LNL) != IpGen::Ip40xx {
+            return TestResult::Fail("Lunar Lake is IP 40xx");
+        }
+        if ip_gen_for(NPU_DEV_PTL_P) != IpGen::Ip50xx {
+            return TestResult::Fail("Panther Lake is IP 50xx");
+        }
+        if btrs_gen_for(NPU_DEV_LNL) != BtrsGen::Lnl || btrs_gen_for(NPU_DEV_PTL_P) != BtrsGen::Lnl
+        {
+            return TestResult::Fail("Lunar and Panther Lake share the LNL buttress");
+        }
+        if btrs_gen_for(NPU_DEV_MTL) != BtrsGen::Mtl || ip_gen_for(NPU_DEV_MTL) != IpGen::Ip37xx {
+            return TestResult::Fail("Meteor Lake generations wrong");
+        }
+        if ip_gen_for(0xFFFF) != IpGen::Unknown || btrs_gen_for(0xFFFF) != BtrsGen::Unknown {
+            return TestResult::Fail("an unknown id must not map to a real generation");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "accel/intel_npu",
+        smoke_intel_npu_generations_are_independent
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_intel_npu_pll_ratio_conversion() -> TestResult {
+        use crate::intel_npu::{pll_ratio_to_mhz, BtrsGen, PLL_REF_CLK_FREQ_MHZ};
+        if PLL_REF_CLK_FREQ_MHZ != 50 {
+            return TestResult::Fail("PLL reference clock wrong");
+        }
+        // LNL: ratio * 50 / 2. MTL: ratio * 50 * 2 / 3. Using one
+        // formula for both is off by a third.
+        if pll_ratio_to_mhz(BtrsGen::Lnl, 40) != 1000 {
+            return TestResult::Fail("LNL ratio conversion wrong");
+        }
+        if pll_ratio_to_mhz(BtrsGen::Mtl, 30) != 1000 {
+            return TestResult::Fail("MTL ratio conversion wrong");
+        }
+        if pll_ratio_to_mhz(BtrsGen::Lnl, 30) == pll_ratio_to_mhz(BtrsGen::Mtl, 30) {
+            return TestResult::Fail("the two generations must not share a formula");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("accel/intel_npu", smoke_intel_npu_pll_ratio_conversion);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_intel_npu_buttress_register_layout() -> TestResult {
+        use crate::intel_npu as npu;
+        if npu::BTRS_INTERRUPT_STAT != 0x0000
+            || npu::BTRS_PLL_FREQ != 0x0148
+            || npu::BTRS_TILE_FUSE != 0x0150
+            || npu::BTRS_VPU_STATUS != 0x0154
+        {
+            return TestResult::Fail("buttress register offsets wrong");
+        }
+        // The two BARs are not interchangeable: RegV is BAR0 and RegB
+        // (which is what this driver reads) is BAR4.
+        if npu::NPU_BAR_REGV != 0 || npu::NPU_BAR_REGB != 4 {
+            return TestResult::Fail("BAR indices wrong");
+        }
+        if npu::BTRS_STATUS_READY != 1 << 0 || npu::BTRS_STATUS_IDLE != 1 << 1 {
+            return TestResult::Fail("VPU_STATUS ready/idle bits wrong");
+        }
+        if npu::BTRS_STATUS_PLATFORM_SHIFT != 29 || npu::BTRS_STATUS_PLATFORM_MASK != 0x7 {
+            return TestResult::Fail("platform field is bits 31:29");
+        }
+        // TILE_FUSE: valid in bit 0, the disable mask in bits 6:1 —
+        // so the config field is shifted, not the whole low byte.
+        if npu::BTRS_TILE_FUSE_VALID != 1 << 0 {
+            return TestResult::Fail("TILE_FUSE valid bit wrong");
+        }
+        if npu::BTRS_TILE_FUSE_CONFIG_SHIFT != 1 || npu::BTRS_TILE_FUSE_CONFIG_MASK != 0x3F {
+            return TestResult::Fail("TILE_FUSE config field wrong");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("accel/intel_npu", smoke_intel_npu_buttress_register_layout);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_intel_npu_platform_decode() -> TestResult {
+        use crate::intel_npu::Platform;
+        if Platform::from_field(0) != Platform::Silicon {
+            return TestResult::Fail("field 0 is silicon");
+        }
+        if Platform::from_field(3) != Platform::Fpga {
+            return TestResult::Fail("field 3 is FPGA");
+        }
+        // Value 1 is not assigned; it must not silently read as
+        // silicon.
+        match Platform::from_field(1) {
+            Platform::Invalid(1) => {}
+            _ => return TestResult::Fail("an unassigned platform value was not preserved"),
+        }
+        if Platform::Silicon.label() != "silicon" {
+            return TestResult::Fail("platform label wrong");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("accel/intel_npu", smoke_intel_npu_platform_decode);
 }

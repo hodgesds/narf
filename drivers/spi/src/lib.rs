@@ -50,6 +50,10 @@ extern crate alloc;
 pub mod amd_fch;
 pub mod cadence;
 pub mod intel_lpss;
+/// Intel PCH SPI *flash* controller — the BIOS-flash hardware
+/// sequencer at `00:1f.5`, distinct from the LPSS SSP masters above.
+/// Read-only; see the module docs for why.
+pub mod intel_spi_flash;
 pub mod pl022;
 
 use alloc::sync::Arc;
@@ -248,6 +252,10 @@ pub fn register_initcalls() {
         } else {
             InitResult::Ok
         }
+    });
+    narf_init::register(Stage::Subsys, "intel-spi-flash", || {
+        intel_spi_flash::register_pci_driver();
+        InitResult::Ok
     });
     narf_init::register(Stage::Device, "cadence-spi", || {
         let n = cadence::probe_all();

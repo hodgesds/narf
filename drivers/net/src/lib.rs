@@ -43,6 +43,7 @@ pub mod mlx5;
 pub mod r8169;
 pub mod rtl8125;
 pub mod rtl8126;
+pub mod rtl8127;
 pub mod rtl8139;
 pub mod rtl_phy;
 pub mod tg3;
@@ -79,6 +80,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "rtl8126", || {
         rtl8126::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtl8127", || {
+        rtl8127::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "mlx5", || {
