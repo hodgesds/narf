@@ -4436,3 +4436,185 @@ kernel_test_in!(
     "bluetooth/btintel_pcie",
     smoke_btintel_pcie_boot_stage_flags
 );
+
+// ── Intel PCIe Bluetooth: DMA rings ──────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_ring_layout_is_aligned_and_disjoint() -> TestResult {
+    use crate::btintel_pcie::rings::{
+        align_dma, RingLayout, CTX_INFO_BYTES, DMA_ALIGN, FRBD_BYTES, INDEX_ARRAY_BYTES, RX_DESCS,
+        TFD_BYTES, TX_DESCS, URBD0_BYTES, URBD1_BYTES,
+    };
+    let l = RingLayout::new();
+    // Every sub-region must start on a 128-byte boundary — Linux
+    // aligns each piece before adding it to the running total.
+    for off in [
+        l.tfds, l.urbd0s, l.frbds, l.urbd1s, l.tr_hia, l.tr_tia, l.cr_hia, l.cr_tia, l.ctx_info,
+    ] {
+        if off % DMA_ALIGN != 0 {
+            return TestResult::Fail("a ring sub-region is not 128-byte aligned");
+        }
+    }
+    // Regions must not overlap: each has to start at or after the end
+    // of the one before.
+    let regions = [
+        (l.tfds, TFD_BYTES * TX_DESCS as u64),
+        (l.urbd0s, URBD0_BYTES * TX_DESCS as u64),
+        (l.frbds, FRBD_BYTES * RX_DESCS as u64),
+        (l.urbd1s, URBD1_BYTES * RX_DESCS as u64),
+        (l.tr_hia, INDEX_ARRAY_BYTES),
+        (l.tr_tia, INDEX_ARRAY_BYTES),
+        (l.cr_hia, INDEX_ARRAY_BYTES),
+        (l.cr_tia, INDEX_ARRAY_BYTES),
+        (l.ctx_info, CTX_INFO_BYTES),
+    ];
+    let mut prev_end = 0u64;
+    for (off, len) in regions {
+        if off < prev_end {
+            return TestResult::Fail("ring sub-regions overlap");
+        }
+        prev_end = off + len;
+    }
+    if l.total < prev_end || l.total % DMA_ALIGN != 0 {
+        return TestResult::Fail("total does not cover every region");
+    }
+    if align_dma(1) != DMA_ALIGN || align_dma(DMA_ALIGN) != DMA_ALIGN {
+        return TestResult::Fail("align_dma is wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_ring_layout_is_aligned_and_disjoint
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_ctx_info_offsets() -> TestResult {
+    use crate::btintel_pcie::rings::*;
+    // `struct ctx_info` is __packed and 38 dwords. A miscounted
+    // offset points the device at the wrong ring, which looks like a
+    // dead controller rather than a decode error.
+    if CTX_INFO_BYTES != 152 {
+        return TestResult::Fail("ctx_info is 38 dwords");
+    }
+    // The four index-array pointers are consecutive u64s after the
+    // 16-byte header.
+    if CI_OFF_ADDR_TR_HIA != 16
+        || CI_OFF_ADDR_TR_TIA != 24
+        || CI_OFF_ADDR_CR_HIA != 32
+        || CI_OFF_ADDR_CR_TIA != 40
+    {
+        return TestResult::Fail("index-array pointer offsets wrong");
+    }
+    if CI_OFF_NUM_TR_IA != 48 || CI_OFF_NUM_CR_IA != 50 {
+        return TestResult::Fail("index-array counts wrong");
+    }
+    if CI_OFF_ADDR_TFDQ != 56 || CI_OFF_ADDR_URBDQ0 != 64 {
+        return TestResult::Fail("TX ring pointer offsets wrong");
+    }
+    if CI_OFF_ADDR_FRBDQ != 80 || CI_OFF_ADDR_URBDQ1 != 88 {
+        return TestResult::Fail("RX ring pointer offsets wrong");
+    }
+    // Every named offset must fit the block and be aligned for the
+    // width it is written at.
+    for (off, width) in [
+        (CI_OFF_ADDR_TR_HIA, 8u64),
+        (CI_OFF_ADDR_CR_TIA, 8),
+        (CI_OFF_ADDR_TFDQ, 8),
+        (CI_OFF_ADDR_URBDQ1, 8),
+        (CI_OFF_NUM_TFDQ, 2),
+        (CI_OFF_URBDQ_DB_VEC, 2),
+        (CI_OFF_DBG_FLAGS, 4),
+    ] {
+        if off + width > CTX_INFO_BYTES {
+            return TestResult::Fail("a ctx_info field runs past the block");
+        }
+        if off % width != 0 {
+            return TestResult::Fail("a ctx_info field is misaligned for its width");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_ctx_info_offsets
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_doorbell_encoding() -> TestResult {
+    use crate::btintel_pcie::rings::{doorbell, RX_DB_VEC, TX_DB_VEC};
+    // Index in the low half, vector in the high half. The RX vector
+    // is 513, which does not fit 8 bits — packing it into the wrong
+    // field would ring the TX doorbell instead.
+    if doorbell(7, TX_DB_VEC) != 7 {
+        return TestResult::Fail("TX doorbell encoding wrong");
+    }
+    if doorbell(0, RX_DB_VEC) != 513 << 16 {
+        return TestResult::Fail("RX doorbell vector not in the high half");
+    }
+    if doorbell(63, RX_DB_VEC) != (513 << 16) | 63 {
+        return TestResult::Fail("doorbell index and vector overlap");
+    }
+    if RX_DB_VEC <= u8::MAX as u32 {
+        return TestResult::Fail("RX_DB_VEC should not fit a byte — check the constant");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_doorbell_encoding
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_hci_packet_types() -> TestResult {
+    use crate::btintel_pcie::rings::{
+        HCI_ACL_PKT, HCI_CMD_PKT, HCI_EVT_PKT, HCI_ISO_PKT, HCI_SCO_PKT, HCI_TYPE_LEN,
+    };
+    // Intel prefixes packets with a 4-byte type word, not the 1-byte
+    // BT SIG indicator the UART/USB transports use. Sending a 1-byte
+    // prefix shifts every packet by three bytes.
+    if HCI_TYPE_LEN != 4 {
+        return TestResult::Fail("the Intel PCIe type prefix is 4 bytes");
+    }
+    if HCI_CMD_PKT != 1 || HCI_ACL_PKT != 2 || HCI_SCO_PKT != 3 {
+        return TestResult::Fail("command/ACL/SCO type values wrong");
+    }
+    if HCI_EVT_PKT != 4 || HCI_ISO_PKT != 5 {
+        return TestResult::Fail("event/ISO type values wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_hci_packet_types
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_queue_geometry() -> TestResult {
+    use crate::btintel_pcie::rings::{
+        BUFFER_SIZE, HCI_TYPE_LEN, NUM_QUEUES, RFH_HDR_BYTES, RXQ_NUM, RX_DESCS, TXQ_NUM, TX_DESCS,
+    };
+    if TX_DESCS != 32 || RX_DESCS != 64 {
+        return TestResult::Fail("descriptor counts wrong");
+    }
+    if BUFFER_SIZE != 4096 {
+        return TestResult::Fail("per-descriptor buffer is 4 KiB");
+    }
+    // The index arrays are indexed by queue number, so those have to
+    // be distinct and inside the array.
+    if TXQ_NUM == RXQ_NUM || RXQ_NUM >= NUM_QUEUES {
+        return TestResult::Fail("queue numbering is inconsistent");
+    }
+    // A received packet loses the RFH header and the type word, so
+    // the largest HCI payload must still be positive.
+    if RFH_HDR_BYTES + HCI_TYPE_LEN >= BUFFER_SIZE {
+        return TestResult::Fail("headers consume the whole buffer");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_pcie_queue_geometry);

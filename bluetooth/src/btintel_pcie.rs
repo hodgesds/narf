@@ -43,14 +43,36 @@
 //! 3. Take MAC access (`MAC_ACCESS_REQ`, wait for `MAC_ACCESS_STS`)
 //!    and read `HW_REV` (CNVi) and `RF_ID` (CNVr), then release it.
 //!
-//! What is **not** here: the TXQ/RXQ ring setup, the context-info
-//! structure the device DMAs its boot parameters from, MSI-X and the
-//! GP0 alive interrupt, firmware download, and therefore any
-//! [`crate::transport::HciTransport`] implementation. This module
-//! deliberately does not register a transport — the HCI core would
-//! then try to reset a controller it cannot actually talk to.
+//! 4. Publish the [`rings`] descriptor set through the
+//!    context-information block, start the MAC, and wait for the
+//!    device to reach its ROM bootloader.
+//!
+//! From there [`BtIntelPcie::send_packet`] and
+//! [`BtIntelPcie::recv_packet`] carry HCI traffic.
+//!
+//! ## What the controller can do at this point
+//!
+//! It answers HCI commands **from its ROM bootloader** — version and
+//! vendor queries, and the secure-send commands that download
+//! operational firmware. It has no Bluetooth radio behind it yet:
+//! that needs `intel/ibt-*.sfi` pushed over this transport, which is
+//! a separate job riding on top of what lands here.
+//!
+//! Also absent: MSI-X. The GP0 alive interrupt and the TX/RX
+//! completion interrupts are all polled instead — the boot-stage
+//! transition GP0 announces is readable from `BOOT_STAGE`, and the
+//! completion rings' index arrays say the same thing the completion
+//! interrupts would.
+//!
+//! No [`crate::transport::HciTransport`] is registered yet. The HCI
+//! core's bring-up sequence assumes a controller running operational
+//! firmware, and pointing it at a bootloader would have it time out
+//! on the first `Read Local Version` rather than report anything
+//! useful.
 
 extern crate alloc;
+
+pub mod rings;
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -236,6 +258,9 @@ pub const BUS_MASTER_QUIESCE_MS: u64 = 40;
 pub const RESET_SETTLE_MS: u64 = 12;
 /// Linux retries the MAC-access grant 15 times at ~1 ms.
 pub const MAC_ACCESS_TIMEOUT_MS: u64 = 20;
+/// `BTINTEL_DEFAULT_INTR_TIMEOUT_MS` — how long the device is given
+/// to reach its ROM bootloader after `MAC_INIT`.
+pub const ALIVE_TIMEOUT_MS: u64 = 3_000;
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -251,6 +276,18 @@ pub enum BtPcieError {
     ResetFailed(u32),
     /// The device never granted MAC access.
     MacAccessTimeout,
+    /// Ran out of memory allocating the descriptor rings.
+    NoMemory,
+    /// An HCI packet did not fit one 4 KiB DMA buffer.
+    PacketTooLarge,
+    /// An index array held a value outside its ring.
+    RingIndexOutOfRange,
+    /// The device did not retire a posted transfer descriptor.
+    TxTimeout,
+    /// The device never reported reaching its ROM bootloader.
+    AliveTimeout,
+    /// `BOOT_STAGE` came back without `ROM` after `MAC_INIT`.
+    NotInBootloader(u32),
 }
 
 // ── Live driver state ───────────────────────────────────────────────
@@ -268,6 +305,8 @@ pub struct BtIntelPcie {
     pub cnvr: u32,
     /// `BOOT_STAGE` as read after the reset.
     pub boot_stage: u32,
+    /// DMA descriptor set, once the transport is up.
+    rings: rings::Rings,
 }
 
 // SAFETY: the only interior-mutable state is the `ctrl` lock itself;
@@ -337,12 +376,15 @@ impl BtIntelPcie {
             cnvi: 0,
             cnvr: 0,
             boot_stage: 0,
+            rings: rings::Rings::alloc()?,
         };
 
         // SAFETY: `dev.mmio` is the mapped CSR window.
         unsafe { dev.reset()? };
         // SAFETY: same.
         unsafe { dev.read_identity()? };
+        // SAFETY: same; the rings and context info are published.
+        unsafe { dev.enable_bt()? };
         Ok(dev)
     }
 
@@ -462,6 +504,88 @@ impl BtIntelPcie {
             };
             compiler_fence(Ordering::SeqCst);
         }
+    }
+
+    /// `btintel_pcie_enable_bt` — publish the context-information
+    /// address, start the MAC, and wait for the device to reach its
+    /// ROM bootloader.
+    ///
+    /// # Safety
+    /// `self.mmio` must be this device's mapped CSR window.
+    unsafe fn enable_bt(&mut self) -> Result<(), BtPcieError> {
+        let ci = self.rings.ctx_info_phys();
+        {
+            let _g = self.ctrl.lock();
+            // SAFETY: caller-asserted mapped CSR window. The context
+            // address must land before MAC_INIT: the device fetches
+            // the block as part of coming up.
+            unsafe {
+                self.mmio.write32(CSR_CI_ADDR_LSB, ci as u32);
+                self.mmio.write32(CSR_CI_ADDR_MSB, (ci >> 32) as u32);
+            }
+            compiler_fence(Ordering::SeqCst);
+
+            // SAFETY: same.
+            let mut reg = unsafe { self.mmio.read32(CSR_FUNC_CTRL) };
+            reg &= !(FUNC_CTRL_FUNC_INIT | FUNC_CTRL_BUS_MASTER_DISCON | FUNC_CTRL_SW_RESET);
+            reg |= FUNC_CTRL_FUNC_ENA | FUNC_CTRL_MAC_INIT;
+            // SAFETY: same.
+            unsafe { self.mmio.write32(CSR_FUNC_CTRL, reg) };
+            compiler_fence(Ordering::SeqCst);
+
+            // MAC is up; enable the BT function on top of it.
+            // SAFETY: same.
+            let reg = unsafe { self.mmio.read32(CSR_FUNC_CTRL) } | FUNC_CTRL_FUNC_INIT;
+            // SAFETY: same.
+            unsafe { self.mmio.write32(CSR_FUNC_CTRL, reg) };
+            // Linux reads the register straight back to flush the
+            // posted write before it starts waiting.
+            // SAFETY: same.
+            let _ = unsafe { self.mmio.read32(CSR_FUNC_CTRL) };
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        // Linux waits on the GP0 mailbox interrupt; this polls
+        // BOOT_STAGE for the same transition, which is the state that
+        // interrupt announces.
+        let alive = narf_scheduler::responsive_spin_until(
+            || self.current_boot_stage() & BOOT_STAGE_ROM != 0,
+            narf_time::Deadline::after_ms(ALIVE_TIMEOUT_MS),
+        );
+        let stage = self.current_boot_stage();
+        if !alive {
+            return Err(BtPcieError::AliveTimeout);
+        }
+        if stage & BOOT_STAGE_DEVICE_HALTED != 0 {
+            return Err(BtPcieError::NotInBootloader(stage));
+        }
+        self.boot_stage = stage;
+
+        // Hand the device the RX ring now that it is running.
+        // SAFETY: `self.mmio` is the mapped CSR window.
+        unsafe { self.rings.start_rx(&self.mmio) };
+        Ok(())
+    }
+
+    /// Send one HCI packet.
+    ///
+    /// `pkt_type` is one of the `rings::HCI_*_PKT` constants — the
+    /// Intel 4-byte type word, not the 1-byte BT SIG indicator.
+    pub fn send_packet(&self, pkt_type: u32, payload: &[u8]) -> Result<(), BtPcieError> {
+        // SAFETY: `self.mmio` is this device's mapped CSR window and
+        // the rings were published during bring-up.
+        unsafe { self.rings.transmit(&self.mmio, pkt_type, payload) }
+    }
+
+    /// Pop one received HCI packet, if the device has completed one.
+    pub fn recv_packet(&self) -> Option<(u32, alloc::vec::Vec<u8>)> {
+        // SAFETY: as above.
+        unsafe { self.rings.receive(&self.mmio) }
+    }
+
+    /// `true` when the controller has RX completions waiting.
+    pub fn rx_pending(&self) -> bool {
+        self.rings.rx_completions_pending()
     }
 
     /// Current `BOOT_STAGE`.
