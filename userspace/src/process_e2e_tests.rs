@@ -2430,6 +2430,9 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
     install_global(t);
 
     crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+    // The parent catches SIGCHLD. An unblocked SIG_DFL SIGCHLD is discarded
+    // at generation (Linux prepare_signal -> sig_ignored) and wakes no one.
+    crate::handlers::__test_set_sigaction(PARENT, 17, 0x1000);
 
     // Build a tiny waker backed by an AtomicBool flag.
     static WOKE: AtomicBool = AtomicBool::new(false);
@@ -2883,6 +2886,9 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     // Register CHILD_PID → PARENT_TASK in the parent-of table (as
     // sys_fork would do using child_pid.raw() as key).
     __test_inject_parent_of(CHILD_PID, PARENT_TASK);
+    // The parent catches SIGCHLD; a default-ignored unblocked SIGCHLD would be
+    // discarded at generation (Linux prepare_signal -> sig_ignored).
+    crate::handlers::__test_set_sigaction(PARENT_TASK, 17, 0x1000);
 
     // Verify lookup works in both directions.
     match pid_to_task_raw(CHILD_PID) {

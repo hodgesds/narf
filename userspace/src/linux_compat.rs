@@ -80,7 +80,7 @@ impl SignalFdFile {
     /// In-mask pending bitmap for the owner.
     fn pending(&self) -> u64 {
         let m = self.mask.load(Ordering::Acquire);
-        crate::handlers::signal_pending_of(self.owner_task) & m
+        crate::handlers::signal_pending_of(crate::handlers::signalfd_reader(self.owner_task)) & m
     }
 }
 
@@ -109,8 +109,13 @@ impl FileOps for SignalFdFile {
             if buf.len() < SIGNALFD_SIGINFO_LEN {
                 return Err(FsError::InvalidData);
             }
-            // Drain lowest pending bit.
-            let signum = crate::handlers::sig_from_bit(pending);
+            // Dequeue for the reading thread: its private set first, then its
+            // group's shared set (`signalfd_dequeue` -> `dequeue_signal`).
+            let reader = crate::handlers::signalfd_reader(self.owner_task);
+            let mask = self.mask.load(Ordering::Acquire);
+            let Some((signum, src)) = crate::handlers::next_deliverable(reader, mask) else {
+                return Err(FsError::WouldBlock);
+            };
             buf[..SIGNALFD_SIGINFO_LEN].fill(0);
             // ssi_signo: u32 at offset 0.
             buf[..4].copy_from_slice(&signum.to_le_bytes());
@@ -122,7 +127,7 @@ impl FileOps for SignalFdFile {
             // store+set), so a queued standard signal is never read as a
             // payload-less SI_USER nor left stranded — same invariant as the
             // sigwait and handler-delivery consumers.
-            if let Some(info) = crate::handlers::sigqueue_take_and_clear(self.owner_task, signum) {
+            if let Some(info) = crate::handlers::sigqueue_take_and_clear(src, signum) {
                 buf[8..12].copy_from_slice(&info.code.to_le_bytes());
                 if let Some(band) = info.poll_band {
                     // SIGIO/SIGPOLL payload. Linux signalfd_siginfo exposes

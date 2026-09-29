@@ -68,6 +68,9 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EINVAL));
             return;
         }
+        // `__set_task_blocked` -> `retarget_shared_pending` for signals the
+        // caller just blocked.
+        note_mask_change(task, old_mask, signal_bits_get(&SIGNAL_MASK, task));
         // An explicit mask install means the user retook control of the
         // mask — drop any suspend-saved record a signal-less (aborted)
         // rt_sigsuspend left behind, so a much-later delivery can't

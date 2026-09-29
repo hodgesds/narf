@@ -4659,18 +4659,24 @@ fn smoke_abi_fdio_fcntl_async_sigio_delivery() -> TestResult {
         if crate::handlers::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(10) == 0 {
             return Err("pipe readiness did not raise the configured SIGIO signal");
         }
-        match crate::handlers::take_sigqueue_info(FAKE_TASK, 10) {
+        // F_SETOWN(pid > 0) is a PIDTYPE_TGID owner (fs/fcntl.c f_setown), so
+        // SIGIO is process-directed: it queues on the shared pending set.
+        let shared = crate::handlers::shared_pending_key(FAKE_TASK);
+        match crate::handlers::take_sigqueue_info(shared, 10) {
             Some((1, fd, band)) if fd == alias as u64 && band == 0x41 => {}
             _ => return Err("SIGIO did not carry Linux POLL_IN si_fd/si_band"),
         }
 
-        crate::handlers::clear_signal_pending(FAKE_TASK, 10);
+        crate::handlers::flush_group_pending_signal(FAKE_TASK, 10);
         // SIGCHLD has its own positive si_code namespace. Linux substitutes
         // SI_SIGIO (-5) to avoid confusing POLL_IN (1) with CLD_EXITED (1),
         // while retaining the SIGPOLL si_fd/si_band union.
         if call(Syscall::Fcntl.raw(), a2(alias as u64, F_SETSIG, 17)) != Some(0) {
             return Err("F_SETSIG(SIGCHLD) failed");
         }
+        // Default-ignored SIGCHLD is discarded at generation unless blocked
+        // (prepare_signal -> sig_ignored); block it to observe the payload.
+        crate::handlers::set_signal_mask_for_task(FAKE_TASK, crate::handlers::sig_bit(17));
         let mut drain = [0u8; 1];
         let _ = call(
             Syscall::Read.raw(),
@@ -4678,11 +4684,12 @@ fn smoke_abi_fdio_fcntl_async_sigio_delivery() -> TestResult {
         );
         let _ = call(Syscall::Write.raw(), a2(wr as u64, byte.as_ptr() as u64, 1));
         let _ = narf_lib::deferred_wake::drain_and_wake();
-        match crate::handlers::take_sigqueue_info(FAKE_TASK, 17) {
+        match crate::handlers::take_sigqueue_info(shared, 17) {
             Some((-5, fd, band)) if fd == alias as u64 && band == 0x41 => {}
             _ => return Err("SIGIO on SIGCHLD did not use Linux SI_SIGIO disambiguation"),
         }
-        crate::handlers::clear_signal_pending(FAKE_TASK, 17);
+        crate::handlers::flush_group_pending_signal(FAKE_TASK, 17);
+        crate::handlers::set_signal_mask_for_task(FAKE_TASK, 0);
 
         // With F_SETSIG reset to zero, fs/fcntl.c falls back to
         // do_send_sig_info(SIGIO, SEND_SIG_PRIV): signum 29, SI_KERNEL.
@@ -4695,11 +4702,11 @@ fn smoke_abi_fdio_fcntl_async_sigio_delivery() -> TestResult {
         );
         let _ = call(Syscall::Write.raw(), a2(wr as u64, byte.as_ptr() as u64, 1));
         let _ = narf_lib::deferred_wake::drain_and_wake();
-        match crate::handlers::take_sigqueue_info(FAKE_TASK, 29) {
+        match crate::handlers::take_sigqueue_info(shared, 29) {
             Some((0x80, 0, 0)) => {}
             _ => return Err("plain SIGIO did not carry Linux SI_KERNEL provenance"),
         }
-        crate::handlers::clear_signal_pending(FAKE_TASK, 29);
+        crate::handlers::flush_group_pending_signal(FAKE_TASK, 29);
 
         if call(Syscall::Fcntl.raw(), a2(alias as u64, F_SETFL, 0)) != Some(0) {
             return Err("clearing O_ASYNC failed");

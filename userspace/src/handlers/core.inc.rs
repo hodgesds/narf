@@ -9944,7 +9944,9 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
 
 fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     let task = current_task_id();
-    let pending = signal_bits_get(&SIGNAL_PENDING, task);
+    // Private and group-shared: a shared signal this thread does not block
+    // interrupts its wait just like a thread-directed one.
+    let pending = signal_pending_of(task);
     let mask = signal_mask_of(task);
     if (pending & !mask) != 0 {
         if let Some(hook) = signal_delivery_hook() {
@@ -11773,6 +11775,17 @@ const __WCLONE: u32 = 0x8000_0000;
 const SIGCHLD: u8 = 17;
 
 
+/// True if `task` is in a JOB-CONTROL stop (not a ptrace stop).
+pub(crate) fn task_job_stopped(task: u64) -> bool {
+    crate::task::with_task_local(task, |task| task.job_stop_signal.load(Ordering::Acquire) != 0)
+        .unwrap_or_else(|| {
+            TASK_STOPPED_FALLBACK
+                .lock()
+                .as_ref()
+                .is_some_and(|stopped| stopped.contains_key(&task))
+        })
+}
+
 /// True if `task` is currently job-control stopped.
 pub fn is_task_stopped(task: u64) -> bool {
     let job_stopped = crate::task::with_task_local(task, |task| {
@@ -11820,7 +11833,7 @@ fn prefer_resumed_child_handoff(online_cpu_bits: u64) -> bool {
 /// Raw pending-signal bitmask for `task` (no mask applied). Used by
 /// the poll loop to let SIGKILL break a job-control stop.
 pub fn signal_pending_bits(task: u64) -> u64 {
-    signal_bits_get(&SIGNAL_PENDING, task)
+    signal_pending_of(task)
 }
 
 /// AND-out the given signal bits from `task`'s pending set.
@@ -11900,22 +11913,12 @@ fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
             || crate::ptrace::is_task_traced(task_to_pid_raw(parent).unwrap_or(parent)));
     let notify_sigchld = !explicitly_suppressed && (!default_ignored || default_must_queue);
     if notify_sigchld {
-        // Route through the canonical raise-notify (not a bare pending-bit set)
-        // so a signalfd-watching parent's epoll readiness EDGE fires.
-        if let Some((was_empty, was_new)) = pending_signal_bits_update(parent, |slot| {
-            let was_empty = *slot == 0;
-            let was_new = *slot & sig_bit(17) == 0;
-            *slot |= sig_bit(17);
-            (was_empty, was_new)
-        }) {
-            // Standard SIGCHLD instances coalesce. Linux's legacy_queue()
-            // stops before complete_signal() when SIGCHLD is already pending,
-            // so it does not repeat the signal wake/generation work. The wait
-            // queue below is still fired for every child-state publication.
-            if was_new {
-                signal_raise_notify(parent, was_empty);
-            }
-        }
+        // `do_notify_parent_cldstop` -> `__group_send_sig_info(SIGCHLD, &info,
+        // parent)`: the parent PROCESS's shared set. An already-pending
+        // SIGCHLD coalesces there without re-running the wake (`legacy_queue`,
+        // applied by the group raise); the wait queue below is still fired for
+        // every child-state publication.
+        let _ = raise_group_signal(parent, 17, GroupSigInfo::None);
     }
     // The producer has lapped the waiter's single Linux-style state slot.
     // Ask the ordinary executor path to cede at syscall exit so the consumer
@@ -12116,14 +12119,255 @@ fn reap_stopcont(
 /// enqueues the new signal (`set_pending_signal_bit`), and the subsequent
 /// canonical raise-notify performs the one required wake.
 fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
-    if signum != 18 {
+    group_stopcont_interaction(task, signum)
+}
+
+/// Live threads of `task`'s thread group (`task` itself included even when
+/// the registry has no row for it, as in syscall-unit fixtures).
+fn live_group_members(task: u64) -> alloc::vec::Vec<u64> {
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    let mut members: alloc::vec::Vec<u64> = thread_group_members(pid)
+        .into_iter()
+        .filter(|&t| {
+            crate::task::task_get(t).is_some_and(|task| {
+                task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING
+            })
+        })
+        .collect();
+    if !members.contains(&task) {
+        members.push(task);
+    }
+    members
+}
+
+/// Linux `prepare_signal`'s job-control half, which acts on the WHOLE thread
+/// group for every send (thread- or process-directed):
+///
+/// ```text
+/// if (sig_kernel_stop(sig)) {
+///         /* This is a stop signal.  Remove SIGCONT from all queues. */
+///         flush_sigqueue_mask(p, &flush, &signal->shared_pending);
+///         for_each_thread(p, t) flush_sigqueue_mask(p, &flush, &t->pending);
+/// } else if (sig == SIGCONT) {
+///         /* Remove all stop signals from all queues, wake all threads. */
+///         flush_sigqueue_mask(p, &flush, &signal->shared_pending);
+///         for_each_thread(p, t) {
+///                 flush_sigqueue_mask(p, &flush, &t->pending);
+///                 task_clear_jobctl_pending(t, JOBCTL_STOP_PENDING);
+///                 if (likely(!(t->ptrace & PT_SEIZED))) wake_up_state(t, __TASK_STOPPED);
+///                 ...
+///         }
+///         /* Notify the parent with CLD_CONTINUED if we were stopped. */
+/// }
+/// ```
+///
+/// Returns true when SIGCONT resumed a stopped group.
+fn group_stopcont_interaction(task: u64, signum: u32) -> bool {
+    const STOP_BITS: u64 = 0b1111u64 << 18; // SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU
+    match signum {
+        19..=22 => {
+            for t in live_group_members(task) {
+                clear_pending_signal_bits(t, sig_bit(18));
+            }
+            clear_pending_signal_bits(shared_pending_key(task), sig_bit(18));
+            false
+        }
+        18 => {
+            let mut was_stopped = false;
+            let members = live_group_members(task);
+            for &t in &members {
+                clear_pending_signal_bits(t, STOP_BITS);
+                if clear_task_stopped(t).is_some() {
+                    was_stopped = true;
+                    wake_signal(t);
+                }
+            }
+            clear_pending_signal_bits(shared_pending_key(task), STOP_BITS);
+            // A group stop still being assembled is cancelled, not reported.
+            group_stop_cancel(task);
+            if was_stopped {
+                push_stopcont_report(task, CONTINUED_WSTATUS, true);
+            }
+            was_stopped
+        }
+        _ => false,
+    }
+}
+
+/// An in-flight group stop (Linux `signal->group_stop_count` +
+/// `JOBCTL_STOP_PENDING`): the stop signal and the threads that have not yet
+/// reached a stop point. The parent's CLD_STOPPED is reported only when the
+/// LAST thread stops (`do_signal_stop` -> `do_notify_parent_cldstop`).
+struct GroupStop {
+    signum: u32,
+    remaining: alloc::collections::BTreeSet<u64>,
+}
+
+static GROUP_STOPS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, GroupStop>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Number of group stops still waiting for threads. Lets the delivery fast
+/// path skip the stop check entirely when no stop is being assembled.
+static GROUP_STOPS_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+pub(crate) fn group_stops_active() -> bool {
+    GROUP_STOPS_ACTIVE.load(Ordering::Acquire) != 0
+}
+
+/// Start a group stop for `task`'s thread group (Linux `do_signal_stop` on the
+/// first thread to dequeue a stop signal): mark every live thread stopped, then
+/// wake/kick the others so each reaches a stop point. Idempotent while a stop
+/// is already in flight.
+fn group_stop_begin(task: u64, signum: u32) {
+    let key = process_state_key(task);
+    let members = live_group_members(task);
+    let started = {
+        let mut g = GROUP_STOPS.lock();
+        match g.get_or_insert_with(BTreeMap::new).entry(key) {
+            alloc::collections::btree_map::Entry::Occupied(_) => false,
+            alloc::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(GroupStop {
+                    signum,
+                    remaining: members.iter().copied().collect(),
+                });
+                GROUP_STOPS_ACTIVE.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+        }
+    };
+    if !started {
+        return;
+    }
+    for &t in &members {
+        let _ = insert_task_stopped(t, signum);
+    }
+    for &t in &members {
+        if t != task {
+            wake_signal(t);
+            narf_scheduler::kick_task(t);
+        }
+    }
+}
+
+/// `task` has reached a stop point. The last thread of an in-flight group
+/// stop notifies the parent (CLD_STOPPED with the stop signal).
+pub(crate) fn group_stop_participate(task: u64) {
+    if !group_stops_active() {
+        return;
+    }
+    let key = process_state_key(task);
+    let done = {
+        let mut g = GROUP_STOPS.lock();
+        let Some(map) = g.as_mut() else {
+            return;
+        };
+        let Some(stop) = map.get_mut(&key) else {
+            return;
+        };
+        stop.remaining.remove(&task);
+        if stop.remaining.is_empty() {
+            let signum = stop.signum;
+            map.remove(&key);
+            GROUP_STOPS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+            Some(signum)
+        } else {
+            None
+        }
+    };
+    if let Some(signum) = done {
+        push_stopcont_report(task, stopped_wstatus(signum), false);
+    }
+}
+
+/// A thread leaving the group (exit) no longer holds up an in-flight stop.
+pub(crate) fn group_stop_forget(task: u64) {
+    group_stop_participate(task);
+}
+
+fn group_stop_cancel(task: u64) {
+    if !group_stops_active() {
+        return;
+    }
+    let key = process_state_key(task);
+    let mut g = GROUP_STOPS.lock();
+    if g.as_mut().and_then(|m| m.remove(&key)).is_some() {
+        GROUP_STOPS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Linux `wants_signal`: could `t` take `signum` now? It must not block it
+/// (a thread parked in rt_sigtimedwait on it counts as not blocking, as Linux
+/// temporarily unblocks the waited set), must be alive and not exiting, and —
+/// except for SIGKILL — not stopped.
+fn wants_signal(t: u64, signum: u32) -> bool {
+    let Some(task) = crate::task::task_get(t) else {
+        return false;
+    };
+    if task.state.load(Ordering::Acquire) != crate::task::TASK_RUNNING
+        || task.group_exiting.load(Ordering::Acquire)
+    {
         return false;
     }
-    let was_stopped = clear_task_stopped(task).is_some();
-    if was_stopped {
-        push_stopcont_report(task, CONTINUED_WSTATUS, true);
+    let bit = sig_bit(signum);
+    if signal_mask_of(t) & bit != 0 {
+        let waiting =
+            crate::user_task::with_user_task_ctx(t, |u| u.sigwait_set.load(Ordering::Acquire) & bit != 0)
+                .unwrap_or(false);
+        if !waiting {
+            return false;
+        }
     }
-    was_stopped
+    signum == 9 || !is_task_stopped(t)
+}
+
+/// Linux `complete_signal` for a signal just added to `target`'s group shared
+/// set: wake ONE thread that wants it — `target` itself first, else any other
+/// thread of the group. When no thread wants it (all block it), it stays
+/// queued until one unblocks it or sigwaits for it.
+pub(crate) fn complete_group_signal(target: u64, signum: u32) {
+    let chosen = if wants_signal(target, signum) {
+        Some(target)
+    } else {
+        let pid = task_to_pid_raw(target).unwrap_or(target);
+        let mut found = None;
+        for_each_group_member(pid, |t| {
+            if t != target && wants_signal(t, signum) {
+                found = Some(t);
+                return false;
+            }
+            true
+        });
+        found
+    };
+    if let Some(t) = chosen {
+        wake_signal(t);
+        narf_scheduler::kick_task(t);
+    }
+}
+
+/// Linux `retarget_shared_pending`: `task` stops being able to take the
+/// signals in `newly_unwanted` (it blocked them, or it is exiting). Wake
+/// another thread for any of them that are pending in the shared set.
+pub(crate) fn retarget_shared_pending(task: u64, newly_unwanted: u64) {
+    let shared = signal_pending_shared(task) & newly_unwanted;
+    if shared == 0 {
+        return;
+    }
+    let members = live_group_members(task);
+    let mut rest = shared;
+    while rest != 0 {
+        let signum = sig_from_bit(rest);
+        rest &= !sig_bit(signum);
+        if let Some(t) = members
+            .iter()
+            .copied()
+            .find(|&t| t != task && wants_signal(t, signum))
+        {
+            wake_signal(t);
+            narf_scheduler::kick_task(t);
+        }
+    }
 }
 
 /// Put the current task into the job-control stopped state and park it
@@ -12139,10 +12383,20 @@ fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
 /// returning 0. With no executor wired (kernel-test context) it returns
 /// without parking so the caller can consume the signal.
 fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
+    // The stop signal was dequeued from whichever set held it (private or
+    // the group's shared set); clear both copies. A stop stops the WHOLE
+    // group (`do_signal_stop`), whether it was sent to the process or to one
+    // thread.
     clear_pending_signal_bits(task, sig_bit(signum));
-    insert_task_stopped(task, signum);
-    clear_pending_signal_bits(task, sig_bit(18)); // SIGCONT
-    push_stopcont_report(task, stopped_wstatus(signum), false);
+    clear_pending_signal_bits(shared_pending_key(task), sig_bit(signum));
+    group_stop_begin(task, signum);
+    group_stop_participate(task);
+    park_current_stopped(ctx);
+}
+
+/// Park the current task in the job-control stopped state until SIGCONT
+/// clears it (`park_should_block`'s stopped branch keeps it parked).
+fn park_current_stopped(ctx: &mut dyn TrapContext) {
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
@@ -12236,6 +12490,7 @@ pub fn wait_init() {
     // the OCI teardown #UD).
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
     crate::user_task::register_process_exit_observer(shm_process_exit);
+    crate::user_task::register_process_exit_observer(shared_pending_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
@@ -12314,7 +12569,8 @@ fn cgroup_exit_observer(pid: u64, _tid: u64) {
 #[cfg(feature = "cgroup")]
 fn cgroup_kill_hook(pid: u64) {
     if let Some(task) = pid_to_task_raw(pid) {
-        raise_signal_pending(task, 9);
+        // cgroup v2 `cgroup.kill` kills whole processes.
+        let _ = raise_group_signal(task, 9, GroupSigInfo::None);
     }
 }
 
@@ -12324,7 +12580,8 @@ fn cgroup_kill_hook(pid: u64) {
 #[cfg(feature = "cgroup")]
 fn cgroup_freeze_hook(pid: u64, freeze: bool) {
     if let Some(task) = pid_to_task_raw(pid) {
-        raise_signal_pending(task, if freeze { 19 } else { 18 });
+        // Freeze/thaw the whole process: a group stop / group continue.
+        let _ = raise_group_signal(task, if freeze { 19 } else { 18 }, GroupSigInfo::None);
     }
 }
 
@@ -13482,7 +13739,7 @@ fn orphanize_children_of(parent_tid: u64) {
             // Threaded reparenting stays inside the same wait domain and does
             // not generate a second SIGCHLD. External reapers are notified.
             if reset_exit_signal {
-                raise_signal_pending(r, 17);
+                let _ = raise_group_signal(r, 17, GroupSigInfo::None);
             }
             wake_wait_child_group(r);
         }
@@ -13528,7 +13785,9 @@ fn orphanize_children_of(parent_tid: u64) {
         let child_tid = pid_to_task_raw(*child_pid).unwrap_or(*child_pid);
         let sig = read_prctl(child_tid).pdeathsig;
         if sig != 0 {
-            raise_signal_pending(child_tid, sig);
+            // `group_send_sig_info(t->pdeath_signal, SEND_SIG_NOINFO, t,
+            // PIDTYPE_TGID)`.
+            let _ = raise_group_signal(child_tid, sig, GroupSigInfo::None);
         }
     }
     match reaper {
@@ -13561,6 +13820,16 @@ fn orphanize_children_of(parent_tid: u64) {
 fn task_tables_exit_observer(_pid: u64, tid: u64) {
     release_task_tables(tid);
     orphanize_children_of(tid);
+}
+
+/// Exit observer for the LAST thread of a group: release the group's shared
+/// pending set (Linux frees `signal->shared_pending` with the signal_struct,
+/// not per thread — a sibling's exit must leave process-directed signals
+/// pending for the survivors). Keyed through `pid` because the last thread
+/// need not be the leader and its own tables are already swept. Runs before
+/// `on_child_exit`, which may release the pid of an orphan.
+fn shared_pending_process_exit(pid: u64, tid: u64) {
+    release_shared_pending(pid_to_task_raw(pid).unwrap_or(tid));
 }
 
 /// Test-only: run the AIO-context exit sweep for `tid` (the
@@ -13835,6 +14104,42 @@ fn set_task_pid_locked(task: u64, tgid: u64) {
             tgid_member_remove(task, o);
         }
         tgid_member_add(task, tgid);
+    }
+}
+
+/// Visit every member TaskId of thread group `tgid` in ascending order until
+/// `f` returns false. Alloc-free and IRQ-safe: members are copied out of the
+/// index lock in fixed-size batches, so `f` runs with no lock held (it may take
+/// the task registry or signal-table locks without a lock-order cycle).
+pub(crate) fn for_each_group_member(tgid: u64, mut f: impl FnMut(u64) -> bool) {
+    const BATCH: usize = 32;
+    let mut after: Option<u64> = None;
+    loop {
+        let mut batch = [0u64; BATCH];
+        let mut n = 0;
+        {
+            let g = TGID_MEMBERS.lock();
+            let Some(set) = g.as_ref().and_then(|m| m.get(&tgid)) else {
+                return;
+            };
+            let lower = match after {
+                None => core::ops::Bound::Unbounded,
+                Some(last) => core::ops::Bound::Excluded(last),
+            };
+            for &t in set.range((lower, core::ops::Bound::Unbounded)).take(BATCH) {
+                batch[n] = t;
+                n += 1;
+            }
+        }
+        for &t in &batch[..n] {
+            if !f(t) {
+                return;
+            }
+        }
+        if n < BATCH {
+            return;
+        }
+        after = Some(batch[n - 1]);
     }
 }
 
@@ -14158,6 +14463,11 @@ fn on_thread_exit(_pid: u64, tid: u64) {
     // flips and a reader (a shell's `$(...)` capture) never sees EOF.
     // Also frees file/socket handles so they don't leak.
     crate::fd::detach(tid);
+    // Linux `exit_signals`: an exiting thread no longer holds up a group stop,
+    // and shared signals it could have taken go to a sibling
+    // (`retarget_shared_pending(tsk, ~blocked)`).
+    group_stop_forget(tid);
+    retarget_shared_pending(tid, !signal_mask_of(tid));
     // Job control: clear the task-local state before the zombie can be reaped
     // and its refcounted Task storage released.
     let _ = clear_task_stopped(tid);
@@ -14310,11 +14620,6 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // __WCLONE. Linux do_notify_parent follows the same rule.
     if exit_signal != 0 {
         let signum = u32::from(exit_signal);
-        let was_empty = pending_signal_bits_update(parent, |slot| {
-            let was_empty = *slot == 0;
-            *slot |= sig_bit(signum);
-            was_empty
-        });
         const CLD_EXITED: i32 = 1;
         const CLD_KILLED: i32 = 2;
         const CLD_DUMPED: i32 = 3;
@@ -14326,28 +14631,18 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             CLD_KILLED
         };
         let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
-        let _ = store_sigqueue_info(parent, signum, si_code, 0, child_in_parent_ns);
-        // Deliver SIGCHLD through the CANONICAL raise-notify path (the same one
-        // kill/tgkill/itimer use) so the parent's signalfd readiness EDGE fires.
-        // A signalfd is a cell-backed epoll source, so epoll's collect_ready fast
-        // pass visits it ONLY when its per-fd persistent waker has pushed it onto
-        // the ready-list (see epoll.rs collect_ready). `signal_raise_notify` bumps
-        // SIGNAL_READABLE_GEN/SIGNAL_RAISE_GEN, fires `wake_signalfds` (which does
-        // that push), and wakes the signal waker. The former hand-rolled
-        // `wake_signal` + `notify(0)` set the pending bit and woke the epoll park,
-        // but NEVER fired the signalfd cell edge — so systemd's epoll_wait, whose
-        // 250 ms timerfd (a non-cell-backed source) keeps returning an event and
-        // thus never falls back to a full level rescan, skipped the readable
-        // signalfd forever. SIGCHLD was never delivered, the child stayed an
-        // unreaped zombie, and a Type=oneshot start job (systemd-tmpfiles-setup)
-        // hung the whole boot. Pairs with the pidfd readiness published above.
-        if let Some(was_empty) = was_empty {
-            signal_raise_notify(parent, was_empty);
-        } else {
-            // No pending-bits slot for the parent (shouldn't happen for a live
-            // waiter): still fire the legacy wakes so nothing regresses.
-            wake_signal(parent);
-        }
+        // `do_notify_parent` -> `__send_signal_locked(sig, &info, tsk->parent,
+        // PIDTYPE_TGID)`: the exit signal goes to the parent PROCESS's shared
+        // pending set, and any of its threads that does not block it takes it
+        // (fish's worker threads block SIGCHLD; its main thread handles it).
+        // The group raise also runs the generation-time ignore rule
+        // (`prepare_signal`), and its notify fires every signalfd of the group
+        // (systemd reaps through a signalfd on its epoll set).
+        let _ = raise_group_signal(
+            parent,
+            signum,
+            GroupSigInfo::Queued(QueuedSiginfo::generic(si_code, 0, child_in_parent_ns)),
+        );
         narf_net::readiness::notify(0);
     }
     // (3) Wake any parent task parked in a blocking wait4.  The waker
@@ -18278,6 +18573,9 @@ mod child_reap_signalfd_tests {
         // with a SIGCHLD exit-signal, and the staged wstatus.
         super::parent_of_set_with_signal(child, parent, 17); // SIGCHLD
         super::stage_pending_termination(child, 0);
+        // A signalfd reader blocks what it reads (systemd blocks SIGCHLD); an
+        // unblocked SIG_DFL SIGCHLD is discarded at generation (sig_ignored).
+        super::set_signal_mask_for_task(parent, super::sig_bit(17));
 
         let sfd = crate::io_mux::SignalFd::new(watch_mask, parent);
         let count = alloc::sync::Arc::new(AtomicU32::new(0));
@@ -18291,6 +18589,7 @@ mod child_reap_signalfd_tests {
         let ready = sfd.poll_readiness() & POLL_IN != 0;
         // Best-effort residue drain (synthetic ids never collide with real ones).
         let _ = super::take_pending_termination(child);
+        super::set_signal_mask_for_task(parent, 0);
         (fired, ready)
     }
 

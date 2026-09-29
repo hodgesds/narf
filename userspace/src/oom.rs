@@ -78,7 +78,10 @@ impl ProcessOomKiller {
         // Deliver an uncatchable SIGKILL; the victim exits at its next
         // return-to-user, and the async reaper reclaims its anonymous frames
         // now rather than waiting for that exit.
-        crate::handlers::raise_signal_pending(tid, SIGKILL);
+        // `do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID)`:
+        // the whole victim process dies.
+        let _ =
+            crate::handlers::raise_group_signal(tid, SIGKILL, crate::handlers::GroupSigInfo::None);
         Some(OomVictim {
             pid,
             tid,

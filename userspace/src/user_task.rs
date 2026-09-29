@@ -883,6 +883,9 @@ fn park_should_block(
     if crate::handlers::is_task_stopped(task_id)
         && (crate::handlers::signal_pending_bits(task_id) & crate::handlers::sig_bit(9)) == 0
     {
+        // A thread parked in a syscall has reached a stop point: count it
+        // toward its group's CLD_STOPPED report (no-op outside a group stop).
+        crate::handlers::group_stop_participate(task_id);
         crate::handlers::register_signal_waker(task_id, waker.clone());
         return true;
     }

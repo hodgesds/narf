@@ -82,7 +82,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         // Store the payload and set the pending bit atomically so a racing
         // sigwait consumer can't strand the bit over an emptied queue (the sigq
         // spurious-sival=0 bug). A full queue is EAGAIN with nothing delivered.
-        if sigqueue_deliver_imported(target, signum, info).is_none() {
+        if sigqueue_deliver_imported_group(target, signum, info).is_none() {
             ctx.set_return(errno_ret(EAGAIN));
             return;
         }
@@ -91,7 +91,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         // fills SI_USER with the sender's pid in the receiver's namespace
         // (do_pidfd_send_signal). Record it so the receiver's signalfd names
         // the sender, matching kill/tkill/tgkill.
-        raise_user_signal_pending(target, signum);
+        let _ = raise_group_signal(target, signum, GroupSigInfo::Sender(SI_USER));
     }
     ctx.set_return(SyscallReturn::ok(0));
 }

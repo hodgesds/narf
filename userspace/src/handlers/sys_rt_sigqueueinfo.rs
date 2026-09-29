@@ -70,7 +70,7 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
     // Store the payload and set the pending bit atomically (bucket lock across
     // both), so a sigwait consumer can't pop the coalesced payload between the
     // store and the raise and strand the bit → spurious SI_USER sival=0.
-    let depth = match sigqueue_deliver_imported(target, sig, info) {
+    let depth = match sigqueue_deliver_imported_group(target, sig, info) {
         Some(d) => d,
         None => {
             // Target's queued-signal budget exhausted (RLIMIT_SIGPENDING

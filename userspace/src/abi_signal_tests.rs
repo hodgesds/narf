@@ -796,8 +796,17 @@ fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
         const CLD_EXITED: i32 = 1;
         const CHILD_PID: u64 = 0x7799;
 
-        // Parent (FAKE_TASK) watches SIGCHLD.
+        // Parent (FAKE_TASK) blocks SIGCHLD and watches it through a
+        // signalfd, as systemd does. Unblocked SIG_DFL SIGCHLD would be
+        // discarded at generation (Linux `sig_ignored`).
         let mask = (1u64 << (SIGCHLD - 1)).to_le_bytes();
+        if call(
+            Syscall::Sigprocmask.raw(),
+            a3(0, mask.as_ptr() as u64, 0, 8),
+        ) != Some(0)
+        {
+            return Err("rt_sigprocmask(SIG_BLOCK, SIGCHLD) failed");
+        }
         let sfd = match call(
             Syscall::Signalfd.raw(),
             a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),

@@ -95,6 +95,17 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
         }
         p
     };
+    // `do_sigaction`: a disposition that now ignores the signal discards every
+    // pending instance of it, in the shared set and in every thread.
+    if let Some(installed) = new_action {
+        let ignored = match installed {
+            Some(a) => a.handler == 1,
+            None => default_signal_action(signum as u32) == DefaultAction::Ignore,
+        };
+        if ignored {
+            flush_group_pending_signal(current_task_id(), signum as u32);
+        }
+    }
 
     // (4) Write the prior action out LAST. Linux `struct sigaction`:
     // sa_handler(8) sa_flags(8) sa_restorer(8) sa_mask(8). sa_mask isn't

@@ -1411,7 +1411,9 @@ fn smoke_abi_proc_job_control_nocldstop_suppresses_only_signal() -> TestResult {
         if crate::handlers::signal_pending_of(FAKE_TASK) & SIGCHLD_BIT == 0 {
             return Err("blocked default SIGCHLD was not retained");
         }
-        crate::handlers::clear_signal_pending(FAKE_TASK, SIGCHLD as u32);
+        // Consume it from the process's shared set (a child's SIGCHLD is
+        // process-directed: do_notify_parent_cldstop -> PIDTYPE_TGID).
+        crate::handlers::flush_group_pending_signal(FAKE_TASK, SIGCHLD as u32);
         crate::handlers::set_signal_mask_for_task(FAKE_TASK, 0);
         status = 0;
         if call(

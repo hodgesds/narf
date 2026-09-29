@@ -459,7 +459,8 @@ impl SignalFd {
     /// table via the public accessor.
     fn pending_in_mask(&self) -> u64 {
         let mask = self.mask.load(Ordering::Acquire);
-        let pending = crate::handlers::signal_pending_of(self.owner_task);
+        let pending =
+            crate::handlers::signal_pending_of(crate::handlers::signalfd_reader(self.owner_task));
         pending & mask
     }
 }
@@ -489,7 +490,14 @@ impl FileOps for SignalFd {
             // 128 bytes; we fill only the first 4 (ssi_signo) and
             // zero the rest. Real consumers read the signo and
             // dispatch.
-            let signum = crate::handlers::sig_from_bit(pending);
+            // Dequeue for the reading thread: private set first, then its
+            // group's shared set (Linux `signalfd_dequeue` -> `dequeue_signal`).
+            let reader = crate::handlers::signalfd_reader(self.owner_task);
+            let Some((signum, src)) =
+                crate::handlers::next_deliverable(reader, self.mask.load(Ordering::Acquire))
+            else {
+                return Err(FsError::WouldBlock);
+            };
             const SI_LEN: usize = 128;
             if buf.len() < SI_LEN {
                 return Err(FsError::InvalidPath);
@@ -497,7 +505,7 @@ impl FileOps for SignalFd {
             buf[..SI_LEN].fill(0);
             buf[..4].copy_from_slice(&signum.to_le_bytes());
             // Clear the bit so subsequent reads see the next signal.
-            crate::handlers::clear_signal_pending(self.owner_task, signum);
+            crate::handlers::clear_signal_pending(src, signum);
             Ok(SI_LEN)
         })
     }
