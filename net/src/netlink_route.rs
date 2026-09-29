@@ -1437,12 +1437,19 @@ pub fn build_replies_with_options_in(
     let mut offset = 0usize;
     let mut replies = Vec::new();
 
-    while offset < datagram.len() {
+    // Linux `netlink_rcv_skb`: walk while a whole header remains, and stop
+    // (silently — sendmsg still returns the full length) at a header whose
+    // nlmsg_len is below NLMSG_HDRLEN or past the end. iproute2 sends its
+    // RTM_GETADDR dump in a zero-padded 152-byte buffer, so the walk must end
+    // at the trailing nlmsg_len == 0 header instead of failing the send.
+    while datagram.len() - offset >= NLMSG_HDRLEN {
         let remaining = &datagram[offset..];
-        let hdr = parse_hdr(remaining).ok_or(())?;
+        let Some(hdr) = parse_hdr(remaining) else {
+            break;
+        };
         let msg_len = hdr.len as usize;
         if msg_len < NLMSG_HDRLEN || msg_len > remaining.len() {
-            return Err(());
+            break;
         }
         let request = &remaining[..msg_len];
         if options.strict_check {
@@ -1484,18 +1491,8 @@ pub fn build_replies_with_options_in(
         }
         replies.extend(build_dump_in(net_ns_id, request));
 
-        let step = nlmsg_align(msg_len);
-        if step > remaining.len() {
-            // An unpadded final message is valid only when its declared bytes
-            // exactly consume the datagram.
-            if msg_len == remaining.len() {
-                offset = datagram.len();
-            } else {
-                return Err(());
-            }
-        } else {
-            offset += step;
-        }
+        // `msglen = NLMSG_ALIGN(nlmsg_len)`, clamped to what is left.
+        offset += nlmsg_align(msg_len).min(remaining.len());
     }
     for reply in &mut replies {
         if options.cap_ack {

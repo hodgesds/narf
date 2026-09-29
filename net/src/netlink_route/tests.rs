@@ -513,14 +513,53 @@ fn batched_requests_keep_sequence_and_ack_independent() {
     }));
 }
 
+// Linux `netlink_rcv_skb` stops at a header whose nlmsg_len is below
+// NLMSG_HDRLEN or past the end of the buffer: no reply, and sendmsg still
+// returns the full length (request content never fails the send).
 #[test]
-fn malformed_batched_message_length_is_rejected() {
+fn malformed_message_length_ends_the_walk_silently() {
     let mut message = req(RTM_GETLINK, 1, 0);
     message[0..4].copy_from_slice(&15u32.to_le_bytes());
-    assert!(build_replies(&message).is_err());
+    assert_eq!(build_replies(&message).unwrap().len(), 0);
 
     message[0..4].copy_from_slice(&1024u32.to_le_bytes());
-    assert!(build_replies(&message).is_err());
+    assert_eq!(build_replies(&message).unwrap().len(), 0);
+
+    // Messages before the malformed one are still processed.
+    let mut batch = req(RTM_GETLINK, 2, 0);
+    let mut bad = req(RTM_GETLINK, 3, 0);
+    bad[0..4].copy_from_slice(&4u32.to_le_bytes());
+    batch.extend_from_slice(&bad);
+    let replies = build_replies(&batch).unwrap();
+    assert!(!replies.is_empty());
+    assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 2));
+}
+
+// iproute2 `ip addr` sends its RTM_GETADDR dump in a zero-padded buffer: the
+// 24-byte request then 128 zero bytes (a trailing nlmsg_len == 0 header). Linux
+// answers the dump and ignores the padding; NARF failed the send with EINVAL
+// ("Cannot send dump request: Invalid argument").
+#[test]
+fn iproute2_zero_padded_getaddr_dump_is_answered() {
+    let body = [0u8; 8]; // struct ifaddrmsg, AF_UNSPEC
+    let mut datagram = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 9, 0, &body);
+    assert_eq!(datagram.len(), 24);
+    datagram.resize(152, 0);
+    let replies = build_replies(&datagram).unwrap();
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
+    assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 9));
+
+    // A trailing fragment shorter than a header is ignored the same way.
+    let mut short = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 10, 0, &body);
+    short.extend_from_slice(&[0u8; 7]);
+    let replies = build_replies(&short).unwrap();
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
 }
 
 #[test]

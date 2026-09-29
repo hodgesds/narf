@@ -6016,6 +6016,74 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getaddr_dump);
 
+// iproute2 `ip addr` sends its RTM_GETADDR dump as the 24-byte request followed
+// by 128 zero bytes (a trailing nlmsg_len == 0 header). Linux `netlink_rcv_skb`
+// stops at that header and `netlink_sendmsg` returns the full length; NARF
+// failed the send with EINVAL ("Cannot send dump request: Invalid argument").
+fn smoke_abi_netlink_route_zero_padded_dump_is_answered() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let mut req = [0u8; 152];
+        let body = 8; // struct ifaddrmsg, AF_UNSPEC
+        req[..NLMSG_HDRLEN].copy_from_slice(&nlmsg_request(RTM_GETADDR, 11));
+        req[0..4].copy_from_slice(&((NLMSG_HDRLEN + body) as u32).to_le_bytes());
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send of a zero-padded RTM_GETADDR dump did not return its full length");
+        }
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            let seq = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            if seq != 11 {
+                return Err("padding was answered as a second request");
+            }
+            if nlmsg_type_of(&buf) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if !saw_done {
+            return Err("zero-padded RTM_GETADDR dump did not end with NLMSG_DONE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_zero_padded_dump_is_answered
+);
+
+// NEGATIVE: a header whose nlmsg_len is below NLMSG_HDRLEN or past the end is
+// not an error on Linux: the walk stops, nothing is answered, and send returns
+// the full length (request content never fails netlink_sendmsg).
+fn smoke_abi_netlink_route_malformed_length_is_skipped() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        for bad_len in [4u32, 1024] {
+            let mut req = nlmsg_request(RTM_GETLINK, 12);
+            req[0..4].copy_from_slice(&bad_len.to_le_bytes());
+            if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+                return Err("send of a malformed nlmsg_len did not return its full length");
+            }
+            let mut buf = [0u8; 512];
+            if netlink_recv(fd, &mut buf) != Some(EAGAIN) {
+                return Err("a malformed nlmsg_len was answered instead of skipped");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_malformed_length_is_skipped
+);
+
 fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
