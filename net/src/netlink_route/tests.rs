@@ -148,20 +148,25 @@ fn getaddr_dump_is_well_formed() {
 }
 
 #[test]
-fn getaddr_dump_honors_family_and_ifindex_filters() {
+fn getaddr_dump_honors_family_and_ignores_legacy_ifindex() {
     let mut body = [0u8; 8];
     body[0] = AF_INET6;
     let ipv6 = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 6, 0, &body);
     let replies = build_dump(&ipv6);
-    assert_eq!(replies.len(), 1);
-    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_DONE);
+    assert!(replies[..replies.len() - 1]
+        .iter()
+        .all(|m| m[NLMSG_HDRLEN] == AF_INET6));
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
 
+    // `inet_dump_addr` reads ifa_index only under strict checking.
     body[0] = AF_INET;
     body[4..8].copy_from_slice(&999u32.to_ne_bytes());
-    let missing_index = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &body);
-    let replies = build_dump(&missing_index);
-    assert_eq!(replies.len(), 1);
-    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_DONE);
+    let legacy_index = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &body);
+    let replies = build_dump(&legacy_index);
+    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, RTM_NEWADDR);
 }
 
 #[test]
@@ -390,8 +395,11 @@ fn ipv6_route_message_reports_gateway_and_oif() {
 
 #[test]
 fn getneigh_dump_honors_ifindex_filter() {
-    let mut request = req(RTM_GETNEIGH, 45, 12);
-    request[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&99i32.to_ne_bytes());
+    // `neigh_valid_dump_req`: the device filter is NDA_IFINDEX (8), not
+    // ndm_ifindex.
+    let mut body = vec![0u8; 12];
+    push_rtattr(&mut body, 8, &99u32.to_ne_bytes());
+    let request = frame_message(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 45, 12, &body);
     let msgs = build_dump(&request);
     assert_eq!(msgs.len(), 1);
     assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
@@ -443,25 +451,39 @@ fn getqdisc_reports_noqueue_for_loopback() {
 }
 
 #[test]
-fn getqdisc_dump_honors_ifindex_filter() {
-    let mut request = req(RTM_GETQDISC, 62, 20);
-    request[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&99i32.to_ne_bytes());
+fn getqdisc_dump_ignores_ifindex() {
+    // `tc_dump_qdisc` walks every device; tcm_ifindex is not a dump filter.
+    let mut body = [0u8; 20];
+    body[4..8].copy_from_slice(&99i32.to_ne_bytes());
+    let request = frame_message(RTM_GETQDISC, NLM_F_REQUEST | NLM_F_DUMP, 62, 20, &body);
     let msgs = build_dump(&request);
-    assert_eq!(msgs.len(), 1);
-    assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
+    assert!(msgs.len() >= 2);
+    assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
+    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
 }
 
 #[test]
 fn absent_optional_collections_return_empty_completed_dumps() {
-    for msg_type in [
-        RTM_GETTCLASS,
-        RTM_GETTFILTER,
-        RTM_GETACTION,
-        RTM_GETADDRLABEL,
-        RTM_GETMDB,
-        RTM_GETNEXTHOP,
+    // Each request carries its full family header. RTM_GETADDRLABEL is only
+    // registered for PF_INET6 and RTM_GETMDB only for PF_BRIDGE.
+    for (msg_type, family, hdrlen) in [
+        (RTM_GETTCLASS, 0, 20),
+        (RTM_GETTFILTER, 0, 20),
+        (RTM_GETACTION, 0, 4),
+        (RTM_GETADDRLABEL, AF_INET6, 12),
+        (RTM_GETMDB, dump::AF_BRIDGE, 8),
+        (RTM_GETNEXTHOP, 0, 8),
     ] {
-        let msgs = build_dump(&req(msg_type, msg_type as u32, 0));
+        let mut body = vec![0u8; hdrlen];
+        body[0] = family;
+        let request = frame_message(
+            msg_type,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            msg_type as u32,
+            0,
+            &body,
+        );
+        let msgs = build_dump(&request);
         assert_eq!(msgs.len(), 1, "type {msg_type} was not an empty dump");
         let hdr = parse_hdr(&msgs[0]).unwrap();
         assert_eq!(hdr.msg_type, NLMSG_DONE);
@@ -501,11 +523,11 @@ fn batched_requests_keep_sequence_and_ack_independent() {
         let h = parse_hdr(m).unwrap();
         h.msg_type == RTM_NEWLINK && h.seq == 101
     }));
-    assert!(replies.iter().any(|m| {
+    // A dump that starts is never ACKed, even with NLM_F_ACK
+    // (`__netlink_dump_start` returns -EINTR; `netlink_rcv_skb` skips).
+    assert!(!replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
-        h.msg_type == NLMSG_ERROR
-            && h.seq == 101
-            && i32::from_le_bytes(m[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) == 0
+        h.msg_type == NLMSG_ERROR && h.seq == 101
     }));
     assert!(replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
@@ -658,7 +680,9 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
 
 #[test]
 fn strict_check_rejects_short_dump_and_accepts_typed_request() {
-    let short = req(RTM_GETADDR, 120, 0);
+    // A strict dump's validation error is the NLMSG_DONE payload
+    // (`netlink_dump_done`), not an NLMSG_ERROR.
+    let short = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 120, 0, &[0]);
     let denied = build_replies_with_options(
         &short,
         None,
@@ -668,6 +692,7 @@ fn strict_check_rejects_short_dump_and_accepts_typed_request() {
         },
     )
     .unwrap();
+    assert_eq!(parse_hdr(&denied[0]).unwrap().msg_type, NLMSG_DONE);
     assert_eq!(
         i32::from_ne_bytes(
             denied[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]

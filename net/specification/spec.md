@@ -182,9 +182,27 @@ Without `NETLINK_CAP_ACK`, `nlmsgerr` echoes the complete offending request.
 With CAP_ACK enabled the echo is header-only and marked `NLM_F_CAPPED`; any
 extended-ACK attributes follow the capped request header.
 
-When `NETLINK_GET_STRICT_CHK` is enabled, requests must carry
-`NLM_F_REQUEST`, the Linux fixed request structure for their message type,
-and a valid family selector. Malformed strict requests return `EINVAL`.
+Requests are walked as `netlink_rcv_skb` / `rtnetlink_rcv_msg` do: a message
+without `NLM_F_REQUEST`, a control message, or one without even a one-byte
+`struct rtgenmsg` is not processed (only `NLM_F_ACK` earns a zero ACK). A
+`NLM_F_DUMP` request selects the Linux dumpit for `(family, type)`, falling
+back to `AF_UNSPEC`; with none registered (for example `RTM_GETADDRLABEL`
+outside `AF_INET6`, `RTM_GETMDB` outside `AF_BRIDGE`) the reply is
+`NLMSG_ERROR(-EOPNOTSUPP)`. A dump that starts is never ACKed. The dumpit
+validates the request exactly as its Linux counterpart (strictly when
+`NETLINK_GET_STRICT_CHK` is set — `rtnl_valid_dump_ifinfo_req`,
+`inet{,6}_valid_dump_ifaddr_req`, `ip_valid_fib_dump_req`,
+`neigh_valid_dump_req`, `fib_valid_dumprule_req`, `ip6addrlbl_valid_dump_req`,
+`rtnl_mdb_valid_dump_req`; `nh_valid_dump_req` and the traffic-control dumps
+validate in both modes), including `nla_policy` attribute validation, and a
+failure (`EINVAL`, `ERANGE`, `ENODEV`, `ENOENT`, `EAFNOSUPPORT`) is the i32
+payload of the terminating `NLMSG_DONE`, flagged `NLM_F_MULTI` plus the dump's
+answer flags, with `NLM_F_ACK_TLVS`, the Linux `NLMSGERR_ATTR_MSG` text, and
+`NLMSGERR_ATTR_OFFS` under `NETLINK_EXT_ACK`. Filtered dumps mark their
+entries (and, where Linux sets `cb->answer_flags`, the `NLMSG_DONE`)
+`NLM_F_DUMP_FILTERED`. Non-dump `RTM_GETLINK` / `RTM_GETROUTE` run
+`rtnl_valid_getlink_req` / `inet_rtm_valid_getroute_req` and answer errors
+with `NLMSG_ERROR`; a successful doit's reply precedes its `NLM_F_ACK`.
 Non-dump `RTM_GETLINK` resolves one interface by positive ifindex or else
 `IFLA_IFNAME`, returning a non-multipart reply, `ENODEV` when the named
 interface is absent, or `EINVAL` when neither selector is present.
@@ -192,10 +210,12 @@ Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
 lookup for `RTA_DST` (absent: 0.0.0.0, as `inet_rtm_getroute`), returning
 the selected route as one non-multipart reply or `ENETUNREACH`; a family
 other than `AF_INET` returns `EOPNOTSUPP`.
-Address dumps honor `ifa_family` and `ifa_index`; route dumps honor
-`rtm_family` and `rtm_table`; neighbor and qdisc dumps honor their interface
-index selectors. A valid filter with no matching objects returns an empty dump
-terminated by `NLMSG_DONE`.
+Address dumps honor `ifa_family`, and `ifa_index` only under strict checking;
+route dumps honor `rtm_family`, and under strict checking `rtm_table` /
+`RTA_TABLE`, `RTA_OIF`, `rtm_protocol`, and `rtm_type`; neighbor dumps filter
+by `NDA_IFINDEX` / `NDA_MASTER`; qdisc dumps cover every device. A valid
+filter with no matching objects returns an empty dump terminated by
+`NLMSG_DONE`.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero

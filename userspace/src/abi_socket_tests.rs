@@ -5334,7 +5334,9 @@ fn netlink_sockaddr_port(portid: u32) -> ([u8; 12], u64) {
 }
 
 /// Build a `struct nlmsghdr` dump request: len(16) type flags(REQUEST|DUMP)
-/// seq pid.
+/// seq pid. It has no family header, so `rtnetlink_rcv_msg` ignores it
+/// (`nlmsg_len(nlh) < sizeof(struct rtgenmsg)` returns 0); rtnetlink tests use
+/// `rtnl_dump_request`, which carries the one-byte `struct rtgenmsg`.
 fn nlmsg_request(msg_type: u16, seq: u32) -> [u8; NLMSG_HDRLEN] {
     let mut b = [0u8; NLMSG_HDRLEN];
     b[0..4].copy_from_slice(&(NLMSG_HDRLEN as u32).to_le_bytes());
@@ -5424,7 +5426,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_socket_bind);
 fn smoke_abi_netlink_route_siocinq() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 40);
+        let req = rtnl_dump_request(RTM_GETLINK, 40);
         if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
             return Err("RTM_GETLINK send failed");
         }
@@ -5447,7 +5449,7 @@ fn smoke_abi_netlink_route_msg_peek() -> TestResult {
     with_setup(|| {
         const MSG_PEEK: u64 = 0x02;
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 41);
+        let req = rtnl_dump_request(RTM_GETLINK, 41);
         if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
             return Err("RTM_GETLINK send failed");
         }
@@ -5473,7 +5475,7 @@ fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
     with_setup(|| {
         const MSG_TRUNC: u64 = 0x20;
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 42);
+        let req = rtnl_dump_request(RTM_GETLINK, 42);
 
         if netlink_send(fd, &req).ok_or("first route send")? != req.len() as i64 {
             return Err("first RTM_GETLINK send failed");
@@ -5521,7 +5523,7 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
 
         // A dump: RTM_GETLINK → one or more RTM_NEWLINK + a terminating
         // NLMSG_DONE. The send allocates the socket's port id.
-        let req = nlmsg_request(RTM_GETLINK, 77);
+        let req = rtnl_dump_request(RTM_GETLINK, 77);
         if netlink_send(fd, &req).ok_or("dump send")? != req.len() as i64 {
             return Err("RTM_GETLINK send failed");
         }
@@ -5927,7 +5929,7 @@ kernel_test_in!(
 fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 42);
+        let req = rtnl_dump_request(RTM_GETLINK, 42);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETLINK) did not echo the request length");
         }
@@ -5978,7 +5980,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getlink_dump);
 fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETADDR, 7);
+        let req = rtnl_dump_request(RTM_GETADDR, 7);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETADDR) did not echo the request length");
         }
@@ -6125,7 +6127,7 @@ kernel_test_in!(
 fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETROUTE, 9);
+        let req = rtnl_dump_request(RTM_GETROUTE, 9);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETROUTE) did not echo the request length");
         }
@@ -6228,7 +6230,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_point_lookup);
 fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETNEIGH, 10);
+        let req = rtnl_dump_request(RTM_GETNEIGH, 10);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETNEIGH) did not echo the request length");
         }
@@ -6258,7 +6260,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getneigh_dump);
 fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETRULE, 11);
+        let req = rtnl_dump_request(RTM_GETRULE, 11);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETRULE) did not echo the request length");
         }
@@ -6286,7 +6288,9 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getrule_dump);
 fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETQDISC, 12);
+        // `tc_dump_qdisc` parses a full struct tcmsg (a shorter request is
+        // DONE(-EINVAL)), so send one.
+        let req = rtnl_request(RTM_GETQDISC, NLM_F_REQUEST_DUMP, 12, &[0u8; 20]);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETQDISC) did not echo the request length");
         }
@@ -6319,7 +6323,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getqdisc_dump);
 fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETTFILTER, 13);
+        let req = rtnl_dump_request(RTM_GETTFILTER, 13);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETTFILTER) did not echo request length");
         }
@@ -6335,6 +6339,1028 @@ fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_empty_collection_dump
+);
+
+// ── rtnetlink dump validation parity (strict + legacy) ──────────────────
+//
+// Linux delivers a dumpit's validation error INSIDE the dump: `netlink_dump`
+// / `netlink_dump_done` (net/netlink/af_netlink.c) write the dumpit's
+// negative return as the i32 payload of the terminating NLMSG_DONE, flagged
+// NLM_F_MULTI | cb->answer_flags (+ NLM_F_ACK_TLVS and NLMSGERR_ATTR_MSG under
+// NETLINK_EXT_ACK). Only a request with no registered dumpit fails before the
+// dump starts, as NLMSG_ERROR(-EOPNOTSUPP) from `rtnetlink_rcv_msg`. A dump
+// that starts is never ACKed (`__netlink_dump_start` returns -EINTR, which
+// `netlink_rcv_skb` skips).
+
+const NETLINK_GET_STRICT_CHK: u64 = 12;
+const NLM_F_MULTI: u16 = 0x02;
+const NLM_F_DUMP_FILTERED: u16 = 0x20;
+const NLM_F_ACK_TLVS: u16 = 0x200;
+const RTM_GETTCLASS: u16 = 42;
+const RTM_GETACTION: u16 = 50;
+const RTM_GETADDRLABEL: u16 = 74;
+const RTM_GETMDB: u16 = 86;
+const RTM_GETNEXTHOP: u16 = 106;
+const RTNL_AF_UNSPEC: u8 = 0;
+const RTNL_AF_INET: u8 = 2;
+const RTNL_AF_BRIDGE: u8 = 7;
+const RTNL_AF_INET6: u8 = 10;
+const RTNL_AF_PACKET: u8 = 17;
+
+/// A framed rtnetlink request: `nlmsg_len = 16 + body.len()`, zero-padded to
+/// NLMSG_ALIGN.
+fn rtnl_request(msg_type: u16, flags: u16, seq: u32, body: &[u8]) -> alloc::vec::Vec<u8> {
+    let len = NLMSG_HDRLEN + body.len();
+    let mut m = alloc::vec::Vec::with_capacity((len + 3) & !3);
+    m.extend_from_slice(&(len as u32).to_ne_bytes());
+    m.extend_from_slice(&msg_type.to_ne_bytes());
+    m.extend_from_slice(&flags.to_ne_bytes());
+    m.extend_from_slice(&seq.to_ne_bytes());
+    m.extend_from_slice(&0u32.to_ne_bytes());
+    m.extend_from_slice(body);
+    m.resize((len + 3) & !3, 0);
+    m
+}
+
+/// A legacy dump request carrying only `struct rtgenmsg { AF_UNSPEC }` —
+/// the smallest request `rtnetlink_rcv_msg` accepts.
+fn rtnl_dump_request(msg_type: u16, seq: u32) -> alloc::vec::Vec<u8> {
+    rtnl_request(msg_type, NLM_F_REQUEST_DUMP, seq, &[RTNL_AF_UNSPEC])
+}
+
+/// Append one `struct nlattr` (aligned) to a request body.
+fn push_nlattr(body: &mut alloc::vec::Vec<u8>, kind: u16, payload: &[u8]) {
+    body.resize((body.len() + 3) & !3, 0);
+    body.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+    body.extend_from_slice(&kind.to_ne_bytes());
+    body.extend_from_slice(payload);
+    body.resize((body.len() + 3) & !3, 0);
+}
+
+fn nl_flags_of(msg: &[u8]) -> u16 {
+    u16::from_ne_bytes([msg[6], msg[7]])
+}
+
+fn nl_seq_of(msg: &[u8]) -> u32 {
+    u32::from_ne_bytes([msg[8], msg[9], msg[10], msg[11]])
+}
+
+/// The i32 at the start of the payload: NLMSG_DONE's dump status or
+/// `nlmsgerr.error`.
+fn nl_status_of(msg: &[u8]) -> i64 {
+    i32::from_ne_bytes([msg[16], msg[17], msg[18], msg[19]]) as i64
+}
+
+/// Send `req` and drain every queued reply until the queue is empty.
+fn rtnl_exchange(
+    fd: u64,
+    req: &[u8],
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, &'static str> {
+    if netlink_send(fd, req).ok_or("rtnl send status")? != req.len() as i64 {
+        return Err("rtnetlink send did not consume the request");
+    }
+    let mut replies = alloc::vec::Vec::new();
+    for _ in 0..256 {
+        let mut buf = [0u8; 2048];
+        match netlink_recv(fd, &mut buf) {
+            Some(n) if n == EAGAIN => return Ok(replies),
+            Some(n) if n >= (NLMSG_HDRLEN + 4) as i64 => replies.push(buf[..n as usize].to_vec()),
+            _ => return Err("rtnetlink recv returned a malformed reply"),
+        }
+    }
+    Err("rtnetlink reply stream did not drain")
+}
+
+/// The replies must be a dump: zero or more entries then exactly one final
+/// NLMSG_DONE. Returns (entries, done).
+fn split_dump(
+    replies: &[alloc::vec::Vec<u8>],
+) -> Result<(&[alloc::vec::Vec<u8>], &alloc::vec::Vec<u8>), &'static str> {
+    let Some((done, entries)) = replies.split_last() else {
+        return Err("dump produced no replies");
+    };
+    if nlmsg_type_of(done) != NLMSG_DONE {
+        return Err("dump did not end with NLMSG_DONE");
+    }
+    if entries
+        .iter()
+        .any(|m| matches!(nlmsg_type_of(m), NLMSG_DONE | NLMSG_ERROR))
+    {
+        return Err("dump carried an NLMSG_ERROR/extra NLMSG_DONE before its end");
+    }
+    if nl_flags_of(done) & NLM_F_MULTI == 0 {
+        return Err("NLMSG_DONE lacked NLM_F_MULTI");
+    }
+    Ok((entries, done))
+}
+
+/// The dump's status: the NLMSG_DONE payload errno (0 = success).
+fn dump_status(fd: u64, req: &[u8]) -> Result<i64, &'static str> {
+    let replies = rtnl_exchange(fd, req)?;
+    let (entries, done) = split_dump(&replies)?;
+    if nl_status_of(done) != 0 && !entries.is_empty() {
+        return Err("a failed dump validation still emitted entries");
+    }
+    Ok(nl_status_of(done))
+}
+
+fn open_route(strict: bool) -> Result<u64, &'static str> {
+    let fd = open_netlink(NETLINK_ROUTE)?;
+    if strict {
+        netlink_set_u32(fd, NETLINK_GET_STRICT_CHK, 1)?;
+    }
+    Ok(fd)
+}
+
+fn close_fd(fd: u64) {
+    let _ = call(Syscall::Close.raw(), a0(fd));
+}
+
+/// `struct ifinfomsg` with the given family, type, index, flags.
+fn ifinfomsg_body(family: u8, ifi_type: u16, index: i32, flags: u32) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, 0];
+    b.extend_from_slice(&ifi_type.to_ne_bytes());
+    b.extend_from_slice(&index.to_ne_bytes());
+    b.extend_from_slice(&flags.to_ne_bytes());
+    b.extend_from_slice(&0u32.to_ne_bytes());
+    b
+}
+
+/// NEGATIVE: `rtnetlink_rcv_msg` returns 0 for a message without even a
+/// one-byte `struct rtgenmsg` — no dump, only the NLM_F_ACK acknowledgement.
+fn smoke_abi_netlink_route_header_only_request_is_ignored() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let bare = nlmsg_request(RTM_GETLINK, 300);
+        if !rtnl_exchange(fd, &bare)?.is_empty() {
+            return Err("a header-only RTM_GETLINK dump was answered");
+        }
+        let mut acked = bare;
+        acked[6..8].copy_from_slice(&(NLM_F_REQUEST_DUMP | NLM_F_ACK).to_ne_bytes());
+        let replies = rtnl_exchange(fd, &acked)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+            || nl_status_of(&replies[0]) != 0
+        {
+            return Err("a header-only request with NLM_F_ACK did not get exactly an ACK");
+        }
+        // POSITIVE: the one-byte rtgenmsg form is a valid legacy dump.
+        let replies = rtnl_exchange(fd, &rtnl_dump_request(RTM_GETLINK, 301))?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("a one-byte rtgenmsg RTM_GETLINK dump was not answered");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_header_only_request_is_ignored
+);
+
+/// NEGATIVE: `netlink_rcv_skb` only handles requests. A message without
+/// NLM_F_REQUEST is skipped (ACKed with 0 only on NLM_F_ACK), in strict mode
+/// too; it is not an -EINVAL error.
+fn smoke_abi_netlink_route_non_request_is_skipped() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        let not_request = rtnl_request(RTM_GETLINK, 0x300, 302, &body);
+        if !rtnl_exchange(fd, &not_request)?.is_empty() {
+            return Err("a message without NLM_F_REQUEST was answered");
+        }
+        let with_ack = rtnl_request(RTM_GETLINK, 0x300 | NLM_F_ACK, 303, &body);
+        let replies = rtnl_exchange(fd, &with_ack)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+            || nl_status_of(&replies[0]) != 0
+        {
+            return Err("a non-request with NLM_F_ACK did not get exactly a zero ACK");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_non_request_is_skipped
+);
+
+/// A dump that starts is never ACKed, even with NLM_F_ACK; a successful doit
+/// is answered by its reply followed by the ACK.
+fn smoke_abi_netlink_route_dump_is_not_acked() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        let dump = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP | NLM_F_ACK, 304, &body);
+        let replies = rtnl_exchange(fd, &dump)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("RTM_GETLINK dump with NLM_F_ACK was not a plain dump");
+        }
+        // Doit: RTM_GETLINK for ifindex 1 (lo) with NLM_F_ACK.
+        let get = rtnl_request(
+            RTM_GETLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            305,
+            &ifinfomsg_body(RTNL_AF_UNSPEC, 0, 1, 0),
+        );
+        let replies = rtnl_exchange(fd, &get)?;
+        if replies.len() != 2
+            || nlmsg_type_of(&replies[0]) != RTM_NEWLINK
+            || nlmsg_type_of(&replies[1]) != NLMSG_ERROR
+            || nl_status_of(&replies[1]) != 0
+        {
+            return Err("RTM_GETLINK doit was not RTM_NEWLINK followed by its ACK");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_dump_is_not_acked
+);
+
+/// `rtnl_valid_dump_ifinfo_req` (strict) + `rtnl_dump_ifinfo`: every
+/// rejection is -EINVAL in NLMSG_DONE, never an NLMSG_ERROR.
+fn smoke_abi_netlink_route_strict_link_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        // Short header (rtgenmsg only).
+        if dump_status(fd, &rtnl_dump_request(RTM_GETLINK, 310))? != EINVAL {
+            return Err("strict short ifinfomsg link dump was not DONE(-EINVAL)");
+        }
+        // Nonzero ifi_type / ifi_flags.
+        for body in [
+            ifinfomsg_body(RTNL_AF_UNSPEC, 1, 0, 0),
+            ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 1),
+        ] {
+            let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 311, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict link dump with header values was not DONE(-EINVAL)");
+            }
+        }
+        // Nonzero ifi_index: filtering by index is not supported.
+        let req = rtnl_request(
+            RTM_GETLINK,
+            NLM_F_REQUEST_DUMP,
+            312,
+            &ifinfomsg_body(RTNL_AF_UNSPEC, 0, 1, 0),
+        );
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with ifi_index was not DONE(-EINVAL)");
+        }
+        // IFLA_MTU passes ifla_policy but is not a dump attribute.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 4, &1500u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 313, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with IFLA_MTU was not DONE(-EINVAL)");
+        }
+        // An attribute type above IFLA_MAX (NL_VALIDATE_MAXTYPE).
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 200, &[0; 4]);
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 314, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with type > IFLA_MAX was not DONE(-EINVAL)");
+        }
+        // IFLA_EXT_MASK shorter than its NLA_U32 policy: -ERANGE.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 29, &[1, 0]);
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 315, &body);
+        if dump_status(fd, &req)? != ERANGE {
+            return Err("strict link dump with a 2-byte IFLA_EXT_MASK was not DONE(-ERANGE)");
+        }
+        // IFLA_TARGET_NETNSID naming an unassigned netns id.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 46, &7i32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 316, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with an unknown netnsid was not DONE(-EINVAL)");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_link_dump_validation
+);
+
+/// POSITIVE: a clean strict link dump with IFLA_EXT_MASK succeeds for ANY
+/// family — `rtnetlink_rcv_msg` falls back to the PF_UNSPEC dumpit and
+/// `rtnl_dump_ifinfo` never checks the family.
+fn smoke_abi_netlink_route_strict_link_dump_accepts_any_family() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        for family in [RTNL_AF_UNSPEC, RTNL_AF_INET, RTNL_AF_PACKET] {
+            let mut body = ifinfomsg_body(family, 0, 0, 0);
+            push_nlattr(&mut body, 29, &1u32.to_ne_bytes()); // IFLA_EXT_MASK
+            let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 320, &body);
+            let replies = rtnl_exchange(fd, &req)?;
+            let (entries, done) = split_dump(&replies)?;
+            if nl_status_of(done) != 0
+                || entries.is_empty()
+                || entries.iter().any(|m| nlmsg_type_of(m) != RTM_NEWLINK)
+            {
+                return Err("strict link dump rejected a valid request for some family");
+            }
+        }
+        // IFLA_MASTER filters (no NARF device has a master) and marks the
+        // dump filtered; the NLMSG_DONE still succeeds.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 10, &1u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 321, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if !entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("IFLA_MASTER link dump was not an empty successful dump");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_link_dump_accepts_any_family
+);
+
+/// Legacy (non-strict) link dumps stay lenient: the rtgenmsg hack, header
+/// values, a nonzero ifi_index, and unknown attributes are all ignored.
+fn smoke_abi_netlink_route_legacy_link_dump_is_lenient() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 1, 99, 1);
+        push_nlattr(&mut body, 4, &1500u32.to_ne_bytes());
+        push_nlattr(&mut body, 200, &[0; 4]);
+        for req in [
+            rtnl_dump_request(RTM_GETLINK, 322),
+            rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 323, &body),
+        ] {
+            let replies = rtnl_exchange(fd, &req)?;
+            let (entries, done) = split_dump(&replies)?;
+            if entries.is_empty() || nl_status_of(done) != 0 {
+                return Err("legacy link dump rejected a lenient request");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_legacy_link_dump_is_lenient
+);
+
+/// NETLINK_EXT_ACK: the failing dump's NLMSG_DONE carries NLM_F_ACK_TLVS and
+/// the Linux extack message; a successful dump's NLMSG_DONE carries neither.
+fn smoke_abi_netlink_route_strict_dump_error_extack() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        netlink_set_u32(fd, NETLINK_EXT_ACK, 1)?;
+        let replies = rtnl_exchange(fd, &rtnl_dump_request(RTM_GETLINK, 330))?;
+        let (_, done) = split_dump(&replies)?;
+        if nl_status_of(done) != EINVAL || nl_flags_of(done) & NLM_F_ACK_TLVS == 0 {
+            return Err("failed link dump DONE lacked -EINVAL + NLM_F_ACK_TLVS");
+        }
+        if !window_contains(done, b"Invalid header for link dump\0") {
+            return Err("failed link dump DONE lacked the Linux extack message");
+        }
+        let body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 331, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        let (_, done) = split_dump(&replies)?;
+        if nl_status_of(done) != 0 || nl_flags_of(done) & NLM_F_ACK_TLVS != 0 {
+            return Err("successful link dump DONE carried an error or extack TLVs");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_dump_error_extack
+);
+
+/// `struct ifaddrmsg`.
+fn ifaddrmsg_body(
+    family: u8,
+    prefixlen: u8,
+    flags: u8,
+    scope: u8,
+    index: u32,
+) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, prefixlen, flags, scope];
+    b.extend_from_slice(&index.to_ne_bytes());
+    b
+}
+
+/// `inet_valid_dump_ifaddr_req` / `inet6_valid_dump_ifaddr_req`.
+fn smoke_abi_netlink_route_strict_addr_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETADDR, 340))? != EINVAL {
+            return Err("strict short ifaddrmsg dump was not DONE(-EINVAL)");
+        }
+        for family in [RTNL_AF_UNSPEC, RTNL_AF_INET, RTNL_AF_INET6] {
+            for body in [
+                ifaddrmsg_body(family, 8, 0, 0, 0),
+                ifaddrmsg_body(family, 0, 1, 0, 0),
+                ifaddrmsg_body(family, 0, 0, 254, 0),
+            ] {
+                let req = rtnl_request(RTM_GETADDR, NLM_F_REQUEST_DUMP, 341, &body);
+                if dump_status(fd, &req)? != EINVAL {
+                    return Err(
+                        "strict addr dump with prefixlen/flags/scope was not DONE(-EINVAL)",
+                    );
+                }
+            }
+            // Only IFA_TARGET_NETNSID is a dump attribute.
+            let mut body = ifaddrmsg_body(family, 0, 0, 0, 0);
+            push_nlattr(&mut body, 2, &[127, 0, 0, 1]); // IFA_LOCAL (IPv4 policy: U32)
+            let req = rtnl_request(RTM_GETADDR, NLM_F_REQUEST_DUMP, 342, &body);
+            let want = if family == RTNL_AF_INET6 {
+                ERANGE
+            } else {
+                EINVAL
+            };
+            // ifa_ipv6_policy[IFA_LOCAL] needs 16 bytes, so the IPv6 parse
+            // fails policy (-ERANGE) before the attribute loop.
+            if dump_status(fd, &req)? != want {
+                return Err("strict addr dump with IFA_LOCAL had the wrong DONE errno");
+            }
+            let mut body = ifaddrmsg_body(family, 0, 0, 0, 0);
+            push_nlattr(&mut body, 10, &3i32.to_ne_bytes()); // IFA_TARGET_NETNSID
+            let req = rtnl_request(RTM_GETADDR, NLM_F_REQUEST_DUMP, 343, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict addr dump with an unknown netnsid was not DONE(-EINVAL)");
+            }
+            // A missing device: -ENODEV, still inside the dump.
+            let req = rtnl_request(
+                RTM_GETADDR,
+                NLM_F_REQUEST_DUMP,
+                344,
+                &ifaddrmsg_body(family, 0, 0, 0, 0x0FFF_FFFF),
+            );
+            if dump_status(fd, &req)? != ENODEV {
+                return Err("strict addr dump of a missing ifindex was not DONE(-ENODEV)");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_addr_dump_validation
+);
+
+/// POSITIVE: a strict ifa_index selects that device's addresses and marks
+/// every entry and the NLMSG_DONE (cb->answer_flags) NLM_F_DUMP_FILTERED.
+fn smoke_abi_netlink_route_strict_addr_dump_index_filter() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            345,
+            &ifaddrmsg_body(RTNL_AF_UNSPEC, 0, 0, 0, 1),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if nl_status_of(done) != 0 || nl_flags_of(done) & NLM_F_DUMP_FILTERED == 0 {
+            return Err("filtered addr dump DONE was not 0 + NLM_F_DUMP_FILTERED");
+        }
+        let mut families = (false, false);
+        for m in entries {
+            let index = u32::from_ne_bytes(m[20..24].try_into().unwrap());
+            if nlmsg_type_of(m) != RTM_NEWADDR
+                || index != 1
+                || nl_flags_of(m) & NLM_F_DUMP_FILTERED == 0
+            {
+                return Err("filtered addr dump entry was off-device or unmarked");
+            }
+            match m[NLMSG_HDRLEN] {
+                RTNL_AF_INET => families.0 = true,
+                RTNL_AF_INET6 => families.1 = true,
+                _ => return Err("filtered addr dump entry had a bad family"),
+            }
+        }
+        if families != (true, true) {
+            return Err("AF_UNSPEC addr dump did not cover both IPv4 and IPv6 of lo");
+        }
+        // A clean unfiltered strict dump is not marked filtered.
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            346,
+            &ifaddrmsg_body(RTNL_AF_INET, 0, 0, 0, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty()
+            || nl_flags_of(done) & NLM_F_DUMP_FILTERED != 0
+            || entries
+                .iter()
+                .any(|m| nl_flags_of(m) & NLM_F_DUMP_FILTERED != 0)
+        {
+            return Err("unfiltered strict addr dump was marked filtered");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_addr_dump_index_filter
+);
+
+/// Legacy address dumps ignore the ifaddrmsg header (`inet_dump_addr` reads
+/// ifa_index only under strict checking), and a family with no RTM_GETADDR
+/// dumpit falls back to `rtnl_dump_all` (every address family).
+fn smoke_abi_netlink_route_legacy_addr_dump_ignores_header() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            347,
+            &ifaddrmsg_body(RTNL_AF_INET, 8, 1, 254, 0x0FFF_FFFF),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if nl_status_of(done) != 0 || !entries.iter().any(|m| window_contains(m, &[127, 0, 0, 1])) {
+            return Err("legacy addr dump honoured a bogus ifa_index / header");
+        }
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            348,
+            &ifaddrmsg_body(RTNL_AF_PACKET, 0, 0, 0, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        let v4 = entries.iter().any(|m| m[NLMSG_HDRLEN] == RTNL_AF_INET);
+        let v6 = entries.iter().any(|m| m[NLMSG_HDRLEN] == RTNL_AF_INET6);
+        if nl_status_of(done) != 0 || !v4 || !v6 {
+            return Err("AF_PACKET addr dump did not fall back to rtnl_dump_all");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_legacy_addr_dump_ignores_header
+);
+
+/// `struct rtmsg`.
+fn rtmsg_body(family: u8, dst_len: u8, table: u8, flags: u32) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, dst_len, 0, 0, table, 0, 0, 0];
+    b.extend_from_slice(&flags.to_ne_bytes());
+    b
+}
+
+/// `ip_valid_fib_dump_req` + `inet_dump_fib` / `inet6_dump_fib`.
+fn smoke_abi_netlink_route_strict_route_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETROUTE, 350))? != EINVAL {
+            return Err("strict short rtmsg dump was not DONE(-EINVAL)");
+        }
+        for body in [
+            rtmsg_body(RTNL_AF_INET, 8, 0, 0),
+            rtmsg_body(RTNL_AF_INET, 0, 0, 0x100), // RTM_F_NOTIFY is not a dump flag
+        ] {
+            let req = rtnl_request(RTM_GETROUTE, NLM_F_REQUEST_DUMP, 351, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict route dump with bad header was not DONE(-EINVAL)");
+            }
+        }
+        let mut body = rtmsg_body(RTNL_AF_INET, 0, 0, 0);
+        push_nlattr(&mut body, 6, &1u32.to_ne_bytes()); // RTA_PRIORITY
+        let req = rtnl_request(RTM_GETROUTE, NLM_F_REQUEST_DUMP, 352, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict route dump with RTA_PRIORITY was not DONE(-EINVAL)");
+        }
+        let mut body = rtmsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 4, &0x0FFF_FFFFu32.to_ne_bytes()); // RTA_OIF
+        let req = rtnl_request(RTM_GETROUTE, NLM_F_REQUEST_DUMP, 353, &body);
+        if dump_status(fd, &req)? != ENODEV {
+            return Err("strict route dump with a missing RTA_OIF was not DONE(-ENODEV)");
+        }
+        // A missing table is -ENOENT only for the table's own family.
+        for (family, want) in [
+            (RTNL_AF_INET, ENOENT),
+            (RTNL_AF_INET6, ENOENT),
+            (RTNL_AF_UNSPEC, 0),
+        ] {
+            let req = rtnl_request(
+                RTM_GETROUTE,
+                NLM_F_REQUEST_DUMP,
+                354,
+                &rtmsg_body(family, 0, 77, 0),
+            );
+            if dump_status(fd, &req)? != want {
+                return Err("strict route dump of a missing table had the wrong DONE errno");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_route_dump_validation
+);
+
+/// POSITIVE: strict route dumps mark every entry NLM_F_DUMP_FILTERED
+/// (`dump_exceptions` is off), and the NLMSG_DONE only when a filter is set.
+/// Legacy dumps ignore rtm_table.
+fn smoke_abi_netlink_route_route_dump_filter_flags() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let req = rtnl_request(
+            RTM_GETROUTE,
+            NLM_F_REQUEST_DUMP,
+            355,
+            &rtmsg_body(RTNL_AF_INET, 0, 0, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty()
+            || nl_status_of(done) != 0
+            || nl_flags_of(done) & NLM_F_DUMP_FILTERED != 0
+            || entries
+                .iter()
+                .any(|m| nl_flags_of(m) & NLM_F_DUMP_FILTERED == 0)
+        {
+            return Err("strict unfiltered route dump flags differ from Linux");
+        }
+        let req = rtnl_request(
+            RTM_GETROUTE,
+            NLM_F_REQUEST_DUMP,
+            356,
+            &rtmsg_body(RTNL_AF_INET, 0, 255, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty()
+            || nl_flags_of(done) & NLM_F_DUMP_FILTERED == 0
+            || entries.iter().any(|m| m[NLMSG_HDRLEN + 4] != 255)
+        {
+            return Err("strict local-table route dump was not filtered to table 255");
+        }
+        close_fd(fd);
+
+        let fd = open_route(false)?;
+        let req = rtnl_request(
+            RTM_GETROUTE,
+            NLM_F_REQUEST_DUMP,
+            357,
+            &rtmsg_body(RTNL_AF_INET, 0, 254, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, _) = split_dump(&replies)?;
+        if !entries.iter().any(|m| m[NLMSG_HDRLEN + 4] == 255) {
+            return Err("legacy route dump filtered by rtm_table");
+        }
+        if entries
+            .iter()
+            .any(|m| nl_flags_of(m) & NLM_F_DUMP_FILTERED != 0)
+        {
+            return Err("legacy route dump entries were marked filtered");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_route_dump_filter_flags
+);
+
+/// `struct ndmsg`.
+fn ndmsg_body(family: u8, ifindex: i32, state: u16, flags: u8) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, 0, 0, 0];
+    b.extend_from_slice(&ifindex.to_ne_bytes());
+    b.extend_from_slice(&state.to_ne_bytes());
+    b.push(flags);
+    b.push(0);
+    b
+}
+
+/// `neigh_valid_dump_req` (strict).
+fn smoke_abi_netlink_route_strict_neigh_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETNEIGH, 360))? != EINVAL {
+            return Err("strict short ndmsg dump was not DONE(-EINVAL)");
+        }
+        for body in [
+            ndmsg_body(RTNL_AF_INET, 1, 0, 0),    // ndm_ifindex
+            ndmsg_body(RTNL_AF_INET, 0, 0x02, 0), // ndm_state
+            ndmsg_body(RTNL_AF_INET, 0, 0, 0x80), // ndm_flags other than NTF_PROXY
+        ] {
+            let req = rtnl_request(RTM_GETNEIGH, NLM_F_REQUEST_DUMP, 361, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict neigh dump with header values was not DONE(-EINVAL)");
+            }
+        }
+        let mut body = ndmsg_body(RTNL_AF_INET, 0, 0, 0);
+        push_nlattr(&mut body, 1, &[10, 0, 0, 1]); // NDA_DST
+        let req = rtnl_request(RTM_GETNEIGH, NLM_F_REQUEST_DUMP, 362, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict neigh dump with NDA_DST was not DONE(-EINVAL)");
+        }
+        // POSITIVE: NDA_IFINDEX is the dump's device filter; NTF_PROXY is
+        // an allowed flag (proxy table).
+        let mut body = ndmsg_body(RTNL_AF_INET, 0, 0, 0);
+        push_nlattr(&mut body, 8, &1u32.to_ne_bytes());
+        for req in [
+            rtnl_request(RTM_GETNEIGH, NLM_F_REQUEST_DUMP, 363, &body),
+            rtnl_request(
+                RTM_GETNEIGH,
+                NLM_F_REQUEST_DUMP,
+                364,
+                &ndmsg_body(RTNL_AF_INET6, 0, 0, 0x08),
+            ),
+        ] {
+            if dump_status(fd, &req)? != 0 {
+                return Err("strict neigh dump rejected a valid request");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_neigh_dump_validation
+);
+
+/// `fib_valid_dumprule_req` (strict) and `fib_nl_dumprule`'s family lookup
+/// (-EAFNOSUPPORT in either mode).
+fn smoke_abi_netlink_route_rule_dump_validation() -> TestResult {
+    with_setup(|| {
+        let rule = |family: u8, table: u8| {
+            let mut b = alloc::vec![family, 0, 0, 0, table, 0, 0, 0];
+            b.extend_from_slice(&0u32.to_ne_bytes());
+            b
+        };
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETRULE, 370))? != EINVAL {
+            return Err("strict short fib_rule_hdr dump was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(
+            RTM_GETRULE,
+            NLM_F_REQUEST_DUMP,
+            371,
+            &rule(RTNL_AF_INET, 254),
+        );
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict rule dump with a table was not DONE(-EINVAL)");
+        }
+        let mut body = rule(RTNL_AF_INET, 0);
+        push_nlattr(&mut body, 6, &0u32.to_ne_bytes()); // FRA_PRIORITY
+        let req = rtnl_request(RTM_GETRULE, NLM_F_REQUEST_DUMP, 372, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict rule dump with attributes was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(RTM_GETRULE, NLM_F_REQUEST_DUMP, 373, &rule(RTNL_AF_INET, 0));
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.len() != 3 || nl_status_of(done) != 0 {
+            return Err("strict IPv4 rule dump did not return the three default rules");
+        }
+        let req = rtnl_request(
+            RTM_GETRULE,
+            NLM_F_REQUEST_DUMP,
+            374,
+            &rule(RTNL_AF_PACKET, 0),
+        );
+        if dump_status(fd, &req)? != EAFNOSUPPORT {
+            return Err("strict rule dump of a family without rules was not -EAFNOSUPPORT");
+        }
+        close_fd(fd);
+        let fd = open_route(false)?;
+        let req = rtnl_request(RTM_GETRULE, NLM_F_REQUEST_DUMP, 375, &[RTNL_AF_PACKET]);
+        if dump_status(fd, &req)? != EAFNOSUPPORT {
+            return Err("legacy rule dump of a family without rules was not -EAFNOSUPPORT");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_rule_dump_validation
+);
+
+/// Traffic-control dumps have no strict validator: `tc_dump_qdisc` fails a
+/// short tcmsg (liberal `nlmsg_parse` → -EINVAL) and policy violations
+/// (-ERANGE), and dumps every device regardless of tcm_ifindex;
+/// `tc_dump_tfilter` treats a short tcmsg as empty; `tc_dump_action` needs
+/// a tcamsg.
+fn smoke_abi_netlink_route_tc_dump_validation() -> TestResult {
+    with_setup(|| {
+        let tcmsg = |ifindex: i32| {
+            let mut b = alloc::vec![0u8, 0, 0, 0];
+            b.extend_from_slice(&ifindex.to_ne_bytes());
+            b.extend_from_slice(&[0u8; 12]);
+            b
+        };
+        let fd = open_route(false)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETQDISC, 380))? != EINVAL {
+            return Err("short tcmsg qdisc dump was not DONE(-EINVAL)");
+        }
+        let mut body = tcmsg(0);
+        push_nlattr(&mut body, 10, &[1, 0, 0, 0]); // TCA_DUMP_INVISIBLE is a flag
+        let req = rtnl_request(RTM_GETQDISC, NLM_F_REQUEST_DUMP, 381, &body);
+        if dump_status(fd, &req)? != ERANGE {
+            return Err("qdisc dump with a non-empty flag attribute was not DONE(-ERANGE)");
+        }
+        let req = rtnl_request(RTM_GETQDISC, NLM_F_REQUEST_DUMP, 382, &tcmsg(0x0FFF_FFFF));
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("qdisc dump treated tcm_ifindex as a filter");
+        }
+        if dump_status(fd, &rtnl_dump_request(RTM_GETTFILTER, 383))? != 0 {
+            return Err("short tcmsg filter dump was not an empty dump");
+        }
+        if dump_status(fd, &rtnl_dump_request(RTM_GETACTION, 384))? != EINVAL {
+            return Err("short tcamsg action dump was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(RTM_GETACTION, NLM_F_REQUEST_DUMP, 385, &[0, 0, 0, 0]);
+        if dump_status(fd, &req)? != 0 {
+            return Err("tcamsg action dump was not an empty dump");
+        }
+        let req = rtnl_request(RTM_GETTCLASS, NLM_F_REQUEST_DUMP, 386, &tcmsg(1));
+        if dump_status(fd, &req)? != 0 {
+            return Err("class dump was not an empty dump");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_tc_dump_validation
+);
+
+/// Families without a dumpit fail before the dump starts:
+/// RTM_GETADDRLABEL is registered only for PF_INET6 and RTM_GETMDB only for
+/// PF_BRIDGE, so any other family is NLMSG_ERROR(-EOPNOTSUPP). With the
+/// right family the strict validators run inside the dump.
+fn smoke_abi_netlink_route_family_only_dumps() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        for (msg_type, family) in [
+            (RTM_GETADDRLABEL, RTNL_AF_UNSPEC),
+            (RTM_GETADDRLABEL, RTNL_AF_INET),
+            (RTM_GETMDB, RTNL_AF_UNSPEC),
+            (RTM_GETMDB, RTNL_AF_INET6),
+        ] {
+            let body = [family, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let replies =
+                rtnl_exchange(fd, &rtnl_request(msg_type, NLM_F_REQUEST_DUMP, 390, &body))?;
+            if replies.len() != 1
+                || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+                || nl_status_of(&replies[0]) != EOPNOTSUPP
+            {
+                return Err("dump of an unregistered family was not NLMSG_ERROR(-EOPNOTSUPP)");
+            }
+        }
+        // ip6addrlbl_valid_dump_req: ifal_index must be zero; no trailing data.
+        let mut body = alloc::vec![RTNL_AF_INET6, 0, 0, 0];
+        body.extend_from_slice(&1u32.to_ne_bytes());
+        body.extend_from_slice(&0u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETADDRLABEL, NLM_F_REQUEST_DUMP, 391, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict addrlabel dump with ifal_index was not DONE(-EINVAL)");
+        }
+        let body = [RTNL_AF_INET6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let req = rtnl_request(RTM_GETADDRLABEL, NLM_F_REQUEST_DUMP, 392, &body);
+        if dump_status(fd, &req)? != 0 {
+            return Err("strict addrlabel dump rejected a valid request");
+        }
+        // rtnl_mdb_valid_dump_req: ifindex filtering is not supported.
+        let mut body = alloc::vec![RTNL_AF_BRIDGE, 0, 0, 0];
+        body.extend_from_slice(&1u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETMDB, NLM_F_REQUEST_DUMP, 393, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict mdb dump with ifindex was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(
+            RTM_GETMDB,
+            NLM_F_REQUEST_DUMP,
+            394,
+            &[RTNL_AF_BRIDGE, 0, 0, 0, 0, 0, 0, 0],
+        );
+        if dump_status(fd, &req)? != 0 {
+            return Err("strict mdb dump rejected a valid request");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_family_only_dumps
+);
+
+/// `nh_valid_dump_req` parses with NL_VALIDATE_STRICT whether or not the
+/// socket asked for strict checking, and accepts every family.
+fn smoke_abi_netlink_route_nexthop_dump_validation() -> TestResult {
+    with_setup(|| {
+        let nhmsg = |family: u8, scope: u8, flags: u32| {
+            let mut b = alloc::vec![family, scope, 0, 0];
+            b.extend_from_slice(&flags.to_ne_bytes());
+            b
+        };
+        for strict in [false, true] {
+            let fd = open_route(strict)?;
+            for family in [RTNL_AF_UNSPEC, RTNL_AF_INET, RTNL_AF_INET6] {
+                let req = rtnl_request(
+                    RTM_GETNEXTHOP,
+                    NLM_F_REQUEST_DUMP,
+                    400,
+                    &nhmsg(family, 0, 0),
+                );
+                if dump_status(fd, &req)? != 0 {
+                    return Err("nexthop dump rejected a valid request");
+                }
+            }
+            if dump_status(fd, &rtnl_dump_request(RTM_GETNEXTHOP, 401))? != EINVAL {
+                return Err("short nhmsg nexthop dump was not DONE(-EINVAL)");
+            }
+            for body in [nhmsg(RTNL_AF_INET, 1, 0), nhmsg(RTNL_AF_INET, 0, 1)] {
+                let req = rtnl_request(RTM_GETNEXTHOP, NLM_F_REQUEST_DUMP, 402, &body);
+                if dump_status(fd, &req)? != EINVAL {
+                    return Err("nexthop dump with header values was not DONE(-EINVAL)");
+                }
+            }
+            // NHA_OIF must be exactly four bytes (NL_VALIDATE_STRICT_ATTRS).
+            let mut body = nhmsg(RTNL_AF_INET, 0, 0);
+            push_nlattr(&mut body, 5, &[1, 0, 0, 0, 0, 0, 0, 0]);
+            let req = rtnl_request(RTM_GETNEXTHOP, NLM_F_REQUEST_DUMP, 403, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("nexthop dump with an 8-byte NHA_OIF was not DONE(-EINVAL)");
+            }
+            // NHA_ID is NLA_UNSPEC in the dump policy (NL_VALIDATE_UNSPEC).
+            let mut body = nhmsg(RTNL_AF_INET, 0, 0);
+            push_nlattr(&mut body, 1, &1u32.to_ne_bytes());
+            let req = rtnl_request(RTM_GETNEXTHOP, NLM_F_REQUEST_DUMP, 404, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("nexthop dump with NHA_ID was not DONE(-EINVAL)");
+            }
+            close_fd(fd);
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_nexthop_dump_validation
+);
+
+/// `rtnl_valid_getlink_req` (strict doit): only IFLA_IFNAME, IFLA_EXT_MASK,
+/// IFLA_TARGET_NETNSID, and IFLA_ALT_IFNAME are accepted; the doit's error is
+/// an NLMSG_ERROR (it is not a dump).
+fn smoke_abi_netlink_route_strict_getlink_doit_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 1, 0);
+        push_nlattr(&mut body, 4, &1500u32.to_ne_bytes()); // IFLA_MTU
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST, 410, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+            || nl_status_of(&replies[0]) != EINVAL
+        {
+            return Err("strict RTM_GETLINK doit with IFLA_MTU was not NLMSG_ERROR(-EINVAL)");
+        }
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 3, b"lo\0"); // IFLA_IFNAME
+        push_nlattr(&mut body, 29, &1u32.to_ne_bytes()); // IFLA_EXT_MASK
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST, 411, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != RTM_NEWLINK
+            || nl_seq_of(&replies[0]) != 411
+        {
+            return Err("strict RTM_GETLINK doit by IFLA_IFNAME did not return lo");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_getlink_doit_validation
 );
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
