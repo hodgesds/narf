@@ -5571,6 +5571,16 @@ fn boot_userspace_init() {
                     "flock_release_glibc",
                     narf_verification::NARF_FLOCK_RELEASE_SMOKE_GLIBC_ELF,
                 ),
+                // Every file kind has a Linux-shaped (st_dev, st_ino): pipefs,
+                // sockfs, the shared anon inode, pidfs, memfd, procfs/sysfs/devfs.
+                (
+                    "inode_identity_smoke",
+                    narf_verification::NARF_INODE_IDENTITY_SMOKE_ELF,
+                ),
+                (
+                    "inode_identity_glibc",
+                    narf_verification::NARF_INODE_IDENTITY_SMOKE_GLIBC_ELF,
+                ),
                 // poll/select/epoll on a raw-mode pty + inotify honour the
                 // timeout (fish's terminal-query wait), musl + glibc.
                 (

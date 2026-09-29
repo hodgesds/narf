@@ -3633,6 +3633,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("sigwake_wait_glibc", "sigwake-wait-ok"),
         ("flock_release_smoke", "flock-release-ok"),
         ("flock_release_glibc", "flock-release-ok"),
+        ("inode_identity_smoke", "inode-identity-ok"),
+        ("inode_identity_glibc", "inode-identity-ok"),
         ("tty_poll_timeout_smoke", "tty-poll-timeout-ok"),
         ("tty_poll_timeout_glibc", "tty-poll-timeout-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices

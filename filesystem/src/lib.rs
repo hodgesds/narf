@@ -80,6 +80,7 @@ pub mod fifo;
 pub mod fs_registry;
 pub mod fuse;
 pub mod fuse_conn;
+pub mod inode_id;
 pub mod memfs;
 pub mod mqueuefs;
 pub mod ntty;

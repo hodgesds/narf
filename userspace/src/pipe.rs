@@ -399,6 +399,10 @@ pub(crate) fn splice_from_source(
 /// future without holding the queue lock.
 #[derive(Debug)]
 struct PipeShared {
+    /// The pipe's pipefs inode, shared by both ends (`create_pipe_files`
+    /// makes one inode and two files on it): both ends fstat to the same
+    /// `(st_dev, st_ino)`, distinct from every other pipe.
+    id: narf_filesystem::inode_id::InodeId,
     queue: queue::Queue,
     publish: IrqSafeSpinLock<()>,
     /// Set when the write half is dropped. The read half observes
@@ -629,6 +633,7 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
 /// (`pipe2(O_DIRECT)`).
 pub fn pipe_pair_flags(packetized: bool) -> (Arc<PipeRead>, Arc<PipeWrite>) {
     let shared = Arc::new(PipeShared {
+        id: narf_filesystem::inode_id::PseudoFs::Pipe.new_inode(),
         queue: queue::Queue::new(PipeBufs::new()),
         publish: IrqSafeSpinLock::new(()),
         writer_closed: AtomicBool::new(false),
@@ -909,6 +914,17 @@ impl Drop for PipeWrite {
 }
 
 impl FileOps for PipeRead {
+    fn ino(&self) -> u64 {
+        self.shared.id.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.shared.id.dev,
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let mut q = self.shared.queue.lock_async().await;
@@ -1108,6 +1124,17 @@ impl FileOps for PipeRead {
 }
 
 impl FileOps for PipeWrite {
+    fn ino(&self) -> u64 {
+        self.shared.id.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.shared.id.dev,
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Reading the write end: EBADF on Linux (`fs/read_write.c::vfs_read`
         // FMODE_READ check — the pipe write end is opened O_WRONLY). The
