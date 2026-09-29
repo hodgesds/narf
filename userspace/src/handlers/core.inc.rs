@@ -16561,23 +16561,37 @@ pub(crate) fn thread_group_empty(task: u64) -> bool {
         .any(|t| t != task && process_state_key(t) == me)
 }
 
+/// The tasks a `which`/`who` selector names, for getpriority/setpriority and
+/// ioprio_get/ioprio_set. Linux visits THREADS, not processes: nice and
+/// ioprio are per-task state (`task_struct->static_prio`, `->io_context`).
+///
+/// ```text
+/// case PRIO_PROCESS: p = who ? find_task_by_vpid(who) : current;
+/// case PRIO_PGRP:    do_each_pid_thread(pgrp, PIDTYPE_PGID, p) { ... }
+/// case PRIO_USER:    for_each_process_thread(g, p) if (uid_eq(task_uid(p), uid) ...)
+/// ```
+///
+/// So PRIO_PROCESS names exactly one thread (a tid, the leader's included),
+/// and the group scopes expand to every thread of every matching process.
 pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> alloc::vec::Vec<u64> {
     let mut out = alloc::vec::Vec::new();
     match scope {
         WhoScope::Process => {
             if who == 0 {
-                out.push(process_state_key(caller));
+                out.push(caller);
                 return out;
             }
-            let Some(outer) = accept_pid_from(caller, who as u64) else {
+            // `find_task_by_vpid(who)`: any task in the caller's pid
+            // namespace. Mesa's util_queue renices each worker with
+            // `setpriority(PRIO_PROCESS, gettid(), 19)`.
+            let Some(task) = signal_tid_from_user(caller, who as u64) else {
                 return out;
             };
-            let t = process_state_key(proc_pid_to_tid(outer));
             // `find_task_by_vpid` returning NULL is the empty set —
-            // `proc_pid_to_tid` falls back to identity for an unregistered
-            // pid, so an existence check is what implements that.
-            if t == process_state_key(caller) || crate::task::task_get(t).is_some() {
-                out.push(t);
+            // `signal_tid_from_user` falls back to identity for an
+            // unregistered id, so an existence check implements that.
+            if task == caller || crate::task::task_get(task).is_some() {
+                out.push(task);
             }
         }
         WhoScope::Pgrp => {
@@ -16592,31 +16606,27 @@ pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> all
             };
             // The caller is checked explicitly because syscall-unit
             // fixtures need not populate the scheduler task registry.
-            let me = process_state_key(caller);
-            if read_pgid(me) == target {
-                out.push(me);
+            if read_pgid(process_state_key(caller)) == target {
+                out.push(caller);
             }
             for t in crate::task::task_ids() {
-                let key = process_state_key(t);
-                if key != me && read_pgid(key) == target && !out.contains(&key) {
-                    out.push(key);
+                if t != caller && read_pgid(process_state_key(t)) == target {
+                    out.push(t);
                 }
             }
         }
         WhoScope::User => {
-            let me = process_state_key(caller);
             let target_uid = if who == 0 {
-                read_uidgid(me).uid
+                read_uidgid(process_state_key(caller)).uid
             } else {
                 who as u32
             };
-            if read_uidgid(me).uid == target_uid {
-                out.push(me);
+            if read_uidgid(process_state_key(caller)).uid == target_uid {
+                out.push(caller);
             }
             for t in crate::task::task_ids() {
-                let key = process_state_key(t);
-                if key != me && read_uidgid(key).uid == target_uid && !out.contains(&key) {
-                    out.push(key);
+                if t != caller && read_uidgid(process_state_key(t)).uid == target_uid {
+                    out.push(t);
                 }
             }
         }
@@ -16665,12 +16675,11 @@ fn read_nice(task: u64) -> i32 {
 #[inline]
 fn read_current_nice() -> i32 {
     // Match Linux's `p = current; task_nice(p)` fast branch. When the sparse
-    // store is empty, the current task's process key cannot affect the answer,
-    // so avoid both task↔pid map lookups as well as NICE_TABLE itself.
+    // store is empty no task has a custom nice, so skip NICE_TABLE itself.
     if NICE_CUSTOM_ROWS.load(Ordering::Acquire) == 0 {
         return 0;
     }
-    read_nice(process_state_key(current_task_id()))
+    read_nice(current_task_id())
 }
 fn write_nice(task: u64, prio: i32) -> bool {
     let mut g = NICE_TABLE.lock();
@@ -16693,7 +16702,7 @@ fn write_nice(task: u64, prio: i32) -> bool {
 /// Linux permission checks so sparse default-row removal can be verified.
 #[doc(hidden)]
 pub fn __test_write_current_nice(prio: i32) -> bool {
-    write_nice(process_state_key(current_task_id()), prio)
+    write_nice(current_task_id(), prio)
 }
 
 
