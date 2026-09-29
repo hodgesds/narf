@@ -206,7 +206,9 @@ impl Drop for DriCardFile {
         // drm_master_release: if this fd held DRM master, drop it so the device
         // is free for the next session's SET_MASTER (greeter→user handoff).
         if let Some(ms) = crate::drm_registry::mode_state(self.index) {
-            ms.lock().master_release(self.open_id);
+            let mut ms = ms.lock();
+            ms.master_release(self.open_id);
+            ms.magic_release(self.open_id);
         }
         // Last master node closed → release the framebuffer back to the
         // kernel console (no-op if a DRM client never took it over).

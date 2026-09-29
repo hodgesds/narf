@@ -1589,6 +1589,129 @@ fn smoke_drm_master_autodrop_on_close() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_master_autodrop_on_close);
 
+/// GET_MAGIC / AUTH_MAGIC follow `drm_auth.c` + `drm_ioctl_permit`: AUTH_MAGIC
+/// is DRM_MASTER-only (EACCES for a non-master or render caller), EINVAL for a
+/// magic no open holds, one-shot per magic, and EFAULT on a bad arg ahead of
+/// the permission check. The load-bearing case is libdrm's `drmIsMaster()` =
+/// `drmAuthMagic(fd, 0) != -EACCES`: on a non-master fd it must see EACCES, or
+/// kwin's createNonMasterFd() runs DROP_MASTER on it, fails, and kills the
+/// Xwayland connection that asked for a wp_drm_lease_device_v1 fd.
+#[allow(dead_code)]
+fn smoke_drm_auth_magic_master_gate() -> TestResult {
+    let idx = register_test_card_unmastered();
+    let set_master = ioc(0, DRM_IOCTL_BASE, 0x1E, 0);
+    let get_magic = ioc(IOC_READ, DRM_IOCTL_BASE, 0x02, 4);
+    let auth_magic = ioc(IOC_WRITE, DRM_IOCTL_BASE, 0x11, 4);
+    const A: u64 = 0x0A33;
+    const B: u64 = 0x0B44;
+    let call = |open_id: u64, cmd: u32, magic: &mut u32, render: bool| {
+        crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open_id,
+            cmd,
+            magic as *mut u32 as usize,
+            render,
+        )
+    };
+
+    if crate::drm_ioctl_bridge::dispatch_card(idx, A, set_master, 0, false) != Ok(0) {
+        return TestResult::Fail("A SET_MASTER on a free device should succeed");
+    }
+    // GET_MAGIC: a stable, non-zero, per-open token.
+    let (mut mb, mut mb2, mut ma) = (0u32, 0u32, 0u32);
+    if call(B, get_magic, &mut mb, false) != Ok(0) || mb == 0 {
+        return TestResult::Fail("GET_MAGIC on a primary fd should return a non-zero magic");
+    }
+    if call(B, get_magic, &mut mb2, false) != Ok(0) || mb2 != mb {
+        return TestResult::Fail("a repeat GET_MAGIC should return the same magic");
+    }
+    if call(A, get_magic, &mut ma, false) != Ok(0) || ma == 0 || ma == mb {
+        return TestResult::Fail("each open should get its own magic");
+    }
+    // drmIsMaster() on the non-master: AUTH_MAGIC(0) must be EACCES.
+    let mut zero = 0u32;
+    if call(B, auth_magic, &mut zero, false) != Err(FsError::PermissionDenied) {
+        return TestResult::Fail("non-master AUTH_MAGIC(0) should be EACCES (drmIsMaster)");
+    }
+    let mut mb_copy = mb;
+    if call(B, auth_magic, &mut mb_copy, false) != Err(FsError::PermissionDenied) {
+        return TestResult::Fail("non-master AUTH_MAGIC of a live magic should be EACCES");
+    }
+    // drmIsMaster() on the master: magic 0 is never issued → EINVAL.
+    let mut zero = 0u32;
+    if call(A, auth_magic, &mut zero, false) != Err(FsError::InvalidData) {
+        return TestResult::Fail("master AUTH_MAGIC(0) should be EINVAL");
+    }
+    let mut unknown = 0x7fff_fff0u32;
+    if call(A, auth_magic, &mut unknown, false) != Err(FsError::InvalidData) {
+        return TestResult::Fail("master AUTH_MAGIC of an unissued magic should be EINVAL");
+    }
+    // The master authenticates B's magic exactly once.
+    let mut mb_copy = mb;
+    if call(A, auth_magic, &mut mb_copy, false) != Ok(0) {
+        return TestResult::Fail("master AUTH_MAGIC of a live magic should succeed");
+    }
+    let mut mb_copy = mb;
+    if call(A, auth_magic, &mut mb_copy, false) != Err(FsError::InvalidData) {
+        return TestResult::Fail("a consumed magic should not authenticate twice (EINVAL)");
+    }
+    // B keeps its magic after being authenticated (drm_file::magic persists).
+    let mut mb3 = 0u32;
+    if call(B, get_magic, &mut mb3, false) != Ok(0) || mb3 != mb {
+        return TestResult::Fail("GET_MAGIC after auth should still return the open's magic");
+    }
+    // Arg copy precedes the permission check: NULL is EFAULT even for B.
+    if crate::drm_ioctl_bridge::dispatch_card(idx, B, auth_magic, 0, false)
+        != Err(FsError::BadAddress)
+    {
+        return TestResult::Fail("AUTH_MAGIC with a NULL arg should be EFAULT before EACCES");
+    }
+    if crate::drm_ioctl_bridge::dispatch_card(idx, A, get_magic, 0, false)
+        != Err(FsError::BadAddress)
+    {
+        return TestResult::Fail("GET_MAGIC with a NULL arg should be EFAULT");
+    }
+    // Render clients: neither ioctl is DRM_RENDER_ALLOW → EACCES; GET_MAGIC
+    // still copies the zeroed kdata back.
+    let mut r = 0xffff_ffffu32;
+    if call(A, get_magic, &mut r, true) != Err(FsError::PermissionDenied) || r != 0 {
+        return TestResult::Fail("render-node GET_MAGIC should be EACCES and write 0");
+    }
+    let mut zero = 0u32;
+    if call(A, auth_magic, &mut zero, true) != Err(FsError::PermissionDenied) {
+        return TestResult::Fail("render-node AUTH_MAGIC should be EACCES");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_auth_magic_master_gate);
+
+/// Closing an open forgets its magic (`drm_file_free`), so a stale token
+/// cannot authenticate a later open that happens to reuse the open id.
+#[allow(dead_code)]
+fn smoke_drm_magic_released_on_close() -> TestResult {
+    let idx = register_test_card();
+    let auth_magic = ioc(IOC_WRITE, DRM_IOCTL_BASE, 0x11, 4);
+    let ms = match crate::drm_registry::mode_state(idx) {
+        Some(ms) => ms,
+        None => return TestResult::Fail("test card has no mode state"),
+    };
+    const C: u64 = 0x0C55;
+    let magic = ms.lock().get_magic(C);
+    ms.lock().magic_release(C);
+    let mut m = magic;
+    match crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID,
+        auth_magic,
+        &mut m as *mut u32 as usize,
+        false,
+    ) {
+        Err(FsError::InvalidData) => TestResult::Pass,
+        _ => TestResult::Fail("a closed open's magic should no longer authenticate"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_magic_released_on_close);
+
 // Anchor the kernel-test framework imports so the kernel-test feature
 // doesn't trip a "use never used" warning on cfg-out builds.
 const _USE_STRING: Option<String> = None;

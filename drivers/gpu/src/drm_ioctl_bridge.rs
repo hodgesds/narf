@@ -1821,22 +1821,45 @@ pub(crate) fn dispatch_card_for_file(
                 Err(_) => Err(FsError::InvalidData), // → EINVAL
             }
         }
-        // GET_MAGIC / AUTH_MAGIC — the DRM magic-token dance a compositor
-        // does to confirm it's authenticated on its GPU fd. A primary-node fd
-        // IS the authenticated master here, so hand back a fixed non-zero
-        // magic (drm_auth.magic = u32 @ offset 0) and accept the auth. Without
-        // these the ioctls fell through to the generic path → UnknownCmd →
-        // ENOTTY, and kwin aborted: "Failed to authenticate the drm magic
-        // token ... Not a tty" — right after TakeDevice handed it the fd.
+        // GET_MAGIC (_IOR) — this open's magic token (`drm_getmagic`).
+        // Render clients are refused: neither magic ioctl carries
+        // DRM_RENDER_ALLOW, so `drm_ioctl_permit` returns EACCES. `drm_ioctl`
+        // still copies the (zeroed) kdata back afterwards, and a faulting
+        // copy-out overrides the return code with EFAULT.
         IoctlCmd::GetMagic => {
-            if arg != 0 {
-                // SAFETY: `arg` is the user drm_auth ptr; copy_out
-                // range-validates it and SMAP-brackets the 4-byte write.
-                unsafe { copy_out(arg, &1u32.to_le_bytes())? };
-            }
-            Ok(0)
+            let (magic, ret) = if ctx.is_render_client() {
+                (0u32, Err(FsError::PermissionDenied))
+            } else {
+                (mode_state.lock().get_magic(open_id), Ok(0))
+            };
+            // SAFETY: `arg` is the user drm_auth ptr; copy_out rejects NULL
+            // and SMAP-brackets the 4-byte write.
+            unsafe { copy_out(arg, &magic.to_le_bytes())? };
+            ret
         }
-        IoctlCmd::AuthMagic => Ok(0),
+        // AUTH_MAGIC (_IOW) is DRM_MASTER-only. `drm_ioctl` copies the arg in
+        // first (EFAULT), then `drm_ioctl_permit` refuses a non-master or
+        // render caller (EACCES), then `drm_authmagic` returns EINVAL for a
+        // magic no open holds. libdrm's `drmIsMaster()` is literally
+        // `drmAuthMagic(fd, 0) != -EACCES`, so accepting every call made each
+        // fd look like master: kwin's createNonMasterFd() then ran DROP_MASTER
+        // on a non-master fd, got EINVAL, and answered Xwayland's
+        // wp_drm_lease_device_v1 bind with an invalid drm_fd — which libwayland
+        // cannot marshal, so kwin dropped the client and Xwayland exited on EOF.
+        IoctlCmd::AuthMagic => {
+            // SAFETY: `arg` is the user drm_auth ptr; copy_in rejects NULL
+            // and SMAP-brackets the 4-byte read.
+            let auth = unsafe { copy_in(arg, 4)? };
+            if ctx.is_render_client() || !mode_state.lock().is_master(open_id) {
+                return Err(FsError::PermissionDenied);
+            }
+            let magic = u32::from_le_bytes([auth[0], auth[1], auth[2], auth[3]]);
+            if mode_state.lock().auth_magic(magic) {
+                Ok(0)
+            } else {
+                Err(FsError::InvalidData) // → EINVAL
+            }
+        }
         // SET_CLIENT_CAP — opt into UAPI behaviours. We accept
         // UNIVERSAL_PLANES (weston REQUIRES it — it enumerates the
         // primary plane through the universal-planes UAPI) but reject

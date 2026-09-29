@@ -416,6 +416,16 @@ pub struct Card {
     /// model, which let a greeter and a user-session compositor both drive the
     /// same scanout with no handoff.
     pub(crate) current_master: Option<u64>,
+    /// Issued DRM magic tokens: `(magic, open_id, authenticated)`. One magic
+    /// per open, allocated on its first `GET_MAGIC` and kept for the life of
+    /// the fd (a repeat `GET_MAGIC` returns the same value). `AUTH_MAGIC`
+    /// consumes an entry by setting `authenticated`, so the same magic cannot
+    /// authenticate twice. Linux analogue: `drm_master::magic_map` (an idr
+    /// based at 1) plus `drm_file::magic`.
+    magics: Vec<(u32, u64, bool)>,
+    /// Next magic to hand out. Starts at 1: magic 0 is never valid, matching
+    /// `idr_init_base(&master->magic_map, 1)`.
+    next_magic: u32,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -478,6 +488,8 @@ impl Card {
             vblank_seq: 0,
             next_vblank_ns: 0,
             current_master: None,
+            magics: Vec::new(),
+            next_magic: 1,
         }
     }
 
@@ -536,6 +548,37 @@ impl Card {
         if self.current_master == Some(open_id) {
             self.current_master = None;
         }
+    }
+
+    /// `DRM_IOCTL_GET_MAGIC`: this open's magic token, allocated on first use.
+    /// Mirrors `drm_getmagic`, which reuses `file_priv->magic` once set.
+    pub fn get_magic(&mut self, open_id: u64) -> u32 {
+        if let Some(&(magic, _, _)) = self.magics.iter().find(|m| m.1 == open_id) {
+            return magic;
+        }
+        let magic = self.next_magic;
+        self.next_magic = self.next_magic.wrapping_add(1).max(1);
+        self.magics.push((magic, open_id, false));
+        magic
+    }
+
+    /// `DRM_IOCTL_AUTH_MAGIC` body, run only for the current master: marks the
+    /// open holding `magic` authenticated. `false` (→ `EINVAL`) when no open
+    /// holds it or it was already consumed. Mirrors `drm_authmagic`, whose
+    /// `idr_replace(.., NULL, magic)` makes a second auth of one magic fail.
+    pub fn auth_magic(&mut self, magic: u32) -> bool {
+        match self.magics.iter_mut().find(|m| m.0 == magic && !m.2) {
+            Some(entry) => {
+                entry.2 = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `drm_file_free`: forget a closing open's magic.
+    pub fn magic_release(&mut self, open_id: u64) {
+        self.magics.retain(|m| m.1 != open_id);
     }
 
     /// Refresh rate (Hz) of a CRTC's currently programmed mode, for vblank
