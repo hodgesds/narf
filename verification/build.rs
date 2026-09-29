@@ -618,6 +618,7 @@ fn main() {
         "tty_poll_timeout_smoke",
         "pty_wake_smoke",
         "proc_fd_magiclink_smoke",
+        "setuid_exec_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
@@ -715,6 +716,7 @@ fn main() {
         "tty_poll_timeout_smoke",
         "pty_wake_smoke",
         "proc_fd_magiclink_smoke",
+        "setuid_exec_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
     ] {

@@ -5608,6 +5608,17 @@ fn boot_userspace_init() {
                     "proc_fd_magiclink_glibc",
                     narf_verification::NARF_PROC_FD_MAGICLINK_SMOKE_GLIBC_ELF,
                 ),
+                // execve of a set-user-ID / set-group-ID binary: the
+                // credential transition, AT_SECURE, dumpability, and every
+                // guard (nosuid, no_new_privs, chroot), musl + glibc.
+                (
+                    "setuid_exec_smoke",
+                    narf_verification::NARF_SETUID_EXEC_SMOKE_ELF,
+                ),
+                (
+                    "setuid_exec_glibc",
+                    narf_verification::NARF_SETUID_EXEC_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

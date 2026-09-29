@@ -3641,6 +3641,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("pty_wake_glibc", "pty-wake-ok"),
         ("proc_fd_magiclink_smoke", "proc-fd-magiclink-ok"),
         ("proc_fd_magiclink_glibc", "proc-fd-magiclink-ok"),
+        // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
+        ("setuid_exec_smoke", "setuid-exec-ok"),
+        ("setuid_exec_glibc", "setuid-exec-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),
