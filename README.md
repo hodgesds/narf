@@ -1,4 +1,6 @@
 # NARF
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/c8d57a15-785b-4753-8351-3b75b3221db8" />
+
 
 **A framekernel with first-class Linux compatibility.**
 
