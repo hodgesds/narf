@@ -3597,6 +3597,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // for the permanent broadcast-waiter strand (requeue silently
         // dropped + the park loop never re-reading the futex word).
         ("condbcast_smoke", "condbcast-ok"),
+        // fork() racing condvar handoffs to file-I/O worker threads — the
+        // Xwayland/Mesa disk-cache wedge that froze kwin under Plasma.
+        ("forkcond_smoke", "forkcond-ok"),
         // Contended futex (N-thread mutex + join + condvar ping-pong).
         // Back in the shared-boot batch at the FULL 16-vCPU/2-socket-NUMA
         // topology: the strand class that forced its SMP=1 pin is fixed

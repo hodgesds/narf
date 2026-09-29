@@ -608,6 +608,7 @@ fn main() {
         "futex_contend_smoke",
         "futex_wakeop_smoke",
         "condbcast_smoke",
+        "forkcond_smoke",
         "notify_epoll_smp_smoke",
         "keyring_smoke",
         "inotify2_smoke",

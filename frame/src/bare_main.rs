@@ -5518,6 +5518,8 @@ fn boot_userspace_init() {
                     "condbcast_smoke",
                     narf_verification::NARF_CONDBCAST_SMOKE_ELF,
                 ),
+                // fork() racing condvar handoffs to file-I/O worker threads.
+                ("forkcond_smoke", narf_verification::NARF_FORKCOND_SMOKE_ELF),
                 // Systemd-style READY=1 datagram: a CPU-1 service wakes the
                 // CPU-0 manager's blocking epoll_wait and supplies SCM_CREDENTIALS.
                 (
