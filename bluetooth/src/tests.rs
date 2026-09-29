@@ -5151,6 +5151,20 @@ fn smoke_btintel_firmware_runs_after_firmware_scans() -> TestResult {
             );
         }
     }
+
+    // And the bring-up pass has to come after the download, since it
+    // acts on whatever transports are registered by then. Inverted,
+    // it would find an empty registry and silently bring nothing up.
+    // Required, not optional: bare_main registers it unconditionally,
+    // so its absence means the boot path lost the pass entirely.
+    let Some(bringup) = pos("bluetooth-bringup") else {
+        return TestResult::Fail("bluetooth-bringup is not registered; nothing drives bring-up");
+    };
+    if bringup < download {
+        return TestResult::Fail(
+            "bluetooth-bringup runs before btintel-pcie-firmware; no transport to bring up",
+        );
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -5288,4 +5302,127 @@ fn smoke_btintel_transport_queues_are_bounded() -> TestResult {
 kernel_test_in!(
     "bluetooth/btintel_pcie",
     smoke_btintel_transport_queues_are_bounded
+);
+
+/// Seed a loopback transport with the canned Command Complete run the
+/// Mandatory bring-up sequence consumes.
+fn seed_bringup_sequence(lt: &LoopbackTransport, bd_addr: [u8; 6]) {
+    lt.enqueue_event(make_command_complete(op::HCI_RESET, 0x00, &[]));
+    lt.enqueue_event(make_command_complete(
+        op::HCI_READ_LOCAL_VERSION,
+        0x00,
+        &[0x0C, 0x10, 0x00, 0x0C, 0xAA, 0xBB, 0x01, 0x00],
+    ));
+    lt.enqueue_event(make_command_complete(op::HCI_READ_BD_ADDR, 0x00, &bd_addr));
+    lt.enqueue_event(make_command_complete(
+        op::HCI_READ_BUFFER_SIZE,
+        0x00,
+        &[0x40, 0x01, 0x40, 0x10, 0x00, 0x08, 0x00],
+    ));
+    lt.enqueue_event(make_command_complete(op::HCI_SET_EVENT_MASK, 0x00, &[]));
+}
+
+/// `bring_up_all` is what turns a registered transport into a usable
+/// adapter at boot. It has to be idempotent — it runs from an
+/// initcall, and a driver may already have brought its own controller
+/// up — and one dead transport must not keep the others offline.
+fn smoke_bluetooth_bring_up_all_is_idempotent() -> TestResult {
+    use crate::bootstrap_bluetooth_authority;
+    use crate::controller::{__test_reset_controllers, bring_up_all, controller_count};
+
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+
+    let lt = Arc::new(LoopbackTransport::new("bringup-a"));
+    seed_bringup_sequence(&lt, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    crate::transport::register(lt.clone());
+
+    let cap = bootstrap_bluetooth_authority();
+    let first = bring_up_all(&cap);
+    if first.len() != 1 {
+        return TestResult::Fail("one registered transport should produce one outcome");
+    }
+    if first[0].result.is_err() {
+        return TestResult::Fail("the seeded loopback should bring up cleanly");
+    }
+    if controller_count() != 1 {
+        return TestResult::Fail("a successful bring-up should register its controller");
+    }
+    match &first[0].result {
+        Ok(info) if info.bd_addr == [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF] => {}
+        _ => return TestResult::Fail("BD_ADDR should be captured from the sequence"),
+    }
+
+    // Second pass: the transport is already backed by a controller, so
+    // there is nothing to do. If this re-ran, it would HCI_Reset a
+    // working adapter — and the loopback's inbox is empty now, so it
+    // would also fail and be reported as a broken controller.
+    let second = bring_up_all(&cap);
+    if !second.is_empty() {
+        return TestResult::Fail("an already-brought-up transport must be skipped");
+    }
+    if controller_count() != 1 {
+        return TestResult::Fail("the second pass must not add another controller");
+    }
+
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/controller",
+    smoke_bluetooth_bring_up_all_is_idempotent
+);
+
+/// A controller that refuses its very first command must not stop the
+/// next one from coming up. Boot order is not a priority order, and a
+/// dongle that does not answer should not keep an onboard controller
+/// offline.
+fn smoke_bluetooth_bring_up_all_isolates_failures() -> TestResult {
+    use crate::bootstrap_bluetooth_authority;
+    use crate::controller::{__test_reset_controllers, bring_up_all, controller_count};
+
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+
+    // Registered first, and fails immediately: HCI_Reset comes back
+    // with a non-zero status rather than timing out, so the smoke
+    // does not spend the controller's multi-second event budget.
+    let bad = Arc::new(LoopbackTransport::new("bringup-bad"));
+    bad.enqueue_event(make_command_complete(op::HCI_RESET, 0x12, &[]));
+    crate::transport::register(bad.clone());
+
+    let good = Arc::new(LoopbackTransport::new("bringup-good"));
+    seed_bringup_sequence(&good, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    crate::transport::register(good.clone());
+
+    let cap = bootstrap_bluetooth_authority();
+    let outcomes = bring_up_all(&cap);
+
+    if outcomes.len() != 2 {
+        return TestResult::Fail("both transports should be attempted");
+    }
+    if outcomes[0].result.is_ok() {
+        return TestResult::Fail("the transport rejecting HCI_Reset should fail");
+    }
+    if outcomes[1].result.is_err() {
+        return TestResult::Fail("a failure on the first transport must not stop the second");
+    }
+    match &outcomes[1].result {
+        Ok(info) if info.bd_addr == [0x11, 0x22, 0x33, 0x44, 0x55, 0x66] => {}
+        _ => return TestResult::Fail("the second controller's BD_ADDR should be captured"),
+    }
+    // Only the working one is registered; a failed bring-up leaves
+    // nothing behind for the stack to try to use.
+    if controller_count() != 1 {
+        return TestResult::Fail("only the successful controller should be registered");
+    }
+
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/controller",
+    smoke_bluetooth_bring_up_all_isolates_failures
 );
