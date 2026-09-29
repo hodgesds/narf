@@ -493,6 +493,12 @@ struct MuslDemoArgs {
     #[arg(long)]
     group: Option<String>,
 
+    /// Run only these cases, by exact command name (comma-separated, e.g.
+    /// `--smoke sigwake_wait_smoke,sigwake_wait_glibc`). Combines with
+    /// `--group`; a name that matches no case is an error.
+    #[arg(long = "smoke", value_delimiter = ',')]
+    smoke: Vec<String>,
+
     /// Print the JSON array of subsystem groups (the CI matrix consumes
     /// this) and exit without booting.
     #[arg(long)]
@@ -3772,6 +3778,17 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     };
     let kernel_override = prebuilt.as_deref();
 
+    // A typo'd `--smoke` name must fail loudly instead of running nothing.
+    for name in &args.smoke {
+        if !lightweight
+            .iter()
+            .chain(GUI_FRESH_BOOT.iter())
+            .any(|(cmd, _)| cmd == name)
+        {
+            bail!("--smoke: no musl-demo case named `{name}`");
+        }
+    }
+
     // Select this invocation's group (or all groups when unset).
     let want = |cmd: &str| {
         (cmd != "userns_smoke" || args.build.features.split(',').any(|f| f == "container"))
@@ -3779,6 +3796,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
                 .group
                 .as_deref()
                 .is_none_or(|g| musl_case_group(cmd) == g)
+            && (args.smoke.is_empty() || args.smoke.iter().any(|name| name == cmd))
     };
     if let Some(g) = &args.group {
         eprintln!("xtask musl-demo: running subsystem group `{g}`");
