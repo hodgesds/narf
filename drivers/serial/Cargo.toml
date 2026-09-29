@@ -25,5 +25,12 @@ narf-console      = { path = "../../console" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
+[features]
+# The smokes in `src/tests.rs` compile unconditionally (they are pure
+# data checks, safe to link everywhere). The feature exists so the
+# kernel image can forward `kernel-test` uniformly to every driver
+# crate without a special case here.
+kernel-test = []
+
 [lints]
 workspace = true

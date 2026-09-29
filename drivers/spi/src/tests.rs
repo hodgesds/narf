@@ -35,13 +35,26 @@ use crate::{registry, SpiBus, SpiError, SpiMode};
 
 // ── Synthetic MMIO backing ────────────────────────────────────────
 //
-// 512-byte zeroed buffer — well above the AMD FIFO_BASE + FIFO_DEPTH
-// (0x80 + 64 = 0xC0) and the Intel SSDR offset (0x10).
+// One page of zeroed memory. It has to cover the *highest* register
+// any driver under test touches, not just the FIFOs:
+//
+//   AMD FCH   FIFO_BASE + FIFO_DEPTH  = 0x80 + 64 = 0x0C0
+//   Intel SSP SSDR                    =             0x010
+//   Intel LPSS private block          = 0x800 + 0x38 = 0x838
+//
+// The LPSS private block is the binding constraint. A region that
+// stops short of it makes `IntelLpssSpi::init` skip the clock-gate
+// write (it is guarded on `mmio_len`), and any test that then reads
+// 0x838 back is reading past the end of the allocation.
+const SYNTHETIC_MMIO_BYTES: usize = 4096;
 
 fn make_mmio() -> (PhysAddr, u64) {
-    let buf: Box<[u8; 512]> = Box::new([0u8; 512]);
+    let buf: Box<[u8; SYNTHETIC_MMIO_BYTES]> = Box::new([0u8; SYNTHETIC_MMIO_BYTES]);
     let raw = Box::leak(buf);
-    (PhysAddr::new(raw.as_ptr() as u64), 512)
+    (
+        PhysAddr::new(raw.as_ptr() as u64),
+        SYNTHETIC_MMIO_BYTES as u64,
+    )
 }
 
 // ── Fake echo-back SpiBus ─────────────────────────────────────────

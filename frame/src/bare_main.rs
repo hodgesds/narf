@@ -2961,6 +2961,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_fs_squashfs::register_initcalls();
             narf_drivers_fs_btrfs::register_initcalls();
             narf_drivers_platform::register_initcalls();
+            narf_drivers_serial::register_initcalls();
+            narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into
             // the system-power surface. Subscribers run in SCI

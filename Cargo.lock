@@ -1760,6 +1760,8 @@ dependencies = [
  "narf-drivers-nvme",
  "narf-drivers-platform",
  "narf-drivers-psp",
+ "narf-drivers-serial",
+ "narf-drivers-spi",
  "narf-drivers-storage",
  "narf-drivers-thunderbolt",
  "narf-drivers-usb",
