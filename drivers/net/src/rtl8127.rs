@@ -45,21 +45,31 @@
 //!    keeps the conservative 1536-byte RMS shared with the rest of the
 //!    family; raising it needs matching RX buffer sizing.
 //!
-//! ## Scope
+//! ## PHY bring-up
 //!
 //! [`PHY_CONFIG_TABLE`] is a complete, in-order transcription of
-//! `rtl8127a_1_hw_phy_config`. What Stage-1 does *not* yet do:
+//! `rtl8127a_1_hw_phy_config`, and [`phy`] applies it: the firmware
+//! patch first when `rtl_nic/rtl8127a-1.fw` is available, then the
+//! table. See that module for why there is no MDIO bus involved —
+//! every access is an address computation onto one OCP window.
 //!
-//! - **Apply** that table. It needs the paged-MDIO accessor the
-//!   PHY-config stage adds; the chip links up without it.
-//! - **EPHY / ASPM entry latency.** Linux's `rtl_hw_start_8127a` calls
-//!   `rtl_set_def_aspm_entry_latency` before the common path; Stage-1
-//!   leaves the firmware's ASPM programming alone.
+//! ## Scope
+//!
+//! What this still does not do:
+//!
+//! - **EPHY / ASPM entry latency.** Linux's `rtl_hw_start_8127a`
+//!   calls `rtl_set_def_aspm_entry_latency` before the common path;
+//!   this leaves the firmware's ASPM programming alone.
 //! - **SFP mode.** `rtl_sfp_init` runs only when `tp->sfp_mode` is
 //!   set. The MS-03's RTL8127 is an RJ45 copper port, so the
 //!   `r8127_sfp_init_10g` SerDes sequence is out of scope here.
+//! - **Link-speed reporting above 1G.** Unchanged: the PHYStatus
+//!   byte has no 10G bit, so the rate still needs an MDIO read even
+//!   now that one is available.
 
 #![allow(dead_code)]
+
+pub mod phy;
 
 mod tests;
 
@@ -1677,6 +1687,13 @@ impl Rtl8127Nic {
         // SAFETY: same.
         unsafe { mmio.write8(REG_9346CR, EEM_NORMAL) };
 
+        // 11. PHY: firmware patch, then the config table. Neither is
+        //     required for the link to come up, so a failure here is
+        //     reported and the controller is still handed back —
+        //     matching `r8169_apply_firmware`, which runs the blob
+        //     only if one was found and applies the table regardless.
+        configure_phy(&mmio);
+
         Ok(Self {
             mmio,
             tx_ring,
@@ -1869,6 +1886,94 @@ impl Rtl8127Nic {
         self.link_up = up;
         up
     }
+}
+
+/// Load the PHY firmware patch if it is present, then apply
+/// [`PHY_CONFIG_TABLE`].
+///
+/// Ordering matches Linux's `rtl8127a_1_hw_phy_config`, whose first
+/// statement is `r8169_apply_firmware`: the blob is a PHY-MCU patch
+/// and several table entries target registers it installs. Without
+/// it the table still programs everything it names, which is why a
+/// missing blob is a log line rather than an error.
+fn configure_phy(mmio: &MmioRegion) {
+    use core::fmt::Write as _;
+
+    let mut access = phy::PhyAccess::new(mmio);
+
+    match load_phy_firmware() {
+        Some(code) => match access.run_firmware(&code) {
+            Ok(()) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8127: applied {} ({} opcodes)",
+                    FIRMWARE_8127A_1,
+                    code.len(),
+                );
+            }
+            Err(e) => {
+                // The blob is a sequence of register writes; a
+                // failure partway leaves the PHY in an unknown state,
+                // so say so rather than silently continuing to the
+                // table on top of it.
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8127: firmware aborted at an opcode: {:?}; PHY may be partly patched",
+                    e,
+                );
+            }
+        },
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8127: {} not present; applying PHY config without it",
+                FIRMWARE_8127A_1,
+            );
+        }
+    }
+
+    if let Err(e) = access.apply_config_table(PHY_CONFIG_TABLE) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8127: PHY config table aborted: {:?}",
+            e
+        );
+    }
+}
+
+/// Fetch and parse `rtl_nic/rtl8127a-1.fw`, if the firmware registry
+/// has it.
+fn load_phy_firmware() -> Option<alloc::vec::Vec<u32>> {
+    use core::fmt::Write as _;
+
+    let auth = narf_firmware::trusted_loader_authority()?.derive().ok()?;
+    let cap = narf_firmware::open(FIRMWARE_8127A_1, &auth).ok()?;
+    let view = narf_firmware::view_of(&cap).ok()?;
+
+    let code = match phy::parse_firmware(view.bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8127: {} failed its format check: {:?}",
+                FIRMWARE_8127A_1,
+                e,
+            );
+            return None;
+        }
+    };
+    // Bounds-check every jump before touching a register, so a
+    // corrupt blob cannot run off the end mid-program.
+    if let Err(e) = phy::validate_firmware(&code) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8127: {} rejected: {:?}",
+            FIRMWARE_8127A_1,
+            e,
+        );
+        return None;
+    }
+    Some(code)
 }
 
 // ── Driver-match registration ────────────────────────────────────────
