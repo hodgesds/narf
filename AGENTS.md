@@ -330,3 +330,7 @@ implementer points them here.)
 
 Do not invent interfaces without updating the spec. Do not claim perf
 numbers without the statistical protocol. Do not merge your own PRs.
+
+## Commit message preference
+
+Do not include the originating user prompt in commit messages.
