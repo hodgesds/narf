@@ -284,6 +284,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         self.state.lock().inode_no as u64
     }
 
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move {
             let _ = self.load_inode().await?;
@@ -386,6 +393,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     fn ino(&self) -> u64 {
         self.state.lock().inode_no as u64
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {

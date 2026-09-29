@@ -290,6 +290,27 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         }
     }
 
+    /// `st_ino`. Linux (fs/fat/inode.c) numbers the root
+    /// `MSDOS_ROOT_INO` = 1 and finds every other inode by `i_pos`, the
+    /// position of its 32-byte directory entry on disk
+    /// (`fat_make_i_pos`: `b_blocknr << dir_per_block_bits | entry index`),
+    /// handing it an `iunique` number while the inode stays cached. NARF
+    /// has no inode cache to keep an `iunique` number stable across
+    /// lookups, so it reports `i_pos` itself: unique per entry on the
+    /// volume, never 0 or 1 (sector 0 is the boot sector, never a
+    /// directory), and the same on every lookup.
+    pub fn inode_number(&self) -> u64 {
+        const MSDOS_ROOT_INO: u64 = 1;
+        match self.entry_location {
+            None => MSDOS_ROOT_INO,
+            Some((lba, offset)) => {
+                let entries_per_sector =
+                    u64::from(self.volume.bpb.bytes_per_sec) / DIR_ENTRY_SIZE as u64;
+                lba * entries_per_sector + (offset / DIR_ENTRY_SIZE) as u64
+            }
+        }
+    }
+
     fn stat_from_entry(&self, entry: &RawDirEntry) -> Stat {
         let sector_size = self.volume.bpb.bytes_per_sec as u64;
         Stat {
@@ -697,6 +718,17 @@ impl<B: BlockDevice + 'static> FatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
+    fn ino(&self) -> u64 {
+        self.inode_number()
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
     /// inode — a FIFO or device node living in this filesystem dispatches
     /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
@@ -879,6 +911,17 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
+    fn ino(&self) -> u64 {
+        self.inode_number()
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     fn dcache_identity(&self) -> (usize, u64, u64) {
         (
             Arc::as_ptr(&self.volume) as *const () as usize,
