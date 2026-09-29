@@ -6328,6 +6328,18 @@ pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
+/// Copy a task's comm into `buf` without allocating (the OOM report runs when
+/// the heap may be exhausted). Returns the copied length; 0 if unknown.
+pub fn proc_comm_of_task_into(tid: u64, buf: &mut [u8; 16]) -> usize {
+    let g = PROC_COMM.lock();
+    let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
+        return 0;
+    };
+    let n = comm.len().min(buf.len());
+    buf[..n].copy_from_slice(&comm.as_bytes()[..n]);
+    n
+}
+
 /// `proc_comm_of_task` for callers running in the timer trap, which can
 /// interrupt a CPU already holding `PROC_COMM` — blocking there deadlocks
 /// the machine the caller is trying to observe. Returns `None` on
