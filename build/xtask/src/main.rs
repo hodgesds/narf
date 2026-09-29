@@ -3246,6 +3246,9 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 /// imprecise match only shifts load, never drops coverage). First match
 /// wins; order matters.
 fn musl_case_group(cmd: &str) -> &'static str {
+    if cmd == "userns_smoke" {
+        return "userns";
+    }
     let has = |needles: &[&str]| needles.iter().any(|n| cmd.contains(n));
     if has(&[
         "wl_",
@@ -3531,6 +3534,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("mremap_smoke", "mremap-ok"),
         ("sendfile_smoke", "sendfile-ok"),
         ("creds_smoke", "creds-ok"),
+        ("userns_smoke", "userns-ok"),
         ("waitid_smoke", "waitid-ok"),
         // Linux-compat round 3: ppoll, sysinfo, splice, membarrier+clock_getres.
         ("ppoll_smoke", "ppoll-ok"),
@@ -3693,7 +3697,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     // boot-flaky under GHA's TCG (multi-process fresh boots that
     // occasionally die before login), so they don't gate CI for now. Run
     // them by hand with `cargo xtask musl-demo --group gui`.
-    const CI_EXCLUDED_GROUPS: &[&str] = &["gui"];
+    // User namespaces run in nightly-oci with the container feature.
+    const CI_EXCLUDED_GROUPS: &[&str] = &["gui", "userns"];
     if args.list_groups {
         let mut groups: Vec<&str> = lightweight
             .iter()
@@ -3710,6 +3715,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
             .join(",");
         println!("[{json}]");
         return Ok(());
+    }
+
+    if args.group.as_deref() == Some("userns")
+        && !args.build.features.split(',').any(|f| f == "container")
+    {
+        bail!("--group=userns requires --features=container");
     }
 
     // Resolve the kernel once: a prebuilt artifact (the per-group CI jobs
@@ -3729,9 +3740,11 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
 
     // Select this invocation's group (or all groups when unset).
     let want = |cmd: &str| {
-        args.group
-            .as_deref()
-            .is_none_or(|g| musl_case_group(cmd) == g)
+        (cmd != "userns_smoke" || args.build.features.split(',').any(|f| f == "container"))
+            && args
+                .group
+                .as_deref()
+                .is_none_or(|g| musl_case_group(cmd) == g)
     };
     if let Some(g) = &args.group {
         eprintln!("xtask musl-demo: running subsystem group `{g}`");

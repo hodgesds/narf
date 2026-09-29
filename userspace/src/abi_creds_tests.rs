@@ -2052,8 +2052,7 @@ fn smoke_abi_userns_unprivileged_uid_map_cannot_claim_host_root() -> TestResult 
         narf_filesystem::procfs::install_ns_proc_hooks(
             crate::handlers::proc_ns_readlink,
             crate::handlers::proc_ns_mountinfo,
-            crate::handlers::proc_ns_idmap_render,
-            crate::handlers::proc_ns_idmap_write,
+            crate::handlers::proc_ns_idmap_open,
             crate::handlers::proc_ns_idmap_owners,
         );
         let base = alloc::format!("/proc_userns_{}", FAKE_TASK);
@@ -2117,6 +2116,9 @@ fn smoke_abi_userns_unprivileged_uid_map_cannot_claim_host_root() -> TestResult 
             )
             .ok_or("uid_map read returned a non-Ok syscall status")?;
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            if n < 0 || n as usize > rendered.len() {
+                return Err("uid_map read returned an invalid length");
+            }
             let text = core::str::from_utf8(&rendered[..n as usize])
                 .map_err(|_| "uid_map procfs read was not UTF-8")?;
             if text.split_whitespace().collect::<alloc::vec::Vec<_>>() != ["0", "1000", "1"] {
@@ -2563,4 +2565,234 @@ fn smoke_abi_creds_proc_hostname_is_uts_namespace() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_creds_proc_hostname_is_uts_namespace
+);
+
+/// Linux keeps kuids/kgids across set_cred_user_ns and maps only the ABI.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_preserves_identity_across_mapping() -> TestResult {
+    with_setup(|| {
+        let groups = [1000u32, 2000];
+        if call(Syscall::Setgroups.raw(), a1(2, groups.as_ptr() as u64)) != Some(0)
+            || call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Unshare.raw(), a0(0x1000_0000)) != Some(0)
+        {
+            return Err("identity regression setup failed");
+        }
+        for syscall in [
+            Syscall::GetUid,
+            Syscall::Geteuid,
+            Syscall::GetGid,
+            Syscall::Getegid,
+        ] {
+            if call(syscall.raw(), a0(0)) != Some(65534) {
+                return Err("unmapped credential was not reported as overflow");
+            }
+        }
+        let cred = crate::handlers::current_ucred();
+        if cred.uid != 1000 || cred.gid != 1000 || crate::handlers::current_groups() != groups {
+            return Err("unshare changed the underlying host identity");
+        }
+        let ns = crate::namespaces::current_user_ns(FAKE_TASK);
+        let uid_map = [crate::namespaces::IdMapEntry {
+            inner_start: 42,
+            outer_start: 1000,
+            count: 1,
+        }];
+        let gid_map = [crate::namespaces::IdMapEntry {
+            inner_start: 43,
+            outer_start: 1000,
+            count: 1,
+        }];
+        ns.write_uid_map(uid_map.to_vec())
+            .map_err(|_| "uid map setup failed")?;
+        ns.write_gid_map(gid_map.to_vec())
+            .map_err(|_| "gid map setup failed")?;
+        if call(Syscall::GetUid.raw(), a0(0)) != Some(42)
+            || call(Syscall::Geteuid.raw(), a0(0)) != Some(42)
+            || call(Syscall::GetGid.raw(), a0(0)) != Some(43)
+            || call(Syscall::Getegid.raw(), a0(0)) != Some(43)
+        {
+            return Err("mapping did not change the visible credential IDs");
+        }
+        let mut res = [0u32; 3];
+        for (syscall, expected) in [(Syscall::Getresuid, 42), (Syscall::Getresgid, 43)] {
+            if call(
+                syscall.raw(),
+                a2(
+                    res.as_mut_ptr() as u64,
+                    res.as_mut_ptr().wrapping_add(1) as u64,
+                    res.as_mut_ptr().wrapping_add(2) as u64,
+                ),
+            ) != Some(0)
+                || res != [expected; 3]
+            {
+                return Err("saved credentials did not survive namespace creation");
+            }
+        }
+        let mut reported_groups = [0u32; 2];
+        if call(
+            Syscall::Getgroups.raw(),
+            a1(2, reported_groups.as_mut_ptr() as u64),
+        ) != Some(2)
+            || reported_groups != [43, 65534]
+        {
+            return Err("supplementary groups did not retain their host identity");
+        }
+        if call(Syscall::SetUid.raw(), a0(42)) != Some(0)
+            || call(Syscall::SetGid.raw(), a0(43)) != Some(0)
+            || call(Syscall::SetUid.raw(), a0(1000)) != Some(-22)
+            || call(Syscall::SetGid.raw(), a0(1000)) != Some(-22)
+            || call(Syscall::Setfsuid.raw(), a0(u32::MAX as u64)) != Some(42)
+            || call(Syscall::Setfsgid.raw(), a0(u32::MAX as u64)) != Some(43)
+        {
+            return Err("credential setters did not translate mapped IDs");
+        }
+        let cred = crate::handlers::current_ucred();
+        if cred.uid != 1000 || cred.gid != 1000 {
+            return Err("setuid/setgid stored namespace IDs as host IDs");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns",
+    smoke_abi_userns_preserves_identity_across_mapping
+);
+
+#[cfg(feature = "container")]
+fn with_userns_proc(body: impl FnOnce(&str) -> Result<(), &'static str>) -> TestResult {
+    with_setup(|| {
+        narf_filesystem::procfs::install_ns_proc_hooks(
+            crate::handlers::proc_ns_readlink,
+            crate::handlers::proc_ns_mountinfo,
+            crate::handlers::proc_ns_idmap_open,
+            crate::handlers::proc_ns_idmap_owners,
+        );
+        let base = alloc::format!("/proc_userns_fd_{}", FAKE_TASK);
+        let mount = registry()
+            .mount(
+                &bootstrap_mount_authority(),
+                &base,
+                narf_filesystem::procfs::ProcFs,
+            )
+            .map_err(|_| "procfs mount failed")?;
+        let result = body(&base);
+        let _ = registry().unmount(&mount, &base);
+        result
+    })
+}
+
+/// proc_id_map_open pins the namespace, not the task's changing nsproxy.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_map_fd_pins_namespace() -> TestResult {
+    with_userns_proc(|base| {
+        let path = alloc::format!("{}/{}/uid_map\0", base, FAKE_TASK);
+        let fd = call_open(path.as_ptr() as u64, 2)
+            .filter(|fd| *fd >= 0)
+            .ok_or("could not open initial uid_map")?;
+        if call(Syscall::Unshare.raw(), a0(0x1000_0000)) != Some(0) {
+            return Err("unshare failed");
+        }
+        let map = b"0 0 1\n";
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, map.as_ptr() as u64, map.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        if wrote != Some(-1) {
+            return Err("an old fd wrote the task's newly created namespace");
+        }
+        if crate::namespaces::current_user_ns(FAKE_TASK).uid_is_mapped(0) {
+            return Err("old namespace fd installed a map in the new namespace");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!("syscall_abi/userns", smoke_abi_userns_map_fd_pins_namespace);
+
+/// map_write rejects nonzero file positions before consuming the map slot.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_map_write_checks_offset() -> TestResult {
+    with_userns_proc(|base| {
+        if call(Syscall::Unshare.raw(), a0(0x1000_0000)) != Some(0) {
+            return Err("unshare failed");
+        }
+        let path = alloc::format!("{}/{}/uid_map\0", base, FAKE_TASK);
+        let fd = call_open(path.as_ptr() as u64, 2)
+            .filter(|fd| *fd >= 0)
+            .ok_or("could not open uid_map")?;
+        let map = b"0 0 1\n";
+        let result = call(
+            Syscall::Pwrite64.raw(),
+            a3(fd as u64, map.as_ptr() as u64, map.len() as u64, 1),
+        );
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, map.as_ptr() as u64, map.len() as u64),
+        );
+        let again = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, map.as_ptr() as u64, map.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        if result != Some(-22) || wrote != Some(map.len() as i64) || again != Some(-22) {
+            return Err("uid_map did not enforce offset zero without consuming the map slot");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns",
+    smoke_abi_userns_map_write_checks_offset
+);
+
+/// Map permissions use the opener's immutable credentials (file->f_cred).
+#[cfg(feature = "container")]
+fn smoke_abi_userns_map_fd_captures_opener_caps() -> TestResult {
+    with_userns_proc(|base| {
+        if call(Syscall::Unshare.raw(), a0(0x1000_0000)) != Some(0) {
+            return Err("unshare failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, !0);
+        let path = alloc::format!("{}/{}/uid_map\0", base, FAKE_TASK);
+        let fd = call_open(path.as_ptr() as u64, 1)
+            .filter(|fd| *fd >= 0)
+            .ok_or("uid_map open without effective caps failed")?;
+        let groups = alloc::format!("{}/{}/setgroups\0", base, FAKE_TASK);
+        if call_open(groups.as_ptr() as u64, 1) != Some(-13) {
+            return Err("writable setgroups open did not require CAP_SYS_ADMIN");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+        let map = b"0 0 1\n";
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, map.as_ptr() as u64, map.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        if wrote != Some(-1) {
+            return Err("map fd gained authority after its opener raised capabilities");
+        }
+        let fd = call_open(path.as_ptr() as u64, 1)
+            .filter(|fd| *fd >= 0)
+            .ok_or("privileged uid_map open failed")?;
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, !0);
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, map.as_ptr() as u64, map.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        if wrote != Some(6) {
+            return Err("self map lost its opener's authority after a capability drop");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns",
+    smoke_abi_userns_map_fd_captures_opener_caps
 );

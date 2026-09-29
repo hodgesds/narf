@@ -5423,6 +5423,7 @@ fn boot_userspace_init() {
                 ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),
                 ("sendfile_smoke", narf_verification::NARF_SENDFILE_SMOKE_ELF),
                 ("creds_smoke", narf_verification::NARF_CREDS_SMOKE_ELF),
+                ("userns_smoke", narf_verification::NARF_USERNS_SMOKE_ELF),
                 ("waitid_smoke", narf_verification::NARF_WAITID_SMOKE_ELF),
                 // Linux-compat round 3: ppoll / sysinfo / splice / membarrier+clock_getres.
                 ("ppoll_smoke", narf_verification::NARF_PPOLL_SMOKE_ELF),

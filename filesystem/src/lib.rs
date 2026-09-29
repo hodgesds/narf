@@ -1603,6 +1603,13 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// Fallible per-open setup after DAC checks. `write` denotes write access;
+    /// O_PATH does not call this hook. Defaults to the existing clone-device
+    /// hook. Procfs uses this to capture namespaces and opener credentials.
+    fn open_instance_checked(&self, _write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        Ok(self.open_instance())
+    }
+
     /// If this file is a named-pipe (FIFO) inode — created by
     /// `mkfifo`/`mknod(S_IFIFO)` — return its shared pipe buffer. Every
     /// `open()` of the same path resolves to the same FIFO node and thus

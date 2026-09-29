@@ -3938,47 +3938,123 @@ pub fn proc_ns_mountinfo_generation(pid: u64) -> u64 {
         .unwrap_or_else(|| narf_filesystem::registry().mountinfo_generation())
 }
 
-/// `/proc/<pid>/{uid,gid}_map` and `setgroups` render.
+/// Per-open procfs state, mirroring proc_id_map_open and file->f_cred.
 #[cfg(feature = "container")]
-pub fn proc_ns_idmap_render(
+struct ProcNsIdMap {
+    target: Arc<crate::namespaces::UserNamespace>,
+    opener_ns: Arc<crate::namespaces::UserNamespace>,
+    opener_ids: UidGid,
+    opener_caps: u64,
+    owners: (u32, u32),
+    file: narf_filesystem::procfs::NsIdMapFile,
+}
+
+#[cfg(feature = "container")]
+impl ProcNsIdMap {
+    fn opener_capable(&self, target: &crate::namespaces::UserNamespace, cap: u32) -> bool {
+        cred_ns_capable(
+            &self.opener_ns,
+            self.opener_ids.euid,
+            self.opener_caps,
+            target,
+            cap,
+        )
+    }
+}
+
+/// Open callback: pin the namespace even if the task later unshares or exits.
+#[cfg(feature = "container")]
+pub fn proc_ns_idmap_open(
     pid: u64,
     file: narf_filesystem::procfs::NsIdMapFile,
-) -> Option<alloc::string::String> {
-    let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let ns = crate::namespaces::current_user_ns(task);
-    Some(match file {
-        narf_filesystem::procfs::NsIdMapFile::UidMap => ns.render_map(true),
-        narf_filesystem::procfs::NsIdMapFile::GidMap => ns.render_map(false),
-        narf_filesystem::procfs::NsIdMapFile::Setgroups => {
-            alloc::string::String::from(ns.render_setgroups())
+    write: bool,
+) -> Result<Arc<dyn narf_filesystem::FileOps>, narf_filesystem::FsError> {
+    let task = pid_to_task_raw(pid).ok_or(narf_filesystem::FsError::NotFound)?;
+    let opener = current_task_id();
+    let target = crate::namespaces::current_user_ns(task);
+    if write
+        && file == narf_filesystem::procfs::NsIdMapFile::Setgroups
+        && !task_ns_capable(opener, &target, CAP_SYS_ADMIN)
+    {
+        return Err(narf_filesystem::FsError::PermissionDenied);
+    }
+    let ids = read_uidgid(task);
+    Ok(Arc::new(ProcNsIdMap {
+        target,
+        opener_ns: crate::namespaces::current_user_ns(opener),
+        opener_ids: read_uidgid(opener),
+        opener_caps: read_caps(opener).effective,
+        owners: (ids.euid, ids.egid),
+        file,
+    }))
+}
+
+#[cfg(feature = "container")]
+impl narf_filesystem::FileOps for ProcNsIdMap {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::procfs::NsIdMapFile;
+            let text = match self.file {
+                NsIdMapFile::UidMap => self.target.render_map(true, &self.opener_ns),
+                NsIdMapFile::GidMap => self.target.render_map(false, &self.opener_ns),
+                NsIdMapFile::Setgroups => {
+                    alloc::string::String::from(self.target.render_setgroups())
+                }
+            };
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(text.len());
+            let count = buf.len().min(text.len() - start);
+            buf[..count].copy_from_slice(&text.as_bytes()[start..start + count]);
+            Ok(count)
+        })
+    }
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move {
+            if offset != 0 {
+                return Err(narf_filesystem::FsError::InvalidData);
+            }
+            proc_ns_idmap_write(self, buf)
+        })
+    }
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mtime_cycles: 0,
+            mode: narf_filesystem::Mode {
+                file_type: narf_filesystem::FileType::File,
+                perms: 0o644,
+            },
         }
-    })
+    }
+    fn owners(&self) -> (u32, u32) {
+        self.owners
+    }
 }
 
 /// `/proc/<pid>/{uid,gid}_map` and `setgroups` writes.
 #[cfg(feature = "container")]
-pub fn proc_ns_idmap_write(
-    pid: u64,
-    file: narf_filesystem::procfs::NsIdMapFile,
+fn proc_ns_idmap_write(
+    opened: &ProcNsIdMap,
     bytes: &[u8],
 ) -> Result<usize, narf_filesystem::FsError> {
     let writer = current_task_id();
-    let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let target_ns = crate::namespaces::current_user_ns(task);
+    let file = opened.file;
+    let target_ns = &opened.target;
     if file == narf_filesystem::procfs::NsIdMapFile::Setgroups {
         if bytes.len() >= 8 {
             return Err(narf_filesystem::FsError::InvalidData);
         }
-        let text = core::str::from_utf8(bytes).map_err(|_| narf_filesystem::FsError::InvalidData)?;
-        let text = text.strip_suffix('\n').unwrap_or(text);
+        let text =
+            core::str::from_utf8(bytes).map_err(|_| narf_filesystem::FsError::InvalidData)?;
+        let text = text.trim_end_matches(char::is_whitespace);
         let allow = match text {
             "allow" => true,
             "deny" => false,
             _ => return Err(narf_filesystem::FsError::InvalidData),
         };
-        if target_ns.parent().is_none()
-            || !task_ns_capable(writer, &target_ns, CAP_SYS_ADMIN)
-        {
+        if target_ns.parent().is_none() || !opened.opener_capable(target_ns, CAP_SYS_ADMIN) {
             return Err(narf_filesystem::FsError::OperationNotPermitted);
         }
         return target_ns
@@ -4023,32 +4099,31 @@ pub fn proc_ns_idmap_write(
             count,
         });
     }
-    let writer_ns = crate::namespaces::current_user_ns(writer);
+    let writer_ns = &opened.opener_ns;
     let parent = target_ns
         .parent()
         .ok_or(narf_filesystem::FsError::OperationNotPermitted)?;
-    let map_admin = task_ns_capable(writer, &target_ns, CAP_SYS_ADMIN);
-    let writer_ids = read_uidgid(writer);
-    let writer_uid_host = writer_ns
-        .translate_uid_to_host(writer_ids.euid);
-    let writer_gid_host = writer_ns
-        .translate_gid_to_host(writer_ids.egid);
+    let map_admin = opened.opener_capable(target_ns, CAP_SYS_ADMIN);
+    let writer_uid_host = opened.opener_ids.euid;
+    let writer_gid_host = opened.opener_ids.egid;
     let r = if is_uid {
         target_ns.write_uid_map_authorized(
             entries,
-            &writer_ns,
+            writer_ns,
             writer_uid_host,
             map_admin,
-            task_ns_capable(writer, parent, CAP_SETUID),
-            task_ns_capable(writer, parent, CAP_SETFCAP),
+            task_ns_capable(writer, parent, CAP_SETUID)
+                && opened.opener_capable(parent, CAP_SETUID),
+            opened.opener_capable(parent, CAP_SETFCAP),
         )
     } else {
         target_ns.write_gid_map_authorized(
             entries,
-            &writer_ns,
-            writer_gid_host,
+            writer_ns,
+            (writer_uid_host, writer_gid_host),
             map_admin,
-            task_ns_capable(writer, parent, CAP_SETGID),
+            task_ns_capable(writer, parent, CAP_SETGID)
+                && opened.opener_capable(parent, CAP_SETGID),
         )
     };
     r.map(|_| bytes.len()).map_err(|error| match error {
@@ -4066,8 +4141,8 @@ pub fn proc_ns_idmap_write(
 #[cfg(feature = "container")]
 pub fn proc_ns_idmap_owners(pid: u64) -> Option<(u32, u32)> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let ns = crate::namespaces::current_user_ns(task);
-    Some((ns.owner_uid(), ns.owner_gid()))
+    let ids = read_uidgid(task);
+    Some((ids.euid, ids.egid))
 }
 
 // ── Wave-67: setns(target, nstype) ─────────────────────────────────

@@ -35,6 +35,12 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let requested_uid = args.arg2 as u32;
     let requested_gid = args.arg3 as u32;
+    let Some((requested_uid, requested_gid)) =
+        chown_ids_from_user(task, requested_uid, requested_gid)
+    else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
 
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {

@@ -625,18 +625,15 @@ pub enum NsIdMapFile {
     GidMap,
     Setgroups,
 }
-/// `(pid, file) -> rendered uid_map/gid_map/setgroups state`.
-type IdMapRenderFn = fn(u64, NsIdMapFile) -> Option<String>;
-/// `(pid, file, bytes) -> Ok(written) | Err`.
-type IdMapWriteFn = fn(u64, NsIdMapFile, &[u8]) -> Result<usize, FsError>;
+/// Capture the target namespace and opener credentials for this open file.
+type IdMapOpenFn = fn(u64, NsIdMapFile, bool) -> Result<Arc<dyn FileOps>, FsError>;
 /// `pid -> host-absolute owner uid/gid` for user-namespace proc files.
 type IdMapOwnersFn = fn(u64) -> Option<(u32, u32)>;
 
 static NS_READLINK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_MOUNTINFO_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_MOUNTINFO_GENERATION_HOOK: AtomicUsize = AtomicUsize::new(0);
-static NS_IDMAP_RENDER_HOOK: AtomicUsize = AtomicUsize::new(0);
-static NS_IDMAP_WRITE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NS_IDMAP_OPEN_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_IDMAP_OWNERS_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Stable u8 tags for namespace flavours, mirroring
@@ -657,14 +654,12 @@ pub mod ns_tag {
 pub fn install_ns_proc_hooks(
     readlink: NsReadlinkFn,
     mountinfo: MountinfoFn,
-    idmap_render: IdMapRenderFn,
-    idmap_write: IdMapWriteFn,
+    idmap_open: IdMapOpenFn,
     idmap_owners: IdMapOwnersFn,
 ) {
     NS_READLINK_HOOK.store(readlink as usize, Ordering::Release);
     NS_MOUNTINFO_HOOK.store(mountinfo as usize, Ordering::Release);
-    NS_IDMAP_RENDER_HOOK.store(idmap_render as usize, Ordering::Release);
-    NS_IDMAP_WRITE_HOOK.store(idmap_write as usize, Ordering::Release);
+    NS_IDMAP_OPEN_HOOK.store(idmap_open as usize, Ordering::Release);
     NS_IDMAP_OWNERS_HOOK.store(idmap_owners as usize, Ordering::Release);
 }
 
@@ -742,28 +737,18 @@ pub(crate) fn hook_ns_mountinfo_generation(pid: u64) -> u64 {
     f(pid)
 }
 
-pub(crate) fn hook_ns_idmap_render(pid: u64, file: NsIdMapFile) -> Option<String> {
-    let v = NS_IDMAP_RENDER_HOOK.load(Ordering::Acquire);
-    if v == 0 {
-        return None;
-    }
-    // SAFETY: stored by install_ns_proc_hooks as an IdMapRenderFn; non-zero confirms it.
-    let f: IdMapRenderFn = unsafe { core::mem::transmute(v) };
-    f(pid, file)
-}
-
-pub(crate) fn hook_ns_idmap_write(
+fn hook_ns_idmap_open(
     pid: u64,
     file: NsIdMapFile,
-    bytes: &[u8],
-) -> Result<usize, FsError> {
-    let v = NS_IDMAP_WRITE_HOOK.load(Ordering::Acquire);
+    write: bool,
+) -> Result<Arc<dyn FileOps>, FsError> {
+    let v = NS_IDMAP_OPEN_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Err(FsError::Unsupported);
     }
-    // SAFETY: stored by install_ns_proc_hooks as an IdMapWriteFn; non-zero confirms it.
-    let f: IdMapWriteFn = unsafe { core::mem::transmute(v) };
-    f(pid, file, bytes)
+    // SAFETY: installed by install_ns_proc_hooks as exactly IdMapOpenFn.
+    let f: IdMapOpenFn = unsafe { core::mem::transmute(v) };
+    f(pid, file, write)
 }
 
 pub(crate) fn hook_ns_idmap_owners(pid: u64) -> Option<(u32, u32)> {
@@ -1818,18 +1803,14 @@ struct ProcIdMapFile {
 }
 
 impl FileOps for ProcIdMapFile {
-    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let pid = self.pid;
-        let file = self.file;
-        Box::pin(async move {
-            let s = hook_ns_idmap_render(pid, file).unwrap_or_default();
-            slice_read(s.as_bytes(), offset, buf)
-        })
+    fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        hook_ns_idmap_open(self.pid, self.file, write).map(Some)
     }
-    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let pid = self.pid;
-        let file = self.file;
-        Box::pin(async move { hook_ns_idmap_write(pid, file, buf) })
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
     fn stat(&self) -> Stat {
         Stat {

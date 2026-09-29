@@ -102,6 +102,14 @@ jobs:
           --retries 0
           --cmd "oci_smoke"
           --expect "oci-uts-isolated"
+      - name: user namespace credentials and procfs end to end
+        run: >
+          cargo xtask run-interactive
+          --arch=x86_64
+          --features container
+          --retries 0
+          --cmd "userns_smoke"
+          --expect "userns-ok"
       # Only when a crash core was actually written: stage it + the matching
       # kernel ELF for upload. Skips the ~230 MB ELF entirely on a clean run.
       - name: stage crash artifacts (only if core captured)

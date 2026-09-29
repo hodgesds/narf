@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-
 // The exact set `kernel/fork.c::check_unshare_flags` accepts. `unshare(2)`
 // takes an `unsigned long`, so every other bit — including the whole upper
 // half of the word — is rejected.
@@ -126,18 +125,10 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "container")]
     if flags & crate::namespaces::CLONE_NEWUSER != 0 {
         let task = current_task_id();
-        // The creator's HOST uid is recorded as the namespace owner, and the
-        // caller becomes uid 0 INSIDE it.
+        // Linux preserves all kernel-global IDs and supplementary groups.
+        // An empty map makes their userspace representation overflow IDs.
         let ids = read_uidgid(task);
         let _ns = crate::namespaces::unshare_user(task, ids.euid, ids.egid);
-        let _ = write_uidgid(task, |e| {
-            e.uid = 0;
-            e.gid = 0;
-            e.euid = 0;
-            e.egid = 0;
-            e.fsgid = 0;
-            e.fsuid = 0;
-        });
         // `set_cred_user_ns`: full permitted/effective/bounding, empty
         // inheritable/ambient — worth everything inside the new namespace and
         // nothing outside it, because `capable()` is host-scoped.
@@ -205,10 +196,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         let pid = task_to_pid_raw(task).unwrap_or(task);
         // `copy_cgroup_ns` stamps the creating task's user namespace onto the
         // new cgroup namespace; `setns` into it is measured against that.
-        narf_filesystem::cgroupfs::unshare_cgroup_ns_owned_by(
-            pid,
-            ns_owner_for(current_task_id()),
-        );
+        narf_filesystem::cgroupfs::unshare_cgroup_ns_owned_by(pid, ns_owner_for(current_task_id()));
         any = true;
     }
 

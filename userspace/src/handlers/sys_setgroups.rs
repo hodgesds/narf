@@ -76,14 +76,10 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     let mut groups = alloc::vec::Vec::with_capacity(size);
     for chunk in bytes.chunks_exact(4) {
         let gid = u32::from_ne_bytes(chunk.try_into().unwrap());
-        #[cfg(feature = "container")]
-        {
-            let ns = crate::namespaces::current_user_ns(current_task_id());
-            if !ns.is_initial() && !ns.gid_is_mapped(gid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-        }
+        let Some(gid) = gid_from_user(current_task_id(), gid) else {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        };
         groups.push(gid);
     }
     let ok = write_groups(current_task_id(), groups);

@@ -13,5 +13,11 @@ use super::*;
 pub(crate) fn sys_getresuid(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let c = read_uidgid(current_task_id());
-    write_res_ids(ctx, a.arg0, a.arg1, a.arg2, [c.uid, c.euid, c.suid]);
+    write_res_ids(
+        ctx,
+        a.arg0,
+        a.arg1,
+        a.arg2,
+        [c.uid, c.euid, c.suid].map(|id| uid_to_user(current_task_id(), id)),
+    );
 }

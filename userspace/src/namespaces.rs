@@ -1406,15 +1406,14 @@ struct UserInner {
 #[derive(Debug)]
 pub struct UserNamespace {
     id: NsId,
-    /// Parent user-ns. Translation that a map doesn't cover does NOT
-    /// chase the parent in this MVP (Linux does, recursively); see the
-    /// deferral note on `translate_uid_to_host`.
+    /// Parent user namespace. Map writes normalize parent-visible IDs to
+    /// kernel-global extents, so credential lookups do not chase this chain.
     parent: Option<Arc<UserNamespace>>,
     /// Host-absolute uid of the task that created this ns (the
     /// owner). Linux uses it for the `CAP_*`-in-owner checks.
     owner_uid: u32,
-    /// Host-absolute primary gid of the creator, used for the unprivileged
-    /// one-id gid_map rule.
+    /// Host-absolute primary gid of the creator. Map authorization uses
+    /// the opener's credential snapshot, which may differ from this value.
     owner_gid: u32,
     /// Linux snapshots whether the parent had CAP_SETFCAP at creation. A
     /// descendant must not map parent uid 0 unless this was true.
@@ -1576,11 +1575,9 @@ impl UserNamespace {
     }
 
     /// Translate an inner uid to a host-absolute uid. Unmapped ids
-    /// return [`OVERFLOW_ID`] — the safe default that grants no host
-    /// authority. (Recursive parent translation is deferred: NARF
-    /// builds shallow, single-level user namespaces today, so a
-    /// uid_map entry's `outer_start` is already a host id. Nesting
-    /// would require walking `parent` here.)
+    /// return [`OVERFLOW_ID`]. Committed extents are kernel-global, including
+    /// nested namespaces. Permission checks and input validation must use
+    /// the fallible range translation: overflow is also a valid host ID.
     pub fn translate_uid_to_host(&self, inner: u32) -> u32 {
         let g = self.inner.lock();
         for e in g.uid_map.iter() {
@@ -1669,12 +1666,17 @@ impl UserNamespace {
         let self_map = entries.len() == 1
             && entries[0].count == 1
             && normalized[0].outer_start == self.owner_uid
-            && (writer_ns.id() == self.id || writer_uid_host == self.owner_uid);
+            && writer_uid_host == self.owner_uid;
         if !writer_has_parent_setuid && !self_map {
             return Err(IdMapWriteError::Permission);
         }
-        let maps_parent_root = normalized.iter().any(|entry| entry.outer_start == 0);
-        if maps_parent_root && !self.parent_could_setfcap && !writer_has_parent_setfcap {
+        let maps_parent_root = entries.iter().any(|entry| entry.outer_start == 0);
+        let root_map_allowed = if writer_ns.id() == self.id {
+            self.parent_could_setfcap
+        } else {
+            writer_has_parent_setfcap
+        };
+        if maps_parent_root && !root_map_allowed {
             return Err(IdMapWriteError::Permission);
         }
 
@@ -1693,7 +1695,7 @@ impl UserNamespace {
         &self,
         entries: Vec<IdMapEntry>,
         writer_ns: &UserNamespace,
-        writer_gid_host: u32,
+        writer_ids_host: (u32, u32),
         writer_has_map_admin: bool,
         writer_has_parent_setgid: bool,
     ) -> Result<(), IdMapWriteError> {
@@ -1701,19 +1703,17 @@ impl UserNamespace {
         if !writer_has_map_admin || !same_or_parent(writer_ns, self, parent) {
             return Err(IdMapWriteError::Permission);
         }
+        let (writer_uid_host, writer_gid_host) = writer_ids_host;
         let normalized = normalize_idmap(parent, &entries, false)?;
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         let self_map = !g.setgroups_allowed
             && entries.len() == 1
             && entries[0].count == 1
-            && normalized[0].outer_start == self.owner_gid
-            && (writer_ns.id() == self.id || writer_gid_host == self.owner_gid);
+            && normalized[0].outer_start == writer_gid_host
+            && writer_uid_host == self.owner_uid;
         if !writer_has_parent_setgid && !self_map {
             return Err(IdMapWriteError::Permission);
         }
-        drop(g);
-
-        let mut g = self.inner.lock();
         if g.gid_map_written {
             return Err(IdMapWriteError::Permission);
         }
@@ -1765,18 +1765,31 @@ impl UserNamespace {
     }
 
     /// Render the uid_map / gid_map as Linux does:
-    /// `      0     1000          1\n`. `is_uid` selects which map.
-    pub fn render_map(&self, is_uid: bool) -> String {
+    /// `      0     1000          1\n`. `is_uid` selects which map. The second
+    /// column is relative to the opener, or our parent for self-reads.
+    pub fn render_map(&self, is_uid: bool, reader: &UserNamespace) -> String {
         use core::fmt::Write as _;
         let g = self.inner.lock();
-        let map = if is_uid { &g.uid_map } else { &g.gid_map };
+        let map = if is_uid {
+            g.uid_map.clone()
+        } else {
+            g.gid_map.clone()
+        };
+        drop(g);
+        let lower = if reader.id() == self.id {
+            self.parent.as_deref().unwrap_or(reader)
+        } else {
+            reader
+        };
         let mut s = String::new();
         for e in map.iter() {
-            let _ = writeln!(
-                s,
-                "{:>10} {:>10} {:>10}",
-                e.inner_start, e.outer_start, e.count
-            );
+            let outer = if is_uid {
+                lower.translate_uid_from_host(e.outer_start)
+            } else {
+                lower.translate_gid_from_host(e.outer_start)
+            }
+            .unwrap_or(u32::MAX);
+            let _ = writeln!(s, "{:>10} {:>10} {:>10}", e.inner_start, outer, e.count);
         }
         s
     }
@@ -1898,8 +1911,8 @@ pub fn user_ns_of(task: u64) -> Option<Arc<UserNamespace>> {
 /// caller's host uid and install it. Returns the new ns.
 pub fn unshare_user(task: u64, owner_uid: u32, owner_gid: u32) -> Arc<UserNamespace> {
     let parent = current_user_ns(task);
-    let owner_host_uid = parent.translate_uid_to_host(owner_uid);
-    let owner_host_gid = parent.translate_gid_to_host(owner_gid);
+    let owner_host_uid = owner_uid;
+    let owner_host_gid = owner_gid;
     let parent_could_setfcap =
         crate::handlers::task_ns_capable(task, &parent, crate::handlers::CAP_SETFCAP);
     let fresh = UserNamespace::new_child_with_credentials(

@@ -76,8 +76,7 @@ fn install_ns_proc_hooks() {
     narf_filesystem::procfs::install_ns_proc_hooks(
         narf_userspace::handlers::proc_ns_readlink,
         narf_userspace::handlers::proc_ns_mountinfo,
-        narf_userspace::handlers::proc_ns_idmap_render,
-        narf_userspace::handlers::proc_ns_idmap_write,
+        narf_userspace::handlers::proc_ns_idmap_open,
         narf_userspace::handlers::proc_ns_idmap_owners,
     );
 }

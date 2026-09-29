@@ -884,7 +884,16 @@ that retains the named namespace and is accepted by `setns(2)`. An
 `O_PATH|O_NOFOLLOW` open retains symlink-node semantics. Initial UTS, network,
 IPC, PID, mount, user, and enabled cgroup namespaces have stable nonzero
 identities even before a task unshares them.
-User namespace creation grants capabilities only in the new namespace. A
+User namespace creation grants capabilities only in the new namespace. Real,
+effective, saved, filesystem IDs and supplementary groups retain their
+kernel-global identity across `clone(CLONE_NEWUSER)`, `unshare`, and `setns`.
+Credential getters and inode stat results translate to the caller's namespace;
+unmapped outputs use 65534. ID setters and chown translate mapped inputs to
+kernel IDs and reject unmapped inputs (the `-1` no-change/query convention is
+preserved). Capability transitions compare against the mapped namespace root.
+Namespace-owner authority requires the caller to belong to the direct parent;
+sharing an owner UID with a sibling's descendant confers no authority.
+A
 rootless writer may install one uid mapping for the namespace owner, and one
 gid mapping for the owner's primary group after writing `deny` to
 `/proc/<pid>/setgroups`. Map writes reject zero or wrapping ranges, overlap,
@@ -894,6 +903,13 @@ namespace (or that capability at child creation); this prevents a namespaced
 root from gaining host-root file capabilities. `setgroups(2)` requires
 CAP_SETGID in the current user namespace, an installed gid_map, and an
 allow-state that has not been disabled.
+Procfs map descriptors pin their target namespace and opener credentials.
+Map authorization checks the opener's target CAP_SYS_ADMIN; privileged ranges
+require both opener and current writer CAP_SETUID/GID in the parent. The
+unprivileged one-ID exception uses the opener's effective UID/GID. Offset must
+be zero and the write shorter than a page. The map's second column is rendered
+in the opener's namespace, or the target's parent when opened from the target.
+Writable `setgroups` opens require target CAP_SYS_ADMIN and capture that grant.
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.

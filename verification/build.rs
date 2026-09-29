@@ -563,6 +563,7 @@ fn main() {
         "mremap_smoke",
         "sendfile_smoke",
         "creds_smoke",
+        "userns_smoke",
         "waitid_smoke",
         "ppoll_smoke",
         "sysinfo_smoke",

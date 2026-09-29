@@ -1256,3 +1256,12 @@ argument = "The fork constructor remains private to the existing memory TCB and 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Fork still allocates a fresh architecture page-table root and clones VMAs, COW ownership, permissions, reverse maps, and mmap cursor through the existing paths. Reusing the parent's floor removes a discarded entropy draw without exposing entropy or changing user-memory access; constructor failure and every later allocation failure retain the existing AddressSpaceError-to-ENOMEM propagation. The cross-architecture regression proves the child inherits both floor and cursor and consumes no fresh layout entropy."
+
+# User namespace credential and procfs descriptor lifetime corrections.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Frame changes only wire the procfs per-open factory and register the user namespace smoke ELF in the existing boot image list. Credential IDs and namespace references remain in userspace; no trusted subsystem, domain assignment, page-table operation, or scheduler authority is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Linux compatibility credentials retain kernel-global UID/GID identity across namespace entry. Procfs files capture namespace Arc references and opener credentials after VFS permission checks; map writes retain one-shot validation, namespace capability checks and parent capability constraints. Opener grants cannot grow when the task changes credentials, and ancestor traversal cannot confer authority into a sibling branch. Native capability and domain checks are unchanged. Regressions cover inherited identity, mapped syscall IDs, descriptor target pinning, file offsets, opener capability changes and nested namespace authority."

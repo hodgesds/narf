@@ -65,7 +65,12 @@ pub(crate) fn fchmod_fd(ctx: &mut dyn TrapContext, fd: u32, mode: u64, allow_pat
 
 pub(crate) fn sys_fchown(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    fchown_fd(ctx, a.arg0 as u32, a.arg1 as u32, a.arg2 as u32, false);
+    let Some((uid, gid)) = chown_ids_from_user(current_task_id(), a.arg1 as u32, a.arg2 as u32)
+    else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
+    fchown_fd(ctx, a.arg0 as u32, uid, gid, false);
 }
 
 /// `chown_common` on the file behind a descriptor. Shared by `fchown` and

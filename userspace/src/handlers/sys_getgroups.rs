@@ -62,7 +62,7 @@ pub(crate) fn sys_getgroups(ctx: &mut dyn TrapContext) {
     }
     let mut bytes = alloc::vec::Vec::with_capacity(groups.len() * 4);
     for gid in groups {
-        bytes.extend_from_slice(&gid.to_ne_bytes());
+        bytes.extend_from_slice(&gid_to_user(current_task_id(), gid).to_ne_bytes());
     }
     // SAFETY: list is a user pointer; copy_to_user validates and SMAP-brackets.
     if unsafe { copy_to_user(list, &bytes) }.is_err() {

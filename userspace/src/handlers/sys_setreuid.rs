@@ -48,20 +48,22 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
     // a task in a user namespace could give itself an id with no mapping —
     // one that then gets compared against file owners from OUTSIDE the
     // namespace. The host root-ns maps everything, so this is inert there.
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() {
-            if ruid != NOCHANGE && !uns.uid_is_mapped(ruid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            if euid != NOCHANGE && !uns.uid_is_mapped(euid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-        }
-    }
+    let Some(ruid) = (if ruid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        uid_from_user(task, ruid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
+    let Some(euid) = (if euid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        uid_from_user(task, euid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
     let old = read_uidgid(task);
 
     if ruid != NOCHANGE && ruid != old.uid && ruid != old.euid && !capable_in_own_ns(CAP_SETUID) {
@@ -100,5 +102,9 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
         // RLIMIT_NPROC, it arms the next execve instead. See the helper.
         flag_nproc_exceeded(task);
     }
-    ctx.set_return(if ok { SyscallReturn::ok(0) } else { errno_ret(EPERM) });
+    ctx.set_return(if ok {
+        SyscallReturn::ok(0)
+    } else {
+        errno_ret(EPERM)
+    });
 }

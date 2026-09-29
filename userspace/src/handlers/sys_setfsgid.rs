@@ -23,18 +23,10 @@ pub(crate) fn sys_setfsgid(ctx: &mut dyn TrapContext) {
     let new = ctx.args().arg0 as u32;
     let old = read_uidgid(task);
     let old_fsgid = old.fsgid;
-    if new == u32::MAX {
-        ctx.set_return(SyscallReturn::ok(old_fsgid as u64));
+    let Some(new) = gid_from_user(task, new) else {
+        ctx.set_return(SyscallReturn::ok(gid_to_user(task, old_fsgid) as u64));
         return;
-    }
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() && !uns.gid_is_mapped(new) {
-            ctx.set_return(SyscallReturn::ok(old_fsgid as u64));
-            return;
-        }
-    }
+    };
     let permitted = new == old.gid
         || new == old.egid
         || new == old.sgid
@@ -43,5 +35,5 @@ pub(crate) fn sys_setfsgid(ctx: &mut dyn TrapContext) {
     if permitted && new != old_fsgid {
         let _ = write_uidgid(task, |e| e.fsgid = new);
     }
-    ctx.set_return(SyscallReturn::ok(old_fsgid as u64));
+    ctx.set_return(SyscallReturn::ok(gid_to_user(task, old_fsgid) as u64));
 }
