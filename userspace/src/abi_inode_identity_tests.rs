@@ -140,21 +140,42 @@ kernel_test_in!("syscall_abi", smoke_abi_inode_proc_self_is_pid_dir);
 /// A sysfs directory is one stable inode (path and open fd agree); two
 /// directories differ.
 fn smoke_abi_inode_sysfs_dirs() -> TestResult {
-    with_setup(|| {
-        let kernel = stat_id(b"/sys/kernel\0")?;
+    // Self-contained: other tests may leave /sys unmounted or the kobject
+    // tree pruned, so create the two directories and mount a private sysfs
+    // instance (sysfs is one tree, so any mount shows the same kobjects).
+    let root = narf_filesystem::sysfs::sysfs_root();
+    let _ = narf_filesystem::sysfs::get_or_create_child(&root, "kernel");
+    let _ = narf_filesystem::sysfs::get_or_create_child(&root, "class");
+    setup();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let handle = match registry().mount(&auth, "/iidsys", narf_filesystem::SysFs::new()) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("sysfs mount failed");
+        }
+    };
+    let outcome = crate::handlers::with_kernel_buffers(|| {
+        let kernel = stat_id(b"/iidsys/kernel\0")?;
         nonzero(kernel, "/sys/kernel: st_dev or st_ino is 0")?;
-        if stat_id(b"/sys/kernel\0")? != kernel {
+        if stat_id(b"/iidsys/kernel\0")? != kernel {
             return Err("/sys/kernel: two stats report different inodes");
         }
-        if fstat_id(b"/sys/kernel\0")? != kernel {
+        if fstat_id(b"/iidsys/kernel\0")? != kernel {
             return Err("/sys/kernel: fstat of an open fd differs from stat");
         }
-        let class = stat_id(b"/sys/class\0")?;
+        let class = stat_id(b"/iidsys/class\0")?;
         if class.1 == kernel.1 || class.0 != kernel.0 {
             return Err("/sys/class and /sys/kernel: same st_ino or different st_dev");
         }
         Ok(())
-    })
+    });
+    let _ = registry().unmount(&handle, "/iidsys");
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
 }
 kernel_test_in!("syscall_abi", smoke_abi_inode_sysfs_dirs);
 
