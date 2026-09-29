@@ -16,7 +16,7 @@
  *   4. snprintf("/dev/pts/%u", n) + open(slave_path, O_RDWR)
  *   5. write(master, "ping\n", 5)
  *   6. read(slave, buf, sizeof buf)    — expect "ping\n" (ICANON line)
- *   7. read(master, buf, sizeof buf)   — expect "ping\n" (ECHO mirror)
+ *   7. read(master, buf, sizeof buf)   — expect "ping\r\n" (ECHO + ONLCR)
  *   8. write(slave, "pong", 4)
  *   9. read(master, buf, sizeof buf)   — expect "pong"
  *  10. write(1, "pty-ok\n", 7)
@@ -128,12 +128,14 @@ static int pty_roundtrip(void) {
         return 7;
     }
 
-    /* ECHO: the master sees "ping\n" mirrored back by the line discipline.
-     * Drain it before the pong exchange below so the master read there is
-     * unambiguous. */
+    /* ECHO passes through OPOST on the slave output side. With the default
+     * ONLCR flag, the input newline is returned to the master as CR-LF.
+     * Drain it before the pong exchange below so that read is unambiguous. */
     char echo[16] = {0};
     rn = read(master, echo, sizeof echo);
-    if (rn != (ssize_t)(sizeof ping - 1) || memcmp(echo, ping, sizeof ping - 1) != 0) {
+    const char expected_echo[] = "ping\r\n";
+    if (rn != (ssize_t)(sizeof expected_echo - 1) ||
+        memcmp(echo, expected_echo, sizeof expected_echo - 1) != 0) {
         fail("read-echo");
         return 8;
     }
