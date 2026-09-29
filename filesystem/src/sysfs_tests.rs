@@ -1390,3 +1390,54 @@ kernel_test_in!(
     "filesystem",
     smoke_sysfs_platform_parent_has_subsystem_and_bus_backlink
 );
+
+/// kernfs inode identity: every kobject directory, attribute and symlink
+/// has its own nonzero inode, the same on every lookup, and the directory's
+/// stat-able marker agrees with the `DirOps` an open fd wraps.
+fn smoke_sysfs_inode_identity_is_stable_and_distinct() -> TestResult {
+    use crate::sysfs::SysKobjDir;
+    use crate::DirOps;
+    let root = Kobject::new_root("iid-root");
+    let a = Kobject::new_child(root.clone(), "a");
+    let b = Kobject::new_child(root.clone(), "b");
+    kobject_add_attr(&a, "x", || "1\n".to_string());
+    kobject_add_attr(&a, "y", || "2\n".to_string());
+    a.add_symlink("link", "../b");
+    let dir = SysKobjDir { kobj: a.clone() };
+    let a_ino = dir.ino();
+    let b_ino = SysKobjDir { kobj: b }.ino();
+    let root_ino = SysKobjDir { kobj: root.clone() }.ino();
+    // kernfs: the root is the first node of its hierarchy, id 1.
+    if root_ino != 1 || a_ino == 0 || a_ino == b_ino || a_ino == root_ino {
+        return TestResult::Fail("kobject directory inodes are not distinct kernfs ids");
+    }
+    let (Some(x1), Some(x2), Some(y), Some(link)) = (
+        dir.lookup("x"),
+        dir.lookup("x"),
+        dir.lookup("y"),
+        dir.lookup("link"),
+    ) else {
+        return TestResult::Fail("sysfs attribute/symlink lookup failed");
+    };
+    if x1.ino() == 0 || x1.ino() != x2.ino() {
+        return TestResult::Fail("two lookups of one sysfs attribute differ (or are 0)");
+    }
+    if x1.ino() == y.ino() || x1.ino() == link.ino() || x1.ino() == a_ino {
+        return TestResult::Fail("two sysfs nodes share an inode");
+    }
+    let parent = SysKobjDir { kobj: root };
+    let (Some(marker), Some(child)) = (parent.lookup("a"), parent.lookup_dir("a")) else {
+        return TestResult::Fail("sysfs child directory lookup failed");
+    };
+    if marker.ino() != a_ino || child.ino() != a_ino {
+        return TestResult::Fail("sysfs dir marker and DirOps report different inodes");
+    }
+    if x1.inode_attrs().dev == 0 || x1.inode_attrs().dev != child.inode_attrs().dev {
+        return TestResult::Fail("sysfs nodes are not on one nonzero st_dev");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_inode_identity_is_stable_and_distinct
+);

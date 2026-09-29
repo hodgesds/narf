@@ -70,6 +70,8 @@ pub struct Iso9660Volume<B: BlockDevice> {
     /// an `await` (the lock would otherwise deadlock under
     /// cooperative async).
     io: IrqSafeSpinLock<VolumeIo>,
+    /// The superblock's `st_dev`, allocated at mount.
+    pub dev: u64,
 }
 
 impl<B: BlockDevice + 'static> Iso9660Volume<B> {
@@ -165,6 +167,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
         }))
     }
 
@@ -260,7 +263,13 @@ impl<B: BlockDevice + 'static> FsInstance for Iso9660Volume<B> {
             .self_weak
             .upgrade()
             .expect("Iso9660Volume::root called after drop");
-        Arc::new(super::node::Iso9660Node::from_record(volume, &record))
+        // The root is a directory, whose inode number comes from its own
+        // extent, so it needs no record position.
+        Arc::new(super::node::Iso9660Node::from_record(
+            volume,
+            &record,
+            (0, 0),
+        ))
     }
 
     fn name(&self) -> &str {

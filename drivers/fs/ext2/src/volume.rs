@@ -340,6 +340,8 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// bitmap, group-descriptor, and primary-superblock writers regenerate
     /// their dependent checksums before returning.
     read_only: bool,
+    /// The superblock's `st_dev`, allocated at mount.
+    pub dev: u64,
 }
 
 /// One filesystem block retained either directly from the unified folio cache
@@ -671,6 +673,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
             read_only,
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
         });
         let root_inode = volume.read_inode(super::EXT2_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root_inode);

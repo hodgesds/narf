@@ -68,6 +68,106 @@ pub mod sys_kernel;
 pub mod sys_net;
 pub mod sys_vm;
 
+// ── Inode identity ───────────────────────────────────────────────
+//
+// Linux gives every procfs inode a number and the whole mount one
+// superblock (`st_dev`):
+//
+// * the root is `PROCFS_ROOT_INO` = 1 (include/uapi/linux/fs.h);
+// * registered entries (`proc_register`: cpuinfo, meminfo, net/*, sys/*,
+//   self, thread-self, pressure/*) take `proc_alloc_inum` numbers from
+//   `PROC_DYNAMIC_FIRST` = 0xF0000000 up (fs/proc/generic.c), fixed for
+//   the life of the entry;
+// * per-process entries (`/proc/<pid>` and everything below it) are
+//   instantiated by `proc_pid_make_inode` with `get_next_ino()`
+//   (fs/proc/base.c) and keep that number while the dentry is cached.
+//
+// NARF has no procfs dentry cache — every lookup builds a fresh node — so
+// a counter would hand out a new number on every stat(). The number is
+// instead DERIVED from where the entry sits: an entry's inode is a hash of
+// (parent directory's inode, entry name), with the root fixed at 1. The
+// same path therefore always yields the same inode, siblings differ, and
+// both `lookup` (the stat-able node) and `lookup_dir` (the DirOps an open
+// directory fd wraps) derive the same number for one directory. Per-pid
+// directories key on the OUTER pid, so `/proc/self`, `/proc/thread-self`
+// and a namespaced reader's `/proc/<inner pid>` all land on the inode of
+// the one process directory. The values stay in Linux's ranges: 32 bits,
+// registered entries in [0xF0000000, 2^32), per-pid entries below. Two
+// entries colliding needs a 32-bit hash collision, which Linux's own
+// 32-bit wrapping `get_next_ino` can also produce.
+
+static PROC_DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+
+/// `PROCFS_ROOT_INO`.
+pub(crate) const PROC_ROOT_INO: u64 = 1;
+/// `PROC_DYNAMIC_FIRST`: the first `proc_alloc_inum` number.
+const PROC_DYNAMIC_FIRST: u64 = 0xF000_0000;
+
+/// The procfs superblock's `st_dev`.
+pub fn proc_dev() -> u64 {
+    PROC_DEV.get()
+}
+
+/// `inode_attrs()` for every procfs node: only the superblock device is
+/// modelled (nlink/atime/ctime keep the untracked defaults).
+pub(crate) fn proc_attrs() -> crate::InodeAttrs {
+    crate::InodeAttrs {
+        dev: proc_dev(),
+        ..Default::default()
+    }
+}
+
+fn proc_name_hash(parent: u64, name: &str) -> u64 {
+    // FNV-1a over (parent inode, name), folded to 32 bits.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in parent.to_le_bytes().iter().chain(name.as_bytes()) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h ^ (h >> 32)) & 0xffff_ffff
+}
+
+/// Inode of the registered (`proc_register`-style) entry `name` in the
+/// directory whose inode is `parent`: [`PROC_DYNAMIC_FIRST`, 2^32).
+pub(crate) fn proc_static_ino(parent: u64, name: &str) -> u64 {
+    PROC_DYNAMIC_FIRST + proc_name_hash(parent, name) % (0x1_0000_0000 - PROC_DYNAMIC_FIRST)
+}
+
+/// Inode of the per-process entry `name` in the directory whose inode is
+/// `parent`: [2, `PROC_DYNAMIC_FIRST`), the `get_next_ino` range.
+pub(crate) fn proc_pid_ino(parent: u64, name: &str) -> u64 {
+    2 + proc_name_hash(parent, name) % (PROC_DYNAMIC_FIRST - 2)
+}
+
+/// Inode of `/proc/<pid>` for the OUTER pid `pid`.
+pub(crate) fn pid_dir_ino(pid: u64) -> u64 {
+    proc_pid_ino(PROC_ROOT_INO, &pid.to_string())
+}
+
+/// Inode of the per-process entry `name` directly under `/proc/<pid>`.
+pub(crate) fn pid_entry_ino(pid: u64, name: &str) -> u64 {
+    proc_pid_ino(pid_dir_ino(pid), name)
+}
+
+/// Inode of the registry entry at `components` (relative to `/proc`).
+fn registry_ino(components: &[&str]) -> u64 {
+    components
+        .iter()
+        .fold(PROC_ROOT_INO, |parent, name| proc_static_ino(parent, name))
+}
+
+/// Inode of a `/proc/<pid>/{uid_map,gid_map,setgroups}` node — shared with
+/// the open instance the id-map open hook mints, so `fstat` of the open
+/// file matches `stat` of the path.
+pub fn idmap_file_ino(pid: u64, file: NsIdMapFile) -> u64 {
+    let name = match file {
+        NsIdMapFile::UidMap => "uid_map",
+        NsIdMapFile::GidMap => "gid_map",
+        NsIdMapFile::Setgroups => "setgroups",
+    };
+    pid_entry_ino(pid, name)
+}
+
 // ── Hook plumbing ───────────────────────────────────────────────
 
 /// Per-task metadata snapshot returned by the kernel when /proc
@@ -1050,6 +1150,13 @@ pub(crate) fn lookup_registry(components: &[&str]) -> Option<ProcNodeSnapshot> {
 struct ProcSelfSymlink;
 
 impl FileOps for ProcSelfSymlink {
+    fn ino(&self) -> u64 {
+        // `self_inum` (fs/proc/self.c): one `proc_alloc_inum` number.
+        proc_static_ino(PROC_ROOT_INO, "self")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = current_pid();
         Box::pin(async move {
@@ -1104,6 +1211,13 @@ fn snapshot_dir(m: &BTreeMap<String, ProcNode>) -> Vec<(String, ProcNodeKind)> {
 struct ProcThreadSelf;
 
 impl FileOps for ProcThreadSelf {
+    fn ino(&self) -> u64 {
+        // `thread_self_inum` (fs/proc/thread_self.c).
+        proc_static_ino(PROC_ROOT_INO, "thread-self")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = current_pid();
         Box::pin(async move {
@@ -1148,6 +1262,8 @@ fn list_registry_dir(components: &[&str]) -> Vec<(String, ProcNodeKind)> {
 /// `FileOps` adapter for a dynamically-registered `ProcFile`.
 pub(crate) struct ProcDynFile {
     pub(crate) file: Arc<dyn ProcFile>,
+    /// The registry entry's inode (see `registry_ino`).
+    pub(crate) ino: u64,
 }
 
 impl core::fmt::Debug for ProcDynFile {
@@ -1159,6 +1275,12 @@ impl core::fmt::Debug for ProcDynFile {
 }
 
 impl FileOps for ProcDynFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let bytes = self.file.read();
@@ -1208,6 +1330,12 @@ impl core::fmt::Debug for ProcStaticFile {
 }
 
 impl FileOps for ProcStaticFile {
+    fn ino(&self) -> u64 {
+        proc_static_ino(PROC_ROOT_INO, self.name)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let s = (self.gen)();
@@ -1248,6 +1376,8 @@ pub(crate) fn task_file_owners(pid: u64) -> (u32, u32) {
 struct ProcPidFile {
     pid: u64,
     field: PidField,
+    /// `/proc/<pid>/<name>`'s inode (see `pid_entry_ino`).
+    ino: u64,
     /// Rendered-body cache: one generation serves every chunk of a
     /// sequential read. A read starting at offset 0 regenerates — Linux's
     /// seq_file traversal shape, where content is snapshotted per pass and
@@ -1282,6 +1412,12 @@ impl core::fmt::Debug for ProcPidFile {
 }
 
 impl FileOps for ProcPidFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         let field = self.field;
@@ -1399,9 +1535,21 @@ pub(crate) fn slice_read(bytes: &[u8], offset: u64, buf: &mut [u8]) -> Result<us
 // check in resolve_async.
 
 #[derive(Debug)]
-pub(crate) struct ProcDirMarker;
+pub(crate) struct ProcDirMarker {
+    /// The inode of the directory this marker stands for — the same number
+    /// that directory's `DirOps::ino` reports, so `stat` of the path (which
+    /// sees the marker) and `fstat` of an open fd (which sees the DirOps)
+    /// agree.
+    pub(crate) ino: u64,
+}
 
 impl FileOps for ProcDirMarker {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
@@ -1426,10 +1574,20 @@ struct ProcPidDir {
 }
 
 impl DirOps for ProcPidDir {
+    fn ino(&self) -> u64 {
+        pid_dir_ino(self.pid)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
-            "fd" | "fdinfo" | "task" | "ns" | "attr" => return Some(Arc::new(ProcDirMarker)),
+            "fd" | "fdinfo" | "task" | "ns" | "attr" => {
+                return Some(Arc::new(ProcDirMarker {
+                    ino: pid_entry_ino(self.pid, name),
+                }))
+            }
             _ => {}
         }
         // user-ns id-map files (read + one-shot write).
@@ -1472,6 +1630,7 @@ impl DirOps for ProcPidDir {
         Some(Arc::new(ProcPidFile {
             pid: self.pid,
             field,
+            ino: pid_entry_ino(self.pid, name),
             rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
         }))
     }
@@ -1481,7 +1640,7 @@ impl DirOps for ProcPidDir {
             "fdinfo" => Some(Arc::new(pid_ext::ProcFdInfoDir { pid: self.pid })),
             "task" => Some(Arc::new(pid_ext::ProcTaskDir { pid: self.pid })),
             "ns" => Some(Arc::new(ProcNsDir { pid: self.pid })),
-            "attr" => Some(Arc::new(ProcAttrDir)),
+            "attr" => Some(Arc::new(ProcAttrDir { pid: self.pid })),
             _ => None,
         }
     }
@@ -1688,6 +1847,12 @@ const NS_NAMES: &[(&str, u8)] = &[
 ];
 
 impl DirOps for ProcNsDir {
+    fn ino(&self) -> u64 {
+        pid_entry_ino(self.pid, "ns")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tag = NS_NAMES.iter().find(|(n, _)| *n == name)?.1;
         Some(Arc::new(ProcNsLink { pid: self.pid, tag }))
@@ -1704,6 +1869,16 @@ impl DirOps for ProcNsDir {
 }
 
 impl FileOps for ProcNsLink {
+    fn ino(&self) -> u64 {
+        let name = NS_NAMES
+            .iter()
+            .find(|(_, t)| *t == self.tag)
+            .map_or("", |(n, _)| *n);
+        proc_pid_ino(pid_entry_ino(self.pid, "ns"), name)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         let tag = self.tag;
@@ -1747,12 +1922,22 @@ const ATTR_NAMES: &[&str] = &[
 ];
 
 #[derive(Debug)]
-struct ProcAttrDir;
+struct ProcAttrDir {
+    pid: u64,
+}
 
 impl DirOps for ProcAttrDir {
+    fn ino(&self) -> u64 {
+        pid_entry_ino(self.pid, "attr")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         if ATTR_NAMES.contains(&name) {
-            Some(Arc::new(ProcAttrFile))
+            Some(Arc::new(ProcAttrFile {
+                ino: proc_pid_ino(self.ino(), name),
+            }))
         } else {
             None
         }
@@ -1771,13 +1956,21 @@ impl DirOps for ProcAttrDir {
 /// One `/proc/<pid>/attr/*` node. Reads empty (no active LSM); writes
 /// succeed as no-ops so a relabel attempt does not error.
 #[derive(Debug)]
-struct ProcAttrFile;
+struct ProcAttrFile {
+    ino: u64,
+}
 
 // `/proc/<pid>/attr/*` really is 0666 in Linux -- the `ATTR(LSM, name, 0666)`
 // entries in fs/proc/base.c -- because the LSM, not the mode, decides who may
 // write a security label. This is the sole `FILE_RW_ALL` user; everything
 // else writable takes the 0644 default.
 impl FileOps for ProcAttrFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
     }
@@ -1803,6 +1996,12 @@ struct ProcIdMapFile {
 }
 
 impl FileOps for ProcIdMapFile {
+    fn ino(&self) -> u64 {
+        idmap_file_ino(self.pid, self.file)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
         hook_ns_idmap_open(self.pid, self.file, write).map(Some)
     }
@@ -1840,6 +2039,12 @@ impl FileOps for ProcIdMapFile {
 pub(crate) struct ProcRoot;
 
 impl DirOps for ProcRoot {
+    fn ino(&self) -> u64 {
+        PROC_ROOT_INO
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
             "cpuinfo" => Some(Arc::new(ProcStaticFile {
@@ -1891,7 +2096,9 @@ impl DirOps for ProcRoot {
             // via lookup_dir("pressure"). Static (no feature gate) so
             // it is always present, like meminfo — systemd's
             // memory-pressure event source needs it to exist.
-            "pressure" => Some(Arc::new(ProcDirMarker)),
+            "pressure" => Some(Arc::new(ProcDirMarker {
+                ino: proc_static_ino(PROC_ROOT_INO, "pressure"),
+            })),
             "self" => Some(Arc::new(ProcSelfSymlink)),
             // /proc/thread-self is a magic symlink (like /proc/self) that
             // resolves to `<pid>/task/<tid>`.  In NARF tid == the per-task
@@ -1907,10 +2114,13 @@ impl DirOps for ProcRoot {
                 // then descend via lookup_dir afterwards.
                 if let Some(snap) = lookup_registry(&[name]) {
                     return Some(match snap {
-                        ProcNodeSnapshot::File(f) => {
-                            Arc::new(ProcDynFile { file: f }) as Arc<dyn FileOps>
-                        }
-                        ProcNodeSnapshot::Dir(_) => Arc::new(ProcDirMarker) as Arc<dyn FileOps>,
+                        ProcNodeSnapshot::File(f) => Arc::new(ProcDynFile {
+                            file: f,
+                            ino: registry_ino(&[name]),
+                        }) as Arc<dyn FileOps>,
+                        ProcNodeSnapshot::Dir(_) => Arc::new(ProcDirMarker {
+                            ino: registry_ino(&[name]),
+                        }) as Arc<dyn FileOps>,
                     });
                 }
                 // Numeric pid → directory marker (lookup-as-file).
@@ -1922,7 +2132,9 @@ impl DirOps for ProcRoot {
                 if let Ok(n) = name.parse::<u64>() {
                     if let Some(pid) = pid_resolve(n) {
                         if task_info(pid, TaskInfoQuery::Basic).is_some() {
-                            return Some(Arc::new(ProcDirMarker));
+                            return Some(Arc::new(ProcDirMarker {
+                                ino: pid_dir_ino(pid),
+                            }));
                         }
                     }
                 }
@@ -2087,12 +2299,20 @@ pub struct ProcDynamicDir {
 }
 
 impl DirOps for ProcDynamicDir {
+    fn ino(&self) -> u64 {
+        let comps: Vec<&str> = self.path_components.iter().map(String::as_str).collect();
+        registry_ino(&comps)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let mut path: Vec<&str> = self.path_components.iter().map(String::as_str).collect();
         path.push(name);
+        let ino = registry_ino(&path);
         match lookup_registry(&path) {
-            Some(ProcNodeSnapshot::File(f)) => Some(Arc::new(ProcDynFile { file: f })),
-            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker)),
+            Some(ProcNodeSnapshot::File(f)) => Some(Arc::new(ProcDynFile { file: f, ino })),
+            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker { ino })),
             None => None,
         }
     }
@@ -3128,6 +3348,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
     let f = ProcPidFile {
         pid: 1,
         field: PidField::Comm,
+        ino: 0,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let perms = f.stat().mode.perms;
@@ -3142,6 +3363,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
     let ro = ProcPidFile {
         pid: 1,
         field: PidField::Stat,
+        ino: 0,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     if ro.stat().mode.perms != 0o444 {
@@ -3158,6 +3380,7 @@ fn smoke_comm_write_updates_read() -> TestResult {
     let f = ProcPidFile {
         pid: PID,
         field: PidField::Comm,
+        ino: 0,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // Write with a trailing newline (Linux userspace shape).
@@ -3176,6 +3399,7 @@ fn smoke_comm_write_truncates_to_15() -> TestResult {
     let f = ProcPidFile {
         pid: PID,
         field: PidField::Comm,
+        ino: 0,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // 30 ASCII 'a' chars + newline — handler must accept and truncate.
@@ -3195,6 +3419,7 @@ fn smoke_non_comm_write_returns_readonly() -> TestResult {
     let f = ProcPidFile {
         pid: 1,
         field: PidField::Stat,
+        ino: 0,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let wr = poll_once(f.write(0, b"ignored\n"));
@@ -3866,7 +4091,7 @@ kernel_test_in!(
 /// /proc/<pid>/attr/current stat() is a regular RW file that reads
 /// empty (no active LSM) — the "unconfined" answer systemd expects.
 fn smoke_attr_current_empty_and_rw() -> TestResult {
-    let dir = ProcAttrDir;
+    let dir = ProcAttrDir { pid: 1 };
     let Some(node) = dir.lookup("current") else {
         return TestResult::Fail("attr/current must exist");
     };
@@ -3945,4 +4170,59 @@ fn smoke_proc_mounts_matches_mountinfo_namespace_view() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs",
     smoke_proc_mounts_matches_mountinfo_namespace_view
+);
+
+/// procfs inode identity: the root is `PROCFS_ROOT_INO`, one entry looked
+/// up twice is one inode, siblings differ, and a directory's stat-able
+/// marker carries the same inode as the `DirOps` an open fd wraps — all on
+/// the one procfs `st_dev`.
+fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
+    let root = ProcRoot;
+    // PROCFS_ROOT_INO (include/uapi/linux/fs.h).
+    if root.ino() != 1 || root.inode_attrs().dev == 0 {
+        return TestResult::Fail("/proc root is not ino 1 on a procfs st_dev");
+    }
+    let (Some(a), Some(b), Some(c)) = (
+        root.lookup("meminfo"),
+        root.lookup("meminfo"),
+        root.lookup("cpuinfo"),
+    ) else {
+        return TestResult::Fail("/proc/meminfo or /proc/cpuinfo missing");
+    };
+    if a.ino() == 0 || a.ino() != b.ino() {
+        return TestResult::Fail("two lookups of /proc/meminfo differ (or are 0)");
+    }
+    if a.ino() == c.ino() {
+        return TestResult::Fail("/proc/meminfo and /proc/cpuinfo share an inode");
+    }
+    if a.inode_attrs().dev != root.inode_attrs().dev {
+        return TestResult::Fail("a procfs file is not on the procfs st_dev");
+    }
+    let pid = ProcPidDir { pid: 7 };
+    let (Some(stat), Some(status), Some(marker), Some(fd_dir)) = (
+        pid.lookup("stat"),
+        pid.lookup("status"),
+        pid.lookup("fd"),
+        pid.lookup_dir("fd"),
+    ) else {
+        return TestResult::Fail("/proc/<pid> entries missing");
+    };
+    if stat.ino() == 0 || stat.ino() == status.ino() {
+        return TestResult::Fail("/proc/<pid>/stat and status share an inode (or 0)");
+    }
+    if marker.ino() != fd_dir.ino() || marker.ino() == 0 {
+        return TestResult::Fail("/proc/<pid>/fd: stat marker and DirOps inodes differ");
+    }
+    let other = ProcPidDir { pid: 8 };
+    if pid.ino() == 0 || pid.ino() == other.ino() || pid.ino() == root.ino() {
+        return TestResult::Fail("/proc/<pid> inode is not keyed on the pid");
+    }
+    if other.lookup("stat").map(|f| f.ino()) == Some(stat.ino()) {
+        return TestResult::Fail("two processes' /proc/<pid>/stat share an inode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_procfs_inode_identity_is_stable_and_distinct
 );

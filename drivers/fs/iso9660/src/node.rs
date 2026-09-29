@@ -44,11 +44,42 @@ pub struct Iso9660NodeState {
 pub struct Iso9660Node<B: BlockDevice> {
     pub volume: Arc<Iso9660Volume<B>>,
     pub state: IrqSafeSpinLock<Iso9660NodeState>,
+    /// `st_ino`: see [`isofs_get_ino`].
+    ino: u64,
+}
+
+/// `log2(SECTOR_SIZE)`: Linux's `ISOFS_BUFFER_BITS` for 2 KiB blocks.
+const ISOFS_BUFFER_BITS: u32 = SECTOR_SIZE.trailing_zeros();
+
+/// Linux `fs/isofs/isofs.h::isofs_get_ino`: the inode number is where the
+/// node's directory record sits, `(block << (bufbits - 5)) | (offset >> 5)`.
+/// A directory is first normalised to its own "." record
+/// (`isofs_normalize_block_and_offset`: block = extent + extended
+/// attribute length, offset 0), so every redundant record naming it —
+/// its entry in the parent, its ".", its children's ".." — gives the
+/// same number, the root included.
+fn isofs_get_ino(block: u64, offset: u64) -> u64 {
+    (block << (ISOFS_BUFFER_BITS - 5)) | (offset >> 5)
 }
 
 impl<B: BlockDevice + 'static> Iso9660Node<B> {
-    /// Build a node from a [`DirectoryRecord`].
-    pub fn from_record(volume: Arc<Iso9660Volume<B>>, record: &DirectoryRecord) -> Self {
+    /// Build a node from a [`DirectoryRecord`] found at `(block, offset)`
+    /// (the record's logical block and byte offset in it; ignored for a
+    /// directory — see [`isofs_get_ino`]).
+    pub fn from_record(
+        volume: Arc<Iso9660Volume<B>>,
+        record: &DirectoryRecord,
+        (block, offset): (u64, u64),
+    ) -> Self {
+        let ino = if record.is_directory() {
+            isofs_get_ino(
+                u64::from(record.extent_lba_le())
+                    + u64::from(record.extended_attribute_record_length),
+                0,
+            )
+        } else {
+            isofs_get_ino(block, offset)
+        };
         let extent_lba = record.extent_lba_le();
         let data_length = record.data_length_le();
         let mode = if record.is_directory() {
@@ -64,6 +95,7 @@ impl<B: BlockDevice + 'static> Iso9660Node<B> {
         };
         Self {
             volume,
+            ino,
             state: IrqSafeSpinLock::new(Iso9660NodeState {
                 extent_lba,
                 data_length,
@@ -76,6 +108,17 @@ impl<B: BlockDevice + 'static> Iso9660Node<B> {
 // ── FileOps ─────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
     /// inode — a FIFO or device node living in this filesystem dispatches
     /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
@@ -139,6 +182,17 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
 // ── DirOps ──────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     fn rcu_walkable(&self) -> bool {
         true
     }
@@ -152,10 +206,10 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let entries = scan_directory(&self.volume, &self.state).await?;
-            for (found_name, record) in entries {
+            for (found_name, record, pos) in entries {
                 if names_match(&found_name, name) {
                     return Ok(
-                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record))
+                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record, pos))
                             as Arc<dyn FileOps>,
                     );
                 }
@@ -171,10 +225,10 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
             let entries = scan_directory(&self.volume, &self.state).await?;
-            for (found_name, record) in entries {
+            for (found_name, record, pos) in entries {
                 if names_match(&found_name, name) && record.is_directory() {
                     return Ok(
-                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record))
+                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record, pos))
                             as Arc<dyn DirOps>,
                     );
                 }
@@ -207,9 +261,9 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
             // the path-resolution layer instead.
             let user_visible: Vec<_> = entries
                 .into_iter()
-                .filter(|(name, _)| name != "." && name != "..")
+                .filter(|(name, _, _)| name != "." && name != "..")
                 .collect();
-            for (i, (name, record)) in user_visible.into_iter().enumerate() {
+            for (i, (name, record, _)) in user_visible.into_iter().enumerate() {
                 if i < cursor {
                     continue;
                 }
@@ -260,7 +314,8 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
 // ── Directory scan ─────────────────────────────────────────────────
 
 /// Read a directory's entire extent into RAM and walk its records,
-/// returning `(name, record_header)` pairs. ECMA-119 §9.1.1
+/// returning `(name, record_header, (block, offset))` triples — the last
+/// being where the record sits (logical block, byte offset in it). ECMA-119 §9.1.1
 /// guarantees a record never crosses a logical-sector boundary, so
 /// a `length == 0` byte means "skip to the next sector". We honour
 /// that by aligning the cursor up to the next 2KiB boundary.
@@ -271,7 +326,7 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
 async fn scan_directory<B: BlockDevice + 'static>(
     volume: &Arc<Iso9660Volume<B>>,
     state: &IrqSafeSpinLock<Iso9660NodeState>,
-) -> Result<Vec<(String, DirectoryRecord)>, FsError> {
+) -> Result<Vec<(String, DirectoryRecord, (u64, u64))>, FsError> {
     let (extent_lba, data_length) = {
         let g = state.lock();
         (g.extent_lba, g.data_length)
@@ -317,7 +372,11 @@ async fn scan_directory<B: BlockDevice + 'static>(
         }
         let id = &body[id_off..id_off + id_len];
         let name = decode_file_identifier(id);
-        out.push((name, record));
+        let pos = (
+            u64::from(extent_lba) + (offset / SECTOR_SIZE) as u64,
+            (offset % SECTOR_SIZE) as u64,
+        );
+        out.push((name, record, pos));
         offset += length_byte as usize;
     }
     Ok(out)

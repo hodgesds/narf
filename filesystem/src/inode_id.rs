@@ -41,6 +41,40 @@ pub fn alloc_anon_dev() -> u64 {
     (minor & 0xff) | ((minor & !0xff) << 12)
 }
 
+/// A superblock's anonymous `st_dev`, allocated from [`alloc_anon_dev`] on
+/// first use and fixed afterwards. For singleton mounted pseudo filesystems
+/// (procfs, sysfs, debugfs, ...) whose superblock is a `static`.
+#[derive(Debug)]
+pub struct LazyAnonDev(AtomicU64);
+
+impl LazyAnonDev {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// The device number, allocated on the first call.
+    pub fn get(&self) -> u64 {
+        let dev = self.0.load(Ordering::Acquire);
+        if dev != 0 {
+            return dev;
+        }
+        let fresh = alloc_anon_dev();
+        match self
+            .0
+            .compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => fresh,
+            Err(existing) => existing,
+        }
+    }
+}
+
+impl Default for LazyAnonDev {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static NEXT_INO: AtomicU64 = AtomicU64::new(0);
 
 /// `get_next_ino`: the next inode number for a pseudo-filesystem inode.

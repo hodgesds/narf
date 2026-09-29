@@ -61,25 +61,17 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
-/// Monotonic inode allocator for bpffs nodes.
-///
-/// A separate counter from `memfs`'s, based far away from it: NARF reports
-/// `st_dev = 0` for every mount, so two filesystems sharing an inode-number
-/// range would hand userspace two nodes with the same `(st_dev, st_ino)` — and
-/// systemd's `rm_rf` treats that as "you have reached a filesystem root" and
-/// refuses to descend. `memfs` bases at `0x1000_0000`; this base is high enough
-/// that it cannot be reached by that counter within a boot.
-static NEXT_INO: AtomicU64 = AtomicU64::new(0x2000_0000_0000);
-
-fn alloc_ino() -> u64 {
-    NEXT_INO.fetch_add(1, Ordering::Relaxed)
-}
+// Inode identity, Linux `kernel/bpf/inode.c`: every bpffs mount is its own
+// superblock (`get_tree_nodev`) with its own anonymous `st_dev`; the root is
+// `simple_fill_super`'s inode 1, and every pin and directory made in it takes
+// a `get_next_ino()` number (`bpf_get_inode`).
+const BPFFS_ROOT_INO: u64 = 1;
 
 /// Permission bits a pin stats with. Linux uses
 /// `S_IFREG | ((S_IRUSR | S_IWUSR) & ~current_umask())` in `bpf_obj_do_pin`.
@@ -95,6 +87,8 @@ const PIN_PERMS: u16 = 0o600;
 /// both.
 pub struct BpfPin {
     ino: u64,
+    /// The mount's `st_dev`.
+    dev: u64,
     obj: Arc<dyn FileOps>,
 }
 
@@ -122,6 +116,13 @@ impl fmt::Debug for BpfPin {
 impl FileOps for BpfPin {
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: self.dev,
+            ..Default::default()
+        }
     }
 
     /// `EINVAL`, matching Linux's `bpf_dummy_read`. A pin is not a byte
@@ -174,6 +175,8 @@ impl fmt::Debug for BpfEntry {
 /// subdirectory are one of these.
 pub struct BpfDir {
     ino: u64,
+    /// The mount's `st_dev`, shared by everything created in it.
+    dev: u64,
     entries: IrqSafeSpinLock<BTreeMap<String, BpfEntry>>,
     perms: AtomicU32,
 }
@@ -188,9 +191,10 @@ impl fmt::Debug for BpfDir {
 }
 
 impl BpfDir {
-    fn new(perms: u16) -> Self {
+    fn new(perms: u16, dev: u64, ino: u64) -> Self {
         Self {
-            ino: alloc_ino(),
+            ino,
+            dev,
             entries: IrqSafeSpinLock::new(BTreeMap::new()),
             perms: AtomicU32::new(u32::from(perms)),
         }
@@ -213,7 +217,8 @@ impl BpfDir {
             return Err(FsError::Busy);
         }
         let pin = Arc::new(BpfPin {
-            ino: alloc_ino(),
+            ino: crate::inode_id::get_next_ino(),
+            dev: self.dev,
             obj,
         });
         g.insert(name.to_string(), BpfEntry::Pin(Arc::clone(&pin)));
@@ -280,6 +285,13 @@ pub fn pinned_object_of(ops: &dyn FileOps) -> Option<Arc<dyn FileOps>> {
 impl DirOps for BpfDir {
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: self.dev,
+            ..Default::default()
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
@@ -371,7 +383,11 @@ impl DirOps for BpfDir {
             if g.contains_key(name) {
                 return Err(FsError::Busy);
             }
-            let d = Arc::new(BpfDir::new(0o755));
+            let d = Arc::new(BpfDir::new(
+                0o755,
+                self.dev,
+                crate::inode_id::get_next_ino(),
+            ));
             g.insert(name.to_string(), BpfEntry::Dir(Arc::clone(&d)));
             Ok(d as Arc<dyn DirOps>)
         })
@@ -424,7 +440,11 @@ impl BpfFs {
         // a capability. `dir_mode` is settable through `chmod(2)` if a
         // deployment wants it looser.
         Self {
-            root: Arc::new(BpfDir::new(0o700)),
+            root: Arc::new(BpfDir::new(
+                0o700,
+                crate::inode_id::alloc_anon_dev(),
+                BPFFS_ROOT_INO,
+            )),
         }
     }
 

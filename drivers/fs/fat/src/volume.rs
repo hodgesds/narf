@@ -78,6 +78,8 @@ pub struct FatVolume<B: BlockDevice> {
     /// inherently sequential — the lock contention is not a hot
     /// concern.
     io: IrqSafeSpinLock<VolumeIo>,
+    /// The superblock's `st_dev`, allocated at mount.
+    pub dev: u64,
 }
 
 impl<B: BlockDevice + 'static> FatVolume<B> {
@@ -153,6 +155,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
         }))
     }
 

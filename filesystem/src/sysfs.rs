@@ -267,6 +267,12 @@ fn net_snapshots() -> Vec<NetIfaceInfo> {
 pub struct Kobject {
     /// Node name (single path component, no slashes).
     name: String,
+    /// The directory's kernfs node id, which is its `st_ino`.
+    ino: u64,
+    /// Kernfs ids of this directory's attribute and symlink nodes, keyed
+    /// by entry name. Each is assigned from the same id space on first
+    /// lookup and kept for the life of the kobject.
+    node_inos: IrqSafeSpinLock<BTreeMap<String, u64>>,
     /// Strong reference to parent so we can compute the full path.
     /// `None` for the tree root.
     parent: Option<Arc<Kobject>>,
@@ -298,6 +304,10 @@ impl Kobject {
     pub fn new_root(name: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
+            // `kernfs_create_root`: the root is the first node of its
+            // hierarchy, id 1.
+            ino: SYSFS_ROOT_INO,
+            node_inos: IrqSafeSpinLock::new(BTreeMap::new()),
             parent: None,
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -312,6 +322,8 @@ impl Kobject {
     pub fn new_child(parent: Arc<Kobject>, name: impl Into<String>) -> Arc<Self> {
         let child = Arc::new(Self {
             name: name.into(),
+            ino: kernfs_next_ino(),
+            node_inos: IrqSafeSpinLock::new(BTreeMap::new()),
             parent: Some(parent.clone()),
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -326,6 +338,23 @@ impl Kobject {
     /// Return the name of this kobject.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The kobject directory's `st_ino` (its kernfs node id).
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /// `st_ino` of the attribute or symlink `name` in this directory:
+    /// assigned on first lookup, then fixed for the life of the kobject.
+    pub fn node_ino(&self, name: &str) -> u64 {
+        let mut map = self.node_inos.lock();
+        if let Some(&ino) = map.get(name) {
+            return ino;
+        }
+        let ino = kernfs_next_ino();
+        map.insert(String::from(name), ino);
+        ino
     }
 
     /// Compute the absolute sysfs path for this kobject (e.g.
@@ -2095,6 +2124,38 @@ pub fn populate_all() {
     get_or_create_child(&fuse_dir, "connections");
 }
 
+// ── Inode identity ───────────────────────────────────────────────────
+//
+// sysfs is kernfs: every directory, attribute and symlink is a
+// `kernfs_node` whose id comes from `idr_alloc_cyclic(&root->ino_idr, kn,
+// 1, ...)` in `__kernfs_new_node` (fs/kernfs/dir.c) and, on 64-bit, IS the
+// inode number (`kernfs_ino` → `kernfs_id_ino`). The root is the first node
+// allocated, id 1. NARF keeps the same shape: a kobject takes its id when it
+// is created, an attribute or symlink when it is first looked up (NARF's
+// attribute maps hold callbacks, not nodes), and every id comes from one
+// counter so no two nodes share one. The whole mount is one superblock with
+// its own anonymous `st_dev`.
+
+const SYSFS_ROOT_INO: u64 = 1;
+static KERNFS_NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2);
+static SYSFS_DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+
+fn kernfs_next_ino() -> u64 {
+    KERNFS_NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The sysfs superblock's `st_dev`.
+pub fn sysfs_dev() -> u64 {
+    SYSFS_DEV.get()
+}
+
+fn sysfs_attrs() -> crate::InodeAttrs {
+    crate::InodeAttrs {
+        dev: sysfs_dev(),
+        ..Default::default()
+    }
+}
+
 // ── SysFs FsInstance ─────────────────────────────────────────────────
 
 /// The sysfs `FsInstance`.  Mount at `/sys`.
@@ -2129,6 +2190,12 @@ impl FsInstance for SysFs {
 struct SysRoot;
 
 impl DirOps for SysRoot {
+    fn ino(&self) -> u64 {
+        get_root().ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let kobj = get_root();
         // Text attrs: use find_attr_key so any dynamically-registered attr
@@ -2195,6 +2262,12 @@ pub struct SysKobjDir {
 }
 
 impl DirOps for SysKobjDir {
+    fn ino(&self) -> u64 {
+        self.kobj.ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Text attrs: use find_attr_key so any dynamically-registered attr
         // (backlight, leds, hwmon, etc.) is visible without a static list.
@@ -2218,7 +2291,10 @@ impl DirOps for SysKobjDir {
         }
         // Symlinks (subsystem/device/driver, …) — readlink reads the target.
         if let Some(target) = self.kobj.get_symlink(name) {
-            return Some(Arc::new(SysSymlinkFile { target }));
+            return Some(Arc::new(SysSymlinkFile {
+                target,
+                ino: self.kobj.node_ino(name),
+            }));
         }
         // Child dirs look like files so resolve() can stat them
         if let Some(child) = self.kobj.get_child(name) {
@@ -2310,6 +2386,13 @@ struct SysDirMarker {
 }
 
 impl FileOps for SysDirMarker {
+    fn ino(&self) -> u64 {
+        // The directory's own id, as its `SysKobjDir` reports it.
+        self.kobj.ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
@@ -2337,9 +2420,16 @@ impl FileOps for SysDirMarker {
 #[derive(Debug)]
 struct SysSymlinkFile {
     target: String,
+    ino: u64,
 }
 
 impl FileOps for SysSymlinkFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let bytes = self.target.as_bytes();
@@ -2388,6 +2478,12 @@ impl fmt::Debug for SysBinAttrFile {
 }
 
 impl FileOps for SysBinAttrFile {
+    fn ino(&self) -> u64 {
+        self.kobj.node_ino(self.attr_name)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let n = self
             .kobj
@@ -2429,6 +2525,12 @@ impl fmt::Debug for SysAttrFile {
 }
 
 impl FileOps for SysAttrFile {
+    fn ino(&self) -> u64 {
+        self.kobj.node_ino(self.attr_name)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
         Box::pin(async move {

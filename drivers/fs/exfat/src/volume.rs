@@ -74,6 +74,8 @@ pub struct ExfatVolume<B: BlockDevice> {
     pub domain: DomainId,
     pub self_weak: Weak<ExfatVolume<B>>,
     io: IrqSafeSpinLock<VolumeIo>,
+    /// The superblock's `st_dev`, allocated at mount.
+    pub dev: u64,
 }
 
 impl<B: BlockDevice + 'static> ExfatVolume<B> {
@@ -140,6 +142,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
         }))
     }
 

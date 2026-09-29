@@ -48,6 +48,9 @@ pub struct ExfatDirent {
     pub file: FileDirectoryEntry,
     pub stream: StreamExtensionEntry,
     pub name_utf16: Vec<u16>,
+    /// Volume-wide index of the primary (§7.4) entry's 32-byte slot:
+    /// `lba * entries_per_sector + slot`. See [`ExfatNode::ino`].
+    pub slot_pos: u64,
 }
 
 impl ExfatDirent {
@@ -71,7 +74,18 @@ pub struct ExfatNodeState {
 pub struct ExfatNode<B: BlockDevice> {
     pub volume: Arc<ExfatVolume<B>>,
     pub state: IrqSafeSpinLock<ExfatNodeState>,
+    /// `st_ino`. Linux (fs/exfat) numbers the root `EXFAT_ROOT_INO` = 1
+    /// and finds every other inode by `i_pos` — where its file entry sits
+    /// (`exfat_make_i_pos`: parent dir cluster << 32 | entry index) —
+    /// giving it an `iunique` number while it stays cached. NARF has no
+    /// inode cache, so it reports the entry's position itself (the
+    /// volume-wide slot index of its primary entry): unique per file,
+    /// the same on every lookup, and never 0 or 1 (the boot region
+    /// precedes the cluster heap).
+    ino: u64,
 }
+
+const EXFAT_ROOT_INO: u64 = 1;
 
 impl<B: BlockDevice + 'static> ExfatNode<B> {
     /// Construct the root node from the volume's
@@ -80,6 +94,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
     pub fn new_root(volume: Arc<ExfatVolume<B>>, first_cluster: u32) -> Self {
         Self {
             volume,
+            ino: EXFAT_ROOT_INO,
             state: IrqSafeSpinLock::new(ExfatNodeState {
                 first_cluster,
                 data_length: 0,
@@ -117,6 +132,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
         };
         Self {
             volume,
+            ino: dirent.slot_pos,
             state: IrqSafeSpinLock::new(ExfatNodeState {
                 first_cluster: stream.first_cluster,
                 data_length: stream.data_length,
@@ -239,6 +255,8 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                     // slots (count derived from
                     // `secondary_count` − 1).
                     let file = read_file_entry(&self.sector.as_ref().unwrap().1, off);
+                    let slot_pos =
+                        lba * u64::from(entries_per_sector) + u64::from(self.entry_in_sector);
                     let secondary_count = file.secondary_count as u32;
                     self.entry_in_sector += 1;
                     if secondary_count < 2 {
@@ -289,6 +307,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                         file,
                         stream,
                         name_utf16,
+                        slot_pos,
                     }));
                 }
 
@@ -371,6 +390,17 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
 // ── FileOps / DirOps surface ────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
     /// inode — a FIFO or device node living in this filesystem dispatches
     /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
@@ -414,6 +444,17 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for ExfatNode<B> {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     fn rcu_walkable(&self) -> bool {
         true
     }
