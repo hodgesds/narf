@@ -6087,253 +6087,422 @@ fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
     }
 }
 
-/// `security/commoncap.c::handle_privileged_root` — the half of
-/// `cap_bprm_creds_from_file` that makes a set-user-ID-**root** binary
-/// actually privileged.
+/// The credential an `execve` installs: `struct linux_binprm`'s `cred`,
+/// `secureexec`, and the `BINPRM_FLAGS_ENFORCE_NONDUMP` interp flag.
 ///
-/// Without it a setuid-root exec would move euid to 0 and stop there, and
-/// on a task that had already dropped root the permitted set is empty, so
-/// the new program would be "root" with no capabilities — the one state
-/// Linux never leaves a process in.
-///
-/// ```text
-/// if (__is_eff(root_uid, new) || __is_real(root_uid, new)) {
-///         /* pP' = (cap_bset & ~0) | (pI & ~0) */
-///         new->cap_permitted = cap_combine(old->cap_bset, old->cap_inheritable);
-/// }
-/// if (__is_eff(root_uid, new))
-///         *effective = true;
-/// ```
-///
-/// The permitted set is REGENERATED from the bounding set rather than
-/// inherited, which is what lets an unprivileged caller gain privilege
-/// through a setuid-root binary at all. The effective set follows only
-/// when the EFFECTIVE uid is root: a binary that merely leaves the real
-/// uid at 0 gets the permissions but must raise them itself.
-fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
-    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
-    // `root_privileged()` is `!issecure(SECURE_NOROOT)`
-    // (`security/commoncap.c:805`). SECURE_NOROOT says "uid 0 is just a
-    // uid" — the root-gets-everything shortcut below is exactly what it
-    // exists to switch off, so a task that set it must not be handed the
-    // full set by execing something owned by root.
-    if new_ids.euid != root_uid && new_ids.uid != root_uid {
-        return;
-    }
-    if issecure(task, SECURE_NOROOT) {
-        return;
-    }
-    let mut caps = read_caps(task);
-    caps.permitted = caps.bounding | caps.inheritable;
-    if new_ids.euid == root_uid {
-        caps.effective = caps.permitted;
-    }
-    write_caps(task, caps);
+/// Computed BEFORE the new image is loaded and committed only AFTER it has
+/// been, because that is where Linux draws the line: `bprm_creds_from_file`
+/// fills `bprm->cred`, the ELF loader reads it for `AT_UID`/`AT_EUID`/
+/// `AT_SECURE`, and `commit_creds` installs it past the point of no return.
+/// Installing it up front (what NARF did) meant an `execve` that then failed
+/// — a set-user-ID-root file that is not a valid ELF, say — returned
+/// ENOEXEC to a caller that was now running as root.
+#[derive(Clone, Copy)]
+pub(crate) struct ExecCred {
+    ids: UidGid,
+    caps: Caps,
+    /// `bprm->secureexec` — the `AT_SECURE` auxv word.
+    secureexec: bool,
+    /// `BINPRM_FLAGS_ENFORCE_NONDUMP`, set by `would_dump`.
+    enforce_nondump: bool,
 }
 
-/// The ambient half of `cap_bprm_creds_from_file`
-/// (`security/commoncap.c:966`).
+/// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID half of
+/// `bprm_creds_from_file`, applied to the proposed credential `new`.
 ///
 /// ```text
-/// /* File caps or setid cancels ambient. */
-/// if (has_fcap || id_changed)
-///         cap_clear(new->cap_ambient);
-/// /* pP' = (X & fP) | (pI & fI) | pA' */
-/// new->cap_permitted = cap_combine(new->cap_permitted, new->cap_ambient);
-/// /* pE' = (fE ? pP' : pA') */
-/// if (effective) new->cap_effective = new->cap_permitted;
-/// else           new->cap_effective = new->cap_ambient;
+/// if (!mnt_may_suid(file->f_path.mnt)) return;
+/// if (task_no_new_privs(current))      return;
+/// mode = READ_ONCE(inode->i_mode);
+/// if (!(mode & (S_ISUID|S_ISGID)))     return;
 /// ...
-/// new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+/// err = inode_permission(idmap, inode, MAY_EXEC);
+/// /* Did the exec bit vanish out from under us? Give up. */
+/// if (err) return;
+/// /* We ignore suid/sgid if there are no mappings for them in the ns */
+/// if (!vfsuid_has_mapping(bprm->cred->user_ns, vfsuid) ||
+///     !vfsgid_has_mapping(bprm->cred->user_ns, vfsgid)) return;
+/// if (mode & S_ISUID) bprm->cred->euid = vfsuid_into_kuid(vfsuid);
+/// if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))
+///         bprm->cred->egid = vfsgid_into_kgid(vfsgid);
 /// ```
 ///
-/// This is the ONLY thing that makes the ambient set worth having: it is
-/// the set that survives an exec, joining permitted and becoming
-/// effective. Without it `PR_CAP_AMBIENT_RAISE` is a write to a field that
-/// never influences anything, which is what it was.
+/// `file` is the file the exec actually maps — for a `#!` script that is
+/// the INTERPRETER (`bprm_creds_from_file` reads `bprm->file`, which
+/// `exec_binprm` has swapped for the interpreter), so a script's own bits
+/// confer nothing while a set-user-ID interpreter's do. `mount_path` is the
+/// absolute path that file was resolved at, AFTER the caller's chroot has
+/// been applied, because that is the path the mount table is keyed by.
 ///
-/// `id_changed` cancels ambient because the new image is already gaining
-/// privilege from the set-user-ID bit; carrying a second, independently
-/// granted set across the same exec would stack two privilege sources the
-/// caller never combined deliberately.
+/// It used to take the caller's path and resolve it again, WITHOUT the
+/// chroot. On a chrooted distro root (NARF runs CachyOS's systemd chrooted
+/// into `/mnt`) `/usr/bin/sudo` then named nothing, the lookup failed, and
+/// every set-user-ID binary ran with the invoker's euid — sudo's "effective
+/// uid is not 0".
 ///
-/// NARF has no file capabilities, so `has_fcap` and `effective` are always
-/// false — which is why `pE' = pA'` here rather than the `fE ? pP' : pA'`
-/// choice, and why the `X & fP` and `pI & fI` terms of `pP'` contribute
-/// nothing. Stated rather than silently simplified.
-fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
-    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
-    let mut caps = read_caps(task);
-    if id_changed {
-        caps.ambient = 0;
-    }
-    caps.permitted |= caps.ambient;
-    // `pE' = fE ? pP' : pA'`. `fE` has two sources in Linux: a file
-    // capability's effective bit, and `handle_privileged_root`, which sets
-    // `effective = true` when the new euid is root and SECURE_NOROOT is
-    // clear. NARF has no file capabilities, so the second is the only one —
-    // which is exactly the condition `cap_exec_privileged_root` above uses
-    // to hand out the full set, and computing it differently here would let
-    // the two disagree about the same exec.
-    let fe = ids.euid == root_uid && !issecure(task, SECURE_NOROOT);
-    caps.effective = if fe { caps.permitted } else { caps.ambient };
-    write_caps(task, caps);
-    // `new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS)` — KEEP_CAPS is
-    // about surviving a uid change, not an exec, and leaving it set would
-    // apply the previous image's choice to the new one.
-    let bits = task_securebits(task);
-    set_task_securebits(task, bits & !(1u64 << SECURE_KEEP_CAPS));
-}
-
-/// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID transition
-/// an `execve` of a privileged binary performs.
-///
-/// Every guard here is load-bearing, because this is the one place in the
-/// tree where an unprivileged task can gain privilege:
-///
-///   * `mnt_may_suid` — a `nosuid` mount confers nothing. That is what
-///     the flag is FOR, and until this existed there was nothing for it
-///     to suppress.
-///   * `task_no_new_privs` — a task that asked to be unable to gain
-///     privilege does not gain it. One-way, so a sandbox cannot be
-///     talked out of it.
-///   * the execute permission is re-checked (`inode_permission(MAY_EXEC)`)
-///     so a binary that lost its exec bit between the open and here
-///     confers nothing.
-///   * S_ISGID alone does nothing; Linux requires `S_ISGID | S_IXGRP`
-///     together, because S_ISGID without group-execute is the mandatory
-///     file-locking marker, not a privilege request.
-///
-/// Returns the new credential when a transition happened.
-fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
-    // Linux ignores the set-user-ID bits on a `#!` script: the kernel
-    // executes the INTERPRETER, and honouring the script's bits would hand
-    // its privilege to an interpreter that was never audited for it. NARF
-    // resolves the shebang itself, so the equivalent is to confer nothing
-    // once a shebang has been followed.
-    if from_script {
-        return None;
-    }
+/// S_ISGID without S_IXGRP is the mandatory-locking marker, not a privilege
+/// request, which is why the group arm tests both bits.
+fn bprm_fill_uid(
+    task: u64,
+    file: &dyn narf_filesystem::FileOps,
+    mount_path: &str,
+    new: &mut UidGid,
+) {
+    // `mnt_may_suid`. LINUX-GAP: its other two terms — the mount belongs to
+    // the caller's mount namespace (`check_mnt`) and the superblock's user
+    // namespace is one the caller is in (`current_in_userns(s_user_ns)`) —
+    // have nothing to read: NARF resolves by path in the caller's own
+    // namespace, and a superblock carries no user namespace.
     if narf_filesystem::any_restricted_mounts()
-        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOSUID != 0
+        && current_mount_flags_at(mount_path) & narf_filesystem::mnt_flags::NOSUID != 0
     {
-        return None;
+        return;
     }
     if read_prctl(task).no_new_privs {
-        return None;
+        return;
     }
-    let file = resolve_file_absolute_ext(path, true)?;
-    let stat = file.stat();
-    let mode = stat.mode.perms;
+    let mode = file.stat().mode.perms;
     if mode & 0o6000 == 0 {
-        return None;
+        return;
     }
     let (file_uid, file_gid) = file.owners();
-    // "Did the exec bit vanish out from under us? Give up."
-    let permitted = narf_filesystem::posix_access_ok(
-        narf_filesystem::FileOwner {
-            uid: file_uid,
-            gid: file_gid,
-            perms: mode,
-            is_dir: false,
-        },
-        &accessor_for_inode(task, file_uid, file_gid),
+    if node_permission(
+        task,
+        Some(file),
+        mode,
+        file_uid,
+        file_gid,
+        false,
         narf_filesystem::AccessRequest {
             read: false,
             write: false,
             exec: true,
         },
-    );
-    if !permitted {
-        return None;
+    )
+    .is_err()
+    {
+        return;
     }
-    let old = read_uidgid(task);
-    let mut new = old;
-    if mode & 0o4000 != 0 && inode_ids_mapped(task, file_uid, file_gid) {
+    if !inode_ids_mapped(task, file_uid, file_gid) {
+        return;
+    }
+    if mode & 0o4000 != 0 {
         new.euid = file_uid;
     }
-    // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
-    if mode & 0o2010 == 0o2010 && inode_ids_mapped(task, file_uid, file_gid) {
+    if mode & 0o2010 == 0o2010 {
         new.egid = file_gid;
     }
-    if new.euid == old.euid && new.egid == old.egid {
-        return None;
-    }
-    // `commit_creds` keeps the filesystem ids in step with the effective
-    // ones; every DAC decision reads fsuid/fsgid, so leaving them behind
-    // would grant the privilege for `access()` and deny it for `open()`.
-    new.fsuid = new.euid;
-    new.fsgid = new.egid;
-    // The saved set-ids record where the privilege came from, which is how
-    // a setuid program drops and regains it (`seteuid` back to `suid`).
-    new.suid = new.euid;
-    new.sgid = new.egid;
-    write_uidgid(task, |e| *e = new);
-    cap_exec_privileged_root(task, new);
-    Some(new)
 }
 
-/// `begin_new_exec`'s dumpability step (`/usr/src/linux/fs/exec.c:1205`).
+/// `kernel/groups.c::in_group_p` against the CURRENT credential:
 ///
 /// ```text
+/// if (!gid_eq(grp, cred->fsgid))
+///         retval = groups_search(cred->group_info, grp);
+/// ```
+fn cred_in_group_p(task: u64, cur: UidGid, gid: u32) -> bool {
+    cur.fsgid == gid || read_groups(task).contains(&gid)
+}
+
+/// `kernel/capability.c::ptracer_capable(current, new->user_ns)`: "an absent
+/// tracer adds no restrictions"; a present one must hold CAP_SYS_PTRACE over
+/// the exec'ing task's user namespace.
+///
+/// LINUX-GAP: Linux asks this of `tsk->ptracer_cred`, the tracer's
+/// credential SNAPSHOTTED at attach time. NARF's ptrace registry records the
+/// tracer's identity only, so the tracer's CURRENT capabilities are asked —
+/// a tracer that dropped CAP_SYS_PTRACE after attaching is treated as
+/// incapable (stricter), one that gained it after attaching as capable.
+fn exec_ptracer_capable(task: u64) -> bool {
+    let Some(tracer) = crate::ptrace::tracer_task_of(task) else {
+        return true;
+    };
+    #[cfg(feature = "container")]
+    {
+        task_ns_capable(
+            tracer,
+            &crate::namespaces::current_user_ns(task),
+            CAP_SYS_PTRACE,
+        )
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        cap_effective(tracer, CAP_SYS_PTRACE)
+    }
+}
+
+/// `security/commoncap.c::cap_bprm_creds_from_file`, on EVERY exec, with
+/// `handle_privileged_root` inlined. Returns `bprm->secureexec`.
+///
+/// NARF has no file capabilities, so `has_fcap` is always false and
+/// `effective` starts false; everything below is otherwise line for line:
+///
+/// ```text
+/// root_uid = make_kuid(new->user_ns, 0);
+/// handle_privileged_root(bprm, has_fcap, &effective, root_uid);
+/// id_changed = !uid_eq(new->euid, old->euid) || !in_group_p(new->egid);
+/// if ((id_changed || __cap_gained(permitted, new, old)) &&
+///     ((bprm->unsafe & ~LSM_UNSAFE_PTRACE) ||
+///      !ptracer_capable(current, new->user_ns))) {
+///         if (!ns_capable(new->user_ns, CAP_SETUID) ||
+///             (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS)) {
+///                 new->euid = new->uid;
+///                 new->egid = new->gid;
+///         }
+///         new->cap_permitted = cap_intersect(new->cap_permitted,
+///                                            old->cap_permitted);
+/// }
+/// new->suid = new->fsuid = new->euid;
+/// new->sgid = new->fsgid = new->egid;
+/// if (has_fcap || id_changed) cap_clear(new->cap_ambient);
+/// new->cap_permitted = cap_combine(new->cap_permitted, new->cap_ambient);
+/// if (effective) new->cap_effective = new->cap_permitted;
+/// else           new->cap_effective = new->cap_ambient;
+/// ...
+/// if (id_changed || !uid_eq(new->euid, old->uid) ||
+///     !gid_eq(new->egid, old->gid) ||
+///     (!__is_real(root_uid, new) &&
+///      (effective || __cap_grew(permitted, ambient, new))))
+///         bprm->secureexec = 1;
+/// ```
+///
+/// Points that are easy to get wrong and each matter:
+///
+///   * `handle_privileged_root` runs whether or not the file was
+///     set-user-ID: a root task that narrowed its permitted set and then
+///     execs an ordinary program gets the full set back (`pP' = bset | pI`),
+///     which is Linux's "root is root across exec" rule. SECURE_NOROOT
+///     switches it off.
+///   * `id_changed` is computed BEFORE the downgrade and not recomputed, so
+///     a downgraded exec still clears ambient and is still `secureexec`.
+///   * the saved and filesystem ids are reset to the effective ones on every
+///     exec, not only on a transition.
+///
+/// LINUX-GAP: `LSM_UNSAFE_SHARE` (another process shares this task's
+/// `fs_struct` via CLONE_FS) is not detected — NARF keeps no count of
+/// fs_struct sharers — so that arm of the downgrade never fires.
+fn cap_bprm_creds_from_file(
+    task: u64,
+    old: UidGid,
+    old_caps: Caps,
+    new: &mut UidGid,
+    caps: &mut Caps,
+) -> bool {
+    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
+    let mut effective = false;
+    // `handle_privileged_root`; `root_privileged()` is
+    // `!issecure(SECURE_NOROOT)`, and `has_fcap` is false.
+    if !issecure(task, SECURE_NOROOT) {
+        if new.euid == root_uid || new.uid == root_uid {
+            caps.permitted = old_caps.bounding | old_caps.inheritable;
+        }
+        if new.euid == root_uid {
+            effective = true;
+        }
+    }
+    let gained = caps.permitted & !old_caps.permitted != 0;
+    let id_changed = new.euid != old.euid || !cred_in_group_p(task, old, new.egid);
+    if id_changed || gained {
+        let nnp = read_prctl(task).no_new_privs;
+        if nnp || !exec_ptracer_capable(task) {
+            if !task_capable_in_own_ns(task, CAP_SETUID) || nnp {
+                new.euid = new.uid;
+                new.egid = new.gid;
+            }
+            caps.permitted &= old_caps.permitted;
+        }
+    }
+    new.suid = new.euid;
+    new.fsuid = new.euid;
+    new.sgid = new.egid;
+    new.fsgid = new.egid;
+    if id_changed {
+        caps.ambient = 0;
+    }
+    caps.permitted |= caps.ambient;
+    caps.effective = if effective {
+        caps.permitted
+    } else {
+        caps.ambient
+    };
+    id_changed
+        || new.euid != old.uid
+        || new.egid != old.gid
+        || (new.uid != root_uid && (effective || caps.permitted & !caps.ambient != 0))
+}
+
+/// `fs/exec.c::would_dump` — "If the binary is not readable then enforce
+/// mm->dumpable=0":
+///
+/// ```text
+/// if (inode_permission(idmap, inode, MAY_READ) < 0)
+///         bprm->interp_flags |= BINPRM_FLAGS_ENFORCE_NONDUMP;
+/// ```
+///
+/// An execute-only binary (mode 0711) is one its invoker may run but not
+/// read; a dumpable process would hand them its text through a core file
+/// or `ptrace` anyway.
+///
+/// LINUX-GAP: Linux also runs this on the ELF interpreter
+/// (`load_elf_binary`) and walks `mm->user_ns` up to a namespace privileged
+/// over the inode; NARF's loader opens the interpreter itself and an
+/// address space carries no user namespace, so only the main binary is
+/// checked.
+fn would_dump(task: u64, file: &dyn narf_filesystem::FileOps) -> bool {
+    let (uid, gid) = file.owners();
+    node_permission(
+        task,
+        Some(file),
+        file.stat().mode.perms,
+        uid,
+        gid,
+        false,
+        narf_filesystem::AccessRequest {
+            read: true,
+            write: false,
+            exec: false,
+        },
+    )
+    .is_err()
+}
+
+/// `bprm_creds_from_file` + `would_dump`: the credential an exec of `file`
+/// will install, without installing it. `file` is `None` for an image with
+/// no file behind it (an anonymous memfd handed to `execveat`), which has
+/// no set-id bits to honour but still gets the capability recomputation.
+pub(crate) fn exec_prepare_credentials(
+    task: u64,
+    file: Option<&dyn narf_filesystem::FileOps>,
+    mount_path: &str,
+) -> ExecCred {
+    let old = read_uidgid(task);
+    let old_caps = read_caps(task);
+    let mut ids = old;
+    let mut caps = old_caps;
+    if let Some(file) = file {
+        bprm_fill_uid(task, file, mount_path, &mut ids);
+    }
+    let secureexec = cap_bprm_creds_from_file(task, old, old_caps, &mut ids, &mut caps);
+    ExecCred {
+        ids,
+        caps,
+        secureexec,
+        enforce_nondump: file.is_some_and(|f| would_dump(task, f)),
+    }
+}
+
+/// The `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE` words
+/// `create_elf_tables` emits from the PROPOSED credential:
+///
+/// ```text
+/// NEW_AUX_ENT(AT_UID, from_kuid_munged(cred->user_ns, cred->uid));
+/// NEW_AUX_ENT(AT_EUID, from_kuid_munged(cred->user_ns, cred->euid));
+/// NEW_AUX_ENT(AT_GID, from_kgid_munged(cred->user_ns, cred->gid));
+/// NEW_AUX_ENT(AT_EGID, from_kgid_munged(cred->user_ns, cred->egid));
+/// NEW_AUX_ENT(AT_SECURE, bprm->secureexec);
+/// ```
+///
+/// These are what libc's secure mode keys on — glibc reads AT_SECURE, musl
+/// compares AT_UID/AT_EUID/AT_GID/AT_EGID as well — so a constant set (the
+/// loader's default, all zero) made every set-user-ID program honour
+/// LD_PRELOAD and LD_LIBRARY_PATH from the user who ran it.
+pub(crate) fn exec_auxv(task: u64, cred: &ExecCred) -> [crate::AuxEntry; 5] {
+    [
+        crate::AuxEntry::Uid(uid_to_user(task, cred.ids.uid)),
+        crate::AuxEntry::Euid(uid_to_user(task, cred.ids.euid)),
+        crate::AuxEntry::Gid(gid_to_user(task, cred.ids.gid)),
+        crate::AuxEntry::Egid(gid_to_user(task, cred.ids.egid)),
+        crate::AuxEntry::Secure(cred.secureexec),
+    ]
+}
+
+/// `_STK_LIM` — the RLIMIT_STACK a secure exec is clamped to.
+const STK_LIM: u64 = 8 * 1024 * 1024;
+
+/// Install `cred`: the credential half of `begin_new_exec` and
+/// `commit_creds`, in their order. Called once the new image is loaded and
+/// the old one's close-on-exec descriptors are gone.
+///
+/// ```text
+/// if (bprm->secureexec) {
+///         me->pdeath_signal = 0;
+///         if (bprm->rlim_stack.rlim_cur > _STK_LIM)
+///                 bprm->rlim_stack.rlim_cur = _STK_LIM;
+/// }
 /// if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
 ///     !(uid_eq(current_euid(), current_uid()) &&
 ///       gid_eq(current_egid(), current_gid())))
 ///         set_dumpable(current->mm, suid_dumpable);
 /// else
 ///         set_dumpable(current->mm, SUID_DUMP_USER);
+/// ...
+/// commit_creds(bprm->cred);
 /// ```
 ///
-/// Runs on EVERY exec, and both directions matter.
+/// and in `commit_creds`:
 ///
-/// Clearing it is what stops a set-uid program being inspected by the user
-/// who launched it: the new image is running with privilege its invoker
-/// does not have, and `__ptrace_may_access`'s credential comparison alone
-/// would not refuse them — they still own the process. Without this, every
-/// set-uid binary was ptrace-able by whoever ran it, which is the attack
-/// the dumpable gate exists for.
+/// ```text
+/// if (!uid_eq(old->euid, new->euid) || !gid_eq(old->egid, new->egid) ||
+///     !uid_eq(old->fsuid, new->fsuid) || !gid_eq(old->fsgid, new->fsgid) ||
+///     !cred_cap_issubset(old, new)) {
+///         set_dumpable(task->mm, suid_dumpable);
+///         task->pdeath_signal = 0;
+/// }
+/// ```
 ///
-/// SETTING it back is equally load-bearing and easier to forget: a process
-/// that called `PR_SET_DUMPABLE(0)` and then execs an ordinary binary must
-/// become dumpable again. The new image did not ask to be protected, and
-/// leaving the flag on would silently make an ordinary program
-/// un-debuggable because of something its predecessor did.
+/// The `begin_new_exec` test reads `current`, the credential BEFORE the
+/// commit — Linux's own comment calls that "wrong, but userspace depends
+/// on it" — and `commit_creds` then catches the transitions. Together: a
+/// set-user-ID image is non-dumpable (the commit changed euid), an ordinary
+/// image run by a process whose euid already differs from its uid is
+/// non-dumpable (the first test), and an ordinary image otherwise becomes
+/// dumpable again even if its predecessor called `PR_SET_DUMPABLE(0)`.
 ///
-/// Note the comparison is against the CURRENT credentials after
-/// `bprm_fill_uid` has run, not against a "was this file set-uid" flag —
-/// Linux's own comment says testing `current` is "wrong, but userspace
-/// depends on it". Matching the observable behaviour, not the intent.
+/// `suid_dumpable` is `/proc/sys/fs/suid_dumpable`, default 0
+/// (SUID_DUMP_DISABLE); NARF has no knob for it, so "suid_dumpable" is
+/// always "not dumpable".
 ///
-/// `suid_dumpable` is the `/proc/sys/fs/suid_dumpable` sysctl, whose
-/// default is 0 (`SUID_DUMP_DISABLE`); NARF has no knob for it, so the
-/// privileged case is always non-dumpable.
-fn exec_set_dumpable(task: u64) {
-    let ids = read_uidgid(task);
-    let privileged = ids.euid != ids.uid || ids.egid != ids.gid;
-    modify_prctl(task, |s| s.dumpable = !privileged);
-}
-
-/// The credential half of `begin_new_exec`, as ONE step.
-///
-/// `bprm_fill_uid` and the dumpability reset are separate functions in
-/// Linux but a single ordered obligation: the second reads the credentials
-/// the first may have just changed, and an exec that ran one without the
-/// other would either leak a set-uid image to its invoker's debugger or
-/// leave an ordinary image carrying its predecessor's `PR_SET_DUMPABLE(0)`.
-///
-/// They are joined here so the exec path has one call to make rather than
-/// two to remember, and so the test hook below exercises the composition
-/// instead of each piece in isolation — a case that called them separately
-/// would keep passing if the exec path stopped calling one of them.
-pub(crate) fn exec_apply_credentials(task: u64, path: &str, from_script: bool) {
-    let id_changed = bprm_fill_uid(task, path, from_script).is_some();
-    let ids = read_uidgid(task);
-    // Ambient BEFORE dumpability: it reads the credentials `bprm_fill_uid`
-    // may have changed, and dumpability reads them too. Order is
-    // `cap_bprm_creds_from_file` then `begin_new_exec`'s dumpability step,
-    // as in Linux.
-    cap_exec_ambient(task, ids, id_changed);
-    exec_set_dumpable(task);
+/// `cap_bprm_creds_from_file` also clears SECURE_KEEP_CAPS in the new
+/// credential; it is applied here with the rest of the credential.
+pub(crate) fn exec_commit_credentials(task: u64, cred: &ExecCred) {
+    let old = read_uidgid(task);
+    let old_caps = read_caps(task);
+    let new = cred.ids;
+    let mut dumpable = !(cred.enforce_nondump || old.euid != old.uid || old.egid != old.gid);
+    let changed = old.euid != new.euid
+        || old.egid != new.egid
+        || old.fsuid != new.fsuid
+        || old.fsgid != new.fsgid
+        || cred.caps.permitted & !old_caps.permitted != 0;
+    if changed {
+        dumpable = false;
+    }
+    let clear_pdeath = cred.secureexec || changed;
+    write_uidgid(task, |e| *e = new);
+    write_caps(task, cred.caps);
+    modify_prctl(task, |s| {
+        s.dumpable = dumpable;
+        if clear_pdeath {
+            s.pdeathsig = 0;
+        }
+        s.securebits &= !issecure_mask(SECURE_KEEP_CAPS);
+    });
+    if cred.secureexec {
+        if let Some(stack) = read_rlimit(task, RLIMIT_STACK) {
+            if stack.cur > STK_LIM {
+                let _ = update_rlimit_atomic(
+                    task,
+                    None,
+                    RLIMIT_STACK,
+                    Some(RLimitPair {
+                        cur: STK_LIM,
+                        max: stack.max,
+                    }),
+                    true,
+                );
+            }
+        }
+    }
 }
 
 /// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
@@ -6454,21 +6623,33 @@ fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
     capable_wrt_inode(task, file_uid, file_gid, CAP_FSETID)
 }
 
-/// Test window onto [`bprm_fill_uid`]. A full `execve` needs a loadable
-/// image and a task switch, neither of which the ABI harness can stage, so
-/// the smoke drives the DECISION — which is the part that decides whether
-/// privilege is granted — directly.
+/// Test window onto the exec credential step. A full `execve` needs a
+/// loadable image and a task switch, neither of which the ABI harness can
+/// stage, so the smoke drives the DECISION — which is the part that decides
+/// whether privilege is granted — directly.
 ///
-/// Returns `(euid, egid, fsuid, effective caps)` after the call, so a test
-/// can assert both the credential transition and the capability
-/// regeneration a setuid-root binary depends on.
+/// `path` is resolved exactly as `execve` resolves it (the caller's chroot
+/// applied, then the caller's mount namespace), and the credential is
+/// prepared and committed through the same two calls the exec path makes,
+/// so a case driving this hook covers the composition.
+///
+/// Returns `(euid, egid, fsuid, effective caps)` after the call.
 #[doc(hidden)]
-pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
-    // The whole credential step, not just `bprm_fill_uid`: this is what the
-    // exec path calls, so a case driving this hook covers the composition.
-    exec_apply_credentials(task, path, from_script);
+pub fn __test_bprm_fill_uid(task: u64, path: &str) -> (u32, u32, u32, u64) {
+    let _ = __test_exec_credentials(task, path);
     let ids = read_uidgid(task);
     (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
+/// [`__test_bprm_fill_uid`], returning `bprm->secureexec` (the `AT_SECURE`
+/// word the exec would publish).
+#[doc(hidden)]
+pub fn __test_exec_credentials(task: u64, path: &str) -> bool {
+    let mount_path = apply_chroot(path);
+    let file = resolve_file_absolute_ext(&mount_path, true);
+    let cred = exec_prepare_credentials(task, file.as_deref(), &mount_path);
+    exec_commit_credentials(task, &cred);
+    cred.secureexec
 }
 
 /// `PR_GET_DUMPABLE` for an explicit task — the observable the exec

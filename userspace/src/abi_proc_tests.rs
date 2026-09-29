@@ -3055,7 +3055,7 @@ fn smoke_abi_proc_ambient_survives_exec() -> TestResult {
             return Err("chmod of the probe binary failed");
         }
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
-        let (_, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (_, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path);
         if effective & bit == 0 {
             crate::handlers::__test_uidgid_reset();
             crate::handlers::__test_caps_reset();
@@ -3075,7 +3075,7 @@ fn smoke_abi_proc_ambient_survives_exec() -> TestResult {
         ) == Some(0)
             && call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) == Some(0);
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
-        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path);
         let ambient_after = crate::handlers::__test_ambient(task);
         crate::handlers::__test_uidgid_reset();
         crate::handlers::__test_caps_reset();

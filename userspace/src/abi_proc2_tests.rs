@@ -2536,7 +2536,7 @@ fn smoke_abi_proc2_exec_resets_dumpable() -> TestResult {
         }
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
         crate::handlers::__test_set_dumpable_for_test(task, false);
-        let _ = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let _ = crate::handlers::__test_bprm_fill_uid(task, path);
         if !crate::handlers::__test_dumpable(task) {
             crate::handlers::__test_uidgid_reset();
             return Err("exec of an ordinary image must restore dumpability");
@@ -2563,7 +2563,7 @@ fn smoke_abi_proc2_exec_resets_dumpable() -> TestResult {
             return Err("chmod +s of the probe binary failed");
         }
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
-        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path);
         let dumpable = crate::handlers::__test_dumpable(task);
         crate::handlers::__test_uidgid_reset();
         if euid != OWNER {

@@ -671,8 +671,10 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // always emits these; NARF must too, or every process looks
             // set-uid — which makes libdbus (via issetugid) refuse the
             // session bus ("Unable to autolaunch when setuid") and stalls
-            // startplasma/plasmashell. NARF processes are uid 0 (root) with
-            // uid==euid, so emit a consistent, non-secure set.
+            // startplasma/plasmashell. `execve` passes the real values (the
+            // new credential and `bprm->secureexec`, see `exec_auxv`), which
+            // take precedence over these; the defaults are for images the
+            // kernel starts itself, which run as root with uid == euid.
             // Linux emits these on every exec. Without them libc falls
             // back to compiled-in guesses: AT_CLKTCK drives
             // sysconf(_SC_CLK_TCK) (must agree with `times()`, which uses

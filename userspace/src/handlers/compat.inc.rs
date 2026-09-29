@@ -2027,11 +2027,6 @@ fn do_execve_resolved(
     // a process pays for the pages it touches. `None` for the fexecve/memfd
     // arm below, whose bytes are already in hand with no file behind them.
     let mut exec_file: Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> = None;
-    // Whether the image came from an fd rather than a path, and whether a
-    // `#!` line was followed to reach it — both decide whether the file's
-    // set-user-ID bits may be honoured below.
-    let image_override_used = image_override.is_some();
-    let mut followed_shebang = false;
     // fexecve fast path: the bytes are already in hand (a memfd fd with no
     // filesystem path). Skip path resolution + shebang — a fexecve'd image is
     // a real binary, and argv[0] is whatever the caller passed.
@@ -2058,7 +2053,6 @@ fn do_execve_resolved(
                     return;
                 }
                 depth += 1;
-                followed_shebang = true;
                 let line_end = prefix
                     .iter()
                     .position(|&c| c == b'\n')
@@ -2106,20 +2100,24 @@ fn do_execve_resolved(
 
     let task = current_task_id();
 
-    // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
-    // transition, applied to the file actually being executed and only
-    // once the image is known good. `image_override` is a memfd/fd image
-    // with no mount and no inode bits behind it, so it confers nothing —
-    // as in Linux, where there is no file to read them from.
-    if image_override_used {
-        let _ = task;
-    } else {
-        // The set-user-ID transition AND `begin_new_exec`'s dumpability
-        // step, in that order because the second reads the credentials the
-        // first may have changed. One call, so the pair cannot be
-        // half-applied.
-        exec_apply_credentials(task, &cur_path, followed_shebang);
-    }
+    // `bprm_creds_from_file`: the credential this exec will install, from
+    // the file actually being mapped — after a `#!` line that is the
+    // interpreter, whose set-id bits apply while the script's do not, as in
+    // Linux (`bprm->file` has been swapped for the interpreter by then). The
+    // mount lookup uses the same chrooted path `read_exec` resolved. An
+    // image with no file behind it (an anonymous memfd) has no set-id bits,
+    // but still gets the capability recomputation.
+    //
+    // PREPARED here and COMMITTED only after the image loads: the loader
+    // publishes the new ids and AT_SECURE in the auxv, and an exec that
+    // fails to load must leave the caller's credential untouched. (Applying
+    // it here, as before, returned ENOEXEC to a caller already running as
+    // the set-user-ID file's owner.)
+    let exec_cred = {
+        let mount_path = apply_chroot(&cur_path);
+        exec_prepare_credentials(task, exec_file.as_deref(), &mount_path)
+    };
+    let exec_aux = exec_auxv(task, &exec_cred);
 
     // Step 4: load the new image. exec REPLACES this process's image, so the
     // loaded `UserProcess` carries the caller's EXISTING pid — minting a fresh
@@ -2134,7 +2132,7 @@ fn do_execve_resolved(
             &exec_src,
             &argv_refs,
             &envp_refs,
-            &[],
+            &exec_aux,
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
             exec_file.as_ref(),
@@ -2192,6 +2190,10 @@ fn do_execve_resolved(
     // across exec — an fd-table leak that is also a sandbox-escape
     // vector (a descriptor the new image was never meant to inherit).
     crate::fd::close_cloexec(task);
+    // Point of no return: install the credential. After the close-on-exec
+    // sweep, as `begin_new_exec` orders it, so the dumpability change never
+    // exposes descriptors that should already be gone.
+    exec_commit_credentials(task, &exec_cred);
 
     // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
     // bytes, derive comm from argv[0]'s basename (Linux convention).
@@ -3080,9 +3082,8 @@ pub(crate) unsafe fn copy_raw_to_user(dst_uptr: u64, src: *const u8, len: usize)
 //
 // MS_RDONLY, MS_NODEV and MS_NOEXEC become the mount's `MNT_*` set and are
 // enforced (`mnt_want_write`, `may_open`'s device arm, `do_open_execat`).
-// MS_NOSUID is stored and reported but has nothing to suppress: NARF's
-// execve does not implement set-user-ID binaries at all, so there is no
-// privilege transition for `nosuid` to block. MS_REC and MS_RELATIME are
+// MS_NOSUID is enforced too: `bprm_fill_uid` consults it (`mnt_may_suid`)
+// before honouring a set-user-ID / set-group-ID bit. MS_REC and MS_RELATIME are
 // accepted and dropped — there is no mount propagation to recurse over and
 // no atime policy to relax.
 const MS_RDONLY: u64 = 1 << 0;
