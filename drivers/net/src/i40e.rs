@@ -46,6 +46,20 @@
 //! 7. Stand up the LAN HMC, install the TX/RX queue contexts, enable
 //!    the queues, and add the MAC filters the VSI needs to receive.
 //!
+//! ## Link state
+//!
+//! Link state is **event-driven**, not a snapshot. Firmware posts a
+//! `get_link_status` event on the Admin Receive Queue whenever the
+//! link changes, and `i40e_arq_pump` drains the ARQ and re-issues the
+//! command. It ignores the event payload and trusts the command's
+//! answer, which is what Linux's `i40e_handle_link_event` does — the
+//! command is the authoritative read, and re-issuing it also re-arms
+//! reporting, which firmware disarms after each event.
+//!
+//! That matters on this board: both SFP+ cages start empty, so a
+//! cached bring-up snapshot would report the port down forever even
+//! after a module is seated.
+//!
 //! Steps 6–7 live in the [`hmc`], [`vsi`] and [`ring`] submodules;
 //! each documents the traps in its own layer.
 //!
@@ -64,6 +78,8 @@
 //!   and SR-IOV VFs; the PF's own VSI already exists and is reused.
 //! - **Jumbo frames.** `rxmax` is pinned at 1522 to match the
 //!   2 KiB per-descriptor buffer.
+//! - **Interrupt-driven ARQ.** The pump polls; firmware raises an
+//!   interrupt for admin events, which would let it park instead.
 //!
 //! ## Multi-port
 //!
@@ -89,7 +105,7 @@ mod tests;
 
 extern crate alloc;
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 
@@ -333,6 +349,9 @@ pub const REG_PF_ARQLEN: u64 = 0x0008_0280;
 pub const REG_PF_ARQH: u64 = 0x0008_0380;
 /// `I40E_PF_ARQT`.
 pub const REG_PF_ARQT: u64 = 0x0008_0480;
+/// `I40E_PF_ARQH_ARQH_MASK` — the head index is 10 bits; the upper
+/// bits of the register are not part of it.
+pub const ARQH_MASK: u32 = 0x3FF;
 
 /// `I40E_PF_ATQLEN_ATQENABLE_MASK` / `..._ARQENABLE_MASK` (bit 31).
 pub const AQLEN_ENABLE: u32 = 1 << 31;
@@ -583,6 +602,16 @@ impl LinkSpeed {
 
 /// `I40E_AQ_LINK_UP` in the `link_info` byte.
 pub const LINK_INFO_LINK_UP: u8 = 0x01;
+/// `I40E_AQ_LSE_ENABLE` — ask firmware to post link-status events on
+/// the ARQ from now on. Reporting is one-shot: firmware disarms it
+/// after each event, so every `get_link_status` has to re-arm.
+pub const AQ_LSE_ENABLE: u8 = 0x3;
+/// `I40E_AQ_LSE_DISABLE`.
+pub const AQ_LSE_DISABLE: u8 = 0x2;
+/// `I40E_AQ_LSE_IS_ENABLED` — set in a *response*'s `command_flags`
+/// when event reporting is currently armed.
+pub const AQ_LSE_IS_ENABLED: u16 = 0x1;
+
 /// `I40E_AQ_MEDIA_AVAILABLE` — a transceiver is present. On an SFP+
 /// port with no module plugged this is clear even though the PF is
 /// healthy, so it is reported separately from link state.
@@ -593,6 +622,8 @@ pub const LINK_INFO_MEDIA_AVAILABLE: u8 = 0x40;
 pub struct LinkStatus {
     pub link_up: bool,
     pub media_available: bool,
+    /// Firmware will post a link-status event on the ARQ.
+    pub lse_enabled: bool,
     pub phy_type: u8,
     pub speed_raw: u8,
     pub max_frame_size: u16,
@@ -606,9 +637,11 @@ impl LinkStatus {
     /// `max_frame_size:u16`, `config:u8`, …
     pub const fn parse(params: &[u8; 16]) -> Self {
         let link_info = params[4];
+        let command_flags = u16::from_le_bytes([params[0], params[1]]);
         Self {
             link_up: link_info & LINK_INFO_LINK_UP != 0,
             media_available: link_info & LINK_INFO_MEDIA_AVAILABLE != 0,
+            lse_enabled: command_flags & AQ_LSE_IS_ENABLED != 0,
             phy_type: params[2],
             speed_raw: params[3],
             max_frame_size: u16::from_le_bytes([params[8], params[9]]),
@@ -618,6 +651,29 @@ impl LinkStatus {
     /// Negotiated speed.
     pub const fn speed(&self) -> LinkSpeed {
         LinkSpeed::from_byte(self.speed_raw)
+    }
+
+    /// Pack into one word so the live state can live in an atomic
+    /// that `Interface::link_up` can read from `&self`.
+    pub const fn encode(&self) -> u64 {
+        (self.link_up as u64)
+            | ((self.media_available as u64) << 1)
+            | ((self.lse_enabled as u64) << 2)
+            | ((self.speed_raw as u64) << 8)
+            | ((self.phy_type as u64) << 16)
+            | ((self.max_frame_size as u64) << 32)
+    }
+
+    /// Inverse of [`Self::encode`].
+    pub const fn decode(v: u64) -> Self {
+        Self {
+            link_up: v & 1 != 0,
+            media_available: (v >> 1) & 1 != 0,
+            lse_enabled: (v >> 2) & 1 != 0,
+            speed_raw: ((v >> 8) & 0xFF) as u8,
+            phy_type: ((v >> 16) & 0xFF) as u8,
+            max_frame_size: ((v >> 32) & 0xFFFF) as u16,
+        }
     }
 }
 
@@ -780,8 +836,15 @@ pub struct I40eNic {
     pub fw: FirmwareVersion,
     /// The port's LAN MAC from `mac_address_read`.
     pub mac: [u8; 6],
-    /// Most recent `get_link_status`.
-    pub link: LinkStatus,
+    /// Live link state, as [`LinkStatus::encode`].
+    ///
+    /// An atomic rather than a plain field because the ARQ pump
+    /// writes it while `Interface::link_up` reads it through `&self`,
+    /// and because a cached snapshot taken at bring-up reports a
+    /// cable plugged in afterwards as still down forever.
+    link_state: AtomicU64,
+    /// Next ARQ descriptor to inspect.
+    arq_ntc: IrqSafeSpinLock<u16>,
     /// PF number within the device (`PF_FUNC_RID`).
     pub pf_id: u8,
     /// First absolute LAN queue assigned to this PF
@@ -818,7 +881,7 @@ impl core::fmt::Debug for I40eNic {
             .field("port_num", &self.port_num)
             .field("fw", &self.fw)
             .field("mac", &self.mac)
-            .field("link", &self.link)
+            .field("link", &self.link_status())
             .finish_non_exhaustive()
     }
 }
@@ -944,7 +1007,8 @@ impl I40eNic {
             port_num,
             fw: FirmwareVersion::default(),
             mac: [0; 6],
-            link: LinkStatus::default(),
+            link_state: AtomicU64::new(0),
+            arq_ntc: IrqSafeSpinLock::new(0),
             pf_id,
             base_queue,
             vsi_seid: 0,
@@ -1004,7 +1068,9 @@ impl I40eNic {
         // this succeeds and the link still stays down, which is why
         // link state is reported separately from bring-up success.
         let _ = nic.aq_set_link_restart_an(true);
-        nic.link = nic.aq_get_link_status()?;
+        // Seeds the atomic and arms LSE reporting; from here the ARQ
+        // pump keeps both current.
+        nic.refresh_link_status()?;
 
         Ok(nic)
     }
@@ -1145,10 +1211,21 @@ impl I40eNic {
         buf_in: Option<&[u8]>,
         buf_len: u16,
     ) -> Result<(usize, AqDesc), I40eError> {
+        // The lock is held for the *whole* transaction — slot claim,
+        // descriptor write, doorbell, and the wait for DD — not just
+        // the slot claim. Two overlapping commands would each publish
+        // their own `slot + 1` as the tail, and the later writer can
+        // move the tail backwards past a descriptor firmware has not
+        // fetched yet. That was latent while every AQ command came
+        // from the single-threaded bring-up path; the ARQ pump now
+        // issues `get_link_status` at arbitrary times, so it is real.
+        //
+        // Holding an `IrqSafeSpinLock` across the spin is sound here:
+        // `responsive_spin_until` is a pure spin loop that never
+        // parks, which is the `block_on_spin` case AGENTS.md allows.
         let mut slot_g = self.atq_next.lock();
         let slot = *slot_g as usize;
         *slot_g = (*slot_g + 1) % AQ_RING_LEN;
-        drop(slot_g);
 
         let mut desc = AqDesc {
             flags: AQ_FLAG_SI,
@@ -1210,6 +1287,7 @@ impl I40eNic {
 
         // SAFETY: as above.
         let wb = unsafe { read_desc(&self.atq, slot) };
+        drop(slot_g);
         let rc = AqError::from_retval(wb.retval);
         if !rc.is_ok() {
             return Err(I40eError::AdminQueueError(rc));
@@ -1282,9 +1360,10 @@ impl I40eNic {
     /// `get_link_status` (0x0607) — direct.
     pub fn aq_get_link_status(&self) -> Result<LinkStatus, I40eError> {
         let mut params = [0u8; 16];
-        // command_flags = I40E_AQ_LSE_ENABLE: ask firmware to also
-        // post link-status events on the ARQ from here on.
-        params[0] = 0x3;
+        // Ask firmware to post link-status events on the ARQ. This is
+        // not sticky — firmware disarms reporting after each event,
+        // so the ARQ pump re-issues this command on every one.
+        params[0] = AQ_LSE_ENABLE;
         let (_slot, wb) = self.aq_send(AqOpcode::GetLinkStatus, params, None, 0)?;
         Ok(LinkStatus::parse(&wb.params))
     }
@@ -1299,16 +1378,81 @@ impl I40eNic {
         Ok(())
     }
 
-    /// Re-read link state from firmware and cache it.
-    pub fn refresh_link_status(&mut self) -> Result<LinkStatus, I40eError> {
+    /// Last known link state.
+    pub fn link_status(&self) -> LinkStatus {
+        LinkStatus::decode(self.link_state.load(Ordering::Acquire))
+    }
+
+    /// Ask firmware for the current link state, publish it, and re-arm
+    /// link-status event reporting.
+    ///
+    /// Takes `&self` — the state lives in an atomic, so this is the
+    /// ARQ pump's normal path as well as a caller-driven refresh.
+    pub fn refresh_link_status(&self) -> Result<LinkStatus, I40eError> {
         let s = self.aq_get_link_status()?;
-        self.link = s;
+        self.link_state.store(s.encode(), Ordering::Release);
         Ok(s)
     }
 
-    /// `true` when the last `get_link_status` reported link up.
+    /// `true` when the link is currently up.
     pub fn link_up(&self) -> bool {
-        self.link.link_up
+        self.link_status().link_up
+    }
+
+    /// Pop one Admin Receive Queue event, if firmware has posted one.
+    ///
+    /// Mirrors `i40e_clean_arq_element`: compare the firmware-advanced
+    /// head against our cursor, take the descriptor, re-arm it against
+    /// the same buffer, and publish the cleaned index as the new tail.
+    pub fn poll_arq_event(&self) -> Option<AqDesc> {
+        let mut ntc_g = self.arq_ntc.lock();
+        let ntc = *ntc_g;
+        // SAFETY: `self.csr` is this PF's mapped CSR window.
+        let ntu = (unsafe { self.csr.read32(REG_PF_ARQH) } & ARQH_MASK) as u16;
+        if ntu == ntc || ntu >= AQ_RING_LEN {
+            return None;
+        }
+
+        // SAFETY: `self.arq` is this PF's identity-mapped ARQ ring and
+        // `ntc < AQ_RING_LEN`.
+        let event = unsafe { read_desc(&self.arq, ntc as usize) };
+
+        // Firmware overwrote `datalen` and the buffer address with the
+        // event's, so the descriptor has to be rebuilt against the
+        // slot's own buffer before it is handed back.
+        let phys = self.arq_bufs[ntc as usize].dma_addr().raw();
+        let mut rearmed = AqDesc {
+            flags: AQ_FLAG_BUF | AQ_FLAG_LB,
+            datalen: AQ_BUF_BYTES as u16,
+            ..AqDesc::default()
+        };
+        set_desc_buf_addr(&mut rearmed, phys);
+        // SAFETY: as above.
+        unsafe { write_desc(&self.arq, ntc as usize, rearmed) };
+        compiler_fence(Ordering::SeqCst);
+
+        // The tail is the last descriptor handed back, so it is the
+        // one just cleaned — not the next one.
+        // SAFETY: `self.csr` is this PF's mapped CSR window.
+        unsafe { self.csr.write32(REG_PF_ARQT, ntc as u32) };
+        compiler_fence(Ordering::SeqCst);
+
+        *ntc_g = (ntc + 1) % AQ_RING_LEN;
+        Some(event)
+    }
+
+    /// Copy `len` bytes out of ARQ slot `slot`'s data buffer.
+    pub fn arq_buf_bytes(&self, slot: usize, len: usize) -> alloc::vec::Vec<u8> {
+        let n = len.min(AQ_BUF_BYTES);
+        let mut out = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            // SAFETY: `arq_bufs[slot]` is an identity-mapped
+            // `AQ_BUF_BYTES` DMA buffer and `i < n <= AQ_BUF_BYTES`.
+            out.push(unsafe {
+                core::ptr::read_volatile(self.arq_bufs[slot].cpu_ptr_at::<u8>(i as u64))
+            });
+        }
+        out
     }
 
     /// The port's LAN MAC.
@@ -1403,6 +1547,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     {
         use core::fmt::Write as _;
+        let link = nic.link_status();
         let _ = writeln!(
             narf_console::Writer,
             "  i40e: {} port {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} fw={}.{} api={}.{} link={} ({}{})",
@@ -1418,9 +1563,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             nic.fw.fw_minor,
             nic.fw.api_major,
             nic.fw.api_minor,
-            if nic.link.link_up { "up" } else { "down" },
-            nic.link.speed().label(),
-            if nic.link.media_available {
+            if link.link_up { "up" } else { "down" },
+            link.speed().label(),
+            if link.media_available {
                 ""
             } else {
                 ", no module"
@@ -1437,6 +1582,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             nic.hmc.l2fpm_size,
             nic.hmc.backing_phys(),
         );
+        if !link.lse_enabled {
+            // Without event reporting the pump has nothing to drain
+            // and link state would only move on a manual refresh.
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i40e: firmware did not arm link-status events; link state will not track \
+                 cable changes"
+            );
+        }
     }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -1509,10 +1663,57 @@ fn spawn_pumps(
     narf_scheduler::spawn(async move {
         i40e_rx_pump(d1, rx_prod).await;
     });
-    let d2 = device;
+    let d2 = device.clone();
     narf_scheduler::spawn(async move {
         i40e_tx_pump(d2, tx_cons).await;
     });
+    let d3 = device;
+    narf_scheduler::spawn(async move {
+        i40e_arq_pump(d3).await;
+    });
+}
+
+/// Drain the Admin Receive Queue and keep link state current.
+///
+/// Firmware posts a `get_link_status` event whenever the link
+/// changes — a cable plugged in, an SFP+ module seated, the peer
+/// bouncing. The payload is deliberately ignored, exactly as Linux's
+/// `i40e_handle_link_event` does: re-issuing the command is the
+/// authoritative read *and* re-arms reporting, which firmware
+/// otherwise leaves disarmed until the next request.
+async fn i40e_arq_pump(device: Arc<I40eNic>) {
+    loop {
+        // Drain everything queued before yielding, so a burst of
+        // events cannot outrun the pump.
+        while let Some(event) = device.poll_arq_event() {
+            if event.opcode == AqOpcode::GetLinkStatus as u16 {
+                match device.refresh_link_status() {
+                    Ok(link) => {
+                        use core::fmt::Write as _;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  i40e: link {} ({})",
+                            if link.link_up { "up" } else { "down" },
+                            link.speed().label(),
+                        );
+                    }
+                    Err(e) => {
+                        // Leave the cached state alone rather than
+                        // guessing; the next event retries.
+                        use core::fmt::Write as _;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  i40e: link event refresh failed: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+            // Any other event is still drained — leaving it would
+            // stall the ring and stop link events arriving too.
+        }
+        narf_scheduler::yield_now().await;
+    }
 }
 
 async fn i40e_rx_pump(device: Arc<I40eNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
@@ -1573,7 +1774,7 @@ impl narf_net::Interface for I40eNicIface {
         1500
     }
     fn link_up(&self) -> bool {
-        self.nic.link.link_up
+        self.nic.link_up()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.nic.rx_ipc_ring
@@ -1594,7 +1795,7 @@ impl crate::HwNic for I40eNicIface {
         1500
     }
     fn link_up(&self) -> bool {
-        self.nic.link.link_up
+        self.nic.link_up()
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelIxgbe

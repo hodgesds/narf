@@ -968,3 +968,82 @@ kernel_test_in!(
     "drivers/net/i40e",
     smoke_i40e_interface_name_table_is_bounded
 );
+
+// ── Link-status events ───────────────────────────────────────────────
+
+fn smoke_i40e_link_status_packing_round_trip() -> TestResult {
+    use super::LinkStatus;
+    let s = LinkStatus {
+        link_up: true,
+        media_available: true,
+        lse_enabled: true,
+        phy_type: 0x1D,
+        speed_raw: 1 << 3,
+        max_frame_size: 9728,
+    };
+    if LinkStatus::decode(s.encode()) != s {
+        return TestResult::Fail("link status did not survive the atomic packing");
+    }
+    // The three flags must not alias each other.
+    let only_up = LinkStatus {
+        link_up: true,
+        ..Default::default()
+    };
+    let d = LinkStatus::decode(only_up.encode());
+    if !d.link_up || d.media_available || d.lse_enabled {
+        return TestResult::Fail("link flags alias in the packed word");
+    }
+    // An empty cage: no media, link down, but reporting armed.
+    let empty = LinkStatus {
+        lse_enabled: true,
+        ..Default::default()
+    };
+    let d = LinkStatus::decode(empty.encode());
+    if d.link_up || d.media_available || !d.lse_enabled {
+        return TestResult::Fail("empty-cage state decoded wrong");
+    }
+    if LinkStatus::decode(0) != LinkStatus::default() {
+        return TestResult::Fail("a zero word should decode to the default state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_link_status_packing_round_trip
+);
+
+fn smoke_i40e_lse_flags() -> TestResult {
+    use super::{LinkStatus, AQ_LSE_DISABLE, AQ_LSE_ENABLE, AQ_LSE_IS_ENABLED};
+    if AQ_LSE_ENABLE != 0x3 || AQ_LSE_DISABLE != 0x2 || AQ_LSE_IS_ENABLED != 0x1 {
+        return TestResult::Fail("LSE constants wrong");
+    }
+    // The response reports whether reporting is armed in the low bit
+    // of command_flags. Missing it means the pump can sit idle with
+    // nothing ever arriving and no indication why.
+    let mut params = [0u8; 16];
+    params[0..2].copy_from_slice(&AQ_LSE_IS_ENABLED.to_le_bytes());
+    if !LinkStatus::parse(&params).lse_enabled {
+        return TestResult::Fail("LSE_IS_ENABLED not decoded from command_flags");
+    }
+    let off = [0u8; 16];
+    if LinkStatus::parse(&off).lse_enabled {
+        return TestResult::Fail("LSE reported armed when command_flags is clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_lse_flags);
+
+fn smoke_i40e_arq_head_mask() -> TestResult {
+    use super::{AQ_RING_LEN, ARQH_MASK};
+    // ARQH is 10 bits; the upper bits of the register are not part of
+    // the index. Using the raw register value would compare a huge
+    // number against the cursor and drain the whole ring.
+    if ARQH_MASK != 0x3FF {
+        return TestResult::Fail("ARQH mask wrong");
+    }
+    if (AQ_RING_LEN as u32) > ARQH_MASK + 1 {
+        return TestResult::Fail("ring is larger than the head index can address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_arq_head_mask);
