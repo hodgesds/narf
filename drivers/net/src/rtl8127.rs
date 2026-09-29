@@ -1687,12 +1687,13 @@ impl Rtl8127Nic {
         // SAFETY: same.
         unsafe { mmio.write8(REG_9346CR, EEM_NORMAL) };
 
-        // 11. PHY: firmware patch, then the config table. Neither is
-        //     required for the link to come up, so a failure here is
-        //     reported and the controller is still handed back —
-        //     matching `r8169_apply_firmware`, which runs the blob
-        //     only if one was found and applies the table regardless.
-        configure_phy(&mmio);
+        // 11. PHY configuration is deliberately NOT done here. See
+        //     `configure_phy_late`: the firmware patch has to run
+        //     before the config table, and the firmware registry is
+        //     not populated until `Stage::Late` — probe is
+        //     `Stage::Device`. Linux has the same split, running the
+        //     whole sequence from `rtl8169_up()` rather than from
+        //     probe.
 
         Ok(Self {
             mmio,
@@ -1939,6 +1940,33 @@ fn configure_phy(mmio: &MmioRegion) {
             e
         );
     }
+}
+
+/// Run the PHY bring-up sequence once the firmware registry exists.
+///
+/// Split out of `bring_up` because of an ordering constraint that
+/// cannot be satisfied at probe time. `rtl8127a_1_hw_phy_config`
+/// calls `r8169_apply_firmware` as its *first* statement and then
+/// writes the config table on top of the patched PHY, so the two
+/// cannot be reordered. But the firmware registry is only populated
+/// by the `Stage::Late` initramfs and rootfs scans, and the PCI probe
+/// pass is `Stage::Device` — so at probe there is never a blob to
+/// apply, and the table would go down on an unpatched PHY.
+///
+/// Linux does not do this at probe either: the sequence runs from
+/// `rtl8169_up()`, when the interface is brought up. NARF has no
+/// interface-up hook yet, so this runs from a `Stage::Late` initcall
+/// registered after the firmware scans.
+pub fn configure_phy_late() {
+    // Take an `Arc` clone and drop the registry lock before touching
+    // the PHY: a firmware delay opcode can spin for up to
+    // `MAX_FIRMWARE_DELAY_MS`, and holding an IrqSafeSpinLock across
+    // that would stall every other controller user.
+    let controller = CONTROLLER.lock().clone();
+    let Some(controller) = controller else {
+        return;
+    };
+    configure_phy(&controller.mmio);
 }
 
 /// Fetch and parse `rtl_nic/rtl8127a-1.fw`, if the firmware registry

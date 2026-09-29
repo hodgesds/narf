@@ -5113,3 +5113,41 @@ fn smoke_btintel_fw_dsbr() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_dsbr);
+
+/// The controller firmware download has the same ordering
+/// requirement as the RTL8127 PHY patch: it runs from `Stage::Late`
+/// and must come after the firmware scans, because `Stage::Late` runs
+/// in registration order and narf-bluetooth registers before
+/// narf-firmware. Getting this wrong leaves the controller parked in
+/// its ROM bootloader with only a log line to show for it.
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_firmware_runs_after_firmware_scans() -> TestResult {
+    let late = narf_init::registered_names(narf_init::Stage::Late);
+    let pos = |needle: &str| late.iter().position(|n| *n == needle);
+
+    let (Some(download), Some(initramfs)) = (
+        pos("btintel-pcie-firmware"),
+        pos("firmware-scan-initramfs"),
+    ) else {
+        return TestResult::Skip("firmware or btintel initcalls not registered in this build");
+    };
+
+    if download < initramfs {
+        return TestResult::Fail(
+            "btintel-pcie-firmware runs before firmware-scan-initramfs; no blob will be found",
+        );
+    }
+    if let Some(rootfs) = pos("firmware-scan-rootfs") {
+        if download < rootfs {
+            return TestResult::Fail(
+                "btintel-pcie-firmware runs before firmware-scan-rootfs; no blob will be found",
+            );
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_firmware_runs_after_firmware_scans
+);

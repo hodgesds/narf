@@ -55,6 +55,22 @@ pub mod vmxnet3;
 // or feature gate can drop them from production binaries.
 mod tests;
 
+/// Register the late PHY-firmware pass.
+///
+/// Kept out of [`register_initcalls`] because it must run after the
+/// firmware registry has been populated, and `Stage::Late` initcalls
+/// run in registration order — this crate registers before
+/// `narf-firmware` does. `bare_main` calls this after
+/// `narf_firmware::register_initcalls()`, which is what puts it after
+/// the initramfs and rootfs firmware scans.
+pub fn register_late_firmware_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "rtl8127-phy-firmware", || {
+        rtl8127::configure_phy_late();
+        InitResult::Ok
+    });
+}
+
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};

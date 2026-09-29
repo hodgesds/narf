@@ -3001,6 +3001,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // controller's firmware download can find its blobs.
             #[cfg(target_arch = "x86_64")]
             narf_bluetooth::register_firmware_initcalls();
+            // Same ordering requirement: the RTL8127 PHY firmware
+            // patch has to run after the firmware scans above.
+            narf_drivers_net::register_late_firmware_initcalls();
             narf_firmware_fw_cfg::register_initcalls();
             narf_firmware_smbios::register_initcalls();
             narf_firmware_fdt::register_initcalls();
