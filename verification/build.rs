@@ -614,6 +614,7 @@ fn main() {
         "procsig_thread_smoke",
         "sigwake_wait_smoke",
         "flock_release_smoke",
+        "tty_poll_timeout_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
@@ -707,6 +708,7 @@ fn main() {
         "procsig_thread_smoke",
         "sigwake_wait_smoke",
         "flock_release_smoke",
+        "tty_poll_timeout_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
     ] {

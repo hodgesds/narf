@@ -5571,6 +5571,16 @@ fn boot_userspace_init() {
                     "flock_release_glibc",
                     narf_verification::NARF_FLOCK_RELEASE_SMOKE_GLIBC_ELF,
                 ),
+                // poll/select/epoll on a raw-mode pty + inotify honour the
+                // timeout (fish's terminal-query wait), musl + glibc.
+                (
+                    "tty_poll_timeout_smoke",
+                    narf_verification::NARF_TTY_POLL_TIMEOUT_SMOKE_ELF,
+                ),
+                (
+                    "tty_poll_timeout_glibc",
+                    narf_verification::NARF_TTY_POLL_TIMEOUT_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,
