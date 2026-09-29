@@ -6959,7 +6959,7 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
 /// indistinguishable from a kernel signal, which is what systemd PID 1's and
 /// udevd's signalfd dispatchers reject or misattribute. Standard signals
 /// coalesce, so this overwrites any prior queued instance (Linux does too).
-pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
+pub(crate) fn queue_sender_siginfo(target: u64, signum: u32, si_code: i32) {
     // SIGKILL and SIGSTOP cannot be caught, blocked, consumed by sigwait, or
     // read through signalfd, so their sender payload is unobservable. Linux's
     // SEND_SIG_NOINFO path likewise avoids allocating a queued siginfo for
@@ -6968,11 +6968,10 @@ pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
     if matches!(signum, 9 | 19) {
         return;
     }
-    const SI_USER: i32 = 0;
     let sender = current_task_id();
     let sender_outer = task_to_pid_raw(sender).unwrap_or(sender);
     let si_pid = report_pid_to(target, sender_outer) as u32;
-    let _ = store_sigqueue_info(target, signum, SI_USER, 0, si_pid);
+    let _ = store_sigqueue_info(target, signum, si_code, 0, si_pid);
 }
 
 /// Linux `sig_ignored()`: an unblocked signal with SIG_IGN or an implicit
@@ -7010,7 +7009,7 @@ fn signal_ignored_at_generation(task: u64, signum: u32) -> bool {
 fn raise_signal_pending_inner(
     task: u64,
     signum: u32,
-    with_sender_siginfo: bool,
+    sender_si_code: Option<i32>,
 ) {
     // Reject signal 0: it's the POSIX null signal (existence probe), never a
     // real signal. Setting pending bit 0 would later be taken by the delivery
@@ -7067,8 +7066,8 @@ fn raise_signal_pending_inner(
         }
         return;
     }
-    if with_sender_siginfo {
-        queue_sender_siginfo(task, signum);
+    if let Some(si_code) = sender_si_code {
+        queue_sender_siginfo(task, signum, si_code);
     }
     let Some(was_empty) = pending_signal_bits_update(task, |slot| {
         let was_empty = *slot == 0;
@@ -7091,11 +7090,30 @@ fn raise_signal_pending_inner(
 }
 
 pub fn raise_signal_pending(task: u64, signum: u32) {
-    raise_signal_pending_inner(task, signum, false);
+    raise_signal_pending_inner(task, signum, None);
 }
 
+/// `si_code` of a user-generated signal (`include/uapi/asm-generic/siginfo.h`).
+pub(crate) const SI_USER: i32 = 0;
+/// `si_code` of a `tkill(2)`/`tgkill(2)` signal. Linux `do_tkill` builds its
+/// siginfo with `prepare_kill_siginfo(sig, &info, PIDTYPE_PID)`, which picks
+/// SI_TKILL for a thread-directed send and SI_USER for `kill(2)`'s
+/// `PIDTYPE_TGID`. glibc depends on the difference: `sighandler_setxid` and
+/// `sigcancel_handler` ignore SIGSETXID/SIGCANCEL whose `si_code` is not
+/// SI_TKILL, so reporting SI_USER hung every set*id() of a multithreaded glibc
+/// process (the caller waits for each thread to acknowledge) and silently
+/// dropped pthread_cancel.
+pub(crate) const SI_TKILL: i32 = -6;
+
+/// Raise a `kill(2)`-shaped user signal (siginfo `SI_USER` + sender pid).
 pub(crate) fn raise_user_signal_pending(task: u64, signum: u32) {
-    raise_signal_pending_inner(task, signum, true);
+    raise_signal_pending_inner(task, signum, Some(SI_USER));
+}
+
+/// Raise a thread-directed user signal from `tkill(2)`/`tgkill(2)` (siginfo
+/// `SI_TKILL` + sender pid).
+pub(crate) fn raise_tkill_signal_pending(task: u64, signum: u32) {
+    raise_signal_pending_inner(task, signum, Some(SI_TKILL));
 }
 
 /// Apply Linux's stop/continue pending-set cancellation and enqueue `signum`
