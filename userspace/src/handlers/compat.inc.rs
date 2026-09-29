@@ -1067,6 +1067,29 @@ fn path_lookup_errno(path: &str) -> i64 {
     ENOENT
 }
 
+/// The caller-view path a followed `/proc/self/fd/N`, `/proc/thread-self/fd/N`
+/// or `/proc/<pid>/fd/N` jumps to: fd N's own file, when it has a filesystem
+/// path. `None` for anything else (the ordinary walk then applies), including
+/// a closed fd or a pathless one (memfd, socket, anon inode).
+fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::String> {
+    let (owner, fd) = if let Some(n) = user_path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| user_path.strip_prefix("/proc/thread-self/fd/"))
+    {
+        (task, n.parse::<u32>().ok()?)
+    } else {
+        let n = parse_proc_self_fd(user_path)?;
+        let pid = user_path
+            .strip_prefix("/proc/")?
+            .split_once('/')?
+            .0
+            .parse::<u64>()
+            .ok()?;
+        (proc_pid_to_tid(pid), n)
+    };
+    fd_path_for_task(owner, fd).filter(|p| p.starts_with('/'))
+}
+
 /// A node found by [`user_path_lookup`].
 pub(crate) struct LookedUpPath {
     /// Host-view absolute path (chroot applied), for resolver calls.
@@ -1103,13 +1126,28 @@ pub(crate) fn user_path_lookup(
         return Err(ENOENT);
     }
     let anchored = resolve_at_path(task, dirfd, raw).map_err(|e| -e)?;
-    let user_path = resolve_cwd_path_user(task, &anchored);
-    let path = resolve_cwd_path(task, &anchored);
+    let mut user_path = resolve_cwd_path_user(task, &anchored);
+    let mut path = resolve_cwd_path(task, &anchored);
     // A trailing slash forces the final component to be followed and to be
     // a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY` in `path_lookupat`).
     let trailing_slash = raw.len() > 1 && raw.ends_with('/');
+    let mut follow_final = follow || trailing_slash;
+    // `/proc/<pid>/fd/N` is a magic link: following it does not re-walk the
+    // link text, it jumps to the fd's own file (`proc_fd_link` ->
+    // `nd_jump_link`) and the walk ends there. An O_PATH|O_NOFOLLOW fd on a
+    // symlink therefore resolves to the symlink itself — systemd's sd-event
+    // watches /etc/localtime exactly this way (inotify_add_watch on
+    // /proc/self/fd/N). Re-walking the text followed /etc/localtime to its
+    // target, or failed with ENOENT, which systemd reports as EBADF.
+    if follow_final {
+        if let Some(target) = proc_fd_magic_target(task, &user_path) {
+            path = resolve_cwd_path(task, &target);
+            user_path = target;
+            follow_final = false;
+        }
+    }
     let Some((stat, _ino, _rdev, uid, gid, _attrs)) =
-        stat_ino_path_dir_aware_ext(&path, follow || trailing_slash)
+        stat_ino_path_dir_aware_ext(&path, follow_final)
     else {
         return Err(path_lookup_errno(&path));
     };

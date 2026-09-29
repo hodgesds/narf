@@ -5598,6 +5598,16 @@ fn boot_userspace_init() {
                     "pty_wake_glibc",
                     narf_verification::NARF_PTY_WAKE_SMOKE_GLIBC_ELF,
                 ),
+                // /proc/self/fd/N magic link to an O_PATH fd, incl. a symlink
+                // opened O_NOFOLLOW (systemd's /etc/localtime watch).
+                (
+                    "proc_fd_magiclink_smoke",
+                    narf_verification::NARF_PROC_FD_MAGICLINK_SMOKE_ELF,
+                ),
+                (
+                    "proc_fd_magiclink_glibc",
+                    narf_verification::NARF_PROC_FD_MAGICLINK_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

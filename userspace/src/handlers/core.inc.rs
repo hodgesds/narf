@@ -3277,6 +3277,7 @@ fn stat_linux_fd(ctx: &mut dyn TrapContext, n: u32, out_ptr: *mut linux_compat::
 }
 
 fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
+    let mut follow_final = follow_final;
     let out_ptr = out_arg as *mut linux_compat::Stat;
     let task = current_task_id();
     // `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) is a magic symlink: `stat(2)`
@@ -3290,14 +3291,21 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // builtin skips the setxattr, and card0 never gets the `user:<uid>:rw` ACL
     // (the greeter's kwin then EACCES's on card0). fexecve/xattr/mount already
     // resolve this symlink per-call; the stat family must too.
+    //
+    // Only a FOLLOWED magic link jumps (`lstat` describes the /proc link
+    // itself), and the jump lands on the fd's own file without following it
+    // further (`nd_jump_link`): an O_PATH|O_NOFOLLOW fd on a symlink stats as
+    // that symlink. Following on from the jump chased /etc/localtime to its
+    // target and missed with ENOENT.
     let magic_owned;
-    let raw: &str = if let Some(n) = parse_proc_self_fd(raw) {
+    let raw: &str = if let Some(n) = parse_proc_self_fd(raw).filter(|_| follow_final) {
         match fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
             // A descriptor with a real filesystem path: stat that node. The
             // path is the fd's view (chroot-stripped), so it goes back through
             // resolve_cwd_path below to re-root under the task's chroot.
             Some(real) => {
                 magic_owned = real;
+                follow_final = false;
                 &magic_owned
             }
             // A pathless/anonymous fd (memfd, socket, O_TMPFILE, pipe): there is

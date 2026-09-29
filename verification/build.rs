@@ -617,6 +617,7 @@ fn main() {
         "inode_identity_smoke",
         "tty_poll_timeout_smoke",
         "pty_wake_smoke",
+        "proc_fd_magiclink_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
@@ -713,6 +714,7 @@ fn main() {
         "inode_identity_smoke",
         "tty_poll_timeout_smoke",
         "pty_wake_smoke",
+        "proc_fd_magiclink_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
     ] {

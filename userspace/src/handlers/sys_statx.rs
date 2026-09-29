@@ -208,10 +208,21 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         };
         // resolve_cwd_path resolves against the cwd AND re-roots under
         // the task's chroot — applying apply_chroot again double-composes.
-        let path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, &effective));
+        let mut path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, &effective));
         // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
         // not its target; otherwise follow like plain stat.
-        let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let mut follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+        // A followed /proc/<pid>/fd/N magic link jumps to the fd's own file
+        // and stops there (`nd_jump_link`), so an O_PATH|O_NOFOLLOW fd on a
+        // symlink describes that symlink. See `proc_fd_magic_target`.
+        if follow_final {
+            if let Some(target) =
+                proc_fd_magic_target(task, &resolve_cwd_path_user(task, &effective))
+            {
+                path_owned = resolve_cwd_path(task, &target);
+                follow_final = false;
+            }
+        }
         let st = stat_ino_path_dir_aware_ext(&path_owned, follow_final);
         let is_mount_root = current_path_is_mount_root(&path_owned);
         let mnt = current_mount_id_at(&path_owned);
