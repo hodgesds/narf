@@ -4618,3 +4618,498 @@ fn smoke_btintel_pcie_queue_geometry() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_pcie_queue_geometry);
+
+// ── btintel-pcie firmware download ──────────────────────────────────
+//
+// The controller these exercise cannot be emulated, so the smokes
+// pin the pure decode/plan layer against values captured from the
+// real MS-03 part and the real signed blobs Intel ships:
+//
+//   Found device firmware: intel/ibt-00a0-01a1-iml.sfi
+//   Boot Address: 0xb02ff000
+//   Firmware Version: 15-18.26
+//
+// and, from `ibt-00a0-01a1-iml.sfi` itself, a CSS header version of
+// 0x00010000 at offset 8, the byte 0x06 at offset 644, and an ECDSA
+// CSS header version of 0x00020000 at offset 652.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_cnvx_pack_swab() -> TestResult {
+    use crate::btintel_pcie::fw::cnvx_pack_swab;
+
+    // CNVi top 0xA00 (Scorpius Peak) stepping 0 prints as 00a0, and
+    // CNVr top 0xA10 stepping 1 as 01a1 — the byte swap is what turns
+    // the packed 0xa000/0xa101 into the filename's leading zeroes.
+    if cnvx_pack_swab(0xA00, 0) != 0x00A0 {
+        return TestResult::Fail("CNVi 0xA00/0 should pack+swab to 0x00a0");
+    }
+    if cnvx_pack_swab(0xA10, 1) != 0x01A1 {
+        return TestResult::Fail("CNVr 0xA10/1 should pack+swab to 0x01a1");
+    }
+    // A stepping that occupies the high nibble must not bleed into
+    // the type field.
+    if cnvx_pack_swab(0x900, 0xF) != 0x0F90 {
+        return TestResult::Fail("BlazarI 0x900/15 should pack+swab to 0x0f90");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_cnvx_pack_swab);
+
+/// Build the version TLV stream the MS-03's ROM bootloader returns.
+#[cfg(target_arch = "x86_64")]
+fn ms03_version_tlvs() -> Vec<u8> {
+    use crate::btintel_pcie::fw::*;
+    let mut v = Vec::new();
+    let mut push = |ty: u8, val: &[u8]| {
+        v.push(ty);
+        v.push(val.len() as u8);
+        v.extend_from_slice(val);
+    };
+    // CNVi top: type 0xA00, stepping 0.
+    push(TLV_CNVI_TOP, &0x0000_0A00u32.to_le_bytes());
+    // CNVr top: type 0xA10, stepping 1.
+    push(TLV_CNVR_TOP, &0x0100_0A10u32.to_le_bytes());
+    // CNVi BT: hw platform 0x37, hw variant 0x1f (ScP).
+    push(TLV_CNVI_BT, &0x001F_3700u32.to_le_bytes());
+    push(TLV_IMAGE_TYPE, &[IMG_BOOTLOADER]);
+    push(TLV_SBE_TYPE, &[SBE_ECDSA]);
+    push(TLV_OTP_BDADDR, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    push(TLV_MIN_FW, &[15, 18, 26]);
+    // An informational type this driver ignores must still be skipped
+    // by its length rather than tripping the walk.
+    push(0x24, b"Intel");
+    v
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_version_tlv_parse() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    let ver = match parse_version_tlv(&ms03_version_tlvs()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("MS-03 version TLV stream should parse"),
+    };
+    if ver.cnvi_top != 0x0000_0A00 || ver.cnvr_top != 0x0100_0A10 {
+        return TestResult::Fail("CNVi/CNVr top words decoded wrong");
+    }
+    if ver.hw_platform() != HW_PLATFORM_INTEL {
+        return TestResult::Fail("hw platform should decode to 0x37");
+    }
+    if ver.hw_variant() != 0x1F {
+        return TestResult::Fail("hw variant should decode to 0x1f (Scorpius Peak)");
+    }
+    if ver.img_type != IMG_BOOTLOADER {
+        return TestResult::Fail("img_type should decode to the ROM bootloader");
+    }
+    if ver.sbe_type != SBE_ECDSA {
+        return TestResult::Fail("sbe_type should decode to ECDSA");
+    }
+    if ver.bdaddr_unconfigured() {
+        return TestResult::Fail("a non-zero OTP address is not 'unconfigured'");
+    }
+    if (ver.min_fw_build_nn, ver.min_fw_build_cw, ver.min_fw_build_yy) != (15, 18, 26) {
+        return TestResult::Fail("MIN_FW should decode as 15-18.26");
+    }
+
+    // A TLV whose length runs past the end of the stream must be
+    // rejected, not read out of bounds into the next record.
+    let mut truncated = ms03_version_tlvs();
+    truncated.truncate(truncated.len() - 2);
+    if parse_version_tlv(&truncated).is_ok() {
+        return TestResult::Fail("a truncated TLV stream must be rejected");
+    }
+
+    // A record shorter than its type's minimum would otherwise decode
+    // by reading the following record's bytes.
+    let short = [TLV_CNVI_TOP, 2, 0x00, 0x0A, TLV_IMAGE_TYPE, 1, IMG_OP];
+    if parse_version_tlv(&short).is_ok() {
+        return TestResult::Fail("a CNVI_TOP shorter than 4 bytes must be rejected");
+    }
+
+    // An empty OTP address is how an unconfigured controller reports.
+    let blank = [TLV_OTP_BDADDR, 6, 0, 0, 0, 0, 0, 0];
+    match parse_version_tlv(&blank) {
+        Ok(v) if v.bdaddr_unconfigured() => {}
+        _ => return TestResult::Fail("an all-zero OTP address means unconfigured"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_version_tlv_parse);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_name_derivation() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    let mut ver = match parse_version_tlv(&ms03_version_tlvs()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("version TLV stream should parse"),
+    };
+
+    // This is the line the real machine prints:
+    //   Found device firmware: intel/ibt-00a0-01a1-iml.sfi
+    if fw_name(&ver, "sfi") != "intel/ibt-00a0-01a1-iml.sfi" {
+        return TestResult::Fail("ROM bootloader should ask for the -iml image");
+    }
+
+    // Once the IML is running the name is driven by the firmware id,
+    // and `-iml` must not come back or the part would reload the
+    // loader instead of the operational image.
+    ver.img_type = IMG_IML;
+    ver.fw_id = alloc::string::String::from("0291");
+    if fw_name(&ver, "sfi") != "intel/ibt-00a0-01a1-0291.sfi" {
+        return TestResult::Fail("IML stage should ask for the fw_id-named image");
+    }
+    if fw_name(&ver, "ddc") != "intel/ibt-00a0-01a1-0291.ddc" {
+        return TestResult::Fail("the DDC file follows the same stem");
+    }
+
+    // Without a firmware id, the legacy two-field name is the
+    // fallback.
+    ver.fw_id = alloc::string::String::new();
+    if fw_name(&ver, "sfi") != "intel/ibt-00a0-01a1.sfi" {
+        return TestResult::Fail("absent fw_id should fall back to the legacy name");
+    }
+
+    // `iml_name` ignores img_type — it is how an already-operational
+    // controller names the loader it booted through.
+    ver.img_type = IMG_OP;
+    if iml_name(&ver, "sfi") != "intel/ibt-00a0-01a1-iml.sfi" {
+        return TestResult::Fail("iml_name should not depend on img_type");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_name_derivation);
+
+/// A synthetic `.sfi` shaped like the real one: RSA CSS header, the
+/// ECDSA marker and header, then `cmds` worth of payload.
+#[cfg(target_arch = "x86_64")]
+fn synthetic_sfi(payload: &[u8]) -> Vec<u8> {
+    use crate::btintel_pcie::fw::*;
+    let mut img = vec![0u8; PAYLOAD_OFFSET];
+    img[CSS_HEADER_OFFSET..CSS_HEADER_OFFSET + 4]
+        .copy_from_slice(&RSA_HEADER_VER.to_le_bytes());
+    img[ECDSA_OFFSET] = ECDSA_PRESENT_MARKER;
+    img[ECDSA_OFFSET + CSS_HEADER_OFFSET..ECDSA_OFFSET + CSS_HEADER_OFFSET + 4]
+        .copy_from_slice(&ECDSA_HEADER_VER.to_le_bytes());
+    img.extend_from_slice(payload);
+    img
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_header_plan() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    let img = synthetic_sfi(&[]);
+
+    // ECDSA: 128-byte CSS header, 96-byte key, 96-byte signature, all
+    // taken from the second header at 644.
+    let ecdsa = match plan_header_fragments(&img, 0x1F, SBE_ECDSA) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("ECDSA header plan should succeed"),
+    };
+    let want_ecdsa = [
+        (FRAG_INIT, ECDSA_OFFSET, 128),
+        (FRAG_PKEY, ECDSA_OFFSET + 128, 96),
+        (FRAG_SIGN, ECDSA_OFFSET + 224, 96),
+    ];
+    if ecdsa.len() != 3 {
+        return TestResult::Fail("ECDSA header is three fragments");
+    }
+    for (got, want) in ecdsa.iter().zip(want_ecdsa.iter()) {
+        if (got.kind, got.offset, got.len) != *want {
+            return TestResult::Fail("ECDSA header fragment offset/len/kind wrong");
+        }
+    }
+    // Every ECDSA fragment must land inside the 320-byte header.
+    for f in &ecdsa {
+        if f.offset + f.len > PAYLOAD_OFFSET {
+            return TestResult::Fail("ECDSA fragment runs past the header region");
+        }
+    }
+
+    // RSA: 128-byte CSS header, 256-byte key, 256-byte signature from
+    // the first header, and the signature must not run past 644.
+    let rsa = match plan_header_fragments(&img, 0x1F, SBE_RSA) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("RSA header plan should succeed"),
+    };
+    let want_rsa = [(FRAG_INIT, 0, 128), (FRAG_PKEY, 128, 256), (FRAG_SIGN, 388, 256)];
+    for (got, want) in rsa.iter().zip(want_rsa.iter()) {
+        if (got.kind, got.offset, got.len) != *want {
+            return TestResult::Fail("RSA header fragment offset/len/kind wrong");
+        }
+    }
+    if rsa[2].offset + rsa[2].len != RSA_HEADER_LEN {
+        return TestResult::Fail("the RSA signature must end exactly at 644");
+    }
+
+    // A CSS header version that is not RSA is not an image we know.
+    let mut bad = img.clone();
+    bad[CSS_HEADER_OFFSET] = 0x99;
+    if plan_header_fragments(&bad, 0x1F, SBE_ECDSA).is_ok() {
+        return TestResult::Fail("a bad CSS header version must be rejected");
+    }
+
+    // On a dual-header part the 0x06 marker is what proves the ECDSA
+    // header is really there; without it the offsets are guesses.
+    let mut no_marker = img.clone();
+    no_marker[ECDSA_OFFSET] = 0x00;
+    if plan_header_fragments(&no_marker, 0x1F, SBE_ECDSA).is_ok() {
+        return TestResult::Fail("a missing ECDSA marker must be rejected");
+    }
+
+    // An unknown secure-boot engine would otherwise silently send the
+    // wrong header and fail verification much later.
+    if plan_header_fragments(&img, 0x1F, 0x07).is_ok() {
+        return TestResult::Fail("an unknown sbe_type must be rejected");
+    }
+
+    // Truncated images must not index past their end.
+    if plan_header_fragments(&img[..600], 0x1F, SBE_ECDSA).is_ok() {
+        return TestResult::Fail("an image shorter than the RSA header must be rejected");
+    }
+    if plan_header_fragments(&img[..700], 0x1F, SBE_ECDSA).is_ok() {
+        return TestResult::Fail("an image shorter than both headers must be rejected");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_header_plan);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_payload_fragments() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    // One 4-byte command aligns on its own; a 3-byte command followed
+    // by a 5-byte one only aligns as a pair, which is the whole point
+    // of accumulating a run before emitting a fragment.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0x01, 0xFC, 1, 0xAA]); // 4 bytes
+    payload.extend_from_slice(&[0x02, 0xFC, 0]); // 3 bytes
+    payload.extend_from_slice(&[0x03, 0xFC, 2, 0xBB, 0xCC]); // 5 bytes
+    let img = synthetic_sfi(&payload);
+
+    let frags = match plan_payload_fragments(&img, PAYLOAD_OFFSET) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("aligned payload should plan"),
+    };
+    if frags.len() != 2 {
+        return TestResult::Fail("payload should split into two aligned fragments");
+    }
+    if (frags[0].offset, frags[0].len) != (PAYLOAD_OFFSET, 4) {
+        return TestResult::Fail("first fragment should be the lone 4-byte command");
+    }
+    if (frags[1].offset, frags[1].len) != (PAYLOAD_OFFSET + 4, 8) {
+        return TestResult::Fail("second fragment should pair the 3- and 5-byte commands");
+    }
+    for f in &frags {
+        if f.kind != FRAG_DATA {
+            return TestResult::Fail("payload fragments are Data fragments");
+        }
+        if f.len % 4 != 0 {
+            return TestResult::Fail("every fragment length must be 4-byte aligned");
+        }
+    }
+    // The fragments must tile the payload exactly — no gap, no
+    // overlap, ending on the last byte.
+    let mut cursor = PAYLOAD_OFFSET;
+    for f in &frags {
+        if f.offset != cursor {
+            return TestResult::Fail("fragments must tile the payload without gaps");
+        }
+        cursor += f.len;
+    }
+    if cursor != img.len() {
+        return TestResult::Fail("fragments must cover the payload to its last byte");
+    }
+
+    // A command whose length runs past the end of the file must be
+    // rejected rather than slicing out of bounds.
+    let overrun = synthetic_sfi(&[0x01, 0xFC, 40, 0x00]);
+    if plan_payload_fragments(&overrun, PAYLOAD_OFFSET).is_ok() {
+        return TestResult::Fail("a command overrunning the image must be rejected");
+    }
+
+    // A payload that never reaches a 4-byte boundary before EOF is
+    // malformed; emitting the unaligned tail would be rejected by the
+    // bootloader with no useful diagnosis.
+    let unaligned = synthetic_sfi(&[0x01, 0xFC, 0]);
+    if plan_payload_fragments(&unaligned, PAYLOAD_OFFSET).is_ok() {
+        return TestResult::Fail("an unaligned payload tail must be rejected");
+    }
+
+    // An empty payload is vacuously fine.
+    match plan_payload_fragments(&synthetic_sfi(&[]), PAYLOAD_OFFSET) {
+        Ok(f) if f.is_empty() => {}
+        _ => return TestResult::Fail("an empty payload should plan to no fragments"),
+    }
+
+    // A start past the end is a caller bug, not a silent empty plan.
+    if plan_payload_fragments(&img, img.len() + 1).is_ok() {
+        return TestResult::Fail("a start past the image end must be rejected");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_payload_fragments);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_boot_param_scan() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    // The scan walks from byte zero as an HCI command stream, so the
+    // synthetic image has to be walkable from the start for the
+    // record to be reachable — exactly the property the real blobs
+    // have and the reason Linux's odd-looking walk works.
+    let mut img = Vec::new();
+    // A filler command: opcode 0xfc02, 1 byte of payload.
+    img.extend_from_slice(&[0x02, 0xFC, 1, 0x00]);
+    // Intel_Write_Boot_Params carrying the MS-03's real values.
+    img.extend_from_slice(&[0x0E, 0xFC, 7]);
+    img.extend_from_slice(&0xB02F_F000u32.to_le_bytes());
+    img.extend_from_slice(&[15, 18, 26]);
+
+    let bp = match scan_boot_params(&img) {
+        Some(b) => b,
+        None => return TestResult::Fail("boot params should be found"),
+    };
+    if bp.boot_addr != 0xB02F_F000 {
+        return TestResult::Fail("boot address should decode to 0xb02ff000");
+    }
+    if (bp.fw_build_num, bp.fw_build_ww, bp.fw_build_yy) != (15, 18, 26) {
+        return TestResult::Fail("firmware version should decode as 15-18.26");
+    }
+
+    // No record at all means there is no address to reboot into, and
+    // booting from zero would hang the controller.
+    let none = [0x02u8, 0xFC, 1, 0x00, 0x03, 0xFC, 0];
+    if scan_boot_params(&none).is_some() {
+        return TestResult::Fail("an image without the record should report none");
+    }
+
+    // A record truncated mid-parameters must not read past the end.
+    let mut short = img.clone();
+    short.truncate(short.len() - 3);
+    if scan_boot_params(&short).is_some() {
+        return TestResult::Fail("a truncated boot-params record must not decode");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_boot_param_scan);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_ddc_and_limits() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    // The DDC file shipped for this part is four bytes: one record of
+    // length 3 (a 2-byte id and a 1-byte value).
+    let ddc = [0x03u8, 0x28, 0x01, 0x18];
+    let recs = match plan_ddc_records(&ddc) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("the shipped DDC file should plan"),
+    };
+    if recs.len() != 1 || (recs[0].offset, recs[0].len) != (0, 4) {
+        return TestResult::Fail("DDC record should span the whole 4-byte file");
+    }
+
+    // Two records back to back must tile exactly.
+    let two = [0x03u8, 0x28, 0x01, 0x18, 0x04, 0x29, 0x01, 0x11, 0x22];
+    match plan_ddc_records(&two) {
+        Ok(r) if r.len() == 2 && r[1].offset == 4 && r[1].len == 5 => {}
+        _ => return TestResult::Fail("two DDC records should tile exactly"),
+    }
+
+    // A record claiming more bytes than remain must be rejected.
+    if plan_ddc_records(&[0x09u8, 0x28, 0x01]).is_ok() {
+        return TestResult::Fail("an overlong DDC record must be rejected");
+    }
+
+    // A Secure Send carries the fragment type plus payload in the
+    // command's single parameter-length byte, so the payload cap has
+    // to leave room for that byte.
+    if SECURE_SEND_MAX_FRAGMENT + 1 > u8::MAX as usize {
+        return TestResult::Fail("secure-send fragment + type byte must fit one plen byte");
+    }
+    if SECURE_SEND_MAX_FRAGMENT != 252 {
+        return TestResult::Fail("secure-send fragment cap should be 252");
+    }
+
+    // The payload starts after both headers; getting this wrong
+    // shifts the entire command stream.
+    if PAYLOAD_OFFSET != RSA_HEADER_LEN + ECDSA_HEADER_LEN || PAYLOAD_OFFSET != 964 {
+        return TestResult::Fail("payload offset should be 644 + 320 = 964");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_ddc_and_limits);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_fw_dsbr() -> TestResult {
+    use crate::btintel_pcie::fw::*;
+
+    // The MS-03's `UefiCnvCommonDSBR` variable body is 00 f1 00 00 00:
+    // a one-byte header then the DSBR word 0x000000f1. (The four
+    // attribute bytes efivarfs shows first are not part of the body.)
+    let body = [0x00u8, 0xF1, 0x00, 0x00, 0x00];
+    let dsbr = match parse_dsbr_variable(&body) {
+        Some(d) => d,
+        None => return TestResult::Fail("the MS-03 DSBR variable should decode"),
+    };
+    if dsbr != 0x0000_00F1 {
+        return TestResult::Fail("DSBR word should decode to 0xf1");
+    }
+    // enable is bit 0; the value is bits 7:4.
+    if dsbr_command_params(dsbr) != [0x01, 0x0F] {
+        return TestResult::Fail("0xf1 should split into enable=1, dsbr=0xf");
+    }
+    // A platform that publishes nothing gets the disabled default,
+    // which is still sent rather than skipped.
+    if dsbr_command_params(0) != [0x00, 0x00] {
+        return TestResult::Fail("an absent DSBR should send the disabled default");
+    }
+    // Only the two defined fields may reach the controller.
+    if dsbr_command_params(0xFFFF_FFFF) != [0x01, 0x0F] {
+        return TestResult::Fail("DSBR params must mask out undefined bits");
+    }
+
+    // A variable of the wrong size is not this structure, and reading
+    // a u32 out of it would be reading someone else's bytes.
+    if parse_dsbr_variable(&[0x00, 0xF1, 0x00, 0x00]).is_some() {
+        return TestResult::Fail("a short DSBR variable must be rejected");
+    }
+    if parse_dsbr_variable(&[0x00, 0xF1, 0x00, 0x00, 0x00, 0x00]).is_some() {
+        return TestResult::Fail("an overlong DSBR variable must be rejected");
+    }
+
+    // Scorpius Peak — the MS-03 — takes the command in its
+    // intermediate loader and nowhere else.
+    if !dsbr_required(HWID_SCP, IMG_IML, 0) {
+        return TestResult::Fail("ScP in the IML image needs DSBR");
+    }
+    if dsbr_required(HWID_SCP, IMG_OP, 0) || dsbr_required(HWID_SCP, IMG_BOOTLOADER, 0) {
+        return TestResult::Fail("ScP needs DSBR only in the IML image");
+    }
+    // BlazarI only at the B0 stepping.
+    if !dsbr_required(HWID_BZRI, IMG_IML, 1) || dsbr_required(HWID_BZRI, IMG_IML, 0) {
+        return TestResult::Fail("BlazarI needs DSBR only at stepping 1");
+    }
+    // Gale Peak2 / BlazarU are USB-only cases, so never over PCIe.
+    if dsbr_required(HWID_GAP, IMG_OP, 0) || dsbr_required(HWID_BZRU, IMG_OP, 0) {
+        return TestResult::Fail("GaP/BzrU DSBR is USB-only, not PCIe");
+    }
+    // Scorpius Peak2 onwards, in the IML.
+    if !dsbr_required(HWID_SCP2, IMG_IML, 0) || !dsbr_required(HWID_SCP2F, IMG_IML, 0) {
+        return TestResult::Fail("ScP2 and ScP2F need DSBR in the IML image");
+    }
+    if dsbr_required(HWID_SCP2, IMG_OP, 0) {
+        return TestResult::Fail("ScP2 needs DSBR only in the IML image");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_dsbr);

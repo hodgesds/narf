@@ -72,6 +72,7 @@
 
 extern crate alloc;
 
+pub mod fw;
 pub mod rings;
 
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -146,6 +147,18 @@ pub const CSR_BOOT_STAGE: u64 = 0x108;
 pub const CSR_IPC_CONTROL: u64 = 0x10C;
 /// `BTINTEL_PCIE_CSR_IPC_STATUS_REG`.
 pub const CSR_IPC_STATUS: u64 = 0x110;
+
+/// `IPC_SLEEP_CTL` — host-driven D-state control. The operational
+/// firmware waits for a D0 write here after its bootup notification
+/// before it will serve HCI.
+pub const CSR_IPC_SLEEP_CTL: u64 = 0x114;
+
+/// `BTINTEL_PCIE_STATE_D0` — fully powered.
+pub const POWER_STATE_D0: u32 = 0;
+/// `BTINTEL_PCIE_STATE_D3_HOT`.
+pub const POWER_STATE_D3_HOT: u32 = 2;
+/// `BTINTEL_PCIE_STATE_D3_COLD`.
+pub const POWER_STATE_D3_COLD: u32 = 3;
 /// `BTINTEL_PCIE_CSR_CI_ADDR_LSB_REG` — low half of the context-info
 /// DMA address the device fetches its boot parameters from.
 pub const CSR_CI_ADDR_LSB: u64 = 0x118;
@@ -588,6 +601,14 @@ impl BtIntelPcie {
         self.rings.rx_completions_pending()
     }
 
+    /// Write the host-side D-state. The operational firmware blocks
+    /// on this after sending its bootup notification.
+    pub fn set_power_state(&self, state: u32) {
+        // SAFETY: `self.mmio` is the mapped CSR window and
+        // `IPC_SLEEP_CTL` is a plain 32-bit register within it.
+        unsafe { self.mmio.write32(CSR_IPC_SLEEP_CTL, state) };
+    }
+
     /// Current `BOOT_STAGE`.
     pub fn current_boot_stage(&self) -> u32 {
         // SAFETY: `self.mmio` is the mapped CSR window.
@@ -701,6 +722,58 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     *CONTROLLER.lock() = Some(alloc::sync::Arc::new(dev));
     Ok(())
+}
+
+/// Download operational firmware into the probed controller.
+///
+/// Runs from a `Stage::Late` initcall rather than from `probe`: the
+/// PCI probe pass is `Stage::Device`, and the firmware registry is
+/// not populated until the `Stage::Late` initramfs and rootfs scans
+/// have run. Probing brings the transport up; this makes the
+/// controller usable.
+pub fn load_firmware() {
+    use core::fmt::Write as _;
+
+    // The controller is reached through an `Arc` clone so the
+    // registry lock is not held across the download, which spins for
+    // as long as the controller takes to verify and boot an image.
+    let controller = CONTROLLER.lock().clone();
+    let Some(controller) = controller else {
+        return;
+    };
+
+    let Some(write_auth) = narf_firmware::trusted_loader_authority() else {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btintel-pcie: no firmware authority; controller left in its ROM bootloader",
+        );
+        return;
+    };
+    let auth = match write_auth.derive() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    match fw::setup(&controller, &auth) {
+        Ok(ver) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware {} running (img-type {:#04x}, build {}-{}.{})",
+                if ver.fw_id.is_empty() { "?" } else { &ver.fw_id },
+                ver.img_type,
+                ver.min_fw_build_nn,
+                ver.min_fw_build_cw,
+                ver.min_fw_build_yy,
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware download failed: {:?}",
+                e,
+            );
+        }
+    }
 }
 
 /// Register the PCIe Bluetooth driver — one match entry per device ID.

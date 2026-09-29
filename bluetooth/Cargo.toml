@@ -16,6 +16,8 @@ narf-lib          = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
 narf-bus          = { path = "../bus" }
 narf-io           = { path = "../io" }
+narf-firmware     = { path = "../firmware" }
+narf-efi          = { path = "../efi" }
 narf-console      = { path = "../console" }
 narf-drivers      = { path = "../drivers" }
 narf-filesystem   = { path = "../filesystem" }

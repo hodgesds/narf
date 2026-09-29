@@ -2997,6 +2997,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_initramfs::register_initcalls();
             narf_filesystem::register_initcalls();
             narf_firmware::register_initcalls();
+            // After the firmware scans above, so the Bluetooth
+            // controller's firmware download can find its blobs.
+            #[cfg(target_arch = "x86_64")]
+            narf_bluetooth::register_firmware_initcalls();
             narf_firmware_fw_cfg::register_initcalls();
             narf_firmware_smbios::register_initcalls();
             narf_firmware_fdt::register_initcalls();
