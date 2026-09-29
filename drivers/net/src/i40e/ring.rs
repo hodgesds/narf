@@ -465,11 +465,16 @@ impl QueuePair {
         // SAFETY: caller-asserted mapped CSR window.
         unsafe {
             pre_tx_queue_cfg(csr, base_queue, self.pf_q, true);
+            // Let any enable/disable already in flight finish before
+            // asking for a new state — a REQ written while STAT is
+            // still catching up is lost.
+            wait_queue_settled(csr, reg_qtx_ena(self.pf_q));
             csr.write32(reg_qtx_head(self.pf_q), 0);
             set_queue_enable(csr, reg_qtx_ena(self.pf_q), true)?;
             wait_queue_state(csr, reg_qtx_ena(self.pf_q), true)
                 .map_err(|_| I40eError::TxQueueEnableTimeout)?;
 
+            wait_queue_settled(csr, reg_qrx_ena(self.pf_q));
             set_queue_enable(csr, reg_qrx_ena(self.pf_q), true)?;
             wait_queue_state(csr, reg_qrx_ena(self.pf_q), true)
                 .map_err(|_| I40eError::RxQueueEnableTimeout)?;
@@ -490,9 +495,11 @@ impl QueuePair {
     pub unsafe fn disable(&self, csr: &MmioRegion, base_queue: u16) {
         // SAFETY: caller-asserted mapped CSR window.
         unsafe {
+            wait_queue_settled(csr, reg_qrx_ena(self.pf_q));
             let _ = set_queue_enable(csr, reg_qrx_ena(self.pf_q), false);
             let _ = wait_queue_state(csr, reg_qrx_ena(self.pf_q), false);
             pre_tx_queue_cfg(csr, base_queue, self.pf_q, false);
+            wait_queue_settled(csr, reg_qtx_ena(self.pf_q));
             let _ = set_queue_enable(csr, reg_qtx_ena(self.pf_q), false);
             let _ = wait_queue_state(csr, reg_qtx_ena(self.pf_q), false);
         }
@@ -650,6 +657,26 @@ unsafe fn set_queue_enable(csr: &MmioRegion, reg: u64, enable: bool) -> Result<(
     unsafe { csr.write32(reg, val) };
     compiler_fence(Ordering::SeqCst);
     Ok(())
+}
+
+/// Wait for `QENA_STAT` to catch up with whatever `QENA_REQ` already
+/// holds, so a fresh request is not written over an in-flight one.
+///
+/// The result is deliberately discarded: Linux's loop also falls
+/// through on timeout and lets the subsequent state wait report the
+/// real failure, which names the queue direction.
+///
+/// # Safety
+/// As [`set_queue_enable`].
+unsafe fn wait_queue_settled(csr: &MmioRegion, reg: u64) {
+    let _ = narf_scheduler::responsive_spin_until(
+        || {
+            // SAFETY: caller-asserted.
+            let v = unsafe { csr.read32(reg) };
+            ((v & QENA_REQ) != 0) == ((v & QENA_STAT) != 0)
+        },
+        narf_time::Deadline::after_ms(QUEUE_ENA_TIMEOUT_MS),
+    );
 }
 
 /// Wait for `QENA_STAT` to match the requested state.
