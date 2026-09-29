@@ -41,18 +41,44 @@
 //! 5. `mac_address_read` (0x0107) for the port's LAN MAC, and
 //!    `get_link_status` (0x0607) for speed / link.
 //!
+//! 6. Find the PF's main VSI via `get_switch_config` (0x0200) and
+//!    read its context with `get_vsi_parameters` (0x0212).
+//! 7. Stand up the LAN HMC, install the TX/RX queue contexts, enable
+//!    the queues, and add the MAC filters the VSI needs to receive.
+//!
+//! Steps 6–7 live in the [`hmc`], [`vsi`] and [`ring`] submodules;
+//! each documents the traps in its own layer.
+//!
 //! ## Scope
 //!
-//! This is the control path. A TX/RX data path on this chip needs a
-//! VSI built over the AQ (`add_vsi` 0x0210, `add_veb`, per-queue
-//! LAN contexts written through `i40e_clear_hw`-style HMC pages),
-//! which is a much larger body of work than the register-ring
-//! drivers already in tree. It is **not** implemented here, and
-//! [`I40eNic`] deliberately does not implement [`crate::HwNic`] —
-//! better a control-plane driver that reports what it can than one
-//! that registers an interface it cannot move packets on.
+//! One queue pair, polled. What is deliberately absent:
+//!
+//! - **MSI-X and interrupt-driven completion.** TX completion comes
+//!   from head writeback and RX from the descriptor done bit, both
+//!   polled by the frame pumps.
+//! - **RSS across multiple queues**, which needs a hash LUT and a
+//!   vector per queue.
+//! - **Checksum and TSO offload.** Every frame goes out as a single
+//!   data descriptor with no context descriptor ahead of it.
+//! - **Extra VSIs.** `add_vsi` (0x0210) is for VMDq, flow director
+//!   and SR-IOV VFs; the PF's own VSI already exists and is reused.
+//! - **Jumbo frames.** `rxmax` is pinned at 1522 to match the
+//!   2 KiB per-descriptor buffer.
+//!
+//! ## Multi-port caveat
+//!
+//! The X710 presents one PF per port, and the MS-03 has two. Both
+//! probe and both bring their queues up, but only the first is
+//! published to the net registry: `narf_net::Interface` names
+//! interfaces with a `&'static str`, and registering two under
+//! "i40e" would make the stack route to whichever landed last. A
+//! second port needs per-instance naming in the registry first.
 
 #![allow(dead_code)]
+
+pub mod hmc;
+pub mod ring;
+pub mod vsi;
 
 mod tests;
 
@@ -65,8 +91,10 @@ use alloc::sync::Arc;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
@@ -213,6 +241,21 @@ pub const REG_PFGEN_PORTNUM: u64 = 0x001C_0480;
 /// `I40E_PFGEN_PORTNUM_PORT_NUM_MASK` — bits [1:0].
 pub const PFGEN_PORTNUM_MASK: u32 = 0x3;
 
+/// `I40E_PF_FUNC_RID` — this function's requester id.
+pub const REG_PF_FUNC_RID: u64 = 0x0009_C000;
+/// `I40E_GLPCI_CAPSUP` — PCIe capability support.
+pub const REG_GLPCI_CAPSUP: u64 = 0x000B_E4A8;
+/// `I40E_GLPCI_CAPSUP_ARI_EN_MASK` — ARI is enabled, which widens
+/// the function-number field of `PF_FUNC_RID` from 3 bits to 8.
+pub const GLPCI_CAPSUP_ARI_EN: u32 = 1 << 4;
+/// `I40E_PFLAN_QALLOC` — the PF's absolute LAN queue range.
+pub const REG_PFLAN_QALLOC: u64 = 0x001C_0400;
+
+/// Queue pairs this driver brings up. One is enough to carry
+/// traffic; RSS across several needs a LUT and per-queue interrupt
+/// vectors, neither of which is in scope here.
+pub const NUM_QUEUE_PAIRS: u32 = 1;
+
 /// `I40E_GLGEN_RSTCTL` — global reset control; bits [5:0] hold
 /// `GRSTDEL`, the global-reset delay in 100 ms units.
 pub const REG_GLGEN_RSTCTL: u64 = 0x000B_8180;
@@ -338,6 +381,14 @@ pub enum AqOpcode {
     ClearPxeMode = 0x0110,
     /// Current link speed / state (direct).
     GetLinkStatus = 0x0607,
+    /// Read the switch topology (indirect).
+    GetSwitchConfig = 0x0200,
+    /// Read an existing VSI's context (indirect).
+    GetVsiParameters = 0x0212,
+    /// Add a MAC/VLAN filter to a VSI (indirect).
+    AddMacvlan = 0x0250,
+    /// Enable the link and restart auto-negotiation (direct).
+    SetLinkRestartAn = 0x0605,
 }
 
 /// Firmware return codes — `enum libie_aq_err`.
@@ -635,6 +686,41 @@ pub enum I40eError {
     AdminQueueError(AqError),
     /// The device reported an all-zero / all-FF MAC.
     BadMacAddress,
+    /// The HMC capability registers read back as absent.
+    HmcUnavailable,
+    /// More queues were requested than this function can back.
+    HmcTooManyQueues,
+    /// The device reports a context size the packing tables were not
+    /// written against, so every field would land at the wrong
+    /// offset.
+    HmcUnexpectedObjectSize,
+    /// A queue index outside the configured range.
+    BadQueueIndex,
+    /// `get_switch_config` returned something undecodable.
+    BadSwitchConfig,
+    /// The switch reported no single PF VSI to attach to.
+    NoMainVsi,
+    /// `get_vsi_parameters` returned a short or undecodable context.
+    BadVsiParams,
+    /// Firmware refused a MAC filter — typically out of filter
+    /// resources.
+    MacFilterRejected,
+    /// `QTX_ENA.QENA_STAT` never followed the request.
+    TxQueueEnableTimeout,
+    /// `QRX_ENA.QENA_STAT` never followed the request.
+    RxQueueEnableTimeout,
+    /// `PFLAN_QALLOC` reported an empty queue range for this PF.
+    NoQueuesAllocated,
+    /// The main VSI does not start at queue 0, or uses non-contiguous
+    /// queue mapping — either way this driver's single-queue
+    /// assumption does not hold for it.
+    UnexpectedVsiQueueMap,
+    /// Frame was empty or larger than one descriptor buffer.
+    FrameTooLong,
+    /// No free TX descriptor.
+    TxRingFull,
+    /// The device's head never advanced past the posted descriptor.
+    TxTimeout,
 }
 
 // ── Live driver state ───────────────────────────────────────────────
@@ -663,15 +749,33 @@ pub struct I40eNic {
     pub mac: [u8; 6],
     /// Most recent `get_link_status`.
     pub link: LinkStatus,
+    /// PF number within the device (`PF_FUNC_RID`).
+    pub pf_id: u8,
+    /// First absolute LAN queue assigned to this PF
+    /// (`PFLAN_QALLOC.FIRSTQ`).
+    pub base_queue: u16,
+    /// Switch element id of the PF's main VSI.
+    pub vsi_seid: u16,
+    /// The main VSI's context as read at bring-up.
+    pub vsi: vsi::VsiParams,
+    /// LAN HMC backing store for the queue contexts.
+    hmc: hmc::LanHmc,
+    /// The single configured queue pair. Guarded because `transmit`
+    /// and `receive` both advance ring indices.
+    queue: IrqSafeSpinLock<ring::QueuePair>,
+
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
-// SAFETY: the only interior-mutable field is `atq_next`, guarded by
-// an `IrqSafeSpinLock`. The DMA buffers and the MMIO region describe
-// identity-mapped physical ranges this PF owns exclusively, and the
-// remaining fields are plain data written once during bring-up.
+// SAFETY: every interior-mutable field (`atq_next`, `queue`, the two
+// IPC ring slots) is guarded by an `IrqSafeSpinLock`. The DMA buffers
+// and the MMIO region describe identity-mapped physical ranges this
+// PF owns exclusively, and the remaining fields are plain data
+// written once during bring-up.
 unsafe impl Send for I40eNic {}
-// SAFETY: as above — every mutating path takes `atq_next`, so
-// concurrent `&I40eNic` use from several CPUs is serialized.
+// SAFETY: as above — every mutating path takes a lock, so concurrent
+// `&I40eNic` access from several CPUs is serialized.
 unsafe impl Sync for I40eNic {}
 
 impl core::fmt::Debug for I40eNic {
@@ -711,6 +815,27 @@ impl I40eNic {
 
         // SAFETY: same.
         let port_num = (unsafe { csr.read32(REG_PFGEN_PORTNUM) } & PFGEN_PORTNUM_MASK) as u8;
+
+        // PF number. With ARI enabled the function number is the full
+        // low byte of `PF_FUNC_RID`; without it, only the low three
+        // bits. The X710 is multi-function, so getting this wrong
+        // points `GLHMC_LAN*BASE(pf)` at another port's FPM.
+        // SAFETY: same.
+        let (capsup, func_rid) =
+            unsafe { (csr.read32(REG_GLPCI_CAPSUP), csr.read32(REG_PF_FUNC_RID)) };
+        let pf_id = if capsup & GLPCI_CAPSUP_ARI_EN != 0 {
+            (func_rid & 0xFF) as u8
+        } else {
+            (func_rid & 0x7) as u8
+        };
+
+        // The PF's absolute LAN queue range.
+        // SAFETY: same.
+        let qalloc = unsafe { csr.read32(REG_PFLAN_QALLOC) };
+        let (base_queue, last_queue) = ring::decode_qalloc(qalloc);
+        if last_queue < base_queue {
+            return Err(I40eError::NoQueuesAllocated);
+        }
 
         // Admin Queue rings. `alloc_coherent` hands back page-aligned
         // memory, which satisfies `I40E_ADMINQ_DESC_ALIGNMENT`.
@@ -762,6 +887,19 @@ impl I40eNic {
             Self::config_arq_regs(&csr, arq.dma_addr().raw())?;
         }
 
+        // The LAN HMC has to exist before any queue context can be
+        // written. Linux builds it *after* the Admin Queue only
+        // because it sizes the object counts from `get_capabilities`,
+        // which is an AQ command; this driver pins the count at
+        // `NUM_QUEUE_PAIRS` and reads the rest straight out of the
+        // `GLHMC_*` capability registers, so it has no such
+        // dependency. Those registers are CORER-reset and the
+        // `PFHMC_SD*` block is PFR-reset, both of which the reset
+        // above already settled.
+        // SAFETY: `csr` is the mapped CSR window.
+        let hmc = unsafe { hmc::LanHmc::bring_up(&csr, pf_id, NUM_QUEUE_PAIRS, NUM_QUEUE_PAIRS)? };
+        let queue = ring::QueuePair::alloc(0)?;
+
         let mut nic = Self {
             csr,
             atq,
@@ -774,6 +912,14 @@ impl I40eNic {
             fw: FirmwareVersion::default(),
             mac: [0; 6],
             link: LinkStatus::default(),
+            pf_id,
+            base_queue,
+            vsi_seid: 0,
+            vsi: vsi::VsiParams::default(),
+            hmc,
+            queue: IrqSafeSpinLock::new(queue),
+            rx_ipc_ring: IrqSafeSpinLock::new(None),
+            tx_ipc_ring: IrqSafeSpinLock::new(None),
         };
 
         nic.fw = nic.aq_get_version()?;
@@ -791,9 +937,58 @@ impl I40eNic {
         if mac_is_invalid(nic.mac) {
             return Err(I40eError::BadMacAddress);
         }
+
+        // Find the PF's main VSI. Firmware built it during device
+        // init, so this reads the existing element rather than
+        // creating one.
+        let switch = nic.aq_get_switch_config()?;
+        let main_vsi = switch.main_vsi().ok_or(I40eError::NoMainVsi)?;
+        nic.vsi_seid = main_vsi.seid;
+        nic.vsi = nic.aq_get_vsi_params(main_vsi.seid)?;
+
+        // Everything below drives PF-relative queue 0. That is the
+        // main VSI's first queue on a freshly reset PF, but it is the
+        // VSI context that says so — refuse rather than quietly drive
+        // someone else's queue if this device disagrees.
+        if !nic.vsi.is_contiguous() || nic.vsi.queue_mapping_0 != 0 {
+            return Err(I40eError::UnexpectedVsiQueueMap);
+        }
+
+        // Install the queue contexts and start the queues.
+        // SAFETY: `nic.csr` is this PF's mapped CSR window and the
+        // HMC backing page is published.
+        unsafe {
+            let q = nic.queue.lock();
+            q.configure(&nic.csr, &nic.hmc, 0, nic.pf_id, nic.vsi.qs_handle_0)?;
+            q.enable(&nic.csr, nic.base_queue)?;
+        }
+
+        // Without these the VSI drops everything: a perfect match on
+        // our own address, plus broadcast for ARP.
+        nic.aq_add_default_mac_filters(nic.vsi_seid, nic.mac)?;
+
+        // Ask the PHY to bring the link up. On an empty SFP+ cage
+        // this succeeds and the link still stays down, which is why
+        // link state is reported separately from bring-up success.
+        let _ = nic.aq_set_link_restart_an(true);
         nic.link = nic.aq_get_link_status()?;
 
         Ok(nic)
+    }
+
+    /// Transmit one frame on queue 0.
+    pub fn transmit(&self, frame: &[u8]) -> Result<(), I40eError> {
+        let mut q = self.queue.lock();
+        // SAFETY: `self.csr` is this PF's mapped CSR window, and the
+        // queue pair was configured and enabled during bring-up.
+        unsafe { q.transmit(&self.csr, frame) }
+    }
+
+    /// Pop one received frame from queue 0, if any.
+    pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        let mut q = self.queue.lock();
+        // SAFETY: as above.
+        unsafe { q.receive(&self.csr) }
     }
 
     /// `i40e_pf_reset`: wait out any global reset, wait for the NVM
@@ -1198,6 +1393,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 ", no module"
             },
         );
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i40e: pf={} vsi seid={} qs_handle={} base_q={} {} queue pair(s), HMC {} B @ {:#018x}",
+            nic.pf_id,
+            nic.vsi_seid,
+            nic.vsi.qs_handle_0,
+            nic.base_queue,
+            NUM_QUEUE_PAIRS,
+            nic.hmc.l2fpm_size,
+            nic.hmc.backing_phys(),
+        );
     }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -1208,8 +1414,140 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    CONTROLLERS.lock().push(Arc::new(nic));
+    // Hand the net stack its ends of the frame rings.
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+    *nic.rx_ipc_ring.lock() = Some(rx_cons);
+    *nic.tx_ipc_ring.lock() = Some(tx_prod);
+
+    let nic = Arc::new(nic);
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(nic.clone());
+        g.len() - 1
+    };
+
+    // Only the first PF is published as an interface. The registry
+    // addresses interfaces by a `&'static str` name, and a second
+    // port would need a distinct one; giving both ports the same
+    // name would make the stack route to whichever registered last.
+    if index == 0 {
+        let auth = match narf_net::trusted_net_authority() {
+            Some(a) => a.derive().ok(),
+            None => None,
+        };
+        if let Some(auth) = auth {
+            let _ = narf_net::registry().register(&auth, I40eNicIface);
+        }
+    }
+
+    spawn_pumps(nic, rx_prod, tx_cons);
     Ok(())
+}
+
+fn spawn_pumps(
+    device: Arc<I40eNic>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        i40e_rx_pump(d1, rx_prod).await;
+    });
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        i40e_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn i40e_rx_pump(device: Arc<I40eNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    loop {
+        if let Some(pkt) = device.receive() {
+            if let Ok(dma_buf) = alloc_coherent(pkt.len(), DomainId::DRIVER_0) {
+                let mut frame = Frame::new(dma_buf, pkt.len() as u32);
+                frame.payload_mut().copy_from_slice(&pkt);
+                let _ = rx_prod.send(frame).await;
+            }
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn i40e_tx_pump(device: Arc<I40eNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.transmit(frame.payload());
+    }
+}
+
+/// `narf_net::Interface` implementation for the first probed PF.
+#[derive(Debug)]
+pub struct I40eNicIface;
+
+impl narf_net::Interface for I40eNicIface {
+    fn name(&self) -> &str {
+        "i40e"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(0, |c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(0, |c| c.link.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
+        with_controller(0, |c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
+        with_controller(0, |c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
+impl crate::HwNic for I40eNicIface {
+    fn name(&self) -> &'static str {
+        "i40e"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(0, |c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(0, |c| c.link.link_up).unwrap_or(false)
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::IntelIxgbe
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::NONE
+    }
+    fn ring_capacity(&self) -> usize {
+        ring::RING_LEN as usize
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        <Self as narf_net::Interface>::rx_ring(self)
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        <Self as narf_net::Interface>::tx_ring(self)
+    }
 }
 
 /// Register the i40e PCI driver — one match entry per device ID.
