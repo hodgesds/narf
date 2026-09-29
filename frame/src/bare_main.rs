@@ -5533,6 +5533,40 @@ fn boot_userspace_init() {
                     "forkcond_glibc",
                     narf_verification::NARF_FORKCOND_SMOKE_GLIBC_ELF,
                 ),
+                // Cross-thread readiness wake matrix (eventfd/pipe/socketpair x
+                // poll/ppoll/select/pselect/epoll), musl + static glibc.
+                (
+                    "xthread_wake_smoke",
+                    narf_verification::NARF_XTHREAD_WAKE_SMOKE_ELF,
+                ),
+                (
+                    "xthread_wake_glibc",
+                    narf_verification::NARF_XTHREAD_WAKE_SMOKE_GLIBC_ELF,
+                ),
+                (
+                    "procsig_thread_smoke",
+                    narf_verification::NARF_PROCSIG_THREAD_SMOKE_ELF,
+                ),
+                (
+                    "procsig_thread_glibc",
+                    narf_verification::NARF_PROCSIG_THREAD_SMOKE_GLIBC_ELF,
+                ),
+                (
+                    "nice_thread_smoke",
+                    narf_verification::NARF_NICE_THREAD_SMOKE_ELF,
+                ),
+                (
+                    "nice_thread_glibc",
+                    narf_verification::NARF_NICE_THREAD_SMOKE_GLIBC_ELF,
+                ),
+                (
+                    "setxid_busy_smoke",
+                    narf_verification::NARF_SETXID_BUSY_SMOKE_ELF,
+                ),
+                (
+                    "setxid_busy_glibc",
+                    narf_verification::NARF_SETXID_BUSY_SMOKE_GLIBC_ELF,
+                ),
                 // Systemd-style READY=1 datagram: a CPU-1 service wakes the
                 // CPU-0 manager's blocking epoll_wait and supplies SCM_CREDENTIALS.
                 (

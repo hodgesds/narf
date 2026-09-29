@@ -49,12 +49,13 @@ static int io_errors = 0;
 static int affinity_errors = 0;
 static int priority_errors = 0;
 static volatile int progress = 0;
+static const char *volatile phase = "start";
 
 static void on_alarm(int sig) {
     (void)sig;
-    char buf[96];
-    int n = snprintf(buf, sizeof buf, "forkcond-fail: stranded at round %d (taken=%d done=%d)\n",
-                     progress, taken, completed);
+    char buf[128];
+    int n = snprintf(buf, sizeof buf, "forkcond-fail: stranded at round %d in %s (taken=%d done=%d)\n",
+                     progress, phase, taken, completed);
     write(1, buf, n);
     _exit(1);
 }
@@ -130,6 +131,7 @@ int main(void) {
     }
     for (int r = 0; r < ROUNDS; r++) {
         progress = r;
+        phase = "queue";
         pthread_mutex_lock(&mtx);
         queued++;
         pthread_cond_signal(&has_job);
@@ -140,11 +142,13 @@ int main(void) {
         // set*id to every thread by signalling each one (glibc SIGSETXID via
         // tgkill, musl __synccall) and waiting for all to acknowledge; a
         // worker that never runs the handler hangs the caller forever.
+        phase = "seteuid";
         if (seteuid(geteuid()) != 0) {
             w("forkcond-fail: seteuid\n");
             return 1;
         }
 
+        phase = "fork";
         pid_t pid = fork();
         if (pid == 0)
             _exit(0);
@@ -152,12 +156,14 @@ int main(void) {
             w("forkcond-fail: fork\n");
             return 1;
         }
+        phase = "waitpid";
         int status = 0;
         if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
             w("forkcond-fail: waitpid\n");
             return 1;
         }
 
+        phase = "wait-job";
         pthread_mutex_lock(&mtx);
         while (completed < queued)
             pthread_cond_wait(&job_done, &mtx);

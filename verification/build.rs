@@ -610,6 +610,10 @@ fn main() {
         "condbcast_smoke",
         "forkcond_smoke",
         "setxid_threads_smoke",
+        "xthread_wake_smoke",
+        "procsig_thread_smoke",
+        "nice_thread_smoke",
+        "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
         "keyring_smoke",
         "inotify2_smoke",
@@ -694,7 +698,14 @@ fn main() {
     // signal mask around clone(), FUTEX_WAIT_BITSET condvars. When gcc or a
     // static libc.a is unavailable the image is an empty placeholder, like
     // the musl smokes without musl-gcc.
-    for test in ["setxid_threads_smoke", "forkcond_smoke"] {
+    for test in [
+        "setxid_threads_smoke",
+        "forkcond_smoke",
+        "xthread_wake_smoke",
+        "procsig_thread_smoke",
+        "nice_thread_smoke",
+        "setxid_busy_smoke",
+    ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
         let out = out_dir.join(format!("{test}_glibc_x86_64"));

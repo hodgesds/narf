@@ -3284,6 +3284,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
     } else if has(&[
         "futex",
         "cond",
+        "xthread",
         "barrier",
         "robust",
         "notify_epoll",
@@ -3327,6 +3328,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "pidfd",
         "strace",
         "sched",
+        "nice_thread",
         "closerange",
         "dup3",
         "fd_cloexec",
@@ -3613,6 +3615,22 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("setxid_threads_smoke", "setxid-threads-ok"),
         ("setxid_threads_glibc", "setxid-threads-ok"),
         ("forkcond_glibc", "forkcond-ok"),
+        // A thread parked in a readiness wait must wake when another thread
+        // makes its fd readable (fish's startup hang that Ctrl-C unsticks).
+        ("xthread_wake_smoke", "xthread-wake-ok"),
+        ("xthread_wake_glibc", "xthread-wake-ok"),
+        // Process-directed signals go to a thread that does not block them
+        // (fish's SIGCHLD-driven topic_monitor wait).
+        ("procsig_thread_smoke", "procsig-thread-ok"),
+        ("procsig_thread_glibc", "procsig-thread-ok"),
+        // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
+        // one thread, and new tasks inherit the forking thread's nice.
+        ("nice_thread_smoke", "nice-thread-ok"),
+        ("nice_thread_glibc", "nice-thread-ok"),
+        // set*id() broadcast while every other thread is busy in one class of
+        // work (file I/O, condvar waits, fork, pure compute).
+        ("setxid_busy_smoke", "setxid-busy-ok"),
+        ("setxid_busy_glibc", "setxid-busy-ok"),
         // Contended futex (N-thread mutex + join + condvar ping-pong).
         // Back in the shared-boot batch at the FULL 16-vCPU/2-socket-NUMA
         // topology: the strand class that forced its SMP=1 pin is fixed
