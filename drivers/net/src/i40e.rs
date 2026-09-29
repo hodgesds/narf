@@ -272,6 +272,14 @@ pub const GLPCI_CAPSUP_ARI_EN: u32 = 1 << 4;
 /// `I40E_PFLAN_QALLOC` — the PF's absolute LAN queue range.
 pub const REG_PFLAN_QALLOC: u64 = 0x001C_0400;
 
+/// Events the ARQ pump drains before yielding.
+///
+/// `I40E_AQ_WORK_LIMIT` in Linux, which sizes it as "max number of
+/// VFs + a little". This driver has no VFs, so the bound is purely
+/// about not letting a device that posts events faster than they can
+/// be handled starve every other task on this CPU.
+pub const AQ_WORK_LIMIT: u32 = 66;
+
 /// Queue pairs this driver brings up. One is enough to carry
 /// traffic; RSS across several needs a LUT and per-queue interrupt
 /// vectors, neither of which is in scope here.
@@ -1683,9 +1691,17 @@ fn spawn_pumps(
 /// otherwise leaves disarmed until the next request.
 async fn i40e_arq_pump(device: Arc<I40eNic>) {
     loop {
-        // Drain everything queued before yielding, so a burst of
-        // events cannot outrun the pump.
-        while let Some(event) = device.poll_arq_event() {
+        // Drain a bounded batch before yielding: enough that a burst
+        // of events cannot outrun the pump, capped so a device
+        // posting them faster than they can be handled cannot starve
+        // everything else on this CPU.
+        let mut drained = 0;
+        while drained < AQ_WORK_LIMIT {
+            let event = match device.poll_arq_event() {
+                Some(e) => e,
+                None => break,
+            };
+            drained += 1;
             if event.opcode == AqOpcode::GetLinkStatus as u16 {
                 match device.refresh_link_status() {
                     Ok(link) => {

@@ -1047,3 +1047,21 @@ fn smoke_i40e_arq_head_mask() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_arq_head_mask);
+
+fn smoke_i40e_arq_work_limit_covers_the_ring() -> TestResult {
+    use super::{AQ_RING_LEN, AQ_WORK_LIMIT};
+    // The batch bound has to exceed the ring, or a full ring could
+    // never be drained in one pass and the pump would fall behind
+    // under sustained events.
+    if AQ_WORK_LIMIT < AQ_RING_LEN as u32 {
+        return TestResult::Fail("work limit is smaller than the ARQ ring");
+    }
+    if AQ_WORK_LIMIT == 0 {
+        return TestResult::Fail("a zero work limit would drain nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_arq_work_limit_covers_the_ring
+);
