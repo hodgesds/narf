@@ -164,6 +164,19 @@ fn stat_from_layout(layout: &EntryLayout) -> Stat {
 // ── FileOps ─────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
+    /// Linux `__udf_iget`: the inode number is the physical block of the
+    /// file's ICB (`udf_get_lb_pblock(sb, &icb, 0)`), which `icb_lsn` holds.
+    fn ino(&self) -> u64 {
+        self.state.lock().icb_lsn
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
     /// inode — a FIFO or device node living in this filesystem dispatches
     /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.

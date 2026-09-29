@@ -156,6 +156,11 @@ impl Default for DevTpm0 {
 }
 
 impl FileOps for DevTpm0 {
+    /// The devfs inode of this device's `/dev` node.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     /// Submit a TPM 2.0 command and store the response.
     ///
     /// Rejects writes when a response is still pending (the previous
@@ -352,6 +357,11 @@ impl Drop for DevTpmRm0 {
 }
 
 impl FileOps for DevTpmRm0 {
+    /// The devfs inode of this device's `/dev` node.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     /// Submit a command; track transient handle allocations in responses.
     ///
     /// After a successful `TPM2_Load`, the response objectHandle is

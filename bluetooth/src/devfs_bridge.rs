@@ -124,6 +124,11 @@ impl RfcommPort {
 }
 
 impl FileOps for RfcommPort {
+    /// The devfs inode of this device's `/dev` node.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     /// Read from the RX ring.
     ///
     /// Non-blocking: returns immediately with however many bytes are

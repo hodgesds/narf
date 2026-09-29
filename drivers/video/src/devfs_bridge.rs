@@ -203,6 +203,11 @@ impl VideoFile {
 }
 
 impl FileOps for VideoFile {
+    /// The devfs inode of this device's `/dev` node.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     /// Return the next complete frame's bytes.
     ///
     /// Returns 0 bytes (EOF-ish) when no frame is queued; callers that

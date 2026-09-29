@@ -46,7 +46,7 @@ use crate::{
 
 /// Linux's compact dev_t encoding for majors below 4096. The high minor bits
 /// occupy bits 20+, matching `new_encode_dev()`.
-pub(crate) const fn linux_makedev(major: u32, minor: u32) -> u64 {
+pub const fn linux_makedev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 

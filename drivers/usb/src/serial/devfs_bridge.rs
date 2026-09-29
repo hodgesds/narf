@@ -269,6 +269,11 @@ impl TtyUsbFile {
 }
 
 impl FileOps for TtyUsbFile {
+    /// The devfs inode of this device's `/dev` node.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     /// Drain bytes from the RX ring into `buf`.
     ///
     /// Returns immediately with the bytes available; callers that want

@@ -5333,6 +5333,7 @@ impl DirOps for InitramfsDir {
                     data: e.data,
                     mode: e.mode,
                     mtime: e.mtime,
+                    ino: initramfs_ino(&target),
                 }));
             }
         }
@@ -5350,6 +5351,7 @@ impl DirOps for InitramfsDir {
                 data: &[],
                 mode: 0o040_755,
                 mtime: 0,
+                ino: initramfs_ino(&target),
             }));
         }
         None
@@ -5431,6 +5433,7 @@ impl DirOps for InitramfsRoot {
                     data: e.data,
                     mode: e.mode,
                     mtime: e.mtime,
+                    ino: initramfs_ino(name),
                 }));
             }
         }
@@ -5452,6 +5455,7 @@ impl DirOps for InitramfsRoot {
                 data: &[],
                 mode: 0o040_755,
                 mtime: 0,
+                ino: initramfs_ino(name),
             }));
         }
         None
@@ -5513,6 +5517,32 @@ struct InitramfsFile {
     data: &'static [u8],
     mode: u32,
     mtime: u64,
+    /// `st_ino`, from the entry's canonical path — see [`initramfs_ino`].
+    ino: u64,
+}
+
+/// The initramfs superblock's `st_dev` (Linux unpacks initramfs into rootfs,
+/// one anonymous-device superblock).
+static INITRAMFS_DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+
+/// Stable inode number for the initramfs entry at canonical `path`.
+///
+/// Linux unpacks the archive into rootfs and numbers each created inode with
+/// `get_next_ino`; NARF re-creates the file object on every lookup, so the
+/// number is derived from the path instead (32-bit FNV-1a, never 0 or 1 —
+/// 1 is the root, `rootfs`'s first inode).
+// LINUX-GAP: path-derived, so two paths could collide (~2^-32), and a
+// hardlink in the archive gets its own number instead of sharing one.
+fn initramfs_ino(path: &str) -> u64 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in path.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    if hash <= 1 {
+        hash = hash.wrapping_add(2);
+    }
+    u64::from(hash)
 }
 
 impl fmt::Debug for InitramfsFile {
@@ -5524,6 +5554,17 @@ impl fmt::Debug for InitramfsFile {
 }
 
 impl FileOps for InitramfsFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs {
+            dev: INITRAMFS_DEV.get(),
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let off = offset as usize;

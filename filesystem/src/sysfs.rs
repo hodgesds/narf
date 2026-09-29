@@ -2140,7 +2140,10 @@ const SYSFS_ROOT_INO: u64 = 1;
 static KERNFS_NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2);
 static SYSFS_DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
 
-fn kernfs_next_ino() -> u64 {
+/// A new kernfs node id from the one sysfs counter. Public so a subsystem
+/// that serves part of /sys itself (the watchdog class) numbers its nodes
+/// in the same space.
+pub fn kernfs_next_ino() -> u64 {
     KERNFS_NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
@@ -2149,7 +2152,8 @@ pub fn sysfs_dev() -> u64 {
     SYSFS_DEV.get()
 }
 
-fn sysfs_attrs() -> crate::InodeAttrs {
+/// `InodeAttrs` for a sysfs node: the sysfs superblock's `st_dev`.
+pub fn sysfs_attrs() -> crate::InodeAttrs {
     crate::InodeAttrs {
         dev: sysfs_dev(),
         ..Default::default()

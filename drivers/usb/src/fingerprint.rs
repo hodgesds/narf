@@ -375,6 +375,13 @@ impl core::fmt::Debug for FpFileNode {
 }
 
 impl narf_filesystem::FileOps for FpFileNode {
+    // LINUX-GAP: NARF-specific node (Linux has no fingerprint char device;
+    // libfprint drives the USB device directly), so there is no Linux inode
+    // scheme to follow. A stable nonzero number per reader slot.
+    fn ino(&self) -> u64 {
+        0xf9_0000 | (u64::from(self.dev.slot_id) + 1)
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         let dev = self.dev.clone();
         Box::pin(async move {
