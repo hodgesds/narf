@@ -76,8 +76,8 @@ fn faccessat_common(ctx: &mut dyn TrapContext, dirfd: u64, path_ptr: u64, mode: 
             // used to answer 0 for any open fd, so `access_fd(fd, X_OK)` on
             // a non-executable file said "executable" (Linux: -EACCES even
             // for root, whose CAP_DAC_OVERRIDE needs some x bit to exist).
-            let ops = fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.clone()))
-                .flatten();
+            let ops =
+                fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.clone())).flatten();
             match ops {
                 Some(file) => access_file(ctx, &file, mode, eaccess),
                 None => ctx.set_return(errno_ret(EBADF)),
@@ -185,9 +185,7 @@ fn access_file(
 ) {
     match poll_blocking(file.access(mode)) {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-        Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
-            ctx.set_return(errno_ret(EACCES))
-        }
+        Some(Err(narf_filesystem::FsError::PermissionDenied)) => ctx.set_return(errno_ret(EACCES)),
         Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
             let st = file.stat();
             let (uid, gid) = file.owners();
@@ -252,7 +250,12 @@ fn access_file(
 /// That is the whole point of access(2) for a set-uid program: "could the
 /// user who ran me open this?" Using the fs ids answered for the program's
 /// owner instead.
-fn access_accessor(task: u64, file_uid: u32, file_gid: u32, eaccess: bool) -> narf_filesystem::Accessor {
+fn access_accessor(
+    task: u64,
+    file_uid: u32,
+    file_gid: u32,
+    eaccess: bool,
+) -> narf_filesystem::Accessor {
     let mut acc = accessor_for_inode(task, file_uid, file_gid);
     if eaccess {
         return acc;
@@ -261,8 +264,8 @@ fn access_accessor(task: u64, file_uid: u32, file_gid: u32, eaccess: bool) -> na
     #[cfg(feature = "container")]
     let initial_ns = {
         let uns = crate::namespaces::current_user_ns(task);
-        acc.uid = uns.translate_uid_to_host(ids.uid);
-        acc.gid = uns.translate_gid_to_host(ids.gid);
+        acc.uid = ids.uid;
+        acc.gid = ids.gid;
         uns.is_initial()
     };
     #[cfg(not(feature = "container"))]
@@ -316,7 +319,11 @@ fn set_access_result(
         request,
         acl,
     );
-    ctx.set_return(if allowed { SyscallReturn::ok(0) } else { errno_ret(EACCES) });
+    ctx.set_return(if allowed {
+        SyscallReturn::ok(0)
+    } else {
+        errno_ret(EACCES)
+    });
 }
 
 pub(crate) fn sys_chown(ctx: &mut dyn TrapContext) {

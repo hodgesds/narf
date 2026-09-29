@@ -2081,10 +2081,13 @@ fn open_impl(
     // Clone devices keep path lookup/stat side-effect free and allocate their
     // per-open state only here after permissions have passed. This covers
     // PTY masters and independent FUSE daemon connections.
-    let ops = if let Some(instance) = ops.open_instance() {
-        instance
-    } else {
-        ops
+    let ops = match ops.open_instance_checked(flags & 3 != 0) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => ops,
+        Err(error) => {
+            ctx.set_return(errno_ret(copy_fs_errno(error)));
+            return;
+        }
     };
 
     // Directory fd: a real fs directory resolves to its raw node, whose
@@ -3172,8 +3175,8 @@ fn linux_stat_from_fs(
         // unlinked temporary from a named file.
         st_nlink: if attrs.tracked { attrs.nlink as u64 } else { 1 },
         st_mode: mode_word,
-        st_uid: uid,
-        st_gid: gid,
+        st_uid: uid_to_user(current_task_id(), uid),
+        st_gid: gid_to_user(current_task_id(), gid),
         __pad0: 0,
         st_rdev: rdev,
         st_size: s.size as i64,
@@ -5342,9 +5345,9 @@ pub(crate) fn capable(cap: u32) -> bool {
 /// for (;;) {
 ///         if (likely(ns == cred->user_ns))
 ///                 return cap_raised(cred->cap_effective, cap) ? 0 : -EPERM;
-///         if (ns == &init_user_ns)
+///         if (ns->level <= cred->user_ns->level)
 ///                 return -EPERM;
-///         if ((ns->level > cred->user_ns->level) && uid_eq(ns->owner, cred->euid))
+///         if ((ns->parent == cred->user_ns) && uid_eq(ns->owner, cred->euid))
 ///                 return 0;
 ///         ns = ns->parent;
 /// }
@@ -5371,27 +5374,39 @@ pub(crate) fn task_ns_capable(
     target: &crate::namespaces::UserNamespace,
     cap: u32,
 ) -> bool {
+    let cred_ns = crate::namespaces::current_user_ns(task);
+    cred_ns_capable(
+        &cred_ns,
+        read_uidgid(task).euid,
+        read_caps(task).effective,
+        target,
+        cap,
+    )
+}
+
+/// Linux cap_capable_helper, also used with an open file's credential snapshot.
+#[cfg(feature = "container")]
+fn cred_ns_capable(
+    cred_ns: &crate::namespaces::UserNamespace,
+    cred_euid: u32,
+    effective: u64,
+    target: &crate::namespaces::UserNamespace,
+    cap: u32,
+) -> bool {
     if u64::from(cap) > CAP_LAST_CAP {
         return false;
     }
-    let cred_ns = crate::namespaces::current_user_ns(task);
-    let cred_level = cred_ns.level();
-    // Host-absolute effective uid — `cred->euid` is a host id, and
-    // `ns->owner` was recorded as one at creation.
-    let cred_euid = read_uidgid(task).euid;
-    let mut cursor: Option<&crate::namespaces::UserNamespace> = Some(target);
+    let mut cursor = Some(target);
     while let Some(ns) = cursor {
         if ns.id() == cred_ns.id() {
-            // The question is about the caller's own namespace, so the
-            // effective set answers it directly. Recursing through
-            // `task_capable` here would ask the HOST question instead and
-            // deny every namespaced task.
-            return cap_effective(task, cap);
+            return effective & (1u64 << cap) != 0;
         }
-        if ns.is_initial() {
+        if ns.level() <= cred_ns.level() {
             return false;
         }
-        if ns.level() > cred_level && ns.owner_uid() == cred_euid {
+        // Ownership confers authority only from the direct parent. A deeper
+        // namespace on a sibling branch must not pass merely by sharing a UID.
+        if ns.parent().is_some_and(|p| p.id() == cred_ns.id()) && ns.owner_uid() == cred_euid {
             return true;
         }
         cursor = ns.parent().map(|parent| &**parent);
@@ -5962,6 +5977,7 @@ pub(crate) fn ambient_clear_all(task: u64) {
 /// changes, and applying half the rules would leave it with neither its
 /// own policy nor the kernel's.
 fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
+    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     // `cap_task_fix_setuid`: `if (!issecure(SECURE_NO_SETUID_FIXUP))
     // cap_emulate_setxuid(new, old);` — the whole juggle is suppressed, not
     // parts of it. A process that set the bit is saying "I manage my own
@@ -5970,8 +5986,8 @@ fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
     if issecure(task, SECURE_NO_SETUID_FIXUP) {
         return;
     }
-    let was_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
-    let is_root = new.uid == 0 || new.euid == 0 || new.suid == 0;
+    let was_root = old.uid == root_uid || old.euid == root_uid || old.suid == root_uid;
+    let is_root = new.uid == root_uid || new.euid == root_uid || new.suid == root_uid;
     let mut caps = read_caps(task);
     let mut changed = false;
     if was_root && !is_root {
@@ -5985,11 +6001,11 @@ fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
         caps.ambient = 0;
         changed = true;
     }
-    if old.euid == 0 && new.euid != 0 {
+    if old.euid == root_uid && new.euid != root_uid {
         caps.effective = 0;
         changed = true;
     }
-    if old.euid != 0 && new.euid == 0 {
+    if old.euid != root_uid && new.euid == root_uid {
         caps.effective = caps.permitted;
         changed = true;
     }
@@ -6062,11 +6078,12 @@ pub fn __test_cap_effective(task: u64, cap: u32) -> bool {
 }
 
 fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
+    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     let mut caps = read_caps(task);
     let before = caps.effective;
-    if old_fsuid == 0 && new_fsuid != 0 {
+    if old_fsuid == root_uid && new_fsuid != root_uid {
         caps.effective &= !CAP_FS_SET;
-    } else if old_fsuid != 0 && new_fsuid == 0 {
+    } else if old_fsuid != root_uid && new_fsuid == root_uid {
         caps.effective |= caps.permitted & CAP_FS_SET;
     }
     if caps.effective != before {
@@ -6098,12 +6115,13 @@ fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
 /// when the EFFECTIVE uid is root: a binary that merely leaves the real
 /// uid at 0 gets the permissions but must raise them itself.
 fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
+    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     // `root_privileged()` is `!issecure(SECURE_NOROOT)`
     // (`security/commoncap.c:805`). SECURE_NOROOT says "uid 0 is just a
     // uid" — the root-gets-everything shortcut below is exactly what it
     // exists to switch off, so a task that set it must not be handed the
     // full set by execing something owned by root.
-    if new_ids.euid != 0 && new_ids.uid != 0 {
+    if new_ids.euid != root_uid && new_ids.uid != root_uid {
         return;
     }
     if issecure(task, SECURE_NOROOT) {
@@ -6111,7 +6129,7 @@ fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
     }
     let mut caps = read_caps(task);
     caps.permitted = caps.bounding | caps.inheritable;
-    if new_ids.euid == 0 {
+    if new_ids.euid == root_uid {
         caps.effective = caps.permitted;
     }
     write_caps(task, caps);
@@ -6148,6 +6166,7 @@ fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
 /// choice, and why the `X & fP` and `pI & fI` terms of `pP'` contribute
 /// nothing. Stated rather than silently simplified.
 fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
+    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     let mut caps = read_caps(task);
     if id_changed {
         caps.ambient = 0;
@@ -6160,7 +6179,7 @@ fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
     // which is exactly the condition `cap_exec_privileged_root` above uses
     // to hand out the full set, and computing it differently here would let
     // the two disagree about the same exec.
-    let fe = ids.euid == 0 && !issecure(task, SECURE_NOROOT);
+    let fe = ids.euid == root_uid && !issecure(task, SECURE_NOROOT);
     caps.effective = if fe { caps.permitted } else { caps.ambient };
     write_caps(task, caps);
     // `new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS)` — KEEP_CAPS is
@@ -6234,11 +6253,11 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
     }
     let old = read_uidgid(task);
     let mut new = old;
-    if mode & 0o4000 != 0 {
+    if mode & 0o4000 != 0 && inode_ids_mapped(task, file_uid, file_gid) {
         new.euid = file_uid;
     }
     // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
-    if mode & 0o2010 == 0o2010 {
+    if mode & 0o2010 == 0o2010 && inode_ids_mapped(task, file_uid, file_gid) {
         new.egid = file_gid;
     }
     if new.euid == old.euid && new.egid == old.egid {
@@ -7156,7 +7175,7 @@ fn xattr_target(path: &str) -> Option<XattrTarget> {
 /// `XATTR_NAME_CAPS`.
 const XATTR_NAME_CAPS: &str = "security.capability";
 /// Linux `CAP_SETFCAP` — "set arbitrary capabilities on a file".
-const CAP_SETFCAP: u32 = 31;
+pub(crate) const CAP_SETFCAP: u32 = 31;
 
 /// `security/commoncap.c::cap_convert_nscap`'s validation of a
 /// `security.capability` value, which `vfs_setxattr` runs (for a non-empty
@@ -10837,9 +10856,17 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
 
     #[cfg(feature = "container")]
     let prepared_user_ns = if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-        Some(crate::namespaces::UserNamespace::new_child(
-            crate::namespaces::current_user_ns(parent_pid),
-            read_uidgid(parent_pid).euid,
+        let parent_user_ns = crate::namespaces::current_user_ns(parent_pid);
+        let owner_ids = read_uidgid(parent_pid);
+        let owner_host_uid = owner_ids.euid;
+        let owner_host_gid = owner_ids.egid;
+        let parent_could_setfcap =
+            task_ns_capable(parent_pid, &parent_user_ns, CAP_SETFCAP);
+        Some(crate::namespaces::UserNamespace::new_child_with_credentials(
+            parent_user_ns,
+            owner_host_uid,
+            owner_host_gid,
+            parent_could_setfcap,
         ))
     } else {
         None
@@ -11278,14 +11305,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
                     .expect("CLONE_NEWUSER prepared a child user namespace"),
             );
             set_cred_user_ns_caps(child);
-            let _ = write_uidgid(child, |e| {
-                e.uid = 0;
-                e.gid = 0;
-                e.euid = 0;
-                e.egid = 0;
-                e.fsuid = 0;
-                e.fsgid = 0;
-            });
         }
         if flags & crate::namespaces::CLONE_NEWUTS != 0 {
             crate::namespaces::unshare_uts(child);
@@ -14760,13 +14779,9 @@ fn console_tiocgsid() -> u64 {
 
 // ── Per-task uid/gid table ─────────────────────────────────────────
 //
-// NARF's authority model is capabilities, not POSIX uids — but
-// real C programs (libstdc++, glibc init paths, some test
-// fixtures) check uid/gid early and refuse to run as root, or
-// require a specific gid before opening a privileged code path.
-// We honour the POSIX surface so those programs behave; the
-// values are kernel-side state with no security implication
-// (capabilities still gate everything that matters).
+// POSIX credential IDs participate in DAC, signal and ptrace checks. Store
+// kernel-global IDs so entering a user namespace never changes identity.
+// User-visible values are translated at the ABI boundary.
 //
 // Storage is sharded by task ID so unrelated processes do not serialize
 // credential reads on the open/stat/access hot paths.
@@ -14796,6 +14811,89 @@ struct UidGid {
     /// unless overridden by setfs*id.
     fsuid: u32,
     fsgid: u32,
+}
+
+// Credentials and supplementary groups use kernel-global IDs, like Linux's
+// kuid_t/kgid_t. Only syscall inputs and user-visible outputs are translated.
+// An unmapped input is invalid, not the overflow ID (which can be a real user).
+fn inode_ids_mapped(task: u64, uid: u32, gid: u32) -> bool {
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(task);
+        ns.translate_uid_from_host(uid).is_some() && ns.translate_gid_from_host(gid).is_some()
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = (task, uid, gid);
+        true
+    }
+}
+
+// chown's -1 sentinel is passed through; all other IDs must map.
+fn chown_ids_from_user(task: u64, uid: u32, gid: u32) -> Option<(u32, u32)> {
+    let uid = if uid == u32::MAX {
+        uid
+    } else {
+        uid_from_user(task, uid)?
+    };
+    let gid = if gid == u32::MAX {
+        gid
+    } else {
+        gid_from_user(task, gid)?
+    };
+    Some((uid, gid))
+}
+
+fn uid_from_user(task: u64, uid: u32) -> Option<u32> {
+    #[cfg(feature = "container")]
+    {
+        crate::namespaces::current_user_ns(task).translate_uid_range_to_host(uid, 1)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = task;
+        (uid != u32::MAX).then_some(uid)
+    }
+}
+
+fn gid_from_user(task: u64, gid: u32) -> Option<u32> {
+    #[cfg(feature = "container")]
+    {
+        crate::namespaces::current_user_ns(task).translate_gid_range_to_host(gid, 1)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = task;
+        (gid != u32::MAX).then_some(gid)
+    }
+}
+
+fn uid_to_user(task: u64, uid: u32) -> u32 {
+    #[cfg(feature = "container")]
+    {
+        crate::namespaces::current_user_ns(task)
+            .translate_uid_from_host(uid)
+            .unwrap_or(crate::namespaces::OVERFLOW_ID)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = task;
+        uid
+    }
+}
+
+fn gid_to_user(task: u64, gid: u32) -> u32 {
+    #[cfg(feature = "container")]
+    {
+        crate::namespaces::current_user_ns(task)
+            .translate_gid_from_host(gid)
+            .unwrap_or(crate::namespaces::OVERFLOW_ID)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = task;
+        gid
+    }
 }
 
 const CREDENTIAL_SHARDS: usize = 32;
@@ -15022,19 +15120,6 @@ pub fn current_ucred() -> crate::socket::Ucred {
             ids.egid,
         )
     });
-    #[cfg(feature = "container")]
-    let (uid, gid) = {
-        let ns = crate::namespaces::current_user_ns(task);
-        if ns.is_initial() {
-            (euid, egid)
-        } else {
-            (
-                ns.translate_uid_to_host(euid),
-                ns.translate_gid_to_host(egid),
-            )
-        }
-    };
-    #[cfg(not(feature = "container"))]
     let (uid, gid) = (euid, egid);
     crate::socket::Ucred {
         pid: pid as u32,
@@ -15046,19 +15131,7 @@ pub fn current_ucred() -> crate::socket::Ucred {
 /// Calling task's supplementary groups in host-absolute form, suitable for
 /// capture in a Unix socket peer-credential snapshot.
 pub fn current_groups() -> alloc::vec::Vec<u32> {
-    let task = current_task_id();
-    let groups = read_groups(task);
-    #[cfg(feature = "container")]
-    {
-        let ns = crate::namespaces::current_user_ns(task);
-        if !ns.is_initial() {
-            return groups
-                .into_iter()
-                .map(|gid| ns.translate_gid_to_host(gid))
-                .collect();
-        }
-    }
-    groups
+    read_groups(current_task_id())
 }
 
 /// Translate host-absolute supplementary groups into the reader's user
@@ -15100,14 +15173,9 @@ pub fn report_ucred_to(reader: u64, mut cred: crate::socket::Ucred) -> crate::so
 
 /// SECURITY-CRITICAL single funnel for every filesystem `Accessor`.
 ///
-/// `posix_access_ok` treats `uid == 0` as omnipotent host-root. With
-/// user namespaces, a task's stored fsuid/fsgid are *in-namespace*
-/// ids: inner uid 0 is host-root ONLY if the user-ns maps inner-0 to
-/// host-0. So before the FS sees the accessor we translate the task's
-/// in-ns fsuid/fsgid to HOST-absolute ids through its user-ns map. An
-/// unmapped id becomes the overflow id (65534), which owns nothing —
-/// the safe default. File owners are kept host-absolute everywhere, so
-/// this is the only translation needed.
+/// Credentials and inode owners are kernel-global IDs, so no namespace
+/// translation occurs during a DAC decision. Unmapped user-visible IDs never
+/// replace the inherited identity, including supplementary groups.
 ///
 /// EVERY production code path that builds a `narf_filesystem::Accessor`
 /// for a real syscall MUST go through here. (Verified by grep: the
@@ -15137,16 +15205,10 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() {
-            // File owners are host-absolute, so the supplementary list has to
-            // be translated exactly like fsgid or it would compare in-ns ids
-            // against host ids and match by coincidence.
             return narf_filesystem::Accessor {
-                uid: uns.translate_uid_to_host(acc.fsuid),
-                gid: uns.translate_gid_to_host(acc.fsgid),
-                groups: groups
-                    .iter()
-                    .map(|g| uns.translate_gid_to_host(*g))
-                    .collect(),
+                uid: acc.fsuid,
+                gid: acc.fsgid,
+                groups,
                 // A task in a non-initial user namespace has no authority
                 // over host-owned inodes, irrespective of its in-namespace
                 // effective capability set.
@@ -15174,20 +15236,7 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
 /// supplementary groups or capability snapshot needed only by a full DAC
 /// decision. This is the Linux owner-first `acl_permission_check` fast path.
 fn current_host_fsuid(task: u64) -> u32 {
-    let fsuid = read_uidgid(task).fsuid;
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if uns.is_initial() {
-            fsuid
-        } else {
-            uns.translate_uid_to_host(fsuid)
-        }
-    }
-    #[cfg(not(feature = "container"))]
-    {
-        fsuid
-    }
+    read_uidgid(task).fsuid
 }
 
 fn fuse_request_context() -> narf_filesystem::fuse_conn::FuseRequestContext {

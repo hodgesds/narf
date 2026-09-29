@@ -21,14 +21,10 @@ use super::*;
 pub(crate) fn sys_setgid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let gid = ctx.args().arg0 as u32;
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() && !uns.gid_is_mapped(gid) {
-            ctx.set_return(errno_ret(EINVAL));
-            return;
-        }
-    }
+    let Some(gid) = gid_from_user(task, gid) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
     let old = read_uidgid(task);
     let ok = if capable_in_own_ns(CAP_SETGID) {
         write_uidgid(task, |e| {

@@ -68,7 +68,7 @@ fn wake_mountinfo_waiters() {
 }
 
 /// Wire the namespace procfs hooks so /proc/<pid>/ns/*, uid_map,
-/// gid_map, and the per-ns mountinfo view reach the userspace
+/// gid_map, setgroups, and the per-ns mountinfo view reach the userspace
 /// namespace tables. Gated on container (the source of the state)
 /// AND linux-compat (where the procfs nodes live).
 #[cfg(feature = "container")]
@@ -76,8 +76,8 @@ fn install_ns_proc_hooks() {
     narf_filesystem::procfs::install_ns_proc_hooks(
         narf_userspace::handlers::proc_ns_readlink,
         narf_userspace::handlers::proc_ns_mountinfo,
-        narf_userspace::handlers::proc_ns_idmap_render,
-        narf_userspace::handlers::proc_ns_idmap_write,
+        narf_userspace::handlers::proc_ns_idmap_open,
+        narf_userspace::handlers::proc_ns_idmap_owners,
     );
 }
 

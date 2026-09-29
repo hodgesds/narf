@@ -33,6 +33,15 @@ use super::*;
 pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     const NGROUPS_MAX: u32 = 65_536;
     let args = *ctx.args();
+    if !capable_in_own_ns(CAP_SETGID) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
+    #[cfg(feature = "container")]
+    if !crate::namespaces::current_user_ns(current_task_id()).may_setgroups() {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
     // `int gidsetsize`, compared as `unsigned` — a negative size becomes a
     // huge unsigned and trips the bound.
     let size = args.arg0 as i32 as u32;
@@ -67,14 +76,10 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     let mut groups = alloc::vec::Vec::with_capacity(size);
     for chunk in bytes.chunks_exact(4) {
         let gid = u32::from_ne_bytes(chunk.try_into().unwrap());
-        #[cfg(feature = "container")]
-        {
-            let ns = crate::namespaces::current_user_ns(current_task_id());
-            if !ns.is_initial() && !ns.gid_is_mapped(gid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-        }
+        let Some(gid) = gid_from_user(current_task_id(), gid) else {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        };
         groups.push(gid);
     }
     let ok = write_groups(current_task_id(), groups);

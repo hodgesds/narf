@@ -62,6 +62,19 @@ acquisition. Attribute failure publishes no descriptor and retains no detached
 mount object. Extensible-record size, user-copy, trailing-byte, flag, atime,
 propagation, and idmapped-mount errors use Linux errno values.
 
+User namespace maps follow the Linux authorization model in
+`/usr/src/linux/kernel/user_namespace.c`: map extents are bounded and
+non-overlapping, child writes are one-shot and authorized through the target
+or parent namespace, and an unprivileged one-entry map is restricted to the
+namespace owner. Mapping namespace uid 0 additionally follows Linux's
+`CAP_SETFCAP` rule. `/proc/<pid>/setgroups` follows
+`/usr/src/linux/fs/proc/base.c`: `deny` is irreversible, while
+`setgroups(2)` follows `/usr/src/linux/kernel/groups.c` and stays blocked
+until a gid map exists and thereafter while the child namespace's policy is
+deny. The id-map proc files retain host-absolute namespace-owner inode IDs,
+matching Linux `task_dump_owner()` and allowing the creator to open them
+before the first map is installed.
+
 Linux `statx(2)` returns a stable `STATX_MNT_ID` whenever the resolved path
 has a covering NARF mount, even when the request mask names only basic fields.
 This is a deliberately useful Linux-permitted superset: service managers use
@@ -871,6 +884,32 @@ that retains the named namespace and is accepted by `setns(2)`. An
 `O_PATH|O_NOFOLLOW` open retains symlink-node semantics. Initial UTS, network,
 IPC, PID, mount, user, and enabled cgroup namespaces have stable nonzero
 identities even before a task unshares them.
+User namespace creation grants capabilities only in the new namespace. Real,
+effective, saved, filesystem IDs and supplementary groups retain their
+kernel-global identity across `clone(CLONE_NEWUSER)`, `unshare`, and `setns`.
+Credential getters and inode stat results translate to the caller's namespace;
+unmapped outputs use 65534. ID setters and chown translate mapped inputs to
+kernel IDs and reject unmapped inputs (the `-1` no-change/query convention is
+preserved). Capability transitions compare against the mapped namespace root.
+Namespace-owner authority requires the caller to belong to the direct parent;
+sharing an owner UID with a sibling's descendant confers no authority.
+A
+rootless writer may install one uid mapping for the namespace owner, and one
+gid mapping for the owner's primary group after writing `deny` to
+`/proc/<pid>/setgroups`. Map writes reject zero or wrapping ranges, overlap,
+unmapped parent ranges, writes by unrelated namespaces, and second successful
+writes. Mapping parent uid 0 additionally requires CAP_SETFCAP in the parent
+namespace (or that capability at child creation); this prevents a namespaced
+root from gaining host-root file capabilities. `setgroups(2)` requires
+CAP_SETGID in the current user namespace, an installed gid_map, and an
+allow-state that has not been disabled.
+Procfs map descriptors pin their target namespace and opener credentials.
+Map authorization checks the opener's target CAP_SYS_ADMIN; privileged ranges
+require both opener and current writer CAP_SETUID/GID in the parent. The
+unprivileged one-ID exception uses the opener's effective UID/GID. Offset must
+be zero and the write shorter than a page. The map's second column is rendered
+in the opener's namespace, or the target's parent when opened from the target.
+Writable `setgroups` opens require target CAP_SYS_ADMIN and capture that grant.
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.

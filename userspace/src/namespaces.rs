@@ -1396,6 +1396,9 @@ struct UserInner {
     /// once. Tracked separately per map.
     uid_map_written: bool,
     gid_map_written: bool,
+    /// Linux `USERNS_SETGROUPS_ALLOWED`. A new namespace inherits this bit
+    /// from its parent; it may be disabled once, before its gid_map is set.
+    setgroups_allowed: bool,
 }
 
 /// A user namespace. `parent` is `None` only for the initial (host)
@@ -1403,14 +1406,26 @@ struct UserInner {
 #[derive(Debug)]
 pub struct UserNamespace {
     id: NsId,
-    /// Parent user-ns. Translation that a map doesn't cover does NOT
-    /// chase the parent in this MVP (Linux does, recursively); see the
-    /// deferral note on `translate_uid_to_host`.
+    /// Parent user namespace. Map writes normalize parent-visible IDs to
+    /// kernel-global extents, so credential lookups do not chase this chain.
     parent: Option<Arc<UserNamespace>>,
     /// Host-absolute uid of the task that created this ns (the
     /// owner). Linux uses it for the `CAP_*`-in-owner checks.
     owner_uid: u32,
+    /// Host-absolute primary gid of the creator. Map authorization uses
+    /// the opener's credential snapshot, which may differ from this value.
+    owner_gid: u32,
+    /// Linux snapshots whether the parent had CAP_SETFCAP at creation. A
+    /// descendant must not map parent uid 0 unless this was true.
+    parent_could_setfcap: bool,
     inner: IrqSafeSpinLock<UserInner>,
+}
+
+/// Failure class from writing a user namespace id map.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IdMapWriteError {
+    Invalid,
+    Permission,
 }
 
 /// A user namespace can own a mount namespace. `narf-filesystem` holds the
@@ -1444,6 +1459,8 @@ impl UserNamespace {
             id,
             parent: None,
             owner_uid: 0,
+            owner_gid: 0,
+            parent_could_setfcap: true,
             inner: IrqSafeSpinLock::new(UserInner {
                 uid_map: alloc::vec![IdMapEntry {
                     inner_start: 0,
@@ -1457,6 +1474,7 @@ impl UserNamespace {
                 }],
                 uid_map_written: true,
                 gid_map_written: true,
+                setgroups_allowed: true,
             }),
         });
         register_ns(&ns, ns_type::USER, 0);
@@ -1469,14 +1487,30 @@ impl UserNamespace {
     /// translates to the overflow id, which is the Linux behaviour and
     /// is the safe default (an unconfigured ns has no host authority).
     pub fn new_child(parent: Arc<UserNamespace>, owner_uid: u32) -> Arc<Self> {
+        Self::new_child_with_credentials(parent, owner_uid, owner_uid, false)
+    }
+
+    /// `create_user_ns()` with the creator's current credential context.
+    pub fn new_child_with_credentials(
+        parent: Arc<UserNamespace>,
+        owner_uid: u32,
+        owner_gid: u32,
+        parent_could_setfcap: bool,
+    ) -> Arc<Self> {
         // A user namespace's owner is its PARENT (`user_ns->parent`), which
         // is what makes the ownership chain walkable.
         let parent_id = parent.id();
+        let setgroups_allowed = parent.setgroups_allowed();
         let ns = Arc::new(Self {
             id: alloc_ns_id(),
             parent: Some(parent),
             owner_uid,
-            inner: IrqSafeSpinLock::new(UserInner::default()),
+            owner_gid,
+            parent_could_setfcap,
+            inner: IrqSafeSpinLock::new(UserInner {
+                setgroups_allowed,
+                ..UserInner::default()
+            }),
         });
         register_ns(&ns, ns_type::USER, parent_id);
         ns
@@ -1490,6 +1524,14 @@ impl UserNamespace {
         self.owner_uid
     }
 
+    pub fn owner_gid(&self) -> u32 {
+        self.owner_gid
+    }
+
+    pub fn parent_could_setfcap(&self) -> bool {
+        self.parent_could_setfcap
+    }
+
     pub fn is_initial(&self) -> bool {
         self.parent.is_none()
     }
@@ -1497,6 +1539,17 @@ impl UserNamespace {
     /// Enclosing user namespace; `None` only for the initial one.
     pub fn parent(&self) -> Option<&Arc<UserNamespace>> {
         self.parent.as_ref()
+    }
+
+    /// Translate a complete range of ids in this namespace to the
+    /// host-absolute space. A range must fit within one extent, as in Linux's
+    /// `map_id_range_down()`; no gaps or partial translations are accepted.
+    pub fn translate_uid_range_to_host(&self, start: u32, count: u32) -> Option<u32> {
+        translate_range_to_host(&self.inner.lock().uid_map, start, count)
+    }
+
+    pub fn translate_gid_range_to_host(&self, start: u32, count: u32) -> Option<u32> {
+        translate_range_to_host(&self.inner.lock().gid_map, start, count)
     }
 
     /// Nesting depth, initial namespace = 0 — Linux's `user_namespace.level`.
@@ -1522,11 +1575,9 @@ impl UserNamespace {
     }
 
     /// Translate an inner uid to a host-absolute uid. Unmapped ids
-    /// return [`OVERFLOW_ID`] — the safe default that grants no host
-    /// authority. (Recursive parent translation is deferred: NARF
-    /// builds shallow, single-level user namespaces today, so a
-    /// uid_map entry's `outer_start` is already a host id. Nesting
-    /// would require walking `parent` here.)
+    /// return [`OVERFLOW_ID`]. Committed extents are kernel-global, including
+    /// nested namespaces. Permission checks and input validation must use
+    /// the fallible range translation: overflow is also a valid host ID.
     pub fn translate_uid_to_host(&self, inner: u32) -> u32 {
         let g = self.inner.lock();
         for e in g.uid_map.iter() {
@@ -1577,7 +1628,7 @@ impl UserNamespace {
     /// written or the entries are malformed.
     pub fn write_uid_map(&self, entries: Vec<IdMapEntry>) -> Result<(), ()> {
         let mut g = self.inner.lock();
-        if g.uid_map_written || entries.is_empty() {
+        if g.uid_map_written || !valid_idmap(&entries) {
             return Err(());
         }
         g.uid_map = entries;
@@ -1587,7 +1638,7 @@ impl UserNamespace {
 
     pub fn write_gid_map(&self, entries: Vec<IdMapEntry>) -> Result<(), ()> {
         let mut g = self.inner.lock();
-        if g.gid_map_written || entries.is_empty() {
+        if g.gid_map_written || !valid_idmap(&entries) {
             return Err(());
         }
         g.gid_map = entries;
@@ -1595,22 +1646,228 @@ impl UserNamespace {
         Ok(())
     }
 
+    /// Linux `map_write()` policy and commit for a uid_map. `entries` use
+    /// the parent namespace's ids as their second column; committed entries
+    /// are normalized to host ids for NARF's DAC and credential helpers.
+    pub fn write_uid_map_authorized(
+        &self,
+        entries: Vec<IdMapEntry>,
+        writer_ns: &UserNamespace,
+        writer_uid_host: u32,
+        writer_has_map_admin: bool,
+        writer_has_parent_setuid: bool,
+        writer_has_parent_setfcap: bool,
+    ) -> Result<(), IdMapWriteError> {
+        let parent = self.parent.as_ref().ok_or(IdMapWriteError::Permission)?;
+        if !writer_has_map_admin || !same_or_parent(writer_ns, self, parent) {
+            return Err(IdMapWriteError::Permission);
+        }
+        let normalized = normalize_idmap(parent, &entries, true)?;
+        let self_map = entries.len() == 1
+            && entries[0].count == 1
+            && normalized[0].outer_start == self.owner_uid
+            && writer_uid_host == self.owner_uid;
+        if !writer_has_parent_setuid && !self_map {
+            return Err(IdMapWriteError::Permission);
+        }
+        let maps_parent_root = entries.iter().any(|entry| entry.outer_start == 0);
+        let root_map_allowed = if writer_ns.id() == self.id {
+            self.parent_could_setfcap
+        } else {
+            writer_has_parent_setfcap
+        };
+        if maps_parent_root && !root_map_allowed {
+            return Err(IdMapWriteError::Permission);
+        }
+
+        let mut g = self.inner.lock();
+        if g.uid_map_written {
+            return Err(IdMapWriteError::Permission);
+        }
+        g.uid_map = normalized;
+        g.uid_map_written = true;
+        Ok(())
+    }
+
+    /// Linux `map_write()` policy and commit for a gid_map. An unprivileged
+    /// one-id map is permitted only after `/proc/<pid>/setgroups` is denied.
+    pub fn write_gid_map_authorized(
+        &self,
+        entries: Vec<IdMapEntry>,
+        writer_ns: &UserNamespace,
+        writer_ids_host: (u32, u32),
+        writer_has_map_admin: bool,
+        writer_has_parent_setgid: bool,
+    ) -> Result<(), IdMapWriteError> {
+        let parent = self.parent.as_ref().ok_or(IdMapWriteError::Permission)?;
+        if !writer_has_map_admin || !same_or_parent(writer_ns, self, parent) {
+            return Err(IdMapWriteError::Permission);
+        }
+        let (writer_uid_host, writer_gid_host) = writer_ids_host;
+        let normalized = normalize_idmap(parent, &entries, false)?;
+        let mut g = self.inner.lock();
+        let self_map = !g.setgroups_allowed
+            && entries.len() == 1
+            && entries[0].count == 1
+            && normalized[0].outer_start == writer_gid_host
+            && writer_uid_host == self.owner_uid;
+        if !writer_has_parent_setgid && !self_map {
+            return Err(IdMapWriteError::Permission);
+        }
+        if g.gid_map_written {
+            return Err(IdMapWriteError::Permission);
+        }
+        g.gid_map = normalized;
+        g.gid_map_written = true;
+        Ok(())
+    }
+
+    pub fn setgroups_allowed(&self) -> bool {
+        self.inner.lock().setgroups_allowed
+    }
+
+    pub fn render_setgroups(&self) -> &'static str {
+        if self.setgroups_allowed() {
+            "allow\n"
+        } else {
+            "deny\n"
+        }
+    }
+
+    pub fn write_setgroups(&self, allow: bool) -> Result<(), IdMapWriteError> {
+        let mut g = self.inner.lock();
+        if allow {
+            // Linux never permits re-enabling the flag after it was denied.
+            return if g.setgroups_allowed {
+                Ok(())
+            } else {
+                Err(IdMapWriteError::Permission)
+            };
+        }
+        if g.gid_map_written {
+            return Err(IdMapWriteError::Permission);
+        }
+        g.setgroups_allowed = false;
+        Ok(())
+    }
+
+    /// Disable supplementary-group changes permanently before gid_map is
+    /// installed, matching `proc_setgroups_write("deny")`.
+    pub fn deny_setgroups(&self) -> Result<(), IdMapWriteError> {
+        self.write_setgroups(false)
+    }
+
+    /// Whether `setgroups(2)` is legal: Linux requires both a gid_map and
+    /// the namespace's setgroups-allowed flag.
+    pub fn may_setgroups(&self) -> bool {
+        let g = self.inner.lock();
+        g.gid_map_written && g.setgroups_allowed
+    }
+
     /// Render the uid_map / gid_map as Linux does:
-    /// `      0     1000          1\n`. `is_uid` selects which map.
-    pub fn render_map(&self, is_uid: bool) -> String {
+    /// `      0     1000          1\n`. `is_uid` selects which map. The second
+    /// column is relative to the opener, or our parent for self-reads.
+    pub fn render_map(&self, is_uid: bool, reader: &UserNamespace) -> String {
         use core::fmt::Write as _;
         let g = self.inner.lock();
-        let map = if is_uid { &g.uid_map } else { &g.gid_map };
+        let map = if is_uid {
+            g.uid_map.clone()
+        } else {
+            g.gid_map.clone()
+        };
+        drop(g);
+        let lower = if reader.id() == self.id {
+            self.parent.as_deref().unwrap_or(reader)
+        } else {
+            reader
+        };
         let mut s = String::new();
         for e in map.iter() {
-            let _ = writeln!(
-                s,
-                "{:>10} {:>10} {:>10}",
-                e.inner_start, e.outer_start, e.count
-            );
+            let outer = if is_uid {
+                lower.translate_uid_from_host(e.outer_start)
+            } else {
+                lower.translate_gid_from_host(e.outer_start)
+            }
+            .unwrap_or(u32::MAX);
+            let _ = writeln!(s, "{:>10} {:>10} {:>10}", e.inner_start, outer, e.count);
         }
         s
     }
+}
+
+const IDMAP_MAX_EXTENTS: usize = 340;
+
+fn valid_idmap(entries: &[IdMapEntry]) -> bool {
+    if entries.is_empty() || entries.len() > IDMAP_MAX_EXTENTS {
+        return false;
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.count == 0
+            || entry.inner_start.checked_add(entry.count).is_none()
+            || entry.outer_start.checked_add(entry.count).is_none()
+        {
+            return false;
+        }
+        let inner_end = entry.inner_start + entry.count;
+        let outer_end = entry.outer_start + entry.count;
+        for previous in &entries[..i] {
+            let previous_inner_end = previous.inner_start + previous.count;
+            let previous_outer_end = previous.outer_start + previous.count;
+            if entry.inner_start < previous_inner_end && previous.inner_start < inner_end
+                || entry.outer_start < previous_outer_end && previous.outer_start < outer_end
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn translate_range_to_host(map: &[IdMapEntry], start: u32, count: u32) -> Option<u32> {
+    let end = start.checked_add(count)?;
+    if count == 0 {
+        return None;
+    }
+    map.iter().find_map(|entry| {
+        let entry_end = entry.inner_start.checked_add(entry.count)?;
+        if start >= entry.inner_start && end <= entry_end {
+            entry.outer_start.checked_add(start - entry.inner_start)
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_idmap(
+    parent: &UserNamespace,
+    entries: &[IdMapEntry],
+    is_uid: bool,
+) -> Result<Vec<IdMapEntry>, IdMapWriteError> {
+    if !valid_idmap(entries) {
+        return Err(IdMapWriteError::Invalid);
+    }
+    let mut normalized = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let host_start = if is_uid {
+            parent.translate_uid_range_to_host(entry.outer_start, entry.count)
+        } else {
+            parent.translate_gid_range_to_host(entry.outer_start, entry.count)
+        }
+        .ok_or(IdMapWriteError::Permission)?;
+        if host_start.checked_add(entry.count).is_none() {
+            return Err(IdMapWriteError::Invalid);
+        }
+        normalized.push(IdMapEntry {
+            inner_start: entry.inner_start,
+            outer_start: host_start,
+            count: entry.count,
+        });
+    }
+    Ok(normalized)
+}
+
+fn same_or_parent(writer: &UserNamespace, target: &UserNamespace, parent: &UserNamespace) -> bool {
+    writer.id() == target.id() || writer.id() == parent.id()
 }
 
 type UserTable = BTreeMap<u64, Arc<UserNamespace>>;
@@ -1652,9 +1909,18 @@ pub fn user_ns_of(task: u64) -> Option<Arc<UserNamespace>> {
 
 /// `unshare(CLONE_NEWUSER)` — mint a child user-ns owned by the
 /// caller's host uid and install it. Returns the new ns.
-pub fn unshare_user(task: u64, owner_host_uid: u32) -> Arc<UserNamespace> {
+pub fn unshare_user(task: u64, owner_uid: u32, owner_gid: u32) -> Arc<UserNamespace> {
     let parent = current_user_ns(task);
-    let fresh = UserNamespace::new_child(parent, owner_host_uid);
+    let owner_host_uid = owner_uid;
+    let owner_host_gid = owner_gid;
+    let parent_could_setfcap =
+        crate::handlers::task_ns_capable(task, &parent, crate::handlers::CAP_SETFCAP);
+    let fresh = UserNamespace::new_child_with_credentials(
+        parent,
+        owner_host_uid,
+        owner_host_gid,
+        parent_could_setfcap,
+    );
     ensure_user_table();
     let mut g = USER_BY_TASK.lock();
     if let Some(map) = g.as_mut() {

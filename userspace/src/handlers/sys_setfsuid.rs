@@ -44,21 +44,10 @@ pub(crate) fn sys_setfsuid(ctx: &mut dyn TrapContext) {
     let old_fsuid = old.fsuid;
     // Every answer from here is `old_fsuid`; only whether the write happens
     // differs. `(uid_t)-1` is a pure query and is never a valid id.
-    if new == u32::MAX {
-        ctx.set_return(SyscallReturn::ok(old_fsuid as u64));
+    let Some(new) = uid_from_user(task, new) else {
+        ctx.set_return(SyscallReturn::ok(uid_to_user(task, old_fsuid) as u64));
         return;
-    }
-    // `make_kuid` + `uid_valid`: in a non-initial user-ns an unmapped id is
-    // INVALID_UID, and the change is refused. The host root-ns maps
-    // everything.
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() && !uns.uid_is_mapped(new) {
-            ctx.set_return(SyscallReturn::ok(old_fsuid as u64));
-            return;
-        }
-    }
+    };
     let permitted = new == old.uid
         || new == old.euid
         || new == old.suid
@@ -73,5 +62,5 @@ pub(crate) fn sys_setfsuid(ctx: &mut dyn TrapContext) {
         // so this is NOT the same transition `setuid` makes.
         cap_emulate_setfsuid(task, old_fsuid, new);
     }
-    ctx.set_return(SyscallReturn::ok(old_fsuid as u64));
+    ctx.set_return(SyscallReturn::ok(uid_to_user(task, old_fsuid) as u64));
 }

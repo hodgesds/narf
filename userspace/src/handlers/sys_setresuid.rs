@@ -48,24 +48,30 @@ pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
     // a task in a user namespace could give itself an id with no mapping —
     // one that then gets compared against file owners from OUTSIDE the
     // namespace. The host root-ns maps everything, so this is inert there.
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() {
-            if ruid != NOCHANGE && !uns.uid_is_mapped(ruid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            if euid != NOCHANGE && !uns.uid_is_mapped(euid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            if suid != NOCHANGE && !uns.uid_is_mapped(suid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-        }
-    }
+    let Some(ruid) = (if ruid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        uid_from_user(task, ruid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
+    let Some(euid) = (if euid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        uid_from_user(task, euid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
+    let Some(suid) = (if suid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        uid_from_user(task, suid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
     let old = read_uidgid(task);
 
     // `/* check for no-op */` — note it compares euid against BOTH old.euid

@@ -329,8 +329,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // `tracked`, not `nlink != 0`: an O_TMPFILE inode has zero links
         // until `linkat` names it, and that zero is meaningful.
         stx_nlink: if attrs.tracked { attrs.nlink } else { 1 },
-        stx_uid: uid,
-        stx_gid: gid,
+        stx_uid: uid_to_user(current_task_id(), uid),
+        stx_gid: gid_to_user(current_task_id(), gid),
         stx_rdev_major: rdev_major,
         stx_rdev_minor: rdev_minor,
         stx_mnt_id: mnt_id.unwrap_or(0),

@@ -56,24 +56,30 @@ pub(crate) fn sys_setresgid(ctx: &mut dyn TrapContext) {
     // a task in a user namespace could give itself an id with no mapping —
     // one that then gets compared against file owners from OUTSIDE the
     // namespace. The host root-ns maps everything, so this is inert there.
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() {
-            if rgid != NOCHANGE && !uns.gid_is_mapped(rgid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            if egid != NOCHANGE && !uns.gid_is_mapped(egid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            if sgid != NOCHANGE && !uns.gid_is_mapped(sgid) {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-        }
-    }
+    let Some(rgid) = (if rgid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        gid_from_user(task, rgid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
+    let Some(egid) = (if egid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        gid_from_user(task, egid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
+    let Some(sgid) = (if sgid == NOCHANGE {
+        Some(NOCHANGE)
+    } else {
+        gid_from_user(task, sgid)
+    }) else {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    };
     let old = read_uidgid(task);
 
     // `/* check for no-op */` — note it compares egid against BOTH old.egid
@@ -107,5 +113,9 @@ pub(crate) fn sys_setresgid(ctx: &mut dyn TrapContext) {
         // `new->fsgid = new->egid;` — the POSSIBLY-UPDATED effective gid.
         e.fsgid = e.egid;
     });
-    ctx.set_return(if ok { SyscallReturn::ok(0) } else { errno_ret(EPERM) });
+    ctx.set_return(if ok {
+        SyscallReturn::ok(0)
+    } else {
+        errno_ret(EPERM)
+    });
 }

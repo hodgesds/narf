@@ -208,6 +208,7 @@ pub trait FileOps {
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
     fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
+    fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError>;
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
@@ -261,6 +262,10 @@ delegates to ordinary `arm_readiness`; providers backed by a Linux-style
 exclusive wait queue override it so one consumable event wakes one syscall.
 Poll and epoll continue to use non-exclusive `arm_readiness` and persistent
 registration, respectively, and therefore all observe the event.
+`open_instance_checked` runs after open permission checks, accepts whether
+write access was requested, and can reject the open. It defaults to calling
+`open_instance`; `O_PATH` bypasses per-open setup. Procfs map nodes use it to
+capture namespace and credential state without lookup/stat side effects.
 `open_instance` defaults to `None`. Clone devices return a fresh open-file
 object so lookup/stat and `O_PATH` remain side-effect free; the Linux open path
 calls it only after access checks. `/dev/pts/ptmx` returns a fresh PTY master
@@ -985,6 +990,16 @@ namespace object for `setns(2)`; `O_PATH|O_NOFOLLOW` instead opens the symlink
 node itself. The proc fd provider returns one `ProcFdSnapshot` containing the
 link target plus live offset, status flags, mount ID, and inode identity, so
 `fd/` and `fdinfo/` project the same open file description.
+For user namespaces, `/proc/<pid>/uid_map` and `gid_map` expose parent-to-child
+id ranges, while `setgroups` reads `allow` or `deny` and accepts the one-way
+`deny` transition before `gid_map` is installed. Their inode owners use the
+target task's kernel-global effective UID/GID, including before child maps
+exist. The procfs/userspace hooks identify files with
+`NsIdMapFile::{UidMap,GidMap,Setgroups}` and supply inode owners and a fallible
+per-open `FileOps` factory. Open descriptors retain the target namespace and
+opener credentials across namespace changes and target exit. Writes reject
+nonzero offsets; map reads translate the second column into the opener's
+namespace (the target's parent for self-reads).
 `/proc/filesystems` uses the `nodev NAME` form for synthetic filesystems.
 `/proc/uptime` reports aggregate idle time across CPUs, and per-task status
 memory fields are derived from VMA extents and resident page counts. Procfs

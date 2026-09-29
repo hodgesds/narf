@@ -6,5 +6,11 @@ use super::*;
 pub(crate) fn sys_getresgid(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let c = read_uidgid(current_task_id());
-    write_res_ids(ctx, a.arg0, a.arg1, a.arg2, [c.gid, c.egid, c.sgid]);
+    write_res_ids(
+        ctx,
+        a.arg0,
+        a.arg1,
+        a.arg2,
+        [c.gid, c.egid, c.sgid].map(|id| gid_to_user(current_task_id(), id)),
+    );
 }
