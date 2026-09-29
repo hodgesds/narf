@@ -11137,8 +11137,35 @@ impl FlockEntry {
     }
 }
 
+/// What a `flock(2)` lock is attached to.
+///
+/// Linux attaches it to the INODE (`locks_inode(file)->i_flctx`): every
+/// open of one file shares one lock list, so independent `open()`s conflict.
+/// Keying by the `FileOps` object instead was wrong twice over: a filesystem
+/// that builds a fresh `FileOps` per open (directories) never conflicted,
+/// and a freed object's address could be reused by an unrelated file, which
+/// then inherited a phantom holder and blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FlockKey {
+    /// `(st_dev, st_ino)` of a file whose filesystem reports an inode.
+    Inode(u64, u64),
+    // LINUX-GAP: synthetic files that report no inode (ino == 0) cannot be
+    // identified across opens, so their locks are per object.
+    Object(usize),
+}
+
+impl FlockKey {
+    fn of(file_ptr: usize, dev: u64, ino: u64) -> Self {
+        if ino != 0 {
+            FlockKey::Inode(dev, ino)
+        } else {
+            FlockKey::Object(file_ptr)
+        }
+    }
+}
+
 static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, FlockEntry>>,
+    Option<alloc::collections::BTreeMap<FlockKey, FlockEntry>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// `fs/locks.c::flock_lock_inode`, reduced to what NARF models.
@@ -11148,9 +11175,10 @@ static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
 /// one it already holds rather than adding another, which is why every arm
 /// tests `other_*` rather than "is the table empty".
 fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result<(), ()> {
+    let key = FlockKey::of(file_ptr, dev, ino);
     let mut g = FLOCK_TABLE.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    let e = map.entry(file_ptr).or_default();
+    let e = map.entry(key).or_default();
     if e.holders.is_empty() {
         e.dev = dev;
         e.ino = ino;
@@ -11162,7 +11190,7 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
             e.holders.remove(i);
         }
         if e.holders.is_empty() {
-            map.remove(&file_ptr);
+            map.remove(&key);
         }
         return Ok(());
     }

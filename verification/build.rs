@@ -613,6 +613,7 @@ fn main() {
         "xthread_wake_smoke",
         "procsig_thread_smoke",
         "sigwake_wait_smoke",
+        "flock_release_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
@@ -705,6 +706,7 @@ fn main() {
         "xthread_wake_smoke",
         "procsig_thread_smoke",
         "sigwake_wait_smoke",
+        "flock_release_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
     ] {

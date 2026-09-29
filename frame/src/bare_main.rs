@@ -5561,6 +5561,16 @@ fn boot_userspace_init() {
                     "sigwake_wait_glibc",
                     narf_verification::NARF_SIGWAKE_WAIT_SMOKE_GLIBC_ELF,
                 ),
+                // flock(2) release on last close / exec CLOEXEC / fork share,
+                // per-inode conflicts (fish's history lock), musl + glibc.
+                (
+                    "flock_release_smoke",
+                    narf_verification::NARF_FLOCK_RELEASE_SMOKE_ELF,
+                ),
+                (
+                    "flock_release_glibc",
+                    narf_verification::NARF_FLOCK_RELEASE_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

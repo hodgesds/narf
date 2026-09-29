@@ -3631,6 +3631,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("procsig_thread_glibc", "procsig-thread-ok"),
         ("sigwake_wait_smoke", "sigwake-wait-ok"),
         ("sigwake_wait_glibc", "sigwake-wait-ok"),
+        ("flock_release_smoke", "flock-release-ok"),
+        ("flock_release_glibc", "flock-release-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),
