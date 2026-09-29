@@ -73,7 +73,8 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     // Linux say -ENOTDIR when the name resolves to a non-directory and
     // -ENOENT when it resolves to nothing; keep the two apart by asking the
     // dir-aware stat resolver what (if anything) is actually there.
-    if resolve_dir_absolute(&resolved).is_none() {
+    let resolved_dir = resolve_dir_absolute(&resolved);
+    if resolved_dir.is_none() {
         let errno = match stat_ino_path_dir_aware_ext(&resolved, true) {
             // Exists, but is not a directory (regular file, device, fifo…).
             Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => ENOTDIR,
@@ -95,7 +96,9 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     //
     // This is the -EACCES that used to be a documented LINUX-GAP here: a
     // directory a task cannot search is one it cannot make its cwd.
-    if !dir_search_permitted(&resolved, task) {
+    // The directory resolved above answers the permission question
+    // directly — no second walk.
+    if resolved_dir.is_some_and(|dir| !dir_search_permitted_resolved(&*dir, task)) {
         ctx.set_return(errno_ret(EACCES));
         return;
     }

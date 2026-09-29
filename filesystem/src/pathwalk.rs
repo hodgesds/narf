@@ -25,7 +25,15 @@ use narf_rcu::{Atomic as RcuAtomic, Owned as RcuOwned, ReadGuard};
 
 use crate::{DirOps, FileOps, FileType, FsError};
 
-const DENTRY_BUCKET_COUNT: usize = 64;
+// 2048 × 8 = 16384 cacheable names. The previous 64 × 8 = 512 held less
+// than a single large directory: any workload cycling through more names
+// than that (stress-ng --chdir walks 8192 directories; a compiler walks a
+// whole source tree) evicted on every insert and paid the filesystem
+// lookup on every walk. The static cost is one RcuAtomic pointer per
+// bucket (16 KiB); dentries themselves are heap-allocated only when
+// cached, ≲3 MiB fully populated — the sizing Linux gets from a
+// memory-pressure-shrunk dcache, approximated here by a fixed ceiling.
+const DENTRY_BUCKET_COUNT: usize = 2048;
 const DENTRY_BUCKET_WAYS: usize = 8;
 
 /// The inode-facing state attached to a VFS name.

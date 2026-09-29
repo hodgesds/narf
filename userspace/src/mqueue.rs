@@ -642,6 +642,14 @@ fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
     f(g.get_or_insert_with(BTreeMap::new))
 }
 
+/// Registry access that also hands the closure the `INOTIFY_ACTIVE` gate,
+/// for the two sites (init, release) that must keep flag and map contents
+/// consistent under one lock hold.
+fn with_inotify_active<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>, &AtomicBool) -> R) -> R {
+    let mut g = INOTIFY.lock();
+    f(g.get_or_insert_with(BTreeMap::new), &INOTIFY_ACTIVE)
+}
+
 // ── fd → path side table ────────────────────────────────────────────
 // The fd table stores only an `Arc<dyn FileOps>`, so sys_write (which has
 // just an fd) can't recover the file's path to fire IN_MODIFY. We record
@@ -1051,6 +1059,24 @@ struct InotifyFile {
     id: u64,
 }
 
+/// `inotify_release`: the last close of an inotify fd destroys the whole
+/// instance — watches, queued events, readiness. Without this, every
+/// instance ever created stayed in the global registry forever and
+/// `INOTIFY_ACTIVE` never cleared, so every path-keyed open/close/rename
+/// in the system scanned the dead instances for the rest of the boot
+/// (stress-ng --close made this quadratic). The gate update happens under
+/// the registry lock: a concurrent `inotify_init` publishes its instance
+/// under the same lock, so the flag can never be cleared while a live
+/// instance exists.
+impl Drop for InotifyFile {
+    fn drop(&mut self) {
+        with_inotify_active(|m, active| {
+            m.remove(&self.id);
+            active.store(!m.is_empty(), Ordering::Release);
+        });
+    }
+}
+
 impl FileOps for InotifyFile {
     /// Readable ONLY when events are queued (an inotify fd is never
     /// writable and has no EOF). Without this override the always-ready
@@ -1201,11 +1227,11 @@ pub fn sys_inotify_init_no_flags(ctx: &mut dyn TrapContext) {
 
 fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
     let id = INOTIFY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    // Publish the slow-path gate before the instance can become visible via
-    // its fd. A concurrent mutation may see an empty registry in this small
-    // window, but no userspace observer can yet own the unpublished fd.
-    INOTIFY_ACTIVE.store(true, Ordering::Release);
-    with_inotify(|m| {
+    // Insert and publish the slow-path gate under one lock hold: a release
+    // of another instance clears the gate under this same lock, so a store
+    // outside it could be overwritten by a concurrent last-close and leave
+    // a live instance invisible to fs_notify.
+    with_inotify_active(|m, active| {
         m.insert(
             id,
             InotifyState {
@@ -1217,7 +1243,8 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
                 // Fresh instance: no events queued, never writable → mask 0.
                 readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
             },
-        )
+        );
+        active.store(true, Ordering::Release);
     });
     let file: Arc<dyn FileOps> = Arc::new(InotifyFile { id });
     let cloexec = if flags & IN_CLOEXEC != 0 {
@@ -1486,6 +1513,14 @@ fn with_fanotify<R>(f: impl FnOnce(&mut BTreeMap<u64, FanGroup>) -> R) -> R {
     f(g.get_or_insert_with(BTreeMap::new))
 }
 
+/// Registry access that also hands the closure the `FANOTIFY_ACTIVE` gate;
+/// see `with_inotify_active` for why init and release update it under the
+/// registry lock.
+fn with_fanotify_active<R>(f: impl FnOnce(&mut BTreeMap<u64, FanGroup>, &AtomicBool) -> R) -> R {
+    let mut g = FANOTIFY.lock();
+    f(g.get_or_insert_with(BTreeMap::new), &FANOTIFY_ACTIVE)
+}
+
 /// fanotify half of [`fs_notify`]: queue an event on every group holding
 /// an inode mark for `abs_path` whose mark mask intersects the event.
 fn fanotify_dispatch(abs_path: &str, mask: u64) {
@@ -1540,6 +1575,18 @@ fn sync_fanotify_readiness(id: u64) {
 
 struct FanotifyFile {
     id: u64,
+}
+
+/// `fanotify_release`: destroying the group on last close is what keeps
+/// `fanotify_dispatch`'s every-group scan bounded by the number of LIVE
+/// groups. See `InotifyFile::drop` for the gate-under-lock reasoning.
+impl Drop for FanotifyFile {
+    fn drop(&mut self) {
+        with_fanotify_active(|m, active| {
+            m.remove(&self.id);
+            active.store(!m.is_empty(), Ordering::Release);
+        });
+    }
 }
 
 impl FileOps for FanotifyFile {
@@ -1741,8 +1788,9 @@ pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
         return;
     }
     let id = FANOTIFY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    FANOTIFY_ACTIVE.store(true, Ordering::Relaxed);
-    with_fanotify(|m| {
+    // Insert + gate publish under one lock hold, mirroring inotify_init:
+    // a concurrent last-close recomputes the gate under this lock.
+    with_fanotify_active(|m, active| {
         m.insert(
             id,
             FanGroup {
@@ -1751,7 +1799,8 @@ pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
                 // Fresh group: no events queued, never writable → mask 0.
                 readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
             },
-        )
+        );
+        active.store(true, Ordering::Relaxed);
     });
     let file: Arc<dyn FileOps> = Arc::new(FanotifyFile { id });
     let cloexec = if flags & FAN_CLOEXEC != 0 {
