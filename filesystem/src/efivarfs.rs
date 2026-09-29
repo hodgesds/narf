@@ -260,9 +260,22 @@ impl EfivarRoot {
     }
 }
 
+/// efivarfs is one superblock (`get_tree_single`), so one `st_dev`.
+fn efivarfs_dev() -> u64 {
+    static DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+    DEV.get()
+}
+
 impl DirOps for EfivarRoot {
     fn ino(&self) -> u64 {
         EFIVARFS_MAGIC
+    }
+
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: efivarfs_dev(),
+            ..Default::default()
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
@@ -454,6 +467,13 @@ impl FileOps for EfivarFile {
 
     fn ino(&self) -> u64 {
         self.entry.ino
+    }
+
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: efivarfs_dev(),
+            ..Default::default()
+        }
     }
 
     fn owners(&self) -> (u32, u32) {

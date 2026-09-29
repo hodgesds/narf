@@ -136,11 +136,33 @@ impl crate::FsInstance for DebugFs {
     }
 }
 
+// Inode identity. Linux debugfs is one superblock (`get_tree_single`) whose
+// root is `simple_fill_super`'s inode 1 (fs/libfs.c) and whose entries take
+// `get_next_ino()` numbers when created (`debugfs_get_inode`,
+// fs/debugfs/inode.c). NARF's tree is fixed, so the numbers are assigned by
+// position in creation order: root 1, `sched/` 2, knob `i` 3 + i.
+const DEBUGFS_ROOT_INO: u64 = 1;
+const DEBUGFS_SCHED_INO: u64 = 2;
+static DEBUGFS_DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+
+fn debugfs_attrs() -> crate::InodeAttrs {
+    crate::InodeAttrs {
+        dev: DEBUGFS_DEV.get(),
+        ..Default::default()
+    }
+}
+
 /// `/sys/kernel/debug` — one subdir today: `sched/`.
 #[derive(Debug)]
 struct DebugRoot;
 
 impl DirOps for DebugRoot {
+    fn ino(&self) -> u64 {
+        DEBUGFS_ROOT_INO
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        debugfs_attrs()
+    }
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         None
     }
@@ -163,6 +185,12 @@ impl DirOps for DebugRoot {
 struct SchedDir;
 
 impl DirOps for SchedDir {
+    fn ino(&self) -> u64 {
+        DEBUGFS_SCHED_INO
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        debugfs_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         SCHED_KNOBS
             .iter()
@@ -185,6 +213,16 @@ struct KnobFile {
 }
 
 impl FileOps for KnobFile {
+    fn ino(&self) -> u64 {
+        let index = SCHED_KNOBS
+            .iter()
+            .position(|k| core::ptr::eq(k, self.knob))
+            .unwrap_or(0);
+        DEBUGFS_SCHED_INO + 1 + index as u64
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        debugfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let value = (self.knob.read)();
         let bytes = value.as_bytes();

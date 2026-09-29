@@ -131,6 +131,13 @@ impl FileOps for PsiFile {
         self.ino
     }
 
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: super::cgroup_dev(),
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = render(self.resource);
         Box::pin(async move {
