@@ -3553,13 +3553,14 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             let a = ctx.args();
             let _ = writeln!(
                 narf_console::Writer,
-                "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
                 crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
                 a.arg0,
                 a.arg1,
                 a.arg2,
                 a.arg3,
+                narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
             );
             trace_syscall_paths(table.name_of(variant).unwrap_or("?"), a);
         }
@@ -3602,9 +3603,10 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "SYSR t={} {} done",
+                "SYSR t={} {} done ms={}",
                 crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
+                narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
             );
         }
         // Close the span. This used to SKIP the fold entirely whenever the
@@ -3930,13 +3932,14 @@ pub fn kernel_syscall_entry_plain_with_state(
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+            "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
             crate::handlers::current_task_id(),
             table.name_of(n).unwrap_or("?"),
             args.arg0,
             args.arg1,
             args.arg2,
             args.arg3,
+            narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
         );
         trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
     }
@@ -3979,7 +3982,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             if !errors_only || is_reportable_syscall_error(r.value) {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                    "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
                     crate::handlers::current_task_id(),
                     table.name_of(n).unwrap_or("?"),
                     r.value as i64,
@@ -3989,6 +3992,7 @@ pub fn kernel_syscall_entry_plain_with_state(
                     args.arg1,
                     args.arg2,
                     args.arg3,
+                    narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
                 );
                 // Errors-only mode suppresses the SYSC entry line, so decode the
                 // path args HERE to show which file/mount the failing op targeted.
