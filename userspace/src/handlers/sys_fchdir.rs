@@ -31,37 +31,42 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
     // index and misses the table — EBADF, same as Linux.
     let fd = args.arg0 as u32;
     let task = current_task_id();
+    // `if (fd_empty(f)) return -EBADF;` — the table decides EBADF before
+    // anything looks at a path.
+    let Some(dir_of_fd) = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.as_dir())).flatten()
+    else {
+        ctx.set_return(errno_ret(EBADF));
+        return;
+    };
+    // Linux fchdir never re-walks the path: `d_can_lookup()` asks the
+    // fd's OWN file. A non-directory descriptor (pipe, socket, regular
+    // file) has no `DirOps` — -ENOTDIR. This also means the answer comes
+    // from the object the fd pinned, never -ENOENT for a concurrently
+    // removed name. (The path re-resolution this replaces was a second
+    // full walk per fchdir — the chdir stressor pays it 2×/iteration.)
+    let Some(dir) = dir_of_fd else {
+        ctx.set_return(errno_ret(ENOTDIR));
+        return;
+    };
+    // The cwd is stored as a path string, so a directory fd NARF cannot
+    // name (a detached fsmount) keeps its historical -ENOTDIR.
     let path = match fd_path_for_task(task, fd) {
-        // fd_path_of falls back to a type_name for pathless fds
-        // (pipes, sockets, …) — those never start with '/' and are
-        // ENOTDIR, same as Linux fchdir on a non-directory fd.
         Some(p) if p.starts_with('/') => p,
-        Some(_) => {
+        _ => {
             ctx.set_return(errno_ret(ENOTDIR));
             return;
         }
-        None => {
-            ctx.set_return(errno_ret(EBADF));
-            return;
-        }
     };
-    // Validate chroot-resolved; store the USER view (chroot applies
-    // exactly once at resolution — see resolve_cwd_path_user).
+    // Store the USER view (chroot applies exactly once at resolution —
+    // see resolve_cwd_path_user).
     let user_abs = resolve_cwd_path_user(task, &path);
-    let abs = resolve_cwd_path(task, &path);
-    if resolve_dir_absolute(&abs).is_none() {
-        // The descriptor exists but its path does not name a directory —
-        // `d_can_lookup()` failing, i.e. -ENOTDIR (never -ENOENT: the fd
-        // pinned the object, so it cannot have gone missing).
-        ctx.set_return(errno_ret(ENOTDIR));
-        return;
-    }
     // `error = file_permission(fd_file(f), MAY_EXEC | MAY_CHDIR);` — the
     // same search check sys_chdir applies to its target. Holding an open
     // descriptor is not itself authority to make the directory a cwd:
     // permissions can have changed since the open, and Linux re-checks
-    // here rather than trusting the fd.
-    if !dir_search_permitted(&abs, task) {
+    // here rather than trusting the fd. The fd's own directory answers
+    // with its LIVE owners/mode, so a chmod after the open is honoured.
+    if !dir_search_permitted_resolved(&*dir, task) {
         ctx.set_return(errno_ret(EACCES));
         return;
     }

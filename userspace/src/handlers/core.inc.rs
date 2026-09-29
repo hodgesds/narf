@@ -15520,6 +15520,14 @@ fn dir_search_permitted(path: &str, task: u64) -> bool {
         // Nothing to search; the caller reports ENOENT/ENOTDIR itself.
         return true;
     };
+    dir_search_permitted_resolved(&*dir, task)
+}
+
+/// [`dir_search_permitted`] for a directory the caller ALREADY resolved —
+/// chdir/fchdir resolve the target to reject non-directories and then
+/// check search permission; re-resolving the same path for the second
+/// question doubled their path-walk cost.
+fn dir_search_permitted_resolved(dir: &dyn narf_filesystem::DirOps, task: u64) -> bool {
     let (uid, gid) = dir.dir_owners();
     narf_filesystem::posix_access_ok(
         narf_filesystem::FileOwner {
