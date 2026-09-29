@@ -3639,6 +3639,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("tty_poll_timeout_glibc", "tty-poll-timeout-ok"),
         ("pty_wake_smoke", "pty-wake-ok"),
         ("pty_wake_glibc", "pty-wake-ok"),
+        // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
+        ("setuid_exec_smoke", "setuid-exec-ok"),
+        ("setuid_exec_glibc", "setuid-exec-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),
