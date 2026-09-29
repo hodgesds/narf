@@ -50,6 +50,17 @@ impl IterLinkFile {
 }
 
 impl FileOps for IterLinkFile {
+    /// Linux `bpf_link_new_fd` uses `anon_inode_getfd("bpf-link")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // A link fd is not readable; the iterator fd from `ITER_CREATE` is.
         Box::pin(async { Err(FsError::Unsupported) })
@@ -126,6 +137,17 @@ impl IterFile {
 }
 
 impl FileOps for IterFile {
+    /// Linux `bpf_iter_new_fd` uses `anon_inode_getfile("bpf_iter")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             // Generate once. A racing first read may generate twice; the loser's

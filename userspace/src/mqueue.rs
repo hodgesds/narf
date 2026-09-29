@@ -1083,6 +1083,17 @@ impl Drop for InotifyFile {
 }
 
 impl FileOps for InotifyFile {
+    /// Linux `inotify_init1` uses `anon_inode_getfd("inotify")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// Readable ONLY when events are queued (an inotify fd is never
     /// writable and has no EOF). Without this override the always-ready
     /// default (POLL_IN|POLL_OUT) makes an epoll-driven consumer busy-spin:
@@ -1595,6 +1606,17 @@ impl Drop for FanotifyFile {
 }
 
 impl FileOps for FanotifyFile {
+    /// Linux `fanotify_init` uses `anon_inode_getfile_fmode("[fanotify]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn poll_readiness(&self) -> u32 {
         let has_events = with_fanotify(|m| {
             m.get(&self.id)

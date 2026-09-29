@@ -2016,16 +2016,37 @@ impl NsFd {
         &self.held
     }
     /// `readlink` text Linux renders for `/proc/<pid>/ns/<flavour>`:
-    /// e.g. `uts:[4026531838]`.
+    /// e.g. `uts:[4026531838]`. The number is the nsfs inode number
+    /// (`fs/nsfs.c::ns_get_name` prints `ns->inum`), the same `st_ino` an
+    /// `fstat` of the ns fd reports.
     pub fn link_text(&self) -> String {
         let mut s = String::new();
         use core::fmt::Write as _;
-        let _ = write!(s, "{}:[{}]", self.held.flavour().tag(), self.held.id());
+        let _ = write!(
+            s,
+            "{}:[{}]",
+            self.held.flavour().tag(),
+            ns_inum(self.held.id())
+        );
         s
     }
 }
 
 impl narf_filesystem::FileOps for NsFd {
+    /// `fs/nsfs.c::nsfs_init_inode`: `inode->i_ino = ns->inum`, on the one
+    /// `nsfs` superblock. Two fds naming one namespace `fstat` equal, which
+    /// is how `ns_match` / `ip netns identify` compare namespaces.
+    fn ino(&self) -> u64 {
+        u64::from(ns_inum(self.held.id()))
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: narf_filesystem::inode_id::PseudoFs::Ns.dev(),
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,
@@ -2039,13 +2060,9 @@ impl narf_filesystem::FileOps for NsFd {
         Box::pin(async move { Err(narf_filesystem::FsError::ReadOnly) })
     }
     fn stat(&self) -> narf_filesystem::Stat {
-        // Report the nsfs INODE number in `size` so `st_ino` (synthesised
-        // from size in the stat syscall) carries the namespace identity —
-        // two fds naming the same ns then stat() equal. The id would do as
-        // well for that, but `st_ino` is what `ns_match` and the nsfs file
-        // handle compare, so it should be the number Linux puts there.
+        // The identity is `ino()`; an nsfs inode has no size.
         narf_filesystem::Stat {
-            size: u64::from(crate::namespaces::ns_inum(self.held.id())),
+            size: 0,
             blocks: 0,
             mode: narf_filesystem::Mode {
                 file_type: narf_filesystem::FileType::Special,

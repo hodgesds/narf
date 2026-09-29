@@ -382,6 +382,18 @@ struct FsContextFile {
 }
 struct MountObjectFile {
     id: u64,
+    /// The inode the fd names. Linux `fsmount` and `open_tree` hand back
+    /// `dentry_open(path, O_PATH)` of the mount's root (`fs/namespace.c`),
+    /// so the fd `fstat`s as that directory, not as an anonymous inode.
+    root: narf_filesystem::inode_id::InodeId,
+}
+
+/// `(st_dev, st_ino)` of a directory, as `stat(2)` of it reports.
+fn dir_identity(dir: &Arc<dyn narf_filesystem::DirOps>) -> narf_filesystem::inode_id::InodeId {
+    narf_filesystem::inode_id::InodeId {
+        dev: dir.inode_attrs().dev,
+        ino: dir.ino(),
+    }
 }
 
 macro_rules! stub_fileops {
@@ -404,12 +416,28 @@ macro_rules! stub_fileops {
             fn $hook(&self) -> Option<u64> {
                 Some(self.id)
             }
+            /// Linux `fsopen`/`fspick` use `anon_inode_getfd("[fscontext]")`:
+            /// the one shared `anon_inodefs` inode.
+            fn ino(&self) -> u64 {
+                narf_filesystem::inode_id::anon_inode().ino
+            }
+            fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+                narf_filesystem::inode_id::anon_inode().attrs()
+            }
         }
     };
 }
 stub_fileops!(FsContextFile, fs_context_id);
 
 impl FileOps for MountObjectFile {
+    fn ino(&self) -> u64 {
+        self.root.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.root.attrs()
+    }
+
     fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
         alloc::boxed::Box::pin(async { Err(FsError::InvalidData) })
     }
@@ -980,6 +1008,7 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let root = dir_identity(&fs.root());
     let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     with_mounts(|m| {
         m.insert(
@@ -1006,7 +1035,7 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
         });
     }
     match install_fd(
-        Arc::new(MountObjectFile { id: mid }),
+        Arc::new(MountObjectFile { id: mid, root }),
         flags & FSMOUNT_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),
@@ -1233,10 +1262,13 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
                 ctx.set_return(err(ENOENT));
                 return;
             }
+            // The fd names the looked-up directory, as Linux's
+            // `dentry_open(&path, O_PATH)` does.
+            let root = dir_identity(&dir);
             let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             with_mounts(|m| m.insert(mid, base_mount));
             match install_fd(
-                Arc::new(MountObjectFile { id: mid }),
+                Arc::new(MountObjectFile { id: mid, root }),
                 a.arg2 & OPEN_TREE_CLOEXEC != 0,
             ) {
                 Some(n) => ctx.set_return(ok(n as u64)),
@@ -1329,10 +1361,11 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let root = dir_identity(&mount.fs.root());
     let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     with_mounts(|m| m.insert(mid, mount));
     match install_fd(
-        Arc::new(MountObjectFile { id: mid }),
+        Arc::new(MountObjectFile { id: mid, root }),
         a.arg2 & OPEN_TREE_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),

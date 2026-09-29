@@ -64,6 +64,17 @@ impl EventFd {
 }
 
 impl FileOps for EventFd {
+    /// Linux `eventfd2` creates its file with `anon_inode_getfile_fmode("[eventfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if buf.len() < 8 {
@@ -283,6 +294,17 @@ impl TimerFd {
 }
 
 impl FileOps for TimerFd {
+    /// Linux `timerfd_create` uses `anon_inode_getfile_fmode("[timerfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// An unexpired timerfd read must WAIT, never report end-of-file.
     ///
     /// Linux blocks a `read()` on a timerfd with no expirations, or returns
@@ -466,6 +488,17 @@ impl SignalFd {
 }
 
 impl FileOps for SignalFd {
+    /// Linux `signalfd4` uses `anon_inode_getfile_fmode("[signalfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// A signalfd with nothing pending must WAIT, never report end-of-file.
     ///
     /// Linux blocks a `read()` on a signalfd with no pending signal in its

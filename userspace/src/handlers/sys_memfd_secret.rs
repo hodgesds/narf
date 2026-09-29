@@ -11,7 +11,7 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
     // `mm/secretmem.c::SYSCALL_DEFINE1(memfd_secret)` allocates the
     // descriptor with `get_unused_fd_flags`: a full table is -EMFILE.
     {
-        let mfd = crate::linux_compat::MemFdFile::new(0);
+        let mfd = crate::linux_compat::MemFdFile::new_secret();
         memfd_arc_register(&mfd);
         // FD_CLOEXEC shares MFD_CLOEXEC's bit value (1).
         let cloexec = (flags & crate::linux_compat::MFD_CLOEXEC) != 0;

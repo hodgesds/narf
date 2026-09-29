@@ -719,6 +719,10 @@ pub struct SocketFile {
     pub kind: u32,
     /// IPPROTO_* recorded at socket() time; surfaced via SO_PROTOCOL.
     pub protocol: u32,
+    /// This socket's sockfs inode. Linux `sock_alloc` gives every socket
+    /// (each end of a socketpair, each accepted connection) its own
+    /// `new_inode_pseudo(sock_mnt->mnt_sb)` numbered by `get_next_ino`.
+    inode: narf_filesystem::inode_id::InodeId,
     state: IrqSafeSpinLock<SocketState>,
     /// Per-socket option storage. Setsockopt writes here; getsockopt
     /// reads. Values that affect packet shape (TCP_NODELAY,
@@ -1636,6 +1640,7 @@ impl SocketFile {
             domain,
             kind,
             protocol,
+            inode: narf_filesystem::inode_id::PseudoFs::Sock.new_inode(),
             state: IrqSafeSpinLock::new(state),
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
@@ -2775,6 +2780,14 @@ pub fn parse_sockaddr_in(addr: &SockAddr) -> Option<(u32, u16)> {
 impl FileOps for SocketFile {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
+    }
+
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
     }
 
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {

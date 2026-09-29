@@ -779,3 +779,183 @@ fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("syscall_abi", smoke_io_mux_empty_reads_are_not_eof);
+
+// ── inode identity — every open file has a Linux-shaped (st_dev, st_ino) ──
+//
+// `fstat` reports `FileOps::ino` and `inode_attrs().dev`; a file that
+// reports ino 0 gets an unstable size/mtime hash instead. Each case below
+// pins the Linux model for one pseudo filesystem (see
+// `filesystem/src/inode_id.rs`) through the real `fstat` path, and the
+// negative half proves the identity is not merely "some shared constant".
+
+/// `(st_dev, st_ino)` of `fd` via the Linux `fstat` path.
+pub(crate) fn fstat_id(fd: u64) -> Result<(u64, u64), &'static str> {
+    let mut st = [0u8; 256];
+    if call(Syscall::Fstat.raw(), a1(fd, st.as_mut_ptr() as u64)) != Some(0) {
+        return Err("fstat failed");
+    }
+    let word = |o: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&st[o..o + 8]);
+        u64::from_ne_bytes(b)
+    };
+    Ok((word(0), word(8)))
+}
+
+fn new_fd(what: &'static str, r: Option<i64>) -> Result<u64, &'static str> {
+    match r {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err(what),
+    }
+}
+
+fn install_ops(ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>) -> Result<u64, &'static str> {
+    crate::fd::install(
+        FAKE_TASK,
+        crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        },
+    )
+    .map(u64::from)
+    .ok_or("fd install failed")
+}
+
+/// Linux `anon_inode_getfile`: eventfd, epoll, signalfd, timerfd and
+/// inotify all share the ONE anon_inodefs inode, and a second eventfd is
+/// the same inode again.
+fn smoke_abi_inode_anon_family_shares_one_inode_pos() -> TestResult {
+    with_setup(|| {
+        let fds = [
+            new_fd("eventfd", call(Syscall::Eventfd.raw(), a1(0, 0)))?,
+            new_fd("epoll_create1", call(Syscall::EpollCreate.raw(), a0(0)))?,
+            new_fd(
+                "signalfd",
+                call(Syscall::Signalfd.raw(), a3((-1i64) as u64, 0, 8, 0)),
+            )?,
+            new_fd(
+                "timerfd_create",
+                call(Syscall::TimerfdCreate.raw(), a1(1, 0)),
+            )?,
+            new_fd("inotify_init1", call(Syscall::InotifyInit1.raw(), a0(0)))?,
+            new_fd("second eventfd", call(Syscall::Eventfd.raw(), a1(0, 0)))?,
+        ];
+        let first = fstat_id(fds[0])?;
+        if first.0 == 0 || first.1 == 0 {
+            return Err("eventfd reported st_dev or st_ino 0");
+        }
+        for fd in &fds[1..] {
+            if fstat_id(*fd)? != first {
+                return Err("an anon-inode file did not share eventfd's inode");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_inode_anon_family_shares_one_inode_pos
+);
+
+/// The shared anon inode is anon_inodefs's, not any other superblock's:
+/// a pipe (pipefs) and a memfd (shm_mnt) are NOT it.
+fn smoke_abi_inode_anon_inode_is_not_other_pseudo_fs_neg() -> TestResult {
+    with_setup(|| {
+        let ev = fstat_id(new_fd("eventfd", call(Syscall::Eventfd.raw(), a1(0, 0)))?)?;
+        let (rd, _wr) = make_pipe2()?;
+        let pipe = fstat_id(rd as u64)?;
+        let mfd = new_fd(
+            "memfd_create",
+            call(
+                Syscall::MemfdCreate.raw(),
+                a1(c"abi-ino".as_ptr() as u64, 0),
+            ),
+        )?;
+        let memfd = fstat_id(mfd)?;
+        if ev == pipe || ev.0 == pipe.0 {
+            return Err("eventfd shares a pipe's inode or st_dev");
+        }
+        if ev == memfd || ev.0 == memfd.0 {
+            return Err("eventfd shares a memfd's inode or st_dev");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_inode_anon_inode_is_not_other_pseudo_fs_neg
+);
+
+/// `shmem_file_setup`: each memfd is its own inode on the one shm_mnt,
+/// and a dup of a memfd is that same inode.
+fn smoke_abi_inode_memfd_unique_per_memfd_pos() -> TestResult {
+    with_setup(|| {
+        let a = new_fd(
+            "memfd a",
+            call(Syscall::MemfdCreate.raw(), a1(c"a".as_ptr() as u64, 0)),
+        )?;
+        let b = new_fd(
+            "memfd b",
+            call(Syscall::MemfdCreate.raw(), a1(c"b".as_ptr() as u64, 0)),
+        )?;
+        let (ia, ib) = (fstat_id(a)?, fstat_id(b)?);
+        if ia.1 == 0 || ia.0 == 0 {
+            return Err("memfd reported st_dev or st_ino 0");
+        }
+        if ia.1 == ib.1 {
+            return Err("two memfds share an st_ino");
+        }
+        if ia.0 != ib.0 {
+            return Err("two memfds are on different superblocks");
+        }
+        let d = new_fd("dup", call(Syscall::Dup.raw(), a0(a)))?;
+        if fstat_id(d)? != ia {
+            return Err("dup of a memfd changed its inode");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_inode_memfd_unique_per_memfd_pos);
+
+/// pidfs (Linux 6.9+): one inode per process — two pidfds of one process
+/// match; another process, or a recycled pid number, is a different inode.
+fn smoke_abi_inode_pidfd_one_inode_per_process_pos() -> TestResult {
+    const PID_A: u64 = 0x7f_1d01;
+    const PID_B: u64 = 0x7f_1d02;
+    with_setup(|| {
+        let open = |pid: u64| {
+            install_ops(alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(
+                crate::pidfd::mint_for(pid, 0, true),
+            )))
+        };
+        let a_first = fstat_id(open(PID_A)?)?;
+        let a_second = fstat_id(open(PID_A)?)?;
+        let b = fstat_id(open(PID_B)?)?;
+        let result = if a_first.1 == 0 || a_first.0 == 0 {
+            Err("pidfd reported st_dev or st_ino 0")
+        } else if a_first != a_second {
+            Err("two pidfds of one process report different inodes")
+        } else if a_first == b {
+            Err("pidfds of two processes share an inode")
+        } else if a_first.0 != b.0 {
+            Err("pidfds of two processes are on different superblocks")
+        } else {
+            // The number goes back to the pool and is reused: a new process.
+            crate::pidfd::forget_pid(PID_A);
+            match fstat_id(open(PID_A)?) {
+                Ok(r) if r == a_first => Err("a recycled pid's pidfd reused the old inode"),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            }
+        };
+        crate::pidfd::forget_pid(PID_A);
+        crate::pidfd::forget_pid(PID_B);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_inode_pidfd_one_inode_per_process_pos
+);
