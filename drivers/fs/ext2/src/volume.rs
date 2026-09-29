@@ -36,6 +36,8 @@ use super::journal;
 use super::metadata_csum;
 use super::superblock::{ExtFlavour, Superblock};
 
+mod extent_write;
+
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
 /// once at `mount()` via `narf_io::register_with_cap` and is the
 /// load-bearing identifier in every `BlockRequest::buffer`. Drop
@@ -1634,15 +1636,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ///
     /// Only the legacy (non-extents) path is supported on the write
     /// side — ext4 extents trees stay read-only for now.
-    pub async fn map_block_alloc(&self, inode: &mut Inode, logical: u64) -> Result<u64, FsError> {
+    pub async fn map_block_alloc(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        logical: u64,
+    ) -> Result<u64, FsError> {
         if self.superblock.uses_extents() && inode.uses_extents() {
-            // Existing mapped extents can be overwritten without changing
-            // the tree. Growing into a hole still needs extent insertion.
-            let mapped = self.map_block(inode, logical).await?;
-            if mapped != 0 {
-                return Ok(mapped);
-            }
-            return Err(FsError::Unsupported);
+            // `ext4_ext_map_blocks(EXT4_GET_BLOCKS_CREATE)` — see
+            // `extent_write`. This used to answer `Unsupported` (-EINVAL at
+            // the syscall) for any block not already mapped, so no
+            // Linux-created ext4 file could grow.
+            return self.extent_map_alloc(inode_no, inode, logical).await;
         }
         let p = self.pointers_per_block() as u64;
         let direct_max = super::inode::N_DIRECT as u64;
@@ -1759,7 +1764,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// the inode.
     pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
         if self.superblock.uses_extents() && inode.uses_extents() {
-            return Err(FsError::Unsupported);
+            // `ext4_ext_remove_space` over the whole file; this answered
+            // `Unsupported` (-EINVAL), so O_TRUNC and unlink failed for every
+            // extent-mapped file.
+            let freed = self.extent_free_all(inode).await?;
+            inode.size = 0;
+            inode.blocks = inode.blocks.saturating_sub(freed);
+            return Ok(());
         }
         let bs = self.block_size();
         let p = self.pointers_per_block() as u64;
@@ -1856,6 +1867,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// as needed via `map_block_alloc`. Extends `inode.size`.
     pub async fn write_inode_data(
         &self,
+        inode_no: u32,
         inode: &mut Inode,
         offset: u64,
         src: &[u8],
@@ -1868,7 +1880,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let logical = cur_off / bs;
             let in_block = (cur_off % bs) as usize;
             let n = core::cmp::min(remaining, bs as usize - in_block);
-            let phys = self.map_block_alloc(inode, logical).await?;
+            let phys = self.map_block_alloc(inode_no, inode, logical).await?;
             // RMW the block.
             let mut bbuf = vec![0u8; bs as usize];
             if in_block != 0 || n != bs as usize {

@@ -5605,6 +5605,10 @@ fn boot_userspace_init() {
                     "remount_glibc",
                     narf_verification::NARF_REMOUNT_SMOKE_GLIBC_ELF,
                 ),
+                // systemd-update-utmp's pututxline + updwtmpx syscall
+                // sequence, with systemd's errno-after-updwtmpx check.
+                ("utmp_smoke", narf_verification::NARF_UTMP_SMOKE_ELF),
+                ("utmp_glibc", narf_verification::NARF_UTMP_SMOKE_GLIBC_ELF),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

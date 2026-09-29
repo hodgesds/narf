@@ -1511,6 +1511,212 @@ fn smoke_ext4_mount_extent_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_mount_extent_round_trip);
 
+// ── ext4 extent-tree write path ─────────────────────────────────────
+//
+// Every regular file Linux creates on ext4 carries EXT4_EXTENTS_FL. The
+// driver could overwrite such a file in place but answered `Unsupported`
+// (-EINVAL at write(2)) for any block that needed a new mapping, and for
+// truncate/unlink — so glibc's updwtmpx append to /var/log/wtmp failed and
+// systemd-update-utmp reported "Failed to write utmp record: Invalid
+// argument".
+
+/// Mount `img`, returning the volume and the `data` file.
+#[allow(clippy::type_complexity)]
+fn mount_ext4_data(
+    device: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
+) -> Result<
+    (
+        alloc::sync::Arc<crate::volume::Ext2Volume<narf_block::ram::RamBlockDevice>>,
+        alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    ),
+    &'static str,
+> {
+    use narf_filesystem::FsInstance;
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return Err("ext4 extent fixture did not mount"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return Err("lookup of the extent-mapped `data` failed"),
+    };
+    Ok((volume, file))
+}
+
+/// glibc updwtmpx's shape — 384-byte appends — plus writes into holes
+/// that force more than the root's four extents (`ext4_ext_grow_indepth`),
+/// on a metadata_csum volume; everything reads back after a remount.
+fn smoke_ext4_extent_file_grows_and_survives_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    let payload = b"wtmp-seed";
+    let mut image = build_ext4_extent_image(payload);
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("could not sign the metadata_csum fixture");
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let mut expected: Vec<u8> = payload.to_vec();
+    // Twenty 384-byte records appended, like updwtmpx.
+    for i in 0..20u8 {
+        let rec = [i.wrapping_add(1); 384];
+        let off = expected.len() as u64;
+        match poll_once(file.write(off, &rec)) {
+            Some(Ok(384)) => {}
+            _ => return TestResult::Fail("appending to an extent-mapped file failed"),
+        }
+        expected.extend_from_slice(&rec);
+    }
+    // Writes into holes far past EOF: five more discontiguous extents.
+    for block in [14u64, 17, 20, 23, 26] {
+        let off = block * 1024 + 7;
+        match poll_once(file.write(off, b"hole")) {
+            Some(Ok(4)) => {}
+            _ => return TestResult::Fail("writing into an extent-file hole failed"),
+        }
+        if expected.len() < off as usize {
+            expected.resize(off as usize, 0);
+        }
+        expected.truncate(off as usize);
+        expected.extend_from_slice(b"hole");
+    }
+    drop(file);
+    drop(volume);
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("the grown extent volume did not remount"),
+    };
+    if file.stat().size != expected.len() as u64 {
+        return TestResult::Fail("i_size after appends and hole writes is wrong");
+    }
+    let mut got = vec![0u8; expected.len()];
+    let mut at = 0usize;
+    while at < got.len() {
+        match poll_once(file.read(at as u64, &mut got[at..])) {
+            Some(Ok(0)) | None => break,
+            Some(Ok(n)) => at += n,
+            Some(Err(_)) => return TestResult::Fail("reading the grown extent file failed"),
+        }
+    }
+    if got != expected {
+        return TestResult::Fail("extent file contents differ after remount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_file_grows_and_survives_remount
+);
+
+/// `truncate(0)` frees the tree (then the file grows again), and unlink of
+/// an extent-mapped file succeeds — both answered `Unsupported` before.
+fn smoke_ext4_extent_truncate_and_unlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"truncate-me"));
+    let (volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !matches!(poll_once(file.truncate(0)), Some(Ok(()))) {
+        return TestResult::Fail("truncate(0) of an extent-mapped file failed");
+    }
+    if file.stat().size != 0 {
+        return TestResult::Fail("truncate(0) left a nonzero size");
+    }
+    if !matches!(poll_once(file.write(0, b"again")), Some(Ok(5))) {
+        return TestResult::Fail("writing after truncate(0) failed");
+    }
+    let mut buf = [0u8; 8];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(5))) || &buf[..5] != b"again" {
+        return TestResult::Fail("data written after truncate(0) did not read back");
+    }
+    use narf_filesystem::FsInstance;
+    let root = volume.root();
+    if !matches!(poll_once(root.unlink("data")), Some(Ok(()))) {
+        return TestResult::Fail("unlink of an extent-mapped file failed");
+    }
+    match poll_once(root.lookup_async("data")) {
+        Some(Err(FsError::NotFound)) => TestResult::Pass,
+        _ => TestResult::Fail("an unlinked extent file is still visible"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_truncate_and_unlink);
+
+/// A write into an UNWRITTEN (fallocated) extent converts just that block:
+/// the rest of the extent still reads as zeros, and the written block holds
+/// the new bytes with zeros around them (`ext4_split_convert_extents`).
+fn smoke_ext4_extent_write_converts_unwritten() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    let mut image = build_ext4_extent_image(b"x");
+    let file_ib = 5 * 1024 + 11 * 128 + 40;
+    // One 3-block unwritten extent over blocks 10..=12 (ee_len > 32768).
+    put_u16(&mut image, file_ib + 16, 3 + 0x8000);
+    put_u32(&mut image, 5 * 1024 + 11 * 128 + 4, 3 * 1024); // i_size
+    image[3 * 1024 + 1] = 0x1F; // blocks 8..=12 in use
+                                // Garbage on disk under the unwritten extent must never surface.
+    for b in &mut image[10 * 1024..13 * 1024] {
+        *b = 0xAA;
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !matches!(poll_once(file.write(1024 + 5, b"XY")), Some(Ok(2))) {
+        return TestResult::Fail("writing into an unwritten extent failed");
+    }
+    let mut got = vec![0u8; 3 * 1024];
+    let mut at = 0usize;
+    while at < got.len() {
+        match poll_once(file.read(at as u64, &mut got[at..])) {
+            Some(Ok(0)) | None => break,
+            Some(Ok(n)) => at += n,
+            Some(Err(_)) => return TestResult::Fail("reading the converted extent failed"),
+        }
+    }
+    let mut want = vec![0u8; 3 * 1024];
+    want[1024 + 5] = b'X';
+    want[1024 + 6] = b'Y';
+    if got != want {
+        return TestResult::Fail("unwritten blocks leaked stale data or lost the write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_write_converts_unwritten
+);
+
+/// A full volume answers `NoSpace` (-ENOSPC), the answer `ext4_mb_new_blocks`
+/// gives — not the `Unsupported` (-EINVAL) the driver gave for every grow.
+fn smoke_ext4_extent_grow_on_full_volume_is_enospc() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    let mut image = build_ext4_extent_image(b"full");
+    for b in &mut image[3 * 1024..3 * 1024 + 8] {
+        *b = 0xFF;
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    match poll_once(file.write(4096, b"more")) {
+        Some(Err(FsError::NoSpace)) => TestResult::Pass,
+        _ => TestResult::Fail("growing an extent file on a full volume must be NoSpace"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_grow_on_full_volume_is_enospc
+);
+
 fn smoke_ext2_read_partial_offset() -> TestResult {
     // Read from a non-zero offset in the middle of the data block to
     // exercise the (logical block, in-block byte) split inside

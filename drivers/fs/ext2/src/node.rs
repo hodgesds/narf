@@ -19,8 +19,8 @@
 //! `volume::truncate_inode` (which sit on the §"Block Allocation"
 //! bitmap allocator — see `volume.rs::alloc_block` /
 //! `alloc_inode`). The legacy 12-direct + indirect block pointer
-//! path is implemented; ext4 extents-tree writes still return
-//! `Unsupported`.
+//! path is implemented, and ext4 extent trees grow, convert unwritten
+//! extents and free through `volume::extent_write`.
 //!
 //! Directory-mutation surface (create / mkdir / unlink / rmdir /
 //! rename / symlink) is implemented in `dir_mut.rs` and dispatched
@@ -262,7 +262,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             }
             let n = self
                 .volume
-                .write_inode_data(&mut inode, offset, buf)
+                .write_inode_data(inode_no, &mut inode, offset, buf)
                 .await?;
             self.volume.write_inode(inode_no, &inode).await?;
             // Refresh cached state.
