@@ -1065,3 +1065,414 @@ kernel_test_in!(
     "drivers/net/i40e",
     smoke_i40e_arq_work_limit_covers_the_ring
 );
+
+// ── MSI-X ───────────────────────────────────────────────────────────
+
+/// The X710 binds queues to a vector through a linked list threaded
+/// across the queue interrupt-control registers, not by writing a
+/// vector number into each queue. The chain has to start where
+/// `PFINT_LNKLSTN` says, alternate RX->TX within a pair and TX->RX
+/// across pairs, and terminate — an unterminated chain sends the
+/// device walking queues that were never configured.
+fn smoke_i40e_msix_vector_chain() -> TestResult {
+    use super::irq::*;
+
+    // Three ring pairs starting at queue 4, on MSI-X vector 1.
+    let writes = match build_vector_chain(1, 4, 3) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("a three-pair chain should build"),
+    };
+    // One head plus two links per pair.
+    if writes.len() != 7 {
+        return TestResult::Fail("chain should be one head plus an RX and TX link per pair");
+    }
+
+    // The register arrays are indexed from the first *queue* vector,
+    // so MSI-X vector 1 uses index 0. Getting this wrong lands every
+    // interrupt on a neighbouring vector.
+    if writes[0].reg != reg_pfint_lnklstn(0) {
+        return TestResult::Fail("MSI-X vector 1 should use PFINT_LNKLSTN index 0");
+    }
+    if writes[0].value != lnklst_value(4, QueueType::Rx) {
+        return TestResult::Fail("the chain should start at the first pair's RX queue");
+    }
+
+    // Pair 0: RX at queue 4 links to TX 4; TX 4 links to RX 5.
+    if writes[1].reg != reg_qint_rqctl(4) || writes[2].reg != reg_qint_tqctl(4) {
+        return TestResult::Fail("the first pair should write RQCTL then TQCTL for queue 4");
+    }
+    let rq = writes[1].value;
+    if (rq >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != 4 {
+        return TestResult::Fail("an RX link should point at its own pair's TX queue");
+    }
+    if (rq >> QINT_CTL_NEXTQ_TYPE_SHIFT) & 1 != QueueType::Tx as u32 {
+        return TestResult::Fail("an RX link's next-queue type should be TX");
+    }
+    if rq & QINT_CTL_CAUSE_ENA == 0 {
+        return TestResult::Fail("a queue in a chain must be enabled as a cause");
+    }
+    if (rq >> QINT_CTL_MSIX_INDX_SHIFT) & QINT_CTL_MSIX_INDX_MASK != 1 {
+        return TestResult::Fail("the queue should carry the MSI-X vector, not the array index");
+    }
+    if (rq >> QINT_CTL_ITR_INDX_SHIFT) & QINT_CTL_ITR_INDX_MASK != ITR_IDX_RX as u32 {
+        return TestResult::Fail("an RX link should use the receive throttle bank");
+    }
+
+    let tq = writes[2].value;
+    if (tq >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != 5 {
+        return TestResult::Fail("a non-final TX link should point at the next pair's RX queue");
+    }
+    if (tq >> QINT_CTL_NEXTQ_TYPE_SHIFT) & 1 != QueueType::Rx as u32 {
+        return TestResult::Fail("a TX link's next-queue type should be RX");
+    }
+    if (tq >> QINT_CTL_ITR_INDX_SHIFT) & QINT_CTL_ITR_INDX_MASK != ITR_IDX_TX as u32 {
+        return TestResult::Fail("a TX link should use the transmit throttle bank");
+    }
+
+    // The final TX link terminates the chain.
+    let last = writes[6].value;
+    if writes[6].reg != reg_qint_tqctl(6) {
+        return TestResult::Fail("the last link should be queue 6's TQCTL");
+    }
+    if (last >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != QUEUE_END_OF_LIST {
+        return TestResult::Fail("the final TX link must carry the end-of-list sentinel");
+    }
+
+    // A single pair is still a well-formed chain: its one TX link is
+    // both the first and the last, so it terminates immediately.
+    let one = match build_vector_chain(2, 0, 1) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("a one-pair chain should build"),
+    };
+    if one.len() != 3 {
+        return TestResult::Fail("a one-pair chain is a head and two links");
+    }
+    if (one[2].value >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != QUEUE_END_OF_LIST {
+        return TestResult::Fail("a one-pair chain must terminate at its only TX link");
+    }
+    if one[0].reg != reg_pfint_lnklstn(1) {
+        return TestResult::Fail("MSI-X vector 2 should use PFINT_LNKLSTN index 1");
+    }
+
+    // Rejections.
+    if build_vector_chain(1, 0, 0) != Err(IrqError::NoRingPairs) {
+        return TestResult::Fail("a chain with no ring pairs must be refused");
+    }
+    if build_vector_chain(0, 0, 1) != Err(IrqError::VectorZeroReserved) {
+        return TestResult::Fail("vector 0 is the misc vector and has its own registers");
+    }
+    if build_vector_chain(0x100, 0, 1) != Err(IrqError::VectorOutOfRange(0x100)) {
+        return TestResult::Fail("a vector beyond the 8-bit field must be refused");
+    }
+    // A queue index that reaches the sentinel would silently
+    // terminate the chain early.
+    match build_vector_chain(1, 0x7FE, 2) {
+        Err(IrqError::QueueIndexOutOfRange(_)) => {}
+        _ => return TestResult::Fail("a chain reaching the end-of-list index must be refused"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_msix_vector_chain);
+
+/// Interrupt register offsets and throttle encoding.
+fn smoke_i40e_msix_registers_and_itr() -> TestResult {
+    use super::irq::*;
+
+    // Offsets straight from i40e_register.h.
+    if REG_PFINT_ICR0 != 0x0003_8780 || REG_PFINT_ICR0_ENA != 0x0003_8800 {
+        return TestResult::Fail("ICR0 register offsets wrong");
+    }
+    if REG_PFINT_DYN_CTL0 != 0x0003_8480 || REG_PFINT_LNKLST0 != 0x0003_8500 {
+        return TestResult::Fail("vector-0 register offsets wrong");
+    }
+    if reg_pfint_dyn_ctln(0) != 0x0003_4800 || reg_pfint_dyn_ctln(2) != 0x0003_4808 {
+        return TestResult::Fail("PFINT_DYN_CTLN should stride by 4");
+    }
+    if reg_pfint_lnklstn(0) != 0x0003_5000 || reg_pfint_lnklstn(3) != 0x0003_500C {
+        return TestResult::Fail("PFINT_LNKLSTN should stride by 4");
+    }
+    if reg_qint_rqctl(0) != 0x0003_A000 || reg_qint_rqctl(5) != 0x0003_A014 {
+        return TestResult::Fail("QINT_RQCTL should stride by 4");
+    }
+    if reg_qint_tqctl(0) != 0x0003_C000 || reg_qint_tqctl(5) != 0x0003_C014 {
+        return TestResult::Fail("QINT_TQCTL should stride by 4");
+    }
+    // The three throttle banks are 2 KiB apart, and each strides by 4.
+    if reg_pfint_itrn(0, 0) != 0x0003_0000 {
+        return TestResult::Fail("ITRN bank 0 base wrong");
+    }
+    if reg_pfint_itrn(1, 0) != 0x0003_0800 || reg_pfint_itrn(2, 0) != 0x0003_1000 {
+        return TestResult::Fail("ITRN banks should be 2 KiB apart");
+    }
+    if reg_pfint_itrn(0, 3) != 0x0003_000C {
+        return TestResult::Fail("ITRN should stride by 4 within a bank");
+    }
+    if reg_pfint_itr0(1) != 0x0003_8080 {
+        return TestResult::Fail("ITR0 banks should be 128 bytes apart");
+    }
+
+    // The register takes 4 µs units while the constants are in 2 µs,
+    // so the value is halved on the way in.
+    if itr_reg_value(ITR_20K) != (ITR_20K >> 1) as u32 {
+        return TestResult::Fail("the throttle value should be halved for the register");
+    }
+    // Bits outside the writable mask must not reach the register.
+    if itr_reg_value(0xFFFF) != (ITR_MASK >> 1) as u32 {
+        return TestResult::Fail("the throttle value should be masked before writing");
+    }
+    // Bit 0 is outside the writable mask, so a value differing only
+    // there must encode identically.
+    if itr_reg_value(ITR_20K) != itr_reg_value(ITR_20K | 1) {
+        return TestResult::Fail("bits outside ITR_MASK must not reach the register");
+    }
+
+    let itr = match build_vector_itr(1, ITR_20K, ITR_8K) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("throttle writes should build"),
+    };
+    if itr.len() != 3 {
+        return TestResult::Fail("a vector has receive, transmit and software throttles");
+    }
+    if itr[0].reg != reg_pfint_itrn(ITR_IDX_RX, 0)
+        || itr[1].reg != reg_pfint_itrn(ITR_IDX_TX, 0)
+        || itr[2].reg != reg_pfint_itrn(ITR_IDX_SW, 0)
+    {
+        return TestResult::Fail("throttle writes should target banks 0, 1 and 2 of index 0");
+    }
+    if itr[2].value != itr_reg_value(ITR_20K) {
+        return TestResult::Fail("the software throttle should be pinned at 20K");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_msix_registers_and_itr);
+
+// ── Offloads ────────────────────────────────────────────────────────
+
+/// The three header lengths packed into a descriptor's OFFSET field
+/// use three different units — 2-byte words, dwords, dwords — and
+/// none of them is bytes. A byte count written straight in still
+/// fits the field for ordinary headers, so the device checksums the
+/// wrong span and emits a corrupt frame rather than failing.
+fn smoke_i40e_tx_offset_units() -> TestResult {
+    use super::offload::*;
+
+    // A plain Ethernet + IPv4 + TCP frame: 14, 20, 20 bytes.
+    let lens = HeaderLens {
+        mac: 14,
+        ip: 20,
+        l4: 20,
+    };
+    let off = match tx_offset_field(lens) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("a standard header stack should encode"),
+    };
+    // 14/2 = 7, 20/4 = 5, 20/4 = 5.
+    let expect = 7u64 | (5u64 << TX_OFFSET_IPLEN_SHIFT) | (5u64 << TX_OFFSET_L4LEN_SHIFT);
+    if off != expect {
+        return TestResult::Fail("header lengths should be converted to their field units");
+    }
+    // The distinguishing check: the byte counts must NOT appear.
+    let raw = 14u64 | (20u64 << TX_OFFSET_IPLEN_SHIFT) | (20u64 << TX_OFFSET_L4LEN_SHIFT);
+    if off == raw {
+        return TestResult::Fail("byte counts must not be written into the OFFSET field");
+    }
+
+    // A VLAN-tagged frame's L2 header is 18 bytes, still even.
+    match tx_offset_field(HeaderLens {
+        mac: 18,
+        ip: 20,
+        l4: 20,
+    }) {
+        Ok(v) if v & TX_OFFSET_MACLEN_MASK == 9 => {}
+        _ => return TestResult::Fail("an 18-byte L2 header should encode as 9 words"),
+    }
+
+    // Lengths that are not whole units cannot be represented, and
+    // truncating them would checksum the wrong span.
+    match tx_offset_field(HeaderLens {
+        mac: 15,
+        ip: 20,
+        l4: 20,
+    }) {
+        Err(OffloadError::NotAWholeUnit {
+            field: "maclen", ..
+        }) => {}
+        _ => return TestResult::Fail("an odd L2 length has no encoding"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 22,
+        l4: 20,
+    }) {
+        Err(OffloadError::NotAWholeUnit { field: "iplen", .. }) => {}
+        _ => return TestResult::Fail("an IP length that is not a whole dword has no encoding"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 20,
+        l4: 21,
+    }) {
+        Err(OffloadError::NotAWholeUnit { field: "l4len", .. }) => {}
+        _ => return TestResult::Fail("an L4 length that is not a whole dword has no encoding"),
+    }
+
+    // Field widths. L4LEN is only four bits, so a 60-byte TCP header
+    // with full options is the largest that fits.
+    if MAX_L4LEN_BYTES != 60 {
+        return TestResult::Fail("L4LEN's four bits top out at 60 bytes");
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 20,
+        l4: 64,
+    }) {
+        Err(OffloadError::TooLong { field: "l4len", .. }) => {}
+        _ => return TestResult::Fail("a 64-byte L4 header does not fit the field"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 512,
+        l4: 20,
+    }) {
+        Err(OffloadError::TooLong { field: "iplen", .. }) => {}
+        _ => return TestResult::Fail("an over-long IP header must be refused"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 256,
+        ip: 20,
+        l4: 20,
+    }) {
+        Err(OffloadError::TooLong {
+            field: "maclen", ..
+        }) => {}
+        _ => return TestResult::Fail("an over-long L2 header must be refused"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_offset_units);
+
+/// Checksum command bits, and the TSO context descriptor.
+fn smoke_i40e_tx_csum_and_tso() -> TestResult {
+    use super::offload::*;
+
+    // Without segmentation the host has already computed a correct
+    // IPv4 header checksum, so the device is told IPV4, not
+    // IPV4_CSUM.
+    let plain = TxCsum::Ipv4 { l4: L4Proto::Tcp }.cmd_bits(false);
+    if plain != TX_CMD_IIPT_IPV4 | TX_CMD_L4T_TCP {
+        return TestResult::Fail("plain IPv4/TCP should request IPV4 without header csum");
+    }
+    // With segmentation every segment gets new length and id fields,
+    // so the header checksum must be recomputed per segment.
+    let tso = TxCsum::Ipv4 { l4: L4Proto::Tcp }.cmd_bits(true);
+    if tso != TX_CMD_IIPT_IPV4_CSUM | TX_CMD_L4T_TCP {
+        return TestResult::Fail("TSO over IPv4 must request the header checksum");
+    }
+    if plain == tso {
+        return TestResult::Fail("the TSO and non-TSO IPv4 encodings must differ");
+    }
+
+    // IPv6 has no header checksum, so the TSO flag changes nothing.
+    let v6 = TxCsum::Ipv6 { l4: L4Proto::Udp };
+    if v6.cmd_bits(false) != TX_CMD_IIPT_IPV6 | TX_CMD_L4T_UDP {
+        return TestResult::Fail("IPv6/UDP command bits wrong");
+    }
+    if v6.cmd_bits(true) != v6.cmd_bits(false) {
+        return TestResult::Fail("IPv6 has no header checksum for TSO to change");
+    }
+    if TxCsum::None.cmd_bits(false) != TX_CMD_IIPT_NONIP {
+        return TestResult::Fail("no offload should select NONIP");
+    }
+    if L4Proto::Sctp.cmd_bits() != TX_CMD_L4T_SCTP {
+        return TestResult::Fail("SCTP command bits wrong");
+    }
+
+    // Context descriptor.
+    let (qw0, qw1) = match tso_context_desc(4000, 1460) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("a normal TSO context should build"),
+    };
+    if qw0 != 0 {
+        return TestResult::Fail("this path uses no tunnelling parameters");
+    }
+    if qw1 & 0xF != TX_DESC_DTYPE_CONTEXT {
+        return TestResult::Fail("a context descriptor must carry the context DTYPE");
+    }
+    if (qw1 >> TXD_CTX_QW1_CMD_SHIFT) & 0xFF != TX_CTX_DESC_TSO {
+        return TestResult::Fail("the context command should be TSO");
+    }
+    if (qw1 >> TXD_CTX_QW1_TSO_LEN_SHIFT) & TXD_CTX_QW1_TSO_LEN_MASK != 4000 {
+        return TestResult::Fail("the payload length should land in the TSO length field");
+    }
+    if (qw1 >> TXD_CTX_QW1_MSS_SHIFT) & TXD_CTX_QW1_MSS_MASK != 1460 {
+        return TestResult::Fail("the segment size should land in the MSS field");
+    }
+    // The context DTYPE must not collide with a data descriptor's.
+    if TX_DESC_DTYPE_CONTEXT == super::ring::TX_DESC_DTYPE_DATA {
+        return TestResult::Fail("context and data descriptors must be distinguishable");
+    }
+
+    if tso_context_desc(4000, 0) != Err(OffloadError::BadMss(0)) {
+        return TestResult::Fail("a zero MSS would never terminate");
+    }
+    if tso_context_desc(4000, 0x4000) != Err(OffloadError::BadMss(0x4000)) {
+        return TestResult::Fail("an MSS beyond 14 bits must be refused");
+    }
+    if tso_context_desc(0x10_0000, 1460) != Err(OffloadError::TsoLengthTooLarge(0x10_0000)) {
+        return TestResult::Fail("a payload beyond 20 bits must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_csum_and_tso);
+
+/// A frame the device did not examine must not be reported as having
+/// a good checksum — treating "not checked" as "correct" is how a
+/// corrupt frame gets accepted.
+fn smoke_i40e_rx_checksum_verdict() -> TestResult {
+    use super::offload::*;
+
+    let l3l4p = 1u64 << RX_STATUS_L3L4P_SHIFT;
+
+    if rx_checksum(0, 0) != RxCsum::NotChecked {
+        return TestResult::Fail("without L3L4P the device did not check");
+    }
+    // Error bits set but L3L4P clear still means "not checked": the
+    // error field is meaningless unless the device looked.
+    if rx_checksum(0, 1 << RX_ERROR_L4E_SHIFT) != RxCsum::NotChecked {
+        return TestResult::Fail("error bits are meaningless without L3L4P");
+    }
+    if rx_checksum(l3l4p, 0) != RxCsum::Good {
+        return TestResult::Fail("checked with no error bits is good");
+    }
+    match rx_checksum(l3l4p, 1 << RX_ERROR_IPE_SHIFT) {
+        RxCsum::Bad {
+            ip: true,
+            l4: false,
+            outer_ip: false,
+        } => {}
+        _ => return TestResult::Fail("IPE should report an IP checksum failure"),
+    }
+    match rx_checksum(l3l4p, 1 << RX_ERROR_L4E_SHIFT) {
+        RxCsum::Bad {
+            ip: false,
+            l4: true,
+            ..
+        } => {}
+        _ => return TestResult::Fail("L4E should report a transport checksum failure"),
+    }
+    match rx_checksum(l3l4p, 1 << RX_ERROR_EIPE_SHIFT) {
+        RxCsum::Bad {
+            outer_ip: true,
+            ip: false,
+            l4: false,
+        } => {}
+        _ => return TestResult::Fail("EIPE should report an outer IP failure"),
+    }
+    // An error bit this driver does not decode must not turn a bad
+    // frame into a good one, nor a good one into bad.
+    if rx_checksum(l3l4p, 1 << 7) != RxCsum::Good {
+        return TestResult::Fail("an unrelated error bit should not affect the verdict");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_checksum_verdict);

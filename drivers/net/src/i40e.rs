@@ -98,6 +98,8 @@
 #![allow(dead_code)]
 
 pub mod hmc;
+pub mod irq;
+pub mod offload;
 pub mod ring;
 pub mod vsi;
 
