@@ -567,12 +567,18 @@ impl Card {
         events: &mut DrmEventQueue,
         user_data: u64,
         crtc_id: u32,
-    ) -> Result<(), DrmEventQueueFull> {
-        const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
-        const EVENT_LEN: usize = DrmEventQueue::FLIP_EVENT_BYTES;
-        if events.event_space < EVENT_LEN {
-            return Err(DrmEventQueueFull);
-        }
+    ) -> Result<u64, DrmEventQueueFull> {
+        let present_at = self.advance_vblank(crtc_id);
+        self.queue_flip_event_at(events, user_data, crtc_id, present_at)?;
+        Ok(present_at)
+    }
+
+    /// Advance the simulated vblank for `crtc_id` and return the TRUE
+    /// vblank time this commit presents at. Split out of
+    /// [`Card::queue_flip_event`] so a commit that carries `OUT_FENCE_PTR`
+    /// but no PAGE_FLIP_EVENT (kmscube's atomic loop) paces on the same
+    /// clock, and a commit carrying BOTH advances it exactly once.
+    pub(crate) fn advance_vblank(&mut self, crtc_id: u32) -> u64 {
         let refresh_hz = self.crtc_refresh_hz(crtc_id);
         let interval_ns = 1_000_000_000u64 / refresh_hz as u64;
         let now = narf_time::wall::monotonic_ns();
@@ -583,6 +589,23 @@ impl Card {
         // is exactly the refresh rate regardless of the slack offset below.
         let present_at = now.max(self.next_vblank_ns);
         self.next_vblank_ns = present_at.saturating_add(interval_ns);
+        present_at
+    }
+
+    /// Queue the flip-complete event for a commit whose vblank was already
+    /// advanced to `present_at` (see [`Card::advance_vblank`]).
+    pub(crate) fn queue_flip_event_at(
+        &mut self,
+        events: &mut DrmEventQueue,
+        user_data: u64,
+        crtc_id: u32,
+        present_at: u64,
+    ) -> Result<(), DrmEventQueueFull> {
+        const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+        const EVENT_LEN: usize = DrmEventQueue::FLIP_EVENT_BYTES;
+        if events.event_space < EVENT_LEN {
+            return Err(DrmEventQueueFull);
+        }
         // Render-slack: make the event deliverable up to `vblank_offset_ns`
         // before the true vblank so the compositor wakes early enough to render
         // and resubmit before scanout. Shifts phase only, not rate.

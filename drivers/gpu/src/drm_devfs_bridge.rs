@@ -130,6 +130,12 @@ pub struct DriCardFile {
     /// this opener's address space, so it must never be visible to another
     /// compositor across a greeter-to-session handoff.
     events: narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>,
+    /// `OUT_FENCE_PTR` results of the last atomic commit: (user pointer,
+    /// vblank deadline ns) pairs. The syscall layer drains these via
+    /// [`FileOps::drm_take_out_fences`] right after the ioctl returns and
+    /// mints the sync_file fds — fd tables belong to that layer, exactly
+    /// like EXECBUFFER's FENCE_FD_OUT.
+    pending_out_fences: narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -163,6 +169,7 @@ impl DriCardFile {
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
+            pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
         })
     }
 
@@ -176,6 +183,7 @@ impl DriCardFile {
         let result = mode_state
             .lock()
             .queue_flip_event(&mut self.events.lock(), user_data, crtc_id)
+            .map(|_present_at| ())
             .map_err(|_| FsError::OutOfMemory);
         result
     }
@@ -263,6 +271,12 @@ impl FileOps for DriCardFile {
     /// heals within the ~10 ms backstop, so no explicit wake is required.
     fn readiness_notifies(&self) -> bool {
         true
+    }
+
+    /// Drain the (user pointer, vblank deadline) pairs the last atomic
+    /// commit's OUT_FENCE_PTR properties produced. See the field docs.
+    fn drm_take_out_fences(&self) -> Vec<(u64, u64)> {
+        core::mem::take(&mut *self.pending_out_fences.lock())
     }
 
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -360,6 +374,7 @@ impl FileOps for DriCardFile {
             /*render*/ false,
             &self.client_caps,
             Some(&self.events),
+            Some(&self.pending_out_fences),
         )
     }
 
@@ -739,6 +754,7 @@ impl FileOps for DriRenderFile {
             arg,
             /*render*/ true,
             &self.client_caps,
+            None,
             None,
         )
     }

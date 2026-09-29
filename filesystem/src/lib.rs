@@ -1438,6 +1438,17 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// Drain the `OUT_FENCE_PTR` requests produced by this fd's last
+    /// `DRM_IOCTL_MODE_ATOMIC` commit: `(user s32* pointer, fence deadline
+    /// in CLOCK_MONOTONIC ns)` pairs, one per requesting CRTC. The syscall
+    /// layer calls this right after a successful ATOMIC ioctl and mints one
+    /// sync_file fd per pair (fd allocation is its domain — the same split
+    /// as `VIRTGPU_EXECBUF_FENCE_FD_OUT`); the fence signals at the
+    /// commit's simulated vblank. Default: no fences (not a DRM card).
+    fn drm_take_out_fences(&self) -> alloc::vec::Vec<(u64, u64)> {
+        alloc::vec::Vec::new()
+    }
+
     /// If this fd is a DRM PRIME dma-buf (exported via
     /// `DRM_IOCTL_PRIME_HANDLE_TO_FD`), return the GEM handle it wraps. Used
     /// by `sys_ioctl(DRM_IOCTL_PRIME_FD_TO_HANDLE)` to re-import the buffer

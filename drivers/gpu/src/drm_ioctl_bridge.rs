@@ -1441,10 +1441,12 @@ pub fn dispatch_card(
         render,
         &client_caps,
         (!render).then_some(&events),
+        None,
     )
 }
 
 /// Stateful card dispatcher used by a real DRM open file.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_card_for_file(
     card_index: u32,
     open_id: u64,
@@ -1453,6 +1455,7 @@ pub(crate) fn dispatch_card_for_file(
     render: bool,
     client_caps: &DrmClientCaps,
     events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
 ) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
@@ -1482,7 +1485,9 @@ pub(crate) fn dispatch_card_for_file(
         // Atomic commit decodes into AtomicState directly — handled
         // here rather than through the generic dispatcher because the
         // dispatcher only carries the wire-format word.
-        IoctlCmd::ModeAtomic => handle_atomic(card_index, &mode_state, arg, &ctx, events),
+        IoctlCmd::ModeAtomic => {
+            handle_atomic(card_index, &mode_state, arg, &ctx, events, out_fences)
+        }
         // GETRESOURCES is special because the response has pointer
         // arrays the user supplied; we must write IDs into those.
         IoctlCmd::ModeGetResources => handle_getresources(&mode_state, arg, &ctx),
@@ -2051,6 +2056,11 @@ const PLANE_ID_BASE: u32 = 0x40;
 /// Property id of the plane "type" enum (a separate id space from objects).
 const PLANE_TYPE_PROP_ID: u32 = 0x50;
 const CRTC_ACTIVE_PROP_ID: u32 = 0x52;
+/// `OUT_FENCE_PTR` on a CRTC: a userspace `s32*` filled with a sync_file
+/// fd whose fence signals at the commit's simulated vblank.
+const CRTC_OUT_FENCE_PTR_PROP_ID: u32 = 0x60;
+/// `IN_FENCE_FD` on a plane: a sync_file fd (-1 = none) gating the flip.
+const PLANE_IN_FENCE_FD_PROP_ID: u32 = 0x5f;
 const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
 const CONNECTOR_CRTC_ID_PROP_ID: u32 = 0x54;
 const PLANE_FB_ID_PROP_ID: u32 = 0x55;
@@ -2307,6 +2317,20 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
             [0, u32::MAX as u64],
         )),
+        // Explicit-fencing pair (drm_atomic_uapi.c "Explicit Fencing
+        // Properties"): IN_FENCE_FD is a signed range accepting -1 (no
+        // fence) through INT_MAX; OUT_FENCE_PTR is a full-range integer
+        // carrying a userspace pointer.
+        PLANE_IN_FENCE_FD_PROP_ID => Some((
+            b"IN_FENCE_FD".as_slice(),
+            DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
+            [(-1i64) as u64, i32::MAX as u64],
+        )),
+        CRTC_OUT_FENCE_PTR_PROP_ID => Some((
+            b"OUT_FENCE_PTR".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u64::MAX],
+        )),
         _ => None,
     };
     if let Some((name, flags, values)) = simple {
@@ -2461,6 +2485,7 @@ fn handle_obj_getproperties(
                     PLANE_CRTC_Y_PROP_ID,
                     PLANE_CRTC_W_PROP_ID,
                     PLANE_CRTC_H_PROP_ID,
+                    PLANE_IN_FENCE_FD_PROP_ID,
                 ],
                 vec![
                     DRM_PLANE_TYPE_PRIMARY,
@@ -2478,13 +2503,22 @@ fn handle_obj_getproperties(
                     crtc.y as u64,
                     width as u64,
                     height as u64,
+                    // IN_FENCE_FD reads back as -1 (never a live fd),
+                    // matching drm_atomic_plane_get_property.
+                    (-1i64) as u64,
                 ],
             )
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
             let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
             (
-                vec![CRTC_ACTIVE_PROP_ID, CRTC_MODE_ID_PROP_ID],
-                vec![crtc.enabled as u64, 0],
+                vec![
+                    CRTC_ACTIVE_PROP_ID,
+                    CRTC_MODE_ID_PROP_ID,
+                    CRTC_OUT_FENCE_PTR_PROP_ID,
+                ],
+                // OUT_FENCE_PTR reads back as 0 (write-only request),
+                // matching drm_atomic_crtc_get_property.
+                vec![crtc.enabled as u64, 0, 0],
             )
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
             let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;
@@ -2603,6 +2637,7 @@ fn handle_atomic(
     arg: usize,
     ctx: &DrmFileCtx,
     events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
 ) -> Result<u64, FsError> {
     // ATOMIC is a DRM_MASTER op (drm_ioctls[] marks DRM_MODE_ATOMIC
     // DRM_MASTER). Only the master may commit; reject render nodes and
@@ -2761,6 +2796,7 @@ fn handle_atomic(
                     src_y: crtc.y,
                     src_w: width,
                     src_h: height,
+                    in_fence_fd: None,
                 };
                 for (&prop, &value) in object_props.iter().zip(object_values) {
                     match prop {
@@ -2776,6 +2812,15 @@ fn handle_atomic(
                         PLANE_CRTC_Y_PROP_ID => plane.crtc_y = value as i64 as i32,
                         PLANE_CRTC_W_PROP_ID => plane.crtc_w = value as u32,
                         PLANE_CRTC_H_PROP_ID => plane.crtc_h = value as u32,
+                        PLANE_IN_FENCE_FD_PROP_ID => {
+                            let fd = value as i64;
+                            // Linux set_property: -1 clears, other negatives
+                            // are EINVAL, and the value must fit an s32.
+                            if fd < -1 || fd > i32::MAX as i64 {
+                                return Err(FsError::InvalidData);
+                            }
+                            plane.in_fence_fd = (fd >= 0).then_some(fd as i32);
+                        }
                         _ => return Err(FsError::InvalidData),
                     }
                 }
@@ -2823,6 +2868,11 @@ fn handle_atomic(
                                     bpp: 32,
                                 })
                             };
+                        }
+                        CRTC_OUT_FENCE_PTR_PROP_ID => {
+                            // A null pointer resets the request (Linux's
+                            // set_out_fence_for_crtc treats 0 as clear).
+                            crtc_state.out_fence_ptr = (value != 0).then_some(value);
                         }
                         _ => return Err(FsError::InvalidData),
                     }
@@ -2917,10 +2967,39 @@ fn handle_atomic(
                 .planes
                 .iter()
                 .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
+            // Advance the simulated vblank exactly once per affected CRTC;
+            // the PAGE_FLIP_EVENT and any OUT_FENCE_PTR on the same CRTC
+            // observe the same present instant.
+            fn present_at_for(
+                card: &mut crate::drm::card::Card,
+                presented: &mut alloc::vec::Vec<(u32, u64)>,
+                crtc_id: u32,
+            ) -> u64 {
+                if let Some(&(_, at)) = presented.iter().find(|(id, _)| *id == crtc_id) {
+                    return at;
+                }
+                let at = card.advance_vblank(crtc_id);
+                presented.push((crtc_id, at));
+                at
+            }
+            let mut presented: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
-                    card.queue_flip_event(queue, req.user_data, crtc_id)
+                    let at = present_at_for(&mut card, &mut presented, crtc_id);
+                    card.queue_flip_event_at(queue, req.user_data, crtc_id, at)
                         .map_err(|_| FsError::OutOfMemory)?;
+                }
+            }
+            // OUT_FENCE_PTR: hand (user pointer, vblank deadline) pairs to
+            // the per-open sink; the syscall layer mints the sync_file fds
+            // (fd tables are its domain) and writes them through the
+            // pointers after the ioctl returns success.
+            for crtc_state in &state.crtcs {
+                if let Some(ptr) = crtc_state.out_fence_ptr {
+                    let at = present_at_for(&mut card, &mut presented, crtc_state.id);
+                    if let Some(sink) = out_fences {
+                        sink.lock().push((ptr, at));
+                    }
                 }
             }
             active_plane.and_then(|(_, fb_id)| {
