@@ -484,7 +484,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let _ = wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000);
 
         // 3) Transcoder: same pattern as pipe.
-        let trans_off = Transcoder::A.base() + PIPECONF_OFFSET;
+        let trans_off = Transcoder::A.conf_base() + PIPECONF_OFFSET;
         let tconf = self.mmio.read32(trans_off);
         self.mmio.write32(trans_off, tconf & !PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
@@ -603,7 +603,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         };
         // PIPE_SRCSZ lives inside the pipe MMIO block.
         self.mmio
-            .write32(PipeIdx::A.base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
+            .write32(PipeIdx::A.trans_base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -719,7 +719,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         use crate::intel_gpu_pipes::{
             Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
         };
-        let off = Transcoder::A.base() + PIPECONF_OFFSET;
+        let off = Transcoder::A.conf_base() + PIPECONF_OFFSET;
         let cur = self.mmio.read32(off);
         self.mmio.write32(off, cur | PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
@@ -1102,7 +1102,7 @@ pub mod tests {
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
         ms.program_pipe(&Mode::VESA_1024X768_60);
-        let writes = mmio.writes_to(PipeIdx::A.base() + PIPE_SRCSZ_OFFSET);
+        let writes = mmio.writes_to(PipeIdx::A.trans_base() + PIPE_SRCSZ_OFFSET);
         if writes.is_empty() {
             return TestResult::Fail("PIPE_SRCSZ not written");
         }
@@ -1169,11 +1169,11 @@ pub mod tests {
         use crate::intel_gpu_pipes::{Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET};
         let mut mmio = FakeMmio::new();
         // Pre-set the state bit so the poll returns immediately.
-        mmio.state_offset = Transcoder::A.base() + PIPECONF_OFFSET;
+        mmio.state_offset = Transcoder::A.conf_base() + PIPECONF_OFFSET;
         mmio.state_value = crate::intel_gpu_pipes::PIPECONF_STATE;
         let mut ms = Modeset::new(&mmio, Ddi::A);
         ms.enable_transcoder();
-        let writes = mmio.writes_to(Transcoder::A.base() + PIPECONF_OFFSET);
+        let writes = mmio.writes_to(Transcoder::A.conf_base() + PIPECONF_OFFSET);
         if !writes.iter().any(|w| w & PIPECONF_ENABLE != 0) {
             return TestResult::Fail("transcoder ENABLE bit not set");
         }
@@ -1233,7 +1233,7 @@ pub mod tests {
         }
         // Pipe + Transcoder PIPECONF must clear ENABLE.
         let pipe_writes = mmio.writes_to(PipeIdx::A.base() + PIPECONF_OFFSET);
-        let trans_writes = mmio.writes_to(Transcoder::A.base() + PIPECONF_OFFSET);
+        let trans_writes = mmio.writes_to(Transcoder::A.conf_base() + PIPECONF_OFFSET);
         if pipe_writes.is_empty() || pipe_writes.iter().any(|w| w & PIPECONF_ENABLE != 0) {
             return TestResult::Fail("pipe ENABLE not cleared");
         }

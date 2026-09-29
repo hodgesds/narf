@@ -49,21 +49,49 @@ pub enum Transcoder {
     Edp = 4,
 }
 
+// ── The display engine has *two* per-pipe register regions ───────
+//
+// They are both indexed by pipe with a 0x1000 stride, which makes it
+// easy to assume there is only one. There is not, and the split does
+// not follow the register names:
+//
+//   0x60000  transcoder timing — TRANS_HTOTAL and friends, plus
+//            PIPE_SRCSZ at +0x1C and TRANS_DDI_FUNC_CTL at +0x400.
+//   0x70000  pipe and plane    — TRANSCONF at +0x008 (despite the
+//            "TRANS" name) and the universal plane block at +0x180.
+//
+// Cross-referenced against i915 `intel_display_regs.h`
+// (`_TRANS_HTOTAL_A` 0x60000, `_PIPEASRC` 0x6001c, `_TRANSACONF`
+// 0x70008, `_TRANS_DDI_FUNC_CTL_A` 0x60400) and
+// `skl_universal_plane_regs.h` (`_PLANE_CTL_1_A` 0x70180).
+
+/// Base of the transcoder timing region.
+pub const TRANS_TIMING_BASE: u64 = 0x0006_0000;
+/// Base of the pipe / plane region.
+pub const PIPE_PLANE_BASE: u64 = 0x0007_0000;
+
 impl Pipe {
     /// Per-pipe MMIO offset stride. Each pipe is exactly `0x1000`
-    /// bytes wide in the display engine MMIO map (PRM Vol. 14
-    /// §"Pipe MMIO Map").
+    /// bytes wide in both regions (PRM Vol. 14 §"Pipe MMIO Map").
     pub const STRIDE: u64 = 0x1000;
-    /// Base of the per-pipe register block. Pipe A starts at
-    /// `0x60000`; pipes B..D follow at +0x1000 each.
+
+    /// Base of this pipe's **pipe/plane** block — `TRANSCONF` and the
+    /// plane registers. Pipe A starts at `0x70000`.
     pub const fn base(self) -> u64 {
-        0x0006_0000 + (self as u64) * Self::STRIDE
+        PIPE_PLANE_BASE + (self as u64) * Self::STRIDE
+    }
+
+    /// Base of this pipe's **transcoder timing** block, which is
+    /// where `PIPE_SRCSZ` lives despite its name. Pipe A starts at
+    /// `0x60000`.
+    pub const fn trans_base(self) -> u64 {
+        TRANS_TIMING_BASE + (self as u64) * Self::STRIDE
     }
 }
 
 impl Transcoder {
     pub const STRIDE: u64 = 0x1000;
-    /// Base of the per-transcoder register block. Transcoder A
+    /// Base of the per-transcoder **timing** block. Transcoder A
     /// starts at `0x60000`; B..D follow at +0x1000; EDP lives
     /// separately at `0x6F000`.
     pub const fn base(self) -> u64 {
@@ -75,11 +103,33 @@ impl Transcoder {
             Transcoder::Edp => 0x0006_F000,
         }
     }
+
+    /// Base of the block holding this transcoder's `TRANSCONF`.
+    ///
+    /// `TRANSCONF` is named for the transcoder but lives in the pipe
+    /// region at `0x70008`, not beside the timing registers. Using
+    /// [`Self::base`] for it lands on `TRANS_HSYNC` instead.
+    ///
+    /// The `Edp` arm mirrors the timing block's `0x6F000` offset.
+    /// Gen12 removed the separate EDP transcoder, and this driver
+    /// only supports Gen12 and later, so that arm is unreachable in
+    /// practice and unverified against hardware.
+    pub const fn conf_base(self) -> u64 {
+        match self {
+            Transcoder::A => 0x0007_0000,
+            Transcoder::B => 0x0007_1000,
+            Transcoder::C => 0x0007_2000,
+            Transcoder::D => 0x0007_3000,
+            Transcoder::Edp => 0x0007_F000,
+        }
+    }
 }
 
 // ── Pipe registers (TGL PRM Vol. 14 §"PIPE_*") ───────────────────
 
-/// `PIPE_SRCSZ` — source size for the pipe.
+/// `PIPE_SRCSZ` — source size for the pipe. Relative to
+/// [`Pipe::trans_base`], *not* [`Pipe::base`]: i915 calls it
+/// `_PIPEASRC` at 0x6001c, in the timing region.
 /// Layout: bits[28:16] = horizontal-1, bits[12:0] = vertical-1.
 pub const PIPE_SRCSZ_OFFSET: u64 = 0x001C;
 /// `PIPECONF` (legacy name) / `PIPE_TRANS_CONF` on Gen12 — top-
@@ -121,22 +171,30 @@ pub const TRANS_DDI_MODE_DVI: u32 = 0b001 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
 pub const TRANS_DDI_MODE_DP_SST: u32 = 0b010 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
 pub const TRANS_DDI_MODE_DP_MST: u32 = 0b011 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
 
-// ── Plane registers (TGL PRM Vol. 14 §"PLANE_*") ─────────────────
+// ── Plane registers (SKL+ universal plane) ───────────────────────
 //
-// Plane register block sits inside the pipe block. The primary
-// plane (plane 1) starts at pipe-base + 0x6000.
+// The plane block sits inside the *pipe* region at [`Pipe::base`],
+// one 0x100-byte block per plane starting at +0x180. Cross-checked
+// against i915 `skl_universal_plane_regs.h`: `_PLANE_CTL_1_A`
+// 0x70180, `_PLANE_STRIDE_1_A` 0x70188, `_PLANE_POS_1_A` 0x7018c,
+// `_PLANE_SIZE_1_A` 0x70190, `_PLANE_SURF_1_A` 0x7019c,
+// `_PLANE_OFFSET_1_A` 0x701a4, with `_PLANE_CTL_2_A` at 0x70280
+// giving the per-plane stride and `_PLANE_CTL_1_B` at 0x71180 the
+// per-pipe one.
 
-/// Primary-plane offset relative to its pipe base.
-pub const PLANE_PRIMARY_OFFSET: u64 = 0x6000;
+/// Primary plane (plane 1) offset relative to its pipe base.
+pub const PLANE_PRIMARY_OFFSET: u64 = 0x0180;
+/// Stride between consecutive planes within one pipe.
+pub const PLANE_STRIDE_BETWEEN_PLANES: u64 = 0x0100;
 
 /// `PLANE_CTL` — top-level plane enable + pixel format.
 pub const PLANE_CTL_OFFSET: u64 = 0x0000;
 /// `PLANE_STRIDE` — surface stride in 64-byte units.
-pub const PLANE_STRIDE_OFFSET: u64 = 0x0028;
+pub const PLANE_STRIDE_OFFSET: u64 = 0x0008;
 /// `PLANE_POS` — destination position (for sub-pipe planes).
-pub const PLANE_POS_OFFSET: u64 = 0x002C;
+pub const PLANE_POS_OFFSET: u64 = 0x000C;
 /// `PLANE_SIZE` — destination size.
-pub const PLANE_SIZE_OFFSET: u64 = 0x0030;
+pub const PLANE_SIZE_OFFSET: u64 = 0x0010;
 /// `PLANE_SURF` — primary-surface address (full GPU virtual
 /// address; stride decoupled).
 pub const PLANE_SURF_OFFSET: u64 = 0x001C;
@@ -342,11 +400,13 @@ pub mod tests {
     }
 
     fn smoke_pipe_base_strides() -> TestResult {
-        if Pipe::A.base() != 0x60000 {
-            return TestResult::Fail("Pipe A base wrong");
+        // The pipe/plane region, where TRANSCONF and the planes live.
+        if Pipe::A.base() != 0x70000 || Pipe::B.base() != 0x71000 {
+            return TestResult::Fail("pipe/plane base wrong");
         }
-        if Pipe::B.base() != 0x61000 {
-            return TestResult::Fail("Pipe B base wrong");
+        // The transcoder timing region, where PIPE_SRCSZ lives.
+        if Pipe::A.trans_base() != 0x60000 || Pipe::B.trans_base() != 0x61000 {
+            return TestResult::Fail("transcoder timing base wrong");
         }
         if Transcoder::Edp.base() != 0x6F000 {
             return TestResult::Fail("EDP transcoder base wrong");
@@ -354,6 +414,92 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_pipes", smoke_pipe_base_strides);
+
+    /// Absolute addresses, cross-checked against i915. The two
+    /// per-pipe regions share a 0x1000 stride, so a register put in
+    /// the wrong one still lands somewhere plausible — these pin the
+    /// values rather than the arithmetic.
+    fn smoke_display_register_addresses_match_i915() -> TestResult {
+        // intel_display_regs.h
+        if Transcoder::A.base() + TRANS_HTOTAL_OFFSET != 0x60000 {
+            return TestResult::Fail("_TRANS_HTOTAL_A is 0x60000");
+        }
+        if Transcoder::A.base() + TRANS_HSYNC_OFFSET != 0x60008 {
+            return TestResult::Fail("_TRANS_HSYNC_A is 0x60008");
+        }
+        if Pipe::A.trans_base() + PIPE_SRCSZ_OFFSET != 0x6001C {
+            return TestResult::Fail("_PIPEASRC is 0x6001c");
+        }
+        if Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET != 0x60400 {
+            return TestResult::Fail("_TRANS_DDI_FUNC_CTL_A is 0x60400");
+        }
+        // TRANSCONF is named for the transcoder but lives in the pipe
+        // region. Reaching it through the timing base would land on
+        // TRANS_HSYNC, which is the bug this pins shut.
+        if Transcoder::A.conf_base() + PIPECONF_OFFSET != 0x70008 {
+            return TestResult::Fail("_TRANSACONF is 0x70008");
+        }
+        if Pipe::A.base() + PIPECONF_OFFSET != 0x70008 {
+            return TestResult::Fail("pipe A TRANSCONF disagrees with the transcoder path");
+        }
+        if Transcoder::A.conf_base() + PIPECONF_OFFSET == Transcoder::A.base() + TRANS_HSYNC_OFFSET
+        {
+            return TestResult::Fail("TRANSCONF still collides with TRANS_HSYNC");
+        }
+
+        // skl_universal_plane_regs.h
+        let plane = Pipe::A.base() + PLANE_PRIMARY_OFFSET;
+        if plane + PLANE_CTL_OFFSET != 0x70180 {
+            return TestResult::Fail("_PLANE_CTL_1_A is 0x70180");
+        }
+        if plane + PLANE_STRIDE_OFFSET != 0x70188 {
+            return TestResult::Fail("_PLANE_STRIDE_1_A is 0x70188");
+        }
+        if plane + PLANE_POS_OFFSET != 0x7018C {
+            return TestResult::Fail("_PLANE_POS_1_A is 0x7018c");
+        }
+        if plane + PLANE_SIZE_OFFSET != 0x70190 {
+            return TestResult::Fail("_PLANE_SIZE_1_A is 0x70190");
+        }
+        if plane + PLANE_SURF_OFFSET != 0x7019C {
+            return TestResult::Fail("_PLANE_SURF_1_A is 0x7019c");
+        }
+        if plane + PLANE_OFFSET_OFFSET != 0x701A4 {
+            return TestResult::Fail("_PLANE_OFFSET_1_A is 0x701a4");
+        }
+        // Per-plane and per-pipe strides.
+        if plane + PLANE_STRIDE_BETWEEN_PLANES != 0x70280 {
+            return TestResult::Fail("_PLANE_CTL_2_A is 0x70280");
+        }
+        if Pipe::B.base() + PLANE_PRIMARY_OFFSET != 0x71180 {
+            return TestResult::Fail("_PLANE_CTL_1_B is 0x71180");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pipes",
+        smoke_display_register_addresses_match_i915
+    );
+
+    /// The two per-pipe regions must not overlap for any pipe.
+    fn smoke_pipe_regions_are_disjoint() -> TestResult {
+        for p in [Pipe::A, Pipe::B, Pipe::C, Pipe::D] {
+            if p.trans_base() >= PIPE_PLANE_BASE {
+                return TestResult::Fail("a timing base reached into the pipe region");
+            }
+            if p.base() < PIPE_PLANE_BASE {
+                return TestResult::Fail("a pipe base fell into the timing region");
+            }
+        }
+        if TRANS_TIMING_BASE != 0x60000 || PIPE_PLANE_BASE != 0x70000 {
+            return TestResult::Fail("region bases wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pipes",
+        smoke_pipe_regions_are_disjoint
+    );
 
     fn smoke_transcoder_program() -> TestResult {
         let p = match build_transcoder(&dt()) {
