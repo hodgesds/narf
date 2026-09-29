@@ -15185,14 +15185,26 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
 /// supplementary groups or capability snapshot needed only by a full DAC
 /// decision. This is the Linux owner-first `acl_permission_check` fast path.
 fn current_host_fsuid(task: u64) -> u32 {
-    let fsuid = read_uidgid(task).fsuid;
+    let ids = read_uidgid(task);
+    let fsuid = ids.fsuid;
     #[cfg(feature = "container")]
     {
         let uns = crate::namespaces::current_user_ns(task);
         if uns.is_initial() {
             fsuid
         } else {
-            uns.translate_uid_to_host(fsuid)
+            // Linux keeps credentials as kernel-global kuid values across
+            // unshare(CLONE_NEWUSER). NARF's credential table stores the
+            // namespace-visible value, so before the first uid_map exists
+            // the creator's inherited fsuid cannot translate through the
+            // empty map. In that unmapped interval it is the namespace owner
+            // recorded at creation (the host fsuid that Linux retained).
+            let mapped = uns.translate_uid_to_host(fsuid);
+            if mapped == crate::namespaces::OVERFLOW_ID && fsuid == ids.euid {
+                uns.owner_uid()
+            } else {
+                mapped
+            }
         }
     }
     #[cfg(not(feature = "container"))]

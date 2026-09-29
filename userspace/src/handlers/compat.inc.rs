@@ -4059,6 +4059,17 @@ pub fn proc_ns_idmap_write(
     })
 }
 
+/// Host-absolute inode ownership for `/proc/<pid>/{uid_map,gid_map,setgroups}`.
+/// Linux's `task_dump_owner()` uses the task's kernel credential ids; the
+/// namespace-visible ids in `TaskInfo` cannot be used for VFS permission
+/// checks on a procfs mount owned by the parent namespace.
+#[cfg(feature = "container")]
+pub fn proc_ns_idmap_owners(pid: u64) -> Option<(u32, u32)> {
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let ns = crate::namespaces::current_user_ns(task);
+    Some((ns.owner_uid(), ns.owner_gid()))
+}
+
 // ── Wave-67: setns(target, nstype) ─────────────────────────────────
 //
 // Linux setns takes a namespace fd opened from /proc/[pid]/ns/<type> (or

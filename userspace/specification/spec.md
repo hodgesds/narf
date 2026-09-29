@@ -68,11 +68,12 @@ non-overlapping, child writes are one-shot and authorized through the target
 or parent namespace, and an unprivileged one-entry map is restricted to the
 namespace owner. Mapping namespace uid 0 additionally follows Linux's
 `CAP_SETFCAP` rule. `/proc/<pid>/setgroups` follows
-`/usr/src/linux/kernel/groups.c` and `fs/proc/base.c`: `deny` is irreversible,
-and `/usr/src/linux/fs/proc/base.c`: `deny` is irreversible, while
+`/usr/src/linux/fs/proc/base.c`: `deny` is irreversible, while
 `setgroups(2)` follows `/usr/src/linux/kernel/groups.c` and stays blocked
 until a gid map exists and thereafter while the child namespace's policy is
-deny.
+deny. The id-map proc files retain host-absolute namespace-owner inode IDs,
+matching Linux `task_dump_owner()` and allowing the creator to open them
+before the first map is installed.
 
 Linux `statx(2)` returns a stable `STATX_MNT_ID` whenever the resolved path
 has a covering NARF mount, even when the request mask names only basic fields.

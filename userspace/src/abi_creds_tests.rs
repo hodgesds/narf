@@ -2049,65 +2049,102 @@ kernel_test_in!(
 fn smoke_abi_userns_unprivileged_uid_map_cannot_claim_host_root() -> TestResult {
     with_setup(|| {
         const CLONE_NEWUSER: u64 = 0x1000_0000;
-        const UID_MAP: &[u8] = b"0 0 1\n";
+        narf_filesystem::procfs::install_ns_proc_hooks(
+            crate::handlers::proc_ns_readlink,
+            crate::handlers::proc_ns_mountinfo,
+            crate::handlers::proc_ns_idmap_render,
+            crate::handlers::proc_ns_idmap_write,
+            crate::handlers::proc_ns_idmap_owners,
+        );
+        let base = alloc::format!("/proc_userns_{}", FAKE_TASK);
+        let auth = bootstrap_mount_authority();
+        let mount = registry()
+            .mount(&auth, &base, narf_filesystem::procfs::ProcFs)
+            .map_err(|_| "user namespace procfs mount failed")?;
+        let result = (|| {
+            let write_proc = |file: &str, bytes: &[u8]| -> Option<i64> {
+                let path = alloc::format!("{}/{}/{}\0", base, FAKE_TASK, file);
+                let fd = call_open(path.as_ptr() as u64, 1)?;
+                if fd < 0 {
+                    return Some(fd);
+                }
+                let wrote = call(
+                    Syscall::Write.raw(),
+                    a2(fd as u64, bytes.as_ptr() as u64, bytes.len() as u64),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                wrote
+            };
 
-        // Exercise the same writer hook used by `/proc/<pid>/uid_map` after
-        // dropping host capabilities and creating the user namespace.
-        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
-            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
-        {
-            return Err("could not drop the test task to host uid/gid 1000");
-        }
-        if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
-            return Err("unprivileged unshare(CLONE_NEWUSER) failed");
-        }
-        use narf_filesystem::procfs::NsIdMapFile;
-        let write_result =
-            crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::UidMap, UID_MAP);
-        match write_result {
-            Err(narf_filesystem::FsError::OperationNotPermitted) => Ok(()),
-            Ok(_) => Err("unprivileged caller mapped namespace root to host root"),
-            Err(_) => Err("uid_map writer returned the wrong error"),
-        }?;
+            // Drop privilege, create the child namespace, and go through
+            // path lookup -> procfs FileOps -> userspace authorization.
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                return Err("unprivileged unshare(CLONE_NEWUSER) failed");
+            }
+            match write_proc("uid_map", b"0 0 1\n") {
+                Some(-1) => (), // EPERM
+                Some(6) => return Err("uid_map write accepted the six-byte host-root map"),
+                Some(-13) => return Err("uid_map open was denied with EACCES"),
+                Some(_) => return Err("unprivileged caller mapped namespace root to host root"),
+                None => return Err("uid_map procfs write returned a non-Ok syscall status"),
+            }
 
-        // The permitted self-map is exactly the creator's host uid. A
-        // failed write must not consume the one-shot map slot.
-        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::UidMap, b"0 1000 1\n")
-            != Ok(b"0 1000 1\n".len())
-        {
-            return Err("unprivileged caller could not map its own host uid");
-        }
-        if crate::namespaces::current_user_ns(FAKE_TASK).translate_uid_to_host(0) != 1000 {
-            return Err("uid_map did not normalize the permitted host uid");
-        }
-        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::UidMap, b"1 1000 1\n")
-            != Err(narf_filesystem::FsError::OperationNotPermitted)
-        {
-            return Err("uid_map was writable more than once");
-        }
-        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::Setgroups, b"deny\n")
-            != Ok(b"deny\n".len())
-        {
-            return Err("could not disable setgroups before writing gid_map");
-        }
-        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::GidMap, b"0 1000 1\n")
-            != Ok(b"0 1000 1\n".len())
-        {
-            return Err("unprivileged caller could not map its own host gid");
-        }
-        let ns = crate::namespaces::current_user_ns(FAKE_TASK);
-        if ns.translate_gid_to_host(0) != 1000 || ns.may_setgroups() {
-            return Err("gid_map or setgroups state was not committed correctly");
-        }
-        if call(Syscall::Setgroups.raw(), a1(0, 0)) != Some(-1) {
-            return Err("setgroups succeeded after the namespace permanently denied it");
-        }
-        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::Setgroups, b"allow\n")
-            != Err(narf_filesystem::FsError::OperationNotPermitted)
-        {
-            return Err("setgroups was re-enabled after deny");
-        }
-        Ok(())
+            // A rejected write must not consume the one-shot map slot.
+            if write_proc("uid_map", b"0 1000 1\n") != Some(9) {
+                return Err("unprivileged caller could not map its own host uid");
+            }
+            if crate::namespaces::current_user_ns(FAKE_TASK).translate_uid_to_host(0) != 1000 {
+                return Err("uid_map did not normalize the permitted host uid");
+            }
+            let mut rendered = [0u8; 32];
+            let path = alloc::format!("{}/{}/uid_map\0", base, FAKE_TASK);
+            let fd = call_open(path.as_ptr() as u64, 0).ok_or("uid_map open returned no result")?;
+            if fd < 0 {
+                return Err("uid_map could not be reopened for reading");
+            }
+            let n = call(
+                Syscall::Read.raw(),
+                a2(
+                    fd as u64,
+                    rendered.as_mut_ptr() as u64,
+                    rendered.len() as u64,
+                ),
+            )
+            .ok_or("uid_map read returned a non-Ok syscall status")?;
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            let text = core::str::from_utf8(&rendered[..n as usize])
+                .map_err(|_| "uid_map procfs read was not UTF-8")?;
+            if text.split_whitespace().collect::<alloc::vec::Vec<_>>() != ["0", "1000", "1"] {
+                return Err("uid_map procfs read did not expose the installed mapping");
+            }
+            if write_proc("uid_map", b"1 1000 1\n") != Some(-1) {
+                return Err("uid_map was writable more than once");
+            }
+            if write_proc("setgroups", b"deny\n") != Some(5) {
+                return Err("could not disable setgroups before writing gid_map");
+            }
+            if write_proc("gid_map", b"0 1000 1\n") != Some(9) {
+                return Err("unprivileged caller could not map its own host gid");
+            }
+            let ns = crate::namespaces::current_user_ns(FAKE_TASK);
+            if ns.translate_gid_to_host(0) != 1000 || ns.may_setgroups() {
+                return Err("gid_map or setgroups state was not committed correctly");
+            }
+            if call(Syscall::Setgroups.raw(), a1(0, 0)) != Some(-1) {
+                return Err("setgroups succeeded after the namespace permanently denied it");
+            }
+            if write_proc("setgroups", b"allow\n") != Some(-1) {
+                return Err("setgroups was re-enabled after deny");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&mount, &base);
+        result
     })
 }
 #[cfg(feature = "container")]

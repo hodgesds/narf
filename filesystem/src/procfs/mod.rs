@@ -629,12 +629,15 @@ pub enum NsIdMapFile {
 type IdMapRenderFn = fn(u64, NsIdMapFile) -> Option<String>;
 /// `(pid, file, bytes) -> Ok(written) | Err`.
 type IdMapWriteFn = fn(u64, NsIdMapFile, &[u8]) -> Result<usize, FsError>;
+/// `pid -> host-absolute owner uid/gid` for user-namespace proc files.
+type IdMapOwnersFn = fn(u64) -> Option<(u32, u32)>;
 
 static NS_READLINK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_MOUNTINFO_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_MOUNTINFO_GENERATION_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_IDMAP_RENDER_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_IDMAP_WRITE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NS_IDMAP_OWNERS_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Stable u8 tags for namespace flavours, mirroring
 /// `userspace::namespaces::NsFlavour`. Kept here so the procfs ns
@@ -656,11 +659,13 @@ pub fn install_ns_proc_hooks(
     mountinfo: MountinfoFn,
     idmap_render: IdMapRenderFn,
     idmap_write: IdMapWriteFn,
+    idmap_owners: IdMapOwnersFn,
 ) {
     NS_READLINK_HOOK.store(readlink as usize, Ordering::Release);
     NS_MOUNTINFO_HOOK.store(mountinfo as usize, Ordering::Release);
     NS_IDMAP_RENDER_HOOK.store(idmap_render as usize, Ordering::Release);
     NS_IDMAP_WRITE_HOOK.store(idmap_write as usize, Ordering::Release);
+    NS_IDMAP_OWNERS_HOOK.store(idmap_owners as usize, Ordering::Release);
 }
 
 /// `fn(pid) -> (rchar, wchar, syscr, syscw)` — per-task I/O accounting for
@@ -759,6 +764,16 @@ pub(crate) fn hook_ns_idmap_write(
     // SAFETY: stored by install_ns_proc_hooks as an IdMapWriteFn; non-zero confirms it.
     let f: IdMapWriteFn = unsafe { core::mem::transmute(v) };
     f(pid, file, bytes)
+}
+
+pub(crate) fn hook_ns_idmap_owners(pid: u64) -> Option<(u32, u32)> {
+    let v = NS_IDMAP_OWNERS_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_ns_proc_hooks as an IdMapOwnersFn; non-zero confirms it.
+    let f: IdMapOwnersFn = unsafe { core::mem::transmute(v) };
+    f(pid)
 }
 
 pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
@@ -1834,7 +1849,7 @@ impl FileOps for ProcIdMapFile {
     }
 
     fn owners(&self) -> (u32, u32) {
-        task_file_owners(self.pid)
+        hook_ns_idmap_owners(self.pid).unwrap_or_else(|| task_file_owners(self.pid))
     }
 }
 

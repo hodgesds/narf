@@ -987,9 +987,11 @@ link target plus live offset, status flags, mount ID, and inode identity, so
 `fd/` and `fdinfo/` project the same open file description.
 For user namespaces, `/proc/<pid>/uid_map` and `gid_map` expose parent-to-child
 id ranges, while `setgroups` reads `allow` or `deny` and accepts the one-way
-`deny` transition before `gid_map` is installed. The procfs/userspace hook
-identifies these files with `NsIdMapFile::{UidMap,GidMap,Setgroups}` so each
-write reaches the matching authorization and state transition.
+`deny` transition before `gid_map` is installed. Their inode owners use the
+host-absolute user-namespace owner IDs so the creator can open these files
+before the child maps exist. The procfs/userspace hooks identify files with
+`NsIdMapFile::{UidMap,GidMap,Setgroups}` and supply rendering, write
+authorization, and owner IDs.
 `/proc/filesystems` uses the `nodev NAME` form for synthetic filesystems.
 `/proc/uptime` reports aggregate idle time across CPUs, and per-task status
 memory fields are derived from VMA extents and resident page counts. Procfs
