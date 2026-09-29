@@ -171,7 +171,7 @@ fn smoke_tx_completion_bounds_and_wrap() -> TestResult {
     boot_context::put16(&mut allocation, 4, u16::MAX);
     q.activate(&allocation).unwrap();
     let mut mmio = Mmio::default();
-    if q.send(&mut mmio, &[0; 36], 24, 0x4100).unwrap() != 0 {
+    if q.send(&mut mmio, &[0; 36], 24, Some(0x4100)).unwrap() != 0 {
         return TestResult::Fail("TX pointer failed to wrap");
     }
     let mut reply = [0; 48];

@@ -35,12 +35,37 @@ pub fn transmit(
     Some(bytes)
 }
 
+/// Add QoS control only after WMM negotiation. No A-MSDU, EOSP or block ACK.
+pub fn transmit_qos(
+    local: [u8; 6],
+    ap: [u8; 6],
+    sequence: u16,
+    ethernet: &[u8],
+    protected: bool,
+    tid: u8,
+) -> Option<Vec<u8>> {
+    if tid > 7 {
+        return None;
+    }
+    let mut frame = transmit(local, ap, sequence, ethernet, protected)?;
+    frame[0] |= 0x80;
+    frame.splice(24..24, [tid, 0]);
+    Some(frame)
+}
+
 #[derive(Debug, Default)]
 pub struct Replay {
     pub pairwise: [u64; 17],
     pub group: [[u64; 17]; 4],
     pub group_valid: [bool; 4],
     sequences: [Option<u16>; 17],
+}
+
+impl Replay {
+    pub fn reset_pairwise(&mut self) {
+        self.pairwise.fill(0);
+        self.sequences.fill(None);
+    }
 }
 
 pub fn receive(

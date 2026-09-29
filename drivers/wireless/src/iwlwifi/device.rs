@@ -16,13 +16,14 @@ use narf_wireless::{
 pub struct Device {
     state: Mutex<State>,
     mac: [u8; 6],
+    irq_vector: Option<u8>,
     channels: Vec<u8>,
     tx_chains: u32,
     firmware: Vec<u8>,
     pnvm: Option<Vec<u8>>,
     up: AtomicBool,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
-    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    tx: [IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>; 4],
 }
 
 impl core::fmt::Debug for Device {
@@ -41,7 +42,6 @@ struct State {
     connection: Option<Connection>,
     needs_reset: bool,
     producer: Option<Producer<Frame, RX_RING_N>>,
-    consumer: Option<Consumer<Frame, TX_RING_N>>,
     eapol: VecDeque<Vec<u8>>,
 }
 
@@ -65,6 +65,7 @@ impl Device {
         }
         let mac = hardware.start(parsed).await?;
         let nvm = Self::configure(&mut hardware, mac).await?;
+        let irq_vector = hardware.irq_vector();
         Ok(Arc::new(Self {
             state: Mutex::new(State {
                 hardware,
@@ -73,17 +74,17 @@ impl Device {
                 connection: None,
                 needs_reset: false,
                 producer: None,
-                consumer: None,
                 eapol: VecDeque::new(),
             }),
             mac,
+            irq_vector,
             channels: nvm.channels,
             tx_chains: nvm.tx_chains,
             firmware: firmware.to_vec(),
             pnvm: parsed.api.pnvm.map(|bytes| bytes.to_vec()),
             up: AtomicBool::new(false),
             rx: IrqSafeSpinLock::new(None),
-            tx: IrqSafeSpinLock::new(None),
+            tx: core::array::from_fn(|_| IrqSafeSpinLock::new(None)),
         }))
     }
 
@@ -139,19 +140,17 @@ impl Device {
         Ok(())
     }
 
-    async fn delay() {
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
-    }
-
     pub fn start_pumps(self: &Arc<Self>) -> Result<(), &'static str> {
         let (rx_producer, rx_consumer) = narf_ipc::channel::<Frame, RX_RING_N>();
-        let (tx_producer, tx_consumer) = narf_ipc::channel::<Frame, TX_RING_N>();
         *self.rx.lock() = Some(rx_consumer);
-        *self.tx.lock() = Some(tx_producer);
+        let tx_consumers = narf_wireless::AccessCategory::ALL.map(|category| {
+            let (producer, consumer) = narf_ipc::channel::<Frame, TX_RING_N>();
+            *self.tx[category as usize].lock() = Some(producer);
+            (category, consumer)
+        });
         {
             let mut state = self.state.try_lock().expect("unpublished interface");
             state.producer = Some(rx_producer);
-            state.consumer = Some(tx_consumer);
         }
         {
             let mut active = ACTIVE.lock();
@@ -170,6 +169,12 @@ impl Device {
         narf_scheduler::spawn(async move {
             device.pump().await;
         });
+        for (category, consumer) in tx_consumers {
+            let device = self.clone();
+            narf_scheduler::spawn(async move {
+                device.transmit_pump(consumer, category as usize).await;
+            });
+        }
         Ok(())
     }
 
@@ -196,7 +201,6 @@ impl Device {
             hardware,
             connection,
             producer,
-            consumer,
             eapol,
             ..
         } = &mut *state;
@@ -245,29 +249,40 @@ impl Device {
                 connection.authorized = false;
                 self.set_link(false);
             }
-            if let Some(consumer) = consumer {
-                for _ in 0..16 {
-                    let Ok(Some(frame)) = consumer.try_recv() else {
-                        break;
-                    };
-                    let _ = connection.enqueue(hardware, frame.payload());
-                }
-            }
         } else {
             hardware.notifications.clear();
-            if let Some(consumer) = consumer {
-                for _ in 0..16 {
-                    if !matches!(consumer.try_recv(), Ok(Some(_))) {
-                        break;
-                    }
-                }
-            }
         }
         output
     }
 
+    async fn transmit_pump(
+        self: Arc<Self>,
+        mut consumer: Consumer<Frame, TX_RING_N>,
+        category: usize,
+    ) {
+        // recv registers the ring waker; queued Ethernet frames need no
+        // timer tick or radio interrupt to start transmission.
+        while let Ok(frame) = consumer.recv().await {
+            let mut state = self.state.lock().await;
+            if state.needs_reset {
+                continue;
+            }
+            let State {
+                hardware,
+                connection,
+                ..
+            } = &mut *state;
+            if let Some(connection) = connection {
+                let _ = connection
+                    .enqueue_wait_for_ac(hardware, frame.payload(), category)
+                    .await;
+            }
+        }
+    }
+
     async fn pump(self: Arc<Self>) {
         loop {
+            let activity = super::iwl_msix::Activity::new(self.irq_vector, 100);
             for mut frame in self.step() {
                 narf_net::iface::on_rx_frame_from(self.name(), &mut frame);
             }
@@ -293,7 +308,16 @@ impl Device {
                     eapol.clear();
                 }
             }
-            Self::delay().await;
+            let pending = {
+                let state = self.state.lock().await;
+                !state.hardware.is_failed()
+                    && (state.hardware.has_pending_rx() || !state.hardware.notifications.is_empty())
+            };
+            if pending {
+                narf_scheduler::yield_now().await;
+            } else {
+                activity.await;
+            }
         }
     }
 }
@@ -315,12 +339,19 @@ impl Interface for Device {
         &self.rx
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        &self.tx
+        &self.tx[1]
     }
 }
 
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn tx_ring_for_ac(
+        &self,
+        category: narf_wireless::AccessCategory,
+    ) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx[category as usize]
+    }
+
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -365,7 +396,7 @@ impl WirelessNetIface for Device {
     }
 
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        if request.ssids.iter().any(|ssid| ssid.len() > 32) {
+        if request.ssids.len() > 20 || request.ssids.iter().any(|ssid| ssid.len() > 32) {
             return Err(WirelessError::InvalidArgs);
         }
         let channels = if request.channels.is_empty() {
@@ -407,10 +438,40 @@ impl WirelessNetIface for Device {
                 ..
             } = &mut *state;
             let version = hw.version(1, 0xd).ok_or(WirelessError::NotSupported)?.0;
-            // Passive scanning is valid even when active was requested;
-            // it does not transmit before regulatory authorization.
-            let body = scan_api::passive(version, uid, &channels)
+            let mut body = scan_api::passive(version, uid, &channels)
                 .map_err(|_| WirelessError::NotSupported)?;
+            if request.active {
+                if let Some(domain) = narf_wireless::reg::db::get_domain() {
+                    let permissions = super::connection::regulatory_channels(hw)
+                        .await
+                        .map_err(|_| WirelessError::HardwareError)?;
+                    let powers: Vec<_> = channels
+                        .iter()
+                        .map(|&channel| {
+                            super::connection::channel_power(&domain, channel, &permissions, true)
+                        })
+                        .collect();
+                    if let Some(power) = powers.iter().flatten().min() {
+                        let power_command = station_api::tx_power(
+                            hw.version(1, 0x9f).ok_or(WirelessError::NotSupported)?.0,
+                            *power,
+                        )
+                        .map_err(|_| WirelessError::NotSupported)?;
+                        hw.command(1, 0x9f, &power_command)
+                            .await
+                            .map_err(|_| WirelessError::HardwareError)?;
+                    }
+                    body = scan_api::active(
+                        version,
+                        uid,
+                        &channels,
+                        &powers.iter().map(Option::is_some).collect::<Vec<_>>(),
+                        self.mac,
+                        &request.ssids,
+                    )
+                    .map_err(|_| WirelessError::InvalidArgs)?;
+                }
+            }
             hw.notifications
                 .retain(|p| !(p.header.group_id == 0 && matches!(p.header.cmd, 0xf | 0xc1)));
             hw.command(1, 0xd, &body)
@@ -419,6 +480,7 @@ impl WirelessNetIface for Device {
             let deadline = narf_time::Deadline::after_ms(15_000);
             let mut result: Vec<BssInfo> = Vec::new();
             loop {
+                let activity = hw.activity();
                 hw.poll().map_err(|_| WirelessError::HardwareError)?;
                 while let Some(packet) = hw.notifications.pop_front() {
                     if packet.header.group_id != 0 {
@@ -453,7 +515,10 @@ impl WirelessNetIface for Device {
                     let Some(beacon) = super::mlme::parse_beacon_to_bss(bssid, body) else {
                         continue;
                     };
-                    if !request.ssids.is_empty() && !request.ssids.contains(&beacon.ssid) {
+                    if !request.ssids.is_empty()
+                        && !request.ssids.iter().any(Vec::is_empty)
+                        && !request.ssids.contains(&beacon.ssid)
+                    {
                         continue;
                     }
                     let record = Beacon {
@@ -464,6 +529,7 @@ impl WirelessNetIface for Device {
                         dtim: super::scan_api::dtim_period(body),
                         rsn: beacon.rsn_ie_body.clone(),
                         privacy: body[10] & 0x10 != 0,
+                        capabilities: u16::from_le_bytes([body[10], body[11]]),
                         information_elements: body[12..].to_vec(),
                     };
                     if let Some(old) = beacons.iter_mut().find(|old| old.bssid == bssid) {
@@ -503,7 +569,7 @@ impl WirelessNetIface for Device {
                         .map_err(|_| WirelessError::HardwareError)?;
                     return Err(WirelessError::Timeout);
                 }
-                Self::delay().await;
+                activity.await;
             }
         }
         .await;
@@ -624,8 +690,10 @@ fn send_frame(bytes: &[u8]) -> Result<(), ()> {
     let buffer = super::runtime::dma_alloc(bytes.len()).map_err(|_| ())?;
     let mut frame = Frame::new(buffer, bytes.len() as u32);
     frame.payload_mut().copy_from_slice(bytes);
-    let result = device
-        .tx
+    let category = super::qos::Parameters::default()
+        .classify(bytes)
+        .ok_or(())?;
+    let result = device.tx[category]
         .lock()
         .as_mut()
         .ok_or(())?

@@ -426,6 +426,7 @@ pub struct Hardware {
     device: narf_bus::BusDevice,
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     format: rx_rfh::CompletionFormat,
+    interrupts: Option<super::iwl_msix::Interrupts>,
     pub notifications: alloc::collections::VecDeque<Packet>,
     responses: alloc::collections::VecDeque<Packet>,
     tx_completed: alloc::collections::VecDeque<(u16, u16, bool)>,
@@ -476,6 +477,7 @@ impl Hardware {
             device,
             cap,
             format,
+            interrupts: None,
             notifications: alloc::collections::VecDeque::new(),
             responses: alloc::collections::VecDeque::new(),
             tx_completed: alloc::collections::VecDeque::new(),
@@ -490,6 +492,28 @@ impl Hardware {
             .chunks_exact(4)
             .find(|entry| entry[0] == command && entry[1] == group)
             .map(|entry| (entry[2], entry[3]))
+    }
+
+    pub fn has_pending_rx(&self) -> bool {
+        // SAFETY: coherent status allocation remains live until DMA stop;
+        // hardware publishes this aligned u16 after completion descriptors.
+        let closed = u16::from_le(unsafe {
+            core::ptr::read_volatile(self.resources.rx.status.as_mut_ptr().cast::<u16>())
+        }) as usize
+            & (RX_DEPTH - 1);
+        self.resources.rx.read != closed
+    }
+
+    pub fn irq_vector(&self) -> Option<u8> {
+        self.interrupts
+            .as_ref()
+            .map(super::iwl_msix::Interrupts::vector)
+    }
+
+    /// Capture the IRQ count before polling completions, including when
+    /// the command caller owns the device mutex across this wait.
+    pub fn activity(&self) -> super::iwl_msix::Activity {
+        super::iwl_msix::Activity::new(self.irq_vector(), 10)
     }
 
     async fn sample_delay() {
@@ -560,7 +584,7 @@ impl Hardware {
         }
 
         // Bz moved reset and clock handshakes into GP_CNTRL. Keep the
-        // MAC access request asserted while this polling transport runs.
+        // MAC access request asserted while the transport runs.
         let (request, ready) = if self.format == rx_rfh::CompletionFormat::Bz {
             (1 << 6 | 1 << 21, 1 << 20)
         } else {
@@ -569,6 +593,22 @@ impl Hardware {
         let gp = self.mmio.read(CSR_GP_CNTRL);
         self.mmio.write(CSR_GP_CNTRL, gp | request);
         self.poll_register(CSR_GP_CNTRL, ready, ready, 25).await?;
+
+        if self.interrupts.is_none() {
+            self.interrupts = Some(super::iwl_msix::Interrupts::new(
+                &self.cap,
+                &self.device,
+                self.mmio.0,
+            )?);
+        }
+        // AX210/Bz/Sc use the UMAC interrupt selector, with peripherals
+        // relocated by 0x300000. Reset clears the selector/IVARs,
+        // so reprogram on every start while retaining the owned vector.
+        super::transport::prph_write_ax210(&mut self.mmio, 0xD05C00, 1 << 25);
+        self.interrupts
+            .as_mut()
+            .unwrap()
+            .enable(self.format == rx_rfh::CompletionFormat::Bz)?;
 
         let boot = &self.resources.boot;
         let regions = super::transport::Gen3BootRegions {
@@ -667,17 +707,17 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
-        let causes = self.mmio.read(super::regs::CSR_INT);
-        let sw_error = if self.format == rx_rfh::CompletionFormat::Bz {
-            1 << 5
-        } else {
-            1 << 25
-        };
-        if causes == u32::MAX || causes & ((1 << 29) | sw_error) != 0 {
-            self.failed = true;
-            return Err("Wi-Fi firmware/device error");
+        if let Some(interrupts) = &self.interrupts {
+            let causes = interrupts.take_causes();
+            if causes.fatal(self.format == rx_rfh::CompletionFormat::Bz) {
+                return Err("Wi-Fi firmware/device error");
+            }
+            if causes.hw & (1 << 7) != 0
+                && self.mmio.read(super::regs::CSR_GP_CNTRL) & (1 << 27) == 0
+            {
+                return Err("Wi-Fi hardware radio disabled");
+            }
         }
-        self.mmio.write(super::regs::CSR_INT, causes);
         for packet in self.resources.rx.drain(&mut self.mmio)? {
             if packet.header.group_id == 0 && packet.header.cmd == 0x1c {
                 if packet.payload.len() < 38 {
@@ -766,6 +806,9 @@ impl Hardware {
     /// disable, exactly as on final teardown.
     pub async fn restart(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         self.failed = true;
+        if let Some(interrupts) = &mut self.interrupts {
+            interrupts.mask();
+        }
         self.mmio.write(super::regs::CSR_INT_MASK, 0);
         if self.armed {
             let (register, request, done) = if self.format == rx_rfh::CompletionFormat::Bz {
@@ -807,12 +850,51 @@ impl Hardware {
         self.start(parsed).await
     }
 
+    /// Stop submitting encrypted data before replacing a station key; all
+    /// frames using the previous key must have terminal TX completions.
+    pub async fn drain_transmits(&mut self) -> Result<(), &'static str> {
+        let deadline = narf_time::Deadline::after_ms(2000);
+        loop {
+            let activity = self.activity();
+            self.poll()?;
+            self.retire_transmits();
+            if self
+                .resources
+                .data
+                .iter()
+                .all(super::data_queue::DataQueue::is_idle)
+            {
+                return Ok(());
+            }
+            if deadline.expired() {
+                self.failed = true;
+                return Err("TX drain before key replacement timed out");
+            }
+            activity.await;
+        }
+    }
+
+    /// Discard RX MPDUs captured across a key replacement before resetting
+    /// host replay state. Other firmware notifications remain available.
+    pub fn discard_key_transition_rx(&mut self) -> Result<(), &'static str> {
+        for _ in 0..RX_DEPTH / 64 + 1 {
+            self.poll()?;
+            self.notifications
+                .retain(|p| p.header.group_id != 0 || p.header.cmd != 0xc1);
+            if !self.has_pending_rx() {
+                return Ok(());
+            }
+        }
+        self.failed = true;
+        Err("RX did not quiesce across key replacement")
+    }
+
     pub fn enqueue_transmit(
         &mut self,
         id: u16,
         frame: &[u8],
         header_len: usize,
-        rate: u32,
+        rate: Option<u32>,
     ) -> Result<(), &'static str> {
         if self.failed {
             return Err("Wi-Fi transport failed");
@@ -827,6 +909,32 @@ impl Hardware {
         Ok(())
     }
 
+    /// The caller owns the async device mutex, so no other submission or
+    /// completion waiter can consume this queue's newly available credit.
+    /// Polling here drains DMA even while the background RX task is excluded.
+    pub(super) async fn wait_tx_space(&mut self, id: u16) -> Result<(), &'static str> {
+        let deadline = narf_time::Deadline::after_ms(2000);
+        loop {
+            let activity = self.activity();
+            self.poll()?;
+            self.retire_transmits();
+            let queue = self
+                .resources
+                .data
+                .iter()
+                .find(|q| q.id() == Some(id))
+                .ok_or("unknown TX queue")?;
+            if queue.has_space() {
+                return Ok(());
+            }
+            if deadline.expired() {
+                self.failed = true;
+                return Err("TX queue credit timed out");
+            }
+            activity.await;
+        }
+    }
+
     /// Best-effort network packets do not have a waiting future. DMA
     /// has already been reclaimed by validated TX responses in poll().
     pub fn retire_transmits(&mut self) {
@@ -838,11 +946,9 @@ impl Hardware {
         id: u16,
         frame: &[u8],
         header_len: usize,
-        rate: u32,
+        rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        if self.failed {
-            return Err("Wi-Fi transport failed");
-        }
+        self.wait_tx_space(id).await?;
         let queue = self
             .resources
             .data
@@ -852,6 +958,7 @@ impl Hardware {
         let ssn = queue.send(&mut self.mmio, frame, header_len, rate)?;
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
+            let activity = self.activity();
             self.poll()?;
             if let Some(index) = self
                 .tx_completed
@@ -868,7 +975,7 @@ impl Hardware {
                 self.failed = true;
                 return Err("TX completion timed out");
             }
-            Self::sample_delay().await;
+            activity.await;
         }
     }
 
@@ -894,6 +1001,7 @@ impl Hardware {
             .retain(|packet| packet.header.sequence != sequence);
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
+            let activity = self.activity();
             self.poll()?;
             if let Some(index) = self
                 .responses
@@ -906,7 +1014,7 @@ impl Hardware {
                 self.failed = true; // pending DMA stays pinned until stop
                 return Err("firmware command timed out");
             }
-            Self::sample_delay().await;
+            activity.await;
         }
     }
 
@@ -918,6 +1026,7 @@ impl Hardware {
     ) -> Result<Packet, &'static str> {
         let deadline = narf_time::Deadline::after_ms(ms);
         loop {
+            let activity = self.activity();
             self.poll()?;
             if let Some(index) = self
                 .notifications
@@ -929,7 +1038,7 @@ impl Hardware {
             if deadline.expired() {
                 return Err("firmware notification timed out");
             }
-            Self::sample_delay().await;
+            activity.await;
         }
     }
 }
@@ -937,6 +1046,9 @@ impl Hardware {
 impl Drop for Hardware {
     fn drop(&mut self) {
         use super::regs::*;
+        if let Some(interrupts) = &mut self.interrupts {
+            interrupts.mask();
+        }
         // Disable host interrupts first, then wait for the device's DMA
         // engine to acknowledge stop before releasing any allocation.
         let stopped = if !self.armed {

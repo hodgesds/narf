@@ -102,6 +102,13 @@ Admin is deliberately separate from Rx/Tx: a stack daemon needs Rx+Tx but
 usually not Admin. `AdminHandle` binds the revocable authority to exactly one
 interface; every operation checks current cap validity before mutation.
 
+`stack::control_registered(&StackAttach)` validates the registered interface
+handle and daemon identity through `Cap::invoke`, returning an interface-bound
+`StackAttachReply` without changing frame routing. This supports a wireless
+control service alongside the existing IP stack. Its administrative handle
+retains both source grants and becomes unusable when either is revoked;
+creating it does not attach an XDP socket or consume interface frame rings.
+
 ### 3.4 Loopback
 
 A built-in `Loopback` implementation of the contract. Always

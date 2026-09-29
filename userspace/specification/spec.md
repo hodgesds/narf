@@ -34,9 +34,19 @@ the admin handle returned by stack attachment to a task's generic-netlink
 fd. This is an internal launcher API, not a Linux syscall accepting raw
 capability bytes. Kernel generic-netlink events reach only subscribers in
 the event's namespace and preserve their multicast group in packet info.
-Service-launch policy must explicitly call the delegation bridge after
-stack attachment; opening an ordinary `iw`/supplicant socket alone does
-not install authority. Automatic daemon launch/delegation is not wired.
+A wireless-only service obtains its reply with
+`net::stack::control_registered`, leaving IP frame delivery with the existing
+stack. `network_daemon::prepare(process, &StackAttachReply, TaskSpec)` installs
+that interface's explicit grant before making the loaded service runnable;
+`spawn` prepares and publishes in one call. The pending form lets the
+launcher install stdio/root/cwd before publishing. The service's ordinary
+route/generic `socket()` calls automatically receive the grant. Fork/clone
+inherit it (including supplicant daemonization), and exec retains it.
+Revocation and interface/namespace authorization are checked at delegation
+and every control request. A namespace move cannot transfer authority.
+Other tasks, including UID 0, acquire none. The caller remains responsible
+for selecting/loading the service executable and presenting stack authority;
+these APIs never infer a grant from a process name or UID.
 
 ```rust
 pub struct Process { /* cap table root, VM root, threads */ }

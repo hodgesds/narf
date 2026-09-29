@@ -40,6 +40,11 @@
 
 ## 3. Public interface
 
+`MsixTable::enable()` enables delivery and clears the function mask after
+entries and handlers are programmed. `unsafe MsixTable::disable()` masks
+the function and clears MSI-X enable; the owner must stop device causes
+and synchronize handlers before releasing their state or vector numbers.
+
 ### 3.1 Device descriptor
 
 ```rust

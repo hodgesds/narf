@@ -41,8 +41,8 @@ enum Operation {
     Scan(crate::ScanRequest),
     Connect {
         ssid: Vec<u8>,
-        bssid: [u8; 6],
-        channel: u32,
+        bssid: Option<[u8; 6]>,
+        channel: Option<u32>,
         pmk: Option<Zeroizing<[u8; 32]>>,
     },
     Disconnect,
@@ -140,17 +140,14 @@ fn parse_operation(command: u8, attrs: &[(u16, &[u8])], offload: bool) -> Result
             if ssids.len() > 16 || channels.len() > 68 {
                 return Err(EINVAL);
             }
-            // Empty SSID is the nl80211 wildcard. The underlying passive
-            // scanner uses an empty filter list for that same request.
-            let ssids = if ssids.iter().any(Vec::is_empty) {
-                Vec::new()
-            } else {
-                ssids
-            };
+            // Presence of at least one SSID (including the empty wildcard)
+            // requests active scanning. Preserve directed entries even when
+            // a wildcard is also present, for hidden-network discovery.
+            let active = !ssids.is_empty();
             Ok(Operation::Scan(crate::ScanRequest {
                 ssids,
                 channels,
-                active: false,
+                active,
             }))
         }
         CONNECT => {
@@ -173,11 +170,13 @@ fn parse_operation(command: u8, attrs: &[(u16, &[u8])], offload: bool) -> Result
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
             }
-            let bssid = attr(attrs, 6)
-                .ok_or(EINVAL)?
-                .try_into()
-                .map_err(|_| EINVAL)?;
-            let channel = channel(u32_attr(attrs, 38)?.ok_or(EINVAL)?)?;
+            let bssid: Option<[u8; 6]> = attr(attrs, 6)
+                .map(|raw| raw.try_into().map_err(|_| EINVAL))
+                .transpose()?;
+            if bssid.is_some_and(|b| b[0] & 1 != 0 || b == [0; 6]) {
+                return Err(EINVAL);
+            }
+            let channel = u32_attr(attrs, 38)?.map(channel).transpose()?;
             if u32_attr(attrs, 53)?.is_some_and(|auth| auth != 0) {
                 return Err(EOPNOTSUPP);
             }
@@ -340,28 +339,78 @@ async fn execute(
             channel,
             pmk,
         } => {
-            let security = pmk
-                .as_ref()
-                .map(|key| crate::SecurityConfig::Wpa2 { psk: **key })
-                .unwrap_or(crate::SecurityConfig::Open);
-            let result = if live {
+            let mut selected = None;
+            let result = async {
+                if !live {
+                    return Err(crate::WirelessError::Denied);
+                }
+                selected = {
+                    let cache = CACHE.lock();
+                    let results = cache
+                        .iter()
+                        .find(|c| c.name == iface.name() && c.namespace == ns);
+                    results.and_then(|c| {
+                        select_bss(
+                            c.results.iter().map(|(b, _)| b),
+                            &ssid,
+                            bssid,
+                            channel,
+                            pmk.is_some(),
+                        )
+                    })
+                };
+                if selected.is_none() {
+                    let mut results = iface
+                        .scan(crate::ScanRequest {
+                            ssids: alloc::vec![ssid.clone()],
+                            channels: channel.into_iter().collect(),
+                            active: true,
+                        })
+                        .await?;
+                    results.truncate(256);
+                    selected = select_bss(results.iter(), &ssid, bssid, channel, pmk.is_some());
+                    if !authorized(&admin, iface.as_ref(), ns) {
+                        return Err(crate::WirelessError::Denied);
+                    }
+                    let entries = results
+                        .into_iter()
+                        .map(|bss| {
+                            let ies = iface
+                                .scan_information_elements(bss.bssid)
+                                .unwrap_or_default();
+                            (bss, ies)
+                        })
+                        .collect();
+                    if let Some(cache) = CACHE.lock().iter_mut().find(|c| c.name == iface.name()) {
+                        cache.results = entries;
+                    }
+                }
+                let bss = selected.as_ref().ok_or(crate::WirelessError::InvalidArgs)?;
+                if !authorized(&admin, iface.as_ref(), ns) {
+                    return Err(crate::WirelessError::Denied);
+                }
+                let security = pmk
+                    .as_ref()
+                    .map(|key| crate::SecurityConfig::Wpa2 { psk: **key })
+                    .unwrap_or(crate::SecurityConfig::Open);
                 iface
                     .associate(crate::AssociateRequest {
                         ssid,
-                        bssid,
-                        channel,
+                        bssid: bss.bssid,
+                        channel: bss.channel,
                         security,
                     })
                     .await
-            } else {
-                Err(crate::WirelessError::HardwareError)
-            };
+            }
+            .await;
             let still_live = authorized(&admin, iface.as_ref(), ns);
             if result.is_ok() && !still_live {
                 let _ = iface.disassociate().await;
             }
             let status: u16 = if result.is_ok() && still_live { 0 } else { 1 };
-            push_attr(&mut attrs, 6, &bssid);
+            if let Some(address) = selected.map(|b| b.bssid).or(bssid) {
+                push_attr(&mut attrs, 6, &address);
+            }
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
             (CONNECT, 19)
         }
@@ -381,6 +430,28 @@ async fn execute(
     if super::in_namespace(iface.as_ref(), ns) {
         publish_event(NL80211_FAMILY_ID, group, ns, GenlReply { command, attrs });
     }
+}
+
+fn select_bss<'a>(
+    results: impl Iterator<Item = &'a crate::BssInfo>,
+    ssid: &[u8],
+    bssid: Option<[u8; 6]>,
+    channel: Option<u32>,
+    secured: bool,
+) -> Option<crate::BssInfo> {
+    results
+        .filter(|b| {
+            b.ssid == ssid
+                && bssid.is_none_or(|address| address == b.bssid)
+                && channel.is_none_or(|ch| ch == b.channel)
+                && if secured {
+                    matches!(b.security, crate::scan::BssSecurity::Wpa2)
+                } else {
+                    matches!(b.security, crate::scan::BssSecurity::Open)
+                }
+        })
+        .max_by_key(|b| b.rssi)
+        .cloned()
 }
 
 fn scan_reply(index: u32, bss: &crate::BssInfo, information_elements: &[u8]) -> GenlReply {

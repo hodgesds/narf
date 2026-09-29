@@ -63,6 +63,14 @@ impl DataQueue {
         Ok(id)
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.read == self.write
+    }
+
+    pub fn has_space(&self) -> bool {
+        (self.write.wrapping_sub(self.read) as usize) < DEPTH - 1
+    }
+
     pub fn id(&self) -> Option<u16> {
         self.id
     }
@@ -72,7 +80,7 @@ impl DataQueue {
         mmio: &mut impl IwlMmio,
         frame: &[u8],
         header_len: usize,
-        rate: u32,
+        rate: Option<u32>,
     ) -> Result<u16, &'static str> {
         let id = self.id.ok_or("TX queue not activated")?;
         if frame.len() < header_len
@@ -82,7 +90,7 @@ impl DataQueue {
         {
             return Err("invalid TX frame geometry");
         }
-        if self.write.wrapping_sub(self.read) as usize >= DEPTH - 1 {
+        if !self.has_space() {
             return Err("TX queue full");
         }
         let slot = self.write as usize & (DEPTH - 1);
@@ -98,13 +106,14 @@ impl DataQueue {
         put16(&mut bytes, 4, frame.len() as u16);
         // Protected frames use the station's firmware CCMP key. The
         // firmware inserts IV/MIC and advances its TX packet number.
-        put16(&mut bytes, 6, if frame[1] & 0x40 != 0 { 1 } else { 3 });
+        let flags = u16::from(rate.is_some()) | if frame[1] & 0x40 != 0 { 0 } else { 2 };
+        put16(&mut bytes, 6, flags);
         put32(
             &mut bytes,
             8,
             ((header_len / 2) as u32) << 8 | if padding != 0 { 1 << 13 } else { 0 },
         );
-        put32(&mut bytes, 20, rate);
+        put32(&mut bytes, 20, rate.unwrap_or(0));
         bytes[32..32 + header_len].copy_from_slice(&frame[..header_len]);
         bytes[32 + header_len + padding..].copy_from_slice(&frame[header_len..]);
         let dma = dma_alloc(bytes.len())?;
@@ -163,4 +172,89 @@ impl DataQueue {
         self.read = ssn;
         Ok((ssn, response[40] == 1))
     }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    struct Mmio;
+    impl IwlMmio for Mmio {
+        fn read(&mut self, _: u32) -> u32 {
+            0
+        }
+        fn write(&mut self, _: u32, _: u32) {}
+    }
+    fn smoke_tx_adaptive_rate_and_qos_padding() -> TestResult {
+        let mut q = DataQueue::new().unwrap();
+        q.activate(&[17, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mut frame = [0; 40];
+        frame[0] = 0x88;
+        frame[1] = 0x41;
+        frame[24] = 6;
+        frame[26..].fill(0x55);
+        q.send(&mut Mmio, &frame, 26, None).unwrap();
+        let dma = q.pending[0].as_ref().unwrap().as_slice();
+        if dma[6..8] != [0, 0]
+            || dma[20..24] != [0; 4]
+            || dma[8..12] != (13u32 << 8 | 1 << 13).to_le_bytes()
+            || dma[56..60] != [6, 0, 0, 0]
+            || dma[60..74] != [0x55; 14]
+        {
+            return TestResult::Fail("adaptive encrypted QoS command flags/TB padding");
+        }
+        frame[1] = 1;
+        q.send(&mut Mmio, &frame, 26, Some(0x4100)).unwrap();
+        let dma = q.pending[1].as_ref().unwrap().as_slice();
+        if dma[6..8] != [3, 0] || dma[20..24] != 0x4100u32.to_le_bytes() {
+            return TestResult::Fail("fixed-rate plaintext management flags");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/runtime",
+        smoke_tx_adaptive_rate_and_qos_padding
+    );
+
+    fn smoke_tx_credit_requires_valid_completion_across_wrap() -> TestResult {
+        let mut q = DataQueue::new().unwrap();
+        q.activate(&[17, 0, 0, 0, 0xfe, 0xff, 0, 0]).unwrap();
+        for _ in 0..DEPTH - 1 {
+            q.send(&mut Mmio, &[0; 24], 24, None).unwrap();
+        }
+        let write = q.write;
+        if q.has_space()
+            || q.send(&mut Mmio, &[0; 24], 24, None).is_ok()
+            || q.write != write
+            || q.pending.iter().flatten().count() != DEPTH - 1
+        {
+            return TestResult::Fail("full TX ring lost ownership or accepted more DMA");
+        }
+        let mut response = [0; 48];
+        response[0] = 1;
+        put16(&mut response, 36, 17);
+        response[40] = 1;
+        // A forged completion skipping the oldest slot cannot create credit.
+        if q.complete(&response).is_ok() || q.has_space() {
+            return TestResult::Fail("invalid completion created TX credit");
+        }
+        put32(&mut response, 44, 0xffff);
+        if q.complete(&response) != Ok((0xffff, true)) || !q.has_space() {
+            return TestResult::Fail("valid completion did not wake TX credit");
+        }
+        q.send(&mut Mmio, &[0; 24], 24, None).unwrap();
+        put32(&mut response, 44, 0);
+        if q.complete(&response) != Ok((0, true)) || !q.has_space() {
+            return TestResult::Fail("wrapped completion lost TX credit");
+        }
+        q.send(&mut Mmio, &[0; 24], 24, None).unwrap();
+        if q.has_space() || q.pending.iter().flatten().count() != DEPTH - 1 {
+            return TestResult::Fail("TX credit was consumed more than once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/runtime",
+        smoke_tx_credit_requires_valid_completion_across_wrap
+    );
 }

@@ -276,3 +276,201 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/protocol",
     smoke_frame_transmit_address_mapping
 );
+
+fn smoke_active_scan_segments_and_channel_permissions() -> TestResult {
+    let local = [2, 1, 2, 3, 4, 5];
+    for (version, capacity) in [(14, 67), (17, 67), (18, 68)] {
+        let ssids = vec![b"hidden".to_vec(), Vec::new()];
+        let command = scan_api::active(
+            version,
+            7,
+            &[1, 36, 52],
+            &[true, true, false],
+            local,
+            &ssids,
+        )
+        .unwrap();
+        let probe = 48 + capacity * 8 + 12;
+        let data = probe + 20;
+        if command[8..10] != [2, 0]
+            || command[48..52] != ((1u32 << 30) | 3).to_le_bytes()
+            || command[56..60] != 3u32.to_le_bytes()
+            || command[64..68] != [0; 4]
+            || command[probe..probe + 4] != [0, 0, 26, 0]
+            || command[data..data + 2] != [0x40, 0]
+            || command[data + 4..data + 10] != [0xff; 6]
+            || command[data + 10..data + 16] != local
+            || command[data + 16..data + 22] != [0xff; 6]
+            || command[data + 24..data + 26] != [0, 0]
+            || command[probe + 536..probe + 544] != *b"\0\x06hidden"
+        {
+            return TestResult::Fail("active scan firmware layout or passive-channel isolation");
+        }
+        let passive = scan_api::active(version, 7, &[52], &[false], local, &ssids).unwrap();
+        if passive != scan_api::passive(version, 7, &[52]).unwrap() {
+            return TestResult::Fail("denied active scan emitted a probe");
+        }
+    }
+    if scan_api::active(18, 0, &[1], &[true], local, &[vec![0; 33]]).is_ok()
+        || scan_api::active(18, 0, &[1], &[], local, &[]).is_ok()
+    {
+        return TestResult::Fail("invalid probe request accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_active_scan_segments_and_channel_permissions
+);
+
+fn smoke_probe_regulatory_intersection() -> TestResult {
+    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    let mut domain = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 5170,
+            freq_end_mhz: 5330,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 17,
+            flags: RegFlags::empty(),
+        }],
+    };
+    let mut flags = vec![0; 51];
+    let i = station_api::channel_index(36).unwrap();
+    flags[i] = 13; // VALID + 20MHz activity + ACTIVE
+    if connection::channel_power(&domain, 36, &flags, true) != Some(17) {
+        return TestResult::Fail("authorized probe channel denied");
+    }
+    flags[i] = 5; // association allowed, initiating a probe is not
+    if connection::channel_power(&domain, 36, &flags, true).is_some()
+        || connection::channel_power(&domain, 36, &flags, false) != Some(17)
+    {
+        return TestResult::Fail("active scan ignored MCC ACTIVE restriction");
+    }
+    flags[i] = 13 | 16;
+    if connection::channel_power(&domain, 36, &flags, true).is_some() {
+        return TestResult::Fail("probe on firmware DFS channel");
+    }
+    flags[i] = 13;
+    domain.rules[0].flags = RegFlags::DFS;
+    if connection::channel_power(&domain, 36, &flags, true).is_some() {
+        return TestResult::Fail("probe on host DFS channel");
+    }
+    domain.rules[0].flags = RegFlags::empty();
+    let mut lower = domain.rules[0].clone();
+    lower.max_power_dbm = 9;
+    domain.rules.push(lower);
+    if connection::channel_power(&domain, 36, &flags, true) != Some(9)
+        || connection::channel_power(&domain, 1, &flags, true).is_some()
+    {
+        return TestResult::Fail("host channel/power intersection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_probe_regulatory_intersection
+);
+
+fn smoke_wmm_edca_and_admission_control() -> TestResult {
+    // Hostapd-style WMM parameters in wire ACI order BE, BK, VI, VO.
+    let mut ie = vec![
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0, 0, 0x03, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94,
+        0, 0x62, 0x32, 47, 0,
+    ];
+    let mut qos = qos::Parameters::parse(&ie).unwrap().unwrap();
+    let mut link = station_api::link(2, [2; 6], true, 36, 100, 1);
+    qos.apply(&mut link);
+    if link[56..60] != 1u32.to_le_bytes()
+        || link[60..68] != [15, 0, 255, 3, 7, 0, 0, 0]
+        || link[76..84] != [7, 0, 15, 0, 2, 0, 0xc0, 0xb]
+        || link[84..92] != [3, 0, 7, 0, 2, 0, 0xe0, 5]
+    {
+        return TestResult::Fail("WMM ACI to firmware AC or TXOP units mismatch");
+    }
+    let mut ethernet = vec![0; 54];
+    ethernet[12..14].copy_from_slice(&[8, 0]);
+    ethernet[14] = 0x45;
+    for (dscp, ac) in [(0, 1), (8, 0), (34, 2), (46, 3)] {
+        ethernet[15] = dscp << 2;
+        if qos.classify(&ethernet) != Some(ac) {
+            return TestResult::Fail("IPv4 DSCP classification");
+        }
+    }
+    qos.ac[3].admission = true;
+    if qos.classify(&ethernet) != Some(2) {
+        return TestResult::Fail("ACM bypassed instead of downgraded");
+    }
+    ethernet[12..14].copy_from_slice(&[0x86, 0xdd]);
+    ethernet[14] = 0x6b;
+    ethernet[15] = 0x80; // IPv6 EF traffic class
+    if qos.classify(&ethernet) != Some(2) {
+        return TestResult::Fail("IPv6 DSCP classification");
+    }
+    for ac in &mut qos.ac {
+        ac.admission = true;
+    }
+    if qos.classify(&ethernet).is_some() {
+        return TestResult::Fail("all ACM categories admitted");
+    }
+    ie[14] = 3; // duplicate BE, missing BK
+    if qos::Parameters::parse(&ie).is_ok() {
+        return TestResult::Fail("duplicate WMM ACI accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_wmm_edca_and_admission_control
+);
+
+fn smoke_qos_transmit_header_and_tid() -> TestResult {
+    let local = [2, 1, 2, 3, 4, 5];
+    let ap = [2, 6, 7, 8, 9, 10];
+    let mut ethernet = vec![0; 18];
+    ethernet[..6].fill(0xff);
+    ethernet[6..12].copy_from_slice(&local);
+    ethernet[12..].copy_from_slice(&[8, 0, 1, 2, 3, 4]);
+    for tid in qos::TIDS {
+        let frame = frame_api::transmit_qos(local, ap, 3, &ethernet, true, tid).unwrap();
+        if frame[..2] != [0x88, 0x41]
+            || frame[24..26] != [tid, 0]
+            || frame[26..] != [0xaa, 0xaa, 3, 0, 0, 0, 8, 0, 1, 2, 3, 4]
+        {
+            return TestResult::Fail("QoS MAC header/LLC geometry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_qos_transmit_header_and_tid
+);
+
+fn smoke_negotiated_legacy_rates_and_tlc() -> TestResult {
+    // OFDM-only 2.4GHz BSS: management must not use the old fixed 1M CCK.
+    let rates = rates::Rates::parse(&[1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108], 6).unwrap();
+    if rates.supported != 0xff0 || rates.basic != 0x150 || rates.management_rate(1) != 0x4100 {
+        return TestResult::Fail("AP basic/supported rate intersection");
+    }
+    let command = rates.tlc(6, 3).unwrap();
+    if command[..4] != [1, 0, 0, 0]
+        || command[8..12] != [0, 0, 3, 0]
+        || command[14..16] != [0xf0, 0xf]
+        || command[16..40] != [0; 24]
+        || command[40..44] != [0xff, 0xf, 0, 0]
+    {
+        return TestResult::Fail("TLC v6 station/rate/MPDU configuration");
+    }
+    if rates::Rates::parse(&[1, 1, 0xff], 6).is_ok()
+        || rates::Rates::parse(&[1, 1, 0x82], 36).is_ok()
+        || rates::Rates::parse(&[1, 2, 0x8c], 36).is_ok()
+    {
+        return TestResult::Fail("unsupported required PHY/band or truncated rates accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_negotiated_legacy_rates_and_tlc
+);

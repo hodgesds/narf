@@ -76,7 +76,7 @@ fn smoke_nl80211_attribute_and_security_validation() -> TestResult {
     if !matches!(
         parse_operation(CONNECT, &attributes(&bytes).unwrap(), true),
         Ok(Operation::Connect {
-            channel: 36,
+            channel: Some(36),
             pmk: None,
             ..
         })
@@ -213,4 +213,68 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
 kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_authority_and_scan_completion
+);
+
+fn smoke_nl80211_active_scan_and_ssid_connect() -> TestResult {
+    let mut ssids = Vec::new();
+    push_attr(&mut ssids, 1, &[]);
+    push_attr(&mut ssids, 2, b"hidden");
+    let mut request = Vec::new();
+    push_attr(&mut request, 45 | NLA_F_NESTED, &ssids);
+    match parse_operation(SCAN, &attributes(&request).unwrap(), true).unwrap() {
+        Operation::Scan(req)
+            if req.active && req.ssids == alloc::vec![Vec::new(), b"hidden".to_vec()] => {}
+        _ => return TestResult::Fail("active wildcard/directed scan request lost"),
+    }
+    if !matches!(
+        parse_operation(SCAN, &[], true),
+        Ok(Operation::Scan(crate::ScanRequest { active: false, .. }))
+    ) {
+        return TestResult::Fail("passive scan became active");
+    }
+    request.clear();
+    push_attr(&mut request, 52, b"home");
+    if !matches!(
+        parse_operation(CONNECT, &attributes(&request).unwrap(), true),
+        Ok(Operation::Connect {
+            bssid: None,
+            channel: None,
+            ..
+        })
+    ) {
+        return TestResult::Fail("SSID-only Linux connect rejected");
+    }
+    let weak = crate::BssInfo {
+        bssid: [2; 6],
+        ssid: b"home".to_vec(),
+        channel: 1,
+        rssi: -80,
+        security: crate::scan::BssSecurity::Wpa2,
+    };
+    let mut strong = weak.clone();
+    strong.bssid = [4; 6];
+    strong.channel = 36;
+    strong.rssi = -40;
+    let mut open = strong.clone();
+    open.bssid = [6; 6];
+    open.rssi = -10;
+    open.security = crate::scan::BssSecurity::Open;
+    let list = [weak, strong, open];
+    if select_bss(list.iter(), b"home", None, None, true)
+        .unwrap()
+        .bssid
+        != [4; 6]
+        || select_bss(list.iter(), b"home", None, Some(1), true)
+            .unwrap()
+            .bssid
+            != [2; 6]
+        || select_bss(list.iter(), b"home", Some([6; 6]), None, true).is_some()
+    {
+        return TestResult::Fail("connect selection ignored security/BSSID/channel filters");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_active_scan_and_ssid_connect
 );

@@ -3,7 +3,7 @@
 //! Retransmissions return cached replies without reinstalling keys.
 
 use super::{handshake, rekey, wpa};
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use narf_wireless::eapol::*;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -146,6 +146,56 @@ mod tests {
         "drivers/wireless/iwlwifi/security",
         smoke_wpa2_higher_counter_retransmit_no_reinstall
     );
+    fn smoke_wpa2_pairwise_rekey_preserves_active_key_until_mic() -> TestResult {
+        let (mut session, m1, m3) = fixture();
+        session.process(&m1).unwrap();
+        session.process(&m3).unwrap();
+        let old_key = session.ptk.as_ref().unwrap().tk.clone();
+        let rekey1 = hex("0203005f02008a0010000000000000000355555555555555555555555555555555555555555555555555555555555555550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        let rekey3 = hex("020300970213ca00100000000000000004555555555555555555555555555555555555555555555555555555555555555500000000000000000000000000000000000000000000000000000000000000000de565ea6423eacef8a8be83dcfcb76100383d3479c5595f9bb85a430c70134b111b0d4cc49b0d9a98319e6561431ffdb340922b32e3e0be2db08738d74ea6f4a5ebf58be766a01c9765");
+        let m2 = session.process_with_nonce(&rekey1, || [0x66; 32]).unwrap();
+        if m2.keys.is_some() || !session.complete() || session.ptk.as_ref().unwrap().tk != old_key {
+            return TestResult::Fail("unauthenticated rekey M1 replaced the active PTK");
+        }
+        let retry = session
+            .process_with_nonce(&rekey1, || panic!("duplicate M1 regenerated SNonce"))
+            .unwrap();
+        if retry.bytes != m2.bytes || retry.keys.is_some() {
+            return TestResult::Fail("M1 retry changed M2/key");
+        }
+        let mut bad = rekey3.clone();
+        bad[81] ^= 1;
+        if session.process(&bad).is_ok()
+            || session.ptk.as_ref().unwrap().tk != old_key
+            || session.replay != 2
+        {
+            return TestResult::Fail("bad rekey MIC changed active PTK/replay");
+        }
+        let m4 = session.process(&rekey3).unwrap();
+        if m4.keys.as_ref().unwrap().pairwise.unwrap().as_slice()
+            != hex("fbf6cf6105dcc23f7ef544dcb168dbb4")
+            || session.pending_rekey.is_some()
+            || session.replay != 4
+            || !session.complete()
+        {
+            return TestResult::Fail("independent pairwise rekey vector mismatch");
+        }
+        let duplicate = session.process(&rekey3).unwrap();
+        if duplicate.keys.is_some()
+            || duplicate.bytes != m4.bytes
+            || session.process(&m3).is_ok()
+            || session
+                .process_with_nonce(&rekey1, || panic!("old M1 reused nonce"))
+                .is_ok()
+        {
+            return TestResult::Fail("rekey retransmission reinstalled or accepted old PTK");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_wpa2_pairwise_rekey_preserves_active_key_until_mic
+    );
 }
 
 pub struct Session {
@@ -161,6 +211,7 @@ pub struct Session {
     last_response: Vec<u8>,
     initial_key_data: Vec<u8>,
     complete: bool,
+    pending_rekey: Option<Box<Session>>,
 }
 
 impl core::fmt::Debug for Session {
@@ -204,6 +255,7 @@ impl Session {
             last_response: Vec::new(),
             initial_key_data: Vec::new(),
             complete: false,
+            pending_rekey: None,
         }
     }
 
@@ -212,6 +264,73 @@ impl Session {
     }
 
     pub fn process(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
+        self.process_with_nonce(pdu, || {
+            let mut nonce = [0; 32];
+            narf_crypto::fill_random_bytes(&mut nonce);
+            nonce
+        })
+    }
+
+    // The old PTK remains active while the unauthenticated M1 is pending.
+    // Commit only after a valid M3 MIC/RSN/wrapped-key check using fresh SNonce.
+    fn process_with_nonce(
+        &mut self,
+        pdu: &[u8],
+        nonce: impl FnOnce() -> [u8; 32],
+    ) -> Result<Response, &'static str> {
+        if self.complete
+            && pdu.len() >= 99
+            && matches!(pdu[0], 1 | 2)
+            && pdu[1] == 3
+            && u16::from_be_bytes([pdu[2], pdu[3]]) as usize == pdu.len() - 4
+        {
+            let key = KeyFrame::decode(&pdu[4..], 16).ok_or("invalid EAPOL key")?;
+            if key.key_information == (KI_VERSION_HMAC_SHA1_AES | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE)
+            {
+                if let Some(pending) = &mut self.pending_rekey {
+                    if pdu == pending.last_request {
+                        return pending.process_inner(pdu);
+                    }
+                }
+                if key.replay_counter <= self.replay
+                    || key.key_nonce == self.anonce
+                    || key.key_nonce == [0; 32]
+                {
+                    return Err("stale pairwise rekey challenge");
+                }
+                let mut candidate = Box::new(Session::new(
+                    self.pmk,
+                    self.ap,
+                    self.local,
+                    nonce(),
+                    self.ap_rsn.clone(),
+                ));
+                let reply = candidate.process_inner(pdu)?;
+                self.pending_rekey = Some(candidate);
+                return Ok(reply);
+            }
+            if key.pairwise()
+                && self
+                    .pending_rekey
+                    .as_ref()
+                    .is_some_and(|p| p.anonce == key.key_nonce)
+            {
+                if key.replay_counter <= self.replay {
+                    return Err("stale rekey completion");
+                }
+                let pending = self.pending_rekey.as_mut().unwrap();
+                let response = pending.process_inner(pdu)?;
+                if pending.complete {
+                    let replacement = self.pending_rekey.take().unwrap();
+                    *self = *replacement; // Drop zeroizes the previous PTK.
+                }
+                return Ok(response);
+            }
+        }
+        self.process_inner(pdu)
+    }
+
+    fn process_inner(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
         if pdu.len() < 99
             || !matches!(pdu[0], 1 | 2)
             || pdu[1] != 3

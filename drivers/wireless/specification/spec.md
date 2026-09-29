@@ -79,14 +79,23 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
 - `get_wireless_info()` reports the real hardware MAC and NVM-enabled
   2.4/5 GHz channels, station mode, and legacy rates. HT/VHT/HE/EHT are
   not advertised by this station implementation.
-- `scan()` runs a bounded passive scan, applies SSID/channel filters,
+- `scan()` runs bounded passive or active scans, applies SSID/channel filters,
   and retains at most 256 BSS records. Association selects a matching
-  cached BSSID/SSID/channel. Active probe transmission and hidden-SSID
-  discovery are not implemented; `active` currently uses passive scanning.
+  cached BSSID/SSID/channel. Active scans emit wildcard or up to 20 directed
+  probes, allowing hidden-SSID discovery. Only channels permitted for active
+  transmission by both the signed host policy and firmware MCC receive a
+  probe bitmap; DFS and disallowed channels remain passive. The lowest
+  applicable power limit is programmed before scanning. Without a host
+  policy all channels remain passive.
 - `associate()` configures a 20 MHz PHY/link/peer, allocates management
-  and data queues, authenticates, and associates. It supports Open and
-  WPA2-PSK with CCMP-128; WPA3, WEP, TKIP and required management-frame
-  protection are unsupported. A configured host regulatory domain and
+  and data queues, authenticates, and associates. Supported/basic rates are
+  intersected with the AP; mandatory unsupported PHY/rate selectors are
+  rejected. TLC v6 adapts data rates within that intersection. WMM negotiation
+  enables BK/BE/VI/VO hardware queues with AP EDCA parameters and QoS headers.
+  DSCP classifies kernel traffic; explicit AC rings preserve daemon priorities.
+  Categories requiring admission control downgrade to an admitted category.
+  Association supports Open and WPA2-PSK with CCMP-128; WPA3, WEP, TKIP and
+  required management-frame protection are unsupported. A configured host regulatory domain and
   firmware MCC permission are required before transmission. The selected
   rule's power ceiling is applied through the firmware power command.
 - WPA2 authenticates the original EAPOL PDU before changing key/replay
@@ -94,8 +103,11 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
   messages cannot reinstall keys, and repeated GTK material cannot reset
   RX counters. RX checks MIC status and per-TID packet numbers before
   delivering plaintext Ethernet. The controlled port opens only after
-  key installation and message-4 TX completion. Group rekey is supported;
-  a fresh pairwise handshake requires reconnecting.
+  key installation and message-4 TX completion. Group and pairwise rekey are
+  supported. A new pairwise challenge uses a fresh SNonce and keeps the active
+  PTK until authenticated M3 succeeds. Key replacement drains TX and discards
+  RX captured across the transition before
+  resetting replay state. Identical key material is never reinstalled.
 - `disassociate()` closes the port, removes TX queues and the peer,
   deactivates/detaches the link, and removes the PHY. Cancellation or a
   transport error leaves the interface down; the next scan/associate
@@ -108,9 +120,19 @@ The best-effort Ethernet path is registered with both the capability frame
 registry and the kernel interface registry. It converts Ethernet and
 unfragmented, nonaggregated 802.11 frames. Synchronous network waits can
 drain RX without polling the executor recursively. Background work uses an
-async mutex and scheduler timers; it does not hold an IRQ-safe lock across
-an await. Interrupt-driven operation, four AC queues, rate adaptation,
-aggregation, 6 GHz, roaming, and suspend/resume remain outside this profile.
+async mutex and MSI-X completion waits with bounded watchdog timers; it does
+not hold an IRQ-safe lock across an await. RX queue 0 and non-RX causes use
+separate MSI-X table entries sharing one owned host vector. The hard IRQ
+acknowledges/rearms and latches error causes; the task drains DMA. Waits
+snapshot the IRQ count before reading completions, including command waits
+that own the async mutex. Each of the four TX tasks waits on its Ethernet
+ring's waker and retains accepted frames while waiting for hardware queue
+credit. Credit waits drain DMA under the async mutex and fail the transport
+after a bounded timeout; only validated completions release descriptors.
+Shutdown masks device and PCI delivery and synchronizes handlers
+before releasing their cookie/vector; restart restores IVAR/UMAC routing.
+Aggregation, HT/VHT/HE/EHT, 6 GHz, roaming, and suspend/resume remain outside
+this station profile (advanced PHY/offloads are assigned to Stage 6).
 
 ### 3.2 DMA lifetime and completion contract
 
@@ -134,8 +156,11 @@ the target Intel radio: successful DMA, RF operation, AP association and
 IP traffic on BE211 still require silicon validation. The existing Gen2
 probe is separate and does not inherit the MLD station implementation.
 
-Validation on 2026-09-29: full QEMU suites returned 8,891 pass / 0 fail /
-79 skip on x86_64 and 6,715 pass / 0 fail / 40 skip on aarch64. Both
+Validation on 2026-09-29: full QEMU suites returned 8,905 pass / 0 fail /
+79 skip on x86_64 and 6,725 pass / 0 fail / 40 skip on aarch64. After the
+final SSID-connect and TX-credit changes, focused wireless/control suites
+returned 522 pass / 0 fail / 7 skip on x86_64 and 231 pass / 0 fail / 0 skip
+on aarch64. Both
 production boot smokes and btrfs interoperability postflights passed, as
 did debug/release builds on both architectures. The host xtask suite
 passed all 66 tests; trusted-key build-parser tests passed both cases.
@@ -152,7 +177,12 @@ The implemented high-level control trait is `narf_wireless::WirelessNetIface`.
 The `nl80211` family bridges explicitly delegated scan/connect/disconnect
 requests to this trait and publishes asynchronous completion events.
 Probe can load a signed `wireless-regulatory.bin` deployment policy via the
-firmware registry (wire format in `wireless/` §3.5). Actual userspace-tool
+firmware registry (wire format in `wireless/` §3.5). A trusted service launcher
+uses `net::stack::control_registered` with its interface/daemon capabilities,
+then `userspace::network_daemon::prepare` (or
+`spawn`) with the loaded executable. This grants the service's ordinary
+netlink sockets without attaching the L3 frame path to XDP. Executable
+selection and boot service policy belong to the launcher. Actual supplicant
 interoperability, provisioned policy and target hardware still require an
 end-to-end integration run.
 

@@ -58,6 +58,8 @@ pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
 pub mod pnvm;
+pub mod qos;
+pub mod rates;
 pub mod regs;
 pub mod rekey;
 pub mod runtime;

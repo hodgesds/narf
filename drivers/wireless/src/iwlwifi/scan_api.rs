@@ -53,6 +53,68 @@ pub fn passive(version: u8, uid: u32, channels: &[u8]) -> Result<Vec<u8>, &'stat
     Ok(out)
 }
 
+/// Directed/wildcard probes only on channels authorized by both the signed
+/// host policy and the firmware MCC response. A zero SSID bitmap leaves an
+/// individual channel passive. Layout is SCAN_PROBE_PARAMS_API_S_VER_4.
+pub fn active(
+    version: u8,
+    uid: u32,
+    channels: &[u8],
+    permitted: &[bool],
+    local: [u8; 6],
+    ssids: &[Vec<u8>],
+) -> Result<Vec<u8>, &'static str> {
+    if permitted.len() != channels.len()
+        || ssids.len() > 20
+        || ssids.iter().any(|s| s.len() > 32)
+        || local[0] & 1 != 0
+        || local == [0; 6]
+    {
+        return Err("invalid active scan request");
+    }
+    let mut out = passive(version, uid, channels)?;
+    if !permitted.iter().any(|&allowed| allowed) {
+        return Ok(out);
+    }
+    put16(&mut out, 8, 1 << 1); // PASS_ALL, without FORCE_PASSIVE
+    out[12..14].fill(30);
+    let count = ssids.len().max(1); // empty list means a wildcard probe
+    let bitmap = (1u32 << count) - 1;
+    for (i, &allowed) in permitted.iter().enumerate() {
+        if allowed {
+            let offset = 48 + i * 8;
+            let flags = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            put32(&mut out, offset, flags | bitmap);
+        }
+    }
+    let capacity = if version == 18 { 68 } else { 67 };
+    let probe = 48 + capacity * 8 + 12;
+    let data = probe + 20; // five offset/length segment descriptors
+    let mut header = super::frame_api::management(0x40, local, [0xff; 6], 0, &[0, 0]);
+    header[1] = 0;
+    out[data..data + header.len()].copy_from_slice(&header);
+    put16(&mut out, probe + 2, header.len() as u16);
+    let rates24 = [
+        1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108,
+    ];
+    let rates5 = [1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108];
+    let mut offset = header.len();
+    for (segment, bytes) in [(4, rates24.as_slice()), (8, rates5.as_slice())] {
+        put16(&mut out, probe + segment, offset as u16);
+        put16(&mut out, probe + segment + 2, bytes.len() as u16);
+        out[data + offset..data + offset + bytes.len()].copy_from_slice(bytes);
+        offset += bytes.len();
+    }
+    // 6 GHz/common segments stay empty. Firmware substitutes each
+    // selected direct_scan SSID into the wildcard IE in the MAC segment.
+    for (i, ssid) in ssids.iter().enumerate() {
+        let entry = probe + 536 + i * 34;
+        out[entry + 1] = ssid.len() as u8;
+        out[entry + 2..entry + 2 + ssid.len()].copy_from_slice(ssid);
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub struct Mpdu<'a> {
     pub frame: &'a [u8],

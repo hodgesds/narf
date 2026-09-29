@@ -74,6 +74,20 @@ pub struct WirelessIfaceInfo {
 }
 ```
 
+`WirelessNetIface::tx_ring_for_ac(AccessCategory)` exposes separate Ethernet
+producers for Background, BestEffort, Video and Voice. The default implementation
+returns the ordinary `Interface::tx_ring()` for drivers with one queue.
+The iwlwifi MLD implementation owns four Narf-Rings, each with an async TX
+consumer and its negotiated hardware queue. AP admission control may downgrade
+a class; non-WMM links use the best-effort hardware queue. The generic network
+interface's `tx_ring()` remains the BestEffort ring.
+
+For nl80211 scans, a nonempty nested SSID list requests active scanning;
+empty SSID entries are wildcard probes and can coexist with directed SSIDs.
+`CONNECT` accepts an SSID with optional BSSID/frequency constraints. It selects
+the strongest matching Open/WPA2 BSS from the cache, or performs a bounded
+scan first, rechecking delegated authority before association.
+
 ### 3.2 Wireless Capabilities
 
 ```rust
