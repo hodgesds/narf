@@ -369,12 +369,38 @@ impl FileOps for DriCardFile {
     ///
     /// `offset` is the value returned by DRM_IOCTL_MODE_MAP_DUMB
     /// (`gem_handle << 12`). `len` must be ≤ the buffer's allocation.
+    ///
+    /// A Linux primary-node `drm_file` has ONE mmap-offset namespace: the
+    /// fake offset a VIRTGPU_MAP hands out is mmap'd on the same card fd.
+    /// Mesa's GBM/EGL stack runs its whole virgl winsys on `card0` (it
+    /// never switches to the render node when the caller handed it a
+    /// card fd), so a dumb-table miss must fall through to this open's
+    /// virtio-gpu resource namespace — exactly what `DriRenderFile`
+    /// serves. Without the fallback, kmscube's first buffer map produced
+    /// an unbackable mapping and a fatal fault at first write.
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
-        crate::drm_ioctl_bridge::dispatch_mmap(self.index, offset, len)
+        match crate::drm_ioctl_bridge::dispatch_mmap(self.index, offset, len) {
+            Ok(frames) => Ok(frames),
+            Err(dumb_miss) => {
+                if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
+                    crate::drm_ioctl_bridge::dispatch_virtgpu_mmap(&self.virtgpu, offset, len)
+                } else {
+                    Err(dumb_miss)
+                }
+            }
+        }
     }
 
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
-        retain_dumb_mapping(self.index, offset, len).map(|lease| lease as Arc<dyn MmapLifetime>)
+        if let Some(lease) = retain_dumb_mapping(self.index, offset, len) {
+            return Some(lease as Arc<dyn MmapLifetime>);
+        }
+        if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
+            return None;
+        }
+        self.virtgpu
+            .mapping_resource(offset, len)
+            .map(|resource| resource as Arc<dyn MmapLifetime>)
     }
 
     /// This IS a DRM master card node — hand back its index so
