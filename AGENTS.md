@@ -20,10 +20,9 @@ Everything here is terse by design. Follow links for depth.
 
 | File                | When to read                                    |
 | ------------------- | ----------------------------------------------- |
-| `DESIGN.md`         | Need the v1.0 vision verbatim.                  |
+| `DESIGN.md`         | Need the current architectural direction.      |
 | `GLOSSARY.md`       | Unknown term (Framekernel, Narf-Ring, Domain…). |
-| `ROADMAP.md`        | Which subsystems are active in which stage.     |
-| `STAGE1.md`         | Writing Stage 1 code — topo-sorted order + critical path. |
+| `STATUS.md`         | Milestone progress and open work.               |
 | `process/…/spec.md` | **Before touching anything** — review bars, AI-agent rules. |
 | `security-model/…`  | Any TCB or security-critical work.              |
 | `verification/…`    | Writing tests, perf numbers, CI gates.          |
@@ -75,7 +74,7 @@ Every folder has: `README.md` (1-paragraph pointer), `specification/spec.md`
 
 When modifying a subsystem interface, update §3 **in the same PR**.
 
-## Stage → active subsystems (exit criteria in `ROADMAP.md`)
+## Stage → active subsystems (historical assignments; progress in `STATUS.md`)
 
 | Stage | Theme          | Active                                              |
 | ----- | -------------- | --------------------------------------------------- |

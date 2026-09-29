@@ -86,8 +86,9 @@ Misclassification is a review finding, not a cause for merge.
    *advisory* — a human must explicitly accept or override them.
 8. **Merge** — maintainer merges. Squash-merges preferred; merge commit
    message cites the PR and classifies the change.
-9. **Post-merge** — if a change affected a spec, the glossary or
-   `ROADMAP.md` mentions update in the same PR.
+9. **Post-merge** — if a change affected a spec, update the glossary or
+   `STATUS.md` in the same PR when the change affects project progress or
+   user-facing terminology.
 
 ## 6. AI agent rules of engagement
 

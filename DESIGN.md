@@ -1,73 +1,84 @@
-# NARF: Not Another Rust Frankenkernel
+# NARF design
 
-**Project Status:** Design Phase (v1.0)
+NARF (Not Another Rust Frame Kernel) is a `no_std` operating system for
+x86_64 and aarch64. Its framekernel design combines a small trusted core,
+capability-checked authority, and kernel services organized into protection
+domains. It also exposes a Linux-compatible userspace interface so existing
+software can run on those native mechanisms.
 
-**Vision:** To provide a "Zero-Overhead" secure operating system by merging
-the safety of Rust with the performance of hardware-assisted isolation.
+This document describes the architectural direction. [STATUS.md](STATUS.md)
+tracks milestones and what has been exercised; subsystem specifications define
+interfaces and invariants. A feature described here is not necessarily
+enforced on every supported machine.
 
-This file is the verbatim v1.0 vision document — the source of truth every
-subsystem specification derives from. Changes to the high-level design belong
-here; subsystem-level detail belongs in the per-subsystem `specification/spec.md`.
+## 1. Architectural blueprint: the framekernel
 
----
+The trusted computing base (TCB) comprises `frame/`, the memory domain
+manager, the capability core, the executor core, and the rules in
+`security-model/`. The frame handles boot, traps, domain transitions, and
+other operations that require system-wide authority. Drivers and services can
+run in Ring 0 / EL1 without automatically receiving the frame's authority.
 
-## 1. Architectural Blueprint: The Framekernel
+NARF declares 16 domain IDs. On x86_64, the kernel selects PKS when available
+or uses PCID-tagged page tables as a fallback. On aarch64, MTE is the intended
+hardware backend; systems without MTE currently have no equivalent enforced
+fallback. The backends have different coverage and validation levels. In
+particular, a domain boundary protects only resources mapped or tagged for
+that boundary; it does not confine all ordinary kernel memory by itself. See
+[docs/DOMAIN_BACKENDS.md](docs/DOMAIN_BACKENDS.md) for the current enforcement
+matrix and its test limits.
 
-NARF rejects the binary choice between "slow microkernel" and "insecure
-monolithic." Instead, it uses a **Framekernel** architecture.
+Capabilities and domains work together: a capability grants authority over an
+object, and the domain backend constrains memory access. Holding a typed
+`Cap<T, R>` records a prior grant; `Cap::invoke()` checks current validity,
+including revocation. The [security model](security-model/specification/spec.md)
+owns the precise boundary and review rules.
 
-- **The TCB (Trusted Computing Base):** A minimalist Rust "Frame" that manages
-  CPU state, PKU domains, and Capability tables.
-- **Intra-Address Space Isolation:** Unlike Linux, where everything in Ring 0
-  shares one big memory space, NARF uses **Intel PKS / ARM Memory Tagging** to
-  divide the kernel's address space into 16 hardware-protected domains.
-- **The "Narf-Link":** Drivers (Network, GPU, NVMe) run in these domains.
-  They share the same virtual memory map for speed but are hardware-blocked
-  from touching each other's data.
+## 2. Async-first execution and communication
 
-## 2. The Continuity Scheduler (Async-First)
+The global executor schedules asynchronous kernel work. Driver operations,
+interrupt follow-up work, and native submissions can use futures; synchronous
+paths remain where hardware and compatibility interfaces require them. The
+scheduler supports capability-checked donation and direct handoff to favor a
+callee without an unnecessary scheduling round trip.
 
-In NARF, the scheduler is not a separate entity; it is a **Global Async Executor**.
+Narf-Ring is the shared-memory transport between cooperating components. Ring
+slots carry handles to buffers, and ownership transfer avoids copying the
+buffer's data bytes. The handle and ring metadata still move through memory;
+"zero-copy" refers to the data path. Release/acquire ordering, cancellation,
+and wake-up behavior are specified in `ipc/` and `abi/`.
 
-- **Everything is a Future:** Every system call, interrupt, and driver task
-  is a stackless Rust `Future`.
-- **Zero-Copy IPC (The Narf-Ring):** Communication happens via shared-memory
-  ring buffers. When data moves from the NIC to an App, NARF uses Rust's
-  Ownership Transfer to "move" the pointer. The bytes never move in physical RAM.
-- **Direct Context Transfer:** If an App calls the Filesystem Service, the
-  Executor "donates" the App's remaining CPU time-slice directly to the
-  Service. This eliminates the "Double Trip" context-switch penalty found in
-  older microkernels.
+## 3. Userspace and compatibility
 
-## 3. Security Model: Capability-Based Access
+NARF has a native process and syscall surface, with a composable
+`linux-compat` personality for Linux syscall and device ABIs. The `container`
+and `cgroup` features add namespace and resource-control surfaces. A Linux
+program sees familiar interfaces while the kernel implementation remains
+NARF-specific. The supported surface is incremental, not a promise of full
+Linux parity; see [docs/PERSONAS.md](docs/PERSONAS.md).
 
-NARF operates on the principle of **Least Privilege**.
+The QEMU path runs an interactive shell, musl binaries, block and network
+drivers, and graphical clients through DRM/KMS and Wayland. These demonstrations
+do not establish the Stage 5 real-laptop boot and native display gate. See
+[STATUS.md](STATUS.md) for verified scope.
 
-- **No Root User:** Permissions are tied to Capabilities (unforgeable tokens).
-- **Object-Level Security:** To write to a disk block, a process must possess
-  a `BlockCap`. To see a network packet, it needs a `NetCap`.
-- **Rust-Enforced:** These capabilities are wrapped in Rust types that cannot
-  be forged, leaked, or used after they are destroyed.
+## 4. Performance direction
 
-## 4. Performance Innovations
+The design aims to keep communication and isolation costs small, without
+assuming a speedup on every workload or backend:
 
-To outpace Linux, NARF focuses on **Hardware Bypass**:
+| Mechanism | Intended benefit | Qualification |
+| --- | --- | --- |
+| Shared-memory rings and buffer ownership transfer | Avoid payload copies between services | Metadata and handles still move; device and user paths may copy |
+| Direct handoff and time-slice donation | Reduce scheduling delay on a service call | Applies when the scheduler can use the handoff path |
+| PKS, MTE, or PCID domain switching | Isolate mapped domain resources without a process boundary for each service | Cost and protection coverage differ by backend |
+| P2P DMA and user-level interrupts | Permit shorter device paths on capable hardware | Hardware support and end-to-end deployment remain separate milestones |
+| Global LTO | Optimize across kernel crates | Performance claims require the protocol in `verification/` |
 
-| Feature    | Implementation                   | Result |
-| ---------- | -------------------------------- | ------ |
-| I/O Path   | Peer-to-Peer DMA (P2PDMA)        | Data moves from NIC → GPU without CPU intervention. |
-| Interrupts | User-Level Interrupts (UIPI)     | Hardware signals the driver directly, bypassing the Kernel Trap. |
-| Compiling  | Global LTO                       | The entire OS is optimized as a single binary unit for maximum inlining. |
+## 5. Development stages
 
-## 5. Development Roadmap
-
-- **Stage 1 (The Skeleton):** Bootloader + Basic Async Executor + Serial Console.
-- **Stage 2 (The Barrier):** Implementation of PKS/PKU memory domain switching.
-- **Stage 3 (The Flow):** First "Narf-Ring" implementation for VirtIO drivers.
-- **Stage 4 (The Compatibility):** relibc integration to run standard Rust binaries.
-
----
-
-**Final Design Quote:**
-
-> "NARF: Because security shouldn't feel like a speed limit."
+Stages 1 (Skeleton), 2 (Barrier), 3 (Flow), and the in-tree Stage 4
+(Compatibility) gate have closed. Compatibility and desktop work continue.
+Stage 5 (Silicon) targets boot, native graphics, input, Wi-Fi, and persistent
+storage on the selected AMD laptops. [STATUS.md](STATUS.md) records the
+current gates and remaining work.
