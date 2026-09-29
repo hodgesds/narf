@@ -17,10 +17,80 @@ use crate::{I2cBus, I2cError, I2cOp};
 
 pub const I801_VENDOR: u16 = 0x8086;
 
-// Device IDs for a few common PCHs.
+// Device IDs for the PCH generations NARF binds. Sourced from the
+// `i801_ids[]` table in Linux `drivers/i2c/busses/i2c-i801.c`; every
+// one of these decodes the same SMBus host-controller register block
+// behind BAR4, so a single `probe` covers the lot.
 pub const I801_DID_LYNX_POINT: u16 = 0x8c22;
 pub const I801_DID_SUNRISE_POINT_H: u16 = 0xa123;
 pub const I801_DID_KABY_LAKE: u16 = 0xa2a3;
+/// Cannon Lake-H (300-series desktop PCH).
+pub const I801_DID_CANNON_LAKE_H: u16 = 0xa323;
+/// Cannon Lake-LP (Whiskey Lake / Coffee Lake mobile).
+pub const I801_DID_CANNON_LAKE_LP: u16 = 0x9da3;
+/// Comet Lake-LP.
+pub const I801_DID_COMET_LAKE_LP: u16 = 0x02a3;
+/// Comet Lake-H.
+pub const I801_DID_COMET_LAKE_H: u16 = 0x06a3;
+/// Ice Lake-LP.
+pub const I801_DID_ICE_LAKE_LP: u16 = 0x34a3;
+/// Tiger Lake-LP.
+pub const I801_DID_TIGER_LAKE_LP: u16 = 0xa0a3;
+/// Tiger Lake-H.
+pub const I801_DID_TIGER_LAKE_H: u16 = 0x43a3;
+/// Alder Lake-S.
+pub const I801_DID_ALDER_LAKE_S: u16 = 0x7aa3;
+/// Alder Lake-P.
+pub const I801_DID_ALDER_LAKE_P: u16 = 0x51a3;
+/// Alder Lake-M.
+pub const I801_DID_ALDER_LAKE_M: u16 = 0x54a3;
+/// Raptor Lake-S.
+pub const I801_DID_RAPTOR_LAKE_S: u16 = 0x7a23;
+/// Meteor Lake-P (Core Ultra Series 1 mobile SoC-attached SMBus).
+pub const I801_DID_METEOR_LAKE_P: u16 = 0x7e22;
+/// Meteor Lake-S SoC.
+pub const I801_DID_METEOR_LAKE_SOC_S: u16 = 0xae22;
+/// Meteor Lake-S PCH.
+pub const I801_DID_METEOR_LAKE_PCH_S: u16 = 0x7f23;
+/// Arrow Lake-H.
+pub const I801_DID_ARROW_LAKE_H: u16 = 0x7722;
+/// Jasper Lake.
+pub const I801_DID_JASPER_LAKE: u16 = 0x4da3;
+/// Wildcat Lake-U — the Panther Lake sibling PCH.
+pub const I801_DID_WILDCAT_LAKE_U: u16 = 0x4d22;
+/// Panther Lake-H (Core Ultra Series 3) — the SMBus controller on
+/// the Minisforum MS-03 at `00:1f.4`.
+pub const I801_DID_PANTHER_LAKE_H: u16 = 0xe322;
+/// Panther Lake-P.
+pub const I801_DID_PANTHER_LAKE_P: u16 = 0xe422;
+
+/// Every PCI device ID this driver claims. Kept as one `const` so
+/// `register_pci_driver` and the match-table smoke read the same
+/// list — no drift between code and test.
+pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
+    I801_DID_LYNX_POINT,
+    I801_DID_SUNRISE_POINT_H,
+    I801_DID_KABY_LAKE,
+    I801_DID_CANNON_LAKE_H,
+    I801_DID_CANNON_LAKE_LP,
+    I801_DID_COMET_LAKE_LP,
+    I801_DID_COMET_LAKE_H,
+    I801_DID_ICE_LAKE_LP,
+    I801_DID_TIGER_LAKE_LP,
+    I801_DID_TIGER_LAKE_H,
+    I801_DID_ALDER_LAKE_S,
+    I801_DID_ALDER_LAKE_P,
+    I801_DID_ALDER_LAKE_M,
+    I801_DID_RAPTOR_LAKE_S,
+    I801_DID_METEOR_LAKE_P,
+    I801_DID_METEOR_LAKE_SOC_S,
+    I801_DID_METEOR_LAKE_PCH_S,
+    I801_DID_ARROW_LAKE_H,
+    I801_DID_JASPER_LAKE,
+    I801_DID_WILDCAT_LAKE_U,
+    I801_DID_PANTHER_LAKE_H,
+    I801_DID_PANTHER_LAKE_P,
+];
 
 const SMBBAR: usize = 4;
 
@@ -277,11 +347,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 }
 
 pub fn register_pci_driver() {
-    for did in [
-        I801_DID_LYNX_POINT,
-        I801_DID_SUNRISE_POINT_H,
-        I801_DID_KABY_LAKE,
-    ] {
+    for did in SUPPORTED_DEVICE_IDS.iter().copied() {
         narf_bus::register_pci_driver(PciMatch {
             name: "i801_smbus",
             kind: MatchKind::VendorDevice {

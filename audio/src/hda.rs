@@ -116,6 +116,20 @@ pub const HDA_INTEL_ALDER_LAKE_DEVICE_C: u16 = 0x51CD;
 
 /// Meteor Lake HD Audio.
 pub const HDA_INTEL_METEOR_LAKE_DEVICE: u16 = 0x7E28;
+// Names below track Linux's `PCI_DEVICE_ID_INTEL_HDA_*` in
+// `include/linux/pci_ids.h` so the two tables can be diffed directly.
+
+/// Arrow Lake HD Audio (`PCI_DEVICE_ID_INTEL_HDA_ARL`).
+pub const HDA_INTEL_ARROW_LAKE_DEVICE: u16 = 0x7728;
+/// Arrow Lake-S HD Audio (`PCI_DEVICE_ID_INTEL_HDA_ARL_S`).
+pub const HDA_INTEL_ARROW_LAKE_S_DEVICE: u16 = 0x7F50;
+/// Lunar Lake-P HD Audio (`PCI_DEVICE_ID_INTEL_HDA_LNL_P`).
+pub const HDA_INTEL_LUNAR_LAKE_P_DEVICE: u16 = 0xA828;
+/// Panther Lake-H HD Audio (`PCI_DEVICE_ID_INTEL_HDA_PTL_H`) — the
+/// controller on the Minisforum MS-03 at `00:1f.3`.
+pub const HDA_INTEL_PANTHER_LAKE_H_DEVICE: u16 = 0xE328;
+/// Panther Lake HD Audio (`PCI_DEVICE_ID_INTEL_HDA_PTL`).
+pub const HDA_INTEL_PANTHER_LAKE_DEVICE: u16 = 0xE428;
 
 // ── Intel iGPU display-audio PCI device ids ───────────────────────
 //
@@ -1835,6 +1849,31 @@ const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
         "hda-intel-meteor-lake",
         HDA_INTEL_ICH9_VENDOR,
         HDA_INTEL_METEOR_LAKE_DEVICE,
+    ),
+    (
+        "hda-intel-arrow-lake",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_ARROW_LAKE_DEVICE,
+    ),
+    (
+        "hda-intel-arrow-lake-s",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_ARROW_LAKE_S_DEVICE,
+    ),
+    (
+        "hda-intel-lunar-lake-p",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_LUNAR_LAKE_P_DEVICE,
+    ),
+    (
+        "hda-intel-panther-lake-h",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_PANTHER_LAKE_H_DEVICE,
+    ),
+    (
+        "hda-intel-panther-lake",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_PANTHER_LAKE_DEVICE,
     ),
     // Intel iGPU display-audio (TGL / TGL-LP graphics function).
     (

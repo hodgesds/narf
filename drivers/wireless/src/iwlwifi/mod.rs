@@ -725,6 +725,11 @@ pub enum MacFamily {
     MaB0,
     /// BE200 — Bz baseband.
     BzA0,
+    /// BE20x / BE21x — Sc ("Scorpius Peak") baseband. Ships as the
+    /// CNVi companion on Lunar Lake and Panther Lake. Verified on
+    /// the Minisforum MS-03: `00:14.3` reports PCI `8086:e340`
+    /// subsys `8086:0114` and Linux loads `sc-a0-wh-b0` firmware.
+    ScA0,
 }
 
 impl MacFamily {
@@ -739,6 +744,7 @@ impl MacFamily {
             MacFamily::MaA0 => "ma-a0",
             MacFamily::MaB0 => "ma-b0",
             MacFamily::BzA0 => "bz-a0",
+            MacFamily::ScA0 => "sc-a0",
         }
     }
 }
@@ -757,6 +763,13 @@ pub enum RfFamily {
     Gf4A0,
     /// "fm-a0" — Wi-Fi 7 FM radio.
     FmA0,
+    /// "fm-b0" — Wi-Fi 7 FM radio, B0 stepping (Sc MAC pairings).
+    FmB0,
+    /// "fm-c0" — Wi-Fi 7 FM radio, C0 stepping (Sc MAC pairings).
+    FmC0,
+    /// "wh-b0" — Wi-Fi 7 "Wildcat Peak" radio, B0 stepping. The RF
+    /// fused on the MS-03's BE211 (`Detected RF WH, rfid=0x20113100`).
+    WhB0,
 }
 
 impl RfFamily {
@@ -766,6 +779,9 @@ impl RfFamily {
             RfFamily::GfA0 => "gf-a0",
             RfFamily::Gf4A0 => "gf4-a0",
             RfFamily::FmA0 => "fm-a0",
+            RfFamily::FmB0 => "fm-b0",
+            RfFamily::FmC0 => "fm-c0",
+            RfFamily::WhB0 => "wh-b0",
         }
     }
 }
@@ -785,12 +801,23 @@ pub struct ChipConfig {
     /// ladder (kernel-side: the actually-fused RF is matched
     /// against this set after probe).
     pub rf_candidates: &'static [RfFamily],
-    /// UCODE API version walk: try filenames with API stamps
-    /// from `api_max` down to `api_min`. Special-case in
-    /// `iwl-drv.c`: when the API counter passes 100, jump to
-    /// 102 (the "core" numbering for Bz+).
+    /// UCODE API version walk: try filenames with API stamps from
+    /// `api_max` down to `api_min`, interpreted together with
+    /// `api_prefix`.
     pub api_max: u32,
     pub api_min: u32,
+    /// Literal prefix stamped in front of the API number in the
+    /// firmware filename. Empty for the historical numbering
+    /// (`…-gf-a0-89.ucode`); `"c"` for the core-release numbering.
+    ///
+    /// Linux encodes both in one integer: an API value at or above
+    /// `API_IS_CORE_START` (1000) is a core release, and `FW_API_ARG`
+    /// renders it as `"c"` plus `value - 1000`
+    /// (`iwl-config.h`). Here the two halves are kept apart —
+    /// `api_max` / `api_min` hold the bare number and this field
+    /// holds the prefix — so the ladder builder stays a plain
+    /// decrementing loop.
+    pub api_prefix: &'static str,
 }
 
 /// AX200 — single fused chip. Linux ships HR-b0 RF only.
@@ -799,6 +826,21 @@ const RF_HR_ONLY: &[RfFamily] = &[RfFamily::HrB0];
 const RF_GF_OR_GF4: &[RfFamily] = &[RfFamily::GfA0, RfFamily::Gf4A0];
 /// BE200 — GF / GF4 / FM RFs.
 const RF_GF_FAMILY: &[RfFamily] = &[RfFamily::GfA0, RfFamily::Gf4A0, RfFamily::FmA0];
+/// BE20x / BE21x on the Sc MAC.
+///
+/// Modern iwlwifi does not carry a static RF list per PCI ID: it
+/// reads the fused RF type + step out of `CSR_HW_RF_ID` and composes
+/// `iwlwifi-<mac>-<step>-<rf>-<step>` at runtime
+/// (`iwl_drv_get_fwname_pre`). Without MMIO at match time we
+/// enumerate the pairings linux-firmware actually ships for `sc-a0`.
+/// WH-b0 goes first because it is the pairing the MS-03 reports
+/// (`Detected RF WH, rfid=0x20113100`, firmware `sc-a0-wh-b0-c103`).
+const RF_SC_A0_CANDIDATES: &[RfFamily] = &[
+    RfFamily::WhB0,
+    RfFamily::FmC0,
+    RfFamily::FmB0,
+    RfFamily::GfA0,
+];
 
 /// Match a PCI device against the iwlwifi chip table.
 pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
@@ -816,6 +858,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_HR_ONLY,
             api_max: 100,
             api_min: 100,
+            api_prefix: "",
         },
         // AX201 family — same MAC/RF as AX200, multiple SKUs.
         0x02f0 | 0x43f0 | 0xa0f0 | 0x7df0 => ChipConfig {
@@ -827,6 +870,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_HR_ONLY,
             api_max: 100,
             api_min: 100,
+            api_prefix: "",
         },
         // AX210.
         0x2725 => ChipConfig {
@@ -838,6 +882,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_GF_OR_GF4,
             api_max: 89,
             api_min: 89,
+            api_prefix: "",
         },
         // AX211 family.
         0x51f0 => ChipConfig {
@@ -849,6 +894,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_GF_OR_GF4,
             api_max: 89,
             api_min: 89,
+            api_prefix: "",
         },
         0x54f0 => ChipConfig {
             vid,
@@ -859,6 +905,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_GF_OR_GF4,
             api_max: 100,
             api_min: 100,
+            api_prefix: "",
         },
         0x7e40 => ChipConfig {
             vid,
@@ -869,6 +916,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_GF_OR_GF4,
             api_max: 100,
             api_min: 100,
+            api_prefix: "",
         },
         // BE200 — Wi-Fi 7 Bz MAC + GF / GF4 / FM RF.
         0x272b => ChipConfig {
@@ -880,6 +928,34 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             rf_candidates: RF_GF_FAMILY,
             api_max: 102,
             api_min: 100,
+            api_prefix: "",
+        },
+        // Sc ("Scorpius Peak") — Wi-Fi 7 BE20x / BE21x CNVi. Every
+        // one of these IDs binds `iwl_sc_mac_cfg` in Linux's
+        // `iwl_hw_card_ids` (pcie/drv.c, "Sc devices" block).
+        //
+        // 0xe340 is hardware-verified on the Minisforum MS-03
+        // (Panther Lake-H, `00:14.3`, subsys 8086:0114): the device
+        // announces as "Wi-Fi 7 BE211 320MHz" and Linux walks
+        // `sc-a0-wh-b0-c107 … c103`, landing on c103.
+        //
+        // The API ladder is the core-release numbering: `iwl_sc_base`
+        // sets `ucode_api_max = ENCODE_CORE_AS_API(107)` and
+        // `ucode_api_min = ENCODE_CORE_AS_API(102)`, and
+        // `FW_API_ARG` stamps those as `c107 … c102`.
+        0x6e70 | 0x9327 | 0xd240 | 0xd340 | 0xe340 | 0xe440 => ChipConfig {
+            vid,
+            did,
+            display_name: match did {
+                0xe340 => "BE211 (sc-a0)",
+                _ => "BE2xx (sc-a0)",
+            },
+            generation: Generation::Gen3,
+            mac: MacFamily::ScA0,
+            rf_candidates: RF_SC_A0_CANDIDATES,
+            api_max: 107,
+            api_min: 102,
+            api_prefix: "c",
         },
         _ => return None,
     };
@@ -919,9 +995,10 @@ pub fn firmware_filename_ladder(chip: &ChipConfig) -> Vec<String> {
             // `/lib/firmware/iwlwifi/iwlwifi-...`) not just the
             // bare filename.
             out.push(format!(
-                "iwlwifi/iwlwifi-{}-{}-{}.ucode",
+                "iwlwifi/iwlwifi-{}-{}-{}{}.ucode",
                 chip.mac.prefix(),
                 rf.prefix(),
+                chip.api_prefix,
                 api,
             ));
             if api == chip.api_min {
@@ -1621,6 +1698,12 @@ const PCI_DIDS: &[(u16, &str)] = &[
     (0x54f0, "iwlwifi-54f0"),
     (0x7e40, "iwlwifi-7e40"),
     (0x272b, "iwlwifi-272b"),
+    (0x6e70, "iwlwifi-6e70"),
+    (0x9327, "iwlwifi-9327"),
+    (0xd240, "iwlwifi-d240"),
+    (0xd340, "iwlwifi-d340"),
+    (0xe340, "iwlwifi-e340"),
+    (0xe440, "iwlwifi-e440"),
 ];
 
 // ── Smoke tests ────────────────────────────────────────────────────
