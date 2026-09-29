@@ -609,6 +609,7 @@ fn main() {
         "futex_wakeop_smoke",
         "condbcast_smoke",
         "forkcond_smoke",
+        "setxid_threads_smoke",
         "notify_epoll_smp_smoke",
         "keyring_smoke",
         "inotify2_smoke",
@@ -683,6 +684,37 @@ fn main() {
         let upper = test.to_uppercase();
         println!("cargo:rustc-env=NARF_{upper}_ELF_X86_64={x86_path}");
         println!("cargo:rustc-env=NARF_{upper}_ELF_AARCH64=/dev/null");
+    }
+
+    // ── glibc variants of selected musl-demo smokes ─────────────────
+    // Same C source, linked statically against the HOST glibc. Desktop
+    // userspace (Xwayland, Mesa, Qt) runs glibc, whose thread internals
+    // differ from musl's in ways the kernel must honour: SIGCANCEL/SIGSETXID
+    // (32/33) for set*id broadcasts and cancellation, the full internal
+    // signal mask around clone(), FUTEX_WAIT_BITSET condvars. When gcc or a
+    // static libc.a is unavailable the image is an empty placeholder, like
+    // the musl smokes without musl-gcc.
+    for test in ["setxid_threads_smoke", "forkcond_smoke"] {
+        let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
+        println!("cargo:rerun-if-changed={}", src.display());
+        let out = out_dir.join(format!("{test}_glibc_x86_64"));
+        let built = which("gcc").is_some()
+            && Command::new("gcc")
+                .args(["-O2", "-Wall", "-static", "-pthread"])
+                .arg(&src)
+                .arg("-o")
+                .arg(&out)
+                .status()
+                .is_ok_and(|s| s.success());
+        let x86_path = if built {
+            out.display().to_string()
+        } else {
+            println!("cargo:warning=musl-demo: static glibc build of {test} unavailable");
+            "/dev/null".to_string()
+        };
+        let upper = test.to_uppercase();
+        println!("cargo:rustc-env=NARF_{upper}_GLIBC_ELF_X86_64={x86_path}");
+        println!("cargo:rustc-env=NARF_{upper}_GLIBC_ELF_AARCH64=/dev/null");
     }
 
     // ── vDSO: real linux-vdso.so.1 for each arch ────────────────────

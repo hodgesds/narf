@@ -3272,7 +3272,14 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "scm_smoke",
     ]) {
         "net"
-    } else if has(&["sig", "alarmloop", "fifoeintr", "profloop", "preemptsched"]) {
+    } else if has(&[
+        "sig",
+        "setxid",
+        "alarmloop",
+        "fifoeintr",
+        "profloop",
+        "preemptsched",
+    ]) {
         "signals"
     } else if has(&[
         "futex",
@@ -3600,6 +3607,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // fork() racing condvar handoffs to file-I/O worker threads — the
         // Xwayland/Mesa disk-cache wedge that froze kwin under Plasma.
         ("forkcond_smoke", "forkcond-ok"),
+        // set*id() broadcast to threads parked in blocking calls, musl
+        // (__synccall) and static glibc (SIGSETXID) — the Xwayland
+        // seteuid() hang behind the Plasma wedge.
+        ("setxid_threads_smoke", "setxid-threads-ok"),
+        ("setxid_threads_glibc", "setxid-threads-ok"),
+        ("forkcond_glibc", "forkcond-ok"),
         // Contended futex (N-thread mutex + join + condvar ping-pong).
         // Back in the shared-boot batch at the FULL 16-vCPU/2-socket-NUMA
         // topology: the strand class that forced its SMP=1 pin is fixed

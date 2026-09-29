@@ -135,6 +135,16 @@ int main(void) {
         pthread_cond_signal(&has_job);
         pthread_mutex_unlock(&mtx);
 
+        // Xwayland's keymap path calls seteuid() with the disk-cache workers
+        // parked in pthread_cond_wait. In a threaded process libc applies a
+        // set*id to every thread by signalling each one (glibc SIGSETXID via
+        // tgkill, musl __synccall) and waiting for all to acknowledge; a
+        // worker that never runs the handler hangs the caller forever.
+        if (seteuid(geteuid()) != 0) {
+            w("forkcond-fail: seteuid\n");
+            return 1;
+        }
+
         pid_t pid = fork();
         if (pid == 0)
             _exit(0);
