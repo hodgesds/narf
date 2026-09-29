@@ -1172,12 +1172,20 @@ fn smoke_abi_fsx2_mount_bind_proc_file_alias_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_proc_file_alias_pos);
 
 fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
-    with_setup(|| {
+    // The root and the staging mountpoint are the test's own: mount(2) of a
+    // missing target is -ENOENT (`user_path_at`), and the case used to lean
+    // on whatever earlier test in the shared image happened to leave a
+    // resolvable directory there — so it passed or failed on registration
+    // order alone.
+    with_memfs("/abi-private-root", "abi-private-root", &[], || {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const MS_RDONLY: u64 = 1;
         const MS_REMOUNT: u64 = 1 << 5;
         const MS_BIND: u64 = 1 << 12;
 
+        if call_mkdir(c"/abi-private-root/abi-private-proc".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("staging mountpoint mkdir failed");
+        }
         let result = (|| {
             // Direct PID 1 runs with its root published at /mnt. Exercise
             // the same root-relative paths that systemd hands to mount(2),
