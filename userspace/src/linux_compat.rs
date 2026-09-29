@@ -85,6 +85,17 @@ impl SignalFdFile {
 }
 
 impl FileOps for SignalFdFile {
+    /// Linux `signalfd4` uses `anon_inode_getfile_fmode("[signalfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// A signalfd with nothing pending must WAIT, never report end-of-file.
     ///
     /// The old comment below called `Ok(0)` an "EAGAIN shape" — but a bare

@@ -10,6 +10,17 @@ use alloc::boxed::Box;
 struct DrmSyncFile;
 
 impl narf_filesystem::FileOps for DrmSyncFile {
+    /// Linux `sync_file_alloc` uses `anon_inode_getfile("sync_file")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,

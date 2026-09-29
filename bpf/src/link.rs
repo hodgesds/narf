@@ -590,6 +590,17 @@ impl LinkFile {
 }
 
 impl narf_filesystem::FileOps for LinkFile {
+    /// Linux `bpf_link_new_fd` uses `anon_inode_getfd("bpf-link")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,
