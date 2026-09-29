@@ -182,12 +182,13 @@ unsafe fn uart_read(base: UartBase, shift: u8, reg: u16) -> u8 {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn uart_write(_base: UartBase, _shift: u8, _reg: u16, _val: u8) {}
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn uart_read(_base: UartBase, _shift: u8, _reg: u16) -> u8 {
-    0
-}
+// There is deliberately no non-x86_64 stub pair here. Every caller of
+// `uart_write` / `uart_read` is itself `cfg(target_arch = "x86_64")`,
+// so stubs would be dead code on aarch64 — and dead code that quietly
+// returns 0 from a register read is worse than absent code, because a
+// future caller added without the cfg gate would compile and then
+// misbehave instead of failing to build. aarch64 platforms use
+// `pl011` for their UART.
 
 // ── UART device ───────────────────────────────────────────────────────
 
