@@ -576,7 +576,11 @@ dependencies = [
  "async-trait",
  "bitflags",
  "futures",
+ "narf-bus",
  "narf-capabilities",
+ "narf-console",
+ "narf-drivers",
+ "narf-init",
  "narf-io",
  "narf-ipc",
  "narf-kernel-test",
@@ -665,7 +669,10 @@ name = "narf-bluetooth"
 version = "0.0.0"
 dependencies = [
  "narf-audio",
+ "narf-bus",
  "narf-capabilities",
+ "narf-console",
+ "narf-drivers",
  "narf-filesystem",
  "narf-init",
  "narf-kernel-test",
