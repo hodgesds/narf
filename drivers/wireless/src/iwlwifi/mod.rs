@@ -66,6 +66,7 @@ pub mod rx;
 pub mod sta;
 pub mod transport;
 pub mod tx;
+pub mod tx_gen2;
 pub mod wpa;
 
 use alloc::boxed::Box;
@@ -2226,4 +2227,323 @@ pub mod tests {
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_register_values_match_linux
     );
+
+    /// The gen2/gen3 descriptor sizes are load-bearing: the device
+    /// strides through the TFD ring by descriptor size and through a
+    /// TFD's buffers by entry size, so a struct that is the wrong
+    /// width desynchronises everything after the first entry. These
+    /// are exactly the numbers the hardware documentation states —
+    /// 10-byte transmit buffers and 256-byte descriptors.
+    fn smoke_iwlwifi_gen2_descriptor_layout() -> TestResult {
+        use super::tx_gen2::*;
+        use core::mem::size_of;
+
+        if size_of::<TfhTb>() != 10 {
+            return TestResult::Fail("iwl_tfh_tb must be 10 bytes (len then 64-bit addr, packed)");
+        }
+        if size_of::<TfhTfd>() != 256 {
+            return TestResult::Fail("iwl_tfh_tfd must be 256 bytes");
+        }
+        // 2 + 25*10 + 4 = 256; if any of the three changes the total
+        // has to be rechecked against the hardware, not just patched.
+        if TBS_OFFSET + IWL_TFH_NUM_TBS * size_of::<TfhTb>() + 4 != size_of::<TfhTfd>() {
+            return TestResult::Fail("TFD size is not num_tbs + 25 buffers + pad");
+        }
+
+        // AX210+: len, flags(16), offload_assist(32), dram(8),
+        // rate_n_flags(32), reserved[8] = 28.
+        if size_of::<DramSecInfo>() != 8 {
+            return TestResult::Fail("iwl_dram_sec_info must be 8 bytes");
+        }
+        if size_of::<TxCmdAx210>() != 28 {
+            return TestResult::Fail("AX210+ iwl_tx_cmd must be 28 bytes");
+        }
+        // 22000-series: len, offload_assist(16), flags(32), dram(8),
+        // rate_n_flags(32) = 20. Different size as well as different
+        // field order, which is the cheapest way to catch a mix-up.
+        if size_of::<TxCmdV9>() != 20 {
+            return TestResult::Fail("iwl_tx_cmd_v9 must be 20 bytes");
+        }
+        if size_of::<TxCmdAx210>() == size_of::<TxCmdV9>() {
+            return TestResult::Fail("the two TX command layouts must not be interchangeable");
+        }
+        if size_of::<BcTblEntry>() != 2 {
+            return TestResult::Fail("iwl_bc_tbl_entry must be a single 16-bit word");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_gen2_descriptor_layout
+    );
+
+    /// Appending transmit buffers has to keep `num_tbs` and the entry
+    /// array in step, mask the count to five bits, and refuse a
+    /// buffer the DMA engine would read from the wrong address.
+    fn smoke_iwlwifi_gen2_tfd_push_tb() -> TestResult {
+        use super::tx_gen2::*;
+
+        let mut tfd = TfhTfd::default();
+        if tfd.num_tbs() != 0 {
+            return TestResult::Fail("a fresh TFD has no buffers");
+        }
+
+        match tfd.push_tb(0x1234_5000, 64) {
+            Ok(0) => {}
+            _ => return TestResult::Fail("the first buffer should land at index 0"),
+        }
+        match tfd.push_tb(0x1234_6000, 128) {
+            Ok(1) => {}
+            _ => return TestResult::Fail("the second buffer should land at index 1"),
+        }
+        if tfd.num_tbs() != 2 {
+            return TestResult::Fail("num_tbs should track the appended buffers");
+        }
+        // Read back through copies: the fields are packed, so they
+        // cannot be referenced directly.
+        let (len0, addr0) = (tfd.tbs[0].tb_len, tfd.tbs[0].addr);
+        let (len1, addr1) = (tfd.tbs[1].tb_len, tfd.tbs[1].addr);
+        if (len0, addr0) != (64, 0x1234_5000) || (len1, addr1) != (128, 0x1234_6000) {
+            return TestResult::Fail("buffer length and address stored wrong");
+        }
+
+        // Filling to capacity then one more.
+        let mut full = TfhTfd::default();
+        for i in 0..IWL_TFH_NUM_TBS {
+            if full.push_tb(0x1000 + (i as u64) * 0x1000, 16).is_err() {
+                return TestResult::Fail("should accept exactly IWL_TFH_NUM_TBS buffers");
+            }
+        }
+        if full.num_tbs() as usize != IWL_TFH_NUM_TBS {
+            return TestResult::Fail("a full TFD should report 25 buffers");
+        }
+        if full.push_tb(0x9_0000, 16) != Err(TfdError::Full) {
+            return TestResult::Fail("a 26th buffer must be refused");
+        }
+
+        // Reserved bits above the count must survive an append —
+        // the device owns them.
+        let mut reserved = TfhTfd {
+            num_tbs: 0xFFE0,
+            ..TfhTfd::default()
+        };
+        if reserved.push_tb(0x2000, 8) != Ok(0) {
+            return TestResult::Fail("reserved bits must not be read as a buffer count");
+        }
+        if reserved.num_tbs & !NUM_TBS_MASK != 0xFFE0 {
+            return TestResult::Fail("appending must not clobber the reserved bits");
+        }
+        if reserved.num_tbs() != 1 {
+            return TestResult::Fail("the count should be 1 after one append");
+        }
+
+        // A buffer straddling 4 GiB is read from the wrong address by
+        // the DMA engine, which computes the end without carrying.
+        if !crosses_4gib(0xFFFF_FFF0, 32) {
+            return TestResult::Fail("a buffer spanning the 4 GiB line should be detected");
+        }
+        if crosses_4gib(0xFFFF_FF00, 16) {
+            return TestResult::Fail("a buffer ending exactly at 4 GiB does not cross it");
+        }
+        if crosses_4gib(0x1_0000_0000, 64) {
+            return TestResult::Fail("a buffer wholly above 4 GiB does not cross a boundary");
+        }
+        let mut bad = TfhTfd::default();
+        match bad.push_tb(0xFFFF_FFF0, 32) {
+            Err(TfdError::CrossesFourGiB { .. }) => {}
+            _ => return TestResult::Fail("a 4 GiB-crossing buffer must be refused"),
+        }
+        if bad.num_tbs() != 0 {
+            return TestResult::Fail("a refused buffer must not be counted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_gen2_tfd_push_tb);
+
+    /// The byte-count table tells the device both how long the frame
+    /// is and how many 64-byte chunks of the descriptor to fetch.
+    /// AX210+ carries the length in bytes; everything before it
+    /// carries dwords and shifts the chunk count four bits higher.
+    fn smoke_iwlwifi_gen2_byte_count_entry() -> TestResult {
+        use super::tx_gen2::*;
+
+        // A TFD with three buffers is 2 + 30 = 32 bytes filled, which
+        // is one 64-byte chunk — encoded as zero.
+        let mut tfd = TfhTfd::default();
+        for i in 0..3 {
+            let _ = tfd.push_tb(0x1000 + (i as u64) * 0x1000, 100);
+        }
+        if tfd.filled_bytes() != 32 {
+            return TestResult::Fail("three buffers should fill 32 bytes of the TFD");
+        }
+        if fetch_chunks(32) != 0 {
+            return TestResult::Fail("32 bytes is one chunk, encoded as 0");
+        }
+        // 64 bytes is still one chunk; 65 needs two.
+        if fetch_chunks(64) != 0 || fetch_chunks(65) != 1 || fetch_chunks(128) != 1 {
+            return TestResult::Fail("chunk count should be DIV_ROUND_UP(filled,64) - 1");
+        }
+        // A full TFD: 2 + 250 = 252 bytes -> four chunks -> 3.
+        let mut full = TfhTfd::default();
+        for i in 0..IWL_TFH_NUM_TBS {
+            let _ = full.push_tb(0x1000 + (i as u64) * 0x1000, 16);
+        }
+        if full.filled_bytes() != 252 || fetch_chunks(full.filled_bytes()) != 3 {
+            return TestResult::Fail("a full TFD is 252 filled bytes and four fetch chunks");
+        }
+
+        // AX210+ packs raw bytes with the chunk count at bit 14.
+        match bc_entry_ax210(1500, 32) {
+            Ok(e) if e.tfd_offset == 1500 => {}
+            _ => return TestResult::Fail("AX210 entry should carry the byte length unscaled"),
+        }
+        match bc_entry_ax210(1500, 252) {
+            Ok(e) if e.tfd_offset == 1500 | (3 << 14) => {}
+            _ => return TestResult::Fail("AX210 entry should put the chunk count at bit 14"),
+        }
+        if bc_entry_ax210(0x4000, 32) != Err(BcError::LengthTooLarge(0x4000)) {
+            return TestResult::Fail("a length needing more than 14 bits must be refused");
+        }
+        match bc_entry_ax210(BC_MAX_LEN_AX210, 32) {
+            Ok(e) if e.tfd_offset == BC_MAX_LEN_AX210 => {}
+            _ => return TestResult::Fail("0x3fff is the largest length that fits"),
+        }
+
+        // Pre-AX210 rounds up to dwords and shifts the count to 12.
+        match bc_entry_pre_ax210(1500, 32) {
+            Ok(e) if e.tfd_offset == 375 => {}
+            _ => return TestResult::Fail("pre-AX210 should carry length in dwords"),
+        }
+        match bc_entry_pre_ax210(1501, 32) {
+            Ok(e) if e.tfd_offset == 376 => {}
+            _ => return TestResult::Fail("pre-AX210 dword length should round up"),
+        }
+        match bc_entry_pre_ax210(1500, 252) {
+            Ok(e) if e.tfd_offset == 375 | (3 << 12) => {}
+            _ => return TestResult::Fail("pre-AX210 should put the chunk count at bit 12"),
+        }
+        // The two encodings must not agree, or one silently stands in
+        // for the other.
+        let a = bc_entry_ax210(1500, 252);
+        let b = bc_entry_pre_ax210(1500, 252);
+        if a == b {
+            return TestResult::Fail("the two byte-count encodings must differ");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_gen2_byte_count_entry
+    );
+
+    /// Gen2 rings every queue through one CSR, with the queue id in
+    /// the written value. RX queues are offset by 512 so RX queue 0
+    /// cannot ring TX queue 0 — the whole point of the encoding.
+    fn smoke_iwlwifi_gen2_doorbell_encoding() -> TestResult {
+        use super::tx_gen2::*;
+
+        if HBUS_TARG_WRPTR != 0x460 {
+            return TestResult::Fail("HBUS_TARG_WRPTR should be HBUS_BASE + 0x60");
+        }
+        // The doorbell is a CSR offset, so it must be inside BAR0.
+        if HBUS_TARG_WRPTR >= 16 * 1024 {
+            return TestResult::Fail("the doorbell must lie inside BAR0");
+        }
+
+        if tx_doorbell(0, 7) != 7 {
+            return TestResult::Fail("TX queue 0 should encode to the bare write pointer");
+        }
+        if tx_doorbell(3, 0x2A) != 0x2A | (3 << 16) {
+            return TestResult::Fail("the TX queue id belongs at bit 16");
+        }
+        if rx_doorbell(0, 0x10) != 0x10 | (512 << 16) {
+            return TestResult::Fail("RX queue 0 should encode as queue 512");
+        }
+        if rx_doorbell(1, 0x10) != 0x10 | (513 << 16) {
+            return TestResult::Fail("RX queue ids should be offset by 512");
+        }
+        if tx_doorbell(0, 0x10) == rx_doorbell(0, 0x10) {
+            return TestResult::Fail("TX and RX queue 0 must not share a doorbell value");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_gen2_doorbell_encoding
+    );
+
+    /// Gen2 queues are created by a host command that hands the
+    /// firmware the rings the driver allocated. The ring depth is
+    /// carried as a biased exponent, which only encodes powers of two
+    /// between 8 and 256.
+    fn smoke_iwlwifi_gen2_queue_cfg() -> TestResult {
+        use super::tx_gen2::*;
+        use core::mem::size_of;
+
+        if size_of::<TxQueueCfgCmd>() != 24 {
+            return TestResult::Fail("iwl_tx_queue_cfg_cmd must be 24 bytes");
+        }
+        if size_of::<TxQueueCfgRsp>() != 8 {
+            return TestResult::Fail("iwl_tx_queue_cfg_rsp must be 8 bytes");
+        }
+
+        // log2(depth) - 3: 8 TFDs is 0, 256 is 5.
+        if cb_size_for(8) != Ok(0) {
+            return TestResult::Fail("8 TFDs should encode as 0");
+        }
+        if cb_size_for(256) != Ok(5) {
+            return TestResult::Fail("256 TFDs should encode as 5");
+        }
+        if cb_size_for(IWL_MGMT_QUEUE_SIZE) != Ok(1) {
+            return TestResult::Fail("the 16-slot management queue should encode as 1");
+        }
+        if cb_size_for(IWL_CMD_QUEUE_SIZE) != Ok(2) {
+            return TestResult::Fail("the 32-slot command queue should encode as 2");
+        }
+
+        // A depth with no encoding is refused rather than rounded:
+        // serving a 200-slot ring as 128 would leave host and
+        // firmware disagreeing about where the ring wraps.
+        if cb_size_for(200) != Err(QueueCfgError::NotPowerOfTwo(200)) {
+            return TestResult::Fail("a non-power-of-two depth must be refused");
+        }
+        if cb_size_for(4) != Err(QueueCfgError::DepthOutOfRange(4)) {
+            return TestResult::Fail("a depth below 8 must be refused");
+        }
+        if cb_size_for(512) != Err(QueueCfgError::DepthOutOfRange(512)) {
+            return TestResult::Fail("a depth above 256 must be refused");
+        }
+
+        let cmd = match TxQueueCfgCmd::enable(0, 7, 256, 0x1234_0000, 0x5678_0000) {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("a 256-deep queue should be describable"),
+        };
+        let (sta, tid, flags, cb) = (cmd.sta_id, cmd.tid, cmd.flags, cmd.cb_size);
+        let (bc, tfdq) = (cmd.byte_cnt_addr, cmd.tfdq_addr);
+        if (sta, tid, cb) != (0, 7, 5) {
+            return TestResult::Fail("queue config fields stored wrong");
+        }
+        if flags & TX_QUEUE_CFG_ENABLE_QUEUE == 0 {
+            return TestResult::Fail("an enable command must set the enable bit");
+        }
+        if (bc, tfdq) != (0x1234_0000, 0x5678_0000) {
+            return TestResult::Fail("the ring addresses must not be transposed");
+        }
+
+        // The AX210+ byte-count table is a fixed 1024 entries, not
+        // one per ring slot: a 16-slot management queue still needs
+        // the full 2 KiB, and sizing it from the ring would hand the
+        // firmware a table it writes past the end of.
+        if BC_TABLE_BYTES_AX210 != 2048 {
+            return TestResult::Fail("an AX210+ byte-count table is 1024 entries of 2 bytes");
+        }
+        if bc_table_bytes_pre_ax210(256) != (256 + 64) * 2 {
+            return TestResult::Fail("pre-AX210 tables are ring depth plus the 64-entry dup");
+        }
+        if bc_table_bytes_pre_ax210(IWL_MGMT_QUEUE_SIZE) >= BC_TABLE_BYTES_AX210 {
+            return TestResult::Fail("the two table sizings should not coincide");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_gen2_queue_cfg);
 }
