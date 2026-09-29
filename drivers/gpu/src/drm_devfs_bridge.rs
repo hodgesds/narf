@@ -287,6 +287,12 @@ impl FileOps for DriCardFile {
         card_rdev(self.index)
     }
 
+    /// The devtmpfs node's inode: every open of `/dev/dri/cardN` is the
+    /// same inode on Linux, so it reports devfs's number for this `rdev`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn owners(&self) -> (u32, u32) {
         let m = self.metadata.lock();
         (m.uid, m.gid)
@@ -388,7 +394,10 @@ impl FileOps for DriCardFile {
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::Unsupported);
         };
-        Ok(Arc::new(VirtGpuPrimeDmaBufFile { resource }))
+        Ok(Arc::new(VirtGpuPrimeDmaBufFile {
+            resource,
+            inode: dma_buf_inode(),
+        }))
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
@@ -446,6 +455,23 @@ pub struct PrimeDmaBufFile {
     gem_handle: u32,
     /// Pins the backing from PRIME export through final fd/mapping teardown.
     backing: Arc<DumbBackingLease>,
+    /// This dma-buf's inode. See [`dma_buf_inode`].
+    inode: narf_filesystem::inode_id::InodeId,
+}
+
+/// A new dma-buf inode: `drivers/dma-buf/dma-buf.c::dma_buf_getfile` makes
+/// one `alloc_anon_inode(dma_buf_mnt->mnt_sb)` per buffer and renumbers it
+/// from a dmabuf-private 64-bit counter (`atomic64_inc_return`, from 1).
+// LINUX-GAP: Linux caches the dma_buf on the GEM object
+// (`drm_gem_prime_handle_to_dmabuf` reuses `obj->dma_buf`), so exporting one
+// handle twice yields the same inode; NARF mints a file, and an inode, per
+// export.
+fn dma_buf_inode() -> narf_filesystem::inode_id::InodeId {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    narf_filesystem::inode_id::InodeId {
+        dev: narf_filesystem::inode_id::PseudoFs::DmaBuf.dev(),
+        ino: NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// One reference in [`crate::drm::card::DumbBacking::refcount`].
@@ -477,6 +503,14 @@ fn retain_dumb_mapping(card_index: u32, offset: u64, len: usize) -> Option<Arc<D
 }
 
 impl FileOps for PrimeDmaBufFile {
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // A dma-buf is not byte-readable; it is mmap'd. read() → 0 (EOF).
         Box::pin(async move { Ok(0) })
@@ -528,9 +562,19 @@ impl FileOps for PrimeDmaBufFile {
 #[derive(Debug)]
 struct VirtGpuPrimeDmaBufFile {
     resource: Arc<crate::drm_ioctl_bridge::VirtGpuResource>,
+    /// This dma-buf's inode. See [`dma_buf_inode`].
+    inode: narf_filesystem::inode_id::InodeId,
 }
 
 impl FileOps for VirtGpuPrimeDmaBufFile {
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
     }
@@ -593,6 +637,7 @@ pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn 
         byte_len,
         gem_handle,
         backing,
+        inode: dma_buf_inode(),
     }))
 }
 
@@ -653,6 +698,11 @@ impl FileOps for DriRenderFile {
     /// `st_rdev` = DRM_MAJOR(226):minor(128 + card index). See [`render_rdev`].
     fn rdev(&self) -> u64 {
         render_rdev(self.index)
+    }
+
+    /// See `DriCardFile::ino`: the devtmpfs node's inode for this `rdev`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
     }
 
     fn owners(&self) -> (u32, u32) {
@@ -728,7 +778,10 @@ impl FileOps for DriRenderFile {
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::NotFound);
         };
-        Ok(Arc::new(VirtGpuPrimeDmaBufFile { resource }))
+        Ok(Arc::new(VirtGpuPrimeDmaBufFile {
+            resource,
+            inode: dma_buf_inode(),
+        }))
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {

@@ -1258,6 +1258,10 @@ unsafe fn write_user_termios2(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
 /// therefore visible to the shell reading `/dev/console` and vice versa.
 pub struct ConsoleFile;
 
+/// `/dev/console`'s device number, `MKDEV(TTYAUX_MAJOR, 1)` in Linux's
+/// `new_encode_dev` form.
+const CONSOLE_RDEV: u64 = (5 << 8) | 1;
+
 impl ConsoleFile {
     pub const fn new() -> Self {
         Self
@@ -1407,6 +1411,18 @@ pub fn __test_reset_tty() {
 }
 
 impl FileOps for ConsoleFile {
+    /// init's fds 0/1/2 are, on Linux, `console_on_rootfs`'s open of
+    /// `/dev/console` (TTYAUX_MAJOR 5, minor 1): report that node's
+    /// `st_rdev` and devfs inode so `ttyname`, which matches `/proc/self/fd/N`
+    /// against a `stat` of the named node, finds `/dev/console`.
+    fn rdev(&self) -> u64 {
+        CONSOLE_RDEV
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(CONSOLE_RDEV)
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Route through the single shared console line discipline
         // (`narf_filesystem::console_tty`), the same path /dev/console
