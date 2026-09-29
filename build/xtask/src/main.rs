@@ -3495,6 +3495,16 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
         ("drm_smoke", "drm-ok"),
+        // VirGL 3D smoke — hand-rolled virgl command stream (clear + a
+        // TGSI-shaded triangle) through renderD128, rendered by the HOST
+        // GPU and pixel-verified after TRANSFER_FROM_HOST_3D. The token
+        // is `virgl3d-done`: printed on success AND on the clean
+        // environment skip (a 2D-only virtio-gpu prints `virgl3d-skip`
+        // first), absent on any real failure — the case gates
+        // correctness wherever it runs and needs no VirGL-capable QEMU
+        // in CI. Full 3D verification: `--gpu-backend virgl --display
+        // egl-headless` + expect `virgl3d-ok 64x64`.
+        ("virgl3d_smoke", "virgl3d-done"),
         // timerfd-in-epoll wake — weston's repaint-loop driver: a timerfd
         // armed via timerfd_settime, blocked on by epoll_wait(-1). Guards the
         // path the whole desktop repaint cadence rides on.
@@ -3976,6 +3986,26 @@ fn run_interactive_boot(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    // Forward QEMU's stderr to ours as it arrives. The pipe used to be
+    // created and never drained, which both swallowed device-backend
+    // diagnostics (virglrenderer's VREND_DEBUG output prints there) and
+    // — once the 64 KiB pipe buffer filled — blocked QEMU mid-write,
+    // wedging the guest under any chatty debug env.
+    if let Some(child_err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let reader = std::io::BufReader::new(child_err);
+            let mut err = std::io::stderr();
+            for line in reader.split(b'\n') {
+                let Ok(mut line) = line else { break };
+                line.push(b'\n');
+                if err.write_all(&line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let prompt_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
         .ok()
@@ -4498,6 +4528,26 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    // Forward QEMU's stderr to ours as it arrives. The pipe used to be
+    // created and never drained, which both swallowed device-backend
+    // diagnostics (virglrenderer's VREND_DEBUG output prints there) and
+    // — once the 64 KiB pipe buffer filled — blocked QEMU mid-write,
+    // wedging the guest under any chatty debug env.
+    if let Some(child_err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let reader = std::io::BufReader::new(child_err);
+            let mut err = std::io::stderr();
+            for line in reader.split(b'\n') {
+                let Ok(mut line) = line else { break };
+                line.push(b'\n');
+                if err.write_all(&line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let timeout_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
         .ok()
