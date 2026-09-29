@@ -2080,4 +2080,150 @@ pub mod tests {
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_bands_populated_from_chip_config
     );
+
+    /// BAR0 on this family is 16 KiB (`lspci` reports `size=16K` for
+    /// the MS-03's 8086:e340). Anything handed to
+    /// `MmioRegion::{read32,write32}` is a *CSR offset* and has to
+    /// land inside that window.
+    ///
+    /// PRPH addresses are a different namespace: they are values
+    /// written *through* the HBUS window, not offsets into it, and
+    /// they legitimately run into the 0xA0_0000 range. Conflating the
+    /// two is how `HBUS_TARG_PRPH_WADDR` came to be 0x44C000 — the
+    /// PRPH data register's 0x44c with four zeroes stuck on — which
+    /// put every indirect register access roughly 4.5 MiB past the
+    /// end of the mapping.
+    fn smoke_iwlwifi_csr_offsets_fit_in_bar0() -> TestResult {
+        use super::regs;
+
+        /// Smallest BAR0 this driver claims to support.
+        const BAR0_BYTES: u32 = 16 * 1024;
+
+        let csr_offsets: &[(&str, u32)] = &[
+            ("CSR_HW_IF_CONFIG_REG", regs::CSR_HW_IF_CONFIG_REG),
+            ("CSR_INT_COALESCING", regs::CSR_INT_COALESCING),
+            ("CSR_INT", regs::CSR_INT),
+            ("CSR_INT_MASK", regs::CSR_INT_MASK),
+            ("CSR_FH_INT_STATUS", regs::CSR_FH_INT_STATUS),
+            ("CSR_GPIO_IN", regs::CSR_GPIO_IN),
+            ("CSR_RESET", regs::CSR_RESET),
+            ("CSR_GP_CNTRL", regs::CSR_GP_CNTRL),
+            ("CSR_HW_REV", regs::CSR_HW_REV),
+            ("CSR_FUNC_SCRATCH", regs::CSR_FUNC_SCRATCH),
+            ("CSR_EEPROM_REG", regs::CSR_EEPROM_REG),
+            ("CSR_UCODE_DRV_GP1", regs::CSR_UCODE_DRV_GP1),
+            ("CSR_UCODE_DRV_GP2", regs::CSR_UCODE_DRV_GP2),
+            ("CSR_GIO_REG", regs::CSR_GIO_REG),
+            ("CSR_CTXT_INFO_ADDR", regs::CSR_CTXT_INFO_ADDR),
+            ("CSR_IML_DATA_ADDR", regs::CSR_IML_DATA_ADDR),
+            ("CSR_IML_SIZE_ADDR", regs::CSR_IML_SIZE_ADDR),
+            ("CSR_CTXT_INFO_BOOT_CTRL", regs::CSR_CTXT_INFO_BOOT_CTRL),
+            ("HBUS_TARG_PRPH_WADDR", regs::HBUS_TARG_PRPH_WADDR),
+            ("HBUS_TARG_PRPH_RADDR", regs::HBUS_TARG_PRPH_RADDR),
+            ("HBUS_TARG_PRPH_WDAT", regs::HBUS_TARG_PRPH_WDAT),
+            ("HBUS_TARG_PRPH_RDAT", regs::HBUS_TARG_PRPH_RDAT),
+            ("FH_TFDIB_CTRL0_REG_SRVC", regs::FH_TFDIB_CTRL0_REG_SRVC),
+            ("FH_TFDIB_CTRL1_REG_SRVC", regs::FH_TFDIB_CTRL1_REG_SRVC),
+        ];
+
+        for (name, off) in csr_offsets {
+            let _ = name;
+            if *off >= BAR0_BYTES {
+                return TestResult::Fail("a CSR offset lies outside the 16 KiB BAR0 window");
+            }
+            // Every register in this device is 32 bits wide and the
+            // MMIO accessors are naturally-aligned reads and writes.
+            if off % 4 != 0 {
+                return TestResult::Fail("a CSR offset is not 4-byte aligned");
+            }
+        }
+
+        // The HBUS window's four registers are distinct and ordered
+        // WADDR, RADDR, WDAT, RDAT at +0x44..+0x50 from HBUS_BASE.
+        const HBUS_BASE: u32 = 0x400;
+        if regs::HBUS_TARG_PRPH_WADDR != HBUS_BASE + 0x44
+            || regs::HBUS_TARG_PRPH_RADDR != HBUS_BASE + 0x48
+            || regs::HBUS_TARG_PRPH_WDAT != HBUS_BASE + 0x4C
+            || regs::HBUS_TARG_PRPH_RDAT != HBUS_BASE + 0x50
+        {
+            return TestResult::Fail("HBUS PRPH window registers are not at their offsets");
+        }
+
+        // PRPH addresses go *through* that window, so they are not
+        // bounded by BAR0 — but they do all live in the peripheral
+        // range, and one small enough to look like a CSR offset is
+        // the symptom of the same confusion.
+        let prph_addrs: &[u32] = &[
+            regs::UREG_DOORBELL_TO_ISR6,
+            regs::PRPH_UREG_UCODE_LOAD_STATUS,
+            regs::PRPH_WFPM_OTP_CFG1_ADDR,
+            regs::PRPH_LMPM_CHICK,
+        ];
+        for a in prph_addrs {
+            if *a < BAR0_BYTES {
+                return TestResult::Fail("a PRPH address is small enough to be a CSR offset");
+            }
+            if a % 4 != 0 {
+                return TestResult::Fail("a PRPH address is not 4-byte aligned");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_csr_offsets_fit_in_bar0
+    );
+
+    /// Pin the register values that were wrong, each against the
+    /// Linux symbol it mirrors. These are not derivable from anything
+    /// in the tree, so a typo in one is invisible without a reference
+    /// to compare against.
+    fn smoke_iwlwifi_register_values_match_linux() -> TestResult {
+        use super::regs;
+
+        // (ours, linux value, linux symbol)
+        let pinned: &[(u32, u32, &str)] = &[
+            (regs::HBUS_TARG_PRPH_WADDR, 0x444, "HBUS_TARG_PRPH_WADDR"),
+            (regs::HBUS_TARG_PRPH_RADDR, 0x448, "HBUS_TARG_PRPH_RADDR"),
+            (regs::HBUS_TARG_PRPH_WDAT, 0x44C, "HBUS_TARG_PRPH_WDAT"),
+            (regs::HBUS_TARG_PRPH_RDAT, 0x450, "HBUS_TARG_PRPH_RDAT"),
+            (regs::CSR_CTXT_INFO_ADDR, 0x118, "CSR_CTXT_INFO_ADDR"),
+            (regs::CSR_IML_DATA_ADDR, 0x120, "CSR_IML_DATA_ADDR"),
+            (regs::CSR_IML_SIZE_ADDR, 0x128, "CSR_IML_SIZE_ADDR"),
+            (
+                regs::CSR_CTXT_INFO_BOOT_CTRL,
+                0x0,
+                "CSR_CTXT_INFO_BOOT_CTRL",
+            ),
+            (
+                regs::UREG_DOORBELL_TO_ISR6,
+                0x00A0_5C04,
+                "UREG_DOORBELL_TO_ISR6",
+            ),
+            (
+                regs::PRPH_UREG_UCODE_LOAD_STATUS,
+                0x00A0_5C40,
+                "UREG_UCODE_LOAD_STATUS",
+            ),
+            (
+                regs::PRPH_WFPM_OTP_CFG1_ADDR,
+                0x00A0_3098,
+                "WFPM_OTP_CFG1_ADDR",
+            ),
+            (regs::PRPH_LMPM_CHICK, 0x00A0_1FF8, "LMPM_CHICK"),
+            (regs::PRPH_RELEASE_CPU_RESET, 0x300C, "RELEASE_CPU_RESET"),
+            (regs::IWL_ALIVE_STATUS_OK, 0xCAFE, "IWL_ALIVE_STATUS_OK"),
+        ];
+        for (ours, linux, sym) in pinned {
+            let _ = sym;
+            if ours != linux {
+                return TestResult::Fail("a register constant no longer matches its Linux value");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_register_values_match_linux
+    );
 }

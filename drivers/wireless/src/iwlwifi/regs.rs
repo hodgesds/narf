@@ -168,25 +168,37 @@ pub const CSR_IML_DATA_ADDR: u32 = 0x120;
 pub const CSR_IML_SIZE_ADDR: u32 = 0x128;
 /// Context-info boot control. Set bit `CSR_AUTO_FUNC_BOOT_ENA`
 /// to kick the device's IML.
-pub const CSR_CTXT_INFO_BOOT_CTRL: u32 = 0x150;
+///
+/// `CSR_CTXT_INFO_BOOT_CTRL` in `pcie/iwl-context-info-v2.h` is 0,
+/// which is the same register as `CSR_HW_IF_CONFIG_REG`: on gen3 the
+/// automatic-boot bits live in the low CSR word rather than in a
+/// window of their own.
+pub const CSR_CTXT_INFO_BOOT_CTRL: u32 = 0x000;
 /// Bit set in `CSR_CTXT_INFO_BOOT_CTRL` to start IML boot.
 pub const CSR_AUTO_FUNC_BOOT_ENA: u32 = 1 << 1;
 
 /// Doorbell register the SMU / WFPM uses for cross-CPU signalling.
 /// The driver writes `DOORBELL_TO_ISR6_NMI_BIT` here to force an
 /// NMI for crash diagnostics.
-pub const UREG_DOORBELL_TO_ISR6: u32 = 0x0AAC_C040;
+pub const UREG_DOORBELL_TO_ISR6: u32 = 0x00A0_5C04;
 pub const DOORBELL_TO_ISR6_NMI_BIT: u32 = 1 << 0;
 
 // ── PRPH — indirect access through HBUS_TARG_* registers ──────────
 
 /// HBUS target window — the driver writes an address here, then
-/// reads/writes data through `HBUS_TARG_PRPH_DATA`. Allows
+/// reads/writes data through the matching data register. Allows
 /// 32-bit-wide PRPH ops without per-register CSR mappings.
-pub const HBUS_TARG_PRPH_WADDR: u32 = 0x0044_C000;
-pub const HBUS_TARG_PRPH_WDAT: u32 = 0x0044_C004;
-pub const HBUS_TARG_PRPH_RADDR: u32 = 0x0044_C008;
-pub const HBUS_TARG_PRPH_RDAT: u32 = 0x0044_C00C;
+///
+/// These are CSR offsets, not PRPH addresses: they are passed
+/// straight to `MmioRegion::{read32,write32}` and so must land
+/// inside BAR0, which is 16 KiB on this part. `HBUS_BASE` is 0x400
+/// and the four registers sit at +0x44/+0x48/+0x4c/+0x50, so note
+/// that the address and data registers interleave read/write rather
+/// than running write-pair then read-pair.
+pub const HBUS_TARG_PRPH_WADDR: u32 = 0x0444;
+pub const HBUS_TARG_PRPH_RADDR: u32 = 0x0448;
+pub const HBUS_TARG_PRPH_WDAT: u32 = 0x044C;
+pub const HBUS_TARG_PRPH_RDAT: u32 = 0x0450;
 
 /// PRPH register: "release CPU from reset". Cleared during
 /// firmware load, set when the section loader is done.
@@ -194,15 +206,15 @@ pub const PRPH_RELEASE_CPU_RESET: u32 = 0x0000_300C;
 pub const PRPH_RELEASE_CPU_RESET_BIT: u32 = 1 << 31;
 /// PRPH register: ucode load status. Driver writes
 /// `FH_UCODE_LOAD_STATUS_GEN2` here on gen2 to signal "host done."
-pub const PRPH_UREG_UCODE_LOAD_STATUS: u32 = 0x0000_0340;
+pub const PRPH_UREG_UCODE_LOAD_STATUS: u32 = 0x00A0_5C40;
 /// PRPH register: OTP cfg1 — fused RF-chip identity. Read by
 /// gen3 probe to decide which `rf_*` to match against.
-pub const PRPH_WFPM_OTP_CFG1_ADDR: u32 = 0x0000_0940;
+pub const PRPH_WFPM_OTP_CFG1_ADDR: u32 = 0x00A0_3098;
 
 /// `LMPM_CHICK` register — toggled when the DMA destination
 /// falls into extended SRAM (0x40000–0x57FFF). The chick bit
 /// gives the channel access to the extended bank.
-pub const PRPH_LMPM_CHICK: u32 = 0x0A_01F4;
+pub const PRPH_LMPM_CHICK: u32 = 0x00A0_1FF8;
 pub const PRPH_LMPM_CHICK_EXT_ADDR_LSB: u32 = 1 << 27;
 
 // ── Address-range constants for `LMPM_CHICK` decision ──────────────
