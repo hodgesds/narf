@@ -39,6 +39,20 @@ pub enum WirelessRight {
 /// A specialized network interface supporting 802.11 operations.
 #[async_trait]
 pub trait WirelessNetIface: Interface {
+    /// The driver performs WPA2-PSK key exchange from a supplied PMK.
+    fn supports_handshake_offload(&self) -> bool {
+        false
+    }
+
+    /// Driver emits nl80211 link-loss notifications, including local teardown.
+    fn reports_disconnect_events(&self) -> bool {
+        false
+    }
+
+    /// Original AP information elements from the most recent scan.
+    fn scan_information_elements(&self, _bssid: [u8; 6]) -> Option<Vec<u8>> {
+        None
+    }
     /// Returns detailed information about the wireless interface.
     fn get_wireless_info(&self) -> WirelessIfaceInfo;
 

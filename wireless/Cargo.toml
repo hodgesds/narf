@@ -2,6 +2,7 @@
 name = "narf-wireless"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 narf-lib = { path = "../lib" }
@@ -16,6 +17,7 @@ async-trait = "0.1"
 futures = { version = "0.3", default-features = false }
 narf-kernel-test = { path = "../verification/kernel-test" }
 bitflags = "2.4"
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
 kernel-test = []

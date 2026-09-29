@@ -2587,14 +2587,20 @@ const TCPO_PEER: [u8; 4] = [10, 0, 11, 40];
 /// Drive an active open to `peer_port` and return the parsed options of the
 /// SYN that leaves the interface.
 ///
-/// `connect` blocks until the handshake completes or a 5 s deadline passes,
-/// and nothing here answers the SYN, so it always returns `Err`. That is
+/// Use a single SYN retry: the production default uses exponential backoff
+/// and can wait for over two minutes. Nothing here answers the SYN, so the
+/// bounded connect always returns `Err`. That is
 /// fine and deliberate: the SYN is built and handed to the interface before
 /// the wait begins, which is the whole of what these cases inspect. The
 /// failed connect cleans up its own TCB.
 fn syn_options_emitted(peer_port: u16) -> Option<crate::tcp::options::ParsedOptions> {
     drain_captured();
-    let _ = core::connect(TCPO_PEER, peer_port);
+    let _ = core::connect_errno_with_options_in(
+        0,
+        TCPO_PEER,
+        peer_port,
+        core::ConnectOptions { syn_retries: 1 },
+    );
     let frames = drain_captured();
     let off = ETH_HDR_LEN + IPV4_HDR_LEN;
     for f in frames {

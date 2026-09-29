@@ -10066,6 +10066,23 @@ pub fn delegate_stack_admin_to_route_socket(
         .as_any()
         .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
         .ok_or(crate::socket::SockError::BadFd)?;
+    if socket.protocol != crate::socket::NETLINK_ROUTE {
+        return Err(crate::socket::SockError::InvalidArg);
+    }
+    socket.delegate_netlink_admin(reply.admin.clone())
+}
+
+/// Launcher bridge for a delegated nl80211 control socket. The same
+/// interface-bound stack authority is accepted by route and generic
+/// netlink; neither protocol acquires authority merely by opening a socket.
+pub fn delegate_stack_admin_to_generic_socket(
+    fd: u32,
+    reply: &narf_net::StackAttachReply,
+) -> Result<(), crate::socket::SockError> {
+    let socket = current_socket(fd).ok_or(crate::socket::SockError::BadFd)?;
+    if socket.protocol != crate::socket::NETLINK_GENERIC {
+        return Err(crate::socket::SockError::InvalidArg);
+    }
     socket.delegate_netlink_admin(reply.admin.clone())
 }
 

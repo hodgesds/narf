@@ -23,17 +23,15 @@
 //!   1. Read the trailing 4 bytes; check magic == `b"NRFW"`.
 //!   2. Read metadata length, walk back to find metadata + signer
 //!      + signature.
-//!   3. SHA-256 the raw firmware bytes (everything before the
+//!   3. BLAKE3 the raw firmware bytes (everything before the
 //!      signature).
 //!   4. Verify the Ed25519 signature against the digest using the
 //!      signer's public key (looked up by fingerprint in the
 //!      kernel's trusted-firmware-signers list).
 //!
-//! Stage-6 step 1: trailer parsing + sha256-of-payload work; the
-//! Ed25519 verification step is wired through `narf-crypto` but
-//! the trusted-signers list is empty — only the unsigned
-//! sentinel (all-zero signature + all-zero fingerprint) is
-//! accepted, gated on the `firmware-allow-unsigned` feature.
+//! Build-time public keys are installed before firmware discovery. An
+//! unconfigured build has no trusted signers; unsigned blobs still require
+//! the explicit `firmware-allow-unsigned` feature.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -53,7 +51,7 @@ pub const BLOB_TRAILER_MAGIC: [u8; 4] = *b"NRFW";
 pub struct BlobTrailer<'a> {
     /// Raw firmware payload — everything before the trailer.
     pub payload: &'a [u8],
-    /// Ed25519 signature over `sha256(payload)`. All-zero when the
+    /// Ed25519 signature over `BLAKE3(payload)`. All-zero when the
     /// blob is unsigned (only accepted under `firmware-allow-unsigned`).
     pub signature: [u8; 64],
     /// SHA-256 fingerprint of the signer's Ed25519 public key.
@@ -173,20 +171,15 @@ pub fn verify(trailer: &BlobTrailer<'_>) -> Result<(), FirmwareError> {
 }
 
 /// Hash function used to compute the firmware-blob digest. Wraps
-/// `narf-crypto`'s blake3 — the hash itself isn't load-bearing for
-/// signature verification (Ed25519 prehash optional), but the
-/// digest gets recorded in `BlobIdentity` for the kernel's
-/// system-state report so observability tools can correlate
-/// driver behaviour with firmware version.
+/// `narf-crypto`'s BLAKE3. This algorithm is part of the wire contract:
+/// the producer signs these exact 32 bytes with ordinary Ed25519.
 pub fn digest_of(bytes: &[u8]) -> [u8; 32] {
     narf_crypto::blake3_hash(bytes)
 }
 
 /// Backwards-compatible alias used by the registry. The spec
-/// names this field `sha256` — the on-the-wire trailer carries no
-/// algorithm tag, so swapping blake3 in here is invisible to
-/// anything outside the registry. Stage-7 may switch to SHA-256
-/// once that surface lands; consumers see `[u8; 32]` either way.
+/// names this field `sha256`, but its historical value is BLAKE3.
+/// Changing the algorithm would require a versioned format migration.
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     digest_of(bytes)
 }
@@ -195,6 +188,16 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// `register_trusted_signer`. The trusted bootstrap stages the
 /// fingerprints+pubkeys at boot.
 static TRUSTED_SIGNERS: IrqSafeSpinLock<Vec<TrustedSigner>> = IrqSafeSpinLock::new(Vec::new());
+
+include!(concat!(env!("OUT_DIR"), "/trusted_keys.rs"));
+
+pub(crate) fn install_build_trusted_signers() {
+    for key in BUILD_TRUSTED_KEYS {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(key);
+        register_trusted_signer(hash.finalize(), *key);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct TrustedSigner {

@@ -7,28 +7,19 @@
 //!   - AX211  (8086:51f0/54f0/7e40) — So/Ma MAC + GF/GF4 RF (gen3)
 //!   - BE200  (8086:272b)  — Bz MAC + GF/GF4/FM RF (gen3, Wi-Fi 7)
 //!
-//! ## Scope of this commit
+//! AX210+ RFH receive rings, TFH commands/data, owned boot context,
+//! firmware API negotiation, and an MLD station control/data path are
+//! implemented in `runtime`, `device`, and `connection`. The current MLD
+//! command profile targets Sc/BE211 firmware. Unsupported command
+//! versions fail startup explicitly; Gen2 retains its older path.
 //!
-//! - PCI device match table.
-//! - Per-chip configuration (firmware filename prefix, MAC/RF
-//!   family, API version range, generation 2 vs 3).
-//! - Firmware filename ladder generator. Linux walks
-//!   `iwlwifi-<mac>-<rf>-<API>.ucode` from `api_max` down to
-//!   `api_min`; first hit wins. We mirror that ordering.
-//! - Intel TLV firmware container parser (magic `0x0a4c5749`).
-//!   Walks the .ucode bytes and yields typed sections — INST,
-//!   DATA, SEC_INIT, SEC_RT, plus a handful of capability TLVs.
-//! - Image-assembly: builds `FwImg` structs from SEC_INIT/SEC_RT
-//!   TLV streams, honouring the CPU1/CPU2 + paging separators.
+//! The station path supports 2.4/5 GHz legacy-rate Open or WPA2-PSK/CCMP
+//! networks. Firmware supplies channel/antenna data and enforces its
+//! regulatory profile alongside the host's configured regulatory domain.
+//! Hardware validation and the userspace wireless control daemon remain
+//! separate from the in-kernel transport and WirelessNetIface contract.
 //!
-//! Out of scope (real-HW + significant MMIO work; per agent
-//! research in this branch):
-//! - PCIe BAR0 register programming (CSR_*, FH_*, PRPH).
-//! - gen2 direct-DMA section loader.
-//! - gen3 IML / context-info-v2 boot path.
-//! - ALIVE notification handshake.
-//! - mac80211-equivalent: scan / associate / data path.
-//!
+
 //! ## References
 //!
 //! Post-2026-05-20 GPL relicense permits direct citation:
@@ -55,18 +46,33 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod bcast;
+pub mod boot_context;
+pub mod connection;
+pub mod data_queue;
+pub mod device;
+pub mod firmware_api;
+pub mod frame_api;
 pub mod fw_loader;
 pub mod handshake;
 pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
+pub mod pnvm;
 pub mod regs;
 pub mod rekey;
+pub mod runtime;
 pub mod rx;
+pub mod rx_rfh;
+pub mod scan_api;
+pub mod security;
 pub mod sta;
+pub mod station_api;
 pub mod transport;
 pub mod tx;
 pub mod tx_gen2;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod protocol_tests;
 pub mod wpa;
 
 use alloc::boxed::Box;
@@ -1117,6 +1123,8 @@ pub const MAX_PAGING_IMAGE_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum ParseError {
+    /// A recognized metadata TLV has an invalid shape.
+    InvalidMetadata(&'static str),
     /// Header too short for the magic + fields.
     TooShort,
     /// Magic doesn't match `IWL_TLV_UCODE_MAGIC`.
@@ -1135,6 +1143,7 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ParseError::InvalidMetadata(reason) => f.write_str(reason),
             ParseError::TooShort => write!(f, "blob too short for header"),
             ParseError::BadMagic(m) => write!(f, "bad TLV magic: {:#x}", m),
             ParseError::TruncatedTlv {
@@ -1181,6 +1190,7 @@ impl<'a> FwSection<'a> {
 /// original CPIO payload.
 #[derive(Clone, Debug)]
 pub struct ParsedUcode<'a> {
+    pub api: firmware_api::FirmwareApi<'a>,
     pub header: UcodeHeader,
     /// Number of CPUs declared by `NUM_OF_CPU` TLV (default 1).
     pub num_of_cpu: u32,
@@ -1190,8 +1200,8 @@ pub struct ParsedUcode<'a> {
     pub rt_sections: Vec<FwSection<'a>>,
     /// Raw `FW_VERSION` triple, if present: (major, minor, api).
     pub fw_version: Option<(u32, u32, u32)>,
-    /// `PNVM_VERSION` requirement for gen3 (`Some(version)` means
-    /// the driver MUST load a matching iwlwifi-*.pnvm sibling).
+    /// PNVM version metadata when present; runtime ALIVE SKU selects
+    /// the required calibration image (embedded or an external sibling).
     pub pnvm_version: Option<u32>,
     /// Unknown / unparsed TLVs surface count for diagnostics. The
     /// walker doesn't fail on these — Intel adds new tags in
@@ -1204,35 +1214,22 @@ impl<'a> ParsedUcode<'a> {
         self.num_of_cpu >= 2
     }
 
-    /// True iff this is a gen3-style blob that requires a PNVM
-    /// sibling. AX210/AX211/BE200 firmware all set this.
+    /// Firmware includes PNVM metadata. The ALIVE SKU determines
+    /// whether calibration must actually be loaded at runtime.
     pub fn requires_pnvm(&self) -> bool {
-        self.pnvm_version.is_some()
+        self.pnvm_version.is_some() || self.api.pnvm.is_some()
     }
 
-    /// Derive the PNVM sibling filename the kernel firmware
-    /// registry should resolve. Linux's `iwl_pnvm.c` builds the
-    /// name from the SKU + PNVM version embedded in the firmware
-    /// TLVs:
-    ///
-    /// ```text
-    /// iwlwifi-<sku>-<pnvm_version>.pnvm
-    /// ```
-    ///
-    /// Where `<sku>` is the same chip identity Linux uses for
-    /// the .ucode (e.g. `so-a0-gf-a0`) and `<pnvm_version>` is
-    /// the hex value from `TlvType::PnvmVersion`.
-    ///
-    /// Returns `None` for blobs that don't declare a PNVM
-    /// requirement (every gen2 chip + a few legacy gen3
-    /// firmwares).
+    /// PNVM uses the MAC/RF prefix without the firmware API or PNVM
+    /// version suffix: `iwlwifi-<mac>-<rf>.pnvm`. Gen2 has no sibling.
     pub fn pnvm_filename(&self, chip: &ChipConfig, rf: RfFamily) -> Option<String> {
-        let ver = self.pnvm_version?;
+        if chip.generation != Generation::Gen3 {
+            return None;
+        }
         Some(format!(
-            "iwlwifi-{}-{}-{:x}.pnvm",
+            "iwlwifi-{}-{}.pnvm",
             chip.mac.prefix(),
             rf.prefix(),
-            ver,
         ))
     }
 }
@@ -1266,6 +1263,7 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
         human_readable: hr,
     };
 
+    let mut api = firmware_api::FirmwareApi::default();
     let mut num_of_cpu: u32 = 1;
     let mut init_sections: Vec<FwSection<'_>> = Vec::new();
     let mut rt_sections: Vec<FwSection<'_>> = Vec::new();
@@ -1275,12 +1273,15 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 
     // TLV stream starts at TLV_HEADER_BYTES.
     let mut pos = TLV_HEADER_BYTES;
-    while pos + 8 <= bytes.len() {
+    while pos < bytes.len() {
+        if bytes.len() - pos < 8 {
+            return Err(ParseError::InvalidMetadata("truncated TLV header"));
+        }
         let raw_type = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         let raw_len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
         pos += 8;
         let len = raw_len as usize;
-        if pos + len > bytes.len() {
+        if len > bytes.len() - pos {
             return Err(ParseError::TruncatedTlv {
                 offset: pos - 8,
                 declared_len: raw_len,
@@ -1288,7 +1289,16 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
             });
         }
         let data = &bytes[pos..pos + len];
-        match TlvType::from_raw(raw_type) {
+        let metadata = api
+            .consume(raw_type, data)
+            .map_err(ParseError::InvalidMetadata)?;
+        // Secure sections use the same wire layout as ordinary sections.
+        let section_type = match raw_type {
+            24 => 19,
+            25 => 20,
+            other => other,
+        };
+        match TlvType::from_raw(section_type) {
             Some(TlvType::NumOfCpu) if len >= 4 => {
                 num_of_cpu = u32::from_le_bytes(data[..4].try_into().unwrap());
             }
@@ -1304,7 +1314,7 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
                     dest_offset,
                     payload: &data[4..],
                 };
-                if matches!(TlvType::from_raw(raw_type), Some(TlvType::SecInit)) {
+                if matches!(TlvType::from_raw(section_type), Some(TlvType::SecInit)) {
                     init_sections.push(sec);
                 } else {
                     rt_sections.push(sec);
@@ -1321,15 +1331,23 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
             }
             Some(_) => {} // recognised but not consumed
             None => {
-                unknown_tlv_count += 1;
+                if !metadata {
+                    unknown_tlv_count += 1;
+                }
             }
         }
         // TLVs are 4-byte aligned in the stream — round `len` up.
         let advance = (len + 3) & !3;
+        if advance > bytes.len() - pos {
+            return Err(ParseError::InvalidMetadata(
+                "truncated TLV alignment padding",
+            ));
+        }
         pos += advance;
     }
 
     Ok(ParsedUcode {
+        api,
         header,
         num_of_cpu,
         init_sections,
@@ -1452,13 +1470,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     api,
                 );
             }
-            if parsed.requires_pnvm() {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  iwlwifi:   gen3 PNVM required — sibling iwlwifi-*.pnvm \
-                     load not yet wired"
-                );
-            }
 
             // ── Hardware bring-up ──
 
@@ -1472,6 +1483,85 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 let _ = writeln!(narf_console::Writer, "  iwlwifi: BAR0 map failed");
                 narf_bus::ProbeError::Other("BAR0 map failed")
             })?;
+            if let Some(format) = rx_rfh::CompletionFormat::for_mac(chip.mac) {
+                // Country selection is deployment policy, not inferred from
+                // a language/timezone or an unauthenticated AP beacon.
+                if narf_wireless::reg::db::get_domain().is_none() {
+                    if let Ok(policy) = narf_firmware::open("wireless-regulatory.bin", &auth) {
+                        if let Ok(policy) = narf_firmware::view_of(&policy) {
+                            if policy.signer.is_some() {
+                                match narf_wireless::reg::parse_policy(policy.bytes) {
+                                    Ok(domain) => narf_wireless::reg::db::set_domain(domain),
+                                    Err(error) => {
+                                        let _ = writeln!(
+                                            narf_console::Writer,
+                                            "iwlwifi: regulatory policy: {}",
+                                            error
+                                        );
+                                    }
+                                }
+                            } else {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "iwlwifi: regulatory policy must be signed"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Startup waits for DMA responses; it must run in executor
+                // context, without blocking probe or holding an IRQ lock.
+                let firmware = view.bytes.to_vec();
+                let external_pnvm = if parsed.api.pnvm.is_none() {
+                    matched_name.rsplit_once('-').and_then(|(prefix, _)| {
+                        let name = format!("{}.pnvm", prefix);
+                        let cap = narf_firmware::open(&name, &auth).ok()?;
+                        let view = narf_firmware::view_of(&cap).ok()?;
+                        Some(view.bytes.to_vec())
+                    })
+                } else {
+                    None
+                };
+                narf_scheduler::spawn(async move {
+                    let result = async {
+                        let mut parsed = parse_ucode(&firmware).map_err(|_| "invalid firmware")?;
+                        if parsed.api.pnvm.is_none() {
+                            parsed.api.pnvm = external_pnvm.as_deref();
+                        }
+                        let hardware =
+                            runtime::Hardware::new(device, cap, mmio_region, &parsed, format)?;
+                        device::Device::initialize(hardware, &parsed, &firmware).await
+                    }
+                    .await;
+                    match result {
+                        Ok(interface) => {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  iwlwifi: MLD firmware initialized, MAC {:02x?}",
+                                interface.mac()
+                            );
+                            match interface.start_pumps() {
+                                Ok(()) => narf_wireless::registry::register(interface),
+                                Err(error) => {
+                                    let _ = writeln!(
+                                        narf_console::Writer,
+                                        "iwlwifi: interface registration: {}",
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  iwlwifi: startup failed: {}",
+                                error
+                            );
+                        }
+                    }
+                });
+                return Ok(());
+            }
             let mut mmio = IwlMmioImpl(mmio_region);
 
             // 2. APM Init (clocks + reset prologue).
@@ -1881,6 +1971,7 @@ pub mod tests {
     fn smoke_iwlwifi_pnvm_filename_derived_correctly() -> TestResult {
         let chip = chip_config_for_pci_id(INTEL_VENDOR, 0x272b).expect("be200");
         let parsed = ParsedUcode {
+            api: Default::default(),
             header: UcodeHeader {
                 version: 0,
                 build: 0,
@@ -1896,7 +1987,7 @@ pub mod tests {
         let name = parsed
             .pnvm_filename(&chip, RfFamily::GfA0)
             .expect("Some filename");
-        if name != "iwlwifi-bz-a0-gf-a0-42.pnvm" {
+        if name != "iwlwifi-bz-a0-gf-a0.pnvm" {
             return TestResult::Fail("PNVM filename wrong");
         }
         TestResult::Pass
@@ -1906,6 +1997,7 @@ pub mod tests {
     fn smoke_iwlwifi_pnvm_filename_none_when_no_version() -> TestResult {
         let chip = chip_config_for_pci_id(INTEL_VENDOR, 0x2723).expect("ax200");
         let parsed = ParsedUcode {
+            api: Default::default(),
             header: UcodeHeader {
                 version: 0,
                 build: 0,
@@ -2546,4 +2638,162 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_gen2_queue_cfg);
+
+    /// The RFH splits receive into a free list the host posts onto
+    /// and a used list the device returns on, each with its own
+    /// stride. A wrong descriptor size desynchronises the ring after
+    /// the first entry, and the Bz and AX210 completion layouts put
+    /// `rbid` at different offsets, so reading one as the other
+    /// yields a tag for the wrong buffer.
+    fn smoke_iwlwifi_rfh_descriptor_layout() -> TestResult {
+        use super::rx_rfh::*;
+        use core::mem::size_of;
+
+        if size_of::<RxTransferDesc>() != 16 {
+            return TestResult::Fail("iwl_rx_transfer_desc must be 16 bytes");
+        }
+        if size_of::<RxCompletionDesc>() != 32 {
+            return TestResult::Fail("the AX210 completion descriptor must be 32 bytes");
+        }
+        if size_of::<RxCompletionDescBz>() != 4 {
+            return TestResult::Fail("the Bz completion descriptor must be 4 bytes");
+        }
+        if CompletionFormat::Ax210.size() != 32 || CompletionFormat::Bz.size() != 4 {
+            return TestResult::Fail("completion stride must match the descriptor size");
+        }
+
+        // The same bytes must decode differently under the two
+        // formats — that is the whole hazard. Here rbid is 0x1111 at
+        // offset 4 for AX210 and 0xAAAA at offset 0 for Bz.
+        let raw = [
+            0xAAu8,
+            0xAA,
+            0x00,
+            0x00,
+            0x11,
+            0x11,
+            RX_CD_FLAGS_FRAGMENTED,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        match CompletionFormat::Ax210.decode(&raw) {
+            Some((0x1111, true)) => {}
+            _ => return TestResult::Fail("AX210 rbid sits at offset 4, flags at 6"),
+        }
+        match CompletionFormat::Bz.decode(&raw) {
+            Some((0xAAAA, false)) => {}
+            _ => return TestResult::Fail("Bz rbid sits at offset 0, flags at 2"),
+        }
+        if CompletionFormat::Ax210.decode(&raw) == CompletionFormat::Bz.decode(&raw) {
+            return TestResult::Fail("the two completion formats must not decode alike");
+        }
+
+        // A short buffer must be refused rather than read past.
+        if CompletionFormat::Ax210.decode(&raw[..31]).is_some() {
+            return TestResult::Fail("a truncated AX210 descriptor must not decode");
+        }
+        if CompletionFormat::Bz.decode(&raw[..3]).is_some() {
+            return TestResult::Fail("a truncated Bz descriptor must not decode");
+        }
+        // Four bytes is enough for Bz but not for AX210.
+        if CompletionFormat::Bz.decode(&raw[..4]).is_none() {
+            return TestResult::Fail("four bytes is a whole Bz descriptor");
+        }
+        if CompletionFormat::Ax210.decode(&raw[..4]).is_some() {
+            return TestResult::Fail("four bytes is not a whole AX210 descriptor");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_rfh_descriptor_layout
+    );
+
+    /// The RFH register block is PRPH except for the write-index
+    /// shadow, which is a direct CSR. Mixing those up sends an index
+    /// through the HBUS window to an address the device does not
+    /// decode — the same namespace confusion that put the PRPH
+    /// window registers 4.5 MiB outside BAR0.
+    fn smoke_iwlwifi_rfh_register_block() -> TestResult {
+        use super::rx_rfh::*;
+
+        const BAR0_BYTES: u32 = 16 * 1024;
+
+        // Every RFH register but the shadow is a PRPH address.
+        let prph: &[u32] = &[
+            RFH_Q0_FRBDCB_BA_LSB,
+            RFH_Q0_FRBDCB_WIDX,
+            RFH_Q0_FRBDCB_RIDX,
+            RFH_Q0_URBDCB_BA_LSB,
+            RFH_Q0_URBDCB_WIDX,
+            RFH_Q0_URBDCB_VAID,
+            RFH_Q0_URBD_STTS_WPTR_LSB,
+        ];
+        for a in prph {
+            if *a < BAR0_BYTES {
+                return TestResult::Fail("an RFH PRPH address is small enough to be a CSR offset");
+            }
+            if a % 4 != 0 {
+                return TestResult::Fail("an RFH PRPH address is not 4-byte aligned");
+            }
+        }
+        // The shadow is the exception and must stay inside BAR0.
+        if RFH_Q0_FRBDCB_WIDX_TRG >= BAR0_BYTES || RFH_Q0_FRBDCB_WIDX_TRG != 0x1C80 {
+            return TestResult::Fail("the write-index shadow is a CSR at 0x1c80");
+        }
+
+        // Per-queue striding: 64-bit registers step by 8, 32-bit by 4.
+        if rfh_frbdcb_ba_lsb(0) != RFH_Q0_FRBDCB_BA_LSB
+            || rfh_frbdcb_ba_lsb(3) != RFH_Q0_FRBDCB_BA_LSB + 24
+        {
+            return TestResult::Fail("64-bit RFH registers stride by 8");
+        }
+        if rfh_urbd_stts_wptr_lsb(2) != RFH_Q0_URBD_STTS_WPTR_LSB + 16 {
+            return TestResult::Fail("the write-back pointer strides by 8");
+        }
+        if rfh_frbdcb_widx(0) != RFH_Q0_FRBDCB_WIDX || rfh_frbdcb_widx(3) != RFH_Q0_FRBDCB_WIDX + 12
+        {
+            return TestResult::Fail("32-bit RFH registers stride by 4");
+        }
+        if rfh_frbdcb_ridx(1) != RFH_Q0_FRBDCB_RIDX + 4 {
+            return TestResult::Fail("the read index strides by 4");
+        }
+        if rfh_urbdcb_widx(1) != RFH_Q0_URBDCB_WIDX + 4 {
+            return TestResult::Fail("the used-list write index strides by 4");
+        }
+        if rfh_frbdcb_widx_trg(1) != 0x1C84 {
+            return TestResult::Fail("the shadow index strides by 4");
+        }
+
+        // The free and used lists must not collide: queue 0's used
+        // list base has to sit past the last free-list write index.
+        if RFH_Q0_URBDCB_BA_LSB <= RFH_Q0_FRBDCB_RIDX {
+            return TestResult::Fail("the used-list block should follow the free-list block");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_rfh_register_block);
 }

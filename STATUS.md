@@ -59,6 +59,17 @@ current test results.
    Wi-Fi, and persistent NVMe storage. AMDGPU, ACPI EC, I²C-HID,
    wireless, TSC calibration, and framebuffer diagnostics have foundations
    in-tree, but the complete gate remains open.
+   The iwlwifi Sc/BE211 work now includes an MLD station path with owned
+   firmware/PNVM boot DMA, RFH receive rings, command/data TX queues,
+   passive scans, Open/WPA2-PSK association, CCMP key/replay handling,
+   and kernel Ethernet routing. Software regressions cover wire layouts,
+   malformed completions, DMA ownership and authenticated EAPOL retries.
+   Delegated nl80211 scan/connect controls and signed deployment regulatory
+   policy loading are wired in, with build-time public-key provisioning
+   and detached-signature firmware packing. Automatic wireless-daemon
+   launch/delegation, silicon, and userspace-tool interoperability remain
+   unfinished or unverified. See
+   [the implemented driver contract](drivers/wireless/specification/spec.md#31-implemented-iwlwifi-mld-station-profile).
 2. **Compatibility and desktop:** extend tested Linux ABI and graphical
    application coverage on QEMU. Use runnable cases in
    [docs/DESKTOP_LINUX_PLAN.md](docs/DESKTOP_LINUX_PLAN.md) and the feature

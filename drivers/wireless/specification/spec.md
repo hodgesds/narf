@@ -13,7 +13,7 @@ states following the May 2026 relicensing to GPL-2.0:
 
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
-| **iwlwifi** | Wi-Fi 6/6E | **Stage 3** (ALIVE) | Gen2/3 DMA, ALIVE handshake |
+| **iwlwifi** | AX210+ transport; Sc/BE211 MLD station profile | RX/TX and station implementation; silicon validation pending | Firmware self-load, RFH, command/data queues, Open/WPA2-PSK |
 | **ath11k** | Wi-Fi 6E | **Stage 2** (M0) | MHI State Machine, BHI AMSS load |
 | **rtw88** | Wi-Fi 5 | **Stage 2** (FW Load) | RTL8822C IDDMA, MCU handshake |
 
@@ -25,9 +25,13 @@ states following the May 2026 relicensing to GPL-2.0:
 - **WNM / RRM Hooks** — hardware-assisted network/radio resource management.
 - **Hardware Queues** — mapping 802.11 Access Categories (AC_VO, AC_VI, AC_BE, AC_BK) to device rings.
 
+**Target split:** MLME and the WPA supplicant belong in a userspace
+Wireless Daemon. The current iwlwifi MLD bring-up path implements the
+station state machine inside the driver behind `WirelessNetIface`.
+Moving it across the management-frame interface remains follow-up work;
+the present implementation must not be described as a userspace supplicant.
+
 **Does NOT own:**
-- 802.11 MLME (Management Entity) — lives in the userspace Wireless Daemon.
-- WPA Supplicant — lives in userspace.
 - IP/TCP stack — lives in stack daemons.
 
 ## 2. Hardware Abstraction: The `WirelessDriver` Trait
@@ -64,11 +68,93 @@ pub trait WirelessDriver: Driver {
 
 Drivers receive traffic via four distinct Narf-Rings (one per AC) from the stack daemon.
 
+### 3.1 Implemented iwlwifi MLD station profile
+
+The production Gen3 probe owns firmware/IML/PNVM bytes and schedules
+initialization in executor context. It registers `wlan0` only after ALIVE,
+PNVM, PHY initialization, NVM reading, and MAC/link configuration succeed.
+Firmware command versions are checked before version-specific layouts are
+used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
+
+- `get_wireless_info()` reports the real hardware MAC and NVM-enabled
+  2.4/5 GHz channels, station mode, and legacy rates. HT/VHT/HE/EHT are
+  not advertised by this station implementation.
+- `scan()` runs a bounded passive scan, applies SSID/channel filters,
+  and retains at most 256 BSS records. Association selects a matching
+  cached BSSID/SSID/channel. Active probe transmission and hidden-SSID
+  discovery are not implemented; `active` currently uses passive scanning.
+- `associate()` configures a 20 MHz PHY/link/peer, allocates management
+  and data queues, authenticates, and associates. It supports Open and
+  WPA2-PSK with CCMP-128; WPA3, WEP, TKIP and required management-frame
+  protection are unsupported. A configured host regulatory domain and
+  firmware MCC permission are required before transmission. The selected
+  rule's power ceiling is applied through the firmware power command.
+- WPA2 authenticates the original EAPOL PDU before changing key/replay
+  state. Pairwise/group keys are installed in firmware. Repeated M3
+  messages cannot reinstall keys, and repeated GTK material cannot reset
+  RX counters. RX checks MIC status and per-TID packet numbers before
+  delivering plaintext Ethernet. The controlled port opens only after
+  key installation and message-4 TX completion. Group rekey is supported;
+  a fresh pairwise handshake requires reconnecting.
+- `disassociate()` closes the port, removes TX queues and the peer,
+  deactivates/detaches the link, and removes the PHY. Cancellation or a
+  transport error leaves the interface down; the next scan/associate
+  resets hardware before accepting another operation.
+- `set_config()` currently accepts the already-associated channel with
+  no power override. Channel changes require reassociation; explicit
+  runtime power overrides return `NotSupported`.
+
+The best-effort Ethernet path is registered with both the capability frame
+registry and the kernel interface registry. It converts Ethernet and
+unfragmented, nonaggregated 802.11 frames. Synchronous network waits can
+drain RX without polling the executor recursively. Background work uses an
+async mutex and scheduler timers; it does not hold an IRQ-safe lock across
+an await. Interrupt-driven operation, four AC queues, rate adaptation,
+aggregation, 6 GHz, roaming, and suspend/resume remain outside this profile.
+
+### 3.2 DMA lifetime and completion contract
+
+AX210 uses 32-byte RFH completions; Bz/Sc uses 4-byte completions. Both use
+16-byte transfer descriptors and buffer IDs rather than completion order.
+Only published IDs may be completed, and a buffer is reposted only after
+its packet has been copied. Fragment chains are discarded as a unit.
+Descriptor writes precede doorbells through a DMA visibility barrier.
+
+Command and data payloads remain allocated until a validated completion.
+Command replies must match the outstanding command and sequence; unsolicited
+notifications cannot reclaim command DMA. The unaggregated TX response must
+advance exactly one owned descriptor. A timeout never frees DMA on its own.
+Reset/drop releases resources only after the hardware DMA-stop handshake
+and PCI bus-master disable succeed; otherwise allocations are quarantined.
+Firmware sections, boot context, scratch, and PNVM remain owned throughout
+the running device's lifetime.
+
+These contracts have QEMU software regression tests. QEMU does not emulate
+the target Intel radio: successful DMA, RF operation, AP association and
+IP traffic on BE211 still require silicon validation. The existing Gen2
+probe is separate and does not inherit the MLD station implementation.
+
+Validation on 2026-09-29: full QEMU suites returned 8,891 pass / 0 fail /
+79 skip on x86_64 and 6,715 pass / 0 fail / 40 skip on aarch64. Both
+production boot smokes and btrfs interoperability postflights passed, as
+did debug/release builds on both architectures. The host xtask suite
+passed all 66 tests; trusted-key build-parser tests passed both cases.
+Formatting and Clippy on the affected kernel libraries and xtask passed.
+These results validate software contracts, not target-radio operation.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.
 - **Handoff**: On successful probe, the framework mints a `Cap<WirelessIface, _>` and registers it with the global `IfaceRegistry` (see `net/spec` §3).
 - **Control Path**: High-level calls like `scan()` are dispatched to the driver's `WirelessDriver` implementation.
+
+The implemented high-level control trait is `narf_wireless::WirelessNetIface`.
+The `nl80211` family bridges explicitly delegated scan/connect/disconnect
+requests to this trait and publishes asynchronous completion events.
+Probe can load a signed `wireless-regulatory.bin` deployment policy via the
+firmware registry (wire format in `wireless/` §3.5). Actual userspace-tool
+interoperability, provisioned policy and target hardware still require an
+end-to-end integration run.
 
 ## 5. Buffer Management
 

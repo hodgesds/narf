@@ -139,6 +139,25 @@ impl AdminHandle {
             .map_err(|_| AdminError::AuthorityRevoked)
     }
 
+    /// Invoke the interface/namespace authorization operation at the
+    /// control-plane boundary. A stored handle alone is not authority
+    /// after revocation or transfer to another network namespace.
+    pub fn authorize_interface(&self, name: &str, net_ns_id: u64) -> Result<(), AdminError> {
+        let permitted = self
+            .cap
+            .invoke(AdminContext {
+                handle: self,
+                name,
+                net_ns_id,
+            })
+            .map_err(|_| AdminError::AuthorityRevoked)?;
+        if permitted {
+            Ok(())
+        } else {
+            Err(AdminError::NoIface)
+        }
+    }
+
     pub fn set_link(&self, up: bool) -> Result<(), AdminError> {
         self.check_live()?;
         // Loopback is synthetic rather than a legacy L3 interface. It is
@@ -341,6 +360,19 @@ impl AdminHandle {
         self.check_live()?;
         crate::ipv6::ndp::neigh_remove(&self.iface_name, &ip);
         Ok(())
+    }
+}
+
+struct AdminContext<'a> {
+    handle: &'a AdminHandle,
+    name: &'a str,
+    net_ns_id: u64,
+}
+impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminContext<'_> {
+    type Output = bool;
+    fn execute(self, _: &Cap<AdminCap, Invoke>) -> Result<bool, narf_capabilities::CapError> {
+        Ok(self.handle.iface_name() == self.name
+            && self.handle.net_ns_id().ok() == Some(self.net_ns_id))
     }
 }
 

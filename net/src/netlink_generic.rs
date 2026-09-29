@@ -70,6 +70,53 @@ pub struct GenlReply {
 /// netlink framing to each returned response.
 pub type GenlHandler = fn(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32>;
 
+/// Authority is supplied by the socket's kernel-held delegation, never
+/// decoded from an attribute or inferred from a userspace UID.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestContext<'a> {
+    pub net_ns_id: u64,
+    pub admin: Option<&'a crate::AdminHandle>,
+}
+
+pub type ContextHandler = fn(u8, &[u8], bool, RequestContext<'_>) -> Result<Vec<GenlReply>, i32>;
+type EventSink = fn(net_ns_id: u64, group: u32, message: &[u8]);
+static CONTEXT_HANDLERS: IrqSafeSpinLock<Vec<(u16, ContextHandler)>> =
+    IrqSafeSpinLock::new(Vec::new());
+static EVENT_SINK: IrqSafeSpinLock<Option<EventSink>> = IrqSafeSpinLock::new(None);
+
+/// Add an authority-aware callback to an already registered family.
+pub fn register_context_handler(id: u16, handler: ContextHandler) -> bool {
+    if !FAMILIES.lock().iter().any(|family| family.id == id) {
+        return false;
+    }
+    let mut handlers = CONTEXT_HANDLERS.lock();
+    if handlers.iter().any(|(known, _)| *known == id) {
+        return false;
+    }
+    handlers.push((id, handler));
+    true
+}
+
+pub fn install_event_sink(sink: EventSink) {
+    *EVENT_SINK.lock() = Some(sink);
+}
+
+/// Deliver a kernel notification to a registered multicast group.
+/// The sink filters subscribers by protocol, membership and namespace.
+pub fn publish_event(id: u16, group: u32, net_ns_id: u64, reply: GenlReply) {
+    let family = FAMILIES.lock().iter().find(|f| f.id == id).copied();
+    let Some(family) = family else { return };
+    if !family.groups.iter().any(|g| g.id == group) {
+        return;
+    }
+    let sink = *EVENT_SINK.lock();
+    if let Some(sink) = sink {
+        let mut body = vec![reply.command, family.version, 0, 0];
+        body.extend_from_slice(&reply.attrs);
+        sink(net_ns_id, group, &frame(id, 0, 0, &body));
+    }
+}
+
 /// Static description of a generic-netlink family supplied by a subsystem.
 #[derive(Copy, Clone, Debug)]
 pub struct GenlFamily {
@@ -231,7 +278,7 @@ fn requested_attr(request: &[u8], requested_kind: u16) -> Option<&[u8]> {
     None
 }
 
-fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+fn build_one(request: &[u8], context: RequestContext<'_>) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN + 4 {
         return Err(());
     }
@@ -270,7 +317,17 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         {
             return Ok(vec![error(EOPNOTSUPP, seq, request)]);
         }
-        let mut out = match (family.handler)(command, &request[NLMSG_HDRLEN + 4..], dump) {
+        let contextual = CONTEXT_HANDLERS
+            .lock()
+            .iter()
+            .find(|(id, _)| *id == kind)
+            .map(|(_, handler)| *handler);
+        let result = if let Some(handler) = contextual {
+            handler(command, &request[NLMSG_HDRLEN + 4..], dump, context)
+        } else {
+            (family.handler)(command, &request[NLMSG_HDRLEN + 4..], dump)
+        };
+        let mut out = match result {
             Ok(payloads) => payloads
                 .into_iter()
                 .map(|reply| {
@@ -361,6 +418,14 @@ pub fn build_replies_with_options(
     datagram: &[u8],
     options: ReplyOptions,
 ) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_with_context(datagram, options, RequestContext::default())
+}
+
+pub fn build_replies_with_context(
+    datagram: &[u8],
+    options: ReplyOptions,
+    context: RequestContext<'_>,
+) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0usize;
     let mut replies = Vec::new();
     while offset < datagram.len() {
@@ -372,7 +437,7 @@ pub fn build_replies_with_options(
         if len < NLMSG_HDRLEN + 4 || len > remaining.len() {
             return Err(());
         }
-        replies.extend(build_one(&remaining[..len])?);
+        replies.extend(build_one(&remaining[..len], context)?);
         let step = align(len);
         if step > remaining.len() {
             if len == remaining.len() {
@@ -436,6 +501,68 @@ fn append_extended_ack(message: &mut Vec<u8>) {
     message[0..4].copy_from_slice(&new_len.to_ne_bytes());
     let flags = u16::from_ne_bytes(message[6..8].try_into().unwrap_or([0; 2])) | NLM_F_ACK_TLVS;
     message[6..8].copy_from_slice(&flags.to_ne_bytes());
+}
+
+mod authority_tests {
+    use super::*;
+    use narf_capabilities::{Cap, Invoke};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn handle(
+        _: u8,
+        _: &[u8],
+        _: bool,
+        context: RequestContext<'_>,
+    ) -> Result<Vec<GenlReply>, i32> {
+        let admin = context.admin.ok_or(1)?;
+        if admin.authorize_interface("lo", context.net_ns_id).is_err() {
+            return Err(1);
+        }
+        Ok(Vec::new())
+    }
+
+    fn smoke_generic_netlink_explicit_authority() -> TestResult {
+        const ID: u16 = 0x3d;
+        const OPS: &[GenlOperation] = &[GenlOperation {
+            command: 7,
+            flags: 2,
+        }];
+        let _ = register_family(GenlFamily {
+            id: ID,
+            name: "narf-ctx-test",
+            version: 1,
+            max_attr: 0,
+            operations: OPS,
+            groups: &[],
+            handler: unsupported_control,
+        });
+        let _ = register_context_handler(ID, handle);
+        let request = frame(ID, 5, 81, &[7, 1, 0, 0]);
+        let options = ReplyOptions {
+            ext_ack: false,
+            cap_ack: true,
+        };
+        let errno = |admin, net_ns_id| {
+            let replies =
+                build_replies_with_context(&request, options, RequestContext { net_ns_id, admin })
+                    .unwrap();
+            i32::from_ne_bytes(replies[0][16..20].try_into().unwrap())
+        };
+        let cap = Cap::<crate::AdminCap, Invoke>::bootstrap();
+        let admin = crate::AdminHandle::new(cap, "lo".into());
+        if errno(None, 0) != -1 || errno(Some(&admin), 1) != -1 || errno(Some(&admin), 0) != 0 {
+            return TestResult::Fail("generic netlink lost capability/namespace context");
+        }
+        cap.revoke();
+        if errno(Some(&admin), 0) != -1 {
+            return TestResult::Fail("revoked generic netlink authority accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/netlink_generic",
+        smoke_generic_netlink_explicit_authority
+    );
 }
 
 #[cfg(test)]

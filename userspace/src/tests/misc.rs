@@ -2851,6 +2851,23 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
         TrapContext,
     };
+    const TASK: u64 = 0x5047_4900;
+    const GROUP_MEMBER: u64 = TASK + 1;
+    // setpgid rejects task zero. Do not inherit another test's current-task
+    // hook, PID mapping, or session state when exercising a real caller.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            crate::task::release_task(GROUP_MEMBER);
+            crate::handlers::__test_reset_task_id_lookup();
+            crate::handlers::__test_pgid_reset();
+            crate::handlers::__test_sid_reset();
+            __test_clear_global();
+        }
+    }
+    let _cleanup = Cleanup;
+    crate::install_task_id_lookup(|| TASK);
+    crate::handlers::pid_task_map_reset();
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -2895,31 +2912,31 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
         ctx.ret
     }
 
-    // Default pgid == pid (which is 0 for the test harness's
-    // current_task_id).
+    // Default pgid == this fixture's nonzero process id.
     let pid = call(Syscall::GetPid, 0, 0).map(|r| r.value).unwrap_or(!0);
     let p0 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if p0 != pid {
         return TestResult::Fail("default pgid != pid");
     }
 
-    // setpgid(0, 7) — join an existing group. Linux (kernel/sys.c) only
-    // permits this when process group 7 actually has a live member in the
+    // Join an existing group. Linux (kernel/sys.c) only
+    // permits this when the process group actually has a live member in the
     // CALLER's session; `if (!g || task_session(g) != task_session(
     // group_leader)) goto out;` is -EPERM otherwise. This step used to pass
     // only because the handler validated nothing and inserted whatever it was
-    // given, so the group has to be made real first: a registered task, put
-    // in group 7, sharing the caller's session the way a fork would.
-    const GROUP_MEMBER: u64 = 7;
+    // given, so the group has to be made real first: a registered task
+    // sharing the caller's session the way a fork would.
     crate::task::release_task(GROUP_MEMBER);
     let _member = crate::task::Task::new_registered(GROUP_MEMBER, GROUP_MEMBER);
     crate::handlers::__test_set_pgid(GROUP_MEMBER, GROUP_MEMBER);
     crate::handlers::sid_fork(pid, GROUP_MEMBER);
-    let _ = call(Syscall::Setpgid, 0, 7);
+    if !matches!(call(Syscall::Setpgid, 0, GROUP_MEMBER), Some(result) if result.status == SyscallReturn::OK && result.value == 0)
+    {
+        return TestResult::Fail("setpgid rejected a group in the caller's session");
+    }
     let p1 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
-    if p1 != 7 {
-        crate::task::release_task(GROUP_MEMBER);
-        return TestResult::Fail("setpgid(7) did not stick");
+    if p1 != GROUP_MEMBER {
+        return TestResult::Fail("joining the existing group did not stick");
     }
 
     // setpgid(0, 0) — pgid resolves to the target's pid (creates

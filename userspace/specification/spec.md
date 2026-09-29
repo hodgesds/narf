@@ -25,6 +25,19 @@ applications above NARF.
 
 ## 3. Public interface
 
+`SocketFile::delegate_netlink_admin` accepts route and generic netlink
+sockets in the delegated interface's namespace. Generic-family requests
+receive that stored handle through `net::netlink_generic::RequestContext`;
+ordinary socket creation conveys no Wi-Fi mutation authority.
+`delegate_stack_admin_to_generic_socket` lets the trusted launcher attach
+the admin handle returned by stack attachment to a task's generic-netlink
+fd. This is an internal launcher API, not a Linux syscall accepting raw
+capability bytes. Kernel generic-netlink events reach only subscribers in
+the event's namespace and preserve their multicast group in packet info.
+Service-launch policy must explicitly call the delegation bridge after
+stack attachment; opening an ordinary `iw`/supplicant socket alone does
+not install authority. Automatic daemon launch/delegation is not wired.
+
 ```rust
 pub struct Process { /* cap table root, VM root, threads */ }
 pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;

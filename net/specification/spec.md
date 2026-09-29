@@ -224,6 +224,22 @@ and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
+Families may additionally register a `ContextHandler` receiving
+`RequestContext { net_ns_id, admin }`. `admin` is an optional, kernel-held
+interface-bound `AdminHandle`; the default reply builder supplies none.
+The socket bridge passes only explicitly delegated authority. Family
+mutations check its current validity, interface name and namespace before
+queueing work, and again when asynchronous work starts. Generic-netlink
+attributes cannot mint or substitute capabilities.
+`AdminHandle::authorize_interface(name, namespace)` performs this boundary
+check through `Cap::invoke`, including the current revocation epoch.
+
+`publish_event` frames a notification only for a registered family/group.
+Its installed socket sink filters by `NETLINK_GENERIC`, namespace and
+membership, queues at most 256 notifications per socket, and wakes readiness
+after releasing the queue lock. This is a bounded, best-effort multicast
+path; callers recover lost scan notifications by querying cached results.
+
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
 `inet_diag_req_v2` dumps for IPv4 and IPv6 TCP and UDP. It filters by the requested
 Linux socket-state mask and emits `inet_diag_msg` records from
