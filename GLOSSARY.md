@@ -5,11 +5,11 @@ once, so subsystem docs can link rather than redefine.
 
 ### Framekernel
 
-NARF's architectural style. A minimalist Rust TCB ("the Frame") runs in
-Ring 0 / EL1, but its single kernel address space is partitioned into
-hardware-enforced domains by PKS (Intel) or MTE (ARM). Drivers run inside
-those domains instead of in separate address spaces — they get the speed of
-a monolithic kernel and the containment of a microkernel.
+NARF's architectural style. A small trusted core establishes protection
+rules for kernel services. PKS or PCID-tagged page tables on x86_64, and
+MTE where available on aarch64, can confine resources assigned to domains.
+The actual protection depends on the selected backend and mapping policy;
+see `docs/DOMAIN_BACKENDS.md`.
 
 ### The Frame
 
@@ -24,22 +24,22 @@ memory regions the driver is permitted to touch.
 
 ### Narf-Ring
 
-NARF's zero-copy IPC primitive. A shared-memory ring buffer whose slots
-carry ownership-transferred pointers rather than copied bytes. Variants:
-SPSC and MPSC. Details in `ipc/specification/spec.md`.
+NARF's shared-memory IPC primitive. Ring slots carry handles to buffers;
+ownership transfer avoids copying the buffer payload, though handles and
+ring metadata are copied. Details in `ipc/specification/spec.md`.
 
-### Domain (PKS / MTE domain)
+### Domain
 
-A hardware-enforced partition of the kernel address space. Up to 16 domains
-on x86_64 via PKS (16 keys) / PKU (16 keys for user); aarch64 provides an
-analogous partitioning via MTE tags. A domain has an id, a set of rights,
-and a set of memory regions tagged to it.
+A named protection context with an ID, rights, and associated resources.
+NARF declares 16 domain IDs. Enforcement uses PKS or PCID on supported
+x86_64 systems and MTE on supported aarch64 systems. Without an active
+backend, a declared domain is not a hardware isolation boundary.
 
 ### Cap (Capability)
 
-An unforgeable, typed token granting one specific right over one specific
-object. Rust's type system prevents forging, aliasing-without-permission,
-and use-after-free. Examples: `Cap<BlockDevice, Write>`, `Cap<NetIface, Recv>`.
+An unforgeable, typed token granting a right over an object. Rust types
+constrain use at compile time; `Cap::invoke()` checks current validity after
+revocation. Examples: `Cap<BlockDevice, Write>`, `Cap<NetIface, Recv>`.
 
 ### Direct Context Transfer
 
@@ -55,10 +55,10 @@ Requires IOMMU configuration; see `io/`.
 
 ### UIPI (User Interrupts)
 
-Intel ISA extension that lets hardware deliver an interrupt directly to a
-user-mode (or non-TCB) handler, bypassing the kernel trap. NARF uses UIPI
-to deliver IRQs straight into the appropriate driver's domain. GICv3 ITS
-provides the conceptual equivalent on aarch64.
+Intel ISA extension for delivering user interrupts without a conventional
+kernel trap. It is an optional hardware path in NARF's design, not the
+default IRQ path on every machine. GICv3 ITS handles interrupt translation
+on aarch64.
 
 ### Global LTO
 
@@ -66,10 +66,10 @@ Link-Time Optimisation spanning the entire OS binary, so calls across
 subsystems can be inlined. NARF treats the kernel as one cargo-workspace
 LTO unit; see `build/`.
 
-### Stage (1/2/3/4)
+### Stage (1/2/3/4/5)
 
-Roadmap stages: Skeleton, Barrier, Flow, Compatibility. Every spec carries
-a Stage assignment. See `ROADMAP.md`.
+Development stages: Skeleton, Barrier, Flow, Compatibility, Silicon. Every
+subsystem spec carries a Stage assignment. See `STATUS.md` for progress.
 
 ### TCB (Trusted Computing Base)
 

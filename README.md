@@ -228,7 +228,7 @@ the BSDs, and classical microkernels).
 
 ```
 narf/
-├── DESIGN.md / ROADMAP.md / STATUS.md / GLOSSARY.md / AGENTS.md
+├── DESIGN.md / STATUS.md / GLOSSARY.md / AGENTS.md
 ├── docs/                       — PERSONAS, DOMAIN_BACKENDS, design notes
 │
 │ ── Cross-cutting ──
@@ -310,10 +310,9 @@ AMD Phoenix HawkPoint1 (RDNA3.5 / DCN 3.5).
 | Doc | When to read |
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Token-efficient navigation map (for AI agents and humans in a hurry) |
-| [`DESIGN.md`](DESIGN.md) | One-page v1.0 vision |
+| [`DESIGN.md`](DESIGN.md) | Architecture and design direction |
 | [`GLOSSARY.md`](GLOSSARY.md) | Framekernel / Narf-Ring / Domain definitions |
-| [`ROADMAP.md`](ROADMAP.md) | Per-stage subsystem activity + exit criteria + Stage × subsystem matrix |
-| [`STATUS.md`](STATUS.md) | Per-feature landing log + live driver portfolio tables |
+| [`STATUS.md`](STATUS.md) | Milestone progress, exercised paths, and open work |
 | [`COMPARISON.md`](COMPARISON.md) | Long-form comparison with Linux, the BSDs, and classical microkernels |
 | [`docs/PERSONAS.md`](docs/PERSONAS.md) | `linux-compat` + `container` feature surfaces |
 | [`docs/DOMAIN_BACKENDS.md`](docs/DOMAIN_BACKENDS.md) | Per-silicon enforcement matrix (PKS / MTE / PCID / VMPL / SFI) |

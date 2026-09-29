@@ -162,8 +162,7 @@ for an init system that manages resources via the cgroup hierarchy.
 ## Implementation status
 
 Both features are **live** as of Wave 77.  The implementation landed
-across Waves 62–77 (per `STATUS.md` "Stage 5 / personality features"
-section):
+across Waves 62–77:
 
 - Wave 62 established the feature flags and stub modules.
 - Wave 63 — dyn-linker aux vector (`AT_PHDR` / `AT_PHENT` / `AT_PHNUM`

@@ -8,9 +8,9 @@ It is a snapshot of the code in this tree. Where a claim could not be verified
 from source it is marked **(unverified)**. All citations are `path:line` into
 this worktree.
 
-Companion docs: [`STATUS.md`](../STATUS.md) (subsystem status),
+Companion docs: [`STATUS.md`](../STATUS.md) (progress),
 [`COMPARISON.md`](../COMPARISON.md) (design-space positioning),
-[`ROADMAP.md`](../ROADMAP.md) (stages), [`PERSONAS.md`](../PERSONAS.md)
+[`PERSONAS.md`](PERSONAS.md)
 (the `linux-compat` / `container` / `cgroup` build profiles).
 
 ---
