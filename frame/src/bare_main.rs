@@ -5609,6 +5609,9 @@ fn boot_userspace_init() {
                 // sequence, with systemd's errno-after-updwtmpx check.
                 ("utmp_smoke", narf_verification::NARF_UTMP_SMOKE_ELF),
                 ("utmp_glibc", narf_verification::NARF_UTMP_SMOKE_GLIBC_ELF),
+                // tmpfiles' `w!` writes to the THP sysfs knobs.
+                ("thp_smoke", narf_verification::NARF_THP_SMOKE_ELF),
+                ("thp_glibc", narf_verification::NARF_THP_SMOKE_GLIBC_ELF),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,
