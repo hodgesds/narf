@@ -5598,6 +5598,13 @@ fn boot_userspace_init() {
                     "pty_wake_glibc",
                     narf_verification::NARF_PTY_WAKE_SMOKE_GLIBC_ELF,
                 ),
+                // `mount -o remount` through libmount's new-API sequence and
+                // mount(2) MS_REMOUNT; flags land in mountinfo (systemd-remount-fs).
+                ("remount_smoke", narf_verification::NARF_REMOUNT_SMOKE_ELF),
+                (
+                    "remount_glibc",
+                    narf_verification::NARF_REMOUNT_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

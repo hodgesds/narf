@@ -660,6 +660,7 @@ fn main() {
         "shmfork_smoke",
         "sigrt_smoke",
         "strace_smoke",
+        "remount_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
@@ -715,6 +716,7 @@ fn main() {
         "pty_wake_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
+        "remount_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

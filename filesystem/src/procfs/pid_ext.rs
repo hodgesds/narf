@@ -619,20 +619,22 @@ fn render_mountinfo(pid: u64) -> String {
     if let Some(rows) = super::hook_ns_mountinfo(pid) {
         let mut s = String::new();
         for line in rows.lines() {
-            let mut it = line.splitn(6, '\t');
+            let mut it = line.splitn(7, '\t');
             let id = it.next().unwrap_or("1");
             let parent = it.next().unwrap_or("0");
             let path = it.next().unwrap_or("/");
             let fs_name = it.next().unwrap_or("rootfs");
             // The two option fields go in DIFFERENT columns: this
             // attachment's MNT_* flags before the `-` separator, and the
-            // filesystem's show_options text after it.
+            // superblock's `rw`/`ro` + `show_sb_opts` + the filesystem's
+            // show_options text after it (`show_mountinfo`).
             let mnt_opts = it.next().unwrap_or("rw");
             let sb_opts = it.next().unwrap_or("");
+            let super_flags = it.next().unwrap_or("rw");
             let _ = writeln!(
                 s,
                 "{} {} 0:1 / {} {} - {} {} {}{}",
-                id, parent, path, mnt_opts, fs_name, fs_name, mnt_opts, sb_opts
+                id, parent, path, mnt_opts, fs_name, fs_name, super_flags, sb_opts
             );
         }
         if s.is_empty() {
@@ -641,11 +643,13 @@ fn render_mountinfo(pid: u64) -> String {
         return s;
     }
     let mut s = String::new();
-    for (id, parent, path, fs_name, mnt_opts, sb_opts) in crate::registry().list_mountinfo() {
+    for (id, parent, path, fs_name, mnt_opts, sb_opts, super_flags) in
+        crate::registry().list_mountinfo()
+    {
         let _ = writeln!(
             s,
             "{} {} 0:1 / {} {} - {} {} {}{}",
-            id, parent, path, mnt_opts, fs_name, fs_name, mnt_opts, sb_opts
+            id, parent, path, mnt_opts, fs_name, fs_name, super_flags, sb_opts
         );
     }
     if s.is_empty() {
@@ -685,7 +689,7 @@ fn render_mounts(_pid: u64) -> String {
     for (path, fs_name, mnt_opts, sb_opts) in crate::registry().list_with_options() {
         let _ = writeln!(
             s,
-            "{} {} {} {},relatime{} 0 0",
+            "{} {} {} {}{} 0 0",
             fs_name, path, fs_name, mnt_opts, sb_opts
         );
     }

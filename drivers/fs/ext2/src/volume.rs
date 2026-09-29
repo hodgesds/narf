@@ -2080,4 +2080,10 @@ impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
     fn name(&self) -> &str {
         "ext2"
     }
+
+    /// `ext4_reconfigure`, after the VFS took its own keys out. See
+    /// [`super::mount_opts::validate_remount`].
+    fn reconfigure(&self, options: &str) -> Result<(), FsError> {
+        super::mount_opts::validate_remount(options)
+    }
 }

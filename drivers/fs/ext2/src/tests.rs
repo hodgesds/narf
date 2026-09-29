@@ -719,6 +719,39 @@ fn smoke_ext2_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_mount_ramblock_round_trip);
 
+/// A mounted volume answers `FsInstance::reconfigure` — the step
+/// `mount -o remount` reaches with the fstab's ext4 parameters. The volume
+/// used to inherit the trait's `Unsupported` for every string, so
+/// `systemd-remount-fs` failed -EINVAL on any fstab line with an ext4
+/// option in it.
+fn smoke_ext2_volume_reconfigure_takes_ext4_params() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("Ext2Volume::mount failed"),
+    };
+    if volume
+        .reconfigure("commit=60,errors=remount-ro,discard")
+        .is_err()
+    {
+        return TestResult::Fail("reconfigure refused fstab ext4 parameters");
+    }
+    match volume.reconfigure("commit=60,not_an_ext4_option") {
+        Err(FsError::Unsupported) => TestResult::Pass,
+        _ => TestResult::Fail("reconfigure accepted a parameter ext4 does not have"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_volume_reconfigure_takes_ext4_params
+);
+
 fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};

@@ -3639,6 +3639,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("tty_poll_timeout_glibc", "tty-poll-timeout-ok"),
         ("pty_wake_smoke", "pty-wake-ok"),
         ("pty_wake_glibc", "pty-wake-ok"),
+        // libmount's remount sequence + MS_REMOUNT flags in mountinfo.
+        ("remount_smoke", "remount-ok"),
+        ("remount_glibc", "remount-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),
