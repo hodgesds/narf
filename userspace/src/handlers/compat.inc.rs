@@ -1419,6 +1419,15 @@ impl narf_filesystem::FileOps for DirFdFile {
         self.dir.ino()
     }
 
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        // `st_dev` (and nlink/atime/ctime) too: `(st_dev, st_ino)` names
+        // the inode, and a path stat of the directory reports the
+        // DirOps' attrs. Dropping them made `fstat(open("/tmp"))` report
+        // st_dev 0 while `stat("/tmp")` reported the tmpfs superblock, so
+        // the same directory looked like two different files.
+        self.dir.inode_attrs()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,
@@ -1441,7 +1450,8 @@ impl narf_filesystem::FileOps for DirFdFile {
                 file_type: narf_filesystem::FileType::Dir,
                 perms: self.dir.dir_mode(),
             },
-            mtime_cycles: 0,
+            // The same mtime a path stat reports (`stat_ino_path_dir_aware_ext`).
+            mtime_cycles: narf_time::ns_to_cycles(self.dir.dir_mtime_ns()),
         }
     }
     fn owners(&self) -> (u32, u32) {
