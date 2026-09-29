@@ -86,6 +86,139 @@ pub(crate) fn rename_absolute(
 /// vfs_rename: source == target → 0; may_delete / may_create (EACCES,
 ///   sticky EPERM, immutable EPERM, then ENOTDIR / EISDIR); mountpoint EBUSY
 /// ```
+/// One side of a rename, resolved ONCE: the parent directory handle, the
+/// leaf name under it, and the child entry probed through that parent.
+///
+/// `rename_impl` used to answer every question about a path with a fresh
+/// full-path resolution — `parentat_dir`, `namespace_node_kind`,
+/// `entry_owner`, `path_inode_flags` and the backend rename each walked
+/// the same components again, 12+ walks per rename, leaving the actual
+/// `DirOps::rename` under 10% of the syscall's cycles. The probe keeps
+/// `do_renameat2`'s check ORDER (documented above `rename_impl`) while
+/// sourcing kind/owner/flags and the backend call from one resolution.
+struct RenameSide {
+    parent: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    leaf: alloc::string::String,
+    /// File-shaped child (regular file, symlink, device node, or a
+    /// synthetic FS's directory-typed marker), when the leaf has one.
+    node: Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+    /// Directory-shaped child.
+    subdir: Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>>,
+}
+
+impl RenameSide {
+    fn exists(&self) -> bool {
+        self.node.is_some() || self.subdir.is_some()
+    }
+    fn is_dir(&self) -> bool {
+        self.subdir.is_some()
+            || self.node.as_ref().is_some_and(|n| {
+                n.stat().mode.file_type == narf_filesystem::FileType::Dir
+            })
+    }
+    /// `entry_owner`'s answer from the already-probed child: file-shaped
+    /// owners first, then the directory's.
+    fn owner(&self) -> Option<(u32, u32)> {
+        if let Some(node) = &self.node {
+            return Some(node.owners());
+        }
+        self.subdir.as_ref().map(|d| d.dir_owners())
+    }
+}
+
+/// Probe `path`'s parent and leaf in a single resolution. `None` means the
+/// parent walk failed (missing component or a non-directory on the way);
+/// the caller classifies that with `path_lookup_errno` exactly as
+/// `parentat_dir` did.
+fn probe_rename_side(path: &str) -> Option<RenameSide> {
+    current_resolve_parent_absolute(path, |_fs, parent, leaf| {
+        // Sync lookup first (memfs and the synthetic FSes answer it);
+        // the async form covers block-backed filesystems whose sync
+        // lookup is stubbed. Mirrors `entry_owner`'s probe order.
+        let node = parent
+            .lookup(leaf)
+            .or_else(|| poll_blocking(parent.lookup_async(leaf)).and_then(|r| r.ok()));
+        let node_is_dir_marker = node.as_ref().is_some_and(|n| {
+            n.stat().mode.file_type == narf_filesystem::FileType::Dir
+        });
+        let subdir = if node.is_none() || node_is_dir_marker {
+            parent
+                .lookup_dir(leaf)
+                .or_else(|| poll_blocking(parent.lookup_dir_async(leaf)).and_then(|r| r.ok()))
+        } else {
+            None
+        };
+        RenameSide {
+            leaf: alloc::string::String::from(leaf),
+            parent,
+            node,
+            subdir,
+        }
+    })
+}
+
+/// `filename_parentat` for one rename side: the parent directory's PATH
+/// (lexical for a LAST_NORM leaf, the path itself for `.`/`..`) plus the
+/// probe when the leaf is LAST_NORM. A failed parent walk is classified
+/// through `path_lookup_errno`, matching `parentat_dir`.
+fn rename_walk_parent(
+    path: &str,
+    last: LastComponent,
+) -> Result<(alloc::string::String, Option<RenameSide>), i64> {
+    match last {
+        LastComponent::Root => Ok((alloc::string::String::from("/"), None)),
+        LastComponent::Dot | LastComponent::DotDot => {
+            // The walk goes THROUGH the named directory, so the path
+            // itself must resolve as one (its leaf is rejected with
+            // EBUSY right after the EXDEV check, so no probe is needed).
+            if stat_ino_path_dir_aware(path)
+                .is_some_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+            {
+                Ok((alloc::string::String::from(path), None))
+            } else {
+                Err(-path_lookup_errno(&alloc::format!("{path}/.")))
+            }
+        }
+        _ => {
+            let dir = parent_of_abs(path);
+            match probe_rename_side(path) {
+                Some(side) => Ok((alloc::string::String::from(dir), Some(side))),
+                None => Err(-path_lookup_errno(&alloc::format!("{dir}/."))),
+            }
+        }
+    }
+}
+
+/// `namespace_node_kind` from the probe: `Some(is_dir)` for an existing
+/// leaf. A leaf that the parent does not list can still exist as a MOUNT
+/// ROOT (the mount table, not the parent directory, makes it a directory)
+/// — the one case the per-parent probe cannot see.
+fn rename_side_kind(path: &str, side: &RenameSide) -> Option<bool> {
+    if side.exists() {
+        return Some(side.is_dir());
+    }
+    if current_path_is_mount_root(path) {
+        return Some(true);
+    }
+    None
+}
+
+/// `path_inode_flags` from the probe. A symlink's flags come from its
+/// TARGET (the file resolver follows the final link) and a directory
+/// answered through the file-shaped resolver — both keep the original
+/// helper; the overwhelmingly common regular-file leaf answers from the
+/// probed node directly.
+fn rename_side_inode_flags(path: &str, side: &RenameSide) -> u32 {
+    match &side.node {
+        Some(node) if node.stat().mode.file_type != narf_filesystem::FileType::Symlink => {
+            node.inode_flags()
+        }
+        Some(_) => path_inode_flags(path),
+        None if side.subdir.is_some() => path_inode_flags(path),
+        None => 0,
+    }
+}
+
 fn rename_impl(
     old_path: &str,
     new_path: &str,
@@ -95,12 +228,12 @@ fn rename_impl(
 ) -> i64 {
     let exchange = flags & RENAME_EXCHANGE != 0;
     let noreplace = flags & RENAME_NOREPLACE != 0;
-    let old_dir = match parentat_dir(old_path, old_last) {
-        Ok(dir) => dir,
+    let (old_dir, old_probe) = match rename_walk_parent(old_path, old_last) {
+        Ok(walked) => walked,
         Err(errno) => return errno,
     };
-    let new_dir = match parentat_dir(new_path, new_last) {
-        Ok(dir) => dir,
+    let (new_dir, new_probe) = match rename_walk_parent(new_path, new_last) {
+        Ok(walked) => walked,
         Err(errno) => return errno,
     };
     if current_mount_id_at(&old_dir) != current_mount_id_at(&new_dir) {
@@ -114,14 +247,21 @@ fn rename_impl(
     if !new_last.is_norm() {
         return if noreplace { -EEXIST } else { -EBUSY };
     }
+    // Both lasts are LAST_NORM from here, so both sides carry a probe.
+    let Some(old_side) = old_probe else {
+        return -ENOENT;
+    };
+    let Some(new_side) = new_probe else {
+        return -ENOENT;
+    };
     // A rename writes BOTH directories; they share a mount (checked above).
     if let Err(errno) = mnt_want_write(old_path).and_then(|()| mnt_want_write(new_path)) {
         return errno;
     }
-    let Some(old_is_dir) = namespace_node_kind(old_path) else {
+    let Some(old_is_dir) = rename_side_kind(old_path, &old_side) else {
         return -ENOENT;
     };
-    let new_kind = namespace_node_kind(new_path);
+    let new_kind = rename_side_kind(new_path, &new_side);
     if noreplace && new_kind.is_some() {
         return -EEXIST;
     }
@@ -159,22 +299,20 @@ fn rename_impl(
     // each victim — moving ANOTHER user's file out of /tmp is exactly what
     // S_ISVTX forbids.
     let task = current_task_id();
-    for (path, must_exist) in [(old_path, true), (new_path, new_kind.is_some())] {
-        let verdict = current_resolve_parent_absolute(path, |_fs, parent, leaf| {
-            match entry_owner(&*parent, leaf) {
-                Some((uid, gid)) => may_delete_in(&*parent, uid, gid, task),
-                None if must_exist => Ok(()),
-                None => may_create_in(&*parent, task),
-            }
-        });
-        if let Some(Err(errno)) = verdict {
+    for (side, must_exist) in [(&old_side, true), (&new_side, new_kind.is_some())] {
+        let verdict = match side.owner() {
+            Some((uid, gid)) => may_delete_in(&*side.parent, uid, gid, task),
+            None if must_exist => Ok(()),
+            None => may_create_in(&*side.parent, task),
+        };
+        if let Err(errno) = verdict {
             return errno;
         }
     }
     // `may_delete`: an immutable or append-only victim is -EPERM — renaming
     // it away is a removal.
-    if path_inode_flags(old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
-        || path_inode_flags(new_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
+    if rename_side_inode_flags(old_path, &old_side) & narf_filesystem::FS_PRIVILEGED_FL != 0
+        || rename_side_inode_flags(new_path, &new_side) & narf_filesystem::FS_PRIVILEGED_FL != 0
     {
         return -EPERM;
     }
@@ -196,29 +334,24 @@ fn rename_impl(
     }
 
     if exchange {
-        let outcome = current_resolve_two_parents_absolute(
-            old_path,
-            new_path,
-            |_fs, old_parent, old_leaf, new_parent, new_leaf| {
-                poll_blocking(old_parent.rename_to(
-                    old_leaf,
-                    &*new_parent,
-                    new_leaf,
-                    RENAME_EXCHANGE,
-                ))
-            },
-        );
+        // The parents are already in hand (same-mount was established by
+        // the EXDEV check above, which is all `resolve_two_parents` added).
+        let outcome = poll_blocking(old_side.parent.rename_to(
+            &old_side.leaf,
+            &*new_side.parent,
+            &new_side.leaf,
+            RENAME_EXCHANGE,
+        ));
         return match outcome {
-            Some(Some(Ok(()))) => {
+            Some(Ok(())) => {
                 crate::mqueue::notify_moved(old_path, new_path);
                 crate::mqueue::notify_moved(new_path, old_path);
                 0
             }
             // A filesystem that cannot exchange answers EINVAL, as Linux's
             // `vfs_rename` does for a flag the backend does not implement.
-            Some(Some(Err(narf_filesystem::FsError::Unsupported))) | Some(None) => -EINVAL,
-            Some(Some(Err(e))) => rename_errno(e) as i64,
-            None => -EXDEV,
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => -EINVAL,
+            Some(Err(e)) => rename_errno(e) as i64,
         };
     }
 
@@ -236,15 +369,9 @@ fn rename_impl(
         // config or cache is never written.
         return cross_dir_rename(old_path, new_path) as i64;
     }
-    let new_leaf = match new_path.rfind('/') {
-        Some(i) => &new_path[i + 1..],
-        None => return -EINVAL,
-    };
-    let outcome = current_resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
-        poll_blocking(parent.rename(old_leaf, new_leaf))
-    });
+    let outcome = poll_blocking(old_side.parent.rename(&old_side.leaf, &new_side.leaf));
     match outcome {
-        Some(Some(Ok(()))) => {
+        Some(Ok(())) => {
             // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.
             crate::mqueue::notify_moved(old_path, new_path);
             0
@@ -255,9 +382,10 @@ fn rename_impl(
         // backend cannot perform — so a flagged rename a backend does not
         // implement is EINVAL, while a flagless one is `vfs_rename`'s
         // `if (!old_dir->i_op->rename) return -EPERM;`.
-        Some(Some(Err(narf_filesystem::FsError::Unsupported))) if flags != 0 => -EINVAL,
-        Some(Some(Err(e))) => rename_errno(e) as i64,
-        // Parent path/filesystem didn't resolve → source can't exist: ENOENT.
-        _ => -ENOENT,
+        Some(Err(narf_filesystem::FsError::Unsupported)) if flags != 0 => -EINVAL,
+        Some(Err(e)) => rename_errno(e) as i64,
+        // The backend never completed the future — treat as the source
+        // having vanished, as the old parent-re-resolution path did.
+        None => -ENOENT,
     }
 }
