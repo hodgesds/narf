@@ -922,3 +922,49 @@ fn smoke_i40e_vsi_queue_map_guard() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_vsi_queue_map_guard);
+
+// ── Per-port interface naming ────────────────────────────────────────
+
+fn smoke_i40e_interface_names_are_unique() -> TestResult {
+    use super::{interface_name, INTERFACE_NAMES};
+    // The registry rejects duplicate names, so a repeated entry would
+    // leave a port silently unregistered.
+    for (i, a) in INTERFACE_NAMES.iter().enumerate() {
+        for b in INTERFACE_NAMES.iter().skip(i + 1) {
+            if a == b {
+                return TestResult::Fail("duplicate interface name in the table");
+            }
+        }
+        if a.is_empty() {
+            return TestResult::Fail("empty interface name");
+        }
+    }
+    if interface_name(0) != Some("i40e0") || interface_name(1) != Some("i40e1") {
+        return TestResult::Fail("names are not assigned in probe order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_interface_names_are_unique);
+
+fn smoke_i40e_interface_name_table_is_bounded() -> TestResult {
+    use super::{interface_name, INTERFACE_NAMES};
+    // Past the table the probe must report `None` rather than reuse a
+    // name. Reuse would hit the registry's duplicate check and leave
+    // the port unregistered with no explanation.
+    if interface_name(INTERFACE_NAMES.len()).is_some() {
+        return TestResult::Fail("index past the table must not resolve to a name");
+    }
+    if interface_name(INTERFACE_NAMES.len() - 1).is_none() {
+        return TestResult::Fail("the last table entry should resolve");
+    }
+    // A 4-port X710 presents four PFs; the table must cover more than
+    // one such card or a second card's ports go unnamed.
+    if INTERFACE_NAMES.len() < 8 {
+        return TestResult::Fail("table is too small for more than one 4-port card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_interface_name_table_is_bounded
+);

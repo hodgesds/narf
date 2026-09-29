@@ -65,14 +65,19 @@
 //! - **Jumbo frames.** `rxmax` is pinned at 1522 to match the
 //!   2 KiB per-descriptor buffer.
 //!
-//! ## Multi-port caveat
+//! ## Multi-port
 //!
-//! The X710 presents one PF per port, and the MS-03 has two. Both
-//! probe and both bring their queues up, but only the first is
-//! published to the net registry: `narf_net::Interface` names
-//! interfaces with a `&'static str`, and registering two under
-//! "i40e" would make the stack route to whichever landed last. A
-//! second port needs per-instance naming in the registry first.
+//! The X710 presents one PF per port — two on the MS-03, four on the
+//! QSFP parts. Each probes independently and registers under its own
+//! name from [`INTERFACE_NAMES`] (`i40e0`, `i40e1`, …), assigned in
+//! probe order.
+//!
+//! [`I40eNicIface`] owns an `Arc<I40eNic>` rather than indexing a
+//! global. That is what makes this work: `Interface::rx_ring` returns
+//! a reference borrowed from `&self`, so an interface with no storage
+//! has to return a `static` — and every port would then share one
+//! pair of rings, quietly delivering the second port's frames to the
+//! first port's queue.
 
 #![allow(dead_code)]
 
@@ -255,6 +260,34 @@ pub const REG_PFLAN_QALLOC: u64 = 0x001C_0400;
 /// traffic; RSS across several needs a LUT and per-queue interrupt
 /// vectors, neither of which is in scope here.
 pub const NUM_QUEUE_PAIRS: u32 = 1;
+
+/// Interface names, one per probed PF.
+///
+/// `HwNic::name` returns `&'static str`, so a per-port name cannot be
+/// built at runtime without leaking it. A fixed table costs nothing
+/// and bounds the driver to a knowable number of ports: a 4-port X710
+/// presents four PFs, so this covers four such cards.
+///
+/// Names are assigned in probe order. That is the same convention
+/// every other NIC driver in tree uses, and it is stable for a fixed
+/// board — but it is *not* topology-derived the way Linux's
+/// `enp89s0f0` is, so a card added to another slot can renumber the
+/// ports after it.
+pub const INTERFACE_NAMES: &[&str] = &[
+    "i40e0", "i40e1", "i40e2", "i40e3", "i40e4", "i40e5", "i40e6", "i40e7", "i40e8", "i40e9",
+    "i40e10", "i40e11", "i40e12", "i40e13", "i40e14", "i40e15",
+];
+
+/// Name for the `index`-th probed PF, or `None` once the table is
+/// exhausted.
+///
+/// Returning `None` rather than reusing a name is deliberate: the
+/// registry rejects duplicates, so a reused name would leave the port
+/// silently unregistered with no indication why. An explicit `None`
+/// lets the probe say so.
+pub fn interface_name(index: usize) -> Option<&'static str> {
+    INTERFACE_NAMES.get(index).copied()
+}
 
 /// `I40E_GLGEN_RSTCTL` — global reset control; bits [5:0] hold
 /// `GRSTDEL`, the global-reset delay in 100 ms units.
@@ -1427,17 +1460,39 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         g.len() - 1
     };
 
-    // Only the first PF is published as an interface. The registry
-    // addresses interfaces by a `&'static str` name, and a second
-    // port would need a distinct one; giving both ports the same
-    // name would make the stack route to whichever registered last.
-    if index == 0 {
-        let auth = match narf_net::trusted_net_authority() {
-            Some(a) => a.derive().ok(),
-            None => None,
-        };
-        if let Some(auth) = auth {
-            let _ = narf_net::registry().register(&auth, I40eNicIface);
+    // Every PF is published under its own name. The X710 presents one
+    // PF per port and the MS-03 has two, so this is the difference
+    // between one usable 10G port and two.
+    match interface_name(index) {
+        Some(name) => {
+            let auth = match narf_net::trusted_net_authority() {
+                Some(a) => a.derive().ok(),
+                None => None,
+            };
+            if let Some(auth) = auth {
+                let iface = I40eNicIface {
+                    name,
+                    nic: nic.clone(),
+                };
+                if let Err(e) = narf_net::registry().register(&auth, iface) {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  i40e: {} not registered with the net stack: {:?}",
+                        name,
+                        e,
+                    );
+                }
+            }
+        }
+        None => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i40e: more than {} ports probed; this one carries traffic but is not \
+                 reachable from the net stack",
+                INTERFACE_NAMES.len(),
+            );
         }
     }
 
@@ -1479,59 +1534,67 @@ async fn i40e_tx_pump(device: Arc<I40eNic>, mut tx_cons: Consumer<Frame, TX_RING
     }
 }
 
-/// `narf_net::Interface` implementation for the first probed PF.
+/// One probed PF, as the net stack sees it.
+///
+/// This owns its `Arc<I40eNic>` rather than looking the controller up
+/// by index. That is what makes multiple ports work at all:
+/// `Interface::rx_ring` / `tx_ring` return a reference borrowed from
+/// `&self`, so an interface with no storage of its own has to hand
+/// back a `static` — and every instance would then share one pair of
+/// rings, with the second port's frames landing in the first port's
+/// queue. Borrowing straight out of the NIC gives each port its own.
 #[derive(Debug)]
-pub struct I40eNicIface;
+pub struct I40eNicIface {
+    /// This port's name, from [`INTERFACE_NAMES`].
+    name: &'static str,
+    nic: Arc<I40eNic>,
+}
+
+impl I40eNicIface {
+    /// The interface name this port registered under.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The controller behind this interface.
+    pub fn nic(&self) -> &I40eNic {
+        &self.nic
+    }
+}
 
 impl narf_net::Interface for I40eNicIface {
     fn name(&self) -> &str {
-        "i40e"
+        self.name
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(0, |c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(0, |c| c.link.link_up).unwrap_or(false)
+        self.nic.link.link_up
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(0, |c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(0, |c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for I40eNicIface {
     fn name(&self) -> &'static str {
-        "i40e"
+        self.name
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(0, |c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(0, |c| c.link.link_up).unwrap_or(false)
+        self.nic.link.link_up
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelIxgbe
