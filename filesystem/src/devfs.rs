@@ -54,6 +54,16 @@ fn device_inode(rdev: u64, kind: u64) -> u64 {
     0xd000_0000_0000_0000 | (kind << 48) | rdev.wrapping_add(1)
 }
 
+/// The devfs inode number of the character-device node for `rdev`.
+///
+/// For FileOps that stand in for a `/dev` node without being looked up
+/// through devfs (the boot console behind init's fds 0/1/2, DRM minors
+/// served by a driver's directory delegate): on Linux they are opens of
+/// the devtmpfs node, so they must report the same inode it does.
+pub fn char_device_inode(rdev: u64) -> u64 {
+    device_inode(rdev, 1)
+}
+
 fn named_inode(name: &str, kind: u64) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ kind;
     for byte in name.bytes() {

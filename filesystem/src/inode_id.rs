@@ -31,6 +31,17 @@ pub struct InodeId {
     pub ino: u64,
 }
 
+impl InodeId {
+    /// The `InodeAttrs` a `FileOps::inode_attrs` on this inode reports: just
+    /// its `st_dev` (a pseudo inode tracks no links or separate times).
+    pub fn attrs(self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: self.dev,
+            ..Default::default()
+        }
+    }
+}
+
 static NEXT_ANON_MINOR: AtomicU64 = AtomicU64::new(1);
 
 /// `get_anon_bdev`: a fresh anonymous device number (major 0), encoded as
@@ -72,11 +83,18 @@ pub enum PseudoFs {
     Ns,
     /// `dmabuf` / DRM sync files and other driver-private anon files.
     DmaBuf,
+    /// `shm_mnt`, the internal tmpfs `kern_mount` that `memfd_create`,
+    /// SysV shm and shared anonymous mappings allocate inodes on
+    /// (`mm/shmem.c::shmem_file_setup`). Not `/dev/shm`, which is a
+    /// separate, user-visible tmpfs mount.
+    Shm,
+    /// `secretmem`: `memfd_secret(2)` inodes (`mm/secretmem.c`).
+    SecretMem,
 }
 
 impl PseudoFs {
     fn slot(self) -> &'static AtomicU64 {
-        static DEVS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        static DEVS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
         &DEVS[self as usize]
     }
 
@@ -100,6 +118,24 @@ impl PseudoFs {
             dev: self.dev(),
             ino: get_next_ino(),
         }
+    }
+}
+
+/// A new inode on `shm_mnt` (see [`PseudoFs::Shm`]).
+///
+/// `shmem_reserve_inode` numbers `SB_KERNMOUNT` inodes from the
+/// superblock's own `next_ino` counter rather than `get_next_ino`, and — the
+/// mount never being visible to a non-LFS `stat` — without the 32-bit
+/// wrap; 0 is skipped (`is_zero_ino`).
+pub fn shmem_kernel_inode() -> InodeId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut ino = NEXT.fetch_add(1, Ordering::Relaxed);
+    if ino == 0 {
+        ino = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    InodeId {
+        dev: PseudoFs::Shm.dev(),
+        ino,
     }
 }
 
