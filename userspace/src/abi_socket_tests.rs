@@ -9186,3 +9186,1195 @@ kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_inode_not_anon_inode_neg
 );
+
+// ───────────── Daemon sockopt parity (resolved / avahi / userdbd) ─────────────
+//
+// systemd-resolved, avahi-daemon and systemd-userdbd refused to start on NARF
+// because options Linux accepts came back ENOPROTOOPT. Each smoke below pins
+// the Linux answer — value, errno and check order — from
+// `net/ipv4/ip_sockglue.c` (`do_ip_setsockopt` / `do_ip_getsockopt`),
+// `net/ipv6/ipv6_sockglue.c` (`do_ipv6_setsockopt` / `do_ipv6_getsockopt`),
+// `net/ipv4/igmp.c` (`__ip_mc_join_group` / `ip_mc_leave_group`),
+// `net/ipv6/mcast.c` (`__ipv6_sock_mc_join` / `ipv6_sock_mc_drop`) and
+// `net/core/sock.c` (`sk_setsockopt` / `sk_getsockopt` / `sock_set_timeout`).
+
+mod sockopt_parity {
+    pub const AF_INET6: u64 = 10;
+    pub const IPPROTO_IP: u64 = 0;
+    pub const IPPROTO_IPV6: u64 = 41;
+    // SOL_SOCKET
+    pub const SO_DONTROUTE: u64 = 5;
+    pub const SO_SNDBUF: u64 = 7;
+    pub const SO_RCVBUF: u64 = 8;
+    pub const SO_OOBINLINE: u64 = 10;
+    pub const SO_NO_CHECK: u64 = 11;
+    pub const SO_PRIORITY: u64 = 12;
+    pub const SO_REUSEPORT: u64 = 15;
+    pub const SO_RCVLOWAT: u64 = 18;
+    pub const SO_SNDLOWAT: u64 = 19;
+    pub const SO_RCVTIMEO_OLD: u64 = 20;
+    pub const SO_SNDTIMEO_OLD: u64 = 21;
+    pub const SO_DETACH_FILTER: u64 = 27;
+    pub const SO_MARK: u64 = 36;
+    pub const SO_INCOMING_CPU: u64 = 49;
+    pub const SO_BINDTOIFINDEX: u64 = 62;
+    pub const SO_RCVTIMEO_NEW: u64 = 66;
+    pub const SO_SNDTIMEO_NEW: u64 = 67;
+    pub const SO_TXREHASH: u64 = 74;
+    // IPPROTO_IP
+    pub const IP_TTL: u64 = 2;
+    pub const IP_PKTINFO: u64 = 8;
+    pub const IP_MTU_DISCOVER: u64 = 10;
+    pub const IP_RECVERR: u64 = 11;
+    pub const IP_RECVTTL: u64 = 12;
+    pub const IP_FREEBIND: u64 = 15;
+    pub const IP_TRANSPARENT: u64 = 19;
+    pub const IP_RECVFRAGSIZE: u64 = 25;
+    pub const IP_MULTICAST_IF: u64 = 32;
+    pub const IP_MULTICAST_TTL: u64 = 33;
+    pub const IP_MULTICAST_LOOP: u64 = 34;
+    pub const IP_ADD_MEMBERSHIP: u64 = 35;
+    pub const IP_DROP_MEMBERSHIP: u64 = 36;
+    pub const IP_MULTICAST_ALL: u64 = 49;
+    pub const IP_UNICAST_IF: u64 = 50;
+    // IPPROTO_IPV6
+    pub const IPV6_UNICAST_HOPS: u64 = 16;
+    pub const IPV6_MULTICAST_IF: u64 = 17;
+    pub const IPV6_MULTICAST_HOPS: u64 = 18;
+    pub const IPV6_MULTICAST_LOOP: u64 = 19;
+    pub const IPV6_ADD_MEMBERSHIP: u64 = 20;
+    pub const IPV6_DROP_MEMBERSHIP: u64 = 21;
+    pub const IPV6_MTU: u64 = 24;
+    pub const IPV6_V6ONLY: u64 = 26;
+    pub const IPV6_MULTICAST_ALL: u64 = 29;
+    pub const IPV6_RECVPKTINFO: u64 = 49;
+    pub const IPV6_RECVHOPLIMIT: u64 = 51;
+    pub const IPV6_TCLASS: u64 = 67;
+    pub const IPV6_UNICAST_IF: u64 = 76;
+    pub const IPV6_RECVFRAGSIZE: u64 = 77;
+    pub const IPV6_FREEBIND: u64 = 78;
+    /// 224.0.0.251 (mDNS) and 224.0.0.252 (LLMNR), host order.
+    pub const MDNS_V4: u32 = 0xE000_00FB;
+    pub const LLMNR_V4: u32 = 0xE000_00FC;
+    /// ff02::fb.
+    pub const MDNS_V6: [u8; 16] = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb];
+    /// An interface index no test host has.
+    pub const NO_IFINDEX: u32 = 0x7fff0;
+}
+use sockopt_parity as so;
+
+fn sockopt_set(fd: u64, level: u64, name: u64, val: &[u8]) -> Result<i64, &'static str> {
+    call(
+        Syscall::SocketSetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: level,
+            arg2: name,
+            arg3: val.as_ptr() as u64,
+            arg4: val.len() as u64,
+            ..Default::default()
+        },
+    )
+    .ok_or("setsockopt status")
+}
+
+fn sockopt_set_int(fd: u64, level: u64, name: u64, v: i32) -> Result<i64, &'static str> {
+    sockopt_set(fd, level, name, &v.to_ne_bytes())
+}
+
+/// getsockopt into `out`; returns (return value, optlen written back).
+fn sockopt_get(fd: u64, level: u64, name: u64, out: &mut [u8]) -> Result<(i64, u32), &'static str> {
+    let mut len = out.len() as u32;
+    let r = call(
+        Syscall::SocketGetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: level,
+            arg2: name,
+            arg3: out.as_mut_ptr() as u64,
+            arg4: (&mut len as *mut u32) as u64,
+            ..Default::default()
+        },
+    )
+    .ok_or("getsockopt status")?;
+    Ok((r, len))
+}
+
+fn sockopt_get_int(fd: u64, level: u64, name: u64) -> Result<i32, &'static str> {
+    let mut out = [0u8; 4];
+    match sockopt_get(fd, level, name, &mut out)? {
+        (0, 4) => Ok(i32::from_ne_bytes(out)),
+        (0, _) => Err("int getsockopt did not report optlen 4"),
+        _ => Err("int getsockopt failed"),
+    }
+}
+
+fn sockopt_expect_int(
+    fd: u64,
+    level: u64,
+    name: u64,
+    want: i32,
+    what: &'static str,
+) -> Result<(), &'static str> {
+    if sockopt_get_int(fd, level, name)? != want {
+        return Err(what);
+    }
+    Ok(())
+}
+
+fn sockopt_socket(domain: u64, kind: u64) -> Result<u64, &'static str> {
+    match socket_errno(domain, kind, 0)? {
+        fd if fd >= 0 => Ok(fd as u64),
+        _ => Err("socket() failed"),
+    }
+}
+
+/// `struct ip_mreqn { imr_multiaddr, imr_address, imr_ifindex }`.
+fn ip_mreqn(group: u32, local: u32, ifindex: u32) -> [u8; 12] {
+    let mut m = [0u8; 12];
+    m[0..4].copy_from_slice(&group.to_be_bytes());
+    m[4..8].copy_from_slice(&local.to_be_bytes());
+    m[8..12].copy_from_slice(&ifindex.to_ne_bytes());
+    m
+}
+
+/// `struct ipv6_mreq { ipv6mr_multiaddr, ipv6mr_interface }`.
+fn ipv6_mreq(group: [u8; 16], ifindex: u32) -> [u8; 20] {
+    let mut m = [0u8; 20];
+    m[..16].copy_from_slice(&group);
+    m[16..20].copy_from_slice(&ifindex.to_ne_bytes());
+    m
+}
+
+fn sockaddr_in(ip: u32, port: u16) -> [u8; 16] {
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&ip.to_be_bytes());
+    sa
+}
+
+fn sockaddr_in6(ip: [u8; 16], port: u16, scope: u32) -> [u8; 28] {
+    let mut sa = [0u8; 28];
+    sa[0..2].copy_from_slice(&(so::AF_INET6 as u16).to_ne_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[8..24].copy_from_slice(&ip);
+    sa[24..28].copy_from_slice(&scope.to_ne_bytes());
+    sa
+}
+
+fn sockopt_bind(fd: u64, sa: &[u8]) -> Result<(), &'static str> {
+    match call(
+        Syscall::SocketBind.raw(),
+        a2(fd, sa.as_ptr() as u64, sa.len() as u64),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("bind failed"),
+    }
+}
+
+fn sockopt_sendto(fd: u64, buf: &[u8], sa: &[u8]) -> Option<i64> {
+    let mut args = a3(fd, buf.as_ptr() as u64, buf.len() as u64, 0);
+    args.arg4 = sa.as_ptr() as u64;
+    args.arg5 = sa.len() as u64;
+    call(Syscall::SocketSend.raw(), args)
+}
+
+fn sockopt_recv_nb(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    call(
+        Syscall::SocketRecv.raw(),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT),
+    )
+}
+
+fn sockopt_close(fds: &[u64]) {
+    for fd in fds {
+        let _ = call(Syscall::Close.raw(), a0(*fd));
+    }
+}
+
+type SetCase<'a> = (u64, u64, &'a [u8], i64, &'static str);
+
+/// resolved's LLMNR/mDNS IPv4 datagram setup (`manager_llmnr_ipv4_udp_fd`,
+/// `manager_mdns_ipv4_fd`) and avahi's `avahi_open_socket_ipv4`, including
+/// avahi's one-byte `uint8_t` IP_MULTICAST_TTL / IP_MULTICAST_LOOP optvals:
+/// every option is accepted and reads back what was stored.
+fn smoke_abi_socket_sockopt_ip_multicast_pos() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        // do_ip_getsockopt defaults: mc_loop 1, mc_ttl 1, mc_all 1,
+        // pmtudisc IP_PMTUDISC_WANT (inet_create), uc_index 0.
+        for (name, want, what) in [
+            (
+                so::IP_MULTICAST_LOOP,
+                1,
+                "default IP_MULTICAST_LOOP is not 1",
+            ),
+            (so::IP_MULTICAST_TTL, 1, "default IP_MULTICAST_TTL is not 1"),
+            (so::IP_MULTICAST_ALL, 1, "default IP_MULTICAST_ALL is not 1"),
+            (
+                so::IP_MTU_DISCOVER,
+                1,
+                "default IP_MTU_DISCOVER is not WANT",
+            ),
+            (so::IP_UNICAST_IF, 0, "default IP_UNICAST_IF is not 0"),
+        ] {
+            sockopt_expect_int(u, so::IPPROTO_IP, name, want, what)?;
+        }
+        for (name, v, what) in [
+            (so::IP_PKTINFO, 1, "IP_PKTINFO"),
+            (so::IP_RECVTTL, 1, "IP_RECVTTL"),
+            (so::IP_TTL, 255, "IP_TTL"),
+            (so::IP_MULTICAST_TTL, 255, "IP_MULTICAST_TTL"),
+            (so::IP_MULTICAST_LOOP, 0, "IP_MULTICAST_LOOP"),
+            (so::IP_MTU_DISCOVER, 5, "IP_MTU_DISCOVER OMIT"),
+            (so::IP_RECVERR, 1, "IP_RECVERR"),
+            (so::IP_RECVFRAGSIZE, 1, "IP_RECVFRAGSIZE"),
+            (so::IP_MULTICAST_ALL, 0, "IP_MULTICAST_ALL"),
+        ] {
+            if sockopt_set_int(u, so::IPPROTO_IP, name, v)? != 0 {
+                return Err(what);
+            }
+            if sockopt_get_int(u, so::IPPROTO_IP, name)? != v {
+                return Err(what);
+            }
+        }
+        // avahi's uint8_t optvals: a 1-byte optval is the value.
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP, &[1])? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP)? != 1
+        {
+            return Err("1-byte IP_MULTICAST_LOOP was not stored");
+        }
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_MULTICAST_TTL, &[7])? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_MULTICAST_TTL)? != 7
+        {
+            return Err("1-byte IP_MULTICAST_TTL was not stored");
+        }
+        // A 1-byte getsockopt of a small value copies one byte (copyval).
+        let mut one = [0u8; 1];
+        if sockopt_get(u, so::IPPROTO_IP, so::IP_MULTICAST_TTL, &mut one)? != (0, 1) || one[0] != 7
+        {
+            return Err("1-byte getsockopt(IP_MULTICAST_TTL) did not copy one byte");
+        }
+        // IP_UNICAST_IF takes the index in network byte order.
+        let be1 = 1u32.to_be_bytes();
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_UNICAST_IF, &be1)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_UNICAST_IF)? != i32::from_ne_bytes(be1)
+        {
+            return Err("IP_UNICAST_IF(lo) did not round-trip in network byte order");
+        }
+        // IP_MULTICAST_IF by in_addr; getsockopt reports the address.
+        let lo = 0x7F00_0001u32.to_be_bytes();
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_MULTICAST_IF, &lo)? != 0 {
+            return Err("IP_MULTICAST_IF(127.0.0.1) was refused");
+        }
+        let mut addr = [0u8; 4];
+        if sockopt_get(u, so::IPPROTO_IP, so::IP_MULTICAST_IF, &mut addr)? != (0, 4) || addr != lo {
+            return Err("getsockopt(IP_MULTICAST_IF) did not report 127.0.0.1");
+        }
+        // FREEBIND and TRANSPARENT are separate inet bits.
+        if sockopt_set_int(u, so::IPPROTO_IP, so::IP_FREEBIND, 1)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_FREEBIND)? != 1
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_TRANSPARENT)? != 0
+        {
+            return Err("IP_FREEBIND leaked into IP_TRANSPARENT");
+        }
+        // Group membership on lo, mreqn and mreq forms.
+        let m = ip_mreqn(so::LLMNR_V4, 0, 1);
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &m)? != 0 {
+            return Err("IP_ADD_MEMBERSHIP(224.0.0.252, lo) was refused");
+        }
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &m)? != 0 {
+            return Err("IP_DROP_MEMBERSHIP of a joined group was refused");
+        }
+        let mreq = ip_mreqn(so::MDNS_V4, 0x7F00_0001, 0);
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &mreq[..8])? != 0
+            || sockopt_set(u, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &mreq[..8])? != 0
+        {
+            return Err("8-byte ip_mreq join/leave by interface address failed");
+        }
+        sockopt_close(&[u]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ip_multicast_pos
+);
+
+/// The IP-level errno contract, in `do_ip_setsockopt`'s check order.
+fn smoke_abi_socket_sockopt_ip_multicast_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let t = sockopt_socket(AF_INET, SOCK_STREAM)?;
+        let one = 1i32.to_ne_bytes();
+        let big = 256i32.to_ne_bytes();
+        let two = 2i32.to_ne_bytes();
+        let six = 6i32.to_ne_bytes();
+        let no_if = so::NO_IFINDEX.to_be_bytes();
+        let testnet = 0xC000_0201u32.to_be_bytes();
+        let group = ip_mreqn(so::MDNS_V4, 0, 1);
+        let unicast = ip_mreqn(0x7F00_0001, 0, 1);
+        let nodev = ip_mreqn(so::MDNS_V4, 0, so::NO_IFINDEX);
+        let nodev_if = ip_mreqn(0, 0, so::NO_IFINDEX);
+        let checks: [SetCase<'_>; 14] = [
+            (
+                u,
+                so::IP_MULTICAST_LOOP,
+                &[],
+                EINVAL,
+                "IP_MULTICAST_LOOP optlen 0 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_TTL,
+                &big,
+                EINVAL,
+                "IP_MULTICAST_TTL 256 is not EINVAL",
+            ),
+            (
+                t,
+                so::IP_MULTICAST_TTL,
+                &one,
+                EINVAL,
+                "IP_MULTICAST_TTL on TCP is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_ALL,
+                &two,
+                EINVAL,
+                "IP_MULTICAST_ALL 2 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MTU_DISCOVER,
+                &six,
+                EINVAL,
+                "IP_MTU_DISCOVER 6 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_UNICAST_IF,
+                &[0],
+                EINVAL,
+                "IP_UNICAST_IF optlen 1 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_UNICAST_IF,
+                &no_if,
+                EADDRNOTAVAIL,
+                "IP_UNICAST_IF unknown index",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_IF,
+                &[0, 0, 0],
+                EINVAL,
+                "IP_MULTICAST_IF optlen 3 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_IF,
+                &testnet,
+                EADDRNOTAVAIL,
+                "IP_MULTICAST_IF non-local addr",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_IF,
+                &nodev_if,
+                EADDRNOTAVAIL,
+                "IP_MULTICAST_IF unknown ifindex",
+            ),
+            (
+                u,
+                so::IP_ADD_MEMBERSHIP,
+                &group[..7],
+                EINVAL,
+                "IP_ADD_MEMBERSHIP optlen 7",
+            ),
+            (
+                u,
+                so::IP_ADD_MEMBERSHIP,
+                &unicast,
+                EINVAL,
+                "IP_ADD_MEMBERSHIP unicast group",
+            ),
+            (
+                u,
+                so::IP_ADD_MEMBERSHIP,
+                &nodev,
+                ENODEV,
+                "IP_ADD_MEMBERSHIP unknown device",
+            ),
+            (
+                t,
+                so::IP_ADD_MEMBERSHIP,
+                &group,
+                EPROTO,
+                "IP_ADD_MEMBERSHIP on TCP is not EPROTO",
+            ),
+        ];
+        for (fd, name, val, want, what) in checks {
+            if sockopt_set(fd, so::IPPROTO_IP, name, val)? != want {
+                return Err(what);
+            }
+        }
+        // Double join → EADDRINUSE; leaving a group never joined → EADDRNOTAVAIL.
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &group)? != 0
+            || sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &group)? != EADDRINUSE
+        {
+            return Err("a repeated IP_ADD_MEMBERSHIP is not EADDRINUSE");
+        }
+        let other = ip_mreqn(so::LLMNR_V4, 0, 1);
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &other)? != EADDRNOTAVAIL {
+            return Err("IP_DROP_MEMBERSHIP of a group never joined is not EADDRNOTAVAIL");
+        }
+        // Unknown IP option; IPv6 level on an AF_INET socket.
+        if sockopt_set(u, so::IPPROTO_IP, 199, &one)? != ENOPROTOOPT {
+            return Err("unknown IP option set is not ENOPROTOOPT");
+        }
+        let mut out = [0u8; 4];
+        if sockopt_get(u, so::IPPROTO_IP, 199, &mut out)?.0 != ENOPROTOOPT {
+            return Err("unknown IP option get is not ENOPROTOOPT");
+        }
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_MULTICAST_LOOP, &one)? != ENOPROTOOPT {
+            return Err("IPPROTO_IPV6 set on AF_INET is not ENOPROTOOPT (ip_setsockopt)");
+        }
+        if sockopt_get(u, so::IPPROTO_IPV6, so::IPV6_MULTICAST_LOOP, &mut out)?.0 != EOPNOTSUPP {
+            return Err("IPPROTO_IPV6 get on AF_INET is not EOPNOTSUPP (do_ip_getsockopt)");
+        }
+        sockopt_close(&[u, t]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ip_multicast_neg
+);
+
+/// resolved's LLMNR/mDNS IPv6 setup and avahi's `avahi_open_socket_ipv6`.
+fn smoke_abi_socket_sockopt_ipv6_multicast_pos() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        // inet6_create defaults: mc_loop 1, mcast_hops 1, mc_all 1,
+        // hop_limit -1 reported as the devconf default 64.
+        for (name, want, what) in [
+            (
+                so::IPV6_MULTICAST_LOOP,
+                1,
+                "default IPV6_MULTICAST_LOOP is not 1",
+            ),
+            (
+                so::IPV6_MULTICAST_HOPS,
+                1,
+                "default IPV6_MULTICAST_HOPS is not 1",
+            ),
+            (
+                so::IPV6_UNICAST_HOPS,
+                64,
+                "default IPV6_UNICAST_HOPS is not 64",
+            ),
+            (
+                so::IPV6_MULTICAST_ALL,
+                1,
+                "default IPV6_MULTICAST_ALL is not 1",
+            ),
+            (
+                so::IPV6_MULTICAST_IF,
+                0,
+                "default IPV6_MULTICAST_IF is not 0",
+            ),
+        ] {
+            sockopt_expect_int(u, so::IPPROTO_IPV6, name, want, what)?;
+        }
+        for (name, v, what) in [
+            (so::IPV6_RECVPKTINFO, 1, "IPV6_RECVPKTINFO"),
+            (so::IPV6_RECVHOPLIMIT, 1, "IPV6_RECVHOPLIMIT"),
+            (so::IPV6_UNICAST_HOPS, 255, "IPV6_UNICAST_HOPS"),
+            (so::IPV6_MULTICAST_HOPS, 255, "IPV6_MULTICAST_HOPS"),
+            (so::IPV6_MULTICAST_LOOP, 0, "IPV6_MULTICAST_LOOP"),
+            (so::IPV6_V6ONLY, 1, "IPV6_V6ONLY"),
+            (so::IPV6_MULTICAST_IF, 1, "IPV6_MULTICAST_IF"),
+            (so::IPV6_TCLASS, 0x28, "IPV6_TCLASS"),
+            (so::IPV6_RECVFRAGSIZE, 1, "IPV6_RECVFRAGSIZE"),
+            (so::IPV6_FREEBIND, 1, "IPV6_FREEBIND"),
+            (so::IPV6_MULTICAST_ALL, 0, "IPV6_MULTICAST_ALL"),
+        ] {
+            if sockopt_set_int(u, so::IPPROTO_IPV6, name, v)? != 0 {
+                return Err(what);
+            }
+            if sockopt_get_int(u, so::IPPROTO_IPV6, name)? != v {
+                return Err(what);
+            }
+        }
+        // -1 selects the default for both hop limits and the traffic class.
+        for (name, want, what) in [
+            (
+                so::IPV6_MULTICAST_HOPS,
+                1,
+                "IPV6_MULTICAST_HOPS -1 did not restore 1",
+            ),
+            (
+                so::IPV6_UNICAST_HOPS,
+                64,
+                "IPV6_UNICAST_HOPS -1 did not report 64",
+            ),
+            (so::IPV6_TCLASS, 0, "IPV6_TCLASS -1 did not restore 0"),
+        ] {
+            if sockopt_set_int(u, so::IPPROTO_IPV6, name, -1)? != 0
+                || sockopt_get_int(u, so::IPPROTO_IPV6, name)? != want
+            {
+                return Err(what);
+            }
+        }
+        // IPV6_MTU: 0 is legal (do_ipv6_setsockopt `val && val < IPV6_MIN_MTU`).
+        if sockopt_set_int(u, so::IPPROTO_IPV6, so::IPV6_MTU, 0)? != 0
+            || sockopt_set_int(u, so::IPPROTO_IPV6, so::IPV6_MTU, 1280)? != 0
+        {
+            return Err("IPV6_MTU 0 / 1280 was refused");
+        }
+        let be1 = 1u32.to_be_bytes();
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_UNICAST_IF, &be1)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IPV6, so::IPV6_UNICAST_IF)? != i32::from_ne_bytes(be1)
+        {
+            return Err("IPV6_UNICAST_IF(lo) did not round-trip");
+        }
+        let m = ipv6_mreq(so::MDNS_V6, 1);
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &m)? != 0
+            || sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_DROP_MEMBERSHIP, &m)? != 0
+        {
+            return Err("IPV6_ADD/DROP_MEMBERSHIP(ff02::fb, lo) failed");
+        }
+        // An AF_INET6 datagram socket takes SOL_IP options (ipv6_setsockopt
+        // hands `level == SOL_IP` to ip_setsockopt).
+        if sockopt_set_int(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP, 0)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP)? != 0
+        {
+            return Err("SOL_IP IP_MULTICAST_LOOP on AF_INET6 did not round-trip");
+        }
+        sockopt_close(&[u]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ipv6_multicast_pos
+);
+
+/// The IPv6-level errno contract (`do_ipv6_setsockopt` / `ipv6_setsockopt`).
+fn smoke_abi_socket_sockopt_ipv6_multicast_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        let t = sockopt_socket(so::AF_INET6, SOCK_STREAM)?;
+        let one = 1i32.to_ne_bytes();
+        let two = 2i32.to_ne_bytes();
+        let big = 256i32.to_ne_bytes();
+        let neg2 = (-2i32).to_ne_bytes();
+        let no_if = so::NO_IFINDEX.to_ne_bytes();
+        let no_if_be = so::NO_IFINDEX.to_be_bytes();
+        let small_mtu = 1000i32.to_ne_bytes();
+        let group = ipv6_mreq(so::MDNS_V6, 1);
+        let nodev = ipv6_mreq(so::MDNS_V6, so::NO_IFINDEX);
+        let mut uni = [0u8; 16];
+        uni[15] = 1;
+        let unicast = ipv6_mreq(uni, 1);
+        let checks: [SetCase<'_>; 16] = [
+            (
+                u,
+                so::IPV6_MULTICAST_LOOP,
+                &one[..1],
+                EINVAL,
+                "IPV6_MULTICAST_LOOP optlen 1",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_LOOP,
+                &two,
+                EINVAL,
+                "IPV6_MULTICAST_LOOP 2 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_HOPS,
+                &one[..3],
+                EINVAL,
+                "IPV6_MULTICAST_HOPS optlen 3",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_HOPS,
+                &big,
+                EINVAL,
+                "IPV6_MULTICAST_HOPS 256 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_HOPS,
+                &neg2,
+                EINVAL,
+                "IPV6_MULTICAST_HOPS -2 is not EINVAL",
+            ),
+            (
+                t,
+                so::IPV6_MULTICAST_HOPS,
+                &one,
+                ENOPROTOOPT,
+                "IPV6_MULTICAST_HOPS on TCP",
+            ),
+            (
+                u,
+                so::IPV6_UNICAST_HOPS,
+                &one[..1],
+                EINVAL,
+                "IPV6_UNICAST_HOPS optlen 1",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_IF,
+                &no_if,
+                ENODEV,
+                "IPV6_MULTICAST_IF unknown index",
+            ),
+            (
+                t,
+                so::IPV6_MULTICAST_IF,
+                &one,
+                ENOPROTOOPT,
+                "IPV6_MULTICAST_IF on TCP",
+            ),
+            (
+                u,
+                so::IPV6_UNICAST_IF,
+                &no_if_be,
+                EADDRNOTAVAIL,
+                "IPV6_UNICAST_IF unknown index",
+            ),
+            (
+                u,
+                so::IPV6_MTU,
+                &small_mtu,
+                EINVAL,
+                "IPV6_MTU 1000 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_TCLASS,
+                &big,
+                EINVAL,
+                "IPV6_TCLASS 256 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_ADD_MEMBERSHIP,
+                &group[..19],
+                EINVAL,
+                "IPV6_ADD_MEMBERSHIP optlen 19",
+            ),
+            (
+                u,
+                so::IPV6_ADD_MEMBERSHIP,
+                &nodev,
+                ENODEV,
+                "IPV6_ADD_MEMBERSHIP unknown device",
+            ),
+            (
+                u,
+                so::IPV6_ADD_MEMBERSHIP,
+                &unicast,
+                EINVAL,
+                "IPV6_ADD_MEMBERSHIP unicast group",
+            ),
+            (
+                t,
+                so::IPV6_ADD_MEMBERSHIP,
+                &group,
+                EPROTO,
+                "IPV6_ADD_MEMBERSHIP on TCP",
+            ),
+        ];
+        for (fd, name, val, want, what) in checks {
+            if sockopt_set(fd, so::IPPROTO_IPV6, name, val)? != want {
+                return Err(what);
+            }
+        }
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &group)? != 0
+            || sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &group)? != EADDRINUSE
+        {
+            return Err("a repeated IPV6_ADD_MEMBERSHIP is not EADDRINUSE");
+        }
+        let other = ipv6_mreq([0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3], 1);
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_DROP_MEMBERSHIP, &other)? != EADDRNOTAVAIL {
+            return Err("IPV6_DROP_MEMBERSHIP of a group never joined is not EADDRNOTAVAIL");
+        }
+        // Unknown option; a foreign level on AF_INET6 is ENOPROTOOPT both ways.
+        let mut out = [0u8; 4];
+        if sockopt_set(u, so::IPPROTO_IPV6, 199, &one)? != ENOPROTOOPT
+            || sockopt_get(u, so::IPPROTO_IPV6, 199, &mut out)?.0 != ENOPROTOOPT
+        {
+            return Err("unknown IPv6 option is not ENOPROTOOPT");
+        }
+        if sockopt_get(u, 281, 1, &mut out)?.0 != ENOPROTOOPT {
+            return Err("a foreign level get on AF_INET6 is not ENOPROTOOPT (ipv6_getsockopt)");
+        }
+        sockopt_close(&[u, t]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ipv6_multicast_neg
+);
+
+fn timeval_bytes(sec: i64, usec: i64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&sec.to_ne_bytes());
+    b[8..].copy_from_slice(&usec.to_ne_bytes());
+    b
+}
+
+fn read_timeval(fd: u64, name: u64) -> Result<(i64, i64), &'static str> {
+    let mut b = [0u8; 16];
+    match sockopt_get(fd, SOL_SOCKET, name, &mut b)? {
+        (0, 16) => Ok((
+            i64::from_ne_bytes(b[..8].try_into().unwrap_or([0; 8])),
+            i64::from_ne_bytes(b[8..].try_into().unwrap_or([0; 8])),
+        )),
+        _ => Err("timeout getsockopt failed or did not report 16 bytes"),
+    }
+}
+
+/// userdbd's `SO_RCVTIMEO` (old `struct timeval` layout on x86_64) and the
+/// `SO_*TIMEO_NEW` `__kernel_sock_timeval` layout: stored, read back through
+/// either name, `{0,0}` = no timeout, a negative tv_sec stores zero.
+fn smoke_abi_socket_sockopt_timeo_pos() -> TestResult {
+    with_setup(|| {
+        let l = open_unix_stream()?;
+        if read_timeval(l, so::SO_RCVTIMEO_OLD)? != (0, 0)
+            || read_timeval(l, so::SO_SNDTIMEO_NEW)? != (0, 0)
+        {
+            return Err("default timeouts are not {0,0}");
+        }
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(25, 0))? != 0 {
+            return Err("SO_RCVTIMEO(25 s) on an AF_UNIX stream socket was refused");
+        }
+        if read_timeval(l, so::SO_RCVTIMEO_OLD)? != (25, 0)
+            || read_timeval(l, so::SO_RCVTIMEO_NEW)? != (25, 0)
+        {
+            return Err("SO_RCVTIMEO did not read back as 25 s through both names");
+        }
+        if sockopt_set(
+            l,
+            SOL_SOCKET,
+            so::SO_SNDTIMEO_NEW,
+            &timeval_bytes(2, 250_000),
+        )? != 0
+            || read_timeval(l, so::SO_SNDTIMEO_OLD)? != (2, 250_000)
+        {
+            return Err("SO_SNDTIMEO_NEW {2, 250000} did not round-trip");
+        }
+        // The send and receive timeouts are independent.
+        if read_timeval(l, so::SO_RCVTIMEO_OLD)? != (25, 0) {
+            return Err("SO_SNDTIMEO clobbered SO_RCVTIMEO");
+        }
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(0, 0))? != 0
+            || read_timeval(l, so::SO_RCVTIMEO_OLD)? != (0, 0)
+        {
+            return Err("SO_RCVTIMEO {0,0} did not clear the timeout");
+        }
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(-3, 0))? != 0
+            || read_timeval(l, so::SO_RCVTIMEO_OLD)? != (0, 0)
+        {
+            return Err("negative SO_RCVTIMEO was not stored as a zero timeout");
+        }
+        // A short getsockopt buffer is truncated to it, not refused.
+        let mut half = [0u8; 8];
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(9, 0))? != 0
+            || sockopt_get(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &mut half)? != (0, 8)
+            || i64::from_ne_bytes(half) != 9
+        {
+            return Err("an 8-byte SO_RCVTIMEO getsockopt was not truncated");
+        }
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        if sockopt_set(u, SOL_SOCKET, so::SO_RCVTIMEO_NEW, &timeval_bytes(1, 0))? != 0 {
+            return Err("SO_RCVTIMEO_NEW on UDP was refused");
+        }
+        sockopt_close(&[l, u]);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sockopt_timeo_pos);
+
+/// `sock_copy_user_timeval` / `sock_set_timeout` errnos.
+fn smoke_abi_socket_sockopt_timeo_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let tv = timeval_bytes(1, 0);
+        for (name, len, what) in [
+            (
+                so::SO_RCVTIMEO_OLD,
+                8usize,
+                "SO_RCVTIMEO optlen 8 is not EINVAL",
+            ),
+            (
+                so::SO_RCVTIMEO_NEW,
+                15,
+                "SO_RCVTIMEO_NEW optlen 15 is not EINVAL",
+            ),
+            (so::SO_SNDTIMEO_OLD, 3, "SO_SNDTIMEO optlen 3 is not EINVAL"),
+        ] {
+            if sockopt_set(u, SOL_SOCKET, name, &tv[..len])? != EINVAL {
+                return Err(what);
+            }
+        }
+        for (usec, what) in [
+            (1_000_000i64, "SO_RCVTIMEO usec 1000000 is not EDOM"),
+            (-1, "SO_RCVTIMEO usec -1 is not EDOM"),
+        ] {
+            if sockopt_set(u, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(1, usec))? != EDOM {
+                return Err(what);
+            }
+        }
+        // EDOM did not store anything.
+        if read_timeval(u, so::SO_RCVTIMEO_OLD)? != (0, 0) {
+            return Err("a rejected SO_RCVTIMEO changed the stored timeout");
+        }
+        sockopt_close(&[u]);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sockopt_timeo_neg);
+
+/// SOL_SOCKET options `sk_setsockopt` accepts and `sk_getsockopt` reports.
+fn smoke_abi_socket_sockopt_sol_socket_pos() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        // SO_SNDBUF / SO_RCVBUF store twice the request, floored at
+        // SOCK_MIN_SNDBUF (4608) / SOCK_MIN_RCVBUF (2304).
+        for (name, v, want, what) in [
+            (
+                so::SO_RCVBUF,
+                4096,
+                8192,
+                "SO_RCVBUF 4096 did not read back 8192",
+            ),
+            (
+                so::SO_SNDBUF,
+                65536,
+                131_072,
+                "SO_SNDBUF 65536 did not read back 131072",
+            ),
+            (so::SO_RCVBUF, 0, 2304, "SO_RCVBUF 0 did not floor at 2304"),
+            (so::SO_SNDBUF, 0, 4608, "SO_SNDBUF 0 did not floor at 4608"),
+            (so::SO_DONTROUTE, 1, 1, "SO_DONTROUTE"),
+            (so::SO_OOBINLINE, 1, 1, "SO_OOBINLINE"),
+            (so::SO_NO_CHECK, 1, 1, "SO_NO_CHECK"),
+            (so::SO_PRIORITY, 6, 6, "SO_PRIORITY 6"),
+            (so::SO_RCVLOWAT, 0, 1, "SO_RCVLOWAT 0 did not read back 1"),
+            (so::SO_RCVLOWAT, 16, 16, "SO_RCVLOWAT 16"),
+            (so::SO_MARK, 7, 7, "SO_MARK (privileged)"),
+            (so::SO_BINDTOIFINDEX, 1, 1, "SO_BINDTOIFINDEX(lo)"),
+        ] {
+            if sockopt_set_int(u, SOL_SOCKET, name, v)? != 0 {
+                return Err(what);
+            }
+            if sockopt_get_int(u, SOL_SOCKET, name)? != want {
+                return Err(what);
+            }
+        }
+        let mut dev = [0u8; 16];
+        if sockopt_get(u, SOL_SOCKET, SO_BINDTODEVICE, &mut dev)? != (0, 3) || &dev[..3] != b"lo\0"
+        {
+            return Err("SO_BINDTOIFINDEX(1) is not visible as SO_BINDTODEVICE \"lo\"");
+        }
+        sockopt_expect_int(u, SOL_SOCKET, so::SO_SNDLOWAT, 1, "SO_SNDLOWAT is not 1")?;
+        sockopt_expect_int(
+            u,
+            SOL_SOCKET,
+            so::SO_INCOMING_CPU,
+            -1,
+            "default SO_INCOMING_CPU is not -1",
+        )?;
+        let t = sockopt_socket(AF_INET, SOCK_STREAM)?;
+        if sockopt_set_int(t, SOL_SOCKET, so::SO_TXREHASH, 0)? != 0
+            || sockopt_get_int(t, SOL_SOCKET, so::SO_TXREHASH)? != 0
+        {
+            return Err("SO_TXREHASH 0 on TCP did not round-trip");
+        }
+        let un = open_unix_stream()?;
+        if sockopt_set_int(un, SOL_SOCKET, SO_PASSCRED, 1)? != 0
+            || sockopt_get_int(un, SOL_SOCKET, SO_PASSCRED)? != 1
+        {
+            return Err("SO_PASSCRED on AF_UNIX did not round-trip");
+        }
+        sockopt_close(&[u, t, un]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_sol_socket_pos
+);
+
+/// SOL_SOCKET errnos: read-only / write-only names, family and protocol
+/// restrictions, short optlen, and the capability checks.
+fn smoke_abi_socket_sockopt_sol_socket_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let un = open_unix_stream()?;
+        let one = 1i32.to_ne_bytes();
+        let mut out = [0u8; 4];
+        if sockopt_set(u, SOL_SOCKET, so::SO_SNDLOWAT, &one)? != ENOPROTOOPT {
+            return Err("SO_SNDLOWAT set is not ENOPROTOOPT");
+        }
+        if sockopt_set(u, SOL_SOCKET, so::SO_DETACH_FILTER, &one)? != ENOENT {
+            return Err("SO_DETACH_FILTER with no filter is not ENOENT");
+        }
+        if sockopt_set(u, SOL_SOCKET, so::SO_TXREHASH, &one)? != EOPNOTSUPP
+            || sockopt_get(u, SOL_SOCKET, so::SO_TXREHASH, &mut out)?.0 != EOPNOTSUPP
+        {
+            return Err("SO_TXREHASH on UDP is not EOPNOTSUPP");
+        }
+        if sockopt_set(u, SOL_SOCKET, SO_PASSCRED, &one)? != EOPNOTSUPP
+            || sockopt_get(u, SOL_SOCKET, SO_PASSCRED, &mut out)?.0 != EOPNOTSUPP
+        {
+            return Err("SO_PASSCRED on AF_INET is not EOPNOTSUPP (sk_may_scm_recv)");
+        }
+        if sockopt_set(un, SOL_SOCKET, so::SO_REUSEPORT, &one)? != EOPNOTSUPP {
+            return Err("SO_REUSEPORT on AF_UNIX is not EOPNOTSUPP");
+        }
+        if sockopt_set_int(un, SOL_SOCKET, so::SO_REUSEPORT, 0)? != 0 {
+            return Err("SO_REUSEPORT 0 on AF_UNIX was refused");
+        }
+        if sockopt_set(u, SOL_SOCKET, so::SO_PRIORITY, &one[..3])? != EINVAL {
+            return Err("SO_PRIORITY optlen 3 is not EINVAL");
+        }
+        if sockopt_set(u, SOL_SOCKET, 1999, &one)? != ENOPROTOOPT
+            || sockopt_get(u, SOL_SOCKET, 1999, &mut out)?.0 != ENOPROTOOPT
+        {
+            return Err("an unknown SOL_SOCKET option is not ENOPROTOOPT");
+        }
+        // sock_bindtoindex_locked: a negative index is EINVAL; it never looks
+        // the index up, so an unknown one is stored as-is.
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_BINDTOIFINDEX, -1)? != EINVAL {
+            return Err("SO_BINDTOIFINDEX -1 is not EINVAL");
+        }
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_BINDTOIFINDEX, so::NO_IFINDEX as i32)? != 0
+            || sockopt_get_int(u, SOL_SOCKET, so::SO_BINDTOIFINDEX)? != so::NO_IFINDEX as i32
+        {
+            return Err("SO_BINDTOIFINDEX of an unknown index was not stored");
+        }
+        // Unprivileged: SO_MARK and SO_PRIORITY > 6 need CAP_NET_RAW/ADMIN.
+        drop_to_unprivileged_uid()?;
+        if sockopt_set(u, SOL_SOCKET, so::SO_MARK, &one)? != EPERM {
+            return Err("unprivileged SO_MARK is not EPERM");
+        }
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_PRIORITY, 7)? != EPERM {
+            return Err("unprivileged SO_PRIORITY 7 is not EPERM");
+        }
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_PRIORITY, 6)? != 0 {
+            return Err("unprivileged SO_PRIORITY 6 was refused");
+        }
+        sockopt_close(&[u, un]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_sol_socket_neg
+);
+
+/// IP_MULTICAST_LOOP / IP_ADD_MEMBERSHIP have real effect: a multicast sent
+/// out lo reaches every local member bound to the port (`ip_mc_output` +
+/// `__udp4_lib_mcast_deliver`); a non-member socket gets it only while
+/// IP_MULTICAST_ALL is set (`ip_mc_sf_allow`).
+fn smoke_abi_socket_sockopt_mcast_delivery_pos() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 47_351;
+        let group = ip_mreqn(so::MDNS_V4, 0, 1);
+        let mut members = [0u64; 2];
+        for m in members.iter_mut() {
+            *m = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+            if sockopt_set_int(*m, SOL_SOCKET, SO_REUSEADDR, 1)? != 0 {
+                return Err("SO_REUSEADDR failed");
+            }
+            sockopt_bind(*m, &sockaddr_in(0, PORT))?;
+            if sockopt_set(*m, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &group)? != 0 {
+                return Err("IP_ADD_MEMBERSHIP(lo) failed");
+            }
+        }
+        let bystander = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let excluded = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        for s in [bystander, excluded] {
+            if sockopt_set_int(s, SOL_SOCKET, SO_REUSEADDR, 1)? != 0 {
+                return Err("SO_REUSEADDR failed");
+            }
+            sockopt_bind(s, &sockaddr_in(0, PORT))?;
+        }
+        if sockopt_set_int(excluded, so::IPPROTO_IP, so::IP_MULTICAST_ALL, 0)? != 0 {
+            return Err("IP_MULTICAST_ALL 0 failed");
+        }
+        let tx = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        if sockopt_set(tx, so::IPPROTO_IP, so::IP_MULTICAST_IF, &ip_mreqn(0, 0, 1))? != 0 {
+            return Err("IP_MULTICAST_IF(lo) failed");
+        }
+        if sockopt_sendto(tx, b"mdns", &sockaddr_in(so::MDNS_V4, PORT)) != Some(4) {
+            return Err("sendto(224.0.0.251) did not send 4 bytes");
+        }
+        let mut buf = [0u8; 16];
+        for m in members {
+            if sockopt_recv_nb(m, &mut buf) != Some(4) || &buf[..4] != b"mdns" {
+                return Err("a member bound to the port did not get its own copy");
+            }
+        }
+        if sockopt_recv_nb(bystander, &mut buf) != Some(4) {
+            return Err("a non-member with IP_MULTICAST_ALL=1 did not get the group's datagram");
+        }
+        if sockopt_recv_nb(excluded, &mut buf) != Some(EAGAIN) {
+            return Err("a non-member with IP_MULTICAST_ALL=0 received the datagram");
+        }
+        // After every member leaves, the host no longer listens on lo.
+        for m in members {
+            if sockopt_set(m, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &group)? != 0 {
+                return Err("IP_DROP_MEMBERSHIP failed");
+            }
+        }
+        if sockopt_sendto(tx, b"late", &sockaddr_in(so::MDNS_V4, PORT)) != Some(4) {
+            return Err("second sendto(224.0.0.251) failed");
+        }
+        if sockopt_recv_nb(bystander, &mut buf) != Some(EAGAIN) {
+            return Err("a group nobody on lo has joined was still delivered");
+        }
+        sockopt_close(&members);
+        sockopt_close(&[bystander, excluded, tx]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_mcast_delivery_pos
+);
+
+/// IPv6: a multicast to ff02::fb out lo reaches a member joined on lo.
+fn smoke_abi_socket_sockopt_mcast6_delivery_pos() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 47_353;
+        let rx = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        sockopt_bind(rx, &sockaddr_in6([0; 16], PORT, 0))?;
+        let group = ipv6_mreq(so::MDNS_V6, 1);
+        if sockopt_set(rx, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &group)? != 0 {
+            return Err("IPV6_ADD_MEMBERSHIP(ff02::fb, lo) failed");
+        }
+        let tx = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        if sockopt_set_int(tx, so::IPPROTO_IPV6, so::IPV6_MULTICAST_IF, 1)? != 0 {
+            return Err("IPV6_MULTICAST_IF(lo) failed");
+        }
+        if sockopt_sendto(tx, b"mdns6", &sockaddr_in6(so::MDNS_V6, PORT, 0)) != Some(5) {
+            return Err("sendto(ff02::fb) did not send 5 bytes");
+        }
+        let mut buf = [0u8; 16];
+        if sockopt_recv_nb(rx, &mut buf) != Some(5) || &buf[..5] != b"mdns6" {
+            return Err("an IPv6 member on lo did not receive the multicast");
+        }
+        sockopt_close(&[rx, tx]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_mcast6_delivery_pos
+);
+
+/// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
+/// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
+/// ("Could not create manager: No data available"). Linux always emits it
+/// (`inet_fill_ifaddr` / `inet6_fill_ifaddr`), with IFA_CACHEINFO.
+fn smoke_abi_socket_rtnl_newaddr_has_ifa_flags() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = rtnl_dump_request(RTM_GETADDR, 91);
+        if netlink_send(fd, &req) != Some(req.len() as i64) {
+            return Err("send(RTM_GETADDR) failed");
+        }
+        let mut seen = 0;
+        let mut done = false;
+        for _ in 0..64 {
+            let mut buf = [0u8; 4096];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n <= 0 {
+                break;
+            }
+            let n = n as usize;
+            let mut off = 0usize;
+            while off + NLMSG_HDRLEN <= n {
+                let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4]));
+                let len = len as usize;
+                if len < NLMSG_HDRLEN || off + len > n {
+                    return Err("malformed netlink frame");
+                }
+                let kind = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                if kind == NLMSG_DONE {
+                    done = true;
+                } else if kind == RTM_NEWADDR {
+                    check_newaddr_flags(&buf[off..off + len])?;
+                    seen += 1;
+                }
+                off += (len + 3) & !3;
+            }
+            if done {
+                break;
+            }
+        }
+        if !done || seen < 2 {
+            return Err("RTM_GETADDR dump did not return v4+v6 loopback addresses");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_rtnl_newaddr_has_ifa_flags
+);
+
+/// One RTM_NEWADDR: an IFA_FLAGS u32 whose low byte is `ifa_flags`, a
+/// 16-byte IFA_CACHEINFO, and IFA_F_PERMANENT on a host-scope address.
+fn check_newaddr_flags(msg: &[u8]) -> Result<(), &'static str> {
+    const IFA_CACHEINFO: u16 = 6;
+    const IFA_FLAGS: u16 = 8;
+    const IFA_F_PERMANENT: u32 = 0x80;
+    const RT_SCOPE_HOST: u8 = 254;
+    let (mut flags, mut cache) = (None, false);
+    let mut a = NLMSG_HDRLEN + 8;
+    while a + 4 <= msg.len() {
+        let alen = u16::from_ne_bytes([msg[a], msg[a + 1]]) as usize;
+        let akind = u16::from_ne_bytes([msg[a + 2], msg[a + 3]]);
+        if alen < 4 || a + alen > msg.len() {
+            return Err("malformed rtattr in RTM_NEWADDR");
+        }
+        if akind == IFA_FLAGS && alen == 8 {
+            flags = Some(u32::from_ne_bytes(
+                msg[a + 4..a + 8].try_into().unwrap_or([0; 4]),
+            ));
+        }
+        if akind == IFA_CACHEINFO && alen == 20 {
+            cache = true;
+        }
+        a += (alen + 3) & !3;
+    }
+    let Some(flags) = flags else {
+        return Err("RTM_NEWADDR without an IFA_FLAGS u32");
+    };
+    if !cache {
+        return Err("RTM_NEWADDR without a 16-byte IFA_CACHEINFO");
+    }
+    if u32::from(msg[NLMSG_HDRLEN + 2]) != flags & 0xff {
+        return Err("ifa_flags disagrees with IFA_FLAGS");
+    }
+    if msg[NLMSG_HDRLEN + 3] == RT_SCOPE_HOST && flags & IFA_F_PERMANENT == 0 {
+        return Err("a host-scope address is not IFA_F_PERMANENT");
+    }
+    Ok(())
+}

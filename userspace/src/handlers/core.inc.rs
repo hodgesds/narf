@@ -13094,6 +13094,19 @@ pub(crate) fn park_reexecute_on_fd(
     ops: &dyn narf_filesystem::FileOps,
     interest: u32,
 ) -> bool {
+    park_reexecute_on_fd_until(ctx, ops, interest, u64::MAX)
+}
+
+/// [`park_reexecute_on_fd`] with a wake deadline (absolute monotonic ns):
+/// the task resumes — and re-executes the syscall — on readiness OR when
+/// `deadline` passes, whichever is first. `u64::MAX` waits for readiness
+/// only.
+pub(crate) fn park_reexecute_on_fd_until(
+    ctx: &mut dyn TrapContext,
+    ops: &dyn narf_filesystem::FileOps,
+    interest: u32,
+    deadline: u64,
+) -> bool {
     // CaptureCtx deliberately reports RIP 0 for a nested sendmsg used by
     // sendmmsg.  The outer handler must decide whether re-execution is safe
     // after accounting for any messages it already transmitted.
@@ -13122,7 +13135,7 @@ pub(crate) fn park_reexecute_on_fd(
             // The provider checked the level and installed this task's waker
             // under the same per-fd lock used by `Readiness::set`.
             // There is no lost-wake window to poll with a 1 ms timer.
-            let parked = park_reexecute_on_io_until(ctx, u64::MAX, true);
+            let parked = park_reexecute_on_io_until(ctx, deadline, true);
             ops.disarm_readiness(task);
             parked
         }

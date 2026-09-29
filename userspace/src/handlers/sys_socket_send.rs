@@ -38,6 +38,8 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // SO_SNDTIMEO: pick up this call's deadline if it is re-executing.
+    let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
     // sendto's sockaddr import follows descriptor/socket validation.  Unlike
     // sendmsg, move_addr_to_kernel rejects (rather than clamps) a length above
     // sockaddr_storage, and a failed user copy is EFAULT rather than silently
@@ -62,7 +64,7 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
         // non-empty buffer makes correct clients busy-loop or treat the stream
         // as broken, and matches nothing Linux ever returns from send(2).
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            socket_send_would_block(ctx, fd, flags, sock.as_ref());
+            socket_send_would_block(ctx, fd, flags, sock.as_ref(), resumed);
         }
         crate::socket::SocketOpResult::Err(e) => {
             // A broken-pipe send raises SIGPIPE to the sender unless MSG_NOSIGNAL
@@ -121,6 +123,7 @@ pub(super) fn socket_send_would_block(
     fd: u32,
     flags: u32,
     sock: &crate::socket::SocketFile,
+    resumed: Option<u64>,
 ) {
     const MSG_DONTWAIT: u32 = 0x40;
     let task = current_task_id();
@@ -128,14 +131,14 @@ pub(super) fn socket_send_would_block(
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
-    if park_reexecute_on_fd(
+    // Bounded by SO_SNDTIMEO (`sock_sndtimeo`). A kernel-test/non-stackful
+    // context cannot sleep and gets the retryable EAGAIN, never a fabricated
+    // zero-byte successful send.
+    handler_sys_socket_recv::socket_block(
         ctx,
         sock,
         narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
-    ) {
-        return;
-    }
-    // Kernel-test/non-stackful context cannot sleep; expose the retryable
-    // condition rather than fabricating a zero-byte successful send.
-    ctx.set_return(errno_ret(EAGAIN));
+        sock.sndtimeo(),
+        resumed,
+    );
 }

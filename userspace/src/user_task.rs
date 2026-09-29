@@ -352,6 +352,16 @@ pub struct UserTaskCtx {
     /// after an unrelated `sleep(2)` can't inherit a stale deadline.
     pub blocking_deadline_ns: AtomicU64,
 
+    /// Absolute monotonic-ns deadline of a socket wait bounded by
+    /// SO_RCVTIMEO / SO_SNDTIMEO (`sock_rcvtimeo` / `sock_sndtimeo`), kept
+    /// across the RIP-rewind re-executions of the parked recv/send/accept.
+    /// Paired with `sock_timeo_key`, which identifies the call (syscall
+    /// return address + socket). The socket handlers TAKE both on entry and
+    /// store them again only when they park, so a completed call never
+    /// leaves a deadline behind for the next one.
+    pub sock_timeo_deadline_ns: AtomicU64,
+    pub sock_timeo_key: AtomicU64,
+
     /// Fd (+1) of a FIFO `open()` that has installed its per-open
     /// [`crate::fifo` handle] and is now BLOCKED waiting for the peer
     /// direction to open (O_RDONLY without a writer, or O_WRONLY without a
@@ -546,6 +556,8 @@ impl UserTaskCtx {
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
             blocking_deadline_ns: AtomicU64::new(0),
+            sock_timeo_deadline_ns: AtomicU64::new(0),
+            sock_timeo_key: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
             syscall_parked_restarting: AtomicBool::new(false),
             kern_span_start_ns: AtomicU64::new(0),

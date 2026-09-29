@@ -195,6 +195,42 @@ fn broadcast_targets(
         .collect()
 }
 
+/// Every socket on `dport` that takes a copy of a multicast from
+/// `saddr:sport` to `daddr` arriving on (or looped back from) device `dif` —
+/// `__udp_is_mcast_sock` (`net/ipv4/udp.c`): a connected peer must be the
+/// sender, a bound address must be the group, a bound device must be `dif`,
+/// and `ip_mc_sf_allow` must admit the group.
+fn mcast_targets(
+    map: &InetDgramMap,
+    ns: u64,
+    saddr: u32,
+    sport: u16,
+    daddr: u32,
+    dport: u16,
+    dif: u32,
+) -> Vec<Arc<SocketFile>> {
+    let Some(socks) = map.get(&(ns, dport)) else {
+        return Vec::new();
+    };
+    socks
+        .iter()
+        .filter(|s| {
+            let Some(v) = view_of(s) else {
+                return false;
+            };
+            if let Some((pa, pp)) = v.peer {
+                if pa != saddr || pp != sport {
+                    return false;
+                }
+            }
+            (v.addr == INADDR_ANY || v.addr == daddr)
+                && (v.dev == 0 || v.dev == dif)
+                && super::sockopt::ip_mc_sf_allow(s, daddr, dif)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Insert `sock` at the head of its port's chain.
 fn hash(map: &mut InetDgramMap, ns: u64, port: u16, sock: &Arc<SocketFile>) {
     map.entry((ns, port)).or_default().insert(0, sock.clone());
@@ -347,6 +383,36 @@ pub(super) fn deliver_wire(
     in_ifindex: u32,
 ) -> bool {
     let saddr = u32::from_be_bytes(src);
+    let daddr = u32::from_be_bytes(dst);
+    if super::sockopt::is_multicast_v4(daddr) {
+        // `ip_route_input_mc` accepts a group only when the arrival device
+        // joined it (`ip_check_mc_rcv`); `__udp4_lib_mcast_deliver` then
+        // hands a copy to every matching socket.
+        if in_ifindex != 0 && !super::sockopt::host_joined_v4(ns, in_ifindex, daddr) {
+            return false;
+        }
+        let targets = {
+            let bound = INET_DGRAM_BOUND.lock();
+            bound
+                .as_ref()
+                .map(|m| mcast_targets(m, ns, saddr, sport, daddr, dport, in_ifindex))
+                .unwrap_or_default()
+        };
+        for t in &targets {
+            enqueue(
+                t,
+                DgramPacket {
+                    peer_unix: None,
+                    sender_cred: Ucred::default(),
+                    peer_addr: saddr,
+                    peer_port: sport,
+                    payload: payload.to_vec(),
+                    fds: Vec::new(),
+                },
+            );
+        }
+        return !targets.is_empty();
+    }
     let sock = {
         let bound = INET_DGRAM_BOUND.lock();
         bound.as_ref().and_then(|m| {
@@ -692,6 +758,9 @@ impl SocketFile {
                 None => return SocketOpResult::Err(SockError::DestAddrReq),
             },
         };
+        if super::sockopt::is_multicast_v4(dest.0) {
+            return self.inet_dgram_send_mcast(buf, local_addr, local_port, dest);
+        }
         let (dev, broadcast, ip_ttl, ip_tos) = {
             let o = self.options.lock();
             (o.bindtodevice_index, o.broadcast, o.ip_ttl, o.ip_tos)
@@ -821,6 +890,95 @@ impl SocketFile {
             }
         }
         SocketOpResult::Ok(buf.len() as u64)
+    }
+
+    /// A datagram to an IPv4 multicast group. `udp_sendmsg` routes it out
+    /// `IP_MULTICAST_IF` (else the bound device, else the route) with the
+    /// `IP_MULTICAST_TTL` hop limit; `ip_mc_output` loops a copy back to
+    /// local members while `IP_MULTICAST_LOOP` is set, and a datagram sent
+    /// out lo comes back in through lo whatever the flag says (the lo route
+    /// outputs through plain `ip_output`).
+    fn inet_dgram_send_mcast(
+        self: &Arc<Self>,
+        buf: &[u8],
+        local_addr: u32,
+        local_port: u16,
+        dest: (u32, u16),
+    ) -> SocketOpResult {
+        let ns = self.net_ns_id();
+        let (egress, mc_loop, mc_ttl, ip_tos) = {
+            let o = self.options.lock();
+            (
+                super::sockopt::mc_egress_v4(ns, &o, dest.0),
+                o.ext.ip_mc_loop,
+                o.ip_multicast_ttl,
+                o.ip_tos,
+            )
+        };
+        let Some(egress) = egress else {
+            return SocketOpResult::Err(SockError::NetUnreach);
+        };
+        if buf.len() > narf_net::udp_sock::UDP_MAX_PAYLOAD {
+            return SocketOpResult::Err(SockError::MsgSize);
+        }
+        if let Some(e) = self.take_pending_error() {
+            return SocketOpResult::Err(e);
+        }
+        if self.sk_shutdown() & SEND_SHUTDOWN != 0 {
+            return SocketOpResult::Err(SockError::Pipe);
+        }
+        let from = if local_addr == INADDR_ANY {
+            super::sockopt::mc_source_v4(ns, egress)
+        } else {
+            local_addr
+        };
+        let via_lo = egress == super::sockopt::LOOPBACK_IFINDEX;
+        if (via_lo || mc_loop) && super::sockopt::host_joined_v4(ns, egress, dest.0) {
+            let targets = {
+                let bound = INET_DGRAM_BOUND.lock();
+                bound
+                    .as_ref()
+                    .map(|m| mcast_targets(m, ns, from, local_port, dest.0, dest.1, egress))
+                    .unwrap_or_default()
+            };
+            for t in targets {
+                enqueue(
+                    &t,
+                    DgramPacket {
+                        peer_unix: None,
+                        sender_cred: Ucred::default(),
+                        peer_addr: from,
+                        peer_port: local_port,
+                        payload: buf.to_vec(),
+                        fds: Vec::new(),
+                    },
+                );
+            }
+        }
+        // "Multicasts with ttl 0 must not go beyond the host" (ip_mc_output).
+        if via_lo || mc_ttl == 0 {
+            return SocketOpResult::Ok(buf.len() as u64);
+        }
+        let udp_opts = narf_net::udp_sock::UdpOptions {
+            bind_to_device: egress,
+            ip_ttl: mc_ttl.min(255) as u8,
+            ip_tos: ip_tos.min(255) as u8,
+            sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
+            ..Default::default()
+        };
+        let dst = narf_net::udp_sock::SocketAddrV4::new(dest.0.to_be_bytes(), dest.1);
+        match narf_net::udp_sock::udp_send_from(ns, local_port, dst, buf, &udp_opts, 0) {
+            Ok(n) => SocketOpResult::Ok(n as u64),
+            Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
+                SocketOpResult::Err(SockError::MsgSize)
+            }
+            // Like the unicast path: an unresolved neighbour is queued, not
+            // an error.
+            Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            Err(_) => SocketOpResult::Err(SockError::NetUnreach),
+        }
     }
 
     /// `recv(2)` family — `udp_recvmsg` (`net/ipv4/udp.c:1816`).

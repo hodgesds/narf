@@ -10647,6 +10647,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             return;
         }
     };
+    // SO_RCVTIMEO bounds a blocking accept (`inet_csk_accept` /
+    // `unix_accept` wait `sock_rcvtimeo`); pick up this call's deadline if
+    // it is re-executing.
+    let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
     // Single-shot: pop pending if any, else WouldBlock-style yield
     // mirroring sys_futex. Caller (libc accept) loops.
     match sock.dispatch_op(crate::socket::SocketOp::Accept) {
@@ -10739,6 +10743,19 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
                 ctx.set_return(errno_ret(EAGAIN)); // -EAGAIN
+                return;
+            }
+            // SO_RCVTIMEO: a finite timeout parks until readiness or the
+            // deadline, then reports -EAGAIN (`inet_csk_wait_for_connect`
+            // / `unix_accept`'s `skb_recv_datagram`).
+            if sock.rcvtimeo().is_some() {
+                handler_sys_socket_recv::socket_block(
+                    ctx,
+                    sock.as_ref(),
+                    narf_filesystem::POLL_IN,
+                    sock.rcvtimeo(),
+                    resumed,
+                );
                 return;
             }
             if let (Some(uctx), Some(hook)) = (
