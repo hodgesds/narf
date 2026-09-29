@@ -5551,6 +5551,16 @@ fn boot_userspace_init() {
                     "procsig_thread_glibc",
                     narf_verification::NARF_PROCSIG_THREAD_SMOKE_GLIBC_ELF,
                 ),
+                // A caught signal wakes a parked wait and SA_RESTART re-runs it
+                // (fish: sem_wait woken by SIGCHLD), musl + static glibc.
+                (
+                    "sigwake_wait_smoke",
+                    narf_verification::NARF_SIGWAKE_WAIT_SMOKE_ELF,
+                ),
+                (
+                    "sigwake_wait_glibc",
+                    narf_verification::NARF_SIGWAKE_WAIT_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

@@ -3629,6 +3629,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // (fish's SIGCHLD-driven topic_monitor wait).
         ("procsig_thread_smoke", "procsig-thread-ok"),
         ("procsig_thread_glibc", "procsig-thread-ok"),
+        ("sigwake_wait_smoke", "sigwake-wait-ok"),
+        ("sigwake_wait_glibc", "sigwake-wait-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),
