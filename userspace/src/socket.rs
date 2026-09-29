@@ -3694,6 +3694,8 @@ impl SocketFile {
                     Ok(msgs) => msgs,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                #[cfg(feature = "syscall-trace")]
+                trace_netlink_route(buf, &msgs);
                 let notifications =
                     narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
                 Self::stamp_netlink_reply_portid(&mut msgs, dest_portid);
@@ -9308,3 +9310,55 @@ kernel_test_in!(
     "userspace/socket",
     smoke_ipv6_socket_options_and_ancillary_are_per_datagram
 );
+
+/// syscall-trace: one line per rtnetlink request and the reply it produced,
+/// for every process (not comm-gated). A netlink failure is carried INSIDE
+/// the reply (an NLMSG_ERROR / NLMSG_DONE errno), so the syscall trace alone
+/// cannot show which request a daemon is waiting on.
+#[cfg(feature = "syscall-trace")]
+fn trace_netlink_route(request: &[u8], replies: &[alloc::vec::Vec<u8>]) {
+    use core::fmt::Write as _;
+    let mut comm = [0u8; 16];
+    let n = crate::handlers::proc_comm_of_task_into(crate::handlers::current_task_id(), &mut comm);
+    let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+    let u16_at = |b: &[u8], o: usize| {
+        b.get(o..o + 2)
+            .map_or(0, |x| u16::from_ne_bytes([x[0], x[1]]))
+    };
+    let u32_at = |b: &[u8], o: usize| {
+        b.get(o..o + 4)
+            .map_or(0, |x| u32::from_ne_bytes([x[0], x[1], x[2], x[3]]))
+    };
+    let mut w = narf_console::Writer;
+    let _ = write!(w, "NLRT comm={comm} len={} req=[", request.len());
+    let mut off = 0usize;
+    while request.len() - off >= 16 {
+        let len = u32_at(request, off) as usize;
+        if len < 16 || len > request.len() - off {
+            break;
+        }
+        let _ = write!(
+            w,
+            " t={} f={:#x} l={} fam={}",
+            u16_at(request, off + 4),
+            u16_at(request, off + 6),
+            len,
+            request.get(off + 16).copied().unwrap_or(0xff),
+        );
+        off += (len + 3) & !3;
+    }
+    let last = replies.last();
+    let last_type = last.map_or(0, |m| u16_at(m, 4));
+    let last_errno = last.map_or(0, |m| u32_at(m, 16) as i32);
+    let _ = writeln!(
+        w,
+        " ] replies={} last_t={} last_err={}",
+        replies.len(),
+        last_type,
+        if last_type == 2 || last_type == 3 {
+            last_errno
+        } else {
+            0
+        },
+    );
+}
