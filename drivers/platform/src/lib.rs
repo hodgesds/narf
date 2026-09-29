@@ -43,10 +43,21 @@ pub mod ec;
 pub mod ec_hotkeys;
 pub mod fan;
 pub mod intel_hid;
+/// Intel VSEC / PMT — telemetry + crashlog capability discovery.
+#[cfg(target_arch = "x86_64")]
+pub mod intel_vsec;
 pub mod ipmi;
 pub mod itco_wdt;
 #[cfg(target_arch = "x86_64")]
 pub mod lid;
+/// Intel MEI / HECI — host interface to the CSME. Uses PCI
+/// config-space firmware-status words and an MMIO register block
+/// that only appear on Intel PCHs.
+#[cfg(target_arch = "x86_64")]
+pub mod mei;
+/// Intel DTT — Dynamic Tuning Technology processor thermal device.
+#[cfg(target_arch = "x86_64")]
+pub mod proc_thermal;
 pub mod smbus;
 pub mod thermal;
 pub mod tpm;
@@ -182,6 +193,21 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "itco_wdt", || {
         itco_wdt::register_initcalls();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "mei-me", || {
+        mei::register_pci_driver();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "intel_vsec", || {
+        intel_vsec::register_pci_driver();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "proc_thermal", || {
+        proc_thermal::register_pci_driver();
         InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]

@@ -13,6 +13,9 @@ path = "src/lib.rs"
 
 [dependencies]
 narf-lib          = { path = "../../lib" }
+narf-bus          = { path = "../../bus" }
+narf-capabilities = { path = "../../capabilities" }
+narf-drivers      = { path = "../" }
 narf-memory       = { path = "../../memory" }
 narf-arch         = { path = "../../arch" }
 narf-aml          = { path = "../../aml" }
