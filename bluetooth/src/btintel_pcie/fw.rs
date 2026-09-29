@@ -303,8 +303,7 @@ pub const FWID_MAXLEN: usize = 64;
 /// silently decode as a short read of the next record's bytes.
 pub const fn tlv_min_len(ty: u8) -> usize {
     match ty {
-        TLV_CNVI_TOP | TLV_CNVR_TOP | TLV_CNVI_BT | TLV_CNVR_BT | TLV_BUILD_NUM
-        | TLV_GIT_SHA1 => 4,
+        TLV_CNVI_TOP | TLV_CNVR_TOP | TLV_CNVI_BT | TLV_CNVR_BT | TLV_BUILD_NUM | TLV_GIT_SHA1 => 4,
         TLV_DEV_REV_ID | TLV_TIME_STAMP => 2,
         TLV_IMAGE_TYPE | TLV_BUILD_TYPE | TLV_SECURE_BOOT | TLV_OTP_LOCK | TLV_API_LOCK
         | TLV_DEBUG_LOCK | TLV_LIMITED_CCE | TLV_SBE_TYPE => 1,
@@ -650,9 +649,21 @@ pub fn plan_header_fragments(
 /// 256-byte public key, then a 256-byte signature.
 fn rsa_header_fragments() -> Vec<Fragment> {
     alloc::vec![
-        Fragment { kind: FRAG_INIT, offset: 0, len: 128 },
-        Fragment { kind: FRAG_PKEY, offset: 128, len: 256 },
-        Fragment { kind: FRAG_SIGN, offset: 388, len: 256 },
+        Fragment {
+            kind: FRAG_INIT,
+            offset: 0,
+            len: 128
+        },
+        Fragment {
+            kind: FRAG_PKEY,
+            offset: 128,
+            len: 256
+        },
+        Fragment {
+            kind: FRAG_SIGN,
+            offset: 388,
+            len: 256
+        },
     ]
 }
 
@@ -660,9 +671,21 @@ fn rsa_header_fragments() -> Vec<Fragment> {
 /// taken from the ECDSA header, with 96-byte key and signature.
 fn ecdsa_header_fragments() -> Vec<Fragment> {
     alloc::vec![
-        Fragment { kind: FRAG_INIT, offset: ECDSA_OFFSET, len: 128 },
-        Fragment { kind: FRAG_PKEY, offset: ECDSA_OFFSET + 128, len: 96 },
-        Fragment { kind: FRAG_SIGN, offset: ECDSA_OFFSET + 224, len: 96 },
+        Fragment {
+            kind: FRAG_INIT,
+            offset: ECDSA_OFFSET,
+            len: 128
+        },
+        Fragment {
+            kind: FRAG_PKEY,
+            offset: ECDSA_OFFSET + 128,
+            len: 96
+        },
+        Fragment {
+            kind: FRAG_SIGN,
+            offset: ECDSA_OFFSET + 224,
+            len: 96
+        },
     ]
 }
 
@@ -691,7 +714,11 @@ pub fn plan_payload_fragments(image: &[u8], start: usize) -> Result<Vec<Fragment
             return Err(FwError::MalformedPayload);
         }
         if run % 4 == 0 {
-            out.push(Fragment { kind: FRAG_DATA, offset: base, len: run });
+            out.push(Fragment {
+                kind: FRAG_DATA,
+                offset: base,
+                len: run,
+            });
             base += run;
             run = 0;
         }
@@ -715,7 +742,11 @@ pub fn plan_ddc_records(image: &[u8]) -> Result<Vec<Fragment>, FwError> {
         if i + plen > image.len() {
             return Err(FwError::MalformedPayload);
         }
-        out.push(Fragment { kind: FRAG_DATA, offset: i, len: plen });
+        out.push(Fragment {
+            kind: FRAG_DATA,
+            offset: i,
+            len: plen,
+        });
         i += plen;
     }
     Ok(out)
@@ -751,7 +782,11 @@ pub struct Session<'a> {
 impl<'a> Session<'a> {
     /// Start a session against `dev`, whose rings must already be up.
     pub fn new(dev: &'a BtIntelPcie) -> Self {
-        Self { dev, bootup_seen: false, secure_send_result: None }
+        Self {
+            dev,
+            bootup_seen: false,
+            secure_send_result: None,
+        }
     }
 
     /// Latch a vendor event. Returns `true` if it was consumed.
@@ -828,7 +863,10 @@ impl<'a> Session<'a> {
                             outcome = Some(if ret[0] == 0 {
                                 Ok(ret.to_vec())
                             } else {
-                                Err(FwError::CommandFailed { opcode, status: ret[0] })
+                                Err(FwError::CommandFailed {
+                                    opcode,
+                                    status: ret[0],
+                                })
                             });
                             return true;
                         }
@@ -841,8 +879,10 @@ impl<'a> Session<'a> {
                                 continue;
                             }
                             if ev[0] != 0 {
-                                outcome =
-                                    Some(Err(FwError::CommandFailed { opcode, status: ev[0] }));
+                                outcome = Some(Err(FwError::CommandFailed {
+                                    opcode,
+                                    status: ev[0],
+                                }));
                                 return true;
                             }
                             // Success here only promises the real
@@ -900,7 +940,11 @@ impl<'a> Session<'a> {
         for chunk in data.chunks(SECURE_SEND_MAX_FRAGMENT) {
             buf[0] = kind;
             buf[1..1 + chunk.len()].copy_from_slice(chunk);
-            self.cmd_sync(OP_INTEL_SECURE_SEND, &buf[..1 + chunk.len()], CMD_TIMEOUT_MS)?;
+            self.cmd_sync(
+                OP_INTEL_SECURE_SEND,
+                &buf[..1 + chunk.len()],
+                CMD_TIMEOUT_MS,
+            )?;
         }
         Ok(())
     }
@@ -956,7 +1000,8 @@ pub fn download_image(
     ver: &IntelVersionTlv,
 ) -> Result<u32, FwError> {
     let name = fw_name(ver, "sfi");
-    let cap = narf_firmware::open(&name, auth).map_err(|_| FwError::FirmwareMissing(name.clone()))?;
+    let cap =
+        narf_firmware::open(&name, auth).map_err(|_| FwError::FirmwareMissing(name.clone()))?;
     let view = narf_firmware::view_of(&cap).map_err(|_| FwError::FirmwareMissing(name.clone()))?;
     let image = view.bytes;
 
@@ -1004,7 +1049,8 @@ pub fn load_ddc(
     ver: &IntelVersionTlv,
 ) -> Result<usize, FwError> {
     let name = fw_name(ver, "ddc");
-    let cap = narf_firmware::open(&name, auth).map_err(|_| FwError::FirmwareMissing(name.clone()))?;
+    let cap =
+        narf_firmware::open(&name, auth).map_err(|_| FwError::FirmwareMissing(name.clone()))?;
     let view = narf_firmware::view_of(&cap).map_err(|_| FwError::FirmwareMissing(name.clone()))?;
     let records = plan_ddc_records(view.bytes)?;
     for r in &records {
@@ -1035,7 +1081,11 @@ pub fn set_dsbr(
     // kernel and this runs in a driver bring-up context, not from an
     // interrupt handler, which is the contract `get_variable` states.
     let raw = unsafe { narf_efi::runtime::get_variable(DSBR_EFI_VAR, &DSBR_EFI_GUID) };
-    let dsbr = raw.ok().as_deref().and_then(parse_dsbr_variable).unwrap_or(0);
+    let dsbr = raw
+        .ok()
+        .as_deref()
+        .and_then(parse_dsbr_variable)
+        .unwrap_or(0);
 
     let params = dsbr_command_params(dsbr);
     narf_console::klog!(
@@ -1066,8 +1116,7 @@ pub fn setup(
     let mut session = Session::new(dev);
     let mut ver = session.read_version()?;
 
-    if ver.hw_platform() != HW_PLATFORM_INTEL
-        || !SUPPORTED_HW_VARIANTS.contains(&ver.hw_variant())
+    if ver.hw_platform() != HW_PLATFORM_INTEL || !SUPPORTED_HW_VARIANTS.contains(&ver.hw_variant())
     {
         return Err(FwError::UnsupportedController {
             platform: ver.hw_platform(),

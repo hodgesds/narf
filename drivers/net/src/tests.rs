@@ -1798,10 +1798,9 @@ fn smoke_rtl8127_phy_firmware_runs_after_firmware_scans() -> TestResult {
 
     let pos = |needle: &str| late.iter().position(|n| *n == needle);
 
-    let (Some(patch), Some(initramfs)) = (
-        pos("rtl8127-phy-firmware"),
-        pos("firmware-scan-initramfs"),
-    ) else {
+    let (Some(patch), Some(initramfs)) =
+        (pos("rtl8127-phy-firmware"), pos("firmware-scan-initramfs"))
+    else {
         return TestResult::Skip("firmware or PHY-patch initcalls not registered in this build");
     };
 

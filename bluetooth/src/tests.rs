@@ -4708,7 +4708,12 @@ fn smoke_btintel_fw_version_tlv_parse() -> TestResult {
     if ver.bdaddr_unconfigured() {
         return TestResult::Fail("a non-zero OTP address is not 'unconfigured'");
     }
-    if (ver.min_fw_build_nn, ver.min_fw_build_cw, ver.min_fw_build_yy) != (15, 18, 26) {
+    if (
+        ver.min_fw_build_nn,
+        ver.min_fw_build_cw,
+        ver.min_fw_build_yy,
+    ) != (15, 18, 26)
+    {
         return TestResult::Fail("MIN_FW should decode as 15-18.26");
     }
 
@@ -4789,8 +4794,7 @@ kernel_test_in!("bluetooth/btintel_pcie", smoke_btintel_fw_name_derivation);
 fn synthetic_sfi(payload: &[u8]) -> Vec<u8> {
     use crate::btintel_pcie::fw::*;
     let mut img = vec![0u8; PAYLOAD_OFFSET];
-    img[CSS_HEADER_OFFSET..CSS_HEADER_OFFSET + 4]
-        .copy_from_slice(&RSA_HEADER_VER.to_le_bytes());
+    img[CSS_HEADER_OFFSET..CSS_HEADER_OFFSET + 4].copy_from_slice(&RSA_HEADER_VER.to_le_bytes());
     img[ECDSA_OFFSET] = ECDSA_PRESENT_MARKER;
     img[ECDSA_OFFSET + CSS_HEADER_OFFSET..ECDSA_OFFSET + CSS_HEADER_OFFSET + 4]
         .copy_from_slice(&ECDSA_HEADER_VER.to_le_bytes());
@@ -4836,7 +4840,11 @@ fn smoke_btintel_fw_header_plan() -> TestResult {
         Ok(f) => f,
         Err(_) => return TestResult::Fail("RSA header plan should succeed"),
     };
-    let want_rsa = [(FRAG_INIT, 0, 128), (FRAG_PKEY, 128, 256), (FRAG_SIGN, 388, 256)];
+    let want_rsa = [
+        (FRAG_INIT, 0, 128),
+        (FRAG_PKEY, 128, 256),
+        (FRAG_SIGN, 388, 256),
+    ];
     for (got, want) in rsa.iter().zip(want_rsa.iter()) {
         if (got.kind, got.offset, got.len) != *want {
             return TestResult::Fail("RSA header fragment offset/len/kind wrong");
@@ -5125,10 +5133,9 @@ fn smoke_btintel_firmware_runs_after_firmware_scans() -> TestResult {
     let late = narf_init::registered_names(narf_init::Stage::Late);
     let pos = |needle: &str| late.iter().position(|n| *n == needle);
 
-    let (Some(download), Some(initramfs)) = (
-        pos("btintel-pcie-firmware"),
-        pos("firmware-scan-initramfs"),
-    ) else {
+    let (Some(download), Some(initramfs)) =
+        (pos("btintel-pcie-firmware"), pos("firmware-scan-initramfs"))
+    else {
         return TestResult::Skip("firmware or btintel initcalls not registered in this build");
     };
 
@@ -5150,4 +5157,135 @@ fn smoke_btintel_firmware_runs_after_firmware_scans() -> TestResult {
 kernel_test_in!(
     "bluetooth/btintel_pcie",
     smoke_btintel_firmware_runs_after_firmware_scans
+);
+
+/// The RX ring carries events, ACL and synchronous data interleaved
+/// in one stream, while `HciTransport` asks for them through separate
+/// calls. Without per-class queues, whichever call ran first would
+/// consume and discard the other classes' traffic. This pins that
+/// `recv_event` leaves ACL alone and vice versa.
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_transport_demuxes_the_shared_ring() -> TestResult {
+    use crate::btintel_pcie::rings::{HCI_ACL_PKT, HCI_EVT_PKT, HCI_ISO_PKT, HCI_SCO_PKT};
+    use crate::btintel_pcie::transport::RxQueues;
+
+    let q = RxQueues::new();
+
+    // A Command Complete for HCI_Reset, then an ACL frame, then SCO —
+    // the order a controller could plausibly deliver them in.
+    q.file(HCI_EVT_PKT, vec![0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]);
+    q.file(HCI_ACL_PKT, vec![0x01, 0x20, 0x02, 0x00, 0xAA, 0xBB]);
+    q.file(HCI_SCO_PKT, vec![0x01, 0x00, 0x02, 0x11, 0x22]);
+
+    if q.depths() != (1, 1, 1) {
+        return TestResult::Fail("one packet of each class should land in its own queue");
+    }
+
+    // Taking the event must not disturb the other two.
+    let ev = match q.pop_event() {
+        Some(e) => e,
+        None => return TestResult::Fail("the event should be available"),
+    };
+    if ev.code != 0x0E {
+        return TestResult::Fail("wrong event code decoded");
+    }
+    if ev.params != [0x01, 0x03, 0x0C, 0x00] {
+        return TestResult::Fail("event parameters decoded wrong");
+    }
+    if q.depths() != (0, 1, 1) {
+        return TestResult::Fail("popping an event must not consume ACL or SCO");
+    }
+
+    match q.pop_acl() {
+        Some(a) if a == [0x01, 0x20, 0x02, 0x00, 0xAA, 0xBB] => {}
+        _ => return TestResult::Fail("the ACL frame should survive the event pop, intact"),
+    }
+    match q.pop_sco() {
+        Some(s) if s == [0x01, 0x00, 0x02, 0x11, 0x22] => {}
+        _ => return TestResult::Fail("the SCO frame should survive both pops, intact"),
+    }
+    if q.depths() != (0, 0, 0) {
+        return TestResult::Fail("queues should be empty after draining each class");
+    }
+
+    // ISO shares the synchronous queue.
+    q.file(HCI_ISO_PKT, vec![0x01, 0x00, 0x01, 0x42]);
+    if q.depths().2 != 1 {
+        return TestResult::Fail("ISO packets belong on the synchronous queue");
+    }
+    // Nothing should have been counted as lost or bad so far.
+    if q.dropped() != 0 || q.malformed() != 0 {
+        return TestResult::Fail("well-formed traffic must not count as dropped or malformed");
+    }
+
+    // An event too short to carry its own header, and a type word the
+    // controller should never emit, are counted rather than guessed
+    // at — and must not land on any queue.
+    let before = q.depths();
+    q.file(HCI_EVT_PKT, vec![0x0E]);
+    q.file(0xDEAD_BEEF, vec![0x00]);
+    if q.malformed() != 2 {
+        return TestResult::Fail("a truncated event and an unknown type should both count");
+    }
+    if q.depths() != before {
+        return TestResult::Fail("malformed packets must not be queued");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_transport_demuxes_the_shared_ring
+);
+
+/// A host that stops draining one class must not be able to grow the
+/// queues without bound. Overflow drops the newest packet and counts
+/// it, leaving the older (earlier in stream) ones in place.
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_transport_queues_are_bounded() -> TestResult {
+    use crate::btintel_pcie::rings::HCI_ACL_PKT;
+    use crate::btintel_pcie::transport::{RxQueues, QUEUE_DEPTH};
+
+    let q = RxQueues::new();
+    for i in 0..QUEUE_DEPTH {
+        q.file(HCI_ACL_PKT, vec![i as u8]);
+    }
+    if q.depths().1 != QUEUE_DEPTH {
+        return TestResult::Fail("the queue should accept exactly QUEUE_DEPTH packets");
+    }
+    if q.dropped() != 0 {
+        return TestResult::Fail("filling to capacity should drop nothing");
+    }
+
+    // One past capacity.
+    q.file(HCI_ACL_PKT, vec![0xFF]);
+    if q.depths().1 != QUEUE_DEPTH {
+        return TestResult::Fail("the queue must not grow past QUEUE_DEPTH");
+    }
+    if q.dropped() != 1 {
+        return TestResult::Fail("the overflowing packet should be counted");
+    }
+
+    // The oldest packet is still at the head — it is the newest that
+    // was dropped, so the retained run stays in order from the front.
+    match q.pop_acl() {
+        Some(p) if p == [0x00] => {}
+        _ => return TestResult::Fail("overflow should drop the newest, not the oldest"),
+    }
+    // And the dropped one never made it in.
+    let mut seen_ff = false;
+    while let Some(p) = q.pop_acl() {
+        if p == [0xFF] {
+            seen_ff = true;
+        }
+    }
+    if seen_ff {
+        return TestResult::Fail("the dropped packet must not be in the queue");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_transport_queues_are_bounded
 );

@@ -74,6 +74,7 @@ extern crate alloc;
 
 pub mod fw;
 pub mod rings;
+pub mod transport;
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -759,12 +760,32 @@ pub fn load_firmware() {
             let _ = writeln!(
                 narf_console::Writer,
                 "  btintel-pcie: firmware {} running (img-type {:#04x}, build {}-{}.{})",
-                if ver.fw_id.is_empty() { "?" } else { &ver.fw_id },
+                if ver.fw_id.is_empty() {
+                    "?"
+                } else {
+                    &ver.fw_id
+                },
                 ver.img_type,
                 ver.min_fw_build_nn,
                 ver.min_fw_build_cw,
                 ver.min_fw_build_yy,
             );
+            // Only an operational image can answer the HCI core's
+            // bring-up. Registering a transport onto a controller
+            // still sitting in its bootloader or intermediate loader
+            // would hand the stack something that times out on Read
+            // Local Version, which is worse than no transport: the
+            // failure would look like a broken HCI core rather than
+            // an unfinished firmware load.
+            if ver.img_type == fw::IMG_OP {
+                register_transport(&controller);
+            } else {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btintel-pcie: img-type {:#04x} is not operational; no HCI transport registered",
+                    ver.img_type,
+                );
+            }
         }
         Err(e) => {
             let _ = writeln!(
@@ -774,6 +795,29 @@ pub fn load_firmware() {
             );
         }
     }
+}
+
+/// Publish this controller to the Bluetooth core as an HCI transport.
+///
+/// Idempotent: the initcall that calls this runs once, but the flag
+/// keeps a re-probe or a test-driven second pass from installing a
+/// duplicate transport for the same controller.
+fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
+    use core::fmt::Write as _;
+    use core::sync::atomic::AtomicBool;
+
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let t = alloc::sync::Arc::new(transport::BtIntelPcieTransport::new(controller.clone()));
+    crate::transport::register(t);
+    let _ = writeln!(
+        narf_console::Writer,
+        "  btintel-pcie: HCI transport registered ({} total)",
+        crate::transport::transport_count(),
+    );
 }
 
 /// Register the PCIe Bluetooth driver — one match entry per device ID.
