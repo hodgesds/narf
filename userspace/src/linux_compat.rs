@@ -304,6 +304,9 @@ pub struct MemFdFile {
     /// every F_ADD_SEALS returns -EPERM and F_GET_SEALS returns
     /// F_SEAL_SEAL — matching Linux's fixed default.
     allow_sealing: bool,
+    /// This memfd's own inode: `memfd_create` -> `shmem_file_setup` gets a
+    /// fresh inode on `shm_mnt`; `memfd_secret` one on `secretmem`.
+    inode: narf_filesystem::inode_id::InodeId,
 }
 
 impl core::fmt::Debug for MemFdFile {
@@ -317,7 +320,24 @@ impl core::fmt::Debug for MemFdFile {
 }
 
 impl MemFdFile {
+    /// `memfd_create(2)`: an inode on `shm_mnt` (`mm/memfd.c::
+    /// memfd_alloc_file` -> `shmem_file_setup`).
+    // LINUX-GAP: MFD_HUGETLB memfds live on the internal hugetlbfs mount
+    // (`hugetlb_file_setup`), a different st_dev; NARF puts them on shm_mnt.
     pub fn new(flags: u32) -> Arc<Self> {
+        Self::with_inode(flags, narf_filesystem::inode_id::shmem_kernel_inode())
+    }
+
+    /// `memfd_secret(2)`: an inode on the `secretmem` kern_mount
+    /// (`mm/secretmem.c::secretmem_file_create`).
+    pub fn new_secret() -> Arc<Self> {
+        Self::with_inode(
+            0,
+            narf_filesystem::inode_id::PseudoFs::SecretMem.new_inode(),
+        )
+    }
+
+    fn with_inode(flags: u32, inode: narf_filesystem::inode_id::InodeId) -> Arc<Self> {
         let allow = (flags & MFD_ALLOW_SEALING) != 0;
         // When sealing is not allowed, the read-side F_GET_SEALS
         // must return F_SEAL_SEAL per Linux man-page semantics.
@@ -329,6 +349,7 @@ impl MemFdFile {
             }),
             seals: AtomicU32::new(initial_seals),
             allow_sealing: allow,
+            inode,
         })
     }
 
@@ -389,6 +410,14 @@ fn store_copy(store: &MemfdStore, off: usize, buf: &mut [u8], to_store: bool) {
 }
 
 impl FileOps for MemFdFile {
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
+    }
+
     fn splice_read_page(
         &self,
         offset: u64,
