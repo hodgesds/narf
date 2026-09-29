@@ -63,7 +63,26 @@ pub enum Transcoder {
 // Cross-referenced against i915 `intel_display_regs.h`
 // (`_TRANS_HTOTAL_A` 0x60000, `_PIPEASRC` 0x6001c, `_TRANSACONF`
 // 0x70008, `_TRANS_DDI_FUNC_CTL_A` 0x60400) and
-// `skl_universal_plane_regs.h` (`_PLANE_CTL_1_A` 0x70180).
+// `skl_universal_plane_regs.h` (`_PLANE_CTL_1_A` 0x70180). The two
+// region bases are `intel_display_device.c`'s `PIPE_A_OFFSET`
+// (0x70000) and `TRANSCODER_A_OFFSET` (0x60000).
+//
+// These hold on Panther Lake as well as Gen12, which is not obvious
+// and is worth recording:
+//
+//   * `_TRANSACONF` and `_PLANE_CTL_1_A` are plain constants with no
+//     `DISPLAY_VER` gating anywhere.
+//   * `xe2_lpd_display` — the Xe2/Xe3-LPD entry Panther Lake
+//     resolves to via `ptl_desc` — reuses the same `PIPE_A_OFFSET`
+//     and `TRANSCODER_A_OFFSET` symbols as the Gen12 entries.
+//   * `INTEL_DISPLAY_DEVICE_PIPE_OFFSET` subtracts the pipe-A offset
+//     from itself for pipe A, leaving only `DISPLAY_MMIO_BASE`,
+//     which is zero on everything but VLV/CHV. The plane macro
+//     applies no device offset at all.
+//   * The `xe` driver that binds Panther Lake compiles i915's
+//     display sources verbatim (`drivers/gpu/drm/xe/Makefile`
+//     builds `i915-display/%.o` from them), so there is no second
+//     register map to diverge.
 
 /// Base of the transcoder timing region.
 pub const TRANS_TIMING_BASE: u64 = 0x0006_0000;
