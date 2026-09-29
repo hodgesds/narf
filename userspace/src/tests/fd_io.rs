@@ -3028,6 +3028,11 @@ fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
 
     struct StatxM0File;
     impl FileOps for StatxM0File {
+        // Every file has an inode (filesystem::inode_id); a fixture must report
+        // one too now that stat has no synthetic size/mtime fallback.
+        fn ino(&self) -> u64 {
+            0x5747_0001
+        }
         fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
             Box::pin(async move { Ok(0) })
         }

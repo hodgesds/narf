@@ -321,11 +321,10 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         stx_mtime: mtime,
         stx_ctime: ctime,
         stx_atime: atime,
-        stx_ino: if ino != 0 {
-            ino
-        } else {
-            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
-        },
+        // Every FileOps reports its inode (filesystem::inode_id); there is
+        // no synthetic fallback, which aliased same-size files and changed
+        // whenever a file did.
+        stx_ino: ino,
         // `tracked`, not `nlink != 0`: an O_TMPFILE inode has zero links
         // until `linkat` names it, and that zero is meaningful.
         stx_nlink: if attrs.tracked { attrs.nlink } else { 1 },

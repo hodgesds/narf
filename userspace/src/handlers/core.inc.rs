@@ -3160,15 +3160,11 @@ fn linux_stat_from_fs(
     });
     linux_compat::Stat {
         st_dev: attrs.dev,
-        // Prefer the filesystem's real inode (distinct per file). Only fall
-        // back to the size/mtime hash for synthetic filesystems that report
-        // no inode (ino == 0) — and never for disk files, whose same-size
-        // libraries would otherwise alias and break musl's DSO dedup.
-        st_ino: if ino != 0 {
-            ino
-        } else {
-            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
-        },
+        // The filesystem's inode. Every FileOps reports one (the Linux
+        // pseudo-filesystem model in filesystem::inode_id); the old size/mtime
+        // hash fallback aliased same-size files (musl's DSO dedup) and changed
+        // whenever the file did.
+        st_ino: ino,
         // `tracked` and not `nlink != 0` is the test on purpose: an
         // `O_TMPFILE` inode really does have zero links until `linkat`
         // gives it a name, and that zero is how userspace tells an
