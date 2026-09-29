@@ -92,7 +92,7 @@ pub(crate) fn sys_socket_recvmmsg(ctx: &mut dyn TrapContext) {
             const MSG_DONTWAIT: u32 = 0x40;
             let nonblock = (flags as u32 & (MSG_DONTWAIT | crate::socket::MSG_ERRQUEUE)) != 0
                 || socket_listener_nonblock(current_task_id(), fd as u32, sock.as_ref());
-            handler_sys_socket_recv::socket_recv_would_block(ctx, nonblock, sock.as_ref());
+            handler_sys_socket_recv::socket_recv_would_block(ctx, nonblock, sock.as_ref(), None);
         }
         Some(ret) => ctx.set_return(SyscallReturn::ok(ret)),
         None => ctx.set_return(SyscallReturn::ok(0)),

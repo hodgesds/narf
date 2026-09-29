@@ -3644,6 +3644,10 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
         ("setuid_exec_smoke", "setuid-exec-ok"),
         ("setuid_exec_glibc", "setuid-exec-ok"),
+        // Daemon setsockopt/getsockopt sequences (resolved, avahi, userdbd)
+        // and the Linux errno contract for IP/IPv6/SOL_SOCKET options.
+        ("sockopt_daemon_smoke", "sockopt-daemon-ok"),
+        ("sockopt_daemon_glibc", "sockopt-daemon-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),

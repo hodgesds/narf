@@ -342,6 +342,69 @@ fn getneigh_dump_terminates() {
         .all(|msg| matches!(hdr_of(msg).1, RTM_NEWNEIGH | NLMSG_DONE)));
 }
 
+/// `inet_fill_ifaddr`: every IPv4 RTM_NEWADDR carries the 32-bit IFA_FLAGS
+/// and IFA_CACHEINFO; a static address is IFA_F_PERMANENT with infinite
+/// lifetimes. systemd-resolved rejects an address message without IFA_FLAGS.
+#[test]
+fn ipv4_address_message_carries_ifa_flags_and_cacheinfo() {
+    let addr = AddrInfo {
+        ifindex: 1,
+        prefix_len: 8,
+        addr: [127, 0, 0, 1],
+        label: "lo".into(),
+    };
+    let msg = build_newaddr(&addr, 3, 0);
+    let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS present");
+    assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
+    assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), IFA_F_PERMANENT);
+    let ci = find_rtattr(&msg, 8, IFA_CACHEINFO).expect("IFA_CACHEINFO present");
+    assert_eq!(ci.len(), 16);
+    assert_eq!(&ci[0..4], &u32::MAX.to_ne_bytes());
+    assert_eq!(&ci[4..8], &u32::MAX.to_ne_bytes());
+}
+
+/// `inet6_fill_ifaddr`: a SLAAC address with finite lifetimes is not
+/// IFA_F_PERMANENT and reports its remaining lifetimes.
+#[test]
+fn ipv6_address_message_with_lifetimes_is_not_permanent() {
+    let addr = crate::ipv6::addrs::Ipv6IfAddr {
+        iface: "eth0".into(),
+        addr: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        prefix_len: 64,
+        state: crate::ipv6::addrs::AddrState::Tentative,
+        scope: crate::ipv6::addrs::AddrScope::Global,
+        preferred_deadline_ns: u64::MAX - 1,
+        valid_deadline_ns: u64::MAX - 1,
+        temporary: true,
+    };
+    let msg = build_newaddr_v6(&addr, 2, 1, 0);
+    let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS present");
+    let flags = u32::from_ne_bytes(flags[..4].try_into().unwrap());
+    assert_eq!(flags, IFA_F_TENTATIVE | IFA_F_TEMPORARY);
+    assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), flags);
+    let ci = find_rtattr(&msg, 8, IFA_CACHEINFO).expect("IFA_CACHEINFO present");
+    assert_ne!(&ci[4..8], &u32::MAX.to_ne_bytes());
+}
+
+/// A notification echoed from an `RTM_NEWADDR` request without IFA_FLAGS or
+/// IFA_CACHEINFO gains both, as `rtmsg_ifa` would have emitted them.
+#[test]
+fn address_notification_is_completed_with_flags() {
+    let mut body = vec![AF_INET, 24, 0, 0];
+    body.extend_from_slice(&2u32.to_ne_bytes());
+    push_rtattr(&mut body, IFA_LOCAL, &[10, 0, 0, 2]);
+    let mut msg = frame_message(RTM_NEWADDR, 0, 0, 0, &body);
+    complete_addr_notification(&mut msg);
+    assert_eq!(
+        u32::from_ne_bytes(msg[0..4].try_into().unwrap()) as usize,
+        msg.len()
+    );
+    let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS appended");
+    assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
+    assert!(find_rtattr(&msg, 8, IFA_CACHEINFO).is_some());
+    assert!(find_rtattr(&msg, 8, IFA_LOCAL).is_some());
+}
+
 #[test]
 fn ipv6_address_message_uses_linux_ifaddr_layout() {
     let addr = crate::ipv6::addrs::Ipv6IfAddr {

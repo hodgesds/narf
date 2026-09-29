@@ -28,7 +28,15 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
-    let in_len_signed = i32::from_ne_bytes(len_raw);
+    let mut in_len_signed = i32::from_ne_bytes(len_raw);
+    // `do_ipv6_getsockopt` never rejects a negative optlen: its int options
+    // copy `min_t(unsigned int, sizeof(int), len)`, i.e. 4 bytes.
+    if in_len_signed < 0
+        && sock.domain == crate::socket::AF_INET6
+        && level == crate::socket::IPPROTO_IPV6
+    {
+        in_len_signed = 4;
+    }
     if in_len_signed < 0 {
         ctx.set_return(errno_ret(EINVAL));
         return;

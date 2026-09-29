@@ -5619,6 +5619,18 @@ fn boot_userspace_init() {
                     "setuid_exec_glibc",
                     narf_verification::NARF_SETUID_EXEC_SMOKE_GLIBC_ELF,
                 ),
+                // The setsockopt/getsockopt sequences systemd-resolved,
+                // avahi-daemon and systemd-userdbd run at startup, plus the
+                // Linux errno contract and SO_RCVTIMEO/IP_MULTICAST_LOOP
+                // behaviour, musl + glibc.
+                (
+                    "sockopt_daemon_smoke",
+                    narf_verification::NARF_SOCKOPT_DAEMON_SMOKE_ELF,
+                ),
+                (
+                    "sockopt_daemon_glibc",
+                    narf_verification::NARF_SOCKOPT_DAEMON_SMOKE_GLIBC_ELF,
+                ),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

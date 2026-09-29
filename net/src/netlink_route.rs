@@ -115,6 +115,17 @@ pub const IF_OPER_DOWN: u8 = 2;
 pub const IFA_ADDRESS: u16 = 1;
 pub const IFA_LOCAL: u16 = 2;
 pub const IFA_LABEL: u16 = 3;
+pub const IFA_CACHEINFO: u16 = 6;
+pub const IFA_FLAGS: u16 = 8;
+
+// ── IFA_F_* address flags (if_addr.h) ───────────────────────────────────
+
+pub const IFA_F_TEMPORARY: u32 = 0x01;
+pub const IFA_F_DEPRECATED: u32 = 0x20;
+pub const IFA_F_TENTATIVE: u32 = 0x40;
+pub const IFA_F_PERMANENT: u32 = 0x80;
+/// `INFINITY_LIFE_TIME` (`include/net/addrconf.h`).
+const INFINITY_LIFE_TIME: u32 = 0xFFFF_FFFF;
 
 // ── RTA_* route attribute types (rtnetlink.h) ──────────────────────────
 
@@ -317,20 +328,76 @@ fn build_newaddr(a: &AddrInfo, seq: u32, pid: u32) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(AF_INET); // ifa_family
     body.push(a.prefix_len); // ifa_prefixlen
-    body.push(0u8); // ifa_flags
-                    // ifa_scope: 0 = RT_SCOPE_UNIVERSE for a routable addr, 254 =
-                    // RT_SCOPE_HOST for loopback (127.0.0.0/8).
+                             // ifa_flags: the low byte of the IFA_FLAGS word below (static → PERMANENT).
+    body.push(IFA_F_PERMANENT as u8);
+    // ifa_scope: 0 = RT_SCOPE_UNIVERSE for a routable addr, 254 =
+    // RT_SCOPE_HOST for loopback (127.0.0.0/8).
     let scope = if a.addr[0] == 127 { 254u8 } else { 0u8 };
     body.push(scope);
-    body.extend_from_slice(&a.ifindex.to_le_bytes()); // ifa_index
+    body.extend_from_slice(&a.ifindex.to_ne_bytes()); // ifa_index
 
     push_rtattr(&mut body, IFA_ADDRESS, &a.addr);
     push_rtattr(&mut body, IFA_LOCAL, &a.addr);
     let mut label_bytes = a.label.as_bytes().to_vec();
     label_bytes.push(0);
     push_rtattr(&mut body, IFA_LABEL, &label_bytes);
+    // `inet_fill_ifaddr` always emits the full 32-bit flags word and the
+    // lifetimes. NARF's IPv4 addresses are configured statically (no
+    // lifetime), which Linux reports as IFA_F_PERMANENT with infinite
+    // preferred/valid lifetimes (`set_ifa_lifetime`). systemd-resolved's
+    // `link_address_update_rtnl` fails the whole manager with ENODATA when
+    // IFA_FLAGS is missing.
+    push_rtattr(&mut body, IFA_FLAGS, &IFA_F_PERMANENT.to_ne_bytes());
+    push_rtattr(
+        &mut body,
+        IFA_CACHEINFO,
+        &ifa_cacheinfo(INFINITY_LIFE_TIME, INFINITY_LIFE_TIME),
+    );
 
     frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
+}
+
+/// `struct ifa_cacheinfo { ifa_prefered, ifa_valid, cstamp, tstamp }`
+/// (`put_cacheinfo`). The two timestamps are hundredths of a second since
+/// boot at creation / last update.
+// LINUX-GAP: `put_cacheinfo` reports the address's creation and update
+// times; NARF does not record them and reports 0 for both.
+fn ifa_cacheinfo(preferred: u32, valid: u32) -> [u8; 16] {
+    let mut ci = [0u8; 16];
+    ci[0..4].copy_from_slice(&preferred.to_ne_bytes());
+    ci[4..8].copy_from_slice(&valid.to_ne_bytes());
+    ci
+}
+
+/// Remaining lifetime in whole seconds for a monotonic-ns deadline, the way
+/// `inet6_fill_ifaddr` ages `prefered_lft` / `valid_lft`.
+fn remaining_lifetime(deadline_ns: u64, now_ns: u64) -> u32 {
+    if deadline_ns == u64::MAX {
+        return INFINITY_LIFE_TIME;
+    }
+    let secs = deadline_ns.saturating_sub(now_ns) / 1_000_000_000;
+    secs.min(u64::from(INFINITY_LIFE_TIME - 1)) as u32
+}
+
+/// The 32-bit `inet6_ifaddr.flags` for an address.
+fn ipv6_ifa_flags(addr: &crate::ipv6::addrs::Ipv6IfAddr) -> u32 {
+    use crate::ipv6::addrs::AddrState;
+    let mut flags = match addr.state {
+        AddrState::Tentative => IFA_F_TENTATIVE,
+        AddrState::Deprecated => IFA_F_DEPRECATED,
+        AddrState::Preferred | AddrState::Invalid => 0,
+    };
+    if addr.temporary {
+        flags |= IFA_F_TEMPORARY;
+    }
+    // A statically configured address — one with no lifetime at all — is
+    // IFA_F_PERMANENT (`inet6_addr_add` → `ifa_flags |= IFA_F_PERMANENT`
+    // when `valid_lft == INFINITY_LIFE_TIME`); SLAAC addresses carry their
+    // router-advertised lifetimes instead.
+    if addr.valid_deadline_ns == u64::MAX && addr.preferred_deadline_ns == u64::MAX {
+        flags |= IFA_F_PERMANENT;
+    }
+    flags
 }
 
 fn build_newaddr_v6(
@@ -339,18 +406,14 @@ fn build_newaddr_v6(
     seq: u32,
     pid: u32,
 ) -> Vec<u8> {
-    use crate::ipv6::addrs::{AddrScope, AddrState};
+    use crate::ipv6::addrs::AddrScope;
 
     let mut body = Vec::new();
     body.push(AF_INET6);
     body.push(addr.prefix_len);
-    let flags = match addr.state {
-        AddrState::Tentative => 0x40,
-        AddrState::Deprecated => 0x20,
-        AddrState::Preferred => 0x80,
-        AddrState::Invalid => 0,
-    };
-    body.push(flags);
+    let flags = ipv6_ifa_flags(addr);
+    // `put_ifaddrmsg`: the legacy u8 field carries the low byte.
+    body.push(flags as u8);
     body.push(match addr.scope {
         AddrScope::Host => 254, // RT_SCOPE_HOST
         AddrScope::Global | AddrScope::UniqueLocal => 0,
@@ -358,6 +421,18 @@ fn build_newaddr_v6(
     });
     body.extend_from_slice(&ifindex.to_ne_bytes());
     push_rtattr(&mut body, IFA_ADDRESS, &addr.addr);
+    // `inet6_fill_ifaddr` order: IFA_ADDRESS, IFA_CACHEINFO, IFA_FLAGS.
+    let (preferred, valid) = if flags & IFA_F_PERMANENT != 0 {
+        (INFINITY_LIFE_TIME, INFINITY_LIFE_TIME)
+    } else {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        (
+            remaining_lifetime(addr.preferred_deadline_ns, now),
+            remaining_lifetime(addr.valid_deadline_ns, now),
+        )
+    };
+    push_rtattr(&mut body, IFA_CACHEINFO, &ifa_cacheinfo(preferred, valid));
+    push_rtattr(&mut body, IFA_FLAGS, &flags.to_ne_bytes());
     frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
 }
 
@@ -851,6 +926,37 @@ fn valid_getroute_req(req: &[u8], strict: bool) -> Result<dump::Tb, i32> {
         return Err(EINVAL);
     }
     Ok(tb)
+}
+
+/// Linux builds an RTM_NEWADDR / RTM_DELADDR notification from the address
+/// itself (`rtmsg_ifa` → `inet_fill_ifaddr`), so it always carries IFA_FLAGS
+/// and IFA_CACHEINFO. NARF echoes the request, which need carry neither;
+/// append them the way `rtm_to_ifaddr` + `set_ifa_lifetime` would have
+/// derived them: flags from `ifa_flags` when IFA_FLAGS was absent, and a
+/// request without IFA_CACHEINFO has infinite lifetimes, i.e. is
+/// IFA_F_PERMANENT.
+fn complete_addr_notification(message: &mut Vec<u8>) {
+    const IFADDRMSG_LEN: usize = 8;
+    if message.len() < NLMSG_HDRLEN + IFADDRMSG_LEN {
+        return;
+    }
+    let has_cacheinfo = find_attr(message, IFADDRMSG_LEN, IFA_CACHEINFO).is_some();
+    if find_attr(message, IFADDRMSG_LEN, IFA_FLAGS).is_none() {
+        let mut flags = u32::from(message[NLMSG_HDRLEN + 2]);
+        if !has_cacheinfo {
+            flags |= IFA_F_PERMANENT;
+        }
+        push_rtattr(message, IFA_FLAGS, &flags.to_ne_bytes());
+    }
+    if !has_cacheinfo {
+        push_rtattr(
+            message,
+            IFA_CACHEINFO,
+            &ifa_cacheinfo(INFINITY_LIFE_TIME, INFINITY_LIFE_TIME),
+        );
+    }
+    let len = message.len() as u32;
+    message[0..4].copy_from_slice(&len.to_ne_bytes());
 }
 
 fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
@@ -1571,6 +1677,9 @@ pub fn successful_mutation_notifications(
             message[8..12].copy_from_slice(&0u32.to_ne_bytes());
             message[12..16].copy_from_slice(&0u32.to_ne_bytes());
             message.resize(nlmsg_align(len), 0);
+            if matches!(msg_type, RTM_NEWADDR | RTM_DELADDR) {
+                complete_addr_notification(&mut message);
+            }
             out.push((group, message));
         }
         offset += nlmsg_align(len);

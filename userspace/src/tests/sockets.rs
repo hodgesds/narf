@@ -1115,11 +1115,11 @@ fn smoke_socket_so_reuseaddr_double_bind_inet() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_so_reuseaddr_double_bind_inet);
 
-/// SO_RCVBUF / SO_SNDBUF clamp small values to ≥ 2 KiB and
-/// round-trip larger values verbatim.
+/// SO_RCVBUF / SO_SNDBUF store twice the request (`sk_setsockopt`), floored
+/// at SOCK_MIN_RCVBUF (2304) / SOCK_MIN_SNDBUF (4608).
 fn smoke_socket_so_rcvbuf_sndbuf_clamp() -> TestResult {
     let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
-    // Set RCVBUF to 100; should clamp to 2048.
+    // Set RCVBUF to 100; 200 is below SOCK_MIN_RCVBUF, so it floors at 2304.
     let v = 100u32.to_ne_bytes();
     let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
         level: crate::socket::SOL_SOCKET,
@@ -1135,10 +1135,10 @@ fn smoke_socket_so_rcvbuf_sndbuf_clamp() -> TestResult {
     if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 }) {
         return TestResult::Fail("SO_RCVBUF get failed");
     }
-    if u32::from_ne_bytes(out) != 2_048 {
+    if u32::from_ne_bytes(out) != 2_304 {
         return TestResult::Fail("SO_RCVBUF did not clamp");
     }
-    // Set SNDBUF to 64 KiB; should round-trip exact.
+    // Set SNDBUF to 64 KiB; Linux reports the doubled 128 KiB.
     let v = 65_536u32.to_ne_bytes();
     let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
         level: crate::socket::SOL_SOCKET,
@@ -1151,9 +1151,9 @@ fn smoke_socket_so_rcvbuf_sndbuf_clamp() -> TestResult {
         buf: &mut out,
     });
     if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
-        || u32::from_ne_bytes(out) != 65_536
+        || u32::from_ne_bytes(out) != 131_072
     {
-        return TestResult::Fail("SO_SNDBUF did not round-trip");
+        return TestResult::Fail("SO_SNDBUF was not doubled");
     }
     TestResult::Pass
 }

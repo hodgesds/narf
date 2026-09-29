@@ -16,6 +16,8 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // SO_RCVTIMEO: pick up this call's deadline if it is re-executing.
+    let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
     if msg_ptr == 0 {
         ctx.set_return(errno_ret(EFAULT));
         return;
@@ -222,7 +224,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         // An empty queue on a blocking socket sleeps (`sock_recvmsg`), it
         // does not surface -EAGAIN.
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            handler_sys_socket_recv::socket_recv_would_block(ctx, nonblock, sock.as_ref());
+            handler_sys_socket_recv::socket_recv_would_block(ctx, nonblock, sock.as_ref(), resumed);
         }
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
