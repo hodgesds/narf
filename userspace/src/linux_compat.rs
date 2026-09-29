@@ -116,30 +116,30 @@ impl FileOps for SignalFdFile {
             let Some((signum, src)) = crate::handlers::next_deliverable(reader, mask) else {
                 return Err(FsError::WouldBlock);
             };
-            buf[..SIGNALFD_SIGINFO_LEN].fill(0);
-            // ssi_signo: u32 at offset 0.
-            buf[..4].copy_from_slice(&signum.to_le_bytes());
-            // ssi_errno (offset 4) left 0. If this instance was queued via
-            // rt_sigqueueinfo/sigqueue, surface its payload: ssi_code @8,
-            // ssi_int @44 (sival_int), ssi_ptr @48 (sival_ptr). Popping the
-            // payload and clearing/re-arming the pending bit happen together
-            // under the sigqueue bucket lock (atomic against a racing sender's
+            // Pop the payload and clear/re-arm the pending bit together under
+            // the sigqueue bucket lock (atomic against a racing sender's
             // store+set), so a queued standard signal is never read as a
             // payload-less SI_USER nor left stranded — same invariant as the
-            // sigwait and handler-delivery consumers.
-            if let Some(info) = crate::handlers::sigqueue_take_and_clear(src, signum) {
-                buf[8..12].copy_from_slice(&info.code.to_le_bytes());
-                if let Some(band) = info.poll_band {
-                    // SIGIO/SIGPOLL payload. Linux signalfd_siginfo exposes
-                    // si_fd at offset 20 and si_band at offset 28.
-                    buf[20..24].copy_from_slice(&(info.value as u32).to_le_bytes());
-                    buf[28..32].copy_from_slice(&band.to_le_bytes());
-                } else {
-                    buf[12..16].copy_from_slice(&info.pid.to_le_bytes()); // ssi_pid
-                    buf[44..48].copy_from_slice(&(info.value as u32).to_le_bytes());
-                    buf[48..56].copy_from_slice(&info.value.to_le_bytes());
-                }
+            // sigwait and handler-delivery consumers. A bit with no payload
+            // reads as SI_USER with zeroed fields.
+            let (si_code, si_value, si_pid, si_addr) =
+                match crate::handlers::sigqueue_take_and_clear(src, signum) {
+                    Some(info) => match info.poll_band {
+                        Some(band) => (info.code, info.value, band, u64::from(band)),
+                        None => (info.code, info.value, info.pid, 0),
+                    },
+                    None => (0, 0, 0, 0),
+                };
+            let ssi = crate::SigDeliveryParams {
+                signum,
+                si_code,
+                si_value,
+                si_pid,
+                si_addr,
+                ..Default::default()
             }
+            .signalfd_siginfo_bytes();
+            buf[..SIGNALFD_SIGINFO_LEN].copy_from_slice(&ssi);
             Ok(SIGNALFD_SIGINFO_LEN)
         })
     }

@@ -835,10 +835,17 @@ fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
             return Err("SIGCHLD ssi_code was not CLD_EXITED");
         }
         match u32::from_le_bytes(rec[12..16].try_into().unwrap()) as u64 {
-            CHILD_PID => Ok(()),
-            0 => Err("SIGCHLD delivered ssi_pid == 0 — the child was not named"),
-            _ => Err("SIGCHLD named the wrong child pid"),
+            CHILD_PID => {}
+            0 => return Err("SIGCHLD delivered ssi_pid == 0 — the child was not named"),
+            _ => return Err("SIGCHLD named the wrong child pid"),
         }
+        // ssi_status @40: the exit code for CLD_EXITED (Linux
+        // do_notify_parent: si_status = exit_code >> 8; signalfd_copyinfo
+        // copies it for the SIL_CHLD layout).
+        if i32::from_le_bytes(rec[40..44].try_into().unwrap()) != 3 {
+            return Err("SIGCHLD ssi_status was not the child's exit code");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);

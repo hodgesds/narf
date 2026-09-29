@@ -443,6 +443,88 @@ static int case_group_stop(void) {
     return 0;
 }
 
+// ── siginfo on every return path ──────────────────────────────────
+
+// A thread in a pure user-space loop takes a signal on an interrupt return,
+// not a syscall exit; its SA_SIGINFO frame must carry the same siginfo.
+// glibc's SIGSETXID handler drops any request whose si_code is not SI_TKILL
+// or whose si_pid is not getpid(), so a wrong frame hangs seteuid().
+static volatile pid_t spin_tid;
+static volatile int spin_got;
+static volatile int spin_code, spin_pid;
+static void spin_info_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig;
+    (void)uc;
+    spin_code = si->si_code;
+    spin_pid = si->si_pid;
+    spin_got = 1;
+}
+static void *spin_worker(void *arg) {
+    (void)arg;
+    spin_tid = gettid();
+    while (!spin_got)
+        ;
+    return NULL;
+}
+static int case_siginfo_spinning(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = spin_info_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR1, &sa, NULL);
+    pthread_t t;
+    pthread_create(&t, NULL, spin_worker, NULL);
+    while (!spin_tid)
+        usleep(1000);
+    // Let the worker reach the loop, so the signal lands on an interrupt.
+    usleep(20000);
+    syscall(SYS_tgkill, getpid(), spin_tid, SIGUSR1);
+    for (int i = 0; i < 2000 && !spin_got; i++)
+        usleep(1000);
+    if (!spin_got)
+        return fail("spinning thread never ran the handler");
+    pthread_join(t, NULL);
+    if (spin_code != SI_TKILL)
+        return fail("si_code is not SI_TKILL on the interrupt-return frame");
+    if (spin_pid != getpid())
+        return fail("si_pid is not the sender on the interrupt-return frame");
+    return 0;
+}
+
+// SIGCHLD's SA_SIGINFO frame names the child and its exit code
+// (do_notify_parent: CLD_EXITED, si_pid, si_status = exit code).
+static volatile int chld_got, chld_code, chld_pid, chld_status;
+static void chld_info_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig;
+    (void)uc;
+    chld_code = si->si_code;
+    chld_pid = si->si_pid;
+    chld_status = si->si_status;
+    chld_got = 1;
+}
+static int case_sigchld_siginfo(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = chld_info_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(7);
+    for (int i = 0; i < 2000 && !chld_got; i++)
+        usleep(1000);
+    if (!chld_got)
+        return fail("SIGCHLD handler never ran");
+    waitpid(pid, NULL, 0);
+    if (chld_code != CLD_EXITED)
+        return fail("si_code is not CLD_EXITED");
+    if (chld_pid != pid)
+        return fail("si_pid is not the child");
+    if (chld_status != 7)
+        return fail("si_status is not the exit code");
+    return 0;
+}
+
 // ── Driver ──────────────────────────────────────────────────────────
 
 static int run(const char *name, int (*fn)(void)) {
@@ -479,6 +561,8 @@ int main(void) {
     failed |= run("rt-queue-order", case_rt_queue_order);
     failed |= run("fatal-group", case_fatal_group);
     failed |= run("group-stop", case_group_stop);
+    failed |= run("siginfo-spinning", case_siginfo_spinning);
+    failed |= run("sigchld-siginfo", case_sigchld_siginfo);
     if (failed)
         return 1;
     w("procsig-thread-ok\n");

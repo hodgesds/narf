@@ -11841,6 +11841,50 @@ pub(crate) fn clear_pending_signal_bits(task: u64, mask: u64) {
     let _ = pending_signal_bits_update_existing(task, |slot| *slot &= !mask);
 }
 
+/// SIGCHLD siginfo for a child exit, as Linux `do_notify_parent` builds it
+/// from the wait status: CLD_DUMPED / CLD_KILLED carry the terminating
+/// signal in `si_status`, CLD_EXITED the exit code; `si_pid` is the child in
+/// the parent's pid namespace. `si_status` rides in the payload value.
+fn sigchld_exit_info(parent: u64, child_pid: u64, status: i32) -> QueuedSiginfo {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    let (code, si_status) = if status & 0x80 != 0 {
+        (CLD_DUMPED, status & 0x7f)
+    } else if status & 0x7f != 0 {
+        (CLD_KILLED, status & 0x7f)
+    } else {
+        (CLD_EXITED, (status >> 8) & 0xff)
+    };
+    let pid = report_pid_to(parent, child_pid) as u32;
+    QueuedSiginfo::generic(code, si_status as u32 as u64, pid)
+}
+
+/// SIGCHLD siginfo for a stop/continue report, as Linux
+/// `do_notify_parent_cldstop` builds it: CLD_CONTINUED carries SIGCONT,
+/// CLD_STOPPED (group stop) or CLD_TRAPPED (a tracer's ptrace stop) the stop
+/// signal.
+fn sigchld_stopcont_info(
+    parent: u64,
+    child_pid: u64,
+    wstatus: i32,
+    is_continued: bool,
+    ptraced: bool,
+) -> QueuedSiginfo {
+    const CLD_TRAPPED: i32 = 4;
+    const CLD_STOPPED: i32 = 5;
+    const CLD_CONTINUED: i32 = 6;
+    let (code, si_status) = if is_continued {
+        (CLD_CONTINUED, 18) // SIGCONT
+    } else if ptraced {
+        (CLD_TRAPPED, (wstatus >> 8) & 0x7f)
+    } else {
+        (CLD_STOPPED, (wstatus >> 8) & 0x7f)
+    };
+    let pid = report_pid_to(parent, child_pid) as u32;
+    QueuedSiginfo::generic(code, si_status as u32 as u64, pid)
+}
+
 /// WIFSTOPPED-shaped wstatus carrying `sig` as WSTOPSIG.
 fn stopped_wstatus(sig: u32) -> i32 {
     ((sig as i32) << 8) | 0x7f
@@ -11918,7 +11962,17 @@ fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
         // SIGCHLD coalesces there without re-running the wake (`legacy_queue`,
         // applied by the group raise); the wait queue below is still fired for
         // every child-state publication.
-        let _ = raise_group_signal(parent, 17, GroupSigInfo::None);
+        let _ = raise_group_signal(
+            parent,
+            17,
+            GroupSigInfo::Queued(sigchld_stopcont_info(
+                parent,
+                child_pid,
+                wstatus,
+                is_continued,
+                ptraced,
+            )),
+        );
     }
     // The producer has lapped the waiter's single Linux-style state slot.
     // Ask the ordinary executor path to cede at syscall exit so the consumer
@@ -13738,8 +13792,17 @@ fn orphanize_children_of(parent_tid: u64) {
             }
             // Threaded reparenting stays inside the same wait domain and does
             // not generate a second SIGCHLD. External reapers are notified.
+            // Linux `reparent_leader` -> `do_notify_parent(p, p->exit_signal)`
+            // per zombie; a standard SIGCHLD coalesces, so the first names
+            // its child.
             if reset_exit_signal {
-                let _ = raise_group_signal(r, 17, GroupSigInfo::None);
+                for entry in &stale {
+                    let _ = raise_group_signal(
+                        r,
+                        17,
+                        GroupSigInfo::Queued(sigchld_exit_info(r, entry.child_pid, entry.status)),
+                    );
+                }
             }
             wake_wait_child_group(r);
         }
@@ -14620,17 +14683,6 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // __WCLONE. Linux do_notify_parent follows the same rule.
     if exit_signal != 0 {
         let signum = u32::from(exit_signal);
-        const CLD_EXITED: i32 = 1;
-        const CLD_KILLED: i32 = 2;
-        const CLD_DUMPED: i32 = 3;
-        let si_code = if status & 0x7f == 0 {
-            CLD_EXITED
-        } else if status & 0x80 != 0 {
-            CLD_DUMPED
-        } else {
-            CLD_KILLED
-        };
-        let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
         // `do_notify_parent` -> `__send_signal_locked(sig, &info, tsk->parent,
         // PIDTYPE_TGID)`: the exit signal goes to the parent PROCESS's shared
         // pending set, and any of its threads that does not block it takes it
@@ -14641,7 +14693,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
         let _ = raise_group_signal(
             parent,
             signum,
-            GroupSigInfo::Queued(QueuedSiginfo::generic(si_code, 0, child_in_parent_ns)),
+            GroupSigInfo::Queued(sigchld_exit_info(parent, child_pid, status)),
         );
         narf_net::readiness::notify(0);
     }
