@@ -554,6 +554,12 @@ fn virtio_gpu_device_arg(backend: GpuBackend) -> String {
         backend == GpuBackend::Virgl && std::env::var_os("XTASK_GPU_DRM_NATIVE").is_some();
     let extra = if native_ctx {
         ",blob=on,hostmem=256M,drm_native_context=on"
+    } else if backend == GpuBackend::Virgl {
+        // Host-visible blob window for classic VirGL too: with `hostmem`
+        // the device exposes shmid 0, the kernel advertises
+        // VIRTGPU_PARAM_HOST_VISIBLE, and Mesa maps host3d blobs directly
+        // instead of bouncing every buffer through TRANSFER ioctls.
+        ",blob=on,hostmem=256M"
     } else {
         ""
     };
