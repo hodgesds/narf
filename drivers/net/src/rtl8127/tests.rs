@@ -268,3 +268,239 @@ fn smoke_rtl8127_irq_mask_bits() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_irq_mask_bits);
+
+// ── PHY: OCP addressing ──────────────────────────────────────────────
+
+fn smoke_rtl8127_ocp_address_validation() -> TestResult {
+    use super::phy::ocp_addr_ok;
+    // GPHY_OCP packs the address at bit 15, so an odd address or one
+    // above 16 bits would corrupt the transaction. Linux's
+    // rtl_ocp_reg_failure rejects exactly `reg & 0xffff0001`.
+    if !ocp_addr_ok(0xB87C) || !ocp_addr_ok(0) || !ocp_addr_ok(0xFFFE) {
+        return TestResult::Fail("a valid even address was rejected");
+    }
+    if ocp_addr_ok(0xB87D) {
+        return TestResult::Fail("an odd address was accepted");
+    }
+    if ocp_addr_ok(0x1_0000) {
+        return TestResult::Fail("an address above 16 bits was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_ocp_address_validation);
+
+fn smoke_rtl8127_paged_address_translation() -> TestResult {
+    use super::phy::{PhyAccess, OCP_STD_PHY_BASE};
+    // phy_modify_paged(0x0bf3, 0x14, ...) -> ocp_base 0xbf30,
+    // register rebased by 0x10 and doubled: 0xbf30 + 4*2 = 0xbf38.
+    match PhyAccess::paged_addr(0x0BF3, 0x14) {
+        Ok(0xBF38) => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("paged address translation wrong");
+        }
+    }
+    // r8168g_phy_param's selector: page 0x0a43 reg 0x13 -> 0xa436.
+    match PhyAccess::paged_addr(0x0A43, 0x13) {
+        Ok(0xA436) => {}
+        _ => return TestResult::Fail("r8168g param selector address wrong"),
+    }
+    // ...and its data register 0x14 -> 0xa438.
+    match PhyAccess::paged_addr(0x0A43, 0x14) {
+        Ok(0xA438) => {}
+        _ => return TestResult::Fail("r8168g param data address wrong"),
+    }
+    // Page 0 is the asymmetric case: OCP_STD_PHY_BASE with the
+    // register *not* rebased. Applying the -0x10 here would shift
+    // every page-0 access by 0x20 bytes.
+    match PhyAccess::paged_addr(0, 0x04) {
+        Ok(a) if a == OCP_STD_PHY_BASE as u32 + 8 => {}
+        _ => return TestResult::Fail("page 0 must not rebase the register"),
+    }
+    // A paged access below the vendor window has no valid address.
+    if PhyAccess::paged_addr(0x0A43, 0x04).is_ok() {
+        return TestResult::Fail("a paged register below 0x10 was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_paged_address_translation
+);
+
+fn smoke_rtl8127_every_table_entry_has_an_address() -> TestResult {
+    use super::phy::{
+        ocp_addr_ok, PhyAccess, R8168G_PARAM_PAGE, RTL8125_PARAM_DATA_ADDR, RTL8125_PARAM_SEL_ADDR,
+    };
+    use super::{PhyConfigKind, PHY_CONFIG_TABLE};
+    // Every one of the 134 transcribed entries must translate to a
+    // legal OCP address. An entry that does not would abort the whole
+    // table part-way, leaving the PHY half-configured.
+    for e in PHY_CONFIG_TABLE.iter().copied() {
+        let addr = match e.kind {
+            PhyConfigKind::ModifyPaged | PhyConfigKind::WritePaged => {
+                match PhyAccess::paged_addr(e.page, e.reg) {
+                    Ok(a) => a,
+                    Err(_) => return TestResult::Fail("a paged entry has no valid address"),
+                }
+            }
+            PhyConfigKind::R8168gParam => match PhyAccess::paged_addr(R8168G_PARAM_PAGE, e.reg) {
+                Ok(a) => a,
+                Err(_) => return TestResult::Fail("an r8168g param entry has no valid address"),
+            },
+            PhyConfigKind::Rtl8125Param => {
+                if e.reg as u32 != RTL8125_PARAM_DATA_ADDR {
+                    return TestResult::Fail("an rtl8125 param entry names the wrong MMD register");
+                }
+                e.reg as u32
+            }
+        };
+        if !ocp_addr_ok(addr) {
+            return TestResult::Fail("a table entry translates to an illegal OCP address");
+        }
+    }
+    if !ocp_addr_ok(RTL8125_PARAM_SEL_ADDR) || !ocp_addr_ok(RTL8125_PARAM_DATA_ADDR) {
+        return TestResult::Fail("the MMD VEND2 selector/data addresses are illegal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_every_table_entry_has_an_address
+);
+
+// ── PHY: firmware container ──────────────────────────────────────────
+
+/// Build a magic==0 container around `code`, with the trailing
+/// checksum byte chosen so the whole file sums to zero.
+fn build_fw_container(code: &[u32]) -> alloc::vec::Vec<u8> {
+    use super::phy::{FW_INFO_BYTES, FW_INFO_LEN_OFF, FW_INFO_START_OFF};
+    let mut v = alloc::vec![0u8; FW_INFO_BYTES];
+    v[FW_INFO_START_OFF..FW_INFO_START_OFF + 4]
+        .copy_from_slice(&(FW_INFO_BYTES as u32).to_le_bytes());
+    v[FW_INFO_LEN_OFF..FW_INFO_LEN_OFF + 4].copy_from_slice(&(code.len() as u32).to_le_bytes());
+    for w in code {
+        v.extend_from_slice(&w.to_le_bytes());
+    }
+    // The last header byte is the checksum; pick it so the file sums
+    // to zero mod 256.
+    let sum = v.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    v[FW_INFO_BYTES - 1] = v[FW_INFO_BYTES - 1].wrapping_sub(sum);
+    v
+}
+
+fn smoke_rtl8127_firmware_container_parse() -> TestResult {
+    use super::phy::parse_firmware;
+    let code = [0x8000_1234u32, 0xE000_000A, 0x0000_0000];
+
+    // Header form: magic 0, checksum must balance.
+    let blob = build_fw_container(&code);
+    match parse_firmware(&blob) {
+        Ok(c) if c == code => {}
+        _ => return TestResult::Fail("header-form container did not parse"),
+    }
+    // Corrupt one payload byte: the checksum must catch it.
+    let mut bad = build_fw_container(&code);
+    let n = bad.len();
+    bad[n - 1] ^= 0xFF;
+    if parse_firmware(&bad).is_ok() {
+        return TestResult::Fail("a corrupt container passed the checksum");
+    }
+
+    // Bare form: non-zero magic means the file is just opcodes.
+    let mut bare = alloc::vec::Vec::new();
+    for w in &code {
+        bare.extend_from_slice(&w.to_le_bytes());
+    }
+    match parse_firmware(&bare) {
+        Ok(c) if c == code => {}
+        _ => return TestResult::Fail("bare opcode array did not parse"),
+    }
+    // ...and it must be a whole number of opcodes.
+    if parse_firmware(&bare[..bare.len() - 1]).is_ok() {
+        return TestResult::Fail("a misaligned bare array was accepted");
+    }
+    // Too short to hold even one opcode.
+    if parse_firmware(&[0u8; 3]).is_ok() {
+        return TestResult::Fail("a 3-byte file was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_firmware_container_parse
+);
+
+fn smoke_rtl8127_firmware_opcode_decode() -> TestResult {
+    use super::phy::{decode_action, PHY_DELAY_MS, PHY_WRITE};
+    // opcode in 31:28, regno in 27:16, data in 15:0.
+    let (op, regno, data) = decode_action(0x8123_4567);
+    if op != PHY_WRITE {
+        return TestResult::Fail("opcode nibble decoded wrong");
+    }
+    if regno != 0x123 {
+        return TestResult::Fail("regno is bits 27:16");
+    }
+    if data != 0x4567 {
+        return TestResult::Fail("data is bits 15:0");
+    }
+    let (op, _, ms) = decode_action(0xE000_0064);
+    if op != PHY_DELAY_MS || ms != 100 {
+        return TestResult::Fail("delay opcode decoded wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_firmware_opcode_decode);
+
+fn smoke_rtl8127_firmware_validation_rejects_bad_jumps() -> TestResult {
+    use super::phy::validate_firmware;
+    // A straight-line program is fine.
+    if validate_firmware(&[0x8000_0001, 0x8000_0002]).is_err() {
+        return TestResult::Fail("a straight-line program was rejected");
+    }
+    // PHY_SKIPN past the end would run off the slice.
+    if validate_firmware(&[0xD004_0000, 0x8000_0001]).is_ok() {
+        return TestResult::Fail("a forward jump past the end was accepted");
+    }
+    // PHY_BJMPN further back than the current index.
+    if validate_firmware(&[0x3004_0000]).is_ok() {
+        return TestResult::Fail("a backward jump before the start was accepted");
+    }
+    // PHY_READCOUNT_EQ_SKIP needs two more opcodes after it.
+    if validate_firmware(&[0x9000_0000, 0x8000_0001]).is_ok() {
+        return TestResult::Fail("readcount-skip without room was accepted");
+    }
+    // PHY_MDIO_CHG only takes 0 or 1.
+    if validate_firmware(&[0x4000_0002]).is_ok() {
+        return TestResult::Fail("an out-of-range MDIO_CHG operand was accepted");
+    }
+    if validate_firmware(&[0x4000_0001]).is_err() {
+        return TestResult::Fail("a valid MDIO_CHG was rejected");
+    }
+    // An opcode outside the known set.
+    if validate_firmware(&[0x5000_0000]).is_ok() {
+        return TestResult::Fail("an unknown opcode was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_firmware_validation_rejects_bad_jumps
+);
+
+fn smoke_rtl8127_firmware_delay_is_capped() -> TestResult {
+    use super::phy::MAX_FIRMWARE_DELAY_MS;
+    // PHY_DELAY_MS takes a 16-bit operand, so a corrupt blob could
+    // ask for 65 seconds and hang boot inside a spin loop.
+    if MAX_FIRMWARE_DELAY_MS == 0 || MAX_FIRMWARE_DELAY_MS > 1000 {
+        return TestResult::Fail("firmware delay cap is not a sane bound");
+    }
+    if MAX_FIRMWARE_DELAY_MS >= u16::MAX as u64 {
+        return TestResult::Fail("the cap does not actually bound the operand");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_firmware_delay_is_capped
+);

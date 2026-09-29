@@ -2997,6 +2997,65 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_initramfs::register_initcalls();
             narf_filesystem::register_initcalls();
             narf_firmware::register_initcalls();
+            // After the firmware scans above, so the Bluetooth
+            // controller's firmware download can find its blobs.
+            #[cfg(target_arch = "x86_64")]
+            narf_bluetooth::register_firmware_initcalls();
+            // Same ordering requirement: the RTL8127 PHY firmware
+            // patch has to run after the firmware scans above.
+            narf_drivers_net::register_late_firmware_initcalls();
+            // Bluetooth bring-up runs after the firmware download
+            // above has had its chance to register a transport, since
+            // Stage::Late runs in registration order.
+            narf_init::register(narf_init::Stage::Late, "bluetooth-bringup", || {
+                let cap = narf_bluetooth::bootstrap_bluetooth_authority();
+                let outcomes = narf_bluetooth::controller::bring_up_all(&cap);
+                if outcomes.is_empty() {
+                    return narf_init::InitResult::NotPresent;
+                }
+                for o in &outcomes {
+                    match &o.result {
+                        Ok(info) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  bluetooth: {} ready — BD_ADDR {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, \
+                                 HCI v{:#04x} rev {:#06x}, manufacturer {:#06x}, \
+                                 ACL {}x{} SCO {}x{}",
+                                o.transport,
+                                info.bd_addr[5],
+                                info.bd_addr[4],
+                                info.bd_addr[3],
+                                info.bd_addr[2],
+                                info.bd_addr[1],
+                                info.bd_addr[0],
+                                info.hci_version,
+                                info.hci_revision,
+                                info.manufacturer,
+                                info.acl_total_num,
+                                info.acl_data_mtu,
+                                info.sco_total_num,
+                                info.sco_data_mtu,
+                            );
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  bluetooth: {} bring-up failed: {:?}",
+                                o.transport,
+                                e
+                            );
+                        }
+                    }
+                }
+                // Report the stage honestly: a pass where every
+                // controller refused is a failure, not a success with
+                // a few log lines.
+                if outcomes.iter().any(|o| o.result.is_ok()) {
+                    narf_init::InitResult::Ok
+                } else {
+                    narf_init::InitResult::Error("no Bluetooth controller completed bring-up")
+                }
+            });
             narf_firmware_fw_cfg::register_initcalls();
             narf_firmware_smbios::register_initcalls();
             narf_firmware_fdt::register_initcalls();

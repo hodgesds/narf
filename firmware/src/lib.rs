@@ -21,20 +21,10 @@
 //! path at `Stage::Late`), and hot-install (highest, via
 //! `install()` cap-gated on `Cap<FirmwareRegistry, Write>`).
 //!
-//! ## Stage-6 cut
-//!
-//! Step 1 of the migration plan in the spec §11. Lands the crate
-//! skeleton + cap types + an in-tree fallback path. Signature
-//! verification calls into `narf-crypto`'s Ed25519 surface but the
-//! trusted-firmware-signers list is empty until production
-//! infrastructure ships keys; under the `firmware-allow-unsigned`
-//! feature the registry accepts blobs whose trailer is a single
-//! all-zero "unsigned" sentinel, which lets developer builds
-//! exercise the path end-to-end.
-//!
-//! initramfs + hot-install are still follow-ups. Calling
-//! `install()` works (the storage layer is ready) but the kernel's
-//! initramfs-unpack code doesn't yet route firmware blobs into it.
+//! Signature verification uses `narf-crypto`. Deployment public keys
+//! are embedded through `NARF_FIRMWARE_TRUSTED_KEYS` and registered
+//! before discovery. The explicit `firmware-allow-unsigned` feature
+//! accepts the all-zero signature/fingerprint developer sentinel.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -117,7 +107,7 @@ pub struct BlobView<'a> {
     /// Vendor-supplied version string parsed from the blob trailer.
     /// `None` when the trailer carried no version metadata.
     pub version: Option<&'a str>,
-    /// SHA-256 of the blob's raw firmware bytes (everything before
+    /// BLAKE3 of the blob's raw firmware bytes (everything before
     /// the signature trailer). Recorded in the bound-driver
     /// inventory so kernel snapshots correlate driver behaviour
     /// with firmware version.
@@ -437,6 +427,9 @@ pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
 /// blobs from both sources; the root partition takes precedence.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Install image-owned trust roots before an in-tree registration or
+    // either filesystem scan can attempt to verify a signed blob.
+    signature::install_build_trusted_signers();
     narf_init::register(Stage::Subsys, "firmware-init", || InitResult::Ok);
 
     // ── firmware-scan-initramfs (Stage::Late, registered first) ────

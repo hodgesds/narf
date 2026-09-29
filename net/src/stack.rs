@@ -76,6 +76,7 @@ pub struct StackAttachReply {
 pub struct AdminHandle {
     cap: Cap<AdminCap, Invoke>,
     iface_name: String,
+    source: Option<StackAttach>,
 }
 
 /// Mint the kernel-held administrative handle for the initial namespace's
@@ -109,7 +110,11 @@ pub struct AdminIpv6Route {
 
 impl AdminHandle {
     pub(crate) fn new(cap: Cap<AdminCap, Invoke>, iface_name: String) -> Self {
-        Self { cap, iface_name }
+        Self {
+            cap,
+            iface_name,
+            source: None,
+        }
     }
 
     pub fn iface_name(&self) -> &str {
@@ -117,7 +122,7 @@ impl AdminHandle {
     }
 
     pub fn is_live(&self) -> bool {
-        self.cap.is_live()
+        self.check_live().is_ok()
     }
 
     pub fn net_ns_id(&self) -> Result<u64, AdminError> {
@@ -134,9 +139,38 @@ impl AdminHandle {
     }
 
     pub fn check_live(&self) -> Result<(), AdminError> {
+        if let Some(source) = &self.source {
+            source
+                .iface
+                .check_live()
+                .map_err(|_| AdminError::AuthorityRevoked)?;
+            source
+                .daemon
+                .check_live()
+                .map_err(|_| AdminError::AuthorityRevoked)?;
+        }
         self.cap
             .check_live()
             .map_err(|_| AdminError::AuthorityRevoked)
+    }
+
+    /// Invoke the interface/namespace authorization operation at the
+    /// control-plane boundary. A stored handle alone is not authority
+    /// after revocation or transfer to another network namespace.
+    pub fn authorize_interface(&self, name: &str, net_ns_id: u64) -> Result<(), AdminError> {
+        let permitted = self
+            .cap
+            .invoke(AdminContext {
+                handle: self,
+                name,
+                net_ns_id,
+            })
+            .map_err(|_| AdminError::AuthorityRevoked)?;
+        if permitted {
+            Ok(())
+        } else {
+            Err(AdminError::NoIface)
+        }
     }
 
     pub fn set_link(&self, up: bool) -> Result<(), AdminError> {
@@ -344,6 +378,19 @@ impl AdminHandle {
     }
 }
 
+struct AdminContext<'a> {
+    handle: &'a AdminHandle,
+    name: &'a str,
+    net_ns_id: u64,
+}
+impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminContext<'_> {
+    type Output = bool;
+    fn execute(self, _: &Cap<AdminCap, Invoke>) -> Result<bool, narf_capabilities::CapError> {
+        Ok(self.handle.iface_name() == self.name
+            && self.handle.net_ns_id().ok() == Some(self.net_ns_id))
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AdminError {
     AuthorityRevoked,
@@ -394,4 +441,46 @@ pub fn attach_registered(
     crate::registry()
         .with_interface_for_handle(&req.iface, |iface| attach(req, iface, socket))
         .ok_or(AttachError::IfaceMismatch)?
+}
+
+/// Delegate control of a registered interface without attaching its frame
+/// path to an XDP stack. Wireless supplicants need administration while the
+/// existing IP stack continues to receive traffic. Both presented grants
+/// must remain live for the resulting handle's lifetime.
+pub fn control_registered(req: &StackAttach) -> Result<StackAttachReply, AttachError> {
+    req.daemon
+        .invoke(ControlGrant(*req))
+        .map_err(|_| AttachError::DaemonCapRevoked)?
+}
+struct ControlGrant(StackAttach);
+impl narf_capabilities::CapOp<StackDaemon, Invoke> for ControlGrant {
+    type Output = Result<StackAttachReply, AttachError>;
+    fn execute(
+        self,
+        _: &Cap<StackDaemon, Invoke>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        Ok(match self.0.iface.invoke(InterfaceControl(self.0)) {
+            Ok(Some(reply)) => Ok(reply),
+            Ok(None) => Err(AttachError::IfaceMismatch),
+            Err(_) => Err(AttachError::IfaceCapRevoked),
+        })
+    }
+}
+struct InterfaceControl(StackAttach);
+impl narf_capabilities::CapOp<NetIface, Write> for InterfaceControl {
+    type Output = Option<StackAttachReply>;
+    fn execute(
+        self,
+        cap: &Cap<NetIface, Write>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        Ok(
+            crate::registry().with_interface_for_handle(cap, |iface| StackAttachReply {
+                admin: AdminHandle {
+                    cap: Cap::<AdminCap, Invoke>::bootstrap(),
+                    iface_name: String::from(iface.name()),
+                    source: Some(self.0),
+                },
+            }),
+        )
+    }
 }

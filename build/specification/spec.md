@@ -22,6 +22,14 @@ and CI compiler-cache integration.
 
 ## 3. Public interface
 
+- `NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/keys.txt` embeds firmware
+  verification public keys (one 64-digit hex Ed25519 key per line).
+  Firmware bootstrap installs them before signed-blob discovery.
+- `cargo xtask pack-firmware --name NAME --payload FILE --signature SIG
+  --public-key KEY` verifies an externally signed BLAKE3 payload digest
+  and stages the NRFW blob in `target/firmware/NAME`. `SIG` and `KEY` are
+  raw 64- and 32-byte files. Without both options, the blob is unsigned.
+
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot.
 - `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
@@ -46,6 +54,10 @@ and CI compiler-cache integration.
   captured and print concise summaries. A failure or timeout emits a bounded
   64-KiB diagnostic tail. Child timeouts use polling rather than process-wide
   signal handlers, so sandboxed runners remain supported.
+- `XTASK_QEMU_SERIAL_LOG=/path/to/serial.log` optionally copies the kernel-test
+  QEMU stdout stream to a host file while tests run. The file is truncated at
+  the start of that phase; normal concise summaries and timeout diagnostics
+  remain enabled. This adds no guest-side instrumentation.
 - The second, whole-kernel phase of `cargo xtask test` strips both
   `kernel-test` and features that transitively select that harness
   (`user-mode-e2e`, `user-mode-testbin`, and `narf-libc-validate`) so it

@@ -34,7 +34,7 @@ use crate::{BlobIdentity, BlobSource, BlobView, FirmwareBlob, FirmwareError};
 pub struct Entry {
     /// Canonical name; used as the lookup key.
     pub name: &'static str,
-    /// SHA-256 of the payload (everything before the trailer).
+    /// BLAKE3 of the payload; historical field name retained for compatibility.
     pub sha256: [u8; 32],
     /// Ed25519 signer fingerprint; `None` on unsigned blobs.
     pub signer: Option<[u8; 32]>,
@@ -181,15 +181,12 @@ pub(crate) fn install_blob(
         alloc_coherent(pages, DomainId::DRIVER_0).map_err(|_| FirmwareError::OutOfMemory)?;
 
     // 3. Copy payload in.
-    let dst = backing.phys_addr().raw();
-    // SAFETY: `dst` is the phys address of a freshly-allocated DMA-
-    // coherent region we own exclusively. It's identity-mapped so
-    // we can write through the phys.
-    // SAFETY: Valid memory or trusted environment
+    let dst = backing.cpu_mut_ptr::<u8>();
+    // SAFETY: the direct-map pointer covers this exclusively owned,
+    // coherent allocation. Its page-rounded capacity holds the payload.
+    // A physical address is not a CPU pointer after user page-table swaps.
     unsafe {
-        for (i, b) in trailer.payload.iter().enumerate() {
-            core::ptr::write_volatile((dst + i as u64) as *mut u8, *b);
-        }
+        core::ptr::copy_nonoverlapping(trailer.payload.as_ptr(), dst, payload_len);
     }
 
     // 4. Build the entry.

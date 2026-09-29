@@ -43,14 +43,38 @@
 //! 3. Take MAC access (`MAC_ACCESS_REQ`, wait for `MAC_ACCESS_STS`)
 //!    and read `HW_REV` (CNVi) and `RF_ID` (CNVr), then release it.
 //!
-//! What is **not** here: the TXQ/RXQ ring setup, the context-info
-//! structure the device DMAs its boot parameters from, MSI-X and the
-//! GP0 alive interrupt, firmware download, and therefore any
-//! [`crate::transport::HciTransport`] implementation. This module
-//! deliberately does not register a transport — the HCI core would
-//! then try to reset a controller it cannot actually talk to.
+//! 4. Publish the [`rings`] descriptor set through the
+//!    context-information block, start the MAC, and wait for the
+//!    device to reach its ROM bootloader.
+//!
+//! From there [`BtIntelPcie::send_packet`] and
+//! [`BtIntelPcie::recv_packet`] carry HCI traffic.
+//!
+//! ## What the controller can do at this point
+//!
+//! It answers HCI commands **from its ROM bootloader** — version and
+//! vendor queries, and the secure-send commands that download
+//! operational firmware. It has no Bluetooth radio behind it yet:
+//! that needs `intel/ibt-*.sfi` pushed over this transport, which is
+//! a separate job riding on top of what lands here.
+//!
+//! Also absent: MSI-X. The GP0 alive interrupt and the TX/RX
+//! completion interrupts are all polled instead — the boot-stage
+//! transition GP0 announces is readable from `BOOT_STAGE`, and the
+//! completion rings' index arrays say the same thing the completion
+//! interrupts would.
+//!
+//! No [`crate::transport::HciTransport`] is registered yet. The HCI
+//! core's bring-up sequence assumes a controller running operational
+//! firmware, and pointing it at a bootloader would have it time out
+//! on the first `Read Local Version` rather than report anything
+//! useful.
 
 extern crate alloc;
+
+pub mod fw;
+pub mod rings;
+pub mod transport;
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -124,6 +148,18 @@ pub const CSR_BOOT_STAGE: u64 = 0x108;
 pub const CSR_IPC_CONTROL: u64 = 0x10C;
 /// `BTINTEL_PCIE_CSR_IPC_STATUS_REG`.
 pub const CSR_IPC_STATUS: u64 = 0x110;
+
+/// `IPC_SLEEP_CTL` — host-driven D-state control. The operational
+/// firmware waits for a D0 write here after its bootup notification
+/// before it will serve HCI.
+pub const CSR_IPC_SLEEP_CTL: u64 = 0x114;
+
+/// `BTINTEL_PCIE_STATE_D0` — fully powered.
+pub const POWER_STATE_D0: u32 = 0;
+/// `BTINTEL_PCIE_STATE_D3_HOT`.
+pub const POWER_STATE_D3_HOT: u32 = 2;
+/// `BTINTEL_PCIE_STATE_D3_COLD`.
+pub const POWER_STATE_D3_COLD: u32 = 3;
 /// `BTINTEL_PCIE_CSR_CI_ADDR_LSB_REG` — low half of the context-info
 /// DMA address the device fetches its boot parameters from.
 pub const CSR_CI_ADDR_LSB: u64 = 0x118;
@@ -236,6 +272,9 @@ pub const BUS_MASTER_QUIESCE_MS: u64 = 40;
 pub const RESET_SETTLE_MS: u64 = 12;
 /// Linux retries the MAC-access grant 15 times at ~1 ms.
 pub const MAC_ACCESS_TIMEOUT_MS: u64 = 20;
+/// `BTINTEL_DEFAULT_INTR_TIMEOUT_MS` — how long the device is given
+/// to reach its ROM bootloader after `MAC_INIT`.
+pub const ALIVE_TIMEOUT_MS: u64 = 3_000;
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -251,6 +290,18 @@ pub enum BtPcieError {
     ResetFailed(u32),
     /// The device never granted MAC access.
     MacAccessTimeout,
+    /// Ran out of memory allocating the descriptor rings.
+    NoMemory,
+    /// An HCI packet did not fit one 4 KiB DMA buffer.
+    PacketTooLarge,
+    /// An index array held a value outside its ring.
+    RingIndexOutOfRange,
+    /// The device did not retire a posted transfer descriptor.
+    TxTimeout,
+    /// The device never reported reaching its ROM bootloader.
+    AliveTimeout,
+    /// `BOOT_STAGE` came back without `ROM` after `MAC_INIT`.
+    NotInBootloader(u32),
 }
 
 // ── Live driver state ───────────────────────────────────────────────
@@ -268,6 +319,8 @@ pub struct BtIntelPcie {
     pub cnvr: u32,
     /// `BOOT_STAGE` as read after the reset.
     pub boot_stage: u32,
+    /// DMA descriptor set, once the transport is up.
+    rings: rings::Rings,
 }
 
 // SAFETY: the only interior-mutable state is the `ctrl` lock itself;
@@ -337,12 +390,15 @@ impl BtIntelPcie {
             cnvi: 0,
             cnvr: 0,
             boot_stage: 0,
+            rings: rings::Rings::alloc()?,
         };
 
         // SAFETY: `dev.mmio` is the mapped CSR window.
         unsafe { dev.reset()? };
         // SAFETY: same.
         unsafe { dev.read_identity()? };
+        // SAFETY: same; the rings and context info are published.
+        unsafe { dev.enable_bt()? };
         Ok(dev)
     }
 
@@ -464,6 +520,96 @@ impl BtIntelPcie {
         }
     }
 
+    /// `btintel_pcie_enable_bt` — publish the context-information
+    /// address, start the MAC, and wait for the device to reach its
+    /// ROM bootloader.
+    ///
+    /// # Safety
+    /// `self.mmio` must be this device's mapped CSR window.
+    unsafe fn enable_bt(&mut self) -> Result<(), BtPcieError> {
+        let ci = self.rings.ctx_info_phys();
+        {
+            let _g = self.ctrl.lock();
+            // SAFETY: caller-asserted mapped CSR window. The context
+            // address must land before MAC_INIT: the device fetches
+            // the block as part of coming up.
+            unsafe {
+                self.mmio.write32(CSR_CI_ADDR_LSB, ci as u32);
+                self.mmio.write32(CSR_CI_ADDR_MSB, (ci >> 32) as u32);
+            }
+            compiler_fence(Ordering::SeqCst);
+
+            // SAFETY: same.
+            let mut reg = unsafe { self.mmio.read32(CSR_FUNC_CTRL) };
+            reg &= !(FUNC_CTRL_FUNC_INIT | FUNC_CTRL_BUS_MASTER_DISCON | FUNC_CTRL_SW_RESET);
+            reg |= FUNC_CTRL_FUNC_ENA | FUNC_CTRL_MAC_INIT;
+            // SAFETY: same.
+            unsafe { self.mmio.write32(CSR_FUNC_CTRL, reg) };
+            compiler_fence(Ordering::SeqCst);
+
+            // MAC is up; enable the BT function on top of it.
+            // SAFETY: same.
+            let reg = unsafe { self.mmio.read32(CSR_FUNC_CTRL) } | FUNC_CTRL_FUNC_INIT;
+            // SAFETY: same.
+            unsafe { self.mmio.write32(CSR_FUNC_CTRL, reg) };
+            // Linux reads the register straight back to flush the
+            // posted write before it starts waiting.
+            // SAFETY: same.
+            let _ = unsafe { self.mmio.read32(CSR_FUNC_CTRL) };
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        // Linux waits on the GP0 mailbox interrupt; this polls
+        // BOOT_STAGE for the same transition, which is the state that
+        // interrupt announces.
+        let alive = narf_scheduler::responsive_spin_until(
+            || self.current_boot_stage() & BOOT_STAGE_ROM != 0,
+            narf_time::Deadline::after_ms(ALIVE_TIMEOUT_MS),
+        );
+        let stage = self.current_boot_stage();
+        if !alive {
+            return Err(BtPcieError::AliveTimeout);
+        }
+        if stage & BOOT_STAGE_DEVICE_HALTED != 0 {
+            return Err(BtPcieError::NotInBootloader(stage));
+        }
+        self.boot_stage = stage;
+
+        // Hand the device the RX ring now that it is running.
+        // SAFETY: `self.mmio` is the mapped CSR window.
+        unsafe { self.rings.start_rx(&self.mmio) };
+        Ok(())
+    }
+
+    /// Send one HCI packet.
+    ///
+    /// `pkt_type` is one of the `rings::HCI_*_PKT` constants — the
+    /// Intel 4-byte type word, not the 1-byte BT SIG indicator.
+    pub fn send_packet(&self, pkt_type: u32, payload: &[u8]) -> Result<(), BtPcieError> {
+        // SAFETY: `self.mmio` is this device's mapped CSR window and
+        // the rings were published during bring-up.
+        unsafe { self.rings.transmit(&self.mmio, pkt_type, payload) }
+    }
+
+    /// Pop one received HCI packet, if the device has completed one.
+    pub fn recv_packet(&self) -> Option<(u32, alloc::vec::Vec<u8>)> {
+        // SAFETY: as above.
+        unsafe { self.rings.receive(&self.mmio) }
+    }
+
+    /// `true` when the controller has RX completions waiting.
+    pub fn rx_pending(&self) -> bool {
+        self.rings.rx_completions_pending()
+    }
+
+    /// Write the host-side D-state. The operational firmware blocks
+    /// on this after sending its bootup notification.
+    pub fn set_power_state(&self, state: u32) {
+        // SAFETY: `self.mmio` is the mapped CSR window and
+        // `IPC_SLEEP_CTL` is a plain 32-bit register within it.
+        unsafe { self.mmio.write32(CSR_IPC_SLEEP_CTL, state) };
+    }
+
     /// Current `BOOT_STAGE`.
     pub fn current_boot_stage(&self) -> u32 {
         // SAFETY: `self.mmio` is the mapped CSR window.
@@ -577,6 +723,101 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     *CONTROLLER.lock() = Some(alloc::sync::Arc::new(dev));
     Ok(())
+}
+
+/// Download operational firmware into the probed controller.
+///
+/// Runs from a `Stage::Late` initcall rather than from `probe`: the
+/// PCI probe pass is `Stage::Device`, and the firmware registry is
+/// not populated until the `Stage::Late` initramfs and rootfs scans
+/// have run. Probing brings the transport up; this makes the
+/// controller usable.
+pub fn load_firmware() {
+    use core::fmt::Write as _;
+
+    // The controller is reached through an `Arc` clone so the
+    // registry lock is not held across the download, which spins for
+    // as long as the controller takes to verify and boot an image.
+    let controller = CONTROLLER.lock().clone();
+    let Some(controller) = controller else {
+        return;
+    };
+
+    let Some(write_auth) = narf_firmware::trusted_loader_authority() else {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btintel-pcie: no firmware authority; controller left in its ROM bootloader",
+        );
+        return;
+    };
+    let auth = match write_auth.derive() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    match fw::setup(&controller, &auth) {
+        Ok(ver) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware {} running (img-type {:#04x}, build {}-{}.{})",
+                if ver.fw_id.is_empty() {
+                    "?"
+                } else {
+                    &ver.fw_id
+                },
+                ver.img_type,
+                ver.min_fw_build_nn,
+                ver.min_fw_build_cw,
+                ver.min_fw_build_yy,
+            );
+            // Only an operational image can answer the HCI core's
+            // bring-up. Registering a transport onto a controller
+            // still sitting in its bootloader or intermediate loader
+            // would hand the stack something that times out on Read
+            // Local Version, which is worse than no transport: the
+            // failure would look like a broken HCI core rather than
+            // an unfinished firmware load.
+            if ver.img_type == fw::IMG_OP {
+                register_transport(&controller);
+            } else {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btintel-pcie: img-type {:#04x} is not operational; no HCI transport registered",
+                    ver.img_type,
+                );
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware download failed: {:?}",
+                e,
+            );
+        }
+    }
+}
+
+/// Publish this controller to the Bluetooth core as an HCI transport.
+///
+/// Idempotent: the initcall that calls this runs once, but the flag
+/// keeps a re-probe or a test-driven second pass from installing a
+/// duplicate transport for the same controller.
+fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
+    use core::fmt::Write as _;
+    use core::sync::atomic::AtomicBool;
+
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let t = alloc::sync::Arc::new(transport::BtIntelPcieTransport::new(controller.clone()));
+    crate::transport::register(t);
+    let _ = writeln!(
+        narf_console::Writer,
+        "  btintel-pcie: HCI transport registered ({} total)",
+        crate::transport::transport_count(),
+    );
 }
 
 /// Register the PCIe Bluetooth driver — one match entry per device ID.

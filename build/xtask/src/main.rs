@@ -188,9 +188,9 @@ enum Cmd {
     /// on the kernel cmdline.
     DiskWritePartitioned(DiskWritePartitionedArgs),
     /// Wrap a raw firmware payload with the NARF trailer
-    /// (`firmware/specification/spec.md` §6). Produces an unsigned
-    /// blob — kernel must be built with `firmware-allow-unsigned`
-    /// for these to load. The wrapped output goes into
+    /// (`firmware/specification/spec.md` §6). Accepts a detached signature
+    /// and public key; omitting both produces a developer-only unsigned
+    /// blob. The wrapped output goes into
     /// `target/firmware/<name>` (so `xtask image` stages it either
     /// into the initramfs CPIO if matched by `--initramfs-firmware`,
     /// or onto the root partition's /lib/firmware/ otherwise).
@@ -270,7 +270,17 @@ struct PackFirmwareArgs {
     #[arg(long)]
     version: Option<String>,
 
-    /// Output path. Defaults to `firmware/<name>` under the
+    /// Detached Ed25519 signature (64 raw bytes) over BLAKE3(payload).
+    /// Signing happens externally; this command never loads private keys.
+    #[arg(long, requires = "public_key")]
+    signature: Option<PathBuf>,
+
+    /// Ed25519 public key (32 raw bytes). Its SHA-256 fingerprint is
+    /// stored in the trailer. The signature is checked before writing.
+    #[arg(long, requires = "signature")]
+    public_key: Option<PathBuf>,
+
+    /// Output path. Defaults to `target/firmware/<name>` under the
     /// workspace root so subsequent `xtask image` runs pick it up.
     #[arg(long)]
     out: Option<String>,
@@ -2724,13 +2734,42 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
 
     println!("xtask: launching {} {}", qemu, kernel.display());
 
+    // Optional host-side copy of the existing serial stream. This leaves
+    // guest instrumentation unchanged and makes an in-progress stall
+    // diagnosable before the overall test deadline expires.
+    let serial_log = if gate_exit {
+        std::env::var_os("XTASK_QEMU_SERIAL_LOG")
+            .map(std::fs::File::create)
+            .transpose()
+            .context("create XTASK_QEMU_SERIAL_LOG")?
+    } else {
+        None
+    };
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
     let serial_reader = child.stdout.take().map(|mut stdout| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            let _ = stdout.read_to_end(&mut bytes);
+            let mut log = serial_log;
+            let mut chunk = [0; 16 * 1024];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        bytes.extend_from_slice(&chunk[..length]);
+                        if let Some(file) = log.as_mut() {
+                            if let Err(error) = file.write_all(&chunk[..length]) {
+                                eprintln!("xtask: serial log write failed: {error}");
+                                log = None;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
             bytes
         })
     });
@@ -7731,6 +7770,53 @@ fn wrap_firmware_trailer(payload: &[u8], version: Option<&str>) -> Vec<u8> {
     blob
 }
 
+fn attach_firmware_signature(
+    blob: &mut [u8],
+    payload_len: usize,
+    signature: &[u8; 64],
+    public_key: &[u8; 32],
+) -> Result<()> {
+    use sha2::Digest;
+    if blob.len() < 104 || payload_len > blob.len() - 104 {
+        bail!("firmware trailer is truncated");
+    }
+    let digest = blake3::hash(&blob[..payload_len]);
+    let key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+        .map_err(|_| anyhow!("invalid Ed25519 public key"))?;
+    key.verify_strict(
+        digest.as_bytes(),
+        &ed25519_dalek::Signature::from_bytes(signature),
+    )
+    .map_err(|_| anyhow!("detached firmware signature does not match payload and public key"))?;
+    blob[payload_len..payload_len + 64].copy_from_slice(signature);
+    blob[payload_len + 64..payload_len + 96].copy_from_slice(&sha2::Sha256::digest(public_key));
+    Ok(())
+}
+
+#[cfg(test)]
+mod firmware_pack_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn detached_signature_authenticates_exact_payload() {
+        // Test-only deterministic key, never a deployment trust root.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let public = key.verifying_key().to_bytes();
+        let payload = b"firmware packing test";
+        let signature = key.sign(blake3::hash(payload).as_bytes()).to_bytes();
+        let mut blob = wrap_firmware_trailer(payload, Some("test"));
+        attach_firmware_signature(&mut blob, payload.len(), &signature, &public).unwrap();
+        assert_eq!(&blob[payload.len()..payload.len() + 64], &signature);
+        assert_eq!(&blob[blob.len() - 4..], b"NRFW");
+        blob[0] ^= 1;
+        assert!(attach_firmware_signature(&mut blob, payload.len(), &signature, &public).is_err());
+        assert!(
+            attach_firmware_signature(&mut blob, payload.len(), &signature, &[0x13; 32]).is_err()
+        );
+    }
+}
+
 /// Bulk-import firmware blobs. Walks the source tree, decompresses
 /// any `.zst` entries, wraps each with the NARF trailer, and writes
 /// the result under the workspace's `firmware/` dir so subsequent
@@ -7935,15 +8021,21 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
 
 /// Wrap a raw firmware payload with the NARF trailer + write it to
 /// disk. Reference: `firmware/src/signature.rs` — payload bytes,
-/// then a 64-byte all-zero signature, 32-byte all-zero signer
-/// fingerprint (the "unsigned" sentinel), metadata TLV bytes
+/// then a 64-byte signature, 32-byte signer fingerprint (both zero for
+/// developer-only unsigned blobs), metadata TLV bytes
 /// (tag 0x01 = ASCII version), 4-byte LE metadata length, then
 /// the 4-byte trailing magic `b"NRFW"`.
 ///
-/// Kernel must be built with `firmware-allow-unsigned` to accept
-/// these — the `firmware-init` initcall rejects unsigned blobs
-/// otherwise.
+/// Signed payloads require a corresponding build-time trusted public key.
 fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
+    if args.name.is_empty()
+        || Path::new(&args.name).is_absolute()
+        || Path::new(&args.name)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("firmware name must be relative and contain no parent components");
+    }
     let payload = std::fs::read(&args.payload)
         .with_context(|| format!("reading payload from {}", &args.payload))?;
     if payload.is_empty() {
@@ -7957,11 +8049,24 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
             bail!("version string too long ({} > 255)", ver.len());
         }
     }
-    let blob = wrap_firmware_trailer(&payload, args.version.as_deref());
+    let mut blob = wrap_firmware_trailer(&payload, args.version.as_deref());
+    match (&args.signature, &args.public_key) {
+        (Some(signature), Some(public_key)) => {
+            let signature: [u8; 64] = std::fs::read(signature)?
+                .try_into()
+                .map_err(|_| anyhow!("signature must contain exactly 64 raw bytes"))?;
+            let public_key: [u8; 32] = std::fs::read(public_key)?
+                .try_into()
+                .map_err(|_| anyhow!("public key must contain exactly 32 raw bytes"))?;
+            attach_firmware_signature(&mut blob, payload.len(), &signature, &public_key)?;
+        }
+        (None, None) => {}
+        _ => bail!("--signature and --public-key must be supplied together"),
+    }
 
     let out_path: PathBuf = match &args.out {
         Some(p) => PathBuf::from(p),
-        None => workspace_root()?.join("firmware").join(&args.name),
+        None => workspace_root()?.join("target/firmware").join(&args.name),
     };
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)

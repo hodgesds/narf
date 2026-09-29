@@ -76,6 +76,9 @@ pub struct Task {
     process_group_pid: AtomicU64,
     /// [`TASK_RUNNING`] | [`TASK_ZOMBIE`].
     pub state: AtomicU32,
+    /// Explicit launch grant; inherited by fork/clone, never minted by a
+    /// Linux uid/capability bit. Released with this task's final reference.
+    pub(crate) network_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
     /// Current job-control stop signal, or zero while not stopped.
     ///
     /// Linux keeps this state in `signal_struct`; keeping it on the refcounted
@@ -159,6 +162,7 @@ impl Task {
             process_group_id: AtomicU64::new(tid),
             process_group_pid: AtomicU64::new(pid),
             state: AtomicU32::new(TASK_RUNNING),
+            network_admin: IrqSafeSpinLock::new(None),
             job_stop_signal: AtomicU32::new(0),
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),

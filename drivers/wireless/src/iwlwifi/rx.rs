@@ -65,8 +65,8 @@ pub const IWL_RX_SEQ_NONE: u16 = 0xFFFF;
 /// received buffer.
 #[derive(Copy, Clone, Debug)]
 pub struct RxPacketHeader {
-    /// Total length of the `len_n_flags` field including the header
-    /// itself. Use `payload_len()` to get the data after the header.
+    /// Length includes the four-byte command header and payload,
+    /// excluding the four-byte len_n_flags word itself.
     pub len_n_flags: u32,
     /// Response type identifier (command ID that triggered this
     /// notification).
@@ -83,13 +83,13 @@ impl RxPacketHeader {
     /// Packet data length in bytes, excluding the 8-byte header.
     pub fn payload_len(self) -> usize {
         let total = (self.len_n_flags & 0x0000_3FFF) as usize;
-        total.saturating_sub(8)
+        total.saturating_sub(4)
     }
 
     /// True iff this is an unsolicited notification (not a command
     /// response).
     pub fn is_notification(self) -> bool {
-        self.sequence == IWL_RX_SEQ_NONE
+        self.sequence & 0x8000 != 0
     }
 }
 
@@ -307,8 +307,8 @@ pub mod tests {
         // Packet bytes: ALIVE notification header (8 bytes) + 4-byte
         // status payload.
         static RXB: &[u8] = &[
-            // len_n_flags: total=12 (0x0C), no flags
-            0x0C, 0x00, 0x00, 0x00,
+            // len_n_flags: command header(4) + payload(4), no flags
+            0x08, 0x00, 0x00, 0x00,
             // cmd=ALIVE(0x01), group=0x00, seq=0xFFFF (notification)
             0x01, 0x00, 0xFF, 0xFF, // payload: ALIVE status = 0xCAFE (little-endian)
             0xFE, 0xCA, 0x00, 0x00,
@@ -419,7 +419,7 @@ pub mod tests {
     fn smoke_iwlwifi_rx_alive_notification_decode() -> TestResult {
         // Full ALIVE RXB: 8-byte header + 4-byte status.
         static RXB: &[u8] = &[
-            0x0C, 0x00, 0x00, 0x00, // len_n_flags = 12
+            0x08, 0x00, 0x00, 0x00, // command header + payload = 8
             0x01, 0x00, 0xFF, 0xFF, // ALIVE, group=0, seq=NONE
             0xFE, 0xCA, 0x00, 0x00, // status = 0xCAFE
         ];

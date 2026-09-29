@@ -1785,3 +1785,43 @@ fn smoke_tg3_txmeta_tso_selects_desc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/tg3", smoke_tg3_txmeta_tso_selects_desc);
+
+/// The RTL8127 PHY firmware patch has to run after the firmware
+/// registry is populated, and `Stage::Late` runs in registration
+/// order. That ordering lives in one line of `bare_main`, and getting
+/// it wrong is silent: `narf_firmware::open` simply reports the blob
+/// missing, the driver falls back to the config table, and the link
+/// still comes up — on an unpatched PHY. This pins the order so the
+/// regression cannot go unnoticed again.
+fn smoke_rtl8127_phy_firmware_runs_after_firmware_scans() -> TestResult {
+    let late = narf_init::registered_names(narf_init::Stage::Late);
+
+    let pos = |needle: &str| late.iter().position(|n| *n == needle);
+
+    let (Some(patch), Some(initramfs)) =
+        (pos("rtl8127-phy-firmware"), pos("firmware-scan-initramfs"))
+    else {
+        return TestResult::Skip("firmware or PHY-patch initcalls not registered in this build");
+    };
+
+    if patch < initramfs {
+        return TestResult::Fail(
+            "rtl8127-phy-firmware runs before firmware-scan-initramfs; the blob will never be found",
+        );
+    }
+
+    // The rootfs scan is the one that actually finds /lib/firmware on
+    // a real boot, and it is registered after the initramfs scan.
+    if let Some(rootfs) = pos("firmware-scan-rootfs") {
+        if patch < rootfs {
+            return TestResult::Fail(
+                "rtl8127-phy-firmware runs before firmware-scan-rootfs; the blob will never be found",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_phy_firmware_runs_after_firmware_scans
+);

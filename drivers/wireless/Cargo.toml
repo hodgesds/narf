@@ -33,6 +33,7 @@ narf-init         = { path = "../../init" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-usb  = { path = "../usb" }
 async-trait = "0.1"
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
 kernel-test = []

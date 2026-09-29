@@ -89,6 +89,22 @@ pub fn bootstrap_bluetooth_authority() -> Cap<Bluetooth, Grant> {
     Cap::<Bluetooth, Grant>::bootstrap()
 }
 
+/// Register the controller-firmware download.
+///
+/// Kept out of [`register_initcalls`] on purpose: it must run after
+/// the firmware registry has been populated, and `Stage::Late`
+/// initcalls run in registration order. `bare_main` calls this after
+/// `narf_firmware::register_initcalls()`, which is what puts it after
+/// the initramfs and rootfs firmware scans.
+#[cfg(target_arch = "x86_64")]
+pub fn register_firmware_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "btintel-pcie-firmware", || {
+        btintel_pcie::load_firmware();
+        InitResult::Ok
+    });
+}
+
 /// Stage::Late initcall registration. Stage 0 just registers a
 /// per-stage placeholder so the boot summary records that the
 /// Bluetooth subsystem is wired in; the actual USB transport bind

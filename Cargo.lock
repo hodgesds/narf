@@ -673,8 +673,11 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-efi",
  "narf-filesystem",
+ "narf-firmware",
  "narf-init",
+ "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
@@ -1587,6 +1590,7 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-wireless",
+ "zeroize",
 ]
 
 [[package]]
@@ -2318,6 +2322,7 @@ dependencies = [
  "narf-lib",
  "narf-net",
  "narf-scheduler",
+ "zeroize",
 ]
 
 [[package]]
@@ -2614,8 +2619,11 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
+ "ed25519-dalek",
  "serde_json",
+ "sha2",
  "wait-timeout",
  "zstd",
 ]

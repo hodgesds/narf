@@ -338,3 +338,1141 @@ fn smoke_i40e_aq_buffer_sizing() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_aq_buffer_sizing);
+
+// ── HMC: FPM sizing ──────────────────────────────────────────────────
+
+fn smoke_i40e_hmc_fpm_layout() -> TestResult {
+    use super::hmc::{align_l2obj_base, calculate_l2fpm_size, OBJ_SIZE_RXQ, OBJ_SIZE_TXQ};
+    if OBJ_SIZE_TXQ != 128 || OBJ_SIZE_RXQ != 32 {
+        return TestResult::Fail("LAN object sizes wrong");
+    }
+    if align_l2obj_base(0) != 0 || align_l2obj_base(1) != 512 || align_l2obj_base(512) != 512 {
+        return TestResult::Fail("512-byte alignment wrong");
+    }
+    // One TX + one RX queue: 128 -> pad to 512, + 32 -> pad to 1024,
+    // then two more zero-count classes that only contribute padding.
+    if calculate_l2fpm_size(1, 1, 0, 0) != 1024 {
+        return TestResult::Fail("one queue pair should need 1024 FPM bytes");
+    }
+    // Four TX queues fill 512 exactly, so the RX class starts right
+    // after with no extra pad.
+    if calculate_l2fpm_size(4, 1, 0, 0) != 1024 {
+        return TestResult::Fail("4 TX queues should fill the first 512-byte block exactly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_hmc_fpm_layout);
+
+fn smoke_i40e_hmc_base_register_is_in_512_byte_units() -> TestResult {
+    use super::hmc::fpm_base_to_reg;
+    // GLHMC_LAN*BASE holds the FPM offset divided by 512. Writing a
+    // byte offset points the device 512x too far into FPM, which
+    // reads back as an all-zero context.
+    if fpm_base_to_reg(0) != 0 {
+        return TestResult::Fail("base 0 should encode as 0");
+    }
+    if fpm_base_to_reg(512) != 1 {
+        return TestResult::Fail("base 512 should encode as 1, not 512");
+    }
+    if fpm_base_to_reg(1024) != 2 {
+        return TestResult::Fail("base 1024 should encode as 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_hmc_base_register_is_in_512_byte_units
+);
+
+// ── HMC: context bit packing ─────────────────────────────────────────
+
+fn smoke_i40e_ctx_field_round_trip() -> TestResult {
+    use super::hmc::{read_ctx_field, write_ctx_field, CtxField, OBJ_SIZE_TXQ};
+    let mut ctx = [0u8; OBJ_SIZE_TXQ as usize];
+
+    // A field that straddles a byte boundary and is not byte-aligned:
+    // `qlen`, 13 bits at bit 161.
+    let qlen = CtxField {
+        name: "qlen",
+        lsb: 161,
+        width: 13,
+    };
+    write_ctx_field(&mut ctx, qlen, 64);
+    if read_ctx_field(&ctx, qlen) != 64 {
+        return TestResult::Fail("13-bit unaligned field did not round-trip");
+    }
+    // Byte 20 holds bits 160..167, so a value of 64 shifted up one
+    // bit lands as 0x80.
+    if ctx[20] != 0x80 {
+        return TestResult::Fail("qlen did not land at bit 161");
+    }
+
+    // A 64-bit field must not be truncated by the width mask.
+    let wb = CtxField {
+        name: "head_wb_addr",
+        lsb: 192,
+        width: 64,
+    };
+    let addr = 0xDEAD_BEEF_CAFE_F000u64;
+    write_ctx_field(&mut ctx, wb, addr);
+    if read_ctx_field(&ctx, wb) != addr {
+        return TestResult::Fail("64-bit field did not round-trip");
+    }
+
+    // A 57-bit field must drop the top bits rather than smear into
+    // its neighbour.
+    let mut ctx2 = [0u8; OBJ_SIZE_TXQ as usize];
+    let base = CtxField {
+        name: "base",
+        lsb: 32,
+        width: 57,
+    };
+    write_ctx_field(&mut ctx2, base, u64::MAX);
+    if read_ctx_field(&ctx2, base) != (1u64 << 57) - 1 {
+        return TestResult::Fail("57-bit field was not truncated to its width");
+    }
+    // `fc_ena` sits at bit 89, immediately above `base`. It must
+    // still be clear.
+    let fc = CtxField {
+        name: "fc_ena",
+        lsb: 89,
+        width: 1,
+    };
+    if read_ctx_field(&ctx2, fc) != 0 {
+        return TestResult::Fail("an over-wide value bled into the next field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_ctx_field_round_trip);
+
+fn smoke_i40e_ctx_tables_are_disjoint() -> TestResult {
+    use super::hmc::{
+        table_is_disjoint, OBJ_SIZE_RXQ, OBJ_SIZE_TXQ, RXQ_CTX_FIELDS, TXQ_CTX_FIELDS,
+    };
+    // Overlapping entries would corrupt a neighbouring field on every
+    // write, and a field past the end would be silently dropped.
+    if !table_is_disjoint(TXQ_CTX_FIELDS, OBJ_SIZE_TXQ) {
+        return TestResult::Fail("TX context table overlaps or overruns");
+    }
+    if !table_is_disjoint(RXQ_CTX_FIELDS, OBJ_SIZE_RXQ) {
+        return TestResult::Fail("RX context table overlaps or overruns");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_ctx_tables_are_disjoint);
+
+fn smoke_i40e_ctx_line_offsets() -> TestResult {
+    use super::hmc::{ctx_field, RXQ_CTX_FIELDS, TXQ_CTX_FIELDS};
+    // Linux writes these offsets as `33 + 128` and `84 + (7 * 128)`
+    // because the context is addressed in 128-bit lines. The
+    // pre-computed absolute bit positions have to match.
+    let qlen = match ctx_field(TXQ_CTX_FIELDS, "qlen") {
+        Some(f) => f,
+        None => return TestResult::Fail("TX qlen field missing"),
+    };
+    if qlen.lsb != 161 || qlen.width != 13 {
+        return TestResult::Fail("TX qlen is 13 bits at 33 + 128");
+    }
+    let rdylist = match ctx_field(TXQ_CTX_FIELDS, "rdylist") {
+        Some(f) => f,
+        None => return TestResult::Fail("TX rdylist field missing"),
+    };
+    if rdylist.lsb != 980 || rdylist.width != 10 {
+        return TestResult::Fail("TX rdylist is 10 bits at 84 + 7*128");
+    }
+    let crc = match ctx_field(TXQ_CTX_FIELDS, "crc") {
+        Some(f) => f,
+        None => return TestResult::Fail("TX crc field missing"),
+    };
+    if crc.lsb != 896 {
+        return TestResult::Fail("TX crc starts line 7 at bit 896");
+    }
+    // RX has no line offsets, but `rxmax` at 174 is a common typo
+    // target (the field before it ends at 128).
+    let rxmax = match ctx_field(RXQ_CTX_FIELDS, "rxmax") {
+        Some(f) => f,
+        None => return TestResult::Fail("RX rxmax field missing"),
+    };
+    if rxmax.lsb != 174 || rxmax.width != 14 {
+        return TestResult::Fail("RX rxmax is 14 bits at 174");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_ctx_line_offsets);
+
+// ── Queue contexts ───────────────────────────────────────────────────
+
+fn smoke_i40e_tx_context_base_is_in_128_byte_units() -> TestResult {
+    use super::hmc::{ctx_field, read_ctx_field, TXQ_CTX_FIELDS};
+    use super::ring::{pack_tx_context, TxQueueContext};
+    let ring_phys = 0x0000_0001_2340_0000u64;
+    let ctx = pack_tx_context(TxQueueContext {
+        ring_phys,
+        qlen: 64,
+        head_wb_phys: ring_phys + 1024,
+        rdylist: 0x123,
+    });
+    let base = match ctx_field(TXQ_CTX_FIELDS, "base") {
+        Some(f) => f,
+        None => return TestResult::Fail("base field missing"),
+    };
+    // The context stores the address divided by 128. Storing the raw
+    // address would point the device 128x too far into memory.
+    if read_ctx_field(&ctx, base) != ring_phys / 128 {
+        return TestResult::Fail("TX context base is not the address / 128");
+    }
+    // head_wb_addr, by contrast, is a whole 64-bit address.
+    let wb = match ctx_field(TXQ_CTX_FIELDS, "head_wb_addr") {
+        Some(f) => f,
+        None => return TestResult::Fail("head_wb_addr field missing"),
+    };
+    if read_ctx_field(&ctx, wb) != ring_phys + 1024 {
+        return TestResult::Fail("head_wb_addr must be a whole address, not divided");
+    }
+    let qlen = match ctx_field(TXQ_CTX_FIELDS, "qlen") {
+        Some(f) => f,
+        None => return TestResult::Fail("qlen field missing"),
+    };
+    if read_ctx_field(&ctx, qlen) != 64 {
+        return TestResult::Fail("qlen wrong");
+    }
+    let rdylist = match ctx_field(TXQ_CTX_FIELDS, "rdylist") {
+        Some(f) => f,
+        None => return TestResult::Fail("rdylist field missing"),
+    };
+    if read_ctx_field(&ctx, rdylist) != 0x123 {
+        return TestResult::Fail("rdylist must carry the VSI's qs_handle");
+    }
+    let new_ctx = match ctx_field(TXQ_CTX_FIELDS, "new_context") {
+        Some(f) => f,
+        None => return TestResult::Fail("new_context field missing"),
+    };
+    if read_ctx_field(&ctx, new_ctx) != 1 {
+        return TestResult::Fail("new_context must be set");
+    }
+    let wb_ena = match ctx_field(TXQ_CTX_FIELDS, "head_wb_ena") {
+        Some(f) => f,
+        None => return TestResult::Fail("head_wb_ena field missing"),
+    };
+    if read_ctx_field(&ctx, wb_ena) != 1 {
+        return TestResult::Fail("head writeback must be enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_tx_context_base_is_in_128_byte_units
+);
+
+fn smoke_i40e_rx_context_units() -> TestResult {
+    use super::hmc::{ctx_field, read_ctx_field, RXQ_CTX_FIELDS};
+    use super::ring::{pack_rx_context, RxQueueContext, RX_BUF_BYTES, RX_MAX_FRAME};
+    let ring_phys = 0x0000_0002_4680_0000u64;
+    let ctx = pack_rx_context(RxQueueContext {
+        ring_phys,
+        qlen: 64,
+        buf_bytes: RX_BUF_BYTES as u16,
+        max_frame: RX_MAX_FRAME,
+    });
+    let get = |name: &str| ctx_field(RXQ_CTX_FIELDS, name).map(|f| read_ctx_field(&ctx, f));
+
+    if get("base") != Some(ring_phys / 128) {
+        return TestResult::Fail("RX context base is not the address / 128");
+    }
+    // dbuff counts 128-byte units too: a 2 KiB buffer is 16.
+    if get("dbuff") != Some(16) {
+        return TestResult::Fail("dbuff must be the buffer size / 128");
+    }
+    if get("qlen") != Some(64) {
+        return TestResult::Fail("RX qlen wrong");
+    }
+    if get("rxmax") != Some(RX_MAX_FRAME as u64) {
+        return TestResult::Fail("rxmax wrong");
+    }
+    // dsize 0 selects 16-byte descriptors, which is the format the
+    // ring code reads back.
+    if get("dsize") != Some(0) {
+        return TestResult::Fail("dsize must be 0 for 16-byte descriptors");
+    }
+    if get("crcstrip") != Some(1) {
+        return TestResult::Fail("CRC strip should be on");
+    }
+    // The datasheet requires both of these at init.
+    if get("prefena") != Some(1) {
+        return TestResult::Fail("prefena must be set at init");
+    }
+    if get("lrxqthresh") != Some(1) {
+        return TestResult::Fail("lrxqthresh must be at least 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_context_units);
+
+// ── Descriptors ──────────────────────────────────────────────────────
+
+fn smoke_i40e_tx_descriptor_encoding() -> TestResult {
+    use super::ring::{
+        build_tx_desc, TXD_QW1_CMD_SHIFT, TXD_QW1_TX_BUF_SZ_SHIFT, TX_DESC_CMD_EOP,
+        TX_DESC_CMD_ICRC, TX_DESC_CMD_RS, TX_DESC_DTYPE_DATA,
+    };
+    let (addr, qw1) = build_tx_desc(0x1234_5678_9ABC_D000, 128);
+    if addr != 0x1234_5678_9ABC_D000 {
+        return TestResult::Fail("buffer address word wrong");
+    }
+    if qw1 & 0xF != TX_DESC_DTYPE_DATA {
+        return TestResult::Fail("DTYPE must be DATA in the low nibble");
+    }
+    let cmd = (qw1 >> TXD_QW1_CMD_SHIFT) & 0xFFF;
+    if cmd & TX_DESC_CMD_EOP == 0 {
+        return TestResult::Fail("EOP not set");
+    }
+    if cmd & TX_DESC_CMD_RS == 0 {
+        return TestResult::Fail("RS not set — without it head never advances");
+    }
+    if cmd & TX_DESC_CMD_ICRC == 0 {
+        return TestResult::Fail("ICRC not set — the device would not append FCS");
+    }
+    // The length lives at bit 34, well above the command field.
+    if (qw1 >> TXD_QW1_TX_BUF_SZ_SHIFT) & 0x3FFF != 128 {
+        return TestResult::Fail("buffer size is not at bit 34");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_descriptor_encoding);
+
+fn smoke_i40e_rx_descriptor_decode() -> TestResult {
+    use super::ring::{
+        rx_desc_done, rx_desc_eof, rx_desc_errors, rx_desc_len, RXD_QW1_ERROR_SHIFT,
+        RXD_QW1_LENGTH_PBUF_SHIFT,
+    };
+    // DD + EOF set, length 1514, no errors.
+    let sel = 0b11u64 | (1514u64 << RXD_QW1_LENGTH_PBUF_SHIFT);
+    if !rx_desc_done(sel) || !rx_desc_eof(sel) {
+        return TestResult::Fail("DD / EOF decode wrong");
+    }
+    if rx_desc_len(sel) != 1514 {
+        return TestResult::Fail("length is 14 bits at 38");
+    }
+    if rx_desc_errors(sel) != 0 {
+        return TestResult::Fail("no error bits should be set");
+    }
+    // An un-written descriptor must not look done.
+    if rx_desc_done(0) {
+        return TestResult::Fail("a zero descriptor must not read as done");
+    }
+    // Error bits live at 19 and must not be confused with the status
+    // field below them.
+    let bad = sel | (0x20u64 << RXD_QW1_ERROR_SHIFT);
+    if rx_desc_errors(bad) != 0x20 {
+        return TestResult::Fail("error field is 8 bits at 19");
+    }
+    if rx_desc_len(bad) != 1514 {
+        return TestResult::Fail("error bits leaked into the length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_descriptor_decode);
+
+// ── Queue enable / allocation ────────────────────────────────────────
+
+fn smoke_i40e_queue_enable_bits() -> TestResult {
+    use super::ring::{QENA_REQ, QENA_STAT};
+    // QENA_STAT is bit 2, not bit 1. Polling the wrong bit makes
+    // every enable look like it timed out.
+    if QENA_REQ != 1 << 0 {
+        return TestResult::Fail("QENA_REQ is bit 0");
+    }
+    if QENA_STAT != 1 << 2 {
+        return TestResult::Fail("QENA_STAT is bit 2, not bit 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_queue_enable_bits);
+
+fn smoke_i40e_queue_register_strides() -> TestResult {
+    use super::ring::{
+        reg_qrx_ena, reg_qrx_tail, reg_qtx_ctl, reg_qtx_ena, reg_qtx_head, reg_qtx_tail,
+    };
+    if reg_qtx_ena(0) != 0x0010_0000 || reg_qtx_ena(1) != 0x0010_0004 {
+        return TestResult::Fail("QTX_ENA base or stride wrong");
+    }
+    if reg_qtx_tail(0) != 0x0010_8000 || reg_qtx_ctl(0) != 0x0010_4000 {
+        return TestResult::Fail("QTX_TAIL / QTX_CTL base wrong");
+    }
+    if reg_qtx_head(0) != 0x000E_4000 {
+        return TestResult::Fail("QTX_HEAD base wrong");
+    }
+    if reg_qrx_ena(0) != 0x0012_0000 || reg_qrx_tail(0) != 0x0012_8000 {
+        return TestResult::Fail("QRX_ENA / QRX_TAIL base wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_queue_register_strides);
+
+fn smoke_i40e_qalloc_decode() -> TestResult {
+    use super::ring::decode_qalloc;
+    // FIRSTQ in 10:0, LASTQ in 26:16.
+    let (first, last) = decode_qalloc(0x0040_0010);
+    if first != 0x10 {
+        return TestResult::Fail("FIRSTQ decode wrong");
+    }
+    if last != 0x40 {
+        return TestResult::Fail("LASTQ decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_qalloc_decode);
+
+fn smoke_i40e_ring_geometry() -> TestResult {
+    use super::ring::{DESC_BYTES, RING_BYTES, RING_LEN};
+    // The datasheet requires a multiple of 32, at least 64, and
+    // `qlen` is 13 bits.
+    if RING_LEN < 64 || RING_LEN % 32 != 0 || RING_LEN > 8160 {
+        return TestResult::Fail("ring length violates the descriptor-count rules");
+    }
+    // One descriptor of slack past the ring is where the TX head
+    // writeback lands; without it the device would scribble past the
+    // allocation.
+    if RING_BYTES != RING_LEN as u64 * DESC_BYTES + DESC_BYTES {
+        return TestResult::Fail("ring allocation has no head-writeback slack");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_ring_geometry);
+
+// ── Switch / VSI decode ──────────────────────────────────────────────
+
+fn smoke_i40e_switch_config_decode() -> TestResult {
+    use super::vsi::{SwitchConfig, ELEMENT_TYPE_MAC, ELEMENT_TYPE_VSI};
+    let mut buf = alloc::vec![0u8; 16 + 32];
+    // header: num_reported = 2, num_total = 2
+    buf[0..2].copy_from_slice(&2u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&2u16.to_le_bytes());
+    // element 0: a MAC element
+    buf[16] = ELEMENT_TYPE_MAC;
+    buf[18..20].copy_from_slice(&0x0002u16.to_le_bytes());
+    // element 1: the PF's VSI, seid 0x0200, uplink 0x0010
+    buf[32] = ELEMENT_TYPE_VSI;
+    buf[34..36].copy_from_slice(&0x0200u16.to_le_bytes());
+    buf[36..38].copy_from_slice(&0x0010u16.to_le_bytes());
+
+    let cfg = match SwitchConfig::parse(&buf) {
+        Some(c) => c,
+        None => return TestResult::Fail("well-formed switch config rejected"),
+    };
+    if cfg.num_reported != 2 || cfg.elements.len() != 2 {
+        return TestResult::Fail("element count wrong");
+    }
+    let main = match cfg.main_vsi() {
+        Some(e) => e,
+        None => return TestResult::Fail("did not find the single VSI element"),
+    };
+    if main.seid != 0x0200 || main.uplink_seid != 0x0010 {
+        return TestResult::Fail("VSI element decoded wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_switch_config_decode);
+
+fn smoke_i40e_switch_config_refuses_ambiguous_vsi() -> TestResult {
+    use super::vsi::{SwitchConfig, ELEMENT_TYPE_VSI};
+    // Two VSI elements: which one is the PF's is a guess, and
+    // guessing wrong attaches the queues to someone else's VSI.
+    let mut buf = alloc::vec![0u8; 16 + 32];
+    buf[0..2].copy_from_slice(&2u16.to_le_bytes());
+    buf[16] = ELEMENT_TYPE_VSI;
+    buf[18..20].copy_from_slice(&0x0200u16.to_le_bytes());
+    buf[32] = ELEMENT_TYPE_VSI;
+    buf[34..36].copy_from_slice(&0x0201u16.to_le_bytes());
+    let cfg = match SwitchConfig::parse(&buf) {
+        Some(c) => c,
+        None => return TestResult::Fail("parse failed"),
+    };
+    if cfg.main_vsi().is_some() {
+        return TestResult::Fail("two VSI elements must not resolve to a main VSI");
+    }
+    // A truncated buffer must not be read past its end.
+    let short = alloc::vec![0u8; 8];
+    if SwitchConfig::parse(&short).is_some() {
+        return TestResult::Fail("a sub-header buffer was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_switch_config_refuses_ambiguous_vsi
+);
+
+fn smoke_i40e_vsi_properties_offsets() -> TestResult {
+    use super::vsi::{
+        VsiParams, VSI_OFF_QS_HANDLE, VSI_OFF_QUEUE_MAPPING, VSI_OFF_TC_MAPPING,
+        VSI_PROPERTIES_BYTES, VSI_TC_QUE_NUMBER_SHIFT,
+    };
+    // qs_handle starts the response section at byte 96 — the comment
+    // in Linux's struct says the first 96 bytes are written by
+    // software, which is the cross-check on this offset.
+    if VSI_OFF_QS_HANDLE != 96 {
+        return TestResult::Fail("qs_handle is at byte 96");
+    }
+    if VSI_OFF_QUEUE_MAPPING != 30 || VSI_OFF_TC_MAPPING != 62 {
+        return TestResult::Fail("queue_mapping / tc_mapping offsets wrong");
+    }
+    if VSI_PROPERTIES_BYTES != 128 {
+        return TestResult::Fail("VSI properties are 128 bytes");
+    }
+    // tc_mapping's queue-count field stores log2 of the count, so a
+    // stored 0 means one queue rather than none.
+    let one = VsiParams {
+        tc_mapping_0: 0,
+        ..Default::default()
+    };
+    if one.tc0_queue_count() != 1 {
+        return TestResult::Fail("a stored 0 must decode to one queue, not zero");
+    }
+    let eight = VsiParams {
+        tc_mapping_0: 3 << VSI_TC_QUE_NUMBER_SHIFT,
+        ..Default::default()
+    };
+    if eight.tc0_queue_count() != 8 {
+        return TestResult::Fail("queue count is 2^field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_vsi_properties_offsets);
+
+fn smoke_i40e_macvlan_element_encoding() -> TestResult {
+    use super::vsi::{
+        encode_macvlan_element, BROADCAST_MAC, MACVLAN_ADD_IGNORE_VLAN, MACVLAN_ADD_PERFECT_MATCH,
+        MACVLAN_ELEMENT_BYTES,
+    };
+    let mac = [0x3C, 0xFD, 0xFE, 0x01, 0x02, 0x03];
+    let flags = MACVLAN_ADD_PERFECT_MATCH | MACVLAN_ADD_IGNORE_VLAN;
+    let e = encode_macvlan_element(mac, flags, 0);
+    if e.len() != MACVLAN_ELEMENT_BYTES {
+        return TestResult::Fail("element is 16 bytes");
+    }
+    if e[0..6] != mac {
+        return TestResult::Fail("MAC is not at offset 0");
+    }
+    // vlan_tag occupies 6..8 and must stay zero with IGNORE_VLAN set.
+    if e[6..8] != [0, 0] {
+        return TestResult::Fail("vlan_tag should be zero");
+    }
+    if u16::from_le_bytes([e[8], e[9]]) != flags {
+        return TestResult::Fail("flags are at offset 8");
+    }
+    if BROADCAST_MAC != [0xFF; 6] {
+        return TestResult::Fail("broadcast address wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_macvlan_element_encoding);
+
+fn smoke_i40e_new_aq_opcodes() -> TestResult {
+    use super::AqOpcode;
+    if AqOpcode::GetSwitchConfig as u16 != 0x0200 {
+        return TestResult::Fail("get_switch_config opcode wrong");
+    }
+    if AqOpcode::GetVsiParameters as u16 != 0x0212 {
+        return TestResult::Fail("get_vsi_parameters opcode wrong");
+    }
+    if AqOpcode::AddMacvlan as u16 != 0x0250 {
+        return TestResult::Fail("add_macvlan opcode wrong");
+    }
+    if AqOpcode::SetLinkRestartAn as u16 != 0x0605 {
+        return TestResult::Fail("set_link_restart_an opcode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_new_aq_opcodes);
+
+fn smoke_i40e_rx_tail_holds_back_one_slot() -> TestResult {
+    use super::ring::{RING_LEN, RX_TAIL_INIT};
+    // The device owns [head, tail). Publishing tail == RING_LEN is
+    // not a legal descriptor index, and tail == head reads as an
+    // empty ring rather than a full one — so exactly one slot is
+    // always held back, matching Linux's I40E_DESC_UNUSED().
+    if RX_TAIL_INIT != RING_LEN - 1 {
+        return TestResult::Fail("initial RX tail must hold back one slot");
+    }
+    if RX_TAIL_INIT >= RING_LEN {
+        return TestResult::Fail("initial RX tail is not a valid descriptor index");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_tail_holds_back_one_slot);
+
+fn smoke_i40e_vsi_queue_map_guard() -> TestResult {
+    use super::vsi::{VsiParams, VSI_QUE_MAP_NONCONTIG};
+    // The driver drives PF-relative queue 0 and only accepts a VSI
+    // whose context agrees. A non-contiguous map means
+    // `queue_mapping[0]` is a queue id rather than a base, so reading
+    // it as a base would point at the wrong queue entirely.
+    let contiguous_at_zero = VsiParams::default();
+    if !contiguous_at_zero.is_contiguous() || contiguous_at_zero.queue_mapping_0 != 0 {
+        return TestResult::Fail("a zeroed VSI context should read as contiguous at queue 0");
+    }
+    let noncontig = VsiParams {
+        mapping_flags: VSI_QUE_MAP_NONCONTIG,
+        ..Default::default()
+    };
+    if noncontig.is_contiguous() {
+        return TestResult::Fail("NONCONTIG flag was not detected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_vsi_queue_map_guard);
+
+// ── Per-port interface naming ────────────────────────────────────────
+
+fn smoke_i40e_interface_names_are_unique() -> TestResult {
+    use super::{interface_name, INTERFACE_NAMES};
+    // The registry rejects duplicate names, so a repeated entry would
+    // leave a port silently unregistered.
+    for (i, a) in INTERFACE_NAMES.iter().enumerate() {
+        for b in INTERFACE_NAMES.iter().skip(i + 1) {
+            if a == b {
+                return TestResult::Fail("duplicate interface name in the table");
+            }
+        }
+        if a.is_empty() {
+            return TestResult::Fail("empty interface name");
+        }
+    }
+    if interface_name(0) != Some("i40e0") || interface_name(1) != Some("i40e1") {
+        return TestResult::Fail("names are not assigned in probe order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_interface_names_are_unique);
+
+fn smoke_i40e_interface_name_table_is_bounded() -> TestResult {
+    use super::{interface_name, INTERFACE_NAMES};
+    // Past the table the probe must report `None` rather than reuse a
+    // name. Reuse would hit the registry's duplicate check and leave
+    // the port unregistered with no explanation.
+    if interface_name(INTERFACE_NAMES.len()).is_some() {
+        return TestResult::Fail("index past the table must not resolve to a name");
+    }
+    if interface_name(INTERFACE_NAMES.len() - 1).is_none() {
+        return TestResult::Fail("the last table entry should resolve");
+    }
+    // A 4-port X710 presents four PFs; the table must cover more than
+    // one such card or a second card's ports go unnamed.
+    if INTERFACE_NAMES.len() < 8 {
+        return TestResult::Fail("table is too small for more than one 4-port card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_interface_name_table_is_bounded
+);
+
+// ── Link-status events ───────────────────────────────────────────────
+
+fn smoke_i40e_link_status_packing_round_trip() -> TestResult {
+    use super::LinkStatus;
+    let s = LinkStatus {
+        link_up: true,
+        media_available: true,
+        lse_enabled: true,
+        phy_type: 0x1D,
+        speed_raw: 1 << 3,
+        max_frame_size: 9728,
+    };
+    if LinkStatus::decode(s.encode()) != s {
+        return TestResult::Fail("link status did not survive the atomic packing");
+    }
+    // The three flags must not alias each other.
+    let only_up = LinkStatus {
+        link_up: true,
+        ..Default::default()
+    };
+    let d = LinkStatus::decode(only_up.encode());
+    if !d.link_up || d.media_available || d.lse_enabled {
+        return TestResult::Fail("link flags alias in the packed word");
+    }
+    // An empty cage: no media, link down, but reporting armed.
+    let empty = LinkStatus {
+        lse_enabled: true,
+        ..Default::default()
+    };
+    let d = LinkStatus::decode(empty.encode());
+    if d.link_up || d.media_available || !d.lse_enabled {
+        return TestResult::Fail("empty-cage state decoded wrong");
+    }
+    if LinkStatus::decode(0) != LinkStatus::default() {
+        return TestResult::Fail("a zero word should decode to the default state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_link_status_packing_round_trip
+);
+
+fn smoke_i40e_lse_flags() -> TestResult {
+    use super::{LinkStatus, AQ_LSE_DISABLE, AQ_LSE_ENABLE, AQ_LSE_IS_ENABLED};
+    if AQ_LSE_ENABLE != 0x3 || AQ_LSE_DISABLE != 0x2 || AQ_LSE_IS_ENABLED != 0x1 {
+        return TestResult::Fail("LSE constants wrong");
+    }
+    // The response reports whether reporting is armed in the low bit
+    // of command_flags. Missing it means the pump can sit idle with
+    // nothing ever arriving and no indication why.
+    let mut params = [0u8; 16];
+    params[0..2].copy_from_slice(&AQ_LSE_IS_ENABLED.to_le_bytes());
+    if !LinkStatus::parse(&params).lse_enabled {
+        return TestResult::Fail("LSE_IS_ENABLED not decoded from command_flags");
+    }
+    let off = [0u8; 16];
+    if LinkStatus::parse(&off).lse_enabled {
+        return TestResult::Fail("LSE reported armed when command_flags is clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_lse_flags);
+
+fn smoke_i40e_arq_head_mask() -> TestResult {
+    use super::{AQ_RING_LEN, ARQH_MASK};
+    // ARQH is 10 bits; the upper bits of the register are not part of
+    // the index. Using the raw register value would compare a huge
+    // number against the cursor and drain the whole ring.
+    if ARQH_MASK != 0x3FF {
+        return TestResult::Fail("ARQH mask wrong");
+    }
+    if (AQ_RING_LEN as u32) > ARQH_MASK + 1 {
+        return TestResult::Fail("ring is larger than the head index can address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_arq_head_mask);
+
+fn smoke_i40e_arq_work_limit_covers_the_ring() -> TestResult {
+    use super::{AQ_RING_LEN, AQ_WORK_LIMIT};
+    // The batch bound has to exceed the ring, or a full ring could
+    // never be drained in one pass and the pump would fall behind
+    // under sustained events.
+    if AQ_WORK_LIMIT < AQ_RING_LEN as u32 {
+        return TestResult::Fail("work limit is smaller than the ARQ ring");
+    }
+    if AQ_WORK_LIMIT == 0 {
+        return TestResult::Fail("a zero work limit would drain nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_arq_work_limit_covers_the_ring
+);
+
+// ── MSI-X ───────────────────────────────────────────────────────────
+
+/// The X710 binds queues to a vector through a linked list threaded
+/// across the queue interrupt-control registers, not by writing a
+/// vector number into each queue. The chain has to start where
+/// `PFINT_LNKLSTN` says, alternate RX->TX within a pair and TX->RX
+/// across pairs, and terminate — an unterminated chain sends the
+/// device walking queues that were never configured.
+fn smoke_i40e_msix_vector_chain() -> TestResult {
+    use super::irq::*;
+
+    // Three ring pairs starting at queue 4, on MSI-X vector 1.
+    let writes = match build_vector_chain(1, 4, 3) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("a three-pair chain should build"),
+    };
+    // One head plus two links per pair.
+    if writes.len() != 7 {
+        return TestResult::Fail("chain should be one head plus an RX and TX link per pair");
+    }
+
+    // The register arrays are indexed from the first *queue* vector,
+    // so MSI-X vector 1 uses index 0. Getting this wrong lands every
+    // interrupt on a neighbouring vector.
+    if writes[0].reg != reg_pfint_lnklstn(0) {
+        return TestResult::Fail("MSI-X vector 1 should use PFINT_LNKLSTN index 0");
+    }
+    if writes[0].value != lnklst_value(4, QueueType::Rx) {
+        return TestResult::Fail("the chain should start at the first pair's RX queue");
+    }
+
+    // Pair 0: RX at queue 4 links to TX 4; TX 4 links to RX 5.
+    if writes[1].reg != reg_qint_rqctl(4) || writes[2].reg != reg_qint_tqctl(4) {
+        return TestResult::Fail("the first pair should write RQCTL then TQCTL for queue 4");
+    }
+    let rq = writes[1].value;
+    if (rq >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != 4 {
+        return TestResult::Fail("an RX link should point at its own pair's TX queue");
+    }
+    if (rq >> QINT_CTL_NEXTQ_TYPE_SHIFT) & 1 != QueueType::Tx as u32 {
+        return TestResult::Fail("an RX link's next-queue type should be TX");
+    }
+    if rq & QINT_CTL_CAUSE_ENA == 0 {
+        return TestResult::Fail("a queue in a chain must be enabled as a cause");
+    }
+    if (rq >> QINT_CTL_MSIX_INDX_SHIFT) & QINT_CTL_MSIX_INDX_MASK != 1 {
+        return TestResult::Fail("the queue should carry the MSI-X vector, not the array index");
+    }
+    if (rq >> QINT_CTL_ITR_INDX_SHIFT) & QINT_CTL_ITR_INDX_MASK != ITR_IDX_RX as u32 {
+        return TestResult::Fail("an RX link should use the receive throttle bank");
+    }
+
+    let tq = writes[2].value;
+    if (tq >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != 5 {
+        return TestResult::Fail("a non-final TX link should point at the next pair's RX queue");
+    }
+    if (tq >> QINT_CTL_NEXTQ_TYPE_SHIFT) & 1 != QueueType::Rx as u32 {
+        return TestResult::Fail("a TX link's next-queue type should be RX");
+    }
+    if (tq >> QINT_CTL_ITR_INDX_SHIFT) & QINT_CTL_ITR_INDX_MASK != ITR_IDX_TX as u32 {
+        return TestResult::Fail("a TX link should use the transmit throttle bank");
+    }
+
+    // The final TX link terminates the chain.
+    let last = writes[6].value;
+    if writes[6].reg != reg_qint_tqctl(6) {
+        return TestResult::Fail("the last link should be queue 6's TQCTL");
+    }
+    if (last >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != QUEUE_END_OF_LIST {
+        return TestResult::Fail("the final TX link must carry the end-of-list sentinel");
+    }
+
+    // A single pair is still a well-formed chain: its one TX link is
+    // both the first and the last, so it terminates immediately.
+    let one = match build_vector_chain(2, 0, 1) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("a one-pair chain should build"),
+    };
+    if one.len() != 3 {
+        return TestResult::Fail("a one-pair chain is a head and two links");
+    }
+    if (one[2].value >> QINT_CTL_NEXTQ_INDX_SHIFT) & QINT_CTL_NEXTQ_INDX_MASK != QUEUE_END_OF_LIST {
+        return TestResult::Fail("a one-pair chain must terminate at its only TX link");
+    }
+    if one[0].reg != reg_pfint_lnklstn(1) {
+        return TestResult::Fail("MSI-X vector 2 should use PFINT_LNKLSTN index 1");
+    }
+
+    // Rejections.
+    if build_vector_chain(1, 0, 0) != Err(IrqError::NoRingPairs) {
+        return TestResult::Fail("a chain with no ring pairs must be refused");
+    }
+    if build_vector_chain(0, 0, 1) != Err(IrqError::VectorZeroReserved) {
+        return TestResult::Fail("vector 0 is the misc vector and has its own registers");
+    }
+    if build_vector_chain(0x100, 0, 1) != Err(IrqError::VectorOutOfRange(0x100)) {
+        return TestResult::Fail("a vector beyond the 8-bit field must be refused");
+    }
+    // A queue index that reaches the sentinel would silently
+    // terminate the chain early.
+    match build_vector_chain(1, 0x7FE, 2) {
+        Err(IrqError::QueueIndexOutOfRange(_)) => {}
+        _ => return TestResult::Fail("a chain reaching the end-of-list index must be refused"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_msix_vector_chain);
+
+/// Interrupt register offsets and throttle encoding.
+fn smoke_i40e_msix_registers_and_itr() -> TestResult {
+    use super::irq::*;
+
+    // Offsets straight from i40e_register.h.
+    if REG_PFINT_ICR0 != 0x0003_8780 || REG_PFINT_ICR0_ENA != 0x0003_8800 {
+        return TestResult::Fail("ICR0 register offsets wrong");
+    }
+    if REG_PFINT_DYN_CTL0 != 0x0003_8480 || REG_PFINT_LNKLST0 != 0x0003_8500 {
+        return TestResult::Fail("vector-0 register offsets wrong");
+    }
+    if reg_pfint_dyn_ctln(0) != 0x0003_4800 || reg_pfint_dyn_ctln(2) != 0x0003_4808 {
+        return TestResult::Fail("PFINT_DYN_CTLN should stride by 4");
+    }
+    if reg_pfint_lnklstn(0) != 0x0003_5000 || reg_pfint_lnklstn(3) != 0x0003_500C {
+        return TestResult::Fail("PFINT_LNKLSTN should stride by 4");
+    }
+    if reg_qint_rqctl(0) != 0x0003_A000 || reg_qint_rqctl(5) != 0x0003_A014 {
+        return TestResult::Fail("QINT_RQCTL should stride by 4");
+    }
+    if reg_qint_tqctl(0) != 0x0003_C000 || reg_qint_tqctl(5) != 0x0003_C014 {
+        return TestResult::Fail("QINT_TQCTL should stride by 4");
+    }
+    // The three throttle banks are 2 KiB apart, and each strides by 4.
+    if reg_pfint_itrn(0, 0) != 0x0003_0000 {
+        return TestResult::Fail("ITRN bank 0 base wrong");
+    }
+    if reg_pfint_itrn(1, 0) != 0x0003_0800 || reg_pfint_itrn(2, 0) != 0x0003_1000 {
+        return TestResult::Fail("ITRN banks should be 2 KiB apart");
+    }
+    if reg_pfint_itrn(0, 3) != 0x0003_000C {
+        return TestResult::Fail("ITRN should stride by 4 within a bank");
+    }
+    if reg_pfint_itr0(1) != 0x0003_8080 {
+        return TestResult::Fail("ITR0 banks should be 128 bytes apart");
+    }
+
+    // The register takes 4 µs units while the constants are in 2 µs,
+    // so the value is halved on the way in.
+    if itr_reg_value(ITR_20K) != (ITR_20K >> 1) as u32 {
+        return TestResult::Fail("the throttle value should be halved for the register");
+    }
+    // Bits outside the writable mask must not reach the register.
+    if itr_reg_value(0xFFFF) != (ITR_MASK >> 1) as u32 {
+        return TestResult::Fail("the throttle value should be masked before writing");
+    }
+    // Bit 0 is outside the writable mask, so a value differing only
+    // there must encode identically.
+    if itr_reg_value(ITR_20K) != itr_reg_value(ITR_20K | 1) {
+        return TestResult::Fail("bits outside ITR_MASK must not reach the register");
+    }
+
+    let itr = match build_vector_itr(1, ITR_20K, ITR_8K) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("throttle writes should build"),
+    };
+    if itr.len() != 3 {
+        return TestResult::Fail("a vector has receive, transmit and software throttles");
+    }
+    if itr[0].reg != reg_pfint_itrn(ITR_IDX_RX, 0)
+        || itr[1].reg != reg_pfint_itrn(ITR_IDX_TX, 0)
+        || itr[2].reg != reg_pfint_itrn(ITR_IDX_SW, 0)
+    {
+        return TestResult::Fail("throttle writes should target banks 0, 1 and 2 of index 0");
+    }
+    if itr[2].value != itr_reg_value(ITR_20K) {
+        return TestResult::Fail("the software throttle should be pinned at 20K");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_msix_registers_and_itr);
+
+// ── Offloads ────────────────────────────────────────────────────────
+
+/// The three header lengths packed into a descriptor's OFFSET field
+/// use three different units — 2-byte words, dwords, dwords — and
+/// none of them is bytes. A byte count written straight in still
+/// fits the field for ordinary headers, so the device checksums the
+/// wrong span and emits a corrupt frame rather than failing.
+fn smoke_i40e_tx_offset_units() -> TestResult {
+    use super::offload::*;
+
+    // A plain Ethernet + IPv4 + TCP frame: 14, 20, 20 bytes.
+    let lens = HeaderLens {
+        mac: 14,
+        ip: 20,
+        l4: 20,
+    };
+    let off = match tx_offset_field(lens) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("a standard header stack should encode"),
+    };
+    // 14/2 = 7, 20/4 = 5, 20/4 = 5.
+    let expect = 7u64 | (5u64 << TX_OFFSET_IPLEN_SHIFT) | (5u64 << TX_OFFSET_L4LEN_SHIFT);
+    if off != expect {
+        return TestResult::Fail("header lengths should be converted to their field units");
+    }
+    // The distinguishing check: the byte counts must NOT appear.
+    let raw = 14u64 | (20u64 << TX_OFFSET_IPLEN_SHIFT) | (20u64 << TX_OFFSET_L4LEN_SHIFT);
+    if off == raw {
+        return TestResult::Fail("byte counts must not be written into the OFFSET field");
+    }
+
+    // A VLAN-tagged frame's L2 header is 18 bytes, still even.
+    match tx_offset_field(HeaderLens {
+        mac: 18,
+        ip: 20,
+        l4: 20,
+    }) {
+        Ok(v) if v & TX_OFFSET_MACLEN_MASK == 9 => {}
+        _ => return TestResult::Fail("an 18-byte L2 header should encode as 9 words"),
+    }
+
+    // Lengths that are not whole units cannot be represented, and
+    // truncating them would checksum the wrong span.
+    match tx_offset_field(HeaderLens {
+        mac: 15,
+        ip: 20,
+        l4: 20,
+    }) {
+        Err(OffloadError::NotAWholeUnit {
+            field: "maclen", ..
+        }) => {}
+        _ => return TestResult::Fail("an odd L2 length has no encoding"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 22,
+        l4: 20,
+    }) {
+        Err(OffloadError::NotAWholeUnit { field: "iplen", .. }) => {}
+        _ => return TestResult::Fail("an IP length that is not a whole dword has no encoding"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 20,
+        l4: 21,
+    }) {
+        Err(OffloadError::NotAWholeUnit { field: "l4len", .. }) => {}
+        _ => return TestResult::Fail("an L4 length that is not a whole dword has no encoding"),
+    }
+
+    // Field widths. L4LEN is only four bits, so a 60-byte TCP header
+    // with full options is the largest that fits.
+    if MAX_L4LEN_BYTES != 60 {
+        return TestResult::Fail("L4LEN's four bits top out at 60 bytes");
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 20,
+        l4: 64,
+    }) {
+        Err(OffloadError::TooLong { field: "l4len", .. }) => {}
+        _ => return TestResult::Fail("a 64-byte L4 header does not fit the field"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 14,
+        ip: 512,
+        l4: 20,
+    }) {
+        Err(OffloadError::TooLong { field: "iplen", .. }) => {}
+        _ => return TestResult::Fail("an over-long IP header must be refused"),
+    }
+    match tx_offset_field(HeaderLens {
+        mac: 256,
+        ip: 20,
+        l4: 20,
+    }) {
+        Err(OffloadError::TooLong {
+            field: "maclen", ..
+        }) => {}
+        _ => return TestResult::Fail("an over-long L2 header must be refused"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_offset_units);
+
+/// Checksum command bits, and the TSO context descriptor.
+fn smoke_i40e_tx_csum_and_tso() -> TestResult {
+    use super::offload::*;
+
+    // Without segmentation the host has already computed a correct
+    // IPv4 header checksum, so the device is told IPV4, not
+    // IPV4_CSUM.
+    let plain = TxCsum::Ipv4 { l4: L4Proto::Tcp }.cmd_bits(false);
+    if plain != TX_CMD_IIPT_IPV4 | TX_CMD_L4T_TCP {
+        return TestResult::Fail("plain IPv4/TCP should request IPV4 without header csum");
+    }
+    // With segmentation every segment gets new length and id fields,
+    // so the header checksum must be recomputed per segment.
+    let tso = TxCsum::Ipv4 { l4: L4Proto::Tcp }.cmd_bits(true);
+    if tso != TX_CMD_IIPT_IPV4_CSUM | TX_CMD_L4T_TCP {
+        return TestResult::Fail("TSO over IPv4 must request the header checksum");
+    }
+    if plain == tso {
+        return TestResult::Fail("the TSO and non-TSO IPv4 encodings must differ");
+    }
+
+    // IPv6 has no header checksum, so the TSO flag changes nothing.
+    let v6 = TxCsum::Ipv6 { l4: L4Proto::Udp };
+    if v6.cmd_bits(false) != TX_CMD_IIPT_IPV6 | TX_CMD_L4T_UDP {
+        return TestResult::Fail("IPv6/UDP command bits wrong");
+    }
+    if v6.cmd_bits(true) != v6.cmd_bits(false) {
+        return TestResult::Fail("IPv6 has no header checksum for TSO to change");
+    }
+    if TxCsum::None.cmd_bits(false) != TX_CMD_IIPT_NONIP {
+        return TestResult::Fail("no offload should select NONIP");
+    }
+    if L4Proto::Sctp.cmd_bits() != TX_CMD_L4T_SCTP {
+        return TestResult::Fail("SCTP command bits wrong");
+    }
+
+    // Context descriptor.
+    let (qw0, qw1) = match tso_context_desc(4000, 1460) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("a normal TSO context should build"),
+    };
+    if qw0 != 0 {
+        return TestResult::Fail("this path uses no tunnelling parameters");
+    }
+    if qw1 & 0xF != TX_DESC_DTYPE_CONTEXT {
+        return TestResult::Fail("a context descriptor must carry the context DTYPE");
+    }
+    if (qw1 >> TXD_CTX_QW1_CMD_SHIFT) & 0xFF != TX_CTX_DESC_TSO {
+        return TestResult::Fail("the context command should be TSO");
+    }
+    if (qw1 >> TXD_CTX_QW1_TSO_LEN_SHIFT) & TXD_CTX_QW1_TSO_LEN_MASK != 4000 {
+        return TestResult::Fail("the payload length should land in the TSO length field");
+    }
+    if (qw1 >> TXD_CTX_QW1_MSS_SHIFT) & TXD_CTX_QW1_MSS_MASK != 1460 {
+        return TestResult::Fail("the segment size should land in the MSS field");
+    }
+    // The context DTYPE must not collide with a data descriptor's.
+    if TX_DESC_DTYPE_CONTEXT == super::ring::TX_DESC_DTYPE_DATA {
+        return TestResult::Fail("context and data descriptors must be distinguishable");
+    }
+
+    if tso_context_desc(4000, 0) != Err(OffloadError::BadMss(0)) {
+        return TestResult::Fail("a zero MSS would never terminate");
+    }
+    if tso_context_desc(4000, 0x4000) != Err(OffloadError::BadMss(0x4000)) {
+        return TestResult::Fail("an MSS beyond 14 bits must be refused");
+    }
+    if tso_context_desc(0x10_0000, 1460) != Err(OffloadError::TsoLengthTooLarge(0x10_0000)) {
+        return TestResult::Fail("a payload beyond 20 bits must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_csum_and_tso);
+
+/// A frame the device did not examine must not be reported as having
+/// a good checksum — treating "not checked" as "correct" is how a
+/// corrupt frame gets accepted.
+fn smoke_i40e_rx_checksum_verdict() -> TestResult {
+    use super::offload::*;
+
+    let l3l4p = 1u64 << RX_STATUS_L3L4P_SHIFT;
+
+    if rx_checksum(0, 0) != RxCsum::NotChecked {
+        return TestResult::Fail("without L3L4P the device did not check");
+    }
+    // Error bits set but L3L4P clear still means "not checked": the
+    // error field is meaningless unless the device looked.
+    if rx_checksum(0, 1 << RX_ERROR_L4E_SHIFT) != RxCsum::NotChecked {
+        return TestResult::Fail("error bits are meaningless without L3L4P");
+    }
+    if rx_checksum(l3l4p, 0) != RxCsum::Good {
+        return TestResult::Fail("checked with no error bits is good");
+    }
+    match rx_checksum(l3l4p, 1 << RX_ERROR_IPE_SHIFT) {
+        RxCsum::Bad {
+            ip: true,
+            l4: false,
+            outer_ip: false,
+        } => {}
+        _ => return TestResult::Fail("IPE should report an IP checksum failure"),
+    }
+    match rx_checksum(l3l4p, 1 << RX_ERROR_L4E_SHIFT) {
+        RxCsum::Bad {
+            ip: false,
+            l4: true,
+            ..
+        } => {}
+        _ => return TestResult::Fail("L4E should report a transport checksum failure"),
+    }
+    match rx_checksum(l3l4p, 1 << RX_ERROR_EIPE_SHIFT) {
+        RxCsum::Bad {
+            outer_ip: true,
+            ip: false,
+            l4: false,
+        } => {}
+        _ => return TestResult::Fail("EIPE should report an outer IP failure"),
+    }
+    // An error bit this driver does not decode must not turn a bad
+    // frame into a good one, nor a good one into bad.
+    if rx_checksum(l3l4p, 1 << 7) != RxCsum::Good {
+        return TestResult::Fail("an unrelated error bit should not affect the verdict");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_checksum_verdict);

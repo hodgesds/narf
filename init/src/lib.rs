@@ -420,6 +420,22 @@ pub fn registered_count(stage: Stage) -> usize {
     REGISTRY.stages[stage as usize].lock().len()
 }
 
+/// Names of the initcalls registered under `stage`, in the order
+/// they will run.
+///
+/// Registration order *is* execution order within a stage, so some
+/// initcalls depend on being registered after another — a driver
+/// whose firmware download needs the firmware registry populated,
+/// for instance. Exposing the order lets those constraints be
+/// asserted instead of left as a comment at the call site.
+pub fn registered_names(stage: Stage) -> Vec<&'static str> {
+    REGISTRY.stages[stage as usize]
+        .lock()
+        .iter()
+        .map(|ic| ic.name)
+        .collect()
+}
+
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __reset_for_test() {

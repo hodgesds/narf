@@ -110,6 +110,61 @@ fn smoke_firmware_install_and_open_unsigned() -> TestResult {
 }
 kernel_test_in!("firmware", smoke_firmware_install_and_open_unsigned);
 
+fn smoke_firmware_signed_install_and_tamper() -> TestResult {
+    // Public test vector: Ed25519 from Python cryptography over the BLAKE3
+    // "abc" vector, SHA-256 public-key fingerprint from hashlib. No
+    // production signing key is embedded in the image.
+    const PUBLIC: [u8; 32] = [
+        33, 82, 248, 209, 155, 121, 29, 36, 69, 50, 66, 225, 95, 46, 171, 108, 183, 207, 250, 123,
+        106, 94, 211, 0, 151, 150, 14, 6, 152, 129, 219, 18,
+    ];
+    const FINGERPRINT: [u8; 32] = [
+        48, 151, 226, 222, 226, 203, 74, 52, 181, 56, 64, 205, 183, 5, 174, 215, 16, 103, 195, 111,
+        104, 219, 14, 15, 85, 156, 63, 63, 160, 67, 49, 95,
+    ];
+    const SIGNATURE: [u8; 64] = [
+        218, 183, 132, 15, 164, 211, 68, 93, 89, 43, 166, 255, 251, 82, 232, 95, 148, 136, 165,
+        219, 224, 227, 24, 245, 89, 32, 211, 5, 171, 3, 54, 144, 22, 197, 138, 230, 208, 224, 203,
+        63, 194, 149, 40, 212, 190, 124, 167, 128, 84, 171, 136, 65, 229, 190, 29, 78, 226, 91,
+        129, 50, 133, 165, 24, 15,
+    ];
+    crate::signature::__reset_trusted_signers();
+    let mut blob = build_unsigned_blob(b"abc", None);
+    blob[3..67].copy_from_slice(&SIGNATURE);
+    blob[67..99].copy_from_slice(&FINGERPRINT);
+    let (write, read) = bootstrap_authority();
+    if install("test/signed", &blob, &write) != Err(FirmwareError::SignatureInvalid) {
+        return TestResult::Fail("unknown signed firmware trusted");
+    }
+    crate::register_trusted_signer(FINGERPRINT, PUBLIC);
+    if install("test/signed", &blob, &write).is_err() {
+        return TestResult::Fail("independent signed firmware rejected");
+    }
+    let cap = match open("test/signed", &read) {
+        Ok(cap) => cap,
+        Err(_) => return TestResult::Fail("signed firmware open failed"),
+    };
+    if !matches!(view_of(&cap), Ok(view) if view.bytes == b"abc" && view.signer == Some(FINGERPRINT))
+    {
+        return TestResult::Fail("signed firmware DMA copy/view mismatch");
+    }
+    for offset in [0, 3, 67] {
+        blob[offset] ^= 1;
+        let result = install("test/signed", &blob, &write);
+        blob[offset] ^= 1;
+        if result != Err(FirmwareError::SignatureInvalid) {
+            return TestResult::Fail("tampered signed firmware accepted");
+        }
+    }
+    if !matches!(view_of(&cap), Ok(view) if view.bytes == b"abc") {
+        return TestResult::Fail("rejected replacement changed the loaded payload");
+    }
+    crate::signature::__reset_trusted_signers();
+    crate::signature::install_build_trusted_signers();
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_signed_install_and_tamper);
+
 fn smoke_firmware_register_in_tree_lands_in_in_tree_tier() -> TestResult {
     if !cfg!(feature = "firmware-allow-unsigned") {
         return TestResult::Skip("firmware-allow-unsigned off");

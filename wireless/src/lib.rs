@@ -19,7 +19,7 @@ pub mod rsn;
 pub mod sae;
 pub mod scan;
 
-pub use iface::{WirelessError, WirelessIface, WirelessIfaceInfo};
+pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
 pub use scan::{BssInfo, ScanRequest, ScanResult};
 
 /// Capability for wireless-specific operations.
@@ -39,6 +39,31 @@ pub enum WirelessRight {
 /// A specialized network interface supporting 802.11 operations.
 #[async_trait]
 pub trait WirelessNetIface: Interface {
+    /// Per-access-category Ethernet producer. Drivers without separate
+    /// queues preserve compatibility by returning their default TX ring.
+    fn tx_ring_for_ac(
+        &self,
+        _category: AccessCategory,
+    ) -> &narf_lib::sync::IrqSafeSpinLock<
+        Option<narf_ipc::Producer<narf_net::Frame, { narf_net::TX_RING_N }>>,
+    > {
+        self.tx_ring()
+    }
+
+    /// The driver performs WPA2-PSK key exchange from a supplied PMK.
+    fn supports_handshake_offload(&self) -> bool {
+        false
+    }
+
+    /// Driver emits nl80211 link-loss notifications, including local teardown.
+    fn reports_disconnect_events(&self) -> bool {
+        false
+    }
+
+    /// Original AP information elements from the most recent scan.
+    fn scan_information_elements(&self, _bssid: [u8; 6]) -> Option<Vec<u8>> {
+        None
+    }
     /// Returns detailed information about the wireless interface.
     fn get_wireless_info(&self) -> WirelessIfaceInfo;
 

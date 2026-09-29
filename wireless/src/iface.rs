@@ -42,3 +42,16 @@ pub struct HwCaps {
 }
 
 pub type WirelessIface = dyn crate::WirelessNetIface;
+
+/// WMM queue identity, in firmware-independent BK/BE/VI/VO order.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AccessCategory {
+    Background = 0,
+    BestEffort = 1,
+    Video = 2,
+    Voice = 3,
+}
+impl AccessCategory {
+    pub const ALL: [Self; 4] = [Self::Background, Self::BestEffort, Self::Video, Self::Voice];
+}
