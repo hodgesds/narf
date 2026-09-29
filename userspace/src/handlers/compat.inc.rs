@@ -3947,6 +3947,8 @@ struct ProcNsIdMap {
     opener_caps: u64,
     owners: (u32, u32),
     file: narf_filesystem::procfs::NsIdMapFile,
+    /// The path's procfs inode, so `fstat` of the open file matches `stat`.
+    ino: u64,
 }
 
 #[cfg(feature = "container")]
@@ -3986,11 +3988,21 @@ pub fn proc_ns_idmap_open(
         opener_caps: read_caps(opener).effective,
         owners: (ids.euid, ids.egid),
         file,
+        ino: narf_filesystem::procfs::idmap_file_ino(pid, file),
     }))
 }
 
 #[cfg(feature = "container")]
 impl narf_filesystem::FileOps for ProcNsIdMap {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: narf_filesystem::procfs::proc_dev(),
+            ..Default::default()
+        }
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::procfs::NsIdMapFile;

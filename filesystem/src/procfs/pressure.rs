@@ -94,9 +94,17 @@ fn render(res: Resource) -> String {
 #[derive(Debug)]
 struct ProcPressureFile {
     res: Resource,
+    /// `/proc/pressure/<res>`'s inode (registered entries: `proc_create`).
+    ino: u64,
 }
 
 impl FileOps for ProcPressureFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let res = self.res;
         Box::pin(async move {
@@ -146,14 +154,26 @@ impl FileOps for ProcPressureFile {
 pub struct ProcPressureDir;
 
 impl ProcPressureDir {
+    fn dir_ino() -> u64 {
+        super::proc_static_ino(super::PROC_ROOT_INO, "pressure")
+    }
+
     /// `FileOps` for a named child, or `None` if the name is not one of
     /// the three PSI resources.
     fn child(name: &str) -> Option<Arc<dyn FileOps>> {
-        Resource::from_name(name).map(|res| Arc::new(ProcPressureFile { res }) as Arc<dyn FileOps>)
+        let ino = super::proc_static_ino(Self::dir_ino(), name);
+        Resource::from_name(name)
+            .map(|res| Arc::new(ProcPressureFile { res, ino }) as Arc<dyn FileOps>)
     }
 }
 
 impl DirOps for ProcPressureDir {
+    fn ino(&self) -> u64 {
+        Self::dir_ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         Self::child(name)
     }
@@ -246,6 +266,7 @@ kernel_test_in!("filesystem/procfs", smoke_pressure_iter_lists_three);
 fn smoke_pressure_read_through_fileops() -> TestResult {
     let f = ProcPressureFile {
         res: Resource::Memory,
+        ino: 0,
     };
     let mut buf = [0u8; 256];
     match poll_once(f.read(0, &mut buf)) {
@@ -260,6 +281,7 @@ kernel_test_in!("filesystem/procfs", smoke_pressure_read_through_fileops);
 fn smoke_pressure_write_accepts_trigger() -> TestResult {
     let f = ProcPressureFile {
         res: Resource::Memory,
+        ino: 0,
     };
     let trigger = b"some 150000 1000000\n";
     match poll_once(f.write(0, trigger)) {
@@ -272,7 +294,10 @@ kernel_test_in!("filesystem/procfs", smoke_pressure_write_accepts_trigger);
 /// poll() is writable but never readable / never EPOLLPRI on an idle
 /// system — so systemd's EPOLLPRI waiter parks quiescently.
 fn smoke_pressure_poll_out_only() -> TestResult {
-    let f = ProcPressureFile { res: Resource::Cpu };
+    let f = ProcPressureFile {
+        res: Resource::Cpu,
+        ino: 0,
+    };
     let r = f.poll_readiness();
     if r & POLL_OUT == POLL_OUT && r & POLL_IN == 0 && r & POLL_PRI == 0 {
         TestResult::Pass
@@ -284,7 +309,10 @@ kernel_test_in!("filesystem/procfs", smoke_pressure_poll_out_only);
 
 /// stat() reports a read-write file so O_RDWR opens succeed.
 fn smoke_pressure_stat_is_rw() -> TestResult {
-    let f = ProcPressureFile { res: Resource::Io };
+    let f = ProcPressureFile {
+        res: Resource::Io,
+        ino: 0,
+    };
     if f.stat().mode == Mode::FILE_RW {
         TestResult::Pass
     } else {

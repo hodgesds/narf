@@ -29,7 +29,7 @@ use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
     hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
     hook_ns_mountinfo_generation, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
-    hook_root_path, slice_read, task_info, ProcDirMarker,
+    hook_root_path, pid_entry_ino, proc_pid_ino, slice_read, task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -84,6 +84,9 @@ pub enum PidExtField {
 pub struct PidExtFile {
     pub pid: u64,
     pub field: PidExtField,
+    /// `/proc/<pid>/<name>`'s inode, set by `lookup_pid_ext` (0 for a node
+    /// built directly, which only tests do).
+    ino: u64,
     mountinfo_generation: AtomicU64,
 }
 
@@ -92,12 +95,19 @@ impl PidExtFile {
         Self {
             pid,
             field,
+            ino: 0,
             mountinfo_generation: AtomicU64::new(hook_ns_mountinfo_generation(pid)),
         }
     }
 }
 
 impl FileOps for PidExtFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn poll_readiness(&self) -> u32 {
         if !matches!(self.field, PidExtField::Mountinfo) {
             return crate::POLL_IN | crate::POLL_OUT;
@@ -307,7 +317,9 @@ pub fn lookup_pid_ext(pid: u64, name: &str) -> Option<PidExtFile> {
         "root" => PidExtField::Root,
         _ => return None,
     };
-    Some(PidExtFile::new(pid, field))
+    let mut file = PidExtFile::new(pid, field);
+    file.ino = pid_entry_ino(pid, name);
+    Some(file)
 }
 
 // ── Renderers ───────────────────────────────────────────────────────
@@ -797,7 +809,22 @@ struct ProcFdFile {
     fd: u32,
 }
 
+impl ProcFdDir {
+    fn dir_ino(pid: u64) -> u64 {
+        pid_entry_ino(pid, "fd")
+    }
+}
+
 impl FileOps for ProcFdFile {
+    fn ino(&self) -> u64 {
+        // `proc_fd_instantiate` → `proc_pid_make_inode`: one inode per
+        // `/proc/<pid>/fd/<n>` link (the target's identity is what `stat`
+        // reports once it follows the link).
+        proc_pid_ino(ProcFdDir::dir_ino(self.pid), &self.fd.to_string())
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         let fd = self.fd;
@@ -828,6 +855,12 @@ impl FileOps for ProcFdFile {
 }
 
 impl DirOps for ProcFdDir {
+    fn ino(&self) -> u64 {
+        Self::dir_ino(self.pid)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let fd: u32 = name.parse().ok()?;
         // Validate the fd exists before returning a file node.
@@ -873,6 +906,12 @@ struct ProcFdInfoFile {
 }
 
 impl FileOps for ProcFdInfoFile {
+    fn ino(&self) -> u64 {
+        proc_pid_ino(pid_entry_ino(self.pid, "fdinfo"), &self.fd.to_string())
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         let fd = self.fd;
@@ -916,6 +955,12 @@ impl FileOps for ProcFdInfoFile {
 }
 
 impl DirOps for ProcFdInfoDir {
+    fn ino(&self) -> u64 {
+        pid_entry_ino(self.pid, "fdinfo")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let fd: u32 = name.parse().ok()?;
         hook_fd_path(self.pid, fd)?; // validate fd exists
@@ -950,15 +995,24 @@ pub struct ProcTaskDir {
 #[derive(Debug)]
 struct ProcTaskTidDir {
     pid: u64,
+    /// The directory's inode: `/proc/<pid>/task/<tid>` (see `ProcTaskDir`).
+    ino: u64,
 }
 
 /// `/proc/<pid>/task/<tid>/comm`
 #[derive(Debug)]
 struct ProcTaskTidComm {
     pid: u64,
+    ino: u64,
 }
 
 impl FileOps for ProcTaskTidComm {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         Box::pin(async move {
@@ -983,9 +1037,18 @@ impl FileOps for ProcTaskTidComm {
 }
 
 impl DirOps for ProcTaskTidDir {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
-            "comm" => Some(Arc::new(ProcTaskTidComm { pid: self.pid })),
+            "comm" => Some(Arc::new(ProcTaskTidComm {
+                pid: self.pid,
+                ino: proc_pid_ino(self.ino, name),
+            })),
             _ => None,
         }
     }
@@ -1044,11 +1107,27 @@ impl ProcTaskDir {
     }
 }
 
+impl ProcTaskDir {
+    /// Inode of `/proc/<pid>/task/<tid>`, keyed on the tid as the reader
+    /// names it (the directory's entry name).
+    fn tid_dir_ino(&self, tid: u64) -> u64 {
+        proc_pid_ino(pid_entry_ino(self.pid, "task"), &tid.to_string())
+    }
+}
+
 impl DirOps for ProcTaskDir {
+    fn ino(&self) -> u64 {
+        pid_entry_ino(self.pid, "task")
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tid: u64 = name.parse().ok()?;
         if self.tids().contains(&tid) {
-            Some(Arc::new(ProcDirMarker))
+            Some(Arc::new(ProcDirMarker {
+                ino: self.tid_dir_ino(tid),
+            }))
         } else {
             None
         }
@@ -1056,7 +1135,10 @@ impl DirOps for ProcTaskDir {
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let tid: u64 = name.parse().ok()?;
         if self.tids().contains(&tid) {
-            Some(Arc::new(ProcTaskTidDir { pid: self.pid }))
+            Some(Arc::new(ProcTaskTidDir {
+                pid: self.pid,
+                ino: self.tid_dir_ino(tid),
+            }))
         } else {
             None
         }
