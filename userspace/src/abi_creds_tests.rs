@@ -2042,6 +2042,107 @@ kernel_test_in!(
     smoke_abi_caps_newuser_grants_authority_only_inside_the_namespace
 );
 
+/// An unprivileged user may map only its own host uid into a newly-created
+/// user namespace. In particular, it must not map namespace uid 0 to host uid
+/// 0. Linux enforces this in `kernel/user_namespace.c::new_idmap_permitted`.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_unprivileged_uid_map_cannot_claim_host_root() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const UID_MAP: &[u8] = b"0 0 1\n";
+
+        // Exercise the same writer hook used by `/proc/<pid>/uid_map` after
+        // dropping host capabilities and creating the user namespace.
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+            return Err("unprivileged unshare(CLONE_NEWUSER) failed");
+        }
+        use narf_filesystem::procfs::NsIdMapFile;
+        let write_result =
+            crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::UidMap, UID_MAP);
+        match write_result {
+            Err(narf_filesystem::FsError::OperationNotPermitted) => Ok(()),
+            Ok(_) => Err("unprivileged caller mapped namespace root to host root"),
+            Err(_) => Err("uid_map writer returned the wrong error"),
+        }?;
+
+        // The permitted self-map is exactly the creator's host uid. A
+        // failed write must not consume the one-shot map slot.
+        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::UidMap, b"0 1000 1\n")
+            != Ok(b"0 1000 1\n".len())
+        {
+            return Err("unprivileged caller could not map its own host uid");
+        }
+        if crate::namespaces::current_user_ns(FAKE_TASK).translate_uid_to_host(0) != 1000 {
+            return Err("uid_map did not normalize the permitted host uid");
+        }
+        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::UidMap, b"1 1000 1\n")
+            != Err(narf_filesystem::FsError::OperationNotPermitted)
+        {
+            return Err("uid_map was writable more than once");
+        }
+        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::Setgroups, b"deny\n")
+            != Ok(b"deny\n".len())
+        {
+            return Err("could not disable setgroups before writing gid_map");
+        }
+        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::GidMap, b"0 1000 1\n")
+            != Ok(b"0 1000 1\n".len())
+        {
+            return Err("unprivileged caller could not map its own host gid");
+        }
+        let ns = crate::namespaces::current_user_ns(FAKE_TASK);
+        if ns.translate_gid_to_host(0) != 1000 || ns.may_setgroups() {
+            return Err("gid_map or setgroups state was not committed correctly");
+        }
+        if call(Syscall::Setgroups.raw(), a1(0, 0)) != Some(-1) {
+            return Err("setgroups succeeded after the namespace permanently denied it");
+        }
+        if crate::handlers::proc_ns_idmap_write(FAKE_TASK, NsIdMapFile::Setgroups, b"allow\n")
+            != Err(narf_filesystem::FsError::OperationNotPermitted)
+        {
+            return Err("setgroups was re-enabled after deny");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns",
+    smoke_abi_userns_unprivileged_uid_map_cannot_claim_host_root
+);
+
+/// Linux `may_setgroups()` requires both CAP_SETGID in the current user
+/// namespace and an installed gid_map with setgroups still enabled.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_setgroups_waits_for_a_gid_map() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+            return Err("unprivileged unshare(CLONE_NEWUSER) failed");
+        }
+        match call(Syscall::Setgroups.raw(), a1(0, 0)) {
+            Some(-1) => Ok(()), // EPERM
+            Some(0) => Err("setgroups(0, NULL) succeeded before gid_map setup"),
+            _ => Err("setgroups before gid_map returned no syscall result"),
+        }
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns",
+    smoke_abi_userns_setgroups_waits_for_a_gid_map
+);
+
 /// `fs/namespace.c::may_mount` gates mount(2) on the MOUNT namespace's owner:
 ///
 ///     return ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN);

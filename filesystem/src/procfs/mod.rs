@@ -618,10 +618,17 @@ type MountinfoFn = fn(u64) -> Option<String>;
 /// value advances. Keeping the lookup here preserves the one-way procfs →
 /// userspace dependency used by the renderer hook above.
 type MountinfoGenerationFn = fn(u64) -> u64;
-/// `(pid, is_uid) -> rendered uid_map/gid_map`.
-type IdMapRenderFn = fn(u64, bool) -> Option<String>;
-/// `(pid, is_uid, bytes) -> Ok(written) | Err`. Linux one-shot rule.
-type IdMapWriteFn = fn(u64, bool, &[u8]) -> Result<usize, FsError>;
+/// Which user-namespace proc file is being accessed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NsIdMapFile {
+    UidMap,
+    GidMap,
+    Setgroups,
+}
+/// `(pid, file) -> rendered uid_map/gid_map/setgroups state`.
+type IdMapRenderFn = fn(u64, NsIdMapFile) -> Option<String>;
+/// `(pid, file, bytes) -> Ok(written) | Err`.
+type IdMapWriteFn = fn(u64, NsIdMapFile, &[u8]) -> Result<usize, FsError>;
 
 static NS_READLINK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_MOUNTINFO_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -730,24 +737,28 @@ pub(crate) fn hook_ns_mountinfo_generation(pid: u64) -> u64 {
     f(pid)
 }
 
-pub(crate) fn hook_ns_idmap_render(pid: u64, is_uid: bool) -> Option<String> {
+pub(crate) fn hook_ns_idmap_render(pid: u64, file: NsIdMapFile) -> Option<String> {
     let v = NS_IDMAP_RENDER_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return None;
     }
     // SAFETY: stored by install_ns_proc_hooks as an IdMapRenderFn; non-zero confirms it.
     let f: IdMapRenderFn = unsafe { core::mem::transmute(v) };
-    f(pid, is_uid)
+    f(pid, file)
 }
 
-pub(crate) fn hook_ns_idmap_write(pid: u64, is_uid: bool, bytes: &[u8]) -> Result<usize, FsError> {
+pub(crate) fn hook_ns_idmap_write(
+    pid: u64,
+    file: NsIdMapFile,
+    bytes: &[u8],
+) -> Result<usize, FsError> {
     let v = NS_IDMAP_WRITE_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return Err(FsError::Unsupported);
     }
     // SAFETY: stored by install_ns_proc_hooks as an IdMapWriteFn; non-zero confirms it.
     let f: IdMapWriteFn = unsafe { core::mem::transmute(v) };
-    f(pid, is_uid, bytes)
+    f(pid, file, bytes)
 }
 
 pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
@@ -1426,13 +1437,19 @@ impl DirOps for ProcPidDir {
             "uid_map" => {
                 return Some(Arc::new(ProcIdMapFile {
                     pid: self.pid,
-                    is_uid: true,
+                    file: NsIdMapFile::UidMap,
                 }))
             }
             "gid_map" => {
                 return Some(Arc::new(ProcIdMapFile {
                     pid: self.pid,
-                    is_uid: false,
+                    file: NsIdMapFile::GidMap,
+                }))
+            }
+            "setgroups" => {
+                return Some(Arc::new(ProcIdMapFile {
+                    pid: self.pid,
+                    file: NsIdMapFile::Setgroups,
                 }))
             }
             _ => {}
@@ -1782,22 +1799,22 @@ impl FileOps for ProcAttrFile {
 #[derive(Debug)]
 struct ProcIdMapFile {
     pid: u64,
-    is_uid: bool,
+    file: NsIdMapFile,
 }
 
 impl FileOps for ProcIdMapFile {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
-        let is_uid = self.is_uid;
+        let file = self.file;
         Box::pin(async move {
-            let s = hook_ns_idmap_render(pid, is_uid).unwrap_or_default();
+            let s = hook_ns_idmap_render(pid, file).unwrap_or_default();
             slice_read(s.as_bytes(), offset, buf)
         })
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
-        let is_uid = self.is_uid;
-        Box::pin(async move { hook_ns_idmap_write(pid, is_uid, buf) })
+        let file = self.file;
+        Box::pin(async move { hook_ns_idmap_write(pid, file, buf) })
     }
     fn stat(&self) -> Stat {
         Stat {

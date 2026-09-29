@@ -985,6 +985,11 @@ namespace object for `setns(2)`; `O_PATH|O_NOFOLLOW` instead opens the symlink
 node itself. The proc fd provider returns one `ProcFdSnapshot` containing the
 link target plus live offset, status flags, mount ID, and inode identity, so
 `fd/` and `fdinfo/` project the same open file description.
+For user namespaces, `/proc/<pid>/uid_map` and `gid_map` expose parent-to-child
+id ranges, while `setgroups` reads `allow` or `deny` and accepts the one-way
+`deny` transition before `gid_map` is installed. The procfs/userspace hook
+identifies these files with `NsIdMapFile::{UidMap,GidMap,Setgroups}` so each
+write reaches the matching authorization and state transition.
 `/proc/filesystems` uses the `nodev NAME` form for synthetic filesystems.
 `/proc/uptime` reports aggregate idle time across CPUs, and per-task status
 memory fields are derived from VMA extents and resident page counts. Procfs

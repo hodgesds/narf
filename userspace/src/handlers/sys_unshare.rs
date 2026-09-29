@@ -128,8 +128,8 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         // The creator's HOST uid is recorded as the namespace owner, and the
         // caller becomes uid 0 INSIDE it.
-        let host_uid = read_uidgid(task).euid;
-        let _ns = crate::namespaces::unshare_user(task, host_uid);
+        let ids = read_uidgid(task);
+        let _ns = crate::namespaces::unshare_user(task, ids.euid, ids.egid);
         let _ = write_uidgid(task, |e| {
             e.uid = 0;
             e.gid = 0;

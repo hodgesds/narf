@@ -1444,6 +1444,74 @@ fn smoke_user_ns_uid_map_translation() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_user_ns_uid_map_translation);
 
+/// Linux `map_write()` rejects zero-length, wrapping, and overlapping
+/// extents before publishing any part of an id map.
+#[cfg(feature = "container")]
+fn smoke_user_ns_rejects_malformed_idmap_extents() -> TestResult {
+    use crate::namespaces::{IdMapEntry, UserNamespace};
+    crate::namespaces::__test_reset_all();
+    let parent = UserNamespace::new_initial();
+    let ns = UserNamespace::new_child(parent, 1000);
+    let malformed = [
+        alloc::vec![IdMapEntry {
+            inner_start: 0,
+            outer_start: 1000,
+            count: 0,
+        }],
+        alloc::vec![IdMapEntry {
+            inner_start: u32::MAX - 1,
+            outer_start: 1000,
+            count: 4,
+        }],
+        alloc::vec![
+            IdMapEntry {
+                inner_start: 0,
+                outer_start: 1000,
+                count: 4,
+            },
+            IdMapEntry {
+                inner_start: 3,
+                outer_start: 2000,
+                count: 1,
+            },
+        ],
+        alloc::vec![
+            IdMapEntry {
+                inner_start: 0,
+                outer_start: 1000,
+                count: 4,
+            },
+            IdMapEntry {
+                inner_start: 4,
+                outer_start: 1003,
+                count: 1,
+            },
+        ],
+    ];
+    for entries in malformed {
+        if ns.write_uid_map(entries).is_ok() {
+            return TestResult::Fail("malformed uid_map extent was accepted");
+        }
+    }
+    if ns
+        .write_uid_map(alloc::vec![IdMapEntry {
+            inner_start: 0,
+            outer_start: 1000,
+            count: 1,
+        }])
+        .is_err()
+    {
+        return TestResult::Fail("rejected malformed map consumed the one-shot write");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace/userns",
+    smoke_user_ns_rejects_malformed_idmap_extents
+);
+
 /// SECURITY GATE (hard): a process that is root *inside* an
 /// unprivileged user-ns whose map does NOT include host-0 is DENIED a
 /// host-root-owned 0600 file; and a file owned by the mapped outer uid
@@ -1563,7 +1631,7 @@ kernel_test_in!("userspace", smoke_user_ns_dac_no_host_root_escape);
 /// never allow.
 #[cfg(feature = "container")]
 fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
-    use crate::namespaces::UserNamespace;
+    use crate::namespaces::{IdMapEntry, UserNamespace};
     crate::namespaces::__test_reset_all();
     crate::handlers::__test_uidgid_reset();
     crate::handlers::__test_caps_reset();
@@ -1577,6 +1645,18 @@ fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
     // Two sibling namespaces beneath the host, BOTH owned by host uid 1000 —
     // the shape a single user running two rootless containers produces.
     let mine = UserNamespace::new_child(host.clone(), 1000);
+    // Inside this namespace, uid 0 represents the unprivileged host owner.
+    // Capability owner checks compare the credential's translated host uid.
+    if mine
+        .write_uid_map(alloc::vec![IdMapEntry {
+            inner_start: 0,
+            outer_start: 1000,
+            count: 1,
+        }])
+        .is_err()
+    {
+        return TestResult::Fail("could not install owner uid mapping");
+    }
     let sibling = UserNamespace::new_child(host.clone(), 1000);
     // A third owned by a different user, to show the owner uid is compared
     // and not merely the depth.
@@ -1587,7 +1667,7 @@ fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
     let task: u64 = 0xBEEF01;
     // Unprivileged: no capabilities at all in the host.
     crate::handlers::__test_set_caps(task, 0, 0);
-    crate::handlers::__test_set_uidgid_euid(task, 1000);
+    crate::handlers::__test_set_uidgid_euid(task, 0);
     crate::namespaces::setns_user(task, mine.clone());
 
     // Arm 1 — the caller's OWN namespace decides on the effective set, which
@@ -1632,7 +1712,7 @@ fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
 }
 #[cfg(feature = "container")]
 kernel_test_in!(
-    "userspace",
+    "userspace/userns",
     smoke_user_ns_capable_is_scoped_to_the_target_namespace
 );
 
@@ -1721,7 +1801,7 @@ fn smoke_ns_inherit_shares_parent_arc() -> TestResult {
     let child: u64 = 0x5678;
     crate::namespaces::unshare_uts(parent);
     crate::namespaces::unshare_ipc(parent);
-    crate::namespaces::unshare_user(parent, 0);
+    crate::namespaces::unshare_user(parent, 0, 0);
 
     crate::namespaces::inherit_into_child(parent, child);
 

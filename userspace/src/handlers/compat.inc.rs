@@ -3938,23 +3938,63 @@ pub fn proc_ns_mountinfo_generation(pid: u64) -> u64 {
         .unwrap_or_else(|| narf_filesystem::registry().mountinfo_generation())
 }
 
-/// `/proc/<pid>/{uid,gid}_map` render.
+/// `/proc/<pid>/{uid,gid}_map` and `setgroups` render.
 #[cfg(feature = "container")]
-pub fn proc_ns_idmap_render(pid: u64, is_uid: bool) -> Option<alloc::string::String> {
+pub fn proc_ns_idmap_render(
+    pid: u64,
+    file: narf_filesystem::procfs::NsIdMapFile,
+) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
-    Some(crate::namespaces::current_user_ns(task).render_map(is_uid))
+    let ns = crate::namespaces::current_user_ns(task);
+    Some(match file {
+        narf_filesystem::procfs::NsIdMapFile::UidMap => ns.render_map(true),
+        narf_filesystem::procfs::NsIdMapFile::GidMap => ns.render_map(false),
+        narf_filesystem::procfs::NsIdMapFile::Setgroups => {
+            alloc::string::String::from(ns.render_setgroups())
+        }
+    })
 }
 
-/// `/proc/<pid>/{uid,gid}_map` write — parses the Linux triple lines
-/// `inner outer count` and applies them under the one-shot rule.
+/// `/proc/<pid>/{uid,gid}_map` and `setgroups` writes.
 #[cfg(feature = "container")]
 pub fn proc_ns_idmap_write(
     pid: u64,
-    is_uid: bool,
+    file: narf_filesystem::procfs::NsIdMapFile,
     bytes: &[u8],
 ) -> Result<usize, narf_filesystem::FsError> {
+    let writer = current_task_id();
     let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let target_ns = crate::namespaces::current_user_ns(task);
+    if file == narf_filesystem::procfs::NsIdMapFile::Setgroups {
+        if bytes.len() >= 8 {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        let text = core::str::from_utf8(bytes).map_err(|_| narf_filesystem::FsError::InvalidData)?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let allow = match text {
+            "allow" => true,
+            "deny" => false,
+            _ => return Err(narf_filesystem::FsError::InvalidData),
+        };
+        if target_ns.parent().is_none()
+            || !task_ns_capable(writer, &target_ns, CAP_SYS_ADMIN)
+        {
+            return Err(narf_filesystem::FsError::OperationNotPermitted);
+        }
+        return target_ns
+            .write_setgroups(allow)
+            .map(|_| bytes.len())
+            .map_err(|_| narf_filesystem::FsError::OperationNotPermitted);
+    }
+    let is_uid = match file {
+        narf_filesystem::procfs::NsIdMapFile::UidMap => true,
+        narf_filesystem::procfs::NsIdMapFile::GidMap => false,
+        narf_filesystem::procfs::NsIdMapFile::Setgroups => unreachable!(),
+    };
     let text = core::str::from_utf8(bytes).map_err(|_| narf_filesystem::FsError::InvalidData)?;
+    if bytes.len() >= 4096 {
+        return Err(narf_filesystem::FsError::InvalidData);
+    }
     let mut entries = alloc::vec::Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -3983,14 +4023,40 @@ pub fn proc_ns_idmap_write(
             count,
         });
     }
-    let uns = crate::namespaces::current_user_ns(task);
+    let writer_ns = crate::namespaces::current_user_ns(writer);
+    let parent = target_ns
+        .parent()
+        .ok_or(narf_filesystem::FsError::OperationNotPermitted)?;
+    let map_admin = task_ns_capable(writer, &target_ns, CAP_SYS_ADMIN);
+    let writer_ids = read_uidgid(writer);
+    let writer_uid_host = writer_ns
+        .translate_uid_to_host(writer_ids.euid);
+    let writer_gid_host = writer_ns
+        .translate_gid_to_host(writer_ids.egid);
     let r = if is_uid {
-        uns.write_uid_map(entries)
+        target_ns.write_uid_map_authorized(
+            entries,
+            &writer_ns,
+            writer_uid_host,
+            map_admin,
+            task_ns_capable(writer, parent, CAP_SETUID),
+            task_ns_capable(writer, parent, CAP_SETFCAP),
+        )
     } else {
-        uns.write_gid_map(entries)
+        target_ns.write_gid_map_authorized(
+            entries,
+            &writer_ns,
+            writer_gid_host,
+            map_admin,
+            task_ns_capable(writer, parent, CAP_SETGID),
+        )
     };
-    r.map(|_| bytes.len())
-        .map_err(|_| narf_filesystem::FsError::InvalidData)
+    r.map(|_| bytes.len()).map_err(|error| match error {
+        crate::namespaces::IdMapWriteError::Invalid => narf_filesystem::FsError::InvalidData,
+        crate::namespaces::IdMapWriteError::Permission => {
+            narf_filesystem::FsError::OperationNotPermitted
+        }
+    })
 }
 
 // ── Wave-67: setns(target, nstype) ─────────────────────────────────

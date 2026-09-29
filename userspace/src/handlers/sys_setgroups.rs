@@ -33,6 +33,15 @@ use super::*;
 pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     const NGROUPS_MAX: u32 = 65_536;
     let args = *ctx.args();
+    if !capable_in_own_ns(CAP_SETGID) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
+    #[cfg(feature = "container")]
+    if !crate::namespaces::current_user_ns(current_task_id()).may_setgroups() {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
     // `int gidsetsize`, compared as `unsigned` — a negative size becomes a
     // huge unsigned and trips the bound.
     let size = args.arg0 as i32 as u32;

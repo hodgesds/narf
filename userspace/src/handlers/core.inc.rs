@@ -5378,7 +5378,10 @@ pub(crate) fn task_ns_capable(
     let cred_level = cred_ns.level();
     // Host-absolute effective uid — `cred->euid` is a host id, and
     // `ns->owner` was recorded as one at creation.
-    let cred_euid = read_uidgid(task).euid;
+    // NARF stores the task's namespace-visible euid, while `ns->owner` is a
+    // host-absolute id. Compare in the kernel-global space as Linux's kuid
+    // credentials do.
+    let cred_euid = cred_ns.translate_uid_to_host(read_uidgid(task).euid);
     let mut cursor: Option<&crate::namespaces::UserNamespace> = Some(target);
     while let Some(ns) = cursor {
         if ns.id() == cred_ns.id() {
@@ -7156,7 +7159,7 @@ fn xattr_target(path: &str) -> Option<XattrTarget> {
 /// `XATTR_NAME_CAPS`.
 const XATTR_NAME_CAPS: &str = "security.capability";
 /// Linux `CAP_SETFCAP` — "set arbitrary capabilities on a file".
-const CAP_SETFCAP: u32 = 31;
+pub(crate) const CAP_SETFCAP: u32 = 31;
 
 /// `security/commoncap.c::cap_convert_nscap`'s validation of a
 /// `security.capability` value, which `vfs_setxattr` runs (for a non-empty
@@ -10837,9 +10840,17 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
 
     #[cfg(feature = "container")]
     let prepared_user_ns = if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-        Some(crate::namespaces::UserNamespace::new_child(
-            crate::namespaces::current_user_ns(parent_pid),
-            read_uidgid(parent_pid).euid,
+        let parent_user_ns = crate::namespaces::current_user_ns(parent_pid);
+        let owner_ids = read_uidgid(parent_pid);
+        let owner_host_uid = parent_user_ns.translate_uid_to_host(owner_ids.euid);
+        let owner_host_gid = parent_user_ns.translate_gid_to_host(owner_ids.egid);
+        let parent_could_setfcap =
+            task_ns_capable(parent_pid, &parent_user_ns, CAP_SETFCAP);
+        Some(crate::namespaces::UserNamespace::new_child_with_credentials(
+            parent_user_ns,
+            owner_host_uid,
+            owner_host_gid,
+            parent_could_setfcap,
         ))
     } else {
         None
