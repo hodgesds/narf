@@ -5323,6 +5323,11 @@ fn boot_userspace_init() {
                 // /dev/pts/N, round-trip "ping" / "pong" across
                 // the master/slave pair. Success token "pty-ok".
                 ("pty_smoke", narf_verification::NARF_PTY_SMOKE_ELF),
+                // VirGL 3D smoke — hand-rolled virgl command stream
+                // through renderD128 (surface + framebuffer + clear on
+                // the HOST GPU), pixels transferred back and verified.
+                // Success: `virgl3d-ok`; skips on a 2D-only host.
+                ("virgl3d_smoke", narf_verification::NARF_VIRGL3D_SMOKE_ELF),
                 // Framebuffer smoke — opens /dev/fb0, mmaps it
                 // MAP_SHARED, draws + reads back. Proves the
                 // device-mmap keystone end-to-end. Success: `fb-ok`.

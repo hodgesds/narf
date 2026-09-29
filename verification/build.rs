@@ -638,6 +638,10 @@ fn main() {
         "fpu_preempt_smoke",
         "procfs2_smoke",
         "pty_smoke",
+        // Hand-rolled VirGL command stream through renderD128: surface +
+        // framebuffer + clear on the HOST GPU, transferred back and
+        // pixel-verified. Self-skips on a 2D-only virtio-gpu.
+        "virgl3d_smoke",
         "numa_smoke",
         "fb_smoke",
         "scm_smoke",

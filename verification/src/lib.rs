@@ -4659,6 +4659,22 @@ pub const NARF_PTY_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_PTY_SMOKE_ELF_X8
 ))]
 pub const NARF_PTY_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_PTY_SMOKE_ELF_AARCH64"));
 
+/// `/bin/virgl3d_smoke` — hand-rolled VirGL command stream through
+/// `/dev/dri/renderD128`: create a render target, EXECBUFFER a
+/// surface+framebuffer+clear, TRANSFER_FROM_HOST_3D the pixels back and
+/// verify them. Proves REAL host-GPU 3D rendering end-to-end. Success
+/// token: `virgl3d-ok`; self-skips (`virgl3d-skip`) without a 3D host.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_VIRGL3D_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_VIRGL3D_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_VIRGL3D_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_VIRGL3D_SMOKE_ELF_AARCH64"));
+
 /// `/bin/fb_smoke` — opens `/dev/fb0`, mmaps it MAP_SHARED, draws, and
 /// reads back through the mapping. Proves the device-mmap keystone +
 /// fbdev ioctls end-to-end from stock musl. Success token: `fb-ok`.
