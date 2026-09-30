@@ -17,7 +17,9 @@ narf-filesystem   = { path = "../filesystem" }
 narf-init         = { path = "../init" }
 narf-capabilities = { path = "../capabilities" }
 narf-boot         = { path = "../boot" }
+narf-block        = { path = "../block" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+zeroize           = { version = "1", default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

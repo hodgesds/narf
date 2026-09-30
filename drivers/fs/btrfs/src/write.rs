@@ -2503,7 +2503,7 @@ fn pack_tree_at<B: BlockDevice + 'static>(
     if levels.len() > MAX_TREE_LEVEL + 1 {
         return Err(FsError::NoSpace);
     }
-    if addrs.len() != levels.iter().sum() {
+    if addrs.len() != levels.iter().sum::<usize>() {
         return Err(FsError::InvalidData);
     }
     let mut nodes = Vec::new();

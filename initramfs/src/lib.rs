@@ -23,6 +23,7 @@
 extern crate alloc;
 
 use narf_lib::sync::IrqSafeSpinLock;
+use zeroize::Zeroizing;
 
 mod tests;
 
@@ -72,6 +73,40 @@ pub fn staged() -> Option<&'static Initramfs> {
 /// `true` once an initramfs has been staged.
 pub fn is_staged() -> bool {
     STAGED.lock().is_some()
+}
+
+const MAX_LUKS_KEYFILE_BYTES: usize = 64 * 1024;
+
+fn canonical_archive_name(name: &str) -> &str {
+    let name = name.strip_prefix("./").unwrap_or(name);
+    name.strip_prefix('/').unwrap_or(name)
+}
+
+fn luks_keyfile_provider(
+    volume: &narf_block::encrypted::LuksVolumeInfo,
+) -> Result<Zeroizing<alloc::vec::Vec<u8>>, narf_block::encrypted::LuksCredentialError> {
+    let args = narf_boot::args();
+    if let Some(selected) = args.value("rd.luks.uuid") {
+        let selected = selected.strip_prefix("luks-").unwrap_or(selected);
+        if !selected.eq_ignore_ascii_case(&volume.uuid) {
+            return Err(narf_block::encrypted::LuksCredentialError::Declined);
+        }
+    }
+    let path = args
+        .value("rd.luks.key")
+        .ok_or(narf_block::encrypted::LuksCredentialError::Unavailable)?;
+    let target = path.strip_prefix('/').unwrap_or(path);
+    let (_, bytes) = staged()
+        .and_then(|archive| {
+            archive
+                .iter_files()
+                .find(|(name, _)| canonical_archive_name(name) == target)
+        })
+        .ok_or(narf_block::encrypted::LuksCredentialError::Unavailable)?;
+    if bytes.len() > MAX_LUKS_KEYFILE_BYTES {
+        return Err(narf_block::encrypted::LuksCredentialError::TooLarge);
+    }
+    Ok(Zeroizing::new(bytes.to_vec()))
 }
 
 #[doc(hidden)]
@@ -177,6 +212,16 @@ pub fn register_initcalls() {
         } else {
             InitResult::NotPresent
         }
+    });
+    // Opt-in non-interactive encrypted-root policy. The key file is an exact
+    // byte string in the measured initramfs; no newline trimming or text
+    // decoding occurs. `rd.luks.uuid=` optionally pins the intended container.
+    narf_init::register(Stage::Early, "luks-keyfile-provider", || {
+        if narf_boot::args().value("rd.luks.key").is_none() {
+            return InitResult::NotPresent;
+        }
+        narf_block::encrypted::install_luks_passphrase_provider(luks_keyfile_provider);
+        InitResult::Ok
     });
     narf_init::register(Stage::Late, "initramfs-mount-at-boot", || {
         if !is_staged() {

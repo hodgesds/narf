@@ -105,6 +105,9 @@ pub enum RootMountError {
     /// `root=<spec>` was given but no registered block device
     /// matched. We refuse to silently mount a different volume.
     SelectorNoMatch,
+    /// A selected LUKS container could not be opened by the installed boot
+    /// credential provider or failed authenticated metadata/keyslot checks.
+    LuksUnlock(narf_block::encrypted::LuksOpenError),
 }
 
 /// Walk the block registry and mount the first viable filesystem on /.
@@ -134,6 +137,13 @@ pub fn try_mount_root_with(
     let mut last_error: Option<RootMountError> = None;
     let mut saw_candidate = false;
     for entry in &devices {
+        let outer_uuid_matches = selector.is_some_and(|selector| match selector {
+            crate::root_selector::RootSelector::ByFsUuid(target) => entry
+                .partition
+                .as_ref()
+                .is_some_and(|metadata| metadata.fs_uuid.eq_ignore_ascii_case(target)),
+            _ => false,
+        });
         // Selector filter: skip devices the cmdline doesn't ask
         // for. ByName matches the registry-string; ByPartLabel /
         // ByPartUuid match the GPT metadata the partition scanner
@@ -156,20 +166,47 @@ pub fn try_mount_root_with(
                     Some(m) if m.partuuid.eq_ignore_ascii_case(target) => {}
                     _ => continue,
                 },
-                // FS-UUID needs per-FS-instance metadata we still
-                // don't carry (would need a UUID accessor on
-                // FsInstance). Lenient until that lands — the
-                // selector is parsed + visible in the boot log,
-                // walker falls through to "first detected".
+                // Resolve this after an optional LUKS open so UUID= may name
+                // either the outer container or the filesystem inside it.
                 RootSelector::ByFsUuid(_) => {}
             }
         }
-        saw_candidate = true;
-        let dev = entry.dev.clone();
+        if !matches!(
+            selector,
+            Some(crate::root_selector::RootSelector::ByFsUuid(_))
+        ) {
+            saw_candidate = true;
+        }
+        let mut dev = entry.dev.clone();
+        let mut unlocked_luks = false;
         let detect = match detect_filesystem(&dev) {
             Ok(Some(t)) => t,
-            Ok(None) | Err(_) => continue,
+            Ok(None) | Err(_) => {
+                match narf_block::encrypted::open_luks_with_provider(dev.clone()) {
+                    Ok(unlocked) => {
+                        dev = Arc::new(unlocked);
+                        unlocked_luks = true;
+                        match detect_filesystem(&dev) {
+                            Ok(Some(t)) => t,
+                            Ok(None) | Err(_) => continue,
+                        }
+                    }
+                    Err(narf_block::encrypted::LuksOpenError::NotLuks) => continue,
+                    Err(error) => {
+                        last_error = Some(RootMountError::LuksUnlock(error));
+                        continue;
+                    }
+                }
+            }
         };
+        if let Some(crate::root_selector::RootSelector::ByFsUuid(target)) = selector {
+            let inner_uuid_matches = narf_block::partition::discover_volume_uuid(dev.as_ref())
+                .is_some_and(|uuid| uuid.eq_ignore_ascii_case(target));
+            if !outer_uuid_matches && !inner_uuid_matches {
+                continue;
+            }
+            saw_candidate = true;
+        }
         let factory = match lookup_factory(detect) {
             Some(f) => f,
             None => {
@@ -177,7 +214,7 @@ pub fn try_mount_root_with(
                 continue;
             }
         };
-        let fs = match factory(dev) {
+        let fs = match factory(dev.clone()) {
             Ok(f) => f,
             Err(e) => {
                 last_error = Some(RootMountError::FactoryFailed(detect, e));
@@ -190,25 +227,25 @@ pub fn try_mount_root_with(
         let _handle = crate::registry()
             .mount_arc(authority, "/", fs)
             .map_err(|e| RootMountError::FactoryFailed(detect, e))?;
+        let device_name = if unlocked_luks {
+            narf_block::register_block_device("cryptroot", dev);
+            "cryptroot"
+        } else {
+            entry.name
+        };
         return Ok(MountReport {
-            device_name: String::from(entry.name),
+            device_name: String::from(device_name),
             fs_type: detect,
         });
     }
-    // If a strict-match selector (ByName / ByPartLabel / ByPartUuid)
-    // was given but nothing matched, surface that distinctly —
-    // silent fallback to a wrong device is worse than refusing.
-    // FS-UUID is excluded from this guard since the walker doesn't
-    // yet carry FS-uuid metadata.
-    if let Some(sel) = selector {
-        use crate::root_selector::RootSelector;
-        let strict = matches!(
-            sel,
-            RootSelector::ByName(_) | RootSelector::ByPartLabel(_) | RootSelector::ByPartUuid(_)
-        );
-        if strict && !saw_candidate {
-            return Err(RootMountError::SelectorNoMatch);
+    // Every explicit selector is strict. Silent fallback to a wrong device is
+    // worse than refusing, including for UUID now that the block scanner and
+    // decrypted adapter both expose immutable volume identifiers.
+    if selector.is_some() && !saw_candidate {
+        if let Some(error @ RootMountError::LuksUnlock(_)) = last_error {
+            return Err(error);
         }
+        return Err(RootMountError::SelectorNoMatch);
     }
     Err(last_error.unwrap_or(RootMountError::NoMountable))
 }

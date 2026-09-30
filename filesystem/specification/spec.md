@@ -43,6 +43,16 @@
 
 ## 3. Public interface
 
+### 3.0 Root-device orchestration
+
+`root_mount::try_mount_root` and `try_mount_root_with` apply every explicit
+`root=` selector strictly, including `UUID=` via immutable block-volume
+metadata. A selected LUKS1/LUKS2 container is opened through block's installed
+credential provider, its inner filesystem is detected and mounted, and the
+adapter is registered as `cryptroot`. Missing credentials and authenticated
+unlock failures surface as `RootMountError::LuksUnlock`; they never fall
+through to an unrelated disk.
+
 ### 3.1 Path and node types
 
 ```rust

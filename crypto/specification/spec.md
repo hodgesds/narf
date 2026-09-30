@@ -54,6 +54,14 @@ pub trait Kdf { /* derive(Cap<Key, Derive>, salt, info) -> Cap<Key, _> */ }
 
 Concrete algorithms (initial set):
 
+The block-encryption surface includes typed `AesXts128` and `AesXts256`
+key capabilities. Their `plain64` helpers accept an explicit power-of-two
+data-unit size (16 bytes or larger); compatibility wrappers for AES-256-XTS
+retain the Linux/LUKS1 512-byte default. A final short data unit must contain
+at least one AES block; invalid lengths return `CryptoError::InvalidInput`
+rather than reaching backend assertions. Block-device adapters impose the
+stricter whole-encryption-sector rule before calling these primitives.
+
 | Role      | Algorithm                         |
 | --------- | --------------------------------- |
 | Hash      | SHA-256, SHA-512, SHA3-256, BLAKE3 |
@@ -63,6 +71,7 @@ Concrete algorithms (initial set):
 | KDF       | HKDF-SHA-256                      |
 | XOF       | SHAKE-128, SHAKE-256              |
 | Stream    | ChaCha20 (via AEAD, not standalone exposed) |
+| Disk      | AES-256-XTS, 512-byte data units, `plain64` little-endian sector tweak |
 
 Post-quantum: algorithm choice left as an open question (§8).
 

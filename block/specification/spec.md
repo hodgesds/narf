@@ -136,17 +136,39 @@ pub fn find_block_device_indexed(
 ```
 
 Registered GPT partitions carry their GPT type GUID, label, and unique GUID
-plus a best-effort filesystem volume UUID parsed from immutable FAT or ext
+plus a best-effort volume UUID parsed from immutable FAT, ext, LUKS1, or LUKS2
 identification bytes. `PartitionMetadata::is_efi_system_partition()` identifies
 an EFI System Partition solely by its UEFI GPT type GUID, never by a volatile
 device name, label, or volume UUID.
 `DevFs` uses that metadata to expose `/dev/disk/by-{label,partuuid,uuid}`
 aliases; discovery never validates or mounts the filesystem.
+`partition::discover_volume_uuid` exposes the same bounded read-only probe to
+root-selection code after an encrypted adapter has been opened.
 
 Targeted lookups clone only the matched device `Arc`; they do not allocate an
 owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux
 minor number across concurrent hot-unplug.
+
+### 3.6 Encrypted-device stacking
+
+`EncryptedBlockDevice` wraps an `Arc<dyn BlockDeviceSync>` and exposes the
+decrypted payload as another `BlockDeviceSync`. Native NARF volumes use the
+TPM-unseal path described in `encrypted.md`; existing Linux installations use
+`EncryptedBlockDevice::open_luks1(inner, passphrase)` or
+`EncryptedBlockDevice::open_luks2(inner, passphrase)`. Both paths are
+read-only for metadata. LUKS2 authenticates and selects redundant metadata,
+supports PBKDF2 and Argon2i/Argon2id keyslots, and maps one normal
+AES-XTS/`plain64` crypt segment. `Luks1UnlockPolicy` and `Luks2UnlockPolicy`
+bound header-controlled CPU, memory, and allocation work.
+The adapter exposes logical blocks of the greater of the underlying device's
+LBA size and the authenticated encryption-sector size, translating each
+visible request to complete underlying LBAs so partial crypto data units cannot
+escape through the block trait.
+`install_luks_passphrase_provider` supplies the boot-policy seam;
+`open_luks_with_provider` probes version/UUID and dispatches to the appropriate
+reader. Root orchestration registers a successfully mounted mapping as
+`cryptroot`.
 
 ## 4. Invariants & safety properties
 

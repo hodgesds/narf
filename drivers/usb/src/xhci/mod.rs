@@ -2815,7 +2815,7 @@ impl Xhci {
         w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
-        if out.len() != w_value.into() && out.is_empty() {
+        if out.len() != usize::from(w_value) && out.is_empty() {
             // Allow the caller to ask for any byte-count that fits
             // a u16; w_length is just the SETUP-packet field.
         }
