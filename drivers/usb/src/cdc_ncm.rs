@@ -984,6 +984,7 @@ pub fn find_ncm_bulk_endpoints(
                     ep_addr,
                     max_packet,
                     kind,
+                    interval: 0,
                 };
                 if is_in {
                     bulk_in = Some(cfg_ep);

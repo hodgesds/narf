@@ -590,17 +590,37 @@ impl EndpointKind {
             EndpointKind::BulkIn | EndpointKind::InterruptIn | EndpointKind::IsochIn
         )
     }
+
+    fn is_periodic(self) -> bool {
+        matches!(
+            self,
+            EndpointKind::InterruptIn
+                | EndpointKind::InterruptOut
+                | EndpointKind::IsochIn
+                | EndpointKind::IsochOut
+        )
+    }
+
+    fn is_isochronous(self) -> bool {
+        matches!(self, EndpointKind::IsochIn | EndpointKind::IsochOut)
+    }
 }
 
 /// Caller-supplied endpoint description for `configure_endpoints`.
 /// `ep_addr` matches the `bEndpointAddress` byte from the USB
 /// endpoint descriptor (low 4 bits = endpoint number, bit 7 = IN
-/// direction). `max_packet` matches `wMaxPacketSize`.
+/// direction). `max_packet` retains the raw USB `wMaxPacketSize`
+/// value so high-speed periodic endpoints keep bits 12:11 (the
+/// additional transactions per microframe). `interval` is the raw
+/// USB `bInterval`; [`Xhci::configure_endpoints`] translates it to
+/// the xHCI Endpoint Context encoding using the addressed slot's
+/// negotiated speed.
 #[derive(Copy, Clone, Debug)]
 pub struct EndpointConfig {
     pub ep_addr: u8,
     pub max_packet: u16,
     pub kind: EndpointKind,
+    pub interval: u8,
 }
 
 impl EndpointConfig {
@@ -610,6 +630,87 @@ impl EndpointConfig {
         let in_bit = if self.kind.is_in() { 1 } else { 0 };
         (num * 2) + in_bit
     }
+}
+
+/// Values written to the scheduling-related Endpoint Context fields.
+/// Kept as a small pure translation so descriptor edge cases can be
+/// regression-tested without a live controller.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndpointContextParams {
+    pub max_packet: u16,
+    pub max_burst: u8,
+    pub interval: u8,
+    pub max_esit_payload: u32,
+    pub error_count: u8,
+}
+
+/// Translate USB 2.0 endpoint-descriptor scheduling fields to xHCI
+/// Endpoint Context fields (xHCI 1.2 §6.2.3.4–6.2.3.8).
+///
+/// SuperSpeed companion descriptors carry additional burst/mult data
+/// and are deliberately outside this USB-2 target path; callers for a
+/// SuperSpeed periodic endpoint must grow `EndpointConfig` first.
+pub(crate) fn endpoint_context_params(
+    speed: PortSpeed,
+    ep: EndpointConfig,
+) -> Option<EndpointContextParams> {
+    let max_packet = ep.max_packet & 0x07ff;
+    if max_packet == 0 {
+        return None;
+    }
+
+    let periodic = ep.kind.is_periodic();
+    let max_burst = if speed == PortSpeed::High && periodic {
+        ((ep.max_packet >> 11) & 0x03) as u8
+    } else {
+        0
+    };
+    // USB 2.0 reserves the 0b11 additional-transaction encoding.
+    if max_burst == 3 {
+        return None;
+    }
+
+    let interval = if periodic {
+        match speed {
+            PortSpeed::High | PortSpeed::Super | PortSpeed::SuperPlus => {
+                if !(1..=16).contains(&ep.interval) {
+                    return None;
+                }
+                ep.interval - 1
+            }
+            PortSpeed::Full if ep.kind.is_isochronous() => {
+                if !(1..=16).contains(&ep.interval) {
+                    return None;
+                }
+                ep.interval + 2
+            }
+            PortSpeed::Full | PortSpeed::Low => {
+                if ep.interval == 0 {
+                    return None;
+                }
+                // FS/LS interrupt bInterval is in milliseconds. Convert
+                // bInterval*8 microframes to the nearest lower power of two.
+                let microframes = u32::from(ep.interval) * 8;
+                (31 - microframes.leading_zeros()) as u8
+            }
+        }
+    } else {
+        0
+    };
+
+    let max_esit_payload = if periodic {
+        u32::from(max_packet) * (u32::from(max_burst) + 1)
+    } else {
+        0
+    };
+    Some(EndpointContextParams {
+        max_packet,
+        max_burst,
+        interval,
+        max_esit_payload,
+        // xHCI requires CErr=0 for isoch and recommends 3 otherwise.
+        error_count: if ep.kind.is_isochronous() { 0 } else { 3 },
+    })
 }
 
 impl core::fmt::Debug for Xhci {
@@ -3132,6 +3233,15 @@ impl Xhci {
             return Ok(());
         }
 
+        let speed = {
+            let devices = self.devices.lock();
+            devices
+                .get(slot_id as usize)
+                .and_then(|device| device.as_ref())
+                .map(|device| device.speed)
+                .ok_or(XhciError::CmdFailed(0xFD))?
+        };
+
         // Allocate Input Context (4 KiB, zeroed). Layout matches
         // address_device — Input Control at 0, Slot Ctx at one
         // stride, per-EP Ctx at `stride * (1 + dci - 1)` =
@@ -3165,6 +3275,7 @@ impl Xhci {
             if !(2..=31).contains(&dci) {
                 return Err(XhciError::CmdFailed(0xFB));
             }
+            let params = endpoint_context_params(speed, ep).ok_or(XhciError::CmdFailed(0xFB))?;
             max_dci = max_dci.max(dci as u32);
             add_mask |= 1 << dci;
 
@@ -3213,20 +3324,32 @@ impl Xhci {
             // = 32 (CSZ=0) or 64 (CSZ=1).
             let cs = self.context_stride();
             let ep_ctx = input_phys + cs * (1 + dci as u64);
-            let ep_d1 = (3 << 1)                                    // Error Count = 3
-                      | (ep.kind.ep_type() << 3)                    // EP Type
-                      | ((ep.max_packet as u32) << 16); // MaxPacketSize
+            let ep_d0 =
+                ((params.interval as u32) << 16) | (((params.max_esit_payload >> 16) & 0xff) << 24);
+            let ep_d1 = ((params.error_count as u32) << 1)
+                | (ep.kind.ep_type() << 3)
+                | ((params.max_burst as u32) << 8)
+                | ((params.max_packet as u32) << 16);
             let trdp_lo = (tr_phys as u32) | 1; // DCS=1
             let trdp_hi = (tr_phys >> 32) as u32;
             // Average TRB length — spec recommends `max_packet / 2`
             // for bulk; 8 for control. We use 8 as a safe default
             // for everything except isoch.
             let avg_trb = match ep.kind {
-                EndpointKind::IsochIn | EndpointKind::IsochOut => ep.max_packet as u32,
+                EndpointKind::IsochIn | EndpointKind::IsochOut => params.max_esit_payload,
+                EndpointKind::InterruptIn | EndpointKind::InterruptOut => {
+                    u32::from(params.max_packet)
+                }
                 _ => 8u32,
             };
+            let ep_d4 =
+                avg_trb.min(u32::from(u16::MAX)) | ((params.max_esit_payload & 0xffff) << 16);
             // SAFETY: identity-mapped DMA; offset in-page.
             unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ep_ctx).kernel_mut_ptr::<u32>(),
+                    ep_d0,
+                );
                 core::ptr::write_volatile(
                     narf_memory::PhysAddr::new(ep_ctx + 4).kernel_mut_ptr::<u32>(),
                     ep_d1,
@@ -3241,12 +3364,12 @@ impl Xhci {
                 );
                 core::ptr::write_volatile(
                     narf_memory::PhysAddr::new(ep_ctx + 16).kernel_mut_ptr::<u32>(),
-                    avg_trb,
+                    ep_d4,
                 );
             }
             new_eps.push(EndpointState {
                 dci,
-                max_packet: ep.max_packet,
+                max_packet: params.max_packet,
                 kind: ep.kind,
                 tr,
                 dma_buf,

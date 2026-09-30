@@ -171,6 +171,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::InterruptIn,
+                            interval: cfg[i + 6],
                         });
                     }
                     // Bulk-IN — ACL data.
@@ -179,6 +180,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkIn,
+                            interval: 0,
                         });
                     }
                     // Bulk-OUT — ACL data.
@@ -187,6 +189,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkOut,
+                            interval: 0,
                         });
                     }
                     _ => {}

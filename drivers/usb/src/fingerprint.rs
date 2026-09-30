@@ -180,6 +180,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkIn,
+                            interval: 0,
                         });
                     }
                     (2, false) if bulk_out.is_none() => {
@@ -187,6 +188,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkOut,
+                            interval: 0,
                         });
                     }
                     (3, true) if intr_in.is_none() => {
@@ -194,6 +196,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::InterruptIn,
+                            interval: cfg[i + 6],
                         });
                     }
                     _ => {}

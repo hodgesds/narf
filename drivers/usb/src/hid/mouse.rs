@@ -137,6 +137,7 @@ pub fn find_boot_mouse(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
                         ep_addr,
                         max_packet: mps,
                         kind: EndpointKind::InterruptIn,
+                        interval: cfg[i + 6],
                     });
                 }
             }

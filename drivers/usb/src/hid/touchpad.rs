@@ -151,6 +151,7 @@ pub fn find_hid_interface(cfg: &[u8]) -> Option<(u8, usize, EndpointConfig)> {
                                 ep_addr,
                                 max_packet: mps,
                                 kind: EndpointKind::InterruptIn,
+                                interval: cfg[i + 6],
                             },
                         ));
                     }

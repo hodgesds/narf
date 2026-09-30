@@ -755,7 +755,12 @@ pub fn find_ccid_endpoints(cfg: &[u8], iface_offset: usize) -> Result<CcidEndpoi
                     } else {
                         EndpointKind::BulkOut
                     };
-                    let ec = EndpointConfig { ep_addr, max_packet, kind };
+                    let ec = EndpointConfig {
+                        ep_addr,
+                        max_packet,
+                        kind,
+                        interval: 0,
+                    };
                     if dir_in && bulk_in.is_none() {
                         bulk_in = Some(ec);
                     } else if !dir_in && bulk_out.is_none() {
@@ -768,6 +773,7 @@ pub fn find_ccid_endpoints(cfg: &[u8], iface_offset: usize) -> Result<CcidEndpoi
                             ep_addr,
                             max_packet,
                             kind: EndpointKind::InterruptIn,
+                            interval: cfg[i + 6],
                         });
                     }
                 }

@@ -198,6 +198,7 @@ pub fn find_bot_endpoints(cfg: &[u8]) -> Result<(EndpointConfig, EndpointConfig)
                         ep_addr,
                         max_packet: mps,
                         kind,
+                        interval: 0,
                     };
                     if is_in {
                         bulk_in = Some(cfg_ep);

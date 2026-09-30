@@ -121,6 +121,17 @@ All driver code is derived strictly from the references below.
 - `Xhci::address_device_with(..., Topology)` retains the topology for later
   Evaluate Context operations; marking a downstream device as a hub must not
   erase its route string or parent-TT fields.
+- `EndpointConfig` retains raw USB `wMaxPacketSize` and `bInterval` values.
+  `Xhci::configure_endpoints` translates USB 2.0 periodic endpoints into xHCI
+  Max Packet, Max Burst, Interval, CErr, and Max ESIT Payload fields using the
+  addressed slot's negotiated speed.
+- `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
+  endpoint with its owning interface and alternate setting.
+  `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
+  alternate that satisfies the PROBE-accepted payload, and
+  `negotiate_and_activate_video_stream(xhci, device_index, desired)` runs the
+  26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
+  the accepted endpoint, and issues `SET_INTERFACE`.
 
 ## Scope
 
@@ -131,7 +142,7 @@ All driver code is derived strictly from the references below.
 | `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
 | `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
 | `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Standard Wireless Controller `e0/01/01` endpoint discovery and Stage-0 HCI transport | Firmware/vendor setup and live HCI Reset/Read Local Version on silicon |
-| `30c9:00cd` | Luxvisions integrated camera | Generic UVC VideoControl bind and descriptor parsing | Alternate-setting selection and end-to-end isochronous video capture |
+| `30c9:00cd` | Luxvisions integrated camera | Generic UVC VideoControl bind, PROBE/COMMIT negotiation, streaming-alternate selection, and USB 2.0 high-bandwidth xHCI endpoint programming | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
 the host controller and are not matched as downstream USB devices.
@@ -165,15 +176,19 @@ the host controller and are not matched as downstream USB devices.
   `FrameReassembler` turns FID toggles into "new frame started" /
   "end of frame" / "error" steps the host driver feeds into the
   buffer manager.
-- **UVC 1.5** (`uvc`): UVC descriptor parser. VC HEADER (bcdUVC,
+- **UVC 1.5** (`uvc`): UVC descriptor parser and USB 2.0 streaming-alternate
+  activation. VC HEADER (bcdUVC,
   clock frequency, controlled VS interfaces), INPUT_TERMINAL with
   the camera-specific extension (objective focal length range,
   controls bitmap), OUTPUT_TERMINAL, PROCESSING_UNIT, VS
   INPUT_HEADER (with the per-format control bitmap list), VS
   FORMAT_UNCOMPRESSED with 16-byte Format-GUIDs (YUY2, NV12), VS
   FRAME_UNCOMPRESSED with both discrete and continuous frame-
-  interval forms, VS FORMAT_MJPEG. Pure descriptor decode — pairs
-  with a future isochronous/bulk video data path.
+  interval forms, VS FORMAT_MJPEG. Bind retains each VideoStreaming alternate's
+  endpoint and bandwidth metadata; the negotiation path performs PROBE/COMMIT,
+  configures the smallest fitting isochronous alternate, and issues
+  SET_INTERFACE.
+  Continuous capture and bulk-streaming orchestration remain follow-ups.
 - **UAC1** (`uac`): USB Audio Class 1.0 descriptor parser. AC
   HEADER, INPUT_TERMINAL, OUTPUT_TERMINAL, FEATURE_UNIT (per-channel
   control bitmaps), AS_GENERAL, Type-I FORMAT_TYPE (discrete sample-

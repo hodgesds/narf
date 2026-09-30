@@ -368,6 +368,7 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<(u8, u8, EndpointConfig, Endpoi
                         } else {
                             EndpointKind::BulkOut
                         },
+                        interval: 0,
                     };
                     if ep_addr & 0x80 != 0 && bulk_in.is_none() {
                         bulk_in = Some(ep_cfg);

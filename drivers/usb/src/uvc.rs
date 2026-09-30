@@ -112,6 +112,20 @@ pub enum UvcError {
     NotVideo,
     /// SET_CONFIGURATION control transfer failed during bind.
     SetConfigFailed,
+    /// No isochronous IN alternate setting can carry the negotiated
+    /// UVC `dwMaxPayloadTransferSize`.
+    NoStreamingEndpoint,
+    /// xHCI rejected the selected VideoStreaming endpoint context.
+    ConfigureEndpointFailed,
+    /// SET_INTERFACE failed while switching from the zero-bandwidth
+    /// alternate setting to the selected streaming alternate.
+    SetInterfaceFailed,
+    /// The device already has a different streaming alternate active.
+    AlreadyStreaming,
+    /// SET_CUR/GET_CUR(PROBE) failed or returned a truncated payload.
+    ProbeFailed,
+    /// SET_CUR(COMMIT) failed for the device-accepted stream parameters.
+    CommitFailed,
 }
 
 fn check_cs(buf: &[u8], expect: u8) -> Result<(), UvcError> {
@@ -627,15 +641,50 @@ extern crate alloc;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// One bound UVC device — slot id + VideoControl interface number.
-#[derive(Copy, Clone, Debug)]
+/// Transport exposed by a VideoStreaming alternate setting.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UvcStreamingTransport {
+    Isochronous,
+    Bulk,
+}
+
+/// One IN endpoint advertised by a VideoStreaming interface alternate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UvcStreamingEndpoint {
+    pub interface_number: u8,
+    pub alternate_setting: u8,
+    pub endpoint_address: u8,
+    pub dci: u8,
+    pub transport: UvcStreamingTransport,
+    /// Raw USB Endpoint Descriptor `wMaxPacketSize`, including the
+    /// USB 2.0 high-bandwidth transaction bits in 12:11.
+    pub raw_max_packet: u16,
+    /// Bytes carried by one USB transaction (`wMaxPacketSize[10:0]`).
+    pub max_packet_size: u16,
+    /// Transactions available in one service interval. USB 2.0
+    /// high-bandwidth isoch endpoints advertise 1–3 here.
+    pub transactions_per_interval: u8,
+    /// Total bytes available in one service interval.
+    pub max_payload_size: u32,
+    /// Raw USB Endpoint Descriptor `bInterval`.
+    pub interval: u8,
+}
+
+/// One bound UVC device — control interface plus its streaming alternates.
+#[derive(Clone, Debug)]
 pub struct UvcDevice {
     pub slot_id: u8,
     /// `bInterfaceNumber` of the VideoControl interface.
     pub vc_iface: u8,
-    /// DCI of the iso-IN endpoint (video frames device→host).
-    /// 0 = no iso IN endpoint found (bulk-streaming variant of UVC).
-    pub iso_in_dci: u8,
+    /// Primary `bInterfaceNumber` of the VideoStreaming interface.
+    pub vs_iface: Option<u8>,
+    /// Every bulk/isochronous IN endpoint found on a VideoStreaming
+    /// alternate setting. Bind retains these until PROBE/COMMIT tells
+    /// the driver how much payload bandwidth to request.
+    pub streaming_endpoints: Vec<UvcStreamingEndpoint>,
+    /// Endpoint whose xHCI context has been configured and whose
+    /// alternate setting has been selected, if streaming is active.
+    pub active_stream: Option<UvcStreamingEndpoint>,
 }
 
 /// System-wide registry of bound UVC devices.
@@ -661,6 +710,28 @@ pub fn find_video_control_interface(cfg: &[u8]) -> Option<u8> {
     None
 }
 
+/// Find the first VideoStreaming interface in `cfg`. Alternate setting
+/// zero is sufficient: every alternate for one stream shares the same
+/// `bInterfaceNumber`.
+pub fn find_video_streaming_interface(cfg: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        if cfg[i + 1] == 0x04
+            && len >= 9
+            && cfg[i + 5] == USB_CLASS_VIDEO
+            && cfg[i + 6] == USB_VIDEO_SUBCLASS_VIDEOSTREAMING
+        {
+            return Some(cfg[i + 2]);
+        }
+        i += len;
+    }
+    None
+}
+
 /// Bind to an already-addressed UVC device. SET_CONFIGURATION,
 /// then record the slot/interface pair.
 pub async fn try_bind_video_already_addressed(
@@ -670,28 +741,31 @@ pub async fn try_bind_video_already_addressed(
 ) -> Result<usize, UvcError> {
     let vc_iface = find_video_control_interface(cfg).ok_or(UvcError::NotVideo)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
-    let mut nothing = [0u8; 0];
+    let nothing = [0u8; 0];
     if xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &nothing,
         )
         .await
         .is_err()
     {
         return Err(UvcError::SetConfigFailed);
     }
-    let iso_in_dci = find_video_streaming_iso_in_ep(cfg);
+    let streaming_endpoints = find_video_streaming_endpoints(cfg);
+    let vs_iface = find_video_streaming_interface(cfg);
     let mut g = UVC_DEVICES.lock();
     let idx = g.len();
     g.push(UvcDevice {
         slot_id,
         vc_iface,
-        iso_in_dci,
+        vs_iface,
+        streaming_endpoints,
+        active_stream: None,
     });
     Ok(idx)
 }
@@ -701,8 +775,9 @@ pub async fn try_bind_video_already_addressed(
 /// "already addressed" = slot is assigned, SET_CONFIGURATION not yet
 /// issued. Returns the device index into [`UVC_DEVICES`].
 ///
-/// Stage-1 milestone: bind + descriptor parse succeeds, iso streaming
-/// not yet opened (requires SET_INTERFACE on the alt-setting).
+/// Bind records all streaming alternates without opening one; call
+/// [`activate_video_stream`] after UVC PROBE/COMMIT returns the accepted
+/// maximum payload size.
 pub async fn try_bind_uvc_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
@@ -711,12 +786,12 @@ pub async fn try_bind_uvc_already_addressed(
     try_bind_video_already_addressed(xhci_dev, slot_id, cfg).await
 }
 
-/// Scan the config blob for the first VideoStreaming interface's
-/// iso-IN endpoint. Returns 0 if not present (UVC bulk-streaming
-/// variant — used by some virtualised cameras).
-pub fn find_video_streaming_iso_in_ep(cfg: &[u8]) -> u8 {
+/// Retain every bulk/isochronous IN endpoint together with the
+/// VideoStreaming interface alternate that owns it.
+pub fn find_video_streaming_endpoints(cfg: &[u8]) -> Vec<UvcStreamingEndpoint> {
+    let mut endpoints = Vec::new();
     let mut i = 0;
-    let mut in_vs_iface = false;
+    let mut vs_iface = None;
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
         if len < 2 || i + len > cfg.len() {
@@ -726,18 +801,235 @@ pub fn find_video_streaming_iso_in_ep(cfg: &[u8]) -> u8 {
         if desc_type == 0x04 && len >= 9 {
             let cls = cfg[i + 5];
             let sub = cfg[i + 6];
-            in_vs_iface = cls == USB_CLASS_VIDEO && sub == USB_VIDEO_SUBCLASS_VIDEOSTREAMING;
-        } else if desc_type == 0x05 && in_vs_iface && len >= 7 {
+            vs_iface = (cls == USB_CLASS_VIDEO && sub == USB_VIDEO_SUBCLASS_VIDEOSTREAMING)
+                .then_some((cfg[i + 2], cfg[i + 3]));
+        } else if desc_type == 0x05 && len >= 7 {
+            let Some((interface_number, alternate_setting)) = vs_iface else {
+                i += len;
+                continue;
+            };
             let ep_addr = cfg[i + 2];
             let attrs = cfg[i + 3];
-            if attrs & 0x03 == 1 && ep_addr & 0x80 != 0 {
-                let ep_num = ep_addr & 0x0F;
-                return (ep_num * 2) + 1; // IN endpoint DCI
+            let transfer_type = attrs & 0x03;
+            let transport = match transfer_type {
+                1 => UvcStreamingTransport::Isochronous,
+                2 => UvcStreamingTransport::Bulk,
+                _ => {
+                    i += len;
+                    continue;
+                }
+            };
+            let ep_num = ep_addr & 0x0f;
+            if ep_addr & 0x80 != 0 && ep_num != 0 {
+                let raw_max_packet = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
+                let max_packet_size = raw_max_packet & 0x07ff;
+                let transactions_per_interval = if transport == UvcStreamingTransport::Isochronous {
+                    (((raw_max_packet >> 11) & 0x03) + 1) as u8
+                } else {
+                    1
+                };
+                // 0b11 in wMaxPacketSize[12:11] is reserved by USB 2.0.
+                if max_packet_size != 0 && transactions_per_interval <= 3 {
+                    endpoints.push(UvcStreamingEndpoint {
+                        interface_number,
+                        alternate_setting,
+                        endpoint_address: ep_addr,
+                        dci: (ep_num * 2) + 1,
+                        transport,
+                        raw_max_packet,
+                        max_packet_size,
+                        transactions_per_interval,
+                        max_payload_size: u32::from(max_packet_size)
+                            * u32::from(transactions_per_interval),
+                        interval: cfg[i + 6],
+                    });
+                }
             }
         }
         i += len;
     }
-    0
+    endpoints
+}
+
+/// Scan the config blob for the first VideoStreaming isoch-IN DCI.
+/// Compatibility helper for descriptor-only callers; activation must
+/// use [`activate_video_stream`] so the owning alternate is selected.
+pub fn find_video_streaming_iso_in_ep(cfg: &[u8]) -> u8 {
+    find_video_streaming_endpoints(cfg)
+        .into_iter()
+        .find(|endpoint| endpoint.transport == UvcStreamingTransport::Isochronous)
+        .map_or(0, |endpoint| endpoint.dci)
+}
+
+/// Choose the least-bandwidth isoch alternate that can carry the
+/// device-accepted `dwMaxPayloadTransferSize` from UVC PROBE.
+pub fn select_video_streaming_iso_endpoint(
+    endpoints: &[UvcStreamingEndpoint],
+    required_payload: u32,
+) -> Option<UvcStreamingEndpoint> {
+    select_video_streaming_iso_endpoint_for_interface(endpoints, None, required_payload)
+}
+
+fn select_video_streaming_iso_endpoint_for_interface(
+    endpoints: &[UvcStreamingEndpoint],
+    interface_number: Option<u8>,
+    required_payload: u32,
+) -> Option<UvcStreamingEndpoint> {
+    endpoints
+        .iter()
+        .copied()
+        .filter(|endpoint| endpoint.transport == UvcStreamingTransport::Isochronous)
+        .filter(|endpoint| {
+            interface_number.is_none_or(|number| endpoint.interface_number == number)
+        })
+        .filter(|endpoint| endpoint.max_payload_size >= required_payload)
+        .min_by_key(|endpoint| {
+            (
+                endpoint.max_payload_size,
+                endpoint.alternate_setting,
+                endpoint.endpoint_address,
+            )
+        })
+}
+
+/// Configure and select the isochronous VideoStreaming alternate chosen
+/// for the payload size accepted by UVC PROBE/COMMIT.
+pub async fn activate_video_stream(
+    xhci_dev: &crate::xhci::Xhci,
+    idx: usize,
+    required_payload: u32,
+) -> Result<UvcStreamingEndpoint, UvcError> {
+    let (slot_id, endpoint) = {
+        let devices = UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
+        let vs_iface = device.vs_iface.ok_or(UvcError::NoStreamingEndpoint)?;
+        if let Some(active) = device.active_stream {
+            let selected = select_video_streaming_iso_endpoint_for_interface(
+                &device.streaming_endpoints,
+                Some(vs_iface),
+                required_payload,
+            )
+            .ok_or(UvcError::NoStreamingEndpoint)?;
+            if active == selected {
+                return Ok(active);
+            }
+            return Err(UvcError::AlreadyStreaming);
+        }
+        let selected = select_video_streaming_iso_endpoint_for_interface(
+            &device.streaming_endpoints,
+            Some(vs_iface),
+            required_payload,
+        )
+        .ok_or(UvcError::NoStreamingEndpoint)?;
+        (device.slot_id, selected)
+    };
+
+    let endpoint_config = crate::xhci::EndpointConfig {
+        ep_addr: endpoint.endpoint_address,
+        max_packet: endpoint.raw_max_packet,
+        kind: crate::xhci::EndpointKind::IsochIn,
+        interval: endpoint.interval,
+    };
+    xhci_dev
+        .configure_endpoints(slot_id, &[endpoint_config])
+        .await
+        .map_err(|_| UvcError::ConfigureEndpointFailed)?;
+    xhci_dev
+        .control_out(
+            slot_id,
+            crate::control::RT_DIR_OUT
+                | crate::control::RT_TYPE_STANDARD
+                | crate::control::RT_RECIP_INTERFACE,
+            crate::control::REQ_SET_INTERFACE,
+            u16::from(endpoint.alternate_setting),
+            u16::from(endpoint.interface_number),
+            &[],
+        )
+        .await
+        .map_err(|_| UvcError::SetInterfaceFailed)?;
+
+    let mut devices = UVC_DEVICES.lock();
+    let device = devices.get_mut(idx).ok_or(UvcError::NotVideo)?;
+    device.active_stream = Some(endpoint);
+    Ok(endpoint)
+}
+
+/// Result of a complete UVC streaming negotiation and alternate activation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UvcNegotiatedStream {
+    pub control: VsProbeCommit,
+    pub endpoint: UvcStreamingEndpoint,
+}
+
+/// Run the UVC 1.0/1.1 26-byte negotiation sequence, then configure and
+/// select the least-bandwidth isochronous alternate that satisfies the
+/// device-accepted maximum payload size.
+pub async fn negotiate_and_activate_video_stream(
+    xhci_dev: &crate::xhci::Xhci,
+    idx: usize,
+    desired: VsProbeCommit,
+) -> Result<UvcNegotiatedStream, UvcError> {
+    let (slot_id, vs_iface) = {
+        let devices = UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
+        (
+            device.slot_id,
+            device.vs_iface.ok_or(UvcError::NoStreamingEndpoint)?,
+        )
+    };
+    let request_type_out = crate::control::RT_DIR_OUT
+        | crate::control::RT_TYPE_CLASS
+        | crate::control::RT_RECIP_INTERFACE;
+    let request_type_in = crate::control::RT_DIR_IN
+        | crate::control::RT_TYPE_CLASS
+        | crate::control::RT_RECIP_INTERFACE;
+    let desired_bytes = desired.encode();
+    xhci_dev
+        .control_out(
+            slot_id,
+            request_type_out,
+            VS_REQ_SET_CUR,
+            VS_PROBE_CONTROL,
+            u16::from(vs_iface),
+            &desired_bytes,
+        )
+        .await
+        .map_err(|_| UvcError::ProbeFailed)?;
+
+    let mut accepted_bytes = [0u8; VsProbeCommit::LEN_V10];
+    let accepted_len = xhci_dev
+        .control_in(
+            slot_id,
+            request_type_in,
+            VS_REQ_GET_CUR,
+            VS_PROBE_CONTROL,
+            u16::from(vs_iface),
+            &mut accepted_bytes,
+        )
+        .await
+        .map_err(|_| UvcError::ProbeFailed)?;
+    if accepted_len < VsProbeCommit::LEN_V10 {
+        return Err(UvcError::ProbeFailed);
+    }
+    let accepted = VsProbeCommit::decode(&accepted_bytes).map_err(|_| UvcError::ProbeFailed)?;
+    let accepted_encoded = accepted.encode();
+    xhci_dev
+        .control_out(
+            slot_id,
+            request_type_out,
+            VS_REQ_SET_CUR,
+            VS_COMMIT_CONTROL,
+            u16::from(vs_iface),
+            &accepted_encoded,
+        )
+        .await
+        .map_err(|_| UvcError::CommitFailed)?;
+
+    let endpoint = activate_video_stream(xhci_dev, idx, accepted.max_payload_transfer_size).await?;
+    Ok(UvcNegotiatedStream {
+        control: accepted,
+        endpoint,
+    })
 }
 
 /// Pull one iso-IN packet (video frame fragment) from the bound
@@ -747,10 +1039,8 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError>
     let (slot_id, dci) = {
         let g = UVC_DEVICES.lock();
         let dev = g.get(idx).ok_or(UvcError::NotVideo)?;
-        if dev.iso_in_dci == 0 {
-            return Err(UvcError::NotVideo);
-        }
-        (dev.slot_id, dev.iso_in_dci)
+        let endpoint = dev.active_stream.ok_or(UvcError::NoStreamingEndpoint)?;
+        (dev.slot_id, endpoint.dci)
     };
     // Sync entry-point on the UVC capture path; bridge to async
     // isoch_in via block_on. Called from non-executor contexts.

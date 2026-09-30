@@ -2523,6 +2523,159 @@ kernel_test_in!(
     smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface
 );
 
+fn smoke_usb_uvc_retains_streaming_alternates_and_selects_bandwidth() -> TestResult {
+    use crate::uvc::{
+        find_video_streaming_endpoints, select_video_streaming_iso_endpoint, UvcStreamingTransport,
+        USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+    };
+
+    let mut cfg = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 2, 1, 0, 0x80, 50]);
+    // VideoControl plus an interrupt endpoint: it must not be mistaken for video data.
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 1, USB_CLASS_VIDEO, 0x01, 0, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x84, 0x03, 0x10, 0x00, 8]);
+    // VideoStreaming alt 0 is the zero-bandwidth idle setting.
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        0,
+        0,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    // Alt 1: one 1024-byte transaction per microframe.
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        1,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x04, 1]);
+    // Alt 2: two 1024-byte transactions (wMaxPacketSize[12:11] = 1).
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        2,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x0c, 1]);
+    // Alt 3: three 1024-byte transactions (wMaxPacketSize[12:11] = 2).
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        3,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x14, 1]);
+    let total = cfg.len() as u16;
+    cfg[2..4].copy_from_slice(&total.to_le_bytes());
+
+    let endpoints = find_video_streaming_endpoints(&cfg);
+    if endpoints.len() != 3 {
+        return TestResult::Fail("UVC streaming alternate count wrong");
+    }
+    let high = endpoints[2];
+    if high.interface_number != 2
+        || high.alternate_setting != 3
+        || high.endpoint_address != 0x81
+        || high.dci != 3
+        || high.transport != UvcStreamingTransport::Isochronous
+        || high.max_packet_size != 1024
+        || high.transactions_per_interval != 3
+        || high.max_payload_size != 3072
+        || high.interval != 1
+    {
+        return TestResult::Fail("UVC high-bandwidth endpoint metadata wrong");
+    }
+    if select_video_streaming_iso_endpoint(&endpoints, 1500)
+        .map(|endpoint| endpoint.alternate_setting)
+        != Some(2)
+    {
+        return TestResult::Fail("UVC selector did not choose smallest fitting alternate");
+    }
+    if select_video_streaming_iso_endpoint(&endpoints, 2500)
+        .map(|endpoint| endpoint.alternate_setting)
+        != Some(3)
+    {
+        return TestResult::Fail("UVC selector did not choose high-bandwidth alternate");
+    }
+    if select_video_streaming_iso_endpoint(&endpoints, 3073).is_some() {
+        return TestResult::Fail("UVC selector accepted an undersized alternate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_retains_streaming_alternates_and_selects_bandwidth
+);
+
+fn smoke_xhci_translates_usb2_periodic_endpoint_schedule() -> TestResult {
+    use crate::xhci::{endpoint_context_params, EndpointConfig, EndpointKind, PortSpeed};
+
+    let high_bandwidth = EndpointConfig {
+        ep_addr: 0x81,
+        max_packet: 0x1400,
+        kind: EndpointKind::IsochIn,
+        interval: 1,
+    };
+    let Some(params) = endpoint_context_params(PortSpeed::High, high_bandwidth) else {
+        return TestResult::Fail("valid HS isoch endpoint was rejected");
+    };
+    if params.max_packet != 1024
+        || params.max_burst != 2
+        || params.interval != 0
+        || params.max_esit_payload != 3072
+        || params.error_count != 0
+    {
+        return TestResult::Fail("HS isoch endpoint context translation wrong");
+    }
+
+    let full_speed_interrupt = EndpointConfig {
+        ep_addr: 0x82,
+        max_packet: 8,
+        kind: EndpointKind::InterruptIn,
+        interval: 10,
+    };
+    let Some(params) = endpoint_context_params(PortSpeed::Full, full_speed_interrupt) else {
+        return TestResult::Fail("valid FS interrupt endpoint was rejected");
+    };
+    // 10 ms = 80 microframes; xHCI requires rounding down to 64 = 2^6.
+    if params.interval != 6 || params.max_burst != 0 || params.max_esit_payload != 8 {
+        return TestResult::Fail("FS interrupt interval translation wrong");
+    }
+
+    let reserved_burst = EndpointConfig {
+        max_packet: 0x1c00,
+        ..high_bandwidth
+    };
+    if endpoint_context_params(PortSpeed::High, reserved_burst).is_some() {
+        return TestResult::Fail("reserved USB2 high-bandwidth encoding accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_translates_usb2_periodic_endpoint_schedule
+);
+
 // ── Bring-up replication: input chain failure modes ───────────────
 //
 // These tests reproduce the failure modes we've hit on real
