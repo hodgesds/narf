@@ -3651,6 +3651,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // systemd-vconsole-setup: /dev/vcs1, KDGKBMODE, loadkeys' ioctls.
         ("vconsole_smoke", "vconsole-ok"),
         ("vconsole_glibc", "vconsole-ok"),
+        // tmpfiles' ACLs via /proc/self/fd/N, inheritance, chmod mask sync.
+        ("acl_smoke", "acl-ok"),
+        ("acl_glibc", "acl-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),

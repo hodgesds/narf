@@ -37,6 +37,7 @@ use super::metadata_csum;
 use super::superblock::{ExtFlavour, Superblock};
 
 mod extent_write;
+pub(crate) mod xattr;
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
 /// once at `mount()` via `narf_io::register_with_cap` and is the
@@ -1606,10 +1607,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
     /// Free inode `inode_no` (1-based).
     pub async fn free_inode(&self, inode_no: u32) -> Result<(), FsError> {
-        let _allocation = self.allocation_lock.lock().await;
         if inode_no == 0 {
             return Ok(());
         }
+        // `ext4_evict_inode` -> `ext4_xattr_delete_inode`: the attribute
+        // block goes with the inode (freed, or unshared by one reference).
+        // Before the allocation lock — releasing frees a block, which takes
+        // it too.
+        self.xattr_release_on_free(inode_no).await?;
+        let _allocation = self.allocation_lock.lock().await;
         let (group, index) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;

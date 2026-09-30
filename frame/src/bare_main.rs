@@ -5618,6 +5618,10 @@ fn boot_userspace_init() {
                     "vconsole_glibc",
                     narf_verification::NARF_VCONSOLE_SMOKE_GLIBC_ELF,
                 ),
+                // tmpfiles' ACL path (/proc/self/fd/N xattrs), default-ACL
+                // inheritance and chmod mask sync.
+                ("acl_smoke", narf_verification::NARF_ACL_SMOKE_ELF),
+                ("acl_glibc", narf_verification::NARF_ACL_SMOKE_GLIBC_ELF),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,
