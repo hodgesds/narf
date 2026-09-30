@@ -14,6 +14,7 @@ use narf_capabilities::{Cap, CapError, CapOp, Read};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FirmwareError {
     Unsupported,
+    VbiosUnavailable,
     Registry(narf_firmware::FirmwareError),
     Image(firmware::Error),
 }
@@ -61,6 +62,16 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyFirmware {
     }
 }
 impl Firmware {
+    /// Prepare against the immutable platform image captured for this GPU.
+    /// No ROM access or GPU writes are performed by preparation.
+    pub fn prepare_from_gpu<'a>(
+        &'a self,
+        gpu: &'a AmdGpu,
+    ) -> Result<firmware::Prepared<'a>, FirmwareError> {
+        dcn314_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let vbios = gpu.vbios.as_ref().ok_or(FirmwareError::VbiosUnavailable)?;
+        self.prepare(vbios.bytes())
+    }
     /// Choose firmware from exact IP discovery, independently of the coarse
     /// PCI family table. DCN 3.5 requires a different hardware boot sequence.
     pub fn open(
@@ -491,6 +502,7 @@ mod tests {
             mode: None,
             fw_loaded: false,
             ip_blocks: alloc::vec![],
+            vbios: None,
         };
         let (write, read) = narf_firmware::bootstrap_authority();
         write.revoke();
@@ -522,6 +534,26 @@ mod tests {
             return TestResult::Fail("ambiguous DCN discovery accepted");
         }
         gpu.ip_blocks.pop();
+        let firmware = Firmware {
+            bytes: crate::amdgpu_dmub_firmware::tests::combined(256, 4),
+        };
+        if !matches!(
+            firmware.prepare_from_gpu(&gpu),
+            Err(FirmwareError::VbiosUnavailable)
+        ) {
+            return TestResult::Fail("missing platform VBIOS ignored");
+        }
+        gpu.vbios = Some(crate::amdgpu_vbios::tests::fixture());
+        let prepared = match firmware.prepare_from_gpu(&gpu) {
+            Ok(prepared) => prepared,
+            Err(_) => return TestResult::Fail("validated platform VBIOS not usable by DMUB"),
+        };
+        let mut staged = alloc::vec![0; prepared.layout().size() as usize];
+        let offset = prepared.layout().region(firmware::Window::Vbios).offset as usize;
+        let bios = gpu.vbios.as_ref().unwrap().bytes();
+        if prepared.stage(&mut staged).is_err() || &staged[offset..offset + bios.len()] != bios {
+            return TestResult::Fail("platform VBIOS not copied to DMUB image");
+        }
         gpu.ip_blocks[0].minor = 5;
         gpu.ip_blocks[0].revision = 0;
         if !matches!(Firmware::open(&gpu, &read), Err(FirmwareError::Unsupported)) {

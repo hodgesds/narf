@@ -238,12 +238,14 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     use crate::amdgpu_atombios::{AtomError, Atombios};
     let mut img = alloc::vec![0u8; 0x200];
     // PCI ROM signature.
-    img[0] = 0xAA;
-    img[1] = 0x55;
-    // "ATOM" marker at offset 4.
-    img[4..8].copy_from_slice(b"ATOM");
+    img[0] = 0x55;
+    img[1] = 0xAA;
+    // Common ROM header at 0x80, signature at header +4.
+    img[0x48..0x4a].copy_from_slice(&0x80u16.to_le_bytes());
+    img[0x80..0x84].copy_from_slice(&[36, 0, 1, 1]);
+    img[0x84..0x88].copy_from_slice(b"ATOM");
     // Master data table at offset 0x100.
-    img[0x4C..0x50].copy_from_slice(&0x100u32.to_le_bytes());
+    img[0xa0..0xa2].copy_from_slice(&0x100u16.to_le_bytes());
     // ATOM_COMMON_TABLE_HEADER: usStructureSize covers header (4) +
     // 3 × u16 entries = 10 bytes.
     img[0x100..0x102].copy_from_slice(&10u16.to_le_bytes());
@@ -292,14 +294,14 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     }
     // Bad ATOM marker.
     let mut bad = img.clone();
-    bad[4] = b'X';
+    bad[0x84] = b'X';
     if !matches!(Atombios::parse(&bad), Err(AtomError::NotAtombios)) {
         return TestResult::Fail("missing ATOM marker should reject");
     }
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/gpu",
+    "drivers/gpu/atombios",
     smoke_amdgpu_atombios_table_directory_round_trip
 );
 
@@ -1122,12 +1124,14 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     // own subtable list.
     use crate::amdgpu_atombios::{AtomError, Atombios};
     let mut img = alloc::vec![0u8; 0x300];
-    img[0] = 0xAA;
-    img[1] = 0x55;
-    img[4..8].copy_from_slice(b"ATOM");
+    img[0] = 0x55;
+    img[1] = 0xAA;
+    img[0x48..0x4a].copy_from_slice(&0x80u16.to_le_bytes());
+    img[0x80..0x84].copy_from_slice(&[36, 0, 1, 1]);
+    img[0x84..0x88].copy_from_slice(b"ATOM");
     // Data master @ 0x100, command master @ 0x200.
-    img[0x4C..0x50].copy_from_slice(&0x100u32.to_le_bytes());
-    img[0x48..0x4C].copy_from_slice(&0x200u32.to_le_bytes());
+    img[0xa0..0xa2].copy_from_slice(&0x100u16.to_le_bytes());
+    img[0x9e..0xa0].copy_from_slice(&0x200u16.to_le_bytes());
     // Data master: 1 entry → 0x150.
     img[0x100..0x102].copy_from_slice(&6u16.to_le_bytes());
     img[0x104..0x106].copy_from_slice(&0x150u16.to_le_bytes());
@@ -1167,7 +1171,10 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_amdgpu_atombios_command_table_directory);
+kernel_test_in!(
+    "drivers/gpu/atombios",
+    smoke_amdgpu_atombios_command_table_directory
+);
 
 fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
     use crate::amdgpu_rlc::{autoload_iter, looks_like_rlc, parse};

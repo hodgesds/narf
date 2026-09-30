@@ -44,6 +44,37 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### AMD platform VBIOS
+
+`atombios::header::parse_rom_header` and `amdgpu_atombios::Atombios::parse`
+share the actual PCI/ATOM layout: 55 AA ROM signature, a u16 header pointer at
+0x48, common header followed by ATOM/MOTA at +4, and u16 command/data directory
+pointers at +0x1e/+0x20. The declared header and directory sizes must fit the
+image; directories contain whole u16 entries. Data tables require at least a
+four-byte common header, command tables at least six bytes. Optional zero
+directory entries denote absent tables. Parsing does not execute BIOS code.
+
+`amdgpu_vbios::Vbios::from_vfct(table, device)` validates the ACPI checksum,
+declared table/image bounds and ATOM directories, then copies exactly one
+matching image into immutable storage. Tables are capped at 2 MiB and VBIOS
+images at 256 KiB. The match requires segment zero, exact bus/device/function
+and vendor/device IDs; specified subsystem IDs must also match. VFCT has no
+segment field. Nonzero segments, bus-renumbering guesses and ambiguous matches
+are rejected. The Lib1 offset bounds the VBIOS sequence when present.
+`bytes()`, `source()` and `version()` expose data already read. These checks
+validate structure and identity, not cryptographic authenticity.
+
+GPU probe retains this snapshot in `AmdGpu::vbios`. If VFCT has no image,
+Renoir/Phoenix APUs may use the firmware shadow in the first 256 KiB of the
+mapped framebuffer BAR, requiring a matching PCIR vendor/device record.
+Malformed or ambiguous VFCT data does not trigger fallback. Reads use live
+PCI authority through `Cap::invoke`; shadow reads recheck it per 4 KiB.
+The new path never enables an expansion ROM or writes VRAM. Failed discovery
+leaves VBIOS unavailable without preventing the existing display attachment.
+Discrete GPUs retain their older ROM-version fallback, which does not supply
+loader data. Boot ACPI tables and GPU mappings must remain readable during
+the probe's unsafe acquisition operation.
+
 ### AMD DCN 3.1.4 USB-C display transport
 
 `amdgpu_dmub::Firmware::open(&AmdGpu, &Cap<FirmwareRegistry, Read>)`
@@ -63,6 +94,8 @@ DCN314 seven-window layout with 256-byte region starts, 64-byte sizes and
 4096-byte total alignment. Separate BSS/shared-state mappings remain
 unsupported for this hardware path. The caller supplies a compatible,
 validated VBIOS; preparation checks its storage size, not ATOM semantics.
+`Firmware::prepare_from_gpu(&AmdGpu)` instead uses the retained, validated
+platform snapshot, rejecting missing VBIOS or unsupported DCN discovery.
 
 `Prepared::stage` initializes an ordinary RAM buffer, copying executable and
 VBIOS data and zeroing padding, stack, mailboxes, trace and state. It rejects
@@ -97,8 +130,8 @@ attempts a bounded synchronous reset without waiting; if stop cannot be
 verified, VRAM and global mailbox/PM ownership remain quarantined. Suspend
 is refused for the loader's lifetime pending firmware replay support. A
 suspended GPU also rejects new loader claims and generic firmware replacement.
-Automatic platform provisioning of the free VRAM pool/VBIOS and the PSP load
-method remain open; the Late worker continues to attach to existing firmware.
+Automatic platform provisioning of the free VRAM pool and the PSP load method
+remain open; the Late worker continues to attach to existing firmware.
 
 `amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
 mailbox and GPU power/firmware ownership for its lifetime. It requires exact

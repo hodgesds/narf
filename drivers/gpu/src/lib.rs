@@ -161,6 +161,7 @@ pub mod amdgpu_smu_v13;
 pub mod amdgpu_ucode;
 pub mod amdgpu_ucode_header;
 pub mod amdgpu_usbc;
+pub mod amdgpu_vbios;
 pub mod amdgpu_video;
 pub mod amdgpu_vmhub_regs;
 pub mod amdgpu_vmid;

@@ -64,7 +64,7 @@ impl<'a> MasterDataTable<'a> {
             return Err(TableDirError::OutOfBounds);
         }
         let struct_size = u16::from_le_bytes([image[dir_off], image[dir_off + 1]]) as usize;
-        if struct_size < 4 || dir_off + struct_size > image.len() {
+        if struct_size < 4 || struct_size % 2 != 0 || dir_off + struct_size > image.len() {
             return Err(TableDirError::BadStructureSize);
         }
         let format_revision = image[dir_off + 2];

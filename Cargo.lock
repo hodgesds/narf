@@ -1179,6 +1179,7 @@ dependencies = [
 name = "narf-drivers-gpu"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
  "narf-arch",
  "narf-bus",
  "narf-capabilities",
