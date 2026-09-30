@@ -5619,6 +5619,27 @@ fn boot_userspace_init() {
                     "pthread_sched_glibc",
                     narf_verification::NARF_PTHREAD_SCHED_SMOKE_GLIBC_ELF,
                 ),
+                // A connect() to a listening AF_UNIX socket (path and abstract)
+                // wakes its poller: kwin's on-demand Xwayland start.
+                (
+                    "unix_listen_wake_smoke",
+                    narf_verification::NARF_UNIX_LISTEN_WAKE_SMOKE_ELF,
+                ),
+                (
+                    "unix_listen_wake_glibc",
+                    narf_verification::NARF_UNIX_LISTEN_WAKE_SMOKE_GLIBC_ELF,
+                ),
+                // A dup()'d socketpair end survives fork/vfork/posix_spawn +
+                // execve without FD_CLOEXEC: kwin's WAYLAND_SOCKET handoff to
+                // Xwayland.
+                (
+                    "fd_inherit_exec_smoke",
+                    narf_verification::NARF_FD_INHERIT_EXEC_SMOKE_ELF,
+                ),
+                (
+                    "fd_inherit_exec_glibc",
+                    narf_verification::NARF_FD_INHERIT_EXEC_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.

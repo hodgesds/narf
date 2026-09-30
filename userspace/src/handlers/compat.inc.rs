@@ -2227,6 +2227,10 @@ fn do_execve_resolved(
     // does this in the exec path). Without it, O_CLOEXEC fds leak
     // across exec — an fd-table leak that is also a sandbox-escape
     // vector (a descriptor the new image was never meant to inherit).
+    // `begin_new_exec` runs `unshare_files()` first: a table shared with a
+    // CLONE_FILES sibling (a CLONE_VM|CLONE_FILES|CLONE_VFORK spawner) is
+    // copied, so the sweep never closes the sibling's descriptors.
+    crate::fd::unshare_table(task);
     crate::fd::close_cloexec(task);
     // Point of no return: install the credential. After the close-on-exec
     // sweep, as `begin_new_exec` orders it, so the dumpability change never

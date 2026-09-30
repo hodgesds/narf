@@ -3643,6 +3643,10 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("proc_fd_magiclink_glibc", "proc-fd-magiclink-ok"),
         ("pthread_sched_smoke", "pthread-sched-ok"),
         ("pthread_sched_glibc", "pthread-sched-ok"),
+        ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
+        ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
+        ("fd_inherit_exec_smoke", "fd-inherit-exec-ok"),
+        ("fd_inherit_exec_glibc", "fd-inherit-exec-ok"),
         // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
         ("setuid_exec_smoke", "setuid-exec-ok"),
         ("setuid_exec_glibc", "setuid-exec-ok"),

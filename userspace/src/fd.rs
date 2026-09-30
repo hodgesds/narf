@@ -1851,11 +1851,34 @@ pub fn share(parent: u64, child: u64) -> usize {
     n
 }
 
+/// Give `task_id` a private copy of its fd table if it currently shares one
+/// with a CLONE_FILES sibling — `kernel/fork.c::unshare_fd` /
+/// `unshare_files`: `if ((unshare_flags & CLONE_FILES) &&
+/// (fd && atomic_read(&fd->count) > 1)) *new_fdp = dup_fd(fd, ...)`. The
+/// siblings keep the original table; open file descriptions are shared
+/// between the two copies exactly as after a fork. A task that already owns
+/// its table (or has none) is left alone. Returns whether a copy was made.
+pub fn unshare_table(task_id: u64) -> bool {
+    let shared = TABLES[table_shard(task_id)]
+        .tables
+        .lock()
+        .get(&task_id)
+        // One reference is the map's own entry; any other is a sharer's.
+        .is_some_and(|arc| Arc::strong_count(arc) > 1);
+    if shared {
+        // `fork(t, t)` snapshots t's current table into a fresh Arc and
+        // installs it under t, replacing the shared one.
+        fork(task_id, task_id);
+    }
+    shared
+}
+
 /// Close every `FD_CLOEXEC`-marked fd for `task_id` (the exec path).
 /// Returns the count closed; no-op if the task has no table (never
-/// opened an fd). Shares one fd table with CLONE_FILES siblings, so a
-/// CLOEXEC close is visible to them too — matching Linux, where exec
-/// unshares files first; NARF's exec implies a non-shared table.
+/// opened an fd). The caller must have made the table private first
+/// ([`unshare_table`]): Linux `begin_new_exec` runs `unshare_files()` before
+/// `do_close_on_exec`, so a CLONE_FILES sibling never loses its descriptors
+/// to another task's exec.
 pub fn close_cloexec(task_id: u64) -> usize {
     let arc = match TABLES[table_shard(task_id)]
         .tables
