@@ -110,6 +110,9 @@ BIOS, scanouts, PSP/TMR, discovery tables and other clients. The allocator
 does not discover free memory from BAR capacity. Page-aligned reservations
 remain unavailable while allocated, and hardware-published reservations are
 quarantined on drop unless their engine has verified shutdown.
+`Pool::reserve_aligned` additionally takes a power-of-two GPU-address
+alignment of at least one page, for the 1 MiB-aligned PSP TMR; its padding
+stays available to other allocations.
 `Pool::from_owned_aperture(mapping, gpu_base, protected)` additionally retains
 permanent aperture-relative exclusions. Ranges are checked, rounded outward
 to pages, sorted and merged; dropping an allocation never removes a protected
@@ -154,14 +157,56 @@ until `boot` is explicitly awaited. The reservation retains its pool for the
 loader's lifetime, including failed-stop quarantine. This constructor does
 not supply the platform boot inventory or enable automatic firmware loading.
 
+`amdgpu_psp_ring::Psp::new` is unsafe: it claims the sole Phoenix PSP 13.0.4
+GPCOM ring, its HDP remap hole and the exclusive right to replace the TMR, and
+reserves its ring/fence buffer from the caller's pool. `start().await` requires
+live SOS firmware, verifies the HDP remap before publishing any device memory,
+zeroes and flushes the ring, then creates it with Linux's register sequence and
+handshake delay. `setup_tmr(toc)` and `load_dmub(signed_instructions)` submit
+bounded GPCOM commands; every address on the ring is a GPU address, never a host
+physical address. Replies are validated, a stale fence never completes a command,
+and a rejection surfaces the firmware status rather than a generic failure.
+Commands are capped at 16 MiB. `bank` resolves an exact IP-discovery register
+bank and is the only supported way to address one. The ring authenticates
+nothing itself: the registry owns container authenticity and the PSP owns
+signature verification. Dropping without verified shutdown quarantines every
+published buffer, payloads included.
+
+`Loader::new_psp` selects the PSP load method instead of the direct one, keeping
+the device, mapping and pool contract of `new` and adding exclusive PSP, HDP and
+power-management ownership. It validates the TOC container and retains its own
+copies of the signed instruction payload and TOC, so no registry borrow
+survives construction. `boot` then starts the ring, installs the TMR and loads
+DMCUB through the PSP, and the secure instruction and stack windows stay owned
+by the PSP: they are verified as enabled rather than programmed, and are never
+cleared by mailbox teardown. A failed PSP load does not fall back to direct
+load, and a dropped boot future cannot start a second attempt. Phoenix now
+rejects the legacy and multi-firmware PSP load helpers outright, so no other
+path can race this ring.
+
+`amdgpu_platform` assembles the one platform display owner. `fb`'s generic
+registration records the physical boot framebuffer geometry before fbdev
+replaces its address with a virtual mapping; recording performs no GPU access.
+`prepare` refuses to guess: it rejects a GPU with loaded firmware or a live
+mode, rejects any live VM context rather than sizing inherited page tables, and
+inventories every enabled HUBP surface and cursor — including latched and
+earliest-in-use addresses, since a boot-time flip can still be draining its
+previous allocation. Only packed linear RGB is treated as a bounded inherited
+scanout; DCC, YUV, stereo, VM and all-ones reads reject provisioning instead of
+overlooking metadata. The resulting inventory feeds the reservation plan, pool
+and PSP loader. Failure leaves the pre-existing firmware attachment usable.
+The Late worker takes this owned path when it succeeds and otherwise attaches to
+running firmware. A partial boot retains ownership and the busy phase so no
+attach fallback can race an outstanding PSP command; suspend stops the loader
+and a failed resume now propagates a device-PM error instead of continuing.
+
 `stop().await` stops owned hardware even after capability revocation. A
 cancelled/failed boot cannot be retried until stopped. Dropping the loader
 attempts a bounded synchronous reset without waiting; if stop cannot be
 verified, VRAM and global mailbox/PM ownership remain quarantined. Suspend
 is refused for the loader's lifetime pending firmware replay support. A
 suspended GPU also rejects new loader claims and generic firmware replacement.
-Automatic boot/client inventory wiring and the PSP load method remain open;
-the Late worker continues to attach to existing firmware.
+The stream pipeline that a booted loader would drive remains open.
 
 `amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
 mailbox and GPU power/firmware ownership for its lifetime. It requires exact
@@ -176,13 +221,49 @@ rescans without assuming a UCSI-to-GPU wiring map. Suspend is refused while a
 command cycle is active; resume revalidates the firmware mailbox mapping.
 Firmware replacement is rejected while this worker owns DMUB.
 
-The attach worker **does not program source encoders, train DisplayPort links
-or expose new active DRM/KMS scanouts**. A successful firmware boot, sink read
-or USB4 tunnel does not prove monitor output. Platform cold-boot wiring,
-PSP loading and native external-display modesetting remain open.
+`amdgpu_dp_training::train` performs async 8b/10b clock recovery and channel
+equalization over a caller-supplied `LinkIo`, which owns the AUX channel and
+source encoder for the whole operation. Source and sink are programmed as one
+transaction: AUX success alone never proves a trained link. Only rate/lane
+combinations that can carry the requested uncompressed mode are attempted, and
+each failed attempt clears the sink pattern and disables the source before
+falling back to a lower rate. Malformed replies and transport errors abort
+instead of masquerading as fallback; loss of interlane alignment fails
+equalization. Native links apply a common PHY drive level satisfying the
+highest per-lane request, clamped to swing+pre-emphasis <= 3, and stop on
+max-swing or five unchanged requests. A transparent USB4 DPIA trains its own
+remote PHY: the host writes sink patterns and reads status without applying
+native voltage settings. DSC, FEC and MST are not negotiated by this SST path.
+Cancelling a training future requires disabling the source before reusing its
+scanout memory or training again.
+
+`amdgpu_dio::Source::new` is unsafe: the caller must exclusively own the idle
+frontend/backend and its physical route across hotplug, power transitions and
+modesets, and the `Route` must come from this GPU's VBIOS or the DPIA
+allocator, never a UCSI connector number. Routes are range-checked against the
+four DPIA and six native AUX instances, and every register access is offset by
+the owned backend and revalidates PCI authority through `Cap::invoke`. Updates
+verify their read-back and treat an all-ones read as a vanished device.
+`train` drives the training state machine through a booted loader's `Phy`
+commands: a native Type-C transmitter's reported pin assignment clamps the lane
+count, a disabled Type-C PHY is refused before anything is programmed, and a
+trained source must be explicitly disabled before it can train again. Only a
+sink-side AUX DEFER or timeout is retried, so a poisoned mailbox never looks
+like a NACK. `disable` detaches the stream frontend only once the PHY is
+confirmed off; a caller must also stop the timing generator and HUBP before
+releasing scanout memory.
+
+Neither the attach worker nor a booted loader **programs the stream pipeline or
+exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
+USB4 tunnel or trained link does not prove monitor output: the DCCG clocks,
+OTG timing, HUBP/DPP/MPC/OPP pipeline, DIG stream encoder, scanout allocation
+and KMS attachment remain open, and no code path yet lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
-`dmub_dcn314.c`, `dcn314_resource.c` and DCN 3.1.4 register headers.
+`dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
+`amdgpu_psp.c`, `hdp_v5_0.c`, `dcn10_link_encoder.c`,
+`dcn31_dio_link_encoder.c`, `link_dp_training_8b_10b.c`,
+`link_dp_training_dpia.c` and DCN 3.1.4 register headers.
 
 ### VirtIO-GPU rendering
 

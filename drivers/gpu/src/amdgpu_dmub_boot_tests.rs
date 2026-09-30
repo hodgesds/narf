@@ -101,9 +101,37 @@ fn fixture() -> (Pool, Engine<Fake>) {
             fb_offset: 0x8000_0000,
             staging,
             state: State::Prepared,
+            secure: false,
         },
     )
 }
+
+fn dmub_psp_boot_preserves_secure_windows() -> TestResult {
+    let (_, mut engine) = fixture();
+    engine.secure = true;
+    engine.io.regs[0x1ad] = WINDOW_ENABLE | 0x123fff;
+    engine.io.regs[0x1ae] = WINDOW_ENABLE | 0x100ffff;
+    engine.io.regs[SEC_CNTL as usize] = 0x3400;
+    if narf_scheduler::block_on_spin(engine.boot(Default::default())).is_err() {
+        return TestResult::Fail("PSP-configured windows rejected");
+    }
+    if engine.io.writes.iter().any(|(reg, _)| {
+        matches!(
+            *reg,
+            SEC_CNTL | 0x1a5 | 0x1a6 | 0x1ad | 0x1ae | 0x1b5..=0x1b8
+        )
+    }) {
+        return TestResult::Fail("host overwrote PSP-owned secure windows");
+    }
+    if narf_scheduler::block_on_spin(engine.stop()).is_err() {
+        return TestResult::Fail("secure firmware stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu-dmub",
+    dmub_psp_boot_preserves_secure_windows
+);
 
 fn dmub_direct_boot_orders_reset_upload_and_windows() -> TestResult {
     let (pool, mut engine) = fixture();

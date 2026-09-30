@@ -471,6 +471,8 @@ pub enum AmdgpuError {
     FirmwareMissing,
     /// PSP firmware-load handshake didn't complete.
     FirmwareLoadFailed,
+    /// This device requires the PSP command-ring loader, not the legacy helper.
+    UnsupportedFirmwareLoad,
     /// SMU bring-up failed — TestMessage echo mismatch, driver-IF
     /// schema mismatch, or mailbox timeout. The MP1 base may be
     /// wrong (IP discovery missing MP1) or SMU firmware never
@@ -868,6 +870,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
+        if self.chip.family == Family::Phoenix {
+            return Err(AmdgpuError::UnsupportedFirmwareLoad);
+        }
         if crate::amdgpu_usbc::firmware_busy() {
             return Err(AmdgpuError::DisplayFirmwareBusy);
         }
@@ -1123,6 +1128,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
+        if self.chip.family == Family::Phoenix {
+            return Err(AmdgpuError::UnsupportedFirmwareLoad);
+        }
         if crate::amdgpu_usbc::firmware_busy() {
             return Err(AmdgpuError::DisplayFirmwareBusy);
         }
@@ -1679,6 +1687,11 @@ unsafe fn read_vbios_version_from_rom(
 // ── Driver-match registration ───────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
+static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
+    IrqSafeSpinLock::new(None);
+pub(crate) fn pci_authority() -> Option<Cap<BusDeviceCap, Write>> {
+    *PCI_AUTHORITY.lock()
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -1707,6 +1720,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     dev.vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) }.ok();
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = matches!(dev.chip.family, Family::Renoir | Family::Phoenix);
+    *PCI_AUTHORITY.lock() = Some(cap);
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("amdgpu"),
@@ -1843,7 +1857,10 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
             unsafe { d.set_mode(mode) }
         });
     }
-    crate::amdgpu_usbc::resume();
+    if !crate::amdgpu_usbc::resume() {
+        PM_SUSPENDED.store(true, core::sync::atomic::Ordering::Release);
+        return Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+    }
     Ok(())
 }
 

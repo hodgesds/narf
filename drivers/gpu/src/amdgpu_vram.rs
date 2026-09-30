@@ -85,18 +85,38 @@ impl Pool {
         })))
     }
     pub fn reserve(&self, size: u64) -> Result<Reservation, Error> {
+        self.reserve_aligned(size, 4096)
+    }
+    /// Reserve with a power-of-two GPU-address alignment (PSP TMR needs 1 MiB).
+    /// Padding remains available to other allocations.
+    pub fn reserve_aligned(&self, size: u64, alignment: u64) -> Result<Reservation, Error> {
+        if alignment < 4096 || !alignment.is_power_of_two() {
+            return Err(Error::Invalid);
+        }
         let size = size.checked_add(4095).ok_or(Error::Invalid)? & !4095;
         if size == 0 {
             return Err(Error::Invalid);
         }
         let mut used = self.0.used.lock();
-        let mut start = 0;
+        let align = |offset: u64| {
+            self.0
+                .address
+                .checked_add(offset)
+                .and_then(|address| address.checked_add(alignment - 1))
+                .map(|address| address & !(alignment - 1))
+                .and_then(|address| address.checked_sub(self.0.address))
+                .ok_or(Error::Exhausted)
+        };
+        let mut start = align(0)?;
         let mut index = 0;
         while index < used.len() {
-            if used[index].start - start >= size {
+            if start
+                .checked_add(size)
+                .is_some_and(|end| end <= used[index].start)
+            {
                 break;
             }
-            start = used[index].end;
+            start = align(start.max(used[index].end))?;
             index += 1;
         }
         let end = start.checked_add(size).ok_or(Error::Exhausted)?;

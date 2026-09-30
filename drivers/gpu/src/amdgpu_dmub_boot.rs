@@ -47,6 +47,7 @@ pub enum Error {
     Transport(amdgpu_dmub::Error),
     Memory(crate::amdgpu_vram_boot::Error),
     Firmware(amdgpu_dmub::FirmwareError),
+    Psp(crate::amdgpu_psp_ring::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -174,12 +175,14 @@ fn force_reset(io: &mut impl Io) -> bool {
     fence(Ordering::SeqCst);
     reset_confirmed(io)
 }
-fn clear_mailboxes(io: &mut impl Io) {
+fn clear_mailboxes(io: &mut impl Io, secure: bool) {
     for reg in [0x1d6, 0x1d7, 0x1da, 0x1db, 0x1de, 0x1df, STATUS, GPINT] {
         io.write(reg, 0);
     }
     // Disable stale cache windows, including CW2/CW7 that this image won't use.
-    for reg in 0x1ad..=0x1b4 {
+    // PSP owns the secure instruction and stack windows. Never clear those
+    // on the PSP path, including between load completion and reset release.
+    for reg in (if secure { 0x1af } else { 0x1ad })..=0x1b4 {
         io.write(reg, 0);
     }
     io.write(0x1a2, 0);
@@ -199,6 +202,7 @@ struct Engine<I: Io> {
     fb_offset: u64,
     staging: Vec<u8>,
     state: State,
+    secure: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -248,9 +252,10 @@ impl<I: Io> Engine<I> {
             };
             if reset {
                 if cleanup {
-                    clear_mailboxes(&mut self.io);
+                    clear_mailboxes(&mut self.io, self.secure);
                 } else {
-                    self.access(clear_mailboxes)?;
+                    let secure = self.secure;
+                    self.access(|io| clear_mailboxes(io, secure))?;
                 }
                 return Ok(());
             }
@@ -293,7 +298,8 @@ impl<I: Io> Engine<I> {
         let layout = self.layout;
         let fb_base = self.fb_base;
         let fb_offset = self.fb_offset;
-        self.access(|io| configure(io, layout, placement, fb_base, fb_offset, options))??;
+        let secure = self.secure;
+        self.access(|io| configure(io, layout, placement, fb_base, fb_offset, options, secure))??;
         let deadline = narf_time::Deadline::after_ms(100);
         loop {
             if self.access(|io| {
@@ -336,7 +342,7 @@ impl<I: Io> Engine<I> {
         if !force_reset(&mut self.io) {
             return false;
         }
-        clear_mailboxes(&mut self.io);
+        clear_mailboxes(&mut self.io, self.secure);
         // SAFETY: synchronous forced reset verified all stop bits. No await in Drop.
         unsafe {
             self.allocation.stopped();
@@ -353,6 +359,7 @@ fn configure(
     fb_base: u64,
     fb_offset: u64,
     options: BootOptions,
+    secure: bool,
 ) -> Result<(), Error> {
     // CW0/1 use translated MC addresses; CW3..6 use GPU addresses directly.
     let translate = |w| {
@@ -365,11 +372,20 @@ fn configure(
     };
     let inst = translate(Window::Instructions)?;
     let stack = translate(Window::Stack)?;
-    update(io, SEC_CNTL, 1 << 16, 1 << 16);
-    for (window, address) in [(Window::Instructions, inst), (Window::Stack, stack)] {
-        write_window(io, window, address, layout.region(window).size, true)?;
+    if secure {
+        for reg in [0x1ad, 0x1ae] {
+            let value = io.read(reg);
+            if value == u32::MAX || value & WINDOW_ENABLE == 0 {
+                return Err(Error::ConfigurationFailed);
+            }
+        }
+    } else {
+        update(io, SEC_CNTL, 1 << 16, 1 << 16);
+        for (window, address) in [(Window::Instructions, inst), (Window::Stack, stack)] {
+            write_window(io, window, address, layout.region(window).size, true)?;
+        }
+        update(io, SEC_CNTL, (1 << 16) | 0x3f00, 0x2000);
     }
-    update(io, SEC_CNTL, (1 << 16) | 0x3f00, 0x2000);
     for window in [Window::Vbios, Window::Mailbox, Window::Trace, Window::State] {
         write_window(
             io,
@@ -396,7 +412,9 @@ fn configure(
         }
     }
     io.write(0x1f1, options.bits());
-    if io.read(SEC_CNTL) & ((1 << 16) | 0x3f00) != 0x2000 || io.read(0x1f1) != options.bits() {
+    if (!secure && io.read(SEC_CNTL) & ((1 << 16) | 0x3f00) != 0x2000)
+        || io.read(0x1f1) != options.bits()
+    {
         return Err(Error::ConfigurationFailed);
     }
     update(io, HUB_RESET, HUB_RESET_BIT, 0);
@@ -441,6 +459,9 @@ pub struct Loader {
     fb: MmioRegion,
     transport: Option<Dmub>,
     ownership: Option<LoaderOwnership>,
+    psp: Option<crate::amdgpu_psp_ring::Psp>,
+    signed_instructions: Vec<u8>,
+    toc: Vec<u8>,
 }
 impl Loader {
     /// Provision firmware storage using VBIOS reservations, current DMUB
@@ -565,16 +586,75 @@ impl Loader {
                 fb_offset,
                 staging,
                 state: State::Prepared,
+                secure: false,
             },
             fb: gpu.fb_bar,
             transport: None,
             ownership: Some(ownership),
+            psp: None,
+            signed_instructions: Vec::new(),
+            toc: Vec::new(),
         })
+    }
+    /// Construct the PSP load method. Both firmware containers must have been
+    /// authenticated by the registry. No fallback to direct load is performed.
+    ///
+    /// # Safety
+    /// The device/mapping/pool ownership requirements of `new` apply, together
+    /// with exclusive PSP, HDP and power-management ownership from `Psp::new`.
+    /// Existing engines must not depend on a driver-managed TMR being replaced.
+    pub unsafe fn new_psp(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        firmware: &amdgpu_dmub::Firmware,
+        toc: &[u8],
+    ) -> Result<Self, Error> {
+        let prepared = firmware.prepare_from_gpu(gpu).map_err(Error::Firmware)?;
+        crate::amdgpu_psp_ring::toc_payload(toc).map_err(Error::Psp)?;
+        // SAFETY: caller owns both engines and the shared pool; construction
+        // performs no resets/uploads. Loader's claim excludes other owners.
+        let mut loader = unsafe { Self::new(gpu, authority, pool, &prepared) }?;
+        let image = firmware.image().map_err(Error::Firmware)?;
+        loader
+            .signed_instructions
+            .try_reserve_exact(image.signed_instructions().len())
+            .map_err(|_| Error::Allocation)?;
+        loader
+            .signed_instructions
+            .extend_from_slice(image.signed_instructions());
+        loader
+            .toc
+            .try_reserve_exact(toc.len())
+            .map_err(|_| Error::Allocation)?;
+        loader.toc.extend_from_slice(toc);
+        // SAFETY: inherited permanent pool, exact physical GPU and exclusive PSP.
+        loader.psp = Some(
+            unsafe { crate::amdgpu_psp_ring::Psp::new(gpu, authority, pool) }
+                .map_err(Error::Psp)?,
+        );
+        loader.engine.secure = true;
+        Ok(loader)
     }
     pub fn state(&self) -> State {
         self.engine.state
     }
     pub async fn boot(&mut self, options: BootOptions) -> Result<(), Error> {
+        if self.psp.is_some() {
+            if !matches!(self.engine.state, State::Prepared | State::Stopped) {
+                return Err(Error::Busy);
+            }
+            // A dropped PSP future must not allow a second boot attempt.
+            self.engine.state = State::Starting;
+            self.engine.quiesce(false).await?;
+            let psp = self.psp.as_mut().unwrap();
+            psp.start().await.map_err(Error::Psp)?;
+            psp.setup_tmr(&self.toc).await.map_err(Error::Psp)?;
+            psp.load_dmub(&self.signed_instructions)
+                .await
+                .map_err(Error::Psp)?;
+            self.engine.state = State::Stopped;
+        }
         self.engine.boot(options).await?;
         let io = &self.engine.io;
         let transport = self
@@ -599,11 +679,24 @@ impl Loader {
     }
     pub async fn stop(&mut self) -> Result<(), Error> {
         self.transport = None;
-        self.engine.stop().await
+        self.engine.stop().await?;
+        if let Some(psp) = self.psp.as_mut() {
+            // SAFETY: verified DMCUB reset precedes release of its secure TMR.
+            unsafe { psp.stop().await }.map_err(Error::Psp)?;
+        }
+        Ok(())
     }
     pub async fn enable_notifications(&mut self) -> Result<(), Error> {
         let dmub = self.transport.as_mut().ok_or(Error::Busy)?;
         authorized(&self.engine.authority, dmub.enable_notifications()).await
+    }
+    pub(crate) async fn command(&mut self, command: [u8; 64]) -> Result<[u8; 64], Error> {
+        let dmub = self.transport.as_mut().ok_or(Error::Busy)?;
+        authorized(&self.engine.authority, dmub.command(command)).await
+    }
+    pub(crate) async fn discover_sinks(&mut self) -> Result<Vec<crate::amdgpu_usbc::Sink>, Error> {
+        let dmub = self.transport.as_mut().ok_or(Error::Busy)?;
+        authorized(&self.engine.authority, crate::amdgpu_usbc::scan(dmub)).await
     }
     pub async fn hpd(&mut self, instance: u8, channel: Channel) -> Result<bool, Error> {
         let dmub = self.transport.as_mut().ok_or(Error::Busy)?;
@@ -644,7 +737,14 @@ async fn authorized<T>(
 impl Drop for Loader {
     fn drop(&mut self) {
         self.transport = None;
-        if !self.engine.stop_on_drop() {
+        let stopped = self.engine.stop_on_drop();
+        let psp_stopped = self.psp.as_ref().is_none_or(|psp| {
+            matches!(
+                psp.state(),
+                crate::amdgpu_psp_ring::State::Prepared | crate::amdgpu_psp_ring::State::Stopped
+            )
+        });
+        if !stopped || !psp_stopped {
             // Keep global mailbox/PM ownership blocked along with quarantined
             // VRAM. A new client must not race a possibly still-running DMUB.
             if let Some(owner) = self.ownership.take() {

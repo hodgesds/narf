@@ -67,12 +67,27 @@ or the APU VRAM shadow, using corrected PCI/ATOM header and directory parsing.
 DMUB preparation can consume that snapshot. An explicit boot-memory path now
 builds a pool with permanent exclusions from VBIOS reservations, current DMUB
 windows and caller-supplied boot/client ranges; it never infers ownership
-from BAR capacity. The Late worker still only attaches to existing firmware:
-automatic boot/client inventory wiring, PSP loading and firmware replay
-remain open.
-**External monitor output is not complete:** source encoder setup, link
-training and KMS integration still need implementation. Physical Lenovo 50ee
-USB-C/USB4 validation is pending.
+from BAR capacity.
+A Phoenix PSP 13.0.4 GPCOM ring now installs the TMR and loads DMCUB through
+the PSP, leaving the secure instruction and stack windows under PSP ownership;
+Phoenix rejects the legacy firmware-load helpers so nothing races that ring.
+The boot handoff assembles the owner: it records the boot framebuffer geometry,
+refuses a GPU with live firmware, a live mode or any VM context, inventories
+every enabled linear-RGB surface and cursor including latched and draining
+addresses, and rejects DCC/YUV/stereo layouts rather than overlooking metadata.
+The Late worker takes this owned path when it succeeds and otherwise falls back
+to attaching to running firmware.
+DisplayPort link training and the DIO link encoder are implemented: async
+8b/10b clock recovery and equalization program source and sink as one
+transaction, fall back only on recovery/equalization failure, clamp lanes to
+the reported Type-C pin assignment, and leave a transparent USB4 DPIA to train
+its own remote PHY.
+**External monitor output is still not complete:** nothing yet drives the
+stream pipeline — DCCG clocks, OTG timing, the HUBP/DPP/MPC/OPP path, the DIG
+stream encoder, scanout allocation and KMS attachment all remain open, so no
+code path lights an external panel. Firmware replay over suspend also remains
+open. Physical Lenovo 50ee USB-C/USB4 validation is pending, and none of this
+path has run on silicon.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 

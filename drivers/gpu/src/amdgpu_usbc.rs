@@ -31,9 +31,17 @@ pub(crate) fn firmware_busy() -> bool {
     OWNED.load(Ordering::Acquire) || PHASE.load(Ordering::Acquire) == 2
 }
 pub(crate) fn suspend() -> bool {
-    PHASE
+    if PHASE
         .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    if !crate::amdgpu_platform::suspend() {
+        PHASE.store(0, Ordering::Release);
+        return false;
+    }
+    true
 }
 
 /// Excludes the attach worker, generic firmware replacement and GPU PM.
@@ -124,15 +132,41 @@ impl Drop for LoaderOwnership {
         OWNED.store(false, Ordering::Release);
     }
 }
-pub(crate) fn resume() {
+pub(crate) fn resume() -> bool {
     if PHASE.load(Ordering::Acquire) != 2 {
-        return;
+        return true;
+    }
+    if !crate::amdgpu_platform::resume() {
+        return false;
     }
     GENERATION.fetch_add(1, Ordering::AcqRel);
     PHASE.store(0, Ordering::Release);
     DIRTY.store(true, Ordering::Release);
+    true
 }
 struct Observer;
+pub(crate) fn observe_connectors() {
+    narf_drivers_usbpd::ucsi::register_observer(Arc::new(Observer));
+}
+pub(crate) fn begin_cycle() -> bool {
+    PHASE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+pub(crate) fn finish_cycle() {
+    PHASE.store(0, Ordering::Release);
+}
+pub(crate) fn publish_sinks(found: Vec<Sink>) {
+    *SINKS.lock() = found;
+}
+pub(crate) async fn wait_for_rescan() {
+    for _ in 0..10 {
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(100).as_instant()).await;
+        if DIRTY.swap(false, Ordering::AcqRel) {
+            break;
+        }
+    }
+}
 impl narf_drivers_usbpd::ucsi::ConnectorObserver for Observer {
     fn changed(&self, _: &narf_drivers_usbpd::ucsi::Connector) {
         DIRTY.store(true, Ordering::Release);
@@ -219,7 +253,7 @@ async fn edid(dmub: &mut Dmub, channel: Channel, instance: u8) -> Result<Vec<u8>
     result
 }
 
-async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
+pub(crate) async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
     let mut result = Vec::new();
     // DCN314 exposes four DPIAs (dcn314_resource.c), independently of the
     // number of NHI PCI functions or physical receptacles. Native AUX channels
@@ -256,6 +290,9 @@ async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
 pub(crate) fn start() -> narf_init::InitResult {
     if !super::amdgpu::is_probed() {
         return narf_init::InitResult::NotPresent;
+    }
+    if crate::amdgpu_platform::start() {
+        return narf_init::InitResult::Ok;
     }
     let Some(ownership) = claim_loader() else {
         return narf_init::InitResult::NotPresent;

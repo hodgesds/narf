@@ -414,6 +414,7 @@ static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<
 static GENERIC_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
+    narf_drivers_gpu::amdgpu_platform::record_boot_framebuffer(fb);
     GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
     *GENERIC_FB.lock() = Some(fb);
 }
