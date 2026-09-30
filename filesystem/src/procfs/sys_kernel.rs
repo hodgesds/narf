@@ -257,6 +257,56 @@ fn write_pid_max(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
+/// `proc_dointvec_minmax` input: `proc_get_long` skips surrounding
+/// whitespace, takes an optional `-` and a base-0 number (`strtoul_lenient`:
+/// `0x` hex, leading `0` octal), and anything else is EINVAL; a value outside
+/// `[min, max]` is EINVAL too.
+fn parse_dointvec_minmax(v: &str, min: i64, max: i64) -> Result<i64, FsError> {
+    let t = v.trim();
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t),
+    };
+    let (body, radix) = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (&digits[1..], 8)
+    } else {
+        (digits, 10)
+    };
+    if body.is_empty() || !body.chars().all(|c| c.is_digit(radix)) {
+        return Err(FsError::InvalidData);
+    }
+    let magnitude = i64::from_str_radix(body, radix).map_err(|_| FsError::InvalidData)?;
+    let value = if neg { -magnitude } else { magnitude };
+    if value < min || value > max {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value)
+}
+
+// `fs/devpts/inode.c::pty_table`: kernel.pty.max and kernel.pty.reserve are
+// 0644 `proc_dointvec_minmax` over [pty_limit_min = 0, pty_limit_max =
+// INT_MAX]; kernel.pty.nr is the 0444 live count.
+fn read_pty_max() -> String {
+    format!("{}\n", crate::devfs_pty::pty_limit())
+}
+fn write_pty_max(v: &str) -> Result<(), FsError> {
+    crate::devfs_pty::set_pty_limit(parse_dointvec_minmax(v, 0, i64::from(i32::MAX))? as i32)
+}
+fn read_pty_reserve() -> String {
+    format!("{}\n", crate::devfs_pty::pty_reserve())
+}
+fn write_pty_reserve(v: &str) -> Result<(), FsError> {
+    crate::devfs_pty::set_pty_reserve(parse_dointvec_minmax(v, 0, i64::from(i32::MAX))? as i32)
+}
+fn read_pty_nr() -> String {
+    format!("{}\n", crate::devfs_pty::pty_nr())
+}
+
 fn read_threads_max() -> String {
     format!("{}\n", THREADS_MAX.load(Ordering::Relaxed))
 }
@@ -481,6 +531,24 @@ pub fn register_all() {
         read: read_pid_max,
         write: Some(write_pid_max),
         perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/pty/max",
+        read: read_pty_max,
+        write: Some(write_pty_max),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/pty/reserve",
+        read: read_pty_reserve,
+        write: Some(write_pty_reserve),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/pty/nr",
+        read: read_pty_nr,
+        write: None,
+        perms: 0o444,
     });
     register_sysctl(SysctlEntry {
         path: "kernel/threads-max",

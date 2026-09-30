@@ -338,11 +338,28 @@ udev coldplug nodes, `/dev/{char,block}/MAJOR:MINOR`, and journald's
 precedence over dynamic names and absent optional hardware nodes are not
 advertised by readdir.
 
-The root `/dev/ptmx` is the relative symlink `pts/ptmx`. Mounting `devpts`
-installs `DevPtsFs`, whose root exposes the live Unix98 slave registry and a
-5:2 clone node rather than an empty in-memory filesystem. The current devpts
-implementation uses one global registry; per-mount instances and mount-option
-policy are not part of this interface yet.
+devtmpfs's `/dev/ptmx` is `DevTmpfsPtmx`, a `c 5:2` node (0666, root-owned,
+chown/chmod persist) beside an empty `/dev/pts` mountpoint. Every devpts mount
+is an independent instance (Linux 4.7+): `DevPtsFs::from_options(options,
+mounter_uid, mounter_gid, reserve)` parses `uid=`, `gid=` (mounter-namespace
+ids via `install_pty_id_map_hook`), `mode=` (default 0600), `ptmxmode=`
+(default 0000), `max=` (`<= NR_UNIX98_PTY_MAX`) and `newinstance`, anything
+else `FsError::InvalidData`; `show_options` prints them as
+`devpts_show_options` does and `reconfigure` resets then re-parses all but
+`reserve` (`reserve` is set for a mount in the initial mount namespace).
+Each instance (`PtsFsInfo`) owns its lowest-free index space below `max`, its
+`ptmx` node (inode 2, mounter-owned, mode `ptmxmode`) and its anonymous
+`st_dev`; a pts node is inode `index + 3` with `uid=`/`gid=`/`mode=` applied
+at creation. `ptmx_open(fsi)` fails `FsError::NoSpace` past `max` or past
+`kernel.pty.max` (less `kernel.pty.reserve` unless `reserve`); `pty_limit`,
+`pty_reserve`, `pty_nr` and their setters back the `kernel.pty.*` sysctls.
+Opening a `c 5:2` that is not an instance's own `ptmx` goes through
+`ptmx_open_beside(node, pts_dir)`: the root of a devpts mounted at `pts` in
+the node's directory, else `FsError::NoDevice` (`ENODEV`). A master reports
+the identity of the node it was opened through. A pty is identified
+system-wide by `tty_id()` / `as_pty_master_id()` (`pty_by_id`, `pty_index`),
+since indices repeat across instances. Boot mounts one instance at
+`/dev/pts` with systemd's `mode=620,gid=5` (`boot_devpts`).
 The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`

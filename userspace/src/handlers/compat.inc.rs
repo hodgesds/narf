@@ -6903,10 +6903,16 @@ pub fn proc_task_info(
             let (tty_nr, fg) = if ctty == CTTY_CONSOLE {
                 ((5u64 << 8) | 1, narf_filesystem::console_tty::fg_pgrp())
             } else {
-                (
-                    (136u64 << 8) | ctty as u64,
-                    narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
-                )
+                // `tty_devnum`: new_encode_dev(MKDEV(136, index)) — the
+                // controlling-tty key is the pty's system-wide id, so map it
+                // to its index within its devpts instance.
+                match narf_filesystem::devfs_pty::pty_index(ctty) {
+                    Some(index) => (
+                        (u64::from(index) & 0xff) | (136u64 << 8) | ((u64::from(index) & !0xff) << 12),
+                        narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
+                    ),
+                    None => (0, 0),
+                }
             };
             let tpgid = if fg == 0 { -1 } else { pgid_to_user(fg) as i64 };
             (tty_nr, tpgid)

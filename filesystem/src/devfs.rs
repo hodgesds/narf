@@ -1818,9 +1818,9 @@ impl DirOps for DynamicDirectory {
 
 fn static_entry_type(name: &str) -> Option<FileType> {
     match name {
-        "fd" | "stdin" | "stdout" | "stderr" | "rtc" | "ptmx" => Some(FileType::Symlink),
-        "null" | "zero" | "full" | "random" | "urandom" | "kmsg" | "console" | "tty" | "tty0"
-        | "tty1" | "uinput" | "fuse" | "fp0" | "fb0" | "tpm0" | "tpmrm0" | "rtc0" => {
+        "fd" | "stdin" | "stdout" | "stderr" | "rtc" => Some(FileType::Symlink),
+        "ptmx" | "null" | "zero" | "full" | "random" | "urandom" | "kmsg" | "console" | "tty"
+        | "tty0" | "tty1" | "uinput" | "fuse" | "fp0" | "fb0" | "tpm0" | "tpmrm0" | "rtc0" => {
             Some(FileType::Special)
         }
         "pts" | "shm" | "mqueue" | "hugepages" | "disk" | "input" | "snd" | "dri" => {
@@ -1953,7 +1953,9 @@ impl DirOps for DevDir {
                 let (kind, vt) = crate::devfs_vt::parse_vcs(n)?;
                 Some(Arc::new(crate::devfs_vt::DevVcs { kind, vt }) as Arc<dyn FileOps>)
             }
-            "ptmx" => Some(symlink_file("ptmx", "pts/ptmx".into())),
+            // devtmpfs's `c 5:2` (`tty_devnode`: 0666). Opening it finds the
+            // devpts mounted at `pts` beside it (`devpts_acquire`).
+            "ptmx" => Some(Arc::new(crate::devfs_pty::DevTmpfsPtmx) as Arc<dyn FileOps>),
             "fb0" if FB0_NODE.lock().is_some() => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
             // Userspace input-injection control device.
             // Linux ref: `drivers/input/misc/uinput.c`.
@@ -2003,12 +2005,14 @@ impl DirOps for DevDir {
     }
 
     /// Look up a subdirectory.
-    /// - `/dev/pts`   → `DevPts` (pseudoterminal slave nodes)
+    /// - `/dev/pts`   → an empty mountpoint; boot mounts devpts over it
     /// - `/dev/disk`  → `DevDiskDir` (by-label / by-partuuid lookups)
     /// - `/dev/input` → `DevInputDir` (evdev event nodes, Wave 12 bridge)
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
-            "pts" => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
+            // devtmpfs has an empty `pts`; the devpts instance is mounted on
+            // it (boot init: `mount_default`, then systemd's own mount).
+            "pts" => Some(Arc::new(DevEmptyDir { inode: 3 }) as Arc<dyn DirOps>),
             // Mountpoint stubs: an init mounts tmpfs/mqueue/hugetlbfs over
             // these; they only need to exist so the O_PATH target open works.
             "shm" => Some(Arc::new(DevEmptyDir { inode: 4 }) as Arc<dyn DirOps>),
@@ -2124,7 +2128,7 @@ impl DirOps for DevDir {
             },
             DirEntry {
                 name: alloc::borrow::Cow::Borrowed("ptmx"),
-                file_type: FileType::Symlink,
+                file_type: FileType::Special,
             },
             DirEntry {
                 name: alloc::borrow::Cow::Borrowed("fb0"),
@@ -2219,7 +2223,7 @@ impl DirOps for DevDir {
             ("tty", FileType::Special),
             ("tty0", FileType::Special),
             ("tty1", FileType::Special),
-            ("ptmx", FileType::Symlink),
+            ("ptmx", FileType::Special),
             ("fb0", FileType::Special),
             ("uinput", FileType::Special),
             ("fuse", FileType::Special),
@@ -2319,6 +2323,13 @@ impl FsInstance for DevFs {
 pub fn mount_default() {
     let auth = crate::bootstrap_mount_authority();
     let _ = crate::registry().mount(&auth, "/dev", DevFs::new());
+    // A Linux init mounts devpts at /dev/pts before anything opens a pty
+    // (systemd: `mode=620,gid=5`); a ptmx open fails ENODEV without one.
+    let _ = crate::registry().mount(
+        &auth,
+        "/dev/pts",
+        crate::devfs_pty::DevPtsFs::with_instance(crate::devfs_pty::boot_devpts()),
+    );
 }
 
 // ── DevSymlink + /dev/fd smokes ───────────────────────────────────────

@@ -1786,6 +1786,7 @@ fn open_impl(
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::NoSpace => 28,
+                        narf_filesystem::FsError::NoDevice => 19, // ENODEV
                         narf_filesystem::FsError::OutOfMemory => 12,
                         narf_filesystem::FsError::QuotaExceeded => 122,
                         // ENOTCONN. No `open` path produces it today — it is
@@ -1885,7 +1886,7 @@ fn open_impl(
     let ops = if mnt_len == 0 && chroot_path_matches(task, path, "/dev/tty", false) {
         let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
             Some(CTTY_CONSOLE) => ops.clone(),
-            Some(index) => match narf_filesystem::devfs_pty::pts_lookup(index) {
+            Some(id) => match narf_filesystem::devfs_pty::pty_by_id(id) {
                 Some(pty) => Arc::new(narf_filesystem::devfs_pty::PtySlave::new(pty)),
                 None => {
                     ctx.set_return(errno_ret(ENXIO)); // -ENXIO
@@ -2077,6 +2078,32 @@ fn open_impl(
             }
         }
     }
+
+    // `ptmx_open` through a `c 5:2` node that is not a devpts instance's own
+    // clone node — devtmpfs's /dev/ptmx, or one made with mknod: Linux
+    // dispatches by rdev to the tty driver, whose `devpts_acquire` →
+    // `devpts_ptmx_path` looks for the root of a devpts mounted at `pts` in
+    // the node's own directory, and fails ENODEV without one. The master
+    // reports the node it was opened through.
+    let ops = if !ops.is_ptmx_clone()
+        && ops.stat().mode.file_type == narf_filesystem::FileType::Special
+        && ops.rdev() == narf_filesystem::devfs::linux_makedev(5, 2)
+    {
+        let dir = match path.rsplit_once('/') {
+            Some(("", _)) | None => "",
+            Some((dir, _)) => dir,
+        };
+        let pts = alloc::format!("{dir}/pts");
+        match narf_filesystem::devfs_pty::ptmx_open_beside(ops.clone(), resolve_dir_absolute(&pts)) {
+            Ok(master) => master,
+            Err(error) => {
+                ctx.set_return(errno_ret(copy_fs_errno(error)));
+                return;
+            }
+        }
+    } else {
+        ops
+    };
 
     // Clone devices keep path lookup/stat side-effect free and allocate their
     // per-open state only here after permissions have passed. This covers
@@ -4562,6 +4589,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::Busy => 16,
         narf_filesystem::FsError::ReadOnly => 30,
         narf_filesystem::FsError::NoSpace => 28,
+        narf_filesystem::FsError::NoDevice => 19, // ENODEV
         narf_filesystem::FsError::OutOfMemory => 12,
         narf_filesystem::FsError::QuotaExceeded => 122,
         // ENOTCONN — see `FsError::NotConnected`.
@@ -15657,6 +15685,30 @@ pub(crate) fn current_fs_ids() -> (u32, u32) {
 pub fn pty_open_fs_ids() -> (u32, u32) {
     let ids = read_uidgid(current_task_id());
     (ids.fsuid, ids.fsgid)
+}
+
+/// devpts `uid=`/`gid=`: `fs_param_is_uid` / `fs_param_is_gid` take the id in
+/// the mounter's user namespace (`make_kuid(fc->user_ns, val)`) and reject
+/// one with no mapping there — EINVAL. Returns the kernel (initial-namespace)
+/// id, which is what the instance stores and `devpts_show_options` prints.
+pub fn devpts_map_mount_id(is_gid: bool, id: u32) -> Option<u32> {
+    if id == u32::MAX {
+        return None; // INVALID_UID / INVALID_GID
+    }
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(current_task_id());
+        if is_gid {
+            ns.translate_gid_range_to_host(id, 1)
+        } else {
+            ns.translate_uid_range_to_host(id, 1)
+        }
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = is_gid;
+        Some(id)
+    }
 }
 
 /// Session lookups for the job-control tty ioctls: the caller's session,

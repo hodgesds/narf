@@ -321,8 +321,18 @@ pub fn build_fs_with_options(
         // make `mount -t bpf` succeed and every pin into it fail with EPERM.
         "bpf" | "bpffs" => Some(Arc::new(narf_filesystem::bpffs::BpfFs::new())),
 
-        // devpts shares the live Unix98 PTY registry with /dev/pts.
-        "devpts" => Some(Arc::new(narf_filesystem::devfs_pty::DevPtsFs)),
+        // devpts: every mount is a new instance (Linux 4.7+) with its own
+        // index space and uid=/gid=/mode=/ptmxmode=/max= options. The
+        // mounter owns its ptmx node; `reserve` is set only for a mount made
+        // in the initial mount namespace (`devpts_init_fs_context`).
+        "devpts" => Some(Arc::new(
+            narf_filesystem::devfs_pty::DevPtsFs::from_options(
+                options,
+                uid,
+                gid,
+                crate::handlers::current_mount_namespace().is_none(),
+            )?,
+        )),
 
         // POSIX message queues: the mount and mq_* syscalls share the calling
         // task's IPC-namespace registry, as Linux mqueue_get_tree does.
@@ -427,11 +437,15 @@ pub(crate) fn reconfigure_super(
     if sb_mask & !sb::RMT_MASK != 0 {
         return Err(EINVAL);
     }
-    if !fs_options.is_empty() {
-        fs.reconfigure(fs_options).map_err(|error| match error {
-            FsError::NoSpace => ENOSPC,
-            _ => EINVAL,
-        })?;
+    // `reconfigure_super` always calls the filesystem's `->reconfigure`: a
+    // devpts remount with no options resets every option to its default
+    // (`devpts_reconfigure`). A filesystem with no reconfigure op ignores an
+    // empty parameter list; given parameters it rejects them.
+    match fs.reconfigure(fs_options) {
+        Ok(()) => {}
+        Err(FsError::Unsupported) if fs_options.is_empty() => {}
+        Err(FsError::NoSpace) => return Err(ENOSPC),
+        Err(_) => return Err(EINVAL),
     }
     if sb_mask != 0 {
         sb::update(fs, sb_flags, sb_mask);

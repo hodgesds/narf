@@ -745,6 +745,9 @@ pub enum FsError {
     Busy,
     ReadOnly,
     NoSpace,
+    /// `ENODEV`: no device behind the node, e.g. a `ptmx` with no devpts
+    /// mounted at `pts` beside it (`devpts_ptmx_path`).
+    NoDevice,
     /// Memory allocation failed, distinct from storage exhaustion (ENOMEM).
     OutOfMemory,
     /// A filesystem quota or qgroup hard limit would be exceeded. Maps to
@@ -1431,10 +1434,10 @@ pub trait FileOps: Send + Sync {
         None
     }
 
-    /// Wave-76: if this file is a PTY master, return the slave index.
-    /// Used by `sys_ioctl(TIOCGPTPEER)` to open a fresh slave fd
-    /// without going through a downcast / Any dance. Default: `None`.
-    fn as_pty_master_index(&self) -> Option<u32> {
+    /// If this file is a PTY master, return its pty's system-wide id
+    /// (`devfs_pty::pty_by_id`). Used by `sys_ioctl(TIOCGPTPEER)` to open a
+    /// fresh slave fd without a downcast / Any dance. Default: `None`.
+    fn as_pty_master_id(&self) -> Option<u32> {
         None
     }
 

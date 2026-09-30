@@ -5754,6 +5754,16 @@ fn boot_userspace_init() {
                     "pts_chown_glibc",
                     narf_verification::NARF_PTS_CHOWN_SMOKE_GLIBC_ELF,
                 ),
+                // devpts mounts are independent instances with their own
+                // uid/gid/mode/ptmxmode/max options (Linux 4.7+).
+                (
+                    "devpts_instances_smoke",
+                    narf_verification::NARF_DEVPTS_INSTANCES_SMOKE_ELF,
+                ),
+                (
+                    "devpts_instances_glibc",
+                    narf_verification::NARF_DEVPTS_INSTANCES_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.

@@ -215,7 +215,7 @@ fn smoke_pty_pts_dir_lists_open_ptys() -> TestResult {
     let master = open_ptmx();
     let idx = master.index();
 
-    let dir = DevPts;
+    let dir = DevPts::boot();
     let entries = dir.enumerate(0, 64);
     let found = entries
         .iter()
@@ -237,7 +237,7 @@ fn smoke_pty_pts_disappears_after_master_drop() -> TestResult {
         // master dropped here → ptmx_close() removes from PTY_TABLE
     };
 
-    let dir = DevPts;
+    let dir = DevPts::boot();
     let entries = dir.enumerate(0, 64);
     let found = entries
         .iter()
@@ -535,7 +535,7 @@ fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
     let idx = master.index();
 
     // Locked-by-default: DevPts::lookup must NOT return the slave.
-    let dir = DevPts;
+    let dir = DevPts::boot();
     let mut tmp = [0u8; 10];
     let digits = {
         let mut n = idx;
@@ -733,7 +733,8 @@ fn smoke_pty_gptpeer_respects_lock() -> TestResult {
     use crate::devfs_pty::{pts_open_peer, TIOCSPTLCK};
     __reset_for_test();
     let master = open_ptmx();
-    let idx = master.index();
+    // TIOCGPTPEER keys on the pty's system-wide id, not its pts index.
+    let idx = master.as_pty_master_id().expect("pty master");
 
     // Default-locked: pts_open_peer returns Some(Err(())).
     match pts_open_peer(idx) {
@@ -750,12 +751,12 @@ fn smoke_pty_gptpeer_respects_lock() -> TestResult {
 }
 kernel_test_in!("filesystem/pty", smoke_pty_gptpeer_respects_lock);
 
-// `DevPtmx` is the clone node at `/dev/pts/ptmx` (the root `/dev/ptmx`
-// path is a symlink to it). `sys_open` uses `open_instance()` to allocate
+// `DevPtmx` is a devpts instance's own clone node, `/dev/pts/ptmx`
+// (devtmpfs's `/dev/ptmx` reaches the same instance through `pts`). `sys_open` uses `open_instance()` to allocate
 // the pair; keep the legacy marker pinned until all out-of-tree users migrate.
 fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
     use crate::devfs_pty::DevPtmx;
-    let p = DevPtmx;
+    let p = DevPtmx::boot();
     if !p.is_ptmx_clone() {
         return TestResult::Fail("DevPtmx::is_ptmx_clone() returned false");
     }
@@ -771,31 +772,39 @@ fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
 }
 kernel_test_in!("filesystem/pty", smoke_pty_devptmx_is_ptmx_clone);
 
-/// Linux exposes `/dev/ptmx` as the relative symlink `pts/ptmx`, while the
-/// mounted devpts instance owns the clone device and shares the live PTY table.
+/// devtmpfs exposes `/dev/ptmx` as its own `c 5:2` node beside an empty
+/// `/dev/pts`; a mounted devpts instance owns its own `ptmx` clone node and
+/// its ptys.
 fn smoke_pty_linux_devpts_mount_shape() -> TestResult {
     use crate::devfs::{linux_makedev, DevFs};
-    use crate::devfs_pty::DevPtsFs;
+    use crate::devfs_pty::{boot_devpts, DevPtsFs};
     use crate::{FileType, FsInstance};
 
     __reset_for_test();
+    // devtmpfs: `/dev/ptmx` is `c 5:2` mode 0666 (`tty_devnode`), and
+    // `/dev/pts` is an empty directory for the devpts mount.
     let dev_root = DevFs::new().root();
-    let ptmx_link = match dev_root.lookup("ptmx") {
-        Some(link) => link,
-        None => return TestResult::Fail("/dev/ptmx symlink is missing"),
+    let ptmx = match dev_root.lookup("ptmx") {
+        Some(node) => node,
+        None => return TestResult::Fail("/dev/ptmx is missing"),
     };
-    if ptmx_link.stat().mode.file_type != FileType::Symlink {
-        return TestResult::Fail("/dev/ptmx is not a symlink");
+    let st = ptmx.stat();
+    if st.mode.file_type != FileType::Special || st.mode.perms != 0o666 {
+        return TestResult::Fail("/dev/ptmx is not a 0666 character device");
     }
-    let mut target = [0u8; 16];
-    match poll_once(ptmx_link.read(0, &mut target)) {
-        Some(Ok(n)) if &target[..n] == b"pts/ptmx" => {}
-        _ => return TestResult::Fail("/dev/ptmx has the wrong target"),
+    if ptmx.rdev() != linux_makedev(5, 2) {
+        return TestResult::Fail("/dev/ptmx is not 5:2");
+    }
+    match dev_root.lookup_dir("pts") {
+        Some(dir) if dir.enumerate(0, 8).is_empty() => {}
+        _ => return TestResult::Fail("devtmpfs /dev/pts is not an empty mountpoint"),
     }
 
+    // The boot devpts: its own `ptmx` (5:2, inode 2, ptmxmode 000) and the
+    // live slaves of that instance.
     let master = open_ptmx();
     let index = master.index();
-    let pts = DevPtsFs.root();
+    let pts = DevPtsFs::with_instance(boot_devpts()).root();
     if !pts
         .enumerate(0, 64)
         .iter()
@@ -807,8 +816,12 @@ fn smoke_pty_linux_devpts_mount_shape() -> TestResult {
         Some(node) => node,
         None => return TestResult::Fail("mounted devpts has no ptmx clone node"),
     };
-    if clone_node.rdev() != linux_makedev(5, 2) || clone_node.open_instance().is_none() {
-        return TestResult::Fail("devpts/ptmx metadata or clone-on-open is wrong");
+    if clone_node.rdev() != linux_makedev(5, 2)
+        || clone_node.ino() != 2
+        || clone_node.stat().mode.perms != 0
+        || !clone_node.is_ptmx_clone()
+    {
+        return TestResult::Fail("devpts/ptmx metadata is wrong");
     }
     TestResult::Pass
 }
@@ -1933,6 +1946,8 @@ fn smoke_pty_exclusive_mode_refuses_second_open() -> TestResult {
     __reset_for_test();
     let master = open_ptmx();
     let idx = master.index();
+    // pts_lookup takes the pts index; TIOCGPTPEER keys on the pty's id.
+    let id = master.as_pty_master_id().expect("pty master");
     let pty = match pts_lookup(idx) {
         Some(p) => p,
         None => return TestResult::Fail("pts_lookup returned None"),
@@ -1940,7 +1955,7 @@ fn smoke_pty_exclusive_mode_refuses_second_open() -> TestResult {
     // unlockpt() first, or the lock rather than exclusivity would refuse.
     pty.locked
         .store(false, core::sync::atomic::Ordering::Release);
-    if !matches!(pts_open_peer(idx), Some(Ok(_))) {
+    if !matches!(pts_open_peer(id), Some(Ok(_))) {
         return TestResult::Fail("an unlocked slave should open");
     }
     pty.exclusive
@@ -1954,7 +1969,7 @@ fn smoke_pty_exclusive_mode_refuses_second_open() -> TestResult {
     }
     pty.exclusive
         .store(false, core::sync::atomic::Ordering::Release);
-    match pts_open_peer(idx) {
+    match pts_open_peer(id) {
         Some(Ok(_)) => TestResult::Pass,
         _ => TestResult::Fail("clearing exclusive mode must allow opens again"),
     }

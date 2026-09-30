@@ -563,11 +563,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     {
         use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPGRP};
 
-        let master_index = ops.as_pty_master_index();
-        let slave_index = ops
+        let master_id = ops.as_pty_master_id();
+        let slave_id = ops
             .tty_id()
             .filter(|&id| id != crate::handlers::CTTY_CONSOLE);
-        if let Some(pty_index) = master_index.or(slave_index) {
+        if let Some(pty_id) = master_id.or(slave_id) {
             match cmd {
                 TIOCSCTTY => {
                     // O_PATH has no tty file_operations on Linux.
@@ -589,7 +589,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 TIOCGPGRP | TIOCGSID => {
                     // Linux lets a PTY master query its slave control state,
                     // but a slave fd must be the caller's controlling tty.
-                    if master_index.is_none() && task_ctty(task) != Some(pty_index) {
+                    if master_id.is_none() && task_ctty(task) != Some(pty_id) {
                         ctx.set_return(errno_ret(ENOTTY));
                         return;
                     }
@@ -616,7 +616,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
                 TIOCSPGRP => {
                     let caller_sid = read_sid(process_state_key(task));
-                    if task_ctty(task) != Some(pty_index)
+                    if task_ctty(task) != Some(pty_id)
                         || ops.tty_session() != Some(caller_sid)
                     {
                         ctx.set_return(errno_ret(ENOTTY));
@@ -664,7 +664,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         // refuses anything but a pty master with EIO
         // (`if (tty->driver != ptm_driver) return -EIO;`). A file that is no
         // tty never reaches `tty_ioctl`: vfs_ioctl answers ENOTTY.
-        let idx = match ops.as_pty_master_index() {
+        let idx = match ops.as_pty_master_id() {
             Some(i) => i,
             None => {
                 let errno = if ops.tty_id().is_some() { EIO } else { ENOTTY };

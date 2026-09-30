@@ -3591,8 +3591,9 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
     install_global(t);
 
     let task = crate::handlers::current_task_id();
-    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
-    let master_obj = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let master_obj = narf_filesystem::devfs_pty::open_ptmx_master();
+    // TIOCGPTPEER-style peer lookups key on the pty's system-wide id.
+    let idx = narf_filesystem::FileOps::as_pty_master_id(&master_obj).expect("pty master");
     // Linux: ptmx_open() hands back a LOCKED slave; `unlockpt(3)` issues
     // TIOCSPTLCK(0) before anything may open /dev/pts/<n>. A terminal does
     // this between openpt and fork, so a test that skips it is testing a
@@ -3604,7 +3605,6 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
         &mut unlock as *mut i32 as usize,
     ) != Ok(0)
     {
-        narf_filesystem::devfs_pty::ptmx_close(idx);
         __test_clear_global();
         return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
     }
@@ -3612,7 +3612,6 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
     let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
         Some(Ok(s)) => s,
         _ => {
-            narf_filesystem::devfs_pty::ptmx_close(idx);
             __test_clear_global();
             return TestResult::Fail("pts_open_peer refused the freshly opened master");
         }
@@ -3639,7 +3638,6 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
     ) {
         (Some(m), Some(s)) => (m, s),
         _ => {
-            narf_filesystem::devfs_pty::ptmx_close(idx);
             __test_clear_global();
             return TestResult::Fail("could not install the pty ends in the fd table");
         }
@@ -3687,8 +3685,6 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
             _ => fail = Some("master read did not return the slave's output"),
         }
     }
-
-    narf_filesystem::devfs_pty::ptmx_close(idx);
     __test_clear_global();
     match fail {
         Some(m) => TestResult::Fail(m),
@@ -3753,18 +3749,17 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
     crate::handlers::detach_controlling_tty(ctty_task());
     narf_filesystem::devfs_pty::set_controlling_tty_hook(crate::handlers::set_controlling_tty);
 
-    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
-    let master = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let master = narf_filesystem::devfs_pty::open_ptmx_master();
+    // TIOCGPTPEER-style peer lookups key on the pty's system-wide id.
+    let idx = narf_filesystem::FileOps::as_pty_master_id(&master).expect("pty master");
     let mut unlock: i32 = 0;
     if FileOps::ioctl(&master, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
-        narf_filesystem::devfs_pty::ptmx_close(idx);
         cleanup_ctty_fixture();
         return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
     }
     let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
         Some(Ok(s)) => s,
         _ => {
-            narf_filesystem::devfs_pty::ptmx_close(idx);
             cleanup_ctty_fixture();
             return TestResult::Fail("pts_open_peer refused the freshly opened master");
         }
@@ -3814,7 +3809,6 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
     }
 
     drop(slave);
-    narf_filesystem::devfs_pty::ptmx_close(idx);
     cleanup_ctty_fixture();
     match fail {
         Some(m) => TestResult::Fail(m),
@@ -3894,15 +3888,14 @@ fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
     install_core_syscalls(&mut table);
     install_global(table);
 
-    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
-    let master_obj = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let master_obj = narf_filesystem::devfs_pty::open_ptmx_master();
+    // TIOCGPTPEER-style peer lookups key on the pty's system-wide id.
+    let idx = narf_filesystem::FileOps::as_pty_master_id(&master_obj).expect("pty master");
     let mut unlock = 0i32;
     if FileOps::ioctl(&master_obj, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
-        narf_filesystem::devfs_pty::ptmx_close(idx);
         return TestResult::Fail("could not unlock PTY fixture");
     }
     let Some(Ok(slave_obj)) = narf_filesystem::devfs_pty::pts_open_peer(idx) else {
-        narf_filesystem::devfs_pty::ptmx_close(idx);
         return TestResult::Fail("could not open PTY slave fixture");
     };
     let master: Arc<dyn FileOps> = Arc::new(master_obj);
@@ -3998,8 +3991,6 @@ fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
     if fail.is_none() && call(owner_master, TIOCSPGRP, &mut owner_group as *mut i32 as u64) != 0 {
         fail = Some("owner could not set its PTY foreground group");
     }
-
-    narf_filesystem::devfs_pty::ptmx_close(idx);
     fd::__test_reset();
     crate::handlers::__test_reset_task_id_lookup();
     crate::handlers::__test_ctty_reset();
