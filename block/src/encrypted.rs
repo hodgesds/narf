@@ -25,6 +25,7 @@ use narf_lib::assert::current_domain;
 use narf_lib::id::DomainId;
 use narf_tpm::TpmDevice;
 
+use crate::luks1::{self, Luks1Error, Luks1UnlockPolicy};
 use crate::registry::{BlockDeviceSync, BlockIoError};
 
 /// Wrapper around the 64-byte AES-XTS Volume Key. Construction is
@@ -127,6 +128,8 @@ pub struct EncryptionHeader {
 /// A block device that transparently encrypts/decrypts data.
 pub struct EncryptedBlockDevice {
     inner: Arc<dyn BlockDeviceSync>,
+    /// First ciphertext LBA in the containing block device.
+    data_offset_lbas: u64,
     /// Volume Key (VK) capability handle.
     vk_cap: Cap<Key<AesXts256>, Grant>,
     /// Raw Volume Key material gated by [`VkBytes`] —
@@ -141,6 +144,7 @@ impl core::fmt::Debug for EncryptedBlockDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EncryptedBlockDevice")
             .field("inner_name", &"dyn BlockDeviceSync")
+            .field("data_offset_lbas", &self.data_offset_lbas)
             .finish_non_exhaustive()
     }
 }
@@ -166,8 +170,36 @@ impl EncryptedBlockDevice {
 
         Ok(Self {
             inner,
+            data_offset_lbas: DATA_OFFSET_LBAS,
             vk_cap,
             vk_bytes,
+        })
+    }
+
+    /// Open an existing LUKS1 partition with the default bounded-work policy.
+    ///
+    /// Supported volumes use AES-256-XTS, `plain64`, 512-byte encryption
+    /// sectors, and PBKDF2-HMAC-SHA1/SHA256/SHA512. The passphrase is borrowed
+    /// and never retained; explicit derived-key byte buffers are zeroized.
+    pub fn open_luks1(
+        inner: Arc<dyn BlockDeviceSync>,
+        passphrase: &[u8],
+    ) -> Result<Self, Luks1Error> {
+        Self::open_luks1_with_policy(inner, passphrase, Luks1UnlockPolicy::default())
+    }
+
+    /// Open LUKS1 with an explicit PBKDF2 work-factor bound.
+    pub fn open_luks1_with_policy(
+        inner: Arc<dyn BlockDeviceSync>,
+        passphrase: &[u8],
+        policy: Luks1UnlockPolicy,
+    ) -> Result<Self, Luks1Error> {
+        let unlocked = luks1::unlock(inner.clone(), passphrase, policy)?;
+        Ok(Self {
+            inner,
+            data_offset_lbas: u64::from(unlocked.header.payload_offset),
+            vk_cap: Cap::<Key<AesXts256>, Grant>::bootstrap(),
+            vk_bytes: unlocked.volume_key,
         })
     }
 
@@ -185,6 +217,9 @@ impl EncryptedBlockDevice {
 
     fn crypt_buffer(&self, encrypt: bool, lba: u64, data: &mut [u8]) -> Result<(), BlockIoError> {
         let block_size = self.inner.lba_size() as usize;
+        if block_size != luks1::SECTOR_BYTES || data.len() % block_size != 0 {
+            return Err(BlockIoError::BufferTooSmall);
+        }
         let blocks = data.len() / block_size;
 
         // Single domain-asserted window per crypt_buffer call. The
@@ -217,23 +252,48 @@ impl BlockDeviceSync for EncryptedBlockDevice {
         self.inner.lba_size()
     }
     fn capacity(&self) -> u64 {
-        self.inner.capacity().saturating_sub(DATA_OFFSET_LBAS)
+        self.inner.capacity().saturating_sub(self.data_offset_lbas)
     }
 
     fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+        let end = lba
+            .checked_add(u64::from(n_blocks))
+            .ok_or(BlockIoError::OutOfRange)?;
+        let required = usize::from(n_blocks)
+            .checked_mul(self.lba_size() as usize)
+            .ok_or(BlockIoError::BufferTooSmall)?;
+        if end > self.capacity() {
+            return Err(BlockIoError::OutOfRange);
+        }
+        if out.len() < required {
+            return Err(BlockIoError::BufferTooSmall);
+        }
         // Offset the LBA and read from inner.
-        self.inner.read(lba + DATA_OFFSET_LBAS, n_blocks, out)?;
+        self.inner
+            .read(lba + self.data_offset_lbas, n_blocks, &mut out[..required])?;
         // Decrypt the result.
-        self.crypt_buffer(false, lba, out)
+        self.crypt_buffer(false, lba, &mut out[..required])
     }
 
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        let end = lba
+            .checked_add(u64::from(n_blocks))
+            .ok_or(BlockIoError::OutOfRange)?;
+        let required = usize::from(n_blocks)
+            .checked_mul(self.lba_size() as usize)
+            .ok_or(BlockIoError::BufferTooSmall)?;
+        if end > self.capacity() {
+            return Err(BlockIoError::OutOfRange);
+        }
+        if data.len() < required {
+            return Err(BlockIoError::BufferTooSmall);
+        }
         // We need a scratch buffer because `write` takes `&[u8]` but we need to encrypt.
         // For Stage 4, we'll use a stack-allocated or temporary buffer.
         // To be safe, we'll allocate a Vec for now (requires `alloc`).
-        let mut encrypted = data.to_vec();
+        let mut encrypted = data[..required].to_vec();
         self.crypt_buffer(true, lba, &mut encrypted)?;
         self.inner
-            .write(lba + DATA_OFFSET_LBAS, n_blocks, &encrypted)
+            .write(lba + self.data_offset_lbas, n_blocks, &encrypted)
     }
 }

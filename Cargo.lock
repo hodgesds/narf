@@ -662,6 +662,7 @@ dependencies = [
  "narf-time",
  "narf-tpm",
  "narf-tracing",
+ "zeroize",
 ]
 
 [[package]]

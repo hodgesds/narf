@@ -302,7 +302,8 @@ pub fn hkdf_expand(
 // ── AES-256-XTS (Block encryption) ───────────────────────────────────
 
 /// AES-XTS-256 encryption. `key_bytes` must be 64 bytes (two 256-bit keys).
-/// `sector_id` is used as the tweak.
+/// `sector_id` is encoded little-endian as the `plain64` tweak for the first
+/// 512-byte encryption sector; subsequent sectors increment it by one.
 pub fn aes_xts_256_encrypt(
     cap: &Cap<Key<AesXts256>, Grant>,
     key_bytes: &[u8; 64],
@@ -321,13 +322,19 @@ pub fn aes_xts_256_encrypt(
         Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
     let xts = Xts128::new(cipher_1, cipher_2);
 
-    xts.encrypt_area(data, 16, sector_id.into(), get_tweak_default);
+    // Linux dm-crypt's `plain64` mode and LUKS1 both define an XTS data unit
+    // as one 512-byte sector. `encrypt_area`'s second argument is the data-unit
+    // size, not the AES block size. Passing 16 here used to restart the tweak
+    // for every AES block, which round-tripped internally but was not dm-crypt
+    // compatible. Reference: ~/git/linux/drivers/md/dm-crypt.c
+    xts.encrypt_area(data, 512, sector_id.into(), get_tweak_default);
 
     Ok(())
 }
 
 /// AES-XTS-256 decryption. `key_bytes` must be 64 bytes (two 256-bit keys).
-/// `sector_id` is used as the tweak.
+/// `sector_id` is encoded little-endian as the `plain64` tweak for the first
+/// 512-byte encryption sector; subsequent sectors increment it by one.
 pub fn aes_xts_256_decrypt(
     cap: &Cap<Key<AesXts256>, Grant>,
     key_bytes: &[u8; 64],
@@ -346,7 +353,7 @@ pub fn aes_xts_256_decrypt(
         Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
     let xts = Xts128::new(cipher_1, cipher_2);
 
-    xts.decrypt_area(data, 16, sector_id.into(), get_tweak_default);
+    xts.decrypt_area(data, 512, sector_id.into(), get_tweak_default);
 
     Ok(())
 }

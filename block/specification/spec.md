@@ -136,7 +136,7 @@ pub fn find_block_device_indexed(
 ```
 
 Registered GPT partitions carry their GPT type GUID, label, and unique GUID
-plus a best-effort filesystem volume UUID parsed from immutable FAT or ext
+plus a best-effort volume UUID parsed from immutable FAT, ext, or LUKS1
 identification bytes. `PartitionMetadata::is_efi_system_partition()` identifies
 an EFI System Partition solely by its UEFI GPT type GUID, never by a volatile
 device name, label, or volume UUID.
@@ -147,6 +147,17 @@ Targeted lookups clone only the matched device `Arc`; they do not allocate an
 owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux
 minor number across concurrent hot-unplug.
+
+### 3.6 Encrypted-device stacking
+
+`EncryptedBlockDevice` wraps an `Arc<dyn BlockDeviceSync>` and exposes the
+decrypted payload as another `BlockDeviceSync`. Native NARF volumes use the
+TPM-unseal path described in `encrypted.md`; existing Linux installations use
+`EncryptedBlockDevice::open_luks1(inner, passphrase)`. The LUKS1 path is
+read-only for metadata and supports AES-256-XTS/`plain64` with 512-byte
+encryption sectors. `Luks1UnlockPolicy` bounds header-controlled PBKDF2 work.
+Passphrase acquisition and registration of the resulting root device belong
+to boot orchestration, not the block adapter.
 
 ## 4. Invariants & safety properties
 

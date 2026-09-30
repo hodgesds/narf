@@ -63,6 +63,7 @@ Concrete algorithms (initial set):
 | KDF       | HKDF-SHA-256                      |
 | XOF       | SHAKE-128, SHAKE-256              |
 | Stream    | ChaCha20 (via AEAD, not standalone exposed) |
+| Disk      | AES-256-XTS, 512-byte data units, `plain64` little-endian sector tweak |
 
 Post-quantum: algorithm choice left as an open question (§8).
 

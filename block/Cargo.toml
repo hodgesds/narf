@@ -19,6 +19,7 @@ narf-tpm     = { path = "../tpm" }
 narf-scheduler = { path = "../scheduler" }
 async-trait = "0.1"
 narf-kernel-test = { path = "../verification/kernel-test" }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
 # cgroup-v2 io controller seam: exposes a hook the cgroupfs `io`
