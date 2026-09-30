@@ -1464,14 +1464,20 @@ dependencies = [
 name = "narf-drivers-thunderbolt"
 version = "0.0.0"
 dependencies = [
+ "narf-aml",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
  "narf-init",
+ "narf-interrupts",
+ "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1516,12 +1522,16 @@ dependencies = [
 name = "narf-drivers-usbpd"
 version = "0.0.0"
 dependencies = [
+ "narf-aml",
  "narf-capabilities",
  "narf-console",
+ "narf-drivers-extcon",
  "narf-drivers-i2c",
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
  "narf-usbpd",

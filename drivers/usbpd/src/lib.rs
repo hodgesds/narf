@@ -37,6 +37,8 @@ pub mod i2c_bridge;
 pub mod policy;
 pub mod tcpm;
 pub mod tps65987;
+pub mod ucsi;
+mod ucsi_acpi;
 
 mod tests;
 
@@ -77,7 +79,13 @@ pub static PORTS: IrqSafeSpinLock<Vec<PortBinding>> = IrqSafeSpinLock::new(Vec::
 pub fn register_initcalls() {
     use core::fmt::Write as _;
     use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "usbpd-ucsi-acpi", ucsi_acpi::probe);
     narf_init::register(Stage::Late, "usbpd-tcpc-probe", || {
+        // A firmware PPM owns the PD controller. Raw I2C probing and a
+        // second policy engine must not compete with it, even if _DSM fails.
+        if !narf_aml::find_all_devices_by_hid("PNP0CA0").is_empty() {
+            return InitResult::NotPresent;
+        }
         let buses = narf_drivers_i2c::registered_buses();
         if buses.is_empty() {
             let _ = writeln!(

@@ -44,6 +44,30 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### AMD DCN 3.1.4 USB-C display transport
+
+`amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
+mailbox and GPU power/firmware ownership for its lifetime. It requires exact
+DCN 3.1.4 IP discovery, running DAL firmware and bounded VRAM inbox/outbox
+windows. Async HPD, Type-C PHY state and AUX commands serialize mailbox access,
+validate replies, and poison the channel after timeout or cancellation.
+
+`amdgpu_usbc::sinks()` returns detected native-AUX/DPIA sinks with DPCD and
+checksum-validated EDID (base plus up to four extension blocks). The Late-stage
+worker is the sole mailbox owner, responds to UCSI changes, and periodically
+rescans without assuming a UCSI-to-GPU wiring map. Suspend is refused while a
+command cycle is active; resume revalidates the firmware mailbox mapping.
+Firmware replacement is rejected while this worker owns DMUB.
+
+This transport **does not load DAL firmware, program source encoders, train
+DisplayPort links or expose new active DRM/KMS scanouts**. A successful sink
+read or USB4 tunnel does not prove monitor output. Cold-boot firmware loading,
+VRAM allocation and native external-display modesetting remain open.
+The implementation references local Linux `dmub_cmd.h`, `dmub_dcn31.c`,
+`dmub_dcn314.c`, `dcn314_resource.c` and DCN 3.1.4 register headers.
+
+### VirtIO-GPU rendering
+
 The Phase-B VirtIO-GPU render path is layered over the existing DRM primary
 and render nodes. It is deliberately small but wire-compatible with Mesa's
 virtgpu userspace ABI:

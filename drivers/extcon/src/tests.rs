@@ -328,3 +328,57 @@ fn smoke_headphone_cable_state() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/extcon", smoke_headphone_cable_state);
+
+fn firmware_state_notifies_without_mux_programming() -> TestResult {
+    use crate::typec::{DataRole, FirmwareState, PowerRole};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug, Default)]
+    struct Mux(AtomicUsize);
+    impl TypecMux for Mux {
+        fn configure(&self, _: MuxSetting) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let connector = TypecConnector::new("firmware-test");
+    let mux = Arc::new(Mux::default());
+    let sink = Arc::new(RecordingSink::new());
+    connector.set_mux(mux.clone());
+    connector.subscribe(sink.clone());
+    let mut state = FirmwareState {
+        orientation: Orientation::Reversed,
+        power_role: PowerRole::Sink,
+        data_role: DataRole::Host,
+        connected: true,
+        usb: true,
+        displayport: true,
+        usb4: true,
+        audio: false,
+    };
+    connector.update_firmware(state);
+    connector.update_firmware(state);
+    if connector.orientation() != Orientation::Reversed
+        || !connector.cable_state(Cable::Dp)
+        || !connector.cable_state(Cable::UsbHost)
+        || !connector.cable_state(Cable::ThunderboltDock)
+        || connector.cable_state(Cable::Usb)
+        || sink.event_count() != 3
+    {
+        return TestResult::Fail("firmware roles/cables or duplicate notifications");
+    }
+    state.connected = false;
+    state.orientation = Orientation::Unknown;
+    connector.update_firmware(state);
+    if connector.cable_state(Cable::Dp)
+        || connector.cable_state(Cable::UsbHost)
+        || connector.cable_state(Cable::ThunderboltDock)
+        || sink.event_count() != 6
+        || mux.0.load(Ordering::Relaxed) != 0
+    {
+        return TestResult::Fail("firmware detach must clear cables without touching host mux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/extcon",
+    firmware_state_notifies_without_mux_programming
+);

@@ -122,6 +122,13 @@ Flow:
    hand `time/` the suspend duration so it can jump forward the
    wall clock without violating monotonic.
 
+The current synchronous `suspend::suspend(&Cap<Power, Invoke>)` aborts with
+`SuspendError::Aborted` when any device PM callback fails, including `Busy`
+from a driver with an outstanding asynchronous transaction. It runs resume
+callbacks to undo partial quiescing and returns the phase to `Idle` before
+returning. No framebuffer blanking or platform sleep occurs on this path.
+`arm_s3_resume` uses this same orchestration; it does not suspend devices twice.
+
 ### 3.4 Thermal
 
 ```rust

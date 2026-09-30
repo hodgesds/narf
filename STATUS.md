@@ -44,6 +44,23 @@ SoundWire, HDMI/DP audio, vendor smart-amplifier quirks, suspend/resume and
 Linux ALSA ioctl/mmap compatibility remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
+## USB-C and Phoenix USB4
+
+UCSI ACPI connector discovery, firmware state notifications, per-NHI native
+USB4 config rings/topology and USB3/DP tunnel programming are implemented
+against `/usr/src/linux`. Native ownership requires ACPI `_OSC`; PCIe and
+XDomain control are not requested. DP tunneling currently supports one RBR
+path per domain, and native USB4 system suspend/replay remains unsupported.
+Memory-backed tests exercise DMA ownership, acknowledgements, path drainage
+and rollback without touching host devices.
+
+The AMD DCN 3.1.4 DMUB transport can attach to running DAL firmware for HPD,
+AUX and EDID discovery. **External monitor output is not complete:** cold-boot
+display firmware loading, source encoder setup, link training and KMS
+integration remain open. Physical Lenovo 50ee USB-C/USB4 validation is pending.
+See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
+interfaces and limits.
+
 ## Exercised paths
 
 - **Kernel on QEMU:** `cargo xtask run` and `cargo xtask test` support x86_64

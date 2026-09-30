@@ -1,6 +1,6 @@
 [package]
 name         = "narf-drivers-thunderbolt"
-description  = "Thunderbolt / USB4 host controller (NHI) driver. Stage-0: PCI match table + BAR0 mapping + identity register read."
+description  = "USB4 NHI, native connection manager, USB3 and DisplayPort tunnels."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -20,6 +20,12 @@ narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-memory       = { path = "../../memory" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-io           = { path = "../../io" }
+narf-interrupts   = { path = "../../interrupts" }
+narf-scheduler    = { path = "../../scheduler" }
+narf-time         = { path = "../../time" }
+narf-aml          = { path = "../../aml" }
+narf-power        = { path = "../../power" }
 
 [features]
 # Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't trip

@@ -1,17 +1,6 @@
-//! NHI (Native Host Interface) bring-up — Stage-0.
-//!
-//! What this stage owns:
-//! - Match table covering the Intel client NHI device IDs the user's
-//!   target hardware ships with: Tiger Lake, Alder Lake, Raptor Lake,
-//!   Meteor Lake, Lunar Lake — plus the discrete Barlow Ridge USB4
-//!   accessory controller.
-//! - Probe: enable MEM_SPACE + BUS_MASTER, map BAR0 (NHI MMIO), read
-//!   `REG_CAPS` for the NHI version + hop count, and emit the
-//!   stage-0 announce line.
-//!
-//! Everything past "announce" is Stage-1+: ring 0 mailbox bring-up,
-//! Connection-Manager command queue, XDomain topology walk, and
-//! tunnelling.
+//! PCI NHI discovery. Modern USB4 controllers use class 0x0c0340;
+//! older Intel PCI identities remain explicit matches. Native ownership and
+//! DMA enablement are deferred to the Late-stage connection manager.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -19,7 +8,7 @@ use narf_bus::{
     map_bar, register_pci_driver, BusDevice, BusDeviceCap, MatchKind, MmioRegion, PciMatch,
     ProbeError,
 };
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 /// Intel PCI vendor ID.
 pub const INTEL_VENDOR: u16 = 0x8086;
@@ -46,8 +35,8 @@ pub const NHI_BAR: u8 = 0;
 
 /// NHI / Thunderbolt PCI device-ID table.
 ///
-/// Sourced from `nhi_ids[]` in Linux `drivers/thunderbolt/nhi.c`
-/// (post-relicense GPL-2.0-or-later citation per NARF policy).
+/// Sourced from `nhi_ids[]` in Linux `drivers/thunderbolt/pci.c`
+/// (register identities; controller behavior follows the USB4 class).
 /// Coverage spans:
 /// - Tiger Lake (Maple Ridge controllers + on-die)
 /// - Alder Lake (Goshen Ridge external + Alder Lake-P on-die)
@@ -71,21 +60,12 @@ pub const TB_DEVICE_IDS: &[(u16, &str)] = &[
     (0x9A1F, "tgl-h-nhi0"),
     (0x9A21, "tgl-h-nhi1"),
     // Alder Lake — Linux `PCI_DEVICE_ID_INTEL_ADL_NHI{0,1}`.
-    // Linux's `ADL_NHI0` is 0x463E, while the user-cited value
-    // 0x463F is the adjacent PCI function on the same package
-    // (some board EEPROMs report it). Register both so we
-    // don't drop a real-HW match on either side.
     (0x463E, "adl-nhi0"),
-    (0x463F, "adl-nhi0-alt"),
     (0x466D, "adl-nhi1"),
     // Raptor Lake — Linux `PCI_DEVICE_ID_INTEL_RPL_NHI{0,1}`.
-    // Same story as ADL: user-cited 0x7EB3 sits beside Linux's
-    // MTL_M_NHI0 (0x7EB2); keep both so neither real-HW board nor
-    // a future EEPROM variant slips past the match table.
     (0xA73E, "rpl-nhi0"),
     (0xA76D, "rpl-nhi1"),
     (0x7EB2, "mtl-m-nhi0"),
-    (0x7EB3, "mtl-m-nhi0-alt"),
     (0x7EC2, "mtl-p-nhi0"),
     (0x7EC3, "mtl-p-nhi1"),
     // Lunar Lake — Linux `PCI_DEVICE_ID_INTEL_LNL_NHI{0,1}`.
@@ -181,7 +161,13 @@ impl Nhi {
 
         Ok(Self {
             device_id: device.id.device,
-            sku: sku_name(device.id.device).unwrap_or("intel-tb-unknown"),
+            sku: if device.id.vendor == INTEL_VENDOR {
+                sku_name(device.id.device).unwrap_or("intel-usb4")
+            } else if device.id.vendor == 0x1022 {
+                "amd-usb4"
+            } else {
+                "usb4-nhi"
+            },
             bar0,
             nhi_version,
             hop_count,
@@ -200,28 +186,17 @@ pub fn sku_name(device_id: u16) -> Option<&'static str> {
 /// Per-driver `probe` invoked by the bus driver-match dispatcher
 /// once a matching device is discovered.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
-    // Defensive double-check on vendor — the match table only
-    // registers exact VendorDevice entries today, but a future edit
-    // might add a class backstop (USB4 host class is 0x0C0340 and
-    // covers AMD USB4 controllers too once we add a separate driver
-    // for those). Stage-0 is Intel-only.
-    if device.id.vendor != INTEL_VENDOR {
+    // Keep the probe guard consistent with explicit IDs and the USB4 class.
+    if !matches_controller(device.id.vendor, device.id.device, device.id.class) {
         return Err(ProbeError::NotForThisDriver);
     }
-    if !TB_DEVICE_IDS.iter().any(|(d, _)| *d == device.id.device) {
-        return Err(ProbeError::NotForThisDriver);
-    }
+    cap.invoke(PowerOn(&device))
+        .map_err(|_| ProbeError::BadDevice)??;
 
-    // Enable MEM_SPACE + BUS_MASTER so BAR0 decodes and the NHI can
-    // later issue mailbox / ring 0 DMA. Stage-0 doesn't initiate
-    // DMA itself, but BUS_MASTER is cheap to set here and matches
-    // every other PCIe driver in NARF (AHCI, NVMe, VMD).
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| ProbeError::BadDevice)?;
+    // Decode registers now. Native ownership, ring setup and bus-master
+    // enablement belong to the connection manager's Late-stage worker.
+    narf_bus::pci::set_command(&cap, &device, narf_bus::pci::cmd::MEM_SPACE)
+        .map_err(|_| ProbeError::BadDevice)?;
 
     // SAFETY: probe owns the device's cfg space + BARs for the
     // duration of this call.
@@ -234,6 +209,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
     TB_INSTANCE_COUNT.fetch_add(1, Ordering::AcqRel);
     TB_LAST_NHI_VERSION.store(nhi.nhi_version as u32, Ordering::Release);
     TB_LAST_HOP_COUNT.store(nhi.hop_count as u32, Ordering::Release);
+    crate::runtime::retain(device, cap, nhi);
 
     // Stage-0 announce. Shape mirrors `i915` / `nvme` / `vmd`
     // probe-announce lines so the boot transcript is grep-friendly.
@@ -255,7 +231,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
     // for downstream peripherals. A dedicated `Usb4Host` variant
     // can land once the CM driver is in tree.
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("intel-thunderbolt"),
+        name: alloc::string::String::from("usb4-nhi"),
         kind: narf_drivers::BoundKind::UsbHost,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
@@ -273,6 +249,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
 /// tie-breaker picks us at full specificity over any later class
 /// backstop that may match the USB4-host class triple.
 pub fn register_pci_driver_thunderbolt() {
+    register_pci_driver(PciMatch {
+        name: "usb4-nhi",
+        kind: MatchKind::ClassFull {
+            class: 0x0c,
+            subclass: 3,
+            prog_if: 0x40,
+        },
+        probe,
+    });
     for (did, name) in TB_DEVICE_IDS.iter().copied() {
         register_pci_driver(PciMatch {
             name,
@@ -282,6 +267,48 @@ pub fn register_pci_driver_thunderbolt() {
             },
             probe,
         });
+    }
+}
+
+/// Linux pci.c binds USB4 NHIs by full class, including AMD Pink Sardine.
+/// PCIe tunnel bridges (0604xx) and xHCI (0c0330) remain separate drivers.
+pub fn matches_controller(vendor: u16, device: u16, class: u32) -> bool {
+    class == 0x0c0340 || (vendor == INTEL_VENDOR && sku_name(device).is_some())
+}
+
+struct PowerOn<'a>(&'a BusDevice);
+impl CapOp<BusDeviceCap, Write> for PowerOn<'_> {
+    type Output = Result<(), ProbeError>;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        Ok((|| {
+            let narf_bus::BusKind::Pcie { cfg_phys, .. } = self.0.kind else {
+                return Err(ProbeError::NotForThisDriver);
+            };
+            // SAFETY: probe owns the PCI function; access is gated by invoke.
+            let offset = match unsafe { narf_bus::pci_cap::find_cap(self.0, 1) } {
+                Ok(Some(v)) => v,
+                Ok(None) | Err(narf_bus::pci_cap::CapError::NoCapList) => return Ok(()),
+                Err(_) => return Err(ProbeError::BadDevice),
+            };
+            let pointer = narf_bus::ecam::ptr_for(cfg_phys, offset + 4)
+                .ok_or(ProbeError::BadDevice)?
+                .cast::<u16>();
+            // SAFETY: mapped and aligned PMCSR of the owned PCI function.
+            let state = unsafe { pointer.read_volatile() };
+            if state == u16::MAX {
+                return Err(ProbeError::BadDevice);
+            }
+            if state & 3 != 0 {
+                // SAFETY: D0 request, preserving RW bits and excluding W1C PME.
+                unsafe { pointer.write_volatile(state & !(3 | 0x8000)) };
+                narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(10));
+                // SAFETY: same PMCSR, after the mandatory D3hot settle interval.
+                if unsafe { pointer.read_volatile() } & 3 != 0 {
+                    return Err(ProbeError::BadDevice);
+                }
+            }
+            Ok(())
+        })())
     }
 }
 
@@ -308,4 +335,27 @@ pub fn __reset_for_test() {
     TB_INSTANCE_COUNT.store(0, Ordering::Release);
     TB_LAST_NHI_VERSION.store(0, Ordering::Release);
     TB_LAST_HOP_COUNT.store(0, Ordering::Release);
+}
+
+#[cfg(feature = "kernel-test")]
+mod matching_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn usb4_amd_class_excludes_xhci_and_pcie_bridges() -> TestResult {
+        // The supplied lspci names do not give numeric NHI IDs. Match the
+        // architectural class instead of inventing a Pink Sardine ID table.
+        if !matches_controller(0x1022, 0xffff, 0x0c0340)
+            || matches_controller(0x1022, 0x15c1, 0x0c0330)
+            || matches_controller(0x1022, 0x1453, 0x060400)
+            || matches_controller(0x8086, 0x463f, 0x060400)
+            || matches_controller(0x8086, 0x7eb3, 0x060400)
+        {
+            return TestResult::Fail("NHI binding confused with xHCI or a tunnel bridge");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/nhi",
+        usb4_amd_class_excludes_xhci_and_pcie_bridges
+    );
 }
