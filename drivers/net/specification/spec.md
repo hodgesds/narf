@@ -40,10 +40,26 @@ a raw-frame Narf-Ring and nothing higher.
 
 ### 3.1 i40e runtime profile
 
-Each X710/XL710/XXV710 PF owns one 64-entry TX/RX pair and two MSI-X entries:
-entry 0 delivers admin/fatal causes; entry 1 links PF-relative RX queue 0 to
-TX queue 0 and terminates the chain. Probe requires both routes. Hard IRQs
-mask/record, and bounded executor drains rearm after inspecting completions.
+Each X710/XL710/XXV710/X722 PF negotiates 1–8 64-entry TX/RX pairs.
+The count is the largest power of two bounded by online CPUs, the PF's queue
+allocation, HMC capacity, firmware RX/TX/RSS capabilities, available MSI-X table
+entries and host IRQ vectors. Entry 0 delivers admin/fatal causes; entry N+1
+links PF-relative RX queue N to TX queue N. A single contiguous TC0 VSI map,
+52-byte Toeplitz key and balanced 128/512-entry RSS table describe the same
+queue set. X710 uses PF key/LUT registers; X722 uses per-VSI AQ key/LUT commands.
+RSS selects non-tunnel IPv4/IPv6 TCP/UDP traffic; other traffic uses queue 0.
+TX selects a stable queue from packet addresses/ports, preserving flow ordering
+across submitting CPUs; fragments use addresses only.
+
+Each pair has its own lock, completion worker, MSI-X route and TX watchdog.
+Workers prefer separate online CPUs. On x86, MSI-X targets the corresponding
+APIC when addressable; the current aarch64 ITS exposes only collection 0,
+so IRQs target the BSP while workers can run on other CPUs. The existing
+single SPSC frame-ring ABI remains usable: RX workers serialize only delivery
+into the shared IPC producer, and the TX worker steers frames to hardware
+queues. `I40eNic::queue_count()` reports the negotiated hardware count.
+
+Hard IRQs mask/record; bounded executor drains rearm after inspecting completions.
 Waits snapshot interrupt counters before checking queues. Timers recover lost
 interrupts (10 ms queue, 100 ms admin); 250 ms without TX progress fails the PF.
 Link changes trigger an asynchronous AQ refresh with a retained retry intent.
@@ -70,13 +86,36 @@ TCP/UDP PTYPE and valid parser/checksum status. Multi-buffer RX packets are
 dropped through EOF; checksum failures are delivered for software verification.
 
 TX head writeback is checked against the submitted interval before returning
-credits or freeing DMA. AQ cancellation/timeout and fatal hardware causes stop
-new submissions and report link down; recovery requires a fresh probe. All DMA
-allocations are owned before publication. Teardown masks/disables MSI-X,
-removes and synchronizes handlers, then waits for PF reset before freeing DMA;
-failed reset quarantines those allocations. Coherent DMA barriers include
-outer-shareable ordering on aarch64. RSS, extra VSIs, jumbo frames, tunnels,
-VLAN insertion and automatic reset recovery are outside this profile.
+credits or freeing DMA. AQ cancellation/timeout, watchdog expiry and fatal
+hardware causes stop new submissions and report link down. A supervisor
+withdraws hardware publication, waits for every bounded worker lease, masks and
+synchronizes interrupts, then waits asynchronously for PF/global reset and NVM
+readiness. Only confirmed reset permits discarding outstanding TX DMA and
+clearing descriptor/completion state. The same initialization path rediscovers
+VSI IDs/queue-set handles and restores AQ, HMC, queue contexts, VLAN policy,
+RSS, filters, MSI-X and link reporting before publishing a new generation.
+Queue count, MAC, registered interface and IPC endpoints remain stable; resource
+shrinkage or a changed MAC fails the rebuild instead of silently changing them.
+
+`I40eNic::recovery_status()` reports recovery activity, generation (successful
+rebuild count), failed attempts and the last rebuild error. Failed attempts
+retain all DMA and retry with 100 ms–30 s capped exponential backoff. The TX
+worker retains an unsubmitted IPC frame through recovery; packets already
+submitted whose completion was lost are discarded and counted in
+`dropped_frames().0`, never replayed. Completion watchdogs reset at generation
+changes. Firmware setup commands use bounded responsive polling; reset waits
+release the executor between samples. No IRQ-disabling guard crosses an await.
+
+All DMA allocations are owned before publication. Final teardown
+masks/disables MSI-X, removes and synchronizes handlers, then waits for PF reset
+before freeing DMA; failed final reset quarantines those allocations.
+Coherent DMA barriers include outer-shareable ordering on aarch64. Extra VSIs,
+DCB, jumbo frames, tunnels and VLAN insertion are outside this profile.
+
+Memory-backed firmware tests exercise real AQ commands, multiqueue/RSS setup,
+failed reset DMA retention, failed rebuild retry, stable publication/IPC and
+post-recovery traffic without touching a physical NIC. Physical reset recovery
+and packet distribution still require validation on a dedicated test adapter.
 
 ## 4. Invariants & safety properties
 
