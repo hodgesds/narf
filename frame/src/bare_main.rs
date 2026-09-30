@@ -5631,6 +5631,30 @@ fn boot_userspace_init() {
                     "sockopt_daemon_glibc",
                     narf_verification::NARF_SOCKOPT_DAEMON_SMOKE_GLIBC_ELF,
                 ),
+                // `mount -o remount` through libmount's new-API sequence and
+                // mount(2) MS_REMOUNT; flags land in mountinfo (systemd-remount-fs).
+                ("remount_smoke", narf_verification::NARF_REMOUNT_SMOKE_ELF),
+                (
+                    "remount_glibc",
+                    narf_verification::NARF_REMOUNT_SMOKE_GLIBC_ELF,
+                ),
+                // systemd-update-utmp's pututxline + updwtmpx syscall
+                // sequence, with systemd's errno-after-updwtmpx check.
+                ("utmp_smoke", narf_verification::NARF_UTMP_SMOKE_ELF),
+                ("utmp_glibc", narf_verification::NARF_UTMP_SMOKE_GLIBC_ELF),
+                // tmpfiles' `w!` writes to the THP sysfs knobs.
+                ("thp_smoke", narf_verification::NARF_THP_SMOKE_ELF),
+                ("thp_glibc", narf_verification::NARF_THP_SMOKE_GLIBC_ELF),
+                // systemd-vconsole-setup's VT probe + loadkeys' KD* ioctls.
+                ("vconsole_smoke", narf_verification::NARF_VCONSOLE_SMOKE_ELF),
+                (
+                    "vconsole_glibc",
+                    narf_verification::NARF_VCONSOLE_SMOKE_GLIBC_ELF,
+                ),
+                // tmpfiles' ACL path (/proc/self/fd/N xattrs), default-ACL
+                // inheritance and chmod mask sync.
+                ("acl_smoke", narf_verification::NARF_ACL_SMOKE_ELF),
+                ("acl_glibc", narf_verification::NARF_ACL_SMOKE_GLIBC_ELF),
                 (
                     "nice_thread_smoke",
                     narf_verification::NARF_NICE_THREAD_SMOKE_ELF,

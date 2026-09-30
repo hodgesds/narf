@@ -3648,6 +3648,21 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // and the Linux errno contract for IP/IPv6/SOL_SOCKET options.
         ("sockopt_daemon_smoke", "sockopt-daemon-ok"),
         ("sockopt_daemon_glibc", "sockopt-daemon-ok"),
+        // libmount's remount sequence + MS_REMOUNT flags in mountinfo.
+        ("remount_smoke", "remount-ok"),
+        ("remount_glibc", "remount-ok"),
+        // systemd-update-utmp: pututxline + updwtmpx leave errno clear.
+        ("utmp_smoke", "utmp-ok"),
+        ("utmp_glibc", "utmp-ok"),
+        // tmpfiles writes to /sys/kernel/mm/transparent_hugepage knobs.
+        ("thp_smoke", "thp-ok"),
+        ("thp_glibc", "thp-ok"),
+        // systemd-vconsole-setup: /dev/vcs1, KDGKBMODE, loadkeys' ioctls.
+        ("vconsole_smoke", "vconsole-ok"),
+        ("vconsole_glibc", "vconsole-ok"),
+        // tmpfiles' ACLs via /proc/self/fd/N, inheritance, chmod mask sync.
+        ("acl_smoke", "acl-ok"),
+        ("acl_glibc", "acl-ok"),
         // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
         // one thread, and new tasks inherit the forking thread's nice.
         ("nice_thread_smoke", "nice-thread-ok"),

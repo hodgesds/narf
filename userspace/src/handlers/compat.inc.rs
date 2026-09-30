@@ -3121,14 +3121,26 @@ pub(crate) unsafe fn copy_raw_to_user(dst_uptr: u64, src: *const u8, len: usize)
 // MS_RDONLY, MS_NODEV and MS_NOEXEC become the mount's `MNT_*` set and are
 // enforced (`mnt_want_write`, `may_open`'s device arm, `do_open_execat`).
 // MS_NOSUID is enforced too: `bprm_fill_uid` consults it (`mnt_may_suid`)
-// before honouring a set-user-ID / set-group-ID bit. MS_REC and MS_RELATIME are
-// accepted and dropped — there is no mount propagation to recurse over and
-// no atime policy to relax.
+// before honouring a set-user-ID / set-group-ID bit. The atime policy
+// (MS_NOATIME / MS_NODIRATIME / MS_RELATIME / MS_STRICTATIME) is recorded on
+// the mount and reported through mountinfo and statmount; NARF's filesystems
+// do not maintain atime from reads, so it has nothing to relax.
 const MS_RDONLY: u64 = 1 << 0;
 const MS_NOSUID: u64 = 1 << 1;
 const MS_NODEV: u64 = 1 << 2;
 const MS_NOEXEC: u64 = 1 << 3;
+const MS_SYNCHRONOUS: u64 = 1 << 4;
 const MS_REMOUNT: u64 = 1 << 5;
+const MS_MANDLOCK: u64 = 1 << 6;
+const MS_DIRSYNC: u64 = 1 << 7;
+const MS_NOSYMFOLLOW: u64 = 1 << 8;
+const MS_NOATIME: u64 = 1 << 10;
+const MS_NODIRATIME: u64 = 1 << 11;
+const MS_STRICTATIME: u64 = 1 << 24;
+const MS_LAZYTIME: u64 = 1 << 25;
+const MS_I_VERSION: u64 = 1 << 23;
+const MS_SILENT: u64 = 1 << 15;
+const MS_POSIXACL: u64 = 1 << 16;
 const MS_BIND: u64 = 1 << 12;
 const MS_MOVE: u64 = 1 << 13;
 const MS_REC: u64 = 1 << 14;
@@ -3524,18 +3536,45 @@ pub(crate) fn current_mount_arc_with_flags(
 /// request, `MNT_*` is the property the attachment carries afterwards.
 pub(crate) fn mnt_flags_from_ms(flags: u64) -> u64 {
     use narf_filesystem::mnt_flags;
-    let mut out = 0;
+    // /* Default to relatime unless overriden */
+    // if (!(flags & MS_NOATIME)) mnt_flags |= MNT_RELATIME;
+    let mut out = if flags & MS_NOATIME == 0 {
+        mnt_flags::RELATIME
+    } else {
+        0
+    };
     for (ms, mnt) in [
-        (MS_RDONLY, mnt_flags::READONLY),
         (MS_NOSUID, mnt_flags::NOSUID),
         (MS_NODEV, mnt_flags::NODEV),
         (MS_NOEXEC, mnt_flags::NOEXEC),
+        (MS_NOATIME, mnt_flags::NOATIME),
+        (MS_NODIRATIME, mnt_flags::NODIRATIME),
     ] {
         if flags & ms != 0 {
             out |= mnt;
         }
     }
+    // if (flags & MS_STRICTATIME) mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
+    if flags & MS_STRICTATIME != 0 {
+        out &= !(mnt_flags::RELATIME | mnt_flags::NOATIME);
+    }
+    if flags & MS_RDONLY != 0 {
+        out |= mnt_flags::READONLY;
+    }
+    if flags & MS_NOSYMFOLLOW != 0 {
+        out |= mnt_flags::NOSYMFOLLOW;
+    }
     out
+}
+
+/// The stored `MNT_*` set of the mount at exactly `path` (no superblock
+/// contribution), or `None` when `path` is not a mount root.
+pub(crate) fn current_mount_flags_exact(path: &str) -> Option<u64> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.mount_flags_exact(path)
+    } else {
+        narf_filesystem::registry().mount_flags_exact(path)
+    }
 }
 
 /// The `MNT_*` flags of the mount covering `path` in the caller's
@@ -3953,7 +3992,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, mnt_opts, sb_opts) in rows {
+    for (id, parent, path, name, mnt_opts, sb_opts, super_flags) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -3965,13 +4004,14 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        // The last two fields are the two option halves: this
-        // attachment's MNT_* flags, then the filesystem's `show_options`
-        // text. procfs renders them in mountinfo's two separate columns.
+        // The last three fields are the option halves: this attachment's
+        // MNT_* flags, then the filesystem's `show_options` text, then the
+        // superblock's `rw`/`ro` + `show_sb_opts`. procfs renders the first
+        // before mountinfo's `-` and the other two after it.
         let _ = writeln!(
             s,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            id, parent, visible, name, mnt_opts, sb_opts
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            id, parent, visible, name, mnt_opts, sb_opts, super_flags
         );
     }
     Some(s)

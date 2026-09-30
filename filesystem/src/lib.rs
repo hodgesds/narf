@@ -75,6 +75,7 @@ pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
+pub(crate) mod devfs_vt;
 pub mod efivarfs;
 pub mod fifo;
 pub mod fs_registry;
@@ -2922,6 +2923,10 @@ pub fn any_restricted_mounts() -> bool {
 }
 
 fn note_mnt_flags(flags: u64) {
+    // The atime bits are recorded policy, never checked on a syscall path;
+    // every ordinary `mount(2)` carries `relatime`, so letting them through
+    // would put the mount-table walk back on every write.
+    let flags = flags & mnt_flags::ENFORCED_MASK;
     if flags != 0 {
         SEEN_MNT_FLAGS.fetch_or(flags, core::sync::atomic::Ordering::Relaxed);
     }
@@ -2950,6 +2955,20 @@ pub mod mnt_flags {
     /// constraint `openat2`'s `RESOLVE_NO_SYMLINKS` asks for per call:
     /// encountering a symlink is -ELOOP, not a silent traversal.
     pub const NOSYMFOLLOW: u64 = 1 << 4;
+    /// `MNT_NOATIME` — reads never update an inode's access time.
+    pub const NOATIME: u64 = 1 << 5;
+    /// `MNT_NODIRATIME` — reading a directory never updates its access time.
+    pub const NODIRATIME: u64 = 1 << 6;
+    /// `MNT_RELATIME` — the access time moves only when it is older than the
+    /// modify/change time. `path_mount` sets it on every mount that asks for
+    /// neither `noatime` nor `strictatime`; a mount carrying none of the three
+    /// atime bits is `strictatime`.
+    pub const RELATIME: u64 = 1 << 7;
+    /// `MNT_ATIME_MASK` — the atime policy, which `path_mount` carries over
+    /// unchanged when a remount names no atime flag.
+    pub const ATIME_MASK: u64 = NOATIME | NODIRATIME | RELATIME;
+    /// The bits a syscall path actually tests. See `note_mnt_flags`.
+    pub const ENFORCED_MASK: u64 = READONLY | NOSUID | NODEV | NOEXEC | NOSYMFOLLOW;
 
     /// Render the set the way `/proc/mounts` does: `rw` or `ro` first,
     /// then each restriction that is on. `show_mountinfo` and `show_vfsmnt`
@@ -2959,10 +2978,15 @@ pub mod mnt_flags {
         let mut out = alloc::string::String::from(if flags & READONLY != 0 { "ro" } else { "rw" });
         // Same order `show_mountinfo` emits them, and `nosymfollow` is in
         // that list — a mount unit that asked for it reads this back.
+        // `fs/proc_namespace.c::show_vfsmnt_opts`: nosuid, nodev, noexec,
+        // noatime, nodiratime, relatime, nosymfollow.
         for (bit, name) in [
             (NOSUID, ",nosuid"),
             (NODEV, ",nodev"),
             (NOEXEC, ",noexec"),
+            (NOATIME, ",noatime"),
+            (NODIRATIME, ",nodiratime"),
+            (RELATIME, ",relatime"),
             (NOSYMFOLLOW, ",nosymfollow"),
         ] {
             if flags & bit != 0 {
@@ -2970,6 +2994,149 @@ pub mod mnt_flags {
             }
         }
         out
+    }
+}
+
+/// Linux `SB_*` (`include/linux/fs.h`) — the per-SUPERBLOCK half of the
+/// flag space: properties of the filesystem instance itself, shared by
+/// every mount of it.
+///
+/// `fsconfig(FSCONFIG_SET_FLAG, "ro")` + `FSCONFIG_CMD_RECONFIGURE` (what
+/// `mount -o remount,ro` does on util-linux 2.39+) and `mount(2)`'s
+/// `MS_REMOUNT|MS_RDONLY` both land here through `reconfigure_super`, and
+/// `__mnt_is_readonly` refuses writes through EVERY mount of a read-only
+/// superblock, not just the one the caller named.
+///
+/// NARF's `FsInstance` has no superblock object to hang these on, so they
+/// live in a table keyed by the instance's `Arc`. A `Weak` guards the key: a
+/// freed instance whose address is reused never inherits its flags.
+///
+/// LINUX-GAP: a bind mount wraps its source in a new `FsInstance`
+/// ([`BindMount`]), so it is a different key here — a read-only remount of
+/// the superblock through the original mount does not reach an existing
+/// bind of it.
+pub mod sb_flags {
+    use alloc::sync::{Arc, Weak};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    /// `SB_RDONLY`.
+    pub const RDONLY: u64 = 1 << 0;
+    /// `SB_SYNCHRONOUS`.
+    pub const SYNCHRONOUS: u64 = 1 << 4;
+    /// `SB_MANDLOCK`.
+    pub const MANDLOCK: u64 = 1 << 6;
+    /// `SB_DIRSYNC`.
+    pub const DIRSYNC: u64 = 1 << 7;
+    /// `SB_LAZYTIME`.
+    pub const LAZYTIME: u64 = 1 << 25;
+    /// `SB_I_VERSION`.
+    pub const I_VERSION: u64 = 1 << 23;
+    /// `MS_RMT_MASK` (`include/uapi/linux/mount.h`): the superblock flags a
+    /// reconfiguration may change. `reconfigure_super` opens with
+    /// `if (fc->sb_flags_mask & ~MS_RMT_MASK) return -EINVAL;` — so a
+    /// `dirsync` passed to a remount is refused, not ignored.
+    pub const RMT_MASK: u64 = RDONLY | SYNCHRONOUS | MANDLOCK | I_VERSION | LAZYTIME;
+
+    type Entry = (Weak<dyn crate::FsInstance>, u64);
+    static TABLE: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+    /// Bumped on every change so `/proc/<pid>/mountinfo` pollers see a
+    /// superblock `ro`/`rw` flip the same way they see an attach.
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    fn key(fs: &Arc<dyn crate::FsInstance>) -> *const () {
+        Arc::as_ptr(fs) as *const ()
+    }
+
+    /// The instance's `s_flags` (only the bits above are modelled).
+    pub fn of(fs: &Arc<dyn crate::FsInstance>) -> u64 {
+        let k = key(fs);
+        TABLE
+            .lock()
+            .iter()
+            .find(|(w, _)| w.as_ptr() as *const () == k && w.strong_count() > 0)
+            .map_or(0, |(_, flags)| *flags)
+    }
+
+    /// `WRITE_ONCE(sb->s_flags, (s_flags & ~mask) | (flags & mask))` — the
+    /// last step of `reconfigure_super`.
+    pub fn update(fs: &Arc<dyn crate::FsInstance>, flags: u64, mask: u64) {
+        let k = key(fs);
+        let mut table = TABLE.lock();
+        table.retain(|(w, _)| w.strong_count() > 0);
+        let next = match table.iter_mut().find(|(w, _)| w.as_ptr() as *const () == k) {
+            Some((_, current)) => {
+                *current = (*current & !mask) | (flags & mask);
+                *current
+            }
+            None => {
+                let value = flags & mask;
+                table.push((Arc::downgrade(fs), value));
+                value
+            }
+        };
+        drop(table);
+        if next & RDONLY != 0 {
+            // Engage the write-path checks: `mnt_want_write` has to look.
+            super::note_mnt_flags(super::mnt_flags::READONLY);
+        }
+        GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// See [`GENERATION`].
+    pub fn generation() -> u64 {
+        GENERATION.load(Ordering::Acquire)
+    }
+
+    /// The superblock half of a mountinfo row: `rw`/`ro`, then
+    /// `show_sb_opts`'s `,sync`, `,dirsync`, `,mand`, `,lazytime`.
+    pub fn render(flags: u64) -> alloc::string::String {
+        let mut out = alloc::string::String::from(if flags & RDONLY != 0 { "ro" } else { "rw" });
+        for (bit, name) in [
+            (SYNCHRONOUS, ",sync"),
+            (DIRSYNC, ",dirsync"),
+            (MANDLOCK, ",mand"),
+            (LAZYTIME, ",lazytime"),
+        ] {
+            if flags & bit != 0 {
+                out.push_str(name);
+            }
+        }
+        out
+    }
+
+    /// `fs/fs_context.c::vfs_parse_sb_flag` — the generic keys every
+    /// filesystem context consumes before the filesystem sees a parameter.
+    /// Returns `(set, clear)` for a recognised key.
+    pub fn parse_key(key: &str) -> Option<(u64, u64)> {
+        Some(match key {
+            "dirsync" => (DIRSYNC, 0),
+            "lazytime" => (LAZYTIME, 0),
+            "mand" => (MANDLOCK, 0),
+            "ro" => (RDONLY, 0),
+            "sync" => (SYNCHRONOUS, 0),
+            "async" => (0, SYNCHRONOUS),
+            "nolazytime" => (0, LAZYTIME),
+            "nomand" => (0, MANDLOCK),
+            "rw" => (0, RDONLY),
+            _ => return None,
+        })
+    }
+}
+
+impl Mount {
+    /// The flags a syscall path must enforce for this attachment: its own
+    /// `MNT_*` set, plus `MNT_READONLY` when its superblock is read-only —
+    /// Linux's `__mnt_is_readonly` (`mnt_flags & MNT_READONLY ||
+    /// sb_rdonly(mnt->mnt_sb)`).
+    pub fn effective_flags(&self) -> u64 {
+        let flags = self.flags();
+        if sb_flags::of(&self.fs) & sb_flags::RDONLY != 0 {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        }
     }
 }
 
@@ -3037,7 +3204,7 @@ pub struct CacheStat {
     pub nr_recently_evicted: u64,
 }
 
-pub type MountInfoRow = (u64, u64, String, String, String, String);
+pub type MountInfoRow = (u64, u64, String, String, String, String, String);
 
 fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
     mounts
@@ -3075,6 +3242,7 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
                 String::from(mount.fs.name()),
                 mnt_flags::render(mount.flags()),
                 mount.fs.show_options(),
+                sb_flags::render(sb_flags::of(&mount.fs)),
             )
         })
         .collect()
@@ -3084,7 +3252,7 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
 /// last-wins rule `single_mount_lookup_resolution` uses — so the answer always
 /// describes the mount a path operation on `abs` would actually reach.
 fn mount_flags_for(mounts: &[Mount], abs: &str) -> Option<u64> {
-    covering_mount(mounts, abs).map(|mount| mount.flags())
+    covering_mount(mounts, abs).map(Mount::effective_flags)
 }
 
 /// The mount covering `abs` by the longest-prefix + newest-wins rule that all
@@ -3762,6 +3930,7 @@ impl MountNamespace {
         self.store()
             .mountinfo_generation
             .load(core::sync::atomic::Ordering::Acquire)
+            .wrapping_add(sb_flags::generation())
     }
 
     /// Resolve an absolute path against this namespace.
@@ -3947,7 +4116,7 @@ impl MountNamespace {
                 (
                     m.path.clone(),
                     String::from(m.fs.name()),
-                    mnt_flags::render(m.flags()),
+                    mnt_flags::render(m.effective_flags()),
                     m.fs.show_options(),
                 )
             })
@@ -3991,6 +4160,14 @@ impl MountNamespace {
     pub fn covering_mount_info(&self, abs: &str) -> Option<(String, u64)> {
         let q = self.store().inner.lock();
         covering_mount(&q, abs).map(|m| (m.path.clone(), m.group_id()))
+    }
+
+    /// The stored `MNT_*` flags (no superblock contribution) of the topmost
+    /// mount at exactly `path` — what a read-modify-write of the
+    /// attachment's own flags must start from.
+    pub fn mount_flags_exact(&self, path: &str) -> Option<u64> {
+        let q = self.store().inner.lock();
+        q.iter().rev().find(|m| m.path == path).map(Mount::flags)
     }
 
     /// Replace the `MNT_*` flags of the mount at exactly `path` — Linux's
@@ -4451,6 +4628,7 @@ impl VfsRegistry {
     pub fn mountinfo_generation(&self) -> u64 {
         self.mountinfo_generation
             .load(core::sync::atomic::Ordering::Acquire)
+            .wrapping_add(sb_flags::generation())
     }
 
     /// Mount `fs` at `path`. The `authority` cap is checked live;
@@ -4652,7 +4830,7 @@ impl VfsRegistry {
                 (
                     m.path.clone(),
                     alloc::string::String::from(m.fs.name()),
-                    mnt_flags::render(m.flags()),
+                    mnt_flags::render(m.effective_flags()),
                     m.fs.show_options(),
                 )
             })
@@ -4690,6 +4868,12 @@ impl VfsRegistry {
     pub fn covering_mount_info(&self, abs: &str) -> Option<(String, u64)> {
         let q = self.inner.lock();
         covering_mount(&q, abs).map(|m| (m.path.clone(), m.group_id()))
+    }
+
+    /// See [`MountNamespace::mount_flags_exact`].
+    pub fn mount_flags_exact(&self, path: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        q.iter().rev().find(|m| m.path == path).map(Mount::flags)
     }
 
     /// Replace the `MNT_*` flags of the mount at exactly `path`.

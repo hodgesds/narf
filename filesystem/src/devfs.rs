@@ -29,6 +29,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::devfs_vt::{
+    vt_keyboard_ioctl, vt_perm, KDFONTOP, KDGKBDIACR, KDGKBDIACRUC, KDGKBENT, KDGKBMETA, KDGKBSENT,
+    KDGKBTYPE, KDSKBDIACR, KDSKBDIACRUC, KDSKBENT, KDSKBMETA, KDSKBSENT,
+};
+
 use crate::{
     DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT,
 };
@@ -50,7 +55,7 @@ pub const fn linux_makedev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 
-fn device_inode(rdev: u64, kind: u64) -> u64 {
+pub(crate) fn device_inode(rdev: u64, kind: u64) -> u64 {
     0xd000_0000_0000_0000 | (kind << 48) | rdev.wrapping_add(1)
 }
 
@@ -1382,15 +1387,38 @@ impl FileOps for DevConsole {
                 // singleton console — drain/flush/flow have nothing to do.
                 Ok(0)
             }
-            KDGKBMODE | KDGETMODE => {
-                // No VT layer: report the default (`K_XLATE` / `KD_TEXT` = 0).
+            KDGETMODE => {
+                // `vc->vc_mode`: NARF's console is always in text mode
+                // (`KD_TEXT` = 0) — see KDSETMODE below.
                 // SAFETY: `arg` is the validated user `int *`.
                 unsafe { write_user_i32(arg, 0)? };
                 Ok(0)
             }
-            KDSKBMODE | KDSIGACCEPT => {
-                // No VT keyboard/kbrequest state to change — accept + no-op.
+            KDGKBMODE => {
+                // `vt_do_kdgkbmode`. This reported 0 — `K_RAW`, not the
+                // `K_XLATE` its comment claimed — so systemd-vconsole-setup
+                // took every VT for one an X server owns ("not in K_XLATE or
+                // K_UNICODE") and never configured the keyboard.
+                // SAFETY: `arg` is the validated user `int *`.
+                unsafe { write_user_i32(arg, crate::vt::kbd_mode(this_vt) as i32)? };
                 Ok(0)
+            }
+            KDSKBMODE => {
+                // `if (!perm) return -EPERM; vt_do_kdskbmode(console, arg)`.
+                if !vt_perm() {
+                    return Err(crate::FsError::OperationNotPermitted);
+                }
+                crate::vt::set_kbd_mode(this_vt, arg as u32)
+                    .map(|()| 0)
+                    .map_err(|()| crate::FsError::InvalidData)
+            }
+            KDSIGACCEPT => {
+                // No VT kbrequest source to route a signal from — accept.
+                Ok(0)
+            }
+            KDGKBTYPE | KDGKBMETA | KDSKBMETA | KDGKBENT | KDSKBENT | KDGKBSENT | KDSKBSENT
+            | KDGKBDIACR | KDGKBDIACRUC | KDSKBDIACR | KDSKBDIACRUC | KDFONTOP => {
+                vt_keyboard_ioctl(this_vt, cmd, arg)
             }
             KDSETMODE => {
                 // KD_TEXT / KD_GRAPHICS. NARF has one framebuffer console and a
@@ -1798,6 +1826,7 @@ fn static_entry_type(name: &str) -> Option<FileType> {
         "pts" | "shm" | "mqueue" | "hugepages" | "disk" | "input" | "snd" | "dri" => {
             Some(FileType::Dir)
         }
+        n if crate::devfs_vt::parse_vcs(n).is_some() => Some(FileType::Special),
         _ => None,
     }
 }
@@ -1916,6 +1945,13 @@ impl DirOps for DevDir {
                 Some(Arc::new(DevConsole {
                     kind: ConsoleNodeKind::Virtual(v),
                 }) as Arc<dyn FileOps>)
+            }
+            // /dev/vcs, /dev/vcsu, /dev/vcsa and their per-VT forms for every
+            // allocated VT (`vc_screen.c`) — systemd-vconsole-setup's test
+            // for "is VT N allocated".
+            n if crate::devfs_vt::parse_vcs(n).is_some() => {
+                let (kind, vt) = crate::devfs_vt::parse_vcs(n)?;
+                Some(Arc::new(crate::devfs_vt::DevVcs { kind, vt }) as Arc<dyn FileOps>)
             }
             "ptmx" => Some(symlink_file("ptmx", "pts/ptmx".into())),
             "fb0" if FB0_NODE.lock().is_some() => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
@@ -2210,6 +2246,10 @@ impl DirOps for DevDir {
         let rfcomm_extras = rfcomm_enumerate();
         let tty_usb_extras = tty_usb_enumerate();
         let video_extras = video_enumerate();
+        let vcs_extras: Vec<(String, FileType)> = crate::devfs_vt::vcs_names()
+            .into_iter()
+            .map(|name| (name, FileType::Special))
+            .collect();
         // Runtime-created files, symlinks, and directories that don't collide
         // with a static name.
         let dynamic_extras: Vec<(String, FileType)> = dynamic_enumerate(&DYNAMIC_NODES)
@@ -2225,6 +2265,7 @@ impl DirOps for DevDir {
             .chain(rfcomm_extras)
             .chain(tty_usb_extras)
             .chain(video_extras)
+            .chain(vcs_extras)
             .chain(dynamic_extras)
             .skip(cursor)
             .take(max)

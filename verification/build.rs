@@ -663,6 +663,11 @@ fn main() {
         "shmfork_smoke",
         "sigrt_smoke",
         "strace_smoke",
+        "remount_smoke",
+        "utmp_smoke",
+        "thp_smoke",
+        "vconsole_smoke",
+        "acl_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
@@ -721,6 +726,11 @@ fn main() {
         "sockopt_daemon_smoke",
         "nice_thread_smoke",
         "setxid_busy_smoke",
+        "remount_smoke",
+        "utmp_smoke",
+        "thp_smoke",
+        "vconsole_smoke",
+        "acl_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

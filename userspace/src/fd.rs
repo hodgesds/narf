@@ -1339,11 +1339,9 @@ pub const TIOCGPGRP: u32 = 0x540F;
 /// `ioctl(fd, TIOCSPGRP, &pid_t)` — set foreground process group.
 pub const TIOCSPGRP: u32 = 0x5410;
 /// `ioctl(fd, KDGKBMODE, &int)` — query the keyboard translation mode.
-/// VT-console keyboard control; NARF has no VT, so it reports the
-/// default `K_XLATE` (0) so the query succeeds.
 pub const KDGKBMODE: u32 = 0x4B44;
 /// `ioctl(fd, KDSKBMODE, int)` — set the keyboard translation mode.
-/// Accepted and ignored (no VT keyboard state to change).
+/// Validated and stored per VT (`narf_filesystem::vt`).
 pub const KDSKBMODE: u32 = 0x4B45;
 /// `ioctl(fd, KDSIGACCEPT, int)` — nominate the signal delivered on the
 /// magic "keyboard request" (kbrequest) SysRq. systemd-PID-1 arms this
@@ -1680,18 +1678,29 @@ impl FileOps for ConsoleFile {
                 narf_filesystem::console_tty::set_fg_pgrp(pgrp);
                 Ok(0)
             }
-            KDSIGACCEPT | KDSKBMODE => {
-                // VT keyboard/kbrequest control. NARF drives a single serial
-                // console with no VT layer, so there is no kbrequest source
-                // or keyboard-translation state to change — accept and no-op
-                // so systemd's early-init arming step succeeds instead of
-                // logging "Inappropriate ioctl for device".
+            KDSIGACCEPT => {
+                // No VT kbrequest source to route a signal through — accept
+                // and no-op so systemd's early-init arming step succeeds
+                // instead of logging "Inappropriate ioctl for device".
                 Ok(0)
             }
+            KDSKBMODE => {
+                // `vt_do_kdskbmode` on the console's VT (the active one),
+                // sharing state with `/dev/ttyN`: one of the five modes, else
+                // -EINVAL; `perm` required (CAP_SYS_TTY_CONFIG here — see
+                // `devfs_vt`'s LINUX-GAP).
+                if !narf_filesystem::caller_capable(26) {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                narf_filesystem::vt::set_kbd_mode(narf_filesystem::vt::active_vt(), arg as u32)
+                    .map(|()| 0)
+                    .map_err(|()| FsError::InvalidData)
+            }
             KDGKBMODE => {
-                // Report the default keyboard mode `K_XLATE` (0). `arg` is an
-                // `int *` out-parameter.
-                let bytes = 0i32.to_le_bytes();
+                // `vt_do_kdgkbmode` for the console's VT. This used to report
+                // 0 — which is `K_RAW`, not `K_XLATE`. `arg` is an `int *`.
+                let mode = narf_filesystem::vt::kbd_mode(narf_filesystem::vt::active_vt()) as i32;
+                let bytes = mode.to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
                 // little-endian encoding of the `int` keyboard mode.
