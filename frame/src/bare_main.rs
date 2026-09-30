@@ -5704,6 +5704,16 @@ fn boot_userspace_init() {
                     "fd_inherit_exec_glibc",
                     narf_verification::NARF_FD_INHERIT_EXEC_SMOKE_GLIBC_ELF,
                 ),
+                // epoll wakes an X server's clients the way os/ospoll.c arms
+                // them (ADD with an empty mask, then MOD EPOLLIN|EPOLLET).
+                (
+                    "xserver_epoll_wake_smoke",
+                    narf_verification::NARF_XSERVER_EPOLL_WAKE_SMOKE_ELF,
+                ),
+                (
+                    "xserver_epoll_wake_glibc",
+                    narf_verification::NARF_XSERVER_EPOLL_WAKE_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.
