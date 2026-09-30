@@ -296,22 +296,42 @@ impl I40eNic {
         // `i40e_aqc_switch_seid.seid` doubles as the start cursor;
         // 0 means "from the beginning".
         params[0..2].copy_from_slice(&0u16.to_le_bytes());
-        let (slot, _wb) = self.aq_send(AqOpcode::GetSwitchConfig, params, None, RESP_LEN)?;
-        let buf = self.atq_buf_bytes(slot, RESP_LEN as usize);
+        let (buf, _wb) = self.aq_send(AqOpcode::GetSwitchConfig, params, None, RESP_LEN)?;
         SwitchConfig::parse(&buf).ok_or(I40eError::BadSwitchConfig)
+    }
+
+    /// Keep VLAN tags in received/transmitted bytes because the frame-ring
+    /// profile does not negotiate hardware tag insertion or stripped tags.
+    pub(super) fn aq_keep_vlan_headers(&mut self) -> Result<(), I40eError> {
+        let mut properties = self.vsi.raw;
+        // Do not override a firmware-assigned port VLAN silently.
+        if properties[8..10] != [0, 0] {
+            return Err(I40eError::BadVsiParams);
+        }
+        properties[0..2].copy_from_slice(&4u16.to_le_bytes()); // VLAN_VALID only
+        properties[12] = 0x03 | 0x18; // MODE_ALL | EMOD_NOTHING
+        let mut params = [0u8; 16];
+        params[0..2].copy_from_slice(&self.vsi_seid.to_le_bytes());
+        self.aq_send(
+            AqOpcode::UpdateVsiParameters,
+            params,
+            Some(&properties),
+            VSI_PROPERTIES_BYTES as u16,
+        )?;
+        self.vsi.raw = properties;
+        Ok(())
     }
 
     /// `get_vsi_parameters` (0x0212) — indirect.
     pub fn aq_get_vsi_params(&self, seid: u16) -> Result<VsiParams, I40eError> {
         let mut params = [0u8; 16];
         params[0..2].copy_from_slice(&seid.to_le_bytes());
-        let (slot, wb) = self.aq_send(
+        let (buf, wb) = self.aq_send(
             AqOpcode::GetVsiParameters,
             params,
             None,
             VSI_PROPERTIES_BYTES as u16,
         )?;
-        let buf = self.atq_buf_bytes(slot, VSI_PROPERTIES_BYTES);
         if buf.len() < VSI_PROPERTIES_BYTES {
             return Err(I40eError::BadVsiParams);
         }
@@ -339,7 +359,7 @@ impl I40eNic {
         // `i40e_aqc_macvlan`: num_addresses:le16, seid[3]:le16.
         params[0..2].copy_from_slice(&1u16.to_le_bytes());
         params[2..4].copy_from_slice(&(seid | MACVLAN_CMD_SEID_VALID).to_le_bytes());
-        let (slot, _wb) = self.aq_send(
+        let (resp, _wb) = self.aq_send(
             AqOpcode::AddMacvlan,
             params,
             Some(&element),
@@ -348,7 +368,6 @@ impl I40eNic {
         // Firmware writes the per-element result back into the same
         // buffer. A command-level OK with a per-element failure is
         // the case a naive caller misses.
-        let resp = self.atq_buf_bytes(slot, MACVLAN_ELEMENT_BYTES);
         if resp.len() >= 13 && resp[12] == MACVLAN_MM_ERR_NO_RES {
             return Err(I40eError::MacFilterRejected);
         }

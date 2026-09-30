@@ -168,6 +168,8 @@ pub struct Frame {
     buf: DmaBuffer,
     offset: u32,
     len: u32,
+    tx_meta: TxMeta,
+    rx_meta: RxMeta,
 }
 
 // `Frame` carries a `DmaBuffer` whose backing storage is referenced
@@ -196,6 +198,8 @@ impl Frame {
             buf,
             offset: 0,
             len: if len > cap { cap } else { len },
+            tx_meta: TxMeta::plain(),
+            rx_meta: RxMeta::default(),
         }
     }
 
@@ -215,6 +219,8 @@ impl Frame {
             buf,
             offset: off,
             len: if len > max_len { max_len } else { len },
+            tx_meta: TxMeta::plain(),
+            rx_meta: RxMeta::default(),
         }
     }
 
@@ -257,9 +263,31 @@ impl Frame {
     /// IPC ring.
     #[inline]
     pub fn payload_mut(&mut self) -> &mut [u8] {
+        self.rx_meta = RxMeta::default();
         let off = self.offset as usize;
         let end = off + self.len as usize;
         &mut self.buf.as_mut_slice()[off..end]
+    }
+
+    /// Offloads requested by the producer. Consult `Interface::offloads` first.
+    pub fn tx_meta(&self) -> TxMeta {
+        self.tx_meta
+    }
+
+    /// The packet contains ordinary wire headers; the driver prepares checksum
+    /// seeds. Unsupported or malformed requests must not reach hardware.
+    pub fn set_tx_meta(&mut self, meta: TxMeta) {
+        self.tx_meta = meta;
+    }
+
+    /// Hardware checksum verification, invalidated by `payload_mut`.
+    pub fn rx_meta(&self) -> RxMeta {
+        self.rx_meta
+    }
+
+    /// Driver completion metadata. Set after the final payload copy.
+    pub fn set_rx_meta(&mut self, meta: RxMeta) {
+        self.rx_meta = meta;
     }
 
     /// Decompose into the underlying `DmaBuffer` + used length.
@@ -328,6 +356,11 @@ pub trait Interface: Send + Sync {
     fn mtu(&self) -> u32;
     /// Link state. Loopback is always up; physical NICs sample PHY.
     fn link_up(&self) -> bool;
+    /// Offloads supported through the frame rings. Producers must negotiate
+    /// before setting TX metadata; the default accepts plain frames only.
+    fn offloads(&self) -> OffloadCapabilities {
+        OffloadCapabilities::default()
+    }
     /// RX consumer half. Caller `lock().take()`s the consumer to drain
     /// inbound frames. `None` after take, until the implementation
     /// hands ownership back (Stage-3 implementations don't).
@@ -770,8 +803,9 @@ pub enum L4CsumKind {
 /// `Frame` to know which hardware offloads to request.
 ///
 /// All fields are `Option`; `None` means "no offload requested". The
-/// driver applies whichever the hardware supports and ignores the rest.
-#[derive(Copy, Clone, Debug, Default)]
+/// producer must first consult `Interface::offloads`. Drivers implementing
+/// offloads reject unsupported requests; they never silently send partial checksums.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TxMeta {
     /// L4 checksum offload. `None` = no offload.
     pub csum_l4: Option<L4CsumKind>,
@@ -816,7 +850,7 @@ impl TxMeta {
 /// Per-frame receive metadata. Drivers populate this from the
 /// completion descriptor so consumers know which offloads the
 /// hardware already verified.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RxMeta {
     /// `true` if the hardware verified the IP (L3) header checksum
     /// and found it valid.
@@ -824,4 +858,17 @@ pub struct RxMeta {
     /// `true` if the hardware verified the L4 (TCP/UDP) checksum
     /// and found it valid.
     pub csum_l4: bool,
+}
+
+/// Capabilities of the frame-ring offload path, not just the underlying silicon.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OffloadCapabilities {
+    /// TCP/UDP checksum generation for unfragmented IPv4/IPv6 packets.
+    pub tx_checksum: bool,
+    /// RX checksum verification metadata may be supplied.
+    pub rx_checksum: bool,
+    /// Largest complete Ethernet TSO packet, or zero when unsupported.
+    pub max_tso_bytes: u32,
+    /// Hardware insertion of `TxMeta::vlan_tag`.
+    pub vlan_insert: bool,
 }

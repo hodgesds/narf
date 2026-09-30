@@ -153,6 +153,8 @@ pub enum NicModel {
     IntelIgb,
     /// Intel 82599 / X540 10-GbE — "ixgbe".
     IntelIxgbe,
+    /// Intel X710 / XL710 / XXV710 — "i40e".
+    IntelI40e,
     /// Mellanox ConnectX-4 / 5 / 6 — "mlx5_core".
     MellanoxMlx5,
     /// Realtek RTL8139 — legacy smoke target.
@@ -176,6 +178,7 @@ impl NicModel {
             NicModel::IntelE1000 => (0x8086, 0x100E),
             NicModel::IntelIgb => (0x8086, 0x10C9),
             NicModel::IntelIxgbe => (0x8086, 0x10B6),
+            NicModel::IntelI40e => (0x8086, 0x1572),
             NicModel::MellanoxMlx5 => (0x15B3, 0x1013),
             NicModel::RealtekRtl8139 => (0x10EC, 0x8139),
             NicModel::RealtekRtl8168 => (0x10EC, 0x8168),

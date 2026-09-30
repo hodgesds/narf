@@ -318,3 +318,199 @@ pub const fn rx_checksum(status: u64, error: u8) -> RxCsum {
         RxCsum::Good
     }
 }
+
+/// The runtime accepts a bounded, non-tunnelled offload profile. The limit
+/// includes Ethernet headers and fits in seventeen 4-KiB data descriptors.
+pub const MAX_TSO_BYTES: usize = 65_535;
+
+/// Validated descriptor fields and checksum preparation offsets.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TxPlan {
+    pub command: u64,
+    pub offset: u64,
+    pub context: Option<(u64, u64)>,
+    ip: usize,
+    checksum: usize,
+    ipv4: bool,
+    seed: u16,
+}
+
+fn be16(packet: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([packet[offset], packet[offset + 1]])
+}
+
+fn sum_words(bytes: &[u8]) -> u32 {
+    bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]) as u32)
+        .sum()
+}
+
+impl TxPlan {
+    pub fn parse(packet: &[u8], meta: narf_net::TxMeta) -> Result<Self, super::I40eError> {
+        use narf_net::L4CsumKind;
+        let bad = super::I40eError::InvalidOffload;
+        if meta.vlan_tag.is_some() {
+            return Err(bad);
+        }
+        if packet.len() < 14 || packet.len() > MAX_TSO_BYTES {
+            return Err(super::I40eError::FrameTooLong);
+        }
+        let mut plan = Self {
+            command: 0,
+            offset: 0,
+            context: None,
+            ip: 0,
+            checksum: 0,
+            ipv4: false,
+            seed: 0,
+        };
+        let mut ip = 14;
+        let mut ether = be16(packet, 12);
+        // In-band VLAN headers stay in the packet. Limit parsing to QinQ.
+        for _ in 0..2 {
+            if ether != 0x8100 && ether != 0x88a8 {
+                break;
+            }
+            if packet.len() < ip + 4 {
+                return Err(bad);
+            }
+            ether = be16(packet, ip + 2);
+            ip += 4;
+        }
+        if meta.tso_mss.is_none() && packet.len() > ip + 1500 {
+            return Err(super::I40eError::FrameTooLong);
+        }
+        if meta.csum_l4.is_none() && meta.tso_mss.is_none() {
+            return Ok(plan);
+        }
+        let (ip_len, protocol, l4_len, mut sum) = match ether {
+            0x0800 => {
+                if packet.len() < ip + 20 || packet[ip] >> 4 != 4 {
+                    return Err(bad);
+                }
+                let ihl = (packet[ip] as usize & 15) * 4;
+                let total = be16(packet, ip + 2) as usize;
+                if ihl < 20
+                    || total < ihl
+                    || ip + total != packet.len()
+                    || be16(packet, ip + 6) & 0x3fff != 0
+                {
+                    return Err(bad);
+                }
+                (
+                    ihl,
+                    packet[ip + 9],
+                    total - ihl,
+                    sum_words(&packet[ip + 12..ip + 20]),
+                )
+            }
+            0x86dd => {
+                if packet.len() < ip + 40 || packet[ip] >> 4 != 6 {
+                    return Err(bad);
+                }
+                let len = be16(packet, ip + 4) as usize;
+                if len == 0 || ip + 40 + len != packet.len() {
+                    return Err(bad);
+                }
+                // Extension headers (including fragments), tunnels and jumbograms
+                // are left to software; never guess the checksum start.
+                (40, packet[ip + 6], len, sum_words(&packet[ip + 8..ip + 40]))
+            }
+            _ => return Err(bad),
+        };
+        let transport = ip + ip_len;
+        let (l4, header_len, checksum) = match protocol {
+            6 => {
+                if meta.csum_l4 == Some(L4CsumKind::Udp) || l4_len < 20 {
+                    return Err(bad);
+                }
+                let len = (packet[transport + 12] >> 4) as usize * 4;
+                if len < 20 || len > l4_len {
+                    return Err(bad);
+                }
+                (L4Proto::Tcp, len, transport + 16)
+            }
+            17 => {
+                if meta.csum_l4 != Some(L4CsumKind::Udp)
+                    || meta.tso_mss.is_some()
+                    || l4_len < 8
+                    || be16(packet, transport + 4) as usize != l4_len
+                {
+                    return Err(bad);
+                }
+                (L4Proto::Udp, 8, transport + 6)
+            }
+            _ => return Err(bad),
+        };
+        if let Some(mss) = meta.tso_mss {
+            // i40e's minimum MSS is 64. Every emitted IP packet fits the MTU.
+            if mss < 64
+                || ip_len + header_len + mss as usize > 1500
+                || l4_len <= header_len
+                || packet[transport + 13] & (0x02 | 0x04 | 0x20) != 0
+            {
+                return Err(bad);
+            }
+            plan.context =
+                Some(tso_context_desc((l4_len - header_len) as u32, mss).map_err(|_| bad)?);
+        } else {
+            sum += l4_len as u32;
+        }
+        sum += protocol as u32;
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        plan.ipv4 = ether == 0x0800;
+        plan.command = if plan.ipv4 {
+            TxCsum::Ipv4 { l4 }
+        } else {
+            TxCsum::Ipv6 { l4 }
+        }
+        .cmd_bits(true);
+        plan.offset = tx_offset_field(HeaderLens {
+            mac: ip as u16,
+            ip: ip_len as u16,
+            l4: header_len as u16,
+        })
+        .map_err(|_| bad)?;
+        plan.ip = ip;
+        plan.checksum = checksum;
+        plan.seed = sum as u16;
+        Ok(plan)
+    }
+
+    /// The device consumes the uncomplemented pseudoheader sum. For TSO it
+    /// supplies each segment's transport length; ordinary checksum adds it here.
+    pub fn prepare(&self, packet: &mut [u8]) {
+        if self.command == 0 {
+            return;
+        }
+        packet[self.checksum..self.checksum + 2].copy_from_slice(&self.seed.to_be_bytes());
+        if self.ipv4 {
+            packet[self.ip + 10..self.ip + 12].fill(0);
+        }
+        if self.context.is_some() {
+            let offset = if self.ipv4 { self.ip + 2 } else { self.ip + 4 };
+            packet[offset..offset + 2].fill(0);
+        }
+    }
+}
+
+/// Only non-tunnelled, non-fragmented TCP/UDP packet types receive checksum
+/// credit. IPv6 extension parsing and PPRS (parser/speed failure) force software
+/// verification. PTYPE values follow libie/rx.c's 8-bit legacy table.
+pub fn rx_metadata(qword: u64) -> narf_net::RxMeta {
+    let ptype = ((qword >> 30) & 0xff) as u8;
+    let errors = ((qword >> 19) & 0xff) as u8;
+    let ipv4 = matches!(ptype, 24 | 26);
+    let ipv6 = matches!(ptype, 90 | 92);
+    let good = (ipv4 || ipv6)
+        && matches!(rx_checksum(qword, errors), RxCsum::Good)
+        && errors & (1 << 7) == 0
+        && (!ipv6 || qword & (1 << 15) == 0);
+    narf_net::RxMeta {
+        csum_l3: good && ipv4,
+        csum_l4: good,
+    }
+}
