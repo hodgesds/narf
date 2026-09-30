@@ -32,7 +32,7 @@
 
 use alloc::vec::Vec;
 
-use super::{AqOpcode, I40eError, I40eNic};
+use super::{AqOpcode, Hardware, I40eError};
 
 // ── Switch configuration (0x0200) ───────────────────────────────────
 
@@ -285,7 +285,41 @@ pub const PHY_LINK_ENABLE: u8 = 0x04;
 
 // ── Driver-side operations ──────────────────────────────────────────
 
-impl I40eNic {
+impl Hardware {
+    /// Map TC0 to the entire contiguous PF-relative queue set. Queue mapping
+    /// validity is independent of VLAN and scheduler sections (Linux update VSI).
+    pub(super) fn aq_configure_queue_map(&mut self, count: u16) -> Result<(), I40eError> {
+        if count == 0 || !count.is_power_of_two() || count > super::MAX_QUEUE_PAIRS {
+            return Err(I40eError::BadQueueIndex);
+        }
+        if !self.vsi.is_contiguous() || self.vsi.queue_mapping_0 != 0 {
+            return Err(I40eError::UnexpectedVsiQueueMap);
+        }
+        let mut properties = self.vsi.raw;
+        properties[..2].copy_from_slice(&0x0040u16.to_le_bytes()); // QUEUE_MAP_VALID
+        properties[VSI_OFF_MAPPING_FLAGS..VSI_OFF_TC_MAPPING + 16].fill(0);
+        let tc0 = (count.trailing_zeros() as u16) << VSI_TC_QUE_NUMBER_SHIFT;
+        properties[VSI_OFF_TC_MAPPING..VSI_OFF_TC_MAPPING + 2].copy_from_slice(&tc0.to_le_bytes());
+        let mut params = [0; 16];
+        params[..2].copy_from_slice(&self.vsi_seid.to_le_bytes());
+        self.aq_send(
+            AqOpcode::UpdateVsiParameters,
+            params,
+            Some(&properties),
+            VSI_PROPERTIES_BYTES as u16,
+        )?;
+        // Re-read firmware's queue-set handle, rather than retaining pre-update state.
+        self.vsi = self.aq_get_vsi_params(self.vsi_seid)?;
+        if !self.vsi.is_contiguous()
+            || self.vsi.queue_mapping_0 != 0
+            || self.vsi.tc0_queue_offset() != 0
+            || self.vsi.tc0_queue_count() != count
+        {
+            return Err(I40eError::UnexpectedVsiQueueMap);
+        }
+        Ok(())
+    }
+
     /// `get_switch_config` (0x0200) — indirect.
     pub fn aq_get_switch_config(&self) -> Result<SwitchConfig, I40eError> {
         // Ask for as much as one AQ data buffer holds. Linux pages

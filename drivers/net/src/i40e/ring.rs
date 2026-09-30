@@ -325,6 +325,26 @@ pub struct QueuePair {
 }
 
 impl QueuePair {
+    /// Discard descriptors only after a confirmed PF reset has stopped DMA.
+    /// Returns the number of submitted packets whose completion was lost.
+    ///
+    /// # Safety
+    /// The caller owns the PF exclusively and has observed completed reset.
+    pub(super) unsafe fn reset_after_quiesce(&mut self) -> u64 {
+        let mut dropped = 0;
+        for buffer in &mut self.tx_bufs {
+            dropped += u64::from(buffer.take().is_some());
+        }
+        self.tx_next = 0;
+        self.tx_clean = 0;
+        self.tx_completed = 0;
+        self.rx_next = 0;
+        self.rx_discard = false;
+        self.zero_rings();
+        self.arm_rx_descriptors();
+        dropped
+    }
+
     /// Allocate both rings and their buffers.
     pub fn alloc(pf_q: u16) -> Result<Self, I40eError> {
         let tx_ring = alloc_coherent(RING_BYTES as usize, DomainId::DRIVER_0)
@@ -771,7 +791,7 @@ unsafe fn wait_queue_state(csr: &MmioRegion, reg: u64, enabled: bool) -> Result<
     }
 }
 
-mod runtime_tests {
+pub(super) mod runtime_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -810,6 +830,23 @@ mod runtime_tests {
                         .cpu_ptr_at::<u64>(slot as u64 * DESC_BYTES + 8),
                 ),
             )
+        }
+    }
+
+    pub(in crate::i40e) fn inject_rx(queue: &QueuePair, bytes: &[u8]) {
+        assert!(bytes.len() <= RX_BUF_BYTES);
+        // SAFETY: test fixture owns this ring with no physical DMA agent. Slot
+        // zero is initially armed and the helper completes it exactly once.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                queue.rx_bufs[0].cpu_mut_ptr_at::<u8>(0),
+                bytes.len(),
+            );
+            core::ptr::write_volatile(
+                queue.rx_ring.cpu_mut_ptr_at::<u64>(8),
+                1 | 2 | (1 << 3) | (26 << 30) | ((bytes.len() as u64) << 38),
+            );
         }
     }
 
