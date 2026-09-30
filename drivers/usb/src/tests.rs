@@ -3004,7 +3004,9 @@ kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_rampatch_validation);
 /// HCI Command Complete retains its leading Status byte. Keep the USB
 /// Stage-0 parser aligned with the shared Bluetooth controller parser.
 fn smoke_btusb_local_version_skips_status() -> TestResult {
-    use crate::btusb::controller_info_from_version_return;
+    use crate::btusb::{
+        apply_bd_addr_return, apply_buffer_size_return, controller_info_from_version_return,
+    };
 
     let ret = [
         0x00, // Status
@@ -3024,6 +3026,20 @@ fn smoke_btusb_local_version_skips_status() -> TestResult {
         || info.lmp_subversion != 0x1234
     {
         return TestResult::Fail("Read Local Version response shifted by status byte");
+    }
+    let mut info = info;
+    if apply_bd_addr_return(&mut info, &[0, 1, 2, 3, 4, 5, 6]).is_err()
+        || info.bd_addr != [1, 2, 3, 4, 5, 6]
+    {
+        return TestResult::Fail("Read BD_ADDR response decoded incorrectly");
+    }
+    if apply_buffer_size_return(&mut info, &[0, 0x40, 0x01, 0x20, 0x10, 0, 8, 0]).is_err()
+        || info.acl_data_mtu != 0x0140
+        || info.sco_data_mtu != 0x20
+        || info.acl_total_num != 16
+        || info.sco_total_num != 8
+    {
+        return TestResult::Fail("Read Buffer Size response decoded incorrectly");
     }
     TestResult::Pass
 }

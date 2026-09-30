@@ -168,6 +168,17 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   endpoint binding, vendor-family identification, and firmware-name/protocol
   metadata. Consulted under NARF's GPL-2.0-or-later license.
 
+## Public interface
+
+- `controller::bring_up_all(cap)` runs the mandatory synchronous HCI sequence
+  for transports registered before the Stage::Late bring-up initcall.
+- `controller::register_ready_transport(transport, info)` adopts a controller
+  whose late-discovered driver completed that same sequence on a native async
+  transport path. Registration is idempotent by transport identity and returns
+  the stable `hci<N>` ordinal.
+- `sysfs_bridge::register_hci_controller(index, info, connections)` publishes
+  a ready controller under `/sys/class/bluetooth/hci<N>`.
+
 ## Scope
 
 ### Landed today
@@ -251,7 +262,8 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 - **USB transport + quirks** (`usb_transport` / `btusb_quirks`): standard
   Wireless Controller class matching, HCI USB framing, vendor-family lookup,
   firmware candidates, and WCN6855 target identity `10ab:9309`. The concrete
-  endpoint/DFU implementation lives in `narf-drivers-usb`.
+  endpoint/DFU implementation lives in `narf-drivers-usb`; late USB discovery
+  adopts its completed async bring-up through `register_ready_transport`.
 
 ### Out of scope (deliberate)
 - Non-QCA vendor firmware protocols and Bluetooth policy daemons.

@@ -208,6 +208,43 @@ kernel_test_in!(
     smoke_controller_bringup_drives_mandatory_sequence
 );
 
+/// A late async driver may complete the mandatory command sequence itself and
+/// adopt the transport without the synchronous controller reissuing Reset.
+fn smoke_register_ready_transport_is_idempotent() -> TestResult {
+    use crate::controller::{
+        __test_reset_controllers, bring_up_all, controller_count, register_ready_transport,
+        ControllerInfo,
+    };
+
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+    let transport: Arc<dyn crate::transport::HciTransport> =
+        Arc::new(LoopbackTransport::new("async-ready"));
+    crate::transport::register(transport.clone());
+    let info = ControllerInfo {
+        hci_version: 0x0C,
+        manufacturer: 0x00D7,
+        ..ControllerInfo::default()
+    };
+    if register_ready_transport(transport.clone(), info) != 0
+        || register_ready_transport(transport, info) != 0
+        || controller_count() != 1
+    {
+        return TestResult::Fail("ready transport registration was not idempotent");
+    }
+    let cap = crate::bootstrap_bluetooth_authority();
+    if !bring_up_all(&cap).is_empty() {
+        return TestResult::Fail("bring_up_all reran an adopted ready transport");
+    }
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/controller",
+    smoke_register_ready_transport_is_idempotent
+);
+
 fn smoke_bring_up_propagates_bad_status() -> TestResult {
     use crate::bootstrap_bluetooth_authority;
     use crate::controller::BringupError;

@@ -144,8 +144,9 @@ also consult upstream Linux GPL sources.
 - `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
   WCN6855 ID it completes the Qualcomm USB firmware/status protocol before
-  issuing HCI Reset and registering the transport. Firmware is selected from
-  the verified registry using the controller-reported ROM/RAM/board identity.
+  running the full mandatory HCI sequence, adopting the ready controller, and
+  publishing `/sys/class/bluetooth/hci<N>`. Firmware is selected from the
+  verified registry using the controller-reported ROM/RAM/board identity.
 
 ## Scope
 
@@ -155,7 +156,7 @@ also consult upstream Linux GPL sources.
 |---|---|---|---|
 | `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
 | `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
-| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, then HCI Reset/Read Local Version and transport registration | Stage the matching signed firmware and validate the full sequence on silicon |
+| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Stage the matching signed firmware and validate the full sequence on silicon |
 | `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by

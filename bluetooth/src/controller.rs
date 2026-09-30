@@ -277,6 +277,36 @@ pub fn controller_count() -> usize {
     CONTROLLERS.lock().len()
 }
 
+/// Adopt a transport whose driver already completed the mandatory HCI
+/// bring-up asynchronously.
+///
+/// USB devices are discovered by the Stage::Late supervisor after the
+/// synchronous `bluetooth-bringup` initcall has run. Re-running
+/// [`Controller::bring_up`] through the synchronous transport trait from that
+/// executor task would trip `block_on`'s re-entrancy guard, so the USB driver
+/// performs the same command sequence on its native async transfer path and
+/// registers the resulting ready controller here.
+///
+/// Idempotent by transport pointer identity. Returns the stable HCI ordinal.
+pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: ControllerInfo) -> usize {
+    let mut controllers = CONTROLLERS.lock();
+    if let Some(index) = controllers
+        .iter()
+        .position(|controller| Arc::ptr_eq(&controller.transport, &transport))
+    {
+        return index;
+    }
+
+    let controller = Arc::new(Controller::new(transport));
+    *controller.info.lock() = info;
+    controller
+        .phase
+        .store(BringupPhase::Ready as u8, Ordering::Release);
+    let index = controllers.len();
+    controllers.push(controller);
+    index
+}
+
 /// Whether `transport` already backs a brought-up controller.
 ///
 /// Compared by `Arc` pointer identity rather than by name: two
