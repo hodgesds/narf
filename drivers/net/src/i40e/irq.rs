@@ -136,7 +136,7 @@ pub const ITR_IDX_SW: u8 = 2;
 /// 3 is the only value that is not a bank.
 pub const ITR_IDX_NONE: u8 = 3;
 
-/// `I40E_ITR_20K` — roughly 20,000 interrupts/s, in 2 µs units.
+/// `I40E_ITR_20K` — a 50 µs interval (roughly 20,000 interrupts/s).
 pub const ITR_20K: u16 = 50;
 /// `I40E_ITR_8K`.
 pub const ITR_8K: u16 = 122;
@@ -145,12 +145,12 @@ pub const ITR_MASK: u16 = 0x1FFE;
 
 /// Encode an interval for `PFINT_ITRN`.
 ///
-/// The register takes the interval in 4 µs units while the constants
-/// above are in 2 µs, which is why Linux writes `target_itr >> 1`.
+/// The register takes 2 µs units while target intervals are in µs,
+/// which is why Linux writes `target_itr >> 1`.
 /// Folding the shift in here keeps the one halving in a single place
 /// rather than at every write site.
-pub const fn itr_reg_value(interval_2us: u16) -> u32 {
-    ((interval_2us & ITR_MASK) >> 1) as u32
+pub const fn itr_reg_value(interval_us: u16) -> u32 {
+    ((interval_us & ITR_MASK) >> 1) as u32
 }
 
 // ── Chain construction ──────────────────────────────────────────────
@@ -255,23 +255,26 @@ pub fn build_vector_chain(
 
 /// Throttle-register writes for a vector: receive, transmit, and the
 /// software bank Linux pins at 20K.
-pub fn build_vector_itr(vector: u16, rx_2us: u16, tx_2us: u16) -> Result<Vec<RegWrite>, IrqError> {
+pub fn build_vector_itr(vector: u16, rx_us: u16, tx_us: u16) -> Result<Vec<RegWrite>, IrqError> {
     if vector == 0 {
         return Err(IrqError::VectorZeroReserved);
+    }
+    if vector as u32 > QINT_CTL_MSIX_INDX_MASK {
+        return Err(IrqError::VectorOutOfRange(vector));
     }
     let n = vector - 1;
     Ok(alloc::vec![
         RegWrite {
             reg: reg_pfint_itrn(ITR_IDX_RX, n),
-            value: itr_reg_value(rx_2us),
+            value: itr_reg_value(rx_us),
         },
         RegWrite {
             reg: reg_pfint_itrn(ITR_IDX_TX, n),
-            value: itr_reg_value(tx_2us),
+            value: itr_reg_value(tx_us),
         },
         RegWrite {
             reg: reg_pfint_itrn(ITR_IDX_SW, n),
-            value: itr_reg_value(ITR_20K),
+            value: ITR_20K as u32,
         },
     ])
 }

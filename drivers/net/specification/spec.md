@@ -38,6 +38,46 @@ a raw-frame Narf-Ring and nothing higher.
 - Outbound: per-queue frame Narf-Rings (RSS / multi-queue), plus a
   control plane (link up/down, stats).
 
+### 3.1 i40e runtime profile
+
+Each X710/XL710/XXV710 PF owns one 64-entry TX/RX pair and two MSI-X entries:
+entry 0 delivers admin/fatal causes; entry 1 links PF-relative RX queue 0 to
+TX queue 0 and terminates the chain. Probe requires both routes. Hard IRQs
+mask/record, and bounded executor drains rearm after inspecting completions.
+Waits snapshot interrupt counters before checking queues. Timers recover lost
+interrupts (10 ms queue, 100 ms admin); 250 ms without TX progress fails the PF.
+Link changes trigger an asynchronous AQ refresh with a retained retry intent.
+
+`I40eNic::transmit_with_meta(bytes, TxMeta)` returns on descriptor publication,
+with an owned DMA copy retained until EOP completion. `transmit` submits plain
+frames with the same asynchronous completion semantics. Ring-full returns
+without publishing a partial packet; the IPC TX task retains its frame while
+waiting for credits. `dropped_frames()` returns rejected TX and dropped RX
+counts. A full RX IPC ring drops incoming frames while completion handling
+continues. Hardware checksum results travel in `Frame::rx_meta`.
+
+`Interface::offloads` and `HwNic::caps` advertise TCP/UDP checksums for
+unfragmented IPv4 and IPv6 without extension headers, RX checksum reporting,
+and TCP TSO up to 65,535 Ethernet bytes. MSS is at least 64; each segment's
+IP packet must fit MTU 1500. IPv4/TCP options and up to two in-band VLAN tags
+are accepted. Offload packets use exact IP lengths without Ethernet padding.
+The driver builds pseudoheader seeds and TSO contexts; the caller need not
+produce Linux `CHECKSUM_PARTIAL` headers. Malformed lengths, IP fragments,
+tunnels, IPv6 extensions, SYN/RST/URG TSO, and VLAN insertion requests are
+rejected. Probe configures the existing VSI to retain VLAN headers and refuses
+a preassigned port VLAN. RX checksum credit requires a known, non-tunnelled
+TCP/UDP PTYPE and valid parser/checksum status. Multi-buffer RX packets are
+dropped through EOF; checksum failures are delivered for software verification.
+
+TX head writeback is checked against the submitted interval before returning
+credits or freeing DMA. AQ cancellation/timeout and fatal hardware causes stop
+new submissions and report link down; recovery requires a fresh probe. All DMA
+allocations are owned before publication. Teardown masks/disables MSI-X,
+removes and synchronizes handlers, then waits for PF reset before freeing DMA;
+failed reset quarantines those allocations. Coherent DMA barriers include
+outer-shareable ordering on aarch64. RSS, extra VSIs, jumbo frames, tunnels,
+VLAN insertion and automatic reset recovery are outside this profile.
+
 ## 4. Invariants & safety properties
 
 - Received frames are placed into buffers the driver domain *owns*; no

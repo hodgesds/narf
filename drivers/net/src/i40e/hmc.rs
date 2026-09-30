@@ -508,12 +508,11 @@ pub struct LanHmc {
 }
 
 impl LanHmc {
-    /// Size the LAN objects, allocate the backing page, publish the
-    /// SD, and program the FPM base/count registers.
+    /// Size and allocate LAN objects without publishing DMA addresses.
     ///
     /// # Safety
     /// `csr` must be this PF's mapped BAR0.
-    pub unsafe fn bring_up(
+    pub unsafe fn alloc(
         csr: &MmioRegion,
         hmc_fn_id: u8,
         txq_num: u32,
@@ -582,6 +581,24 @@ impl LanHmc {
             unsafe { core::ptr::write_volatile(backing.cpu_mut_ptr_at::<u8>(i), 0) };
         }
 
+        Ok(Self {
+            backing,
+            txq,
+            rxq,
+            l2fpm_size,
+            hmc_fn_id,
+        })
+    }
+
+    /// Publish the backing page only after the NIC owns all DMA allocations.
+    /// # Safety
+    /// `csr` belongs to this PF; backing must live until a completed PF reset.
+    pub unsafe fn publish(&self, csr: &MmioRegion) {
+        let phys = self.backing.dma_addr().raw();
+        let hmc_fn_id = self.hmc_fn_id;
+        let txq = self.txq;
+        let rxq = self.rxq;
+        super::dma_barrier();
         // `I40E_SET_PF_SD_ENTRY` for sd_index 0, direct mode.
         let val_high = (phys >> 32) as u32;
         let val_low = (phys as u32)
@@ -613,14 +630,6 @@ impl LanHmc {
             csr.write32(reg_glhmc_fcoefbase(hmc_fn_id), 0);
             csr.write32(reg_glhmc_fcoefcnt(hmc_fn_id), 0);
         }
-
-        Ok(Self {
-            backing,
-            txq,
-            rxq,
-            l2fpm_size,
-            hmc_fn_id,
-        })
     }
 
     /// Byte offset of TX queue `q`'s context within the backing page.

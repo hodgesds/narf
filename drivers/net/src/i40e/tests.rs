@@ -6,8 +6,6 @@
 //! response decoders. Those are exactly the places a transcription
 //! error from `i40e_register.h` / `libie/adminq.h` would hide.
 
-#![cfg(target_arch = "x86_64")]
-
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
@@ -1211,7 +1209,7 @@ fn smoke_i40e_msix_registers_and_itr() -> TestResult {
         return TestResult::Fail("ITR0 banks should be 128 bytes apart");
     }
 
-    // The register takes 4 µs units while the constants are in 2 µs,
+    // The register takes 2 µs units while target intervals are in µs,
     // so the value is halved on the way in.
     if itr_reg_value(ITR_20K) != (ITR_20K >> 1) as u32 {
         return TestResult::Fail("the throttle value should be halved for the register");
@@ -1239,7 +1237,7 @@ fn smoke_i40e_msix_registers_and_itr() -> TestResult {
     {
         return TestResult::Fail("throttle writes should target banks 0, 1 and 2 of index 0");
     }
-    if itr[2].value != itr_reg_value(ITR_20K) {
+    if itr[2].value != ITR_20K as u32 {
         return TestResult::Fail("the software throttle should be pinned at 20K");
     }
     TestResult::Pass
@@ -1476,3 +1474,219 @@ fn smoke_i40e_rx_checksum_verdict() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_checksum_verdict);
+
+/// Ordinary headers, not Linux CHECKSUM_PARTIAL input. The driver supplies seeds.
+pub(super) fn tcp_packet(ipv6: bool, payload: usize) -> alloc::vec::Vec<u8> {
+    let ip_len = if ipv6 { 40 } else { 20 };
+    let mut packet = alloc::vec![0u8; 14 + ip_len + 20 + payload];
+    let transport = 14 + ip_len;
+    if ipv6 {
+        packet[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        packet[14] = 0x60;
+        packet[18..20].copy_from_slice(&((20 + payload) as u16).to_be_bytes());
+        packet[20] = 6;
+        packet[21] = 64;
+        packet[22..38].fill(0x12);
+        packet[38..54].fill(0x34);
+    } else {
+        packet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        packet[14] = 0x45;
+        packet[16..18].copy_from_slice(&((40 + payload) as u16).to_be_bytes());
+        packet[22] = 64;
+        packet[23] = 6;
+        packet[24..26].fill(0x55);
+        packet[26..30].copy_from_slice(&[192, 0, 2, 1]);
+        packet[30..34].copy_from_slice(&[198, 51, 100, 2]);
+    }
+    packet[transport + 12] = 0x50;
+    packet[transport + 13] = 0x18;
+    packet[transport + 16..transport + 18].fill(0xaa);
+    packet[transport + 20..].fill(0x5a);
+    packet
+}
+
+fn smoke_i40e_offload_preparation() -> TestResult {
+    use super::offload::TxPlan;
+    use narf_net::{L4CsumKind, TxMeta};
+    for ipv6 in [false, true] {
+        let mut packet = tcp_packet(ipv6, 200);
+        let original = packet.clone();
+        let plan = TxPlan::parse(&packet, TxMeta::with_csum(L4CsumKind::Tcp)).unwrap();
+        plan.prepare(&mut packet);
+        let transport = if ipv6 { 54 } else { 34 };
+        // Independent pseudoheader sum for the fixed source/destination above.
+        let mut sum = if ipv6 {
+            8 * 0x1212 + 8 * 0x3434
+        } else {
+            0xc000 + 0x0201 + 0xc633 + 0x6402
+        };
+        sum += 6 + 220;
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        if packet[transport + 16..transport + 18] != (sum as u16).to_be_bytes()
+            || packet[transport + 20..] != original[transport + 20..]
+            || plan.context.is_some()
+        {
+            return TestResult::Fail("checksum request did not prepare wire pseudoheader seed");
+        }
+        let mut tso = tcp_packet(ipv6, 9000);
+        let plan = TxPlan::parse(&tso, TxMeta::with_tso(1440)).unwrap();
+        plan.prepare(&mut tso);
+        let length = if ipv6 { 18 } else { 16 };
+        let (_, context) = plan.context.unwrap();
+        if tso[length..length + 2] != [0, 0]
+            || (context >> 30) & 0xfffff != 9000
+            || context >> 50 != 1440
+        {
+            return TestResult::Fail("TSO context length/MSS or IP length preparation wrong");
+        }
+        let mut seed = if ipv6 {
+            8 * 0x1212 + 8 * 0x3434 + 6
+        } else {
+            0xc000 + 0x0201 + 0xc633 + 0x6402 + 6
+        };
+        while seed >> 16 != 0 {
+            seed = (seed & 0xffff) + (seed >> 16);
+        }
+        if tso[transport + 16..transport + 18] != (seed as u16).to_be_bytes() {
+            return TestResult::Fail("TSO pseudoheader must exclude transport length");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_offload_preparation);
+
+fn smoke_i40e_offload_rejects_malformed_packets() -> TestResult {
+    use super::offload::TxPlan;
+    use narf_net::{L4CsumKind, TxMeta};
+    let packet = tcp_packet(false, 200);
+    for len in 0..packet.len() {
+        if TxPlan::parse(&packet[..len], TxMeta::with_tso(100)).is_ok() {
+            return TestResult::Fail("truncated offload packet accepted");
+        }
+    }
+    for (offset, value) in [
+        (14, 0x44),
+        (20, 0x20),
+        (21, 1),
+        (23, 1),
+        (46, 0x40),
+        (47, 0x02),
+    ] {
+        let mut bad = packet.clone();
+        bad[offset] = value;
+        if TxPlan::parse(&bad, TxMeta::with_tso(100)).is_ok() {
+            return TestResult::Fail("malformed/fragmented/unsupported offload accepted");
+        }
+    }
+    for mss in [0, 1, 63, 1461, 65535] {
+        if TxPlan::parse(&packet, TxMeta::with_tso(mss)).is_ok() {
+            return TestResult::Fail("out-of-profile MSS accepted");
+        }
+    }
+    let mut v6 = tcp_packet(true, 200);
+    v6[20] = 44;
+    if TxPlan::parse(&v6, TxMeta::with_tso(100)).is_ok()
+        || TxPlan::parse(&packet, TxMeta::with_csum(L4CsumKind::Udp)).is_ok()
+        || TxPlan::parse(
+            &packet,
+            TxMeta {
+                vlan_tag: Some(1),
+                ..TxMeta::plain()
+            },
+        )
+        .is_ok()
+    {
+        return TestResult::Fail("unsupported metadata was silently ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_offload_rejects_malformed_packets
+);
+
+fn smoke_i40e_rx_metadata_is_conservative() -> TestResult {
+    use super::offload::rx_metadata;
+    for ptype in 0..256u64 {
+        let base = 3 | (1 << 3) | (ptype << 30) | (64 << 38);
+        let meta = rx_metadata(base);
+        if meta.csum_l4 != matches!(ptype, 24 | 26 | 90 | 92)
+            || meta.csum_l3 != matches!(ptype, 24 | 26)
+        {
+            return TestResult::Fail("unknown/tunnel/fragment PTYPE received checksum credit");
+        }
+        for error in [3, 4, 5, 7] {
+            if rx_metadata(base | (1 << (19 + error))).csum_l4 {
+                return TestResult::Fail("checksum/parser failure received checksum credit");
+            }
+        }
+        if rx_metadata(base & !(1 << 3)).csum_l4 {
+            return TestResult::Fail("unchecked RX claimed checksum verification");
+        }
+    }
+    if rx_metadata(3 | (1 << 3) | (1 << 15) | (92 << 30)).csum_l4 {
+        return TestResult::Fail("IPv6 extension checksum must be verified in software");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_metadata_is_conservative);
+
+fn smoke_i40e_udp_and_vlan_offload() -> TestResult {
+    use super::offload::TxPlan;
+    use narf_net::{L4CsumKind, TxMeta};
+    for ipv6 in [false, true] {
+        let ip_len = if ipv6 { 40 } else { 20 };
+        let transport = 14 + ip_len;
+        let mut packet = tcp_packet(ipv6, 100);
+        // Reuse the 120-byte transport span as an 8-byte UDP header + payload.
+        packet[if ipv6 { 20 } else { 23 }] = 17;
+        packet[transport + 4..transport + 6].copy_from_slice(&120u16.to_be_bytes());
+        let mut tagged = alloc::vec::Vec::from(&packet[..12]);
+        tagged.extend_from_slice(&[0x81, 0, 0, 42]);
+        tagged.extend_from_slice(&packet[12..]);
+        let plan = TxPlan::parse(&tagged, TxMeta::with_csum(L4CsumKind::Udp)).unwrap();
+        plan.prepare(&mut tagged);
+        if plan.offset & 0x7f != 9
+            || (plan.command & 0x300) != 0x300
+            || tagged[12..18] != [0x81, 0, 0, 42, packet[12], packet[13]]
+        {
+            return TestResult::Fail("UDP VLAN header offsets or in-band tag changed");
+        }
+        tagged[transport + 4 + 4] = 0xff;
+        if TxPlan::parse(&tagged, TxMeta::with_csum(L4CsumKind::Udp)).is_ok() {
+            return TestResult::Fail("UDP length mismatch accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_udp_and_vlan_offload);
+
+fn smoke_i40e_frame_metadata_ring_roundtrip() -> TestResult {
+    use narf_net::{Frame, RxMeta, TxMeta};
+    let buffer = narf_io::alloc_coherent(128, narf_lib::id::DomainId::DRIVER_0).unwrap();
+    let mut frame = Frame::with_offset(buffer, 16, 64);
+    frame.payload_mut().fill(0x42);
+    frame.set_tx_meta(TxMeta::with_tso(512));
+    frame.set_rx_meta(RxMeta {
+        csum_l3: true,
+        csum_l4: true,
+    });
+    let (mut producer, mut consumer) = narf_ipc::channel::<Frame, 8>();
+    producer.try_send(frame).unwrap();
+    let mut frame = consumer.try_recv().unwrap().unwrap();
+    if frame.offset() != 16
+        || frame.tx_meta() != TxMeta::with_tso(512)
+        || !frame.rx_meta().csum_l4
+        || frame.payload() != [0x42; 64]
+    {
+        return TestResult::Fail("IPC transfer lost frame offsets/offload metadata");
+    }
+    frame.payload_mut()[0] = 0;
+    if frame.rx_meta() != RxMeta::default() || frame.tx_meta() != TxMeta::with_tso(512) {
+        return TestResult::Fail("mutable payload did not invalidate RX verification");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_frame_metadata_ring_roundtrip);

@@ -14,6 +14,16 @@ current test results.
 | 4 · Compatibility | In-tree shell gate met; compatibility continues | Interactive `echo hello world` follows serial IRQ → input ring → shell → UART. Linux-compatible musl programs, storage, networking, and graphics have additional QEMU proofs. The original relibc-specific criterion is not the closure proof. |
 | 5 · Silicon | In progress | Driver and diagnostic foundations exist; the selected AMD laptop end-to-end gate has not been demonstrated. |
 
+## i40e MSI-X and offloads
+
+The i40e runtime connects dedicated admin/queue MSI-X routes to bounded async
+completion tasks. Frame rings carry TCP/UDP checksum and TCP TSO requests plus
+RX checksum results. Owned TX DMA survives partial completion; invalid heads,
+AQ timeouts and fatal causes fail the PF safely. See `drivers/net/` §3.1 for
+the supported profile and recovery limits. Descriptor, checksum, IPC metadata
+and interrupt-race smokes run under QEMU on both architectures. Physical X710
+validation remains pending; the development host is a live router.
+
 ## Exercised paths
 
 - **Kernel on QEMU:** `cargo xtask run` and `cargo xtask test` support x86_64

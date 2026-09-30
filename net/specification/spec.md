@@ -78,6 +78,23 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
 - Multi-queue is explicit. The consumer chooses queue affinity;
   default is "per-CPU queue" for hash-steered RX.
 
+The in-tree `Frame` owns a DMA buffer, payload offset and length. Its
+`tx_meta()` / `set_tx_meta(TxMeta)` and `rx_meta()` / `set_rx_meta(RxMeta)`
+accessors carry offload metadata with the same IPC ownership transfer.
+Constructors default to plain TX and unchecked RX. `payload_mut()` invalidates
+RX checksum results; decomposition into DMA parts discards metadata.
+
+`Interface::offloads() -> OffloadCapabilities` reports the implemented frame-ring
+profile: TCP/UDP TX checksum, RX checksum reporting, maximum TSO frame bytes
+(zero means unsupported), and VLAN insertion. The default advertises none.
+Producers must negotiate before setting `TxMeta`. Packets contain ordinary wire
+headers; drivers prepare hardware checksum seeds, validate lengths and reject
+unsupported requests rather than transmit partially checksummed packets.
+`RxMeta::csum_l3` means a verified IPv4 header checksum; IPv6 never sets it.
+`csum_l4` means verified TCP/UDP. Consumers verify in software whenever a flag
+is false. These fields describe the in-kernel frame-ring contract; they do not
+change the stack-daemon attach wire ABI.
+
 ### 3.3 Control-plane operations
 
 ```rust

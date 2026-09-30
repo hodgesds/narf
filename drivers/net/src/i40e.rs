@@ -13,6 +13,8 @@
 //!   `i40e_config_arq_regs`, `i40e_asq_send_command`.
 //! - `i40e_adminq_cmd.h` + `include/linux/net/intel/libie/adminq.h` —
 //!   descriptor layout, flags, opcodes.
+//! - Intel 710 Series Datasheet v4.1, Admin Queue descriptor flags:
+//!   https://cdrdv2-public.intel.com/332464/332464_710_Series_Datasheet_v_4_1.pdf
 //!
 //! ## Hardware this targets
 //!
@@ -65,21 +67,13 @@
 //!
 //! ## Scope
 //!
-//! One queue pair, polled. What is deliberately absent:
+//! One queue pair with dedicated admin and queue MSI-X vectors. The frame
+//! rings carry IPv4/IPv6 TCP/UDP checksum requests, TCP TSO requests, and RX
+//! checksum results. Completions retain DMA ownership and wake bounded async
+//! drains; timers provide lost-interrupt recovery and a TX progress watchdog.
 //!
-//! - **MSI-X and interrupt-driven completion.** TX completion comes
-//!   from head writeback and RX from the descriptor done bit, both
-//!   polled by the frame pumps.
-//! - **RSS across multiple queues**, which needs a hash LUT and a
-//!   vector per queue.
-//! - **Checksum and TSO offload.** Every frame goes out as a single
-//!   data descriptor with no context descriptor ahead of it.
-//! - **Extra VSIs.** `add_vsi` (0x0210) is for VMDq, flow director
-//!   and SR-IOV VFs; the PF's own VSI already exists and is reused.
-//! - **Jumbo frames.** `rxmax` is pinned at 1522 to match the
-//!   2 KiB per-descriptor buffer.
-//! - **Interrupt-driven ARQ.** The pump polls; firmware raises an
-//!   interrupt for admin events, which would let it park instead.
+//! RSS/multiple queues, extra VSIs, jumbo frames, tunnel offloads and hardware
+//! VLAN insertion remain outside this profile. In-band VLAN headers are kept.
 //!
 //! ## Multi-port
 //!
@@ -98,7 +92,10 @@
 #![allow(dead_code)]
 
 pub mod hmc;
+mod interrupts;
 pub mod irq;
+use core::mem::ManuallyDrop;
+use core::sync::atomic::AtomicBool;
 pub mod offload;
 pub mod ring;
 pub mod vsi;
@@ -414,7 +411,7 @@ pub const AQ_FLAG_RD: u16 = 1 << 10;
 pub const AQ_FLAG_VFC: u16 = 1 << 11;
 /// An external data buffer is attached.
 pub const AQ_FLAG_BUF: u16 = 1 << 12;
-/// Signed command.
+/// Suppress completion interrupt (Intel 710 datasheet, Admin Queue flags).
 pub const AQ_FLAG_SI: u16 = 1 << 13;
 /// Error interrupt.
 pub const AQ_FLAG_EI: u16 = 1 << 14;
@@ -447,6 +444,8 @@ pub enum AqOpcode {
     GetSwitchConfig = 0x0200,
     /// Read an existing VSI's context (indirect).
     GetVsiParameters = 0x0212,
+    /// Update selected sections of an existing VSI.
+    UpdateVsiParameters = 0x0211,
     /// Add a MAC/VLAN filter to a VSI (indirect).
     AddMacvlan = 0x0250,
     /// Enable the link and restart auto-negotiation (direct).
@@ -762,6 +761,19 @@ pub const fn mac_is_invalid(mac: [u8; 6]) -> bool {
     all_zero || all_ff
 }
 
+/// Order CPU access to coherent DMA against the peripheral on both arches.
+fn dma_barrier() {
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: orders outer-shareable memory without accessing any object.
+    unsafe {
+        core::arch::asm!("dmb osh", options(nostack, preserves_flags))
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -781,6 +793,8 @@ pub enum I40eError {
     AdminQueueConfig,
     /// A posted command never got its `DD` bit back.
     AdminQueueTimeout,
+    /// Another command owns the Admin Send Queue.
+    AdminQueueBusy,
     /// Firmware completed the command with a non-OK `retval`.
     AdminQueueError(AqError),
     /// The device reported an all-zero / all-FF MAC.
@@ -820,6 +834,14 @@ pub enum I40eError {
     TxRingFull,
     /// The device's head never advanced past the posted descriptor.
     TxTimeout,
+    /// Unsupported or malformed offload request.
+    InvalidOffload,
+    /// Completion head is outside the submitted interval.
+    InvalidTxHead,
+    /// MSI-X setup failed.
+    InterruptSetup,
+    /// Fatal device error; resources retained until reset.
+    DeviceFailed,
 }
 
 // ── Live driver state ───────────────────────────────────────────────
@@ -829,15 +851,18 @@ pub enum I40eError {
 pub struct I40eNic {
     csr: MmioRegion,
     /// ATQ descriptor ring.
-    atq: DmaBuffer,
+    atq: ManuallyDrop<DmaBuffer>,
     /// One data buffer per ATQ slot, for indirect commands.
-    atq_bufs: alloc::vec::Vec<DmaBuffer>,
+    atq_bufs: ManuallyDrop<alloc::vec::Vec<DmaBuffer>>,
     /// ARQ descriptor ring.
-    arq: DmaBuffer,
+    arq: ManuallyDrop<DmaBuffer>,
     /// One data buffer per ARQ slot.
-    arq_bufs: alloc::vec::Vec<DmaBuffer>,
+    arq_bufs: ManuallyDrop<alloc::vec::Vec<DmaBuffer>>,
     /// Next ATQ slot to post into.
     atq_next: IrqSafeSpinLock<u16>,
+    atq_busy: AtomicBool,
+    tx_rejected: AtomicU64,
+    rx_dropped: AtomicU64,
     /// PCI device id, for diagnostics.
     pub device_id: u16,
     /// Physical port this PF drives (`PFGEN_PORTNUM`).
@@ -865,10 +890,11 @@ pub struct I40eNic {
     /// The main VSI's context as read at bring-up.
     pub vsi: vsi::VsiParams,
     /// LAN HMC backing store for the queue contexts.
-    hmc: hmc::LanHmc,
+    hmc: ManuallyDrop<hmc::LanHmc>,
     /// The single configured queue pair. Guarded because `transmit`
     /// and `receive` both advance ring indices.
-    queue: IrqSafeSpinLock<ring::QueuePair>,
+    queue: ManuallyDrop<IrqSafeSpinLock<ring::QueuePair>>,
+    interrupts: Option<interrupts::Interrupts>,
 
     rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -896,6 +922,42 @@ impl core::fmt::Debug for I40eNic {
     }
 }
 
+// Cancellation/timeout cannot release an in-flight AQ slot for reuse. Poison
+// the PF while keeping all DMA allocations owned until reset.
+struct AqTransaction<'a> {
+    nic: &'a I40eNic,
+    complete: bool,
+}
+impl Drop for AqTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.nic.irq().fail();
+        }
+        self.nic.atq_busy.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for I40eNic {
+    fn drop(&mut self) {
+        // Mask and synchronize before reset invalidates queue/cause registers.
+        self.interrupts.take();
+        // SAFETY: exclusive PF ownership; reset completion ends all PF DMA.
+        if unsafe { Self::pf_reset(&self.csr) }.is_ok() {
+            // SAFETY: DMA is quiescent and these fields are dropped exactly once.
+            unsafe {
+                ManuallyDrop::drop(&mut self.queue);
+                ManuallyDrop::drop(&mut self.hmc);
+                ManuallyDrop::drop(&mut self.atq);
+                ManuallyDrop::drop(&mut self.arq);
+                ManuallyDrop::drop(&mut self.atq_bufs);
+                ManuallyDrop::drop(&mut self.arq_bufs);
+            }
+        }
+        // A failed reset quarantines DMA allocations: freeing memory still
+        // reachable by the device would corrupt unrelated allocations.
+    }
+}
+
 impl I40eNic {
     /// Map BAR0, reset the PF, stand up the Admin Queue, and run the
     /// firmware handshake.
@@ -904,7 +966,7 @@ impl I40eNic {
     /// Caller owns the device's BAR0 and config space exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, I40eError> {
         // SAFETY: forwarded — caller owns BAR0.
         let csr = unsafe { map_bar(device, I40E_BAR_CSR) }.map_err(|_| I40eError::BarMapFailed)?;
@@ -986,33 +1048,23 @@ impl I40eNic {
             unsafe { write_desc(&arq, i, d) };
         }
 
-        // SAFETY: `csr` is the mapped CSR window; the ring physical
-        // addresses come from DMA allocations owned by this PF.
-        unsafe {
-            Self::config_asq_regs(&csr, atq.dma_addr().raw())?;
-            Self::config_arq_regs(&csr, arq.dma_addr().raw())?;
-        }
-
-        // The LAN HMC has to exist before any queue context can be
-        // written. Linux builds it *after* the Admin Queue only
-        // because it sizes the object counts from `get_capabilities`,
-        // which is an AQ command; this driver pins the count at
-        // `NUM_QUEUE_PAIRS` and reads the rest straight out of the
-        // `GLHMC_*` capability registers, so it has no such
-        // dependency. Those registers are CORER-reset and the
-        // `PFHMC_SD*` block is PFR-reset, both of which the reset
-        // above already settled.
-        // SAFETY: `csr` is the mapped CSR window.
-        let hmc = unsafe { hmc::LanHmc::bring_up(&csr, pf_id, NUM_QUEUE_PAIRS, NUM_QUEUE_PAIRS)? };
+        // Allocate before publishing any DMA address. Every subsequent failure
+        // runs the NIC destructor, which resets before freeing DMA memory.
+        // SAFETY: CSR mapping was validated and this caller owns the PF.
+        let hmc = unsafe { hmc::LanHmc::alloc(&csr, pf_id, NUM_QUEUE_PAIRS, NUM_QUEUE_PAIRS)? };
         let queue = ring::QueuePair::alloc(0)?;
+        let interrupts = interrupts::Interrupts::new(cap, device, csr)?;
 
         let mut nic = Self {
             csr,
-            atq,
-            atq_bufs,
-            arq,
-            arq_bufs,
+            atq: ManuallyDrop::new(atq),
+            atq_bufs: ManuallyDrop::new(atq_bufs),
+            arq: ManuallyDrop::new(arq),
+            arq_bufs: ManuallyDrop::new(arq_bufs),
             atq_next: IrqSafeSpinLock::new(0),
+            atq_busy: AtomicBool::new(false),
+            tx_rejected: AtomicU64::new(0),
+            rx_dropped: AtomicU64::new(0),
             device_id: device.id.device,
             port_num,
             fw: FirmwareVersion::default(),
@@ -1023,12 +1075,20 @@ impl I40eNic {
             base_queue,
             vsi_seid: 0,
             vsi: vsi::VsiParams::default(),
-            hmc,
-            queue: IrqSafeSpinLock::new(queue),
+            hmc: ManuallyDrop::new(hmc),
+            queue: ManuallyDrop::new(IrqSafeSpinLock::new(queue)),
+            interrupts: Some(interrupts),
             rx_ipc_ring: IrqSafeSpinLock::new(None),
             tx_ipc_ring: IrqSafeSpinLock::new(None),
         };
 
+        dma_barrier();
+        // SAFETY: ownership of every published buffer is now held by nic.
+        unsafe {
+            nic.hmc.publish(&nic.csr);
+            Self::config_asq_regs(&nic.csr, nic.atq.dma_addr().raw())?;
+            Self::config_arq_regs(&nic.csr, nic.arq.dma_addr().raw())?;
+        }
         nic.fw = nic.aq_get_version()?;
         // Announce ourselves. Firmware tolerates this failing on some
         // NVM revisions, so a non-OK retval is logged, not fatal.
@@ -1052,6 +1112,7 @@ impl I40eNic {
         let main_vsi = switch.main_vsi().ok_or(I40eError::NoMainVsi)?;
         nic.vsi_seid = main_vsi.seid;
         nic.vsi = nic.aq_get_vsi_params(main_vsi.seid)?;
+        nic.aq_keep_vlan_headers()?;
 
         // Everything below drives PF-relative queue 0. That is the
         // main VSI's first queue on a freshly reset PF, but it is the
@@ -1061,12 +1122,25 @@ impl I40eNic {
             return Err(I40eError::UnexpectedVsiQueueMap);
         }
 
+        // Linux lowers the hardware MSS guard before enabling TSO, otherwise
+        // valid small-MSS packets trigger malicious-driver detection/reset.
+        // SAFETY: this documented global threshold is only lowered to 64 bytes.
+        unsafe {
+            let mss = nic.csr.read32(0x000E_64DC);
+            if mss & 0x03FF_0000 > 0x0040_0000 {
+                nic.csr
+                    .write32(0x000E_64DC, (mss & !0x03FF_0000) | 0x0040_0000);
+            }
+        }
+
         // Install the queue contexts and start the queues.
         // SAFETY: `nic.csr` is this PF's mapped CSR window and the
         // HMC backing page is published.
         unsafe {
             let q = nic.queue.lock();
             q.configure(&nic.csr, &nic.hmc, 0, nic.pf_id, nic.vsi.qs_handle_0)?;
+            // Route fatal causes before queue enable can expose bad contexts.
+            nic.interrupts.as_mut().unwrap().enable()?;
             q.enable(&nic.csr, nic.base_queue)?;
         }
 
@@ -1081,20 +1155,56 @@ impl I40eNic {
         // Seeds the atomic and arms LSE reporting; from here the ARQ
         // pump keeps both current.
         nic.refresh_link_status()?;
+        if nic.irq().failed() {
+            return Err(I40eError::DeviceFailed);
+        }
 
         Ok(nic)
     }
 
-    /// Transmit one frame on queue 0.
+    fn irq(&self) -> &interrupts::Interrupts {
+        self.interrupts.as_ref().unwrap()
+    }
+
+    /// Rejected IPC TX requests and RX frames dropped before IPC delivery.
+    pub fn dropped_frames(&self) -> (u64, u64) {
+        (
+            self.tx_rejected.load(Ordering::Relaxed),
+            self.rx_dropped.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Submit with negotiated metadata. Success means the ring owns a DMA copy;
+    /// completion is asynchronous. A full ring leaves the caller's bytes intact.
+    pub fn transmit_with_meta(
+        &self,
+        frame: &[u8],
+        meta: narf_net::TxMeta,
+    ) -> Result<(), I40eError> {
+        if self.irq().failed() {
+            return Err(I40eError::DeviceFailed);
+        }
+        let result = {
+            let mut queue = self.queue.lock();
+            // SAFETY: this PF owns the configured queue and its DMA buffers.
+            unsafe { queue.submit(&self.csr, frame, meta) }
+        };
+        if result == Err(I40eError::InvalidTxHead) {
+            self.irq().fail();
+        }
+        result
+    }
+
+    /// Submit one plain frame on queue 0 without waiting for completion.
     pub fn transmit(&self, frame: &[u8]) -> Result<(), I40eError> {
-        let mut q = self.queue.lock();
-        // SAFETY: `self.csr` is this PF's mapped CSR window, and the
-        // queue pair was configured and enabled during bring-up.
-        unsafe { q.transmit(&self.csr, frame) }
+        self.transmit_with_meta(frame, narf_net::TxMeta::plain())
     }
 
     /// Pop one received frame from queue 0, if any.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        if self.irq().failed() {
+            return None;
+        }
         let mut q = self.queue.lock();
         // SAFETY: as above.
         unsafe { q.receive(&self.csr) }
@@ -1137,21 +1247,17 @@ impl I40eNic {
         let ctrl = unsafe { csr.read32(REG_PFGEN_CTRL) };
         // SAFETY: same; `PFGEN_CTRL` is a writable control register.
         unsafe { csr.write32(REG_PFGEN_CTRL, ctrl | PFGEN_CTRL_PFSWR) };
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
 
         let cleared = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: same.
                 let c = unsafe { csr.read32(REG_PFGEN_CTRL) };
-                if c & PFGEN_CTRL_PFSWR == 0 {
-                    return true;
-                }
-                // A global reset starting underneath us supersedes
-                // the PF reset — Linux breaks out of the loop the
-                // same way.
-                // SAFETY: same.
+                // Reset is a DMA lifetime boundary. A global reset starting
+                // underneath us is not completion: wait for both domains idle.
+                // SAFETY: same mapped CSR window.
                 let rstat = unsafe { csr.read32(REG_GLGEN_RSTAT) };
-                rstat & GLGEN_RSTAT_DEVSTATE_MASK != 0
+                c & PFGEN_CTRL_PFSWR == 0 && rstat & GLGEN_RSTAT_DEVSTATE_MASK == 0
             },
             narf_time::Deadline::after_ms(PF_RESET_MAX_MS),
         );
@@ -1175,7 +1281,7 @@ impl I40eNic {
             csr.write32(REG_PF_ATQBAL, ring_phys as u32);
             csr.write32(REG_PF_ATQBAH, (ring_phys >> 32) as u32);
         }
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
         // Read one register back: if the low base doesn't stick, the
         // CSR window isn't really ours.
         // SAFETY: same.
@@ -1200,7 +1306,7 @@ impl I40eNic {
             csr.write32(REG_PF_ARQBAH, (ring_phys >> 32) as u32);
             csr.write32(REG_PF_ARQT, (AQ_RING_LEN - 1) as u32);
         }
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
         // SAFETY: same.
         if unsafe { csr.read32(REG_PF_ARQBAL) } != ring_phys as u32 {
             return Err(I40eError::AdminQueueConfig);
@@ -1212,15 +1318,16 @@ impl I40eNic {
     /// it back. `buf_in` is copied into the slot's data buffer before
     /// the doorbell when the command carries data outbound.
     ///
-    /// Returns the written-back descriptor. The caller reads any
-    /// response buffer with [`Self::atq_buf_bytes`].
+    /// Returns an owned response buffer and descriptor. Copying under the
+    /// transaction gate prevents slot reuse racing a preempted decoder.
     fn aq_send(
         &self,
         opcode: AqOpcode,
         params: [u8; 16],
         buf_in: Option<&[u8]>,
         buf_len: u16,
-    ) -> Result<(usize, AqDesc), I40eError> {
+    ) -> Result<(alloc::vec::Vec<u8>, AqDesc), I40eError> {
+        let mut transaction = self.aq_transaction()?;
         // The lock is held for the *whole* transaction — slot claim,
         // descriptor write, doorbell, and the wait for DD — not just
         // the slot claim. Two overlapping commands would each publish
@@ -1274,13 +1381,13 @@ impl I40eNic {
         // SAFETY: `self.atq` is this PF's identity-mapped ring of
         // `AQ_RING_LEN` descriptors and `slot < AQ_RING_LEN`.
         unsafe { write_desc(&self.atq, slot, desc) };
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
 
         // Doorbell: tail = the slot after the one we just filled.
         let tail = ((slot + 1) % AQ_RING_LEN as usize) as u32;
         // SAFETY: `self.csr` is this PF's mapped CSR window.
         unsafe { self.csr.write32(REG_PF_ATQT, tail) };
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
 
         let done = narf_scheduler::responsive_spin_until(
             || {
@@ -1295,14 +1402,90 @@ impl I40eNic {
             return Err(I40eError::AdminQueueTimeout);
         }
 
-        // SAFETY: as above.
+        dma_barrier();
+        // SAFETY: serialized AQ transaction still owns this descriptor.
         let wb = unsafe { read_desc(&self.atq, slot) };
+        transaction.complete = true;
         drop(slot_g);
         let rc = AqError::from_retval(wb.retval);
         if !rc.is_ok() {
             return Err(I40eError::AdminQueueError(rc));
         }
-        Ok((slot, wb))
+        let bytes = self.atq_buf_bytes(slot, (buf_len as usize).min(wb.datalen as usize));
+        Ok((bytes, wb))
+    }
+
+    fn aq_transaction(&self) -> Result<AqTransaction<'_>, I40eError> {
+        if self.irq().failed() {
+            return Err(I40eError::DeviceFailed);
+        }
+        self.atq_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| I40eError::AdminQueueBusy)?;
+        Ok(AqTransaction {
+            nic: self,
+            complete: false,
+        })
+    }
+
+    /// Runtime link refresh uses IRQ completion with a timer fallback. No
+    /// IRQ-disabling lock spans an await, and cancellation poisons the PF.
+    async fn refresh_link_async(&self) -> Result<LinkStatus, I40eError> {
+        let mut transaction = self.aq_transaction()?;
+        let deadline = narf_time::Deadline::after_ms(AQ_CMD_TIMEOUT_MS);
+        let mut params = [0u8; 16];
+        params[0] = AQ_LSE_ENABLE;
+        let slot = {
+            let mut next = self.atq_next.lock();
+            let slot = *next as usize;
+            *next = (*next + 1) % AQ_RING_LEN;
+            // SAFETY: serialized transaction owns this AQ slot. SI is clear,
+            // requesting completion notification on the admin vector.
+            unsafe {
+                write_desc(
+                    &self.atq,
+                    slot,
+                    AqDesc {
+                        opcode: AqOpcode::GetLinkStatus as u16,
+                        params,
+                        ..AqDesc::default()
+                    },
+                );
+                dma_barrier();
+                self.csr.write32(REG_PF_ATQT, *next as u32);
+            }
+            slot
+        };
+        loop {
+            let activity = narf_interrupts::wait::wait_for_irq_until(
+                self.irq().admin_vector(),
+                narf_time::Deadline::after_ms(10),
+            );
+            if self.irq().failed() {
+                return Err(I40eError::DeviceFailed);
+            }
+            // SAFETY: the live transaction owns slot through completion.
+            let wb = unsafe { read_desc(&self.atq, slot) };
+            if wb.flags & AQ_FLAG_DD != 0 {
+                dma_barrier();
+                // SAFETY: slot remains owned; re-read response fields after
+                // acquiring device writeback.
+                let wb = unsafe { read_desc(&self.atq, slot) };
+                transaction.complete = true;
+                let error = AqError::from_retval(wb.retval);
+                if !error.is_ok() {
+                    return Err(I40eError::AdminQueueError(error));
+                }
+                let link = LinkStatus::parse(&wb.params);
+                self.link_state.store(link.encode(), Ordering::Release);
+                return Ok(link);
+            }
+            if deadline.expired() {
+                return Err(I40eError::AdminQueueTimeout);
+            }
+            self.irq().rearm_admin();
+            let _ = activity.await;
+        }
     }
 
     /// Copy `len` bytes out of the ATQ slot's data buffer — where
@@ -1356,12 +1539,11 @@ impl I40eNic {
     /// MAC, which is the address the port transmits from.
     pub fn aq_read_mac_address(&self) -> Result<[u8; 6], I40eError> {
         const RESP_LEN: u16 = 24; // struct i40e_aqc_mac_address_read_data
-        let (slot, wb) = self.aq_send(AqOpcode::MacAddressRead, [0; 16], None, RESP_LEN)?;
+        let (buf, wb) = self.aq_send(AqOpcode::MacAddressRead, [0; 16], None, RESP_LEN)?;
         let flags = u16::from_le_bytes([wb.params[0], wb.params[1]]);
         if flags & MAC_ADDR_LAN_VALID == 0 {
             return Err(I40eError::BadMacAddress);
         }
-        let buf = self.atq_buf_bytes(slot, RESP_LEN as usize);
         MacAddresses::parse(&buf)
             .map(|m| m.pf_lan)
             .ok_or(I40eError::BadMacAddress)
@@ -1396,8 +1578,8 @@ impl I40eNic {
     /// Ask firmware for the current link state, publish it, and re-arm
     /// link-status event reporting.
     ///
-    /// Takes `&self` — the state lives in an atomic, so this is the
-    /// ARQ pump's normal path as well as a caller-driven refresh.
+    /// Synchronous control-plane helper; the runtime ARQ pump uses the
+    /// asynchronous transaction path instead.
     pub fn refresh_link_status(&self) -> Result<LinkStatus, I40eError> {
         let s = self.aq_get_link_status()?;
         self.link_state.store(s.encode(), Ordering::Release);
@@ -1406,7 +1588,7 @@ impl I40eNic {
 
     /// `true` when the link is currently up.
     pub fn link_up(&self) -> bool {
-        self.link_status().link_up
+        !self.irq().failed() && self.link_status().link_up
     }
 
     /// Pop one Admin Receive Queue event, if firmware has posted one.
@@ -1423,6 +1605,7 @@ impl I40eNic {
             return None;
         }
 
+        dma_barrier();
         // SAFETY: `self.arq` is this PF's identity-mapped ARQ ring and
         // `ntc < AQ_RING_LEN`.
         let event = unsafe { read_desc(&self.arq, ntc as usize) };
@@ -1439,13 +1622,13 @@ impl I40eNic {
         set_desc_buf_addr(&mut rearmed, phys);
         // SAFETY: as above.
         unsafe { write_desc(&self.arq, ntc as usize, rearmed) };
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
 
         // The tail is the last descriptor handed back, so it is the
         // one just cleaned — not the next one.
         // SAFETY: `self.csr` is this PF's mapped CSR window.
         unsafe { self.csr.write32(REG_PF_ARQT, ntc as u32) };
-        compiler_fence(Ordering::SeqCst);
+        dma_barrier();
 
         *ntc_g = (ntc + 1) % AQ_RING_LEN;
         Some(event)
@@ -1692,64 +1875,146 @@ fn spawn_pumps(
 /// authoritative read *and* re-arms reporting, which firmware
 /// otherwise leaves disarmed until the next request.
 async fn i40e_arq_pump(device: Arc<I40eNic>) {
+    let mut refresh = false;
     loop {
-        // Drain a bounded batch before yielding: enough that a burst
-        // of events cannot outrun the pump, capped so a device
-        // posting them faster than they can be handled cannot starve
-        // everything else on this CPU.
+        let activity = narf_interrupts::wait::wait_for_irq_until(
+            device.irq().admin_vector(),
+            narf_time::Deadline::after_ms(100),
+        );
+        if device.irq().failed() {
+            return;
+        }
         let mut drained = 0;
         while drained < AQ_WORK_LIMIT {
-            let event = match device.poll_arq_event() {
-                Some(e) => e,
-                None => break,
+            let Some(event) = device.poll_arq_event() else {
+                break;
             };
             drained += 1;
-            if event.opcode == AqOpcode::GetLinkStatus as u16 {
-                match device.refresh_link_status() {
-                    Ok(link) => {
-                        use core::fmt::Write as _;
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  i40e: link {} ({})",
-                            if link.link_up { "up" } else { "down" },
-                            link.speed().label(),
-                        );
-                    }
-                    Err(e) => {
-                        // Leave the cached state alone rather than
-                        // guessing; the next event retries.
-                        use core::fmt::Write as _;
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  i40e: link event refresh failed: {:?}",
-                            e
-                        );
-                    }
-                }
-            }
-            // Any other event is still drained — leaving it would
-            // stall the ring and stop link events arriving too.
+            refresh |= event.opcode == AqOpcode::GetLinkStatus as u16;
         }
-        narf_scheduler::yield_now().await;
+        if refresh {
+            // Keep retry intent on busy/error: an LSE notification disarms
+            // reporting, so waiting for a second event would lose link changes.
+            if let Ok(link) = device.refresh_link_async().await {
+                refresh = false;
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i40e: link {} ({})",
+                    if link.link_up { "up" } else { "down" },
+                    link.speed().label()
+                );
+            }
+        }
+        if drained == AQ_WORK_LIMIT {
+            narf_scheduler::yield_now().await;
+        } else {
+            device.irq().rearm_admin();
+            let _ = activity.await;
+        }
     }
 }
 
 async fn i40e_rx_pump(device: Arc<I40eNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    let mut last_clean = 0;
+    let mut was_pending = false;
+    let mut deadline = narf_time::Deadline::after_ms(250);
     loop {
-        if let Some(pkt) = device.receive() {
-            if let Ok(dma_buf) = alloc_coherent(pkt.len(), DomainId::DRIVER_0) {
-                let mut frame = Frame::new(dma_buf, pkt.len() as u32);
-                frame.payload_mut().copy_from_slice(&pkt);
-                let _ = rx_prod.send(frame).await;
+        // Snapshot BEFORE inspecting completion state: an IRQ between the drain
+        // and await must cause immediate progress rather than a lost wakeup.
+        let activity = narf_interrupts::wait::wait_for_irq_until(
+            device.irq().queue_vector(),
+            narf_time::Deadline::after_ms(10),
+        );
+        if device.irq().failed() {
+            return;
+        }
+        let progress = {
+            let mut queue = device.queue.lock();
+            queue
+                .reclaim()
+                .map(|()| (queue.tx_progress(), queue.tx_pending()))
+        };
+        let (clean, pending) = match progress {
+            Ok(progress) => progress,
+            Err(_) => {
+                device.irq().fail();
+                return;
+            }
+        };
+        if !pending || !was_pending || clean != last_clean {
+            deadline = narf_time::Deadline::after_ms(250);
+        } else if deadline.expired() {
+            device.irq().fail();
+            return;
+        }
+        last_clean = clean;
+        was_pending = pending;
+        let mut drained = 0;
+        while drained < ring::RING_LEN {
+            let packet = {
+                let mut queue = device.queue.lock();
+                // SAFETY: queue and BAR remain owned by device across this batch.
+                unsafe { queue.receive_with_meta(&device.csr) }
+            };
+            let Some(packet) = packet else {
+                break;
+            };
+            drained += 1;
+            let delivered = if let Some((bytes, meta)) = packet {
+                if let Ok(buffer) = alloc_coherent(bytes.len(), DomainId::DRIVER_0) {
+                    let mut frame = Frame::new(buffer, bytes.len() as u32);
+                    frame.payload_mut().copy_from_slice(&bytes);
+                    frame.set_rx_meta(meta);
+                    // Backpressure drops only RX packets, never blocks completion
+                    // cleanup/rearm or the TX watchdog behind a stalled consumer.
+                    rx_prod.try_send(frame).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !delivered {
+                device.rx_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
-        narf_scheduler::yield_now().await;
+        if drained == ring::RING_LEN {
+            narf_scheduler::yield_now().await;
+        } else {
+            device.irq().rearm_queue();
+            let _ = activity.await;
+        }
     }
 }
 
 async fn i40e_tx_pump(device: Arc<I40eNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.transmit(frame.payload());
+        let deadline = narf_time::Deadline::after_ms(250);
+        loop {
+            let activity = narf_interrupts::wait::wait_for_irq_until(
+                device.irq().queue_vector(),
+                narf_time::Deadline::after_ms(10),
+            );
+            match device.transmit_with_meta(frame.payload(), frame.tx_meta()) {
+                Ok(()) => break,
+                Err(I40eError::TxRingFull) if !deadline.expired() => {
+                    let _ = activity.await;
+                }
+                Err(error) => {
+                    device.tx_rejected.fetch_add(1, Ordering::Relaxed);
+                    if error == I40eError::TxRingFull {
+                        device.irq().fail();
+                    }
+                    if device.irq().failed() {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+        // Bound a run of ready IPC frames so RX/TX reclamation gets a turn.
+        narf_scheduler::yield_now().await;
     }
 }
 
@@ -1794,6 +2059,14 @@ impl narf_net::Interface for I40eNicIface {
     fn link_up(&self) -> bool {
         self.nic.link_up()
     }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            rx_checksum: true,
+            max_tso_bytes: offload::MAX_TSO_BYTES as u32,
+            vlan_insert: false,
+        }
+    }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.nic.rx_ipc_ring
     }
@@ -1816,10 +2089,10 @@ impl crate::HwNic for I40eNicIface {
         self.nic.link_up()
     }
     fn model(&self) -> crate::NicModel {
-        crate::NicModel::IntelIxgbe
+        crate::NicModel::IntelI40e
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::NONE
+        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM | crate::NicCaps::TSO
     }
     fn ring_capacity(&self) -> usize {
         ring::RING_LEN as usize
