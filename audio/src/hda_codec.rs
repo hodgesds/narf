@@ -13,7 +13,7 @@
 //!     Capabilities, Pin Capabilities, Input/Output Amp Capabilities,
 //!     Connection List Length).
 //!
-//! No GPL / Linux source consulted.
+//! Enumeration and routing checked against Linux sound/hda/core and codecs/generic.c.
 //!
 //! ## What this module is
 //!
@@ -312,21 +312,23 @@ where
 {
     // Vendor / Device id.
     let vid_did = verb(make_verb(addr, 0, verb::GET_PARAMETER | param::VENDOR_ID));
-    let device_id = (vid_did >> 16) as u16;
-    let vendor_id = (vid_did & 0xFFFF) as u16;
+    let vendor_id = (vid_did >> 16) as u16;
+    let device_id = vid_did as u16;
     let revision = verb(make_verb(addr, 0, verb::GET_PARAMETER | param::REVISION_ID));
     let sub_root = verb(make_verb(
         addr,
         0,
         verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT,
     ));
-    let first_fg = (sub_root & 0xFF) as u8;
-    let n_fg = ((sub_root >> 16) & 0xFF) as u8;
+    let first_fg = ((sub_root >> 16) & 0xFF) as u8;
+    let n_fg = (sub_root & 0xFF) as u8;
 
     // Find the first Audio Function Group (Function Group Type = 1).
     let mut afg_nid = 0u8;
     for i in 0..n_fg {
-        let nid = first_fg + i;
+        let Some(nid) = first_fg.checked_add(i) else {
+            break;
+        };
         let fgt = verb(make_verb(
             addr,
             nid,
@@ -346,10 +348,12 @@ where
             afg_nid,
             verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT,
         ));
-        let first_w = (sub_afg & 0xFF) as u8;
-        let n_w = ((sub_afg >> 16) & 0xFF) as u8;
+        let first_w = ((sub_afg >> 16) & 0xFF) as u8;
+        let n_w = (sub_afg & 0xFF) as u8;
         for i in 0..n_w {
-            let nid = first_w + i;
+            let Some(nid) = first_w.checked_add(i) else {
+                break;
+            };
             let caps_raw = verb(make_verb(
                 addr,
                 nid,
@@ -367,33 +371,41 @@ where
                 ));
                 let n = (cll & 0x7F) as u8;
                 let long_form = cll & (1 << 7) != 0;
-                let mut idx = 0u8;
-                while idx < n {
-                    let resp = verb(make_verb(
+                let width = if long_form { 16 } else { 8 };
+                let per_word = 32 / width;
+                let range_bit = 1u32 << (width - 1);
+                let mut previous = 0u32;
+                'entries: for idx in (0..n as usize).step_by(per_word) {
+                    let response = verb(make_verb(
                         addr,
                         nid,
                         verb::GET_CONNECTION_LIST_ENTRY | idx as u32,
                     ));
-                    if long_form {
-                        // Two 16-bit entries per response (§7.3.3.3).
-                        connections.push((resp & 0xFFFF) as u8);
-                        if idx + 1 < n {
-                            connections.push(((resp >> 16) & 0xFFFF) as u8);
+                    for slot in 0..per_word.min(n as usize - idx) {
+                        let raw = (response >> (slot * width)) & ((1 << width) - 1);
+                        let node = raw & (range_bit - 1);
+                        if node == 0 || node > 255 {
+                            continue;
                         }
-                        idx += 2;
-                    } else {
-                        // Four 8-bit entries.
-                        connections.push((resp & 0xFF) as u8);
-                        if idx + 1 < n {
-                            connections.push(((resp >> 8) & 0xFF) as u8);
+                        if raw & range_bit != 0 {
+                            if previous == 0 || node <= previous {
+                                continue;
+                            }
+                            if connections.len() + (node - previous) as usize > 256 {
+                                connections.clear();
+                                break 'entries;
+                            }
+                            for child in previous + 1..=node {
+                                connections.push(child as u8);
+                            }
+                        } else {
+                            if connections.len() == 256 {
+                                connections.clear();
+                                break 'entries;
+                            }
+                            connections.push(node as u8);
                         }
-                        if idx + 2 < n {
-                            connections.push(((resp >> 16) & 0xFF) as u8);
-                        }
-                        if idx + 3 < n {
-                            connections.push(((resp >> 24) & 0xFF) as u8);
-                        }
-                        idx += 4;
+                        previous = node;
                     }
                 }
             }
@@ -420,7 +432,11 @@ where
             let in_amp = if caps.in_amp_present() {
                 Some(AmpCaps::decode(verb(make_verb(
                     addr,
-                    nid,
+                    if caps.amp_param_override() {
+                        nid
+                    } else {
+                        afg_nid
+                    },
                     verb::GET_PARAMETER | param::INPUT_AMP_CAPS,
                 ))))
             } else {
@@ -429,7 +445,11 @@ where
             let out_amp = if caps.out_amp_present() {
                 Some(AmpCaps::decode(verb(make_verb(
                     addr,
-                    nid,
+                    if caps.amp_param_override() {
+                        nid
+                    } else {
+                        afg_nid
+                    },
                     verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS,
                 ))))
             } else {
@@ -495,7 +515,7 @@ pub fn find_output_path(c: &Codec) -> Option<AudioPath> {
             if cfg.port_connectivity == 0x1 {
                 continue;
             }
-            if let Some(p) = trace_to_converter(c, w.nid, WidgetType::AudioOutput, 4) {
+            if let Some(p) = trace_to_converter(c, w.nid, WidgetType::AudioOutput, 16) {
                 return Some(p);
             }
         }
@@ -504,7 +524,7 @@ pub fn find_output_path(c: &Codec) -> Option<AudioPath> {
 }
 
 /// Walk every input Pin Complex (Mic In, Line In, AUX), pick the
-/// first one whose connection list reaches an Audio-Input converter.
+/// first one reached by an Audio-Input converter's connection list.
 pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
     // Preference: Mic In (0xA) > Line In (0x8) > AUX (0x9).
     const PREF: &[u8] = &[0xA, 0x8, 0x9];
@@ -524,8 +544,22 @@ pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
             if cfg.port_connectivity == 0x1 {
                 continue;
             }
-            if let Some(p) = trace_to_converter(c, w.nid, WidgetType::AudioInput, 4) {
-                return Some(p);
+            if w.caps.digital() || w.pin_caps.unwrap_or(0) & 0x20 == 0 {
+                continue;
+            }
+            for adc in c
+                .widgets
+                .iter()
+                .filter(|n| n.ty() == WidgetType::AudioInput && !n.caps.digital())
+            {
+                let mut path = Vec::new();
+                if trace_to_pin(c, adc.nid, w.nid, &mut path) {
+                    return Some(AudioPath {
+                        pin_nid: w.nid,
+                        converter_nid: adc.nid,
+                        chain: path,
+                    });
+                }
             }
         }
     }
@@ -556,6 +590,9 @@ fn trace_step(
     }
     let w = c.widget(nid)?;
     for &child in &w.connections {
+        if child == nid || chain.contains(&child) {
+            continue;
+        }
         if let Some(cw) = c.widget(child) {
             if cw.ty() == want {
                 return Some(child);
@@ -574,4 +611,31 @@ fn trace_step(
         }
     }
     None
+}
+
+fn trace_to_pin(c: &Codec, from: u8, pin: u8, path: &mut Vec<u8>) -> bool {
+    if path.len() >= 16 {
+        return false;
+    }
+    let Some(node) = c.widget(from) else {
+        return false;
+    };
+    for &next in &node.connections {
+        if next == from || path.contains(&next) {
+            continue;
+        }
+        if next == pin {
+            return true;
+        }
+        if let Some(w) = c.widget(next) {
+            if matches!(w.ty(), WidgetType::AudioMixer | WidgetType::AudioSelector) {
+                path.push(next);
+                if trace_to_pin(c, next, pin, path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+    }
+    false
 }

@@ -1,116 +1,28 @@
-//! AMD ACP (Audio Coprocessor) driver — clean-room.
+//! Compatibility surface for the retired generic ACP scaffold.
 //!
-//! Covers ACP3.x → ACP6.x. The PCI register file at BAR0 is the same
-//! shape across the family; the SoC version is read from the
-//! `ACP_VERSION` register at offset `0x100`. Targeted SoCs:
-//!
-//! | PCI ID    | SoC family            | ACP rev | Status        |
-//! |-----------|-----------------------|---------|---------------|
-//! | 1022:15E2 | Renoir / Lucienne / Cezanne (Zen2 APU) | 6.0 | bring-up target |
-//! | 1022:15E3 | Pink Sardine          | 6.x     | match-only    |
-//! | 1022:15BE | Rembrandt (Zen3+)     | 6.2     | match-only    |
-//! | 1022:638F | Mero / Mendocino / newer parts | 6.3 | match-only    |
-//!
-//! The user's bring-up box is AMD Family 0x17 Models 0x30..0xAF —
-//! Renoir / Lucienne / Cezanne — which exposes `1022:15E2` as
-//! `Multimedia controller [0480]`. See user memory
-//! `project_bringup_target.md`.
-//!
-//! ## References
-//!
-//! All citations below are GPL-2.0-or-later Linux sources — NARF
-//! is itself GPL-2.0-or-later as of 2026-05-20, so direct citation
-//! and adaptation is allowed.
-//!
-//! - **AMD Renoir / Cezanne PPR**, §13 "ACP" — register table for
-//!   `ACP_VERSION` / `ACP_SOFT_RESET` / `ACP_CONTROL` / `ACP_STATUS`
-//!   and the I2S DMA block.
-//! - Linux `sound/soc/amd/raven/acp3x-pcm-dma.c` (lines ~80-260):
-//!   ACP DMA descriptor-ring shape used by the I2S TX engine —
-//!   `ACP_I2S_TX_RINGBUFADDR / RINGBUFSIZE / LINKPOSITIONCNTR`,
-//!   plus the FIFO-watermark register pair. The ACP6 register
-//!   offsets shifted from ACP3 — see `sound/soc/amd/acp/acp-mach.c`
-//!   for the version multiplexing.
-//! - Linux `sound/soc/amd/renoir/acp3x.c` — ACP6 PCI probe + soft
-//!   reset; reset sequence below mirrors `acp3x_init()`.
-//! - Linux `sound/soc/amd/acp/acp-pci.c` — PCI ID table; the
-//!   shared device id `0x15E2` is reused across Renoir / Lucienne
-//!   / Cezanne (the SoC family is distinguishable only via CPUID).
-//! - Linux `sound/soc/codecs/wm8960.c` — WM8960 codec init verbs;
-//!   matched in `audio/src/wm8960.rs`.
-//! - Wolfson **WM8960 datasheet**, Rev 4.4 (public, non-GPL).
-//!
-//! ## Operating mode
-//!
-//! Passthrough I2S DMA: the ACP block is brought out of reset, its
-//! clock is enabled, and the I2S0 TX engine is programmed to stream
-//! PCM frames from a kernel-side ring buffer to the off-die codec.
-//! No DSP firmware blob is required for this mode — the on-die
-//! ACP DSP can stay parked. Linux operates the simpler ACP3X parts
-//! the same way (`sound/soc/amd/raven/acp3x-i2s.c`).
-//!
-//! The optional `load_firmware()` path stages a vendor-signed
-//! runtime image (`sof-rn.ri`) into the on-die scratch RAM for
-//! parts that *do* need DSP-side processing — kept here as a
-//! capture-path future, not used by play_pcm.
+//! Physical devices are registered through `acp63`, using Linux's
+//! snd_pci_ps register map and revision/firmware checks. The historical I2S
+//! model and its constants below remain for existing software tests; they are
+//! not a hardware programming contract and cannot bind a physical controller.
+//! In particular, 1022:15e3 is HDA, not ACP. Generic ACP_VERSION/RI upload
+//! registers from this scaffold are not valid for Phoenix.
 
-use core::sync::atomic::{compiler_fence, Ordering};
-
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Advanced Micro Devices, Inc.
 pub const ACP_VENDOR: u16 = 0x1022;
-/// AMD Renoir / Lucienne / Cezanne ACP6.0 (Zen2 APU bring-up target).
-/// Linux `sound/soc/amd/acp/acp-pci.c` uses this same device id
-/// across all three SKUs.
+/// Shared AMD ACP PCI ID; revision distinguishes the supported register map.
 pub const ACP_RENOIR: u16 = 0x15E2;
-/// Legacy alias for source-compat — same silicon as `ACP_RENOIR`.
+/// Phoenix uses the same PCI device ID with revision 0x63.
 pub const ACP_PHOENIX: u16 = ACP_RENOIR;
-/// AMD Pink Sardine ACP.
-pub const ACP_PINK_SARDINE: u16 = 0x15E3;
-/// AMD Rembrandt ACP6.2.
-pub const ACP_REMBRANDT: u16 = 0x15BE;
-/// Newer ACP (Mero / Mendocino / 2024+ parts).
-pub const ACP_MERO: u16 = 0x638F;
 
-// ── BAR0 register-block offsets ────────────────────────────────────
-//
-// The ACP register file at BAR0 + 0x0 is the same shape across
-// ACP3.0 → ACP6.x; SoC-specific bits are gated through the
-// `ACP_VERSION` register at +0x100. References below are the
-// Phoenix PPR §13.3 register table.
+// Historical model constants, used only by unbound legacy helpers.
 pub(crate) mod regs {
-    /// `ACP_VERSION` — vendor / revision triple. Used as a
-    /// presence test (`0xFFFFFFFF` ↔ device-gone / D3cold).
     pub const ACP_VERSION: u64 = 0x100;
-    pub const VERSION_GONE: u32 = 0xFFFF_FFFF;
-
-    /// `ACP_SOFT_RESET` — write the SOFT_RESET bit, poll
-    /// `ACP_SOFT_RESET_DONE`.
-    pub const ACP_SOFT_RESET: u64 = 0x104;
-    /// `ACP_CONTROL` — bit 0 = ClkEn, bit 1 = Run.
-    pub const ACP_CONTROL: u64 = 0x108;
-    /// `ACP_STATUS` — bit 0 = ACP_BUSY, bit 1 = READY.
-    pub const ACP_STATUS: u64 = 0x10C;
-
-    /// `ACP_RI_ADDR` — phys base (low / high split).
-    pub const ACP_RI_ADDR_LO: u64 = 0x130;
-    pub const ACP_RI_ADDR_HI: u64 = 0x134;
-    /// `ACP_RI_SIZE` — bytes.
-    pub const ACP_RI_SIZE: u64 = 0x138;
-    /// `ACP_RI_KICK` — write 1 to start the DMA load.
-    pub const ACP_RI_KICK: u64 = 0x13C;
-
-    /// `ACP_SOFT_RESET` bits.
-    pub const RESET_REQUEST: u32 = 1 << 0;
-    pub const RESET_DONE: u32 = 1 << 16;
-    /// `ACP_CONTROL` bits.
     pub const CONTROL_CLKEN: u32 = 1 << 0;
     pub const CONTROL_RUN: u32 = 1 << 1;
-    /// `ACP_STATUS` bits.
-    pub const STATUS_READY: u32 = 1 << 1;
 
     // ── I2S TX path (passthrough DMA) ──────────────────────────────
     //
@@ -187,6 +99,7 @@ pub(crate) mod regs {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AcpError {
+    UnsupportedDevice,
     BarMapFailed,
     /// `ACP_VERSION` read 0xFFFFFFFF — device gone.
     DeviceGone,
@@ -231,136 +144,26 @@ impl core::fmt::Debug for AcpDevice {
 }
 
 impl AcpDevice {
-    /// Map BAR0, assert + deassert ACP soft reset, leave RUN clear.
-    /// Real PCM capture follows a successful `load_firmware`.
-    ///
+    /// The retired generic ACP scaffold cannot identify a safe register map.
+    /// Use the revision-specific `acp63::probe` for physical devices.
     /// # Safety
-    /// Caller owns BAR0 exclusively for the duration of probe.
+    /// Kept for source compatibility; no hardware is accessed.
     pub unsafe fn bring_up(
-        device: &BusDevice,
+        _device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, AcpError> {
-        // SAFETY: caller-authority over BAR0.
-        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| AcpError::BarMapFailed)?;
-
-        // Probe ACP_VERSION as a presence test.
-        // SAFETY: identity-mapped MMIO.
-        let raw = unsafe { mmio.read32(regs::ACP_VERSION) };
-        if raw == regs::VERSION_GONE {
-            return Err(AcpError::DeviceGone);
-        }
-        let major = ((raw >> 24) & 0xFF) as u8;
-        let minor = ((raw >> 16) & 0xFF) as u8;
-        let version = AcpVersion { raw, major, minor };
-
-        // Assert ACP soft reset, wait for RESET_DONE. The PPR
-        // notes: the bit at +16 latches `1` once reset settles;
-        // the request bit self-clears.
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(regs::ACP_SOFT_RESET, regs::RESET_REQUEST);
-        }
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
-        // alive during ACP soft-reset settle. 100 ms wedge
-        // threshold (typical reset latches in <1 ms per AMD PPR
-        // §13.3.2).
-        let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: same.
-            || unsafe { mmio.read32(regs::ACP_SOFT_RESET) } & regs::RESET_DONE != 0,
-            narf_time::Deadline::after_ms(100),
-        );
-        if !done {
-            return Err(AcpError::ResetTimeout);
-        }
-
-        // Enable the ACP clock so RI DMA load can run; leave RUN
-        // clear (set on firmware-load completion).
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(regs::ACP_CONTROL, regs::CONTROL_CLKEN);
-        }
-
-        Ok(Self {
-            mmio,
-            version,
-            fw_loaded: false,
-            i2s_tx_prepared: false,
-        })
+        Err(AcpError::UnsupportedDevice)
     }
 
-    /// Stage the ACP RI runtime image via the kernel firmware
-    /// registry, drive the DMA load handshake, set RUN.
-    ///
-    /// Sequence per PPR §13.3.4:
-    ///   1. Program `ACP_RI_ADDR_LO/HI` from the blob's phys.
-    ///   2. Program `ACP_RI_SIZE` from the blob's byte length.
-    ///   3. Write 1 to `ACP_RI_KICK`.
-    ///   4. Poll `ACP_STATUS` until `READY` asserts (~10 ms).
-    ///   5. Set `ACP_CONTROL.RUN`.
-    ///
-    /// Returns `FirmwareMissing` if the registry has no entry.
-    /// Returns `FirmwareLoadFailed` on any device-side timeout.
-    ///
+    /// Firmware upload is not implemented by the retired scaffold.
+    /// Native ACP 6.3 PDM capture does not need DSP firmware.
     /// # Safety
-    /// Caller owns BAR0 exclusively. The blob's `view().phys` must
-    /// remain valid for the duration of the load — the cap stays
-    /// alive until this function returns.
+    /// Kept for source compatibility; no hardware is accessed.
     pub unsafe fn load_firmware(
         &mut self,
-        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+        _fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AcpError> {
-        let cap = narf_firmware::open("amd/acp/sof-rn.ri", fw_authority).map_err(|e| match e {
-            narf_firmware::FirmwareError::NotFound => AcpError::FirmwareMissing,
-            _ => AcpError::FirmwareLoadFailed,
-        })?;
-        let view = narf_firmware::view_of(&cap).map_err(|_| AcpError::FirmwareLoadFailed)?;
-        let phys = view.phys;
-        let len = view.bytes.len() as u32;
-        // SAFETY: BAR0 mapped, exclusive owner.
-        unsafe {
-            self.mmio.write32(regs::ACP_RI_ADDR_LO, phys as u32);
-            self.mmio.write32(regs::ACP_RI_ADDR_HI, (phys >> 32) as u32);
-            self.mmio.write32(regs::ACP_RI_SIZE, len);
-        }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: same.
-        unsafe {
-            self.mmio.write32(regs::ACP_RI_KICK, 1);
-        }
-
-        // Wait for ACP_STATUS.READY. responsive_spin_until ticks
-        // sleep_pumps so cursor/FB/serial stay alive across the
-        // ~10 ms RI DMA load. 500 ms wedge threshold (50x typical
-        // per AMD PPR §13.3.4).
-        let ready = narf_scheduler::responsive_spin_until(
-            // SAFETY: same.
-            || unsafe { self.mmio.read32(regs::ACP_STATUS) } & regs::STATUS_READY != 0,
-            narf_time::Deadline::after_ms(500),
-        );
-        if !ready {
-            return Err(AcpError::FirmwareLoadFailed);
-        }
-
-        // Set RUN.
-        // SAFETY: same.
-        unsafe {
-            self.mmio
-                .write32(regs::ACP_CONTROL, regs::CONTROL_CLKEN | regs::CONTROL_RUN);
-        }
-
-        // Record the firmware-version coupling for observability.
-        narf_drivers::set_bound_firmware(
-            "acp6",
-            narf_drivers::BoundFirmware {
-                blob_name: alloc::string::String::from("amd/acp/sof-rn.ri"),
-                sha256: view.sha256,
-                signer: view.signer,
-                version: None,
-            },
-        );
-
-        self.fw_loaded = true;
-        Ok(())
+        Err(AcpError::UnsupportedDevice)
     }
 
     pub fn version(&self) -> AcpVersion {
@@ -375,56 +178,14 @@ impl AcpDevice {
 
 static CONTROLLER: IrqSafeSpinLock<Option<AcpDevice>> = IrqSafeSpinLock::new(None);
 
+/// Compatibility registration entry. Native ACP 6.3 lives in `acp63`.
+/// The old I2S scaffold is not bound to physical devices.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    // SAFETY: caller-authority.
-    let dev = match unsafe { AcpDevice::bring_up(&device, &cap) } {
-        Ok(d) => d,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
-    };
-    *CONTROLLER.lock() = Some(dev);
-    narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("acp6"),
-        kind: narf_drivers::BoundKind::Audio,
-        pci_vid: Some(device.id.vendor),
-        pci_did: Some(device.id.device),
-        domain: narf_drivers::BoundKind::Audio.default_domain(),
-    });
-    Ok(())
+    crate::acp63::probe(device, cap)
 }
 
-/// Register all known AMD ACP PCI ids with the bus match table.
-///
-/// Multiple registrations rather than a class-match because AMD ACP
-/// uses PCI class `0x04 / 0x80` ("multimedia controller / other"),
-/// which would also pick up unrelated DSPs. Linux's
-/// `sound/soc/amd/acp/acp-pci.c` does the same explicit ID table.
 pub fn register_pci_driver() {
-    for (name, device) in [
-        ("acp6-renoir", ACP_RENOIR),
-        ("acp6-pink-sardine", ACP_PINK_SARDINE),
-        ("acp6-rembrandt", ACP_REMBRANDT),
-        ("acp6-mero", ACP_MERO),
-    ] {
-        narf_bus::register_pci_driver(narf_bus::PciMatch {
-            name,
-            kind: narf_bus::MatchKind::VendorDevice {
-                vendor: ACP_VENDOR,
-                device,
-            },
-            probe,
-        });
-    }
+    crate::acp63::register_pci_driver();
 }
 
 pub fn is_probed() -> bool {

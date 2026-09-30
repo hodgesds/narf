@@ -40,7 +40,7 @@ pub const HDA_AMD_RENOIR_DEVICE: u16 = 0x15E3;
 /// AMD Phoenix / HawkPoint (Zen4 mobile APUs) HDA controller —
 /// the user's second bring-up laptop.
 pub const HDA_AMD_PHOENIX_VENDOR: u16 = 0x1022;
-pub const HDA_AMD_PHOENIX_DEVICE: u16 = 0x15E2;
+pub const HDA_AMD_PHOENIX_DEVICE: u16 = 0x15E3;
 /// AMD Radeon iGPU HD Audio (HDMI/DP audio side). Same programming
 /// model.
 pub const HDA_AMD_RADEON_DEVICE: u16 = 0x1640;
@@ -338,8 +338,7 @@ pub fn supported_device(vendor: u16, device: u16) -> bool {
     matches!(
         (vendor, device),
         (HDA_AMD_RENOIR_VENDOR, HDA_AMD_RENOIR_DEVICE)
-            | (HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE)
-            | (HDA_AMD_VENDOR, HDA_AMD_RADEON_DEVICE)
+            | (0x1002, HDA_AMD_RADEON_DEVICE)
             | (HDA_INTEL_VENDOR, _)
     )
 }

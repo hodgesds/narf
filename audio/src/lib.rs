@@ -1,10 +1,8 @@
 //! narf-audio — PCM audio subsystem.
 //!
-//! Sits between PCM-capable device drivers (virtio-sound today;
-//! intel-hda / ac97 in the future) and any consumer that wants to
-//! play or capture audio: kernel-side beep / boot chime in commit B,
-//! userspace `narf_user_runtime::audio::AudioContext` once the
-//! syscall surface lands.
+//! VirtIO and native HDA playback, HDA/ACP 6.3 capture, and the
+//! capability-gated kernel API. Native PCM and mixer endpoints are also
+//! published through narf-drivers-sound's card/file bridge.
 //!
 //! Surface (parallels narf-fb's shape):
 //!
@@ -19,11 +17,9 @@
 //!     `Cap<AudioStreamCap, Read>`  — capture (recording)
 //!     `Cap<AudioStreamCap, Write>` — playback
 //!
-//! Stage-4 cut: probe only, no submission path. The data plane lands
-//! once virtio-sound's tx virtqueue is fully wired in
-//! `narf-drivers-virtio::snd_pci`. The trait shape is intentionally
-//! complete so consumers can be written against it now and switch to
-//! a real backend without API churn.
+//! AudioReader requires explicit capture authority; enumeration never
+//! starts recording. See specification/spec.md for the implemented formats
+//! and the distinction between the NARF file protocol and Linux ALSA.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -32,6 +28,7 @@
 extern crate alloc;
 
 pub mod acp6;
+pub mod acp63;
 pub mod acp6_bdl;
 pub mod acp6_codec_link;
 pub mod acp6_pcm;
@@ -40,6 +37,10 @@ pub mod hda;
 pub mod hda_codec;
 pub mod i2s;
 pub mod msbc;
+mod native_firmware;
+mod native_irq;
+mod native_pci;
+mod native_pcm;
 pub mod realtek_alc;
 pub mod sbc;
 pub mod wm8960;
@@ -63,6 +64,8 @@ pub enum SampleFormat {
     /// 32-bit IEEE float little-endian. Optional; backends advertise
     /// support via `AudioStream::supports`.
     F32Le,
+    /// Signed 32-bit PCM, used by the native ACP digital microphone.
+    S32Le,
 }
 
 /// Channel layout. Stage-4 supports mono + stereo; multichannel
@@ -99,7 +102,7 @@ impl AudioFormat {
     pub const fn bytes_per_frame(self) -> u32 {
         let per_sample = match self.format {
             SampleFormat::S16Le => 2,
-            SampleFormat::F32Le => 4,
+            SampleFormat::F32Le | SampleFormat::S32Le => 4,
         };
         per_sample * (self.channels as u32)
     }
@@ -230,6 +233,17 @@ pub struct AudioWriter {
     format: AudioFormat,
 }
 
+// Keep the actual operation behind the epoch gate, including its device access.
+struct AudioOp<F>(F);
+impl<R: narf_capabilities::Rights, F: FnOnce() -> T, T> narf_capabilities::CapOp<AudioStreamCap, R>
+    for AudioOp<F>
+{
+    type Output = T;
+    fn execute(self, _: &Cap<AudioStreamCap, R>) -> Result<T, narf_capabilities::CapError> {
+        Ok((self.0)())
+    }
+}
+
 impl AudioWriter {
     /// Construct from a Write cap + requested format. Returns
     /// `NoActiveStream` if no playback backend is up;
@@ -238,6 +252,8 @@ impl AudioWriter {
         cap: Cap<AudioStreamCap, Write>,
         fmt: AudioFormat,
     ) -> Result<Self, AudioWriteError> {
+        cap.invoke(narf_capabilities::NoopOp)
+            .map_err(|_| AudioWriteError::StreamClosed)?;
         let stream = select_active_playback().ok_or(AudioWriteError::NoActiveStream)?;
         if !stream.supports(fmt) {
             return Err(AudioWriteError::UnsupportedFormat);
@@ -259,21 +275,18 @@ impl AudioWriter {
         self.stream.name()
     }
 
-    /// Validate cap is still live.
-    fn check_live(&self) -> Result<(), AudioWriteError> {
-        self.cap
-            .check_live()
-            .map_err(|_| AudioWriteError::StreamClosed)
-    }
-
     /// Submit a buffer of PCM frames for playback. Blocks until the
-    /// backend acks the buffer; returns the cumulative frame count
-    /// played (today: synthesised from the byte count, since the
+    /// backend acks the buffer; returns the frame count in this
+    /// submission (derived from the byte count, since the
     /// virtio-sound device doesn't expose a frame counter directly).
     ///
     /// `pcm.len()` must be a non-zero multiple of `format.bytes_per_frame()`.
     pub fn submit(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
-        self.check_live()?;
+        self.cap
+            .invoke(AudioOp(|| self.submit_live(pcm)))
+            .map_err(|_| AudioWriteError::StreamClosed)?
+    }
+    fn submit_live(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
         let bpf = self.format.bytes_per_frame() as usize;
         if pcm.is_empty() || bpf == 0 || pcm.len() % bpf != 0 {
             return Err(AudioWriteError::UnsupportedFormat);
@@ -302,7 +315,9 @@ impl AudioWriter {
             SampleFormat::S16Le => VIRTIO_SND_PCM_FMT_S16,
             // F32Le not on the supports() list yet; rejecting here
             // so a fmt that snuck past becomes a clean error.
-            SampleFormat::F32Le => return Err(AudioWriteError::UnsupportedFormat),
+            SampleFormat::F32Le | SampleFormat::S32Le => {
+                return Err(AudioWriteError::UnsupportedFormat)
+            }
         };
         let params = PcmParams {
             buffer_bytes: 8192,
@@ -315,34 +330,10 @@ impl AudioWriter {
         Ok((pcm.len() / bpf) as u64)
     }
 
-    /// Intel HDA submit path. Loads the PCM samples into the
-    /// driver's cyclic period buffer + sets SDnCTL.RUN. Returns the
-    /// number of frames the period buffer accepted.
-    ///
-    /// Note: HDA is cyclic, not packet-oriented like virtio-sound —
-    /// the period buffer is fixed-size + the engine wraps. For
-    /// `pcm.len() <= period_bytes()` this looks like a one-shot
-    /// playback; longer streams need the consumer to call `submit`
-    /// once per period at LPIB intervals.
+    /// Feed the HDA ring with backpressure, drain all submitted frames, and stop.
     fn submit_hda(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
-        let bpf = self.format.bytes_per_frame() as usize;
-        // i16 samples are interleaved; reinterpret the byte slice.
-        let samples_n = pcm.len() / 2;
-        let mut tmp: alloc::vec::Vec<i16> = alloc::vec::Vec::with_capacity(samples_n);
-        for i in 0..samples_n {
-            let lo = pcm[i * 2];
-            let hi = pcm[i * 2 + 1];
-            tmp.push(i16::from_le_bytes([lo, hi]));
-        }
-        let loaded =
-            hda::with_controller(|c| c.load_period(&tmp)).ok_or(AudioWriteError::NoActiveStream)?;
-        // Kick the engine if it isn't already running. Idempotent
-        // per HDA::start_output.
-        let _started = hda::with_controller(|c|
-            // SAFETY: singleton owns BAR0 for its lifetime.
-            unsafe { c.start_output() })
-        .unwrap_or(false);
-        Ok((loaded * 2 / bpf) as u64)
+        let written = hda::play_buffer(pcm).map_err(|_| AudioWriteError::StreamClosed)?;
+        Ok((written / self.format.bytes_per_frame() as usize) as u64)
     }
 
     /// Zero-copy submit: forwards a `(shmem_handle, byte_offset,
@@ -361,7 +352,18 @@ impl AudioWriter {
         byte_offset: u64,
         byte_len: u64,
     ) -> Result<u64, AudioWriteError> {
-        self.check_live()?;
+        self.cap
+            .invoke(AudioOp(|| {
+                self.submit_shmem_live(shmem_handle, byte_offset, byte_len)
+            }))
+            .map_err(|_| AudioWriteError::StreamClosed)?
+    }
+    fn submit_shmem_live(
+        &self,
+        shmem_handle: u64,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> Result<u64, AudioWriteError> {
         let bpf = self.format.bytes_per_frame() as u64;
         if byte_len == 0 || bpf == 0 || byte_len % bpf != 0 {
             return Err(AudioWriteError::UnsupportedFormat);
@@ -374,6 +376,9 @@ impl AudioWriter {
         }
         let phys =
             narf_shmem::phys_at(shmem_handle, byte_offset).ok_or(AudioWriteError::StreamClosed)?;
+        if self.stream.name() == "intel-hda" {
+            return Err(AudioWriteError::UnsupportedFormat);
+        }
         use narf_drivers_virtio::snd_pci::{
             self, PcmParams, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_RATE_44100,
             VIRTIO_SND_PCM_RATE_48000,
@@ -385,7 +390,9 @@ impl AudioWriter {
         };
         let format_code = match self.format.format {
             SampleFormat::S16Le => VIRTIO_SND_PCM_FMT_S16,
-            SampleFormat::F32Le => return Err(AudioWriteError::UnsupportedFormat),
+            SampleFormat::F32Le | SampleFormat::S32Le => {
+                return Err(AudioWriteError::UnsupportedFormat)
+            }
         };
         let params = PcmParams {
             buffer_bytes: 8192,
@@ -397,6 +404,88 @@ impl AudioWriter {
         snd_pci::play_buffer_phys(params, phys, byte_len as u32)
             .map_err(|_| AudioWriteError::StreamClosed)?;
         Ok(byte_len / bpf)
+    }
+}
+
+/// Errors from native PCM capture.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AudioReadError {
+    NoActiveStream,
+    UnsupportedFormat,
+    StreamClosed,
+    Timeout,
+}
+
+/// Capability-gated microphone stream. Capture starts only when explicitly
+/// opened with a live Read capability; Drop stops DMA through the PCM lease.
+#[derive(Debug)]
+pub struct AudioReader {
+    cap: Cap<AudioStreamCap, Read>,
+    stream: narf_drivers_sound::CaptureStream,
+    format: AudioFormat,
+}
+impl AudioReader {
+    pub fn open(cap: Cap<AudioStreamCap, Read>) -> Result<Self, AudioReadError> {
+        cap.invoke(AudioOp(|| Self::open_live(cap)))
+            .map_err(|_| AudioReadError::StreamClosed)?
+    }
+    fn open_live(cap: Cap<AudioStreamCap, Read>) -> Result<Self, AudioReadError> {
+        let card = acp63::capture_card()
+            .or_else(hda::capture_card)
+            .ok_or(AudioReadError::NoActiveStream)?;
+        let params = narf_drivers_sound::default_hw_params(card, true)
+            .map_err(|_| AudioReadError::UnsupportedFormat)?;
+        let format = AudioFormat {
+            sample_rate_hz: params.rate.hz(),
+            channels: ChannelLayout::Stereo,
+            format: match params.format {
+                narf_drivers_sound::format::SampleFormat::S32LE => SampleFormat::S32Le,
+                narf_drivers_sound::format::SampleFormat::S16LE => SampleFormat::S16Le,
+                _ => return Err(AudioReadError::UnsupportedFormat),
+            },
+        };
+        let mut stream = narf_drivers_sound::open_capture(card, 0)
+            .map_err(|_| AudioReadError::NoActiveStream)?;
+        stream
+            .hw_params(params)
+            .map_err(|_| AudioReadError::UnsupportedFormat)?;
+        stream.prepare().map_err(|_| AudioReadError::StreamClosed)?;
+        stream.start().map_err(|_| AudioReadError::StreamClosed)?;
+        Ok(Self {
+            cap,
+            stream,
+            format,
+        })
+    }
+    pub fn format(&self) -> AudioFormat {
+        self.format
+    }
+    /// Return completed whole frames; wait up to 500 ms for the first samples.
+    pub fn read(&mut self, out: &mut [u8]) -> Result<usize, AudioReadError> {
+        if out.is_empty() || out.len() % self.format.bytes_per_frame() as usize != 0 {
+            return Err(AudioReadError::UnsupportedFormat);
+        }
+        let mut result = Ok(0);
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                result = match self.cap.invoke(AudioOp(|| self.stream.read(out))) {
+                    Ok(read) => read.map_err(|_| AudioReadError::StreamClosed),
+                    Err(_) => {
+                        let _ = self.stream.stop();
+                        Err(AudioReadError::StreamClosed)
+                    }
+                };
+                !matches!(result, Ok(0))
+            },
+            narf_time::Deadline::after_ms(500),
+        );
+        if !done {
+            return Err(AudioReadError::Timeout);
+        }
+        result
+    }
+    pub fn stop(&mut self) -> Result<(), AudioReadError> {
+        self.stream.stop().map_err(|_| AudioReadError::StreamClosed)
     }
 }
 
@@ -441,12 +530,13 @@ pub fn register_initcalls() {
         hda::register_pci_driver();
         InitResult::Ok
     });
-    // AMD Phoenix ACP6.0 PCI registration. Probe maps BAR0 +
-    // brings the DSP out of soft reset; full PCM capture path is
-    // gated on the ACP RI runtime image being present in the
-    // firmware registry (see narf-firmware + audio::acp6).
+    // Native Phoenix ACP 6.3 PDM capture; PCI revision and ACPI gate probe.
     narf_init::register(Stage::Subsys, "acp6-pci", || {
         acp6::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Late, "native-audio-devices", || {
+        narf_drivers_sound::sound_fs_initcall();
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "audio-playback-picker", || {
@@ -459,7 +549,3 @@ pub fn register_initcalls() {
         }
     });
 }
-
-// Read-cap stub for completeness; used by future capture audits.
-#[allow(dead_code)]
-fn _read_cap_demo(_c: Cap<AudioStreamCap, Read>) {}

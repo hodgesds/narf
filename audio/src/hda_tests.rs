@@ -219,7 +219,7 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     // End-to-end PCM submit through AudioWriter → hda. Probes
     // the device, opens an AudioWriter at the default playback
     // format (S16LE / 48 kHz / stereo), and submits 1024 bytes.
-    use crate::{bootstrap_writer, hda, AudioFormat, AudioWriter};
+    use crate::{bootstrap_writer, hda, AudioFormat, AudioWriter, HDA_PLAYBACK};
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
@@ -235,10 +235,10 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
             && d.id.vendor == hda::HDA_INTEL_ICH9_VENDOR
-            && d.id.device == hda::HDA_INTEL_ICH9_DEVICE
+            && matches!(d.id.device, 0x2668 | 0x293e)
     });
     if !has {
-        return TestResult::Skip("no intel-hda (ICH9)");
+        return TestResult::Skip("no emulated Intel HDA");
     }
 
     hda::__reset_for_test();
@@ -254,10 +254,13 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
         return TestResult::Fail("probe_all_pci");
     }
 
-    let cap = bootstrap_writer();
-    let writer = match AudioWriter::open(cap, AudioFormat::default_playback()) {
-        Ok(w) => w,
-        Err(_) => return TestResult::Fail("AudioWriter::open"),
+    if !hda::is_probed() {
+        return TestResult::Fail("present HDA device failed probe");
+    }
+    let writer = AudioWriter {
+        cap: bootstrap_writer(),
+        format: AudioFormat::default_playback(),
+        stream: &HDA_PLAYBACK,
     };
 
     // 1024 bytes = 256 stereo S16 frames = ~5.3 ms @ 48 kHz.
@@ -268,6 +271,24 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     };
     if frames != 256 {
         return TestResult::Fail("submit returned wrong frame count");
+    }
+    // Larger than the DMA ring: exercise wrap, reclamation and a second lease.
+    if writer.submit(&alloc::vec![0u8; 49152]) != Ok(12288) {
+        return TestResult::Fail("streaming playback across ring wrap");
+    }
+    let read_cap =
+        narf_capabilities::Cap::<crate::AudioStreamCap, narf_capabilities::Read>::bootstrap();
+    let mut reader = match crate::AudioReader::open(read_cap) {
+        Ok(reader) => reader,
+        Err(_) => return TestResult::Fail("HDA capture open"),
+    };
+    let mut captured = [0xa5u8; 1024];
+    if !matches!(reader.read(&mut captured), Ok(n) if n > 0 && n % 4 == 0) {
+        return TestResult::Fail("HDA capture DMA progress");
+    }
+    read_cap.revoke();
+    if reader.read(&mut captured) != Err(crate::AudioReadError::StreamClosed) {
+        return TestResult::Fail("capture revocation must stop DMA");
     }
     TestResult::Pass
 }
@@ -297,7 +318,7 @@ fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
 
     table.insert(
         make_verb(addr, 0, verb::GET_PARAMETER | param::VENDOR_ID),
-        0x0287_10EC,
+        0x10EC_0287,
     );
 
     table.insert(
@@ -323,7 +344,7 @@ fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
 
     table.insert(
         make_verb(addr, 1, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT),
-        0x0003_0002,
+        0x0002_0003,
     );
 
     // Widget 2: PinComplex, has conn list, has out amp.
