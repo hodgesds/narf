@@ -79,6 +79,21 @@ fn ensure_target(target: &[u8]) {
     }
 }
 
+/// Install the fixture's writable root (see
+/// `narf_filesystem::__test_ensure_mount_target`) before a case snapshots or
+/// counts mounts.
+///
+/// `mount_args` installs it lazily, on the first mount a case makes. The
+/// mount smokes reset the registry between cases, so whether it is already
+/// there depends on which case ran before. A case that calls
+/// `unshare(CLONE_NEWNS)` first then copies a table without the writable root,
+/// and every later target is created where its private namespace cannot see
+/// it (ENOENT). A case that counts mounts sees the root appear inside its
+/// window.
+fn ensure_writable_root() {
+    narf_filesystem::__test_ensure_mount_target("/");
+}
+
 /// `mount_args` without the target-creation step, for the cases whose
 /// subject IS the missing target.
 fn mount_args_no_target(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> SyscallArgs {
@@ -813,6 +828,7 @@ fn smoke_mount_ns_isolation() -> TestResult {
 
     // unshare(CLONE_NEWNS): snapshot the current (global) table privately.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -916,6 +932,7 @@ fn smoke_mount_ns_fork_inherits_private_view() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
     set_task(PARENT);
 
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -988,6 +1005,7 @@ fn smoke_umount_private_pseudofs_actually_removes() -> TestResult {
 
     // unshare(CLONE_NEWNS): private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1097,6 +1115,7 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
 
     // unshare(CLONE_NEWNS): the task now has a private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1170,6 +1189,7 @@ fn smoke_recursive_bind_exposes_subtree() -> TestResult {
 
     // unshare(CLONE_NEWNS): private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1260,6 +1280,7 @@ fn smoke_sandbox_root_swap_deep_path_resolves() -> TestResult {
 
     // unshare(CLONE_NEWNS).
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1384,6 +1405,7 @@ fn smoke_execve_resolves_private_ns_binary() -> TestResult {
 
     // unshare(CLONE_NEWNS): private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1464,6 +1486,7 @@ fn smoke_interp_read_uses_private_ns() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
 
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -2272,6 +2295,7 @@ fn smoke_propagation_only_noop() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
 
     // A propagation-only change on "/" (SLAVE|REC) succeeds and adds nothing.
+    ensure_writable_root();
     let before = narf_filesystem::registry().list().len();
     let slave_ok = mount_ok(b"\0", b"/\0", b"\0", MS_SLAVE | MS_REC);
     // MS_PRIVATE|MS_REC on an unmounted path also succeeds without creating it.
@@ -2373,6 +2397,7 @@ fn smoke_mount_ns_snapshot_depth() -> TestResult {
         return TestResult::Fail("pre-unshare mount /ns_pre failed");
     }
 
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3008,6 +3033,7 @@ fn smoke_mount_ns_clone_inherits_peer_group() -> TestResult {
     }
 
     // unshare(CLONE_NEWNS): the private snapshot must carry the SAME group id.
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3077,6 +3103,7 @@ fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
 
     // Task B unshares first — an EXISTING peer of the global /shared_run.
     set_task(task_b);
+    ensure_writable_root();
     let mut ub = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3084,6 +3111,7 @@ fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
     crate::handlers::sys_unshare(&mut ub);
     // Task A unshares — another peer — and mounts UNDER the shared base.
     set_task(task_a);
+    ensure_writable_root();
     let mut ua = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3167,12 +3195,14 @@ fn smoke_mount_under_private_does_not_propagate() -> TestResult {
     crate::handlers::sys_mount_for_test(&mut mb);
 
     set_task(task_b);
+    ensure_writable_root();
     let mut ub = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
     };
     crate::handlers::sys_unshare(&mut ub);
     set_task(task_a);
+    ensure_writable_root();
     let mut ua = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
