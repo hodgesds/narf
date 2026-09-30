@@ -657,7 +657,7 @@ mod gpu_backend_tests {
         assert_eq!(args.gpu_backend, GpuBackend::Virgl);
         assert_eq!(
             virtio_gpu_device_arg(args.gpu_backend),
-            "virtio-gpu-gl-pci,id=vgpu0,disable-legacy=on,disable-modern=off"
+            "virtio-gpu-gl-pci,id=vgpu0,disable-legacy=on,disable-modern=off,blob=on,hostmem=256M"
         );
         assert_eq!(
             qemu_display_arg("gtk", args.gpu_backend),
