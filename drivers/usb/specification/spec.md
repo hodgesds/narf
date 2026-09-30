@@ -160,11 +160,31 @@ also consult upstream Linux GPL sources.
 |---|---|---|---|
 | `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
 | `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
-| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Stage the matching signed firmware and validate the full sequence on silicon |
+| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Production-sign the imported firmware and validate the full sequence on silicon |
 | `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
 the host controller and are not matched as downstream USB devices.
+
+### WCN6855 firmware staging
+
+For bring-up, import the Qualcomm tree and place both the generic WCN6855
+files and the QCA2066 board-ID fallback in the initramfs:
+
+```sh
+cargo xtask import-firmware --vendor qca --clean
+cargo xtask image --arch=x86_64 \
+  --initramfs-firmware 'qca/*' \
+  --initramfs-firmware 'qca/QCA2066/*'
+```
+
+The second glob is required for board IDs `030a`/`030b`; firmware globs are
+single-directory patterns, so `qca/*` does not cross into `qca/QCA2066/`.
+`import-firmware` produces developer-only unsigned NARF trailers, while the
+production image must use externally generated signatures and a configured
+`NARF_FIRMWARE_TRUSTED_KEYS` set. The two-pattern bundle was boot-validated
+with 146 Qualcomm entries and a successful `firmware-scan-initramfs` pass;
+the USB download itself remains a target-silicon gate.
 
 ### Landed
 - **xHCI** (`xhci`): MMIO bring-up, BAR mapping, command/event ring
