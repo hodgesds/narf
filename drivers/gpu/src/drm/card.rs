@@ -302,12 +302,14 @@ impl DrmEventQueue {
         self.events.back().map(|(deliver_at, _)| *deliver_at)
     }
 
-    /// Delivery time of the earliest queued event that is still in the future.
-    pub(crate) fn next_event_deadline_ns(&self, now: u64) -> Option<u64> {
-        self.events
-            .front()
-            .map(|(deliver_at, _)| *deliver_at)
-            .filter(|deliver_at| *deliver_at > now)
+    /// Delivery time of the earliest queued event.
+    ///
+    /// Keep returning an already-due deadline until the event is consumed.
+    /// A poller's readiness scan can race the deadline becoming due; returning
+    /// `None` after that race would let the caller park forever even though the
+    /// fd is now readable and no later edge will wake it.
+    pub(crate) fn next_event_deadline_ns(&self, _now: u64) -> Option<u64> {
+        self.events.front().map(|(deliver_at, _)| *deliver_at)
     }
 
     /// Whether the front event's simulated-vblank time has arrived.

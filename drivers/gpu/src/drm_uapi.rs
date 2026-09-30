@@ -371,6 +371,16 @@ pub struct DrmVirtGpuExecBufferUapi {
     pub in_syncobjs: u64,
     pub out_syncobjs: u64,
 }
+/// One binary dependency entry in an EXECBUFFER in/out syncobj array.
+/// Timeline points are present in the wire ABI but remain unsupported by this
+/// binary-syncobj implementation and must therefore be zero.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuExecBufferSyncobjUapi {
+    pub handle: u32,
+    pub flags: u32,
+    pub point: u64,
+}
 /// Shared layout of `drm_virtgpu_3d_transfer_{to,from}_host`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -412,6 +422,7 @@ const _: () = assert!(core::mem::size_of::<DrmVirtGpuResourceInfoUapi>() == 16);
 const _: () = assert!(core::mem::size_of::<DrmVirtGpuContextInitUapi>() == 16);
 const _: () = assert!(core::mem::size_of::<DrmVirtGpuResourceCreateBlobUapi>() == 48);
 const _: () = assert!(core::mem::size_of::<DrmVirtGpuExecBufferUapi>() == 64);
+const _: () = assert!(core::mem::size_of::<DrmVirtGpuExecBufferSyncobjUapi>() == 16);
 const _: () = assert!(core::mem::size_of::<DrmVirtGpuTransferToHostUapi>() == 44);
 const _: () = assert!(core::mem::size_of::<DrmVirtGpuWaitUapi>() == 8);
 const _: () = assert!(core::mem::size_of::<DrmVirtGpuGetCapsUapi>() == 24);

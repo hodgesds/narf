@@ -19,7 +19,7 @@
 //!   state.
 //! - `drm_syncobj_create_ioctl` (handle table alloc), `..._destroy`
 //!   (handle table free), `..._wait` (block on N handles), `..._signal`
-//!   (mark a syncobj's current fence signalled).
+//!   (replace a syncobj's payload with a signalled stub fence).
 //!
 //! What is implemented:
 //!
@@ -100,6 +100,13 @@ pub trait DmaFence: Send + Sync + core::fmt::Debug {
     ///
     /// Linux equivalent: `dma_fence_signal`.
     fn signal(&self);
+
+    /// Driver-private ordered execution-context key. A later job on the same
+    /// context already depends on this fence and need not synchronously wait
+    /// before queueing (Linux's `dma_fence_match_context` optimization).
+    fn context(&self) -> Option<u64> {
+        None
+    }
 }
 
 // ── BinaryFence ────────────────────────────────────────────────────────
@@ -295,14 +302,36 @@ impl SyncObjTable {
     ///
     /// Linux equivalent: `drm_syncobj_array_wait`.
     pub fn wait_handles(&self, ids: &[u32], timeout_ns: u64, flags: u32) -> Result<u32, SyncError> {
+        let fences = self.snapshot_fences(ids)?;
+        Self::wait_fences(ids, &fences, timeout_ns, flags)
+    }
+
+    /// Clone the current fences for an array of handles. Callers that keep the
+    /// table behind an IRQ-safe lock use this to drop that lock before a
+    /// potentially long hardware wait.
+    pub fn snapshot_fences(
+        &self,
+        ids: &[u32],
+    ) -> Result<Vec<Option<Arc<dyn DmaFence>>>, SyncError> {
         if ids.is_empty() {
             return Err(SyncError::EmptyHandles);
         }
-        // Resolve handles up-front so an unknown handle errors out.
-        let fences: Vec<Option<Arc<dyn DmaFence>>> = ids
-            .iter()
+        ids.iter()
             .map(|&id| self.get(id).map(|o| o.fence.clone()))
-            .collect::<Result<_, _>>()?;
+            .collect()
+    }
+
+    /// Wait on a snapshot returned by [`Self::snapshot_fences`]. The snapshot
+    /// keeps each fence alive without retaining the per-fd handle-table lock.
+    pub fn wait_fences(
+        ids: &[u32],
+        fences: &[Option<Arc<dyn DmaFence>>],
+        timeout_ns: u64,
+        flags: u32,
+    ) -> Result<u32, SyncError> {
+        if ids.is_empty() || ids.len() != fences.len() {
+            return Err(SyncError::EmptyHandles);
+        }
 
         let wait_all = (flags & SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
 
@@ -330,6 +359,9 @@ impl SyncObjTable {
         } else if let Some(id) = first_signalled() {
             return Ok(id);
         }
+        if timeout_ns == 0 {
+            return Err(SyncError::Timeout);
+        }
 
         // Slow path — bounded poll. Each fence's `wait` will spin up
         // to `timeout_ns / count`. This mirrors Linux's per-fence
@@ -356,9 +388,11 @@ impl SyncObjTable {
 
     /// Signal an array of syncobj handles.
     ///
-    /// Linux equivalent: `drm_syncobj_signal_ioctl`.  Each syncobj's
-    /// current fence is signalled; if it has no fence attached, a
-    /// fresh already-signalled binary fence is bound.
+    /// Linux equivalent: `drm_syncobj_signal_ioctl` via
+    /// `drm_syncobj_assign_null_handle`. Each syncobj's current payload is
+    /// replaced by a fresh already-signalled stub fence. The old payload must
+    /// not itself be signalled because it may also back a BO reservation or
+    /// sync-file owned by another caller.
     pub fn signal_handles(&mut self, ids: &[u32]) -> Result<(), SyncError> {
         if ids.is_empty() {
             return Err(SyncError::EmptyHandles);
@@ -369,10 +403,7 @@ impl SyncObjTable {
         }
         for &id in ids {
             let obj = self.get_mut(id).expect("validated above");
-            match &obj.fence {
-                Some(f) => f.signal(),
-                None => obj.fence = Some(BinaryFence::signalled() as Arc<dyn DmaFence>),
-            }
+            obj.fence = Some(BinaryFence::signalled() as Arc<dyn DmaFence>);
         }
         Ok(())
     }

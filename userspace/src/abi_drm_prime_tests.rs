@@ -14,7 +14,7 @@
 use crate::abi_test_support::*;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 
 /// `_IOWR('d'=0x64, 0x2e, struct drm_prime_handle)` — 12-byte payload.
@@ -56,6 +56,82 @@ impl FileOps for FakeRenderNode {
         } else {
             Err(narf_filesystem::FsError::Unsupported)
         }
+    }
+}
+
+struct FakeDeviceFence {
+    signalled: AtomicBool,
+    waits: AtomicU32,
+    context: u64,
+}
+
+impl FakeDeviceFence {
+    fn new(context: u64) -> Arc<Self> {
+        Arc::new(Self {
+            signalled: AtomicBool::new(false),
+            waits: AtomicU32::new(0),
+            context,
+        })
+    }
+
+    fn signal(&self) {
+        self.signalled.store(true, Ordering::Release);
+    }
+}
+
+impl narf_filesystem::DrmFence for FakeDeviceFence {
+    fn is_signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    fn wait(&self, _timeout_ms: u64) -> bool {
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.is_signalled()
+    }
+
+    fn context(&self) -> Option<u64> {
+        Some(self.context)
+    }
+}
+
+/// Render-node double that hands the syscall layer one exact asynchronous
+/// device fence after each successful EXECBUFFER.
+struct FakeFencedRenderNode {
+    fence: Arc<FakeDeviceFence>,
+}
+
+impl FileOps for FakeFencedRenderNode {
+    fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+        let n = b.len();
+        Box::pin(async move { Ok(n) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
+    }
+    fn as_drm_render_index(&self) -> Option<u32> {
+        Some(0)
+    }
+    fn ioctl(&self, cmd: u32, _arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        if cmd as u64 == DRM_IOCTL_VIRTGPU_EXECBUFFER {
+            EXECBUFFER_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        } else {
+            Err(narf_filesystem::FsError::Unsupported)
+        }
+    }
+    fn drm_execbuf_fence(&self) -> Option<Arc<dyn narf_filesystem::DrmFence>> {
+        Some(self.fence.clone())
+    }
+    fn drm_execbuf_context(&self, ring_idx: u32) -> Option<u64> {
+        Some(self.fence.context + u64::from(ring_idx))
     }
 }
 
@@ -198,8 +274,8 @@ kernel_test_in!(
 );
 
 // Linux drivers/gpu/drm/virtio/virtgpu_submit.c installs an O_CLOEXEC
-// sync_file for FENCE_FD_OUT. NARF submissions finish synchronously, so the
-// returned fence must be immediately POLLIN and reusable as FENCE_FD_IN.
+// sync_file for FENCE_FD_OUT. A driver without an asynchronous fence retains
+// the compatibility fallback: immediately POLLIN and reusable as FENCE_FD_IN.
 fn smoke_abi_drm_virtgpu_execbuffer_signalled_out_fence() -> TestResult {
     with_setup(|| {
         EXECBUFFER_CALLS.store(0, Ordering::Relaxed);
@@ -258,6 +334,75 @@ fn smoke_abi_drm_virtgpu_execbuffer_signalled_out_fence() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_drm_virtgpu_execbuffer_signalled_out_fence
+);
+
+// A real driver fence must remain attached to the sync_file rather than being
+// replaced by the historical pre-signalled placeholder. Reusing it on the
+// same ordered context must carry the dependency without calling wait().
+fn smoke_abi_drm_virtgpu_execbuffer_async_out_fence() -> TestResult {
+    with_setup(|| {
+        EXECBUFFER_CALLS.store(0, Ordering::Relaxed);
+        let fence = FakeDeviceFence::new(0xABCD);
+        let render_fd = install_ops(Arc::new(FakeFencedRenderNode {
+            fence: fence.clone(),
+        }))
+        .ok_or("install fenced render node")?;
+        let mut execbuf = virtgpu_execbuffer(VIRTGPU_EXECBUF_FENCE_FD_OUT, -1);
+        let r = call(
+            Syscall::Ioctl.raw(),
+            a3(
+                render_fd as u64,
+                DRM_IOCTL_VIRTGPU_EXECBUFFER,
+                execbuf.as_mut_ptr() as u64,
+                0,
+            ),
+        );
+        if r != Some(0) {
+            return Err("asynchronous FENCE_FD_OUT submission failed");
+        }
+        let fence_fd = i32::from_ne_bytes(execbuf[28..32].try_into().unwrap());
+        let readiness = fd::with_table(FAKE_TASK, |table| {
+            table
+                .get(fence_fd as u32)
+                .map(|entry| entry.ops.poll_readiness())
+        })
+        .flatten()
+        .ok_or("asynchronous fence fd was not installed")?;
+        if readiness != 0 {
+            return Err("unsignalled device fence reported POLLIN");
+        }
+
+        let mut reuse = virtgpu_execbuffer(VIRTGPU_EXECBUF_FENCE_FD_IN, fence_fd);
+        let reused = call(
+            Syscall::Ioctl.raw(),
+            a3(
+                render_fd as u64,
+                DRM_IOCTL_VIRTGPU_EXECBUFFER,
+                reuse.as_mut_ptr() as u64,
+                0,
+            ),
+        );
+        if reused != Some(0) || fence.waits.load(Ordering::Relaxed) != 0 {
+            return Err("same-context input fence serialized submission");
+        }
+
+        fence.signal();
+        let readiness = fd::with_table(FAKE_TASK, |table| {
+            table
+                .get(fence_fd as u32)
+                .map(|entry| entry.ops.poll_readiness())
+        })
+        .flatten()
+        .ok_or("asynchronous fence fd disappeared")?;
+        if readiness != narf_filesystem::POLL_IN {
+            return Err("device fence signal did not make sync_file readable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_drm_virtgpu_execbuffer_async_out_fence
 );
 
 // sync_file_get_fence() returns NULL for both an invalid descriptor and an fd

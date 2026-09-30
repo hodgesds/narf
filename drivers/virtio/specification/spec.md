@@ -44,8 +44,13 @@ blk/net/console/rng.
   `virgl_enabled()` is true only after immutable negotiation accepts
   `VIRTIO_GPU_F_VIRGL`. When enabled, the transport provides typed controlQ
   operations for context creation/destruction, resource attachment, 3D
-  resource creation, and bounded `SUBMIT_3D` command streams. The DRM
-  render-node bridge owns per-open resource lifetime and validates all
+  resource creation, and bounded `SUBMIT_3D` command streams. Fenced submits
+  use a bounded four-slot controlQ pipeline with private coherent staging and
+  return a shared per-submission completion object. Completion is tracked per
+  fence, not by a device-global id watermark, because native-context rings may
+  retire out of global order. Synchronous commands and fence reaping share one
+  request gate and route every used entry back to its descriptor chain. The
+  DRM render-node bridge owns per-open resource lifetime and validates all
   user-provided command sizes before it calls this surface. Resource and blob
   creation accept a bounded `MemEntry` scatter/gather list, matching Linux's
   shmem scatterlist translation; callers retain every segment until detach +

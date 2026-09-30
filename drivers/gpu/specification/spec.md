@@ -78,12 +78,20 @@ virtgpu userspace ABI:
   read waits (or is interrupted with `EINTR`), and a too-small buffer returns
   zero without consuming the event. Each open has Linux's 4 KiB event budget;
   an ioctl that cannot reserve another completion returns `ENOMEM`.
-- Outbound: completion is synchronous for v1. `EXECBUFFER` with
-  `FENCE_FD_OUT` returns a close-on-exec, already-signalled sync-file fd;
-  `FENCE_FD_IN` accepts only one of those sync-file descriptions and otherwise
-  returns `EINVAL`. Descriptor exhaustion returns `EMFILE` before submission.
-  Timeline-syncobj arrays remain unsupported because their distinct lifetime
-  and ordering semantics are not implemented.
+- Outbound: `EXECBUFFER` queues a fenced VirtIO-GPU `SUBMIT_3D` without waiting
+  for host execution. Up to four submissions occupy private request/response
+  slots on the control queue; a full pipeline waits responsively for a slot.
+  The returned fence is shared by the referenced BO reservations,
+  `FENCE_FD_OUT` sync-file, and binary output syncobjs. `VIRTGPU_WAIT`, poll,
+  input fence fds, and foreign-context input syncobjs observe that real device
+  completion; dependencies on the same ordered context/ring do not serialize
+  submission. Descriptor exhaustion returns `EMFILE` before GPU work is
+  queued. EXECBUFFER syncobj records accept binary point zero and the input
+  RESET flag; non-zero timeline points remain unsupported.
+- A queued page-flip deadline remains advertised to poll until its event is
+  consumed, even after the deadline expires. This closes the readiness-scan
+  to park race: an event that becomes due in that interval forces an immediate
+  poll retry instead of leaving the task parked without a future wake edge.
 - Linux-compatible DRM devfs nodes have stable metadata shared across
   lookups. Primary and render nodes start at the conservative devtmpfs policy
   `0600 root:root`; `set_owners`/`set_perms` persist the distribution policy

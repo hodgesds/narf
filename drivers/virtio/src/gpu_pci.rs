@@ -25,6 +25,7 @@
 
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_bus::{BusDevice, BusDeviceCap};
@@ -130,6 +131,69 @@ const fn virgl_command_fits(len: usize) -> bool {
     len <= MAX_VIRGL_COMMAND_BYTES
 }
 
+/// Concurrently in-flight fenced submissions. Each occupies a 2-descriptor
+/// chain on the 16-deep controlq, so four slots leave headroom for the shared
+/// synchronous request/response pair alongside a full async pipeline.
+const FENCE_SLOT_COUNT: usize = 4;
+/// Response DMA size for one fenced submission: SUBMIT_3D answers with a bare
+/// `virtio_gpu_ctrl_hdr` (24 bytes, carrying the echoed flags + fence_id).
+const FENCE_RESP_BYTES: usize = 64;
+
+/// One asynchronous fenced-submission slot: a private request/response DMA
+/// pair plus in-flight bookkeeping. Private buffers keep the shared
+/// `req_buf`/`resp_buf` scratch exclusively synchronous, so a fenced submit
+/// never has to wait for (or corrupt) a concurrent sync command's staging.
+struct FenceSlot {
+    req: DmaBuffer,
+    resp: DmaBuffer,
+    in_flight: bool,
+    /// Descriptor-chain head this in-flight submission occupies — how a
+    /// consumed used-ring element is routed back to its slot.
+    head: u16,
+    /// Fence carried in the request header and shared with every consumer of
+    /// this submission (BO reservation, sync_file, and syncobj).  Keeping the
+    /// signal bit on the fence itself is important for native-context rings:
+    /// responses may retire out of global id order, even though each ring is
+    /// ordered in its own fence context.
+    fence: Option<Arc<SubmittedFence>>,
+}
+
+/// One VirtIO-GPU fence shared by the transport and its DRM consumers.
+///
+/// Fence ids are device-global identifiers placed on the wire, but completion
+/// ordering is only guaranteed within one fence context/ring.  A per-fence
+/// signal bit therefore remains correct when native-context rings complete
+/// out of order, unlike a device-global high-water mark.
+#[derive(Debug)]
+pub struct SubmittedFence {
+    id: u64,
+    signalled: AtomicBool,
+}
+
+impl SubmittedFence {
+    fn new(id: u64) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            signalled: AtomicBool::new(false),
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn is_signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// Mark this exact submission complete. Device completion uses this
+    /// idempotent operation; the DRM adapter also exposes it through its
+    /// dma-fence trait implementation.
+    pub fn signal(&self) {
+        self.signalled.store(true, Ordering::Release);
+    }
+}
+
 /// Maximum primary scanout size. A 4 MiB contiguous DMA allocation covers
 /// QEMU GTK's normal 1280×800 mode; a larger host mode is safely capped to
 /// this size rather than creating a resource whose backing cannot cover it.
@@ -233,6 +297,13 @@ pub struct VirtioGpuPci {
     shm_cap: Option<crate::pci::VirtioShmCap>,
     /// Diagnostic bitmask of all vendor-cap cfg_types seen at bring-up.
     cfg_type_mask: u32,
+    /// Fenced-submission slot pool, allocated lazily on the first fenced
+    /// submit (a 2D-only guest never pays the 4 × 64 KiB). Every access runs
+    /// with `req_gate` held — the lock only provides interior mutability and
+    /// keeps `Self: Sync`.
+    fence_slots: IrqSafeSpinLock<Vec<FenceSlot>>,
+    /// Next fence id to hand out. Starts at 1; fence 0 is never emitted.
+    next_fence_id: AtomicU64,
 }
 
 impl core::fmt::Debug for VirtioGpuPci {
@@ -405,6 +476,8 @@ impl VirtioGpuPci {
             host_visible_cursor: AtomicU64::new(0),
             shm_cap: caps.shm_host_visible,
             cfg_type_mask: caps.cfg_type_mask,
+            fence_slots: IrqSafeSpinLock::new(Vec::new()),
+            next_fence_id: AtomicU64::new(1),
         };
 
         // Enumerate the host's capsets now that the control queue is live, so
@@ -805,6 +878,246 @@ impl VirtioGpuPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         Ok(())
+    }
+
+    /// Allocate the fenced-submission slot pool on first use. The caller
+    /// holds `req_gate`, which serialises pool creation; the whole pool is
+    /// built before publication so an allocation failure leaves it empty and
+    /// a later submit retries cleanly.
+    fn ensure_fence_slots(&self) -> Result<(), VirtioPciError> {
+        if !self.fence_slots.lock().is_empty() {
+            return Ok(());
+        }
+        let mut pool = Vec::with_capacity(FENCE_SLOT_COUNT);
+        for _ in 0..FENCE_SLOT_COUNT {
+            let req = alloc_coherent(CONTROL_REQUEST_BYTES, DomainId::DRIVER_0)
+                .map_err(|_| VirtioPciError::BarMapFailed)?;
+            let resp = alloc_coherent(FENCE_RESP_BYTES, DomainId::DRIVER_0)
+                .map_err(|_| VirtioPciError::BarMapFailed)?;
+            pool.push(FenceSlot {
+                req,
+                resp,
+                in_flight: false,
+                head: 0,
+                fence: None,
+            });
+        }
+        *self.fence_slots.lock() = pool;
+        Ok(())
+    }
+
+    /// Index of a free (not in-flight) fenced slot, if any.
+    fn free_fence_slot(&self) -> Option<usize> {
+        self.fence_slots
+            .lock()
+            .iter()
+            .position(|slot| !slot.in_flight)
+    }
+
+    /// Retire one consumed used-ring element belonging to a fenced slot:
+    /// signal that submission's exact fence, release the slot, and recycle
+    /// its descriptor chain.
+    ///
+    /// Also reached from the SYNCHRONOUS [`submit`] poll loop when it
+    /// consumes a used element that is not its own head — that entry is a
+    /// fenced submission retiring mid-sync-command, and dropping it (the
+    /// pre-fence behavior) would leak the chain AND lose the completion.
+    fn complete_async_used(&self, id: u32) {
+        let mut slots = self.fence_slots.lock();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.in_flight && slot.head as u32 == id)
+        else {
+            // Not a fenced slot. Nothing else can be outstanding, but an
+            // unreturned chain would shrink the 16-deep controlq forever, so
+            // recycle it regardless.
+            drop(slots);
+            if let Some(q) = self.ctrl_q.lock().as_mut() {
+                q.free_chain(id as u16);
+            }
+            return;
+        };
+        // A used entry is the completion of this exact descriptor chain. The
+        // host normally echoes flags + id in the response header, but the
+        // chain identity remains authoritative even for an error response
+        // that omits the echo.
+        let fence = slot.fence.take();
+        slot.in_flight = false;
+        drop(slots);
+        if let Some(fence) = fence {
+            fence.signal();
+        }
+        if let Some(q) = self.ctrl_q.lock().as_mut() {
+            q.free_chain(id as u16);
+        }
+    }
+
+    /// Drain every published used-ring entry into the fenced-slot
+    /// bookkeeping. Caller holds `req_gate`; that excludes any mid-flight
+    /// synchronous submit (which holds the gate across its whole round-trip),
+    /// so every entry drained here belongs to a fenced slot.
+    fn reap_fenced_locked(&self) {
+        loop {
+            let elem = {
+                let mut g = self.ctrl_q.lock();
+                match g.as_mut() {
+                    Some(q) => q.poll_used(),
+                    None => return,
+                }
+            };
+            match elem {
+                Some((id, _len)) => self.complete_async_used(id),
+                None => return,
+            }
+        }
+    }
+
+    /// Poll the control queue for retired fenced submissions, signal their
+    /// exact fences, and recycle their slots. Serialised with every other
+    /// used-ring consumer by the request gate.
+    pub fn reap_fenced_completions(&self) {
+        let _gate = ReqGate::acquire(&self.req_gate);
+        self.reap_fenced_locked();
+    }
+
+    /// Submit one opaque virgl command stream WITHOUT waiting for host
+    /// completion, returning a shared fence for this exact submission (Linux
+    /// `virtio_gpu_execbuffer_ioctl`). Completion is observed through
+    /// [`Self::fence_signalled`] / [`Self::wait_fence`]. The stream is copied
+    /// into a private slot buffer before notify, so callers may reuse their
+    /// source buffer as soon as this returns.
+    pub fn submit_virgl_fenced(
+        &self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        commands: &[u8],
+    ) -> Result<Arc<SubmittedFence>, VirtioPciError> {
+        if !self.virgl_enabled() {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        if !virgl_command_fits(commands.len()) {
+            return Err(VirtioPciError::RequestTooLarge);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        self.ensure_fence_slots()?;
+        // Recycle already-retired slots before looking for a free one.
+        self.reap_fenced_locked();
+        let slot_index = match self.free_fence_slot() {
+            Some(index) => index,
+            None => {
+                // Full pipeline: wait for the device to retire a slot.
+                // Publish this CPU as the gate-holding spinner so a nested
+                // cursor `flush()` skips instead of deadlocking on the gate
+                // this CPU already holds — see [`submit`] and [`flush`].
+                let prev_submit_cpu = self
+                    .req_gate_submit_cpu
+                    .swap(narf_lib::percpu::current_cpu(), Ordering::Relaxed);
+                let mut found = None;
+                let done = narf_scheduler::responsive_spin_until(
+                    || {
+                        self.reap_fenced_locked();
+                        found = self.free_fence_slot();
+                        found.is_some()
+                    },
+                    narf_time::Deadline::after_ms(1_000),
+                );
+                self.req_gate_submit_cpu
+                    .store(prev_submit_cpu, Ordering::Relaxed);
+                if !done {
+                    return Err(VirtioPciError::CompletionTimeout);
+                }
+                found.ok_or(VirtioPciError::CompletionTimeout)?
+            }
+        };
+        let fence_id = self.next_fence_id.fetch_add(1, Ordering::Relaxed);
+        // Reaching the reserved zero id would require 2^64 submissions, but
+        // do not silently manufacture the sentinel if the counter wraps.
+        if fence_id == 0 {
+            return Err(VirtioPciError::AddBufferFailed);
+        }
+        let fence = SubmittedFence::new(fence_id);
+        let request_len = cmd::SUBMIT_3D_PREFIX_LEN + commands.len();
+        // Build in temporary owned memory, then copy to the slot's DMA — a
+        // fixed 64 KiB array would overflow a kernel stack (see submit_virgl).
+        let mut request = alloc::vec![0u8; request_len];
+        cmd::build_submit_3d_fenced(&mut request, ctx_id, ring_idx, fence_id, commands);
+        let descs = {
+            let mut slots = self.fence_slots.lock();
+            let slot = &mut slots[slot_index];
+            // SAFETY: the slot's DMA pair is coherent kernel-mapped memory;
+            // `request_len` is bounded to CONTROL_REQUEST_BYTES above, and
+            // the gate plus `in_flight == false` give exclusive slot access.
+            // The response header is cleared so a stale prior completion
+            // cannot be misread as this submission's echo.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    request.as_ptr(),
+                    slot.req.cpu_mut_ptr::<u8>(),
+                    request_len,
+                );
+                core::ptr::write_bytes(slot.resp.cpu_mut_ptr::<u8>(), 0, HDR_LEN);
+            }
+            [
+                VirtqDesc {
+                    addr: slot.req.dma_addr().raw(),
+                    len: request_len as u32,
+                    flags: VIRTQ_DESC_F_NEXT,
+                    next: 0, // patched by Virtqueue::add_buffer
+                },
+                VirtqDesc {
+                    addr: slot.resp.dma_addr().raw(),
+                    len: HDR_LEN as u32,
+                    flags: VIRTQ_DESC_F_WRITE,
+                    next: 0,
+                },
+            ]
+        };
+        let (head, kick) = {
+            let mut g = self.ctrl_q.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            let head = q
+                .add_buffer(&descs)
+                .ok_or(VirtioPciError::AddBufferFailed)?;
+            (head, q.needs_kick())
+        };
+        {
+            // Record the head before the gate drops: once it does, a
+            // concurrent sync submit may consume this chain's used entry and
+            // must be able to route it back to this slot.
+            let mut slots = self.fence_slots.lock();
+            let slot = &mut slots[slot_index];
+            slot.head = head;
+            slot.fence = Some(fence.clone());
+            slot.in_flight = true;
+        }
+        compiler_fence(Ordering::SeqCst);
+        if kick {
+            let off = (self.ctrl_q_notify_off as u64) * (self.notify_off_multiplier as u64);
+            // SAFETY: identity-mapped notify region.
+            unsafe {
+                self.notify.write16(off, 0);
+            }
+        }
+        Ok(fence)
+    }
+
+    /// Whether a fence from [`Self::submit_virgl_fenced`] has completed.
+    pub fn fence_signalled(&self, fence: &SubmittedFence) -> bool {
+        if fence.is_signalled() {
+            return true;
+        }
+        self.reap_fenced_completions();
+        fence.is_signalled()
+    }
+
+    /// Wait (responsively — sleep pumps keep running, and the request gate is
+    /// only held for brief reap polls) until `fence` signals or
+    /// `timeout_ms` expires. Returns whether it signalled.
+    pub fn wait_fence(&self, fence: &SubmittedFence, timeout_ms: u64) -> bool {
+        narf_scheduler::responsive_spin_until(
+            || self.fence_signalled(fence),
+            narf_time::Deadline::after_ms(timeout_ms),
+        )
     }
 
     /// Synchronise a resource's guest backing into the host VirGL context.
@@ -1231,7 +1544,18 @@ impl VirtioGpuPci {
                         }
                     }
                 };
-                matches!(elem, Some((id, _)) if id == head as u32)
+                match elem {
+                    Some((id, _)) if id == head as u32 => true,
+                    // A fenced async submission retired while this sync
+                    // command was in flight; route it to its slot. Dropping
+                    // it here would leak its descriptor chain and lose the
+                    // fence completion.
+                    Some((id, _)) => {
+                        self.complete_async_used(id);
+                        false
+                    }
+                    None => false,
+                }
             },
             narf_time::Deadline::after_ms(1_000),
         );

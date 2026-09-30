@@ -922,6 +922,24 @@ pub struct DirEntry {
 
 // ── FileOps / DirOps ───────────────────────────────────────────────
 
+/// Driver-owned completion primitive exposed through a DRM `sync_file`.
+///
+/// The VFS/syscall layer owns descriptors and poll integration, while the DRM
+/// driver owns the hardware completion mechanism. Sharing this object keeps
+/// one exact submission attached to the fd even when later EXECBUFFER calls
+/// on the same DRM open produce newer fences.
+pub trait DrmFence: Send + Sync {
+    fn is_signalled(&self) -> bool;
+    fn wait(&self, timeout_ms: u64) -> bool;
+
+    /// Driver-private execution context used to elide a self-dependency wait:
+    /// work submitted later to the same ordered ring already depends on this
+    /// fence. Foreign contexts return a different key (or `None`) and wait.
+    fn context(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// Per-file async op surface. Methods take `&self` because a file
 /// node may be looked up concurrently from multiple tasks; per-file
 /// state (e.g. an offset cursor) lives in the *handle*, not here.
@@ -1447,6 +1465,20 @@ pub trait FileOps: Send + Sync {
     /// commit's simulated vblank. Default: no fences (not a DRM card).
     fn drm_take_out_fences(&self) -> alloc::vec::Vec<(u64, u64)> {
         alloc::vec::Vec::new()
+    }
+
+    /// Consume the calling task's fenced EXECBUFFER submission. The syscall
+    /// layer calls this right after a successful EXECBUFFER to back the
+    /// `VIRTGPU_EXECBUF_FENCE_FD_OUT` sync_file with the exact driver-owned
+    /// completion object (falling back to a pre-signalled file on `None`).
+    fn drm_execbuf_fence(&self) -> Option<Arc<dyn DrmFence>> {
+        None
+    }
+
+    /// Ordered execution-context key for an EXECBUFFER ring. Used only by the
+    /// syscall layer's FENCE_FD_IN handling; non-DRM files return `None`.
+    fn drm_execbuf_context(&self, _ring_idx: u32) -> Option<u64> {
+        None
     }
 
     /// If this fd is a DRM PRIME dma-buf (exported via
