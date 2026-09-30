@@ -58,7 +58,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_bluetooth::controller::ControllerInfo;
-use narf_bluetooth::event::{CommandComplete, EventCode};
+use narf_bluetooth::event::{CommandComplete, CommandStatus, EventCode};
 use narf_bluetooth::hci::{Command, Event};
 use narf_bluetooth::opcode as op;
 use narf_bluetooth::transport::{HciTransport, TransportError};
@@ -430,6 +430,13 @@ async fn send_command_and_await_complete(
                 // is success and re-loop (some controllers emit a
                 // dummy CommandStatus before CommandComplete).
                 if event.code == EventCode::CommandStatus as u8 {
+                    let status = CommandStatus::parse(&event).ok_or(BtUsbError::EventTimeout)?;
+                    if status.opcode != opcode {
+                        return Err(BtUsbError::OpcodeMismatch);
+                    }
+                    if status.status != 0 {
+                        return Err(BtUsbError::BadStatus(status.status));
+                    }
                     // Re-arm and continue polling for CommandComplete.
                     let _ = xhci.arm_interrupt_in(slot_id, event_dci, len);
                     continue;
@@ -453,6 +460,28 @@ async fn send_command_and_await_complete(
             Err(_) => return Err(BtUsbError::CommandTransfer),
         }
     }
+}
+
+/// Decode Read Local Version's Command Complete return parameters.
+/// The first byte is HCI Status; the eight-byte version payload follows.
+pub(crate) fn controller_info_from_version_return(
+    ret: &[u8],
+) -> Result<ControllerInfo, BtUsbError> {
+    if ret.len() < 9 {
+        return Err(BtUsbError::ShortReturnParams);
+    }
+    if ret[0] != 0 {
+        return Err(BtUsbError::BadStatus(ret[0]));
+    }
+    Ok(ControllerInfo {
+        bd_addr: [0; 6],
+        hci_version: ret[1],
+        hci_revision: u16::from_le_bytes([ret[2], ret[3]]),
+        lmp_version: ret[4],
+        manufacturer: u16::from_le_bytes([ret[5], ret[6]]),
+        lmp_subversion: u16::from_le_bytes([ret[7], ret[8]]),
+        ..Default::default()
+    })
 }
 
 /// Post-address Bluetooth bind: caller has already issued port_reset +
@@ -546,8 +575,8 @@ pub async fn try_bind_btusb_already_addressed(
     .await?;
 
     // HCI_Read_Local_Version_Information (§7.4.1) — returns
-    // HCI_Version (1) + HCI_Revision (2) + LMP_Version (1) +
-    // Manufacturer_Name (2) + LMP_Subversion (2).
+    // Status (1) + HCI_Version (1) + HCI_Revision (2) +
+    // LMP_Version (1) + Manufacturer_Name (2) + LMP_Subversion (2).
     let ret = send_command_and_await_complete(
         xhci_dev,
         slot_id,
@@ -558,18 +587,7 @@ pub async fn try_bind_btusb_already_addressed(
         &[],
     )
     .await?;
-    if ret.len() < 8 {
-        return Err(BtUsbError::ShortReturnParams);
-    }
-    let info = ControllerInfo {
-        bd_addr: [0; 6],
-        hci_version: ret[0],
-        hci_revision: u16::from_le_bytes([ret[1], ret[2]]),
-        lmp_version: ret[3],
-        manufacturer: u16::from_le_bytes([ret[4], ret[5]]),
-        lmp_subversion: u16::from_le_bytes([ret[6], ret[7]]),
-        ..Default::default()
-    };
+    let info = controller_info_from_version_return(&ret)?;
 
     // Register a sync-context transport for Stage-1+ callers (L2CAP
     // pump, ACL data plane). Stage-0 itself is done: every command

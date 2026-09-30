@@ -3001,6 +3001,34 @@ fn smoke_btusb_qca_rampatch_validation() -> TestResult {
 }
 kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_rampatch_validation);
 
+/// HCI Command Complete retains its leading Status byte. Keep the USB
+/// Stage-0 parser aligned with the shared Bluetooth controller parser.
+fn smoke_btusb_local_version_skips_status() -> TestResult {
+    use crate::btusb::controller_info_from_version_return;
+
+    let ret = [
+        0x00, // Status
+        0x0C, // HCI version 5.3
+        0x10, 0x00, // HCI revision 0x0010
+        0x0C, // LMP version
+        0xD7, 0x00, // Qualcomm company ID 0x00d7
+        0x34, 0x12, // LMP subversion 0x1234
+    ];
+    let info = match controller_info_from_version_return(&ret) {
+        Ok(info) => info,
+        Err(_) => return TestResult::Fail("valid Read Local Version response rejected"),
+    };
+    if info.hci_version != 0x0C
+        || info.hci_revision != 0x0010
+        || info.manufacturer != 0x00D7
+        || info.lmp_subversion != 0x1234
+    {
+        return TestResult::Fail("Read Local Version response shifted by status byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_local_version_skips_status);
+
 // ── fingerprint ────────────────────────────────────────────────────
 
 /// USB-ID table matches: all 16 VID/PID entries resolve to a vendor.
