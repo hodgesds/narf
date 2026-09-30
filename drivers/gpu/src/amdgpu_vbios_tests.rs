@@ -80,6 +80,9 @@ fn error(table: &[u8], expected: Error) -> bool {
 pub(crate) fn fixture() -> Vbios {
     Vbios::from_vfct(&vfct(&[image()]), &device()).unwrap()
 }
+pub(crate) fn with_image(image: Vec<u8>) -> Vbios {
+    Vbios::from_vfct(&vfct(&[image]), &device()).unwrap()
+}
 
 fn vbios_vfct_owns_correct_atom_image() -> TestResult {
     let image = image();

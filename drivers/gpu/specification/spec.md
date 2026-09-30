@@ -110,6 +110,29 @@ BIOS, scanouts, PSP/TMR, discovery tables and other clients. The allocator
 does not discover free memory from BAR capacity. Page-aligned reservations
 remain unavailable while allocated, and hardware-published reservations are
 quarantined on drop unless their engine has verified shutdown.
+`Pool::from_owned_aperture(mapping, gpu_base, protected)` additionally retains
+permanent aperture-relative exclusions. Ranges are checked, rounded outward
+to pages, sorted and merged; dropping an allocation never removes a protected
+range. The same unsafe ownership contract applies to the remaining memory.
+
+`amdgpu_vram_boot::Plan::read` snapshots the DCN314 FB base/top/offset through
+live PCI authority and builds a read-only VRAM inventory. It requires the
+bootloader framebuffer's bus-physical byte range and explicit GPU-address
+ranges for other clients. It retains the entire framebuffer prefix (at least
+Linux's 9 MiB VGA reservation), the VBIOS FirmwareInfo v3.4/v3.5 tail, the
+discovery tail, VRAMUsage v2.1/v2.2 firmware/driver ranges, and existing
+supported DMCUB windows. FirmwareInfo and the master directory revision must
+be known; missing or unsupported metadata, SR-IOV reservation modes, invalid
+translations and all-ones register reads fail closed. Unsupported active
+CW2/CW7 and Region4/6 layouts also reject provisioning. CW0/1 addresses use
+the inverse MC translation; other supported windows use GPU addresses.
+
+The plan preserves full-aperture offsets even when BAR0 is smaller than VRAM.
+`Plan::into_pool` clips exclusions to the visible mapping before allocation.
+It is unsafe: the caller must have included all other scanouts, cursors,
+PSP/GART buffers and existing pools, own the unprotected memory, and serialize
+future GPU reconfiguration. An inventory alone is not ownership authority.
+No hardware is modified while gathering reservations or creating the pool.
 
 `amdgpu_dmub_boot::Loader::new` validates exact DCN314 discovery, the PCI
 capability, register bounds and the pool's CPU/GPU address correspondence,
@@ -124,14 +147,21 @@ for a failed PSP load. Uploads yield after each 4 KiB; all waits use scheduler
 futures. Only a completed boot exposes HPD/AUX/Type-C commands, whose every
 future poll revalidates PCI authority through `Cap::invoke`.
 
+`Loader::from_boot_memory` combines the retained VBIOS, the reservation plan
+and allocator with the same direct-load lifecycle. It requires a complete
+boot/client inventory under exclusive ownership and does not reset or upload
+until `boot` is explicitly awaited. The reservation retains its pool for the
+loader's lifetime, including failed-stop quarantine. This constructor does
+not supply the platform boot inventory or enable automatic firmware loading.
+
 `stop().await` stops owned hardware even after capability revocation. A
 cancelled/failed boot cannot be retried until stopped. Dropping the loader
 attempts a bounded synchronous reset without waiting; if stop cannot be
 verified, VRAM and global mailbox/PM ownership remain quarantined. Suspend
 is refused for the loader's lifetime pending firmware replay support. A
 suspended GPU also rejects new loader claims and generic firmware replacement.
-Automatic platform provisioning of the free VRAM pool and the PSP load method
-remain open; the Late worker continues to attach to existing firmware.
+Automatic boot/client inventory wiring and the PSP load method remain open;
+the Late worker continues to attach to existing firmware.
 
 `amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
 mailbox and GPU power/firmware ownership for its lifetime. It requires exact

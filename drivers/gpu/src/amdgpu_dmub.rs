@@ -472,9 +472,15 @@ fn aux_reply(reply: &[u8; 64], action: u8, data: &mut [u8]) -> Result<(), Error>
 }
 
 #[cfg(feature = "kernel-test")]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    pub(crate) fn fixture_firmware() -> Firmware {
+        Firmware {
+            bytes: crate::amdgpu_dmub_firmware::tests::combined(256, 4),
+        }
+    }
 
     fn dmub_firmware_requires_exact_discovery_and_live_authority() -> TestResult {
         use crate::amdgpu::{ChipInfo, Family, AMD_VENDOR, PHOENIX_HAWKPOINT1};

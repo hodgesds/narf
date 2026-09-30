@@ -27,6 +27,22 @@ impl Pool {
     /// for this pool, including from BIOS, PSP and all other GPU clients.
     /// Retain that exclusion even if an allocation is quarantined or leaked.
     pub unsafe fn from_owned_range(mapping: MmioRegion, address: u64) -> Result<Self, Error> {
+        // SAFETY: the whole aperture is owned and has no protected holes.
+        unsafe { Self::from_owned_aperture(mapping, address, &[]) }
+    }
+    /// Create a pool with permanently protected, aperture-relative byte ranges.
+    /// Exclusions are rounded outward to pages and overlapping ranges merged.
+    ///
+    /// # Safety
+    /// The mapping/ownership contract of `from_owned_range` applies to all
+    /// bytes outside `protected`. Every existing client must be represented,
+    /// and future clients must allocate from this pool. Protected ranges remain
+    /// excluded for the pool's lifetime, even when its allocations are freed.
+    pub unsafe fn from_owned_aperture(
+        mapping: MmioRegion,
+        address: u64,
+        protected: &[Range<u64>],
+    ) -> Result<Self, Error> {
         if mapping.len == 0
             || mapping.len % 4096 != 0
             || mapping.virt % 4096 != 0
@@ -40,10 +56,32 @@ impl Pool {
         {
             return Err(Error::Invalid);
         }
+        let mut used: Vec<Range<u64>> = Vec::new();
+        used.try_reserve_exact(protected.len())
+            .map_err(|_| Error::Exhausted)?;
+        for range in protected {
+            if range.start >= range.end || range.end > mapping.len {
+                return Err(Error::Invalid);
+            }
+            let end = range.end.checked_add(4095).ok_or(Error::Invalid)? & !4095;
+            used.push((range.start & !4095)..end);
+        }
+        used.sort_unstable_by_key(|range| range.start);
+        let mut count = 0;
+        for index in 0..used.len() {
+            let range = used[index].clone();
+            if count != 0 && range.start <= used[count - 1].end {
+                used[count - 1].end = used[count - 1].end.max(range.end);
+            } else {
+                used[count] = range;
+                count += 1;
+            }
+        }
+        used.truncate(count);
         Ok(Self(Arc::new(Inner {
             mapping,
             address,
-            used: IrqSafeSpinLock::new(Vec::new()),
+            used: IrqSafeSpinLock::new(used),
         })))
     }
     pub fn reserve(&self, size: u64) -> Result<Reservation, Error> {

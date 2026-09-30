@@ -45,6 +45,8 @@ pub enum Error {
     ConfigurationFailed,
     BootTimeout,
     Transport(amdgpu_dmub::Error),
+    Memory(crate::amdgpu_vram_boot::Error),
+    Firmware(amdgpu_dmub::FirmwareError),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -441,6 +443,36 @@ pub struct Loader {
     ownership: Option<LoaderOwnership>,
 }
 impl Loader {
+    /// Provision firmware storage using VBIOS reservations, current DMUB
+    /// windows, the boot framebuffer and explicit existing GPU allocations.
+    /// Construction only reads registers and stages ordinary RAM; `boot` is
+    /// still the explicit point that replaces firmware.
+    ///
+    /// # Safety
+    /// The contracts of `new` and `amdgpu_vram_boot::Plan::into_pool` apply.
+    /// In particular, every non-firmware allocation (including other scanouts,
+    /// cursors, PSP/GART storage and other pools) must appear in `other_clients`
+    /// as GPU addresses. `boot_framebuffer` uses PCI/bus-physical addresses.
+    /// The caller owns the unprotected VRAM for this loader's entire lifetime.
+    pub unsafe fn from_boot_memory(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        firmware: &amdgpu_dmub::Firmware,
+        boot_framebuffer: core::ops::Range<u64>,
+        other_clients: &[core::ops::Range<u64>],
+    ) -> Result<Self, Error> {
+        let prepared = firmware.prepare_from_gpu(gpu).map_err(Error::Firmware)?;
+        // SAFETY: inherited readable mappings, matching cap and stable ownership.
+        let plan = unsafe {
+            crate::amdgpu_vram_boot::Plan::read(gpu, &authority, boot_framebuffer, other_clients)
+        }
+        .map_err(Error::Memory)?;
+        // SAFETY: caller supplies the complete inventory and owns the remainder.
+        let pool = unsafe { plan.into_pool() }.map_err(Error::Memory)?;
+        // SAFETY: this pool owns the free ranges; the retained VBIOS and device
+        // lifetime/direct-load requirements are inherited from the caller.
+        unsafe { Self::new(gpu, authority, &pool, &prepared) }
+    }
     /// # Safety
     /// `authority` must control this GPU. The caller must retain its mappings
     /// and exclusive device ownership (including resets/hot-unplug) for this

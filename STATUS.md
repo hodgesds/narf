@@ -64,9 +64,12 @@ Failed stop/cancellation retains memory until shutdown is verified. Loader
 ownership excludes the attach worker, firmware replacement and suspend.
 GPU probe now retains a bounded, device-matched VBIOS snapshot from ACPI VFCT
 or the APU VRAM shadow, using corrected PCI/ATOM header and directory parsing.
-DMUB preparation can consume that snapshot. The Late worker still only
-attaches to existing firmware: automatic free-VRAM provisioning, PSP loading
-and firmware replay remain open.
+DMUB preparation can consume that snapshot. An explicit boot-memory path now
+builds a pool with permanent exclusions from VBIOS reservations, current DMUB
+windows and caller-supplied boot/client ranges; it never infers ownership
+from BAR capacity. The Late worker still only attaches to existing firmware:
+automatic boot/client inventory wiring, PSP loading and firmware replay
+remain open.
 **External monitor output is not complete:** source encoder setup, link
 training and KMS integration still need implementation. Physical Lenovo 50ee
 USB-C/USB4 validation is pending.

@@ -166,6 +166,7 @@ pub mod amdgpu_video;
 pub mod amdgpu_vmhub_regs;
 pub mod amdgpu_vmid;
 pub mod amdgpu_vram;
+pub mod amdgpu_vram_boot;
 pub mod aspeed;
 pub mod atombios;
 pub mod backlight;
