@@ -57,11 +57,16 @@ and rollback without touching host devices.
 The AMD DCN 3.1.4 DMUB transport can attach to running DAL firmware for HPD,
 AUX and EDID discovery. Firmware preparation now selects the DCN314 blob
 from IP discovery, validates DMCUB containers and metadata, separates PSP
-packaging, and stages a bounded seven-window image in RAM. It does not yet
-reserve VRAM or upload/start firmware. **External monitor output is not
-complete:** cold-boot display firmware loading, source encoder setup, link
-training and KMS integration remain open. Physical Lenovo 50ee USB-C/USB4
-validation is pending.
+packaging, and stages a bounded seven-window image in RAM. An explicit
+direct-load lifecycle now reserves from caller-owned VRAM, stops DMCUB,
+uploads/flushes the image, programs cache windows and validates boot readiness.
+Failed stop/cancellation retains memory until shutdown is verified. Loader
+ownership excludes the attach worker, firmware replacement and suspend.
+The Late worker still only attaches to existing firmware: automatic platform
+VRAM/VBIOS provisioning, PSP loading and firmware replay remain open.
+**External monitor output is not complete:** source encoder setup, link
+training and KMS integration still need implementation. Physical Lenovo 50ee
+USB-C/USB4 validation is pending.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 

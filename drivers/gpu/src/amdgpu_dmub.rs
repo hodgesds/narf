@@ -85,7 +85,7 @@ impl Firmware {
     }
 }
 
-fn dcn314_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
+pub(crate) fn dcn314_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
         .ip_blocks
         .iter()
@@ -136,15 +136,22 @@ impl Dmub {
             return Err(Error::Unsupported);
         }
         let base = ip.base_addrs[2] as u64 * 4;
-        if base
-            .checked_add(0x478 * 4)
-            .is_none_or(|end| end > gpu.regs.len)
-        {
+        // SAFETY: inherited mapping and exclusive mailbox ownership.
+        unsafe { Self::attach_regions(gpu.regs, gpu.fb_bar, base) }
+    }
+    /// # Safety
+    /// Valid DCN314 mappings and exclusive DMUB ownership must outlive Self.
+    pub(crate) unsafe fn attach_regions(
+        regs: MmioRegion,
+        fb: MmioRegion,
+        base: u64,
+    ) -> Result<Self, Error> {
+        if base.checked_add(0x478 * 4).is_none_or(|end| end > regs.len) {
             return Err(Error::Invalid);
         }
         let mut d = Self {
-            regs: gpu.regs,
-            fb: gpu.fb_bar,
+            regs,
+            fb,
             base,
             inbox: 0,
             outbox: 0,
@@ -182,7 +189,7 @@ impl Dmub {
             window_end,
             inbox_base,
             d.inbox_size,
-            gpu.fb_bar.len,
+            fb.len,
         )?;
         d.outbox = mailbox_offset(
             offset,
@@ -190,7 +197,7 @@ impl Dmub {
             window_end,
             outbox_base,
             d.outbox_size,
-            gpu.fb_bar.len,
+            fb.len,
         )?;
         if d.inbox < d.outbox + d.outbox_size as u64 && d.outbox < d.inbox + d.inbox_size as u64 {
             return Err(Error::Invalid);

@@ -865,7 +865,7 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        if crate::amdgpu_usbc::owns_dmub() {
+        if crate::amdgpu_usbc::firmware_busy() {
             return Err(AmdgpuError::DisplayFirmwareBusy);
         }
         // Prefer the discovery-driven MP0 base (true for every
@@ -1120,7 +1120,7 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
-        if crate::amdgpu_usbc::owns_dmub() {
+        if crate::amdgpu_usbc::firmware_busy() {
             return Err(AmdgpuError::DisplayFirmwareBusy);
         }
         // Fall through to the single-blob path for chips whose IP

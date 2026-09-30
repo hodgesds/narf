@@ -325,4 +325,4 @@ impl Prepared<'_> {
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dmub_firmware_tests.rs"]
-mod tests;
+pub(crate) mod tests;

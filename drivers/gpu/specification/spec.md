@@ -68,10 +68,37 @@ validated VBIOS; preparation checks its storage size, not ATOM semantics.
 VBIOS data and zeroing padding, stack, mailboxes, trace and state. It rejects
 a short buffer before writing anything. `Layout::place` checks page alignment,
 48-bit GPU addresses and aperture bounds; it computes addresses without
-allocating VRAM or proving exclusive ownership. These APIs perform no MMIO
-and do not mark firmware as loaded. The cold-boot loader must still reserve
-VRAM, stop DMCUB before replacing its memory, upload/flush the image, program
-the correct windows and verify firmware boot completion.
+allocating VRAM or proving exclusive ownership. These preparation APIs perform
+no MMIO and do not mark firmware as loaded.
+
+`amdgpu_vram::Pool::from_owned_range` is unsafe: its caller must provide a
+permanent CPU mapping of GPU VRAM exclusively reserved for the pool, excluding
+BIOS, scanouts, PSP/TMR, discovery tables and other clients. The allocator
+does not discover free memory from BAR capacity. Page-aligned reservations
+remain unavailable while allocated, and hardware-published reservations are
+quarantined on drop unless their engine has verified shutdown.
+
+`amdgpu_dmub_boot::Loader::new` validates exact DCN314 discovery, the PCI
+capability, register bounds and the pool's CPU/GPU address correspondence,
+reserves its image storage, and claims exclusive DMUB/PM ownership. Its unsafe
+contract requires the matching authenticated image, validated GPU-specific
+VBIOS, persistent mappings and a platform supporting direct loading.
+`boot(options).await` implements Linux's explicit direct-load path: bounded
+STOP_FW/reset, volatile VRAM upload with complete WC readback, translated MC
+addresses for CW0/1, GPU addresses for CW3..6, window/mailbox readback checks,
+boot options, reset release and DAL/mailbox readiness. It is not a fallback
+for a failed PSP load. Uploads yield after each 4 KiB; all waits use scheduler
+futures. Only a completed boot exposes HPD/AUX/Type-C commands, whose every
+future poll revalidates PCI authority through `Cap::invoke`.
+
+`stop().await` stops owned hardware even after capability revocation. A
+cancelled/failed boot cannot be retried until stopped. Dropping the loader
+attempts a bounded synchronous reset without waiting; if stop cannot be
+verified, VRAM and global mailbox/PM ownership remain quarantined. Suspend
+is refused for the loader's lifetime pending firmware replay support. A
+suspended GPU also rejects new loader claims and generic firmware replacement.
+Automatic platform provisioning of the free VRAM pool/VBIOS and the PSP load
+method remain open; the Late worker continues to attach to existing firmware.
 
 `amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
 mailbox and GPU power/firmware ownership for its lifetime. It requires exact
@@ -86,10 +113,10 @@ rescans without assuming a UCSI-to-GPU wiring map. Suspend is refused while a
 command cycle is active; resume revalidates the firmware mailbox mapping.
 Firmware replacement is rejected while this worker owns DMUB.
 
-This transport **does not load DAL firmware, program source encoders, train
-DisplayPort links or expose new active DRM/KMS scanouts**. A successful sink
-read or USB4 tunnel does not prove monitor output. Cold-boot firmware loading,
-VRAM allocation and native external-display modesetting remain open.
+The attach worker **does not program source encoders, train DisplayPort links
+or expose new active DRM/KMS scanouts**. A successful firmware boot, sink read
+or USB4 tunnel does not prove monitor output. Platform cold-boot wiring,
+PSP loading and native external-display modesetting remain open.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c` and DCN 3.1.4 register headers.

@@ -14,7 +14,7 @@ fn write_metadata(bytes: &mut [u8]) {
     put32(bytes, 12, 0x0800_5d00);
     bytes[16] = 1;
 }
-fn combined(footer: usize, padding: usize) -> Vec<u8> {
+pub(crate) fn combined(footer: usize, padding: usize) -> Vec<u8> {
     let payload_start = 256;
     let inst_size = PSP_HEADER_SIZE + 512 + padding + footer;
     let mut bytes = vec![0u8; payload_start + inst_size];
