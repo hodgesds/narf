@@ -127,7 +127,8 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // everything depends on, so a global umount of one is a keep-mounted no-op.
     // That covers the singleton alone — the sole mount at its path. Anything
     // stacked on top of it is an ordinary mount and umount pops it, as Linux's
-    // do_umount pops the top mount of the path.
+    // do_umount pops the top mount of the path. The match is on the fstype each
+    // filesystem reports (`FsInstance::name`, what /proc/mounts shows).
     //
     // A task with a PRIVATE mount namespace (every systemd service sandbox, after
     // unshare(CLONE_NEWNS)) must NOT get that no-op: `ns.unmount` only pops that
@@ -147,7 +148,7 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         && at_target.len() == 1
         && matches!(
             at_target[0].1.as_str(),
-            "procfs" | "sysfs" | "devfs" | "devtmpfs" | "cgroup2" | "cgroupfs"
+            "proc" | "sysfs" | "devtmpfs" | "cgroup2"
         );
     if protected {
         ctx.set_return(SyscallReturn::ok(0));

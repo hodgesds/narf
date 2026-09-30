@@ -2338,6 +2338,47 @@ kernel_test_in!(
     smoke_umount_pops_mount_stacked_over_api_fs
 );
 
+// ── Smoke 14c: a global umount of a sole proc mount keeps it mounted ──
+// The keep-mounted rule for the global API singletons covers /proc too. It
+// is keyed on the filesystem's reported type, and procfs reports "proc" (its
+// Linux fstype) — a rule spelling it "procfs" matched nothing, so a global
+// umount of /proc really removed it.
+fn smoke_umount_keeps_sole_global_proc_mount() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_11);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    while unmount_for_test("/keep_proc").is_ok() {}
+    if !mount_ok(b"proc\0", b"/keep_proc\0", b"proc\0", 0) {
+        return TestResult::Fail("mount proc at /keep_proc failed");
+    }
+    let mut u = StubCtx {
+        args: unmount_args(b"/keep_proc\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut u);
+    let umount_ok = matches!(u.ret, Some(r) if r.value == 0);
+    let kept = registry_has("/keep_proc");
+
+    crate::handlers::__test_root_dir_reset();
+    while unmount_for_test("/keep_proc").is_ok() {}
+
+    if !umount_ok {
+        TestResult::Fail("global umount2 of the sole proc mount must answer 0")
+    } else if !kept {
+        TestResult::Fail("global umount2 must keep the sole proc mount mounted")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("userspace/mount", smoke_umount_keeps_sole_global_proc_mount);
+
 // ── Smoke 15: propagation-only mount is a no-op success ────────────
 // mount(NULL, target, NULL, MS_SLAVE|MS_REC) / MS_PRIVATE changes only the
 // propagation type of an existing mount. NARF has no propagation model, so
