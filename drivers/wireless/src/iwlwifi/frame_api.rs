@@ -35,7 +35,7 @@ pub fn transmit(
     Some(bytes)
 }
 
-/// Add QoS control only after WMM negotiation. No A-MSDU, EOSP or block ACK.
+/// Add QoS control after WMM negotiation. Firmware selects the TX BA policy.
 pub fn transmit_qos(
     local: [u8; 6],
     ap: [u8; 6],
@@ -53,18 +53,30 @@ pub fn transmit_qos(
     Some(frame)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Replay {
     pub pairwise: [u64; 17],
     pub group: [[u64; 17]; 4],
     pub group_valid: [bool; 4],
     sequences: [Option<u16>; 17],
+    subframes: [u8; 17],
+    amsdu_open: [bool; 17],
+    // 0 = plaintext, 1 = pairwise, 2..5 = GTK index. A continuation may
+    // reuse a PN only within the same key's authenticated aggregate.
+    amsdu_key: [u8; 17],
 }
 
 impl Replay {
     pub fn reset_pairwise(&mut self) {
         self.pairwise.fill(0);
+        self.reset_subframes();
+    }
+
+    pub fn reset_subframes(&mut self) {
         self.sequences.fill(None);
+        self.subframes.fill(0);
+        self.amsdu_open.fill(false);
+        self.amsdu_key.fill(0);
     }
 }
 
@@ -83,7 +95,6 @@ pub fn receive(
         || frame[10..16] != ap
         || (frame[4..10] != local && frame[4] & 1 == 0)
         || frame[22] & 0xf != 0
-        || mpdu.amsdu
     {
         return None;
     }
@@ -93,9 +104,22 @@ pub fn receive(
     } else {
         16
     };
-    if qos && *frame.get(24)? & 0x80 != 0 {
+    if qos && *frame.get(24)? & 0x80 != 0 && !mpdu.amsdu {
         return None;
-    } // no A-MSDU negotiation
+    } // Raw aggregates are never mistaken for firmware-deaggregated MPDUs.
+    let sequence = u16::from_le_bytes(frame[22..24].try_into().ok()?);
+    let continuation = mpdu.amsdu
+        && replay.amsdu_open[tid]
+        && replay.sequences[tid] == Some(sequence)
+        && mpdu.amsdu_index == replay.subframes[tid].saturating_add(1);
+    // Firmware may number the initial subframe zero (also used by ordinary
+    // MPDUs) or one. A missing initial prefix still needs a fresh PN; only
+    // a consecutive member of an open aggregate may reuse that PN.
+    if (mpdu.amsdu && (!qos || (mpdu.amsdu_index > 1 && !continuation)))
+        || (!mpdu.amsdu && mpdu.amsdu_index != 0)
+    {
+        return None;
+    }
     let header_len = 24
         + if qos {
             2 + if frame[1] & 0x80 != 0 { 4 } else { 0 }
@@ -104,6 +128,7 @@ pub fn receive(
         };
     let encrypted = frame[1] & 0x40 != 0;
     let mut update = None;
+    let mut key_context = 0;
     let body = if encrypted {
         // Hardware authenticates CCM; the host maintains replay state
         // per key and TID. Never advance PN before MIC validation.
@@ -113,6 +138,7 @@ pub fn receive(
         let iv: &[u8; 8] = frame.get(header_len..header_len + 8)?.try_into().ok()?;
         let (pn, key_id) = narf_wireless::ccmp::decode_ccmp_header(iv).ok()?;
         let multicast = frame[4] & 1 != 0;
+        key_context = if multicast { 2 + key_id } else { 1 };
         let previous = if multicast {
             if !replay.group_valid[key_id as usize] {
                 return None;
@@ -124,12 +150,18 @@ pub fn receive(
             }
             replay.pairwise[tid]
         };
-        if pn <= previous {
+        if pn < previous
+            || (pn == previous && !continuation)
+            || (continuation && (pn != previous || replay.amsdu_key[tid] != key_context))
+        {
             return None;
         }
         update = Some((pn, key_id as usize, multicast));
         mpdu.body(header_len, 8)?
     } else {
+        if continuation && replay.amsdu_key[tid] != key_context {
+            return None;
+        }
         mpdu.body(header_len, 0)?
     };
     if body.len() < 8 || body[..6] != [0xaa, 0xaa, 3, 0, 0, 0] {
@@ -140,8 +172,8 @@ pub fn receive(
     if secure && !encrypted && body[6..8] != [0x88, 0x8e] {
         return None;
     }
-    let sequence = u16::from_le_bytes(frame[22..24].try_into().ok()?);
-    if frame[1] & 8 != 0 && replay.sequences[tid] == Some(sequence) {
+    if !continuation && (frame[1] & 8 != 0 || mpdu.amsdu) && replay.sequences[tid] == Some(sequence)
+    {
         return None;
     }
     if let Some((pn, key, multicast)) = update {
@@ -152,6 +184,9 @@ pub fn receive(
         }
     }
     replay.sequences[tid] = Some(sequence);
+    replay.subframes[tid] = mpdu.amsdu_index;
+    replay.amsdu_open[tid] = mpdu.amsdu && !mpdu.amsdu_last;
+    replay.amsdu_key[tid] = key_context;
     let mut ethernet = Vec::with_capacity(body.len() + 6);
     ethernet.extend_from_slice(&frame[4..10]);
     ethernet.extend_from_slice(&frame[16..22]);

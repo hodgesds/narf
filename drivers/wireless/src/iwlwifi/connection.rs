@@ -6,7 +6,7 @@ use super::{
     runtime::Hardware,
     scan_api, security, station_api,
 };
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use zeroize::Zeroize;
 
 #[derive(Clone, Debug)]
@@ -37,6 +37,10 @@ pub struct Connection {
     pairwise_key: Option<[u8; 16]>,
     tx_antenna: u32,
     rates: super::rates::Rates,
+    phy: super::ht_vht::Negotiated,
+    local_phy: super::ht_vht::Local,
+    rx_ba: [Option<super::aggregation::Window>; super::aggregation::MAX_TIDS],
+    actions: VecDeque<Vec<u8>>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -65,6 +69,7 @@ impl Connection {
         beacon: Beacon,
         psk: Option<[u8; 32]>,
         tx_chains: u32,
+        local_phy: super::ht_vht::Local,
     ) -> Result<Self, &'static str> {
         let secure = psk.is_some();
         if secure {
@@ -85,11 +90,30 @@ impl Connection {
         } else if beacon.privacy {
             return Err("secured AP requested as open");
         }
-        let rates = super::rates::Rates::parse(&beacon.information_elements, beacon.channel)?;
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
-        let max_power = authorize_channel(hw, beacon.channel).await?;
-        hw.command(1, 8, &station_api::phy(1, beacon.channel))
-            .await?;
+        let domain = narf_wireless::reg::db::get_domain()
+            .ok_or("wireless regulatory domain is not configured")?;
+        let permissions = regulatory_channels(hw).await?;
+        let phy = super::ht_vht::Negotiated::parse(
+            local_phy,
+            &beacon.information_elements,
+            beacon.channel,
+            qos.is_some(),
+            |width, center| {
+                channel_power_width(&domain, beacon.channel, width, center, &permissions).is_some()
+            },
+        )?;
+        let rates = super::rates::Rates::parse_for_phy(
+            &beacon.information_elements,
+            beacon.channel,
+            phy.mode,
+        )?;
+        let max_power =
+            channel_power_width(&domain, beacon.channel, phy.width, phy.center, &permissions)
+                .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
+        let mut phy_command = station_api::phy(1, beacon.channel);
+        phy.apply_phy(&mut phy_command, beacon.channel);
+        hw.command(1, 8, &phy_command).await?;
         // PHY binding is accepted only while the link stays inactive.
         // Combining the bind with activation causes firmware to ignore
         // phy_id, leaving the link detached from its channel context.
@@ -119,13 +143,16 @@ impl Connection {
         if let Some(qos) = &qos {
             qos.apply(&mut link);
         }
+        phy.apply_link(&mut link);
         hw.command(3, 9, &link).await?;
         let power = station_api::tx_power(
             hw.version(1, 0x9f).ok_or("missing TX power command")?.0,
             max_power,
         )?;
         hw.command(1, 0x9f, &power).await?;
-        hw.command(3, 0xa, &station_api::peer(beacon.bssid)).await?;
+        let mut peer = station_api::peer(beacon.bssid);
+        phy.apply_peer(&mut peer, 0);
+        hw.command(3, 0xa, &peer).await?;
         let management_queue = hw.allocate_tx(0, 15).await?;
         let mut data_queues = [None; 4];
         for (ac, &tid) in super::qos::TIDS.iter().enumerate() {
@@ -161,6 +188,10 @@ impl Connection {
             pairwise_key: None,
             tx_antenna: tx_chains & tx_chains.wrapping_neg(),
             rates,
+            phy,
+            local_phy,
+            rx_ba: core::array::from_fn(|_| None),
+            actions: VecDeque::new(),
         };
         let auth = this.management(0xb0, &mlme::build_open_auth_body());
         hw.transmit(management_queue, &auth, 24, this.rate())
@@ -193,6 +224,7 @@ impl Connection {
         if this.qos.is_some() {
             request.extend_from_slice(&super::qos::INFORMATION_IE);
         }
+        request.extend_from_slice(&this.phy.association_ies(local_phy, this.beacon.channel));
         this.sequence = this.sequence.wrapping_add(1);
         hw.transmit(management_queue, &request, 24, this.rate())
             .await?;
@@ -206,41 +238,80 @@ impl Connection {
             // Association response may refine contention parameters from
             // the beacon. Only use QoS if the AP confirms WMM support.
             this.qos = super::qos::Parameters::parse(&reply[6..])?;
-            if let Some(qos) = &this.qos {
-                let mut link = station_api::link(
-                    2,
-                    local,
-                    true,
-                    this.beacon.channel,
-                    this.beacon.interval,
-                    this.beacon.dtim,
-                );
-                this.rates.apply(&mut link);
-                put32(
-                    &mut link,
-                    44,
-                    u32::from(this.beacon.capabilities & (1 << 5) != 0),
-                );
-                put32(
-                    &mut link,
-                    48,
-                    u32::from(this.beacon.capabilities & (1 << 10) != 0),
-                );
-                qos.apply(&mut link);
-                hw.command(3, 9, &link).await?;
-            }
         }
+        this.phy = this.phy.confirm(
+            local_phy,
+            &this.beacon.information_elements,
+            &reply[6..],
+            this.beacon.channel,
+            this.qos.is_some(),
+        )?;
+        // The response can choose a different secondary channel while
+        // narrowing bandwidth. Revalidate the resulting entire span.
+        let final_power = channel_power_width(
+            &domain,
+            this.beacon.channel,
+            this.phy.width,
+            this.phy.center,
+            &permissions,
+        )
+        .ok_or("association response selected a prohibited channel span")?;
+        if final_power < max_power {
+            let power = station_api::tx_power(
+                hw.version(1, 0x9f).ok_or("missing TX power command")?.0,
+                final_power,
+            )?;
+            hw.command(1, 0x9f, &power).await?;
+        }
+        // Recheck membership selectors after a response downgrades PHY.
+        this.rates = super::rates::Rates::parse_for_phy(
+            &this.beacon.information_elements,
+            this.beacon.channel,
+            this.phy.mode,
+        )?;
+        let mut phy_command = station_api::phy(2, this.beacon.channel);
+        this.phy.apply_phy(&mut phy_command, this.beacon.channel);
+        hw.command(1, 8, &phy_command).await?;
+        {
+            let mut link = station_api::link(
+                2,
+                local,
+                true,
+                this.beacon.channel,
+                this.beacon.interval,
+                this.beacon.dtim,
+            );
+            this.rates.apply(&mut link);
+            put32(
+                &mut link,
+                44,
+                u32::from(this.beacon.capabilities & (1 << 5) != 0),
+            );
+            put32(
+                &mut link,
+                48,
+                u32::from(this.beacon.capabilities & (1 << 10) != 0),
+            );
+            if let Some(qos) = &this.qos {
+                qos.apply(&mut link);
+            }
+            this.phy.apply_link(&mut link);
+            hw.command(3, 9, &link).await?;
+        }
+        let mut peer = station_api::peer(this.beacon.bssid);
+        this.phy.apply_peer(&mut peer, response.aid);
+        hw.command(3, 0xa, &peer).await?;
         hw.command(3, 8, &station_api::mac(2, local, Some(response.aid)))
             .await?;
-        hw.command(
-            5,
-            0xf,
-            &this.rates.tlc(
-                hw.version(5, 0xf).ok_or("firmware has no TLC command")?.0,
-                tx_chains,
-            )?,
-        )
-        .await?;
+        let mut tlc = this.rates.tlc(
+            hw.version(5, 0xf).ok_or("firmware has no TLC command")?.0,
+            tx_chains,
+        )?;
+        if this.phy.mode != 0 {
+            hw.enable_aggregation()?;
+        }
+        this.phy.apply_tlc(&mut tlc);
+        hw.command(5, 0xf, &tlc).await?;
         if secure {
             let deadline = narf_time::Deadline::after_ms(8000);
             while !this.security.as_ref().unwrap().complete() {
@@ -432,6 +503,234 @@ impl Connection {
         Ok(self.authorized.then_some(ethernet))
     }
 
+    /// Reorder raw authenticated MPDUs before advancing CCMP packet numbers.
+    /// This runs in both the executor pump and nonblocking network drain.
+    pub fn receive_packet(
+        &mut self,
+        packet: &super::runtime::Packet,
+    ) -> Result<Vec<Vec<u8>>, &'static str> {
+        let mut output = Vec::new();
+        if packet.header.group_id != 0 {
+            return Ok(output);
+        }
+        let now = narf_time::now_cycles();
+        match packet.header.cmd {
+            0xc1 => {
+                let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
+                    return Ok(output);
+                };
+                let frame = mpdu.frame;
+                if frame.len() >= 24
+                    && frame[0] == 0xd0
+                    && frame[1] & 0xc7 == 0
+                    && frame[22] & 15 == 0
+                    && frame[4..10] == self.local
+                    && frame[10..16] == self.beacon.bssid
+                    && frame[16..22] == self.beacon.bssid
+                    && self.authorized
+                    && self.phy.mode != 0
+                {
+                    if let Some(body) = mpdu.body(24, 0) {
+                        if super::aggregation::action(body).is_some() && self.actions.len() < 16 {
+                            self.actions.push_back(body.to_vec());
+                        }
+                    }
+                    return Ok(output);
+                }
+                if frame.len() >= 26 && frame[0] == 0x88 && frame[4] & 1 == 0 {
+                    let baid = ((mpdu.reorder >> 24) & 127) as u8;
+                    if baid != 127 && self.phy.mode != 0 {
+                        // An unauthenticated frame cannot advance the BA window
+                        // on a secured BSS. Replay state stays unchanged here.
+                        if (self.security.is_some() && frame[1] & 0x40 == 0)
+                            || frame_api::receive(
+                                &mpdu,
+                                self.local,
+                                self.beacon.bssid,
+                                self.security.is_some(),
+                                &mut self.replay.clone(),
+                            )
+                            .is_none()
+                        {
+                            return Ok(output);
+                        }
+                        if let Some(window) =
+                            self.rx_ba.iter_mut().flatten().find(|w| w.baid == baid)
+                        {
+                            let released = window.push(&packet.payload, now);
+                            self.deliver_reordered(released, &mut output)?;
+                        }
+                        return Ok(output);
+                    }
+                }
+                if let Some(frame) = self.receive_frame(&mpdu)? {
+                    output.push(frame);
+                }
+            }
+            0xc3 if packet.payload.len() == 4 => {
+                let baid = packet.payload[0];
+                let nssn = u16::from_le_bytes(packet.payload[2..4].try_into().unwrap());
+                if let Some(window) = self.rx_ba.iter_mut().flatten().find(|w| w.baid == baid) {
+                    let released = window.release(nssn, now);
+                    self.deliver_reordered(released, &mut output)?;
+                }
+            }
+            0xc2 if packet.payload.len() == 8 => {
+                let sta_tid = u32::from_le_bytes(packet.payload[..4].try_into().unwrap());
+                let info = u32::from_le_bytes(packet.payload[4..8].try_into().unwrap());
+                if sta_tid & 0x1f0 == 0 {
+                    if let Some(window) = self
+                        .rx_ba
+                        .get_mut((sta_tid & 15) as usize)
+                        .and_then(Option::as_mut)
+                    {
+                        if window.baid == ((info >> 24) & 63) as u8 {
+                            let released = window.release((info & 4095) as u16, now);
+                            self.deliver_reordered(released, &mut output)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(output)
+    }
+
+    fn deliver_reordered(
+        &mut self,
+        packets: Vec<Vec<u8>>,
+        output: &mut Vec<Vec<u8>>,
+    ) -> Result<(), &'static str> {
+        for packet in packets {
+            if let Some(mpdu) = scan_api::mpdu(&packet) {
+                if let Some(frame) = self.receive_frame(&mpdu)? {
+                    output.push(frame);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reorder_tick(&mut self) -> Result<Vec<Vec<u8>>, &'static str> {
+        let mut output = Vec::new();
+        let now = narf_time::now_cycles();
+        for tid in 0..self.rx_ba.len() {
+            if let Some(window) = &mut self.rx_ba[tid] {
+                let packets = window.tick(now);
+                self.deliver_reordered(packets, &mut output)?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub async fn service_aggregation(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        use super::aggregation::{self, Action};
+        if !self.authorized {
+            self.actions.clear();
+            return Ok(());
+        }
+        while let Some(body) = self.actions.pop_front() {
+            match aggregation::action(&body) {
+                Some(Action::Add {
+                    token,
+                    tid,
+                    window,
+                    ssn,
+                    timeout,
+                    immediate,
+                }) => {
+                    let mut status = 37; // decline delayed BA and unsupported TIDs
+                    if immediate && (tid as usize) < self.rx_ba.len() && self.phy.mode != 0 {
+                        let existing = self.rx_ba[tid as usize].as_ref();
+                        if existing.is_some_and(|old| {
+                            old.token == token
+                                && old.start == ssn
+                                && old.size == window
+                                && old.timeout == timeout
+                        }) {
+                            status = 0; // retransmission: preserve buffered data/PN
+                        } else {
+                            if existing.is_some() {
+                                self.stop_rx_ba(hw, tid).await?;
+                            }
+                            // Allocate host storage before publishing the FW command.
+                            let mut state = aggregation::Window::new(
+                                0,
+                                tid,
+                                token,
+                                ssn,
+                                window,
+                                timeout,
+                                narf_time::now_cycles(),
+                            )?;
+                            let response = hw
+                                .command(5, 0x16, &aggregation::allocate(tid, ssn, window))
+                                .await?;
+                            if response.payload.len() != 4 {
+                                return Err("invalid BAID allocation response");
+                            }
+                            let baid =
+                                u32::from_le_bytes(response.payload[..4].try_into().unwrap());
+                            if baid >= 32
+                                || self
+                                    .rx_ba
+                                    .iter()
+                                    .flatten()
+                                    .any(|old| old.baid as u32 == baid)
+                            {
+                                return Err("firmware reused/returned invalid BAID");
+                            }
+                            state.baid = baid as u8;
+                            self.rx_ba[tid as usize] = Some(state);
+                            status = 0;
+                        }
+                    }
+                    let response = aggregation::add_response(token, tid, window, timeout, status);
+                    let frame = self.management(0xd0, &response);
+                    hw.transmit(self.management_queue, &frame, 24, self.rate())
+                        .await?;
+                }
+                Some(Action::Delete {
+                    tid,
+                    originator: true,
+                }) if (tid as usize) < self.rx_ba.len() => {
+                    self.stop_rx_ba(hw, tid).await?;
+                }
+                _ => {} // firmware owns the TX BA session, including DELBA
+            }
+        }
+        for tid in 0..self.rx_ba.len() {
+            if self.rx_ba[tid]
+                .as_ref()
+                .is_some_and(|w| w.expired(narf_time::now_cycles()))
+            {
+                self.stop_rx_ba(hw, tid as u8).await?;
+                let frame = self.management(0xd0, &aggregation::delete(tid as u8));
+                hw.transmit(self.management_queue, &frame, 24, self.rate())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn stop_rx_ba(&mut self, hw: &mut Hardware, tid: u8) -> Result<(), &'static str> {
+        if self.rx_ba[tid as usize].is_some() {
+            hw.command(5, 0x16, &super::aggregation::remove(tid))
+                .await?;
+            // Preserve ordering across BAID reuse: discard packets captured
+            // during removal before accepting a new session with that ID.
+            hw.discard_key_transition_rx()?;
+            self.rx_ba[tid as usize] = None;
+        }
+        Ok(())
+    }
+
+    fn discard_reorder(&mut self) {
+        for window in self.rx_ba.iter_mut().flatten() {
+            window.discard();
+        }
+    }
+
     pub fn receive_frame(
         &mut self,
         mpdu: &scan_api::Mpdu<'_>,
@@ -442,6 +741,24 @@ impl Connection {
             && frame[16..22] == self.beacon.bssid
         {
             if frame[0] == 0x80 {
+                if self.phy.mode != 0 {
+                    let body = mpdu.body(24, 0).ok_or("invalid associated beacon")?;
+                    let ies = body.get(12..).ok_or("short associated beacon")?;
+                    // Live channel/PHY changes require reassociation. Stop TX
+                    // immediately if the AP's current operating constraints no
+                    // longer match the programmed width, MCS or protection.
+                    if self.phy.confirm(
+                        self.local_phy,
+                        ies,
+                        ies,
+                        self.beacon.channel,
+                        self.qos.is_some(),
+                    )? != self.phy
+                    {
+                        self.authorized = false;
+                        return Err("AP changed PHY operation; reassociation required");
+                    }
+                }
                 self.last_beacon = narf_time::now_cycles();
             }
             if matches!(frame[0], 0xa0 | 0xc0)
@@ -497,6 +814,7 @@ impl Connection {
                     }
                     self.pairwise_key = Some(*pairwise);
                     self.replay.reset_pairwise();
+                    self.discard_reorder();
                 }
             }
             let id = keys.group_id as usize;
@@ -515,6 +833,8 @@ impl Connection {
                 self.group_keys[id] = Some(keys.group);
                 self.replay.group[id].fill(keys.group_rx_pn);
                 self.replay.group_valid[id] = true;
+                self.replay.reset_subframes();
+                self.discard_reorder();
             }
         }
         let mut reply = Vec::new();
@@ -529,6 +849,10 @@ impl Connection {
 
     pub async fn disconnect(mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         self.authorized = false;
+        for tid in 0..self.rx_ba.len() {
+            self.stop_rx_ba(hw, tid as u8).await?;
+        }
+        hw.drain_transmits().await?;
         let frame = self.management(0xa0, &3u16.to_le_bytes());
         let _ = hw
             .transmit(self.management_queue, &frame, 24, self.rate())
@@ -653,10 +977,60 @@ pub(super) fn channel_power(
     power
 }
 
-async fn authorize_channel(hw: &mut Hardware, channel: u8) -> Result<i8, &'static str> {
-    let domain = narf_wireless::reg::db::get_domain()
-        .ok_or("wireless regulatory domain is not configured")?;
-    let firmware = regulatory_channels(hw).await?;
-    channel_power(&domain, channel, &firmware, false)
-        .ok_or("channel transmission prohibited by host/firmware regulatory policy")
+/// Every occupied 20 MHz subchannel and the full spectral span must be
+/// allowed by both policies. A primary-channel permission is insufficient.
+pub(super) fn channel_power_width(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    primary: u8,
+    width: u8,
+    center: u8,
+    firmware: &[u32],
+) -> Option<i8> {
+    if width == 0 {
+        return (primary == center)
+            .then(|| channel_power(domain, primary, firmware, false))
+            .flatten();
+    }
+    if width > 2 || primary == 14 || (width == 2 && primary <= 14) {
+        return None;
+    }
+    let offsets: &[i16] = if width == 1 {
+        &[-2, 2]
+    } else {
+        &[-6, -2, 2, 6]
+    };
+    let mut power = i8::MAX;
+    let mut contains_primary = false;
+    for offset in offsets {
+        let channel = u8::try_from(i16::from(center) + offset).ok()?;
+        if (channel <= 14) != (primary <= 14) || channel == 14 {
+            return None;
+        }
+        contains_primary |= channel == primary;
+        let flags = *firmware.get(station_api::channel_index(channel)?)?;
+        if flags & (1 << (8 + width)) == 0 {
+            return None;
+        }
+        power = power.min(channel_power(domain, channel, firmware, false)?);
+    }
+    if !contains_primary {
+        return None;
+    }
+    let mhz = 20u32 << width;
+    let frequency = if primary <= 14 { 2407 } else { 5000 } + 5 * u32::from(center);
+    let mut span_power = None;
+    for rule in &domain.rules {
+        if rule.freq_start_mhz <= frequency - mhz / 2
+            && rule.freq_end_mhz >= frequency + mhz / 2
+            && rule.max_bandwidth_mhz >= mhz
+        {
+            span_power =
+                Some(span_power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
+        }
+    }
+    Some(power.min(span_power?))
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "connection_tests.rs"]
+mod tests;

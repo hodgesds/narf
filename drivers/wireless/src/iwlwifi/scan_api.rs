@@ -121,9 +121,12 @@ pub struct Mpdu<'a> {
     pub channel: u8,
     pub rssi: i8,
     pub status: u32,
+    pub reorder: u32,
     padding: usize,
     trailer: usize,
     pub amsdu: bool,
+    pub amsdu_index: u8,
+    pub amsdu_last: bool,
 }
 
 impl<'a> Mpdu<'a> {
@@ -161,8 +164,69 @@ pub fn mpdu(bytes: &[u8]) -> Option<Mpdu<'_>> {
         channel: bytes[42],
         rssi: -(energy.min(127) as i8),
         status,
+        reorder: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
         padding: if bytes[3] & 0x20 != 0 { 2 } else { 0 },
         trailer: ((bytes[2] >> 4) as usize) * 2,
         amsdu: bytes[3] & 0x40 != 0,
+        amsdu_index: bytes[4] & 0x7f,
+        amsdu_last: bytes[4] & 0x80 != 0,
     })
+}
+
+/// Add band-specific PHY capabilities to active probe templates. Direct
+/// SSID entries are outside the 512-byte packet buffer and stay in place.
+pub fn with_phy_capabilities(
+    version: u8,
+    body: &mut [u8],
+    local: super::ht_vht::Local,
+) -> Result<(), &'static str> {
+    let capacity = match version {
+        14..=17 => 67,
+        18 => 68,
+        _ => return Err("unsupported scan version"),
+    };
+    let probe = 48 + capacity * 8 + 12;
+    if body.len() < probe + 1344 {
+        return Err("short scan probe template");
+    }
+    if u16::from_le_bytes(body[8..10].try_into().unwrap()) & (1 << 11) != 0 {
+        return Ok(());
+    }
+    let mut segments = Vec::new();
+    for (descriptor, band) in [(4, 2400), (8, 5000)] {
+        let offset = u16::from_le_bytes(
+            body[probe + descriptor..probe + descriptor + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let length = u16::from_le_bytes(
+            body[probe + descriptor + 2..probe + descriptor + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if offset + length > 512 {
+            return Err("invalid probe segment");
+        }
+        let mut bytes = body[probe + 20 + offset..probe + 20 + offset + length].to_vec();
+        if let Some(caps) = local.capabilities(band) {
+            bytes.extend_from_slice(&[45, 26]);
+            bytes.extend_from_slice(&caps.ht);
+            if let Some(vht) = caps.vht {
+                bytes.extend_from_slice(&[191, 12]);
+                bytes.extend_from_slice(&vht);
+            }
+        }
+        segments.push((descriptor, bytes));
+    }
+    let mut offset = 26usize;
+    for (descriptor, bytes) in segments {
+        if offset + bytes.len() > 512 {
+            return Err("probe capabilities exceed template");
+        }
+        put16(body, probe + descriptor, offset as u16);
+        put16(body, probe + descriptor + 2, bytes.len() as u16);
+        body[probe + 20 + offset..probe + 20 + offset + bytes.len()].copy_from_slice(&bytes);
+        offset += bytes.len();
+    }
+    Ok(())
 }

@@ -63,9 +63,13 @@ current test results.
    firmware/PNVM boot DMA, RFH receive rings, command/data TX queues,
    MSI-X completion delivery, active/passive scans, Open/WPA2-PSK association,
    CCMP replay protection and pairwise/group rekey, WMM/four AC rings,
-   firmware rate adaptation, TX queue backpressure, and kernel Ethernet
+   HT20/40 and VHT20/40/80 negotiation (up to two spatial streams),
+   firmware rate adaptation and TX A-MPDU completion, RX Block Ack
+   negotiation/reordering, standalone RX A-MSDU deaggregation,
+   TX queue backpressure, and kernel Ethernet
    routing. Software regressions cover wire layouts,
-   malformed completions, DMA ownership and authenticated EAPOL retries.
+   malformed completions, DMA ownership, authenticated EAPOL retries,
+   channel-span limits, BA sequence wrap and replay checks after reordering.
    Delegated nl80211 scan/connect controls and signed deployment regulatory
    policy loading are wired in, with build-time public-key provisioning
    and detached-signature firmware packing. Explicit network-service launch

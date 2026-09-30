@@ -19,6 +19,7 @@ pub struct Device {
     irq_vector: Option<u8>,
     channels: Vec<u8>,
     tx_chains: u32,
+    phy: super::ht_vht::Local,
     firmware: Vec<u8>,
     pnvm: Option<Vec<u8>>,
     up: AtomicBool,
@@ -80,6 +81,7 @@ impl Device {
             irq_vector,
             channels: nvm.channels,
             tx_chains: nvm.tx_chains,
+            phy: nvm.phy,
             firmware: firmware.to_vec(),
             pnvm: parsed.api.pnvm.map(|bytes| bytes.to_vec()),
             up: AtomicBool::new(false),
@@ -97,6 +99,9 @@ impl Device {
             hardware.version(0xc, 2).ok_or("missing NVM version")?.1,
             &nvm_packet.payload,
         )?;
+        if nvm.phy.ht {
+            hardware.check_aggregation_api()?;
+        }
         hardware
             .command(1, 0x98, &nvm.tx_chains.to_le_bytes())
             .await?;
@@ -132,7 +137,7 @@ impl Device {
         let nvm = Self::configure(&mut state.hardware, mac)
             .await
             .map_err(|_| WirelessError::HardwareError)?;
-        if nvm.tx_chains != self.tx_chains || nvm.channels != self.channels {
+        if nvm.tx_chains != self.tx_chains || nvm.channels != self.channels || nvm.phy != self.phy {
             state.hardware.fail();
             return Err(WirelessError::HardwareError);
         }
@@ -214,33 +219,33 @@ impl Device {
                 let Some(packet) = hardware.notifications.pop_front() else {
                     break;
                 };
-                if packet.header.group_id != 0 || packet.header.cmd != 0xc1 {
-                    continue;
-                }
-                let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
-                    continue;
-                };
-                match connection.receive_frame(&mpdu) {
-                    Ok(Some(bytes)) if bytes[12..14] == [0x88, 0x8e] => {
-                        if eapol.len() < 16 {
-                            eapol.push_back(bytes);
+                match connection.receive_packet(&packet) {
+                    Ok(frames) => {
+                        for bytes in frames {
+                            queue_ethernet(
+                                bytes,
+                                connection.authorized,
+                                producer,
+                                eapol,
+                                &mut output,
+                            );
                         }
                     }
-                    Ok(Some(bytes)) if connection.authorized => {
-                        if let (Some(producer), Ok(buffer)) =
-                            (producer.as_mut(), super::runtime::dma_alloc(bytes.len()))
-                        {
-                            let mut frame = Frame::new(buffer, bytes.len() as u32);
-                            frame.payload_mut().copy_from_slice(&bytes);
-                            let _ = producer.try_send(frame);
-                        }
-                        output.push(bytes);
-                    }
-                    Ok(_) => {}
                     Err(_) => {
                         connection.authorized = false;
                         self.set_link(false);
                     }
+                }
+            }
+            match connection.reorder_tick() {
+                Ok(frames) => {
+                    for bytes in frames {
+                        queue_ethernet(bytes, connection.authorized, producer, eapol, &mut output);
+                    }
+                }
+                Err(_) => {
+                    connection.authorized = false;
+                    self.set_link(false);
                 }
             }
             if narf_time::now_cycles().wrapping_sub(connection.last_beacon)
@@ -304,6 +309,10 @@ impl Device {
                             self.set_link(false);
                         }
                     }
+                    if connection.service_aggregation(hardware).await.is_err() {
+                        connection.authorized = false;
+                        self.set_link(false);
+                    }
                 } else {
                     eapol.clear();
                 }
@@ -319,6 +328,29 @@ impl Device {
                 activity.await;
             }
         }
+    }
+}
+
+fn queue_ethernet(
+    bytes: Vec<u8>,
+    authorized: bool,
+    producer: &mut Option<Producer<Frame, RX_RING_N>>,
+    eapol: &mut VecDeque<Vec<u8>>,
+    output: &mut Vec<Vec<u8>>,
+) {
+    if bytes[12..14] == [0x88, 0x8e] {
+        if eapol.len() < 16 {
+            eapol.push_back(bytes);
+        }
+    } else if authorized {
+        if let (Some(producer), Ok(buffer)) =
+            (producer.as_mut(), super::runtime::dma_alloc(bytes.len()))
+        {
+            let mut frame = Frame::new(buffer, bytes.len() as u32);
+            frame.payload_mut().copy_from_slice(&bytes);
+            let _ = producer.try_send(frame);
+        }
+        output.push(bytes);
     }
 }
 
@@ -345,6 +377,9 @@ impl Interface for Device {
 
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        self.phy.capabilities(band_mhz)
+    }
     fn tx_ring_for_ac(
         &self,
         category: narf_wireless::AccessCategory,
@@ -387,8 +422,8 @@ impl WirelessNetIface for Device {
                 .collect(),
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
-                vht_supported: false,
+                ht_supported: self.phy.ht,
+                vht_supported: self.phy.vht,
                 he_supported: false,
                 eht_supported: false,
             },
@@ -470,6 +505,8 @@ impl WirelessNetIface for Device {
                         &request.ssids,
                     )
                     .map_err(|_| WirelessError::InvalidArgs)?;
+                    scan_api::with_phy_capabilities(version, &mut body, self.phy)
+                        .map_err(|_| WirelessError::InvalidArgs)?;
                 }
             }
             hw.notifications
@@ -612,8 +649,15 @@ impl WirelessNetIface for Device {
         // Cancellation leaves this set. The pump fails closed rather
         // than driving partially configured station/queue state.
         state.needs_reset = true;
-        match Connection::associate(&mut state.hardware, self.mac, beacon, psk, self.tx_chains)
-            .await
+        match Connection::associate(
+            &mut state.hardware,
+            self.mac,
+            beacon,
+            psk,
+            self.tx_chains,
+            self.phy,
+        )
+        .await
         {
             Ok(connection) => {
                 state.connection = Some(connection);

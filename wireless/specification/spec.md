@@ -82,6 +82,15 @@ consumer and its negotiated hardware queue. AP admission control may downgrade
 a class; non-WMM links use the best-effort hardware queue. The generic network
 interface's `tx_ring()` remains the BestEffort ring.
 
+`WirelessNetIface::phy_capabilities(band_mhz) -> Option<PhyCapabilities>`
+returns band-specific IEEE HT (26-byte) and optional VHT (12-byte) capability
+bodies. The default returns `None`. Band identifiers are 2400 and 5000 MHz.
+Drivers must restrict these capabilities to implemented PHY modes and their
+NVM/antenna limits; `HwCaps` remains a summary. The iwlwifi Sc profile exposes
+up to two streams, HT20/40 and VHT20/40/80, with firmware TX A-MPDU and host
+RX Block Ack reordering. Actual association intersects AP capabilities and
+regulatory permission before programming firmware.
+
 For nl80211 scans, a nonempty nested SSID list requests active scanning;
 empty SSID entries are wildcard probes and can coexist with directed SSIDs.
 `CONNECT` accepts an SSID with optional BSSID/frequency constraints. It selects
@@ -115,6 +124,10 @@ The wireless subsystem registers the `nl80211` generic-netlink family through
 the `net/` family registry. Read-only `GET_WIPHY` and `GET_INTERFACE` point and
 dump requests enumerate the canonical wireless-interface registry and emit
 Linux `NEW_WIPHY` / `NEW_INTERFACE` records. Wiphy records carry a nested
+band description with HT/VHT capabilities, MCS sets, HT A-MPDU factor and
+density when supplied by `phy_capabilities()`. VHT is absent from the
+2.4 GHz band. Capability integers use native netlink byte order; IEEE MCS
+arrays retain their wire layout. Wiphy records also carry a nested
 `SUPPORTED_COMMANDS` list, and `GET_PROTOCOL_FEATURES` returns a zero bitmap
 instead of claiming optional split-dump behavior NARF does not implement.
 The family also implements `TRIGGER_SCAN`, `GET_SCAN`, `CONNECT`, and

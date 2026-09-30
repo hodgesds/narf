@@ -1,4 +1,4 @@
-//! MLD firmware commands used for a single legacy-rate station link.
+//! MLD firmware commands used for a single station link.
 //! Layouts: Linux iwlwifi fw/api/{mac-cfg,phy-ctxt,nvm-reg}.h.
 
 use super::boot_context::{put16, put32};
@@ -19,6 +19,7 @@ pub struct Nvm {
     pub tx_chains: u32,
     pub rx_chains: u32,
     pub channels: Vec<u8>,
+    pub phy: super::ht_vht::Local,
 }
 
 impl Nvm {
@@ -56,6 +57,11 @@ impl Nvm {
             tx_chains,
             rx_chains,
             channels,
+            phy: super::ht_vht::Local::from_nvm(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                tx_chains,
+                rx_chains,
+            ),
         })
     }
 }
@@ -116,7 +122,7 @@ pub fn peer(address: [u8; 6]) -> [u8; 104] {
     let mut out = [0; 104];
     out[8..14].copy_from_slice(&address);
     out[16..22].copy_from_slice(&address);
-    // Station/link ID 0, type PEER=0. No HT/HE/EHT or aggregation.
+    // Station/link ID 0, type PEER=0. Negotiated PHY fields are applied later.
     out
 }
 

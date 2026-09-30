@@ -45,6 +45,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+pub mod aggregation;
 pub mod bcast;
 pub mod boot_context;
 pub mod connection;
@@ -54,6 +55,7 @@ pub mod firmware_api;
 pub mod frame_api;
 pub mod fw_loader;
 pub mod handshake;
+pub mod ht_vht;
 pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;

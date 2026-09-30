@@ -719,6 +719,13 @@ impl Hardware {
             }
         }
         for packet in self.resources.rx.drain(&mut self.mmio)? {
+            if packet.header.group_id == 0 && packet.header.cmd == 0xc5 {
+                if !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7)) {
+                    return Err("unsupported compressed BA notification");
+                }
+                super::aggregation::complete_tx_ba(&mut self.resources.data, &packet.payload)?;
+                continue;
+            }
             if packet.header.group_id == 0 && packet.header.cmd == 0x1c {
                 if packet.payload.len() < 38 {
                     return Err("short TX completion");
@@ -730,11 +737,13 @@ impl Hardware {
                     .iter_mut()
                     .find(|q| q.id() == Some(id))
                     .ok_or("TX completion for unknown queue")?;
+                let first = queue.next_completion();
                 let (ssn, success) = queue.complete(&packet.payload)?;
                 if self.tx_completed.len() == 256 {
                     return Err("unconsumed TX completion overflow");
                 }
-                self.tx_completed.push_back((id, ssn, success));
+                self.tx_completed
+                    .push_back((id, if success { ssn } else { first }, success));
                 continue;
             }
             if self.resources.commands.complete(packet.header)? {
@@ -756,7 +765,7 @@ impl Hardware {
         if self.version(5, 0x17).map(|v| v.0) != Some(3) {
             return Err("unsupported queue allocation version");
         }
-        let queue = super::data_queue::DataQueue::new()?;
+        let mut queue = super::data_queue::DataQueue::new()?;
         let body = queue.configure(station, tid)?;
         let index = self.resources.data.len();
         // Pin BEFORE publishing the allocation command. Timeout does
@@ -772,6 +781,23 @@ impl Hardware {
             return Err("firmware reused an active queue ID");
         }
         Ok(id)
+    }
+
+    pub fn check_aggregation_api(&self) -> Result<(), &'static str> {
+        if self.version(5, 0x16).map(|v| v.0) != Some(2)
+            || !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7))
+        {
+            return Err("firmware has no supported Block Ack API");
+        }
+        Ok(())
+    }
+
+    pub fn enable_aggregation(&mut self) -> Result<(), &'static str> {
+        self.check_aggregation_api()?;
+        for queue in &mut self.resources.data {
+            queue.enable_aggregation();
+        }
+        Ok(())
     }
 
     pub async fn remove_tx(&mut self, id: u16, station: u8, tid: u8) -> Result<(), &'static str> {
@@ -874,13 +900,13 @@ impl Hardware {
         }
     }
 
-    /// Discard RX MPDUs captured across a key replacement before resetting
-    /// host replay state. Other firmware notifications remain available.
+    /// Discard RX MPDUs and reorder releases captured across a key/session
+    /// transition. Other firmware notifications remain available.
     pub fn discard_key_transition_rx(&mut self) -> Result<(), &'static str> {
         for _ in 0..RX_DEPTH / 64 + 1 {
             self.poll()?;
             self.notifications
-                .retain(|p| p.header.group_id != 0 || p.header.cmd != 0xc1);
+                .retain(|p| p.header.group_id != 0 || !matches!(p.header.cmd, 0xc1..=0xc3));
             if !self.has_pending_rx() {
                 return Ok(());
             }
@@ -970,6 +996,17 @@ impl Hardware {
                 } else {
                     Err("frame transmission failed")
                 };
+            }
+            // A compressed BA cumulatively retires successful frames. A
+            // failed MPDU is retried singly and reported through TX_CMD.
+            if self
+                .resources
+                .data
+                .iter()
+                .find(|q| q.id() == Some(id))
+                .is_some_and(|q| q.has_completed(ssn))
+            {
+                return Ok(());
             }
             if deadline.expired() {
                 self.failed = true;
