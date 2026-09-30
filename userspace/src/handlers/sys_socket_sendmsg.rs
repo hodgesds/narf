@@ -34,10 +34,12 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // SO_SNDTIMEO: pick up this call's deadline if it is re-executing.
+    let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
     match sendmsg_on_socket(&sock, msg_ptr, flags, false) {
         SendMsgResult::Sent { written, .. } => ctx.set_return(SyscallReturn::ok(written as u64)),
         SendMsgResult::WouldBlock => {
-            handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref())
+            handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref(), resumed)
         }
         SendMsgResult::Error(errno) => {
             // Broken-pipe sendmsg raises SIGPIPE to the sender unless

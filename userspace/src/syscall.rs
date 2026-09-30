@@ -298,6 +298,150 @@ pub struct SigDeliveryParams {
     pub prerewound_syscall: bool,
 }
 
+impl SigDeliveryParams {
+    /// The user-visible 128-byte `siginfo_t` for this delivery, with the
+    /// `_sifields` union laid out per Linux `siginfo_layout(sig, si_code)`
+    /// (kernel/signal.c). Every frame writer and `rt_sigtimedwait` share this
+    /// encoder so the union can't be chosen differently per return path: the
+    /// timer-IRQ writer once stored `si_addr` at offset 16 for a tgkill, so a
+    /// handler reached from an interrupted busy loop read `si_pid == 0`, and
+    /// glibc's SIGSETXID handler dropped the request and hung `seteuid()`.
+    pub fn siginfo_bytes(&self) -> [u8; 128] {
+        let mut info = [0u8; 128];
+        info[0..4].copy_from_slice(&(self.signum as i32).to_ne_bytes());
+        info[8..12].copy_from_slice(&self.si_code.to_ne_bytes());
+        match siginfo_layout(self.signum, self.si_code) {
+            SiginfoLayout::Fault | SiginfoLayout::Sys => {
+                info[16..24].copy_from_slice(&self.si_addr.to_ne_bytes());
+            }
+            // si_band (long) @16, si_fd (int) @24. The delivery hook carries
+            // the band in `si_addr` and the fd in `si_value`.
+            SiginfoLayout::Poll => {
+                info[16..24].copy_from_slice(&self.si_addr.to_ne_bytes());
+                info[24..28].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
+            }
+            // si_pid @16, si_uid @20 (0), si_status @24.
+            SiginfoLayout::Chld => {
+                info[16..20].copy_from_slice(&self.si_pid.to_ne_bytes());
+                info[24..28].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
+            }
+            // SIL_KILL: si_pid @16, si_uid @20.
+            SiginfoLayout::Kill => {
+                info[16..20].copy_from_slice(&self.si_pid.to_ne_bytes());
+            }
+            // SIL_RT / SIL_TIMER: an int pair @16 (si_pid+si_uid, or
+            // si_tid+si_overrun) then si_value @24.
+            SiginfoLayout::Rt | SiginfoLayout::Timer => {
+                info[16..20].copy_from_slice(&self.si_pid.to_ne_bytes());
+                info[24..32].copy_from_slice(&self.si_value.to_ne_bytes());
+            }
+        }
+        info
+    }
+
+    /// The 128-byte `struct signalfd_siginfo` a signalfd read returns for this
+    /// signal: Linux `signalfd_copyinfo` (fs/signalfd.c) copies the members
+    /// of the `siginfo_layout` union into their fixed `ssi_*` slots.
+    pub fn signalfd_siginfo_bytes(&self) -> [u8; 128] {
+        const PID: usize = 12;
+        const FD: usize = 20;
+        const TID: usize = 24;
+        const BAND: usize = 28;
+        const STATUS: usize = 40;
+        const INT: usize = 44;
+        const PTR: usize = 48;
+        const ADDR: usize = 72;
+        const CALL_ADDR: usize = 88;
+        let mut ssi = [0u8; 128];
+        ssi[0..4].copy_from_slice(&self.signum.to_ne_bytes());
+        ssi[8..12].copy_from_slice(&self.si_code.to_ne_bytes());
+        match siginfo_layout(self.signum, self.si_code) {
+            SiginfoLayout::Kill => {
+                ssi[PID..PID + 4].copy_from_slice(&self.si_pid.to_ne_bytes());
+            }
+            SiginfoLayout::Rt => {
+                ssi[PID..PID + 4].copy_from_slice(&self.si_pid.to_ne_bytes());
+                ssi[INT..INT + 4].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
+                ssi[PTR..PTR + 8].copy_from_slice(&self.si_value.to_ne_bytes());
+            }
+            SiginfoLayout::Timer => {
+                ssi[TID..TID + 4].copy_from_slice(&self.si_pid.to_ne_bytes());
+                ssi[INT..INT + 4].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
+                ssi[PTR..PTR + 8].copy_from_slice(&self.si_value.to_ne_bytes());
+            }
+            SiginfoLayout::Poll => {
+                ssi[BAND..BAND + 4].copy_from_slice(&(self.si_addr as u32).to_ne_bytes());
+                ssi[FD..FD + 4].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
+            }
+            SiginfoLayout::Chld => {
+                ssi[PID..PID + 4].copy_from_slice(&self.si_pid.to_ne_bytes());
+                ssi[STATUS..STATUS + 4].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
+            }
+            SiginfoLayout::Fault => {
+                ssi[ADDR..ADDR + 8].copy_from_slice(&self.si_addr.to_ne_bytes());
+            }
+            SiginfoLayout::Sys => {
+                ssi[CALL_ADDR..CALL_ADDR + 8].copy_from_slice(&self.si_addr.to_ne_bytes());
+            }
+        }
+        ssi
+    }
+}
+
+/// Which member of the `siginfo_t` `_sifields` union a `(signal, si_code)`
+/// pair uses — Linux `enum siginfo_layout`, folded to the members NARF fills.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SiginfoLayout {
+    Kill,
+    Timer,
+    Poll,
+    Fault,
+    Chld,
+    Rt,
+    Sys,
+}
+
+/// Linux `siginfo_layout` (kernel/signal.c). A positive `si_code` below
+/// `SI_KERNEL` is signal-specific (`sig_sicodes[]`: the fault signals,
+/// SIGCHLD, SIGPOLL, SIGSYS, each up to its `NSIG*` limit); any other
+/// positive code up to `NSIGPOLL` is a SIGPOLL-style fasync report (F_SETSIG
+/// can pick any signal). Non-positive codes: SI_TIMER, SI_SIGIO, and the
+/// negative user/queue codes (SIL_RT); SI_USER and SI_KERNEL are SIL_KILL.
+pub fn siginfo_layout(signum: u32, si_code: i32) -> SiginfoLayout {
+    const SI_USER: i32 = 0;
+    const SI_KERNEL: i32 = 0x80;
+    const SI_TIMER: i32 = -2;
+    const SI_SIGIO: i32 = -5;
+    const NSIGPOLL: i32 = 6;
+    if si_code > SI_USER && si_code < SI_KERNEL {
+        // (layout, NSIG* limit) per sig_sicodes[].
+        let specific = match signum {
+            4 => Some((SiginfoLayout::Fault, 11)),  // SIGILL, NSIGILL
+            5 => Some((SiginfoLayout::Fault, 6)),   // SIGTRAP, NSIGTRAP
+            7 => Some((SiginfoLayout::Fault, 5)),   // SIGBUS, NSIGBUS
+            8 => Some((SiginfoLayout::Fault, 15)),  // SIGFPE, NSIGFPE
+            11 => Some((SiginfoLayout::Fault, 10)), // SIGSEGV, NSIGSEGV
+            17 => Some((SiginfoLayout::Chld, 6)),   // SIGCHLD, NSIGCHLD
+            29 => Some((SiginfoLayout::Poll, NSIGPOLL)),
+            31 => Some((SiginfoLayout::Sys, 2)), // SIGSYS, NSIGSYS
+            _ => None,
+        };
+        match specific {
+            Some((layout, limit)) if si_code <= limit => layout,
+            _ if si_code <= NSIGPOLL => SiginfoLayout::Poll,
+            _ => SiginfoLayout::Kill,
+        }
+    } else if si_code == SI_TIMER {
+        SiginfoLayout::Timer
+    } else if si_code == SI_SIGIO {
+        SiginfoLayout::Poll
+    } else if si_code < 0 {
+        SiginfoLayout::Rt
+    } else {
+        SiginfoLayout::Kill
+    }
+}
+
 // ── Numbers ─────────────────────────────────────────────────────────
 
 /// Canonical syscall numbers.
@@ -3409,13 +3553,14 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             let a = ctx.args();
             let _ = writeln!(
                 narf_console::Writer,
-                "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
                 crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
                 a.arg0,
                 a.arg1,
                 a.arg2,
                 a.arg3,
+                narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
             );
             trace_syscall_paths(table.name_of(variant).unwrap_or("?"), a);
         }
@@ -3458,9 +3603,10 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "SYSR t={} {} done",
+                "SYSR t={} {} done ms={}",
                 crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
+                narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
             );
         }
         // Close the span. This used to SKIP the fold entirely whenever the
@@ -3726,6 +3872,17 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
     kernel_syscall_entry_plain_with_state(num, args, core::ptr::null_mut())
 }
 
+/// The name of NARF syscall id `num`, if a table is installed.
+pub fn syscall_name(num: u32) -> Option<&'static str> {
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: as in `kernel_syscall_entry`: a published, never-freed table.
+    let table = unsafe { &*p };
+    table.name_of(Syscall::from_raw(num)?)
+}
+
 pub fn kernel_syscall_entry_plain_with_state(
     num: u32,
     args: &SyscallArgs,
@@ -3786,13 +3943,14 @@ pub fn kernel_syscall_entry_plain_with_state(
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+            "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
             crate::handlers::current_task_id(),
             table.name_of(n).unwrap_or("?"),
             args.arg0,
             args.arg1,
             args.arg2,
             args.arg3,
+            narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
         );
         trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
     }
@@ -3835,7 +3993,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             if !errors_only || is_reportable_syscall_error(r.value) {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                    "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
                     crate::handlers::current_task_id(),
                     table.name_of(n).unwrap_or("?"),
                     r.value as i64,
@@ -3845,6 +4003,7 @@ pub fn kernel_syscall_entry_plain_with_state(
                     args.arg1,
                     args.arg2,
                     args.arg3,
+                    narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
                 );
                 // Errors-only mode suppresses the SYSC entry line, so decode the
                 // path args HERE to show which file/mount the failing op targeted.
@@ -4341,25 +4500,7 @@ mod sigframe {
                 uc_sigmask: 0,
             };
 
-            let mut siginfo = [0u8; 128];
-            siginfo[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
-            siginfo[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
-            // Offset 16 is a union: for user/queue-origin signals (SI_USER=0,
-            // SI_QUEUE=-1, SI_TKILL=-6, ... — all si_code <= 0) it is
-            // `_sifields._kill.si_pid` (u32) + `si_uid` (u32 @ 20); for
-            // fault-origin signals (si_code > 0: SEGV_MAPERR, BUS_*, ...) it is
-            // `_sifields._sigfault.si_addr` (u64). Writing si_addr for a queued
-            // signal left the handler's `si->si_pid` at 0 — stress-ng --sigrt's
-            // child replies with `sigqueue(si->si_pid, ...)` and lost the target.
-            if params.si_code <= 0 {
-                siginfo[16..20].copy_from_slice(&params.si_pid.to_ne_bytes());
-                // si_uid @ 20 left 0 (NARF has no per-process uid distinction
-                // that sigqueue callers depend on here).
-            } else {
-                siginfo[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
-            }
-            // _sifields._rt.si_sigval (sigqueue payload) at offset 24.
-            siginfo[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
+            let siginfo = params.siginfo_bytes();
 
             // The interrupted task's FPU registers are live in hardware here:
             // delivery runs on the task's own kernel→user return path and

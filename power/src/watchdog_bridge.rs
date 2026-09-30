@@ -87,6 +87,9 @@ pub struct WatchdogState {
     pub identity: IrqSafeSpinLock<String>,
     /// Firmware version string ("unknown" if not available).
     pub fw_version: IrqSafeSpinLock<String>,
+    /// kernfs ids of this device's sysfs attributes, assigned on first
+    /// lookup and fixed for the device's life (`kernfs_next_ino`).
+    attr_inos: IrqSafeSpinLock<alloc::collections::BTreeMap<String, u64>>,
 }
 
 impl core::fmt::Debug for WatchdogState {
@@ -99,6 +102,17 @@ impl core::fmt::Debug for WatchdogState {
 }
 
 impl WatchdogState {
+    /// `st_ino` of sysfs attribute `name` under this device's directory.
+    fn attr_ino(&self, name: &str) -> u64 {
+        let mut map = self.attr_inos.lock();
+        if let Some(&ino) = map.get(name) {
+            return ino;
+        }
+        let ino = narf_filesystem::sysfs::kernfs_next_ino();
+        map.insert(String::from(name), ino);
+        ino
+    }
+
     pub fn new(
         identity: String,
         timeout_secs: u32,
@@ -118,6 +132,7 @@ impl WatchdogState {
             bootstatus: AtomicBool::new(bootstatus),
             identity: IrqSafeSpinLock::new(identity),
             fw_version: IrqSafeSpinLock::new(fw_version),
+            attr_inos: IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
         })
     }
 }
@@ -181,6 +196,16 @@ impl DevWatchdog {
 }
 
 impl FileOps for DevWatchdog {
+    /// `st_rdev` = misc major 10, `WATCHDOG_MINOR` 130
+    /// (include/linux/miscdevice.h); the inode is devfs's node for it.
+    fn rdev(&self) -> u64 {
+        narf_filesystem::devfs::linux_makedev(10, 130)
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     /// Read returns 0 (write-only semantics).
     /// `watchdog_dev.c:231–237` — `watchdog_read` returns `-EINVAL`.
     /// We return 0 (EOF) which is the idiomatic no-data response.
@@ -293,6 +318,7 @@ pub fn lookup_dev_watchdog_n(name: &str) -> Option<Arc<dyn FileOps>> {
 /// `kernfs_seq_show` pattern in `fs/kernfs/file.c:172`).
 struct WatchdogAttrFile {
     show: Arc<dyn Fn() -> String + Send + Sync>,
+    ino: u64,
 }
 
 impl core::fmt::Debug for WatchdogAttrFile {
@@ -302,6 +328,14 @@ impl core::fmt::Debug for WatchdogAttrFile {
 }
 
 impl FileOps for WatchdogAttrFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::sysfs::sysfs_attrs()
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = (self.show)();
         Box::pin(async move {
@@ -348,6 +382,7 @@ type StoreFn = Arc<dyn Fn(&[u8]) -> Result<(), FsError> + Send + Sync>;
 struct WatchdogWritableAttrFile {
     show: Arc<dyn Fn() -> String + Send + Sync>,
     store: StoreFn,
+    ino: u64,
 }
 
 impl core::fmt::Debug for WatchdogWritableAttrFile {
@@ -358,6 +393,14 @@ impl core::fmt::Debug for WatchdogWritableAttrFile {
 }
 
 impl FileOps for WatchdogWritableAttrFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::sysfs::sysfs_attrs()
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = (self.show)();
         Box::pin(async move {
@@ -422,19 +465,27 @@ impl core::fmt::Debug for WatchdogDevDir {
 }
 
 impl WatchdogDevDir {
-    fn ro_attr(show: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn FileOps> {
+    fn ro_attr(
+        &self,
+        name: &str,
+        show: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Arc<dyn FileOps> {
         Arc::new(WatchdogAttrFile {
             show: Arc::new(show),
+            ino: self.state.attr_ino(name),
         })
     }
 
     fn rw_attr(
+        &self,
+        name: &str,
         show: impl Fn() -> String + Send + Sync + 'static,
         store: impl Fn(&[u8]) -> Result<(), FsError> + Send + Sync + 'static,
     ) -> Arc<dyn FileOps> {
         Arc::new(WatchdogWritableAttrFile {
             show: Arc::new(show),
             store: Arc::new(store),
+            ino: self.state.attr_ino(name),
         })
     }
 }
@@ -479,17 +530,17 @@ impl DirOps for WatchdogDevDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let s = self.state.clone();
         match name {
-            "identity" => Some(Self::ro_attr(move || {
+            "identity" => Some(self.ro_attr("identity", move || {
                 format!("{}\n", s.identity.lock().as_str())
             })),
-            "state" => Some(Self::ro_attr(move || {
+            "state" => Some(self.ro_attr("state", move || {
                 if s.active.load(Ordering::Acquire) {
                     "active\n".to_string()
                 } else {
                     "inactive\n".to_string()
                 }
             })),
-            "status" => Some(Self::ro_attr(move || {
+            "status" => Some(self.ro_attr("status", move || {
                 // Bit 2 (0x4) = WDIOF_CARDRESET: previous boot was a WD reset.
                 // `watchdog_dev.c:WDIOC_GETSTATUS`.
                 let bits: u32 = if s.bootstatus.load(Ordering::Acquire) {
@@ -502,7 +553,8 @@ impl DirOps for WatchdogDevDir {
             "timeout" => {
                 let s_show = s.clone();
                 let s_store = s.clone();
-                Some(Self::rw_attr(
+                Some(self.rw_attr(
+                    "timeout",
                     move || format!("{}\n", s_show.timeout_secs.load(Ordering::Acquire)),
                     move |buf| {
                         let text = core::str::from_utf8(buf)
@@ -520,7 +572,8 @@ impl DirOps for WatchdogDevDir {
             "pretimeout" => {
                 let s_show = s.clone();
                 let s_store = s.clone();
-                Some(Self::rw_attr(
+                Some(self.rw_attr(
+                    "pretimeout",
                     move || format!("{}\n", s_show.pretimeout_secs.load(Ordering::Acquire)),
                     move |buf| {
                         let text = core::str::from_utf8(buf)
@@ -532,14 +585,14 @@ impl DirOps for WatchdogDevDir {
                     },
                 ))
             }
-            "nowayout" => Some(Self::ro_attr(move || {
+            "nowayout" => Some(self.ro_attr("nowayout", move || {
                 if s.nowayout.load(Ordering::Acquire) {
                     "1\n".to_string()
                 } else {
                     "0\n".to_string()
                 }
             })),
-            "bootstatus" => Some(Self::ro_attr(move || {
+            "bootstatus" => Some(self.ro_attr("bootstatus", move || {
                 // Reflects sp5100 CONTROL_FIRED bit latched at probe time.
                 // `sp5100_tco.c:291–327` — `tco_timer_start` checks `WDT_FIRED`.
                 if s.bootstatus.load(Ordering::Acquire) {
@@ -548,7 +601,7 @@ impl DirOps for WatchdogDevDir {
                     "0\n".to_string()
                 }
             })),
-            "fw_version" => Some(Self::ro_attr(move || {
+            "fw_version" => Some(self.ro_attr("fw_version", move || {
                 format!("{}\n", s.fw_version.lock().as_str())
             })),
             _ => None,

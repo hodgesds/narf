@@ -403,6 +403,54 @@ fn smoke_fat_mount_root_via_vfs_resolve() -> TestResult {
 }
 kernel_test_in!("drivers/fs/fat", smoke_fat_mount_root_via_vfs_resolve);
 
+/// FAT inode identity (fs/fat/inode.c): the root is `MSDOS_ROOT_INO` = 1,
+/// a file is numbered by its directory entry's position (`i_pos`) — the
+/// same on every lookup and never the root's — and every node reports its
+/// volume's `st_dev`, which differs from another volume's.
+fn smoke_fat_inode_identity_is_stable_and_distinct() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let mount = || {
+        let img = build_fat12_image(128, b"narf\n");
+        poll_once(FatVolume::mount(
+            RamBlockDevice::from_image(512, img),
+            DomainId::DRIVER_0,
+        ))
+    };
+    let (Some(Ok(vol)), Some(Ok(other))) = (mount(), mount()) else {
+        return TestResult::Fail("FatVolume::mount failed");
+    };
+    let root = vol.root();
+    if root.ino() != 1 {
+        return TestResult::Fail("FAT root is not MSDOS_ROOT_INO");
+    }
+    let (Some(Ok(a)), Some(Ok(b))) = (
+        poll_once(root.lookup_async("NARF.TXT")),
+        poll_once(root.lookup_async("narf.txt")),
+    ) else {
+        return TestResult::Fail("lookup_async NARF.TXT failed");
+    };
+    if a.ino() <= 1 || a.ino() != b.ino() {
+        return TestResult::Fail("a FAT file's inode is 0/1 or changes between lookups");
+    }
+    let dev = root.inode_attrs().dev;
+    if dev == 0 || a.inode_attrs().dev != dev {
+        return TestResult::Fail("FAT nodes are not on one nonzero st_dev");
+    }
+    if other.root().inode_attrs().dev == dev {
+        return TestResult::Fail("two FAT volumes share an st_dev");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_inode_identity_is_stable_and_distinct
+);
+
 fn smoke_fat_create_write_read_unlink_round_trip() -> TestResult {
     // Empty FAT12 volume → create + write + re-lookup + read +
     // enumerate + unlink + confirm gone. Proves the mutating side of

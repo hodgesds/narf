@@ -2269,3 +2269,53 @@ fn smoke_abi_nsfs_traversal_is_privileged() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_nsfs_traversal_is_privileged);
+
+/// nsfs (`fs/nsfs.c::nsfs_init_inode`): an ns fd's `st_ino` IS the
+/// namespace's inum — the number `readlink /proc/<pid>/ns/<type>` shows —
+/// on the one nsfs superblock, so two fds naming one namespace `fstat`
+/// equal. A task that unshared names a different namespace, hence a
+/// different inode.
+fn smoke_abi_nsfs_inode_is_ns_inum_pos() -> TestResult {
+    const OTHER: u64 = 0x7f_5e11;
+    with_setup(|| {
+        use crate::namespaces::{ns_fd_for, ns_inum, NsFlavour};
+        let install = |f: alloc::sync::Arc<crate::namespaces::NsFd>| {
+            crate::fd::install(
+                FAKE_TASK,
+                crate::fd::FdEntry {
+                    ops: f,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                },
+            )
+            .map(u64::from)
+            .ok_or("fd install failed")
+        };
+        let a = ns_fd_for(FAKE_TASK, NsFlavour::Uts).ok_or("ns_fd_for(uts) failed")?;
+        let b = ns_fd_for(FAKE_TASK, NsFlavour::Uts).ok_or("ns_fd_for(uts) failed")?;
+        let inum = u64::from(ns_inum(a.held().id()));
+        let link = alloc::format!("uts:[{inum}]");
+        let ia = crate::abi_fdio2_tests::fstat_id(install(a.clone())?)?;
+        let ib = crate::abi_fdio2_tests::fstat_id(install(b)?)?;
+        if ia.1 != inum {
+            return Err("an ns fd's st_ino is not the namespace's inum");
+        }
+        if ia.0 == 0 || ia != ib {
+            return Err("two fds of one namespace do not fstat equal on nsfs");
+        }
+        if a.link_text() != link {
+            return Err("ns readlink text does not carry the nsfs inode number");
+        }
+        crate::namespaces::unshare_uts(OTHER);
+        let other = ns_fd_for(OTHER, NsFlavour::Uts).ok_or("ns_fd_for(other uts) failed");
+        let io = other.and_then(|f| crate::abi_fdio2_tests::fstat_id(install(f)?));
+        crate::namespaces::release_task(OTHER);
+        let io = io?;
+        if io.1 == ia.1 || io.0 != ia.0 {
+            return Err("an unshared UTS namespace reports the parent's nsfs inode");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_inode_is_ns_inum_pos);

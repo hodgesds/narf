@@ -2015,6 +2015,30 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
     send_resched_ipi(target_cpu);
 }
 
+/// Linux `kick_process()`: if `task` is running on ANOTHER CPU right now,
+/// interrupt that CPU so the task passes through a kernel exit to user mode
+/// promptly. Signal generation calls this after making a signal pending for
+/// a task (`signal_wake_up_state` -> `kick_process`): a task parked in a
+/// syscall is woken through its waker instead, but a task RUNNING user code
+/// would otherwise not look at its pending set until an unrelated interrupt.
+/// The IPI carries no request of its own; the interrupted CPU's return-to-user
+/// path performs signal delivery.
+///
+/// No-op when the task is not currently running, or runs on this CPU (the
+/// caller's own exit to user mode handles it).
+pub fn kick_task(task: u64) {
+    if task == 0 {
+        return;
+    }
+    let me = narf_lib::percpu::current_cpu();
+    for (cpu, slot) in CURRENT_TASK.iter().enumerate() {
+        if cpu != me && slot.0.load(Ordering::Acquire) == task {
+            send_resched_ipi(cpu as u32);
+            return;
+        }
+    }
+}
+
 #[inline]
 fn send_resched_ipi(target_cpu: u32) {
     let p = RESCHED_IPI_HOOK.load(Ordering::Acquire);

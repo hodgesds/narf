@@ -5334,7 +5334,9 @@ fn netlink_sockaddr_port(portid: u32) -> ([u8; 12], u64) {
 }
 
 /// Build a `struct nlmsghdr` dump request: len(16) type flags(REQUEST|DUMP)
-/// seq pid.
+/// seq pid. It has no family header, so `rtnetlink_rcv_msg` ignores it
+/// (`nlmsg_len(nlh) < sizeof(struct rtgenmsg)` returns 0); rtnetlink tests use
+/// `rtnl_dump_request`, which carries the one-byte `struct rtgenmsg`.
 fn nlmsg_request(msg_type: u16, seq: u32) -> [u8; NLMSG_HDRLEN] {
     let mut b = [0u8; NLMSG_HDRLEN];
     b[0..4].copy_from_slice(&(NLMSG_HDRLEN as u32).to_le_bytes());
@@ -5424,7 +5426,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_socket_bind);
 fn smoke_abi_netlink_route_siocinq() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 40);
+        let req = rtnl_dump_request(RTM_GETLINK, 40);
         if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
             return Err("RTM_GETLINK send failed");
         }
@@ -5447,7 +5449,7 @@ fn smoke_abi_netlink_route_msg_peek() -> TestResult {
     with_setup(|| {
         const MSG_PEEK: u64 = 0x02;
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 41);
+        let req = rtnl_dump_request(RTM_GETLINK, 41);
         if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
             return Err("RTM_GETLINK send failed");
         }
@@ -5473,7 +5475,7 @@ fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
     with_setup(|| {
         const MSG_TRUNC: u64 = 0x20;
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 42);
+        let req = rtnl_dump_request(RTM_GETLINK, 42);
 
         if netlink_send(fd, &req).ok_or("first route send")? != req.len() as i64 {
             return Err("first RTM_GETLINK send failed");
@@ -5521,7 +5523,7 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
 
         // A dump: RTM_GETLINK → one or more RTM_NEWLINK + a terminating
         // NLMSG_DONE. The send allocates the socket's port id.
-        let req = nlmsg_request(RTM_GETLINK, 77);
+        let req = rtnl_dump_request(RTM_GETLINK, 77);
         if netlink_send(fd, &req).ok_or("dump send")? != req.len() as i64 {
             return Err("RTM_GETLINK send failed");
         }
@@ -5927,7 +5929,7 @@ kernel_test_in!(
 fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETLINK, 42);
+        let req = rtnl_dump_request(RTM_GETLINK, 42);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETLINK) did not echo the request length");
         }
@@ -5978,7 +5980,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getlink_dump);
 fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETADDR, 7);
+        let req = rtnl_dump_request(RTM_GETADDR, 7);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETADDR) did not echo the request length");
         }
@@ -6015,6 +6017,74 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getaddr_dump);
+
+// iproute2 `ip addr` sends its RTM_GETADDR dump as the 24-byte request followed
+// by 128 zero bytes (a trailing nlmsg_len == 0 header). Linux `netlink_rcv_skb`
+// stops at that header and `netlink_sendmsg` returns the full length; NARF
+// failed the send with EINVAL ("Cannot send dump request: Invalid argument").
+fn smoke_abi_netlink_route_zero_padded_dump_is_answered() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let mut req = [0u8; 152];
+        let body = 8; // struct ifaddrmsg, AF_UNSPEC
+        req[..NLMSG_HDRLEN].copy_from_slice(&nlmsg_request(RTM_GETADDR, 11));
+        req[0..4].copy_from_slice(&((NLMSG_HDRLEN + body) as u32).to_le_bytes());
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send of a zero-padded RTM_GETADDR dump did not return its full length");
+        }
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            let seq = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            if seq != 11 {
+                return Err("padding was answered as a second request");
+            }
+            if nlmsg_type_of(&buf) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if !saw_done {
+            return Err("zero-padded RTM_GETADDR dump did not end with NLMSG_DONE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_zero_padded_dump_is_answered
+);
+
+// NEGATIVE: a header whose nlmsg_len is below NLMSG_HDRLEN or past the end is
+// not an error on Linux: the walk stops, nothing is answered, and send returns
+// the full length (request content never fails netlink_sendmsg).
+fn smoke_abi_netlink_route_malformed_length_is_skipped() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        for bad_len in [4u32, 1024] {
+            let mut req = nlmsg_request(RTM_GETLINK, 12);
+            req[0..4].copy_from_slice(&bad_len.to_le_bytes());
+            if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+                return Err("send of a malformed nlmsg_len did not return its full length");
+            }
+            let mut buf = [0u8; 512];
+            if netlink_recv(fd, &mut buf) != Some(EAGAIN) {
+                return Err("a malformed nlmsg_len was answered instead of skipped");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_malformed_length_is_skipped
+);
 
 fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
     with_setup(|| {
@@ -6057,7 +6127,7 @@ kernel_test_in!(
 fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETROUTE, 9);
+        let req = rtnl_dump_request(RTM_GETROUTE, 9);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETROUTE) did not echo the request length");
         }
@@ -6160,7 +6230,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_point_lookup);
 fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETNEIGH, 10);
+        let req = rtnl_dump_request(RTM_GETNEIGH, 10);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETNEIGH) did not echo the request length");
         }
@@ -6190,7 +6260,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getneigh_dump);
 fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETRULE, 11);
+        let req = rtnl_dump_request(RTM_GETRULE, 11);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETRULE) did not echo the request length");
         }
@@ -6218,7 +6288,9 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getrule_dump);
 fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETQDISC, 12);
+        // `tc_dump_qdisc` parses a full struct tcmsg (a shorter request is
+        // DONE(-EINVAL)), so send one.
+        let req = rtnl_request(RTM_GETQDISC, NLM_F_REQUEST_DUMP, 12, &[0u8; 20]);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETQDISC) did not echo the request length");
         }
@@ -6251,7 +6323,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getqdisc_dump);
 fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
-        let req = nlmsg_request(RTM_GETTFILTER, 13);
+        let req = rtnl_dump_request(RTM_GETTFILTER, 13);
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send(RTM_GETTFILTER) did not echo request length");
         }
@@ -6267,6 +6339,1028 @@ fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_empty_collection_dump
+);
+
+// ── rtnetlink dump validation parity (strict + legacy) ──────────────────
+//
+// Linux delivers a dumpit's validation error INSIDE the dump: `netlink_dump`
+// / `netlink_dump_done` (net/netlink/af_netlink.c) write the dumpit's
+// negative return as the i32 payload of the terminating NLMSG_DONE, flagged
+// NLM_F_MULTI | cb->answer_flags (+ NLM_F_ACK_TLVS and NLMSGERR_ATTR_MSG under
+// NETLINK_EXT_ACK). Only a request with no registered dumpit fails before the
+// dump starts, as NLMSG_ERROR(-EOPNOTSUPP) from `rtnetlink_rcv_msg`. A dump
+// that starts is never ACKed (`__netlink_dump_start` returns -EINTR, which
+// `netlink_rcv_skb` skips).
+
+const NETLINK_GET_STRICT_CHK: u64 = 12;
+const NLM_F_MULTI: u16 = 0x02;
+const NLM_F_DUMP_FILTERED: u16 = 0x20;
+const NLM_F_ACK_TLVS: u16 = 0x200;
+const RTM_GETTCLASS: u16 = 42;
+const RTM_GETACTION: u16 = 50;
+const RTM_GETADDRLABEL: u16 = 74;
+const RTM_GETMDB: u16 = 86;
+const RTM_GETNEXTHOP: u16 = 106;
+const RTNL_AF_UNSPEC: u8 = 0;
+const RTNL_AF_INET: u8 = 2;
+const RTNL_AF_BRIDGE: u8 = 7;
+const RTNL_AF_INET6: u8 = 10;
+const RTNL_AF_PACKET: u8 = 17;
+
+/// A framed rtnetlink request: `nlmsg_len = 16 + body.len()`, zero-padded to
+/// NLMSG_ALIGN.
+fn rtnl_request(msg_type: u16, flags: u16, seq: u32, body: &[u8]) -> alloc::vec::Vec<u8> {
+    let len = NLMSG_HDRLEN + body.len();
+    let mut m = alloc::vec::Vec::with_capacity((len + 3) & !3);
+    m.extend_from_slice(&(len as u32).to_ne_bytes());
+    m.extend_from_slice(&msg_type.to_ne_bytes());
+    m.extend_from_slice(&flags.to_ne_bytes());
+    m.extend_from_slice(&seq.to_ne_bytes());
+    m.extend_from_slice(&0u32.to_ne_bytes());
+    m.extend_from_slice(body);
+    m.resize((len + 3) & !3, 0);
+    m
+}
+
+/// A legacy dump request carrying only `struct rtgenmsg { AF_UNSPEC }` —
+/// the smallest request `rtnetlink_rcv_msg` accepts.
+fn rtnl_dump_request(msg_type: u16, seq: u32) -> alloc::vec::Vec<u8> {
+    rtnl_request(msg_type, NLM_F_REQUEST_DUMP, seq, &[RTNL_AF_UNSPEC])
+}
+
+/// Append one `struct nlattr` (aligned) to a request body.
+fn push_nlattr(body: &mut alloc::vec::Vec<u8>, kind: u16, payload: &[u8]) {
+    body.resize((body.len() + 3) & !3, 0);
+    body.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+    body.extend_from_slice(&kind.to_ne_bytes());
+    body.extend_from_slice(payload);
+    body.resize((body.len() + 3) & !3, 0);
+}
+
+fn nl_flags_of(msg: &[u8]) -> u16 {
+    u16::from_ne_bytes([msg[6], msg[7]])
+}
+
+fn nl_seq_of(msg: &[u8]) -> u32 {
+    u32::from_ne_bytes([msg[8], msg[9], msg[10], msg[11]])
+}
+
+/// The i32 at the start of the payload: NLMSG_DONE's dump status or
+/// `nlmsgerr.error`.
+fn nl_status_of(msg: &[u8]) -> i64 {
+    i32::from_ne_bytes([msg[16], msg[17], msg[18], msg[19]]) as i64
+}
+
+/// Send `req` and drain every queued reply until the queue is empty.
+fn rtnl_exchange(
+    fd: u64,
+    req: &[u8],
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, &'static str> {
+    if netlink_send(fd, req).ok_or("rtnl send status")? != req.len() as i64 {
+        return Err("rtnetlink send did not consume the request");
+    }
+    let mut replies = alloc::vec::Vec::new();
+    for _ in 0..256 {
+        let mut buf = [0u8; 2048];
+        match netlink_recv(fd, &mut buf) {
+            Some(n) if n == EAGAIN => return Ok(replies),
+            Some(n) if n >= (NLMSG_HDRLEN + 4) as i64 => replies.push(buf[..n as usize].to_vec()),
+            _ => return Err("rtnetlink recv returned a malformed reply"),
+        }
+    }
+    Err("rtnetlink reply stream did not drain")
+}
+
+/// The replies must be a dump: zero or more entries then exactly one final
+/// NLMSG_DONE. Returns (entries, done).
+fn split_dump(
+    replies: &[alloc::vec::Vec<u8>],
+) -> Result<(&[alloc::vec::Vec<u8>], &alloc::vec::Vec<u8>), &'static str> {
+    let Some((done, entries)) = replies.split_last() else {
+        return Err("dump produced no replies");
+    };
+    if nlmsg_type_of(done) != NLMSG_DONE {
+        return Err("dump did not end with NLMSG_DONE");
+    }
+    if entries
+        .iter()
+        .any(|m| matches!(nlmsg_type_of(m), NLMSG_DONE | NLMSG_ERROR))
+    {
+        return Err("dump carried an NLMSG_ERROR/extra NLMSG_DONE before its end");
+    }
+    if nl_flags_of(done) & NLM_F_MULTI == 0 {
+        return Err("NLMSG_DONE lacked NLM_F_MULTI");
+    }
+    Ok((entries, done))
+}
+
+/// The dump's status: the NLMSG_DONE payload errno (0 = success).
+fn dump_status(fd: u64, req: &[u8]) -> Result<i64, &'static str> {
+    let replies = rtnl_exchange(fd, req)?;
+    let (entries, done) = split_dump(&replies)?;
+    if nl_status_of(done) != 0 && !entries.is_empty() {
+        return Err("a failed dump validation still emitted entries");
+    }
+    Ok(nl_status_of(done))
+}
+
+fn open_route(strict: bool) -> Result<u64, &'static str> {
+    let fd = open_netlink(NETLINK_ROUTE)?;
+    if strict {
+        netlink_set_u32(fd, NETLINK_GET_STRICT_CHK, 1)?;
+    }
+    Ok(fd)
+}
+
+fn close_fd(fd: u64) {
+    let _ = call(Syscall::Close.raw(), a0(fd));
+}
+
+/// `struct ifinfomsg` with the given family, type, index, flags.
+fn ifinfomsg_body(family: u8, ifi_type: u16, index: i32, flags: u32) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, 0];
+    b.extend_from_slice(&ifi_type.to_ne_bytes());
+    b.extend_from_slice(&index.to_ne_bytes());
+    b.extend_from_slice(&flags.to_ne_bytes());
+    b.extend_from_slice(&0u32.to_ne_bytes());
+    b
+}
+
+/// NEGATIVE: `rtnetlink_rcv_msg` returns 0 for a message without even a
+/// one-byte `struct rtgenmsg` — no dump, only the NLM_F_ACK acknowledgement.
+fn smoke_abi_netlink_route_header_only_request_is_ignored() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let bare = nlmsg_request(RTM_GETLINK, 300);
+        if !rtnl_exchange(fd, &bare)?.is_empty() {
+            return Err("a header-only RTM_GETLINK dump was answered");
+        }
+        let mut acked = bare;
+        acked[6..8].copy_from_slice(&(NLM_F_REQUEST_DUMP | NLM_F_ACK).to_ne_bytes());
+        let replies = rtnl_exchange(fd, &acked)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+            || nl_status_of(&replies[0]) != 0
+        {
+            return Err("a header-only request with NLM_F_ACK did not get exactly an ACK");
+        }
+        // POSITIVE: the one-byte rtgenmsg form is a valid legacy dump.
+        let replies = rtnl_exchange(fd, &rtnl_dump_request(RTM_GETLINK, 301))?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("a one-byte rtgenmsg RTM_GETLINK dump was not answered");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_header_only_request_is_ignored
+);
+
+/// NEGATIVE: `netlink_rcv_skb` only handles requests. A message without
+/// NLM_F_REQUEST is skipped (ACKed with 0 only on NLM_F_ACK), in strict mode
+/// too; it is not an -EINVAL error.
+fn smoke_abi_netlink_route_non_request_is_skipped() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        let not_request = rtnl_request(RTM_GETLINK, 0x300, 302, &body);
+        if !rtnl_exchange(fd, &not_request)?.is_empty() {
+            return Err("a message without NLM_F_REQUEST was answered");
+        }
+        let with_ack = rtnl_request(RTM_GETLINK, 0x300 | NLM_F_ACK, 303, &body);
+        let replies = rtnl_exchange(fd, &with_ack)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+            || nl_status_of(&replies[0]) != 0
+        {
+            return Err("a non-request with NLM_F_ACK did not get exactly a zero ACK");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_non_request_is_skipped
+);
+
+/// A dump that starts is never ACKed, even with NLM_F_ACK; a successful doit
+/// is answered by its reply followed by the ACK.
+fn smoke_abi_netlink_route_dump_is_not_acked() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        let dump = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP | NLM_F_ACK, 304, &body);
+        let replies = rtnl_exchange(fd, &dump)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("RTM_GETLINK dump with NLM_F_ACK was not a plain dump");
+        }
+        // Doit: RTM_GETLINK for ifindex 1 (lo) with NLM_F_ACK.
+        let get = rtnl_request(
+            RTM_GETLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            305,
+            &ifinfomsg_body(RTNL_AF_UNSPEC, 0, 1, 0),
+        );
+        let replies = rtnl_exchange(fd, &get)?;
+        if replies.len() != 2
+            || nlmsg_type_of(&replies[0]) != RTM_NEWLINK
+            || nlmsg_type_of(&replies[1]) != NLMSG_ERROR
+            || nl_status_of(&replies[1]) != 0
+        {
+            return Err("RTM_GETLINK doit was not RTM_NEWLINK followed by its ACK");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_dump_is_not_acked
+);
+
+/// `rtnl_valid_dump_ifinfo_req` (strict) + `rtnl_dump_ifinfo`: every
+/// rejection is -EINVAL in NLMSG_DONE, never an NLMSG_ERROR.
+fn smoke_abi_netlink_route_strict_link_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        // Short header (rtgenmsg only).
+        if dump_status(fd, &rtnl_dump_request(RTM_GETLINK, 310))? != EINVAL {
+            return Err("strict short ifinfomsg link dump was not DONE(-EINVAL)");
+        }
+        // Nonzero ifi_type / ifi_flags.
+        for body in [
+            ifinfomsg_body(RTNL_AF_UNSPEC, 1, 0, 0),
+            ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 1),
+        ] {
+            let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 311, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict link dump with header values was not DONE(-EINVAL)");
+            }
+        }
+        // Nonzero ifi_index: filtering by index is not supported.
+        let req = rtnl_request(
+            RTM_GETLINK,
+            NLM_F_REQUEST_DUMP,
+            312,
+            &ifinfomsg_body(RTNL_AF_UNSPEC, 0, 1, 0),
+        );
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with ifi_index was not DONE(-EINVAL)");
+        }
+        // IFLA_MTU passes ifla_policy but is not a dump attribute.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 4, &1500u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 313, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with IFLA_MTU was not DONE(-EINVAL)");
+        }
+        // An attribute type above IFLA_MAX (NL_VALIDATE_MAXTYPE).
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 200, &[0; 4]);
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 314, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with type > IFLA_MAX was not DONE(-EINVAL)");
+        }
+        // IFLA_EXT_MASK shorter than its NLA_U32 policy: -ERANGE.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 29, &[1, 0]);
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 315, &body);
+        if dump_status(fd, &req)? != ERANGE {
+            return Err("strict link dump with a 2-byte IFLA_EXT_MASK was not DONE(-ERANGE)");
+        }
+        // IFLA_TARGET_NETNSID naming an unassigned netns id.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 46, &7i32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 316, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict link dump with an unknown netnsid was not DONE(-EINVAL)");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_link_dump_validation
+);
+
+/// POSITIVE: a clean strict link dump with IFLA_EXT_MASK succeeds for ANY
+/// family — `rtnetlink_rcv_msg` falls back to the PF_UNSPEC dumpit and
+/// `rtnl_dump_ifinfo` never checks the family.
+fn smoke_abi_netlink_route_strict_link_dump_accepts_any_family() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        for family in [RTNL_AF_UNSPEC, RTNL_AF_INET, RTNL_AF_PACKET] {
+            let mut body = ifinfomsg_body(family, 0, 0, 0);
+            push_nlattr(&mut body, 29, &1u32.to_ne_bytes()); // IFLA_EXT_MASK
+            let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 320, &body);
+            let replies = rtnl_exchange(fd, &req)?;
+            let (entries, done) = split_dump(&replies)?;
+            if nl_status_of(done) != 0
+                || entries.is_empty()
+                || entries.iter().any(|m| nlmsg_type_of(m) != RTM_NEWLINK)
+            {
+                return Err("strict link dump rejected a valid request for some family");
+            }
+        }
+        // IFLA_MASTER filters (no NARF device has a master) and marks the
+        // dump filtered; the NLMSG_DONE still succeeds.
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 10, &1u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 321, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if !entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("IFLA_MASTER link dump was not an empty successful dump");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_link_dump_accepts_any_family
+);
+
+/// Legacy (non-strict) link dumps stay lenient: the rtgenmsg hack, header
+/// values, a nonzero ifi_index, and unknown attributes are all ignored.
+fn smoke_abi_netlink_route_legacy_link_dump_is_lenient() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 1, 99, 1);
+        push_nlattr(&mut body, 4, &1500u32.to_ne_bytes());
+        push_nlattr(&mut body, 200, &[0; 4]);
+        for req in [
+            rtnl_dump_request(RTM_GETLINK, 322),
+            rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 323, &body),
+        ] {
+            let replies = rtnl_exchange(fd, &req)?;
+            let (entries, done) = split_dump(&replies)?;
+            if entries.is_empty() || nl_status_of(done) != 0 {
+                return Err("legacy link dump rejected a lenient request");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_legacy_link_dump_is_lenient
+);
+
+/// NETLINK_EXT_ACK: the failing dump's NLMSG_DONE carries NLM_F_ACK_TLVS and
+/// the Linux extack message; a successful dump's NLMSG_DONE carries neither.
+fn smoke_abi_netlink_route_strict_dump_error_extack() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        netlink_set_u32(fd, NETLINK_EXT_ACK, 1)?;
+        let replies = rtnl_exchange(fd, &rtnl_dump_request(RTM_GETLINK, 330))?;
+        let (_, done) = split_dump(&replies)?;
+        if nl_status_of(done) != EINVAL || nl_flags_of(done) & NLM_F_ACK_TLVS == 0 {
+            return Err("failed link dump DONE lacked -EINVAL + NLM_F_ACK_TLVS");
+        }
+        if !window_contains(done, b"Invalid header for link dump\0") {
+            return Err("failed link dump DONE lacked the Linux extack message");
+        }
+        let body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST_DUMP, 331, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        let (_, done) = split_dump(&replies)?;
+        if nl_status_of(done) != 0 || nl_flags_of(done) & NLM_F_ACK_TLVS != 0 {
+            return Err("successful link dump DONE carried an error or extack TLVs");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_dump_error_extack
+);
+
+/// `struct ifaddrmsg`.
+fn ifaddrmsg_body(
+    family: u8,
+    prefixlen: u8,
+    flags: u8,
+    scope: u8,
+    index: u32,
+) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, prefixlen, flags, scope];
+    b.extend_from_slice(&index.to_ne_bytes());
+    b
+}
+
+/// `inet_valid_dump_ifaddr_req` / `inet6_valid_dump_ifaddr_req`.
+fn smoke_abi_netlink_route_strict_addr_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETADDR, 340))? != EINVAL {
+            return Err("strict short ifaddrmsg dump was not DONE(-EINVAL)");
+        }
+        for family in [RTNL_AF_UNSPEC, RTNL_AF_INET, RTNL_AF_INET6] {
+            for body in [
+                ifaddrmsg_body(family, 8, 0, 0, 0),
+                ifaddrmsg_body(family, 0, 1, 0, 0),
+                ifaddrmsg_body(family, 0, 0, 254, 0),
+            ] {
+                let req = rtnl_request(RTM_GETADDR, NLM_F_REQUEST_DUMP, 341, &body);
+                if dump_status(fd, &req)? != EINVAL {
+                    return Err(
+                        "strict addr dump with prefixlen/flags/scope was not DONE(-EINVAL)",
+                    );
+                }
+            }
+            // Only IFA_TARGET_NETNSID is a dump attribute.
+            let mut body = ifaddrmsg_body(family, 0, 0, 0, 0);
+            push_nlattr(&mut body, 2, &[127, 0, 0, 1]); // IFA_LOCAL (IPv4 policy: U32)
+            let req = rtnl_request(RTM_GETADDR, NLM_F_REQUEST_DUMP, 342, &body);
+            let want = if family == RTNL_AF_INET6 {
+                ERANGE
+            } else {
+                EINVAL
+            };
+            // ifa_ipv6_policy[IFA_LOCAL] needs 16 bytes, so the IPv6 parse
+            // fails policy (-ERANGE) before the attribute loop.
+            if dump_status(fd, &req)? != want {
+                return Err("strict addr dump with IFA_LOCAL had the wrong DONE errno");
+            }
+            let mut body = ifaddrmsg_body(family, 0, 0, 0, 0);
+            push_nlattr(&mut body, 10, &3i32.to_ne_bytes()); // IFA_TARGET_NETNSID
+            let req = rtnl_request(RTM_GETADDR, NLM_F_REQUEST_DUMP, 343, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict addr dump with an unknown netnsid was not DONE(-EINVAL)");
+            }
+            // A missing device: -ENODEV, still inside the dump.
+            let req = rtnl_request(
+                RTM_GETADDR,
+                NLM_F_REQUEST_DUMP,
+                344,
+                &ifaddrmsg_body(family, 0, 0, 0, 0x0FFF_FFFF),
+            );
+            if dump_status(fd, &req)? != ENODEV {
+                return Err("strict addr dump of a missing ifindex was not DONE(-ENODEV)");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_addr_dump_validation
+);
+
+/// POSITIVE: a strict ifa_index selects that device's addresses and marks
+/// every entry and the NLMSG_DONE (cb->answer_flags) NLM_F_DUMP_FILTERED.
+fn smoke_abi_netlink_route_strict_addr_dump_index_filter() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            345,
+            &ifaddrmsg_body(RTNL_AF_UNSPEC, 0, 0, 0, 1),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if nl_status_of(done) != 0 || nl_flags_of(done) & NLM_F_DUMP_FILTERED == 0 {
+            return Err("filtered addr dump DONE was not 0 + NLM_F_DUMP_FILTERED");
+        }
+        let mut families = (false, false);
+        for m in entries {
+            let index = u32::from_ne_bytes(m[20..24].try_into().unwrap());
+            if nlmsg_type_of(m) != RTM_NEWADDR
+                || index != 1
+                || nl_flags_of(m) & NLM_F_DUMP_FILTERED == 0
+            {
+                return Err("filtered addr dump entry was off-device or unmarked");
+            }
+            match m[NLMSG_HDRLEN] {
+                RTNL_AF_INET => families.0 = true,
+                RTNL_AF_INET6 => families.1 = true,
+                _ => return Err("filtered addr dump entry had a bad family"),
+            }
+        }
+        if families != (true, true) {
+            return Err("AF_UNSPEC addr dump did not cover both IPv4 and IPv6 of lo");
+        }
+        // A clean unfiltered strict dump is not marked filtered.
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            346,
+            &ifaddrmsg_body(RTNL_AF_INET, 0, 0, 0, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty()
+            || nl_flags_of(done) & NLM_F_DUMP_FILTERED != 0
+            || entries
+                .iter()
+                .any(|m| nl_flags_of(m) & NLM_F_DUMP_FILTERED != 0)
+        {
+            return Err("unfiltered strict addr dump was marked filtered");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_addr_dump_index_filter
+);
+
+/// Legacy address dumps ignore the ifaddrmsg header (`inet_dump_addr` reads
+/// ifa_index only under strict checking), and a family with no RTM_GETADDR
+/// dumpit falls back to `rtnl_dump_all` (every address family).
+fn smoke_abi_netlink_route_legacy_addr_dump_ignores_header() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(false)?;
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            347,
+            &ifaddrmsg_body(RTNL_AF_INET, 8, 1, 254, 0x0FFF_FFFF),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if nl_status_of(done) != 0 || !entries.iter().any(|m| window_contains(m, &[127, 0, 0, 1])) {
+            return Err("legacy addr dump honoured a bogus ifa_index / header");
+        }
+        let req = rtnl_request(
+            RTM_GETADDR,
+            NLM_F_REQUEST_DUMP,
+            348,
+            &ifaddrmsg_body(RTNL_AF_PACKET, 0, 0, 0, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        let v4 = entries.iter().any(|m| m[NLMSG_HDRLEN] == RTNL_AF_INET);
+        let v6 = entries.iter().any(|m| m[NLMSG_HDRLEN] == RTNL_AF_INET6);
+        if nl_status_of(done) != 0 || !v4 || !v6 {
+            return Err("AF_PACKET addr dump did not fall back to rtnl_dump_all");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_legacy_addr_dump_ignores_header
+);
+
+/// `struct rtmsg`.
+fn rtmsg_body(family: u8, dst_len: u8, table: u8, flags: u32) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, dst_len, 0, 0, table, 0, 0, 0];
+    b.extend_from_slice(&flags.to_ne_bytes());
+    b
+}
+
+/// `ip_valid_fib_dump_req` + `inet_dump_fib` / `inet6_dump_fib`.
+fn smoke_abi_netlink_route_strict_route_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETROUTE, 350))? != EINVAL {
+            return Err("strict short rtmsg dump was not DONE(-EINVAL)");
+        }
+        for body in [
+            rtmsg_body(RTNL_AF_INET, 8, 0, 0),
+            rtmsg_body(RTNL_AF_INET, 0, 0, 0x100), // RTM_F_NOTIFY is not a dump flag
+        ] {
+            let req = rtnl_request(RTM_GETROUTE, NLM_F_REQUEST_DUMP, 351, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict route dump with bad header was not DONE(-EINVAL)");
+            }
+        }
+        let mut body = rtmsg_body(RTNL_AF_INET, 0, 0, 0);
+        push_nlattr(&mut body, 6, &1u32.to_ne_bytes()); // RTA_PRIORITY
+        let req = rtnl_request(RTM_GETROUTE, NLM_F_REQUEST_DUMP, 352, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict route dump with RTA_PRIORITY was not DONE(-EINVAL)");
+        }
+        let mut body = rtmsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 4, &0x0FFF_FFFFu32.to_ne_bytes()); // RTA_OIF
+        let req = rtnl_request(RTM_GETROUTE, NLM_F_REQUEST_DUMP, 353, &body);
+        if dump_status(fd, &req)? != ENODEV {
+            return Err("strict route dump with a missing RTA_OIF was not DONE(-ENODEV)");
+        }
+        // A missing table is -ENOENT only for the table's own family.
+        for (family, want) in [
+            (RTNL_AF_INET, ENOENT),
+            (RTNL_AF_INET6, ENOENT),
+            (RTNL_AF_UNSPEC, 0),
+        ] {
+            let req = rtnl_request(
+                RTM_GETROUTE,
+                NLM_F_REQUEST_DUMP,
+                354,
+                &rtmsg_body(family, 0, 77, 0),
+            );
+            if dump_status(fd, &req)? != want {
+                return Err("strict route dump of a missing table had the wrong DONE errno");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_route_dump_validation
+);
+
+/// POSITIVE: strict route dumps mark every entry NLM_F_DUMP_FILTERED
+/// (`dump_exceptions` is off), and the NLMSG_DONE only when a filter is set.
+/// Legacy dumps ignore rtm_table.
+fn smoke_abi_netlink_route_route_dump_filter_flags() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let req = rtnl_request(
+            RTM_GETROUTE,
+            NLM_F_REQUEST_DUMP,
+            355,
+            &rtmsg_body(RTNL_AF_INET, 0, 0, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty()
+            || nl_status_of(done) != 0
+            || nl_flags_of(done) & NLM_F_DUMP_FILTERED != 0
+            || entries
+                .iter()
+                .any(|m| nl_flags_of(m) & NLM_F_DUMP_FILTERED == 0)
+        {
+            return Err("strict unfiltered route dump flags differ from Linux");
+        }
+        let req = rtnl_request(
+            RTM_GETROUTE,
+            NLM_F_REQUEST_DUMP,
+            356,
+            &rtmsg_body(RTNL_AF_INET, 0, 255, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty()
+            || nl_flags_of(done) & NLM_F_DUMP_FILTERED == 0
+            || entries.iter().any(|m| m[NLMSG_HDRLEN + 4] != 255)
+        {
+            return Err("strict local-table route dump was not filtered to table 255");
+        }
+        close_fd(fd);
+
+        let fd = open_route(false)?;
+        let req = rtnl_request(
+            RTM_GETROUTE,
+            NLM_F_REQUEST_DUMP,
+            357,
+            &rtmsg_body(RTNL_AF_INET, 0, 254, 0),
+        );
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, _) = split_dump(&replies)?;
+        if !entries.iter().any(|m| m[NLMSG_HDRLEN + 4] == 255) {
+            return Err("legacy route dump filtered by rtm_table");
+        }
+        if entries
+            .iter()
+            .any(|m| nl_flags_of(m) & NLM_F_DUMP_FILTERED != 0)
+        {
+            return Err("legacy route dump entries were marked filtered");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_route_dump_filter_flags
+);
+
+/// `struct ndmsg`.
+fn ndmsg_body(family: u8, ifindex: i32, state: u16, flags: u8) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![family, 0, 0, 0];
+    b.extend_from_slice(&ifindex.to_ne_bytes());
+    b.extend_from_slice(&state.to_ne_bytes());
+    b.push(flags);
+    b.push(0);
+    b
+}
+
+/// `neigh_valid_dump_req` (strict).
+fn smoke_abi_netlink_route_strict_neigh_dump_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETNEIGH, 360))? != EINVAL {
+            return Err("strict short ndmsg dump was not DONE(-EINVAL)");
+        }
+        for body in [
+            ndmsg_body(RTNL_AF_INET, 1, 0, 0),    // ndm_ifindex
+            ndmsg_body(RTNL_AF_INET, 0, 0x02, 0), // ndm_state
+            ndmsg_body(RTNL_AF_INET, 0, 0, 0x80), // ndm_flags other than NTF_PROXY
+        ] {
+            let req = rtnl_request(RTM_GETNEIGH, NLM_F_REQUEST_DUMP, 361, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("strict neigh dump with header values was not DONE(-EINVAL)");
+            }
+        }
+        let mut body = ndmsg_body(RTNL_AF_INET, 0, 0, 0);
+        push_nlattr(&mut body, 1, &[10, 0, 0, 1]); // NDA_DST
+        let req = rtnl_request(RTM_GETNEIGH, NLM_F_REQUEST_DUMP, 362, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict neigh dump with NDA_DST was not DONE(-EINVAL)");
+        }
+        // POSITIVE: NDA_IFINDEX is the dump's device filter; NTF_PROXY is
+        // an allowed flag (proxy table).
+        let mut body = ndmsg_body(RTNL_AF_INET, 0, 0, 0);
+        push_nlattr(&mut body, 8, &1u32.to_ne_bytes());
+        for req in [
+            rtnl_request(RTM_GETNEIGH, NLM_F_REQUEST_DUMP, 363, &body),
+            rtnl_request(
+                RTM_GETNEIGH,
+                NLM_F_REQUEST_DUMP,
+                364,
+                &ndmsg_body(RTNL_AF_INET6, 0, 0, 0x08),
+            ),
+        ] {
+            if dump_status(fd, &req)? != 0 {
+                return Err("strict neigh dump rejected a valid request");
+            }
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_neigh_dump_validation
+);
+
+/// `fib_valid_dumprule_req` (strict) and `fib_nl_dumprule`'s family lookup
+/// (-EAFNOSUPPORT in either mode).
+fn smoke_abi_netlink_route_rule_dump_validation() -> TestResult {
+    with_setup(|| {
+        let rule = |family: u8, table: u8| {
+            let mut b = alloc::vec![family, 0, 0, 0, table, 0, 0, 0];
+            b.extend_from_slice(&0u32.to_ne_bytes());
+            b
+        };
+        let fd = open_route(true)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETRULE, 370))? != EINVAL {
+            return Err("strict short fib_rule_hdr dump was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(
+            RTM_GETRULE,
+            NLM_F_REQUEST_DUMP,
+            371,
+            &rule(RTNL_AF_INET, 254),
+        );
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict rule dump with a table was not DONE(-EINVAL)");
+        }
+        let mut body = rule(RTNL_AF_INET, 0);
+        push_nlattr(&mut body, 6, &0u32.to_ne_bytes()); // FRA_PRIORITY
+        let req = rtnl_request(RTM_GETRULE, NLM_F_REQUEST_DUMP, 372, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict rule dump with attributes was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(RTM_GETRULE, NLM_F_REQUEST_DUMP, 373, &rule(RTNL_AF_INET, 0));
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.len() != 3 || nl_status_of(done) != 0 {
+            return Err("strict IPv4 rule dump did not return the three default rules");
+        }
+        let req = rtnl_request(
+            RTM_GETRULE,
+            NLM_F_REQUEST_DUMP,
+            374,
+            &rule(RTNL_AF_PACKET, 0),
+        );
+        if dump_status(fd, &req)? != EAFNOSUPPORT {
+            return Err("strict rule dump of a family without rules was not -EAFNOSUPPORT");
+        }
+        close_fd(fd);
+        let fd = open_route(false)?;
+        let req = rtnl_request(RTM_GETRULE, NLM_F_REQUEST_DUMP, 375, &[RTNL_AF_PACKET]);
+        if dump_status(fd, &req)? != EAFNOSUPPORT {
+            return Err("legacy rule dump of a family without rules was not -EAFNOSUPPORT");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_rule_dump_validation
+);
+
+/// Traffic-control dumps have no strict validator: `tc_dump_qdisc` fails a
+/// short tcmsg (liberal `nlmsg_parse` → -EINVAL) and policy violations
+/// (-ERANGE), and dumps every device regardless of tcm_ifindex;
+/// `tc_dump_tfilter` treats a short tcmsg as empty; `tc_dump_action` needs
+/// a tcamsg.
+fn smoke_abi_netlink_route_tc_dump_validation() -> TestResult {
+    with_setup(|| {
+        let tcmsg = |ifindex: i32| {
+            let mut b = alloc::vec![0u8, 0, 0, 0];
+            b.extend_from_slice(&ifindex.to_ne_bytes());
+            b.extend_from_slice(&[0u8; 12]);
+            b
+        };
+        let fd = open_route(false)?;
+        if dump_status(fd, &rtnl_dump_request(RTM_GETQDISC, 380))? != EINVAL {
+            return Err("short tcmsg qdisc dump was not DONE(-EINVAL)");
+        }
+        let mut body = tcmsg(0);
+        push_nlattr(&mut body, 10, &[1, 0, 0, 0]); // TCA_DUMP_INVISIBLE is a flag
+        let req = rtnl_request(RTM_GETQDISC, NLM_F_REQUEST_DUMP, 381, &body);
+        if dump_status(fd, &req)? != ERANGE {
+            return Err("qdisc dump with a non-empty flag attribute was not DONE(-ERANGE)");
+        }
+        let req = rtnl_request(RTM_GETQDISC, NLM_F_REQUEST_DUMP, 382, &tcmsg(0x0FFF_FFFF));
+        let replies = rtnl_exchange(fd, &req)?;
+        let (entries, done) = split_dump(&replies)?;
+        if entries.is_empty() || nl_status_of(done) != 0 {
+            return Err("qdisc dump treated tcm_ifindex as a filter");
+        }
+        if dump_status(fd, &rtnl_dump_request(RTM_GETTFILTER, 383))? != 0 {
+            return Err("short tcmsg filter dump was not an empty dump");
+        }
+        if dump_status(fd, &rtnl_dump_request(RTM_GETACTION, 384))? != EINVAL {
+            return Err("short tcamsg action dump was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(RTM_GETACTION, NLM_F_REQUEST_DUMP, 385, &[0, 0, 0, 0]);
+        if dump_status(fd, &req)? != 0 {
+            return Err("tcamsg action dump was not an empty dump");
+        }
+        let req = rtnl_request(RTM_GETTCLASS, NLM_F_REQUEST_DUMP, 386, &tcmsg(1));
+        if dump_status(fd, &req)? != 0 {
+            return Err("class dump was not an empty dump");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_tc_dump_validation
+);
+
+/// Families without a dumpit fail before the dump starts:
+/// RTM_GETADDRLABEL is registered only for PF_INET6 and RTM_GETMDB only for
+/// PF_BRIDGE, so any other family is NLMSG_ERROR(-EOPNOTSUPP). With the
+/// right family the strict validators run inside the dump.
+fn smoke_abi_netlink_route_family_only_dumps() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        for (msg_type, family) in [
+            (RTM_GETADDRLABEL, RTNL_AF_UNSPEC),
+            (RTM_GETADDRLABEL, RTNL_AF_INET),
+            (RTM_GETMDB, RTNL_AF_UNSPEC),
+            (RTM_GETMDB, RTNL_AF_INET6),
+        ] {
+            let body = [family, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let replies =
+                rtnl_exchange(fd, &rtnl_request(msg_type, NLM_F_REQUEST_DUMP, 390, &body))?;
+            if replies.len() != 1
+                || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+                || nl_status_of(&replies[0]) != EOPNOTSUPP
+            {
+                return Err("dump of an unregistered family was not NLMSG_ERROR(-EOPNOTSUPP)");
+            }
+        }
+        // ip6addrlbl_valid_dump_req: ifal_index must be zero; no trailing data.
+        let mut body = alloc::vec![RTNL_AF_INET6, 0, 0, 0];
+        body.extend_from_slice(&1u32.to_ne_bytes());
+        body.extend_from_slice(&0u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETADDRLABEL, NLM_F_REQUEST_DUMP, 391, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict addrlabel dump with ifal_index was not DONE(-EINVAL)");
+        }
+        let body = [RTNL_AF_INET6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let req = rtnl_request(RTM_GETADDRLABEL, NLM_F_REQUEST_DUMP, 392, &body);
+        if dump_status(fd, &req)? != 0 {
+            return Err("strict addrlabel dump rejected a valid request");
+        }
+        // rtnl_mdb_valid_dump_req: ifindex filtering is not supported.
+        let mut body = alloc::vec![RTNL_AF_BRIDGE, 0, 0, 0];
+        body.extend_from_slice(&1u32.to_ne_bytes());
+        let req = rtnl_request(RTM_GETMDB, NLM_F_REQUEST_DUMP, 393, &body);
+        if dump_status(fd, &req)? != EINVAL {
+            return Err("strict mdb dump with ifindex was not DONE(-EINVAL)");
+        }
+        let req = rtnl_request(
+            RTM_GETMDB,
+            NLM_F_REQUEST_DUMP,
+            394,
+            &[RTNL_AF_BRIDGE, 0, 0, 0, 0, 0, 0, 0],
+        );
+        if dump_status(fd, &req)? != 0 {
+            return Err("strict mdb dump rejected a valid request");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_family_only_dumps
+);
+
+/// `nh_valid_dump_req` parses with NL_VALIDATE_STRICT whether or not the
+/// socket asked for strict checking, and accepts every family.
+fn smoke_abi_netlink_route_nexthop_dump_validation() -> TestResult {
+    with_setup(|| {
+        let nhmsg = |family: u8, scope: u8, flags: u32| {
+            let mut b = alloc::vec![family, scope, 0, 0];
+            b.extend_from_slice(&flags.to_ne_bytes());
+            b
+        };
+        for strict in [false, true] {
+            let fd = open_route(strict)?;
+            for family in [RTNL_AF_UNSPEC, RTNL_AF_INET, RTNL_AF_INET6] {
+                let req = rtnl_request(
+                    RTM_GETNEXTHOP,
+                    NLM_F_REQUEST_DUMP,
+                    400,
+                    &nhmsg(family, 0, 0),
+                );
+                if dump_status(fd, &req)? != 0 {
+                    return Err("nexthop dump rejected a valid request");
+                }
+            }
+            if dump_status(fd, &rtnl_dump_request(RTM_GETNEXTHOP, 401))? != EINVAL {
+                return Err("short nhmsg nexthop dump was not DONE(-EINVAL)");
+            }
+            for body in [nhmsg(RTNL_AF_INET, 1, 0), nhmsg(RTNL_AF_INET, 0, 1)] {
+                let req = rtnl_request(RTM_GETNEXTHOP, NLM_F_REQUEST_DUMP, 402, &body);
+                if dump_status(fd, &req)? != EINVAL {
+                    return Err("nexthop dump with header values was not DONE(-EINVAL)");
+                }
+            }
+            // NHA_OIF must be exactly four bytes (NL_VALIDATE_STRICT_ATTRS).
+            let mut body = nhmsg(RTNL_AF_INET, 0, 0);
+            push_nlattr(&mut body, 5, &[1, 0, 0, 0, 0, 0, 0, 0]);
+            let req = rtnl_request(RTM_GETNEXTHOP, NLM_F_REQUEST_DUMP, 403, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("nexthop dump with an 8-byte NHA_OIF was not DONE(-EINVAL)");
+            }
+            // NHA_ID is NLA_UNSPEC in the dump policy (NL_VALIDATE_UNSPEC).
+            let mut body = nhmsg(RTNL_AF_INET, 0, 0);
+            push_nlattr(&mut body, 1, &1u32.to_ne_bytes());
+            let req = rtnl_request(RTM_GETNEXTHOP, NLM_F_REQUEST_DUMP, 404, &body);
+            if dump_status(fd, &req)? != EINVAL {
+                return Err("nexthop dump with NHA_ID was not DONE(-EINVAL)");
+            }
+            close_fd(fd);
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_nexthop_dump_validation
+);
+
+/// `rtnl_valid_getlink_req` (strict doit): only IFLA_IFNAME, IFLA_EXT_MASK,
+/// IFLA_TARGET_NETNSID, and IFLA_ALT_IFNAME are accepted; the doit's error is
+/// an NLMSG_ERROR (it is not a dump).
+fn smoke_abi_netlink_route_strict_getlink_doit_validation() -> TestResult {
+    with_setup(|| {
+        let fd = open_route(true)?;
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 1, 0);
+        push_nlattr(&mut body, 4, &1500u32.to_ne_bytes()); // IFLA_MTU
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST, 410, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != NLMSG_ERROR
+            || nl_status_of(&replies[0]) != EINVAL
+        {
+            return Err("strict RTM_GETLINK doit with IFLA_MTU was not NLMSG_ERROR(-EINVAL)");
+        }
+        let mut body = ifinfomsg_body(RTNL_AF_UNSPEC, 0, 0, 0);
+        push_nlattr(&mut body, 3, b"lo\0"); // IFLA_IFNAME
+        push_nlattr(&mut body, 29, &1u32.to_ne_bytes()); // IFLA_EXT_MASK
+        let req = rtnl_request(RTM_GETLINK, NLM_F_REQUEST, 411, &body);
+        let replies = rtnl_exchange(fd, &req)?;
+        if replies.len() != 1
+            || nlmsg_type_of(&replies[0]) != RTM_NEWLINK
+            || nl_seq_of(&replies[0]) != 411
+        {
+            return Err("strict RTM_GETLINK doit by IFLA_IFNAME did not return lo");
+        }
+        close_fd(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_strict_getlink_doit_validation
 );
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
@@ -8022,3 +9116,1265 @@ fn smoke_abi_socket_recvmsg_header_errnos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_header_errnos);
+
+// ─────────────────────────── inode identity ───────────────────────────
+//
+// Linux `sock_alloc`: every socket is its own sockfs inode
+// (`new_inode_pseudo` + `get_next_ino`), so the two ends of a socketpair
+// and two independent sockets all differ, while all share sockfs's st_dev.
+
+fn socketpair_fds() -> Result<(u64, u64), &'static str> {
+    let mut sv = [0u8; 8];
+    let r = call(
+        Syscall::SocketPair.raw(),
+        a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+    );
+    if r != Some(0) {
+        return Err("socketpair failed");
+    }
+    let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+    let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+    Ok((fd0, fd1))
+}
+
+fn smoke_abi_socket_inode_per_socket_pos() -> TestResult {
+    with_setup(|| {
+        let (s0, s1) = socketpair_fds()?;
+        let a = crate::abi_fdio2_tests::fstat_id(s0)?;
+        let b = crate::abi_fdio2_tests::fstat_id(s1)?;
+        let c = crate::abi_fdio2_tests::fstat_id(open_unix_stream()?)?;
+        if a.0 == 0 || a.1 == 0 {
+            return Err("a socket reported st_dev or st_ino 0");
+        }
+        if a.1 == b.1 {
+            return Err("the two ends of a socketpair share an st_ino");
+        }
+        if a.1 == c.1 || b.1 == c.1 {
+            return Err("two sockets share an st_ino");
+        }
+        if a.0 != b.0 || a.0 != c.0 {
+            return Err("sockets are not all on the sockfs superblock");
+        }
+        // A dup is the same socket, so the same inode.
+        let d = call(Syscall::Dup.raw(), a0(s0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("dup failed")? as u64;
+        if crate::abi_fdio2_tests::fstat_id(d)? != a {
+            return Err("dup of a socket changed its inode");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_inode_per_socket_pos);
+
+/// sockfs is its own superblock: a socket is neither the shared anon inode
+/// nor on its superblock.
+fn smoke_abi_socket_inode_not_anon_inode_neg() -> TestResult {
+    with_setup(|| {
+        let s = crate::abi_fdio2_tests::fstat_id(open_unix_stream()?)?;
+        let ev = call(Syscall::Eventfd.raw(), a1(0, 0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("eventfd failed")? as u64;
+        let e = crate::abi_fdio2_tests::fstat_id(ev)?;
+        if s == e || s.0 == e.0 {
+            return Err("a socket reports the anon inode's st_dev");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_inode_not_anon_inode_neg
+);
+
+// ───────────── Daemon sockopt parity (resolved / avahi / userdbd) ─────────────
+//
+// systemd-resolved, avahi-daemon and systemd-userdbd refused to start on NARF
+// because options Linux accepts came back ENOPROTOOPT. Each smoke below pins
+// the Linux answer — value, errno and check order — from
+// `net/ipv4/ip_sockglue.c` (`do_ip_setsockopt` / `do_ip_getsockopt`),
+// `net/ipv6/ipv6_sockglue.c` (`do_ipv6_setsockopt` / `do_ipv6_getsockopt`),
+// `net/ipv4/igmp.c` (`__ip_mc_join_group` / `ip_mc_leave_group`),
+// `net/ipv6/mcast.c` (`__ipv6_sock_mc_join` / `ipv6_sock_mc_drop`) and
+// `net/core/sock.c` (`sk_setsockopt` / `sk_getsockopt` / `sock_set_timeout`).
+
+mod sockopt_parity {
+    pub const AF_INET6: u64 = 10;
+    pub const IPPROTO_IP: u64 = 0;
+    pub const IPPROTO_IPV6: u64 = 41;
+    // SOL_SOCKET
+    pub const SO_DONTROUTE: u64 = 5;
+    pub const SO_SNDBUF: u64 = 7;
+    pub const SO_RCVBUF: u64 = 8;
+    pub const SO_OOBINLINE: u64 = 10;
+    pub const SO_NO_CHECK: u64 = 11;
+    pub const SO_PRIORITY: u64 = 12;
+    pub const SO_REUSEPORT: u64 = 15;
+    pub const SO_RCVLOWAT: u64 = 18;
+    pub const SO_SNDLOWAT: u64 = 19;
+    pub const SO_RCVTIMEO_OLD: u64 = 20;
+    pub const SO_SNDTIMEO_OLD: u64 = 21;
+    pub const SO_DETACH_FILTER: u64 = 27;
+    pub const SO_MARK: u64 = 36;
+    pub const SO_INCOMING_CPU: u64 = 49;
+    pub const SO_BINDTOIFINDEX: u64 = 62;
+    pub const SO_RCVTIMEO_NEW: u64 = 66;
+    pub const SO_SNDTIMEO_NEW: u64 = 67;
+    pub const SO_TXREHASH: u64 = 74;
+    // IPPROTO_IP
+    pub const IP_TTL: u64 = 2;
+    pub const IP_PKTINFO: u64 = 8;
+    pub const IP_MTU_DISCOVER: u64 = 10;
+    pub const IP_RECVERR: u64 = 11;
+    pub const IP_RECVTTL: u64 = 12;
+    pub const IP_FREEBIND: u64 = 15;
+    pub const IP_TRANSPARENT: u64 = 19;
+    pub const IP_RECVFRAGSIZE: u64 = 25;
+    pub const IP_MULTICAST_IF: u64 = 32;
+    pub const IP_MULTICAST_TTL: u64 = 33;
+    pub const IP_MULTICAST_LOOP: u64 = 34;
+    pub const IP_ADD_MEMBERSHIP: u64 = 35;
+    pub const IP_DROP_MEMBERSHIP: u64 = 36;
+    pub const IP_MULTICAST_ALL: u64 = 49;
+    pub const IP_UNICAST_IF: u64 = 50;
+    // IPPROTO_IPV6
+    pub const IPV6_UNICAST_HOPS: u64 = 16;
+    pub const IPV6_MULTICAST_IF: u64 = 17;
+    pub const IPV6_MULTICAST_HOPS: u64 = 18;
+    pub const IPV6_MULTICAST_LOOP: u64 = 19;
+    pub const IPV6_ADD_MEMBERSHIP: u64 = 20;
+    pub const IPV6_DROP_MEMBERSHIP: u64 = 21;
+    pub const IPV6_MTU: u64 = 24;
+    pub const IPV6_V6ONLY: u64 = 26;
+    pub const IPV6_MULTICAST_ALL: u64 = 29;
+    pub const IPV6_RECVPKTINFO: u64 = 49;
+    pub const IPV6_RECVHOPLIMIT: u64 = 51;
+    pub const IPV6_TCLASS: u64 = 67;
+    pub const IPV6_UNICAST_IF: u64 = 76;
+    pub const IPV6_RECVFRAGSIZE: u64 = 77;
+    pub const IPV6_FREEBIND: u64 = 78;
+    /// 224.0.0.251 (mDNS) and 224.0.0.252 (LLMNR), host order.
+    pub const MDNS_V4: u32 = 0xE000_00FB;
+    pub const LLMNR_V4: u32 = 0xE000_00FC;
+    /// ff02::fb.
+    pub const MDNS_V6: [u8; 16] = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb];
+    /// An interface index no test host has.
+    pub const NO_IFINDEX: u32 = 0x7fff0;
+}
+use sockopt_parity as so;
+
+fn sockopt_set(fd: u64, level: u64, name: u64, val: &[u8]) -> Result<i64, &'static str> {
+    call(
+        Syscall::SocketSetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: level,
+            arg2: name,
+            arg3: val.as_ptr() as u64,
+            arg4: val.len() as u64,
+            ..Default::default()
+        },
+    )
+    .ok_or("setsockopt status")
+}
+
+fn sockopt_set_int(fd: u64, level: u64, name: u64, v: i32) -> Result<i64, &'static str> {
+    sockopt_set(fd, level, name, &v.to_ne_bytes())
+}
+
+/// getsockopt into `out`; returns (return value, optlen written back).
+fn sockopt_get(fd: u64, level: u64, name: u64, out: &mut [u8]) -> Result<(i64, u32), &'static str> {
+    let mut len = out.len() as u32;
+    let r = call(
+        Syscall::SocketGetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: level,
+            arg2: name,
+            arg3: out.as_mut_ptr() as u64,
+            arg4: (&mut len as *mut u32) as u64,
+            ..Default::default()
+        },
+    )
+    .ok_or("getsockopt status")?;
+    Ok((r, len))
+}
+
+fn sockopt_get_int(fd: u64, level: u64, name: u64) -> Result<i32, &'static str> {
+    let mut out = [0u8; 4];
+    match sockopt_get(fd, level, name, &mut out)? {
+        (0, 4) => Ok(i32::from_ne_bytes(out)),
+        (0, _) => Err("int getsockopt did not report optlen 4"),
+        _ => Err("int getsockopt failed"),
+    }
+}
+
+fn sockopt_expect_int(
+    fd: u64,
+    level: u64,
+    name: u64,
+    want: i32,
+    what: &'static str,
+) -> Result<(), &'static str> {
+    if sockopt_get_int(fd, level, name)? != want {
+        return Err(what);
+    }
+    Ok(())
+}
+
+fn sockopt_socket(domain: u64, kind: u64) -> Result<u64, &'static str> {
+    match socket_errno(domain, kind, 0)? {
+        fd if fd >= 0 => Ok(fd as u64),
+        _ => Err("socket() failed"),
+    }
+}
+
+/// `struct ip_mreqn { imr_multiaddr, imr_address, imr_ifindex }`.
+fn ip_mreqn(group: u32, local: u32, ifindex: u32) -> [u8; 12] {
+    let mut m = [0u8; 12];
+    m[0..4].copy_from_slice(&group.to_be_bytes());
+    m[4..8].copy_from_slice(&local.to_be_bytes());
+    m[8..12].copy_from_slice(&ifindex.to_ne_bytes());
+    m
+}
+
+/// `struct ipv6_mreq { ipv6mr_multiaddr, ipv6mr_interface }`.
+fn ipv6_mreq(group: [u8; 16], ifindex: u32) -> [u8; 20] {
+    let mut m = [0u8; 20];
+    m[..16].copy_from_slice(&group);
+    m[16..20].copy_from_slice(&ifindex.to_ne_bytes());
+    m
+}
+
+fn sockaddr_in(ip: u32, port: u16) -> [u8; 16] {
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&ip.to_be_bytes());
+    sa
+}
+
+fn sockaddr_in6(ip: [u8; 16], port: u16, scope: u32) -> [u8; 28] {
+    let mut sa = [0u8; 28];
+    sa[0..2].copy_from_slice(&(so::AF_INET6 as u16).to_ne_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[8..24].copy_from_slice(&ip);
+    sa[24..28].copy_from_slice(&scope.to_ne_bytes());
+    sa
+}
+
+fn sockopt_bind(fd: u64, sa: &[u8]) -> Result<(), &'static str> {
+    match call(
+        Syscall::SocketBind.raw(),
+        a2(fd, sa.as_ptr() as u64, sa.len() as u64),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("bind failed"),
+    }
+}
+
+fn sockopt_sendto(fd: u64, buf: &[u8], sa: &[u8]) -> Option<i64> {
+    let mut args = a3(fd, buf.as_ptr() as u64, buf.len() as u64, 0);
+    args.arg4 = sa.as_ptr() as u64;
+    args.arg5 = sa.len() as u64;
+    call(Syscall::SocketSend.raw(), args)
+}
+
+fn sockopt_recv_nb(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    call(
+        Syscall::SocketRecv.raw(),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT),
+    )
+}
+
+fn sockopt_close(fds: &[u64]) {
+    for fd in fds {
+        let _ = call(Syscall::Close.raw(), a0(*fd));
+    }
+}
+
+type SetCase<'a> = (u64, u64, &'a [u8], i64, &'static str);
+
+/// resolved's LLMNR/mDNS IPv4 datagram setup (`manager_llmnr_ipv4_udp_fd`,
+/// `manager_mdns_ipv4_fd`) and avahi's `avahi_open_socket_ipv4`, including
+/// avahi's one-byte `uint8_t` IP_MULTICAST_TTL / IP_MULTICAST_LOOP optvals:
+/// every option is accepted and reads back what was stored.
+fn smoke_abi_socket_sockopt_ip_multicast_pos() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        // do_ip_getsockopt defaults: mc_loop 1, mc_ttl 1, mc_all 1,
+        // pmtudisc IP_PMTUDISC_WANT (inet_create), uc_index 0.
+        for (name, want, what) in [
+            (
+                so::IP_MULTICAST_LOOP,
+                1,
+                "default IP_MULTICAST_LOOP is not 1",
+            ),
+            (so::IP_MULTICAST_TTL, 1, "default IP_MULTICAST_TTL is not 1"),
+            (so::IP_MULTICAST_ALL, 1, "default IP_MULTICAST_ALL is not 1"),
+            (
+                so::IP_MTU_DISCOVER,
+                1,
+                "default IP_MTU_DISCOVER is not WANT",
+            ),
+            (so::IP_UNICAST_IF, 0, "default IP_UNICAST_IF is not 0"),
+        ] {
+            sockopt_expect_int(u, so::IPPROTO_IP, name, want, what)?;
+        }
+        for (name, v, what) in [
+            (so::IP_PKTINFO, 1, "IP_PKTINFO"),
+            (so::IP_RECVTTL, 1, "IP_RECVTTL"),
+            (so::IP_TTL, 255, "IP_TTL"),
+            (so::IP_MULTICAST_TTL, 255, "IP_MULTICAST_TTL"),
+            (so::IP_MULTICAST_LOOP, 0, "IP_MULTICAST_LOOP"),
+            (so::IP_MTU_DISCOVER, 5, "IP_MTU_DISCOVER OMIT"),
+            (so::IP_RECVERR, 1, "IP_RECVERR"),
+            (so::IP_RECVFRAGSIZE, 1, "IP_RECVFRAGSIZE"),
+            (so::IP_MULTICAST_ALL, 0, "IP_MULTICAST_ALL"),
+        ] {
+            if sockopt_set_int(u, so::IPPROTO_IP, name, v)? != 0 {
+                return Err(what);
+            }
+            if sockopt_get_int(u, so::IPPROTO_IP, name)? != v {
+                return Err(what);
+            }
+        }
+        // avahi's uint8_t optvals: a 1-byte optval is the value.
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP, &[1])? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP)? != 1
+        {
+            return Err("1-byte IP_MULTICAST_LOOP was not stored");
+        }
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_MULTICAST_TTL, &[7])? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_MULTICAST_TTL)? != 7
+        {
+            return Err("1-byte IP_MULTICAST_TTL was not stored");
+        }
+        // A 1-byte getsockopt of a small value copies one byte (copyval).
+        let mut one = [0u8; 1];
+        if sockopt_get(u, so::IPPROTO_IP, so::IP_MULTICAST_TTL, &mut one)? != (0, 1) || one[0] != 7
+        {
+            return Err("1-byte getsockopt(IP_MULTICAST_TTL) did not copy one byte");
+        }
+        // IP_UNICAST_IF takes the index in network byte order.
+        let be1 = 1u32.to_be_bytes();
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_UNICAST_IF, &be1)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_UNICAST_IF)? != i32::from_ne_bytes(be1)
+        {
+            return Err("IP_UNICAST_IF(lo) did not round-trip in network byte order");
+        }
+        // IP_MULTICAST_IF by in_addr; getsockopt reports the address.
+        let lo = 0x7F00_0001u32.to_be_bytes();
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_MULTICAST_IF, &lo)? != 0 {
+            return Err("IP_MULTICAST_IF(127.0.0.1) was refused");
+        }
+        let mut addr = [0u8; 4];
+        if sockopt_get(u, so::IPPROTO_IP, so::IP_MULTICAST_IF, &mut addr)? != (0, 4) || addr != lo {
+            return Err("getsockopt(IP_MULTICAST_IF) did not report 127.0.0.1");
+        }
+        // FREEBIND and TRANSPARENT are separate inet bits.
+        if sockopt_set_int(u, so::IPPROTO_IP, so::IP_FREEBIND, 1)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_FREEBIND)? != 1
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_TRANSPARENT)? != 0
+        {
+            return Err("IP_FREEBIND leaked into IP_TRANSPARENT");
+        }
+        // Group membership on lo, mreqn and mreq forms.
+        let m = ip_mreqn(so::LLMNR_V4, 0, 1);
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &m)? != 0 {
+            return Err("IP_ADD_MEMBERSHIP(224.0.0.252, lo) was refused");
+        }
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &m)? != 0 {
+            return Err("IP_DROP_MEMBERSHIP of a joined group was refused");
+        }
+        let mreq = ip_mreqn(so::MDNS_V4, 0x7F00_0001, 0);
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &mreq[..8])? != 0
+            || sockopt_set(u, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &mreq[..8])? != 0
+        {
+            return Err("8-byte ip_mreq join/leave by interface address failed");
+        }
+        sockopt_close(&[u]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ip_multicast_pos
+);
+
+/// The IP-level errno contract, in `do_ip_setsockopt`'s check order.
+fn smoke_abi_socket_sockopt_ip_multicast_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let t = sockopt_socket(AF_INET, SOCK_STREAM)?;
+        let one = 1i32.to_ne_bytes();
+        let big = 256i32.to_ne_bytes();
+        let two = 2i32.to_ne_bytes();
+        let six = 6i32.to_ne_bytes();
+        let no_if = so::NO_IFINDEX.to_be_bytes();
+        let testnet = 0xC000_0201u32.to_be_bytes();
+        let group = ip_mreqn(so::MDNS_V4, 0, 1);
+        let unicast = ip_mreqn(0x7F00_0001, 0, 1);
+        let nodev = ip_mreqn(so::MDNS_V4, 0, so::NO_IFINDEX);
+        let nodev_if = ip_mreqn(0, 0, so::NO_IFINDEX);
+        let checks: [SetCase<'_>; 14] = [
+            (
+                u,
+                so::IP_MULTICAST_LOOP,
+                &[],
+                EINVAL,
+                "IP_MULTICAST_LOOP optlen 0 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_TTL,
+                &big,
+                EINVAL,
+                "IP_MULTICAST_TTL 256 is not EINVAL",
+            ),
+            (
+                t,
+                so::IP_MULTICAST_TTL,
+                &one,
+                EINVAL,
+                "IP_MULTICAST_TTL on TCP is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_ALL,
+                &two,
+                EINVAL,
+                "IP_MULTICAST_ALL 2 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MTU_DISCOVER,
+                &six,
+                EINVAL,
+                "IP_MTU_DISCOVER 6 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_UNICAST_IF,
+                &[0],
+                EINVAL,
+                "IP_UNICAST_IF optlen 1 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_UNICAST_IF,
+                &no_if,
+                EADDRNOTAVAIL,
+                "IP_UNICAST_IF unknown index",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_IF,
+                &[0, 0, 0],
+                EINVAL,
+                "IP_MULTICAST_IF optlen 3 is not EINVAL",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_IF,
+                &testnet,
+                EADDRNOTAVAIL,
+                "IP_MULTICAST_IF non-local addr",
+            ),
+            (
+                u,
+                so::IP_MULTICAST_IF,
+                &nodev_if,
+                EADDRNOTAVAIL,
+                "IP_MULTICAST_IF unknown ifindex",
+            ),
+            (
+                u,
+                so::IP_ADD_MEMBERSHIP,
+                &group[..7],
+                EINVAL,
+                "IP_ADD_MEMBERSHIP optlen 7",
+            ),
+            (
+                u,
+                so::IP_ADD_MEMBERSHIP,
+                &unicast,
+                EINVAL,
+                "IP_ADD_MEMBERSHIP unicast group",
+            ),
+            (
+                u,
+                so::IP_ADD_MEMBERSHIP,
+                &nodev,
+                ENODEV,
+                "IP_ADD_MEMBERSHIP unknown device",
+            ),
+            (
+                t,
+                so::IP_ADD_MEMBERSHIP,
+                &group,
+                EPROTO,
+                "IP_ADD_MEMBERSHIP on TCP is not EPROTO",
+            ),
+        ];
+        for (fd, name, val, want, what) in checks {
+            if sockopt_set(fd, so::IPPROTO_IP, name, val)? != want {
+                return Err(what);
+            }
+        }
+        // Double join → EADDRINUSE; leaving a group never joined → EADDRNOTAVAIL.
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &group)? != 0
+            || sockopt_set(u, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &group)? != EADDRINUSE
+        {
+            return Err("a repeated IP_ADD_MEMBERSHIP is not EADDRINUSE");
+        }
+        let other = ip_mreqn(so::LLMNR_V4, 0, 1);
+        if sockopt_set(u, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &other)? != EADDRNOTAVAIL {
+            return Err("IP_DROP_MEMBERSHIP of a group never joined is not EADDRNOTAVAIL");
+        }
+        // Unknown IP option; IPv6 level on an AF_INET socket.
+        if sockopt_set(u, so::IPPROTO_IP, 199, &one)? != ENOPROTOOPT {
+            return Err("unknown IP option set is not ENOPROTOOPT");
+        }
+        let mut out = [0u8; 4];
+        if sockopt_get(u, so::IPPROTO_IP, 199, &mut out)?.0 != ENOPROTOOPT {
+            return Err("unknown IP option get is not ENOPROTOOPT");
+        }
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_MULTICAST_LOOP, &one)? != ENOPROTOOPT {
+            return Err("IPPROTO_IPV6 set on AF_INET is not ENOPROTOOPT (ip_setsockopt)");
+        }
+        if sockopt_get(u, so::IPPROTO_IPV6, so::IPV6_MULTICAST_LOOP, &mut out)?.0 != EOPNOTSUPP {
+            return Err("IPPROTO_IPV6 get on AF_INET is not EOPNOTSUPP (do_ip_getsockopt)");
+        }
+        sockopt_close(&[u, t]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ip_multicast_neg
+);
+
+/// resolved's LLMNR/mDNS IPv6 setup and avahi's `avahi_open_socket_ipv6`.
+fn smoke_abi_socket_sockopt_ipv6_multicast_pos() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        // inet6_create defaults: mc_loop 1, mcast_hops 1, mc_all 1,
+        // hop_limit -1 reported as the devconf default 64.
+        for (name, want, what) in [
+            (
+                so::IPV6_MULTICAST_LOOP,
+                1,
+                "default IPV6_MULTICAST_LOOP is not 1",
+            ),
+            (
+                so::IPV6_MULTICAST_HOPS,
+                1,
+                "default IPV6_MULTICAST_HOPS is not 1",
+            ),
+            (
+                so::IPV6_UNICAST_HOPS,
+                64,
+                "default IPV6_UNICAST_HOPS is not 64",
+            ),
+            (
+                so::IPV6_MULTICAST_ALL,
+                1,
+                "default IPV6_MULTICAST_ALL is not 1",
+            ),
+            (
+                so::IPV6_MULTICAST_IF,
+                0,
+                "default IPV6_MULTICAST_IF is not 0",
+            ),
+        ] {
+            sockopt_expect_int(u, so::IPPROTO_IPV6, name, want, what)?;
+        }
+        for (name, v, what) in [
+            (so::IPV6_RECVPKTINFO, 1, "IPV6_RECVPKTINFO"),
+            (so::IPV6_RECVHOPLIMIT, 1, "IPV6_RECVHOPLIMIT"),
+            (so::IPV6_UNICAST_HOPS, 255, "IPV6_UNICAST_HOPS"),
+            (so::IPV6_MULTICAST_HOPS, 255, "IPV6_MULTICAST_HOPS"),
+            (so::IPV6_MULTICAST_LOOP, 0, "IPV6_MULTICAST_LOOP"),
+            (so::IPV6_V6ONLY, 1, "IPV6_V6ONLY"),
+            (so::IPV6_MULTICAST_IF, 1, "IPV6_MULTICAST_IF"),
+            (so::IPV6_TCLASS, 0x28, "IPV6_TCLASS"),
+            (so::IPV6_RECVFRAGSIZE, 1, "IPV6_RECVFRAGSIZE"),
+            (so::IPV6_FREEBIND, 1, "IPV6_FREEBIND"),
+            (so::IPV6_MULTICAST_ALL, 0, "IPV6_MULTICAST_ALL"),
+        ] {
+            if sockopt_set_int(u, so::IPPROTO_IPV6, name, v)? != 0 {
+                return Err(what);
+            }
+            if sockopt_get_int(u, so::IPPROTO_IPV6, name)? != v {
+                return Err(what);
+            }
+        }
+        // -1 selects the default for both hop limits and the traffic class.
+        for (name, want, what) in [
+            (
+                so::IPV6_MULTICAST_HOPS,
+                1,
+                "IPV6_MULTICAST_HOPS -1 did not restore 1",
+            ),
+            (
+                so::IPV6_UNICAST_HOPS,
+                64,
+                "IPV6_UNICAST_HOPS -1 did not report 64",
+            ),
+            (so::IPV6_TCLASS, 0, "IPV6_TCLASS -1 did not restore 0"),
+        ] {
+            if sockopt_set_int(u, so::IPPROTO_IPV6, name, -1)? != 0
+                || sockopt_get_int(u, so::IPPROTO_IPV6, name)? != want
+            {
+                return Err(what);
+            }
+        }
+        // IPV6_MTU: 0 is legal (do_ipv6_setsockopt `val && val < IPV6_MIN_MTU`).
+        if sockopt_set_int(u, so::IPPROTO_IPV6, so::IPV6_MTU, 0)? != 0
+            || sockopt_set_int(u, so::IPPROTO_IPV6, so::IPV6_MTU, 1280)? != 0
+        {
+            return Err("IPV6_MTU 0 / 1280 was refused");
+        }
+        let be1 = 1u32.to_be_bytes();
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_UNICAST_IF, &be1)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IPV6, so::IPV6_UNICAST_IF)? != i32::from_ne_bytes(be1)
+        {
+            return Err("IPV6_UNICAST_IF(lo) did not round-trip");
+        }
+        let m = ipv6_mreq(so::MDNS_V6, 1);
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &m)? != 0
+            || sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_DROP_MEMBERSHIP, &m)? != 0
+        {
+            return Err("IPV6_ADD/DROP_MEMBERSHIP(ff02::fb, lo) failed");
+        }
+        // An AF_INET6 datagram socket takes SOL_IP options (ipv6_setsockopt
+        // hands `level == SOL_IP` to ip_setsockopt).
+        if sockopt_set_int(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP, 0)? != 0
+            || sockopt_get_int(u, so::IPPROTO_IP, so::IP_MULTICAST_LOOP)? != 0
+        {
+            return Err("SOL_IP IP_MULTICAST_LOOP on AF_INET6 did not round-trip");
+        }
+        sockopt_close(&[u]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ipv6_multicast_pos
+);
+
+/// The IPv6-level errno contract (`do_ipv6_setsockopt` / `ipv6_setsockopt`).
+fn smoke_abi_socket_sockopt_ipv6_multicast_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        let t = sockopt_socket(so::AF_INET6, SOCK_STREAM)?;
+        let one = 1i32.to_ne_bytes();
+        let two = 2i32.to_ne_bytes();
+        let big = 256i32.to_ne_bytes();
+        let neg2 = (-2i32).to_ne_bytes();
+        let no_if = so::NO_IFINDEX.to_ne_bytes();
+        let no_if_be = so::NO_IFINDEX.to_be_bytes();
+        let small_mtu = 1000i32.to_ne_bytes();
+        let group = ipv6_mreq(so::MDNS_V6, 1);
+        let nodev = ipv6_mreq(so::MDNS_V6, so::NO_IFINDEX);
+        let mut uni = [0u8; 16];
+        uni[15] = 1;
+        let unicast = ipv6_mreq(uni, 1);
+        let checks: [SetCase<'_>; 16] = [
+            (
+                u,
+                so::IPV6_MULTICAST_LOOP,
+                &one[..1],
+                EINVAL,
+                "IPV6_MULTICAST_LOOP optlen 1",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_LOOP,
+                &two,
+                EINVAL,
+                "IPV6_MULTICAST_LOOP 2 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_HOPS,
+                &one[..3],
+                EINVAL,
+                "IPV6_MULTICAST_HOPS optlen 3",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_HOPS,
+                &big,
+                EINVAL,
+                "IPV6_MULTICAST_HOPS 256 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_HOPS,
+                &neg2,
+                EINVAL,
+                "IPV6_MULTICAST_HOPS -2 is not EINVAL",
+            ),
+            (
+                t,
+                so::IPV6_MULTICAST_HOPS,
+                &one,
+                ENOPROTOOPT,
+                "IPV6_MULTICAST_HOPS on TCP",
+            ),
+            (
+                u,
+                so::IPV6_UNICAST_HOPS,
+                &one[..1],
+                EINVAL,
+                "IPV6_UNICAST_HOPS optlen 1",
+            ),
+            (
+                u,
+                so::IPV6_MULTICAST_IF,
+                &no_if,
+                ENODEV,
+                "IPV6_MULTICAST_IF unknown index",
+            ),
+            (
+                t,
+                so::IPV6_MULTICAST_IF,
+                &one,
+                ENOPROTOOPT,
+                "IPV6_MULTICAST_IF on TCP",
+            ),
+            (
+                u,
+                so::IPV6_UNICAST_IF,
+                &no_if_be,
+                EADDRNOTAVAIL,
+                "IPV6_UNICAST_IF unknown index",
+            ),
+            (
+                u,
+                so::IPV6_MTU,
+                &small_mtu,
+                EINVAL,
+                "IPV6_MTU 1000 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_TCLASS,
+                &big,
+                EINVAL,
+                "IPV6_TCLASS 256 is not EINVAL",
+            ),
+            (
+                u,
+                so::IPV6_ADD_MEMBERSHIP,
+                &group[..19],
+                EINVAL,
+                "IPV6_ADD_MEMBERSHIP optlen 19",
+            ),
+            (
+                u,
+                so::IPV6_ADD_MEMBERSHIP,
+                &nodev,
+                ENODEV,
+                "IPV6_ADD_MEMBERSHIP unknown device",
+            ),
+            (
+                u,
+                so::IPV6_ADD_MEMBERSHIP,
+                &unicast,
+                EINVAL,
+                "IPV6_ADD_MEMBERSHIP unicast group",
+            ),
+            (
+                t,
+                so::IPV6_ADD_MEMBERSHIP,
+                &group,
+                EPROTO,
+                "IPV6_ADD_MEMBERSHIP on TCP",
+            ),
+        ];
+        for (fd, name, val, want, what) in checks {
+            if sockopt_set(fd, so::IPPROTO_IPV6, name, val)? != want {
+                return Err(what);
+            }
+        }
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &group)? != 0
+            || sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &group)? != EADDRINUSE
+        {
+            return Err("a repeated IPV6_ADD_MEMBERSHIP is not EADDRINUSE");
+        }
+        let other = ipv6_mreq([0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3], 1);
+        if sockopt_set(u, so::IPPROTO_IPV6, so::IPV6_DROP_MEMBERSHIP, &other)? != EADDRNOTAVAIL {
+            return Err("IPV6_DROP_MEMBERSHIP of a group never joined is not EADDRNOTAVAIL");
+        }
+        // Unknown option; a foreign level on AF_INET6 is ENOPROTOOPT both ways.
+        let mut out = [0u8; 4];
+        if sockopt_set(u, so::IPPROTO_IPV6, 199, &one)? != ENOPROTOOPT
+            || sockopt_get(u, so::IPPROTO_IPV6, 199, &mut out)?.0 != ENOPROTOOPT
+        {
+            return Err("unknown IPv6 option is not ENOPROTOOPT");
+        }
+        if sockopt_get(u, 281, 1, &mut out)?.0 != ENOPROTOOPT {
+            return Err("a foreign level get on AF_INET6 is not ENOPROTOOPT (ipv6_getsockopt)");
+        }
+        sockopt_close(&[u, t]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_ipv6_multicast_neg
+);
+
+fn timeval_bytes(sec: i64, usec: i64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&sec.to_ne_bytes());
+    b[8..].copy_from_slice(&usec.to_ne_bytes());
+    b
+}
+
+fn read_timeval(fd: u64, name: u64) -> Result<(i64, i64), &'static str> {
+    let mut b = [0u8; 16];
+    match sockopt_get(fd, SOL_SOCKET, name, &mut b)? {
+        (0, 16) => Ok((
+            i64::from_ne_bytes(b[..8].try_into().unwrap_or([0; 8])),
+            i64::from_ne_bytes(b[8..].try_into().unwrap_or([0; 8])),
+        )),
+        _ => Err("timeout getsockopt failed or did not report 16 bytes"),
+    }
+}
+
+/// userdbd's `SO_RCVTIMEO` (old `struct timeval` layout on x86_64) and the
+/// `SO_*TIMEO_NEW` `__kernel_sock_timeval` layout: stored, read back through
+/// either name, `{0,0}` = no timeout, a negative tv_sec stores zero.
+fn smoke_abi_socket_sockopt_timeo_pos() -> TestResult {
+    with_setup(|| {
+        let l = open_unix_stream()?;
+        if read_timeval(l, so::SO_RCVTIMEO_OLD)? != (0, 0)
+            || read_timeval(l, so::SO_SNDTIMEO_NEW)? != (0, 0)
+        {
+            return Err("default timeouts are not {0,0}");
+        }
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(25, 0))? != 0 {
+            return Err("SO_RCVTIMEO(25 s) on an AF_UNIX stream socket was refused");
+        }
+        if read_timeval(l, so::SO_RCVTIMEO_OLD)? != (25, 0)
+            || read_timeval(l, so::SO_RCVTIMEO_NEW)? != (25, 0)
+        {
+            return Err("SO_RCVTIMEO did not read back as 25 s through both names");
+        }
+        if sockopt_set(
+            l,
+            SOL_SOCKET,
+            so::SO_SNDTIMEO_NEW,
+            &timeval_bytes(2, 250_000),
+        )? != 0
+            || read_timeval(l, so::SO_SNDTIMEO_OLD)? != (2, 250_000)
+        {
+            return Err("SO_SNDTIMEO_NEW {2, 250000} did not round-trip");
+        }
+        // The send and receive timeouts are independent.
+        if read_timeval(l, so::SO_RCVTIMEO_OLD)? != (25, 0) {
+            return Err("SO_SNDTIMEO clobbered SO_RCVTIMEO");
+        }
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(0, 0))? != 0
+            || read_timeval(l, so::SO_RCVTIMEO_OLD)? != (0, 0)
+        {
+            return Err("SO_RCVTIMEO {0,0} did not clear the timeout");
+        }
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(-3, 0))? != 0
+            || read_timeval(l, so::SO_RCVTIMEO_OLD)? != (0, 0)
+        {
+            return Err("negative SO_RCVTIMEO was not stored as a zero timeout");
+        }
+        // A short getsockopt buffer is truncated to it, not refused.
+        let mut half = [0u8; 8];
+        if sockopt_set(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(9, 0))? != 0
+            || sockopt_get(l, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &mut half)? != (0, 8)
+            || i64::from_ne_bytes(half) != 9
+        {
+            return Err("an 8-byte SO_RCVTIMEO getsockopt was not truncated");
+        }
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        if sockopt_set(u, SOL_SOCKET, so::SO_RCVTIMEO_NEW, &timeval_bytes(1, 0))? != 0 {
+            return Err("SO_RCVTIMEO_NEW on UDP was refused");
+        }
+        sockopt_close(&[l, u]);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sockopt_timeo_pos);
+
+/// `sock_copy_user_timeval` / `sock_set_timeout` errnos.
+fn smoke_abi_socket_sockopt_timeo_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let tv = timeval_bytes(1, 0);
+        for (name, len, what) in [
+            (
+                so::SO_RCVTIMEO_OLD,
+                8usize,
+                "SO_RCVTIMEO optlen 8 is not EINVAL",
+            ),
+            (
+                so::SO_RCVTIMEO_NEW,
+                15,
+                "SO_RCVTIMEO_NEW optlen 15 is not EINVAL",
+            ),
+            (so::SO_SNDTIMEO_OLD, 3, "SO_SNDTIMEO optlen 3 is not EINVAL"),
+        ] {
+            if sockopt_set(u, SOL_SOCKET, name, &tv[..len])? != EINVAL {
+                return Err(what);
+            }
+        }
+        for (usec, what) in [
+            (1_000_000i64, "SO_RCVTIMEO usec 1000000 is not EDOM"),
+            (-1, "SO_RCVTIMEO usec -1 is not EDOM"),
+        ] {
+            if sockopt_set(u, SOL_SOCKET, so::SO_RCVTIMEO_OLD, &timeval_bytes(1, usec))? != EDOM {
+                return Err(what);
+            }
+        }
+        // EDOM did not store anything.
+        if read_timeval(u, so::SO_RCVTIMEO_OLD)? != (0, 0) {
+            return Err("a rejected SO_RCVTIMEO changed the stored timeout");
+        }
+        sockopt_close(&[u]);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sockopt_timeo_neg);
+
+/// SOL_SOCKET options `sk_setsockopt` accepts and `sk_getsockopt` reports.
+fn smoke_abi_socket_sockopt_sol_socket_pos() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        // SO_SNDBUF / SO_RCVBUF store twice the request, floored at
+        // SOCK_MIN_SNDBUF (4608) / SOCK_MIN_RCVBUF (2304).
+        for (name, v, want, what) in [
+            (
+                so::SO_RCVBUF,
+                4096,
+                8192,
+                "SO_RCVBUF 4096 did not read back 8192",
+            ),
+            (
+                so::SO_SNDBUF,
+                65536,
+                131_072,
+                "SO_SNDBUF 65536 did not read back 131072",
+            ),
+            (so::SO_RCVBUF, 0, 2304, "SO_RCVBUF 0 did not floor at 2304"),
+            (so::SO_SNDBUF, 0, 4608, "SO_SNDBUF 0 did not floor at 4608"),
+            (so::SO_DONTROUTE, 1, 1, "SO_DONTROUTE"),
+            (so::SO_OOBINLINE, 1, 1, "SO_OOBINLINE"),
+            (so::SO_NO_CHECK, 1, 1, "SO_NO_CHECK"),
+            (so::SO_PRIORITY, 6, 6, "SO_PRIORITY 6"),
+            (so::SO_RCVLOWAT, 0, 1, "SO_RCVLOWAT 0 did not read back 1"),
+            (so::SO_RCVLOWAT, 16, 16, "SO_RCVLOWAT 16"),
+            (so::SO_MARK, 7, 7, "SO_MARK (privileged)"),
+            (so::SO_BINDTOIFINDEX, 1, 1, "SO_BINDTOIFINDEX(lo)"),
+        ] {
+            if sockopt_set_int(u, SOL_SOCKET, name, v)? != 0 {
+                return Err(what);
+            }
+            if sockopt_get_int(u, SOL_SOCKET, name)? != want {
+                return Err(what);
+            }
+        }
+        let mut dev = [0u8; 16];
+        if sockopt_get(u, SOL_SOCKET, SO_BINDTODEVICE, &mut dev)? != (0, 3) || &dev[..3] != b"lo\0"
+        {
+            return Err("SO_BINDTOIFINDEX(1) is not visible as SO_BINDTODEVICE \"lo\"");
+        }
+        sockopt_expect_int(u, SOL_SOCKET, so::SO_SNDLOWAT, 1, "SO_SNDLOWAT is not 1")?;
+        sockopt_expect_int(
+            u,
+            SOL_SOCKET,
+            so::SO_INCOMING_CPU,
+            -1,
+            "default SO_INCOMING_CPU is not -1",
+        )?;
+        let t = sockopt_socket(AF_INET, SOCK_STREAM)?;
+        if sockopt_set_int(t, SOL_SOCKET, so::SO_TXREHASH, 0)? != 0
+            || sockopt_get_int(t, SOL_SOCKET, so::SO_TXREHASH)? != 0
+        {
+            return Err("SO_TXREHASH 0 on TCP did not round-trip");
+        }
+        let un = open_unix_stream()?;
+        if sockopt_set_int(un, SOL_SOCKET, SO_PASSCRED, 1)? != 0
+            || sockopt_get_int(un, SOL_SOCKET, SO_PASSCRED)? != 1
+        {
+            return Err("SO_PASSCRED on AF_UNIX did not round-trip");
+        }
+        sockopt_close(&[u, t, un]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_sol_socket_pos
+);
+
+/// SOL_SOCKET errnos: read-only / write-only names, family and protocol
+/// restrictions, short optlen, and the capability checks.
+fn smoke_abi_socket_sockopt_sol_socket_neg() -> TestResult {
+    with_setup(|| {
+        let u = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let un = open_unix_stream()?;
+        let one = 1i32.to_ne_bytes();
+        let mut out = [0u8; 4];
+        if sockopt_set(u, SOL_SOCKET, so::SO_SNDLOWAT, &one)? != ENOPROTOOPT {
+            return Err("SO_SNDLOWAT set is not ENOPROTOOPT");
+        }
+        if sockopt_set(u, SOL_SOCKET, so::SO_DETACH_FILTER, &one)? != ENOENT {
+            return Err("SO_DETACH_FILTER with no filter is not ENOENT");
+        }
+        if sockopt_set(u, SOL_SOCKET, so::SO_TXREHASH, &one)? != EOPNOTSUPP
+            || sockopt_get(u, SOL_SOCKET, so::SO_TXREHASH, &mut out)?.0 != EOPNOTSUPP
+        {
+            return Err("SO_TXREHASH on UDP is not EOPNOTSUPP");
+        }
+        if sockopt_set(u, SOL_SOCKET, SO_PASSCRED, &one)? != EOPNOTSUPP
+            || sockopt_get(u, SOL_SOCKET, SO_PASSCRED, &mut out)?.0 != EOPNOTSUPP
+        {
+            return Err("SO_PASSCRED on AF_INET is not EOPNOTSUPP (sk_may_scm_recv)");
+        }
+        if sockopt_set(un, SOL_SOCKET, so::SO_REUSEPORT, &one)? != EOPNOTSUPP {
+            return Err("SO_REUSEPORT on AF_UNIX is not EOPNOTSUPP");
+        }
+        if sockopt_set_int(un, SOL_SOCKET, so::SO_REUSEPORT, 0)? != 0 {
+            return Err("SO_REUSEPORT 0 on AF_UNIX was refused");
+        }
+        if sockopt_set(u, SOL_SOCKET, so::SO_PRIORITY, &one[..3])? != EINVAL {
+            return Err("SO_PRIORITY optlen 3 is not EINVAL");
+        }
+        if sockopt_set(u, SOL_SOCKET, 1999, &one)? != ENOPROTOOPT
+            || sockopt_get(u, SOL_SOCKET, 1999, &mut out)?.0 != ENOPROTOOPT
+        {
+            return Err("an unknown SOL_SOCKET option is not ENOPROTOOPT");
+        }
+        // sock_bindtoindex_locked: a negative index is EINVAL; it never looks
+        // the index up, so an unknown one is stored as-is.
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_BINDTOIFINDEX, -1)? != EINVAL {
+            return Err("SO_BINDTOIFINDEX -1 is not EINVAL");
+        }
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_BINDTOIFINDEX, so::NO_IFINDEX as i32)? != 0
+            || sockopt_get_int(u, SOL_SOCKET, so::SO_BINDTOIFINDEX)? != so::NO_IFINDEX as i32
+        {
+            return Err("SO_BINDTOIFINDEX of an unknown index was not stored");
+        }
+        // Unprivileged: SO_MARK and SO_PRIORITY > 6 need CAP_NET_RAW/ADMIN.
+        drop_to_unprivileged_uid()?;
+        if sockopt_set(u, SOL_SOCKET, so::SO_MARK, &one)? != EPERM {
+            return Err("unprivileged SO_MARK is not EPERM");
+        }
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_PRIORITY, 7)? != EPERM {
+            return Err("unprivileged SO_PRIORITY 7 is not EPERM");
+        }
+        if sockopt_set_int(u, SOL_SOCKET, so::SO_PRIORITY, 6)? != 0 {
+            return Err("unprivileged SO_PRIORITY 6 was refused");
+        }
+        sockopt_close(&[u, un]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_sol_socket_neg
+);
+
+/// IP_MULTICAST_LOOP / IP_ADD_MEMBERSHIP have real effect: a multicast sent
+/// out lo reaches every local member bound to the port (`ip_mc_output` +
+/// `__udp4_lib_mcast_deliver`); a non-member socket gets it only while
+/// IP_MULTICAST_ALL is set (`ip_mc_sf_allow`).
+fn smoke_abi_socket_sockopt_mcast_delivery_pos() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 47_351;
+        let group = ip_mreqn(so::MDNS_V4, 0, 1);
+        let mut members = [0u64; 2];
+        for m in members.iter_mut() {
+            *m = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+            if sockopt_set_int(*m, SOL_SOCKET, SO_REUSEADDR, 1)? != 0 {
+                return Err("SO_REUSEADDR failed");
+            }
+            sockopt_bind(*m, &sockaddr_in(0, PORT))?;
+            if sockopt_set(*m, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &group)? != 0 {
+                return Err("IP_ADD_MEMBERSHIP(lo) failed");
+            }
+        }
+        let bystander = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let excluded = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        for s in [bystander, excluded] {
+            if sockopt_set_int(s, SOL_SOCKET, SO_REUSEADDR, 1)? != 0 {
+                return Err("SO_REUSEADDR failed");
+            }
+            sockopt_bind(s, &sockaddr_in(0, PORT))?;
+        }
+        if sockopt_set_int(excluded, so::IPPROTO_IP, so::IP_MULTICAST_ALL, 0)? != 0 {
+            return Err("IP_MULTICAST_ALL 0 failed");
+        }
+        let tx = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        if sockopt_set(tx, so::IPPROTO_IP, so::IP_MULTICAST_IF, &ip_mreqn(0, 0, 1))? != 0 {
+            return Err("IP_MULTICAST_IF(lo) failed");
+        }
+        if sockopt_sendto(tx, b"mdns", &sockaddr_in(so::MDNS_V4, PORT)) != Some(4) {
+            return Err("sendto(224.0.0.251) did not send 4 bytes");
+        }
+        let mut buf = [0u8; 16];
+        for m in members {
+            if sockopt_recv_nb(m, &mut buf) != Some(4) || &buf[..4] != b"mdns" {
+                return Err("a member bound to the port did not get its own copy");
+            }
+        }
+        if sockopt_recv_nb(bystander, &mut buf) != Some(4) {
+            return Err("a non-member with IP_MULTICAST_ALL=1 did not get the group's datagram");
+        }
+        if sockopt_recv_nb(excluded, &mut buf) != Some(EAGAIN) {
+            return Err("a non-member with IP_MULTICAST_ALL=0 received the datagram");
+        }
+        // After every member leaves, the host no longer listens on lo.
+        for m in members {
+            if sockopt_set(m, so::IPPROTO_IP, so::IP_DROP_MEMBERSHIP, &group)? != 0 {
+                return Err("IP_DROP_MEMBERSHIP failed");
+            }
+        }
+        if sockopt_sendto(tx, b"late", &sockaddr_in(so::MDNS_V4, PORT)) != Some(4) {
+            return Err("second sendto(224.0.0.251) failed");
+        }
+        if sockopt_recv_nb(bystander, &mut buf) != Some(EAGAIN) {
+            return Err("a group nobody on lo has joined was still delivered");
+        }
+        sockopt_close(&members);
+        sockopt_close(&[bystander, excluded, tx]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_mcast_delivery_pos
+);
+
+/// IPv6: a multicast to ff02::fb out lo reaches a member joined on lo.
+fn smoke_abi_socket_sockopt_mcast6_delivery_pos() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 47_353;
+        let rx = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        sockopt_bind(rx, &sockaddr_in6([0; 16], PORT, 0))?;
+        let group = ipv6_mreq(so::MDNS_V6, 1);
+        if sockopt_set(rx, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &group)? != 0 {
+            return Err("IPV6_ADD_MEMBERSHIP(ff02::fb, lo) failed");
+        }
+        let tx = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        if sockopt_set_int(tx, so::IPPROTO_IPV6, so::IPV6_MULTICAST_IF, 1)? != 0 {
+            return Err("IPV6_MULTICAST_IF(lo) failed");
+        }
+        if sockopt_sendto(tx, b"mdns6", &sockaddr_in6(so::MDNS_V6, PORT, 0)) != Some(5) {
+            return Err("sendto(ff02::fb) did not send 5 bytes");
+        }
+        let mut buf = [0u8; 16];
+        if sockopt_recv_nb(rx, &mut buf) != Some(5) || &buf[..5] != b"mdns6" {
+            return Err("an IPv6 member on lo did not receive the multicast");
+        }
+        sockopt_close(&[rx, tx]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sockopt_mcast6_delivery_pos
+);
+
+/// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
+/// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
+/// ("Could not create manager: No data available"). Linux always emits it
+/// (`inet_fill_ifaddr` / `inet6_fill_ifaddr`), with IFA_CACHEINFO.
+fn smoke_abi_socket_rtnl_newaddr_has_ifa_flags() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = rtnl_dump_request(RTM_GETADDR, 91);
+        if netlink_send(fd, &req) != Some(req.len() as i64) {
+            return Err("send(RTM_GETADDR) failed");
+        }
+        let mut seen = 0;
+        let mut done = false;
+        for _ in 0..64 {
+            let mut buf = [0u8; 4096];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n <= 0 {
+                break;
+            }
+            let n = n as usize;
+            let mut off = 0usize;
+            while off + NLMSG_HDRLEN <= n {
+                let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4]));
+                let len = len as usize;
+                if len < NLMSG_HDRLEN || off + len > n {
+                    return Err("malformed netlink frame");
+                }
+                let kind = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                if kind == NLMSG_DONE {
+                    done = true;
+                } else if kind == RTM_NEWADDR {
+                    check_newaddr_flags(&buf[off..off + len])?;
+                    seen += 1;
+                }
+                off += (len + 3) & !3;
+            }
+            if done {
+                break;
+            }
+        }
+        if !done || seen < 2 {
+            return Err("RTM_GETADDR dump did not return v4+v6 loopback addresses");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_rtnl_newaddr_has_ifa_flags
+);
+
+/// One RTM_NEWADDR: an IFA_FLAGS u32 whose low byte is `ifa_flags`, a
+/// 16-byte IFA_CACHEINFO, and IFA_F_PERMANENT on a host-scope address.
+fn check_newaddr_flags(msg: &[u8]) -> Result<(), &'static str> {
+    const IFA_CACHEINFO: u16 = 6;
+    const IFA_FLAGS: u16 = 8;
+    const IFA_F_PERMANENT: u32 = 0x80;
+    const RT_SCOPE_HOST: u8 = 254;
+    let (mut flags, mut cache) = (None, false);
+    let mut a = NLMSG_HDRLEN + 8;
+    while a + 4 <= msg.len() {
+        let alen = u16::from_ne_bytes([msg[a], msg[a + 1]]) as usize;
+        let akind = u16::from_ne_bytes([msg[a + 2], msg[a + 3]]);
+        if alen < 4 || a + alen > msg.len() {
+            return Err("malformed rtattr in RTM_NEWADDR");
+        }
+        if akind == IFA_FLAGS && alen == 8 {
+            flags = Some(u32::from_ne_bytes(
+                msg[a + 4..a + 8].try_into().unwrap_or([0; 4]),
+            ));
+        }
+        if akind == IFA_CACHEINFO && alen == 20 {
+            cache = true;
+        }
+        a += (alen + 3) & !3;
+    }
+    let Some(flags) = flags else {
+        return Err("RTM_NEWADDR without an IFA_FLAGS u32");
+    };
+    if !cache {
+        return Err("RTM_NEWADDR without a 16-byte IFA_CACHEINFO");
+    }
+    if u32::from(msg[NLMSG_HDRLEN + 2]) != flags & 0xff {
+        return Err("ifa_flags disagrees with IFA_FLAGS");
+    }
+    if msg[NLMSG_HDRLEN + 3] == RT_SCOPE_HOST && flags & IFA_F_PERMANENT == 0 {
+        return Err("a host-scope address is not IFA_F_PERMANENT");
+    }
+    Ok(())
+}

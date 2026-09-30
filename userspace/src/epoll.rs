@@ -867,6 +867,17 @@ impl EpollInstance {
 }
 
 impl FileOps for EpollInstance {
+    /// Linux `epoll_create1` uses `anon_inode_getfile("[eventpoll]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }

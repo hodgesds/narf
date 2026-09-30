@@ -200,6 +200,14 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         any = true;
     }
 
+    // CLONE_FILES — `unshare_fd` builds a private copy of a shared fd table,
+    // and `ksys_unshare` swaps it in with the other results only once every
+    // fallible step above has succeeded.
+    if flags & CLONE_FILES != 0 {
+        crate::fd::unshare_table(current_task_id());
+        any = true;
+    }
+
     // Honour the no-op path (no NS bits set) as success — Linux unshare
     // returns 0 with flags=0.
     let _ = any;

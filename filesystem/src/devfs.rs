@@ -29,6 +29,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::devfs_vt::{
+    vt_keyboard_ioctl, vt_perm, KDFONTOP, KDGKBDIACR, KDGKBDIACRUC, KDGKBENT, KDGKBMETA, KDGKBSENT,
+    KDGKBTYPE, KDSKBDIACR, KDSKBDIACRUC, KDSKBENT, KDSKBMETA, KDSKBSENT,
+};
+
 use crate::{
     DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT,
 };
@@ -46,12 +51,22 @@ use crate::{
 
 /// Linux's compact dev_t encoding for majors below 4096. The high minor bits
 /// occupy bits 20+, matching `new_encode_dev()`.
-pub(crate) const fn linux_makedev(major: u32, minor: u32) -> u64 {
+pub const fn linux_makedev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 
-fn device_inode(rdev: u64, kind: u64) -> u64 {
+pub(crate) fn device_inode(rdev: u64, kind: u64) -> u64 {
     0xd000_0000_0000_0000 | (kind << 48) | rdev.wrapping_add(1)
+}
+
+/// The devfs inode number of the character-device node for `rdev`.
+///
+/// For FileOps that stand in for a `/dev` node without being looked up
+/// through devfs (the boot console behind init's fds 0/1/2, DRM minors
+/// served by a driver's directory delegate): on Linux they are opens of
+/// the devtmpfs node, so they must report the same inode it does.
+pub fn char_device_inode(rdev: u64) -> u64 {
+    device_inode(rdev, 1)
 }
 
 fn named_inode(name: &str, kind: u64) -> u64 {
@@ -1372,15 +1387,38 @@ impl FileOps for DevConsole {
                 // singleton console — drain/flush/flow have nothing to do.
                 Ok(0)
             }
-            KDGKBMODE | KDGETMODE => {
-                // No VT layer: report the default (`K_XLATE` / `KD_TEXT` = 0).
+            KDGETMODE => {
+                // `vc->vc_mode`: NARF's console is always in text mode
+                // (`KD_TEXT` = 0) — see KDSETMODE below.
                 // SAFETY: `arg` is the validated user `int *`.
                 unsafe { write_user_i32(arg, 0)? };
                 Ok(0)
             }
-            KDSKBMODE | KDSIGACCEPT => {
-                // No VT keyboard/kbrequest state to change — accept + no-op.
+            KDGKBMODE => {
+                // `vt_do_kdgkbmode`. This reported 0 — `K_RAW`, not the
+                // `K_XLATE` its comment claimed — so systemd-vconsole-setup
+                // took every VT for one an X server owns ("not in K_XLATE or
+                // K_UNICODE") and never configured the keyboard.
+                // SAFETY: `arg` is the validated user `int *`.
+                unsafe { write_user_i32(arg, crate::vt::kbd_mode(this_vt) as i32)? };
                 Ok(0)
+            }
+            KDSKBMODE => {
+                // `if (!perm) return -EPERM; vt_do_kdskbmode(console, arg)`.
+                if !vt_perm() {
+                    return Err(crate::FsError::OperationNotPermitted);
+                }
+                crate::vt::set_kbd_mode(this_vt, arg as u32)
+                    .map(|()| 0)
+                    .map_err(|()| crate::FsError::InvalidData)
+            }
+            KDSIGACCEPT => {
+                // No VT kbrequest source to route a signal from — accept.
+                Ok(0)
+            }
+            KDGKBTYPE | KDGKBMETA | KDSKBMETA | KDGKBENT | KDSKBENT | KDGKBSENT | KDSKBSENT
+            | KDGKBDIACR | KDGKBDIACRUC | KDSKBDIACR | KDSKBDIACRUC | KDFONTOP => {
+                vt_keyboard_ioctl(this_vt, cmd, arg)
             }
             KDSETMODE => {
                 // KD_TEXT / KD_GRAPHICS. NARF has one framebuffer console and a
@@ -1780,14 +1818,15 @@ impl DirOps for DynamicDirectory {
 
 fn static_entry_type(name: &str) -> Option<FileType> {
     match name {
-        "fd" | "stdin" | "stdout" | "stderr" | "rtc" | "ptmx" => Some(FileType::Symlink),
-        "null" | "zero" | "full" | "random" | "urandom" | "kmsg" | "console" | "tty" | "tty0"
-        | "tty1" | "uinput" | "fuse" | "fp0" | "fb0" | "tpm0" | "tpmrm0" | "rtc0" => {
+        "fd" | "stdin" | "stdout" | "stderr" | "rtc" => Some(FileType::Symlink),
+        "ptmx" | "null" | "zero" | "full" | "random" | "urandom" | "kmsg" | "console" | "tty"
+        | "tty0" | "tty1" | "uinput" | "fuse" | "fp0" | "fb0" | "tpm0" | "tpmrm0" | "rtc0" => {
             Some(FileType::Special)
         }
         "pts" | "shm" | "mqueue" | "hugepages" | "disk" | "input" | "snd" | "dri" => {
             Some(FileType::Dir)
         }
+        n if crate::devfs_vt::parse_vcs(n).is_some() => Some(FileType::Special),
         _ => None,
     }
 }
@@ -1907,7 +1946,16 @@ impl DirOps for DevDir {
                     kind: ConsoleNodeKind::Virtual(v),
                 }) as Arc<dyn FileOps>)
             }
-            "ptmx" => Some(symlink_file("ptmx", "pts/ptmx".into())),
+            // /dev/vcs, /dev/vcsu, /dev/vcsa and their per-VT forms for every
+            // allocated VT (`vc_screen.c`) — systemd-vconsole-setup's test
+            // for "is VT N allocated".
+            n if crate::devfs_vt::parse_vcs(n).is_some() => {
+                let (kind, vt) = crate::devfs_vt::parse_vcs(n)?;
+                Some(Arc::new(crate::devfs_vt::DevVcs { kind, vt }) as Arc<dyn FileOps>)
+            }
+            // devtmpfs's `c 5:2` (`tty_devnode`: 0666). Opening it finds the
+            // devpts mounted at `pts` beside it (`devpts_acquire`).
+            "ptmx" => Some(Arc::new(crate::devfs_pty::DevTmpfsPtmx) as Arc<dyn FileOps>),
             "fb0" if FB0_NODE.lock().is_some() => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
             // Userspace input-injection control device.
             // Linux ref: `drivers/input/misc/uinput.c`.
@@ -1957,12 +2005,14 @@ impl DirOps for DevDir {
     }
 
     /// Look up a subdirectory.
-    /// - `/dev/pts`   → `DevPts` (pseudoterminal slave nodes)
+    /// - `/dev/pts`   → an empty mountpoint; boot mounts devpts over it
     /// - `/dev/disk`  → `DevDiskDir` (by-label / by-partuuid lookups)
     /// - `/dev/input` → `DevInputDir` (evdev event nodes, Wave 12 bridge)
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
-            "pts" => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
+            // devtmpfs has an empty `pts`; the devpts instance is mounted on
+            // it (boot init: `mount_default`, then systemd's own mount).
+            "pts" => Some(Arc::new(DevEmptyDir { inode: 3 }) as Arc<dyn DirOps>),
             // Mountpoint stubs: an init mounts tmpfs/mqueue/hugetlbfs over
             // these; they only need to exist so the O_PATH target open works.
             "shm" => Some(Arc::new(DevEmptyDir { inode: 4 }) as Arc<dyn DirOps>),
@@ -2078,7 +2128,7 @@ impl DirOps for DevDir {
             },
             DirEntry {
                 name: alloc::borrow::Cow::Borrowed("ptmx"),
-                file_type: FileType::Symlink,
+                file_type: FileType::Special,
             },
             DirEntry {
                 name: alloc::borrow::Cow::Borrowed("fb0"),
@@ -2173,7 +2223,7 @@ impl DirOps for DevDir {
             ("tty", FileType::Special),
             ("tty0", FileType::Special),
             ("tty1", FileType::Special),
-            ("ptmx", FileType::Symlink),
+            ("ptmx", FileType::Special),
             ("fb0", FileType::Special),
             ("uinput", FileType::Special),
             ("fuse", FileType::Special),
@@ -2200,6 +2250,10 @@ impl DirOps for DevDir {
         let rfcomm_extras = rfcomm_enumerate();
         let tty_usb_extras = tty_usb_enumerate();
         let video_extras = video_enumerate();
+        let vcs_extras: Vec<(String, FileType)> = crate::devfs_vt::vcs_names()
+            .into_iter()
+            .map(|name| (name, FileType::Special))
+            .collect();
         // Runtime-created files, symlinks, and directories that don't collide
         // with a static name.
         let dynamic_extras: Vec<(String, FileType)> = dynamic_enumerate(&DYNAMIC_NODES)
@@ -2215,6 +2269,7 @@ impl DirOps for DevDir {
             .chain(rfcomm_extras)
             .chain(tty_usb_extras)
             .chain(video_extras)
+            .chain(vcs_extras)
             .chain(dynamic_extras)
             .skip(cursor)
             .take(max)
@@ -2268,6 +2323,13 @@ impl FsInstance for DevFs {
 pub fn mount_default() {
     let auth = crate::bootstrap_mount_authority();
     let _ = crate::registry().mount(&auth, "/dev", DevFs::new());
+    // A Linux init mounts devpts at /dev/pts before anything opens a pty
+    // (systemd: `mode=620,gid=5`); a ptmx open fails ENODEV without one.
+    let _ = crate::registry().mount(
+        &auth,
+        "/dev/pts",
+        crate::devfs_pty::DevPtsFs::with_instance(crate::devfs_pty::boot_devpts()),
+    );
 }
 
 // ── DevSymlink + /dev/fd smokes ───────────────────────────────────────

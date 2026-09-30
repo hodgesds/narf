@@ -37,7 +37,8 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let _position_guard = if endpoint.ops.is_stream() {
+    // Linux `fdget_pos`: only FMODE_ATOMIC_POS files lock their position.
+    let _position_guard = if !endpoint.description.locks_position(endpoint.ops.as_ref()) {
         None
     } else {
         match poll_blocking(endpoint.description.position_lock.lock()) {

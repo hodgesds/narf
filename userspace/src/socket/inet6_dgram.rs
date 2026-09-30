@@ -111,6 +111,72 @@ fn lookup(
     None
 }
 
+/// Every socket on `port` that takes a copy of a multicast from
+/// `src:sport` to `group` on device `dif` — `__udp_v6_is_mcast_sock` +
+/// `inet6_mc_check`.
+fn mcast_targets(
+    map: &Inet6DgramMap,
+    ns: u64,
+    src: [u8; 16],
+    sport: u16,
+    group: [u8; 16],
+    port: u16,
+    dif: u32,
+) -> Vec<Arc<SocketFile>> {
+    let Some(socks) = map.get(&(ns, port)) else {
+        return Vec::new();
+    };
+    socks
+        .iter()
+        .filter(|sock| {
+            let bound_dev = sock.options.lock().bindtodevice_index;
+            (bound_dev == 0 || bound_dev == dif)
+                && state_view(sock).is_some_and(|(local, _, peer)| {
+                    (local == UNSPEC || local == group)
+                        && peer.is_none_or(|p| p.0 == src && p.1 == sport)
+                })
+                && super::sockopt::inet6_mc_check(sock, &group)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Queue `pkt` on `target` unless its receive buffer is full.
+fn enqueue6(target: &SocketFile, pkt: DgramPacket6) {
+    let rcvbuf = target.options.lock().rcvbuf as usize;
+    let mut state = target.state.lock();
+    if let SocketState::Inet6Dgram { inbox, rmem, .. } = &mut *state {
+        let charge = pkt.payload.len() + DGRAM_TRUESIZE_OVERHEAD;
+        if rmem.saturating_add(charge) <= rcvbuf {
+            inbox.push_back(pkt);
+            *rmem += charge;
+            drop(state);
+            target.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
+            target.dgram_readiness.notify(narf_filesystem::POLL_IN);
+        }
+    }
+}
+
+/// The address a multicast leaving device `ifindex` carries: ::1 out lo,
+/// else the device's first (link-local preferred) address.
+fn mc_source_v6(ns: u64, ifindex: u32) -> [u8; 16] {
+    if ifindex == super::sockopt::LOOPBACK_IFINDEX {
+        return LOOPBACK;
+    }
+    let Some(name) = super::sockopt::ifindex_name(ns, ifindex) else {
+        return UNSPEC;
+    };
+    let addrs: Vec<_> = narf_net::ipv6::addrs::list_all_in(ns)
+        .into_iter()
+        .filter(|a| a.iface == name)
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.addr[0] == 0xfe && a.addr[1] & 0xc0 == 0x80)
+        .or_else(|| addrs.first())
+        .map_or(UNSPEC, |a| a.addr)
+}
+
 impl SocketFile {
     pub(super) fn dispatch_inet6_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
@@ -396,6 +462,9 @@ impl SocketFile {
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
+        if super::sockopt::is_multicast_v6(&dest.0) {
+            return self.inet6_dgram_send_mcast(buf, local, local_port, dest);
+        }
         let options = self.options.lock().clone();
         let hop_limit = options.ipv6_unicast_hops;
         let is_local =
@@ -476,6 +545,87 @@ impl SocketFile {
         SocketOpResult::Ok(buf.len() as u64)
     }
 
+    /// A datagram to an IPv6 multicast group: out the destination scope,
+    /// `IPV6_MULTICAST_IF`, the bound device or the first NIC, with the
+    /// `IPV6_MULTICAST_HOPS` limit; `ip6_finish_output2` loops a copy back
+    /// to local members while `IPV6_MULTICAST_LOOP` is set, and one sent out
+    /// lo comes back in through lo regardless.
+    fn inet6_dgram_send_mcast(
+        self: &Arc<Self>,
+        buf: &[u8],
+        local: [u8; 16],
+        local_port: u16,
+        dest: Inet6Peer,
+    ) -> SocketOpResult {
+        let ns = self.net_ns_id();
+        let options = self.options.lock().clone();
+        let Some(egress) = super::sockopt::mc_egress_v6(ns, &options, dest.2) else {
+            return SocketOpResult::Err(SockError::NetUnreach);
+        };
+        let hops = options.ext.ipv6_mcast_hops;
+        let source = if local == UNSPEC {
+            mc_source_v6(ns, egress)
+        } else {
+            local
+        };
+        let via_lo = egress == super::sockopt::LOOPBACK_IFINDEX;
+        if (via_lo || options.ext.ipv6_mc_loop)
+            && super::sockopt::host_joined_v6(ns, egress, &dest.0)
+        {
+            let targets = {
+                let guard = INET6_DGRAM_BOUND.lock();
+                guard
+                    .as_ref()
+                    .map(|m| mcast_targets(m, ns, source, local_port, dest.0, dest.1, egress))
+                    .unwrap_or_default()
+            };
+            for t in targets {
+                enqueue6(
+                    &t,
+                    DgramPacket6 {
+                        peer_addr: source,
+                        peer_port: local_port,
+                        scope_id: egress,
+                        destination: dest.0,
+                        hop_limit: hops,
+                        payload: buf.to_vec(),
+                    },
+                );
+            }
+        }
+        if via_lo || hops == 0 {
+            return SocketOpResult::Ok(buf.len() as u64);
+        }
+        match narf_net::ipv6_stack::send_udp(
+            ns,
+            (local != UNSPEC).then_some(local),
+            local_port,
+            dest.0,
+            dest.1,
+            buf,
+            egress,
+            hops as u8,
+            options.ipv6_mtu_set.then_some(options.ipv6_mtu),
+            options.ipv6_mtu_discover,
+            options.ipv6_dontfrag,
+        ) {
+            Ok(n) => SocketOpResult::Ok(n as u64),
+            Err(narf_net::ipv6_stack::Udp6SendError::MessageTooLong) => {
+                SocketOpResult::Err(SockError::MsgSize)
+            }
+            Err(narf_net::ipv6_stack::Udp6SendError::NeighborPending) => {
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            Err(narf_net::ipv6_stack::Udp6SendError::NoSourceAddress) => {
+                SocketOpResult::Err(SockError::AddrNotAvail)
+            }
+            Err(narf_net::ipv6_stack::Udp6SendError::QueueFull) => {
+                SocketOpResult::Err(SockError::NoBufs)
+            }
+            Err(_) => SocketOpResult::Err(SockError::NetUnreach),
+        }
+    }
+
     fn inet6_dgram_recv(&self, buf: &mut [u8], flags: u32) -> SocketOpResult {
         if flags & MSG_ERRQUEUE != 0 {
             return SocketOpResult::Err(SockError::WouldBlock);
@@ -550,6 +700,35 @@ pub(super) fn deliver_wire(
     in_ifindex: u32,
     hop_limit: u8,
 ) -> bool {
+    if super::sockopt::is_multicast_v6(&dst_ip) {
+        // `ip6_mc_input`: only groups the arrival device joined.
+        if in_ifindex != 0 && !super::sockopt::host_joined_v6(net_ns_id, in_ifindex, &dst_ip) {
+            return false;
+        }
+        let targets = {
+            let guard = INET6_DGRAM_BOUND.lock();
+            guard
+                .as_ref()
+                .map(|m| {
+                    mcast_targets(m, net_ns_id, src_ip, src_port, dst_ip, dst_port, in_ifindex)
+                })
+                .unwrap_or_default()
+        };
+        for t in &targets {
+            enqueue6(
+                t,
+                DgramPacket6 {
+                    peer_addr: src_ip,
+                    peer_port: src_port,
+                    scope_id: in_ifindex,
+                    destination: dst_ip,
+                    hop_limit: hop_limit as i32,
+                    payload: payload.to_vec(),
+                },
+            );
+        }
+        return !targets.is_empty();
+    }
     let target = {
         let guard = INET6_DGRAM_BOUND.lock();
         guard.as_ref().and_then(|map| {

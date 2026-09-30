@@ -25,6 +25,17 @@ struct DrmSyncFile {
 }
 
 impl narf_filesystem::FileOps for DrmSyncFile {
+    /// Linux `sync_file_alloc` uses `anon_inode_getfile("sync_file")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,
@@ -552,11 +563,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     {
         use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPGRP};
 
-        let master_index = ops.as_pty_master_index();
-        let slave_index = ops
+        let master_id = ops.as_pty_master_id();
+        let slave_id = ops
             .tty_id()
             .filter(|&id| id != crate::handlers::CTTY_CONSOLE);
-        if let Some(pty_index) = master_index.or(slave_index) {
+        if let Some(pty_id) = master_id.or(slave_id) {
             match cmd {
                 TIOCSCTTY => {
                     // O_PATH has no tty file_operations on Linux.
@@ -578,7 +589,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 TIOCGPGRP | TIOCGSID => {
                     // Linux lets a PTY master query its slave control state,
                     // but a slave fd must be the caller's controlling tty.
-                    if master_index.is_none() && task_ctty(task) != Some(pty_index) {
+                    if master_id.is_none() && task_ctty(task) != Some(pty_id) {
                         ctx.set_return(errno_ret(ENOTTY));
                         return;
                     }
@@ -605,7 +616,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
                 TIOCSPGRP => {
                     let caller_sid = read_sid(process_state_key(task));
-                    if task_ctty(task) != Some(pty_index)
+                    if task_ctty(task) != Some(pty_id)
                         || ops.tty_session() != Some(caller_sid)
                     {
                         ctx.set_return(errno_ret(ENOTTY));
@@ -649,11 +660,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // the caller's table. The fd-allocation side lives here (not in the
     // filesystem crate), so we hijack the dispatch before delegating.
     if cmd == narf_filesystem::devfs_pty::TIOCGPTPEER {
-        let idx = match ops.as_pty_master_index() {
+        // `tty_ioctl` handles TIOCGPTPEER for every tty and `ptm_open_peer`
+        // refuses anything but a pty master with EIO
+        // (`if (tty->driver != ptm_driver) return -EIO;`). A file that is no
+        // tty never reaches `tty_ioctl`: vfs_ioctl answers ENOTTY.
+        let idx = match ops.as_pty_master_id() {
             Some(i) => i,
             None => {
-                // Not a master fd — ENOTTY (Linux semantics).
-                ctx.set_return(errno_ret(ENOTTY));
+                let errno = if ops.tty_id().is_some() { EIO } else { ENOTTY };
+                ctx.set_return(errno_ret(errno));
                 return;
             }
         };
@@ -670,13 +685,17 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             }
         };
         let ops_dyn: Arc<dyn narf_filesystem::FileOps> = slave;
+        // `FD_ADD(flags, dentry_open(slave, flags))`: O_CLOEXEC becomes the
+        // new descriptor's FD_CLOEXEC, and the open file description keeps
+        // the access mode and the F_SETFL bits (O_NONBLOCK, O_APPEND, ...)
+        // exactly as open(2) would — `do_dentry_open` drops O_CREAT/O_EXCL/
+        // O_NOCTTY/O_TRUNC, and O_CLOEXEC is not a file status flag.
+        let open_flags = arg as u32;
         let new_fd = fd::install(task, fd::FdEntry {
                 ops: ops_dyn,
                 offset: 0,
-                // `arg` carries open(2) flags from glibc (O_RDWR | O_NOCTTY |
-                // O_CLOEXEC). We mirror the CLOEXEC bit; the rest are no-ops.
-                flags: if (arg as u32) & 0o2000000 != 0 { 1 } else { 0 },
-                status_flags: arg as u32,
+                flags: if open_flags & fd::O_CLOEXEC != 0 { fd::FD_CLOEXEC } else { 0 },
+                status_flags: open_flags & (fd::O_ACCMODE | fd::O_SETFL_MASK),
             });
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),

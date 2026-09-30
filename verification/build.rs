@@ -608,6 +608,30 @@ fn main() {
         "futex_contend_smoke",
         "futex_wakeop_smoke",
         "condbcast_smoke",
+        "forkcond_smoke",
+        "setxid_threads_smoke",
+        "xthread_wake_smoke",
+        "procsig_thread_smoke",
+        "sigwake_wait_smoke",
+        "flock_release_smoke",
+        "inode_identity_smoke",
+        "tty_poll_timeout_smoke",
+        "pty_wake_smoke",
+        "proc_fd_magiclink_smoke",
+        "pthread_sched_smoke",
+        "unix_listen_wake_smoke",
+        "fd_inherit_exec_smoke",
+        "xserver_epoll_wake_smoke",
+        "dev_tty_read_smoke",
+        "blocking_read_waits_smoke",
+        "tiocgptpeer_smoke",
+        "pts_chown_smoke",
+        "devpts_instances_smoke",
+        "overmount_pseudo_smoke",
+        "setuid_exec_smoke",
+        "sockopt_daemon_smoke",
+        "nice_thread_smoke",
+        "setxid_busy_smoke",
         "notify_epoll_smp_smoke",
         "keyring_smoke",
         "inotify2_smoke",
@@ -653,6 +677,11 @@ fn main() {
         "shmfork_smoke",
         "sigrt_smoke",
         "strace_smoke",
+        "remount_smoke",
+        "utmp_smoke",
+        "thp_smoke",
+        "vconsole_smoke",
+        "acl_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
@@ -686,6 +715,67 @@ fn main() {
         let upper = test.to_uppercase();
         println!("cargo:rustc-env=NARF_{upper}_ELF_X86_64={x86_path}");
         println!("cargo:rustc-env=NARF_{upper}_ELF_AARCH64=/dev/null");
+    }
+
+    // ── glibc variants of selected musl-demo smokes ─────────────────
+    // Same C source, linked statically against the HOST glibc. Desktop
+    // userspace (Xwayland, Mesa, Qt) runs glibc, whose thread internals
+    // differ from musl's in ways the kernel must honour: SIGCANCEL/SIGSETXID
+    // (32/33) for set*id broadcasts and cancellation, the full internal
+    // signal mask around clone(), FUTEX_WAIT_BITSET condvars. When gcc or a
+    // static libc.a is unavailable the image is an empty placeholder, like
+    // the musl smokes without musl-gcc.
+    for test in [
+        "setxid_threads_smoke",
+        "forkcond_smoke",
+        "xthread_wake_smoke",
+        "procsig_thread_smoke",
+        "sigwake_wait_smoke",
+        "flock_release_smoke",
+        "inode_identity_smoke",
+        "tty_poll_timeout_smoke",
+        "pty_wake_smoke",
+        "proc_fd_magiclink_smoke",
+        "pthread_sched_smoke",
+        "unix_listen_wake_smoke",
+        "fd_inherit_exec_smoke",
+        "xserver_epoll_wake_smoke",
+        "dev_tty_read_smoke",
+        "blocking_read_waits_smoke",
+        "tiocgptpeer_smoke",
+        "pts_chown_smoke",
+        "devpts_instances_smoke",
+        "overmount_pseudo_smoke",
+        "setuid_exec_smoke",
+        "sockopt_daemon_smoke",
+        "nice_thread_smoke",
+        "setxid_busy_smoke",
+        "remount_smoke",
+        "utmp_smoke",
+        "thp_smoke",
+        "vconsole_smoke",
+        "acl_smoke",
+    ] {
+        let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
+        println!("cargo:rerun-if-changed={}", src.display());
+        let out = out_dir.join(format!("{test}_glibc_x86_64"));
+        let built = which("gcc").is_some()
+            && Command::new("gcc")
+                .args(["-O2", "-Wall", "-static", "-pthread"])
+                .arg(&src)
+                .arg("-o")
+                .arg(&out)
+                .status()
+                .is_ok_and(|s| s.success());
+        let x86_path = if built {
+            out.display().to_string()
+        } else {
+            println!("cargo:warning=musl-demo: static glibc build of {test} unavailable");
+            "/dev/null".to_string()
+        };
+        let upper = test.to_uppercase();
+        println!("cargo:rustc-env=NARF_{upper}_GLIBC_ELF_X86_64={x86_path}");
+        println!("cargo:rustc-env=NARF_{upper}_GLIBC_ELF_AARCH64=/dev/null");
     }
 
     // ── vDSO: real linux-vdso.so.1 for each arch ────────────────────

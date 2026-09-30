@@ -100,36 +100,33 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
 
     // A signal in `set` is pending → consume ONE instance and return it.
     // Popping the payload and clearing/re-arming the pending bit happen
-    // together under the sigqueue bucket lock (sigwait_take_locked), atomic
+    // together under the sigqueue bucket lock (sigwait_take -> sigwait_take_locked), atomic
     // against a racing sender's store+set (sigqueue_store_and_raise_bit) — so
     // a coalescing standard signal under a sigqueue flood can never be
     // observed as a bit set over an emptied queue (which delivered a spurious
     // SI_USER sival=0 that stress-ng --sigq read as its termination sentinel).
-    if let Some((signum, queued)) = sigwait_take_locked(task, set) {
+    if let Some((signum, queued)) = sigwait_take(task, set) {
         clear_routing(uctx_opt);
         if info_out != 0 {
-            // Build the 128-byte siginfo_t in kernel memory, then copy it
-            // out through the SMAP bracket. si_signo/si_errno/si_code are
-            // the union-discriminating prefix; si_pid (offset 16) + si_value
-            // (the sigval union, offset 24) carry the queued sender payload
-            // (stress-ng --sigrt's child replies to si_pid). Rest stays zero.
-            let mut si = [0u8; 128];
-            let (si_code, si_value, si_pid, poll_band) = queued.map_or(
-                (0, 0, 0, None),
-                |info| (info.code, info.value, info.pid, info.poll_band),
-            );
-            si[..4].copy_from_slice(&(signum as i32).to_ne_bytes()); // si_signo
-            si[8..12].copy_from_slice(&si_code.to_ne_bytes()); // si_code
-            if let Some(band) = poll_band {
-                // SIGPOLL union: si_band is long at offset 16; si_fd is int at
-                // offset 24. The zero-filled tail supplies ABI padding.
-                si[16..24].copy_from_slice(&u64::from(band).to_ne_bytes());
-                si[24..28].copy_from_slice(&(si_value as u32).to_ne_bytes());
-            } else {
-                si[16..20].copy_from_slice(&si_pid.to_ne_bytes()); // si_pid
-                si[24..32].copy_from_slice(&si_value.to_ne_bytes()); // si_value
+            // Build the 128-byte siginfo_t in kernel memory with the same
+            // union encoder the handler frames use (the SIGPOLL band rides in
+            // `si_addr`, as on the delivery path), then copy it out through
+            // the SMAP bracket.
+            let (si_code, si_value, si_pid, si_addr) =
+                queued.map_or((0, 0, 0, 0), |info| match info.poll_band {
+                    Some(band) => (info.code, info.value, band, u64::from(band)),
+                    None => (info.code, info.value, info.pid, 0),
+                });
+            let si = crate::SigDeliveryParams {
+                signum,
+                si_code,
+                si_value,
+                si_pid,
+                si_addr,
+                ..Default::default()
             }
-                                                                 // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
+            .siginfo_bytes();
+            // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
             let _ = unsafe { copy_to_user(info_out, &si) };
         }
         ctx.set_return(SyscallReturn::ok(signum as u64));

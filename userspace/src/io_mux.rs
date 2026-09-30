@@ -64,6 +64,17 @@ impl EventFd {
 }
 
 impl FileOps for EventFd {
+    /// Linux `eventfd2` creates its file with `anon_inode_getfile_fmode("[eventfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if buf.len() < 8 {
@@ -283,6 +294,17 @@ impl TimerFd {
 }
 
 impl FileOps for TimerFd {
+    /// Linux `timerfd_create` uses `anon_inode_getfile_fmode("[timerfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// An unexpired timerfd read must WAIT, never report end-of-file.
     ///
     /// Linux blocks a `read()` on a timerfd with no expirations, or returns
@@ -459,12 +481,24 @@ impl SignalFd {
     /// table via the public accessor.
     fn pending_in_mask(&self) -> u64 {
         let mask = self.mask.load(Ordering::Acquire);
-        let pending = crate::handlers::signal_pending_of(self.owner_task);
+        let pending =
+            crate::handlers::signal_pending_of(crate::handlers::signalfd_reader(self.owner_task));
         pending & mask
     }
 }
 
 impl FileOps for SignalFd {
+    /// Linux `signalfd4` uses `anon_inode_getfile_fmode("[signalfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// A signalfd with nothing pending must WAIT, never report end-of-file.
     ///
     /// Linux blocks a `read()` on a signalfd with no pending signal in its
@@ -489,7 +523,14 @@ impl FileOps for SignalFd {
             // 128 bytes; we fill only the first 4 (ssi_signo) and
             // zero the rest. Real consumers read the signo and
             // dispatch.
-            let signum = crate::handlers::sig_from_bit(pending);
+            // Dequeue for the reading thread: private set first, then its
+            // group's shared set (Linux `signalfd_dequeue` -> `dequeue_signal`).
+            let reader = crate::handlers::signalfd_reader(self.owner_task);
+            let Some((signum, src)) =
+                crate::handlers::next_deliverable(reader, self.mask.load(Ordering::Acquire))
+            else {
+                return Err(FsError::WouldBlock);
+            };
             const SI_LEN: usize = 128;
             if buf.len() < SI_LEN {
                 return Err(FsError::InvalidPath);
@@ -497,7 +538,7 @@ impl FileOps for SignalFd {
             buf[..SI_LEN].fill(0);
             buf[..4].copy_from_slice(&signum.to_le_bytes());
             // Clear the bit so subsequent reads see the next signal.
-            crate::handlers::clear_signal_pending(self.owner_task, signum);
+            crate::handlers::clear_signal_pending(src, signum);
             Ok(SI_LEN)
         })
     }

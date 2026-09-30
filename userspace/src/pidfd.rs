@@ -52,6 +52,20 @@ pub struct PidFdState {
     /// the mask entirely. The legacy `notify(0)` in `notify_exit` stays
     /// belt-and-suspenders during the migration; this cell is ADDITIVE.
     pub readiness: narf_lib::readiness::Readiness,
+    /// The process's pidfs inode number. Linux (6.9+) gives each `struct
+    /// pid` one pidfs inode, numbered at `alloc_pid` time by
+    /// `fs/pidfs.c::pidfs_add_pid` -> `pidfs_alloc_ino` (a 64-bit counter
+    /// that is never reused), so every pidfd of one process `fstat`s equal
+    /// and a recycled pid number gets a new inode. One `PidFdState` is
+    /// exactly that lifetime: `mint_for` shares it between pidfds of a live
+    /// process and mints a fresh one once the number is recycled.
+    pub ino: u64,
+}
+
+/// `pidfs_alloc_ino` on 64-bit: `gen_cookie_next`, starting at 1.
+fn pidfs_alloc_ino() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl PidFdState {
@@ -67,6 +81,7 @@ impl PidFdState {
             // would park for an edge that never re-fires. Matches the `exited`
             // flag and `poll_readiness` for the already-zombie mint.
             readiness: narf_lib::readiness::Readiness::new(if exited { POLL_IN } else { 0 }),
+            ino: pidfs_alloc_ino(),
         })
     }
 
@@ -218,6 +233,17 @@ impl PidFdFile {
 }
 
 impl FileOps for PidFdFile {
+    fn ino(&self) -> u64 {
+        self.state.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: narf_filesystem::inode_id::PseudoFs::Pid.dev(),
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Linux: read() on a pidfd returns EOPNOTSUPP. We use EIO
         // shape (`FsError::Unsupported` → ENOTTY at the syscall

@@ -149,6 +149,19 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
+    /// `st_ino`: the on-disk inode number, as Linux's `minix_iget` uses it
+    /// (the root is `MINIX_ROOT_INO` = 1).
+    fn ino(&self) -> u64 {
+        u64::from(self.ino)
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
     /// inode — a FIFO or device node living in this filesystem dispatches
     /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
@@ -231,6 +244,19 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
+    /// `st_ino`: the on-disk inode number, as Linux's `minix_iget` uses it
+    /// (the root is `MINIX_ROOT_INO` = 1).
+    fn ino(&self) -> u64 {
+        u64::from(self.ino)
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
+    }
+
     fn dcache_identity(&self) -> (usize, u64, u64) {
         (
             Arc::as_ptr(&self.volume) as *const () as usize,

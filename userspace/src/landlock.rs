@@ -112,6 +112,17 @@ struct RulesetFile {
 }
 
 impl narf_filesystem::FileOps for RulesetFile {
+    /// Linux `landlock_create_ruleset` uses `anon_inode_getfd("[landlock-ruleset]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,

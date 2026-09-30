@@ -800,15 +800,8 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
             // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::write_volatile(new_sp as *mut u64, fallback_return);
-                let info_p = siginfo_vaddr as *mut u8;
-                core::ptr::write_bytes(info_p, 0, 128);
-                (info_p as *mut i32).write_unaligned(params.signum as i32);
-                (info_p.add(4) as *mut i32).write_unaligned(0);
-                (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
-                (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
-                // _sifields._rt.si_sigval (sigqueue payload). Unused by
-                // non-queued signals, so writing 0 there is harmless.
-                (info_p.add(24) as *mut u64).write_unaligned(params.si_value);
+                let info = params.siginfo_bytes();
+                core::ptr::copy_nonoverlapping(info.as_ptr(), siginfo_vaddr as *mut u8, 128);
                 core::ptr::write_volatile(uctx_vaddr as *mut AArch64UContext, uctx);
             }
 

@@ -1067,6 +1067,29 @@ fn path_lookup_errno(path: &str) -> i64 {
     ENOENT
 }
 
+/// The caller-view path a followed `/proc/self/fd/N`, `/proc/thread-self/fd/N`
+/// or `/proc/<pid>/fd/N` jumps to: fd N's own file, when it has a filesystem
+/// path. `None` for anything else (the ordinary walk then applies), including
+/// a closed fd or a pathless one (memfd, socket, anon inode).
+fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::String> {
+    let (owner, fd) = if let Some(n) = user_path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| user_path.strip_prefix("/proc/thread-self/fd/"))
+    {
+        (task, n.parse::<u32>().ok()?)
+    } else {
+        let n = parse_proc_self_fd(user_path)?;
+        let pid = user_path
+            .strip_prefix("/proc/")?
+            .split_once('/')?
+            .0
+            .parse::<u64>()
+            .ok()?;
+        (proc_pid_to_tid(pid), n)
+    };
+    fd_path_for_task(owner, fd).filter(|p| p.starts_with('/'))
+}
+
 /// A node found by [`user_path_lookup`].
 pub(crate) struct LookedUpPath {
     /// Host-view absolute path (chroot applied), for resolver calls.
@@ -1103,13 +1126,28 @@ pub(crate) fn user_path_lookup(
         return Err(ENOENT);
     }
     let anchored = resolve_at_path(task, dirfd, raw).map_err(|e| -e)?;
-    let user_path = resolve_cwd_path_user(task, &anchored);
-    let path = resolve_cwd_path(task, &anchored);
+    let mut user_path = resolve_cwd_path_user(task, &anchored);
+    let mut path = resolve_cwd_path(task, &anchored);
     // A trailing slash forces the final component to be followed and to be
     // a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY` in `path_lookupat`).
     let trailing_slash = raw.len() > 1 && raw.ends_with('/');
+    let mut follow_final = follow || trailing_slash;
+    // `/proc/<pid>/fd/N` is a magic link: following it does not re-walk the
+    // link text, it jumps to the fd's own file (`proc_fd_link` ->
+    // `nd_jump_link`) and the walk ends there. An O_PATH|O_NOFOLLOW fd on a
+    // symlink therefore resolves to the symlink itself — systemd's sd-event
+    // watches /etc/localtime exactly this way (inotify_add_watch on
+    // /proc/self/fd/N). Re-walking the text followed /etc/localtime to its
+    // target, or failed with ENOENT, which systemd reports as EBADF.
+    if follow_final {
+        if let Some(target) = proc_fd_magic_target(task, &user_path) {
+            path = resolve_cwd_path(task, &target);
+            user_path = target;
+            follow_final = false;
+        }
+    }
     let Some((stat, _ino, _rdev, uid, gid, _attrs)) =
-        stat_ino_path_dir_aware_ext(&path, follow || trailing_slash)
+        stat_ino_path_dir_aware_ext(&path, follow_final)
     else {
         return Err(path_lookup_errno(&path));
     };
@@ -1419,6 +1457,15 @@ impl narf_filesystem::FileOps for DirFdFile {
         self.dir.ino()
     }
 
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        // `st_dev` (and nlink/atime/ctime) too: `(st_dev, st_ino)` names
+        // the inode, and a path stat of the directory reports the
+        // DirOps' attrs. Dropping them made `fstat(open("/tmp"))` report
+        // st_dev 0 while `stat("/tmp")` reported the tmpfs superblock, so
+        // the same directory looked like two different files.
+        self.dir.inode_attrs()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,
@@ -1441,7 +1488,8 @@ impl narf_filesystem::FileOps for DirFdFile {
                 file_type: narf_filesystem::FileType::Dir,
                 perms: self.dir.dir_mode(),
             },
-            mtime_cycles: 0,
+            // The same mtime a path stat reports (`stat_ino_path_dir_aware_ext`).
+            mtime_cycles: narf_time::ns_to_cycles(self.dir.dir_mtime_ns()),
         }
     }
     fn owners(&self) -> (u32, u32) {
@@ -1561,6 +1609,95 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
 
     fn nonblock_read_eagain(&self) -> bool {
         self.inner.nonblock_read_eagain()
+    }
+
+    // Everything below is the terminal's behaviour, not the /dev/tty node's
+    // metadata, so it must come from the terminal itself. Linux's /dev/tty
+    // open (`tty_open` → `tty_open_current_tty`) hands back a struct file on
+    // the controlling tty's own tty_struct: its reads block and wake, it is
+    // pollable, and TIOCSPGRP / TIOCSCTTY act on that terminal. Without these
+    // a blocking read had no readiness source to park on and failed EAGAIN
+    // (sudo / su password prompts).
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        self.inner.readiness()
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        self.inner.readiness_notifies()
+    }
+
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.inner.arm_readiness(task_id, interest, waker)
+    }
+
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.inner.arm_readiness_exclusive(task_id, interest, waker)
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.inner.arm_readiness_persistent(id, interest, waker)
+    }
+
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        self.inner.disarm_readiness(task_id)
+    }
+
+    fn can_poll(&self) -> bool {
+        self.inner.can_poll()
+    }
+
+    fn poll_deadline(&self) -> Option<u64> {
+        self.inner.poll_deadline()
+    }
+
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsIoctlReply> {
+        self.inner.ioctl_async(cmd, arg, input, out_size)
+    }
+
+    fn flush<'a>(&'a self) -> narf_filesystem::FsFuture<'a, ()> {
+        self.inner.flush()
+    }
+
+    fn has_flush(&self) -> bool {
+        self.inner.has_flush()
+    }
+
+    fn tty_session(&self) -> Option<u64> {
+        self.inner.tty_session()
+    }
+
+    fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool {
+        self.inner.set_tty_fg_pgrp(pgrp)
+    }
+
+    fn tty_acquire_controlling(
+        &self,
+        arg: usize,
+        readable: bool,
+    ) -> Result<bool, narf_filesystem::FsError> {
+        self.inner.tty_acquire_controlling(arg, readable)
     }
 }
 
@@ -2017,11 +2154,6 @@ fn do_execve_resolved(
     // a process pays for the pages it touches. `None` for the fexecve/memfd
     // arm below, whose bytes are already in hand with no file behind them.
     let mut exec_file: Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> = None;
-    // Whether the image came from an fd rather than a path, and whether a
-    // `#!` line was followed to reach it — both decide whether the file's
-    // set-user-ID bits may be honoured below.
-    let image_override_used = image_override.is_some();
-    let mut followed_shebang = false;
     // fexecve fast path: the bytes are already in hand (a memfd fd with no
     // filesystem path). Skip path resolution + shebang — a fexecve'd image is
     // a real binary, and argv[0] is whatever the caller passed.
@@ -2048,7 +2180,6 @@ fn do_execve_resolved(
                     return;
                 }
                 depth += 1;
-                followed_shebang = true;
                 let line_end = prefix
                     .iter()
                     .position(|&c| c == b'\n')
@@ -2096,20 +2227,24 @@ fn do_execve_resolved(
 
     let task = current_task_id();
 
-    // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
-    // transition, applied to the file actually being executed and only
-    // once the image is known good. `image_override` is a memfd/fd image
-    // with no mount and no inode bits behind it, so it confers nothing —
-    // as in Linux, where there is no file to read them from.
-    if image_override_used {
-        let _ = task;
-    } else {
-        // The set-user-ID transition AND `begin_new_exec`'s dumpability
-        // step, in that order because the second reads the credentials the
-        // first may have changed. One call, so the pair cannot be
-        // half-applied.
-        exec_apply_credentials(task, &cur_path, followed_shebang);
-    }
+    // `bprm_creds_from_file`: the credential this exec will install, from
+    // the file actually being mapped — after a `#!` line that is the
+    // interpreter, whose set-id bits apply while the script's do not, as in
+    // Linux (`bprm->file` has been swapped for the interpreter by then). The
+    // mount lookup uses the same chrooted path `read_exec` resolved. An
+    // image with no file behind it (an anonymous memfd) has no set-id bits,
+    // but still gets the capability recomputation.
+    //
+    // PREPARED here and COMMITTED only after the image loads: the loader
+    // publishes the new ids and AT_SECURE in the auxv, and an exec that
+    // fails to load must leave the caller's credential untouched. (Applying
+    // it here, as before, returned ENOEXEC to a caller already running as
+    // the set-user-ID file's owner.)
+    let exec_cred = {
+        let mount_path = apply_chroot(&cur_path);
+        exec_prepare_credentials(task, exec_file.as_deref(), &mount_path)
+    };
+    let exec_aux = exec_auxv(task, &exec_cred);
 
     // Step 4: load the new image. exec REPLACES this process's image, so the
     // loaded `UserProcess` carries the caller's EXISTING pid — minting a fresh
@@ -2124,7 +2259,7 @@ fn do_execve_resolved(
             &exec_src,
             &argv_refs,
             &envp_refs,
-            &[],
+            &exec_aux,
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
             exec_file.as_ref(),
@@ -2181,7 +2316,15 @@ fn do_execve_resolved(
     // does this in the exec path). Without it, O_CLOEXEC fds leak
     // across exec — an fd-table leak that is also a sandbox-escape
     // vector (a descriptor the new image was never meant to inherit).
+    // `begin_new_exec` runs `unshare_files()` first: a table shared with a
+    // CLONE_FILES sibling (a CLONE_VM|CLONE_FILES|CLONE_VFORK spawner) is
+    // copied, so the sweep never closes the sibling's descriptors.
+    crate::fd::unshare_table(task);
     crate::fd::close_cloexec(task);
+    // Point of no return: install the credential. After the close-on-exec
+    // sweep, as `begin_new_exec` orders it, so the dumpability change never
+    // exposes descriptors that should already be gone.
+    exec_commit_credentials(task, &exec_cred);
 
     // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
     // bytes, derive comm from argv[0]'s basename (Linux convention).
@@ -3070,16 +3213,27 @@ pub(crate) unsafe fn copy_raw_to_user(dst_uptr: u64, src: *const u8, len: usize)
 //
 // MS_RDONLY, MS_NODEV and MS_NOEXEC become the mount's `MNT_*` set and are
 // enforced (`mnt_want_write`, `may_open`'s device arm, `do_open_execat`).
-// MS_NOSUID is stored and reported but has nothing to suppress: NARF's
-// execve does not implement set-user-ID binaries at all, so there is no
-// privilege transition for `nosuid` to block. MS_REC and MS_RELATIME are
-// accepted and dropped — there is no mount propagation to recurse over and
-// no atime policy to relax.
+// MS_NOSUID is enforced too: `bprm_fill_uid` consults it (`mnt_may_suid`)
+// before honouring a set-user-ID / set-group-ID bit. The atime policy
+// (MS_NOATIME / MS_NODIRATIME / MS_RELATIME / MS_STRICTATIME) is recorded on
+// the mount and reported through mountinfo and statmount; NARF's filesystems
+// do not maintain atime from reads, so it has nothing to relax.
 const MS_RDONLY: u64 = 1 << 0;
 const MS_NOSUID: u64 = 1 << 1;
 const MS_NODEV: u64 = 1 << 2;
 const MS_NOEXEC: u64 = 1 << 3;
+const MS_SYNCHRONOUS: u64 = 1 << 4;
 const MS_REMOUNT: u64 = 1 << 5;
+const MS_MANDLOCK: u64 = 1 << 6;
+const MS_DIRSYNC: u64 = 1 << 7;
+const MS_NOSYMFOLLOW: u64 = 1 << 8;
+const MS_NOATIME: u64 = 1 << 10;
+const MS_NODIRATIME: u64 = 1 << 11;
+const MS_STRICTATIME: u64 = 1 << 24;
+const MS_LAZYTIME: u64 = 1 << 25;
+const MS_I_VERSION: u64 = 1 << 23;
+const MS_SILENT: u64 = 1 << 15;
+const MS_POSIXACL: u64 = 1 << 16;
 const MS_BIND: u64 = 1 << 12;
 const MS_MOVE: u64 = 1 << 13;
 const MS_REC: u64 = 1 << 14;
@@ -3475,18 +3629,45 @@ pub(crate) fn current_mount_arc_with_flags(
 /// request, `MNT_*` is the property the attachment carries afterwards.
 pub(crate) fn mnt_flags_from_ms(flags: u64) -> u64 {
     use narf_filesystem::mnt_flags;
-    let mut out = 0;
+    // /* Default to relatime unless overriden */
+    // if (!(flags & MS_NOATIME)) mnt_flags |= MNT_RELATIME;
+    let mut out = if flags & MS_NOATIME == 0 {
+        mnt_flags::RELATIME
+    } else {
+        0
+    };
     for (ms, mnt) in [
-        (MS_RDONLY, mnt_flags::READONLY),
         (MS_NOSUID, mnt_flags::NOSUID),
         (MS_NODEV, mnt_flags::NODEV),
         (MS_NOEXEC, mnt_flags::NOEXEC),
+        (MS_NOATIME, mnt_flags::NOATIME),
+        (MS_NODIRATIME, mnt_flags::NODIRATIME),
     ] {
         if flags & ms != 0 {
             out |= mnt;
         }
     }
+    // if (flags & MS_STRICTATIME) mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
+    if flags & MS_STRICTATIME != 0 {
+        out &= !(mnt_flags::RELATIME | mnt_flags::NOATIME);
+    }
+    if flags & MS_RDONLY != 0 {
+        out |= mnt_flags::READONLY;
+    }
+    if flags & MS_NOSYMFOLLOW != 0 {
+        out |= mnt_flags::NOSYMFOLLOW;
+    }
     out
+}
+
+/// The stored `MNT_*` set of the mount at exactly `path` (no superblock
+/// contribution), or `None` when `path` is not a mount root.
+pub(crate) fn current_mount_flags_exact(path: &str) -> Option<u64> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.mount_flags_exact(path)
+    } else {
+        narf_filesystem::registry().mount_flags_exact(path)
+    }
 }
 
 /// The `MNT_*` flags of the mount covering `path` in the caller's
@@ -3904,7 +4085,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, mnt_opts, sb_opts) in rows {
+    for (id, parent, path, name, mnt_opts, sb_opts, super_flags) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -3916,13 +4097,14 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        // The last two fields are the two option halves: this
-        // attachment's MNT_* flags, then the filesystem's `show_options`
-        // text. procfs renders them in mountinfo's two separate columns.
+        // The last three fields are the option halves: this attachment's
+        // MNT_* flags, then the filesystem's `show_options` text, then the
+        // superblock's `rw`/`ro` + `show_sb_opts`. procfs renders the first
+        // before mountinfo's `-` and the other two after it.
         let _ = writeln!(
             s,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            id, parent, visible, name, mnt_opts, sb_opts
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            id, parent, visible, name, mnt_opts, sb_opts, super_flags
         );
     }
     Some(s)
@@ -3947,6 +4129,8 @@ struct ProcNsIdMap {
     opener_caps: u64,
     owners: (u32, u32),
     file: narf_filesystem::procfs::NsIdMapFile,
+    /// The path's procfs inode, so `fstat` of the open file matches `stat`.
+    ino: u64,
 }
 
 #[cfg(feature = "container")]
@@ -3986,11 +4170,21 @@ pub fn proc_ns_idmap_open(
         opener_caps: read_caps(opener).effective,
         owners: (ids.euid, ids.egid),
         file,
+        ino: narf_filesystem::procfs::idmap_file_ino(pid, file),
     }))
 }
 
 #[cfg(feature = "container")]
 impl narf_filesystem::FileOps for ProcNsIdMap {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: narf_filesystem::procfs::proc_dev(),
+            ..Default::default()
+        }
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::procfs::NsIdMapFile;
@@ -5284,7 +5478,7 @@ pub(crate) struct QueuedSiginfo {
 }
 
 impl QueuedSiginfo {
-    const fn generic(code: i32, value: u64, pid: u32) -> Self {
+    pub(crate) const fn generic(code: i32, value: u64, pid: u32) -> Self {
         Self {
             code,
             value,
@@ -5635,7 +5829,7 @@ pub(crate) fn sigwait_should_wake(task: u64, set: u64) -> bool {
 }
 
 pub fn is_signal_pending(task_id: u64) -> bool {
-    let pending = signal_bits_get(&SIGNAL_PENDING, task_id);
+    let pending = signal_pending_of(task_id);
     let mask = signal_bits_get(&SIGNAL_MASK, task_id);
     (pending & !mask) != 0
 }
@@ -5649,7 +5843,7 @@ pub fn is_signal_pending(task_id: u64) -> bool {
 /// action. Keep `is_signal_pending` as the raw deliverability probe used by
 /// diagnostics and signal consumption; blocking waits use this filtered form.
 pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
-    let pending = signal_bits_get(&SIGNAL_PENDING, task_id);
+    let pending = signal_pending_of(task_id);
     let mut deliverable = pending & !signal_mask_of(task_id);
     while deliverable != 0 {
         let signum = sig_from_bit(deliverable);
@@ -5965,9 +6159,130 @@ pub fn __test_signal_reset() {
     *SUSPEND_SAVED_MASK.lock() = Some(BTreeMap::new());
 }
 
-/// Diagnostic: peek the pending bitmap for `task`.
-pub fn signal_pending_of(task: u64) -> u64 {
+// ── Thread-group shared pending (Linux `signal->shared_pending`) ─────
+//
+// Linux keeps two pending sets per task: the thread's private
+// `task->pending` (tkill/tgkill/rt_tgsigqueueinfo, synchronous faults,
+// SIGPIPE, ptrace) and the thread group's `signal->shared_pending`
+// (kill(pid), sigqueue(pid), pidfd, a child's SIGCHLD, SIGIO/timers aimed at
+// a process, tty job-control signals to a process group). `dequeue_signal`
+// drains the private set first, then the shared one; `sigpending()` reports
+// their union; any thread that does not block a shared signal may take it
+// (`complete_signal`).
+//
+// The shared set lives in the SAME tables as the private ones
+// (SIGNAL_PENDING, SIGQUEUE_INFO, SIGNAL_READABLE_GEN, SIGNAL_RAISE_GEN)
+// under a key no task id can take: SHARED_PENDING_KEY_BIT | the group
+// leader's task id. Every per-key primitive therefore works on either set,
+// and a consumer only has to decide WHICH key it is operating on.
+
+/// Tag bit marking a thread group's shared-pending key (task ids are far
+/// below 2^62).
+const SHARED_PENDING_KEY_BIT: u64 = 1 << 62;
+
+/// Key of the shared pending set of `task`'s thread group.
+#[inline]
+pub(crate) fn shared_pending_key(task: u64) -> u64 {
+    SHARED_PENDING_KEY_BIT | process_state_key(task)
+}
+
+/// The thread's private pending set (`task->pending`).
+#[inline]
+pub(crate) fn signal_pending_private(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_PENDING, task)
+}
+
+/// Its thread group's shared pending set (`signal->shared_pending`).
+#[inline]
+pub(crate) fn signal_pending_shared(task: u64) -> u64 {
+    if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    signal_bits_get(&SIGNAL_PENDING, shared_pending_key(task))
+}
+
+/// Every signal pending for `task`: its private set plus its group's
+/// shared set — what `sigpending()` and every "is a signal pending" check
+/// see on Linux.
+pub fn signal_pending_of(task: u64) -> u64 {
+    signal_pending_private(task) | signal_pending_shared(task)
+}
+
+
+/// Consume one instance of the lowest pending signal in `set` for a
+/// `rt_sigtimedwait` caller: the private set first, then the group's shared
+/// set (`dequeue_signal`).
+pub(crate) fn sigwait_take(task: u64, set: u64) -> Option<SigwaitTaken> {
+    sigwait_take_locked(task, set).or_else(|| sigwait_take_locked(shared_pending_key(task), set))
+}
+
+/// The task a signalfd operation acts for. Linux `signalfd_poll`/`read` use
+/// `current`: the thread reading or polling dequeues its OWN private set plus
+/// its group's shared set, whichever thread created the fd. A caller outside
+/// the creator's thread group (an inherited fd across fork) keeps reading as
+/// the creator, the historical NARF binding.
+pub(crate) fn signalfd_reader(owner: u64) -> u64 {
+    let current = current_task_id();
+    if current != 0 && process_state_key(current) == process_state_key(owner) {
+        current
+    } else {
+        owner
+    }
+}
+
+/// Drop `task`'s thread group's shared pending set: bits, queued payloads and
+/// readiness generations. Called when the whole group has exited.
+pub(crate) fn release_shared_pending(task: u64) {
+    let key = shared_pending_key(task);
+    pending_signal_bits_remove(key);
+    signal_bits_remove(&SIGNAL_READABLE_GEN, key);
+    signal_bits_remove(&SIGNAL_RAISE_GEN, key);
+    if let Some(m) = SIGQUEUE_INFO[sigqueue_bucket(key)].values.lock().as_mut() {
+        m.retain(|&(k, _), _| k != key);
+    }
+}
+
+/// Discard every pending instance of `signum` for `task`'s whole thread
+/// group — its shared set and each thread's private set. Linux
+/// `do_sigaction` does this when the new disposition ignores the signal
+/// (POSIX: "the pending signal shall be discarded, whether or not it is
+/// blocked").
+pub(crate) fn flush_group_pending_signal(task: u64, signum: u32) {
+    let key = shared_pending_key(task);
+    clear_pending_signal_bits(key, sig_bit(signum));
+    purge_sigqueue(key, signum);
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    let mut members = thread_group_members(pid);
+    if !members.contains(&task) {
+        members.push(task);
+    }
+    for t in members {
+        clear_pending_signal_bits(t, sig_bit(signum));
+        purge_sigqueue(t, signum);
+    }
+}
+
+/// `__set_task_blocked` -> `retarget_shared_pending`: signals newly blocked by
+/// `task` that are pending in its group's shared set are handed to a thread
+/// that can still take them.
+#[inline]
+pub(crate) fn note_mask_change(task: u64, old: u64, new: u64) {
+    let newly_blocked = new & !old;
+    if newly_blocked != 0 && signal_pending_shared(task) & newly_blocked != 0 {
+        retarget_shared_pending(task, newly_blocked);
+    }
+}
+
+/// `next_signal` over the two sets: the lowest deliverable signal in the
+/// private set if any, else the lowest in the shared set. `allowed` is the
+/// set the caller may take (e.g. `!blocked`). Returns `(signum, source key)`.
+pub(crate) fn next_deliverable(task: u64, allowed: u64) -> Option<(u32, u64)> {
+    let private = signal_pending_private(task) & allowed;
+    if private != 0 {
+        return Some((sig_from_bit(private), task));
+    }
+    let shared = signal_pending_shared(task) & allowed;
+    (shared != 0).then(|| (sig_from_bit(shared), shared_pending_key(task)))
 }
 
 /// Linux `fatal_signal_pending()` for the CURRENT task: an uncatchable
@@ -5991,13 +6306,16 @@ pub fn __test_pending_signal_task_count() -> usize {
 }
 
 pub fn signal_readable_generation(task: u64) -> u64 {
+    // A raise to either set advances what this task can read.
     signal_bits_get(&SIGNAL_READABLE_GEN, task)
+        .wrapping_add(signal_bits_get(&SIGNAL_READABLE_GEN, shared_pending_key(task)))
 }
 
 /// Per-task raise generation — bumped on every signal raise. See
 /// [`SIGNAL_RAISE_GEN`]. Read by the poll/epoll park's signalfd lost-wake guard.
 pub fn signal_raise_generation(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_RAISE_GEN, task)
+        .wrapping_add(signal_bits_get(&SIGNAL_RAISE_GEN, shared_pending_key(task)))
 }
 
 /// POSIX default action for a signal when no handler is installed.
@@ -6202,6 +6520,18 @@ pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
 pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.lock();
     g.as_ref().and_then(|m| m.get(&tid).cloned())
+}
+
+/// Copy a task's comm into `buf` without allocating (the OOM report runs when
+/// the heap may be exhausted). Returns the copied length; 0 if unknown.
+pub fn proc_comm_of_task_into(tid: u64, buf: &mut [u8; 16]) -> usize {
+    let g = PROC_COMM.lock();
+    let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
+        return 0;
+    };
+    let n = comm.len().min(buf.len());
+    buf[..n].copy_from_slice(&comm.as_bytes()[..n]);
+    n
 }
 
 /// `proc_comm_of_task` for callers running in the timer trap, which can
@@ -6573,10 +6903,16 @@ pub fn proc_task_info(
             let (tty_nr, fg) = if ctty == CTTY_CONSOLE {
                 ((5u64 << 8) | 1, narf_filesystem::console_tty::fg_pgrp())
             } else {
-                (
-                    (136u64 << 8) | ctty as u64,
-                    narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
-                )
+                // `tty_devnum`: new_encode_dev(MKDEV(136, index)) — the
+                // controlling-tty key is the pty's system-wide id, so map it
+                // to its index within its devpts instance.
+                match narf_filesystem::devfs_pty::pty_index(ctty) {
+                    Some(index) => (
+                        (u64::from(index) & 0xff) | (136u64 << 8) | ((u64::from(index) & !0xff) << 12),
+                        narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
+                    ),
+                    None => (0, 0),
+                }
             };
             let tpgid = if fg == 0 { -1 } else { pgid_to_user(fg) as i64 };
             (tty_nr, tpgid)
@@ -6959,7 +7295,14 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
 /// indistinguishable from a kernel signal, which is what systemd PID 1's and
 /// udevd's signalfd dispatchers reject or misattribute. Standard signals
 /// coalesce, so this overwrites any prior queued instance (Linux does too).
-pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
+pub(crate) fn queue_sender_siginfo(target: u64, signum: u32, si_code: i32) {
+    queue_sender_siginfo_into(target, target, signum, si_code);
+}
+
+/// Record the sender's siginfo for a signal pending in the set `key`
+/// (a task's private set or a group's shared set). `si_pid` is reported in
+/// `target`'s pid namespace.
+fn queue_sender_siginfo_into(key: u64, target: u64, signum: u32, si_code: i32) {
     // SIGKILL and SIGSTOP cannot be caught, blocked, consumed by sigwait, or
     // read through signalfd, so their sender payload is unobservable. Linux's
     // SEND_SIG_NOINFO path likewise avoids allocating a queued siginfo for
@@ -6968,11 +7311,10 @@ pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
     if matches!(signum, 9 | 19) {
         return;
     }
-    const SI_USER: i32 = 0;
     let sender = current_task_id();
     let sender_outer = task_to_pid_raw(sender).unwrap_or(sender);
     let si_pid = report_pid_to(target, sender_outer) as u32;
-    let _ = store_sigqueue_info(target, signum, SI_USER, 0, si_pid);
+    let _ = store_sigqueue_info(key, signum, si_code, 0, si_pid);
 }
 
 /// Linux `sig_ignored()`: an unblocked signal with SIG_IGN or an implicit
@@ -7010,7 +7352,7 @@ fn signal_ignored_at_generation(task: u64, signum: u32) -> bool {
 fn raise_signal_pending_inner(
     task: u64,
     signum: u32,
-    with_sender_siginfo: bool,
+    sender_si_code: Option<i32>,
 ) {
     // Reject signal 0: it's the POSIX null signal (existence probe), never a
     // real signal. Setting pending bit 0 would later be taken by the delivery
@@ -7067,8 +7409,8 @@ fn raise_signal_pending_inner(
         }
         return;
     }
-    if with_sender_siginfo {
-        queue_sender_siginfo(task, signum);
+    if let Some(si_code) = sender_si_code {
+        queue_sender_siginfo(task, signum, si_code);
     }
     let Some(was_empty) = pending_signal_bits_update(task, |slot| {
         let was_empty = *slot == 0;
@@ -7091,11 +7433,139 @@ fn raise_signal_pending_inner(
 }
 
 pub fn raise_signal_pending(task: u64, signum: u32) {
-    raise_signal_pending_inner(task, signum, false);
+    raise_signal_pending_inner(task, signum, None);
 }
 
-pub(crate) fn raise_user_signal_pending(task: u64, signum: u32) {
-    raise_signal_pending_inner(task, signum, true);
+/// What a process-directed send records alongside the pending bit.
+pub(crate) enum GroupSigInfo {
+    /// A kernel-generated signal with no sender payload (SIGCHLD's status is
+    /// reported through wait, SIGIO carries its own queued record, ...).
+    None,
+    /// `kill(2)`-shaped: `si_code` plus the sender's pid.
+    Sender(i32),
+    /// A queued payload (`sigqueue`/`rt_sigqueueinfo`/`pidfd_send_signal`
+    /// with info, SIGIO band records).
+    Queued(QueuedSiginfo),
+}
+
+/// Send `signum` to the THREAD GROUP of `target` — Linux
+/// `send_signal_locked(sig, info, p, PIDTYPE_TGID)`:
+///
+///   1. `prepare_signal`: group-wide stop/continue interaction, then drop the
+///      signal if the group ignores it;
+///   2. queue it on `signal->shared_pending` (standard signals coalesce, RT
+///      signals queue);
+///   3. `complete_signal`: wake one thread that does not block it.
+///
+/// SIGKILL is not queued: like Linux's fatal path it is added to every
+/// thread's private set so the whole group dies.
+///
+/// Returns the shared set's queued-payload depth, or `None` when an RT queue
+/// is full (the sender reports -EAGAIN).
+pub(crate) fn raise_group_signal(target: u64, signum: u32, info: GroupSigInfo) -> Option<usize> {
+    if signum == 0 || signum > 64 {
+        return Some(0);
+    }
+    if signum == 9 {
+        let pid = task_to_pid_raw(target).unwrap_or(target);
+        let mut members: alloc::vec::Vec<u64> = thread_group_members(pid);
+        if !members.contains(&target) {
+            members.push(target);
+        }
+        for t in members {
+            if t == target
+                || crate::task::task_get(t).is_some_and(|task| {
+                    task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING
+                })
+            {
+                raise_signal_pending_inner(t, 9, Some(SI_USER));
+            }
+        }
+        return Some(0);
+    }
+    let resumed = signal_stopcont_interaction(target, signum);
+    if signal_ignored_at_generation(target, signum) {
+        let _ = resumed; // the continue already woke every stopped thread
+        return Some(0);
+    }
+    let key = shared_pending_key(target);
+    // `legacy_queue`: a standard (non-RT) signal already pending in the set
+    // is not queued again, and `complete_signal` does not run a second time.
+    if signum < SIGRT_QUEUE_MIN && signal_bits_get(&SIGNAL_PENDING, key) & sig_bit(signum) != 0 {
+        return Some(0);
+    }
+    let (depth, was_empty) = match info {
+        GroupSigInfo::Queued(payload) => sigqueue_store_payload_and_raise_bit(key, signum, payload)?,
+        GroupSigInfo::Sender(si_code) => {
+            if !matches!(signum, 9 | 19) {
+                queue_sender_siginfo_into(key, target, signum, si_code);
+            }
+            let was_empty = pending_signal_bits_update_or_init(key, |slot| {
+                let was_empty = *slot == 0;
+                set_pending_signal_bit(slot, signum);
+                was_empty
+            });
+            (0, was_empty)
+        }
+        GroupSigInfo::None => {
+            let was_empty = pending_signal_bits_update_or_init(key, |slot| {
+                let was_empty = *slot == 0;
+                set_pending_signal_bit(slot, signum);
+                was_empty
+            });
+            (0, was_empty)
+        }
+    };
+    group_signal_notify(target, key, was_empty);
+    complete_group_signal(target, signum);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if resumed && prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits()) {
+        narf_scheduler::stackful::note_urgent_wake_preempt(target);
+    }
+    Some(depth)
+}
+
+/// Readiness bookkeeping for a shared-set raise: advance the shared set's
+/// generations (each thread's view is private + shared, see
+/// `signal_raise_generation`) and wake every signalfd of the group — Linux
+/// `signalfd_notify` wakes `sighand->signalfd_wqh`, which the whole group
+/// shares.
+fn group_signal_notify(target: u64, key: u64, was_empty: bool) {
+    if was_empty {
+        signal_bits_update_or_init(&SIGNAL_READABLE_GEN, key, |generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+    signal_bits_update_or_init(&SIGNAL_RAISE_GEN, key, |generation| {
+        *generation = generation.wrapping_add(1);
+    });
+    let pid = task_to_pid_raw(target).unwrap_or(target);
+    let mut members = thread_group_members(pid);
+    if !members.contains(&target) {
+        members.push(target);
+    }
+    for t in members {
+        crate::io_mux::wake_signalfds(t);
+    }
+}
+
+/// `si_code` of a user-generated signal (`include/uapi/asm-generic/siginfo.h`).
+pub(crate) const SI_USER: i32 = 0;
+/// `si_code` of a `tkill(2)`/`tgkill(2)` signal. Linux `do_tkill` builds its
+/// siginfo with `prepare_kill_siginfo(sig, &info, PIDTYPE_PID)`, which picks
+/// SI_TKILL for a thread-directed send and SI_USER for `kill(2)`'s
+/// `PIDTYPE_TGID`. glibc depends on the difference: `sighandler_setxid` and
+/// `sigcancel_handler` ignore SIGSETXID/SIGCANCEL whose `si_code` is not
+/// SI_TKILL, so reporting SI_USER hung every set*id() of a multithreaded glibc
+/// process (the caller waits for each thread to acknowledge) and silently
+/// dropped pthread_cancel.
+pub(crate) const SI_TKILL: i32 = -6;
+
+
+/// Raise a thread-directed user signal from `tkill(2)`/`tgkill(2)` (siginfo
+/// `SI_TKILL` + sender pid).
+pub(crate) fn raise_tkill_signal_pending(task: u64, signum: u32) {
+    raise_signal_pending_inner(task, signum, Some(SI_TKILL));
 }
 
 /// Apply Linux's stop/continue pending-set cancellation and enqueue `signum`
@@ -7134,6 +7604,9 @@ fn signal_raise_notify(task: u64, was_empty: bool) {
     // refill; the fd's poll_readiness still gates delivery on its mask.
     crate::io_mux::wake_signalfds(task);
     wake_signal(task);
+    // `signal_wake_up` -> `kick_process`: a target running user code on
+    // another CPU must pass through a kernel exit to take the signal now.
+    narf_scheduler::kick_task(task);
 }
 
 /// Deliver `signum` to every task in process group `pgrp` (job-control
@@ -7146,12 +7619,39 @@ pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
     if pgrp == 0 || signum > 64 {
         return false;
     }
+    signal_pgrp(pgrp, signum, false)
+}
+
+/// `kill(-pgid)`/`kill(0)` from userspace: like [`deliver_signal_to_pgrp`],
+/// but each process's siginfo names the sender (`SI_USER`).
+pub(crate) fn kill_pgrp_user(pgrp: u64, signum: u32) -> bool {
+    if pgrp == 0 || signum > 64 {
+        return false;
+    }
+    signal_pgrp(pgrp, signum, true)
+}
+
+/// Linux `__kill_pgrp_info`: `group_send_sig_info` to every PROCESS in the
+/// group — one shared-pending send per thread group, however many of its
+/// threads the membership table lists.
+fn signal_pgrp(pgrp: u64, signum: u32, from_user: bool) -> bool {
     let targets = pgrp_task_snapshot(pgrp);
     if targets.is_empty() {
         return false;
     }
+    let mut seen: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for t in targets {
-        raise_signal_pending(t, signum);
+        let group = process_state_key(t);
+        if seen.contains(&group) {
+            continue;
+        }
+        seen.push(group);
+        let info = if from_user {
+            GroupSigInfo::Sender(SI_USER)
+        } else {
+            GroupSigInfo::None
+        };
+        let _ = raise_group_signal(t, signum, info);
     }
     true
 }
@@ -7198,15 +7698,46 @@ pub(crate) fn pgrp_task_snapshot(pgrp: u64) -> alloc::vec::Vec<u64> {
 /// With F_SETSIG left at zero Linux sends ordinary SI_KERNEL SIGIO instead.
 /// If a realtime queue is full Linux falls back to that plain SIGIO; preserve
 /// the guarantee and its siginfo provenance here.
+///
+/// `group` selects Linux `send_sigio_to_task`'s `type`: false for an
+/// `F_OWNER_TID` owner (the thread's private set, `PIDTYPE_PID`), true for a
+/// process or process-group owner (each process's shared set).
 pub(crate) fn raise_sigio_pending(
     task: u64,
     configured_signal: u32,
     poll_code: i32,
     poll_band: u32,
     fd: i32,
+    group: bool,
 ) {
     const SIGIO: u32 = 29;
     const SI_SIGIO: i32 = -5;
+    if group {
+        let signal_has_specific_codes =
+            matches!(configured_signal, 4 | 5 | 7 | 8 | 11 | 17 | 29 | 31);
+        let queued = configured_signal != 0 && {
+            let si_code = if configured_signal != SIGIO && signal_has_specific_codes {
+                SI_SIGIO
+            } else {
+                poll_code
+            };
+            raise_group_signal(
+                task,
+                configured_signal,
+                GroupSigInfo::Queued(QueuedSiginfo::sigpoll(si_code, fd, poll_band)),
+            )
+            .is_some()
+        };
+        if !queued {
+            // F_SETSIG 0, or the realtime queue is full: plain SI_KERNEL SIGIO.
+            let _ = raise_group_signal(
+                task,
+                SIGIO,
+                GroupSigInfo::Queued(QueuedSiginfo::generic(0x80, 0, 0)),
+            );
+        }
+        return;
+    }
     if configured_signal == 0 {
         signal_stopcont_interaction(task, SIGIO);
         if let Some((_depth, was_empty)) =
@@ -7299,6 +7830,12 @@ fn tty_background_access(
 /// if the entry already exists or the table is uninitialised.
 pub fn ensure_signal_pending_slot(task: u64) {
     let _ = pending_signal_bits_update(task, |_| {});
+    // Process-directed timer signals (ITIMER_*, SIGEV_SIGNAL) are raised on the
+    // group's shared set from IRQ context: seed those rows too.
+    let shared = shared_pending_key(task);
+    let _ = pending_signal_bits_update(shared, |_| {});
+    let _ = signal_bits_update(&SIGNAL_READABLE_GEN, shared, |_| {});
+    let _ = signal_bits_update(&SIGNAL_RAISE_GEN, shared, |_| {});
     // The IRQ raise advances readability on the first pending signal. Seed
     // that row here too so the IRQ path never allocates.
     let _ = signal_bits_update(&SIGNAL_READABLE_GEN, task, |_| {});
@@ -7317,6 +7854,36 @@ pub fn ensure_signal_pending_slot(task: u64) {
 /// interrupted task is running, not parked, and SIGALRM is not a
 /// stop/cont signal). The signal is taken on the same trap's
 /// return-to-user via the preemptive delivery hook.
+/// Alloc-free, IRQ-safe process-directed raise: `send_signal_locked(sig,
+/// SEND_SIG_PRIV, p, PIDTYPE_TGID)` from a timer interrupt (ITIMER_REAL's
+/// SIGALRM, ITIMER_VIRTUAL/PROF's SIGVTALRM/SIGPROF). Sets the bit in the
+/// group's pre-seeded shared set (see `ensure_signal_pending_slot`) and wakes
+/// one thread that wants it (`complete_signal`). Returns false if the shared
+/// row was never seeded.
+pub fn raise_group_signal_irq(task: u64, signum: u32) -> bool {
+    if signum == 0 || signum > 64 {
+        return false;
+    }
+    let key = shared_pending_key(task);
+    let Some(was_empty) = pending_signal_bits_update_existing(key, |slot| {
+        let was_empty = *slot == 0;
+        *slot |= sig_bit(signum);
+        was_empty
+    }) else {
+        return false;
+    };
+    if was_empty {
+        let _ = signal_bits_update_existing(&SIGNAL_READABLE_GEN, key, |generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+    let _ = signal_bits_update_existing(&SIGNAL_RAISE_GEN, key, |generation| {
+        *generation = generation.wrapping_add(1);
+    });
+    complete_group_signal(task, signum);
+    true
+}
+
 pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     // Signal 0 is the null signal — never deliverable (see raise_signal_pending).
     if signum == 0 || signum > 64 {
@@ -7404,13 +7971,15 @@ pub(crate) fn raise_due_itimer_real(now: u64) {
         after = Some(t);
         // SIGALRM (14). Slot was pre-created when the timer was armed, so
         // this only sets a bit in an existing entry (never allocates).
-        let _ = raise_signal_pending_irq(t, 14);
-        // Wake the owner if it's parked so waitpid/pause returns EINTR and
-        // SIGALRM is delivered on its return-to-user. For the currently
-        // running owner (the original CPU-bound case) this is a harmless
-        // no-op — it has no parked waker and takes the signal on this
-        // trap's return.
-        wake_signal(t);
+        // ITIMER_REAL is process-directed (`it_real_fn` ->
+        // `kill_pid_info(SIGALRM, SEND_SIG_PRIV, leader_pid)`): raise it on the
+        // group's shared set and wake a thread that wants it — which may be a
+        // sibling when the owner blocks SIGALRM. The owner's slot was seeded
+        // when the timer was armed, so this never allocates.
+        if !raise_group_signal_irq(t, 14) {
+            let _ = raise_signal_pending_irq(t, 14);
+            wake_signal(t);
+        }
     }
 }
 
@@ -7496,11 +8065,13 @@ pub(crate) fn set_signal_mask_for_task(task: u64, mask: u64) -> u64 {
     // SIGKILL/SIGSTOP can never be blocked, whichever install path the
     // mask arrives through (sigsuspend / ppoll / epoll_pwait / sigreturn
     // restore all funnel here) — same strip sys_sigprocmask applies.
-    signal_bits_update_or_init(&SIGNAL_MASK, task, |slot| {
+    let old = signal_bits_update_or_init(&SIGNAL_MASK, task, |slot| {
         let old = *slot;
         *slot = mask & !UNBLOCKABLE_MASK;
         old
-    })
+    });
+    note_mask_change(task, old, mask & !UNBLOCKABLE_MASK);
+    old
 }
 
 /// Send `signum` to the single process named by outer pid `pid`.
@@ -7518,66 +8089,23 @@ fn kill_process(pid: u64, signum: u32) -> bool {
         return false;
     };
     let leader_state = leader.state.load(Ordering::Acquire);
-
-    // A non-fatal process-directed signal may be delivered to any eligible
-    // member. Prefer the live leader without even consulting group metadata.
-    // This is the fork-child fast path used by SIGSTOP/SIGCONT workloads.
-    if signum != 9 && leader_state == crate::task::TASK_RUNNING {
-        raise_user_signal_pending(leader_tid, signum);
-        return true;
-    }
-
-    // The ordinary fork child is a one-thread group. Linux can address its
-    // task_struct directly; do the same instead of allocating two temporary
-    // member vectors for every kill(2). stress-ng `wait` sends SIGSTOP then
-    // SIGCONT on this path for every bogo operation.
-    if thread_group_live_count(pid) <= 1 {
-        if leader_state == crate::task::TASK_ZOMBIE {
-            // Signalling a zombie is a no-op success.
-            return true;
-        }
-        if leader_state != crate::task::TASK_RUNNING {
-            return false;
-        }
-        // The canonical raise performs stop/continue interaction, sender
-        // siginfo publication, and exactly one targeted wake.
-        raise_user_signal_pending(leader_tid, signum);
-        return true;
-    }
-
-    // Multi-thread groups are uncommon for process-directed kill. Snapshot
-    // once, then filter while walking; a second collected Vec used to add an
-    // allocation even though non-SIGKILL delivery needs only one target.
-    let members = thread_group_members(pid);
-    if signum == 9 {
-        // Fatal group kill: every live thread dies.
-        let mut any = false;
-        for t in members {
-            if crate::task::task_get(t)
-                .is_some_and(|task| task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
-            {
-                raise_user_signal_pending(t, signum);
-                any = true;
-            }
-        }
-        return any || leader_state == crate::task::TASK_ZOMBIE;
-    }
-    // Process-directed: deliver to the leader if alive, else the first
-    // live sibling. (Full shared-pending "any thread with it unblocked
-    // may dequeue" semantics are a follow-up; see the redesign doc.)
+    // `kill_pid_info` -> `group_send_sig_info(..., PIDTYPE_TGID)`: the signal
+    // goes to the thread GROUP's shared pending set, addressed through a live
+    // member (the leader, or any live thread once the leader has exited).
     let target = if leader_state == crate::task::TASK_RUNNING {
         Some(leader_tid)
     } else {
-        members.into_iter().find(|&tid| {
+        thread_group_members(pid).into_iter().find(|&tid| {
             crate::task::task_get(tid).is_some_and(|task| {
                 task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING
             })
         })
     };
     let Some(target) = target else {
+        // Signalling a zombie is a no-op success; anything else is gone.
         return leader_state == crate::task::TASK_ZOMBIE;
     };
-    raise_user_signal_pending(target, signum);
+    let _ = raise_group_signal(target, signum, GroupSigInfo::Sender(SI_USER));
     true
 }
 
@@ -7711,6 +8239,22 @@ fn sigqueue_deliver_imported(target: u64, sig: u32, info: ImportedSiginfo) -> Op
         narf_scheduler::stackful::note_urgent_wake_preempt(target);
     }
     Some(depth)
+}
+
+/// Process-directed form of [`sigqueue_deliver_imported`]
+/// (`rt_sigqueueinfo(pid)`, `pidfd_send_signal` with info): queue the payload
+/// on the thread group's shared set (`kill_pid_info` -> `PIDTYPE_TGID`).
+/// `None` = RT queue full (-EAGAIN).
+fn sigqueue_deliver_imported_group(
+    target: u64,
+    sig: u32,
+    info: ImportedSiginfo,
+) -> Option<usize> {
+    raise_group_signal(
+        target,
+        sig,
+        GroupSigInfo::Queued(QueuedSiginfo::generic(info.code, info.value, info.pid)),
+    )
 }
 
 #[inline]
@@ -9123,7 +9667,7 @@ pub(crate) fn default_signal_delivery_restricted(
     // The common syscall-return case has no pending signals anywhere. Avoid
     // resolving the current task and locking its sharded B-tree until a writer
     // has published a non-empty pending bitmap.
-    if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
+    if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 && !group_stops_active() {
         return false;
     }
     default_signal_delivery_restricted_active(ctx, syscall_no, restrict, prerewound)
@@ -9138,7 +9682,18 @@ fn default_signal_delivery_restricted_active(
 ) -> bool {
     let task = current_task_id();
 
-    let pending = signal_bits_get(&SIGNAL_PENDING, task);
+    // A group stop (`do_signal_stop`) marked this thread stopped while it was
+    // running: stop here, at its exit to user mode, and count it toward the
+    // group's CLD_STOPPED report.
+    if task_job_stopped(task) {
+        group_stop_participate(task);
+        park_current_stopped(ctx);
+        return true;
+    }
+
+    // Private and group-shared pending together (`dequeue_signal` reads
+    // `tsk->pending`, then `signal->shared_pending`).
+    let pending = signal_pending_of(task);
     if pending == 0 {
         return false;
     }
@@ -9182,12 +9737,16 @@ fn default_signal_delivery_restricted_active(
     // stall: a wedged worker group `timeout(1)` itself could not SIGKILL-reap.
     // Force SIGKILL/SIGSTOP past the reservation.
     let kill_stop = sig_bit(9) | sig_bit(19);
-    let deliverable =
-        (pending & !mask & restrict & !sigwait_reserved) | (pending & restrict & kill_stop);
-    if deliverable == 0 {
+    let allowed = (!mask & restrict & !sigwait_reserved) | (restrict & kill_stop);
+    if pending & allowed == 0 {
         return false;
     }
-    let signum = sig_from_bit(deliverable);
+    // `src` is the set the signal is dequeued from: every consume below
+    // (pending bit, queued payload) operates on that set, not blindly on the
+    // thread's private one.
+    let Some((signum, src)) = next_deliverable(task, allowed) else {
+        return false;
+    };
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
         return true;
     }
@@ -9198,7 +9757,7 @@ fn default_signal_delivery_restricted_active(
             // No user handler installed → POSIX default action.
             // Clear the pending bit before applying the action so a
             // retry trap doesn't re-fire the same signal.
-            let _ = pending_signal_bits_update_existing(task, |slot| {
+            let _ = pending_signal_bits_update_existing(src, |slot| {
                 *slot &= !(sig_bit(signum));
             });
             match default_signal_action(signum) {
@@ -9206,7 +9765,7 @@ fn default_signal_delivery_restricted_active(
                     // Silently consumed (existing behaviour). Discard any
                     // queued RT payloads too — each queued ignored instance
                     // is "delivered" by being dropped (signal(7)).
-                    purge_sigqueue(task, signum);
+                    purge_sigqueue(src, signum);
                 }
                 DefaultAction::Terminate => {
                     terminate_current_task(ctx, task, signum, false);
@@ -9241,11 +9800,11 @@ fn default_signal_delivery_restricted_active(
     // stored as `None`, so it never reaches here (the None arm above applies
     // the default action); a SIG_IGN slot is the only `handler <= 1` case.
     if action.handler <= 1 {
-        let _ = pending_signal_bits_update_existing(task, |slot| {
+        let _ = pending_signal_bits_update_existing(src, |slot| {
             *slot &= !(sig_bit(signum));
         });
         // SIG_IGN consumes every queued RT instance with the bit.
-        purge_sigqueue(task, signum);
+        purge_sigqueue(src, signum);
         return true;
     }
     // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
@@ -9254,7 +9813,7 @@ fn default_signal_delivery_restricted_active(
     // payload (don't dequeue yet): the commit below pops it only after the
     // frame write succeeds, so a failed delivery retries with the payload
     // still queued instead of draining it into a payload-less SI_USER retry.
-    let queued = peek_sigqueue_info(task, signum);
+    let queued = peek_sigqueue_info(src, signum);
     let (si_code, si_value, si_pid, si_addr) =
         queued.map_or((0, 0, 0, 0), |info| match info.poll_band {
             Some(band) => {
@@ -9322,7 +9881,7 @@ fn default_signal_delivery_restricted_active(
     // bucket lock, so a concurrent sender can neither strand the bit over an
     // emptied queue nor lose its payload behind a cleared bit. (The peek above
     // read this same front instance to build the frame.)
-    let _ = sigqueue_take_and_clear(task, signum);
+    let _ = sigqueue_take_and_clear(src, signum);
     // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
     // undoing the auto-block below. Captured BEFORE the SA_NODEFER OR so the
     // restored value is the mask in effect when the handler was entered.
@@ -9337,6 +9896,10 @@ fn default_signal_delivery_restricted_active(
     // signal to the mask so the handler runs without re-entrancy.
     if (action.flags & SA_NODEFER) == 0 {
         let _ = signal_bits_update(&SIGNAL_MASK, task, |slot| *slot |= sig_bit(signum));
+        // The handler now blocks `signum`: another pending shared instance
+        // belongs to a sibling that does not (`signal_setup_done` ->
+        // `set_current_blocked` -> `retarget_shared_pending`).
+        note_mask_change(task, 0, sig_bit(signum));
     }
     // SA_RESETHAND: one-shot — clear the handler so the next
     // occurrence falls through to the default action. Cleared in the
@@ -10279,6 +10842,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             return;
         }
     };
+    // SO_RCVTIMEO bounds a blocking accept (`inet_csk_accept` /
+    // `unix_accept` wait `sock_rcvtimeo`); pick up this call's deadline if
+    // it is re-executing.
+    let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
     // Single-shot: pop pending if any, else WouldBlock-style yield
     // mirroring sys_futex. Caller (libc accept) loops.
     match sock.dispatch_op(crate::socket::SocketOp::Accept) {
@@ -10371,6 +10938,19 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
                 ctx.set_return(errno_ret(EAGAIN)); // -EAGAIN
+                return;
+            }
+            // SO_RCVTIMEO: a finite timeout parks until readiness or the
+            // deadline, then reports -EAGAIN (`inet_csk_wait_for_connect`
+            // / `unix_accept`'s `skb_recv_datagram`).
+            if sock.rcvtimeo().is_some() {
+                handler_sys_socket_recv::socket_block(
+                    ctx,
+                    sock.as_ref(),
+                    narf_filesystem::POLL_IN,
+                    sock.rcvtimeo(),
+                    resumed,
+                );
                 return;
             }
             if let (Some(uctx), Some(hook)) = (
@@ -10791,8 +11371,35 @@ impl FlockEntry {
     }
 }
 
+/// What a `flock(2)` lock is attached to.
+///
+/// Linux attaches it to the INODE (`locks_inode(file)->i_flctx`): every
+/// open of one file shares one lock list, so independent `open()`s conflict.
+/// Keying by the `FileOps` object instead was wrong twice over: a filesystem
+/// that builds a fresh `FileOps` per open (directories) never conflicted,
+/// and a freed object's address could be reused by an unrelated file, which
+/// then inherited a phantom holder and blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FlockKey {
+    /// `(st_dev, st_ino)` of a file whose filesystem reports an inode.
+    Inode(u64, u64),
+    // LINUX-GAP: synthetic files that report no inode (ino == 0) cannot be
+    // identified across opens, so their locks are per object.
+    Object(usize),
+}
+
+impl FlockKey {
+    fn of(file_ptr: usize, dev: u64, ino: u64) -> Self {
+        if ino != 0 {
+            FlockKey::Inode(dev, ino)
+        } else {
+            FlockKey::Object(file_ptr)
+        }
+    }
+}
+
 static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, FlockEntry>>,
+    Option<alloc::collections::BTreeMap<FlockKey, FlockEntry>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// `fs/locks.c::flock_lock_inode`, reduced to what NARF models.
@@ -10802,9 +11409,10 @@ static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
 /// one it already holds rather than adding another, which is why every arm
 /// tests `other_*` rather than "is the table empty".
 fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result<(), ()> {
+    let key = FlockKey::of(file_ptr, dev, ino);
     let mut g = FLOCK_TABLE.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    let e = map.entry(file_ptr).or_default();
+    let e = map.entry(key).or_default();
     if e.holders.is_empty() {
         e.dev = dev;
         e.ino = ino;
@@ -10816,7 +11424,7 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
             e.holders.remove(i);
         }
         if e.holders.is_empty() {
-            map.remove(&file_ptr);
+            map.remove(&key);
         }
         return Ok(());
     }
@@ -11073,8 +11681,8 @@ pub fn maybe_deliver_signal_for_input(byte: u8) -> bool {
     if deliver_signal_to_pgrp(pgrp, signum) {
         return true;
     }
-    // Fallback: no pgrp members resolved — deliver to the reader itself.
-    raise_signal_pending(task, signum);
+    // Fallback: no pgrp members resolved — deliver to the reader's process.
+    let _ = raise_group_signal(task, signum, GroupSigInfo::None);
     true
 }
 

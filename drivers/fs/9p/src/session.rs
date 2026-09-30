@@ -108,6 +108,9 @@ pub struct P9Session {
     next_tag: AtomicU16,
     next_fid: AtomicU32,
     msize: AtomicU32,
+    /// The mount's superblock `st_dev` (one session per mount, as Linux
+    /// has one `v9fs_session_info` per superblock).
+    dev: u64,
 }
 
 impl Default for P9Session {
@@ -117,8 +120,14 @@ impl Default for P9Session {
 }
 
 impl P9Session {
+    /// The mount's `st_dev`.
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
     pub fn new() -> Self {
         Self {
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
             // tag 0xFFFF is NOTAG (version-only); start tags at 1.
             next_tag: AtomicU16::new(1),
             // fid 0xFFFFFFFF is NOFID (attach afid hole); start at 1.

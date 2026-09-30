@@ -79,6 +79,21 @@ fn ensure_target(target: &[u8]) {
     }
 }
 
+/// Install the fixture's writable root (see
+/// `narf_filesystem::__test_ensure_mount_target`) before a case snapshots or
+/// counts mounts.
+///
+/// `mount_args` installs it lazily, on the first mount a case makes. The
+/// mount smokes reset the registry between cases, so whether it is already
+/// there depends on which case ran before. A case that calls
+/// `unshare(CLONE_NEWNS)` first then copies a table without the writable root,
+/// and every later target is created where its private namespace cannot see
+/// it (ENOENT). A case that counts mounts sees the root appear inside its
+/// window.
+fn ensure_writable_root() {
+    narf_filesystem::__test_ensure_mount_target("/");
+}
+
 /// `mount_args` without the target-creation step, for the cases whose
 /// subject IS the missing target.
 fn mount_args_no_target(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> SyscallArgs {
@@ -813,6 +828,7 @@ fn smoke_mount_ns_isolation() -> TestResult {
 
     // unshare(CLONE_NEWNS): snapshot the current (global) table privately.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -916,6 +932,7 @@ fn smoke_mount_ns_fork_inherits_private_view() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
     set_task(PARENT);
 
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -988,6 +1005,7 @@ fn smoke_umount_private_pseudofs_actually_removes() -> TestResult {
 
     // unshare(CLONE_NEWNS): private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1097,6 +1115,7 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
 
     // unshare(CLONE_NEWNS): the task now has a private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1170,6 +1189,7 @@ fn smoke_recursive_bind_exposes_subtree() -> TestResult {
 
     // unshare(CLONE_NEWNS): private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1260,6 +1280,7 @@ fn smoke_sandbox_root_swap_deep_path_resolves() -> TestResult {
 
     // unshare(CLONE_NEWNS).
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1384,6 +1405,7 @@ fn smoke_execve_resolves_private_ns_binary() -> TestResult {
 
     // unshare(CLONE_NEWNS): private mount table.
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -1464,6 +1486,7 @@ fn smoke_interp_read_uses_private_ns() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
 
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -2207,16 +2230,14 @@ fn smoke_move_mount_relocates() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_move_mount_relocates);
 
-// ── Smoke 14: pseudo-fs double-mount is idempotent (single entry) ──
-// The registry supports mount stacking for real binds/overmounts (see
-// smoke_registry_overmount_stacks), but the sys_mount pseudo-fs arm
-// deliberately DEDUPS API filesystems: re-mounting a tmpfs onto an
-// already-mounted target short-circuits to success BEFORE reaching the
-// registry, so it reports ok and leaves exactly ONE entry for that path
-// (NARF's pseudo-fs are shared singletons; stacking identical views is
-// pointless). This runs the pseudo-fs arm, not the stacking path.
-// Linux ref: fs/namespace.c:do_new_mount (repeated API-fs mount).
-fn smoke_double_mount_idempotent() -> TestResult {
+// ── Smoke 14: a second tmpfs mount on the same path stacks ─────────
+// Linux attaches every new filesystem on top of whatever is mounted at the
+// target: do_new_mount → do_add_mount refuses only when the top mount there
+// already has the same superblock (-EBUSY), and a fresh tmpfs is always a new
+// superblock. So the second mount succeeds, the path carries two mounts, and
+// one umount pops the upper one and leaves the lower one in place.
+// Linux ref: fs/namespace.c:do_add_mount.
+fn smoke_double_mount_stacks() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
     // buffers. `validate_user_range` confines a real syscall to the user half,
@@ -2227,31 +2248,136 @@ fn smoke_double_mount_idempotent() -> TestResult {
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 
-    let _ = unmount_for_test("/dbl");
+    while unmount_for_test("/dbl").is_ok() {}
+    let count = || {
+        narf_filesystem::registry()
+            .list()
+            .iter()
+            .filter(|p| p.as_str() == "/dbl")
+            .count()
+    };
 
     if !mount_ok(b"tmpfs\0", b"/dbl\0", b"tmpfs\0", 0) {
         return TestResult::Fail("first mount /dbl failed");
     }
-    // Second mount of the same fstype at the same path: idempotent success.
     let second_ok = mount_ok(b"tmpfs\0", b"/dbl\0", b"tmpfs\0", 0);
-
-    // Exactly one entry for /dbl (no stacking / duplicate).
-    let count = narf_filesystem::registry()
-        .list()
-        .iter()
-        .filter(|p| p.as_str() == "/dbl")
-        .count();
+    let stacked = count();
+    let popped = unmount_for_test("/dbl").is_ok();
+    let left = count();
 
     crate::handlers::__test_root_dir_reset();
-    let _ = unmount_for_test("/dbl");
+    while unmount_for_test("/dbl").is_ok() {}
 
-    if second_ok && count == 1 {
-        TestResult::Pass
+    if !second_ok {
+        TestResult::Fail("a second tmpfs mount onto a mounted path must succeed")
+    } else if stacked != 2 {
+        TestResult::Fail("a second tmpfs mount must stack (two registry entries)")
+    } else if !popped || left != 1 {
+        TestResult::Fail("umount must pop only the upper tmpfs")
     } else {
-        TestResult::Fail("tmpfs double-mount must be idempotent (ok, single registry entry)")
+        TestResult::Pass
     }
 }
-kernel_test_in!("userspace/mount", smoke_double_mount_idempotent);
+kernel_test_in!("userspace/mount", smoke_double_mount_stacks);
+
+// ── Smoke 14b: umount2 pops a mount stacked over a core API fs ─────
+// The global /proc, /sys, /dev and cgroup2 are boot singletons NARF keeps
+// mounted (a global umount of one is a no-op). That keep-mounted rule is for
+// the singleton alone: a filesystem stacked on top of one is an ordinary
+// mount, and umount2 of the path must pop it (fs/namespace.c:do_umount on the
+// top mount of the path), not answer success and leave it in place.
+fn smoke_umount_pops_mount_stacked_over_api_fs() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_10);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    while unmount_for_test("/stk_api").is_ok() {}
+    let count = || {
+        narf_filesystem::registry()
+            .list()
+            .iter()
+            .filter(|p| p.as_str() == "/stk_api")
+            .count()
+    };
+
+    if !mount_ok(b"sysfs\0", b"/stk_api\0", b"sysfs\0", 0) {
+        return TestResult::Fail("mount sysfs at /stk_api failed");
+    }
+    if !mount_ok(b"tmpfs\0", b"/stk_api\0", b"tmpfs\0", 0) {
+        while unmount_for_test("/stk_api").is_ok() {}
+        return TestResult::Fail("mount tmpfs over /stk_api failed");
+    }
+    let stacked = count();
+    let mut u = StubCtx {
+        args: unmount_args(b"/stk_api\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut u);
+    let umount_ok = matches!(u.ret, Some(r) if r.value == 0);
+    let left = count();
+
+    crate::handlers::__test_root_dir_reset();
+    while unmount_for_test("/stk_api").is_ok() {}
+
+    if stacked != 2 {
+        TestResult::Fail("tmpfs over sysfs must stack (two registry entries)")
+    } else if !umount_ok || left != 1 {
+        TestResult::Fail("umount2 must pop the tmpfs stacked over the sysfs mount")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_umount_pops_mount_stacked_over_api_fs
+);
+
+// ── Smoke 14c: a global umount of a sole proc mount keeps it mounted ──
+// The keep-mounted rule for the global API singletons covers /proc too. It
+// is keyed on the filesystem's reported type, and procfs reports "proc" (its
+// Linux fstype) — a rule spelling it "procfs" matched nothing, so a global
+// umount of /proc really removed it.
+fn smoke_umount_keeps_sole_global_proc_mount() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_11);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    while unmount_for_test("/keep_proc").is_ok() {}
+    if !mount_ok(b"proc\0", b"/keep_proc\0", b"proc\0", 0) {
+        return TestResult::Fail("mount proc at /keep_proc failed");
+    }
+    let mut u = StubCtx {
+        args: unmount_args(b"/keep_proc\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut u);
+    let umount_ok = matches!(u.ret, Some(r) if r.value == 0);
+    let kept = registry_has("/keep_proc");
+
+    crate::handlers::__test_root_dir_reset();
+    while unmount_for_test("/keep_proc").is_ok() {}
+
+    if !umount_ok {
+        TestResult::Fail("global umount2 of the sole proc mount must answer 0")
+    } else if !kept {
+        TestResult::Fail("global umount2 must keep the sole proc mount mounted")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("userspace/mount", smoke_umount_keeps_sole_global_proc_mount);
 
 // ── Smoke 15: propagation-only mount is a no-op success ────────────
 // mount(NULL, target, NULL, MS_SLAVE|MS_REC) / MS_PRIVATE changes only the
@@ -2272,6 +2398,7 @@ fn smoke_propagation_only_noop() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
 
     // A propagation-only change on "/" (SLAVE|REC) succeeds and adds nothing.
+    ensure_writable_root();
     let before = narf_filesystem::registry().list().len();
     let slave_ok = mount_ok(b"\0", b"/\0", b"\0", MS_SLAVE | MS_REC);
     // MS_PRIVATE|MS_REC on an unmounted path also succeeds without creating it.
@@ -2373,6 +2500,7 @@ fn smoke_mount_ns_snapshot_depth() -> TestResult {
         return TestResult::Fail("pre-unshare mount /ns_pre failed");
     }
 
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3008,6 +3136,7 @@ fn smoke_mount_ns_clone_inherits_peer_group() -> TestResult {
     }
 
     // unshare(CLONE_NEWNS): the private snapshot must carry the SAME group id.
+    ensure_writable_root();
     let mut uctx = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3077,6 +3206,7 @@ fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
 
     // Task B unshares first — an EXISTING peer of the global /shared_run.
     set_task(task_b);
+    ensure_writable_root();
     let mut ub = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3084,6 +3214,7 @@ fn smoke_mount_propagates_under_shared_to_peers() -> TestResult {
     crate::handlers::sys_unshare(&mut ub);
     // Task A unshares — another peer — and mounts UNDER the shared base.
     set_task(task_a);
+    ensure_writable_root();
     let mut ua = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
@@ -3167,12 +3298,14 @@ fn smoke_mount_under_private_does_not_propagate() -> TestResult {
     crate::handlers::sys_mount_for_test(&mut mb);
 
     set_task(task_b);
+    ensure_writable_root();
     let mut ub = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,
     };
     crate::handlers::sys_unshare(&mut ub);
     set_task(task_a);
+    ensure_writable_root();
     let mut ua = StubCtx {
         args: flags_args(CLONE_NEWNS),
         ret: None,

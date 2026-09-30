@@ -148,20 +148,25 @@ fn getaddr_dump_is_well_formed() {
 }
 
 #[test]
-fn getaddr_dump_honors_family_and_ifindex_filters() {
+fn getaddr_dump_honors_family_and_ignores_legacy_ifindex() {
     let mut body = [0u8; 8];
     body[0] = AF_INET6;
     let ipv6 = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 6, 0, &body);
     let replies = build_dump(&ipv6);
-    assert_eq!(replies.len(), 1);
-    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_DONE);
+    assert!(replies[..replies.len() - 1]
+        .iter()
+        .all(|m| m[NLMSG_HDRLEN] == AF_INET6));
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
 
+    // `inet_dump_addr` reads ifa_index only under strict checking.
     body[0] = AF_INET;
     body[4..8].copy_from_slice(&999u32.to_ne_bytes());
-    let missing_index = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &body);
-    let replies = build_dump(&missing_index);
-    assert_eq!(replies.len(), 1);
-    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_DONE);
+    let legacy_index = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &body);
+    let replies = build_dump(&legacy_index);
+    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, RTM_NEWADDR);
 }
 
 #[test]
@@ -337,6 +342,69 @@ fn getneigh_dump_terminates() {
         .all(|msg| matches!(hdr_of(msg).1, RTM_NEWNEIGH | NLMSG_DONE)));
 }
 
+/// `inet_fill_ifaddr`: every IPv4 RTM_NEWADDR carries the 32-bit IFA_FLAGS
+/// and IFA_CACHEINFO; a static address is IFA_F_PERMANENT with infinite
+/// lifetimes. systemd-resolved rejects an address message without IFA_FLAGS.
+#[test]
+fn ipv4_address_message_carries_ifa_flags_and_cacheinfo() {
+    let addr = AddrInfo {
+        ifindex: 1,
+        prefix_len: 8,
+        addr: [127, 0, 0, 1],
+        label: "lo".into(),
+    };
+    let msg = build_newaddr(&addr, 3, 0);
+    let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS present");
+    assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
+    assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), IFA_F_PERMANENT);
+    let ci = find_rtattr(&msg, 8, IFA_CACHEINFO).expect("IFA_CACHEINFO present");
+    assert_eq!(ci.len(), 16);
+    assert_eq!(&ci[0..4], &u32::MAX.to_ne_bytes());
+    assert_eq!(&ci[4..8], &u32::MAX.to_ne_bytes());
+}
+
+/// `inet6_fill_ifaddr`: a SLAAC address with finite lifetimes is not
+/// IFA_F_PERMANENT and reports its remaining lifetimes.
+#[test]
+fn ipv6_address_message_with_lifetimes_is_not_permanent() {
+    let addr = crate::ipv6::addrs::Ipv6IfAddr {
+        iface: "eth0".into(),
+        addr: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        prefix_len: 64,
+        state: crate::ipv6::addrs::AddrState::Tentative,
+        scope: crate::ipv6::addrs::AddrScope::Global,
+        preferred_deadline_ns: u64::MAX - 1,
+        valid_deadline_ns: u64::MAX - 1,
+        temporary: true,
+    };
+    let msg = build_newaddr_v6(&addr, 2, 1, 0);
+    let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS present");
+    let flags = u32::from_ne_bytes(flags[..4].try_into().unwrap());
+    assert_eq!(flags, IFA_F_TENTATIVE | IFA_F_TEMPORARY);
+    assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), flags);
+    let ci = find_rtattr(&msg, 8, IFA_CACHEINFO).expect("IFA_CACHEINFO present");
+    assert_ne!(&ci[4..8], &u32::MAX.to_ne_bytes());
+}
+
+/// A notification echoed from an `RTM_NEWADDR` request without IFA_FLAGS or
+/// IFA_CACHEINFO gains both, as `rtmsg_ifa` would have emitted them.
+#[test]
+fn address_notification_is_completed_with_flags() {
+    let mut body = vec![AF_INET, 24, 0, 0];
+    body.extend_from_slice(&2u32.to_ne_bytes());
+    push_rtattr(&mut body, IFA_LOCAL, &[10, 0, 0, 2]);
+    let mut msg = frame_message(RTM_NEWADDR, 0, 0, 0, &body);
+    complete_addr_notification(&mut msg);
+    assert_eq!(
+        u32::from_ne_bytes(msg[0..4].try_into().unwrap()) as usize,
+        msg.len()
+    );
+    let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS appended");
+    assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
+    assert!(find_rtattr(&msg, 8, IFA_CACHEINFO).is_some());
+    assert!(find_rtattr(&msg, 8, IFA_LOCAL).is_some());
+}
+
 #[test]
 fn ipv6_address_message_uses_linux_ifaddr_layout() {
     let addr = crate::ipv6::addrs::Ipv6IfAddr {
@@ -390,8 +458,11 @@ fn ipv6_route_message_reports_gateway_and_oif() {
 
 #[test]
 fn getneigh_dump_honors_ifindex_filter() {
-    let mut request = req(RTM_GETNEIGH, 45, 12);
-    request[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&99i32.to_ne_bytes());
+    // `neigh_valid_dump_req`: the device filter is NDA_IFINDEX (8), not
+    // ndm_ifindex.
+    let mut body = vec![0u8; 12];
+    push_rtattr(&mut body, 8, &99u32.to_ne_bytes());
+    let request = frame_message(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 45, 12, &body);
     let msgs = build_dump(&request);
     assert_eq!(msgs.len(), 1);
     assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
@@ -443,25 +514,39 @@ fn getqdisc_reports_noqueue_for_loopback() {
 }
 
 #[test]
-fn getqdisc_dump_honors_ifindex_filter() {
-    let mut request = req(RTM_GETQDISC, 62, 20);
-    request[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&99i32.to_ne_bytes());
+fn getqdisc_dump_ignores_ifindex() {
+    // `tc_dump_qdisc` walks every device; tcm_ifindex is not a dump filter.
+    let mut body = [0u8; 20];
+    body[4..8].copy_from_slice(&99i32.to_ne_bytes());
+    let request = frame_message(RTM_GETQDISC, NLM_F_REQUEST | NLM_F_DUMP, 62, 20, &body);
     let msgs = build_dump(&request);
-    assert_eq!(msgs.len(), 1);
-    assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
+    assert!(msgs.len() >= 2);
+    assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
+    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
 }
 
 #[test]
 fn absent_optional_collections_return_empty_completed_dumps() {
-    for msg_type in [
-        RTM_GETTCLASS,
-        RTM_GETTFILTER,
-        RTM_GETACTION,
-        RTM_GETADDRLABEL,
-        RTM_GETMDB,
-        RTM_GETNEXTHOP,
+    // Each request carries its full family header. RTM_GETADDRLABEL is only
+    // registered for PF_INET6 and RTM_GETMDB only for PF_BRIDGE.
+    for (msg_type, family, hdrlen) in [
+        (RTM_GETTCLASS, 0, 20),
+        (RTM_GETTFILTER, 0, 20),
+        (RTM_GETACTION, 0, 4),
+        (RTM_GETADDRLABEL, AF_INET6, 12),
+        (RTM_GETMDB, dump::AF_BRIDGE, 8),
+        (RTM_GETNEXTHOP, 0, 8),
     ] {
-        let msgs = build_dump(&req(msg_type, msg_type as u32, 0));
+        let mut body = vec![0u8; hdrlen];
+        body[0] = family;
+        let request = frame_message(
+            msg_type,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            msg_type as u32,
+            0,
+            &body,
+        );
+        let msgs = build_dump(&request);
         assert_eq!(msgs.len(), 1, "type {msg_type} was not an empty dump");
         let hdr = parse_hdr(&msgs[0]).unwrap();
         assert_eq!(hdr.msg_type, NLMSG_DONE);
@@ -501,11 +586,11 @@ fn batched_requests_keep_sequence_and_ack_independent() {
         let h = parse_hdr(m).unwrap();
         h.msg_type == RTM_NEWLINK && h.seq == 101
     }));
-    assert!(replies.iter().any(|m| {
+    // A dump that starts is never ACKed, even with NLM_F_ACK
+    // (`__netlink_dump_start` returns -EINTR; `netlink_rcv_skb` skips).
+    assert!(!replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
-        h.msg_type == NLMSG_ERROR
-            && h.seq == 101
-            && i32::from_le_bytes(m[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) == 0
+        h.msg_type == NLMSG_ERROR && h.seq == 101
     }));
     assert!(replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
@@ -513,14 +598,53 @@ fn batched_requests_keep_sequence_and_ack_independent() {
     }));
 }
 
+// Linux `netlink_rcv_skb` stops at a header whose nlmsg_len is below
+// NLMSG_HDRLEN or past the end of the buffer: no reply, and sendmsg still
+// returns the full length (request content never fails the send).
 #[test]
-fn malformed_batched_message_length_is_rejected() {
+fn malformed_message_length_ends_the_walk_silently() {
     let mut message = req(RTM_GETLINK, 1, 0);
     message[0..4].copy_from_slice(&15u32.to_le_bytes());
-    assert!(build_replies(&message).is_err());
+    assert_eq!(build_replies(&message).unwrap().len(), 0);
 
     message[0..4].copy_from_slice(&1024u32.to_le_bytes());
-    assert!(build_replies(&message).is_err());
+    assert_eq!(build_replies(&message).unwrap().len(), 0);
+
+    // Messages before the malformed one are still processed.
+    let mut batch = req(RTM_GETLINK, 2, 0);
+    let mut bad = req(RTM_GETLINK, 3, 0);
+    bad[0..4].copy_from_slice(&4u32.to_le_bytes());
+    batch.extend_from_slice(&bad);
+    let replies = build_replies(&batch).unwrap();
+    assert!(!replies.is_empty());
+    assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 2));
+}
+
+// iproute2 `ip addr` sends its RTM_GETADDR dump in a zero-padded buffer: the
+// 24-byte request then 128 zero bytes (a trailing nlmsg_len == 0 header). Linux
+// answers the dump and ignores the padding; NARF failed the send with EINVAL
+// ("Cannot send dump request: Invalid argument").
+#[test]
+fn iproute2_zero_padded_getaddr_dump_is_answered() {
+    let body = [0u8; 8]; // struct ifaddrmsg, AF_UNSPEC
+    let mut datagram = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 9, 0, &body);
+    assert_eq!(datagram.len(), 24);
+    datagram.resize(152, 0);
+    let replies = build_replies(&datagram).unwrap();
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
+    assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 9));
+
+    // A trailing fragment shorter than a header is ignored the same way.
+    let mut short = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 10, 0, &body);
+    short.extend_from_slice(&[0u8; 7]);
+    let replies = build_replies(&short).unwrap();
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
 }
 
 #[test]
@@ -619,7 +743,9 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
 
 #[test]
 fn strict_check_rejects_short_dump_and_accepts_typed_request() {
-    let short = req(RTM_GETADDR, 120, 0);
+    // A strict dump's validation error is the NLMSG_DONE payload
+    // (`netlink_dump_done`), not an NLMSG_ERROR.
+    let short = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 120, 0, &[0]);
     let denied = build_replies_with_options(
         &short,
         None,
@@ -629,6 +755,7 @@ fn strict_check_rejects_short_dump_and_accepts_typed_request() {
         },
     )
     .unwrap();
+    assert_eq!(parse_hdr(&denied[0]).unwrap().msg_type, NLMSG_DONE);
     assert_eq!(
         i32::from_ne_bytes(
             denied[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]

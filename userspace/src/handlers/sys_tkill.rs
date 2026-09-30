@@ -29,6 +29,6 @@ pub(crate) fn sys_tkill(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    raise_user_signal_pending(tid, signum);
+    raise_tkill_signal_pending(tid, signum);
     ctx.set_return(SyscallReturn::ok(0));
 }

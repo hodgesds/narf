@@ -53,7 +53,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use narf_lib::smp;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -267,6 +267,12 @@ fn net_snapshots() -> Vec<NetIfaceInfo> {
 pub struct Kobject {
     /// Node name (single path component, no slashes).
     name: String,
+    /// The directory's kernfs node id, which is its `st_ino`.
+    ino: u64,
+    /// Kernfs ids of this directory's attribute and symlink nodes, keyed
+    /// by entry name. Each is assigned from the same id space on first
+    /// lookup and kept for the life of the kobject.
+    node_inos: IrqSafeSpinLock<BTreeMap<String, u64>>,
     /// Strong reference to parent so we can compute the full path.
     /// `None` for the tree root.
     parent: Option<Arc<Kobject>>,
@@ -298,6 +304,10 @@ impl Kobject {
     pub fn new_root(name: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
+            // `kernfs_create_root`: the root is the first node of its
+            // hierarchy, id 1.
+            ino: SYSFS_ROOT_INO,
+            node_inos: IrqSafeSpinLock::new(BTreeMap::new()),
             parent: None,
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -312,6 +322,8 @@ impl Kobject {
     pub fn new_child(parent: Arc<Kobject>, name: impl Into<String>) -> Arc<Self> {
         let child = Arc::new(Self {
             name: name.into(),
+            ino: kernfs_next_ino(),
+            node_inos: IrqSafeSpinLock::new(BTreeMap::new()),
             parent: Some(parent.clone()),
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -326,6 +338,23 @@ impl Kobject {
     /// Return the name of this kobject.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The kobject directory's `st_ino` (its kernfs node id).
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /// `st_ino` of the attribute or symlink `name` in this directory:
+    /// assigned on first lookup, then fixed for the life of the kobject.
+    pub fn node_ino(&self, name: &str) -> u64 {
+        let mut map = self.node_inos.lock();
+        if let Some(&ino) = map.get(name) {
+            return ino;
+        }
+        let ino = kernfs_next_ino();
+        map.insert(String::from(name), ino);
+        ino
     }
 
     /// Compute the absolute sysfs path for this kobject (e.g.
@@ -1255,16 +1284,265 @@ pub fn populate_kernel_dir() {
     kobject_add_attr(&kernel, "uevent_seqnum", crate::uevent::gen_uevent_seqnum);
     kobject_add_bin_attr(&kernel, "notes", Arc::new(kernel_notes_read));
 
-    // /sys/kernel/mm/transparent_hugepage/ — THP policy knobs.
-    // NARF implements no huge-page promotion; `[never]` is permanently active.
-    // The bracket notation mirrors Linux: `enabled_show` prints the active
-    // policy token in brackets alongside the available options.
     let mm = get_or_create_child(&kernel, "mm");
-    let thp = get_or_create_child(&mm, "transparent_hugepage");
-    kobject_add_attr(&thp, "enabled", || "always madvise [never]\n".to_string());
-    kobject_add_attr(&thp, "defrag", || {
-        "always defer madvise [never]\n".to_string()
+    populate_thp_dir(&mm);
+}
+
+// ── /sys/kernel/mm/transparent_hugepage ─────────────────────────────
+//
+// `mm/huge_memory.c::hugepage_attr` and `mm/khugepaged.c::khugepaged_attr`.
+// These are root-writable (0644) policy knobs; distributions set them at
+// boot through tmpfiles.d (CachyOS: `w! .../defrag - - - - defer+madvise`,
+// `w! .../khugepaged/max_ptes_none - - - - 409`). They were read-only here,
+// so every such write failed with EROFS and systemd-tmpfiles reported the
+// boot as failed.
+//
+// LINUX-GAP: NARF has no transparent huge pages and no khugepaged. The
+// knobs store, validate and report exactly as Linux's do, and the policy
+// they select has nothing to act on. `enabled` defaults to `never`, which
+// is what a `CONFIG_TRANSPARENT_HUGEPAGE_NEVER` kernel boots with and the
+// only honest answer here (`defrag` likewise defaults to `never`); the
+// rest carry Linux's defaults. A number too
+// large for its type is -EINVAL here where `kstrto*` answers -ERANGE
+// (`FsError` has no ERANGE).
+
+/// `TRANSPARENT_HUGEPAGE_*` policy for `enabled`: 0 never, 1 madvise, 2 always.
+static THP_ENABLED: AtomicU32 = AtomicU32::new(0);
+/// `defrag`: 0 never, 1 madvise, 2 defer+madvise, 3 defer, 4 always.
+/// Linux boots with `madvise` (`TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG`); NARF
+/// keeps `never`, the policy it actually has with no THP to defragment for.
+static THP_DEFRAG: AtomicU32 = AtomicU32::new(0);
+/// `TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG` — set by default.
+static THP_USE_ZERO_PAGE: AtomicU32 = AtomicU32::new(1);
+/// `split_underused_thp` — `true` by default.
+static THP_SHRINK_UNDERUSED: AtomicU32 = AtomicU32::new(1);
+/// `TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG` — set by default.
+static KHP_DEFRAG: AtomicU32 = AtomicU32::new(1);
+/// `khugepaged_init`: `HPAGE_PMD_NR - 1`, `/ 8`, `/ 2`, `* 8`.
+static KHP_MAX_PTES_NONE: AtomicU32 = AtomicU32::new(HPAGE_PMD_NR - 1);
+static KHP_MAX_PTES_SWAP: AtomicU32 = AtomicU32::new(HPAGE_PMD_NR / 8);
+static KHP_MAX_PTES_SHARED: AtomicU32 = AtomicU32::new(HPAGE_PMD_NR / 2);
+static KHP_PAGES_TO_SCAN: AtomicU32 = AtomicU32::new(HPAGE_PMD_NR * 8);
+static KHP_SCAN_SLEEP_MS: AtomicU32 = AtomicU32::new(10000);
+static KHP_ALLOC_SLEEP_MS: AtomicU32 = AtomicU32::new(60000);
+
+/// `HPAGE_PMD_NR` on x86_64/arm64 with 4 KiB pages.
+const HPAGE_PMD_NR: u32 = 512;
+/// `HPAGE_PMD_SIZE`.
+const HPAGE_PMD_SIZE: u64 = 2 * 1024 * 1024;
+
+/// `lib/string.c::sysfs_streq`: equal, allowing one trailing newline.
+fn sysfs_streq(buf: &[u8], s: &str) -> bool {
+    buf.strip_suffix(b"\n").unwrap_or(buf) == s.as_bytes()
+}
+
+/// `lib/kstrtox.c::kstrtoull(s, 10, ..)`: optional `+`, at least one
+/// digit, optional single trailing newline, nothing else.
+fn kstrtoull10(buf: &[u8]) -> Result<u64, crate::FsError> {
+    let s = buf.strip_prefix(b"+").unwrap_or(buf);
+    let s = s.strip_suffix(b"\n").unwrap_or(s);
+    if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+        return Err(crate::FsError::InvalidData);
+    }
+    let mut v: u64 = 0;
+    for &d in s {
+        v = v
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(d - b'0')))
+            .ok_or(crate::FsError::InvalidData)?;
+    }
+    Ok(v)
+}
+
+/// `kstrtouint(s, 10, ..)`.
+fn kstrtouint10(buf: &[u8]) -> Result<u32, crate::FsError> {
+    u32::try_from(kstrtoull10(buf)?).map_err(|_| crate::FsError::InvalidData)
+}
+
+/// `lib/kstrtox.c::kstrtobool` — the first character (two for `on`/`of`).
+fn kstrtobool(buf: &[u8]) -> Result<bool, crate::FsError> {
+    match buf.first() {
+        Some(b'e' | b'E' | b'y' | b'Y' | b't' | b'T' | b'1') => Ok(true),
+        Some(b'd' | b'D' | b'n' | b'N' | b'f' | b'F' | b'0') => Ok(false),
+        Some(b'o' | b'O') => match buf.get(1) {
+            Some(b'n' | b'N') => Ok(true),
+            Some(b'f' | b'F') => Ok(false),
+            _ => Err(crate::FsError::InvalidData),
+        },
+        _ => Err(crate::FsError::InvalidData),
+    }
+}
+
+/// Render an enum knob Linux-style: every choice, the active one bracketed.
+fn thp_choices(choices: &[&str], active: u32) -> String {
+    let mut out = String::new();
+    for (i, c) in choices.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if i as u32 == active {
+            out.push('[');
+            out.push_str(c);
+            out.push(']');
+        } else {
+            out.push_str(c);
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// `enabled_show` order: always madvise never.
+const THP_ENABLED_CHOICES: [&str; 3] = ["always", "madvise", "never"];
+/// `defrag_show` order: always defer defer+madvise madvise never.
+const THP_DEFRAG_CHOICES: [&str; 5] = ["always", "defer", "defer+madvise", "madvise", "never"];
+
+/// `single_hugepage_flag_store`: `kstrtoul` (its error), then `> 1` EINVAL.
+fn store_flag(slot: &'static AtomicU32) -> impl Fn(&[u8]) -> Result<(), crate::FsError> {
+    move |buf| {
+        let v = kstrtoull10(buf)?;
+        if v > 1 {
+            return Err(crate::FsError::InvalidData);
+        }
+        slot.store(v as u32, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// `max_ptes_{none,swap,shared}_store`: `if (err || v > HPAGE_PMD_NR - 1)
+/// return -EINVAL;`.
+fn store_max_ptes(slot: &'static AtomicU32) -> impl Fn(&[u8]) -> Result<(), crate::FsError> {
+    move |buf| {
+        let v = kstrtoull10(buf)?;
+        if v > u64::from(HPAGE_PMD_NR - 1) {
+            return Err(crate::FsError::InvalidData);
+        }
+        slot.store(v as u32, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// `__sleep_millisecs_store`: `kstrtouint`, any error is -EINVAL.
+fn store_sleep_ms(slot: &'static AtomicU32) -> impl Fn(&[u8]) -> Result<(), crate::FsError> {
+    move |buf| {
+        slot.store(kstrtouint10(buf)?, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn show_u32(slot: &'static AtomicU32) -> impl Fn() -> String {
+    move || format!("{}\n", slot.load(Ordering::Relaxed))
+}
+
+fn populate_thp_dir(mm: &Arc<Kobject>) {
+    let thp = get_or_create_child(mm, "transparent_hugepage");
+    // THP_ENABLED stores the index into THP_ENABLED_CHOICES reversed so the
+    // default (0) is `never`; map both ways here.
+    kobject_add_writable_attr(
+        &thp,
+        "enabled",
+        || {
+            thp_choices(
+                &THP_ENABLED_CHOICES,
+                2 - THP_ENABLED.load(Ordering::Relaxed),
+            )
+        },
+        |buf| {
+            // `enabled_store`: exactly one of the three, else -EINVAL.
+            let v = if sysfs_streq(buf, "always") {
+                2
+            } else if sysfs_streq(buf, "madvise") {
+                1
+            } else if sysfs_streq(buf, "never") {
+                0
+            } else {
+                return Err(crate::FsError::InvalidData);
+            };
+            THP_ENABLED.store(v, Ordering::Relaxed);
+            Ok(())
+        },
+    );
+    kobject_add_writable_attr(
+        &thp,
+        "defrag",
+        || {
+            let active = match THP_DEFRAG.load(Ordering::Relaxed) {
+                4 => 0, // always
+                3 => 1, // defer
+                2 => 2, // defer+madvise
+                1 => 3, // madvise
+                _ => 4, // never
+            };
+            thp_choices(&THP_DEFRAG_CHOICES, active)
+        },
+        |buf| {
+            // `defrag_store`, in its comparison order.
+            let v = if sysfs_streq(buf, "always") {
+                4
+            } else if sysfs_streq(buf, "defer+madvise") {
+                2
+            } else if sysfs_streq(buf, "defer") {
+                3
+            } else if sysfs_streq(buf, "madvise") {
+                1
+            } else if sysfs_streq(buf, "never") {
+                0
+            } else {
+                return Err(crate::FsError::InvalidData);
+            };
+            THP_DEFRAG.store(v, Ordering::Relaxed);
+            Ok(())
+        },
+    );
+    kobject_add_writable_attr(
+        &thp,
+        "use_zero_page",
+        show_u32(&THP_USE_ZERO_PAGE),
+        store_flag(&THP_USE_ZERO_PAGE),
+    );
+    kobject_add_attr(&thp, "hpage_pmd_size", || format!("{}\n", HPAGE_PMD_SIZE));
+    kobject_add_writable_attr(
+        &thp,
+        "shrink_underused",
+        show_u32(&THP_SHRINK_UNDERUSED),
+        |buf| {
+            // `split_underused_thp_store`: `kstrtobool`, -EINVAL on error.
+            THP_SHRINK_UNDERUSED.store(u32::from(kstrtobool(buf)?), Ordering::Relaxed);
+            Ok(())
+        },
+    );
+
+    let khp = get_or_create_child(&thp, "khugepaged");
+    kobject_add_writable_attr(
+        &khp,
+        "defrag",
+        show_u32(&KHP_DEFRAG),
+        store_flag(&KHP_DEFRAG),
+    );
+    for (name, slot) in [
+        ("max_ptes_none", &KHP_MAX_PTES_NONE),
+        ("max_ptes_swap", &KHP_MAX_PTES_SWAP),
+        ("max_ptes_shared", &KHP_MAX_PTES_SHARED),
+    ] {
+        kobject_add_writable_attr(&khp, name, show_u32(slot), store_max_ptes(slot));
+    }
+    kobject_add_writable_attr(&khp, "pages_to_scan", show_u32(&KHP_PAGES_TO_SCAN), |buf| {
+        // `pages_to_scan_store`: `if (err || !pages) return -EINVAL;`.
+        let v = kstrtouint10(buf)?;
+        if v == 0 {
+            return Err(crate::FsError::InvalidData);
+        }
+        KHP_PAGES_TO_SCAN.store(v, Ordering::Relaxed);
+        Ok(())
     });
+    kobject_add_attr(&khp, "pages_collapsed", || "0\n".to_string());
+    kobject_add_attr(&khp, "full_scans", || "0\n".to_string());
+    for (name, slot) in [
+        ("scan_sleep_millisecs", &KHP_SCAN_SLEEP_MS),
+        ("alloc_sleep_millisecs", &KHP_ALLOC_SLEEP_MS),
+    ] {
+        kobject_add_writable_attr(&khp, name, show_u32(slot), store_sleep_ms(slot));
+    }
 }
 
 /// Build a Linux-style CPU bitmap string (comma-separated 32-bit
@@ -2095,6 +2373,42 @@ pub fn populate_all() {
     get_or_create_child(&fuse_dir, "connections");
 }
 
+// ── Inode identity ───────────────────────────────────────────────────
+//
+// sysfs is kernfs: every directory, attribute and symlink is a
+// `kernfs_node` whose id comes from `idr_alloc_cyclic(&root->ino_idr, kn,
+// 1, ...)` in `__kernfs_new_node` (fs/kernfs/dir.c) and, on 64-bit, IS the
+// inode number (`kernfs_ino` → `kernfs_id_ino`). The root is the first node
+// allocated, id 1. NARF keeps the same shape: a kobject takes its id when it
+// is created, an attribute or symlink when it is first looked up (NARF's
+// attribute maps hold callbacks, not nodes), and every id comes from one
+// counter so no two nodes share one. The whole mount is one superblock with
+// its own anonymous `st_dev`.
+
+const SYSFS_ROOT_INO: u64 = 1;
+static KERNFS_NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2);
+static SYSFS_DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+
+/// A new kernfs node id from the one sysfs counter. Public so a subsystem
+/// that serves part of /sys itself (the watchdog class) numbers its nodes
+/// in the same space.
+pub fn kernfs_next_ino() -> u64 {
+    KERNFS_NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The sysfs superblock's `st_dev`.
+pub fn sysfs_dev() -> u64 {
+    SYSFS_DEV.get()
+}
+
+/// `InodeAttrs` for a sysfs node: the sysfs superblock's `st_dev`.
+pub fn sysfs_attrs() -> crate::InodeAttrs {
+    crate::InodeAttrs {
+        dev: sysfs_dev(),
+        ..Default::default()
+    }
+}
+
 // ── SysFs FsInstance ─────────────────────────────────────────────────
 
 /// The sysfs `FsInstance`.  Mount at `/sys`.
@@ -2129,6 +2443,12 @@ impl FsInstance for SysFs {
 struct SysRoot;
 
 impl DirOps for SysRoot {
+    fn ino(&self) -> u64 {
+        get_root().ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let kobj = get_root();
         // Text attrs: use find_attr_key so any dynamically-registered attr
@@ -2195,6 +2515,12 @@ pub struct SysKobjDir {
 }
 
 impl DirOps for SysKobjDir {
+    fn ino(&self) -> u64 {
+        self.kobj.ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Text attrs: use find_attr_key so any dynamically-registered attr
         // (backlight, leds, hwmon, etc.) is visible without a static list.
@@ -2218,7 +2544,10 @@ impl DirOps for SysKobjDir {
         }
         // Symlinks (subsystem/device/driver, …) — readlink reads the target.
         if let Some(target) = self.kobj.get_symlink(name) {
-            return Some(Arc::new(SysSymlinkFile { target }));
+            return Some(Arc::new(SysSymlinkFile {
+                target,
+                ino: self.kobj.node_ino(name),
+            }));
         }
         // Child dirs look like files so resolve() can stat them
         if let Some(child) = self.kobj.get_child(name) {
@@ -2310,6 +2639,13 @@ struct SysDirMarker {
 }
 
 impl FileOps for SysDirMarker {
+    fn ino(&self) -> u64 {
+        // The directory's own id, as its `SysKobjDir` reports it.
+        self.kobj.ino()
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
@@ -2337,9 +2673,16 @@ impl FileOps for SysDirMarker {
 #[derive(Debug)]
 struct SysSymlinkFile {
     target: String,
+    ino: u64,
 }
 
 impl FileOps for SysSymlinkFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let bytes = self.target.as_bytes();
@@ -2388,6 +2731,12 @@ impl fmt::Debug for SysBinAttrFile {
 }
 
 impl FileOps for SysBinAttrFile {
+    fn ino(&self) -> u64 {
+        self.kobj.node_ino(self.attr_name)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let n = self
             .kobj
@@ -2429,6 +2778,12 @@ impl fmt::Debug for SysAttrFile {
 }
 
 impl FileOps for SysAttrFile {
+    fn ino(&self) -> u64 {
+        self.kobj.node_ino(self.attr_name)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        sysfs_attrs()
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
         Box::pin(async move {

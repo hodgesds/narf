@@ -336,14 +336,19 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
                     let sender = current_task_id();
                     let sender_outer = crate::handlers::task_to_pid_raw(sender).unwrap_or(sender);
                     let si_pid = crate::handlers::report_pid_to(receiver, sender_outer) as u32;
-                    crate::handlers::store_sigqueue_info(
+                    // `do_send_sig_info(sigev_signo, &sig_i, task, PIDTYPE_TGID)`:
+                    // the notification goes to the registering PROCESS.
+                    let _ = crate::handlers::raise_group_signal(
                         receiver,
                         notification.signal as u32,
-                        SI_MESGQ,
-                        notification.value,
-                        si_pid,
+                        crate::handlers::GroupSigInfo::Queued(
+                            crate::handlers::QueuedSiginfo::generic(
+                                SI_MESGQ,
+                                notification.value,
+                                si_pid,
+                            ),
+                        ),
                     );
-                    crate::handlers::raise_signal_pending(receiver, notification.signal as u32);
                 }
             }
             narf_net::readiness::notify(0);
@@ -1078,6 +1083,17 @@ impl Drop for InotifyFile {
 }
 
 impl FileOps for InotifyFile {
+    /// Linux `inotify_init1` uses `anon_inode_getfd("inotify")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// Readable ONLY when events are queued (an inotify fd is never
     /// writable and has no EOF). Without this override the always-ready
     /// default (POLL_IN|POLL_OUT) makes an epoll-driven consumer busy-spin:
@@ -1590,6 +1606,17 @@ impl Drop for FanotifyFile {
 }
 
 impl FileOps for FanotifyFile {
+    /// Linux `fanotify_init` uses `anon_inode_getfile_fmode("[fanotify]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn poll_readiness(&self) -> u32 {
         let has_events = with_fanotify(|m| {
             m.get(&self.id)

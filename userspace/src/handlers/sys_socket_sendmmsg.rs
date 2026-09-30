@@ -87,7 +87,7 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
         return;
     }
     if first_error == EAGAIN {
-        handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref());
+        handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref(), None);
         return;
     }
     if first_error != 0 {

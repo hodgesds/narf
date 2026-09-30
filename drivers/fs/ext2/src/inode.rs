@@ -87,6 +87,11 @@ pub struct Inode {
     pub generation: u32,
     /// `i_block[15]` — block pointers (12 direct + 3 indirect tiers).
     pub block: [u32; I_BLOCK_LEN],
+    /// Whether the slot carries any extended attribute: an `i_file_acl`
+    /// block, or the in-inode `EXT4_XATTR_MAGIC`. Decoded, never encoded —
+    /// a hint that lets a lookup skip the xattr read for the (common)
+    /// inode with none, e.g. `DirOps::access_acl_present`.
+    pub has_xattrs: bool,
 }
 
 impl Inode {
@@ -111,6 +116,18 @@ impl Inode {
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
         let generation = u32::from_le_bytes([buf[100], buf[101], buf[102], buf[103]]);
+        let file_acl = u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]) != 0
+            || u16::from_le_bytes([buf[118], buf[119]]) != 0;
+        let ibody = buf.len() > 130 && {
+            let magic_at = 128 + u16::from_le_bytes([buf[128], buf[129]]) as usize;
+            magic_at + 4 <= buf.len()
+                && u32::from_le_bytes([
+                    buf[magic_at],
+                    buf[magic_at + 1],
+                    buf[magic_at + 2],
+                    buf[magic_at + 3],
+                ]) == 0xEA02_0000
+        };
         let mut block = [0u32; I_BLOCK_LEN];
         for (i, b) in block.iter_mut().enumerate() {
             let off = 40 + i * 4;
@@ -129,6 +146,7 @@ impl Inode {
             flags,
             generation,
             block,
+            has_xattrs: file_acl || ibody,
         })
     }
 
@@ -198,6 +216,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            has_xattrs: false,
         }
     }
 
@@ -218,6 +237,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            has_xattrs: false,
         }
     }
 
@@ -238,6 +258,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            has_xattrs: false,
         }
     }
 

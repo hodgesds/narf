@@ -2247,13 +2247,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 );
             }
 
-            let mut info = [0u8; 128];
-            info[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
-            info[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
-            info[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
-            // _sifields._rt.si_sigval (sigqueue payload). Unused by
-            // non-queued signals, so writing 0 there is harmless.
-            info[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
+            let info = params.siginfo_bytes();
             // SAFETY: each source is a live kernel object; destinations are
             // within the preflighted frame. Each guarded copy catches a racing
             // permission/unmap fault and leaves the trap frame unredirected;

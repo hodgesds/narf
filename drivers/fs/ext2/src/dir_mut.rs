@@ -304,7 +304,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // block. Allocate, seed with a single record, write, then
         // bump the parent's i_size + i_blocks.
         let new_logical = blocks as u64;
-        let phys = self.map_block_alloc(parent_inode, new_logical).await?;
+        let phys = self
+            .map_block_alloc(parent_inode_no, parent_inode, new_logical)
+            .await?;
         let mut blockbuf = vec![0u8; bs];
         // Single record filling the whole block.
         let rec_len = if self.superblock.has_metadata_csum() {

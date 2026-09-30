@@ -899,3 +899,125 @@ fn smoke_evdev_device_drop_invalidates_reader() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("input/evdev", smoke_evdev_device_drop_invalidates_reader);
+
+// Linux drivers/tty/sysrq.c: with Alt and SysRq held, the next key press is a
+// SysRq command, is recorded, and is NOT delivered to readers; a plain key, or
+// the letter with only Alt or only SysRq held, is delivered normally.
+fn smoke_input_sysrq_alt_sysrq_t_is_a_command() -> TestResult {
+    use crate::evdev::{dispatch_key_to_node, take_sysrq_request, DeviceCaps, EventType, ROUTER};
+    const KEY_LEFTALT: u16 = 56;
+    const KEY_SYSRQ: u16 = 99;
+    const KEY_T: u16 = 20;
+
+    let mut caps = DeviceCaps::new();
+    for k in [KEY_LEFTALT, KEY_SYSRQ, KEY_T] {
+        caps.add_key(k);
+    }
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = match ROUTER.open_reader(id) {
+        Some(r) => r,
+        None => return TestResult::Fail("open_reader failed"),
+    };
+    let _ = take_sysrq_request();
+    let t_events = |reader: &crate::evdev::Reader| {
+        let mut n = 0;
+        while let Some(ev) = reader.poll_event() {
+            if ev.type_ == EventType::Key && ev.code == KEY_T {
+                n += 1;
+            }
+        }
+        n
+    };
+
+    // A plain T is an ordinary key.
+    dispatch_key_to_node(&node, KEY_T, true);
+    dispatch_key_to_node(&node, KEY_T, false);
+    if take_sysrq_request().is_some() || t_events(&reader) != 2 {
+        return TestResult::Fail("a plain T was treated as a SysRq command");
+    }
+    // Alt alone, then SysRq alone: still ordinary.
+    dispatch_key_to_node(&node, KEY_LEFTALT, true);
+    dispatch_key_to_node(&node, KEY_T, true);
+    dispatch_key_to_node(&node, KEY_T, false);
+    dispatch_key_to_node(&node, KEY_LEFTALT, false);
+    dispatch_key_to_node(&node, KEY_SYSRQ, true);
+    dispatch_key_to_node(&node, KEY_T, true);
+    dispatch_key_to_node(&node, KEY_T, false);
+    dispatch_key_to_node(&node, KEY_SYSRQ, false);
+    if take_sysrq_request().is_some() || t_events(&reader) != 4 {
+        return TestResult::Fail("T with only Alt or only SysRq held was a SysRq command");
+    }
+    // Alt+SysRq+T: recorded, and the T press/release is swallowed.
+    dispatch_key_to_node(&node, KEY_LEFTALT, true);
+    dispatch_key_to_node(&node, KEY_SYSRQ, true);
+    dispatch_key_to_node(&node, KEY_T, true);
+    dispatch_key_to_node(&node, KEY_T, false);
+    dispatch_key_to_node(&node, KEY_SYSRQ, false);
+    dispatch_key_to_node(&node, KEY_LEFTALT, false);
+    let req = take_sysrq_request();
+    let delivered = t_events(&reader);
+    ROUTER.unregister_device(id);
+    if req != Some(KEY_T) {
+        return TestResult::Fail("Alt+SysRq+T did not record a SysRq T command");
+    }
+    if delivered != 0 {
+        return TestResult::Fail("the SysRq command key reached the reader");
+    }
+    if take_sysrq_request().is_some() {
+        return TestResult::Fail("a SysRq request was taken twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_sysrq_alt_sysrq_t_is_a_command);
+
+// Linux `drivers/tty/sysrq.c` keeps the Alt/SysRq state per input handle
+// (`struct sysrq_state`, one per connected keyboard in `sysrq_connect`), so a
+// modifier held on one keyboard never arms another. A device whose Alt is
+// stuck down (or was unplugged mid-press) must not turn SysRq+T on a second
+// keyboard into a command, and must not swallow that keyboard's T.
+fn smoke_input_sysrq_state_is_per_device() -> TestResult {
+    use crate::evdev::{dispatch_key_to_node, take_sysrq_request, DeviceCaps, EventType, ROUTER};
+    const KEY_LEFTALT: u16 = 56;
+    const KEY_SYSRQ: u16 = 99;
+    const KEY_T: u16 = 20;
+
+    let keyboard = || {
+        let mut caps = DeviceCaps::new();
+        for k in [KEY_LEFTALT, KEY_SYSRQ, KEY_T] {
+            caps.add_key(k);
+        }
+        ROUTER.register_device(caps)
+    };
+    let (id_a, node_a) = keyboard();
+    let (id_b, node_b) = keyboard();
+    let reader_b = match ROUTER.open_reader(id_b) {
+        Some(r) => r,
+        None => return TestResult::Fail("open_reader failed"),
+    };
+    let _ = take_sysrq_request();
+
+    // Alt held on keyboard A; SysRq+T on keyboard B.
+    dispatch_key_to_node(&node_a, KEY_LEFTALT, true);
+    dispatch_key_to_node(&node_b, KEY_SYSRQ, true);
+    dispatch_key_to_node(&node_b, KEY_T, true);
+    dispatch_key_to_node(&node_b, KEY_T, false);
+    dispatch_key_to_node(&node_b, KEY_SYSRQ, false);
+    dispatch_key_to_node(&node_a, KEY_LEFTALT, false);
+    let req = take_sysrq_request();
+    let mut t = 0;
+    while let Some(ev) = reader_b.poll_event() {
+        if ev.type_ == EventType::Key && ev.code == KEY_T {
+            t += 1;
+        }
+    }
+    ROUTER.unregister_device(id_a);
+    ROUTER.unregister_device(id_b);
+    if req.is_some() {
+        return TestResult::Fail("Alt on one keyboard armed SysRq on another");
+    }
+    if t != 2 {
+        return TestResult::Fail("the second keyboard's T was swallowed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_sysrq_state_is_per_device);

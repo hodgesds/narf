@@ -70,6 +70,8 @@ pub struct UdfVolume<B: BlockDevice> {
     pub device: Arc<B>,
     pub domain: DomainId,
     pub self_weak: Weak<UdfVolume<B>>,
+    /// The superblock's `st_dev`, allocated at mount.
+    pub dev: u64,
     /// Anchor that the mount used. Kept around for debugging /
     /// observability; the rest of the volume state is derived from
     /// it.
@@ -248,6 +250,7 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
             device,
             domain,
             self_weak: self_weak.clone(),
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
             anchor,
             partition,
             lvd,

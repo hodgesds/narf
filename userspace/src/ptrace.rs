@@ -280,6 +280,34 @@ pub fn get_task_tracer(child_pid: u64) -> Option<u64> {
     g.as_ref()?.tracers.get(&child_pid).copied()
 }
 
+/// The TASK id of the tracer of `task` (a task id), if it is traced —
+/// `current->ptrace` plus the tracer, which the exec credential step needs
+/// for `ptracer_capable`.
+pub(crate) fn tracer_task_of(task: u64) -> Option<u64> {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    get_task_tracer(tid_to_pid(task)).map(pid_to_tid)
+}
+
+/// Test-only: make `tracer` (a task id) the tracer of `tracee` (a task id),
+/// or detach it with `None`, without a live PTRACE_ATTACH. Keeps
+/// `PTRACE_TRACEES` exact, as every real attach/detach does.
+#[doc(hidden)]
+pub fn __test_set_tracer(tracee: u64, tracer: Option<u64>) {
+    let mut g = PTRACE_STATE.lock();
+    let r = g.get_or_insert_with(PtraceRegistry::default);
+    let key = tid_to_pid(tracee);
+    let had = r.tracers.remove(&key).is_some();
+    if had {
+        PTRACE_TRACEES.fetch_sub(1, Ordering::Release);
+    }
+    if let Some(t) = tracer {
+        r.tracers.insert(key, tid_to_pid(t));
+        PTRACE_TRACEES.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub fn is_task_traced(child_pid: u64) -> bool {
     get_task_tracer(child_pid).is_some()
 }

@@ -13,9 +13,9 @@
 // accepted a NULL param and never checked a priority, and `sched_getattr`
 // replayed whatever bytes `sched_setattr` last stored.
 //
-// Nice is deliberately NOT here. It stays in NICE_TABLE, which
-// getpriority/setpriority own; `sched_setattr` writes through to it the way
-// `__setscheduler_params` writes `static_prio`.
+// Nice is deliberately NOT here. It stays in NICE_TABLE (per task, like
+// Linux's `static_prio`), which getpriority/setpriority own; `sched_setattr`
+// writes through to it the way `__setscheduler_params` writes `static_prio`.
 //
 // Configuration this models, where Linux's answer is config-dependent:
 //   * !CONFIG_UCLAMP_TASK   — util-clamp requests are -EOPNOTSUPP.
@@ -292,9 +292,9 @@ fn priority_min_for_policy(policy: i32) -> Option<i64> {
 
 /// `find_process_by_pid(pid)` — `pid ? find_task_by_vpid(pid) : current`.
 ///
-/// The pid is resolved in the CALLER's pid namespace. `proc_pid_to_tid`
-/// falls back to the identity mapping for an unregistered pid, so the
-/// registry lookup is what makes a pid that names nothing come back `None`
+/// The id is resolved in the CALLER's pid namespace and may name any task:
+/// a thread's tid or a process leader's pid (`signal_tid_from_user`). The
+/// registry lookup is what makes an id that names nothing come back `None`
 /// (→ -ESRCH) instead of silently addressing a phantom row. The caller
 /// itself always resolves, even in syscall-unit fixtures that never
 /// populate the task registry.
@@ -309,8 +309,12 @@ fn find_process_by_pid(pid: i32) -> Option<u64> {
     if pid < 0 {
         return None;
     }
-    let outer = accept_pid_from(caller, pid as u64)?;
-    let task = proc_pid_to_tid(outer);
+    // `find_task_by_vpid` resolves ANY task id in the caller's namespace — a
+    // sibling thread's tid as well as a process leader's pid. Mapping through
+    // the process registry missed every non-leader thread, so glibc's
+    // pthread_create, which applies explicit scheduling attributes with
+    // sched_setscheduler(new_tid), failed with ESRCH (Qt's QThread::start).
+    let task = signal_tid_from_user(caller, pid as u64)?;
     if task == caller || crate::task::task_get(task).is_some() {
         Some(task)
     } else {
@@ -409,7 +413,7 @@ fn sched_get_params(task: u64, state: &SchedState, attr: &mut SchedAttr) {
     } else if rt_policy(state.policy) {
         attr.priority = state.rt_priority;
     } else {
-        attr.nice = read_nice(process_state_key(task));
+        attr.nice = read_nice(task);
         attr.runtime = task_slice_ns(state);
     }
 }
@@ -540,7 +544,7 @@ fn sched_user_check(
             Err(EPERM)
         }
     };
-    let nice_now = read_nice(process_state_key(task));
+    let nice_now = read_nice(task);
 
     if fair_policy(policy) && attr.nice < nice_now && !is_nice_reduction(task, attr.nice) {
         return req_priv();
@@ -620,7 +624,7 @@ fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
     // store a possible modification of reset_on_fork."
     if policy == state.policy {
         let changed = if fair_policy(policy) {
-            attr.nice != read_nice(process_state_key(task)) || attr.runtime != task_slice_ns(&state)
+            attr.nice != read_nice(task) || attr.runtime != task_slice_ns(&state)
         } else if rt_policy(policy) {
             attr.priority != state.rt_priority
         } else if dl_policy(policy) {
@@ -675,7 +679,7 @@ fn sched_setscheduler_checked(task: u64, attr: &SchedAttr) -> Result<(), i64> {
         next.dl_period = 0;
         next.dl_flags = 0;
         if fair_policy(policy) {
-            let _ = write_nice(process_state_key(task), attr.nice);
+            let _ = write_nice(task, attr.nice);
             next.custom_slice = if attr.runtime != 0 {
                 // NSEC_PER_MSEC/10 ..= NSEC_PER_MSEC*100.
                 attr.runtime.clamp(100_000, 100_000_000)
@@ -709,7 +713,7 @@ fn sched_param_attr(task: u64, policy: i32, priority: i32) -> SchedAttr {
     let mut attr = SchedAttr {
         policy,
         priority: priority as u32,
-        nice: read_nice(process_state_key(task)),
+        nice: read_nice(task),
         runtime: state.custom_slice,
         ..SchedAttr::default()
     };
@@ -754,19 +758,16 @@ fn sched_fork_denied(parent: u64) -> bool {
 }
 
 /// `kernel/sched/core.c::sched_fork` inheritance: the child copies the
-/// parent's policy, priority and nice — unless `reset_on_fork` is set, in
-/// which case an RT/DL parent's child restarts as SCHED_NORMAL at nice 0,
-/// a fair parent's child loses only a negative nice and any custom slice,
-/// and the flag itself is consumed.
+/// FORKING THREAD's policy, priority and nice (`p->static_prio =
+/// current->static_prio`) — unless `reset_on_fork` is set, in which case an
+/// RT/DL parent's child restarts as SCHED_NORMAL at nice 0, a fair parent's
+/// child loses only a negative nice and any custom slice, and the flag itself
+/// is consumed.
 ///
-/// Nice lives in NICE_TABLE keyed by PROCESS, so a CLONE_THREAD child
-/// already shares it; only a new process copies it. (Linux's per-thread
-/// reset of a negative nice on a CLONE_THREAD child therefore cannot be
-/// represented and is skipped.)
+/// Nice is per-thread (NICE_TABLE is keyed by task), so this applies to
+/// CLONE_THREAD children exactly as to new processes.
 fn sched_fork(parent: u64, child: u64) {
-    let parent_key = process_state_key(parent);
-    let child_key = process_state_key(child);
-    let mut nice = read_nice(parent_key);
+    let mut nice = read_nice(parent);
     let mut st = read_sched_state(parent);
     if st.reset_on_fork {
         if dl_policy(st.policy) || rt_policy(st.policy) {
@@ -781,7 +782,7 @@ fn sched_fork(parent: u64, child: u64) {
     if st != SchedState::DEFAULT {
         write_sched_state(child, st);
     }
-    if child_key != parent_key && nice != 0 {
-        let _ = write_nice(child_key, nice);
+    if nice != 0 {
+        let _ = write_nice(child, nice);
     }
 }

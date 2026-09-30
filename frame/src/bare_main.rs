@@ -5582,6 +5582,261 @@ fn boot_userspace_init() {
                     "condbcast_smoke",
                     narf_verification::NARF_CONDBCAST_SMOKE_ELF,
                 ),
+                // fork() racing condvar handoffs to file-I/O worker threads.
+                ("forkcond_smoke", narf_verification::NARF_FORKCOND_SMOKE_ELF),
+                // set*id broadcast to parked threads (musl + static glibc).
+                (
+                    "setxid_threads_smoke",
+                    narf_verification::NARF_SETXID_THREADS_SMOKE_ELF,
+                ),
+                (
+                    "setxid_threads_glibc",
+                    narf_verification::NARF_SETXID_THREADS_SMOKE_GLIBC_ELF,
+                ),
+                (
+                    "forkcond_glibc",
+                    narf_verification::NARF_FORKCOND_SMOKE_GLIBC_ELF,
+                ),
+                // Cross-thread readiness wake matrix (eventfd/pipe/socketpair x
+                // poll/ppoll/select/pselect/epoll), musl + static glibc.
+                (
+                    "xthread_wake_smoke",
+                    narf_verification::NARF_XTHREAD_WAKE_SMOKE_ELF,
+                ),
+                (
+                    "xthread_wake_glibc",
+                    narf_verification::NARF_XTHREAD_WAKE_SMOKE_GLIBC_ELF,
+                ),
+                (
+                    "procsig_thread_smoke",
+                    narf_verification::NARF_PROCSIG_THREAD_SMOKE_ELF,
+                ),
+                (
+                    "procsig_thread_glibc",
+                    narf_verification::NARF_PROCSIG_THREAD_SMOKE_GLIBC_ELF,
+                ),
+                // A caught signal wakes a parked wait and SA_RESTART re-runs it
+                // (fish: sem_wait woken by SIGCHLD), musl + static glibc.
+                (
+                    "sigwake_wait_smoke",
+                    narf_verification::NARF_SIGWAKE_WAIT_SMOKE_ELF,
+                ),
+                (
+                    "sigwake_wait_glibc",
+                    narf_verification::NARF_SIGWAKE_WAIT_SMOKE_GLIBC_ELF,
+                ),
+                // flock(2) release on last close / exec CLOEXEC / fork share,
+                // per-inode conflicts (fish's history lock), musl + glibc.
+                (
+                    "flock_release_smoke",
+                    narf_verification::NARF_FLOCK_RELEASE_SMOKE_ELF,
+                ),
+                (
+                    "flock_release_glibc",
+                    narf_verification::NARF_FLOCK_RELEASE_SMOKE_GLIBC_ELF,
+                ),
+                // Every file kind has a Linux-shaped (st_dev, st_ino): pipefs,
+                // sockfs, the shared anon inode, pidfs, memfd, procfs/sysfs/devfs.
+                (
+                    "inode_identity_smoke",
+                    narf_verification::NARF_INODE_IDENTITY_SMOKE_ELF,
+                ),
+                (
+                    "inode_identity_glibc",
+                    narf_verification::NARF_INODE_IDENTITY_SMOKE_GLIBC_ELF,
+                ),
+                // poll/select/epoll on a raw-mode pty + inotify honour the
+                // timeout (fish's terminal-query wait), musl + glibc.
+                (
+                    "tty_poll_timeout_smoke",
+                    narf_verification::NARF_TTY_POLL_TIMEOUT_SMOKE_ELF,
+                ),
+                (
+                    "tty_poll_timeout_glibc",
+                    narf_verification::NARF_TTY_POLL_TIMEOUT_SMOKE_GLIBC_ELF,
+                ),
+                // A write to one side of a pty wakes a reader parked on the
+                // other (fish's query -> konsole's master poll), musl + glibc.
+                ("pty_wake_smoke", narf_verification::NARF_PTY_WAKE_SMOKE_ELF),
+                (
+                    "pty_wake_glibc",
+                    narf_verification::NARF_PTY_WAKE_SMOKE_GLIBC_ELF,
+                ),
+                // /proc/self/fd/N magic link to an O_PATH fd, incl. a symlink
+                // opened O_NOFOLLOW (systemd's /etc/localtime watch).
+                (
+                    "proc_fd_magiclink_smoke",
+                    narf_verification::NARF_PROC_FD_MAGICLINK_SMOKE_ELF,
+                ),
+                (
+                    "proc_fd_magiclink_glibc",
+                    narf_verification::NARF_PROC_FD_MAGICLINK_SMOKE_GLIBC_ELF,
+                ),
+                // pthread_create with explicit sched attrs (glibc applies them
+                // with sched_setscheduler(new_tid)) + sibling-tid sched_* calls,
+                // also inside a new PID namespace (Qt's QThread::start).
+                (
+                    "pthread_sched_smoke",
+                    narf_verification::NARF_PTHREAD_SCHED_SMOKE_ELF,
+                ),
+                (
+                    "pthread_sched_glibc",
+                    narf_verification::NARF_PTHREAD_SCHED_SMOKE_GLIBC_ELF,
+                ),
+                // A connect() to a listening AF_UNIX socket (path and abstract)
+                // wakes its poller: kwin's on-demand Xwayland start.
+                (
+                    "unix_listen_wake_smoke",
+                    narf_verification::NARF_UNIX_LISTEN_WAKE_SMOKE_ELF,
+                ),
+                (
+                    "unix_listen_wake_glibc",
+                    narf_verification::NARF_UNIX_LISTEN_WAKE_SMOKE_GLIBC_ELF,
+                ),
+                // A dup()'d socketpair end survives fork/vfork/posix_spawn +
+                // execve without FD_CLOEXEC: kwin's WAYLAND_SOCKET handoff to
+                // Xwayland.
+                (
+                    "fd_inherit_exec_smoke",
+                    narf_verification::NARF_FD_INHERIT_EXEC_SMOKE_ELF,
+                ),
+                (
+                    "fd_inherit_exec_glibc",
+                    narf_verification::NARF_FD_INHERIT_EXEC_SMOKE_GLIBC_ELF,
+                ),
+                // epoll wakes an X server's clients the way os/ospoll.c arms
+                // them (ADD with an empty mask, then MOD EPOLLIN|EPOLLET).
+                (
+                    "xserver_epoll_wake_smoke",
+                    narf_verification::NARF_XSERVER_EPOLL_WAKE_SMOKE_ELF,
+                ),
+                (
+                    "xserver_epoll_wake_glibc",
+                    narf_verification::NARF_XSERVER_EPOLL_WAKE_SMOKE_GLIBC_ELF,
+                ),
+                // A blocking read of /dev/tty waits for the line (sudo / su
+                // password prompts), independent of another fd's O_NONBLOCK.
+                (
+                    "dev_tty_read_smoke",
+                    narf_verification::NARF_DEV_TTY_READ_SMOKE_ELF,
+                ),
+                (
+                    "dev_tty_read_glibc",
+                    narf_verification::NARF_DEV_TTY_READ_SMOKE_GLIBC_ELF,
+                ),
+                // A blocking read on an empty pty / eventfd / timerfd /
+                // signalfd waits for data; only O_NONBLOCK gets EAGAIN.
+                (
+                    "blocking_read_waits_smoke",
+                    narf_verification::NARF_BLOCKING_READ_WAITS_SMOKE_ELF,
+                ),
+                (
+                    "blocking_read_waits_glibc",
+                    narf_verification::NARF_BLOCKING_READ_WAITS_SMOKE_GLIBC_ELF,
+                ),
+                // TIOCGPTPEER (Linux `_IO('T', 0x41)`) opens a master's slave,
+                // as openpty() and sudo's use_pty do.
+                (
+                    "tiocgptpeer_smoke",
+                    narf_verification::NARF_TIOCGPTPEER_SMOKE_ELF,
+                ),
+                (
+                    "tiocgptpeer_glibc",
+                    narf_verification::NARF_TIOCGPTPEER_SMOKE_GLIBC_ELF,
+                ),
+                // A pty slave's owner and mode can be changed (sudo's
+                // get_pty chowns the slave it just opened).
+                (
+                    "pts_chown_smoke",
+                    narf_verification::NARF_PTS_CHOWN_SMOKE_ELF,
+                ),
+                (
+                    "pts_chown_glibc",
+                    narf_verification::NARF_PTS_CHOWN_SMOKE_GLIBC_ELF,
+                ),
+                // devpts mounts are independent instances with their own
+                // uid/gid/mode/ptmxmode/max options (Linux 4.7+).
+                (
+                    "devpts_instances_smoke",
+                    narf_verification::NARF_DEVPTS_INSTANCES_SMOKE_ELF,
+                ),
+                (
+                    "devpts_instances_glibc",
+                    narf_verification::NARF_DEVPTS_INSTANCES_SMOKE_GLIBC_ELF,
+                ),
+                // A second mount of a pseudo filesystem on an occupied
+                // mountpoint stacks a new mount (tmpfs, devpts).
+                (
+                    "overmount_pseudo_smoke",
+                    narf_verification::NARF_OVERMOUNT_PSEUDO_SMOKE_ELF,
+                ),
+                (
+                    "overmount_pseudo_glibc",
+                    narf_verification::NARF_OVERMOUNT_PSEUDO_SMOKE_GLIBC_ELF,
+                ),
+                // execve of a set-user-ID / set-group-ID binary: the
+                // credential transition, AT_SECURE, dumpability, and every
+                // guard (nosuid, no_new_privs, chroot), musl + glibc.
+                (
+                    "setuid_exec_smoke",
+                    narf_verification::NARF_SETUID_EXEC_SMOKE_ELF,
+                ),
+                (
+                    "setuid_exec_glibc",
+                    narf_verification::NARF_SETUID_EXEC_SMOKE_GLIBC_ELF,
+                ),
+                // The setsockopt/getsockopt sequences systemd-resolved,
+                // avahi-daemon and systemd-userdbd run at startup, plus the
+                // Linux errno contract and SO_RCVTIMEO/IP_MULTICAST_LOOP
+                // behaviour, musl + glibc.
+                (
+                    "sockopt_daemon_smoke",
+                    narf_verification::NARF_SOCKOPT_DAEMON_SMOKE_ELF,
+                ),
+                (
+                    "sockopt_daemon_glibc",
+                    narf_verification::NARF_SOCKOPT_DAEMON_SMOKE_GLIBC_ELF,
+                ),
+                // `mount -o remount` through libmount's new-API sequence and
+                // mount(2) MS_REMOUNT; flags land in mountinfo (systemd-remount-fs).
+                ("remount_smoke", narf_verification::NARF_REMOUNT_SMOKE_ELF),
+                (
+                    "remount_glibc",
+                    narf_verification::NARF_REMOUNT_SMOKE_GLIBC_ELF,
+                ),
+                // systemd-update-utmp's pututxline + updwtmpx syscall
+                // sequence, with systemd's errno-after-updwtmpx check.
+                ("utmp_smoke", narf_verification::NARF_UTMP_SMOKE_ELF),
+                ("utmp_glibc", narf_verification::NARF_UTMP_SMOKE_GLIBC_ELF),
+                // tmpfiles' `w!` writes to the THP sysfs knobs.
+                ("thp_smoke", narf_verification::NARF_THP_SMOKE_ELF),
+                ("thp_glibc", narf_verification::NARF_THP_SMOKE_GLIBC_ELF),
+                // systemd-vconsole-setup's VT probe + loadkeys' KD* ioctls.
+                ("vconsole_smoke", narf_verification::NARF_VCONSOLE_SMOKE_ELF),
+                (
+                    "vconsole_glibc",
+                    narf_verification::NARF_VCONSOLE_SMOKE_GLIBC_ELF,
+                ),
+                // tmpfiles' ACL path (/proc/self/fd/N xattrs), default-ACL
+                // inheritance and chmod mask sync.
+                ("acl_smoke", narf_verification::NARF_ACL_SMOKE_ELF),
+                ("acl_glibc", narf_verification::NARF_ACL_SMOKE_GLIBC_ELF),
+                (
+                    "nice_thread_smoke",
+                    narf_verification::NARF_NICE_THREAD_SMOKE_ELF,
+                ),
+                (
+                    "nice_thread_glibc",
+                    narf_verification::NARF_NICE_THREAD_SMOKE_GLIBC_ELF,
+                ),
+                (
+                    "setxid_busy_smoke",
+                    narf_verification::NARF_SETXID_BUSY_SMOKE_ELF,
+                ),
+                (
+                    "setxid_busy_glibc",
+                    narf_verification::NARF_SETXID_BUSY_SMOKE_GLIBC_ELF,
+                ),
                 // Systemd-style READY=1 datagram: a CPU-1 service wakes the
                 // CPU-0 manager's blocking epoll_wait and supplies SCM_CREDENTIALS.
                 (

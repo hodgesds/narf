@@ -506,6 +506,12 @@ struct MuslDemoArgs {
     #[arg(long)]
     group: Option<String>,
 
+    /// Run only these cases, by exact command name (comma-separated, e.g.
+    /// `--smoke sigwake_wait_smoke,sigwake_wait_glibc`). Combines with
+    /// `--group`; a name that matches no case is an error.
+    #[arg(long = "smoke", value_delimiter = ',')]
+    smoke: Vec<String>,
+
     /// Print the JSON array of subsystem groups (the CI matrix consumes
     /// this) and exit without booting.
     #[arg(long)]
@@ -3634,11 +3640,19 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "scm_smoke",
     ]) {
         "net"
-    } else if has(&["sig", "alarmloop", "fifoeintr", "profloop", "preemptsched"]) {
+    } else if has(&[
+        "sig",
+        "setxid",
+        "alarmloop",
+        "fifoeintr",
+        "profloop",
+        "preemptsched",
+    ]) {
         "signals"
     } else if has(&[
         "futex",
         "cond",
+        "xthread",
         "barrier",
         "robust",
         "notify_epoll",
@@ -3682,6 +3696,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "pidfd",
         "strace",
         "sched",
+        "nice_thread",
         "closerange",
         "dup3",
         "fd_cloexec",
@@ -3969,6 +3984,85 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // for the permanent broadcast-waiter strand (requeue silently
         // dropped + the park loop never re-reading the futex word).
         ("condbcast_smoke", "condbcast-ok"),
+        // fork() racing condvar handoffs to file-I/O worker threads — the
+        // Xwayland/Mesa disk-cache wedge that froze kwin under Plasma.
+        ("forkcond_smoke", "forkcond-ok"),
+        // set*id() broadcast to threads parked in blocking calls, musl
+        // (__synccall) and static glibc (SIGSETXID) — the Xwayland
+        // seteuid() hang behind the Plasma wedge.
+        ("setxid_threads_smoke", "setxid-threads-ok"),
+        ("setxid_threads_glibc", "setxid-threads-ok"),
+        ("forkcond_glibc", "forkcond-ok"),
+        // A thread parked in a readiness wait must wake when another thread
+        // makes its fd readable (fish's startup hang that Ctrl-C unsticks).
+        ("xthread_wake_smoke", "xthread-wake-ok"),
+        ("xthread_wake_glibc", "xthread-wake-ok"),
+        // Process-directed signals go to a thread that does not block them
+        // (fish's SIGCHLD-driven topic_monitor wait).
+        ("procsig_thread_smoke", "procsig-thread-ok"),
+        ("procsig_thread_glibc", "procsig-thread-ok"),
+        ("sigwake_wait_smoke", "sigwake-wait-ok"),
+        ("sigwake_wait_glibc", "sigwake-wait-ok"),
+        ("flock_release_smoke", "flock-release-ok"),
+        ("flock_release_glibc", "flock-release-ok"),
+        ("inode_identity_smoke", "inode-identity-ok"),
+        ("inode_identity_glibc", "inode-identity-ok"),
+        ("tty_poll_timeout_smoke", "tty-poll-timeout-ok"),
+        ("tty_poll_timeout_glibc", "tty-poll-timeout-ok"),
+        ("pty_wake_smoke", "pty-wake-ok"),
+        ("pty_wake_glibc", "pty-wake-ok"),
+        ("proc_fd_magiclink_smoke", "proc-fd-magiclink-ok"),
+        ("proc_fd_magiclink_glibc", "proc-fd-magiclink-ok"),
+        ("pthread_sched_smoke", "pthread-sched-ok"),
+        ("pthread_sched_glibc", "pthread-sched-ok"),
+        ("unix_listen_wake_smoke", "unix-listen-wake-ok"),
+        ("unix_listen_wake_glibc", "unix-listen-wake-ok"),
+        ("fd_inherit_exec_smoke", "fd-inherit-exec-ok"),
+        ("fd_inherit_exec_glibc", "fd-inherit-exec-ok"),
+        ("xserver_epoll_wake_smoke", "xserver-epoll-wake-ok"),
+        ("xserver_epoll_wake_glibc", "xserver-epoll-wake-ok"),
+        ("dev_tty_read_smoke", "dev-tty-read-ok"),
+        ("dev_tty_read_glibc", "dev-tty-read-ok"),
+        ("blocking_read_waits_smoke", "blocking-read-waits-ok"),
+        ("blocking_read_waits_glibc", "blocking-read-waits-ok"),
+        ("tiocgptpeer_smoke", "tiocgptpeer-ok"),
+        ("tiocgptpeer_glibc", "tiocgptpeer-ok"),
+        ("pts_chown_smoke", "pts-chown-ok"),
+        ("pts_chown_glibc", "pts-chown-ok"),
+        ("devpts_instances_smoke", "devpts-instances-ok"),
+        ("devpts_instances_glibc", "devpts-instances-ok"),
+        ("overmount_pseudo_smoke", "overmount-pseudo-ok"),
+        ("overmount_pseudo_glibc", "overmount-pseudo-ok"),
+        // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
+        ("setuid_exec_smoke", "setuid-exec-ok"),
+        ("setuid_exec_glibc", "setuid-exec-ok"),
+        // Daemon setsockopt/getsockopt sequences (resolved, avahi, userdbd)
+        // and the Linux errno contract for IP/IPv6/SOL_SOCKET options.
+        ("sockopt_daemon_smoke", "sockopt-daemon-ok"),
+        ("sockopt_daemon_glibc", "sockopt-daemon-ok"),
+        // libmount's remount sequence + MS_REMOUNT flags in mountinfo.
+        ("remount_smoke", "remount-ok"),
+        ("remount_glibc", "remount-ok"),
+        // systemd-update-utmp: pututxline + updwtmpx leave errno clear.
+        ("utmp_smoke", "utmp-ok"),
+        ("utmp_glibc", "utmp-ok"),
+        // tmpfiles writes to /sys/kernel/mm/transparent_hugepage knobs.
+        ("thp_smoke", "thp-ok"),
+        ("thp_glibc", "thp-ok"),
+        // systemd-vconsole-setup: /dev/vcs1, KDGKBMODE, loadkeys' ioctls.
+        ("vconsole_smoke", "vconsole-ok"),
+        ("vconsole_glibc", "vconsole-ok"),
+        // tmpfiles' ACLs via /proc/self/fd/N, inheritance, chmod mask sync.
+        ("acl_smoke", "acl-ok"),
+        ("acl_glibc", "acl-ok"),
+        // Nice is per-thread: setpriority(PRIO_PROCESS, gettid()) renices
+        // one thread, and new tasks inherit the forking thread's nice.
+        ("nice_thread_smoke", "nice-thread-ok"),
+        ("nice_thread_glibc", "nice-thread-ok"),
+        // set*id() broadcast while every other thread is busy in one class of
+        // work (file I/O, condvar waits, fork, pure compute).
+        ("setxid_busy_smoke", "setxid-busy-ok"),
+        ("setxid_busy_glibc", "setxid-busy-ok"),
         // Contended futex (N-thread mutex + join + condvar ping-pong).
         // Back in the shared-boot batch at the FULL 16-vCPU/2-socket-NUMA
         // topology: the strand class that forced its SMP=1 pin is fixed
@@ -4110,6 +4204,17 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     };
     let kernel_override = prebuilt.as_deref();
 
+    // A typo'd `--smoke` name must fail loudly instead of running nothing.
+    for name in &args.smoke {
+        if !lightweight
+            .iter()
+            .chain(GUI_FRESH_BOOT.iter())
+            .any(|(cmd, _)| cmd == name)
+        {
+            bail!("--smoke: no musl-demo case named `{name}`");
+        }
+    }
+
     // Select this invocation's group (or all groups when unset).
     let want = |cmd: &str| {
         (cmd != "userns_smoke" || args.build.features.split(',').any(|f| f == "container"))
@@ -4117,6 +4222,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
                 .group
                 .as_deref()
                 .is_none_or(|g| musl_case_group(cmd) == g)
+            && (args.smoke.is_empty() || args.smoke.iter().any(|name| name == cmd))
     };
     if let Some(g) = &args.group {
         eprintln!("xtask musl-demo: running subsystem group `{g}`");

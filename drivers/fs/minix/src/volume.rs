@@ -74,6 +74,8 @@ pub struct MinixVolume<B: BlockDevice> {
     /// FAT driver — held synchronously during the copy span only,
     /// never across an `await`.
     io: IrqSafeSpinLock<VolumeIo>,
+    /// The superblock's `st_dev`, allocated at mount.
+    pub dev: u64,
 }
 
 impl<B: BlockDevice + 'static> MinixVolume<B> {
@@ -129,6 +131,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            dev: narf_filesystem::inode_id::alloc_anon_dev(),
         }))
     }
 

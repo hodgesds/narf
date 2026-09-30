@@ -12,10 +12,9 @@
 //! `PtyMaster::index()` and to Linux callers through PTY ioctls. As on Linux,
 //! `stat().size` remains zero and does not encode private state.
 //!
-//! Both handles share one `Arc<Pty>`.  The pair is registered in
-//! `PTY_TABLE` on allocation and removed when **both** handles have been
-//! dropped (the `Arc` refcount hits one in each of the master/slave
-//! wrappers, tracked via separate `Arc`s keyed by index).
+//! Both handles share one `Arc<Pty>`. A pty belongs to the devpts instance
+//! (`PtsFsInfo`) its master was opened on: it is registered there by index on
+//! allocation and system-wide by id, and leaves both when the master closes.
 //!
 //! ## Data-flow
 //!
@@ -32,21 +31,22 @@
 //!                                         v   PtyMaster::read
 //! ```
 //!
-//! ## Remaining differences
+//! ## Instances
 //!
-//! NARF currently has one global PTY registry. Separate devpts mounts expose
-//! that registry rather than allocating Linux-style independent instances,
-//! and devpts mount options (`newinstance`, `gid`, `mode`, `ptmxmode`, `max`)
-//! are not yet applied.
+//! Every devpts mount is an independent instance with its own index space,
+//! `ptmx` node and `uid=`/`gid=`/`mode=`/`ptmxmode=`/`max=` options, as in
+//! Linux 4.7+. devtmpfs's `/dev/ptmx` finds the instance mounted at `pts`
+//! beside it (`ptmx_open_beside`).
 
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -70,7 +70,9 @@ pub const TIOCGPTN: u32 = 0x80045430;
 pub const TIOCSPTLCK: u32 = 0x40045431;
 /// `ioctl(master_fd, TIOCGPTPEER, flags)` — open a fresh slave fd. Handled
 /// by the syscall layer because fd allocation lives in userspace::fd.
-pub const TIOCGPTPEER: u32 = 0x40045441;
+/// `_IO('T', 0x41)` (include/uapi/asm-generic/ioctls.h): no direction or size
+/// bits — `flags` is passed by value.
+pub const TIOCGPTPEER: u32 = 0x5441;
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
@@ -647,8 +649,16 @@ pub struct Pty {
     /// concurrent reader from observing half of a `TIOCSCTTY` publication.
     ctrl: IrqSafeSpinLock<PtyControl>,
 
-    /// Allocation index; becomes the `/dev/pts/<N>` name.
+    /// Allocation index within its devpts instance; becomes the
+    /// `/dev/pts/<N>` name and the minor of rdev 136:N.
     pub(crate) index: u32,
+
+    /// System-wide identity: `tty_id()` and the controlling-tty table key on
+    /// it, since two devpts instances can each have a pts `index` 0.
+    pub(crate) id: u32,
+
+    /// The devpts instance this pty was allocated in.
+    pub(crate) fsi: Arc<PtsFsInfo>,
 
     /// Owner of the `/dev/pts/<N>` slave node, captured from the task that
     /// opened `/dev/ptmx`.
@@ -662,12 +672,17 @@ pub struct Pty {
     /// hardcoded root owner makes every `open("/dev/pts/N")` by an ordinary
     /// desktop user fail with EACCES — which is exactly how a terminal
     /// emulator dies inside a normal (uid != 0) graphical session.
-    // LINUX-GAP: devpts `uid=`/`gid=` mount options are still not parsed
-    // (see the module header), so the `opts->setuid`/`setgid` branches above
-    // have no equivalent here and the caller's credentials always win.
+    // `uid=`/`gid=` (`opts->setuid`/`setgid`) are applied by `ptmx_open`.
     pub(crate) uid: AtomicU32,
     /// Group of the slave node — `current_fsgid()` at ptmx-open time.
     pub(crate) gid: AtomicU32,
+    /// Permission bits of the slave node: the instance's `mode=` at
+    /// `devpts_pty_new`, then whatever `chmod` stores. devpts pts inodes have
+    /// no `setattr` of their own, so `chown`/`chmod` land in `simple_setattr`
+    /// and the inode keeps the new values for the pty's lifetime — the owner
+    /// in `uid`/`gid` above, the mode here. sudo's `get_pty` fails outright
+    /// unless `chown(slave, ttyuid, ttygid)` succeeds.
+    pub(crate) perms: AtomicU32,
 
     /// How many `PtySlave` handles are currently open, and whether one ever
     /// was. Together these are the HANGUP condition: a master read may only
@@ -1301,12 +1316,12 @@ impl Pty {
         let _txn = TIOCSCTTY_TXN.lock();
         let hook = (*CTTY_HOOK.lock()).ok_or(FsError::Unsupported)?;
         let tty_sid = self.ctrl.lock().sid;
-        let (sid, pgid) = hook(self.index, tty_sid, arg, readable)?;
+        let (sid, pgid) = hook(self.id, tty_sid, arg, readable)?;
         *self.ctrl.lock() = PtyControl { sid, fg_pgrp: pgid };
         Ok(())
     }
 
-    fn new(index: u32, uid: u32, gid: u32) -> Self {
+    fn new(id: u32, index: u32, fsi: Arc<PtsFsInfo>, uid: u32, gid: u32, perms: u16) -> Self {
         Self {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             output: IrqSafeSpinLock::new(crate::ntty::OutputState::new()),
@@ -1324,8 +1339,11 @@ impl Pty {
             window: IrqSafeSpinLock::new(WinSize::default()),
             ctrl: IrqSafeSpinLock::new(PtyControl::default()),
             index,
+            id,
+            fsi,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
+            perms: AtomicU32::new(u32::from(perms)),
             // Linux: ptmx_open() starts with the slave locked. unlockpt()
             // clears via TIOCSPTLCK(0) before the slave can be opened.
             locked: AtomicBool::new(true),
@@ -1337,18 +1355,302 @@ impl Pty {
     }
 }
 
-// ── PTY table ─────────────────────────────────────────────────────────────────
+// ── devpts instances ──────────────────────────────────────────────────────────
+//
+// `fs/devpts/inode.c`: since Linux 4.7 every devpts mount is its own
+// `pts_fs_info` — an index allocator, mount options and a `ptmx` node — and a
+// pty belongs to the instance its master was opened on. A pty therefore has
+// two identities: its per-instance `index` (`/dev/pts/N`, rdev 136:N) and a
+// system-wide `id` that the controlling-tty table and `tty_id()` key on, so
+// two instances' pts 0 never alias.
 
-/// Global table mapping PTY index → shared `Arc<Pty>`.
-///
-/// Inserted on `ptmx_open()`; removed when the master drops (which happens
-/// after the slave has also been dropped, since the slave holds its own
-/// `Arc<Pty>`).  We use a `Vec` because the table is expected to hold O(10)
-/// entries at most; a `BTreeMap` would require `narf-alloc` features not yet
-/// pulled in here.
-static PTY_TABLE: IrqSafeSpinLock<Vec<(u32, Arc<Pty>)>> = IrqSafeSpinLock::new(Vec::new());
+/// `NR_UNIX98_PTY_MAX` (`1 << MINORBITS`): the absolute per-instance limit.
+pub const NR_UNIX98_PTY_MAX: u32 = 1 << 20;
+/// `NR_UNIX98_PTY_DEFAULT`: the default `kernel.pty.max`.
+pub const NR_UNIX98_PTY_DEFAULT: i32 = 4096;
+/// `NR_UNIX98_PTY_RESERVE`: the default `kernel.pty.reserve`, held back for
+/// devpts mounts made in the initial mount namespace.
+pub const NR_UNIX98_PTY_RESERVE: i32 = 1024;
+/// `DEVPTS_DEFAULT_MODE`: pts node mode without `mode=`.
+pub const DEVPTS_DEFAULT_MODE: u16 = 0o600;
+/// `DEVPTS_DEFAULT_PTMX_MODE`: the instance's ptmx node mode without
+/// `ptmxmode=`.
+pub const DEVPTS_DEFAULT_PTMX_MODE: u16 = 0o000;
 
-static NEXT_PTY_INDEX: AtomicU32 = AtomicU32::new(0);
+/// `kernel.pty.max` (`pty_limit`).
+static PTY_LIMIT: AtomicI32 = AtomicI32::new(NR_UNIX98_PTY_DEFAULT);
+/// `kernel.pty.reserve` (`pty_reserve`).
+static PTY_RESERVE: AtomicI32 = AtomicI32::new(NR_UNIX98_PTY_RESERVE);
+/// `kernel.pty.nr` (`pty_count`): ptys allocated across all instances.
+static PTY_COUNT: AtomicI32 = AtomicI32::new(0);
+
+/// `kernel.pty.max`.
+pub fn pty_limit() -> i32 {
+    PTY_LIMIT.load(Ordering::Relaxed)
+}
+/// `kernel.pty.reserve`.
+pub fn pty_reserve() -> i32 {
+    PTY_RESERVE.load(Ordering::Relaxed)
+}
+/// `kernel.pty.nr`.
+pub fn pty_nr() -> i32 {
+    PTY_COUNT.load(Ordering::Relaxed)
+}
+/// Write `kernel.pty.max` — `proc_dointvec_minmax` with `extra1 =
+/// pty_limit_min (0)`, `extra2 = pty_limit_max (INT_MAX)`.
+pub fn set_pty_limit(v: i32) -> Result<(), FsError> {
+    if v < 0 {
+        return Err(FsError::InvalidData);
+    }
+    PTY_LIMIT.store(v, Ordering::Relaxed);
+    Ok(())
+}
+/// Write `kernel.pty.reserve` — same bounds as `kernel.pty.max`.
+pub fn set_pty_reserve(v: i32) -> Result<(), FsError> {
+    if v < 0 {
+        return Err(FsError::InvalidData);
+    }
+    PTY_RESERVE.store(v, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `struct pts_mount_opts`, less `reserve` (fixed at mount; a remount keeps
+/// it). `uid`/`gid` are kernel (initial-namespace) ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtsMountOpts {
+    pub setuid: bool,
+    pub setgid: bool,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub ptmxmode: u16,
+    pub max: u32,
+}
+
+impl Default for PtsMountOpts {
+    /// `devpts_init_fs_context`.
+    fn default() -> Self {
+        Self {
+            setuid: false,
+            setgid: false,
+            uid: 0,
+            gid: 0,
+            mode: DEVPTS_DEFAULT_MODE,
+            ptmxmode: DEVPTS_DEFAULT_PTMX_MODE,
+            max: NR_UNIX98_PTY_MAX,
+        }
+    }
+}
+
+/// `fn(is_gid, id) -> kernel id` for the calling task: `make_kuid` /
+/// `make_kgid` against its user namespace, `None` when the id has no mapping
+/// there. Installed by userspace; until then ids map to themselves.
+static PTY_ID_MAP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the devpts `uid=`/`gid=` mapping hook. See `PTY_ID_MAP_HOOK`.
+pub fn install_pty_id_map_hook(hook: fn(bool, u32) -> Option<u32>) {
+    PTY_ID_MAP_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn map_mount_id(is_gid: bool, id: u32) -> Option<u32> {
+    let raw = PTY_ID_MAP_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        // `make_kuid(&init_user_ns, -1)` is INVALID_UID.
+        return (id != u32::MAX).then_some(id);
+    }
+    // SAFETY: `raw` was stored by `install_pty_id_map_hook` from a
+    // `fn(bool, u32) -> Option<u32>`, the only writer of this slot.
+    let hook: fn(bool, u32) -> Option<u32> = unsafe { core::mem::transmute(raw) };
+    hook(is_gid, id)
+}
+
+/// `kstrtoull(s, base, ...)` for a `u64`: an optional leading `+`, base-0
+/// prefix handling (`0x` hex, `0` octal) when `base == 0`, digits only, and
+/// one optional trailing newline.
+fn kstrtou64(s: &str, base: u32) -> Option<u64> {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let (digits, radix) = match base {
+        0 => {
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                (hex, 16)
+            } else if s.len() > 1 && s.starts_with('0') {
+                (&s[1..], 8)
+            } else {
+                (s, 10)
+            }
+        }
+        b => (s, b),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+/// `kstrtouint(s, base, ...)`.
+fn kstrtouint(s: &str, base: u32) -> Option<u32> {
+    kstrtou64(s, base).and_then(|v| u32::try_from(v).ok())
+}
+
+/// `kstrtoint(s, base, ...)`: `kstrtoll` accepts one leading `-`.
+fn kstrtoint(s: &str, base: u32) -> Option<i32> {
+    match s.strip_prefix('-') {
+        Some(rest) => kstrtou64(rest, base)
+            .and_then(|v| i64::try_from(v).ok())
+            .and_then(|v| i32::try_from(-v).ok()),
+        None => kstrtou64(s, base).and_then(|v| i32::try_from(v).ok()),
+    }
+}
+
+impl PtsMountOpts {
+    /// `devpts_parse_param` over the filesystem part of a mount's data
+    /// (`vfs_parse_sb_flag` already consumed `ro`, `rw`, ...), starting from
+    /// the defaults — so a remount resets every option it does not repeat,
+    /// as `devpts_reconfigure` does. Parameter types follow
+    /// `devpts_param_specs`: `uid`/`gid` (`fs_param_is_uid`/`_gid`:
+    /// `kstrtouint(v, 0)` then a valid `make_k[ug]id`), `max`
+    /// (`fs_param_is_s32`, then `> NR_UNIX98_PTY_MAX` is out of range),
+    /// `mode`/`ptmxmode` (`fs_param_is_u32` base 8, `& S_IALLUGO`), and the
+    /// flag `newinstance`, which takes no value. Anything else is EINVAL.
+    pub fn parse(options: &str) -> Result<Self, FsError> {
+        let bad = || FsError::InvalidData;
+        let mut o = Self::default();
+        for raw in options.split(',').filter(|part| !part.is_empty()) {
+            let (key, value) = match raw.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (raw, None),
+            };
+            match key {
+                "uid" => {
+                    let id = value.and_then(|v| kstrtouint(v, 0)).ok_or_else(bad)?;
+                    o.uid = map_mount_id(false, id).ok_or_else(bad)?;
+                    o.setuid = true;
+                }
+                "gid" => {
+                    let id = value.and_then(|v| kstrtouint(v, 0)).ok_or_else(bad)?;
+                    o.gid = map_mount_id(true, id).ok_or_else(bad)?;
+                    o.setgid = true;
+                }
+                "mode" => {
+                    o.mode =
+                        (value.and_then(|v| kstrtouint(v, 8)).ok_or_else(bad)? & 0o7777) as u16;
+                }
+                "ptmxmode" => {
+                    o.ptmxmode =
+                        (value.and_then(|v| kstrtouint(v, 8)).ok_or_else(bad)? & 0o7777) as u16;
+                }
+                "newinstance" => {
+                    if value.is_some() {
+                        return Err(bad());
+                    }
+                }
+                "max" => {
+                    let v = value.and_then(|v| kstrtoint(v, 0)).ok_or_else(bad)?;
+                    // `result.uint_32 > NR_UNIX98_PTY_MAX`: a negative s32
+                    // read as u32 is out of range too.
+                    let v = v as u32;
+                    if v > NR_UNIX98_PTY_MAX {
+                        return Err(bad());
+                    }
+                    o.max = v;
+                }
+                _ => return Err(bad()),
+            }
+        }
+        Ok(o)
+    }
+
+    /// `devpts_show_options`.
+    pub fn show(&self) -> String {
+        use core::fmt::Write as _;
+        let mut out = String::new();
+        if self.setuid {
+            let _ = write!(out, ",uid={}", self.uid);
+        }
+        if self.setgid {
+            let _ = write!(out, ",gid={}", self.gid);
+        }
+        let _ = write!(out, ",mode={:03o}", self.mode);
+        let _ = write!(out, ",ptmxmode={:03o}", self.ptmxmode);
+        if self.max < NR_UNIX98_PTY_MAX {
+            let _ = write!(out, ",max={}", self.max);
+        }
+        out
+    }
+}
+
+/// One devpts instance — Linux `struct pts_fs_info` with its superblock's
+/// anonymous device and its `ptmx` node's owner.
+pub struct PtsFsInfo {
+    opts: IrqSafeSpinLock<PtsMountOpts>,
+    /// `mount_opts.reserve`: mounted in the initial mount namespace, so it
+    /// may use `kernel.pty.reserve`. Fixed at mount.
+    reserve: bool,
+    /// `mknod_ptmx`: the mounter's fsuid/fsgid.
+    ptmx_owner: (u32, u32),
+    dev: crate::inode_id::LazyAnonDev,
+    /// `allocated_ptys`: index -> live pty.
+    ptys: IrqSafeSpinLock<BTreeMap<u32, Weak<Pty>>>,
+}
+
+impl core::fmt::Debug for PtsFsInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PtsFsInfo")
+            .field("opts", &*self.opts.lock())
+            .field("reserve", &self.reserve)
+            .finish()
+    }
+}
+
+impl PtsFsInfo {
+    pub fn new(opts: PtsMountOpts, reserve: bool, ptmx_owner: (u32, u32)) -> Arc<Self> {
+        Arc::new(Self {
+            opts: IrqSafeSpinLock::new(opts),
+            reserve,
+            ptmx_owner,
+            dev: crate::inode_id::LazyAnonDev::new(),
+            ptys: IrqSafeSpinLock::new(BTreeMap::new()),
+        })
+    }
+
+    /// The instance's current mount options.
+    pub fn opts(&self) -> PtsMountOpts {
+        *self.opts.lock()
+    }
+
+    /// `devpts_reconfigure`: replace every option except `reserve`.
+    pub fn set_opts(&self, opts: PtsMountOpts) {
+        *self.opts.lock() = opts;
+    }
+
+    /// The superblock's anonymous `st_dev`.
+    pub fn dev(&self) -> u64 {
+        self.dev.get()
+    }
+
+    /// Live pty of this instance at `index`.
+    pub fn lookup(&self, index: u32) -> Option<Arc<Pty>> {
+        self.ptys.lock().get(&index).and_then(Weak::upgrade)
+    }
+
+    /// Live indices, ascending.
+    pub fn indices(&self) -> Vec<u32> {
+        self.ptys
+            .lock()
+            .iter()
+            .filter(|(_, pty)| pty.strong_count() > 0)
+            .map(|(index, _)| *index)
+            .collect()
+    }
+}
+
+/// System-wide pty id → pty, for the controlling-tty table and `tty_id()`.
+static ALL_PTYS: IrqSafeSpinLock<BTreeMap<u32, Weak<Pty>>> = IrqSafeSpinLock::new(BTreeMap::new());
+/// Next system-wide pty id. Never reused, so a stale controlling-tty entry
+/// cannot resolve to a different terminal; stays below the console and
+/// detached sentinels (`TTY_ID_CONSOLE`, `u32::MAX`).
+static NEXT_PTY_ID: AtomicU32 = AtomicU32::new(0);
 
 /// `fn() -> (fsuid, fsgid)` for the calling task, installed by userspace.
 ///
@@ -1432,24 +1734,58 @@ fn current_pty_creds() -> (u32, u32) {
     hook()
 }
 
-/// Allocate a fresh PTY index, create the shared `Pty`, and register it.
-/// Returns `(index, Arc<Pty>)`.
+/// `ptmx_open` → `devpts_new_index` + `devpts_pty_new`: allocate the lowest
+/// free index of `fsi` below its `max=`, create the pty and register it.
 ///
-/// Called in the syscall context of `open("/dev/ptmx")`, so the credentials
-/// sampled here are the opener's — which is precisely what Linux stamps on
-/// the slave inode.
-pub fn ptmx_open() -> (u32, Arc<Pty>) {
-    let index = NEXT_PTY_INDEX.fetch_add(1, Ordering::Relaxed);
-    let (uid, gid) = current_pty_creds();
-    let pty = Arc::new(Pty::new(index, uid, gid));
-    PTY_TABLE.lock().push((index, Arc::clone(&pty)));
-    (index, pty)
+/// `devpts_new_index` fails ENOSPC once `kernel.pty.nr` would reach
+/// `kernel.pty.max` (less `kernel.pty.reserve` for an instance mounted outside
+/// the initial mount namespace) or the instance has no free index below
+/// `max`. The slave takes `uid=`/`gid=` when set, else the opener's
+/// fsuid/fsgid (sampled here, in the `open` syscall), and `mode=`.
+pub fn ptmx_open(fsi: &Arc<PtsFsInfo>) -> Result<Arc<Pty>, FsError> {
+    let opts = fsi.opts();
+    let limit = pty_limit() - if fsi.reserve { 0 } else { pty_reserve() };
+    if PTY_COUNT.fetch_add(1, Ordering::AcqRel) + 1 >= limit {
+        PTY_COUNT.fetch_sub(1, Ordering::AcqRel);
+        return Err(FsError::NoSpace);
+    }
+    let (fsuid, fsgid) = current_pty_creds();
+    let uid = if opts.setuid { opts.uid } else { fsuid };
+    let gid = if opts.setgid { opts.gid } else { fsgid };
+    let mut ptys = fsi.ptys.lock();
+    ptys.retain(|_, pty| pty.strong_count() > 0);
+    // `ida_alloc_max(&fsi->allocated_ptys, max - 1)`: the lowest free index.
+    let mut index = 0u32;
+    for used in ptys.keys() {
+        if *used != index {
+            break;
+        }
+        index += 1;
+    }
+    if index >= opts.max {
+        drop(ptys);
+        PTY_COUNT.fetch_sub(1, Ordering::AcqRel);
+        return Err(FsError::NoSpace);
+    }
+    let id = NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed);
+    let pty = Arc::new(Pty::new(id, index, Arc::clone(fsi), uid, gid, opts.mode));
+    ptys.insert(index, Arc::downgrade(&pty));
+    drop(ptys);
+    ALL_PTYS.lock().insert(id, Arc::downgrade(&pty));
+    Ok(pty)
 }
 
-/// Remove the PTY from the table (called when the master is dropped).
-pub fn ptmx_close(index: u32) {
-    let mut tbl = PTY_TABLE.lock();
-    tbl.retain(|(i, _)| *i != index);
+/// `devpts_kill_index` + `devpts_pty_kill`: the master is gone, so the pts
+/// node leaves its instance and `kernel.pty.nr` drops.
+pub fn ptmx_close(pty: &Pty) {
+    {
+        let mut ptys = pty.fsi.ptys.lock();
+        if ptys.remove(&pty.index).is_none() {
+            return;
+        }
+    }
+    ALL_PTYS.lock().remove(&pty.id);
+    PTY_COUNT.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// `fn(pgrp: u64, signum: u32) -> bool` installed by userspace to deliver
@@ -1498,35 +1834,30 @@ fn pty_deliver_signal(pgrp: u64, signum: u32) -> bool {
     hook(pgrp, signum)
 }
 
-/// Look up a PTY by its pts index.  Returns `None` if not found.
-pub fn pts_lookup(index: u32) -> Option<Arc<Pty>> {
-    PTY_TABLE
-        .lock()
-        .iter()
-        .find(|(i, _)| *i == index)
-        .map(|(_, p)| Arc::clone(p))
+/// Look up a live PTY by its system-wide id (`tty_id()`, the key of the
+/// controlling-tty table). `None` once its master has closed.
+pub fn pty_by_id(id: u32) -> Option<Arc<Pty>> {
+    ALL_PTYS.lock().get(&id).and_then(Weak::upgrade)
 }
 
-/// Snapshot the current list of active PTY indices.
-pub fn pts_indices() -> Vec<u32> {
-    PTY_TABLE.lock().iter().map(|(i, _)| *i).collect()
+/// Per-instance index of pty `id` — the `N` of `/dev/pts/N` and the minor of
+/// rdev 136:N (`/proc/<pid>/stat`'s `tty_nr`).
+pub fn pty_index(id: u32) -> Option<u32> {
+    pty_by_id(id).map(|pty| pty.index)
 }
 
-/// Foreground process group (TASK-space) of PTY `index`, or 0 if the index is
-/// unknown or no fg pgrp has been installed. Backs `/proc/<pid>/stat`'s tpgid
-/// for a process whose controlling terminal is `/dev/pts/<index>`.
-pub fn pty_fg_pgrp(index: u32) -> u64 {
-    pts_lookup(index)
-        .map(|p| p.ctrl.lock().fg_pgrp)
-        .unwrap_or(0)
+/// Foreground process group (TASK-space) of pty `id`, or 0 if the pty is
+/// gone or no fg pgrp has been installed. Backs `/proc/<pid>/stat`'s tpgid
+/// for a process whose controlling terminal is that pty.
+pub fn pty_fg_pgrp(id: u32) -> u64 {
+    pty_by_id(id).map(|p| p.ctrl.lock().fg_pgrp).unwrap_or(0)
 }
 
-/// Wave-76: open a fresh slave by master index. Used by the syscall
-/// layer to satisfy `TIOCGPTPEER` (musl/glibc prefer this over
-/// `ptsname()+open()`). Returns `None` if the master is gone, or
-/// `Some(Err(()))` if the slave is still locked.
-pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
-    let pty = pts_lookup(index)?;
+/// `TIOCGPTPEER` (`ptm_open_peer`): open a fresh slave of the master whose
+/// pty id is `id`. Returns `None` if the master is gone, or `Some(Err(()))`
+/// if the slave is still locked (or exclusive).
+pub fn pts_open_peer(id: u32) -> Option<Result<Arc<PtySlave>, ()>> {
+    let pty = pty_by_id(id)?;
     if pty.locked.load(Ordering::Acquire) {
         return Some(Err(()));
     }
@@ -2040,6 +2371,8 @@ pub(crate) unsafe fn read_user_termios2(uptr: usize) -> Result<[u8; TERMIOS_WIRE
 /// Linux ref: `drivers/tty/pty.c` `ptm_unix98_ops`
 pub struct PtyMaster {
     pty: Arc<Pty>,
+    /// The ptmx node this master was opened through; see `stat`.
+    node: Arc<dyn FileOps>,
 }
 
 impl core::fmt::Debug for PtyMaster {
@@ -2051,13 +2384,11 @@ impl core::fmt::Debug for PtyMaster {
 }
 
 impl PtyMaster {
-    pub fn new(pty: Arc<Pty>) -> Self {
-        Self { pty }
+    pub fn new(pty: Arc<Pty>, node: Arc<dyn FileOps>) -> Self {
+        Self { pty, node }
     }
 
-    /// Return the PTY index.  Userspace can use this to construct the
-    /// `/dev/pts/<N>` path (substitute for `ioctl(TIOCGPTN)` which is
-    /// not yet available in NARF).
+    /// The pty's index within its devpts instance (`TIOCGPTN`).
     pub fn index(&self) -> u32 {
         self.pty.index
     }
@@ -2072,7 +2403,7 @@ impl Drop for PtyMaster {
         // Wake a slave parked in read/poll so it sees the EOF/HUP now instead of
         // waiting for a writer that can never return.
         self.pty.sync_slave_readiness();
-        ptmx_close(self.pty.index);
+        ptmx_close(&self.pty);
     }
 }
 
@@ -2214,35 +2545,37 @@ impl FileOps for PtyMaster {
         Box::pin(async move { Ok(n) })
     }
 
+    // A master's `struct file` stays on the ptmx inode it was opened
+    // through — the devpts instance's own `ptmx`, or a devtmpfs / mknod'd
+    // `c 5:2` beside a devpts `pts` — so `fstat(master)` is that node's
+    // identity, and follows its later `chmod` / remount like any inode.
+
     fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o620,
-            },
-            mtime_cycles: 0,
-        }
+        self.node.stat()
     }
 
     fn rdev(&self) -> u64 {
-        crate::devfs::linux_makedev(5, 2)
+        self.node.rdev()
     }
 
     fn ino(&self) -> u64 {
-        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+        self.node.ino()
     }
 
     fn owners(&self) -> (u32, u32) {
-        (0, 5)
+        self.node.owners()
     }
 
-    /// Wave-76: PtyMaster identifies itself via the FileOps hook so
-    /// `sys_ioctl(TIOCGPTPEER)` can allocate a fresh slave fd without
-    /// a `Any`-based downcast on `Arc<dyn FileOps>`.
-    fn as_pty_master_index(&self) -> Option<u32> {
-        Some(self.pty.index)
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        self.node.inode_attrs()
+    }
+
+    /// PtyMaster identifies itself via the FileOps hook so
+    /// `sys_ioctl(TIOCGPTPEER)` can open its slave without an `Any`-based
+    /// downcast on `Arc<dyn FileOps>`. The value is the pty's system-wide id
+    /// (see [`pty_by_id`]).
+    fn as_pty_master_id(&self) -> Option<u32> {
+        Some(self.pty.id)
     }
 
     fn tty_fg_pgrp(&self) -> Option<u64> {
@@ -2680,7 +3013,7 @@ impl FileOps for PtySlave {
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o620,
+                perms: self.pty.perms.load(Ordering::Acquire) as u16,
             },
             mtime_cycles: 0,
         }
@@ -2690,8 +3023,19 @@ impl FileOps for PtySlave {
         crate::devfs::linux_makedev(136, self.pty.index)
     }
 
+    /// `devpts_pty_new`: `inode->i_ino = index + 3` on the instance's
+    /// superblock (1 is the root, 2 the `ptmx` node).
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            nlink: 1,
+            dev: self.pty.fsi.dev(),
+            tracked: true,
+            ..Default::default()
+        }
+    }
+
     fn ino(&self) -> u64 {
-        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+        u64::from(self.pty.index) + 3
     }
 
     /// The opener of `/dev/ptmx` owns the slave — see [`Pty::uid`]. With the
@@ -2702,6 +3046,24 @@ impl FileOps for PtySlave {
             self.pty.uid.load(Ordering::Acquire),
             self.pty.gid.load(Ordering::Acquire),
         )
+    }
+
+    /// `chown(2)` on `/dev/pts/N` — devpts has no `setattr`, so Linux's
+    /// `simple_setattr` stores the new owner on the pts inode. The syscall
+    /// layer has already applied `setattr_prepare`'s `chown_ok`/`chgrp_ok`
+    /// and resolved `-1` to the current ids.
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        self.pty.uid.store(uid, Ordering::Release);
+        self.pty.gid.store(gid, Ordering::Release);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// `chmod(2)` on `/dev/pts/N`: `simple_setattr` stores the mode bits.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.pty
+            .perms
+            .store(u32::from(perms & 0o7777), Ordering::Release);
+        Box::pin(async { Ok(()) })
     }
 
     /// Wave-76: slave-side ioctls.
@@ -2899,9 +3261,10 @@ impl FileOps for PtySlave {
         Some(&self.pty.slave_readiness)
     }
 
-    /// Job control: the slave's tty id is its `/dev/pts/<N>` index.
+    /// Job control: the slave's tty id is its pty's system-wide id — the
+    /// `/dev/pts/<N>` index is only unique within one devpts instance.
     fn tty_id(&self) -> Option<u32> {
-        Some(self.pty.index)
+        Some(self.pty.id)
     }
 
     /// Job control: this PTY's foreground process group (0 = unset).
@@ -2960,12 +3323,23 @@ pub fn set_controlling_tty_hook(hook: CttyHook) {
     *CTTY_HOOK.lock() = Some(hook);
 }
 
-// ── DevPtmx FileOps ───────────────────────────────────────────────────────────
+// ── ptmx nodes ────────────────────────────────────────────────────────────────
 
-/// The devpts `ptmx` clone node. Path lookup and stat are side-effect free;
-/// `FileOps::open_instance` allocates a fresh master/slave pair only after a
-/// successful open has passed permission checks.
-pub struct DevPtmx;
+/// A devpts instance's own `ptmx` clone node (`mknod_ptmx`): `c 5:2`, inode 2
+/// on the instance's superblock, owned by the mounter, mode `ptmxmode=`
+/// (`update_ptmx_mode` follows a remount). Path lookup and stat are side-effect
+/// free; `open_instance_checked` allocates a master on THIS instance only after
+/// the open has passed its permission checks.
+pub struct DevPtmx {
+    fsi: Arc<PtsFsInfo>,
+}
+
+impl DevPtmx {
+    /// The boot `/dev/pts` instance's `ptmx` node.
+    pub fn boot() -> Self {
+        Self { fsi: boot_devpts() }
+    }
+}
 
 impl core::fmt::Debug for DevPtmx {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -2988,23 +3362,79 @@ impl FileOps for DevPtmx {
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                // cdev 5:2 in Linux (major 5, minor 2)
-                perms: 0o666,
+                perms: self.fsi.opts().ptmxmode,
             },
             mtime_cycles: 0,
         }
     }
 
-    /// Mark this FileOps as the ptmx clone-on-open node. `sys_open`
-    /// allocates a fresh `Pty` pair via [`open_ptmx`] and installs
-    /// the master FileOps in the caller's fd table instead of this
-    /// singleton. Linux: `drivers/tty/pty.c::ptmx_open`.
+    /// `drivers/tty/pty.c::ptmx_open` on the devpts the node lives on.
     fn is_ptmx_clone(&self) -> bool {
         true
     }
 
-    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
-        Some(open_ptmx() as Arc<dyn FileOps>)
+    fn open_instance_checked(&self, _write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        let pty = ptmx_open(&self.fsi)?;
+        let node = Arc::new(DevPtmx {
+            fsi: Arc::clone(&self.fsi),
+        }) as Arc<dyn FileOps>;
+        Ok(Some(Arc::new(PtyMaster::new(pty, node)) as Arc<dyn FileOps>))
+    }
+
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(5, 2)
+    }
+
+    fn ino(&self) -> u64 {
+        2
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        self.fsi.ptmx_owner
+    }
+
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            nlink: 1,
+            dev: self.fsi.dev(),
+            tracked: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// devtmpfs's `/dev/ptmx`: `c 5:2`, mode 0666 (`tty_devnode`), owned by root
+/// until udev's `GROUP="tty"` rule chowns it. It is not on a devpts, so an
+/// open resolves its instance through the `pts` directory beside it — see
+/// [`ptmx_open_beside`]; the syscall layer, which knows the path, does that.
+#[derive(Debug)]
+pub struct DevTmpfsPtmx;
+
+/// devtmpfs `/dev/ptmx` owner and mode — the node is persistent, so
+/// `chown`/`chmod` (udev) stick.
+static DEVTMPFS_PTMX_UID: AtomicU32 = AtomicU32::new(0);
+static DEVTMPFS_PTMX_GID: AtomicU32 = AtomicU32::new(0);
+static DEVTMPFS_PTMX_PERMS: AtomicU32 = AtomicU32::new(0o666);
+
+impl FileOps for DevTmpfsPtmx {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: DEVTMPFS_PTMX_PERMS.load(Ordering::Acquire) as u16,
+            },
+            mtime_cycles: 0,
+        }
     }
 
     fn rdev(&self) -> u64 {
@@ -3014,25 +3444,107 @@ impl FileOps for DevPtmx {
     fn ino(&self) -> u64 {
         0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
     }
+
+    fn owners(&self) -> (u32, u32) {
+        (
+            DEVTMPFS_PTMX_UID.load(Ordering::Acquire),
+            DEVTMPFS_PTMX_GID.load(Ordering::Acquire),
+        )
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        DEVTMPFS_PTMX_UID.store(uid, Ordering::Release);
+        DEVTMPFS_PTMX_GID.store(gid, Ordering::Release);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        DEVTMPFS_PTMX_PERMS.store(u32::from(perms & 0o7777), Ordering::Release);
+        Box::pin(async { Ok(()) })
+    }
 }
 
-/// Open a new PTY master.  This is the programmatic equivalent of
-/// `open("/dev/ptmx", O_RDWR)` on Linux.
+/// `ptmx_open` for a `c 5:2` node that is not on a devpts (devtmpfs's
+/// `/dev/ptmx`, or one made with `mknod`): `devpts_acquire` →
+/// `devpts_ptmx_path` looks for a devpts mounted at `pts` in the node's own
+/// directory. `pts_dir` is that directory as the caller resolved it through
+/// the mount table; anything but the root of a devpts is ENODEV. The master
+/// reports `node` — the inode it was opened through.
+pub fn ptmx_open_beside(
+    node: Arc<dyn FileOps>,
+    pts_dir: Option<Arc<dyn DirOps>>,
+) -> Result<Arc<dyn FileOps>, FsError> {
+    let fsi = pts_dir
+        .as_deref()
+        .and_then(|dir| dir.as_any())
+        .and_then(|any| any.downcast_ref::<DevPts>())
+        .map(|devpts| Arc::clone(&devpts.fsi))
+        .ok_or(FsError::NoDevice)?;
+    let pty = ptmx_open(&fsi)?;
+    Ok(Arc::new(PtyMaster::new(pty, node)) as Arc<dyn FileOps>)
+}
+
+/// The devpts that NARF's boot init mounts at `/dev/pts`
+/// (`devfs::mount_default`), as a Linux init does before anything opens a pty.
+static BOOT_DEVPTS: IrqSafeSpinLock<Option<Arc<PtsFsInfo>>> = IrqSafeSpinLock::new(None);
+
+/// systemd's devpts options (`mount_setup`: `mode=620,gid=5`), which is what
+/// a booted Linux system's `/dev/pts` carries.
+pub const BOOT_DEVPTS_OPTIONS: &str = "mode=620,gid=5";
+
+/// The boot devpts instance, created on first use.
+pub fn boot_devpts() -> Arc<PtsFsInfo> {
+    let mut slot = BOOT_DEVPTS.lock();
+    if let Some(fsi) = slot.as_ref() {
+        return Arc::clone(fsi);
+    }
+    let opts = PtsMountOpts::parse(BOOT_DEVPTS_OPTIONS).unwrap_or_default();
+    // Mounted by the kernel in the initial mount namespace, as root.
+    let fsi = PtsFsInfo::new(opts, true, (0, 0));
+    *slot = Some(Arc::clone(&fsi));
+    fsi
+}
+
+/// Look up the live pty at `index` of the boot `/dev/pts` instance.
+pub fn pts_lookup(index: u32) -> Option<Arc<Pty>> {
+    boot_devpts().lookup(index)
+}
+
+/// [`open_ptmx`] returning the master by value, for callers that wrap it
+/// themselves.
+pub fn open_ptmx_master() -> PtyMaster {
+    let fsi = boot_devpts();
+    let pty = ptmx_open(&fsi).expect("boot devpts has a free pty index");
+    let node = Arc::new(DevPtmx { fsi }) as Arc<dyn FileOps>;
+    PtyMaster::new(pty, node)
+}
+
+/// Open a new PTY master on the boot devpts instance — the programmatic
+/// equivalent of `open("/dev/ptmx", O_RDWR)` on a booted system.
 pub fn open_ptmx() -> Arc<PtyMaster> {
-    let (_index, pty) = ptmx_open();
-    Arc::new(PtyMaster::new(pty))
+    let fsi = boot_devpts();
+    let pty = ptmx_open(&fsi).expect("boot devpts has a free pty index");
+    let node = Arc::new(DevPtmx { fsi }) as Arc<dyn FileOps>;
+    Arc::new(PtyMaster::new(pty, node))
 }
 
-// ── DevPts DirOps ─────────────────────────────────────────────────────────────
+/// The root directory of a devpts instance: `ptmx` plus one `N` per live
+/// pty. Inode 1, `S_IFDIR | S_IRUGO | S_IXUGO | S_IWUSR` (`devpts_fill_super`).
+pub struct DevPts {
+    fsi: Arc<PtsFsInfo>,
+}
 
-/// `/dev/pts/` directory.
-///
-/// `lookup("N")` returns a `PtySlave` for the PTY with that index if it
-/// exists.  `iter()` / `enumerate()` report the currently-open PTY
-/// indices.
-///
-/// Linux ref: `fs/devpts/inode.c devpts_get_inode` (slave inode lookup).
-pub struct DevPts;
+impl DevPts {
+    /// The root of the boot `/dev/pts` instance.
+    pub fn boot() -> Self {
+        Self { fsi: boot_devpts() }
+    }
+
+    /// The instance this directory is the root of.
+    pub fn instance(&self) -> &Arc<PtsFsInfo> {
+        &self.fsi
+    }
+}
 
 impl core::fmt::Debug for DevPts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -3042,15 +3554,17 @@ impl core::fmt::Debug for DevPts {
 
 impl DirOps for DevPts {
     fn ino(&self) -> u64 {
-        3
+        1
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         if name == "ptmx" {
-            return Some(Arc::new(DevPtmx) as Arc<dyn FileOps>);
+            return Some(Arc::new(DevPtmx {
+                fsi: Arc::clone(&self.fsi),
+            }) as Arc<dyn FileOps>);
         }
         let idx: u32 = name.parse().ok()?;
-        let pty = pts_lookup(idx)?;
+        let pty = self.fsi.lookup(idx)?;
         // Wave-76: a locked slave is invisible to `lookup()` — the
         // async path surfaces this as EIO. We can't return Err from
         // a sync `lookup`, so a locked PTY reports NotFound here.
@@ -3064,14 +3578,16 @@ impl DirOps for DevPts {
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             if name == "ptmx" {
-                return Ok(Arc::new(DevPtmx) as Arc<dyn FileOps>);
+                return Ok(Arc::new(DevPtmx {
+                    fsi: Arc::clone(&self.fsi),
+                }) as Arc<dyn FileOps>);
             }
             let idx: u32 = name.parse().map_err(|_| FsError::NotFound)?;
-            let pty = pts_lookup(idx).ok_or(FsError::NotFound)?;
+            let pty = self.fsi.lookup(idx).ok_or(FsError::NotFound)?;
             // `tty_open`: `if (test_bit(TTY_EXCLUSIVE, &tty->flags) &&
             // !capable(CAP_SYS_ADMIN)) return -EBUSY;` — exclusive mode is
             // what stops a second program attaching to a terminal another
-            // already owns.
+            // owns.
             if pty.exclusive.load(Ordering::Acquire) && !caller_capable(CAP_SYS_ADMIN) {
                 return Err(FsError::Busy);
             }
@@ -3083,15 +3599,12 @@ impl DirOps for DevPts {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // We can't return references to a locally-allocated Vec here —
-        // `DirEntry.name` is `&'static str`.  The pts enumeration uses
-        // `enumerate()` which returns owned Strings.
         Box::new(core::iter::empty())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
         core::iter::once((String::from("ptmx"), FileType::Special))
-            .chain(pts_indices().into_iter().map(|idx| {
+            .chain(self.fsi.indices().into_iter().map(|idx| {
                 let mut s = String::new();
                 let mut tmp = [0u8; 10];
                 let digits = u32_to_str(idx, &mut tmp);
@@ -3110,25 +3623,80 @@ impl DirOps for DevPts {
     ) -> FsFuture<'a, Vec<(String, FileType)>> {
         Box::pin(async move { Ok(self.enumerate(cursor, max)) })
     }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            nlink: 2,
+            dev: self.fsi.dev(),
+            tracked: true,
+            ..Default::default()
+        }
+    }
 }
 
-/// Mountable Linux `devpts` filesystem. It shares NARF's PTY registry with
-/// the built-in `/dev/pts` view, so mounting `devpts` over that path preserves
-/// live Unix98 slave nodes instead of replacing them with an empty tmpfs.
-#[derive(Debug, Default)]
-pub struct DevPtsFs;
+/// A devpts mount (Linux `devpts_fs_type`): one [`PtsFsInfo`] instance.
+#[derive(Debug)]
+pub struct DevPtsFs {
+    fsi: Arc<PtsFsInfo>,
+}
+
+impl DevPtsFs {
+    /// `devpts_init_fs_context` + `devpts_parse_param`s + `devpts_fill_super`.
+    /// `uid`/`gid` are the mounter's fsuid/fsgid, which own the instance's
+    /// `ptmx` node (`mknod_ptmx`); `reserve` is set for a mount made in the
+    /// initial mount namespace.
+    pub fn from_options(options: &str, uid: u32, gid: u32, reserve: bool) -> Result<Self, FsError> {
+        let opts = PtsMountOpts::parse(options)?;
+        Ok(Self {
+            fsi: PtsFsInfo::new(opts, reserve, (uid, gid)),
+        })
+    }
+
+    /// Wrap an existing instance (the boot devpts).
+    pub fn with_instance(fsi: Arc<PtsFsInfo>) -> Self {
+        Self { fsi }
+    }
+
+    /// The mounted instance.
+    pub fn instance(&self) -> &Arc<PtsFsInfo> {
+        &self.fsi
+    }
+}
 
 impl FsInstance for DevPtsFs {
     fn root(&self) -> Arc<dyn DirOps> {
-        Arc::new(DevPts)
+        Arc::new(DevPts {
+            fsi: Arc::clone(&self.fsi),
+        })
     }
 
     fn name(&self) -> &str {
         "devpts"
     }
+
+    /// One superblock per instance: a bind mount of this instance shares it.
+    fn backing_identity(&self) -> usize {
+        Arc::as_ptr(&self.fsi) as usize
+    }
+
+    fn show_options(&self) -> String {
+        self.fsi.opts().show()
+    }
+
+    /// `devpts_reconfigure`: every option but `reserve` is reset to its
+    /// default and re-parsed; the instance's ptmx node mode follows at once
+    /// (`update_ptmx_mode` — `DevPtmx::stat` reads the live options).
+    fn reconfigure(&self, options: &str) -> Result<(), FsError> {
+        let opts = PtsMountOpts::parse(options)?;
+        self.fsi.set_opts(opts);
+        Ok(())
+    }
 }
 
-/// Format a `u32` into `buf` (right-justified).  Returns the decimal string.
 fn u32_to_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
     if n == 0 {
         buf[9] = b'0';
@@ -3153,8 +3721,10 @@ fn u32_to_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 /// Reset the PTY table and index counter.  ONLY for use in kernel tests.
+/// Drop every pty and give the boot instance a fresh index space.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    PTY_TABLE.lock().clear();
-    NEXT_PTY_INDEX.store(0, Ordering::Relaxed);
+    *BOOT_DEVPTS.lock() = None;
+    ALL_PTYS.lock().clear();
+    PTY_COUNT.store(0, Ordering::Relaxed);
 }

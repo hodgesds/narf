@@ -35,7 +35,7 @@ use crate::fd;
 use crate::handlers::{
     apply_chroot, copy_from_user_vec, copy_user_cstr_checked, current_change_propagation,
     current_clone_mount_subtree, current_clone_tree_at, current_fs_arc_at, current_mount_arc,
-    current_mount_flags_at, current_mount_list, current_set_mount_flags, current_task_id,
+    current_mount_flags_exact, current_mount_list, current_set_mount_flags, current_task_id,
     fd_path_for_task, mount_admin, parse_proc_self_fd, resolve_at_path, resolve_cwd_path,
     stat_path_dir_aware,
 };
@@ -110,6 +110,12 @@ struct FsContext {
     fsname: String,
     created: Option<Arc<dyn FsInstance>>,
     options: BTreeMap<String, Option<String>>,
+    /// `fc->sb_flags` / `fc->sb_flags_mask`: what `vfs_parse_sb_flag` took
+    /// out of the parameter stream (`ro`, `rw`, `sync`, ...). They never
+    /// reach the filesystem; `reconfigure_super` applies them to the
+    /// superblock.
+    sb_flags: u64,
+    sb_mask: u64,
     uid: u32,
     gid: u32,
     phase: CtxPhase,
@@ -214,10 +220,23 @@ fn with_mounts<R>(f: impl FnOnce(&mut BTreeMap<u64, MountObject>) -> R) -> R {
 /// POINT, but the new-mount-API sets a mount read-only (etc.) while it is still
 /// detached, before `move_mount` gives it a path. Record it here and apply it in
 /// `sys_move_mount` once the mount is attached.
-static MOUNT_ATTRS: IrqSafeSpinLock<Option<BTreeMap<u64, MountAttr>>> = IrqSafeSpinLock::new(None);
-fn with_mount_attrs<R>(f: impl FnOnce(&mut BTreeMap<u64, MountAttr>) -> R) -> R {
+///
+/// The value is the detached mount's accumulated `MNT_*` set, not the last
+/// request: `fsmount(fd, 0, MOUNT_ATTR_NODEV)` followed by
+/// `mount_setattr(fd, "", AT_EMPTY_PATH, {RDONLY})` is a `nodev,ro` mount,
+/// and keeping only the second request dropped the `nodev`.
+static MOUNT_ATTRS: IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> = IrqSafeSpinLock::new(None);
+fn with_mount_attrs<R>(f: impl FnOnce(&mut BTreeMap<u64, u64>) -> R) -> R {
     let mut g = MOUNT_ATTRS.lock();
     f(g.get_or_insert_with(BTreeMap::new))
+}
+
+/// Fold `attr` into the detached mount `mid`'s pending flags.
+fn record_detached_attr(mid: u64, attr: &MountAttr) {
+    with_mount_attrs(|m| {
+        let flags = mount_attr_to_mnt_flags(m.get(&mid).copied().unwrap_or(0), attr);
+        m.insert(mid, flags);
+    });
 }
 
 fn context_of(task: u64, fd_no: u32) -> Option<u64> {
@@ -302,8 +321,18 @@ pub fn build_fs_with_options(
         // make `mount -t bpf` succeed and every pin into it fail with EPERM.
         "bpf" | "bpffs" => Some(Arc::new(narf_filesystem::bpffs::BpfFs::new())),
 
-        // devpts shares the live Unix98 PTY registry with /dev/pts.
-        "devpts" => Some(Arc::new(narf_filesystem::devfs_pty::DevPtsFs)),
+        // devpts: every mount is a new instance (Linux 4.7+) with its own
+        // index space and uid=/gid=/mode=/ptmxmode=/max= options. The
+        // mounter owns its ptmx node; `reserve` is set only for a mount made
+        // in the initial mount namespace (`devpts_init_fs_context`).
+        "devpts" => Some(Arc::new(
+            narf_filesystem::devfs_pty::DevPtsFs::from_options(
+                options,
+                uid,
+                gid,
+                crate::handlers::current_mount_namespace().is_none(),
+            )?,
+        )),
 
         // POSIX message queues: the mount and mq_* syscalls share the calling
         // task's IPC-namespace registry, as Linux mqueue_get_tree does.
@@ -351,18 +380,20 @@ fn context_options(context: &FsContext) -> String {
     rendered
 }
 
-/// Separate generic VFS parameters and mount attributes from
-/// filesystem-specific remount options.
-/// The registry does not yet persist per-mount RO/NOSWAP state, but Linux
-/// accepts these flags for tmpfs credentials mounts and systemd requires the
-/// reconfigure step to succeed before it attaches the detached mount.
+/// The filesystem-specific half of a reconfiguration. The superblock keys
+/// (`ro`, `rw`, `sync`, ...) were already taken out of the stream when they
+/// were set — see [`FsContext::sb_flags`]. `noswap` is tmpfs's own:
+/// `shmem_reconfigure` refuses to switch it ON by reconfiguration ("Cannot
+/// disable swap on remount") but accepts a repeat on a noswap instance.
+/// NARF's tmpfs takes it only at creation, and systemd's credentials fs
+/// repeats it before its read-only reconfigure (`exec-credential.c`), so it
+/// is dropped here. LINUX-GAP: a first-time `noswap` on reconfigure is
+/// accepted rather than refused.
 fn filesystem_reconfigure_options(context: &FsContext) -> String {
     context
         .options
         .iter()
-        .filter(|(key, _)| {
-            key.as_str() != "source" && key.as_str() != "ro" && key.as_str() != "noswap"
-        })
+        .filter(|(key, _)| key.as_str() != "source" && key.as_str() != "noswap")
         .fold(String::new(), |mut rendered, (key, value)| {
             if !rendered.is_empty() {
                 rendered.push(',');
@@ -376,12 +407,112 @@ fn filesystem_reconfigure_options(context: &FsContext) -> String {
         })
 }
 
+/// `fs/super.c::reconfigure_super`, shared by `fsconfig(CMD_RECONFIGURE)`
+/// and `mount(2)`'s `MS_REMOUNT` (`do_remount`), in its order:
+///
+/// ```text
+/// if (fc->sb_flags_mask & ~MS_RMT_MASK) return -EINVAL;
+/// ...
+/// if (fc->ops->reconfigure) { retval = fc->ops->reconfigure(fc); ... }
+/// WRITE_ONCE(sb->s_flags, ((sb->s_flags & ~fc->sb_flags_mask) |
+///                          (fc->sb_flags & fc->sb_flags_mask)));
+/// ```
+///
+/// `fs_options` is the filesystem's own parameter string (the superblock
+/// keys already taken out). A filesystem that takes no parameters rejects
+/// any: `vfs_parse_fs_param`'s `"%s: Unknown parameter '%s'"` -EINVAL,
+/// which NARF's filesystems report as `FsError::Unsupported` from
+/// `reconfigure`. Errors are positive errno values.
+///
+/// LINUX-GAP: a read-write -> read-only transition does not run
+/// `sb_prepare_remount_readonly` (NARF does not count a superblock's
+/// writers), so it never answers -EBUSY for a file still open for write.
+pub(crate) fn reconfigure_super(
+    fs: &Arc<dyn FsInstance>,
+    sb_flags: u64,
+    sb_mask: u64,
+    fs_options: &str,
+) -> Result<(), i64> {
+    use narf_filesystem::sb_flags as sb;
+    if sb_mask & !sb::RMT_MASK != 0 {
+        return Err(EINVAL);
+    }
+    // `reconfigure_super` always calls the filesystem's `->reconfigure`: a
+    // devpts remount with no options resets every option to its default
+    // (`devpts_reconfigure`). A filesystem with no reconfigure op ignores an
+    // empty parameter list; given parameters it rejects them.
+    match fs.reconfigure(fs_options) {
+        Ok(()) => {}
+        Err(FsError::Unsupported) if fs_options.is_empty() => {}
+        Err(FsError::NoSpace) => return Err(ENOSPC),
+        Err(_) => return Err(EINVAL),
+    }
+    if sb_mask != 0 {
+        sb::update(fs, sb_flags, sb_mask);
+    }
+    Ok(())
+}
+
+/// `fs/fs_context.c::vfs_parse_monolithic_sep` over a legacy `mount(2)`
+/// `data` string: split on commas (a double-quoted value may contain one),
+/// hand each key to `vfs_parse_sb_flag`, and keep the rest for the
+/// filesystem. Returns `(sb_set, sb_clear, fs_options)`.
+pub(crate) fn split_monolithic_options(data: &str) -> (u64, u64, String) {
+    let (mut set, mut clear) = (0u64, 0u64);
+    let mut rest = String::new();
+    let mut in_quote = false;
+    let mut start = 0usize;
+    let bytes = data.as_bytes();
+    let take = |item: &str, set: &mut u64, clear: &mut u64, rest: &mut String| {
+        if item.is_empty() {
+            return;
+        }
+        let key = item.split_once('=').map_or(item, |(key, _)| key);
+        match narf_filesystem::sb_flags::parse_key(key) {
+            Some((s, c)) => {
+                *set = (*set | s) & !c;
+                *clear = (*clear | c) & !s;
+            }
+            None => {
+                if !rest.is_empty() {
+                    rest.push(',');
+                }
+                rest.push_str(item);
+            }
+        }
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quote = !in_quote,
+            b',' if !in_quote => {
+                take(&data[start..i], &mut set, &mut clear, &mut rest);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    take(&data[start..], &mut set, &mut clear, &mut rest);
+    (set, clear, rest)
+}
+
 // ── fd-backed handles ───────────────────────────────────────────────
 struct FsContextFile {
     id: u64,
 }
 struct MountObjectFile {
     id: u64,
+    /// The inode the fd names. Linux `fsmount` and `open_tree` hand back
+    /// `dentry_open(path, O_PATH)` of the mount's root (`fs/namespace.c`),
+    /// so the fd `fstat`s as that directory, not as an anonymous inode.
+    root: narf_filesystem::inode_id::InodeId,
+}
+
+/// `(st_dev, st_ino)` of a directory, as `stat(2)` of it reports.
+fn dir_identity(dir: &Arc<dyn narf_filesystem::DirOps>) -> narf_filesystem::inode_id::InodeId {
+    narf_filesystem::inode_id::InodeId {
+        dev: dir.inode_attrs().dev,
+        ino: dir.ino(),
+    }
 }
 
 macro_rules! stub_fileops {
@@ -404,12 +535,28 @@ macro_rules! stub_fileops {
             fn $hook(&self) -> Option<u64> {
                 Some(self.id)
             }
+            /// Linux `fsopen`/`fspick` use `anon_inode_getfd("[fscontext]")`:
+            /// the one shared `anon_inodefs` inode.
+            fn ino(&self) -> u64 {
+                narf_filesystem::inode_id::anon_inode().ino
+            }
+            fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+                narf_filesystem::inode_id::anon_inode().attrs()
+            }
         }
     };
 }
 stub_fileops!(FsContextFile, fs_context_id);
 
 impl FileOps for MountObjectFile {
+    fn ino(&self) -> u64 {
+        self.root.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.root.attrs()
+    }
+
     fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
         alloc::boxed::Box::pin(async { Err(FsError::InvalidData) })
     }
@@ -671,6 +818,8 @@ pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
                 fsname,
                 created: None,
                 options: BTreeMap::new(),
+                sb_flags: 0,
+                sb_mask: 0,
                 uid,
                 gid,
                 phase: CtxPhase::CreateParams,
@@ -824,6 +973,12 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                 };
                 match built {
                     Ok(Some(fs)) => {
+                        // `vfs_get_tree` builds the superblock with
+                        // `fc->sb_flags` — `fsconfig(SET_FLAG, "ro")` before
+                        // CMD_CREATE is a read-only filesystem from birth.
+                        if c.sb_mask != 0 {
+                            narf_filesystem::sb_flags::update(&fs, c.sb_flags, c.sb_mask);
+                        }
                         c.created = Some(fs);
                         Some(Ok(true))
                     }
@@ -852,25 +1007,25 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                 }
                 let fs = context.created.clone()?;
                 let options = filesystem_reconfigure_options(context);
-                // `ro` and `noswap` are VFS mount attributes. NARF's mount
-                // registry does not model them yet, so an otherwise-empty
-                // remount is a successful no-op rather than an invalid tmpfs
-                // option (systemd's credentials fs depends on this).
-                let result = if options.is_empty() {
-                    Ok(())
-                } else {
-                    fs.reconfigure(&options)
-                };
-                if result.is_err() {
-                    context.phase = CtxPhase::Failed;
+                let result = reconfigure_super(&fs, context.sb_flags, context.sb_mask, &options);
+                match result {
+                    // `vfs_clean_context`: the filesystem's parameters and
+                    // `sb_flags` are dropped, the phase returns to taking
+                    // parameters. `sb_flags_mask` is NOT reset there, so a
+                    // second bare CMD_RECONFIGURE re-applies the masked bits
+                    // from the now-zero `sb_flags` — Linux's behaviour too.
+                    Ok(()) => {
+                        context.options.clear();
+                        context.sb_flags = 0;
+                    }
+                    Err(_) => context.phase = CtxPhase::Failed,
                 }
                 Some(result.map_err(Some))
             });
             match result {
                 Some(Ok(())) => ctx.set_return(ok(0)),
                 Some(Err(None)) => ctx.set_return(err(EBUSY)),
-                Some(Err(Some(FsError::NoSpace))) => ctx.set_return(err(ENOSPC)),
-                Some(Err(Some(_))) => ctx.set_return(err(EINVAL)),
+                Some(Err(Some(errno))) => ctx.set_return(err(errno)),
                 None => ctx.set_return(err(EBADF)),
             }
         }
@@ -891,7 +1046,19 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                 ) {
                     return Some(false);
                 }
-                context.options.insert(key, value);
+                // `vfs_parse_fs_param` offers every key to
+                // `vfs_parse_sb_flag` first: `ro`/`rw`/`sync`/... are
+                // superblock flags, consumed here, and the filesystem never
+                // sees them as parameters.
+                match narf_filesystem::sb_flags::parse_key(&key) {
+                    Some((set, clear)) => {
+                        context.sb_flags = (context.sb_flags | set) & !clear;
+                        context.sb_mask |= set | clear;
+                    }
+                    None => {
+                        context.options.insert(key, value);
+                    }
+                }
                 Some(true)
             });
             ctx.set_return(match r {
@@ -980,6 +1147,7 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let root = dir_identity(&fs.root());
     let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     with_mounts(|m| {
         m.insert(
@@ -993,20 +1161,19 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
     // The detached mount carries `attr_flags` from birth. NARF applies mount
     // flags at the mount POINT, so record them the way
     // `mount_setattr(fd, AT_EMPTY_PATH)` does and let `move_mount` land them.
-    if attr_flags & !MOUNT_ATTR__ATIME != 0 {
-        with_mount_attrs(|m| {
-            m.insert(
-                mid,
-                MountAttr {
-                    attr_set: attr_flags,
-                    attr_clr: 0,
-                    propagation: 0,
-                },
-            );
-        });
-    }
+    // `fsmount`'s atime switch is total — `MOUNT_ATTR_RELATIME` (0) is
+    // `mnt_flags |= MNT_RELATIME` — so the whole atime field is replaced,
+    // which is what clearing `MOUNT_ATTR__ATIME` first expresses.
+    record_detached_attr(
+        mid,
+        &MountAttr {
+            attr_set: attr_flags,
+            attr_clr: MOUNT_ATTR__ATIME,
+            propagation: 0,
+        },
+    );
     match install_fd(
-        Arc::new(MountObjectFile { id: mid }),
+        Arc::new(MountObjectFile { id: mid, root }),
         flags & FSMOUNT_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),
@@ -1159,8 +1326,8 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
     // mount was detached — it now has a mount point, so the flags can land.
     // Best-effort: an unattachable attr must not undo the successful attach
     // (Linux applied it at mount_setattr time; NARF defers to here).
-    if let Some(attr) = with_mount_attrs(|m| m.remove(&mid)) {
-        let _ = apply_mount_attr(&target, &attr);
+    if let Some(flags) = with_mount_attrs(|m| m.remove(&mid)) {
+        let _ = current_set_mount_flags(&target, flags);
     }
     for (relative, fs) in mount.descendants {
         let child_target = if target == "/" {
@@ -1233,10 +1400,13 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
                 ctx.set_return(err(ENOENT));
                 return;
             }
+            // The fd names the looked-up directory, as Linux's
+            // `dentry_open(&path, O_PATH)` does.
+            let root = dir_identity(&dir);
             let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             with_mounts(|m| m.insert(mid, base_mount));
             match install_fd(
-                Arc::new(MountObjectFile { id: mid }),
+                Arc::new(MountObjectFile { id: mid, root }),
                 a.arg2 & OPEN_TREE_CLOEXEC != 0,
             ) {
                 Some(n) => ctx.set_return(ok(n as u64)),
@@ -1329,10 +1499,11 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let root = dir_identity(&mount.fs.root());
     let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     with_mounts(|m| m.insert(mid, mount));
     match install_fd(
-        Arc::new(MountObjectFile { id: mid }),
+        Arc::new(MountObjectFile { id: mid, root }),
         a.arg2 & OPEN_TREE_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),
@@ -1383,9 +1554,7 @@ pub fn sys_open_tree_attr(ctx: &mut dyn TrapContext) {
                 }
                 if let Some(mid) = mount_of(task, fd_no) {
                     // Detached: land the attributes when move_mount attaches it.
-                    with_mount_attrs(|m| {
-                        m.insert(mid, attr);
-                    });
+                    record_detached_attr(mid, &attr);
                     return Ok(());
                 }
                 let path = resolve_at_mount_path(task, u64::from(fd_no), "")?;
@@ -1467,6 +1636,8 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
                 fsname,
                 created: Some(fs),
                 options: BTreeMap::new(),
+                sb_flags: 0,
+                sb_mask: 0,
                 uid: 0,
                 gid: 0,
                 phase: CtxPhase::ReconfParams,
@@ -1535,9 +1706,7 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     // other fd names the path it was opened on, below.
     if a.arg2 & AT_EMPTY_PATH != 0 {
         if let Some(mid) = mount_of(task, a.arg0 as u32) {
-            with_mount_attrs(|m| {
-                m.insert(mid, attr);
-            });
+            record_detached_attr(mid, &attr);
             ctx.set_return(ok(0));
             return;
         }
@@ -1582,40 +1751,24 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Translate `MOUNT_ATTR_*` to `mnt_flags` and write them onto the mount.
+/// `build_mount_kattr` + `mount_setattr_commit`: translate `MOUNT_ATTR_*` to
+/// `mnt_flags` and write them onto the mount at exactly `path`.
 ///
-/// Five of the seven move. `MOUNT_ATTR_NOSYMFOLLOW` reaches the same
-/// resolver check `openat2`'s `RESOLVE_NO_SYMLINKS` does, which is how
-/// Linux implements it too (`fs/namei.c:2036` tests them together).
+/// `MOUNT_ATTR_NOSYMFOLLOW` reaches the same resolver check `openat2`'s
+/// `RESOLVE_NO_SYMLINKS` does, which is how Linux implements it too
+/// (`fs/namei.c:2036` tests them together).
 ///
-/// The atime family (`MOUNT_ATTR__ATIME`, `MOUNT_ATTR_NODIRATIME`) has
-/// nowhere to go: NARF has no per-inode access-time policy to relax, which
-/// is the same reason `mount(2)` already accepts and ignores `MS_RELATIME`.
-/// They are validated above — a nonsensical combination is still -EINVAL —
-/// and then have no effect, exactly as on a kernel whose filesystem does
-/// not implement them.
+/// The atime policy is an ENUM in the uapi (`MOUNT_ATTR_RELATIME` is 0), so
+/// `build_mount_kattr` handles it apart from the bits: when `attr_clr`
+/// carries the whole `MOUNT_ATTR__ATIME` (validated above), both
+/// `MNT_RELATIME` and `MNT_NOATIME` are cleared and exactly the one
+/// `attr_set` names is set — nothing for `STRICTATIME`. `NODIRATIME` is an
+/// ordinary bit. They are recorded and reported (mountinfo, statmount);
+/// LINUX-GAP: NARF's filesystems do not maintain `atime` from reads, so the
+/// policy has nothing to relax.
 fn apply_mount_attr(path: &str, attr: &MountAttr) -> Result<(), i64> {
-    use narf_filesystem::mnt_flags;
-    const PAIRS: [(u64, u64); 5] = [
-        (MOUNT_ATTR_RDONLY, mnt_flags::READONLY),
-        (MOUNT_ATTR_NOSUID, mnt_flags::NOSUID),
-        (MOUNT_ATTR_NODEV, mnt_flags::NODEV),
-        (MOUNT_ATTR_NOEXEC, mnt_flags::NOEXEC),
-        (MOUNT_ATTR_NOSYMFOLLOW, mnt_flags::NOSYMFOLLOW),
-    ];
-    let current = current_mount_flags_at(path);
-    let mut next = current;
-    for (uapi, mnt) in PAIRS {
-        // `attr_clr` is applied before `attr_set`, so a request naming the
-        // same bit in both ends up SET — Linux builds `mnt_flags` the same
-        // way round in `build_mount_kattr`.
-        if attr.attr_clr & uapi != 0 {
-            next &= !mnt;
-        }
-        if attr.attr_set & uapi != 0 {
-            next |= mnt;
-        }
-    }
+    let current = current_mount_flags_exact(path).ok_or(ENOENT)?;
+    let next = mount_attr_to_mnt_flags(current, attr);
     if next == current {
         return Ok(());
     }
@@ -1624,4 +1777,38 @@ fn apply_mount_attr(path: &str, attr: &MountAttr) -> Result<(), i64> {
     } else {
         Err(ENOENT)
     }
+}
+
+/// The pure half of [`apply_mount_attr`]: `(mnt_flags & ~attr_clr) |
+/// attr_set` in `MNT_*` space. `attr_clr` goes first, so a bit named in
+/// both ends up SET — the order `mount_setattr_commit` uses.
+fn mount_attr_to_mnt_flags(current: u64, attr: &MountAttr) -> u64 {
+    use narf_filesystem::mnt_flags;
+    const MOUNT_ATTR_NODIRATIME: u64 = 0x0000_0080;
+    const PAIRS: [(u64, u64); 6] = [
+        (MOUNT_ATTR_RDONLY, mnt_flags::READONLY),
+        (MOUNT_ATTR_NOSUID, mnt_flags::NOSUID),
+        (MOUNT_ATTR_NODEV, mnt_flags::NODEV),
+        (MOUNT_ATTR_NOEXEC, mnt_flags::NOEXEC),
+        (MOUNT_ATTR_NODIRATIME, mnt_flags::NODIRATIME),
+        (MOUNT_ATTR_NOSYMFOLLOW, mnt_flags::NOSYMFOLLOW),
+    ];
+    let (mut set, mut clr) = (0u64, 0u64);
+    for (uapi, mnt) in PAIRS {
+        if attr.attr_clr & uapi != 0 {
+            clr |= mnt;
+        }
+        if attr.attr_set & uapi != 0 {
+            set |= mnt;
+        }
+    }
+    if attr.attr_clr & MOUNT_ATTR__ATIME != 0 {
+        clr |= mnt_flags::RELATIME | mnt_flags::NOATIME;
+        match attr.attr_set & MOUNT_ATTR__ATIME {
+            0 => set |= mnt_flags::RELATIME,
+            MOUNT_ATTR_NOATIME => set |= mnt_flags::NOATIME,
+            _ => {} // MOUNT_ATTR_STRICTATIME
+        }
+    }
+    (current & !clr) | set
 }

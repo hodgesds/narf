@@ -1202,22 +1202,13 @@ impl Drop for InodeLease {
     }
 }
 
-/// Anonymous device numbers, Linux `fs/super.c::get_anon_bdev`.
-///
-/// Every superblock without a block device still needs a distinct `st_dev`,
-/// because that is what makes two files on different mounts different files:
-/// `rename` across them is EXDEV, `find -xdev` prunes at the boundary, `du
-/// -x` stops, and systemd's mount-point probe compares a directory's
-/// `st_dev` with its parent's. NARF reported 0 for every mount, so every
-/// tmpfs looked like the same filesystem as every other — and as the root.
-static NEXT_ANON_MINOR: AtomicU64 = AtomicU64::new(1);
-
-/// Linux `new_encode_dev` for major 0: the low 8 bits of the minor stay
-/// put and the rest moves above the 12-bit major field.
-fn alloc_anon_dev() -> u64 {
-    let minor = NEXT_ANON_MINOR.fetch_add(1, Ordering::Relaxed);
-    (minor & 0xff) | ((minor & !0xff) << 12)
-}
+// Anonymous device numbers, Linux `fs/super.c::get_anon_bdev` — shared with
+// every other superblock (see `inode_id`). Every superblock without a block
+// device still needs a distinct `st_dev`, because that is what makes two files
+// on different mounts different files: `rename` across them is EXDEV, `find
+// -xdev` prunes at the boundary, `du -x` stops, and systemd's mount-point probe
+// compares a directory's `st_dev` with its parent's.
+use crate::inode_id::alloc_anon_dev;
 
 /// Wall-clock nanoseconds since the epoch, the unit every inode timestamp
 /// is stored in.

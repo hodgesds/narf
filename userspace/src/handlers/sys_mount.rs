@@ -27,6 +27,80 @@ fn mount_target_exists(target: &str) -> bool {
         || current_file_exists(target)
 }
 
+/// `MS_REMOUNT`, the tail of `path_mount` (`fs/namespace.c`):
+///
+/// ```text
+/// /* The default atime for remount is preservation */
+/// if ((flags & MS_REMOUNT) &&
+///     ((flags & (MS_NOATIME | MS_NODIRATIME | MS_RELATIME |
+///                MS_STRICTATIME)) == 0)) {
+///         mnt_flags &= ~MNT_ATIME_MASK;
+///         mnt_flags |= path->mnt->mnt_flags & MNT_ATIME_MASK;
+/// }
+/// sb_flags = flags & (SB_RDONLY | SB_SYNCHRONOUS | SB_MANDLOCK | SB_DIRSYNC |
+///                     SB_SILENT | SB_POSIXACL | SB_LAZYTIME | SB_I_VERSION);
+/// if ((flags & (MS_REMOUNT | MS_BIND)) == (MS_REMOUNT | MS_BIND))
+///         return do_reconfigure_mnt(path, mnt_flags);
+/// if (flags & MS_REMOUNT)
+///         return do_remount(path, sb_flags, mnt_flags, data_page);
+/// ```
+///
+/// Both halves open with `if (!path_mounted(path)) return -EINVAL;` — a
+/// remount names a mount, and "mount point not mounted or bad option" is
+/// util-linux's text for exactly that -EINVAL. `do_reconfigure_mnt` only
+/// replaces the attachment's flags. `do_remount` reconfigures the SUPERBLOCK
+/// first — `fs_context_for_reconfigure(dentry, sb_flags, MS_RMT_MASK)`, then
+/// `parse_monolithic_mount_data(fc, data)` (the generic `ro`/`rw`/`sync`
+/// keys, then the filesystem's own), then `reconfigure_super` — and sets the
+/// mount's flags only once that succeeded.
+///
+/// This used to write the flags before looking at `data`, so a remount the
+/// filesystem refused still changed the mount, and any `data` at all went
+/// to the filesystem whole: ext4 had no reconfigure, so `mount -o remount /`
+/// with fstab's options was -EINVAL and systemd-remount-fs failed on every
+/// boot.
+fn remount(target: &str, flags: u64, mnt_flags: u64, data: &str) -> Result<(), i64> {
+    use narf_filesystem::{mnt_flags as mnt, sb_flags as sb};
+    let target = if target.len() > 1 {
+        target.trim_end_matches('/')
+    } else {
+        target
+    };
+    // `path_mounted`.
+    let Some(current) = current_mount_flags_exact(target) else {
+        return Err(EINVAL);
+    };
+    let mut mnt_flags = mnt_flags;
+    if flags & (MS_NOATIME | MS_NODIRATIME | MS_RELATIME | MS_STRICTATIME) == 0 {
+        mnt_flags = (mnt_flags & !mnt::ATIME_MASK) | (current & mnt::ATIME_MASK);
+    }
+    if flags & MS_BIND == 0 {
+        let fs = current_fs_arc_at(target).ok_or(EINVAL)?;
+        // `fs_context_for_reconfigure(..., sb_flags, MS_RMT_MASK)`: the
+        // legacy call restates every reconfigurable superblock flag.
+        let mut sb_flags = flags
+            & (MS_RDONLY
+                | MS_SYNCHRONOUS
+                | MS_MANDLOCK
+                | MS_DIRSYNC
+                | MS_SILENT
+                | MS_POSIXACL
+                | MS_LAZYTIME
+                | MS_I_VERSION);
+        let mut sb_mask = sb::RMT_MASK;
+        let (set, clear, fs_options) = crate::mount_api::split_monolithic_options(data);
+        sb_flags = (sb_flags | set) & !clear;
+        sb_mask |= set | clear;
+        crate::mount_api::reconfigure_super(&fs, sb_flags, sb_mask, &fs_options)?;
+    }
+    // `set_mount_attributes`.
+    if current_set_mount_flags(target, mnt_flags) {
+        Ok(())
+    } else {
+        Err(EINVAL)
+    }
+}
+
 /// `path` positively resolves to something that is not a directory.
 fn target_is_non_dir(path: &str) -> bool {
     resolve_dir_absolute(path).is_none() && current_file_exists(path)
@@ -374,10 +448,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // `path_mount` translates the restriction flags into the `MNT_*` set
     // the mount carries, which the VFS then enforces per mount. MS_REC is
     // honoured for bind mounts (the bind branch replicates the source's
-    // submounts) and for change_type (below); MS_RELATIME has no NARF
-    // counterpart (no atime policy to relax) so it alone is accepted and dropped.
+    // submounts) and for change_type (below).
     let mnt_flags = mnt_flags_from_ms(flags);
-    let _ = flags & (MS_REMOUNT | MS_RELATIME);
 
     // `fs/namespace.c::do_change_type` — `mount --make-{shared,private,slave,
     // unbindable}[,rshared,...]`. Reached when a propagation bit is set and no
@@ -431,61 +503,10 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // a request to create another bind. systemd uses this after constructing
     // each service's private mount namespace.
     if (flags & MS_REMOUNT) != 0 {
-        // The -ENOENT this branch checked for itself now applies to every
-        // mount(2) above, where `do_mount` applies it.
-        // `do_reconfigure_mnt` replaces the mount's flags wholesale, so a
-        // remount that omits MS_RDONLY makes a read-only mount writable
-        // again. This is the operation systemd uses to seal a service's
-        // filesystem view after setting it up.
-        current_set_mount_flags(&target, mnt_flags);
-        if !data.is_empty() {
-            let result = current_fs_arc_at(&target).map(|fs| fs.reconfigure(&data));
-            ctx.set_return(match result {
-                Some(Ok(())) => SyscallReturn::ok(0),
-                Some(Err(narf_filesystem::FsError::NoSpace)) => errno_ret(ENOSPC),
-                Some(Err(_)) => einval,
-                None => enoent,
-            });
-            return;
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Idempotent pseudo-filesystem mount. An init system mounts the API
-    // filesystems (/proc, /sys, /dev, /run, ...) unconditionally at startup.
-    // NARF's Stage::Late `mnt-dev-bind` makes procfs/sysfs/devfs reachable in
-    // the selected root before PID 1 runs; userspace mounts writable runtime
-    // filesystems itself. NARF has no mount stacking, so a re-mount of an
-    // already-provided pseudo-fs target reports success (matching Linux, which
-    // stacks and succeeds) rather than erroring. Scoped to the fstypes
-    // `mount_api::build_fs` recognizes (the in-memory / synthetic filesystems)
-    // so bind / block-device mounts keep their real handling (a bind onto an
-    // existing path is a distinct op).
-    // The fstype→backend dispatch lives in the linux-compat-only mount_api;
-    // the mount(2) syscall itself is only wired under linux-compat, so the
-    // non-linux-compat build just needs this to compile (no pseudo-fs there).
-    let is_pseudo_fs = {
-        let (uid, gid) = current_fs_ids();
-        match crate::mount_api::build_fs_with_options(fstype.as_str(), data.as_str(), uid, gid) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(narf_filesystem::FsError::NoSpace) => {
-                ctx.set_return(errno_ret(ENOSPC));
-                return;
-            }
-            Err(narf_filesystem::FsError::Unsupported) => {
-                ctx.set_return(errno_ret(EOPNOTSUPP));
-                return;
-            }
-            Err(_) => {
-                ctx.set_return(einval);
-                return;
-            }
-        }
-    };
-    if is_pseudo_fs && current_mount_list().iter().any(|m| m == &target) {
-        ctx.set_return(SyscallReturn::ok(0));
+        ctx.set_return(match remount(&target, flags, mnt_flags, &data) {
+            Ok(()) => SyscallReturn::ok(0),
+            Err(errno) => errno_ret(errno),
+        });
         return;
     }
 

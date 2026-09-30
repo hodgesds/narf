@@ -118,6 +118,11 @@ struct PosixTimer {
     /// because ownership and destination genuinely differ for that one form,
     /// and folding them delivered a sibling's timer to the creator.
     target: u64,
+    /// `SIGEV_SIGNAL | SIGEV_THREAD_ID`: the expiry signal is queued to the
+    /// `target` THREAD (`PIDTYPE_PID`). Every other form queues it to the
+    /// thread group's shared set (`PIDTYPE_TGID`), where any thread that does
+    /// not block it may take it.
+    thread_directed: bool,
     /// One of CLOCK_REALTIME / CLOCK_MONOTONIC / CLOCK_BOOTTIME, as the
     /// 32-bit `clockid_t` the ABI delivers. Realtime currently shares the
     /// monotonic source — no NTP yet.
@@ -449,6 +454,7 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
     // `SIGEV_SIGNAL | SIGEV_THREAD_ID`, which resolves
     // `sigev_notify_thread_id` and targets that thread.
     let mut target_task = current_task_id();
+    let mut thread_directed = false;
     let effective_signum = match parsed {
         None => SIGALRM,
         Some((notify, signo, tid)) => {
@@ -486,7 +492,10 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
                     // the wrong one of two simultaneous errors.
                     if notify == SIGEV_SIGNAL_THREAD_ID {
                         match resolve_thread_in_group(target_task, tid) {
-                            Some(thread) => target_task = thread,
+                            Some(thread) => {
+                                target_task = thread;
+                                thread_directed = true;
+                            }
                             None => {
                                 ctx.set_return(err(EINVAL));
                                 return;
@@ -535,6 +544,7 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
             id,
             PosixTimer {
                 target: target_task,
+                thread_directed,
                 clockid,
                 signum: effective_signum,
                 next_fire_ns: 0,
@@ -1417,7 +1427,7 @@ pub fn sys_alarm(ctx: &mut dyn TrapContext) {
 /// Sleep-pump half for ITIMER_REAL — collect SIGALRM deliveries for
 /// every task whose real-timer slot has expired, re-arming periodic
 /// timers. Called from `posix_timer_pump` under no lock nesting.
-fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32)>) {
+fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32, bool)>) {
     let mut g = ITIMERS.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -1428,7 +1438,8 @@ fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32)>) {
         if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
             continue;
         }
-        deliveries.push((*task, SIGALRM));
+        // ITIMER_REAL: process-directed.
+        deliveries.push((*task, SIGALRM, false));
         if slot.interval_ns == 0 {
             slot.next_fire_ns = 0;
         } else {
@@ -1612,11 +1623,14 @@ pub fn itimer_cpu_tick() {
         return;
     };
     let (fire_virtual, fire_prof) = itimer_cpu_check_due(task, virt_now, prof_now);
+    // ITIMER_VIRTUAL/ITIMER_PROF expiries are process-directed
+    // (`check_cpu_itimer` -> `send_signal_locked(signo, SEND_SIG_PRIV, tsk,
+    // PIDTYPE_TGID)`).
     if fire_virtual {
-        let _ = crate::handlers::raise_signal_pending_irq(task, SIGVTALRM);
+        let _ = crate::handlers::raise_group_signal_irq(task, SIGVTALRM);
     }
     if fire_prof {
-        let _ = crate::handlers::raise_signal_pending_irq(task, SIGPROF);
+        let _ = crate::handlers::raise_group_signal_irq(task, SIGPROF);
     }
 }
 
@@ -1711,7 +1725,8 @@ fn posix_timer_pump() {
 fn posix_timer_pump_at(now: u64) {
     // Collect (task, signum) pairs under the lock; deliver after
     // releasing it so we don't nest SIGNAL_PENDING under TIMERS.
-    let mut deliveries: Vec<(u64, u32)> = Vec::new();
+    // (target task, signum, thread-directed)
+    let mut deliveries: Vec<(u64, u32, bool)> = Vec::new();
     {
         // The POSIX-timer table may be uninitialised in a real boot
         // (`posix_timer_init` only runs in the test harness). Skip its
@@ -1742,7 +1757,7 @@ fn posix_timer_pump_at(now: u64) {
                         // attribute the count to.
                         t.overrun_last = t.overrun;
                         t.overrun = 0;
-                        deliveries.push((t.target, t.signum));
+                        deliveries.push((t.target, t.signum, t.thread_directed));
                     }
                     if t.interval_ns == 0 {
                         t.next_fire_ns = 0;
@@ -1756,8 +1771,16 @@ fn posix_timer_pump_at(now: u64) {
         }
     }
     itimer_pump_collect(now, &mut deliveries);
-    for (task, signum) in deliveries {
-        raise_signal_pending(task, signum);
+    for (task, signum, thread_directed) in deliveries {
+        if thread_directed {
+            raise_signal_pending(task, signum);
+        } else {
+            let _ = crate::handlers::raise_group_signal(
+                task,
+                signum,
+                crate::handlers::GroupSigInfo::None,
+            );
+        }
     }
 }
 

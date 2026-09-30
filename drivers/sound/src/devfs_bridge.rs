@@ -151,6 +151,19 @@ impl SoundControlFile {
 }
 
 impl FileOps for SoundControlFile {
+    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
+    /// the inode is devfs's node for that device.
+    fn rdev(&self) -> u64 {
+        narf_filesystem::devfs::linux_makedev(
+            crate::sysfs_bridge::SNDRV_MAJOR,
+            crate::sysfs_bridge::control_minor(self.card_index),
+        )
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = self.render_controls();
         Box::pin(async move {
@@ -264,6 +277,19 @@ impl SoundPcmPlaybackFile {
 }
 
 impl FileOps for SoundPcmPlaybackFile {
+    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
+    /// the inode is devfs's node for that device.
+    fn rdev(&self) -> u64 {
+        narf_filesystem::devfs::linux_makedev(
+            crate::sysfs_bridge::SNDRV_MAJOR,
+            crate::sysfs_bridge::pcm_playback_minor(self.card_index, self.device),
+        )
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Playback file: reads are not meaningful (no capture data).
         // Return 0 (EOF) so a cat /dev/snd/pcmC0D0p exits cleanly.
@@ -352,6 +378,19 @@ impl SoundPcmCaptureFile {
 }
 
 impl FileOps for SoundPcmCaptureFile {
+    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
+    /// the inode is devfs's node for that device.
+    fn rdev(&self) -> u64 {
+        narf_filesystem::devfs::linux_makedev(
+            crate::sysfs_bridge::SNDRV_MAJOR,
+            crate::sysfs_bridge::pcm_capture_minor(self.card_index, self.device),
+        )
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if buf.is_empty() {
@@ -420,6 +459,19 @@ impl FileOps for SoundPcmCaptureFile {
 pub struct SoundTimerFile;
 
 impl FileOps for SoundTimerFile {
+    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
+    /// the inode is devfs's node for that device.
+    fn rdev(&self) -> u64 {
+        narf_filesystem::devfs::linux_makedev(
+            crate::sysfs_bridge::SNDRV_MAJOR,
+            33, /* SNDRV_MINOR_TIMER */
+        )
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
     }
@@ -449,6 +501,19 @@ impl FileOps for SoundTimerFile {
 pub struct SoundSeqFile;
 
 impl FileOps for SoundSeqFile {
+    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
+    /// the inode is devfs's node for that device.
+    fn rdev(&self) -> u64 {
+        narf_filesystem::devfs::linux_makedev(
+            crate::sysfs_bridge::SNDRV_MAJOR,
+            1, /* SNDRV_MINOR_SEQUENCER */
+        )
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
     }

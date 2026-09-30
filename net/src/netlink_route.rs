@@ -49,6 +49,8 @@ pub fn rta_align(len: usize) -> usize {
 pub const NLMSG_NOOP: u16 = 1;
 pub const NLMSG_ERROR: u16 = 2;
 pub const NLMSG_DONE: u16 = 3;
+/// Types below this are netlink control messages (`netlink_rcv_skb` skips them).
+pub const NLMSG_MIN_TYPE: u16 = 0x10;
 
 pub const RTM_NEWLINK: u16 = 16;
 pub const RTM_DELLINK: u16 = 17;
@@ -73,6 +75,9 @@ pub const RTM_GETACTION: u16 = 50;
 pub const RTM_GETADDRLABEL: u16 = 74;
 pub const RTM_GETMDB: u16 = 86;
 pub const RTM_GETNEXTHOP: u16 = 106;
+/// `RTM_MAX` (include/uapi/linux/rtnetlink.h): `rtnetlink_rcv_msg` rejects
+/// larger types with -EOPNOTSUPP.
+pub const RTM_MAX: u16 = 123;
 
 // ── netlink flags (nlmsg_flags) ─────────────────────────────────────────
 
@@ -110,6 +115,17 @@ pub const IF_OPER_DOWN: u8 = 2;
 pub const IFA_ADDRESS: u16 = 1;
 pub const IFA_LOCAL: u16 = 2;
 pub const IFA_LABEL: u16 = 3;
+pub const IFA_CACHEINFO: u16 = 6;
+pub const IFA_FLAGS: u16 = 8;
+
+// ── IFA_F_* address flags (if_addr.h) ───────────────────────────────────
+
+pub const IFA_F_TEMPORARY: u32 = 0x01;
+pub const IFA_F_DEPRECATED: u32 = 0x20;
+pub const IFA_F_TENTATIVE: u32 = 0x40;
+pub const IFA_F_PERMANENT: u32 = 0x80;
+/// `INFINITY_LIFE_TIME` (`include/net/addrconf.h`).
+const INFINITY_LIFE_TIME: u32 = 0xFFFF_FFFF;
 
 // ── RTA_* route attribute types (rtnetlink.h) ──────────────────────────
 
@@ -312,20 +328,76 @@ fn build_newaddr(a: &AddrInfo, seq: u32, pid: u32) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(AF_INET); // ifa_family
     body.push(a.prefix_len); // ifa_prefixlen
-    body.push(0u8); // ifa_flags
-                    // ifa_scope: 0 = RT_SCOPE_UNIVERSE for a routable addr, 254 =
-                    // RT_SCOPE_HOST for loopback (127.0.0.0/8).
+                             // ifa_flags: the low byte of the IFA_FLAGS word below (static → PERMANENT).
+    body.push(IFA_F_PERMANENT as u8);
+    // ifa_scope: 0 = RT_SCOPE_UNIVERSE for a routable addr, 254 =
+    // RT_SCOPE_HOST for loopback (127.0.0.0/8).
     let scope = if a.addr[0] == 127 { 254u8 } else { 0u8 };
     body.push(scope);
-    body.extend_from_slice(&a.ifindex.to_le_bytes()); // ifa_index
+    body.extend_from_slice(&a.ifindex.to_ne_bytes()); // ifa_index
 
     push_rtattr(&mut body, IFA_ADDRESS, &a.addr);
     push_rtattr(&mut body, IFA_LOCAL, &a.addr);
     let mut label_bytes = a.label.as_bytes().to_vec();
     label_bytes.push(0);
     push_rtattr(&mut body, IFA_LABEL, &label_bytes);
+    // `inet_fill_ifaddr` always emits the full 32-bit flags word and the
+    // lifetimes. NARF's IPv4 addresses are configured statically (no
+    // lifetime), which Linux reports as IFA_F_PERMANENT with infinite
+    // preferred/valid lifetimes (`set_ifa_lifetime`). systemd-resolved's
+    // `link_address_update_rtnl` fails the whole manager with ENODATA when
+    // IFA_FLAGS is missing.
+    push_rtattr(&mut body, IFA_FLAGS, &IFA_F_PERMANENT.to_ne_bytes());
+    push_rtattr(
+        &mut body,
+        IFA_CACHEINFO,
+        &ifa_cacheinfo(INFINITY_LIFE_TIME, INFINITY_LIFE_TIME),
+    );
 
     frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
+}
+
+/// `struct ifa_cacheinfo { ifa_prefered, ifa_valid, cstamp, tstamp }`
+/// (`put_cacheinfo`). The two timestamps are hundredths of a second since
+/// boot at creation / last update.
+// LINUX-GAP: `put_cacheinfo` reports the address's creation and update
+// times; NARF does not record them and reports 0 for both.
+fn ifa_cacheinfo(preferred: u32, valid: u32) -> [u8; 16] {
+    let mut ci = [0u8; 16];
+    ci[0..4].copy_from_slice(&preferred.to_ne_bytes());
+    ci[4..8].copy_from_slice(&valid.to_ne_bytes());
+    ci
+}
+
+/// Remaining lifetime in whole seconds for a monotonic-ns deadline, the way
+/// `inet6_fill_ifaddr` ages `prefered_lft` / `valid_lft`.
+fn remaining_lifetime(deadline_ns: u64, now_ns: u64) -> u32 {
+    if deadline_ns == u64::MAX {
+        return INFINITY_LIFE_TIME;
+    }
+    let secs = deadline_ns.saturating_sub(now_ns) / 1_000_000_000;
+    secs.min(u64::from(INFINITY_LIFE_TIME - 1)) as u32
+}
+
+/// The 32-bit `inet6_ifaddr.flags` for an address.
+fn ipv6_ifa_flags(addr: &crate::ipv6::addrs::Ipv6IfAddr) -> u32 {
+    use crate::ipv6::addrs::AddrState;
+    let mut flags = match addr.state {
+        AddrState::Tentative => IFA_F_TENTATIVE,
+        AddrState::Deprecated => IFA_F_DEPRECATED,
+        AddrState::Preferred | AddrState::Invalid => 0,
+    };
+    if addr.temporary {
+        flags |= IFA_F_TEMPORARY;
+    }
+    // A statically configured address — one with no lifetime at all — is
+    // IFA_F_PERMANENT (`inet6_addr_add` → `ifa_flags |= IFA_F_PERMANENT`
+    // when `valid_lft == INFINITY_LIFE_TIME`); SLAAC addresses carry their
+    // router-advertised lifetimes instead.
+    if addr.valid_deadline_ns == u64::MAX && addr.preferred_deadline_ns == u64::MAX {
+        flags |= IFA_F_PERMANENT;
+    }
+    flags
 }
 
 fn build_newaddr_v6(
@@ -334,18 +406,14 @@ fn build_newaddr_v6(
     seq: u32,
     pid: u32,
 ) -> Vec<u8> {
-    use crate::ipv6::addrs::{AddrScope, AddrState};
+    use crate::ipv6::addrs::AddrScope;
 
     let mut body = Vec::new();
     body.push(AF_INET6);
     body.push(addr.prefix_len);
-    let flags = match addr.state {
-        AddrState::Tentative => 0x40,
-        AddrState::Deprecated => 0x20,
-        AddrState::Preferred => 0x80,
-        AddrState::Invalid => 0,
-    };
-    body.push(flags);
+    let flags = ipv6_ifa_flags(addr);
+    // `put_ifaddrmsg`: the legacy u8 field carries the low byte.
+    body.push(flags as u8);
     body.push(match addr.scope {
         AddrScope::Host => 254, // RT_SCOPE_HOST
         AddrScope::Global | AddrScope::UniqueLocal => 0,
@@ -353,6 +421,18 @@ fn build_newaddr_v6(
     });
     body.extend_from_slice(&ifindex.to_ne_bytes());
     push_rtattr(&mut body, IFA_ADDRESS, &addr.addr);
+    // `inet6_fill_ifaddr` order: IFA_ADDRESS, IFA_CACHEINFO, IFA_FLAGS.
+    let (preferred, valid) = if flags & IFA_F_PERMANENT != 0 {
+        (INFINITY_LIFE_TIME, INFINITY_LIFE_TIME)
+    } else {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        (
+            remaining_lifetime(addr.preferred_deadline_ns, now),
+            remaining_lifetime(addr.valid_deadline_ns, now),
+        )
+    };
+    push_rtattr(&mut body, IFA_CACHEINFO, &ifa_cacheinfo(preferred, valid));
+    push_rtattr(&mut body, IFA_FLAGS, &flags.to_ne_bytes());
     frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
 }
 
@@ -482,12 +562,6 @@ fn build_newqdisc(ifindex: u32, seq: u32, pid: u32) -> Vec<u8> {
     body.extend_from_slice(&0u32.to_ne_bytes());
     push_rtattr(&mut body, TCA_KIND, b"noqueue\0");
     frame_message(RTM_NEWQDISC, NLM_F_MULTI, seq, pid, &body)
-}
-
-/// Build an `NLMSG_DONE` message (payload is a single i32 = 0). Terminates
-/// every dump so the caller stops reading.
-fn build_done(seq: u32, pid: u32) -> Vec<u8> {
-    frame_message(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
 }
 
 /// Build an `NLMSG_ERROR` message carrying `-errno` (negated per netlink
@@ -636,10 +710,27 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
 }
 
 pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
+    build_get_in(net_ns_id, req, false, false)
+}
+
+/// Answer one `RTM_GET*` request: a `NLM_F_DUMP` request runs the Linux
+/// dumpit (`dump::run`); otherwise the doit. `strict` is the socket's
+/// `NETLINK_GET_STRICT_CHK`, `ext_ack` its `NETLINK_EXT_ACK`.
+fn build_get_in(net_ns_id: u64, req: &[u8], strict: bool, ext_ack: bool) -> Vec<Vec<u8>> {
     let hdr = match parse_hdr(req) {
         Some(h) => h,
         None => return Vec::new(),
     };
+    let len = (hdr.len as usize).min(req.len());
+    if len < NLMSG_HDRLEN {
+        return Vec::new();
+    }
+    let req = &req[..len];
+    // `rtnetlink_rcv_msg`: `nlmsg_flags & NLM_F_DUMP` (either bit) selects
+    // the dumpit.
+    if hdr.flags & NLM_F_DUMP != 0 && dump::is_dump_type(hdr.msg_type) {
+        return dump::run(net_ns_id, req, strict, ext_ack);
+    }
     let seq = hdr.seq;
     // Replies originate from the kernel netlink endpoint. Linux stamps
     // nlmsg_pid=0; the requester's port ID is not echoed in reply headers.
@@ -648,274 +739,224 @@ pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
     match hdr.msg_type {
         RTM_GETLINK => {
             let (links, _addrs) = enumerate_in(net_ns_id);
-            if hdr.flags & NLM_F_DUMP == NLM_F_DUMP {
-                for link in &links {
-                    out.push(build_newlink(link, seq, pid));
+            let tb = match valid_getlink_req(req, strict) {
+                Ok(tb) => tb,
+                Err(errno) => {
+                    out.push(build_error(errno, seq, pid, req));
+                    return out;
                 }
-                out.push(build_done(seq, pid));
+            };
+            // `rtnl_getlink`: IFLA_TARGET_NETNSID names a peer netns; NARF
+            // assigns no netns ids, so `rtnl_get_net_ns_capable` fails.
+            if tb[46].is_some() {
+                out.push(build_error(EINVAL, seq, pid, req));
+                return out;
+            }
+            let ifindex = i32::from_ne_bytes(req[20..24].try_into().unwrap_or([0; 4]));
+            let requested_name = tb[IFLA_IFNAME as usize].and_then(|(off, len)| {
+                let raw = &req[off..off + len];
+                core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok()
+            });
+            // `rtnl_getlink`: a positive ifindex selects by index only;
+            // otherwise IFLA_IFNAME selects by name; with neither the
+            // request is malformed (-EINVAL), not a missing device.
+            // LINUX-GAP: IFLA_ALT_IFNAME selection is not implemented.
+            if ifindex <= 0 && requested_name.is_none() {
+                out.push(build_error(EINVAL, seq, pid, req));
+                return out;
+            }
+            let selected = links.iter().find(|link| {
+                if ifindex > 0 {
+                    link.ifindex == ifindex as u32
+                } else {
+                    requested_name.is_some_and(|name| link.name == name)
+                }
+            });
+            if let Some(link) = selected {
+                let mut message = build_newlink(link, seq, pid);
+                clear_multipart(&mut message);
+                out.push(message);
             } else {
-                if req.len() < NLMSG_HDRLEN + 16 {
-                    out.push(build_error(EINVAL, seq, pid, req));
+                out.push(build_error(ENODEV, seq, pid, req));
+            }
+        }
+        RTM_GETROUTE => {
+            let (links, _addrs) = enumerate_in(net_ns_id);
+            // `rtnetlink_rcv_msg` dispatches a doit by family; a family
+            // without an RTM_GETROUTE doit (AF_UNSPEC, or AF_INET6 which
+            // NARF has not implemented) answers -EOPNOTSUPP.
+            // LINUX-GAP: inet6_rtm_getroute / ipmr_rtm_getroute /
+            // ip6mr_rtm_getroute are not implemented.
+            if req.get(NLMSG_HDRLEN).copied() != Some(AF_INET) {
+                out.push(build_error(EOPNOTSUPP, seq, pid, req));
+                return out;
+            }
+            let tb = match valid_getroute_req(req, strict) {
+                Ok(tb) => tb,
+                Err(errno) => {
+                    out.push(build_error(errno, seq, pid, req));
                     return out;
                 }
-                let ifindex = i32::from_ne_bytes(req[20..24].try_into().unwrap_or([0; 4]));
-                let requested_name = find_attr(req, 16, IFLA_IFNAME).and_then(|raw| {
-                    core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok()
-                });
-                // `rtnl_getlink`: a positive ifindex selects by index only;
-                // otherwise IFLA_IFNAME selects by name; with neither the
-                // request is malformed (-EINVAL), not a missing device.
-                if ifindex <= 0 && requested_name.is_none() {
-                    out.push(build_error(EINVAL, seq, pid, req));
-                    return out;
-                }
-                let selected = links.iter().find(|link| {
-                    if ifindex > 0 {
-                        link.ifindex == ifindex as u32
-                    } else {
-                        requested_name.is_some_and(|name| link.name == name)
-                    }
-                });
-                if let Some(link) = selected {
-                    let mut message = build_newlink(link, seq, pid);
+            };
+            // `inet_rtm_getroute`: `nla_get_in_addr_default(tb[RTA_DST], 0)`
+            // — an absent RTA_DST looks up 0.0.0.0, it is not an error. The
+            // policy guarantees a present RTA_DST carries four bytes.
+            let dst = tb[RTA_DST as usize]
+                .and_then(|(off, _)| req[off..off + 4].try_into().ok())
+                .unwrap_or([0; 4]);
+            let dst = crate::ipv4::Ipv4Addr(dst);
+            if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
+                if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                    let mut message = build_newroute(&route, link.ifindex, seq, pid);
                     clear_multipart(&mut message);
                     out.push(message);
                 } else {
                     out.push(build_error(ENODEV, seq, pid, req));
                 }
-            }
-        }
-        RTM_GETADDR => {
-            let (_links, addrs) = enumerate_in(net_ns_id);
-            let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
-            let requested_ifindex = req
-                .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
-                .and_then(|raw| raw.try_into().ok())
-                .map(u32::from_ne_bytes)
-                .unwrap_or(0);
-            if requested_family == 0 || requested_family == AF_INET {
-                for addr in &addrs {
-                    if requested_ifindex == 0 || requested_ifindex == addr.ifindex {
-                        out.push(build_newaddr(addr, seq, pid));
-                    }
-                }
-            }
-            if requested_family == 0 || requested_family == AF_INET6 {
-                let loopback = builtin_loopback_ipv6();
-                if requested_ifindex == 0 || requested_ifindex == 1 {
-                    out.push(build_newaddr_v6(&loopback, 1, seq, pid));
-                }
-                for addr in crate::ipv6::addrs::list_all() {
-                    if addr.state == crate::ipv6::addrs::AddrState::Invalid {
-                        continue;
-                    }
-                    if let Some(ifindex) = ifindex_for_name(&addr.iface) {
-                        if requested_ifindex == 0 || requested_ifindex == ifindex {
-                            out.push(build_newaddr_v6(&addr, ifindex, seq, pid));
-                        }
-                    }
-                }
-            }
-            out.push(build_done(seq, pid));
-        }
-        RTM_GETROUTE => {
-            let (links, _addrs) = enumerate_in(net_ns_id);
-            if hdr.flags & NLM_F_DUMP == NLM_F_DUMP {
-                let mut routes = crate::route::route_list_in(net_ns_id);
-                // Link/address dumps always expose loopback. Mirror that invariant
-                // in route dumps even during early boot before net init installs
-                // the canonical loopback FIB entry.
-                if !routes.iter().any(|r| {
-                    r.iface == "lo" && r.dst.addr.0 == [127, 0, 0, 0] && r.dst.prefix_len == 8
-                }) {
-                    routes.push(crate::route::Route {
-                        net_ns_id,
-                        dst: crate::route::Ipv4Net {
-                            addr: crate::ipv4::Ipv4Addr([127, 0, 0, 0]),
-                            prefix_len: 8,
-                        },
-                        gateway: None,
-                        iface: alloc::string::String::from("lo"),
-                        src_hint: Some(crate::ipv4::Ipv4Addr([127, 0, 0, 1])),
-                        metric: 0,
-                        scope: crate::route::Scope::Host,
-                        table: crate::route::TABLE_LOCAL,
-                    });
-                }
-                for route in &routes {
-                    let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
-                    let requested_table = req.get(NLMSG_HDRLEN + 4).copied().unwrap_or(0);
-                    if requested_family != 0 && requested_family != AF_INET {
-                        continue;
-                    }
-                    if requested_table != 0 && requested_table != route.table {
-                        continue;
-                    }
-                    if let Some(link) = links.iter().find(|link| link.name == route.iface) {
-                        out.push(build_newroute(route, link.ifindex, seq, pid));
-                    }
-                }
-                let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
-                let requested_table = req.get(NLMSG_HDRLEN + 4).copied().unwrap_or(0);
-                if requested_family == 0 || requested_family == AF_INET6 {
-                    for route in crate::ipv6::route::list_all() {
-                        if requested_table != 0 && requested_table != crate::route::TABLE_MAIN {
-                            continue;
-                        }
-                        if let Some(link) = links.iter().find(|link| link.name == route.iface) {
-                            out.push(build_newroute_v6(&route, link.ifindex, seq, pid));
-                        }
-                    }
-                }
-                out.push(build_done(seq, pid));
             } else {
-                if req.len() < NLMSG_HDRLEN + 12 {
-                    out.push(build_error(EINVAL, seq, pid, req));
-                    return out;
-                }
-                // `rtnetlink_rcv_msg` dispatches a doit by family; a family
-                // without an RTM_GETROUTE doit (AF_UNSPEC, or AF_INET6 which
-                // NARF has not implemented) answers -EOPNOTSUPP.
-                if req[NLMSG_HDRLEN] != AF_INET {
-                    out.push(build_error(EOPNOTSUPP, seq, pid, req));
-                    return out;
-                }
-                // `inet_rtm_getroute`: `nla_get_in_addr_default(tb[RTA_DST], 0)`
-                // — an absent RTA_DST looks up 0.0.0.0, it is not an error.
-                let dst = match find_attr(req, 12, RTA_DST) {
-                    None => [0; 4],
-                    Some(raw) if raw.len() == 4 => raw.try_into().unwrap_or([0; 4]),
-                    Some(_) => {
-                        out.push(build_error(EINVAL, seq, pid, req));
-                        return out;
-                    }
-                };
-                let dst = crate::ipv4::Ipv4Addr(dst);
-                if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
-                    if let Some(link) = links.iter().find(|link| link.name == route.iface) {
-                        let mut message = build_newroute(&route, link.ifindex, seq, pid);
-                        clear_multipart(&mut message);
-                        out.push(message);
-                    } else {
-                        out.push(build_error(ENODEV, seq, pid, req));
-                    }
-                } else {
-                    out.push(build_error(ENETUNREACH, seq, pid, req));
-                }
+                out.push(build_error(ENETUNREACH, seq, pid, req));
             }
         }
-        RTM_GETNEIGH => {
-            let (links, _addrs) = enumerate_in(net_ns_id);
-            let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
-            let requested_ifindex = req
-                .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(i32::from_ne_bytes)
-                .unwrap_or(0);
-            if requested_family == 0 || requested_family == AF_INET {
-                for (iface, entry) in crate::arp::snapshot() {
-                    if let Some(link) = links.iter().find(|link| link.name == iface) {
-                        if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
-                            continue;
-                        }
-                        out.push(build_newneigh(
-                            &NeighInfo {
-                                family: AF_INET,
-                                dst: &entry.ip,
-                                mac: Some(entry.mac),
-                                ifindex: link.ifindex,
-                                state: NUD_REACHABLE,
-                                flags: 0,
-                            },
-                            seq,
-                            pid,
-                        ));
-                    }
-                }
-            }
-            if requested_family == 0 || requested_family == AF_INET6 {
-                for entry in crate::ipv6::ndp::neigh_list_in(net_ns_id) {
-                    if let Some(link) = links.iter().find(|link| link.name == entry.iface) {
-                        if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
-                            continue;
-                        }
-                        let state = match entry.state {
-                            crate::ipv6::ndp::NeighState::Incomplete => NUD_INCOMPLETE,
-                            crate::ipv6::ndp::NeighState::Reachable => NUD_REACHABLE,
-                            crate::ipv6::ndp::NeighState::Stale => NUD_STALE,
-                            crate::ipv6::ndp::NeighState::Delay => NUD_DELAY,
-                            crate::ipv6::ndp::NeighState::Probe => NUD_PROBE,
-                        };
-                        out.push(build_newneigh(
-                            &NeighInfo {
-                                family: AF_INET6,
-                                dst: &entry.ip,
-                                mac: entry.mac,
-                                ifindex: link.ifindex,
-                                state,
-                                flags: if entry.is_router { NTF_ROUTER } else { 0 },
-                            },
-                            seq,
-                            pid,
-                        ));
-                    }
-                }
-            }
-            out.push(build_done(seq, pid));
-        }
-        RTM_GETRULE => {
-            let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
-            if requested_family == 0 || requested_family == AF_INET {
-                // Linux installs these policy-routing rules by default:
-                // priority 0 → local, 32766 → main, 32767 → default.
-                out.push(build_newrule(
-                    AF_INET,
-                    crate::route::TABLE_LOCAL,
-                    0,
-                    seq,
-                    pid,
-                ));
-                out.push(build_newrule(
-                    AF_INET,
-                    crate::route::TABLE_MAIN,
-                    32_766,
-                    seq,
-                    pid,
-                ));
-                out.push(build_newrule(
-                    AF_INET,
-                    crate::route::TABLE_DEFAULT,
-                    32_767,
-                    seq,
-                    pid,
-                ));
-            }
-            out.push(build_done(seq, pid));
-        }
-        RTM_GETQDISC => {
-            let (links, _addrs) = enumerate_in(net_ns_id);
-            let requested_ifindex = req
-                .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(i32::from_ne_bytes)
-                .unwrap_or(0);
-            for link in links {
-                if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
-                    continue;
-                }
-                out.push(build_newqdisc(link.ifindex, seq, pid));
-            }
-            out.push(build_done(seq, pid));
-        }
-        RTM_GETTCLASS | RTM_GETTFILTER | RTM_GETACTION | RTM_GETADDRLABEL | RTM_GETMDB
-        | RTM_GETNEXTHOP => {
-            out.push(build_done(seq, pid));
+        // LINUX-GAP: the other RTM_GET* doits (inet6_rtm_getaddr, neigh_get,
+        // tc_get_qdisc, rtm_get_nexthop, ...) are not implemented; a request
+        // without NLM_F_DUMP is answered with the (non-strict) dump.
+        msg_type if dump::is_dump_type(msg_type) => {
+            return dump::run(net_ns_id, req, false, ext_ack);
         }
         _ => {
             out.push(build_error(EOPNOTSUPP, seq, pid, req));
         }
     }
     out
+}
+
+/// `rtnl_valid_getlink_req` (net/core/rtnetlink.c).
+fn valid_getlink_req(req: &[u8], strict: bool) -> Result<dump::Tb, i32> {
+    let mut extack = dump::ExtAck::default();
+    if req.len() < NLMSG_HDRLEN + 16 {
+        return Err(EINVAL);
+    }
+    if !strict {
+        return dump::nlmsg_parse(
+            req,
+            16,
+            &dump::IFLA_POLICY,
+            dump::NL_VALIDATE_LIBERAL,
+            &mut extack,
+        );
+    }
+    // __ifi_pad, ifi_type, ifi_flags, ifi_change.
+    if req[NLMSG_HDRLEN + 1] != 0
+        || req[NLMSG_HDRLEN + 2..NLMSG_HDRLEN + 4] != [0, 0]
+        || req[NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 16] != [0; 8]
+    {
+        return Err(EINVAL);
+    }
+    let tb = dump::nlmsg_parse(
+        req,
+        16,
+        &dump::IFLA_POLICY,
+        dump::NL_VALIDATE_DEPRECATED_STRICT,
+        &mut extack,
+    )?;
+    // IFLA_IFNAME, IFLA_EXT_MASK, IFLA_TARGET_NETNSID, IFLA_ALT_IFNAME.
+    if tb
+        .iter()
+        .enumerate()
+        .any(|(i, attr)| attr.is_some() && !matches!(i, 3 | 29 | 46 | 53))
+    {
+        return Err(EINVAL);
+    }
+    Ok(tb)
+}
+
+/// `inet_rtm_valid_getroute_req` (net/ipv4/route.c).
+fn valid_getroute_req(req: &[u8], strict: bool) -> Result<dump::Tb, i32> {
+    const RTM_F_NOTIFY: u32 = 0x100;
+    const RTM_F_FIB_MATCH: u32 = 0x2000;
+    const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
+    let mut extack = dump::ExtAck::default();
+    if req.len() < NLMSG_HDRLEN + 12 {
+        return Err(EINVAL);
+    }
+    if !strict {
+        return dump::nlmsg_parse(
+            req,
+            12,
+            &dump::RTM_IPV4_POLICY,
+            dump::NL_VALIDATE_LIBERAL,
+            &mut extack,
+        );
+    }
+    let dst_len = req[NLMSG_HDRLEN + 1];
+    let src_len = req[NLMSG_HDRLEN + 2];
+    // rtm_table, rtm_protocol, rtm_scope, rtm_type.
+    if (src_len != 0 && src_len != 32)
+        || (dst_len != 0 && dst_len != 32)
+        || req[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8] != [0; 4]
+    {
+        return Err(EINVAL);
+    }
+    let flags = u32::from_ne_bytes(
+        req[NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 12]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    if flags & !(RTM_F_NOTIFY | RTM_F_LOOKUP_TABLE | RTM_F_FIB_MATCH) != 0 {
+        return Err(EINVAL);
+    }
+    let tb = dump::nlmsg_parse(
+        req,
+        12,
+        &dump::RTM_IPV4_POLICY,
+        dump::NL_VALIDATE_DEPRECATED_STRICT,
+        &mut extack,
+    )?;
+    // RTA_SRC (2) / RTA_DST (1) require the matching /32 header length.
+    if (tb[2].is_some() && src_len == 0) || (tb[1].is_some() && dst_len == 0) {
+        return Err(EINVAL);
+    }
+    // RTA_IIF RTA_OIF RTA_SRC RTA_DST RTA_IP_PROTO RTA_SPORT RTA_DPORT
+    // RTA_MARK RTA_UID.
+    if tb
+        .iter()
+        .enumerate()
+        .any(|(i, attr)| attr.is_some() && !matches!(i, 1 | 2 | 3 | 4 | 16 | 25 | 27 | 28 | 29))
+    {
+        return Err(EINVAL);
+    }
+    Ok(tb)
+}
+
+/// Linux builds an RTM_NEWADDR / RTM_DELADDR notification from the address
+/// itself (`rtmsg_ifa` → `inet_fill_ifaddr`), so it always carries IFA_FLAGS
+/// and IFA_CACHEINFO. NARF echoes the request, which need carry neither;
+/// append them the way `rtm_to_ifaddr` + `set_ifa_lifetime` would have
+/// derived them: flags from `ifa_flags` when IFA_FLAGS was absent, and a
+/// request without IFA_CACHEINFO has infinite lifetimes, i.e. is
+/// IFA_F_PERMANENT.
+fn complete_addr_notification(message: &mut Vec<u8>) {
+    const IFADDRMSG_LEN: usize = 8;
+    if message.len() < NLMSG_HDRLEN + IFADDRMSG_LEN {
+        return;
+    }
+    let has_cacheinfo = find_attr(message, IFADDRMSG_LEN, IFA_CACHEINFO).is_some();
+    if find_attr(message, IFADDRMSG_LEN, IFA_FLAGS).is_none() {
+        let mut flags = u32::from(message[NLMSG_HDRLEN + 2]);
+        if !has_cacheinfo {
+            flags |= IFA_F_PERMANENT;
+        }
+        push_rtattr(message, IFA_FLAGS, &flags.to_ne_bytes());
+    }
+    if !has_cacheinfo {
+        push_rtattr(
+            message,
+            IFA_CACHEINFO,
+            &ifa_cacheinfo(INFINITY_LIFE_TIME, INFINITY_LIFE_TIME),
+        );
+    }
+    let len = message.len() as u32;
+    message[0..4].copy_from_slice(&len.to_ne_bytes());
 }
 
 fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
@@ -1437,64 +1478,79 @@ pub fn build_replies_with_options_in(
     let mut offset = 0usize;
     let mut replies = Vec::new();
 
-    while offset < datagram.len() {
+    // Linux `netlink_rcv_skb`: walk while a whole header remains, and stop
+    // (silently — sendmsg still returns the full length) at a header whose
+    // nlmsg_len is below NLMSG_HDRLEN or past the end. iproute2 sends its
+    // RTM_GETADDR dump in a zero-padded 152-byte buffer, so the walk must end
+    // at the trailing nlmsg_len == 0 header instead of failing the send.
+    while datagram.len() - offset >= NLMSG_HDRLEN {
         let remaining = &datagram[offset..];
-        let hdr = parse_hdr(remaining).ok_or(())?;
+        let Some(hdr) = parse_hdr(remaining) else {
+            break;
+        };
         let msg_len = hdr.len as usize;
         if msg_len < NLMSG_HDRLEN || msg_len > remaining.len() {
-            return Err(());
+            break;
         }
         let request = &remaining[..msg_len];
-        if options.strict_check {
-            if let Err(errno) = validate_strict_request(request, &hdr) {
-                replies.push(build_error(errno, hdr.seq, 0, request));
-                offset += nlmsg_align(msg_len);
-                continue;
+        // `msglen = NLMSG_ALIGN(nlmsg_len)`, clamped to what is left.
+        let advance = nlmsg_align(msg_len).min(remaining.len());
+        offset += advance;
+        let wants_ack = hdr.flags & NLM_F_ACK != 0;
+
+        // `netlink_rcv_skb`: only requests are handled by the kernel, and
+        // control messages are skipped; either is ACKed (error 0) only on
+        // NLM_F_ACK.
+        if hdr.flags & NLM_F_REQUEST == 0 || hdr.msg_type < NLMSG_MIN_TYPE {
+            if wants_ack {
+                replies.push(build_ack(hdr.seq, request));
             }
+            continue;
+        }
+        // `rtnetlink_rcv_msg`: an out-of-range type is -EOPNOTSUPP; a
+        // message without even a one-byte `rtgenmsg` is ignored (returns 0).
+        if hdr.msg_type > RTM_MAX {
+            replies.push(build_error(EOPNOTSUPP, hdr.seq, 0, request));
+            continue;
+        }
+        if msg_len - NLMSG_HDRLEN < 1 {
+            if wants_ack {
+                replies.push(build_ack(hdr.seq, request));
+            }
+            continue;
         }
         if is_mutation(hdr.msg_type) {
             match apply_mutation(request, admin) {
                 Ok(()) => {
-                    if hdr.flags & NLM_F_ACK != 0 {
+                    if wants_ack {
                         replies.push(build_ack(hdr.seq, request));
                     }
                 }
                 Err(errno) => replies.push(build_error(errno, hdr.seq, 0, request)),
             }
-            offset += nlmsg_align(msg_len);
             continue;
         }
-        let supported = matches!(
-            hdr.msg_type,
-            RTM_GETLINK
-                | RTM_GETADDR
-                | RTM_GETROUTE
-                | RTM_GETNEIGH
-                | RTM_GETRULE
-                | RTM_GETQDISC
-                | RTM_GETTCLASS
-                | RTM_GETTFILTER
-                | RTM_GETACTION
-                | RTM_GETADDRLABEL
-                | RTM_GETMDB
-                | RTM_GETNEXTHOP
-        );
-        if supported && hdr.flags & NLM_F_ACK != 0 {
-            replies.push(build_ack(hdr.seq, request));
+        // A dump that starts is never ACKed: `__netlink_dump_start` returns
+        // -EINTR and `netlink_rcv_skb` skips the ACK. Its errors travel in
+        // the terminating NLMSG_DONE instead (`netlink_dump_done`).
+        if hdr.flags & NLM_F_DUMP != 0 && dump::is_dump_type(hdr.msg_type) {
+            replies.extend(dump::run(
+                net_ns_id,
+                request,
+                options.strict_check,
+                options.ext_ack,
+            ));
+            continue;
         }
-        replies.extend(build_dump_in(net_ns_id, request));
-
-        let step = nlmsg_align(msg_len);
-        if step > remaining.len() {
-            // An unpadded final message is valid only when its declared bytes
-            // exactly consume the datagram.
-            if msg_len == remaining.len() {
-                offset = datagram.len();
-            } else {
-                return Err(());
-            }
-        } else {
-            offset += step;
+        // A doit's error is its (only) ACK; a successful doit's reply is
+        // followed by the ACK when NLM_F_ACK asked for one.
+        let answer = build_get_in(net_ns_id, request, options.strict_check, options.ext_ack);
+        let failed = answer
+            .iter()
+            .any(|message| parse_hdr(message).is_some_and(|reply| reply.msg_type == NLMSG_ERROR));
+        replies.extend(answer);
+        if wants_ack && !failed {
+            replies.push(build_ack(hdr.seq, request));
         }
     }
     for reply in &mut replies {
@@ -1506,33 +1562,6 @@ pub fn build_replies_with_options_in(
         }
     }
     Ok(replies)
-}
-
-fn validate_strict_request(request: &[u8], hdr: &NlMsgHdr) -> Result<(), i32> {
-    if hdr.flags & NLM_F_REQUEST == 0 {
-        return Err(EINVAL);
-    }
-    let (fixed_len, families): (usize, &[u8]) = match hdr.msg_type {
-        RTM_GETLINK => (16, &[0]),
-        RTM_GETADDR => (8, &[0, AF_INET, AF_INET6]),
-        RTM_GETROUTE => (12, &[0, AF_INET, AF_INET6]),
-        RTM_GETNEIGH => (12, &[0, AF_INET, AF_INET6]),
-        RTM_GETRULE => (12, &[0, AF_INET]),
-        RTM_GETQDISC | RTM_GETTCLASS | RTM_GETTFILTER => (20, &[0]),
-        RTM_GETACTION => (4, &[0]),
-        RTM_GETADDRLABEL => (12, &[0, AF_INET6]),
-        RTM_GETMDB => (8, &[0]),
-        RTM_GETNEXTHOP => (8, &[0, AF_INET]),
-        mutation if is_mutation(mutation) => return Ok(()),
-        _ => return Ok(()),
-    };
-    if request.len() < NLMSG_HDRLEN + fixed_len {
-        return Err(EINVAL);
-    }
-    if !families.contains(&request[NLMSG_HDRLEN]) {
-        return Err(EINVAL);
-    }
-    Ok(())
 }
 
 fn cap_acknowledgement(message: &mut Vec<u8>) {
@@ -1604,7 +1633,9 @@ pub fn successful_mutation_notifications(
         if len < NLMSG_HDRLEN || offset + len > datagram.len() {
             break;
         }
-        if !is_mutation(hdr.msg_type) {
+        // Mirror the walk in `build_replies_with_options_in`: a message
+        // without NLM_F_REQUEST, or with no payload, is never applied.
+        if !is_mutation(hdr.msg_type) || hdr.flags & NLM_F_REQUEST == 0 || len == NLMSG_HDRLEN {
             offset += nlmsg_align(len);
             continue;
         }
@@ -1646,12 +1677,18 @@ pub fn successful_mutation_notifications(
             message[8..12].copy_from_slice(&0u32.to_ne_bytes());
             message[12..16].copy_from_slice(&0u32.to_ne_bytes());
             message.resize(nlmsg_align(len), 0);
+            if matches!(msg_type, RTM_NEWADDR | RTM_DELADDR) {
+                complete_addr_notification(&mut message);
+            }
             out.push((group, message));
         }
         offset += nlmsg_align(len);
     }
     out
 }
+
+#[path = "netlink_route/dump.rs"]
+mod dump;
 
 #[cfg(test)]
 #[path = "netlink_route/tests.rs"]

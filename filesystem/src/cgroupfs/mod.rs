@@ -1771,6 +1771,13 @@ impl FileOps for CgroupAttrFile {
         self.ino
     }
 
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: cgroup_dev(),
+            ..Default::default()
+        }
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Reading `cgroup.events` consumes the pending edge: re-sync this
         // fd's observed generation to the live one so `poll_readiness`
@@ -1956,6 +1963,13 @@ impl DirOps for CgroupDir {
         self.cg.ino
     }
 
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        crate::InodeAttrs {
+            dev: cgroup_dev(),
+            ..Default::default()
+        }
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         if let Some(f) = CoreFile::from_name(name) {
             if core_files_for(&self.cg).contains(&f) {
@@ -2109,6 +2123,15 @@ impl Default for CgroupFs {
     fn default() -> Self {
         CgroupFs::new()
     }
+}
+
+/// The cgroup2 superblock's `st_dev`. cgroup2 is one kernfs hierarchy
+/// (`cgrp_dfl_root`) and every mount of it — including a cgroup
+/// namespace's — shares the one superblock (`kernfs_get_tree` finds it
+/// with `sget_fc`), so they all report one device.
+pub fn cgroup_dev() -> u64 {
+    static DEV: crate::inode_id::LazyAnonDev = crate::inode_id::LazyAnonDev::new();
+    DEV.get()
 }
 
 impl crate::FsInstance for CgroupFs {

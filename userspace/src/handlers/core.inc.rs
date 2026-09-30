@@ -1786,6 +1786,7 @@ fn open_impl(
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::NoSpace => 28,
+                        narf_filesystem::FsError::NoDevice => 19, // ENODEV
                         narf_filesystem::FsError::OutOfMemory => 12,
                         narf_filesystem::FsError::QuotaExceeded => 122,
                         // ENOTCONN. No `open` path produces it today — it is
@@ -1885,7 +1886,7 @@ fn open_impl(
     let ops = if mnt_len == 0 && chroot_path_matches(task, path, "/dev/tty", false) {
         let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
             Some(CTTY_CONSOLE) => ops.clone(),
-            Some(index) => match narf_filesystem::devfs_pty::pts_lookup(index) {
+            Some(id) => match narf_filesystem::devfs_pty::pty_by_id(id) {
                 Some(pty) => Arc::new(narf_filesystem::devfs_pty::PtySlave::new(pty)),
                 None => {
                     ctx.set_return(errno_ret(ENXIO)); // -ENXIO
@@ -2077,6 +2078,32 @@ fn open_impl(
             }
         }
     }
+
+    // `ptmx_open` through a `c 5:2` node that is not a devpts instance's own
+    // clone node — devtmpfs's /dev/ptmx, or one made with mknod: Linux
+    // dispatches by rdev to the tty driver, whose `devpts_acquire` →
+    // `devpts_ptmx_path` looks for the root of a devpts mounted at `pts` in
+    // the node's own directory, and fails ENODEV without one. The master
+    // reports the node it was opened through.
+    let ops = if !ops.is_ptmx_clone()
+        && ops.stat().mode.file_type == narf_filesystem::FileType::Special
+        && ops.rdev() == narf_filesystem::devfs::linux_makedev(5, 2)
+    {
+        let dir = match path.rsplit_once('/') {
+            Some(("", _)) | None => "",
+            Some((dir, _)) => dir,
+        };
+        let pts = alloc::format!("{dir}/pts");
+        match narf_filesystem::devfs_pty::ptmx_open_beside(ops.clone(), resolve_dir_absolute(&pts)) {
+            Ok(master) => master,
+            Err(error) => {
+                ctx.set_return(errno_ret(copy_fs_errno(error)));
+                return;
+            }
+        }
+    } else {
+        ops
+    };
 
     // Clone devices keep path lookup/stat side-effect free and allocate their
     // per-open state only here after permissions have passed. This covers
@@ -3160,15 +3187,11 @@ fn linux_stat_from_fs(
     });
     linux_compat::Stat {
         st_dev: attrs.dev,
-        // Prefer the filesystem's real inode (distinct per file). Only fall
-        // back to the size/mtime hash for synthetic filesystems that report
-        // no inode (ino == 0) — and never for disk files, whose same-size
-        // libraries would otherwise alias and break musl's DSO dedup.
-        st_ino: if ino != 0 {
-            ino
-        } else {
-            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
-        },
+        // The filesystem's inode. Every FileOps reports one (the Linux
+        // pseudo-filesystem model in filesystem::inode_id); the old size/mtime
+        // hash fallback aliased same-size files (musl's DSO dedup) and changed
+        // whenever the file did.
+        st_ino: ino,
         // `tracked` and not `nlink != 0` is the test on purpose: an
         // `O_TMPFILE` inode really does have zero links until `linkat`
         // gives it a name, and that zero is how userspace tells an
@@ -3281,6 +3304,7 @@ fn stat_linux_fd(ctx: &mut dyn TrapContext, n: u32, out_ptr: *mut linux_compat::
 }
 
 fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
+    let mut follow_final = follow_final;
     let out_ptr = out_arg as *mut linux_compat::Stat;
     let task = current_task_id();
     // `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) is a magic symlink: `stat(2)`
@@ -3294,14 +3318,21 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // builtin skips the setxattr, and card0 never gets the `user:<uid>:rw` ACL
     // (the greeter's kwin then EACCES's on card0). fexecve/xattr/mount already
     // resolve this symlink per-call; the stat family must too.
+    //
+    // Only a FOLLOWED magic link jumps (`lstat` describes the /proc link
+    // itself), and the jump lands on the fd's own file without following it
+    // further (`nd_jump_link`): an O_PATH|O_NOFOLLOW fd on a symlink stats as
+    // that symlink. Following on from the jump chased /etc/localtime to its
+    // target and missed with ENOENT.
     let magic_owned;
-    let raw: &str = if let Some(n) = parse_proc_self_fd(raw) {
+    let raw: &str = if let Some(n) = parse_proc_self_fd(raw).filter(|_| follow_final) {
         match fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
             // A descriptor with a real filesystem path: stat that node. The
             // path is the fd's view (chroot-stripped), so it goes back through
             // resolve_cwd_path below to re-root under the task's chroot.
             Some(real) => {
                 magic_owned = real;
+                follow_final = false;
                 &magic_owned
             }
             // A pathless/anonymous fd (memfd, socket, O_TMPFILE, pipe): there is
@@ -4558,6 +4589,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::Busy => 16,
         narf_filesystem::FsError::ReadOnly => 30,
         narf_filesystem::FsError::NoSpace => 28,
+        narf_filesystem::FsError::NoDevice => 19, // ENODEV
         narf_filesystem::FsError::OutOfMemory => 12,
         narf_filesystem::FsError::QuotaExceeded => 122,
         // ENOTCONN — see `FsError::NotConnected`.
@@ -6091,253 +6123,422 @@ fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
     }
 }
 
-/// `security/commoncap.c::handle_privileged_root` — the half of
-/// `cap_bprm_creds_from_file` that makes a set-user-ID-**root** binary
-/// actually privileged.
+/// The credential an `execve` installs: `struct linux_binprm`'s `cred`,
+/// `secureexec`, and the `BINPRM_FLAGS_ENFORCE_NONDUMP` interp flag.
 ///
-/// Without it a setuid-root exec would move euid to 0 and stop there, and
-/// on a task that had already dropped root the permitted set is empty, so
-/// the new program would be "root" with no capabilities — the one state
-/// Linux never leaves a process in.
-///
-/// ```text
-/// if (__is_eff(root_uid, new) || __is_real(root_uid, new)) {
-///         /* pP' = (cap_bset & ~0) | (pI & ~0) */
-///         new->cap_permitted = cap_combine(old->cap_bset, old->cap_inheritable);
-/// }
-/// if (__is_eff(root_uid, new))
-///         *effective = true;
-/// ```
-///
-/// The permitted set is REGENERATED from the bounding set rather than
-/// inherited, which is what lets an unprivileged caller gain privilege
-/// through a setuid-root binary at all. The effective set follows only
-/// when the EFFECTIVE uid is root: a binary that merely leaves the real
-/// uid at 0 gets the permissions but must raise them itself.
-fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
-    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
-    // `root_privileged()` is `!issecure(SECURE_NOROOT)`
-    // (`security/commoncap.c:805`). SECURE_NOROOT says "uid 0 is just a
-    // uid" — the root-gets-everything shortcut below is exactly what it
-    // exists to switch off, so a task that set it must not be handed the
-    // full set by execing something owned by root.
-    if new_ids.euid != root_uid && new_ids.uid != root_uid {
-        return;
-    }
-    if issecure(task, SECURE_NOROOT) {
-        return;
-    }
-    let mut caps = read_caps(task);
-    caps.permitted = caps.bounding | caps.inheritable;
-    if new_ids.euid == root_uid {
-        caps.effective = caps.permitted;
-    }
-    write_caps(task, caps);
+/// Computed BEFORE the new image is loaded and committed only AFTER it has
+/// been, because that is where Linux draws the line: `bprm_creds_from_file`
+/// fills `bprm->cred`, the ELF loader reads it for `AT_UID`/`AT_EUID`/
+/// `AT_SECURE`, and `commit_creds` installs it past the point of no return.
+/// Installing it up front (what NARF did) meant an `execve` that then failed
+/// — a set-user-ID-root file that is not a valid ELF, say — returned
+/// ENOEXEC to a caller that was now running as root.
+#[derive(Clone, Copy)]
+pub(crate) struct ExecCred {
+    ids: UidGid,
+    caps: Caps,
+    /// `bprm->secureexec` — the `AT_SECURE` auxv word.
+    secureexec: bool,
+    /// `BINPRM_FLAGS_ENFORCE_NONDUMP`, set by `would_dump`.
+    enforce_nondump: bool,
 }
 
-/// The ambient half of `cap_bprm_creds_from_file`
-/// (`security/commoncap.c:966`).
+/// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID half of
+/// `bprm_creds_from_file`, applied to the proposed credential `new`.
 ///
 /// ```text
-/// /* File caps or setid cancels ambient. */
-/// if (has_fcap || id_changed)
-///         cap_clear(new->cap_ambient);
-/// /* pP' = (X & fP) | (pI & fI) | pA' */
-/// new->cap_permitted = cap_combine(new->cap_permitted, new->cap_ambient);
-/// /* pE' = (fE ? pP' : pA') */
-/// if (effective) new->cap_effective = new->cap_permitted;
-/// else           new->cap_effective = new->cap_ambient;
+/// if (!mnt_may_suid(file->f_path.mnt)) return;
+/// if (task_no_new_privs(current))      return;
+/// mode = READ_ONCE(inode->i_mode);
+/// if (!(mode & (S_ISUID|S_ISGID)))     return;
 /// ...
-/// new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+/// err = inode_permission(idmap, inode, MAY_EXEC);
+/// /* Did the exec bit vanish out from under us? Give up. */
+/// if (err) return;
+/// /* We ignore suid/sgid if there are no mappings for them in the ns */
+/// if (!vfsuid_has_mapping(bprm->cred->user_ns, vfsuid) ||
+///     !vfsgid_has_mapping(bprm->cred->user_ns, vfsgid)) return;
+/// if (mode & S_ISUID) bprm->cred->euid = vfsuid_into_kuid(vfsuid);
+/// if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))
+///         bprm->cred->egid = vfsgid_into_kgid(vfsgid);
 /// ```
 ///
-/// This is the ONLY thing that makes the ambient set worth having: it is
-/// the set that survives an exec, joining permitted and becoming
-/// effective. Without it `PR_CAP_AMBIENT_RAISE` is a write to a field that
-/// never influences anything, which is what it was.
+/// `file` is the file the exec actually maps — for a `#!` script that is
+/// the INTERPRETER (`bprm_creds_from_file` reads `bprm->file`, which
+/// `exec_binprm` has swapped for the interpreter), so a script's own bits
+/// confer nothing while a set-user-ID interpreter's do. `mount_path` is the
+/// absolute path that file was resolved at, AFTER the caller's chroot has
+/// been applied, because that is the path the mount table is keyed by.
 ///
-/// `id_changed` cancels ambient because the new image is already gaining
-/// privilege from the set-user-ID bit; carrying a second, independently
-/// granted set across the same exec would stack two privilege sources the
-/// caller never combined deliberately.
+/// It used to take the caller's path and resolve it again, WITHOUT the
+/// chroot. On a chrooted distro root (NARF runs CachyOS's systemd chrooted
+/// into `/mnt`) `/usr/bin/sudo` then named nothing, the lookup failed, and
+/// every set-user-ID binary ran with the invoker's euid — sudo's "effective
+/// uid is not 0".
 ///
-/// NARF has no file capabilities, so `has_fcap` and `effective` are always
-/// false — which is why `pE' = pA'` here rather than the `fE ? pP' : pA'`
-/// choice, and why the `X & fP` and `pI & fI` terms of `pP'` contribute
-/// nothing. Stated rather than silently simplified.
-fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
-    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
-    let mut caps = read_caps(task);
-    if id_changed {
-        caps.ambient = 0;
-    }
-    caps.permitted |= caps.ambient;
-    // `pE' = fE ? pP' : pA'`. `fE` has two sources in Linux: a file
-    // capability's effective bit, and `handle_privileged_root`, which sets
-    // `effective = true` when the new euid is root and SECURE_NOROOT is
-    // clear. NARF has no file capabilities, so the second is the only one —
-    // which is exactly the condition `cap_exec_privileged_root` above uses
-    // to hand out the full set, and computing it differently here would let
-    // the two disagree about the same exec.
-    let fe = ids.euid == root_uid && !issecure(task, SECURE_NOROOT);
-    caps.effective = if fe { caps.permitted } else { caps.ambient };
-    write_caps(task, caps);
-    // `new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS)` — KEEP_CAPS is
-    // about surviving a uid change, not an exec, and leaving it set would
-    // apply the previous image's choice to the new one.
-    let bits = task_securebits(task);
-    set_task_securebits(task, bits & !(1u64 << SECURE_KEEP_CAPS));
-}
-
-/// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID transition
-/// an `execve` of a privileged binary performs.
-///
-/// Every guard here is load-bearing, because this is the one place in the
-/// tree where an unprivileged task can gain privilege:
-///
-///   * `mnt_may_suid` — a `nosuid` mount confers nothing. That is what
-///     the flag is FOR, and until this existed there was nothing for it
-///     to suppress.
-///   * `task_no_new_privs` — a task that asked to be unable to gain
-///     privilege does not gain it. One-way, so a sandbox cannot be
-///     talked out of it.
-///   * the execute permission is re-checked (`inode_permission(MAY_EXEC)`)
-///     so a binary that lost its exec bit between the open and here
-///     confers nothing.
-///   * S_ISGID alone does nothing; Linux requires `S_ISGID | S_IXGRP`
-///     together, because S_ISGID without group-execute is the mandatory
-///     file-locking marker, not a privilege request.
-///
-/// Returns the new credential when a transition happened.
-fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
-    // Linux ignores the set-user-ID bits on a `#!` script: the kernel
-    // executes the INTERPRETER, and honouring the script's bits would hand
-    // its privilege to an interpreter that was never audited for it. NARF
-    // resolves the shebang itself, so the equivalent is to confer nothing
-    // once a shebang has been followed.
-    if from_script {
-        return None;
-    }
+/// S_ISGID without S_IXGRP is the mandatory-locking marker, not a privilege
+/// request, which is why the group arm tests both bits.
+fn bprm_fill_uid(
+    task: u64,
+    file: &dyn narf_filesystem::FileOps,
+    mount_path: &str,
+    new: &mut UidGid,
+) {
+    // `mnt_may_suid`. LINUX-GAP: its other two terms — the mount belongs to
+    // the caller's mount namespace (`check_mnt`) and the superblock's user
+    // namespace is one the caller is in (`current_in_userns(s_user_ns)`) —
+    // have nothing to read: NARF resolves by path in the caller's own
+    // namespace, and a superblock carries no user namespace.
     if narf_filesystem::any_restricted_mounts()
-        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOSUID != 0
+        && current_mount_flags_at(mount_path) & narf_filesystem::mnt_flags::NOSUID != 0
     {
-        return None;
+        return;
     }
     if read_prctl(task).no_new_privs {
-        return None;
+        return;
     }
-    let file = resolve_file_absolute_ext(path, true)?;
-    let stat = file.stat();
-    let mode = stat.mode.perms;
+    let mode = file.stat().mode.perms;
     if mode & 0o6000 == 0 {
-        return None;
+        return;
     }
     let (file_uid, file_gid) = file.owners();
-    // "Did the exec bit vanish out from under us? Give up."
-    let permitted = narf_filesystem::posix_access_ok(
-        narf_filesystem::FileOwner {
-            uid: file_uid,
-            gid: file_gid,
-            perms: mode,
-            is_dir: false,
-        },
-        &accessor_for_inode(task, file_uid, file_gid),
+    if node_permission(
+        task,
+        Some(file),
+        mode,
+        file_uid,
+        file_gid,
+        false,
         narf_filesystem::AccessRequest {
             read: false,
             write: false,
             exec: true,
         },
-    );
-    if !permitted {
-        return None;
+    )
+    .is_err()
+    {
+        return;
     }
-    let old = read_uidgid(task);
-    let mut new = old;
-    if mode & 0o4000 != 0 && inode_ids_mapped(task, file_uid, file_gid) {
+    if !inode_ids_mapped(task, file_uid, file_gid) {
+        return;
+    }
+    if mode & 0o4000 != 0 {
         new.euid = file_uid;
     }
-    // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
-    if mode & 0o2010 == 0o2010 && inode_ids_mapped(task, file_uid, file_gid) {
+    if mode & 0o2010 == 0o2010 {
         new.egid = file_gid;
     }
-    if new.euid == old.euid && new.egid == old.egid {
-        return None;
-    }
-    // `commit_creds` keeps the filesystem ids in step with the effective
-    // ones; every DAC decision reads fsuid/fsgid, so leaving them behind
-    // would grant the privilege for `access()` and deny it for `open()`.
-    new.fsuid = new.euid;
-    new.fsgid = new.egid;
-    // The saved set-ids record where the privilege came from, which is how
-    // a setuid program drops and regains it (`seteuid` back to `suid`).
-    new.suid = new.euid;
-    new.sgid = new.egid;
-    write_uidgid(task, |e| *e = new);
-    cap_exec_privileged_root(task, new);
-    Some(new)
 }
 
-/// `begin_new_exec`'s dumpability step (`/usr/src/linux/fs/exec.c:1205`).
+/// `kernel/groups.c::in_group_p` against the CURRENT credential:
 ///
 /// ```text
+/// if (!gid_eq(grp, cred->fsgid))
+///         retval = groups_search(cred->group_info, grp);
+/// ```
+fn cred_in_group_p(task: u64, cur: UidGid, gid: u32) -> bool {
+    cur.fsgid == gid || read_groups(task).contains(&gid)
+}
+
+/// `kernel/capability.c::ptracer_capable(current, new->user_ns)`: "an absent
+/// tracer adds no restrictions"; a present one must hold CAP_SYS_PTRACE over
+/// the exec'ing task's user namespace.
+///
+/// LINUX-GAP: Linux asks this of `tsk->ptracer_cred`, the tracer's
+/// credential SNAPSHOTTED at attach time. NARF's ptrace registry records the
+/// tracer's identity only, so the tracer's CURRENT capabilities are asked —
+/// a tracer that dropped CAP_SYS_PTRACE after attaching is treated as
+/// incapable (stricter), one that gained it after attaching as capable.
+fn exec_ptracer_capable(task: u64) -> bool {
+    let Some(tracer) = crate::ptrace::tracer_task_of(task) else {
+        return true;
+    };
+    #[cfg(feature = "container")]
+    {
+        task_ns_capable(
+            tracer,
+            &crate::namespaces::current_user_ns(task),
+            CAP_SYS_PTRACE,
+        )
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        cap_effective(tracer, CAP_SYS_PTRACE)
+    }
+}
+
+/// `security/commoncap.c::cap_bprm_creds_from_file`, on EVERY exec, with
+/// `handle_privileged_root` inlined. Returns `bprm->secureexec`.
+///
+/// NARF has no file capabilities, so `has_fcap` is always false and
+/// `effective` starts false; everything below is otherwise line for line:
+///
+/// ```text
+/// root_uid = make_kuid(new->user_ns, 0);
+/// handle_privileged_root(bprm, has_fcap, &effective, root_uid);
+/// id_changed = !uid_eq(new->euid, old->euid) || !in_group_p(new->egid);
+/// if ((id_changed || __cap_gained(permitted, new, old)) &&
+///     ((bprm->unsafe & ~LSM_UNSAFE_PTRACE) ||
+///      !ptracer_capable(current, new->user_ns))) {
+///         if (!ns_capable(new->user_ns, CAP_SETUID) ||
+///             (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS)) {
+///                 new->euid = new->uid;
+///                 new->egid = new->gid;
+///         }
+///         new->cap_permitted = cap_intersect(new->cap_permitted,
+///                                            old->cap_permitted);
+/// }
+/// new->suid = new->fsuid = new->euid;
+/// new->sgid = new->fsgid = new->egid;
+/// if (has_fcap || id_changed) cap_clear(new->cap_ambient);
+/// new->cap_permitted = cap_combine(new->cap_permitted, new->cap_ambient);
+/// if (effective) new->cap_effective = new->cap_permitted;
+/// else           new->cap_effective = new->cap_ambient;
+/// ...
+/// if (id_changed || !uid_eq(new->euid, old->uid) ||
+///     !gid_eq(new->egid, old->gid) ||
+///     (!__is_real(root_uid, new) &&
+///      (effective || __cap_grew(permitted, ambient, new))))
+///         bprm->secureexec = 1;
+/// ```
+///
+/// Points that are easy to get wrong and each matter:
+///
+///   * `handle_privileged_root` runs whether or not the file was
+///     set-user-ID: a root task that narrowed its permitted set and then
+///     execs an ordinary program gets the full set back (`pP' = bset | pI`),
+///     which is Linux's "root is root across exec" rule. SECURE_NOROOT
+///     switches it off.
+///   * `id_changed` is computed BEFORE the downgrade and not recomputed, so
+///     a downgraded exec still clears ambient and is still `secureexec`.
+///   * the saved and filesystem ids are reset to the effective ones on every
+///     exec, not only on a transition.
+///
+/// LINUX-GAP: `LSM_UNSAFE_SHARE` (another process shares this task's
+/// `fs_struct` via CLONE_FS) is not detected — NARF keeps no count of
+/// fs_struct sharers — so that arm of the downgrade never fires.
+fn cap_bprm_creds_from_file(
+    task: u64,
+    old: UidGid,
+    old_caps: Caps,
+    new: &mut UidGid,
+    caps: &mut Caps,
+) -> bool {
+    let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
+    let mut effective = false;
+    // `handle_privileged_root`; `root_privileged()` is
+    // `!issecure(SECURE_NOROOT)`, and `has_fcap` is false.
+    if !issecure(task, SECURE_NOROOT) {
+        if new.euid == root_uid || new.uid == root_uid {
+            caps.permitted = old_caps.bounding | old_caps.inheritable;
+        }
+        if new.euid == root_uid {
+            effective = true;
+        }
+    }
+    let gained = caps.permitted & !old_caps.permitted != 0;
+    let id_changed = new.euid != old.euid || !cred_in_group_p(task, old, new.egid);
+    if id_changed || gained {
+        let nnp = read_prctl(task).no_new_privs;
+        if nnp || !exec_ptracer_capable(task) {
+            if !task_capable_in_own_ns(task, CAP_SETUID) || nnp {
+                new.euid = new.uid;
+                new.egid = new.gid;
+            }
+            caps.permitted &= old_caps.permitted;
+        }
+    }
+    new.suid = new.euid;
+    new.fsuid = new.euid;
+    new.sgid = new.egid;
+    new.fsgid = new.egid;
+    if id_changed {
+        caps.ambient = 0;
+    }
+    caps.permitted |= caps.ambient;
+    caps.effective = if effective {
+        caps.permitted
+    } else {
+        caps.ambient
+    };
+    id_changed
+        || new.euid != old.uid
+        || new.egid != old.gid
+        || (new.uid != root_uid && (effective || caps.permitted & !caps.ambient != 0))
+}
+
+/// `fs/exec.c::would_dump` — "If the binary is not readable then enforce
+/// mm->dumpable=0":
+///
+/// ```text
+/// if (inode_permission(idmap, inode, MAY_READ) < 0)
+///         bprm->interp_flags |= BINPRM_FLAGS_ENFORCE_NONDUMP;
+/// ```
+///
+/// An execute-only binary (mode 0711) is one its invoker may run but not
+/// read; a dumpable process would hand them its text through a core file
+/// or `ptrace` anyway.
+///
+/// LINUX-GAP: Linux also runs this on the ELF interpreter
+/// (`load_elf_binary`) and walks `mm->user_ns` up to a namespace privileged
+/// over the inode; NARF's loader opens the interpreter itself and an
+/// address space carries no user namespace, so only the main binary is
+/// checked.
+fn would_dump(task: u64, file: &dyn narf_filesystem::FileOps) -> bool {
+    let (uid, gid) = file.owners();
+    node_permission(
+        task,
+        Some(file),
+        file.stat().mode.perms,
+        uid,
+        gid,
+        false,
+        narf_filesystem::AccessRequest {
+            read: true,
+            write: false,
+            exec: false,
+        },
+    )
+    .is_err()
+}
+
+/// `bprm_creds_from_file` + `would_dump`: the credential an exec of `file`
+/// will install, without installing it. `file` is `None` for an image with
+/// no file behind it (an anonymous memfd handed to `execveat`), which has
+/// no set-id bits to honour but still gets the capability recomputation.
+pub(crate) fn exec_prepare_credentials(
+    task: u64,
+    file: Option<&dyn narf_filesystem::FileOps>,
+    mount_path: &str,
+) -> ExecCred {
+    let old = read_uidgid(task);
+    let old_caps = read_caps(task);
+    let mut ids = old;
+    let mut caps = old_caps;
+    if let Some(file) = file {
+        bprm_fill_uid(task, file, mount_path, &mut ids);
+    }
+    let secureexec = cap_bprm_creds_from_file(task, old, old_caps, &mut ids, &mut caps);
+    ExecCred {
+        ids,
+        caps,
+        secureexec,
+        enforce_nondump: file.is_some_and(|f| would_dump(task, f)),
+    }
+}
+
+/// The `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE` words
+/// `create_elf_tables` emits from the PROPOSED credential:
+///
+/// ```text
+/// NEW_AUX_ENT(AT_UID, from_kuid_munged(cred->user_ns, cred->uid));
+/// NEW_AUX_ENT(AT_EUID, from_kuid_munged(cred->user_ns, cred->euid));
+/// NEW_AUX_ENT(AT_GID, from_kgid_munged(cred->user_ns, cred->gid));
+/// NEW_AUX_ENT(AT_EGID, from_kgid_munged(cred->user_ns, cred->egid));
+/// NEW_AUX_ENT(AT_SECURE, bprm->secureexec);
+/// ```
+///
+/// These are what libc's secure mode keys on — glibc reads AT_SECURE, musl
+/// compares AT_UID/AT_EUID/AT_GID/AT_EGID as well — so a constant set (the
+/// loader's default, all zero) made every set-user-ID program honour
+/// LD_PRELOAD and LD_LIBRARY_PATH from the user who ran it.
+pub(crate) fn exec_auxv(task: u64, cred: &ExecCred) -> [crate::AuxEntry; 5] {
+    [
+        crate::AuxEntry::Uid(uid_to_user(task, cred.ids.uid)),
+        crate::AuxEntry::Euid(uid_to_user(task, cred.ids.euid)),
+        crate::AuxEntry::Gid(gid_to_user(task, cred.ids.gid)),
+        crate::AuxEntry::Egid(gid_to_user(task, cred.ids.egid)),
+        crate::AuxEntry::Secure(cred.secureexec),
+    ]
+}
+
+/// `_STK_LIM` — the RLIMIT_STACK a secure exec is clamped to.
+const STK_LIM: u64 = 8 * 1024 * 1024;
+
+/// Install `cred`: the credential half of `begin_new_exec` and
+/// `commit_creds`, in their order. Called once the new image is loaded and
+/// the old one's close-on-exec descriptors are gone.
+///
+/// ```text
+/// if (bprm->secureexec) {
+///         me->pdeath_signal = 0;
+///         if (bprm->rlim_stack.rlim_cur > _STK_LIM)
+///                 bprm->rlim_stack.rlim_cur = _STK_LIM;
+/// }
 /// if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
 ///     !(uid_eq(current_euid(), current_uid()) &&
 ///       gid_eq(current_egid(), current_gid())))
 ///         set_dumpable(current->mm, suid_dumpable);
 /// else
 ///         set_dumpable(current->mm, SUID_DUMP_USER);
+/// ...
+/// commit_creds(bprm->cred);
 /// ```
 ///
-/// Runs on EVERY exec, and both directions matter.
+/// and in `commit_creds`:
 ///
-/// Clearing it is what stops a set-uid program being inspected by the user
-/// who launched it: the new image is running with privilege its invoker
-/// does not have, and `__ptrace_may_access`'s credential comparison alone
-/// would not refuse them — they still own the process. Without this, every
-/// set-uid binary was ptrace-able by whoever ran it, which is the attack
-/// the dumpable gate exists for.
+/// ```text
+/// if (!uid_eq(old->euid, new->euid) || !gid_eq(old->egid, new->egid) ||
+///     !uid_eq(old->fsuid, new->fsuid) || !gid_eq(old->fsgid, new->fsgid) ||
+///     !cred_cap_issubset(old, new)) {
+///         set_dumpable(task->mm, suid_dumpable);
+///         task->pdeath_signal = 0;
+/// }
+/// ```
 ///
-/// SETTING it back is equally load-bearing and easier to forget: a process
-/// that called `PR_SET_DUMPABLE(0)` and then execs an ordinary binary must
-/// become dumpable again. The new image did not ask to be protected, and
-/// leaving the flag on would silently make an ordinary program
-/// un-debuggable because of something its predecessor did.
+/// The `begin_new_exec` test reads `current`, the credential BEFORE the
+/// commit — Linux's own comment calls that "wrong, but userspace depends
+/// on it" — and `commit_creds` then catches the transitions. Together: a
+/// set-user-ID image is non-dumpable (the commit changed euid), an ordinary
+/// image run by a process whose euid already differs from its uid is
+/// non-dumpable (the first test), and an ordinary image otherwise becomes
+/// dumpable again even if its predecessor called `PR_SET_DUMPABLE(0)`.
 ///
-/// Note the comparison is against the CURRENT credentials after
-/// `bprm_fill_uid` has run, not against a "was this file set-uid" flag —
-/// Linux's own comment says testing `current` is "wrong, but userspace
-/// depends on it". Matching the observable behaviour, not the intent.
+/// `suid_dumpable` is `/proc/sys/fs/suid_dumpable`, default 0
+/// (SUID_DUMP_DISABLE); NARF has no knob for it, so "suid_dumpable" is
+/// always "not dumpable".
 ///
-/// `suid_dumpable` is the `/proc/sys/fs/suid_dumpable` sysctl, whose
-/// default is 0 (`SUID_DUMP_DISABLE`); NARF has no knob for it, so the
-/// privileged case is always non-dumpable.
-fn exec_set_dumpable(task: u64) {
-    let ids = read_uidgid(task);
-    let privileged = ids.euid != ids.uid || ids.egid != ids.gid;
-    modify_prctl(task, |s| s.dumpable = !privileged);
-}
-
-/// The credential half of `begin_new_exec`, as ONE step.
-///
-/// `bprm_fill_uid` and the dumpability reset are separate functions in
-/// Linux but a single ordered obligation: the second reads the credentials
-/// the first may have just changed, and an exec that ran one without the
-/// other would either leak a set-uid image to its invoker's debugger or
-/// leave an ordinary image carrying its predecessor's `PR_SET_DUMPABLE(0)`.
-///
-/// They are joined here so the exec path has one call to make rather than
-/// two to remember, and so the test hook below exercises the composition
-/// instead of each piece in isolation — a case that called them separately
-/// would keep passing if the exec path stopped calling one of them.
-pub(crate) fn exec_apply_credentials(task: u64, path: &str, from_script: bool) {
-    let id_changed = bprm_fill_uid(task, path, from_script).is_some();
-    let ids = read_uidgid(task);
-    // Ambient BEFORE dumpability: it reads the credentials `bprm_fill_uid`
-    // may have changed, and dumpability reads them too. Order is
-    // `cap_bprm_creds_from_file` then `begin_new_exec`'s dumpability step,
-    // as in Linux.
-    cap_exec_ambient(task, ids, id_changed);
-    exec_set_dumpable(task);
+/// `cap_bprm_creds_from_file` also clears SECURE_KEEP_CAPS in the new
+/// credential; it is applied here with the rest of the credential.
+pub(crate) fn exec_commit_credentials(task: u64, cred: &ExecCred) {
+    let old = read_uidgid(task);
+    let old_caps = read_caps(task);
+    let new = cred.ids;
+    let mut dumpable = !(cred.enforce_nondump || old.euid != old.uid || old.egid != old.gid);
+    let changed = old.euid != new.euid
+        || old.egid != new.egid
+        || old.fsuid != new.fsuid
+        || old.fsgid != new.fsgid
+        || cred.caps.permitted & !old_caps.permitted != 0;
+    if changed {
+        dumpable = false;
+    }
+    let clear_pdeath = cred.secureexec || changed;
+    write_uidgid(task, |e| *e = new);
+    write_caps(task, cred.caps);
+    modify_prctl(task, |s| {
+        s.dumpable = dumpable;
+        if clear_pdeath {
+            s.pdeathsig = 0;
+        }
+        s.securebits &= !issecure_mask(SECURE_KEEP_CAPS);
+    });
+    if cred.secureexec {
+        if let Some(stack) = read_rlimit(task, RLIMIT_STACK) {
+            if stack.cur > STK_LIM {
+                let _ = update_rlimit_atomic(
+                    task,
+                    None,
+                    RLIMIT_STACK,
+                    Some(RLimitPair {
+                        cur: STK_LIM,
+                        max: stack.max,
+                    }),
+                    true,
+                );
+            }
+        }
+    }
 }
 
 /// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
@@ -6458,21 +6659,33 @@ fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
     capable_wrt_inode(task, file_uid, file_gid, CAP_FSETID)
 }
 
-/// Test window onto [`bprm_fill_uid`]. A full `execve` needs a loadable
-/// image and a task switch, neither of which the ABI harness can stage, so
-/// the smoke drives the DECISION — which is the part that decides whether
-/// privilege is granted — directly.
+/// Test window onto the exec credential step. A full `execve` needs a
+/// loadable image and a task switch, neither of which the ABI harness can
+/// stage, so the smoke drives the DECISION — which is the part that decides
+/// whether privilege is granted — directly.
 ///
-/// Returns `(euid, egid, fsuid, effective caps)` after the call, so a test
-/// can assert both the credential transition and the capability
-/// regeneration a setuid-root binary depends on.
+/// `path` is resolved exactly as `execve` resolves it (the caller's chroot
+/// applied, then the caller's mount namespace), and the credential is
+/// prepared and committed through the same two calls the exec path makes,
+/// so a case driving this hook covers the composition.
+///
+/// Returns `(euid, egid, fsuid, effective caps)` after the call.
 #[doc(hidden)]
-pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
-    // The whole credential step, not just `bprm_fill_uid`: this is what the
-    // exec path calls, so a case driving this hook covers the composition.
-    exec_apply_credentials(task, path, from_script);
+pub fn __test_bprm_fill_uid(task: u64, path: &str) -> (u32, u32, u32, u64) {
+    let _ = __test_exec_credentials(task, path);
     let ids = read_uidgid(task);
     (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
+/// [`__test_bprm_fill_uid`], returning `bprm->secureexec` (the `AT_SECURE`
+/// word the exec would publish).
+#[doc(hidden)]
+pub fn __test_exec_credentials(task: u64, path: &str) -> bool {
+    let mount_path = apply_chroot(path);
+    let file = resolve_file_absolute_ext(&mount_path, true);
+    let cred = exec_prepare_credentials(task, file.as_deref(), &mount_path);
+    exec_commit_credentials(task, &cred);
+    cred.secureexec
 }
 
 /// `PR_GET_DUMPABLE` for an explicit task — the observable the exec
@@ -9945,7 +10158,9 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
 
 fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     let task = current_task_id();
-    let pending = signal_bits_get(&SIGNAL_PENDING, task);
+    // Private and group-shared: a shared signal this thread does not block
+    // interrupts its wait just like a thread-directed one.
+    let pending = signal_pending_of(task);
     let mask = signal_mask_of(task);
     if (pending & !mask) != 0 {
         if let Some(hook) = signal_delivery_hook() {
@@ -11774,6 +11989,17 @@ const __WCLONE: u32 = 0x8000_0000;
 const SIGCHLD: u8 = 17;
 
 
+/// True if `task` is in a JOB-CONTROL stop (not a ptrace stop).
+pub(crate) fn task_job_stopped(task: u64) -> bool {
+    crate::task::with_task_local(task, |task| task.job_stop_signal.load(Ordering::Acquire) != 0)
+        .unwrap_or_else(|| {
+            TASK_STOPPED_FALLBACK
+                .lock()
+                .as_ref()
+                .is_some_and(|stopped| stopped.contains_key(&task))
+        })
+}
+
 /// True if `task` is currently job-control stopped.
 pub fn is_task_stopped(task: u64) -> bool {
     let job_stopped = crate::task::with_task_local(task, |task| {
@@ -11821,12 +12047,56 @@ fn prefer_resumed_child_handoff(online_cpu_bits: u64) -> bool {
 /// Raw pending-signal bitmask for `task` (no mask applied). Used by
 /// the poll loop to let SIGKILL break a job-control stop.
 pub fn signal_pending_bits(task: u64) -> u64 {
-    signal_bits_get(&SIGNAL_PENDING, task)
+    signal_pending_of(task)
 }
 
 /// AND-out the given signal bits from `task`'s pending set.
 pub(crate) fn clear_pending_signal_bits(task: u64, mask: u64) {
     let _ = pending_signal_bits_update_existing(task, |slot| *slot &= !mask);
+}
+
+/// SIGCHLD siginfo for a child exit, as Linux `do_notify_parent` builds it
+/// from the wait status: CLD_DUMPED / CLD_KILLED carry the terminating
+/// signal in `si_status`, CLD_EXITED the exit code; `si_pid` is the child in
+/// the parent's pid namespace. `si_status` rides in the payload value.
+fn sigchld_exit_info(parent: u64, child_pid: u64, status: i32) -> QueuedSiginfo {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    let (code, si_status) = if status & 0x80 != 0 {
+        (CLD_DUMPED, status & 0x7f)
+    } else if status & 0x7f != 0 {
+        (CLD_KILLED, status & 0x7f)
+    } else {
+        (CLD_EXITED, (status >> 8) & 0xff)
+    };
+    let pid = report_pid_to(parent, child_pid) as u32;
+    QueuedSiginfo::generic(code, si_status as u32 as u64, pid)
+}
+
+/// SIGCHLD siginfo for a stop/continue report, as Linux
+/// `do_notify_parent_cldstop` builds it: CLD_CONTINUED carries SIGCONT,
+/// CLD_STOPPED (group stop) or CLD_TRAPPED (a tracer's ptrace stop) the stop
+/// signal.
+fn sigchld_stopcont_info(
+    parent: u64,
+    child_pid: u64,
+    wstatus: i32,
+    is_continued: bool,
+    ptraced: bool,
+) -> QueuedSiginfo {
+    const CLD_TRAPPED: i32 = 4;
+    const CLD_STOPPED: i32 = 5;
+    const CLD_CONTINUED: i32 = 6;
+    let (code, si_status) = if is_continued {
+        (CLD_CONTINUED, 18) // SIGCONT
+    } else if ptraced {
+        (CLD_TRAPPED, (wstatus >> 8) & 0x7f)
+    } else {
+        (CLD_STOPPED, (wstatus >> 8) & 0x7f)
+    };
+    let pid = report_pid_to(parent, child_pid) as u32;
+    QueuedSiginfo::generic(code, si_status as u32 as u64, pid)
 }
 
 /// WIFSTOPPED-shaped wstatus carrying `sig` as WSTOPSIG.
@@ -11901,22 +12171,22 @@ fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
             || crate::ptrace::is_task_traced(task_to_pid_raw(parent).unwrap_or(parent)));
     let notify_sigchld = !explicitly_suppressed && (!default_ignored || default_must_queue);
     if notify_sigchld {
-        // Route through the canonical raise-notify (not a bare pending-bit set)
-        // so a signalfd-watching parent's epoll readiness EDGE fires.
-        if let Some((was_empty, was_new)) = pending_signal_bits_update(parent, |slot| {
-            let was_empty = *slot == 0;
-            let was_new = *slot & sig_bit(17) == 0;
-            *slot |= sig_bit(17);
-            (was_empty, was_new)
-        }) {
-            // Standard SIGCHLD instances coalesce. Linux's legacy_queue()
-            // stops before complete_signal() when SIGCHLD is already pending,
-            // so it does not repeat the signal wake/generation work. The wait
-            // queue below is still fired for every child-state publication.
-            if was_new {
-                signal_raise_notify(parent, was_empty);
-            }
-        }
+        // `do_notify_parent_cldstop` -> `__group_send_sig_info(SIGCHLD, &info,
+        // parent)`: the parent PROCESS's shared set. An already-pending
+        // SIGCHLD coalesces there without re-running the wake (`legacy_queue`,
+        // applied by the group raise); the wait queue below is still fired for
+        // every child-state publication.
+        let _ = raise_group_signal(
+            parent,
+            17,
+            GroupSigInfo::Queued(sigchld_stopcont_info(
+                parent,
+                child_pid,
+                wstatus,
+                is_continued,
+                ptraced,
+            )),
+        );
     }
     // The producer has lapped the waiter's single Linux-style state slot.
     // Ask the ordinary executor path to cede at syscall exit so the consumer
@@ -12117,14 +12387,255 @@ fn reap_stopcont(
 /// enqueues the new signal (`set_pending_signal_bit`), and the subsequent
 /// canonical raise-notify performs the one required wake.
 fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
-    if signum != 18 {
+    group_stopcont_interaction(task, signum)
+}
+
+/// Live threads of `task`'s thread group (`task` itself included even when
+/// the registry has no row for it, as in syscall-unit fixtures).
+fn live_group_members(task: u64) -> alloc::vec::Vec<u64> {
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    let mut members: alloc::vec::Vec<u64> = thread_group_members(pid)
+        .into_iter()
+        .filter(|&t| {
+            crate::task::task_get(t).is_some_and(|task| {
+                task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING
+            })
+        })
+        .collect();
+    if !members.contains(&task) {
+        members.push(task);
+    }
+    members
+}
+
+/// Linux `prepare_signal`'s job-control half, which acts on the WHOLE thread
+/// group for every send (thread- or process-directed):
+///
+/// ```text
+/// if (sig_kernel_stop(sig)) {
+///         /* This is a stop signal.  Remove SIGCONT from all queues. */
+///         flush_sigqueue_mask(p, &flush, &signal->shared_pending);
+///         for_each_thread(p, t) flush_sigqueue_mask(p, &flush, &t->pending);
+/// } else if (sig == SIGCONT) {
+///         /* Remove all stop signals from all queues, wake all threads. */
+///         flush_sigqueue_mask(p, &flush, &signal->shared_pending);
+///         for_each_thread(p, t) {
+///                 flush_sigqueue_mask(p, &flush, &t->pending);
+///                 task_clear_jobctl_pending(t, JOBCTL_STOP_PENDING);
+///                 if (likely(!(t->ptrace & PT_SEIZED))) wake_up_state(t, __TASK_STOPPED);
+///                 ...
+///         }
+///         /* Notify the parent with CLD_CONTINUED if we were stopped. */
+/// }
+/// ```
+///
+/// Returns true when SIGCONT resumed a stopped group.
+fn group_stopcont_interaction(task: u64, signum: u32) -> bool {
+    const STOP_BITS: u64 = 0b1111u64 << 18; // SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU
+    match signum {
+        19..=22 => {
+            for t in live_group_members(task) {
+                clear_pending_signal_bits(t, sig_bit(18));
+            }
+            clear_pending_signal_bits(shared_pending_key(task), sig_bit(18));
+            false
+        }
+        18 => {
+            let mut was_stopped = false;
+            let members = live_group_members(task);
+            for &t in &members {
+                clear_pending_signal_bits(t, STOP_BITS);
+                if clear_task_stopped(t).is_some() {
+                    was_stopped = true;
+                    wake_signal(t);
+                }
+            }
+            clear_pending_signal_bits(shared_pending_key(task), STOP_BITS);
+            // A group stop still being assembled is cancelled, not reported.
+            group_stop_cancel(task);
+            if was_stopped {
+                push_stopcont_report(task, CONTINUED_WSTATUS, true);
+            }
+            was_stopped
+        }
+        _ => false,
+    }
+}
+
+/// An in-flight group stop (Linux `signal->group_stop_count` +
+/// `JOBCTL_STOP_PENDING`): the stop signal and the threads that have not yet
+/// reached a stop point. The parent's CLD_STOPPED is reported only when the
+/// LAST thread stops (`do_signal_stop` -> `do_notify_parent_cldstop`).
+struct GroupStop {
+    signum: u32,
+    remaining: alloc::collections::BTreeSet<u64>,
+}
+
+static GROUP_STOPS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, GroupStop>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Number of group stops still waiting for threads. Lets the delivery fast
+/// path skip the stop check entirely when no stop is being assembled.
+static GROUP_STOPS_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+pub(crate) fn group_stops_active() -> bool {
+    GROUP_STOPS_ACTIVE.load(Ordering::Acquire) != 0
+}
+
+/// Start a group stop for `task`'s thread group (Linux `do_signal_stop` on the
+/// first thread to dequeue a stop signal): mark every live thread stopped, then
+/// wake/kick the others so each reaches a stop point. Idempotent while a stop
+/// is already in flight.
+fn group_stop_begin(task: u64, signum: u32) {
+    let key = process_state_key(task);
+    let members = live_group_members(task);
+    let started = {
+        let mut g = GROUP_STOPS.lock();
+        match g.get_or_insert_with(BTreeMap::new).entry(key) {
+            alloc::collections::btree_map::Entry::Occupied(_) => false,
+            alloc::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(GroupStop {
+                    signum,
+                    remaining: members.iter().copied().collect(),
+                });
+                GROUP_STOPS_ACTIVE.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+        }
+    };
+    if !started {
+        return;
+    }
+    for &t in &members {
+        let _ = insert_task_stopped(t, signum);
+    }
+    for &t in &members {
+        if t != task {
+            wake_signal(t);
+            narf_scheduler::kick_task(t);
+        }
+    }
+}
+
+/// `task` has reached a stop point. The last thread of an in-flight group
+/// stop notifies the parent (CLD_STOPPED with the stop signal).
+pub(crate) fn group_stop_participate(task: u64) {
+    if !group_stops_active() {
+        return;
+    }
+    let key = process_state_key(task);
+    let done = {
+        let mut g = GROUP_STOPS.lock();
+        let Some(map) = g.as_mut() else {
+            return;
+        };
+        let Some(stop) = map.get_mut(&key) else {
+            return;
+        };
+        stop.remaining.remove(&task);
+        if stop.remaining.is_empty() {
+            let signum = stop.signum;
+            map.remove(&key);
+            GROUP_STOPS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+            Some(signum)
+        } else {
+            None
+        }
+    };
+    if let Some(signum) = done {
+        push_stopcont_report(task, stopped_wstatus(signum), false);
+    }
+}
+
+/// A thread leaving the group (exit) no longer holds up an in-flight stop.
+pub(crate) fn group_stop_forget(task: u64) {
+    group_stop_participate(task);
+}
+
+fn group_stop_cancel(task: u64) {
+    if !group_stops_active() {
+        return;
+    }
+    let key = process_state_key(task);
+    let mut g = GROUP_STOPS.lock();
+    if g.as_mut().and_then(|m| m.remove(&key)).is_some() {
+        GROUP_STOPS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Linux `wants_signal`: could `t` take `signum` now? It must not block it
+/// (a thread parked in rt_sigtimedwait on it counts as not blocking, as Linux
+/// temporarily unblocks the waited set), must be alive and not exiting, and —
+/// except for SIGKILL — not stopped.
+fn wants_signal(t: u64, signum: u32) -> bool {
+    let Some(task) = crate::task::task_get(t) else {
+        return false;
+    };
+    if task.state.load(Ordering::Acquire) != crate::task::TASK_RUNNING
+        || task.group_exiting.load(Ordering::Acquire)
+    {
         return false;
     }
-    let was_stopped = clear_task_stopped(task).is_some();
-    if was_stopped {
-        push_stopcont_report(task, CONTINUED_WSTATUS, true);
+    let bit = sig_bit(signum);
+    if signal_mask_of(t) & bit != 0 {
+        let waiting =
+            crate::user_task::with_user_task_ctx(t, |u| u.sigwait_set.load(Ordering::Acquire) & bit != 0)
+                .unwrap_or(false);
+        if !waiting {
+            return false;
+        }
     }
-    was_stopped
+    signum == 9 || !is_task_stopped(t)
+}
+
+/// Linux `complete_signal` for a signal just added to `target`'s group shared
+/// set: wake ONE thread that wants it — `target` itself first, else any other
+/// thread of the group. When no thread wants it (all block it), it stays
+/// queued until one unblocks it or sigwaits for it.
+pub(crate) fn complete_group_signal(target: u64, signum: u32) {
+    let chosen = if wants_signal(target, signum) {
+        Some(target)
+    } else {
+        let pid = task_to_pid_raw(target).unwrap_or(target);
+        let mut found = None;
+        for_each_group_member(pid, |t| {
+            if t != target && wants_signal(t, signum) {
+                found = Some(t);
+                return false;
+            }
+            true
+        });
+        found
+    };
+    if let Some(t) = chosen {
+        wake_signal(t);
+        narf_scheduler::kick_task(t);
+    }
+}
+
+/// Linux `retarget_shared_pending`: `task` stops being able to take the
+/// signals in `newly_unwanted` (it blocked them, or it is exiting). Wake
+/// another thread for any of them that are pending in the shared set.
+pub(crate) fn retarget_shared_pending(task: u64, newly_unwanted: u64) {
+    let shared = signal_pending_shared(task) & newly_unwanted;
+    if shared == 0 {
+        return;
+    }
+    let members = live_group_members(task);
+    let mut rest = shared;
+    while rest != 0 {
+        let signum = sig_from_bit(rest);
+        rest &= !sig_bit(signum);
+        if let Some(t) = members
+            .iter()
+            .copied()
+            .find(|&t| t != task && wants_signal(t, signum))
+        {
+            wake_signal(t);
+            narf_scheduler::kick_task(t);
+        }
+    }
 }
 
 /// Put the current task into the job-control stopped state and park it
@@ -12140,10 +12651,20 @@ fn signal_stopcont_interaction(task: u64, signum: u32) -> bool {
 /// returning 0. With no executor wired (kernel-test context) it returns
 /// without parking so the caller can consume the signal.
 fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
+    // The stop signal was dequeued from whichever set held it (private or
+    // the group's shared set); clear both copies. A stop stops the WHOLE
+    // group (`do_signal_stop`), whether it was sent to the process or to one
+    // thread.
     clear_pending_signal_bits(task, sig_bit(signum));
-    insert_task_stopped(task, signum);
-    clear_pending_signal_bits(task, sig_bit(18)); // SIGCONT
-    push_stopcont_report(task, stopped_wstatus(signum), false);
+    clear_pending_signal_bits(shared_pending_key(task), sig_bit(signum));
+    group_stop_begin(task, signum);
+    group_stop_participate(task);
+    park_current_stopped(ctx);
+}
+
+/// Park the current task in the job-control stopped state until SIGCONT
+/// clears it (`park_should_block`'s stopped branch keeps it parked).
+fn park_current_stopped(ctx: &mut dyn TrapContext) {
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
@@ -12213,6 +12734,13 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn wait_init() {
+    // Once per boot: wait_init runs again on every test reset, and the pump
+    // registry has a fixed number of slots.
+    static SYSRQ_PUMP_REGISTERED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_scheduler::sleep_pumps::register(sysrq_pump);
+    }
     *PARENT_OF.lock() = Some(BTreeMap::new());
     parent_child_counts_init();
     crate::ptrace::ptrace_init();
@@ -12237,6 +12765,7 @@ pub fn wait_init() {
     // the OCI teardown #UD).
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
     crate::user_task::register_process_exit_observer(shm_process_exit);
+    crate::user_task::register_process_exit_observer(shared_pending_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
@@ -12315,7 +12844,8 @@ fn cgroup_exit_observer(pid: u64, _tid: u64) {
 #[cfg(feature = "cgroup")]
 fn cgroup_kill_hook(pid: u64) {
     if let Some(task) = pid_to_task_raw(pid) {
-        raise_signal_pending(task, 9);
+        // cgroup v2 `cgroup.kill` kills whole processes.
+        let _ = raise_group_signal(task, 9, GroupSigInfo::None);
     }
 }
 
@@ -12325,7 +12855,8 @@ fn cgroup_kill_hook(pid: u64) {
 #[cfg(feature = "cgroup")]
 fn cgroup_freeze_hook(pid: u64, freeze: bool) {
     if let Some(task) = pid_to_task_raw(pid) {
-        raise_signal_pending(task, if freeze { 19 } else { 18 });
+        // Freeze/thaw the whole process: a group stop / group continue.
+        let _ = raise_group_signal(task, if freeze { 19 } else { 18 }, GroupSigInfo::None);
     }
 }
 
@@ -12788,6 +13319,19 @@ pub(crate) fn park_reexecute_on_fd(
     ops: &dyn narf_filesystem::FileOps,
     interest: u32,
 ) -> bool {
+    park_reexecute_on_fd_until(ctx, ops, interest, u64::MAX)
+}
+
+/// [`park_reexecute_on_fd`] with a wake deadline (absolute monotonic ns):
+/// the task resumes — and re-executes the syscall — on readiness OR when
+/// `deadline` passes, whichever is first. `u64::MAX` waits for readiness
+/// only.
+pub(crate) fn park_reexecute_on_fd_until(
+    ctx: &mut dyn TrapContext,
+    ops: &dyn narf_filesystem::FileOps,
+    interest: u32,
+    deadline: u64,
+) -> bool {
     // CaptureCtx deliberately reports RIP 0 for a nested sendmsg used by
     // sendmmsg.  The outer handler must decide whether re-execution is safe
     // after accounting for any messages it already transmitted.
@@ -12816,7 +13360,7 @@ pub(crate) fn park_reexecute_on_fd(
             // The provider checked the level and installed this task's waker
             // under the same per-fd lock used by `Readiness::set`.
             // There is no lost-wake window to poll with a 1 ms timer.
-            let parked = park_reexecute_on_io_until(ctx, u64::MAX, true);
+            let parked = park_reexecute_on_io_until(ctx, deadline, true);
             ops.disarm_readiness(task);
             parked
         }
@@ -13482,8 +14026,17 @@ fn orphanize_children_of(parent_tid: u64) {
             }
             // Threaded reparenting stays inside the same wait domain and does
             // not generate a second SIGCHLD. External reapers are notified.
+            // Linux `reparent_leader` -> `do_notify_parent(p, p->exit_signal)`
+            // per zombie; a standard SIGCHLD coalesces, so the first names
+            // its child.
             if reset_exit_signal {
-                raise_signal_pending(r, 17);
+                for entry in &stale {
+                    let _ = raise_group_signal(
+                        r,
+                        17,
+                        GroupSigInfo::Queued(sigchld_exit_info(r, entry.child_pid, entry.status)),
+                    );
+                }
             }
             wake_wait_child_group(r);
         }
@@ -13529,7 +14082,9 @@ fn orphanize_children_of(parent_tid: u64) {
         let child_tid = pid_to_task_raw(*child_pid).unwrap_or(*child_pid);
         let sig = read_prctl(child_tid).pdeathsig;
         if sig != 0 {
-            raise_signal_pending(child_tid, sig);
+            // `group_send_sig_info(t->pdeath_signal, SEND_SIG_NOINFO, t,
+            // PIDTYPE_TGID)`.
+            let _ = raise_group_signal(child_tid, sig, GroupSigInfo::None);
         }
     }
     match reaper {
@@ -13556,12 +14111,69 @@ fn orphanize_children_of(parent_tid: u64) {
     }
 }
 
+/// Run a pending Magic SysRq command (`narf_input::evdev::take_sysrq_request`)
+/// outside interrupt context. Only `t` (show task states) is implemented.
+fn sysrq_pump() {
+    const KEY_T: u16 = 20;
+    if narf_input::evdev::take_sysrq_request() == Some(KEY_T) {
+        sysrq_show_tasks();
+    }
+}
+
+/// Linux SysRq-T (`show_state`): one line per task with its state and, for a
+/// task parked in a syscall, which syscall and arguments it is blocked in.
+/// Costs nothing until requested, so it can be used on a wedged system
+/// without changing its timing.
+pub fn sysrq_show_tasks() {
+    use core::fmt::Write as _;
+    let mut w = narf_console::Writer;
+    let tasks = crate::task::snapshot_identities();
+    let _ = writeln!(w, "sysrq: show task states ({} tasks)", tasks.len());
+    for (tid, pid) in tasks {
+        let mut comm = [0u8; 16];
+        let n = proc_comm_of_task_into(tid, &mut comm);
+        let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+        match crate::user_task::with_user_task_ctx(tid, |u| u.blocked_syscall()) {
+            Some(Some(r)) => {
+                let name = crate::syscall::syscall_name(r[0] as u32).unwrap_or("?");
+                let _ = writeln!(
+                    w,
+                    "sysrq: tid={tid} pid={pid} comm={comm} BLOCKED-IN {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    r[6],
+                );
+            }
+            Some(None) => {
+                let _ = writeln!(w, "sysrq: tid={tid} pid={pid} comm={comm} RUNNING");
+            }
+            None => {
+                let _ = writeln!(w, "sysrq: tid={tid} pid={pid} comm={comm} (kernel/no user context)");
+            }
+        }
+    }
+    let _ = writeln!(w, "sysrq: end of task states");
+}
+
 /// Exit observer running AFTER `on_child_exit` (parent notification
 /// must see the dying task's pgid/sid intact): the master per-task
 /// teardown. `_pid` is the visible pid; all swept tables key on tid.
 fn task_tables_exit_observer(_pid: u64, tid: u64) {
     release_task_tables(tid);
     orphanize_children_of(tid);
+}
+
+/// Exit observer for the LAST thread of a group: release the group's shared
+/// pending set (Linux frees `signal->shared_pending` with the signal_struct,
+/// not per thread — a sibling's exit must leave process-directed signals
+/// pending for the survivors). Keyed through `pid` because the last thread
+/// need not be the leader and its own tables are already swept. Runs before
+/// `on_child_exit`, which may release the pid of an orphan.
+fn shared_pending_process_exit(pid: u64, tid: u64) {
+    release_shared_pending(pid_to_task_raw(pid).unwrap_or(tid));
 }
 
 /// Test-only: run the AIO-context exit sweep for `tid` (the
@@ -13836,6 +14448,42 @@ fn set_task_pid_locked(task: u64, tgid: u64) {
             tgid_member_remove(task, o);
         }
         tgid_member_add(task, tgid);
+    }
+}
+
+/// Visit every member TaskId of thread group `tgid` in ascending order until
+/// `f` returns false. Alloc-free and IRQ-safe: members are copied out of the
+/// index lock in fixed-size batches, so `f` runs with no lock held (it may take
+/// the task registry or signal-table locks without a lock-order cycle).
+pub(crate) fn for_each_group_member(tgid: u64, mut f: impl FnMut(u64) -> bool) {
+    const BATCH: usize = 32;
+    let mut after: Option<u64> = None;
+    loop {
+        let mut batch = [0u64; BATCH];
+        let mut n = 0;
+        {
+            let g = TGID_MEMBERS.lock();
+            let Some(set) = g.as_ref().and_then(|m| m.get(&tgid)) else {
+                return;
+            };
+            let lower = match after {
+                None => core::ops::Bound::Unbounded,
+                Some(last) => core::ops::Bound::Excluded(last),
+            };
+            for &t in set.range((lower, core::ops::Bound::Unbounded)).take(BATCH) {
+                batch[n] = t;
+                n += 1;
+            }
+        }
+        for &t in &batch[..n] {
+            if !f(t) {
+                return;
+            }
+        }
+        if n < BATCH {
+            return;
+        }
+        after = Some(batch[n - 1]);
     }
 }
 
@@ -14159,6 +14807,11 @@ fn on_thread_exit(_pid: u64, tid: u64) {
     // flips and a reader (a shell's `$(...)` capture) never sees EOF.
     // Also frees file/socket handles so they don't leak.
     crate::fd::detach(tid);
+    // Linux `exit_signals`: an exiting thread no longer holds up a group stop,
+    // and shared signals it could have taken go to a sibling
+    // (`retarget_shared_pending(tsk, ~blocked)`).
+    group_stop_forget(tid);
+    retarget_shared_pending(tid, !signal_mask_of(tid));
     // Job control: clear the task-local state before the zombie can be reaped
     // and its refcounted Task storage released.
     let _ = clear_task_stopped(tid);
@@ -14311,44 +14964,18 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // __WCLONE. Linux do_notify_parent follows the same rule.
     if exit_signal != 0 {
         let signum = u32::from(exit_signal);
-        let was_empty = pending_signal_bits_update(parent, |slot| {
-            let was_empty = *slot == 0;
-            *slot |= sig_bit(signum);
-            was_empty
-        });
-        const CLD_EXITED: i32 = 1;
-        const CLD_KILLED: i32 = 2;
-        const CLD_DUMPED: i32 = 3;
-        let si_code = if status & 0x7f == 0 {
-            CLD_EXITED
-        } else if status & 0x80 != 0 {
-            CLD_DUMPED
-        } else {
-            CLD_KILLED
-        };
-        let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
-        let _ = store_sigqueue_info(parent, signum, si_code, 0, child_in_parent_ns);
-        // Deliver SIGCHLD through the CANONICAL raise-notify path (the same one
-        // kill/tgkill/itimer use) so the parent's signalfd readiness EDGE fires.
-        // A signalfd is a cell-backed epoll source, so epoll's collect_ready fast
-        // pass visits it ONLY when its per-fd persistent waker has pushed it onto
-        // the ready-list (see epoll.rs collect_ready). `signal_raise_notify` bumps
-        // SIGNAL_READABLE_GEN/SIGNAL_RAISE_GEN, fires `wake_signalfds` (which does
-        // that push), and wakes the signal waker. The former hand-rolled
-        // `wake_signal` + `notify(0)` set the pending bit and woke the epoll park,
-        // but NEVER fired the signalfd cell edge — so systemd's epoll_wait, whose
-        // 250 ms timerfd (a non-cell-backed source) keeps returning an event and
-        // thus never falls back to a full level rescan, skipped the readable
-        // signalfd forever. SIGCHLD was never delivered, the child stayed an
-        // unreaped zombie, and a Type=oneshot start job (systemd-tmpfiles-setup)
-        // hung the whole boot. Pairs with the pidfd readiness published above.
-        if let Some(was_empty) = was_empty {
-            signal_raise_notify(parent, was_empty);
-        } else {
-            // No pending-bits slot for the parent (shouldn't happen for a live
-            // waiter): still fire the legacy wakes so nothing regresses.
-            wake_signal(parent);
-        }
+        // `do_notify_parent` -> `__send_signal_locked(sig, &info, tsk->parent,
+        // PIDTYPE_TGID)`: the exit signal goes to the parent PROCESS's shared
+        // pending set, and any of its threads that does not block it takes it
+        // (fish's worker threads block SIGCHLD; its main thread handles it).
+        // The group raise also runs the generation-time ignore rule
+        // (`prepare_signal`), and its notify fires every signalfd of the group
+        // (systemd reaps through a signalfd on its epoll set).
+        let _ = raise_group_signal(
+            parent,
+            signum,
+            GroupSigInfo::Queued(sigchld_exit_info(parent, child_pid, status)),
+        );
         narf_net::readiness::notify(0);
     }
     // (3) Wake any parent task parked in a blocking wait4.  The waker
@@ -15058,6 +15685,30 @@ pub(crate) fn current_fs_ids() -> (u32, u32) {
 pub fn pty_open_fs_ids() -> (u32, u32) {
     let ids = read_uidgid(current_task_id());
     (ids.fsuid, ids.fsgid)
+}
+
+/// devpts `uid=`/`gid=`: `fs_param_is_uid` / `fs_param_is_gid` take the id in
+/// the mounter's user namespace (`make_kuid(fc->user_ns, val)`) and reject
+/// one with no mapping there — EINVAL. Returns the kernel (initial-namespace)
+/// id, which is what the instance stores and `devpts_show_options` prints.
+pub fn devpts_map_mount_id(is_gid: bool, id: u32) -> Option<u32> {
+    if id == u32::MAX {
+        return None; // INVALID_UID / INVALID_GID
+    }
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(current_task_id());
+        if is_gid {
+            ns.translate_gid_range_to_host(id, 1)
+        } else {
+            ns.translate_uid_range_to_host(id, 1)
+        }
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = is_gid;
+        Some(id)
+    }
 }
 
 /// Session lookups for the job-control tty ioctls: the caller's session,
@@ -16562,23 +17213,37 @@ pub(crate) fn thread_group_empty(task: u64) -> bool {
         .any(|t| t != task && process_state_key(t) == me)
 }
 
+/// The tasks a `which`/`who` selector names, for getpriority/setpriority and
+/// ioprio_get/ioprio_set. Linux visits THREADS, not processes: nice and
+/// ioprio are per-task state (`task_struct->static_prio`, `->io_context`).
+///
+/// ```text
+/// case PRIO_PROCESS: p = who ? find_task_by_vpid(who) : current;
+/// case PRIO_PGRP:    do_each_pid_thread(pgrp, PIDTYPE_PGID, p) { ... }
+/// case PRIO_USER:    for_each_process_thread(g, p) if (uid_eq(task_uid(p), uid) ...)
+/// ```
+///
+/// So PRIO_PROCESS names exactly one thread (a tid, the leader's included),
+/// and the group scopes expand to every thread of every matching process.
 pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> alloc::vec::Vec<u64> {
     let mut out = alloc::vec::Vec::new();
     match scope {
         WhoScope::Process => {
             if who == 0 {
-                out.push(process_state_key(caller));
+                out.push(caller);
                 return out;
             }
-            let Some(outer) = accept_pid_from(caller, who as u64) else {
+            // `find_task_by_vpid(who)`: any task in the caller's pid
+            // namespace. Mesa's util_queue renices each worker with
+            // `setpriority(PRIO_PROCESS, gettid(), 19)`.
+            let Some(task) = signal_tid_from_user(caller, who as u64) else {
                 return out;
             };
-            let t = process_state_key(proc_pid_to_tid(outer));
             // `find_task_by_vpid` returning NULL is the empty set —
-            // `proc_pid_to_tid` falls back to identity for an unregistered
-            // pid, so an existence check is what implements that.
-            if t == process_state_key(caller) || crate::task::task_get(t).is_some() {
-                out.push(t);
+            // `signal_tid_from_user` falls back to identity for an
+            // unregistered id, so an existence check implements that.
+            if task == caller || crate::task::task_get(task).is_some() {
+                out.push(task);
             }
         }
         WhoScope::Pgrp => {
@@ -16593,31 +17258,27 @@ pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> all
             };
             // The caller is checked explicitly because syscall-unit
             // fixtures need not populate the scheduler task registry.
-            let me = process_state_key(caller);
-            if read_pgid(me) == target {
-                out.push(me);
+            if read_pgid(process_state_key(caller)) == target {
+                out.push(caller);
             }
             for t in crate::task::task_ids() {
-                let key = process_state_key(t);
-                if key != me && read_pgid(key) == target && !out.contains(&key) {
-                    out.push(key);
+                if t != caller && read_pgid(process_state_key(t)) == target {
+                    out.push(t);
                 }
             }
         }
         WhoScope::User => {
-            let me = process_state_key(caller);
             let target_uid = if who == 0 {
-                read_uidgid(me).uid
+                read_uidgid(process_state_key(caller)).uid
             } else {
                 who as u32
             };
-            if read_uidgid(me).uid == target_uid {
-                out.push(me);
+            if read_uidgid(process_state_key(caller)).uid == target_uid {
+                out.push(caller);
             }
             for t in crate::task::task_ids() {
-                let key = process_state_key(t);
-                if key != me && read_uidgid(key).uid == target_uid && !out.contains(&key) {
-                    out.push(key);
+                if t != caller && read_uidgid(process_state_key(t)).uid == target_uid {
+                    out.push(t);
                 }
             }
         }
@@ -16666,12 +17327,11 @@ fn read_nice(task: u64) -> i32 {
 #[inline]
 fn read_current_nice() -> i32 {
     // Match Linux's `p = current; task_nice(p)` fast branch. When the sparse
-    // store is empty, the current task's process key cannot affect the answer,
-    // so avoid both task↔pid map lookups as well as NICE_TABLE itself.
+    // store is empty no task has a custom nice, so skip NICE_TABLE itself.
     if NICE_CUSTOM_ROWS.load(Ordering::Acquire) == 0 {
         return 0;
     }
-    read_nice(process_state_key(current_task_id()))
+    read_nice(current_task_id())
 }
 fn write_nice(task: u64, prio: i32) -> bool {
     let mut g = NICE_TABLE.lock();
@@ -16694,7 +17354,7 @@ fn write_nice(task: u64, prio: i32) -> bool {
 /// Linux permission checks so sparse default-row removal can be verified.
 #[doc(hidden)]
 pub fn __test_write_current_nice(prio: i32) -> bool {
-    write_nice(process_state_key(current_task_id()), prio)
+    write_nice(current_task_id(), prio)
 }
 
 
@@ -18270,6 +18930,9 @@ mod child_reap_signalfd_tests {
         // with a SIGCHLD exit-signal, and the staged wstatus.
         super::parent_of_set_with_signal(child, parent, 17); // SIGCHLD
         super::stage_pending_termination(child, 0);
+        // A signalfd reader blocks what it reads (systemd blocks SIGCHLD); an
+        // unblocked SIG_DFL SIGCHLD is discarded at generation (sig_ignored).
+        super::set_signal_mask_for_task(parent, super::sig_bit(17));
 
         let sfd = crate::io_mux::SignalFd::new(watch_mask, parent);
         let count = alloc::sync::Arc::new(AtomicU32::new(0));
@@ -18283,6 +18946,7 @@ mod child_reap_signalfd_tests {
         let ready = sfd.poll_readiness() & POLL_IN != 0;
         // Best-effort residue drain (synthetic ids never collide with real ones).
         let _ = super::take_pending_termination(child);
+        super::set_signal_mask_for_task(parent, 0);
         (fired, ready)
     }
 

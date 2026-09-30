@@ -1217,9 +1217,7 @@ kernel_test_in!(
 /// that is real.
 ///
 /// `fs/exec.c::bprm_fill_uid` is the one place an unprivileged task can
-/// gain privilege, and NARF did not implement it at all — set-user-ID
-/// binaries simply did not work, which is also why `MS_NOSUID` had nothing
-/// to suppress.
+/// gain privilege, and `MS_NOSUID` exists to suppress it.
 ///
 /// This drives the decision directly rather than through a real `execve`:
 /// a full exec needs a loadable image and a task switch that the ABI
@@ -1261,7 +1259,7 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
         // ── set-user-ID: euid becomes the file's owner ────────────────
         stage(0o4755)?;
         as_caller();
-        let (euid, _, fsuid, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, _, fsuid, _) = crate::handlers::__test_bprm_fill_uid(task, path);
         if euid != OWNER {
             crate::handlers::__test_uidgid_reset();
             return Err("a set-user-ID binary did not move the effective uid");
@@ -1278,7 +1276,7 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
         // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
         stage(0o2745)?;
         as_caller();
-        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path);
         if egid == GROUP {
             crate::handlers::__test_uidgid_reset();
             return Err("S_ISGID without group-execute granted the file's group");
@@ -1287,22 +1285,18 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
         // ── S_ISGID WITH group-execute does transition ───────────────
         stage(0o2755)?;
         as_caller();
-        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path);
         if egid != GROUP {
             crate::handlers::__test_uidgid_reset();
             return Err("a set-group-ID binary did not move the effective gid");
         }
 
-        // ── a shebang confers nothing ────────────────────────────────
-        // The kernel executes the INTERPRETER; honouring the script's bits
-        // would hand its privilege to an interpreter never audited for it.
-        stage(0o4755)?;
-        as_caller();
-        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, true);
-        if euid == OWNER {
-            crate::handlers::__test_uidgid_reset();
-            return Err("a set-user-ID script granted privilege through its interpreter");
-        }
+        // A `#!` script is decided on its INTERPRETER, not its own bits
+        // (`bprm_creds_from_file` reads `bprm->file`, which is the
+        // interpreter by then). That choice is made by the exec path, which
+        // hands this step the interpreter's file; it is covered end to end
+        // by the `setuid_exec_smoke` musl-demo (`setuid-script`,
+        // `script-setuid-interp`).
 
         // ── no_new_privs refuses the transition ──────────────────────
         stage(0o4755)?;
@@ -1312,7 +1306,7 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
             crate::handlers::__test_uidgid_reset();
             return Err("prctl(PR_SET_NO_NEW_PRIVS) failed");
         }
-        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path);
         crate::handlers::__test_prctl_reset();
         if euid == OWNER {
             crate::handlers::__test_uidgid_reset();
@@ -1338,7 +1332,7 @@ fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
             return Err("chmod setuid-root of the test binary failed");
         }
         as_caller();
-        let (euid, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path);
         crate::handlers::__test_uidgid_reset();
         if euid != 0 {
             return Err("a set-user-ID-root binary did not reach uid 0");
@@ -1426,7 +1420,7 @@ fn smoke_abi_fsx_nosuid_mount_confers_no_privilege() -> TestResult {
             return finish(Err(msg));
         }
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
-        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path);
         crate::handlers::__test_uidgid_reset();
         // `__test_bprm_fill_uid` performs the WHOLE exec credential step,
         // and that step ends in `pE' = fE ? pP' : pA'` — so an exec as a
@@ -1451,7 +1445,7 @@ fn smoke_abi_fsx_nosuid_mount_confers_no_privilege() -> TestResult {
             return finish(Err(msg));
         }
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
-        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path);
         if euid == OWNER {
             return finish(Err("a nosuid mount granted a set-user-ID transition"));
         }
@@ -1464,6 +1458,441 @@ fn smoke_abi_fsx_nosuid_mount_confers_no_privilege() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx_nosuid_mount_confers_no_privilege
+);
+
+/// Stage `cpath` as root-owned with `mode`. Staging is privileged (chown of
+/// a file the caller does not own is EPERM), so it runs as the boot
+/// credential; `chmod` comes after `chown` because a chown clears the
+/// set-id bits.
+fn stage_root_owned(cpath: &[u8], mode: u64) -> Result<(), &'static str> {
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_caps_reset();
+    crate::handlers::__test_prctl_reset();
+    if call(Syscall::Chown.raw(), a2(cpath.as_ptr() as u64, 0, 0)) != Some(0) {
+        return Err("chown root of the test binary failed");
+    }
+    if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, mode)) != Some(0) {
+        return Err("chmod of the test binary failed");
+    }
+    Ok(())
+}
+
+/// Put the harness task back to the boot credential.
+fn creds_reset() {
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_caps_reset();
+    crate::handlers::__test_prctl_reset();
+    crate::handlers::__test_root_dir_reset();
+}
+
+/// A set-user-ID-root binary exec'd from INSIDE a chroot raises euid, and a
+/// nosuid mount inside the chroot still suppresses it.
+///
+/// This is the CachyOS `sudo` failure ("effective uid is not 0"): NARF runs
+/// the distro's systemd chrooted into `/mnt`, and the set-user-ID decision
+/// re-resolved the exec path WITHOUT the chroot, so `/usr/bin/sudo` named
+/// nothing and the transition was silently skipped. Linux decides on the
+/// file the exec opened (`bprm->file`), so the chroot is already applied.
+///
+/// The nosuid half pins the other consequence: the mount lookup must be
+/// made with the chrooted path too, or a nosuid mount inside the chroot is
+/// looked up as whatever covers the bare path outside it.
+fn smoke_abi_fsx_setuid_exec_honours_chroot() -> TestResult {
+    const CALLER: u32 = 1400;
+    const MS_NOSUID: u64 = 1 << 1;
+    with_memfs(
+        "/abi-suidchroot",
+        "abi-suidchroot",
+        &[("prog", b"\x7fELF")],
+        || {
+            let task = crate::handlers::current_task_id();
+            stage_root_owned(b"/abi-suidchroot/prog\0", 0o4755)?;
+            let _ = crate::handlers::install_root_dir(task, "/abi-suidchroot");
+            crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+            let (euid, _, fsuid, effective) = crate::handlers::__test_bprm_fill_uid(task, "/prog");
+            creds_reset();
+            if euid != 0 {
+                return Err("a set-user-ID-root binary exec'd inside a chroot did not raise euid");
+            }
+            if fsuid != 0 || effective == 0 {
+                return Err("a chrooted set-user-ID-root exec reached euid 0 without fsuid/caps");
+            }
+
+            // nosuid mount INSIDE the chroot.
+            let target = b"/abi-suidchroot-ns\0";
+            let mounted = call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: c"tmpfs".as_ptr() as u64,
+                    arg1: target.as_ptr() as u64,
+                    arg2: c"tmpfs".as_ptr() as u64,
+                    arg3: MS_NOSUID,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            );
+            if mounted != Some(0) {
+                return Err("mounting a nosuid tmpfs failed");
+            }
+            let finish = |r: Result<(), &'static str>| {
+                creds_reset();
+                let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+                r
+            };
+            let cpath = b"/abi-suidchroot-ns/prog\0";
+            match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, cpath.as_ptr() as u64, 0o100 | 0o2, 0o755),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return finish(Err("creating the nosuid test binary failed")),
+            }
+            if let Err(e) = stage_root_owned(cpath, 0o4755) {
+                return finish(Err(e));
+            }
+            let _ = crate::handlers::install_root_dir(task, "/abi-suidchroot-ns");
+            crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+            let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, "/prog");
+            if euid != CALLER {
+                return finish(Err(
+                    "a nosuid mount inside a chroot granted a set-user-ID transition",
+                ));
+            }
+            finish(Ok(()))
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_setuid_exec_honours_chroot);
+
+/// Every exec resets the saved and filesystem ids to the effective ones,
+/// not only a set-user-ID one:
+///
+/// ```text
+/// new->suid = new->fsuid = new->euid;
+/// new->sgid = new->fsgid = new->egid;
+/// ```
+///
+/// (`cap_bprm_creds_from_file`, unconditional.) A process that kept a
+/// privileged saved uid, or lowered fsuid for one operation, does not pass
+/// either to the program it execs — the saved uid in particular is what
+/// `setuid(suid)` would let the new image climb back to.
+fn smoke_abi_fsx_exec_resets_saved_and_fs_ids() -> TestResult {
+    const CALLER: u32 = 1500;
+    const FSID: u64 = 5500;
+    with_memfs(
+        "/abi-execids",
+        "abi-execids",
+        &[("prog", b"\x7fELF")],
+        || {
+            let task = crate::handlers::current_task_id();
+            stage_root_owned(b"/abi-execids/prog\0", 0o755)?;
+            // uid = euid = CALLER, saved uid still 0 (the boot credential).
+            crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+            if call(Syscall::Setfsuid.raw(), a0(FSID)).is_none() {
+                creds_reset();
+                return Err("setfsuid fixture failed");
+            }
+            let (euid, _, fsuid, _) =
+                crate::handlers::__test_bprm_fill_uid(task, "/abi-execids/prog");
+            let (mut r, mut e, mut s) = (u32::MAX, u32::MAX, u32::MAX);
+            let got = call(
+                Syscall::Getresuid.raw(),
+                a2(
+                    &mut r as *mut u32 as u64,
+                    &mut e as *mut u32 as u64,
+                    &mut s as *mut u32 as u64,
+                ),
+            );
+            creds_reset();
+            if got != Some(0) {
+                return Err("getresuid failed");
+            }
+            if euid != CALLER || r != CALLER || e != CALLER {
+                return Err("an ordinary exec changed the real/effective uid");
+            }
+            if s != CALLER {
+                return Err("an ordinary exec kept a saved uid that differs from euid");
+            }
+            if fsuid != CALLER {
+                return Err("an ordinary exec kept an fsuid that differs from euid");
+            }
+            Ok(())
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_exec_resets_saved_and_fs_ids);
+
+/// Root that narrowed its permitted set gets the full set back on ANY
+/// exec, and `no_new_privs` refuses that regain.
+///
+/// `handle_privileged_root` runs on every exec whose new euid or uid is
+/// root — `pP' = cap_bset | pI` — not only on a set-user-ID one. With
+/// `no_new_privs` the gain is an `LSM_UNSAFE_NO_NEW_PRIVS` downgrade:
+/// `new->cap_permitted = cap_intersect(new->cap_permitted,
+/// old->cap_permitted)`. The regained set also makes the exec
+/// non-dumpable: `commit_creds` sees `!cred_cap_issubset(old, new)`.
+fn smoke_abi_fsx_root_exec_regenerates_permitted() -> TestResult {
+    const CAP_NET_ADMIN: u32 = 12;
+    with_memfs(
+        "/abi-rootexec",
+        "abi-rootexec",
+        &[("prog", b"\x7fELF")],
+        || {
+            let task = crate::handlers::current_task_id();
+            let path = "/abi-rootexec/prog";
+            let narrowed = !(1u64 << CAP_NET_ADMIN);
+            stage_root_owned(b"/abi-rootexec/prog\0", 0o755)?;
+            crate::handlers::__test_set_caps(task, narrowed, narrowed);
+            crate::handlers::__test_set_dumpable_for_test(task, true);
+            let _ = crate::handlers::__test_bprm_fill_uid(task, path);
+            let regained = crate::handlers::__test_cap_effective(task, CAP_NET_ADMIN);
+            let dumpable = crate::handlers::__test_dumpable(task);
+            creds_reset();
+            if !regained {
+                return Err(
+                    "root's exec did not regenerate the permitted set from the bounding set",
+                );
+            }
+            if dumpable {
+                return Err("an exec that grew the permitted set stayed dumpable");
+            }
+
+            stage_root_owned(b"/abi-rootexec/prog\0", 0o755)?;
+            crate::handlers::__test_set_caps(task, narrowed, narrowed);
+            const PR_SET_NO_NEW_PRIVS: u64 = 38;
+            if call(Syscall::Prctl.raw(), a2(PR_SET_NO_NEW_PRIVS, 1, 0)) != Some(0) {
+                creds_reset();
+                return Err("prctl(PR_SET_NO_NEW_PRIVS) failed");
+            }
+            let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path);
+            let regained = crate::handlers::__test_cap_effective(task, CAP_NET_ADMIN);
+            creds_reset();
+            if euid != 0 {
+                return Err("no_new_privs changed root's euid on an ordinary exec");
+            }
+            if regained {
+                return Err("no_new_privs let root regain a dropped capability across exec");
+            }
+            Ok(())
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_root_exec_regenerates_permitted);
+
+/// An execute-only binary makes the new image non-dumpable (`would_dump`:
+/// `inode_permission(MAY_READ)` fails -> `BINPRM_FLAGS_ENFORCE_NONDUMP`),
+/// and a readable one leaves it dumpable.
+fn smoke_abi_fsx_exec_unreadable_binary_is_not_dumpable() -> TestResult {
+    const CALLER: u32 = 1600;
+    with_memfs(
+        "/abi-execonly",
+        "abi-execonly",
+        &[("prog", b"\x7fELF")],
+        || {
+            let task = crate::handlers::current_task_id();
+            let path = "/abi-execonly/prog";
+            for (mode, want_dumpable, msg) in [
+                (
+                    0o711u64,
+                    false,
+                    "an execute-only binary left the new image dumpable",
+                ),
+                (
+                    0o755u64,
+                    true,
+                    "a readable binary made the new image non-dumpable",
+                ),
+            ] {
+                stage_root_owned(b"/abi-execonly/prog\0", mode)?;
+                crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+                // No CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH: the mode decides.
+                crate::handlers::__test_set_caps(task, 0, 0);
+                crate::handlers::__test_set_dumpable_for_test(task, !want_dumpable);
+                let _ = crate::handlers::__test_bprm_fill_uid(task, path);
+                let dumpable = crate::handlers::__test_dumpable(task);
+                creds_reset();
+                if dumpable != want_dumpable {
+                    return Err(msg);
+                }
+            }
+            Ok(())
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_exec_unreadable_binary_is_not_dumpable
+);
+
+/// Drop the harness task to `uid`/`gid` the way a login does (setresgid +
+/// setresuid from root). Unlike `__test_set_fsids` this also empties the
+/// permitted set (`cap_emulate_setxuid`), which is the state an ordinary
+/// unprivileged process is in.
+fn drop_to(uid: u32, gid: u32) -> Result<(), &'static str> {
+    let (u, g) = (uid as u64, gid as u64);
+    if call(Syscall::Setresgid.raw(), a2(g, g, g)) != Some(0)
+        || call(Syscall::Setresuid.raw(), a2(u, u, u)) != Some(0)
+    {
+        creds_reset();
+        return Err("dropping to the unprivileged fixture uid failed");
+    }
+    Ok(())
+}
+
+/// The harness task's `getresuid`.
+fn current_resuid() -> Result<(u32, u32, u32), &'static str> {
+    let (mut r, mut e, mut s) = (u32::MAX, u32::MAX, u32::MAX);
+    let got = call(
+        Syscall::Getresuid.raw(),
+        a2(
+            &mut r as *mut u32 as u64,
+            &mut e as *mut u32 as u64,
+            &mut s as *mut u32 as u64,
+        ),
+    );
+    if got != Some(0) {
+        return Err("getresuid failed");
+    }
+    Ok((r, e, s))
+}
+
+/// `AT_SECURE` (`bprm->secureexec`) is raised exactly when Linux raises it:
+///
+/// ```text
+/// if (id_changed || !uid_eq(new->euid, old->uid) ||
+///     !gid_eq(new->egid, old->gid) ||
+///     (!__is_real(root_uid, new) &&
+///      (effective || __cap_grew(permitted, ambient, new))))
+///         bprm->secureexec = 1;
+/// ```
+///
+/// It is what glibc's secure mode keys on (LD_PRELOAD / LD_LIBRARY_PATH
+/// ignored, dangerous environment scrubbed), so a set-user-ID exec that
+/// does not raise it runs attacker-chosen libraries with the file owner's
+/// privilege, and an ordinary exec that does raise it breaks programs
+/// that rely on their environment.
+fn smoke_abi_fsx_exec_secureexec_decision() -> TestResult {
+    const CALLER: u32 = 1700;
+    with_memfs("/abi-secure", "abi-secure", &[("prog", b"\x7fELF")], || {
+        let task = crate::handlers::current_task_id();
+        let path = "/abi-secure/prog";
+        let cpath = b"/abi-secure/prog\0";
+        for (mode, drop, want, msg) in [
+            (
+                0o4755u64,
+                true,
+                true,
+                "a set-user-ID exec did not set AT_SECURE",
+            ),
+            (
+                0o755,
+                true,
+                false,
+                "an ordinary exec by an unprivileged uid set AT_SECURE",
+            ),
+            (
+                0o755,
+                false,
+                false,
+                "an ordinary exec by root set AT_SECURE",
+            ),
+            (
+                0o2745,
+                true,
+                false,
+                "S_ISGID without group-execute set AT_SECURE",
+            ),
+            (
+                0o2755,
+                true,
+                true,
+                "a set-group-ID exec did not set AT_SECURE",
+            ),
+        ] {
+            stage_root_owned(cpath, mode)?;
+            if drop {
+                drop_to(CALLER, CALLER)?;
+            }
+            let secure = crate::handlers::__test_exec_credentials(task, path);
+            creds_reset();
+            if secure != want {
+                return Err(msg);
+            }
+        }
+        // A non-root uid still holding a permitted set: `__cap_grew(permitted,
+        // ambient)` — the new image holds privilege its uid does not imply.
+        stage_root_owned(cpath, 0o755)?;
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let secure = crate::handlers::__test_exec_credentials(task, path);
+        creds_reset();
+        if !secure {
+            return Err("a non-root exec that keeps permitted capabilities did not set AT_SECURE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_exec_secureexec_decision);
+
+/// A traced task gains nothing from a set-user-ID binary unless its tracer
+/// holds CAP_SYS_PTRACE (`cap_bprm_creds_from_file`'s
+/// `!ptracer_capable(current, new->user_ns)` downgrade: without CAP_SETUID
+/// the euid falls back to the real uid). Otherwise an unprivileged
+/// debugger would own a root process the moment it exec'd `su`.
+///
+/// The downgraded exec is still `secureexec`: `id_changed` is computed
+/// before the downgrade and never recomputed.
+fn smoke_abi_fsx_setuid_exec_under_unprivileged_tracer() -> TestResult {
+    const OWNER: u32 = 4800;
+    const CALLER: u32 = 1800;
+    const TRACER: u64 = 0x7e57_7ace;
+    with_memfs("/abi-traced", "abi-traced", &[("prog", b"\x7fELF")], || {
+        let task = crate::handlers::current_task_id();
+        let path = "/abi-traced/prog";
+        let cpath = b"/abi-traced/prog\0";
+        for (tracer_caps, want_euid, msg) in [
+            (
+                0u64,
+                CALLER,
+                "a tracer without CAP_SYS_PTRACE let a set-user-ID exec raise euid",
+            ),
+            (
+                !0u64,
+                OWNER,
+                "a CAP_SYS_PTRACE tracer suppressed a set-user-ID transition",
+            ),
+        ] {
+            creds_reset();
+            // chown to OWNER first: a chown clears the set-user-ID bit.
+            if call(
+                Syscall::Chown.raw(),
+                a2(cpath.as_ptr() as u64, OWNER as u64, OWNER as u64),
+            ) != Some(0)
+                || call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) != Some(0)
+            {
+                return Err("staging the set-user-ID binary failed");
+            }
+            drop_to(CALLER, CALLER)?;
+            crate::handlers::__test_set_caps(TRACER, tracer_caps, tracer_caps);
+            crate::ptrace::__test_set_tracer(task, Some(TRACER));
+            let secure = crate::handlers::__test_exec_credentials(task, path);
+            crate::ptrace::__test_set_tracer(task, None);
+            let (_, euid, _) = current_resuid()?;
+            creds_reset();
+            if euid != want_euid {
+                return Err(msg);
+            }
+            if !secure {
+                return Err("a (possibly downgraded) set-user-ID exec did not set AT_SECURE");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setuid_exec_under_unprivileged_tracer
 );
 
 /// Writing to a file strips its set-user-ID bit.

@@ -16,7 +16,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -61,6 +61,9 @@ pub(crate) struct OpenFileDescription {
     /// on Linux.
     status_flags: AtomicU32,
     pub(crate) position_lock: narf_lib::mutex::Mutex<()>,
+    /// Linux `FMODE_ATOMIC_POS`, cached on first use: 0 unknown, 1 set, 2 clear.
+    /// See [`OpenFileDescription::locks_position`].
+    atomic_pos: AtomicU8,
     /// Index into the bounded inode/FileOps append-lock shard table.
     append_lock_index: usize,
     /// Linux `file::f_owner` analogue. Ownership, configured signal and the
@@ -174,6 +177,34 @@ fn append_lock_index(ops: &Arc<dyn FileOps>) -> usize {
 }
 
 impl OpenFileDescription {
+    /// Whether read/write/lseek serialize on this description's position —
+    /// Linux `fdget_pos()`, which takes `f_pos_lock` only for files with
+    /// `FMODE_ATOMIC_POS`. `do_dentry_open` sets that for regular files and
+    /// directories alone: anon-inode files (eventfd, signalfd, timerfd,
+    /// inotify, pidfd, ...), ttys, sockets and pipes never lock their
+    /// position. Taking the lock anyway deadlocks a blocking reader against
+    /// a writer sharing its description: the reader parks holding it (its
+    /// syscall frame stays alive on its own stack) while a fork child's
+    /// `write()` to the same eventfd waits on it forever.
+    ///
+    /// Decided from the file type on first use and cached — the type of an
+    /// open file never changes — and first use is outside any fd-table lock,
+    /// so a `stat()` that has to consult its backend cannot stall the table.
+    pub(crate) fn locks_position(&self, ops: &dyn FileOps) -> bool {
+        match self.atomic_pos.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let atomic = matches!(
+                    ops.stat().mode.file_type,
+                    narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+                );
+                self.atomic_pos
+                    .store(if atomic { 1 } else { 2 }, Ordering::Relaxed);
+                atomic
+            }
+        }
+    }
     /// This description's identity, used as the owner of its OFD locks.
     ///
     /// The same address `Arc::as_ptr` yields, and the same address `Drop`
@@ -566,6 +597,7 @@ impl FdTable {
             }),
             status_flags: AtomicU32::new(entry.status_flags),
             position_lock: narf_lib::mutex::Mutex::new(()),
+            atomic_pos: AtomicU8::new(0),
             append_lock_index: append_lock_index(&entry.ops),
             fasync: IrqSafeSpinLock::new(FasyncConfig {
                 owner: FasyncOwner::None,
@@ -1258,6 +1290,10 @@ unsafe fn write_user_termios2(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
 /// therefore visible to the shell reading `/dev/console` and vice versa.
 pub struct ConsoleFile;
 
+/// `/dev/console`'s device number, `MKDEV(TTYAUX_MAJOR, 1)` in Linux's
+/// `new_encode_dev` form.
+const CONSOLE_RDEV: u64 = (5 << 8) | 1;
+
 impl ConsoleFile {
     pub const fn new() -> Self {
         Self
@@ -1335,11 +1371,9 @@ pub const TIOCGPGRP: u32 = 0x540F;
 /// `ioctl(fd, TIOCSPGRP, &pid_t)` — set foreground process group.
 pub const TIOCSPGRP: u32 = 0x5410;
 /// `ioctl(fd, KDGKBMODE, &int)` — query the keyboard translation mode.
-/// VT-console keyboard control; NARF has no VT, so it reports the
-/// default `K_XLATE` (0) so the query succeeds.
 pub const KDGKBMODE: u32 = 0x4B44;
 /// `ioctl(fd, KDSKBMODE, int)` — set the keyboard translation mode.
-/// Accepted and ignored (no VT keyboard state to change).
+/// Validated and stored per VT (`narf_filesystem::vt`).
 pub const KDSKBMODE: u32 = 0x4B45;
 /// `ioctl(fd, KDSIGACCEPT, int)` — nominate the signal delivered on the
 /// magic "keyboard request" (kbrequest) SysRq. systemd-PID-1 arms this
@@ -1407,6 +1441,18 @@ pub fn __test_reset_tty() {
 }
 
 impl FileOps for ConsoleFile {
+    /// init's fds 0/1/2 are, on Linux, `console_on_rootfs`'s open of
+    /// `/dev/console` (TTYAUX_MAJOR 5, minor 1): report that node's
+    /// `st_rdev` and devfs inode so `ttyname`, which matches `/proc/self/fd/N`
+    /// against a `stat` of the named node, finds `/dev/console`.
+    fn rdev(&self) -> u64 {
+        CONSOLE_RDEV
+    }
+
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(CONSOLE_RDEV)
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Route through the single shared console line discipline
         // (`narf_filesystem::console_tty`), the same path /dev/console
@@ -1664,18 +1710,29 @@ impl FileOps for ConsoleFile {
                 narf_filesystem::console_tty::set_fg_pgrp(pgrp);
                 Ok(0)
             }
-            KDSIGACCEPT | KDSKBMODE => {
-                // VT keyboard/kbrequest control. NARF drives a single serial
-                // console with no VT layer, so there is no kbrequest source
-                // or keyboard-translation state to change — accept and no-op
-                // so systemd's early-init arming step succeeds instead of
-                // logging "Inappropriate ioctl for device".
+            KDSIGACCEPT => {
+                // No VT kbrequest source to route a signal through — accept
+                // and no-op so systemd's early-init arming step succeeds
+                // instead of logging "Inappropriate ioctl for device".
                 Ok(0)
             }
+            KDSKBMODE => {
+                // `vt_do_kdskbmode` on the console's VT (the active one),
+                // sharing state with `/dev/ttyN`: one of the five modes, else
+                // -EINVAL; `perm` required (CAP_SYS_TTY_CONFIG here — see
+                // `devfs_vt`'s LINUX-GAP).
+                if !narf_filesystem::caller_capable(26) {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                narf_filesystem::vt::set_kbd_mode(narf_filesystem::vt::active_vt(), arg as u32)
+                    .map(|()| 0)
+                    .map_err(|()| FsError::InvalidData)
+            }
             KDGKBMODE => {
-                // Report the default keyboard mode `K_XLATE` (0). `arg` is an
-                // `int *` out-parameter.
-                let bytes = 0i32.to_le_bytes();
+                // `vt_do_kdgkbmode` for the console's VT. This used to report
+                // 0 — which is `K_RAW`, not `K_XLATE`. `arg` is an `int *`.
+                let mode = narf_filesystem::vt::kbd_mode(narf_filesystem::vt::active_vt()) as i32;
+                let bytes = mode.to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
                 // little-endian encoding of the `int` keyboard mode.
@@ -1826,11 +1883,34 @@ pub fn share(parent: u64, child: u64) -> usize {
     n
 }
 
+/// Give `task_id` a private copy of its fd table if it currently shares one
+/// with a CLONE_FILES sibling — `kernel/fork.c::unshare_fd` /
+/// `unshare_files`: `if ((unshare_flags & CLONE_FILES) &&
+/// (fd && atomic_read(&fd->count) > 1)) *new_fdp = dup_fd(fd, ...)`. The
+/// siblings keep the original table; open file descriptions are shared
+/// between the two copies exactly as after a fork. A task that already owns
+/// its table (or has none) is left alone. Returns whether a copy was made.
+pub fn unshare_table(task_id: u64) -> bool {
+    let shared = TABLES[table_shard(task_id)]
+        .tables
+        .lock()
+        .get(&task_id)
+        // One reference is the map's own entry; any other is a sharer's.
+        .is_some_and(|arc| Arc::strong_count(arc) > 1);
+    if shared {
+        // `fork(t, t)` snapshots t's current table into a fresh Arc and
+        // installs it under t, replacing the shared one.
+        fork(task_id, task_id);
+    }
+    shared
+}
+
 /// Close every `FD_CLOEXEC`-marked fd for `task_id` (the exec path).
 /// Returns the count closed; no-op if the task has no table (never
-/// opened an fd). Shares one fd table with CLONE_FILES siblings, so a
-/// CLOEXEC close is visible to them too — matching Linux, where exec
-/// unshares files first; NARF's exec implies a non-shared table.
+/// opened an fd). The caller must have made the table private first
+/// ([`unshare_table`]): Linux `begin_new_exec` runs `unshare_files()` before
+/// `do_close_on_exec`, so a CLONE_FILES sibling never loses its descriptors
+/// to another task's exec.
 pub fn close_cloexec(task_id: u64) -> usize {
     let arc = match TABLES[table_shard(task_id)]
         .tables

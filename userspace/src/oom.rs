@@ -75,10 +75,14 @@ impl ProcessOomKiller {
         }
 
         let (tid, pid, rss_pages, _badness, address_space) = best?;
+        report_kill(tid, pid, rss_pages);
         // Deliver an uncatchable SIGKILL; the victim exits at its next
         // return-to-user, and the async reaper reclaims its anonymous frames
         // now rather than waiting for that exit.
-        crate::handlers::raise_signal_pending(tid, SIGKILL);
+        // `do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID)`:
+        // the whole victim process dies.
+        let _ =
+            crate::handlers::raise_group_signal(tid, SIGKILL, crate::handlers::GroupSigInfo::None);
         Some(OomVictim {
             pid,
             tid,
@@ -89,6 +93,25 @@ impl ProcessOomKiller {
             retries_left: 0,
         })
     }
+}
+
+/// Linux `__oom_kill_process`'s "Out of memory: Killed process N (comm)
+/// anon-rss:…" line, so a runaway process is named rather than a bare pid.
+/// Allocation-free: it runs when the heap may be exhausted.
+fn report_kill(tid: u64, pid: u64, rss_pages: usize) {
+    use core::fmt::Write as _;
+    let mut comm = [0u8; 16];
+    let n = crate::handlers::proc_comm_of_task_into(tid, &mut comm);
+    let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+    let stats = narf_memory::frame::stats();
+    let _ = writeln!(
+        narf_console::Writer,
+        "  oom: Out of memory: Killed process {pid} ({comm}) anon-rss:{}kB oom_score_adj:{} free:{}kB total:{}kB",
+        rss_pages * 4,
+        crate::handlers::proc_oom_adj_of(pid),
+        stats.free * 4,
+        stats.total * 4,
+    );
 }
 
 impl OomKiller for ProcessOomKiller {

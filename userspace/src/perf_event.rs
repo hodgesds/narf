@@ -3379,6 +3379,17 @@ impl Drop for PerfEventFile {
 }
 
 impl FileOps for PerfEventFile {
+    /// Linux `perf_event_open` uses `anon_inode_getfile("[perf_event]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             // Linux exposes a pinned group which could not be scheduled as

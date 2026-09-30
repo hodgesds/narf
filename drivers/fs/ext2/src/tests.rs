@@ -719,6 +719,39 @@ fn smoke_ext2_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_mount_ramblock_round_trip);
 
+/// A mounted volume answers `FsInstance::reconfigure` — the step
+/// `mount -o remount` reaches with the fstab's ext4 parameters. The volume
+/// used to inherit the trait's `Unsupported` for every string, so
+/// `systemd-remount-fs` failed -EINVAL on any fstab line with an ext4
+/// option in it.
+fn smoke_ext2_volume_reconfigure_takes_ext4_params() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("Ext2Volume::mount failed"),
+    };
+    if volume
+        .reconfigure("commit=60,errors=remount-ro,discard")
+        .is_err()
+    {
+        return TestResult::Fail("reconfigure refused fstab ext4 parameters");
+    }
+    match volume.reconfigure("commit=60,not_an_ext4_option") {
+        Err(FsError::Unsupported) => TestResult::Pass,
+        _ => TestResult::Fail("reconfigure accepted a parameter ext4 does not have"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_volume_reconfigure_takes_ext4_params
+);
+
 fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -900,11 +933,21 @@ kernel_test_in!(
 /// `map_block` → `map_block_extents` — end to end (the thing a real
 /// `mkfs.ext4` rootfs uses that a legacy ext2 image never touches).
 fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
+    build_ext4_extent_image_sized(file_data, 128)
+}
+
+/// [`build_ext4_extent_image`] with `inode_size`-byte inodes. At 256 every
+/// inode carries `i_extra_isize = 32`, leaving the in-inode xattr region
+/// Linux's mkfs.ext4 default gives; the inode table grows to 8 blocks and
+/// the directory/file data move to blocks 13/14.
+fn build_ext4_extent_image_sized(file_data: &[u8], inode_size: u16) -> Vec<u8> {
     const BS: usize = 1024;
     const TOTAL_BLOCKS: u32 = 64;
     const INODES_PER_GROUP: u32 = 32;
-    const INODE_SIZE: u16 = 128;
     const BLOCKS_PER_GROUP: u32 = 64;
+    let table_blocks = INODES_PER_GROUP as usize * inode_size as usize / BS;
+    let dir_blk = 5 + table_blocks;
+    let file_blk = dir_blk + 1;
 
     let mut img = vec![0u8; BS * TOTAL_BLOCKS as usize];
 
@@ -918,8 +961,12 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
     put_u32(&mut img, sb + 40, INODES_PER_GROUP);
     put_u16(&mut img, sb + 56, 0xEF53); // magic
     put_u32(&mut img, sb + 76, 1); // s_rev_level = 1
-    put_u16(&mut img, sb + 88, INODE_SIZE);
+    put_u16(&mut img, sb + 88, inode_size);
     put_u32(&mut img, sb + 96, 0x40); // s_feature_incompat = INCOMPAT_EXTENTS
+    if inode_size > 128 {
+        put_u16(&mut img, sb + 0x15C, 32); // s_min_extra_isize
+        put_u16(&mut img, sb + 0x15E, 32); // s_want_extra_isize
+    }
 
     // Block group descriptor at start of block 2.
     let gdt = 2 * BS;
@@ -928,9 +975,10 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
     put_u32(&mut img, gdt + 8, 5); // inode table
     put_u16(&mut img, gdt + 16, 1); // used dirs (root)
 
-    // Bitmaps (blocks 3, 4) — mark blocks 0..=10 and inodes 1,2,12 used.
-    img[3 * BS] = 0xFF;
-    img[3 * BS + 1] = 0x07;
+    // Bitmaps (blocks 3, 4) — mark blocks 0..=file_blk and inodes 1,2,12 used.
+    for bit in 0..=file_blk {
+        img[3 * BS + bit / 8] |= 1 << (bit % 8);
+    }
     img[4 * BS] = 0b0000_0011;
     img[4 * BS + 1] = 0b0000_1000;
 
@@ -938,7 +986,10 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
 
     // Write an extent-tree root (header + one leaf extent) into an inode's
     // 60-byte i_block region, mapping logical block 0 → `phys` for `len`.
-    fn write_extent_root(img: &mut [u8], inode_off: usize, phys: u32, len: u16) {
+    fn write_extent_root(img: &mut [u8], inode_off: usize, phys: u32, len: u16, isize: u16) {
+        if isize > 128 {
+            put_u16(img, inode_off + 128, 32); // i_extra_isize
+        }
         put_u32(img, inode_off + 32, 0x0008_0000); // i_flags: EXT4_EXTENTS_FL
         let ib = inode_off + 40; // i_block[0]
         put_u16(img, ib, 0xF30A); // eh_magic
@@ -953,14 +1004,14 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
     }
 
     // Root directory inode (#2) at table index 1 — extent → dir data (blk 9).
-    let root_off = itab + INODE_SIZE as usize;
+    let root_off = itab + inode_size as usize;
     put_u16(&mut img, root_off, 0x4000 | 0o755); // S_IFDIR | 0755
     put_u32(&mut img, root_off + 4, BS as u32); // size = 1 block
     put_u32(&mut img, root_off + 28, (BS / 512) as u32); // i_blocks
-    write_extent_root(&mut img, root_off, 9, 1);
+    write_extent_root(&mut img, root_off, dir_blk as u32, 1, inode_size);
 
     // File inode (#12) at table index 11 — extent → file data (blk 10).
-    let file_off = itab + 11 * INODE_SIZE as usize;
+    let file_off = itab + 11 * inode_size as usize;
     put_u16(&mut img, file_off, 0x8000 | 0o644); // S_IFREG | 0644
     put_u32(&mut img, file_off + 4, file_data.len() as u32);
     put_u32(
@@ -969,11 +1020,11 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
         file_data.len().div_ceil(512) as u32,
     );
     if !file_data.is_empty() {
-        write_extent_root(&mut img, file_off, 10, 1);
+        write_extent_root(&mut img, file_off, file_blk as u32, 1, inode_size);
     }
 
     // Root directory data (block 9): ".", "..", "data" → inode 12.
-    let rd = 9 * BS;
+    let rd = dir_blk * BS;
     put_u32(&mut img, rd, 2);
     put_u16(&mut img, rd + 4, 12);
     img[rd + 6] = 1;
@@ -995,7 +1046,7 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
 
     // File data (block 10).
     if !file_data.is_empty() {
-        let data_off = 10 * BS;
+        let data_off = file_blk * BS;
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
     }
 
@@ -1477,6 +1528,498 @@ fn smoke_ext4_mount_extent_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_mount_extent_round_trip);
+
+// ── ext4 extent-tree write path ─────────────────────────────────────
+//
+// Every regular file Linux creates on ext4 carries EXT4_EXTENTS_FL. The
+// driver could overwrite such a file in place but answered `Unsupported`
+// (-EINVAL at write(2)) for any block that needed a new mapping, and for
+// truncate/unlink — so glibc's updwtmpx append to /var/log/wtmp failed and
+// systemd-update-utmp reported "Failed to write utmp record: Invalid
+// argument".
+
+/// Mount `img`, returning the volume and the `data` file.
+#[allow(clippy::type_complexity)]
+fn mount_ext4_data(
+    device: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
+) -> Result<
+    (
+        alloc::sync::Arc<crate::volume::Ext2Volume<narf_block::ram::RamBlockDevice>>,
+        alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    ),
+    &'static str,
+> {
+    use narf_filesystem::FsInstance;
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return Err("ext4 extent fixture did not mount"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return Err("lookup of the extent-mapped `data` failed"),
+    };
+    Ok((volume, file))
+}
+
+/// glibc updwtmpx's shape — 384-byte appends — plus writes into holes
+/// that force more than the root's four extents (`ext4_ext_grow_indepth`),
+/// on a metadata_csum volume; everything reads back after a remount.
+fn smoke_ext4_extent_file_grows_and_survives_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    let payload = b"wtmp-seed";
+    let mut image = build_ext4_extent_image(payload);
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("could not sign the metadata_csum fixture");
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let mut expected: Vec<u8> = payload.to_vec();
+    // Twenty 384-byte records appended, like updwtmpx.
+    for i in 0..20u8 {
+        let rec = [i.wrapping_add(1); 384];
+        let off = expected.len() as u64;
+        match poll_once(file.write(off, &rec)) {
+            Some(Ok(384)) => {}
+            _ => return TestResult::Fail("appending to an extent-mapped file failed"),
+        }
+        expected.extend_from_slice(&rec);
+    }
+    // Writes into holes far past EOF: five more discontiguous extents.
+    for block in [14u64, 17, 20, 23, 26] {
+        let off = block * 1024 + 7;
+        match poll_once(file.write(off, b"hole")) {
+            Some(Ok(4)) => {}
+            _ => return TestResult::Fail("writing into an extent-file hole failed"),
+        }
+        if expected.len() < off as usize {
+            expected.resize(off as usize, 0);
+        }
+        expected.truncate(off as usize);
+        expected.extend_from_slice(b"hole");
+    }
+    drop(file);
+    drop(volume);
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("the grown extent volume did not remount"),
+    };
+    if file.stat().size != expected.len() as u64 {
+        return TestResult::Fail("i_size after appends and hole writes is wrong");
+    }
+    let mut got = vec![0u8; expected.len()];
+    let mut at = 0usize;
+    while at < got.len() {
+        match poll_once(file.read(at as u64, &mut got[at..])) {
+            Some(Ok(0)) | None => break,
+            Some(Ok(n)) => at += n,
+            Some(Err(_)) => return TestResult::Fail("reading the grown extent file failed"),
+        }
+    }
+    if got != expected {
+        return TestResult::Fail("extent file contents differ after remount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_file_grows_and_survives_remount
+);
+
+/// `truncate(0)` frees the tree (then the file grows again), and unlink of
+/// an extent-mapped file succeeds — both answered `Unsupported` before.
+fn smoke_ext4_extent_truncate_and_unlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"truncate-me"));
+    let (volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !matches!(poll_once(file.truncate(0)), Some(Ok(()))) {
+        return TestResult::Fail("truncate(0) of an extent-mapped file failed");
+    }
+    if file.stat().size != 0 {
+        return TestResult::Fail("truncate(0) left a nonzero size");
+    }
+    if !matches!(poll_once(file.write(0, b"again")), Some(Ok(5))) {
+        return TestResult::Fail("writing after truncate(0) failed");
+    }
+    let mut buf = [0u8; 8];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(5))) || &buf[..5] != b"again" {
+        return TestResult::Fail("data written after truncate(0) did not read back");
+    }
+    use narf_filesystem::FsInstance;
+    let root = volume.root();
+    if !matches!(poll_once(root.unlink("data")), Some(Ok(()))) {
+        return TestResult::Fail("unlink of an extent-mapped file failed");
+    }
+    match poll_once(root.lookup_async("data")) {
+        Some(Err(FsError::NotFound)) => TestResult::Pass,
+        _ => TestResult::Fail("an unlinked extent file is still visible"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_truncate_and_unlink);
+
+/// A write into an UNWRITTEN (fallocated) extent converts just that block:
+/// the rest of the extent still reads as zeros, and the written block holds
+/// the new bytes with zeros around them (`ext4_split_convert_extents`).
+fn smoke_ext4_extent_write_converts_unwritten() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    let mut image = build_ext4_extent_image(b"x");
+    let file_ib = 5 * 1024 + 11 * 128 + 40;
+    // One 3-block unwritten extent over blocks 10..=12 (ee_len > 32768).
+    put_u16(&mut image, file_ib + 16, 3 + 0x8000);
+    put_u32(&mut image, 5 * 1024 + 11 * 128 + 4, 3 * 1024); // i_size
+    image[3 * 1024 + 1] = 0x1F; // blocks 8..=12 in use
+                                // Garbage on disk under the unwritten extent must never surface.
+    for b in &mut image[10 * 1024..13 * 1024] {
+        *b = 0xAA;
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !matches!(poll_once(file.write(1024 + 5, b"XY")), Some(Ok(2))) {
+        return TestResult::Fail("writing into an unwritten extent failed");
+    }
+    let mut got = vec![0u8; 3 * 1024];
+    let mut at = 0usize;
+    while at < got.len() {
+        match poll_once(file.read(at as u64, &mut got[at..])) {
+            Some(Ok(0)) | None => break,
+            Some(Ok(n)) => at += n,
+            Some(Err(_)) => return TestResult::Fail("reading the converted extent failed"),
+        }
+    }
+    let mut want = vec![0u8; 3 * 1024];
+    want[1024 + 5] = b'X';
+    want[1024 + 6] = b'Y';
+    if got != want {
+        return TestResult::Fail("unwritten blocks leaked stale data or lost the write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_write_converts_unwritten
+);
+
+/// A full volume answers `NoSpace` (-ENOSPC), the answer `ext4_mb_new_blocks`
+/// gives — not the `Unsupported` (-EINVAL) the driver gave for every grow.
+fn smoke_ext4_extent_grow_on_full_volume_is_enospc() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    let mut image = build_ext4_extent_image(b"full");
+    for b in &mut image[3 * 1024..3 * 1024 + 8] {
+        *b = 0xFF;
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    match poll_once(file.write(4096, b"more")) {
+        Some(Err(FsError::NoSpace)) => TestResult::Pass,
+        _ => TestResult::Fail("growing an extent file on a full volume must be NoSpace"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_grow_on_full_volume_is_enospc
+);
+
+// ── ext4 extended attributes and POSIX ACLs ─────────────────────────
+//
+// The driver had no xattr store: every set answered `Unsupported`, so the
+// syscall layer returned -EOPNOTSUPP for `system.posix_acl_*`,
+// systemd-tmpfiles concluded the root filesystem has no ACLs, and
+// /var/log/journal never got its group:adm / group:wheel entries.
+
+/// uapi `system.posix_acl_*` bytes (version 2): user::rwx group::r-x
+/// group:<gid>:r-x mask::r-x other::---.
+fn uapi_group_acl(gid: u32) -> Vec<u8> {
+    use narf_filesystem::{
+        AclEntry, PosixAcl, ACL_GROUP, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER, ACL_USER_OBJ,
+    };
+    PosixAcl::from_entries(vec![
+        AclEntry::tagged(ACL_USER_OBJ, 7),
+        AclEntry::tagged(ACL_GROUP_OBJ, 5),
+        AclEntry::with_id(ACL_GROUP, gid, 5),
+        AclEntry::tagged(ACL_MASK, 5),
+        AclEntry::tagged(ACL_OTHER, 0),
+    ])
+    .to_xattr()
+}
+
+fn count_used_blocks(image: &[u8]) -> u32 {
+    image[3 * 1024..3 * 1024 + 8]
+        .iter()
+        .map(|b| b.count_ones())
+        .sum()
+}
+
+/// tmpfiles' `a+ /var/log/journal ... d:group:adm:r-x,group:adm:r-x`: an
+/// access and a default ACL on a directory and a user xattr on a file land
+/// in the in-inode region and an xattr block, survive a remount, update the
+/// mode (`posix_acl_update_mode`), feed the VFS's `default_acl()` hook and
+/// DAC check, and list.
+fn smoke_ext4_xattr_acl_roundtrip_survives_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT as DEFAULT;
+    use narf_filesystem::{AclType, FsInstance, XATTR_NAME_POSIX_ACL_ACCESS as ACCESS};
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image_sized(b"j", 256));
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let adm = uapi_group_acl(4);
+    let wheel = uapi_group_acl(998);
+    let root = volume.root();
+    if root.access_acl_present() != Some(false) {
+        return TestResult::Fail("an xattr-free directory must say so cheaply");
+    }
+    if !matches!(poll_once(root.set_xattr(ACCESS, &adm, 0)), Some(Ok(()))) {
+        return TestResult::Fail("setting an access ACL on an ext4 directory failed");
+    }
+    if !matches!(poll_once(root.set_xattr(DEFAULT, &wheel, 0)), Some(Ok(()))) {
+        return TestResult::Fail("setting a default ACL on an ext4 directory failed");
+    }
+    if !matches!(poll_once(file.set_xattr(ACCESS, &adm, 0)), Some(Ok(()))) {
+        return TestResult::Fail("setting an access ACL on an ext4 file failed");
+    }
+    // A value too big for the inode body forces the external block.
+    let big = vec![0x5a; 300];
+    if !matches!(poll_once(file.set_xattr("user.big", &big, 0)), Some(Ok(()))) {
+        return TestResult::Fail("setting a 300-byte user xattr failed");
+    }
+    drop((file, root, volume));
+    let (volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("volume with xattrs did not remount"),
+    };
+    let root = volume.root();
+    if poll_once(root.get_xattr(ACCESS)).and_then(Result::ok) != Some(adm.clone())
+        || poll_once(root.get_xattr(DEFAULT)).and_then(Result::ok) != Some(wheel.clone())
+    {
+        return TestResult::Fail("directory ACLs did not survive the remount");
+    }
+    if root.access_acl_present() == Some(false) {
+        return TestResult::Fail("a directory with an ACL must not claim to have none");
+    }
+    if root.default_acl() != Some(wheel) {
+        return TestResult::Fail("DirOps::default_acl must hand the VFS the default ACL");
+    }
+    if poll_once(file.get_xattr(ACCESS)).and_then(Result::ok) != Some(adm)
+        || poll_once(file.get_xattr("user.big")).and_then(Result::ok) != Some(big)
+    {
+        return TestResult::Fail("file xattrs did not survive the remount");
+    }
+    // posix_acl_update_mode: the mode becomes user::rwx, mask r-x, other --- = 0750.
+    if root.dir_mode() & 0o777 != 0o750 || file.stat().mode.perms & 0o777 != 0o750 {
+        return TestResult::Fail("setting an access ACL did not rewrite the mode");
+    }
+    let names = poll_once(file.list_xattr())
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if names != b"system.posix_acl_access\0user.big\0" {
+        return TestResult::Fail("listxattr did not report both attributes");
+    }
+    // The VFS DAC check sees the ACL: gid 4 may read, gid 5 may not.
+    let acl = match poll_once(narf_filesystem::acl_of_file(file.as_ref(), AclType::Access)) {
+        Some(Ok(Some(acl))) => acl,
+        _ => return TestResult::Fail("acl_of_file did not decode the stored ACL"),
+    };
+    let owner = narf_filesystem::FileOwner {
+        uid: 0,
+        gid: 0,
+        perms: 0o750,
+        is_dir: false,
+    };
+    let read = narf_filesystem::AccessRequest {
+        read: true,
+        write: false,
+        exec: false,
+    };
+    let member = narf_filesystem::Accessor {
+        uid: 1000,
+        gid: 4,
+        ..Default::default()
+    };
+    let stranger = narf_filesystem::Accessor {
+        uid: 1000,
+        gid: 5,
+        ..Default::default()
+    };
+    if !narf_filesystem::posix_access_ok_with_acl(owner, &member, read, Some(&acl))
+        || narf_filesystem::posix_access_ok_with_acl(owner, &stranger, read, Some(&acl))
+    {
+        return TestResult::Fail("the stored ACL did not decide the DAC check");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_xattr_acl_roundtrip_survives_remount
+);
+
+/// 128-byte inodes (no in-inode region) on a metadata_csum volume: the ACL
+/// goes to a checksummed xattr block, which the remount verifies.
+fn smoke_ext4_xattr_block_metadata_csum_survives_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::XATTR_NAME_POSIX_ACL_ACCESS as ACCESS;
+    let mut image = build_ext4_extent_image(b"csum");
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("could not sign the metadata_csum fixture");
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let acl = uapi_group_acl(4);
+    if !matches!(poll_once(file.set_xattr(ACCESS, &acl, 0)), Some(Ok(()))) {
+        return TestResult::Fail("setting an ACL on a 128-byte inode failed");
+    }
+    drop((file, volume));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(_) => {
+            return TestResult::Fail("metadata_csum volume with an xattr block did not remount")
+        }
+    };
+    match poll_once(file.get_xattr(ACCESS)) {
+        Some(Ok(v)) if v == acl => TestResult::Pass,
+        _ => TestResult::Fail("the checksummed xattr block did not read back"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_xattr_block_metadata_csum_survives_remount
+);
+
+/// `posix_acl_chmod` keeps the mask in step with chmod, and unlinking the
+/// file releases its xattr block (`ext4_xattr_delete_inode`).
+fn smoke_ext4_acl_chmod_masks_and_unlink_frees_block() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{AclType, FsInstance, ACL_MASK, XATTR_NAME_POSIX_ACL_ACCESS as ACCESS};
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"chmod"));
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let before = count_used_blocks(&device.snapshot());
+    if !matches!(
+        poll_once(file.set_xattr(ACCESS, &uapi_group_acl(4), 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("setting an ACL failed");
+    }
+    if count_used_blocks(&device.snapshot()) != before + 1 {
+        return TestResult::Fail("a 128-byte inode's ACL must take one xattr block");
+    }
+    if !matches!(poll_once(file.set_perms(0o600)), Some(Ok(()))) {
+        return TestResult::Fail("chmod 0600 failed");
+    }
+    let acl = match poll_once(narf_filesystem::acl_of_file(file.as_ref(), AclType::Access)) {
+        Some(Ok(Some(acl))) => acl,
+        _ => return TestResult::Fail("the ACL vanished on chmod"),
+    };
+    if acl
+        .entries
+        .iter()
+        .find(|e| e.tag == ACL_MASK)
+        .map(|e| e.perm)
+        != Some(0)
+    {
+        return TestResult::Fail("chmod 0600 must set the ACL mask to ---");
+    }
+    drop(file);
+    if !matches!(poll_once(volume.root().unlink("data")), Some(Ok(()))) {
+        return TestResult::Fail("unlink of the ACL-carrying file failed");
+    }
+    // The data block and the xattr block both come back.
+    if count_used_blocks(&device.snapshot()) != before - 1 {
+        return TestResult::Fail("unlink must free the file's xattr block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_acl_chmod_masks_and_unlink_frees_block
+);
+
+/// Linux's refusals: a default ACL on a file (`acl ? -EACCES : 0`), an
+/// ACL whose entries are not a valid sequence (-EINVAL), an unknown
+/// `a_version` (`Unsupported`, which the syscall layer reports as
+/// -EOPNOTSUPP for an ACL name), XATTR_CREATE/XATTR_REPLACE (-EEXIST /
+/// -ENODATA), a missing attribute (-ENODATA), and a value no single block
+/// can hold (-ENOSPC without ea_inode).
+fn smoke_ext4_xattr_rejects_like_linux() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT as DEFAULT;
+    use narf_filesystem::{FsError, XATTR_NAME_POSIX_ACL_ACCESS as ACCESS};
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image_sized(b"neg", 256));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let set = |name: &str, value: &[u8], flags: u32| poll_once(file.set_xattr(name, value, flags));
+    if !matches!(
+        set(DEFAULT, &uapi_group_acl(4), 0),
+        Some(Err(FsError::PermissionDenied))
+    ) {
+        return TestResult::Fail("a default ACL on a regular file must be PermissionDenied");
+    }
+    // Removing a default ACL that cannot exist is a successful no-op.
+    if !matches!(poll_once(file.remove_xattr(DEFAULT)), Some(Ok(()))) {
+        return TestResult::Fail("removing a file's (absent) default ACL must succeed");
+    }
+    let mut bad_tag = uapi_group_acl(4);
+    bad_tag[4] = 0x40;
+    if !matches!(set(ACCESS, &bad_tag, 0), Some(Err(FsError::InvalidData))) {
+        return TestResult::Fail("an ACL with an unknown tag must be InvalidData");
+    }
+    let mut v1 = uapi_group_acl(4);
+    v1[0] = 1;
+    if !matches!(set(ACCESS, &v1, 0), Some(Err(FsError::Unsupported))) {
+        return TestResult::Fail("an ACL with a_version 1 must be Unsupported (EOPNOTSUPP)");
+    }
+    if !matches!(set("user.a", b"1", 1), Some(Ok(())))
+        || !matches!(set("user.a", b"2", 1), Some(Err(FsError::Busy)))
+    {
+        return TestResult::Fail("XATTR_CREATE on an existing name must be Busy (EEXIST)");
+    }
+    if !matches!(set("user.missing", b"x", 2), Some(Err(FsError::NotFound))) {
+        return TestResult::Fail("XATTR_REPLACE on a missing name must be NotFound (ENODATA)");
+    }
+    if !matches!(
+        poll_once(file.get_xattr("user.missing")),
+        Some(Err(FsError::NotFound))
+    ) || !matches!(
+        poll_once(file.remove_xattr("user.missing")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("get/remove of a missing xattr must be NotFound (ENODATA)");
+    }
+    if !matches!(
+        set("user.huge", &vec![1u8; 2048], 0),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("a value larger than a block must be NoSpace (ENOSPC)");
+    }
+    match poll_once(file.get_xattr("user.a")) {
+        Some(Ok(v)) if v == b"1" => TestResult::Pass,
+        _ => TestResult::Fail("a refused XATTR_CREATE clobbered the stored value"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_xattr_rejects_like_linux);
 
 fn smoke_ext2_read_partial_offset() -> TestResult {
     // Read from a non-zero offset in the middle of the data block to

@@ -54,7 +54,7 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
             } else if signum == 0 {
                 true
             } else {
-                deliver_signal_to_pgrp(pgrp, signum)
+                kill_pgrp_user(pgrp, signum)
             }
         }
         -1 => {
@@ -106,7 +106,7 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
             } else if signum == 0 {
                 true
             } else {
-                deliver_signal_to_pgrp(pgrp, signum)
+                kill_pgrp_user(pgrp, signum)
             }
         }
     };

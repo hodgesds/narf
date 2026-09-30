@@ -208,10 +208,21 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         };
         // resolve_cwd_path resolves against the cwd AND re-roots under
         // the task's chroot — applying apply_chroot again double-composes.
-        let path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, &effective));
+        let mut path_owned = dir_named.unwrap_or_else(|| resolve_cwd_path(task, &effective));
         // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
         // not its target; otherwise follow like plain stat.
-        let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let mut follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+        // A followed /proc/<pid>/fd/N magic link jumps to the fd's own file
+        // and stops there (`nd_jump_link`), so an O_PATH|O_NOFOLLOW fd on a
+        // symlink describes that symlink. See `proc_fd_magic_target`.
+        if follow_final {
+            if let Some(target) =
+                proc_fd_magic_target(task, &resolve_cwd_path_user(task, &effective))
+            {
+                path_owned = resolve_cwd_path(task, &target);
+                follow_final = false;
+            }
+        }
         let st = stat_ino_path_dir_aware_ext(&path_owned, follow_final);
         let is_mount_root = current_path_is_mount_root(&path_owned);
         let mnt = current_mount_id_at(&path_owned);
@@ -321,11 +332,10 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         stx_mtime: mtime,
         stx_ctime: ctime,
         stx_atime: atime,
-        stx_ino: if ino != 0 {
-            ino
-        } else {
-            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
-        },
+        // Every FileOps reports its inode (filesystem::inode_id); there is
+        // no synthetic fallback, which aliased same-size files and changed
+        // whenever a file did.
+        stx_ino: ino,
         // `tracked`, not `nlink != 0`: an O_TMPFILE inode has zero links
         // until `linkat` names it, and that zero is meaningful.
         stx_nlink: if attrs.tracked { attrs.nlink } else { 1 },

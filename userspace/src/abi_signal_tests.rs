@@ -796,8 +796,17 @@ fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
         const CLD_EXITED: i32 = 1;
         const CHILD_PID: u64 = 0x7799;
 
-        // Parent (FAKE_TASK) watches SIGCHLD.
+        // Parent (FAKE_TASK) blocks SIGCHLD and watches it through a
+        // signalfd, as systemd does. Unblocked SIG_DFL SIGCHLD would be
+        // discarded at generation (Linux `sig_ignored`).
         let mask = (1u64 << (SIGCHLD - 1)).to_le_bytes();
+        if call(
+            Syscall::Sigprocmask.raw(),
+            a3(0, mask.as_ptr() as u64, 0, 8),
+        ) != Some(0)
+        {
+            return Err("rt_sigprocmask(SIG_BLOCK, SIGCHLD) failed");
+        }
         let sfd = match call(
             Syscall::Signalfd.raw(),
             a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
@@ -826,10 +835,17 @@ fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
             return Err("SIGCHLD ssi_code was not CLD_EXITED");
         }
         match u32::from_le_bytes(rec[12..16].try_into().unwrap()) as u64 {
-            CHILD_PID => Ok(()),
-            0 => Err("SIGCHLD delivered ssi_pid == 0 — the child was not named"),
-            _ => Err("SIGCHLD named the wrong child pid"),
+            CHILD_PID => {}
+            0 => return Err("SIGCHLD delivered ssi_pid == 0 — the child was not named"),
+            _ => return Err("SIGCHLD named the wrong child pid"),
         }
+        // ssi_status @40: the exit code for CLD_EXITED (Linux
+        // do_notify_parent: si_status = exit_code >> 8; signalfd_copyinfo
+        // copies it for the SIL_CHLD layout).
+        if i32::from_le_bytes(rec[40..44].try_into().unwrap()) != 3 {
+            return Err("SIGCHLD ssi_status was not the child's exit code");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);
@@ -1070,6 +1086,90 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload
 );
+
+/// Read one signalfd record for `signum` sent by `send`, returning
+/// `(ssi_code, ssi_pid)`.
+fn signalfd_sender_of(
+    signum: u32,
+    send: impl FnOnce() -> Option<i64>,
+) -> Result<(i32, u32), &'static str> {
+    let sfd = signalfd_watching(signum)?;
+    if send() != Some(0) {
+        return Err("the send syscall did not return 0");
+    }
+    let mut rec = [0u8; 128];
+    if call(
+        Syscall::Read.raw(),
+        a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+    ) != Some(128)
+    {
+        return Err("signalfd read did not return one signalfd_siginfo record");
+    }
+    if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != signum {
+        return Err("signalfd record named the wrong signal");
+    }
+    Ok((
+        i32::from_le_bytes(rec[8..12].try_into().unwrap()),
+        u32::from_le_bytes(rec[12..16].try_into().unwrap()),
+    ))
+}
+
+// tkill/tgkill report SI_TKILL; kill reports SI_USER. Linux `do_tkill` builds
+// its siginfo with `prepare_kill_siginfo(sig, &info, PIDTYPE_PID)` and
+// `kill_something_info` with PIDTYPE_TGID, and `prepare_kill_siginfo` picks
+// `si_code = (type == PIDTYPE_PID) ? SI_TKILL : SI_USER`, `si_pid` = the
+// sender's tgid. glibc's SIGSETXID/SIGCANCEL handlers drop anything that is
+// not SI_TKILL from their own pid, so an SI_USER here hung every set*id() in a
+// multithreaded glibc process (CachyOS Xwayland -> kwin -> blank Plasma).
+fn smoke_abi_signal_tkill_tgkill_report_si_tkill() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SI_TKILL: i32 = -6;
+        let pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u64;
+        let tid = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid")? as u64;
+
+        let (code, sender) = signalfd_sender_of(SIGUSR1, || {
+            call(Syscall::Tgkill.raw(), a2(pid, tid, SIGUSR1 as u64))
+        })?;
+        if code != SI_TKILL {
+            return Err("tgkill signal should report ssi_code SI_TKILL (-6)");
+        }
+        if u64::from(sender) != pid {
+            return Err("tgkill signal should report the sender's pid");
+        }
+
+        let (code, sender) = signalfd_sender_of(SIGUSR1, || {
+            call(Syscall::Tkill.raw(), a1(tid, SIGUSR1 as u64))
+        })?;
+        if code != SI_TKILL {
+            return Err("tkill signal should report ssi_code SI_TKILL (-6)");
+        }
+        if u64::from(sender) != pid {
+            return Err("tkill signal should report the sender's pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_tgkill_report_si_tkill);
+
+fn smoke_abi_signal_kill_reports_si_user() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SI_USER: i32 = 0;
+        let pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u64;
+        let (code, sender) = signalfd_sender_of(SIGUSR1, || {
+            call(Syscall::Kill.raw(), a1(pid, SIGUSR1 as u64))
+        })?;
+        if code != SI_USER {
+            return Err("kill signal should report ssi_code SI_USER (0)");
+        }
+        if u64::from(sender) != pid {
+            return Err("kill signal should report the sender's pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_kill_reports_si_user);
 
 fn smoke_abi_signal_pidfd_send_signal_validation_order() -> TestResult {
     with_setup(|| {

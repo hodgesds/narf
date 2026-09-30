@@ -216,8 +216,13 @@ fn smoke_abi_ipc_mq_notify_si_pid() -> TestResult {
                 return Err("mq_timedsend into the empty queue did not succeed");
             }
 
-            // The receiver's queued siginfo must name the sender.
-            match crate::handlers::take_sigqueue_info(R_TASK, SIG as u32) {
+            // The notification is process-directed (Linux kill_pid_info with
+            // PIDTYPE_TGID), so it is queued on the receiver's shared set, and
+            // the siginfo must name the sender.
+            match crate::handlers::take_sigqueue_info(
+                crate::handlers::shared_pending_key(R_TASK),
+                SIG as u32,
+            ) {
                 Some((code, value, si_pid)) => {
                     if code != SI_MESGQ {
                         Err("mq notify siginfo si_code was not SI_MESGQ")

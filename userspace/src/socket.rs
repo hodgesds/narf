@@ -36,7 +36,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod inet6_dgram;
 mod inet_dgram;
 mod inet_port;
+mod sockopt;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
+pub use sockopt::{timeo_ns, SockOptExt};
 
 // ── POSIX-numbered constants ────────────────────────────────────
 
@@ -719,6 +721,10 @@ pub struct SocketFile {
     pub kind: u32,
     /// IPPROTO_* recorded at socket() time; surfaced via SO_PROTOCOL.
     pub protocol: u32,
+    /// This socket's sockfs inode. Linux `sock_alloc` gives every socket
+    /// (each end of a socketpair, each accepted connection) its own
+    /// `new_inode_pseudo(sock_mnt->mnt_sb)` numbered by `get_next_ino`.
+    inode: narf_filesystem::inode_id::InodeId,
     state: IrqSafeSpinLock<SocketState>,
     /// Per-socket option storage. Setsockopt writes here; getsockopt
     /// reads. Values that affect packet shape (TCP_NODELAY,
@@ -966,9 +972,11 @@ pub struct SockOptions {
     pub ip_recvttl: bool,
     pub ip_mtu: u32,
     pub ip_multicast_ttl: u32,
-    /// IP_FREEBIND / IP_TRANSPARENT: permit binding an address no local
-    /// interface owns (`inet_addr_valid_or_nonlocal`).
+    /// IP_FREEBIND (and IPV6_FREEBIND, the same inet bit): permit binding
+    /// an address no local interface owns (`inet_addr_valid_or_nonlocal`).
     pub ip_freebind: bool,
+    /// Options owned by `socket/sockopt.rs`.
+    pub ext: SockOptExt,
 }
 
 impl Default for SockOptions {
@@ -1022,6 +1030,7 @@ impl Default for SockOptions {
             ip_mtu: 1500,
             ip_multicast_ttl: 1,
             ip_freebind: false,
+            ext: SockOptExt::default(),
         }
     }
 }
@@ -1636,6 +1645,7 @@ impl SocketFile {
             domain,
             kind,
             protocol,
+            inode: narf_filesystem::inode_id::PseudoFs::Sock.new_inode(),
             state: IrqSafeSpinLock::new(state),
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
@@ -2702,9 +2712,6 @@ const CAP_NET_BIND_SERVICE: u32 = 10;
 /// `ip_unprivileged_port_start` default: lower ports need
 /// CAP_NET_BIND_SERVICE (`inet_port_requires_bind_service`).
 const INET_PROT_SOCK: u16 = 1024;
-/// `IP_FREEBIND` / `IP_TRANSPARENT` (include/uapi/linux/in.h).
-const IP_FREEBIND: u32 = 15;
-const IP_TRANSPARENT: u32 = 19;
 
 /// `__inet_bind` / `raw_bind`: `inet_addr_valid_or_nonlocal` — without
 /// IP_FREEBIND the address must be INADDR_ANY, local (all of 127/8 is on
@@ -2775,6 +2782,14 @@ pub fn parse_sockaddr_in(addr: &SockAddr) -> Option<(u32, u16)> {
 impl FileOps for SocketFile {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
+    }
+
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
     }
 
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -4333,6 +4348,9 @@ impl SocketFile {
         if level == SOL_SOCKET && name != SO_BINDTODEVICE && value.len() < 4 {
             return SocketOpResult::Err(SockError::InvalidArg);
         }
+        if let Some(r) = self.sockopt_set_ext(level, name, value) {
+            return r;
+        }
         if level == SOL_NETLINK {
             // `netlink_setsockopt` reads the int only when
             // `optlen >= sizeof(int)`; a shorter value is treated as 0.
@@ -4472,7 +4490,12 @@ impl SocketFile {
             if !classic_filter_is_valid(&program) {
                 return SocketOpResult::Err(SockError::InvalidArg);
             }
-            self.options.lock().classic_filter = Some(program);
+            // `__sk_attach_prog`: a locked filter cannot be replaced.
+            let mut o = self.options.lock();
+            if o.ext.filter_locked {
+                return SocketOpResult::Err(SockError::PermDenied);
+            }
+            o.classic_filter = Some(program);
             return SocketOpResult::Ok(0);
         }
         // `do_ipv6_setsockopt(IPV6_V6ONLY)` rejects a short integer and any
@@ -4502,13 +4525,6 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
-            (SOL_SOCKET, SO_REUSEPORT) => match read_u32(value) {
-                Ok(v) => {
-                    opts.reuseport = v != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(e) => SocketOpResult::Err(e),
-            },
             (SOL_SOCKET, SO_KEEPALIVE) => match read_u32(value) {
                 Ok(v) => {
                     opts.keepalive = v != 0;
@@ -4519,13 +4535,6 @@ impl SocketFile {
             (SOL_SOCKET, SO_BROADCAST) => match read_u32(value) {
                 Ok(v) => {
                     opts.broadcast = v != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(e) => SocketOpResult::Err(e),
-            },
-            (SOL_SOCKET, SO_PASSCRED) => match read_u32(value) {
-                Ok(v) => {
-                    self.passcred.store(v != 0, Ordering::Release);
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
@@ -4555,58 +4564,6 @@ impl SocketFile {
                 opts.linger_on = onoff != 0;
                 opts.linger_sec = linger;
                 SocketOpResult::Ok(0)
-            }
-            (SOL_SOCKET, SO_RCVBUF) => match read_u32(value) {
-                Ok(v) => {
-                    opts.rcvbuf = v.max(2_048);
-                    SocketOpResult::Ok(0)
-                }
-                Err(e) => SocketOpResult::Err(e),
-            },
-            (SOL_SOCKET, SO_RCVBUFFORCE) => {
-                if !crate::handlers::task_capable(
-                    crate::handlers::current_task_id(),
-                    crate::handlers::CAP_NET_ADMIN,
-                ) {
-                    return SocketOpResult::Err(SockError::PermDenied);
-                }
-                match read_u32(value) {
-                    Ok(v) => {
-                        let requested = (v as i32).max(0) as u32;
-                        opts.rcvbuf = requested
-                            .min((i32::MAX / 2) as u32)
-                            .saturating_mul(2)
-                            .max(2_048);
-                        SocketOpResult::Ok(0)
-                    }
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
-            (SOL_SOCKET, SO_SNDBUF) => match read_u32(value) {
-                Ok(v) => {
-                    opts.sndbuf = v.max(2_048);
-                    SocketOpResult::Ok(0)
-                }
-                Err(e) => SocketOpResult::Err(e),
-            },
-            (SOL_SOCKET, SO_SNDBUFFORCE) => {
-                if !crate::handlers::task_capable(
-                    crate::handlers::current_task_id(),
-                    crate::handlers::CAP_NET_ADMIN,
-                ) {
-                    return SocketOpResult::Err(SockError::PermDenied);
-                }
-                match read_u32(value) {
-                    Ok(v) => {
-                        let requested = (v as i32).max(0) as u32;
-                        opts.sndbuf = requested
-                            .min((i32::MAX / 2) as u32)
-                            .saturating_mul(2)
-                            .max(2_048);
-                        SocketOpResult::Ok(0)
-                    }
-                    Err(e) => SocketOpResult::Err(e),
-                }
             }
             (SOL_SOCKET, SO_BINDTODEVICE) => {
                 // `sock_setbindtodevice` (`net/core/sock.c:685`): the name
@@ -4927,37 +4884,6 @@ impl SocketFile {
                     SocketOpResult::Ok(0)
                 }
             },
-            // IP_FREEBIND / IP_TRANSPARENT relax `__inet_bind`'s
-            // EADDRNOTAVAIL. IP_TRANSPARENT needs CAP_NET_RAW or
-            // CAP_NET_ADMIN (`do_ip_setsockopt`) — EPERM otherwise.
-            (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IP, IP_TRANSPARENT) => {
-                let v = read_ip_int(value).unwrap_or(0);
-                if name == IP_TRANSPARENT
-                    && v != 0
-                    && !crate::handlers::task_capable(
-                        crate::handlers::current_task_id(),
-                        crate::handlers::CAP_NET_RAW,
-                    )
-                {
-                    return SocketOpResult::Err(SockError::PermDenied);
-                }
-                opts.ip_freebind = v != 0;
-                SocketOpResult::Ok(0)
-            }
-            (IPPROTO_IP, IP_PKTINFO) => match read_u32(value) {
-                Ok(v) => {
-                    opts.ip_pktinfo = v != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(e) => SocketOpResult::Err(e),
-            },
-            (IPPROTO_IP, IP_RECVTTL) => match read_u32(value) {
-                Ok(v) => {
-                    opts.ip_recvttl = v != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(e) => SocketOpResult::Err(e),
-            },
             // `do_ip_setsockopt` IP_MULTICAST_TTL: SOCK_STREAM → EINVAL;
             // optlen < 1 → EINVAL; -1 means 1; otherwise 0..=255.
             (IPPROTO_IP, IP_MULTICAST_TTL) => {
@@ -4982,58 +4908,6 @@ impl SocketFile {
                     SocketOpResult::Ok(0)
                 }
                 Err(e) => SocketOpResult::Err(e),
-            },
-            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) if self.domain == AF_INET6 => {
-                match read_ip_int(value) {
-                    Some(value) if value == -1 || (0..=255).contains(&value) => {
-                        opts.ipv6_unicast_hops = value;
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::InvalidArg),
-                }
-            }
-            (IPPROTO_IPV6, IPV6_MTU_DISCOVER) if self.domain == AF_INET6 => match read_u32(value) {
-                Ok(value) if value <= 5 => {
-                    opts.ipv6_mtu_discover = value;
-                    SocketOpResult::Ok(0)
-                }
-                _ => SocketOpResult::Err(SockError::InvalidArg),
-            },
-            (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => match read_u32(value) {
-                Ok(value) if value >= 1280 => {
-                    opts.ipv6_mtu = value;
-                    opts.ipv6_mtu_set = true;
-                    SocketOpResult::Ok(0)
-                }
-                _ => SocketOpResult::Err(SockError::InvalidArg),
-            },
-            (IPPROTO_IPV6, IPV6_RECVERR) if self.domain == AF_INET6 => match read_u32(value) {
-                Ok(value) => {
-                    opts.ipv6_recverr = value != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(error) => SocketOpResult::Err(error),
-            },
-            (IPPROTO_IPV6, IPV6_RECVPKTINFO) if self.domain == AF_INET6 => match read_u32(value) {
-                Ok(value) => {
-                    opts.ipv6_recvpktinfo = value != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(error) => SocketOpResult::Err(error),
-            },
-            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if self.domain == AF_INET6 => match read_u32(value) {
-                Ok(value) => {
-                    opts.ipv6_recvhoplimit = value != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(error) => SocketOpResult::Err(error),
-            },
-            (IPPROTO_IPV6, IPV6_DONTFRAG) if self.domain == AF_INET6 => match read_u32(value) {
-                Ok(value) => {
-                    opts.ipv6_dontfrag = value != 0;
-                    SocketOpResult::Ok(0)
-                }
-                Err(error) => SocketOpResult::Err(error),
             },
             // Linux's protocol option handlers return ENOPROTOOPT from their
             // default arm. Never claim an unknown feature was enabled: doing
@@ -5077,14 +4951,25 @@ impl SocketFile {
         // INET: a level that is neither the transport's own (`tcp_getsockopt`
         // / `udp_getsockopt` pass it on) nor SOL_IP reaches
         // `do_ip_getsockopt`: `if (level != SOL_IP) return -EOPNOTSUPP;`.
-        if matches!(self.domain, AF_INET | AF_INET6)
+        if self.domain == AF_INET
             && level != SOL_SOCKET
             && level != IPPROTO_IP
-            && !(level == IPPROTO_IPV6 && self.domain == AF_INET6)
             && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
             && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
         {
             return SocketOpResult::Err(SockError::NotSupported);
+        }
+        // AF_INET6: `ipv6_getsockopt` hands SOL_IP to the IPv4 handler
+        // (except on SOCK_RAW) and answers every other foreign level with
+        // `if (level != SOL_IPV6) return -ENOPROTOOPT;`.
+        if self.domain == AF_INET6
+            && level != SOL_SOCKET
+            && level != IPPROTO_IPV6
+            && !(level == IPPROTO_IP && self.kind != SOCK_RAW)
+            && !(level == IPPROTO_TCP && self.kind == SOCK_STREAM)
+            && !(level == IPPROTO_UDP && self.kind == SOCK_DGRAM)
+        {
+            return SocketOpResult::Err(SockError::NoProtoOpt);
         }
         if level == SOL_SOCKET && name == SO_ERROR {
             // Linux `sk_getsockopt`: `-sock_error(sk)`, else the soft error,
@@ -5127,6 +5012,9 @@ impl SocketFile {
             );
             return write_bool(buf, listening);
         }
+        if let Some(r) = self.sockopt_get_ext(level, name, buf) {
+            return r;
+        }
         let opts = self.options.lock();
         match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => write_bool(buf, opts.reuseaddr),
@@ -5158,7 +5046,6 @@ impl SocketFile {
                 SocketOpResult::OptValue { n: bytes.len() + 1 }
             }
             (SOL_SOCKET, SO_TYPE) => write_u32(buf, self.kind),
-            (SOL_SOCKET, SO_PASSCRED) => write_bool(buf, self.passcred.load(Ordering::Acquire)),
             (SOL_SOCKET, SO_TIMESTAMP_OLD) => write_bool(
                 buf,
                 opts.timestamp_enabled && !opts.timestamp_new && !opts.timestamp_ns,
@@ -5293,8 +5180,6 @@ impl SocketFile {
             }
             (IPPROTO_IP, IP_TTL) => write_ip(buf, opts.ip_ttl),
             (IPPROTO_IP, IP_TOS) => write_ip(buf, opts.ip_tos),
-            (IPPROTO_IP, IP_PKTINFO) => write_bool(buf, opts.ip_pktinfo),
-            (IPPROTO_IP, IP_RECVTTL) => write_bool(buf, opts.ip_recvttl),
             // `do_ip_getsockopt` IP_MTU: no cached route (unconnected) →
             // ENOTCONN.
             (IPPROTO_IP, IP_MTU) => {
@@ -5312,17 +5197,8 @@ impl SocketFile {
                 write_ip(buf, opts.ip_mtu)
             }
             (IPPROTO_IP, IP_MULTICAST_TTL) => write_ip(buf, opts.ip_multicast_ttl),
-            (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IP, IP_TRANSPARENT) => {
-                write_ip(buf, opts.ip_freebind as u32)
-            }
             (IPPROTO_IPV6, IPV6_V6ONLY) if self.domain == AF_INET6 => {
                 write_bool(buf, opts.ipv6_v6only)
-            }
-            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) if self.domain == AF_INET6 => {
-                write_u32(buf, opts.ipv6_unicast_hops as u32)
-            }
-            (IPPROTO_IPV6, IPV6_MTU_DISCOVER) if self.domain == AF_INET6 => {
-                write_u32(buf, opts.ipv6_mtu_discover)
             }
             (IPPROTO_IPV6, IPV6_MTU) if self.domain == AF_INET6 => {
                 let connected = matches!(
@@ -5335,18 +5211,6 @@ impl SocketFile {
                     return SocketOpResult::Err(SockError::NotConnected);
                 }
                 write_u32(buf, opts.ipv6_mtu)
-            }
-            (IPPROTO_IPV6, IPV6_RECVERR) if self.domain == AF_INET6 => {
-                write_bool(buf, opts.ipv6_recverr)
-            }
-            (IPPROTO_IPV6, IPV6_RECVPKTINFO) if self.domain == AF_INET6 => {
-                write_bool(buf, opts.ipv6_recvpktinfo)
-            }
-            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if self.domain == AF_INET6 => {
-                write_bool(buf, opts.ipv6_recvhoplimit)
-            }
-            (IPPROTO_IPV6, IPV6_DONTFRAG) if self.domain == AF_INET6 => {
-                write_bool(buf, opts.ipv6_dontfrag)
             }
             (SOL_NETLINK, NETLINK_PKTINFO) => {
                 write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
@@ -6496,7 +6360,10 @@ impl SocketFile {
     /// `port` is `Some` — EACCES for a port below
     /// `ip_unprivileged_port_start` without CAP_NET_BIND_SERVICE.
     fn inet4_bind_precheck(&self, ip: u32, port: Option<u16>) -> Result<(), SockError> {
-        let freebind = self.options.lock().ip_freebind;
+        let freebind = {
+            let o = self.options.lock();
+            o.ip_freebind || o.ext.ip_transparent
+        };
         if !inet4_bindable(self.net_ns_id(), ip, freebind) {
             return Err(SockError::AddrNotAvail);
         }
@@ -7605,6 +7472,7 @@ const RING_CAP: usize = 64 * 1024;
 /// so it does not pin the refcount.)
 impl Drop for SocketFile {
     fn drop(&mut self) {
+        self.release_multicast();
         // Closing this endpoint deads BOTH directions of the connection:
         // - `tx` (this end writes, the PEER reads) → close surfaces EOF to the
         //   peer's read (any buffered bytes still drain first, then EOF).

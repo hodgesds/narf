@@ -19,8 +19,8 @@
 //! `volume::truncate_inode` (which sit on the §"Block Allocation"
 //! bitmap allocator — see `volume.rs::alloc_block` /
 //! `alloc_inode`). The legacy 12-direct + indirect block pointer
-//! path is implemented; ext4 extents-tree writes still return
-//! `Unsupported`.
+//! path is implemented, and ext4 extent trees grow, convert unwritten
+//! extents and free through `volume::extent_write`.
 //!
 //! Directory-mutation surface (create / mkdir / unlink / rmdir /
 //! rename / symlink) is implemented in `dir_mut.rs` and dispatched
@@ -262,7 +262,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             }
             let n = self
                 .volume
-                .write_inode_data(&mut inode, offset, buf)
+                .write_inode_data(inode_no, &mut inode, offset, buf)
                 .await?;
             self.volume.write_inode(inode_no, &inode).await?;
             // Refresh cached state.
@@ -282,6 +282,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         // Real on-disk inode number — distinct per file, so musl's
         // DSO dedup by (st_dev, st_ino) never collapses two libraries.
         self.state.lock().inode_no as u64
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
     }
 
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
@@ -355,12 +362,25 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             inode.mode = (inode.mode & S_IFMT) | (perms & 0o7777);
             inode.touch_ctime(Ext2Volume::<B>::now_secs());
             self.volume.write_inode(inode_no, &inode).await?;
-            let stat = Self::stat_from_inode(&self.volume, &inode);
-            let mut state = self.state.lock();
-            state.inode = Some(inode);
-            state.stat = stat;
-            Ok(())
+            self.acl_chmod_locked(inode_no, perms).await?;
+            self.refresh_cached_inode(inode_no).await
         })
+    }
+
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(self.xattr_set(name, Some(value), flags))
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(self.xattr_get(name))
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(self.xattr_list())
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(self.xattr_set(name, None, 0))
     }
 
     /// Bridge an opened-directory fd to its `DirOps`. `resolve_async`
@@ -386,6 +406,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     fn ino(&self) -> u64 {
         self.state.lock().inode_no as u64
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            ..Default::default()
+        }
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
@@ -507,11 +534,8 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
             inode.mode = (inode.mode & S_IFMT) | (perms & 0o7777);
             inode.touch_ctime(Ext2Volume::<B>::now_secs());
             self.volume.write_inode(inode_no, &inode).await?;
-            let stat = Self::stat_from_inode(&self.volume, &inode);
-            let mut state = self.state.lock();
-            state.inode = Some(inode);
-            state.stat = stat;
-            Ok(())
+            self.acl_chmod_locked(inode_no, perms).await?;
+            self.refresh_cached_inode(inode_no).await
         })
     }
 
@@ -617,5 +641,180 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 target_inode,
             )) as Arc<dyn FileOps>)
         })
+    }
+
+    /// `Some(false)` for a directory whose inode carries no xattr at all —
+    /// the path-walk permission check then skips the ACL read — else "ask
+    /// properly".
+    fn access_acl_present(&self) -> Option<bool> {
+        match self.state.lock().inode {
+            Some(inode) if !inode.has_xattrs => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The directory's `system.posix_acl_default` in uapi form, for the
+    /// VFS's `posix_acl_create` at create time.
+    fn default_acl(&self) -> Option<Vec<u8>> {
+        narf_scheduler::block_on_spin(self.xattr_get(narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT))
+            .ok()
+    }
+
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(self.xattr_set(name, Some(value), flags))
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(self.xattr_get(name))
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(self.xattr_list())
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(self.xattr_set(name, None, 0))
+    }
+}
+
+// ── extended attributes and POSIX ACLs ──────────────────────────────
+//
+// Storage is `volume::xattr`. The ACL rules are `fs/ext4/acl.c`:
+// `ext4_set_acl` runs `posix_acl_update_mode` for an ACCESS ACL (the mode's
+// permission bits become the ACL's, and an ACL that is exactly the mode is
+// not stored), `__ext4_set_acl` refuses a DEFAULT ACL on a non-directory
+// (`acl ? -EACCES : 0`), and `ext4_setattr` -> `posix_acl_chmod` keeps the
+// stored ACL's mask/group entry in step with a chmod. `inode_owner_or_capable`
+// is the syscall layer's (see `xattr_permission_check`).
+
+/// `setxattr(2)` flags.
+const XATTR_CREATE: u32 = 1;
+const XATTR_REPLACE: u32 = 2;
+
+impl<B: BlockDevice + 'static> Ext2Node<B> {
+    async fn xattr_get(&self, name: &str) -> Result<Vec<u8>, FsError> {
+        use super::volume::xattr;
+        let (index, suffix) = xattr::split_name(name).ok_or(FsError::Unsupported)?;
+        let inode_no = self.state.lock().inode_no;
+        let st = self.volume.xattr_load(inode_no).await?;
+        let entry = xattr::find(&st, index, suffix).ok_or(FsError::NotFound)?;
+        if index == xattr::INDEX_ACL_ACCESS || index == xattr::INDEX_ACL_DEFAULT {
+            // `ext4_get_acl` -> `ext4_acl_from_disk`, then the VFS's
+            // `posix_acl_to_xattr`.
+            return Ok(xattr::acl_from_disk(&entry.value)?.to_xattr());
+        }
+        Ok(entry.value.clone())
+    }
+
+    async fn xattr_list(&self) -> Result<Vec<u8>, FsError> {
+        let inode_no = self.state.lock().inode_no;
+        let st = self.volume.xattr_load(inode_no).await?;
+        Ok(Ext2Volume::<B>::xattr_list_names(&st))
+    }
+
+    /// Set (`Some`) or remove (`None`) one attribute.
+    async fn xattr_set(&self, name: &str, value: Option<&[u8]>, flags: u32) -> Result<(), FsError> {
+        use super::volume::xattr;
+        use narf_filesystem::PosixAcl;
+        let (index, suffix) = xattr::split_name(name).ok_or(FsError::Unsupported)?;
+        let _update = self.volume.inode_update_lock.lock().await;
+        let inode_no = self.state.lock().inode_no;
+        let inode = self.volume.read_inode(inode_no).await?;
+        let st = self.volume.xattr_load(inode_no).await?;
+        let is_acl = index == xattr::INDEX_ACL_ACCESS || index == xattr::INDEX_ACL_DEFAULT;
+        let (entries, mode) = if is_acl {
+            // `do_set_acl` decodes only a non-empty value; a zero-entry
+            // header also decodes to "no ACL". `setxattr`'s CREATE/REPLACE
+            // flags do not apply on this path.
+            let acl = match value {
+                Some(v) if !v.is_empty() => PosixAcl::from_xattr(v)?,
+                _ => None,
+            };
+            if index == xattr::INDEX_ACL_DEFAULT {
+                if !inode.is_dir() {
+                    return match acl {
+                        Some(_) => Err(FsError::PermissionDenied),
+                        None => Ok(()),
+                    };
+                }
+                let disk = match acl {
+                    Some(acl) => {
+                        acl.valid()?;
+                        Some(xattr::acl_to_disk(&acl)?)
+                    }
+                    None => None,
+                };
+                (xattr::with_value(&st, index, suffix, disk), None)
+            } else {
+                match acl {
+                    Some(acl) => {
+                        acl.valid()?;
+                        let (mode, stored) = narf_filesystem::posix_acl_update_mode(
+                            inode.mode & 0o7777,
+                            acl,
+                            narf_filesystem::caller_in_group_or_capable(inode.uid, inode.gid),
+                        )?;
+                        let disk = match stored {
+                            Some(acl) => Some(xattr::acl_to_disk(&acl)?),
+                            None => None,
+                        };
+                        (xattr::with_value(&st, index, suffix, disk), Some(mode))
+                    }
+                    None => (xattr::with_value(&st, index, suffix, None), None),
+                }
+            }
+        } else {
+            let exists = xattr::find(&st, index, suffix).is_some();
+            match value {
+                Some(v) => {
+                    // `ext4_xattr_set_handle`: XATTR_CREATE on an existing
+                    // name is -EEXIST, XATTR_REPLACE on a missing one
+                    // -ENODATA.
+                    if flags & XATTR_CREATE != 0 && exists {
+                        return Err(FsError::Busy);
+                    }
+                    if flags & XATTR_REPLACE != 0 && !exists {
+                        return Err(FsError::NotFound);
+                    }
+                    (
+                        xattr::with_value(&st, index, suffix, Some(v.to_vec())),
+                        None,
+                    )
+                }
+                None => {
+                    if !exists {
+                        return Err(FsError::NotFound);
+                    }
+                    (xattr::with_value(&st, index, suffix, None), None)
+                }
+            }
+        };
+        self.volume.xattr_store(inode_no, st, entries, mode).await?;
+        self.refresh_cached_inode(inode_no).await
+    }
+
+    async fn refresh_cached_inode(&self, inode_no: u32) -> Result<(), FsError> {
+        let inode = self.volume.read_inode(inode_no).await?;
+        let stat = Self::stat_from_inode(&self.volume, &inode);
+        let mut state = self.state.lock();
+        state.inode = Some(inode);
+        state.stat = stat;
+        Ok(())
+    }
+
+    /// `posix_acl_chmod`: after a chmod, re-mask the stored access ACL so
+    /// its mask (or group) entry matches the new group bits. Called with
+    /// `inode_update_lock` held.
+    async fn acl_chmod_locked(&self, inode_no: u32, perms: u16) -> Result<(), FsError> {
+        use super::volume::xattr;
+        let st = self.volume.xattr_load(inode_no).await?;
+        let Some(entry) = xattr::find(&st, xattr::INDEX_ACL_ACCESS, b"") else {
+            return Ok(());
+        };
+        let mut acl = xattr::acl_from_disk(&entry.value)?;
+        acl.chmod_masq(perms)?;
+        let disk = xattr::acl_to_disk(&acl)?;
+        let entries = xattr::with_value(&st, xattr::INDEX_ACL_ACCESS, b"", Some(disk));
+        self.volume.xattr_store(inode_no, st, entries, None).await
     }
 }

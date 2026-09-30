@@ -52,6 +52,13 @@ impl NinepNode {
         }
     }
 
+    /// `st_ino`: Linux `fs/9p/v9fs_vfs.h::QID2INO` on 64-bit —
+    /// `qid.path + 2`. The server's qid.path is its unique file id; the
+    /// +2 keeps a path of 0 (commonly the export root) off inode 0.
+    pub fn inode_number(&self) -> u64 {
+        self.qid.path.wrapping_add(2)
+    }
+
     fn map_err<E: core::fmt::Debug>(_e: E) -> FsError {
         FsError::Io(narf_block::BlockError::IOError)
     }
@@ -276,6 +283,17 @@ impl Drop for NinepNode {
 }
 
 impl FileOps for NinepNode {
+    fn ino(&self) -> u64 {
+        self.inode_number()
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.session.dev(),
+            ..Default::default()
+        }
+    }
+
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
     /// inode — a FIFO or device node living in this filesystem dispatches
     /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
@@ -364,6 +382,17 @@ impl FileOps for NinepNode {
 }
 
 impl DirOps for NinepNode {
+    fn ino(&self) -> u64 {
+        self.inode_number()
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.session.dev(),
+            ..Default::default()
+        }
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // Async-only; the VFS routes to lookup_async automatically.
         None

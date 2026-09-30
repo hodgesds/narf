@@ -80,11 +80,22 @@ impl SignalFdFile {
     /// In-mask pending bitmap for the owner.
     fn pending(&self) -> u64 {
         let m = self.mask.load(Ordering::Acquire);
-        crate::handlers::signal_pending_of(self.owner_task) & m
+        crate::handlers::signal_pending_of(crate::handlers::signalfd_reader(self.owner_task)) & m
     }
 }
 
 impl FileOps for SignalFdFile {
+    /// Linux `signalfd4` uses `anon_inode_getfile_fmode("[signalfd]")`: every such file shares the ONE `anon_inodefs` inode
+    /// (`fs/anon_inodes.c::anon_inode_inode`), so all of them report the
+    /// same `(st_dev, st_ino)`.
+    fn ino(&self) -> u64 {
+        narf_filesystem::inode_id::anon_inode().ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::inode_id::anon_inode().attrs()
+    }
+
     /// A signalfd with nothing pending must WAIT, never report end-of-file.
     ///
     /// The old comment below called `Ok(0)` an "EAGAIN shape" — but a bare
@@ -109,32 +120,37 @@ impl FileOps for SignalFdFile {
             if buf.len() < SIGNALFD_SIGINFO_LEN {
                 return Err(FsError::InvalidData);
             }
-            // Drain lowest pending bit.
-            let signum = crate::handlers::sig_from_bit(pending);
-            buf[..SIGNALFD_SIGINFO_LEN].fill(0);
-            // ssi_signo: u32 at offset 0.
-            buf[..4].copy_from_slice(&signum.to_le_bytes());
-            // ssi_errno (offset 4) left 0. If this instance was queued via
-            // rt_sigqueueinfo/sigqueue, surface its payload: ssi_code @8,
-            // ssi_int @44 (sival_int), ssi_ptr @48 (sival_ptr). Popping the
-            // payload and clearing/re-arming the pending bit happen together
-            // under the sigqueue bucket lock (atomic against a racing sender's
+            // Dequeue for the reading thread: its private set first, then its
+            // group's shared set (`signalfd_dequeue` -> `dequeue_signal`).
+            let reader = crate::handlers::signalfd_reader(self.owner_task);
+            let mask = self.mask.load(Ordering::Acquire);
+            let Some((signum, src)) = crate::handlers::next_deliverable(reader, mask) else {
+                return Err(FsError::WouldBlock);
+            };
+            // Pop the payload and clear/re-arm the pending bit together under
+            // the sigqueue bucket lock (atomic against a racing sender's
             // store+set), so a queued standard signal is never read as a
             // payload-less SI_USER nor left stranded — same invariant as the
-            // sigwait and handler-delivery consumers.
-            if let Some(info) = crate::handlers::sigqueue_take_and_clear(self.owner_task, signum) {
-                buf[8..12].copy_from_slice(&info.code.to_le_bytes());
-                if let Some(band) = info.poll_band {
-                    // SIGIO/SIGPOLL payload. Linux signalfd_siginfo exposes
-                    // si_fd at offset 20 and si_band at offset 28.
-                    buf[20..24].copy_from_slice(&(info.value as u32).to_le_bytes());
-                    buf[28..32].copy_from_slice(&band.to_le_bytes());
-                } else {
-                    buf[12..16].copy_from_slice(&info.pid.to_le_bytes()); // ssi_pid
-                    buf[44..48].copy_from_slice(&(info.value as u32).to_le_bytes());
-                    buf[48..56].copy_from_slice(&info.value.to_le_bytes());
-                }
+            // sigwait and handler-delivery consumers. A bit with no payload
+            // reads as SI_USER with zeroed fields.
+            let (si_code, si_value, si_pid, si_addr) =
+                match crate::handlers::sigqueue_take_and_clear(src, signum) {
+                    Some(info) => match info.poll_band {
+                        Some(band) => (info.code, info.value, band, u64::from(band)),
+                        None => (info.code, info.value, info.pid, 0),
+                    },
+                    None => (0, 0, 0, 0),
+                };
+            let ssi = crate::SigDeliveryParams {
+                signum,
+                si_code,
+                si_value,
+                si_pid,
+                si_addr,
+                ..Default::default()
             }
+            .signalfd_siginfo_bytes();
+            buf[..SIGNALFD_SIGINFO_LEN].copy_from_slice(&ssi);
             Ok(SIGNALFD_SIGINFO_LEN)
         })
     }
@@ -288,6 +304,9 @@ pub struct MemFdFile {
     /// every F_ADD_SEALS returns -EPERM and F_GET_SEALS returns
     /// F_SEAL_SEAL — matching Linux's fixed default.
     allow_sealing: bool,
+    /// This memfd's own inode: `memfd_create` -> `shmem_file_setup` gets a
+    /// fresh inode on `shm_mnt`; `memfd_secret` one on `secretmem`.
+    inode: narf_filesystem::inode_id::InodeId,
 }
 
 impl core::fmt::Debug for MemFdFile {
@@ -301,7 +320,24 @@ impl core::fmt::Debug for MemFdFile {
 }
 
 impl MemFdFile {
+    /// `memfd_create(2)`: an inode on `shm_mnt` (`mm/memfd.c::
+    /// memfd_alloc_file` -> `shmem_file_setup`).
+    // LINUX-GAP: MFD_HUGETLB memfds live on the internal hugetlbfs mount
+    // (`hugetlb_file_setup`), a different st_dev; NARF puts them on shm_mnt.
     pub fn new(flags: u32) -> Arc<Self> {
+        Self::with_inode(flags, narf_filesystem::inode_id::shmem_kernel_inode())
+    }
+
+    /// `memfd_secret(2)`: an inode on the `secretmem` kern_mount
+    /// (`mm/secretmem.c::secretmem_file_create`).
+    pub fn new_secret() -> Arc<Self> {
+        Self::with_inode(
+            0,
+            narf_filesystem::inode_id::PseudoFs::SecretMem.new_inode(),
+        )
+    }
+
+    fn with_inode(flags: u32, inode: narf_filesystem::inode_id::InodeId) -> Arc<Self> {
         let allow = (flags & MFD_ALLOW_SEALING) != 0;
         // When sealing is not allowed, the read-side F_GET_SEALS
         // must return F_SEAL_SEAL per Linux man-page semantics.
@@ -313,6 +349,7 @@ impl MemFdFile {
             }),
             seals: AtomicU32::new(initial_seals),
             allow_sealing: allow,
+            inode,
         })
     }
 
@@ -373,6 +410,14 @@ fn store_copy(store: &MemfdStore, off: usize, buf: &mut [u8], to_store: bool) {
 }
 
 impl FileOps for MemFdFile {
+    fn ino(&self) -> u64 {
+        self.inode.ino
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.inode.attrs()
+    }
+
     fn splice_read_page(
         &self,
         offset: u64,

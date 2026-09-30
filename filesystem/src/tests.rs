@@ -5936,14 +5936,17 @@ fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
         Some(t) => t,
         None => return TestResult::Fail("resolve /dev/tty1 failed"),
     };
-    // KDGKBMODE / KDGETMODE succeed and report the default (0).
-    for &(cmd, name) in &[(KDGKBMODE, "KDGKBMODE"), (KDGETMODE, "KDGETMODE")] {
+    // KDGKBMODE / KDGETMODE succeed and report Linux's boot defaults:
+    // `K_UNICODE` (3, `vt.default_utf8=1`) and `KD_TEXT` (0). This used to
+    // expect 0 from both, which for KDGKBMODE is `K_RAW` — the mode an X
+    // server leaves a VT in, and what made systemd-vconsole-setup refuse it.
+    for &(cmd, name, want) in &[(KDGKBMODE, "KDGKBMODE", 3), (KDGETMODE, "KDGETMODE", 0)] {
         let mut mode: i32 = -7;
         if tty1.ioctl(cmd, &mut mode as *mut i32 as usize) != Ok(0) {
             return TestResult::Fail(name);
         }
-        if mode != 0 {
-            return TestResult::Fail("KD probe did not report default mode 0");
+        if mode != want {
+            return TestResult::Fail("KD probe did not report Linux's boot default mode");
         }
     }
     // VT_OPENQRY returns the first free logical VT through `int *`.

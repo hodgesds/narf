@@ -180,16 +180,29 @@ fn deliver_fasync(wake: &FasyncWake) {
     } else {
         (1, 0x041)
     };
-    let targets = match state.owner {
-        crate::fd::FasyncOwner::None => alloc::vec::Vec::new(),
-        crate::fd::FasyncOwner::Tid(task) | crate::fd::FasyncOwner::Process(task) => {
-            alloc::vec![task]
+    // `send_sigio_to_task(p, fown, fd, band, type)`: F_OWNER_TID signals the
+    // thread (PIDTYPE_PID); F_OWNER_PID / F_OWNER_PGRP signal each owning
+    // process through its shared pending set.
+    let (targets, group) = match state.owner {
+        crate::fd::FasyncOwner::None => (alloc::vec::Vec::new(), false),
+        crate::fd::FasyncOwner::Tid(task) => (alloc::vec![task], false),
+        crate::fd::FasyncOwner::Process(task) => (alloc::vec![task], true),
+        crate::fd::FasyncOwner::ProcessGroup(pgrp) => {
+            let mut per_process: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            for t in pgrp_task_snapshot(pgrp) {
+                if !per_process
+                    .iter()
+                    .any(|&p| process_state_key(p) == process_state_key(t))
+                {
+                    per_process.push(t);
+                }
+            }
+            (per_process, true)
         }
-        crate::fd::FasyncOwner::ProcessGroup(group) => pgrp_task_snapshot(group),
     };
     for target in targets {
         if sigio_permitted(target, state) {
-            raise_sigio_pending(target, state.signal, poll_code, poll_band, state.fd);
+            raise_sigio_pending(target, state.signal, poll_code, poll_band, state.fd, group);
         }
     }
 }

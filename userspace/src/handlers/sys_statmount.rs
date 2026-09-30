@@ -222,14 +222,26 @@ fn mnt_id_req_from_user(req: u64, by_fd: bool) -> Result<(u32, u64, u64, u64), i
     Ok((mnt_fd, mnt_id, param, mnt_ns_id))
 }
 
-/// Every mount visible to the caller, as
+/// `(unique_id, unique_parent_id, old_id, path, fstype, mnt_opts, sb_opts,
+/// super_flags)`.
 /// `(unique_id, unique_parent_id, old_id, path, fstype, mnt_opts, sb_opts)`.
-fn visible_mounts() -> alloc::vec::Vec<(u64, u64, u64, alloc::string::String, alloc::string::String, alloc::string::String, alloc::string::String)> {
+type VisibleMount = (
+    u64,
+    u64,
+    u64,
+    alloc::string::String,
+    alloc::string::String,
+    alloc::string::String,
+    alloc::string::String,
+    alloc::string::String,
+);
+
+fn visible_mounts() -> alloc::vec::Vec<VisibleMount> {
     let rows = mount_namespace_of(current_task_id())
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
     rows.into_iter()
-        .map(|(id, parent, path, fstype, mnt_opts, sb_opts)| {
+        .map(|(id, parent, path, fstype, mnt_opts, sb_opts, super_flags)| {
             // `struct statmount`: "mnt_parent_id — Unique ID of parent (for
             // root == mnt_id)". Linux's root mount has `mnt_parent` pointing
             // at itself, so `do_statmount` reports its own id.
@@ -248,6 +260,7 @@ fn visible_mounts() -> alloc::vec::Vec<(u64, u64, u64, alloc::string::String, al
                 fstype,
                 mnt_opts,
                 sb_opts,
+                super_flags,
             )
         })
         .collect()
@@ -391,8 +404,8 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(ENOENT));
         return;
     };
-    let (unique, parent_unique, old_id, path, fstype, mnt_opts, sb_opts) =
-        (m.0, m.1, m.2, &m.3, &m.4, &m.5, &m.6);
+    let (unique, parent_unique, old_id, path, fstype, mnt_opts, sb_opts, super_flags) =
+        (m.0, m.1, m.2, &m.3, &m.4, &m.5, &m.6, &m.7);
 
     // Build the string area first: each `[str]` field is a u32 OFFSET into
     // it, so the offsets are only knowable once the area exists.
@@ -411,8 +424,23 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
         // sb_dev_major/minor and sb_magic stay 0: NARF's filesystems are not
         // backed by a numbered block device here, and
         // `/proc/self/mountinfo` reports the same 0:0 for them.
-        // SB_RDONLY (1) is the only superblock flag NARF models.
-        sm.sb_flags = u32::from(mnt_opts.starts_with("ro"));
+        //
+        // `sb->s_flags & (SB_RDONLY|SB_SYNCHRONOUS|SB_DIRSYNC|SB_LAZYTIME)`:
+        // the SUPERBLOCK's flags, which is the `super_flags` rendering
+        // (mountinfo's column after the `-`), not this attachment's
+        // `ro`. A read-only bind of a read-write filesystem reports 0 here.
+        use narf_filesystem::sb_flags;
+        let mut flags = 0u64;
+        for (i, opt) in super_flags.split(',').enumerate() {
+            flags |= match (i, opt) {
+                (0, "ro") => sb_flags::RDONLY,
+                (_, "sync") => sb_flags::SYNCHRONOUS,
+                (_, "dirsync") => sb_flags::DIRSYNC,
+                (_, "lazytime") => sb_flags::LAZYTIME,
+                _ => 0,
+            };
+        }
+        sm.sb_flags = flags as u32;
     }
     if mask & STATMOUNT_MNT_BASIC != 0 {
         got |= STATMOUNT_MNT_BASIC;
@@ -426,19 +454,36 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
         const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
         const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
         const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+        const MOUNT_ATTR_RELATIME: u64 = 0x0000_0000;
+        const MOUNT_ATTR_NOATIME: u64 = 0x0000_0010;
+        const MOUNT_ATTR_STRICTATIME: u64 = 0x0000_0020;
+        const MOUNT_ATTR_NODIRATIME: u64 = 0x0000_0080;
+        const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x0020_0000;
+        let has = |needle: &str| mnt_opts.split(',').any(|o| o == needle);
         let mut attr = 0u64;
-        if mnt_opts.split(',').any(|o| o == "ro") {
+        if has("ro") {
             attr |= MOUNT_ATTR_RDONLY;
         }
         for (needle, bit) in [
             ("nosuid", MOUNT_ATTR_NOSUID),
             ("nodev", MOUNT_ATTR_NODEV),
             ("noexec", MOUNT_ATTR_NOEXEC),
+            ("nodiratime", MOUNT_ATTR_NODIRATIME),
+            ("nosymfollow", MOUNT_ATTR_NOSYMFOLLOW),
         ] {
-            if mnt_opts.split(',').any(|o| o == needle) {
+            if has(needle) {
                 attr |= bit;
             }
         }
+        // `mnt_to_attr_flags`: the atime policy is an enum, reported as
+        // exactly one of NOATIME / RELATIME / STRICTATIME.
+        attr |= if has("noatime") {
+            MOUNT_ATTR_NOATIME
+        } else if has("relatime") {
+            MOUNT_ATTR_RELATIME
+        } else {
+            MOUNT_ATTR_STRICTATIME
+        };
         sm.mnt_attr = attr;
         // mnt_propagation stays 0 (MS_PRIVATE), and peer_group/master with
         // it: NARF has no propagation, which is exactly what a private

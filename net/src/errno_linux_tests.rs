@@ -492,14 +492,28 @@ fn smoke_rtnl_getlink_without_selector_is_einval() -> TestResult {
     if first_errno(&replies) != Some(e::EINVAL) {
         return TestResult::Fail("RTM_GETLINK without ifindex or IFLA_IFNAME must be -EINVAL");
     }
+    // The name must fit ifla_policy[IFLA_IFNAME] (NLA_STRING, IFNAMSIZ-1).
+    // It used to be "errno-no-such-link" (18 bytes), which Linux rejects in
+    // `rtnl_valid_getlink_req`'s policy parse with -ERANGE before any lookup.
     let req = nlmsg(
         RTM_GETLINK,
         NLM_F_REQUEST,
         32,
-        &ifinfomsg(0, Some("errno-no-such-link"), None),
+        &ifinfomsg(0, Some("errno-nolink0"), None),
     );
     if first_errno(&crate::netlink_route::build_dump(&req)) != Some(e::ENODEV) {
         return TestResult::Fail("RTM_GETLINK of a missing name must be -ENODEV");
+    }
+    // NEGATIVE: an IFLA_IFNAME longer than IFNAMSIZ-1 fails `validate_nla`
+    // (NLA_STRING .len) with -ERANGE.
+    let req = nlmsg(
+        RTM_GETLINK,
+        NLM_F_REQUEST,
+        33,
+        &ifinfomsg(0, Some("errno-no-such-link"), None),
+    );
+    if first_errno(&crate::netlink_route::build_dump(&req)) != Some(e::ERANGE) {
+        return TestResult::Fail("RTM_GETLINK with an over-long IFLA_IFNAME must be -ERANGE");
     }
     TestResult::Pass
 }

@@ -159,6 +159,11 @@ unsafe fn read_user<T: Copy + Default>(uptr: usize) -> Result<T, FsError> {
 pub struct DevFb0;
 
 impl FileOps for DevFb0 {
+    /// The devfs inode of this device's `/dev` node.
+    fn ino(&self) -> u64 {
+        narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let n = match fbdev_info() {
             Some(info) => {
