@@ -133,6 +133,10 @@ also consult upstream Linux GPL sources.
   `Xhci::configure_endpoints` translates USB 2.0 periodic endpoints into xHCI
   Max Packet, Max Burst, Interval, CErr, and Max ESIT Payload fields using the
   addressed slot's negotiated speed.
+- `Xhci::control_in` accepts only SETUP packets with the device-to-host
+  direction bit set; `Xhci::control_out` accepts only host-to-device requests.
+  Payload-bearing class requests (including HID `SET_REPORT`) must use the
+  matching method so the xHCI Data Stage has the correct direction.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest

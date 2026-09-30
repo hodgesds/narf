@@ -207,16 +207,15 @@ impl UsbHub {
         let descriptor = HubDescriptor::decode(&desc_buf[..n]).ok_or(HubError::BadDescriptor)?;
 
         // Power on every downstream port via SET_FEATURE(PORT_POWER).
-        let mut nothing = [0u8; 0];
         for p in 1..=descriptor.num_ports {
             let _ = xhci_dev
-                .control_in(
+                .control_out(
                     slot_id,
                     RT_HOST_TO_DEV_CLASS_OTHER,
                     REQ_SET_FEATURE,
                     PORT_POWER,
                     p as u16,
-                    &mut nothing,
+                    &[],
                 )
                 .await;
         }
@@ -276,15 +275,14 @@ impl UsbHub {
     /// PORT_RESET, polls PORT_STATUS until RESET clears + ENABLE
     /// asserts, then clears the C_PORT_RESET change bit.
     pub async fn port_reset(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
-        let mut nothing = [0u8; 0];
         let _ = xhci_dev
-            .control_in(
+            .control_out(
                 self.slot_id,
                 RT_HOST_TO_DEV_CLASS_OTHER,
                 REQ_SET_FEATURE,
                 PORT_RESET,
                 port as u16,
-                &mut nothing,
+                &[],
             )
             .await?;
         // 100 ms wall-clock budget (USB 2.0 §11.5.1.5 TDRST max
@@ -315,13 +313,13 @@ impl UsbHub {
             // Clear the change bit so the next reset returns a
             // fresh edge.
             let _ = xhci_dev
-                .control_in(
+                .control_out(
                     self.slot_id,
                     RT_HOST_TO_DEV_CLASS_OTHER,
                     REQ_CLEAR_FEATURE,
                     C_PORT_RESET,
                     port as u16,
-                    &mut nothing,
+                    &[],
                 )
                 .await;
             return Ok(());
@@ -336,15 +334,14 @@ impl UsbHub {
     /// goes into Suspend within 3 ms of seeing the J/K bus state.
     /// Re-issue [`port_resume`] to wake it.
     pub async fn port_suspend(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
-        let mut nothing = [0u8; 0];
         let _ = xhci_dev
-            .control_in(
+            .control_out(
                 self.slot_id,
                 RT_HOST_TO_DEV_CLASS_OTHER,
                 REQ_SET_FEATURE,
                 PORT_SUSPEND,
                 port as u16,
-                &mut nothing,
+                &[],
             )
             .await?;
         Ok(())
@@ -357,25 +354,24 @@ impl UsbHub {
     /// `CLEAR_FEATURE(C_PORT_SUSPEND)` so the next suspend cycle
     /// observes a fresh edge.
     pub async fn port_resume(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
-        let mut nothing = [0u8; 0];
         let _ = xhci_dev
-            .control_in(
+            .control_out(
                 self.slot_id,
                 RT_HOST_TO_DEV_CLASS_OTHER,
                 REQ_CLEAR_FEATURE,
                 PORT_SUSPEND,
                 port as u16,
-                &mut nothing,
+                &[],
             )
             .await?;
         let _ = xhci_dev
-            .control_in(
+            .control_out(
                 self.slot_id,
                 RT_HOST_TO_DEV_CLASS_OTHER,
                 REQ_CLEAR_FEATURE,
                 C_PORT_SUSPEND,
                 port as u16,
-                &mut nothing,
+                &[],
             )
             .await;
         Ok(())

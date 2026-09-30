@@ -443,15 +443,14 @@ pub async fn try_bind_audio_already_addressed(
 ) -> Result<usize, UacError> {
     let ac_iface = find_audio_control_interface(cfg).ok_or(UacError::NotAudio)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
-    let mut nothing = [0u8; 0];
     if xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .is_err()

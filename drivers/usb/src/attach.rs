@@ -428,15 +428,14 @@ async fn dispatch_after_address(
         // SET_CONFIGURATION before any class request (USB 2.0
         // §9.4.7) — without it, `UsbHub::attach`'s
         // GET_DESCRIPTOR(Hub) would STALL.
-        let mut nothing = [0u8; 0];
         if xhci_dev
-            .control_in(
+            .control_out(
                 slot_id,
                 0x00,
                 hid::STD_REQ_SET_CONFIGURATION,
                 cfg_value as u16,
                 0,
-                &mut nothing,
+                &[],
             )
             .await
             .is_err()

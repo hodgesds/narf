@@ -815,15 +815,14 @@ pub async fn try_bind_ccid_already_addressed(
     let eps = find_ccid_endpoints(cfg, iface_off)?;
 
     // Step 3: SET_CONFIGURATION (USB 2.0 §9.4.7).
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             STD_REQ_SET_CONFIGURATION,
             eps.config_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| CcidError::Transfer)?;

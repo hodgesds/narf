@@ -289,18 +289,16 @@ pub async fn set_leds(
     let w_value = (HID_REPORT_TYPE_OUTPUT << 8) | report_id;
     // SET_REPORT: bmRequestType=0x21, bRequest=0x09, wValue=(type<<8|id),
     // wIndex=interface, wLength=len, data=[led_byte].
+    let mut data = [0u8; 2];
+    data[..len].copy_from_slice(&buf[..len]);
     xhci_dev
-        .control_in(
+        .control_out(
             kbd.slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             HID_REQ_SET_REPORT,
             w_value,
             kbd.interface_num as u16,
-            &mut {
-                let mut d = [0u8; 2];
-                d[..len].copy_from_slice(&buf[..len]);
-                d
-            }[..len],
+            &data[..len],
         )
         .await
         .map_err(HidError::Xhci)
@@ -345,15 +343,14 @@ pub async fn try_switch_to_report_protocol(
     let led_rid = find_led_output_report_id(&desc);
 
     // Issue SET_PROTOCOL(Report).
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             kbd.slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             HID_REQ_SET_PROTOCOL,
             HID_REPORT_PROTOCOL,
             kbd.interface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| HidError::SetProtocolFailed)?;
@@ -411,29 +408,28 @@ pub async fn try_bind_keyboard_already_addressed(
     interface_num: u8,
     interrupt_in_dci: u8,
 ) -> Result<(), HidError> {
-    let mut nothing = [0u8; 0];
     // SET_PROTOCOL(Boot): wValue=0.
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             HID_REQ_SET_PROTOCOL,
             HID_BOOT_PROTOCOL,
             interface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| HidError::SetProtocolFailed)?;
 
     // SET_IDLE(0, 0) — non-fatal.
     let _ = xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             HID_REQ_SET_IDLE,
             0,
             interface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await;
 

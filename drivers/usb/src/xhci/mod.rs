@@ -383,6 +383,13 @@ pub enum XhciError {
     PortResetTimeout,
 }
 
+/// Return whether the SETUP packet requests a device-to-host data direction.
+/// Kept as a small pure helper so the control-transfer API contract is covered
+/// by the in-kernel test harness without constructing an MMIO controller.
+pub(crate) const fn control_request_is_in(bm_request_type: u8) -> bool {
+    bm_request_type & 0x80 != 0
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct XhciCaps {
     pub caplength: u8,
@@ -2930,6 +2937,11 @@ impl Xhci {
         w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
+        if !control_request_is_in(bm_request_type) {
+            // Internal call-site contract violation: a control-IN
+            // transfer must set the USB SETUP direction bit.
+            return Err(XhciError::CmdFailed(0xF8));
+        }
         if out.len() != usize::from(w_value) && out.is_empty() {
             // Allow the caller to ask for any byte-count that fits
             // a u16; w_length is just the SETUP-packet field.
@@ -3066,6 +3078,11 @@ impl Xhci {
         w_index: u16,
         data: &[u8],
     ) -> Result<usize, XhciError> {
+        if control_request_is_in(bm_request_type) {
+            // Internal call-site contract violation: a control-OUT
+            // transfer must clear the USB SETUP direction bit.
+            return Err(XhciError::CmdFailed(0xF8));
+        }
         if data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }

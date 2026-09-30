@@ -3190,6 +3190,23 @@ fn smoke_fp_no_reader_on_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
 
+/// xHCI control helpers reject a method/SETUP direction mismatch. This is
+/// load-bearing for payload-carrying host-to-device requests such as HID
+/// SET_REPORT: routing one through `control_in` would otherwise DMA in the
+/// wrong direction and silently discard the keyboard LED report.
+fn smoke_xhci_control_direction_contract() -> TestResult {
+    use crate::xhci::control_request_is_in;
+
+    if control_request_is_in(0x00) || control_request_is_in(0x21) {
+        return TestResult::Fail("host-to-device request classified as control-IN");
+    }
+    if !control_request_is_in(0x80) || !control_request_is_in(0xA1) {
+        return TestResult::Fail("device-to-host request classified as control-OUT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_control_direction_contract);
+
 // ── ccid ────────────────────────────────────────────────────────────
 
 /// Class constants for CCID (USB-IF CCID spec rev 1.1 §4.3 Table 5-1).

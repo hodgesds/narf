@@ -635,15 +635,14 @@ pub async fn try_bind_consumer_already_addressed(
         return Err(HidError::NoInterruptIn);
     }
     let cfg_value = desc[5];
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(HidError::Xhci)?;
@@ -654,25 +653,25 @@ pub async fn try_bind_consumer_already_addressed(
     // neither Boot nor Report protocol explicitly and respond to both
     // without needing SET_PROTOCOL).
     let _ = xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             HID_REQ_SET_PROTOCOL,
             HID_REPORT_PROTOCOL,
             iface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await;
 
     // SET_IDLE(0, 0) — "report on change only".
     let _ = xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             HID_REQ_SET_IDLE,
             0,
             iface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await;
 
