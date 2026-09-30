@@ -2,7 +2,7 @@
 //!
 //! Targets the AMD HDA controllers that ship on the user's two
 //! bring-up laptops (Zen2 Renoir `1022:15E3`, Phoenix HawkPoint1
-//! `1022:15E2`) and the Realtek ALC-family codec on the codec link.
+//! `1022:15E3`) and the Realtek ALC-family codec on the codec link.
 //! Also probes Intel PCH HDA — the programming model is identical;
 //! only PCI IDs change.
 //!
@@ -37,14 +37,11 @@
 //!
 //! ## Relationship to other audio code in NARF
 //!
-//! - `narf-audio` (`audio/`) is the older Stage-4 scaffold for the
-//!   virtio-sound-pci backend. It carries an early HDA bring-up
-//!   inside that crate. This crate is the long-form HDA path with
-//!   the per-codec init tables and the ALSA-equivalent PCM/mixer
-//!   surface that userspace can drive.
-//! - `narf-audio::acp6` is a separate AMD-specific path. Most AMD
-//!   laptops expose HDA alongside or instead of ACP6 depending on
-//!   chipset — this crate targets the standard HDA controller path.
+//! - `narf-audio` owns the active native HDA and ACP 6.3 engines and
+//!   registers hardware PCM/mixer backends here. This crate's older
+//!   HDA/codec/software-PCM models remain for compatibility and tests.
+//! - The file bridge exposes NARF's PCM protocol. Linux ALSA ioctl/mmap
+//!   compatibility is separate work; these are ALSA-style interfaces.
 //! - USB Audio Class is a separate driver under `drivers/usb/` and is
 //!   not in this scope.
 //!
@@ -71,6 +68,7 @@ extern crate alloc;
 pub mod codec;
 pub mod devfs_bridge;
 pub mod format;
+pub mod hardware;
 pub mod hda;
 pub mod intel8x0;
 pub mod max98357a;
@@ -165,6 +163,7 @@ pub struct SoundCard {
     /// controller is owned by `hda::controller::REGISTRY` so the
     /// card entry is `Copy`-safe (it doesn't own MMIO state).
     controller_index: usize,
+    hardware: Option<alloc::sync::Arc<dyn hardware::PcmDevice>>,
 }
 
 impl SoundCard {
@@ -205,9 +204,33 @@ pub fn register_card(
     let card = SoundCard {
         info,
         controller_index,
+        hardware: None,
     };
     CARD_REGISTRY.lock().push(card);
     index
+}
+
+/// Publish a physical card whose PCM operations reach owned DMA and MMIO.
+pub fn register_hardware_card(
+    mut info: CardInfo,
+    hardware: alloc::sync::Arc<dyn hardware::PcmDevice>,
+) -> u32 {
+    let index = NEXT_CARD_INDEX.fetch_add(1, Ordering::AcqRel) as u32;
+    info.index = index;
+    CARD_REGISTRY.lock().push(SoundCard {
+        info,
+        controller_index: index as usize,
+        hardware: Some(hardware),
+    });
+    index
+}
+
+/// Remove a native card during driver teardown. Existing stream leases keep
+/// their hardware alive until they have stopped DMA.
+pub fn unregister_hardware_card(index: u32) {
+    CARD_REGISTRY
+        .lock()
+        .retain(|c| c.info.index != index || c.hardware.is_none());
 }
 
 /// List every probed sound card. Mirrors `cat /proc/asound/cards`.
@@ -335,8 +358,12 @@ pub fn open_playback(card: u32, device: u32) -> Result<PlaybackStream, SoundErro
         return Err(SoundError::NoSuchDevice);
     }
     let controller_index = _card.controller_index;
+    let hardware = _card.hardware.clone();
     drop(registry);
-    let substream = crate::pcm::PcmSubstream::new_playback(controller_index, device)?;
+    let mut substream = crate::pcm::PcmSubstream::new_playback(controller_index, device)?;
+    if let Some(hardware) = hardware {
+        substream.hardware = Some(hardware.open(false, device)?);
+    }
     Ok(PlaybackStream {
         card,
         device,
@@ -356,13 +383,38 @@ pub fn open_capture(card: u32, device: u32) -> Result<CaptureStream, SoundError>
         return Err(SoundError::NoSuchDevice);
     }
     let controller_index = _card.controller_index;
+    let hardware = _card.hardware.clone();
     drop(registry);
-    let substream = crate::pcm::PcmSubstream::new_capture(controller_index, device)?;
+    let mut substream = crate::pcm::PcmSubstream::new_capture(controller_index, device)?;
+    if let Some(hardware) = hardware {
+        substream.hardware = Some(hardware.open(true, device)?);
+    }
     Ok(CaptureStream {
         card,
         device,
         substream,
     })
+}
+
+/// Baseline format chosen by the physical backend for this direction.
+pub fn default_hw_params(card: u32, capture: bool) -> Result<HwParams, SoundError> {
+    let hardware = CARD_REGISTRY
+        .lock()
+        .iter()
+        .find(|c| c.info.index == card)
+        .ok_or(SoundError::NoSuchCard)?
+        .hardware
+        .clone();
+    Ok(hardware.map_or(
+        HwParams {
+            format: SampleFormat::S16LE,
+            rate: SampleRate::R48000,
+            channels: ChannelCount::Stereo,
+            period_size: 1024,
+            periods: 4,
+        },
+        |h| h.default_params(capture),
+    ))
 }
 
 // ── Mixer access ────────────────────────────────────────────────────
@@ -377,10 +429,12 @@ pub fn mixer(card: u32) -> Result<Mixer, SoundError> {
         .find(|c| c.info.index == card)
         .ok_or(SoundError::NoSuchCard)?;
     let controller_index = c.controller_index;
+    let hardware = c.hardware.clone();
     drop(registry);
     Ok(Mixer {
         card,
         controller_index,
+        hardware,
     })
 }
 
@@ -389,6 +443,7 @@ pub fn mixer(card: u32) -> Result<Mixer, SoundError> {
 pub struct Mixer {
     card: u32,
     controller_index: usize,
+    hardware: Option<alloc::sync::Arc<dyn hardware::PcmDevice>>,
 }
 
 impl Mixer {
@@ -399,17 +454,26 @@ impl Mixer {
     /// List every control on the card. Returns IDs that
     /// `get_control_value`/`set_control_value` accept.
     pub fn list_controls(&self) -> Vec<ControlId> {
+        if let Some(hardware) = &self.hardware {
+            return hardware.controls();
+        }
         crate::mixer::list_for_controller(self.controller_index)
     }
 
     /// Read a control's current value.
     pub fn get_control_value(&self, id: ControlId) -> Result<ControlValue, SoundError> {
+        if let Some(hardware) = &self.hardware {
+            return hardware.get_control(id);
+        }
         crate::mixer::get(self.controller_index, id).map_err(SoundError::from)
     }
 
     /// Write a control. Range-checks against the control's
     /// `info.value_max` and emits the underlying codec verb.
     pub fn set_control_value(&self, id: ControlId, val: ControlValue) -> Result<(), SoundError> {
+        if let Some(hardware) = &self.hardware {
+            return hardware.set_control(id, val);
+        }
         crate::mixer::set(self.controller_index, id, val).map_err(SoundError::from)
     }
 }

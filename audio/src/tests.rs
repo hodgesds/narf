@@ -277,38 +277,37 @@ fn smoke_acp6_pcm_wm8960_init_sequence_shape() -> TestResult {
 }
 kernel_test_in!("audio/acp6", smoke_acp6_pcm_wm8960_init_sequence_shape);
 
-fn smoke_acp6_pci_all_zen2_variants_registered() -> TestResult {
-    // Confirm the four documented ACP6 PCI ids are all installed
-    // in the bus match table. The Zen2 bring-up box uses 0x15E2;
-    // the others are present so an SoC swap doesn't silently
-    // skip probe.
-    use crate::acp6;
-    use narf_bus::driver_match::__reset_for_test as bus_reset;
+fn smoke_acp63_pci_match_excludes_hda() -> TestResult {
     use narf_bus::{registered_pci_drivers, MatchKind};
-    bus_reset();
-    acp6::register_pci_driver();
-    let regs = registered_pci_drivers();
-    let want = [
-        acp6::ACP_RENOIR,
-        acp6::ACP_PINK_SARDINE,
-        acp6::ACP_REMBRANDT,
-        acp6::ACP_MERO,
-    ];
-    for did in want {
-        let found = regs.iter().any(|m| {
-            matches!(
-                m.kind,
-                MatchKind::VendorDevice { vendor, device }
-                    if vendor == acp6::ACP_VENDOR && device == did
-            )
-        });
-        if !found {
-            return TestResult::Fail("ACP PCI ID not registered");
-        }
+    narf_bus::driver_match::__reset_for_test();
+    let _restore = AudioProbeRestore;
+    crate::acp6::register_pci_driver();
+    let registrations = registered_pci_drivers();
+    if !registrations.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::VendorDevice {
+                vendor: 0x1022,
+                device: 0x15e2
+            }
+        )
+    }) {
+        return TestResult::Fail("ACP 6.3 match missing");
+    }
+    if registrations.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::VendorDevice {
+                vendor: 0x1022,
+                device: 0x15e3
+            }
+        )
+    }) {
+        return TestResult::Fail("ACP must never claim the HDA function");
     }
     TestResult::Pass
 }
-kernel_test_in!("audio/acp6", smoke_acp6_pci_all_zen2_variants_registered);
+kernel_test_in!("audio/acp63", smoke_acp63_pci_match_excludes_hda);
 
 fn smoke_audio_format_unsupported_rate_rejects() -> TestResult {
     let s = match select_active_playback() {

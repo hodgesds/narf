@@ -28,6 +28,22 @@ Memory-backed firmware, descriptor and IRQ tests cover rebuild failure/retry
 and DMA ownership without resetting a host device. Physical X710 validation
 remains pending; the development host is a live router.
 
+## Phoenix native audio
+
+Native HDA analog playback/capture and ACP 6.3 PDM microphone capture are
+implemented against `/usr/src/linux`. The sound-card/PCM/mixer file surfaces
+now delegate to owned hardware DMA. ACP probe requires revision 0x63, a PDM
+pin configuration and ACPI microphone properties; enumeration does not start
+recording. HDA routes BIOS-described analog paths and handles headphone
+speaker automute. Timeout paths retain DMA until the hardware is quiescent.
+
+Fake-device tests cover command transport, DMA accounting, capture overrun
+and failed-stop retention. QEMU HDA exercises playback across buffer wrap,
+capture and capability revocation. Physical Lenovo 50ee validation is pending.
+SoundWire, HDMI/DP audio, vendor smart-amplifier quirks, suspend/resume and
+Linux ALSA ioctl/mmap compatibility remain open. See
+[audio's implemented contract](audio/specification/spec.md).
+
 ## Exercised paths
 
 - **Kernel on QEMU:** `cargo xtask run` and `cargo xtask test` support x86_64

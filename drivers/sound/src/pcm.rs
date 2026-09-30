@@ -42,6 +42,7 @@ pub enum SubstreamState {
 /// PCM substream — one stream descriptor + its cyclic buffer + BDL.
 #[derive(Debug)]
 pub struct PcmSubstream {
+    pub(crate) hardware: Option<alloc::boxed::Box<dyn crate::hardware::PcmHardware>>,
     #[allow(dead_code)]
     pub(crate) controller_index: usize,
     #[allow(dead_code)]
@@ -83,6 +84,7 @@ impl PcmSubstream {
             is_input: is_capture,
         };
         Ok(PcmSubstream {
+            hardware: None,
             controller_index,
             device,
             is_capture,
@@ -117,6 +119,13 @@ impl PcmSubstream {
         }
         if params.period_size == 0 || params.periods == 0 {
             return Err(SoundError::InvalidParams);
+        }
+        if let Some(hardware) = &mut self.hardware {
+            hardware.configure(params)?;
+            self.params = Some(params);
+            self.sd_fmt = pack_sdfmt(params.format, params.rate, params.channels);
+            self.state = SubstreamState::Configured;
+            return Ok(());
         }
         let buf_bytes = params.buffer_bytes();
         if buf_bytes == 0 || buf_bytes > 256 * 1024 {
@@ -159,6 +168,9 @@ impl PcmSubstream {
         ) {
             return Err(SoundError::BadState);
         }
+        if let Some(hardware) = &mut self.hardware {
+            hardware.prepare()?;
+        }
         self.position_frames.store(0, Ordering::SeqCst);
         self.write_cursor = 0;
         self.state = SubstreamState::Prepared;
@@ -173,6 +185,9 @@ impl PcmSubstream {
         ) {
             return Err(SoundError::BadState);
         }
+        if let Some(hardware) = &mut self.hardware {
+            hardware.start()?;
+        }
         self.state = SubstreamState::Running;
         Ok(())
     }
@@ -182,12 +197,18 @@ impl PcmSubstream {
         if !matches!(self.state, SubstreamState::Running) {
             return Err(SoundError::BadState);
         }
+        if let Some(hardware) = &mut self.hardware {
+            hardware.stop()?;
+        }
         self.state = SubstreamState::Stopped;
         Ok(())
     }
 
     /// Current position in frames since `trigger_start`.
     pub fn pointer(&self) -> u64 {
+        if let Some(hardware) = &self.hardware {
+            return hardware.pointer();
+        }
         self.position_frames.load(Ordering::Acquire)
     }
 
@@ -205,6 +226,9 @@ impl PcmSubstream {
         ) || self.is_capture
         {
             return Err(SoundError::BadState);
+        }
+        if let Some(hardware) = &mut self.hardware {
+            return hardware.write(samples);
         }
         let total = self.buffer.len();
         if total == 0 {
@@ -228,6 +252,9 @@ impl PcmSubstream {
         {
             return Err(SoundError::BadState);
         }
+        if let Some(hardware) = &mut self.hardware {
+            return hardware.read(out);
+        }
         let total = self.buffer.len();
         if total == 0 {
             return Err(SoundError::BadState);
@@ -245,6 +272,11 @@ impl PcmSubstream {
     /// On the synthetic test bus this is a no-op (position is driven
     /// externally); on real HW it spins on SDxLPIB.
     pub fn drain(&mut self) -> Result<(), SoundError> {
+        if let Some(hardware) = &mut self.hardware {
+            hardware.drain()?;
+            self.state = SubstreamState::Stopped;
+            return Ok(());
+        }
         if !matches!(self.state, SubstreamState::Running) {
             return Err(SoundError::BadState);
         }
@@ -254,6 +286,9 @@ impl PcmSubstream {
 
     /// Number of BDL entries.
     pub fn bdl_len(&self) -> usize {
+        if self.hardware.is_some() {
+            return self.params.map_or(0, |p| p.periods as usize);
+        }
         self.bdl.len()
     }
 
@@ -269,12 +304,15 @@ impl PcmSubstream {
 
     /// SDxCBL register image (cyclic buffer length in bytes).
     pub fn cbl(&self) -> u32 {
+        if self.hardware.is_some() {
+            return self.params.map_or(0, |p| p.buffer_bytes() as u32);
+        }
         self.buffer.len() as u32
     }
 
     /// SDxLVI register image (last valid BDL index).
     pub fn lvi(&self) -> u8 {
-        (self.bdl.len() as u8).saturating_sub(1)
+        self.bdl_len().saturating_sub(1) as u8
     }
 
     /// Stream tag.

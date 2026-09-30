@@ -18,8 +18,8 @@
 //!
 //! # hw_params setsockopt-style helper
 //!
-//! NARF does not have `ioctl(2)`.  PCM callers configure hw_params by
-//! writing a 20-byte packed little-endian record into the control file
+//! This bridge does not implement the Linux ALSA ioctl ABI. PCM callers
+//! configure hw_params by writing a 20-byte packed little-endian record into the PCM file
 //! at offset `HW_PARAMS_MAGIC_OFFSET` (0xFFFF_0000).  Layout matches
 //! `HwParams` field order: `[format:u32][rate:u32][channels:u32]
 //! [period_size:u32][periods:u32]`. Any write at a normal offset
@@ -36,7 +36,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
 use crate::mixer::ControlValue;
-use crate::{list_cards, open_capture, open_playback, PlaybackStream, SoundError};
+use crate::{list_cards, open_capture, open_playback, CaptureStream, PlaybackStream, SoundError};
 
 // ── Offset sentinel for hw_params writes ─────────────────────────────
 
@@ -231,7 +231,7 @@ impl FileOps for SoundControlFile {
 ///
 /// On first write the substream is lazily opened and hw_params are set
 /// to a safe default (48 kHz stereo S16).  Callers that need a different
-/// format must send a hw_params record via `SoundControlFile` first.
+/// format must send a hw_params record to this PCM file first.
 ///
 /// Linux ref: `sound/core/pcm_native.c::snd_pcm_write` — user-space
 /// writes land in the DMA cyclic buffer via `snd_pcm_lib_write`.
@@ -239,8 +239,7 @@ impl FileOps for SoundControlFile {
 pub struct SoundPcmPlaybackFile {
     card_index: u32,
     device: u32,
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
-    stream: IrqSafeSpinLock<Option<PlaybackStream>>,
+    stream: IrqSafeSpinLock<Option<(PlaybackStream, bool)>>,
 }
 
 impl SoundPcmPlaybackFile {
@@ -252,21 +251,13 @@ impl SoundPcmPlaybackFile {
         }
     }
 
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn ensure_open(&self) -> Result<(), SoundError> {
         let mut g = self.stream.lock();
         if g.is_none() {
             let mut s = open_playback(self.card_index, self.device)?;
-            // Default hw_params: 48 kHz stereo S16 × 4 periods of 1024 frames.
-            s.hw_params(HwParams {
-                format: SampleFormat::S16LE,
-                rate: SampleRate::R48000,
-                channels: ChannelCount::Stereo,
-                period_size: 1024,
-                periods: 4,
-            })?;
+            s.hw_params(crate::default_hw_params(self.card_index, false)?)?;
             s.prepare()?;
-            *g = Some(s);
+            *g = Some((s, false));
         }
         Ok(())
     }
@@ -280,36 +271,49 @@ impl FileOps for SoundPcmPlaybackFile {
     }
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let card_index = self.card_index;
-        let device = self.device;
         Box::pin(async move {
             if offset == HW_PARAMS_MAGIC_OFFSET {
-                // hw_params setsockopt path on the PCM file itself.
                 let params = decode_hw_params(buf).ok_or(FsError::InvalidPath)?;
-                let mut s = open_playback(card_index, device).map_err(|_| FsError::Busy)?;
+                let mut guard = self.stream.lock();
+                guard.take();
+                let mut s =
+                    open_playback(self.card_index, self.device).map_err(|_| FsError::Busy)?;
                 s.hw_params(params).map_err(|_| FsError::InvalidPath)?;
+                s.prepare().map_err(|_| FsError::Unsupported)?;
+                *guard = Some((s, false));
                 return Ok(buf.len());
             }
-            // Sample-data write into the cyclic ring.
-            // Ensure stream is open with default params.
-            // Note: we re-open per-call since the lock cannot cross async
-            // boundary; IrqSafeSpinLock is !Send across await.
-            let mut s = open_playback(card_index, device).map_err(|e| match e {
-                SoundError::NoSuchCard | SoundError::NoSuchDevice => FsError::NotFound,
-                SoundError::DeviceBusy => FsError::Busy,
-                _ => FsError::Unsupported,
-            })?;
-            s.hw_params(HwParams {
-                format: SampleFormat::S16LE,
-                rate: SampleRate::R48000,
-                channels: ChannelCount::Stereo,
-                period_size: 1024,
-                periods: 4,
-            })
-            .ok();
-            s.prepare().ok();
-            let n = s.write(buf).map_err(|_| FsError::Unsupported)?;
-            Ok(n)
+            self.ensure_open().map_err(|_| FsError::Unsupported)?;
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let deadline = narf_time::Deadline::after_ms(1000);
+            loop {
+                {
+                    let mut guard = self.stream.lock();
+                    let (stream, started) = guard.as_mut().ok_or(FsError::Busy)?;
+                    let n = match stream.write(buf) {
+                        Err(SoundError::BadState) if *started => {
+                            stream.stop().map_err(|_| FsError::Unsupported)?;
+                            stream.prepare().map_err(|_| FsError::Unsupported)?;
+                            *started = false;
+                            stream.write(buf).map_err(|_| FsError::Unsupported)?
+                        }
+                        result => result.map_err(|_| FsError::Unsupported)?,
+                    };
+                    if n != 0 {
+                        if !*started {
+                            stream.start().map_err(|_| FsError::Unsupported)?;
+                            *started = true;
+                        }
+                        return Ok(n);
+                    }
+                }
+                if deadline.expired() {
+                    return Err(FsError::Busy);
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(2).as_instant()).await;
+            }
         })
     }
 
@@ -334,35 +338,56 @@ impl FileOps for SoundPcmPlaybackFile {
 pub struct SoundPcmCaptureFile {
     card_index: u32,
     device: u32,
+    stream: IrqSafeSpinLock<Option<CaptureStream>>,
 }
 
 impl SoundPcmCaptureFile {
     pub fn new(card_index: u32, device: u32) -> Self {
-        Self { card_index, device }
+        Self {
+            card_index,
+            device,
+            stream: IrqSafeSpinLock::new(None),
+        }
     }
 }
 
 impl FileOps for SoundPcmCaptureFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let card_index = self.card_index;
-        let device = self.device;
         Box::pin(async move {
-            let mut s = open_capture(card_index, device).map_err(|e| match e {
-                SoundError::NoSuchCard | SoundError::NoSuchDevice => FsError::NotFound,
-                SoundError::DeviceBusy => FsError::Busy,
-                _ => FsError::Unsupported,
-            })?;
-            s.hw_params(HwParams {
-                format: SampleFormat::S16LE,
-                rate: SampleRate::R48000,
-                channels: ChannelCount::Stereo,
-                period_size: 1024,
-                periods: 4,
-            })
-            .ok();
-            s.prepare().ok();
-            let n = s.read(buf).map_err(|_| FsError::Unsupported)?;
-            Ok(n)
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let deadline = narf_time::Deadline::after_ms(500);
+            loop {
+                {
+                    let mut guard = self.stream.lock();
+                    if guard.is_none() {
+                        let mut stream = open_capture(self.card_index, self.device)
+                            .map_err(|_| FsError::Busy)?;
+                        stream
+                            .hw_params(
+                                crate::default_hw_params(self.card_index, true)
+                                    .map_err(|_| FsError::Unsupported)?,
+                            )
+                            .map_err(|_| FsError::Unsupported)?;
+                        stream.prepare().map_err(|_| FsError::Unsupported)?;
+                        stream.start().map_err(|_| FsError::Unsupported)?;
+                        *guard = Some(stream);
+                    }
+                    let n = guard
+                        .as_mut()
+                        .unwrap()
+                        .read(buf)
+                        .map_err(|_| FsError::Unsupported)?;
+                    if n != 0 {
+                        return Ok(n);
+                    }
+                }
+                if deadline.expired() {
+                    return Err(FsError::Busy);
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(2).as_instant()).await;
+            }
         })
     }
 
