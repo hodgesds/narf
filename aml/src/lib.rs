@@ -773,8 +773,8 @@ pub fn device_cids(device_path: &str) -> alloc::vec::Vec<alloc::string::String> 
 /// Returns `None` when the namespace hasn't been built yet, when
 /// `\_S5` is missing (rare — every spec-conformant DSDT carries
 /// it), when the body isn't a Package, or when fewer than two
-/// integer elements are present. Callers fall back to platform
-/// defaults (QEMU + most x86_64 firmware uses `(5, 0)`).
+/// integer elements are present. The returned integers are opaque
+/// platform encodings; zero is valid (QEMU q35 uses `(0, 0)` for S5).
 pub fn evaluate_s5() -> Option<(u8, u8)> {
     let node = find_node("\\_S5_").or_else(|| find_node("\\_S5"))?;
     let (offset, length) = match node.value? {

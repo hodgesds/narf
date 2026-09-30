@@ -378,9 +378,25 @@ impl MsixTable {
         // global-enable.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            cfg_write16(self.cfg_phys, off, mc | (1 << 15));
+            cfg_write16(self.cfg_phys, off, (mc | (1 << 15)) & !(1 << 14));
         }
         Ok(())
+    }
+
+    /// Function-mask and disable MSI-X before releasing handlers/vectors.
+    ///
+    /// # Safety
+    /// Caller owns the device's config space and has stopped its interrupt
+    /// sources. Synchronize in-flight handlers before freeing their state.
+    pub unsafe fn disable(&mut self) {
+        let off = self.cap_offset + 2;
+        // SAFETY: the capability offset was validated during discovery;
+        // exclusive config-space ownership is the caller's contract.
+        unsafe {
+            let mc = cfg_read16(self.cfg_phys, off);
+            cfg_write16(self.cfg_phys, off, (mc | (1 << 14)) & !(1 << 15));
+            let _ = cfg_read16(self.cfg_phys, off);
+        }
     }
 
     /// `true` once `enable()` has flipped the MSI-X enable bit. Reads

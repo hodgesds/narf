@@ -25,6 +25,29 @@ applications above NARF.
 
 ## 3. Public interface
 
+`SocketFile::delegate_netlink_admin` accepts route and generic netlink
+sockets in the delegated interface's namespace. Generic-family requests
+receive that stored handle through `net::netlink_generic::RequestContext`;
+ordinary socket creation conveys no Wi-Fi mutation authority.
+`delegate_stack_admin_to_generic_socket` lets the trusted launcher attach
+the admin handle returned by stack attachment to a task's generic-netlink
+fd. This is an internal launcher API, not a Linux syscall accepting raw
+capability bytes. Kernel generic-netlink events reach only subscribers in
+the event's namespace and preserve their multicast group in packet info.
+A wireless-only service obtains its reply with
+`net::stack::control_registered`, leaving IP frame delivery with the existing
+stack. `network_daemon::prepare(process, &StackAttachReply, TaskSpec)` installs
+that interface's explicit grant before making the loaded service runnable;
+`spawn` prepares and publishes in one call. The pending form lets the
+launcher install stdio/root/cwd before publishing. The service's ordinary
+route/generic `socket()` calls automatically receive the grant. Fork/clone
+inherit it (including supplicant daemonization), and exec retains it.
+Revocation and interface/namespace authorization are checked at delegation
+and every control request. A namespace move cannot transfer authority.
+Other tasks, including UID 0, acquire none. The caller remains responsible
+for selecting/loading the service executable and presenting stack authority;
+these APIs never infer a grant from a process name or UID.
+
 ```rust
 pub struct Process { /* cap table root, VM root, threads */ }
 pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;
@@ -1113,12 +1136,18 @@ event. The audited command matrix and remaining gaps live in
 DRM ioctl handling that creates process descriptors remains in the syscall
 layer even when request validation and submission are driver-owned. VirtIO-GPU
 `EXECBUFFER(FENCE_FD_OUT)` reserves a descriptor before submission, installs
-an already-signalled sync-file description with `FD_CLOEXEC` after synchronous
-completion, and then copies the descriptor number to the ioctl structure.
-`FENCE_FD_IN` resolves and type-checks the supplied description first;
-negative or non-sync-file descriptors return `EINVAL`, and descriptor-table
-exhaustion returns `EMFILE` without submitting work. Installation precedes the
-final user copy, matching Linux's observable lifetime if that copy faults.
+a sync-file description backed by the driver's exact asynchronous submission
+fence with `FD_CLOEXEC`, and then copies the descriptor number to the ioctl
+structure. `FENCE_FD_IN` resolves and type-checks the supplied description
+first; same-context/ring dependencies rely on device queue ordering, while
+foreign contexts wait responsively with the GPU hang bound. Negative or
+non-sync-file descriptors return `EINVAL`, and descriptor-table exhaustion
+returns `EMFILE` without submitting work. Installation precedes the final user
+copy, matching Linux's observable lifetime if that copy faults.
+Device-backed sync-file poll publishes a bounded 1 ms completion-reap deadline
+until the fence signals, because the VirtIO control queue has no userspace
+waker. Time-backed sync files continue publishing their deadline after expiry
+until readiness is observed, preventing a due-between-scan-and-park lost wake.
 
 Linux perf wire definitions are owned by the separate
 `narf-linux-perf-uapi` crate, transcribed through `PERF_ATTR_SIZE_VER9` from

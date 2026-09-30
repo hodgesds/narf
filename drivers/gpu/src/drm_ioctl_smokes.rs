@@ -457,14 +457,15 @@ fn smoke_drm_ioctl_planes_synth_primary() -> TestResult {
         return TestResult::Fail("plane has empty possible_crtcs");
     }
     // OBJ_GETPROPERTIES(plane) → the "type" property reads PRIMARY (1).
-    // The object exposes the complete atomic property set, so provide room
-    // for all eleven entries just as libdrm's two-pass allocation does.
-    let mut props = [0u32; 11];
-    let mut vals = [0u64; 11];
+    // The object exposes the complete atomic property set — including the
+    // explicit-fencing IN_FENCE_FD — so provide room for all twelve
+    // entries just as libdrm's two-pass allocation does.
+    let mut props = [0u32; 12];
+    let mut vals = [0u64; 12];
     let mut og = [0u8; 32];
     og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
     og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
-    og[16..20].copy_from_slice(&11u32.to_le_bytes()); // count_props (room)
+    og[16..20].copy_from_slice(&12u32.to_le_bytes()); // count_props (room)
     og[20..24].copy_from_slice(&0x40u32.to_le_bytes()); // obj_id = plane
     og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes()); // PLANE
     let obj_getprops = iowr(DRM_IOCTL_BASE, 0xB9, 32);

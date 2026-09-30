@@ -532,6 +532,97 @@ kernel_test_in!(
     smoke_virtio_gpu_flush_reentrancy_skips_not_deadlocks
 );
 
+fn smoke_virtio_gpu_submission_fences_are_independent() -> TestResult {
+    let first = super::SubmittedFence::new(5);
+    let second = super::SubmittedFence::new(9);
+    if first.id() != 5 || second.id() != 9 || first.is_signalled() || second.is_signalled() {
+        return TestResult::Fail("fresh submission fence state");
+    }
+    // Native-context rings may retire globally out of id order. Signalling a
+    // later id must not falsely complete an unrelated earlier-ring fence.
+    second.signal();
+    if !second.is_signalled() || first.is_signalled() {
+        return TestResult::Fail("out-of-order fence signalling leaked across submissions");
+    }
+    first.signal();
+    first.signal(); // idempotent, like dma_fence_signal
+    if !first.is_signalled() {
+        return TestResult::Fail("submission fence did not signal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_submission_fences_are_independent
+);
+
+fn smoke_virtio_gpu_fenced_submit_3d_wire_shape() -> TestResult {
+    use super::cmd::{
+        build_submit_3d_fenced, read_hdr, SUBMIT_3D_PREFIX_LEN, VIRTIO_GPU_CMD_SUBMIT_3D,
+        VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+    };
+    let commands = [0x5Au8; 8];
+    let mut submit = [0u8; SUBMIT_3D_PREFIX_LEN + 8];
+    build_submit_3d_fenced(&mut submit, 7, Some(2), 0x1122_3344_5566_7788, &commands);
+    let hdr = read_hdr(&submit);
+    if hdr.cmd_type != VIRTIO_GPU_CMD_SUBMIT_3D || hdr.ctx_id != 7 {
+        return TestResult::Fail("fenced SUBMIT_3D header");
+    }
+    // FENCE and INFO_RING_IDX must compose; ring byte lives at offset 20.
+    if hdr.flags != VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX {
+        return TestResult::Fail("fenced SUBMIT_3D flags");
+    }
+    if hdr.fence_id != 0x1122_3344_5566_7788 || submit[20] != 2 {
+        return TestResult::Fail("fenced SUBMIT_3D fence_id / ring byte");
+    }
+    if submit[SUBMIT_3D_PREFIX_LEN..] != commands {
+        return TestResult::Fail("fenced SUBMIT_3D payload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_fenced_submit_3d_wire_shape
+);
+
+fn smoke_virtio_gpu_live_fenced_submit_signals() -> TestResult {
+    use crate::gpu_pci;
+    // The ktest QEMU config runs a 2D-only virtio-gpu; the fenced 3D path
+    // needs a live virgl host renderer.
+    let Some(dev) = gpu_pci::probed_device().filter(|d| d.virgl_enabled()) else {
+        return TestResult::Skip("no virgl-capable virtio-gpu on this run");
+    };
+    // Private high context id: the DRM bridge's per-open ids count up from 1.
+    const TEST_CTX_ID: u32 = 0xFFF0;
+    if dev.create_context(TEST_CTX_ID, 0).is_err() {
+        return TestResult::Fail("CTX_CREATE for fence smoke failed");
+    }
+    // An empty stream is a valid no-op submission (EXECBUFFER allows size 0).
+    let first = match dev.submit_virgl_fenced(TEST_CTX_ID, None, &[]) {
+        Ok(fence_id) => fence_id,
+        Err(_) => return TestResult::Fail("first fenced submit failed"),
+    };
+    let second = match dev.submit_virgl_fenced(TEST_CTX_ID, None, &[]) {
+        Ok(fence_id) => fence_id,
+        Err(_) => return TestResult::Fail("second fenced submit failed"),
+    };
+    if second.id() <= first.id() {
+        return TestResult::Fail("fence ids must be strictly increasing");
+    }
+    if !dev.wait_fence(&second, 5_000) {
+        return TestResult::Fail("fenced submission did not signal within 5 s");
+    }
+    // In-order controlq: the later fence signalling implies the earlier one.
+    if !dev.fence_signalled(&first) {
+        return TestResult::Fail("earlier fence unsignalled after later fence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_live_fenced_submit_signals
+);
+
 fn smoke_virtio_gpu_capset_info_round_trip() -> TestResult {
     use super::cmd::{
         build_get_capset_info, read_capset_info, read_hdr, CapsetInfo, GET_CAPSET_INFO_LEN,

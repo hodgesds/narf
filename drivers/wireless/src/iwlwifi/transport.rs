@@ -108,6 +108,15 @@ pub fn prph_write<M: IwlMmio>(mmio: &mut M, addr: u32, value: u32) {
     mmio.write(regs::HBUS_TARG_PRPH_WDAT, value);
 }
 
+/// AX210+ uses a 24-bit peripheral address. Bits 24..25 encode the
+/// transfer width minus one: omitting 3<<24 issues a byte access and
+/// silently drops the PNVM doorbell bit at bit 20.
+pub fn prph_write_ax210<M: IwlMmio>(mmio: &mut M, addr: u32, value: u32) {
+    mmio.write(regs::HBUS_TARG_PRPH_WADDR, (addr & 0x00ff_ffff) | (3 << 24));
+    compiler_fence(Ordering::SeqCst);
+    mmio.write(regs::HBUS_TARG_PRPH_WDAT, value);
+}
+
 // ── APM init — common prologue ─────────────────────────────────────
 
 /// Bring the device out of low-power, request the MAC clock, and

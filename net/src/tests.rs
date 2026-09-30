@@ -8372,3 +8372,39 @@ fn smoke_net_gateway_config_installs_default_route() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net", smoke_net_gateway_config_installs_default_route);
+
+fn smoke_control_grant_keeps_frame_owner_and_revokes() -> TestResult {
+    use narf_capabilities::{Cap, Invoke, Write};
+    let name = "lo.wireless-control";
+    bypass_register_loopback_for_test(name);
+    let iface = crate::registry().with_handle(name, |h| *h).unwrap();
+    let daemon = Cap::<crate::StackDaemon, Invoke>::bootstrap();
+    let req = crate::StackAttach { iface, daemon };
+    let reply = crate::stack::control_registered(&req).expect("control grant");
+    if crate::bypass::is_attached(name)
+        || reply.admin.authorize_interface(name, 0).is_err()
+        || reply.admin.authorize_interface("lo", 0).is_ok()
+        || reply.admin.authorize_interface(name, 18).is_ok()
+    {
+        return TestResult::Fail("control delegation changed frame routing or escaped scope");
+    }
+    let forged = crate::StackAttach {
+        iface: Cap::<crate::NetIface, Write>::bootstrap(),
+        daemon,
+    };
+    if !matches!(
+        crate::stack::control_registered(&forged),
+        Err(crate::AttachError::IfaceMismatch)
+    ) {
+        return TestResult::Fail("control grant accepted an unregistered interface cap");
+    }
+    daemon.revoke();
+    if reply.admin.authorize_interface(name, 0).is_ok() || reply.admin.is_live() {
+        return TestResult::Fail("daemon revocation left control grant usable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/control_grant",
+    smoke_control_grant_keeps_frame_owner_and_revokes
+);

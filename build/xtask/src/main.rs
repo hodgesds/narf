@@ -188,9 +188,9 @@ enum Cmd {
     /// on the kernel cmdline.
     DiskWritePartitioned(DiskWritePartitionedArgs),
     /// Wrap a raw firmware payload with the NARF trailer
-    /// (`firmware/specification/spec.md` §6). Produces an unsigned
-    /// blob — kernel must be built with `firmware-allow-unsigned`
-    /// for these to load. The wrapped output goes into
+    /// (`firmware/specification/spec.md` §6). Accepts a detached signature
+    /// and public key; omitting both produces a developer-only unsigned
+    /// blob. The wrapped output goes into
     /// `target/firmware/<name>` (so `xtask image` stages it either
     /// into the initramfs CPIO if matched by `--initramfs-firmware`,
     /// or onto the root partition's /lib/firmware/ otherwise).
@@ -270,7 +270,17 @@ struct PackFirmwareArgs {
     #[arg(long)]
     version: Option<String>,
 
-    /// Output path. Defaults to `firmware/<name>` under the
+    /// Detached Ed25519 signature (64 raw bytes) over BLAKE3(payload).
+    /// Signing happens externally; this command never loads private keys.
+    #[arg(long, requires = "public_key")]
+    signature: Option<PathBuf>,
+
+    /// Ed25519 public key (32 raw bytes). Its SHA-256 fingerprint is
+    /// stored in the trailer. The signature is checked before writing.
+    #[arg(long, requires = "signature")]
+    public_key: Option<PathBuf>,
+
+    /// Output path. Defaults to `target/firmware/<name>` under the
     /// workspace root so subsequent `xtask image` runs pick it up.
     #[arg(long)]
     out: Option<String>,
@@ -560,6 +570,12 @@ fn virtio_gpu_device_arg(backend: GpuBackend) -> String {
         backend == GpuBackend::Virgl && std::env::var_os("XTASK_GPU_DRM_NATIVE").is_some();
     let extra = if native_ctx {
         ",blob=on,hostmem=256M,drm_native_context=on"
+    } else if backend == GpuBackend::Virgl {
+        // Host-visible blob window for classic VirGL too: with `hostmem`
+        // the device exposes shmid 0, the kernel advertises
+        // VIRTGPU_PARAM_HOST_VISIBLE, and Mesa maps host3d blobs directly
+        // instead of bouncing every buffer through TRANSFER ioctls.
+        ",blob=on,hostmem=256M"
     } else {
         ""
     };
@@ -647,7 +663,7 @@ mod gpu_backend_tests {
         assert_eq!(args.gpu_backend, GpuBackend::Virgl);
         assert_eq!(
             virtio_gpu_device_arg(args.gpu_backend),
-            "virtio-gpu-gl-pci,id=vgpu0,disable-legacy=on,disable-modern=off"
+            "virtio-gpu-gl-pci,id=vgpu0,disable-legacy=on,disable-modern=off,blob=on,hostmem=256M"
         );
         assert_eq!(
             qemu_display_arg("gtk", args.gpu_backend),
@@ -2730,13 +2746,42 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
 
     println!("xtask: launching {} {}", qemu, kernel.display());
 
+    // Optional host-side copy of the existing serial stream. This leaves
+    // guest instrumentation unchanged and makes an in-progress stall
+    // diagnosable before the overall test deadline expires.
+    let serial_log = if gate_exit {
+        std::env::var_os("XTASK_QEMU_SERIAL_LOG")
+            .map(std::fs::File::create)
+            .transpose()
+            .context("create XTASK_QEMU_SERIAL_LOG")?
+    } else {
+        None
+    };
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
     let serial_reader = child.stdout.take().map(|mut stdout| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            let _ = stdout.read_to_end(&mut bytes);
+            let mut log = serial_log;
+            let mut chunk = [0; 16 * 1024];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        bytes.extend_from_slice(&chunk[..length]);
+                        if let Some(file) = log.as_mut() {
+                            if let Err(error) = file.write_all(&chunk[..length]) {
+                                eprintln!("xtask: serial log write failed: {error}");
+                                log = None;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
             bytes
         })
     });
@@ -2814,7 +2859,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
 /// Failure: any panic marker, OR timeout without all success markers.
 fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     // Force the `boot-smoke` feature on so the kernel triggers a clean
-    // ACPI / isa-debug-exit shutdown after the real init flow drains.
+    // ACPI S5 / PSCI SYSTEM_OFF transition after the real init flow drains.
     // Same pattern as the kernel-test harness — no kill-after-timeout
     // race; QEMU exits naturally on success or stays alive on hang.
     let mut args = args.clone();
@@ -2938,7 +2983,7 @@ fn wait_for_boot_smoke(
         transcript
     });
 
-    // Wait for QEMU to exit naturally (kernel calls exit_kernel),
+    // Wait for QEMU to exit naturally after the guest powers itself off,
     // OR force-kill on timeout.
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     let (status, timed_out) = loop {
@@ -2967,7 +3012,7 @@ fn wait_for_boot_smoke(
     if timed_out {
         emit_serial_tail(&transcript);
         bail!(
-            "xtask {label}: kernel did not call exit_kernel within {}s — possible boot hang",
+            "xtask {label}: kernel did not power off within {}s — possible boot hang",
             timeout_secs
         );
     }
@@ -2975,17 +3020,10 @@ fn wait_for_boot_smoke(
         emit_serial_tail(&transcript);
         bail!("xtask {label}: QEMU exited without the kernel clean-exit marker");
     }
-    // Clean-exit status is arch-dependent:
-    //  * x86_64 uses `isa-debug-exit` (port I/O), which encodes
-    //    `(code << 1) | 1` into QEMU's exit status — so a kernel
-    //    exit code of 0 yields QEMU status 1.
-    //  * aarch64 has no `isa-debug-exit`; the kernel shuts down via
-    //    PSCI or semihosting `SYS_EXIT`, and QEMU exits naturally
-    //    with status 0.
-    let expected = match arch {
-        Arch::X86_64 => Some(1),
-        Arch::Aarch64 => Some(0),
-    };
+    // ACPI S5 and PSCI SYSTEM_OFF both make QEMU exit naturally with status
+    // zero. This deliberately differs from the test-only x86 isa-debug-exit
+    // status (1), so accidentally falling back to exit_kernel cannot pass.
+    let expected = Some(0);
     if status.code() != expected {
         emit_serial_tail(&transcript);
         bail!(
@@ -3510,6 +3548,16 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
         ("drm_smoke", "drm-ok"),
+        // VirGL 3D smoke — hand-rolled virgl command stream (clear + a
+        // TGSI-shaded triangle) through renderD128, rendered by the HOST
+        // GPU and pixel-verified after TRANSFER_FROM_HOST_3D. The token
+        // is `virgl3d-done`: printed on success AND on the clean
+        // environment skip (a 2D-only virtio-gpu prints `virgl3d-skip`
+        // first), absent on any real failure — the case gates
+        // correctness wherever it runs and needs no VirGL-capable QEMU
+        // in CI. Full 3D verification: `--gpu-backend virgl --display
+        // egl-headless` + expect `virgl3d-ok 64x64`.
+        ("virgl3d_smoke", "virgl3d-done"),
         // timerfd-in-epoll wake — weston's repaint-loop driver: a timerfd
         // armed via timerfd_settime, blocked on by epoll_wait(-1). Guards the
         // path the whole desktop repaint cadence rides on.
@@ -4069,6 +4117,26 @@ fn run_interactive_boot(
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
+    // Forward QEMU's stderr to ours as it arrives. The pipe used to be
+    // created and never drained, which both swallowed device-backend
+    // diagnostics (virglrenderer's VREND_DEBUG output prints there) and
+    // — once the 64 KiB pipe buffer filled — blocked QEMU mid-write,
+    // wedging the guest under any chatty debug env.
+    if let Some(child_err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let reader = std::io::BufReader::new(child_err);
+            let mut err = std::io::stderr();
+            for line in reader.split(b'\n') {
+                let Ok(mut line) = line else { break };
+                line.push(b'\n');
+                if err.write_all(&line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let prompt_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -4590,6 +4658,26 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    // Forward QEMU's stderr to ours as it arrives. The pipe used to be
+    // created and never drained, which both swallowed device-backend
+    // diagnostics (virglrenderer's VREND_DEBUG output prints there) and
+    // — once the 64 KiB pipe buffer filled — blocked QEMU mid-write,
+    // wedging the guest under any chatty debug env.
+    if let Some(child_err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let reader = std::io::BufReader::new(child_err);
+            let mut err = std::io::stderr();
+            for line in reader.split(b'\n') {
+                let Ok(mut line) = line else { break };
+                line.push(b'\n');
+                if err.write_all(&line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let timeout_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
         .ok()
@@ -7773,6 +7861,53 @@ fn wrap_firmware_trailer(payload: &[u8], version: Option<&str>) -> Vec<u8> {
     blob
 }
 
+fn attach_firmware_signature(
+    blob: &mut [u8],
+    payload_len: usize,
+    signature: &[u8; 64],
+    public_key: &[u8; 32],
+) -> Result<()> {
+    use sha2::Digest;
+    if blob.len() < 104 || payload_len > blob.len() - 104 {
+        bail!("firmware trailer is truncated");
+    }
+    let digest = blake3::hash(&blob[..payload_len]);
+    let key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+        .map_err(|_| anyhow!("invalid Ed25519 public key"))?;
+    key.verify_strict(
+        digest.as_bytes(),
+        &ed25519_dalek::Signature::from_bytes(signature),
+    )
+    .map_err(|_| anyhow!("detached firmware signature does not match payload and public key"))?;
+    blob[payload_len..payload_len + 64].copy_from_slice(signature);
+    blob[payload_len + 64..payload_len + 96].copy_from_slice(&sha2::Sha256::digest(public_key));
+    Ok(())
+}
+
+#[cfg(test)]
+mod firmware_pack_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn detached_signature_authenticates_exact_payload() {
+        // Test-only deterministic key, never a deployment trust root.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let public = key.verifying_key().to_bytes();
+        let payload = b"firmware packing test";
+        let signature = key.sign(blake3::hash(payload).as_bytes()).to_bytes();
+        let mut blob = wrap_firmware_trailer(payload, Some("test"));
+        attach_firmware_signature(&mut blob, payload.len(), &signature, &public).unwrap();
+        assert_eq!(&blob[payload.len()..payload.len() + 64], &signature);
+        assert_eq!(&blob[blob.len() - 4..], b"NRFW");
+        blob[0] ^= 1;
+        assert!(attach_firmware_signature(&mut blob, payload.len(), &signature, &public).is_err());
+        assert!(
+            attach_firmware_signature(&mut blob, payload.len(), &signature, &[0x13; 32]).is_err()
+        );
+    }
+}
+
 /// Bulk-import firmware blobs. Walks the source tree, decompresses
 /// any `.zst` entries, wraps each with the NARF trailer, and writes
 /// the result under the workspace's `firmware/` dir so subsequent
@@ -7977,15 +8112,21 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
 
 /// Wrap a raw firmware payload with the NARF trailer + write it to
 /// disk. Reference: `firmware/src/signature.rs` — payload bytes,
-/// then a 64-byte all-zero signature, 32-byte all-zero signer
-/// fingerprint (the "unsigned" sentinel), metadata TLV bytes
+/// then a 64-byte signature, 32-byte signer fingerprint (both zero for
+/// developer-only unsigned blobs), metadata TLV bytes
 /// (tag 0x01 = ASCII version), 4-byte LE metadata length, then
 /// the 4-byte trailing magic `b"NRFW"`.
 ///
-/// Kernel must be built with `firmware-allow-unsigned` to accept
-/// these — the `firmware-init` initcall rejects unsigned blobs
-/// otherwise.
+/// Signed payloads require a corresponding build-time trusted public key.
 fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
+    if args.name.is_empty()
+        || Path::new(&args.name).is_absolute()
+        || Path::new(&args.name)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("firmware name must be relative and contain no parent components");
+    }
     let payload = std::fs::read(&args.payload)
         .with_context(|| format!("reading payload from {}", &args.payload))?;
     if payload.is_empty() {
@@ -7999,11 +8140,24 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
             bail!("version string too long ({} > 255)", ver.len());
         }
     }
-    let blob = wrap_firmware_trailer(&payload, args.version.as_deref());
+    let mut blob = wrap_firmware_trailer(&payload, args.version.as_deref());
+    match (&args.signature, &args.public_key) {
+        (Some(signature), Some(public_key)) => {
+            let signature: [u8; 64] = std::fs::read(signature)?
+                .try_into()
+                .map_err(|_| anyhow!("signature must contain exactly 64 raw bytes"))?;
+            let public_key: [u8; 32] = std::fs::read(public_key)?
+                .try_into()
+                .map_err(|_| anyhow!("public key must contain exactly 32 raw bytes"))?;
+            attach_firmware_signature(&mut blob, payload.len(), &signature, &public_key)?;
+        }
+        (None, None) => {}
+        _ => bail!("--signature and --public-key must be supplied together"),
+    }
 
     let out_path: PathBuf = match &args.out {
         Some(p) => PathBuf::from(p),
-        None => workspace_root()?.join("firmware").join(&args.name),
+        None => workspace_root()?.join("target/firmware").join(&args.name),
     };
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)

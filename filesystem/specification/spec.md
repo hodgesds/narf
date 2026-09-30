@@ -215,6 +215,8 @@ pub trait FileOps {
     fn arm_readiness_exclusive(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
     fn disarm_readiness(&self, task_id: u64) -> bool;
+    fn drm_execbuf_fence(&self) -> Option<Arc<dyn DrmFence>>;
+    fn drm_execbuf_context(&self, ring_idx: u32) -> Option<u64>;
     fn tty_fg_pgrp(&self) -> Option<u64>;
     fn tty_session(&self) -> Option<u64>;
     fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool;
@@ -223,6 +225,12 @@ pub trait FileOps {
         arg: usize,
         readable: bool,
     ) -> Result<bool, FsError>;
+}
+
+pub trait DrmFence: Send + Sync {
+    fn is_signalled(&self) -> bool;
+    fn wait(&self, timeout_ms: u64) -> bool;
+    fn context(&self) -> Option<u64>;
 }
 
 pub enum FileType {
@@ -887,6 +895,14 @@ per-open DRM GEM namespaces. The syscall layer owns descriptor allocation;
 the DRM file owns handle lookup/import and may recover its driver-specific
 dma-buf through `FileOps::as_any`. Drivers without a per-open implementation
 return `Unsupported` and retain the card-global compatibility hook.
+
+`FileOps::drm_execbuf_fence()` hands the descriptor-owning syscall layer the
+exact driver-owned completion object from the calling task's successful DRM
+EXECBUFFER. `DrmFence` supplies readiness, bounded wait, and an optional
+ordered-context key; `drm_execbuf_context(ring_idx)` supplies the matching key
+for a new submission so a same-ring input fence can rely on queue ordering
+without a synchronous wait. Drivers that do not produce device fences return
+`None` and retain the pre-signalled compatibility behavior.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

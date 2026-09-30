@@ -40,6 +40,11 @@
 
 ## 3. Public interface
 
+`MsixTable::enable()` enables delivery and clears the function mask after
+entries and handlers are programmed. `unsafe MsixTable::disable()` masks
+the function and clears MSI-X enable; the owner must stop device causes
+and synchronize handlers before releasing their state or vector numbers.
+
 ### 3.1 Device descriptor
 
 ```rust
@@ -101,7 +106,30 @@ A driver normally gets one such cap per device it owns; the
 driver's manifest names the device by `DeviceId` and the
 framework matches.
 
-### 3.4 Hot-plug
+### 3.4 Config-space access
+
+```rust
+pub const CFG_WINDOW_BYTES: u64 = 4096;
+
+pub fn pci::read_config32(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    offset: u16,
+) -> Result<u32, PciError>;
+```
+
+Reads one dword from anywhere in the claimed function's 4 KiB config
+window. `pci::save_config` covers the standard type-0 header and
+`pci_cap` walks the capability list, but vendors put device-specific
+state in 0x40..0x100 that is neither — Intel's HECI firmware-status
+words at 0x40 / 0x48 / 0x60 are the motivating case. `offset` must be
+dword-aligned and within `CFG_WINDOW_BYTES`, else `PciError::BadOffset`.
+
+A read of a device that has fallen off the bus returns `0xFFFF_FFFF`,
+the same as the raw ECAM read; callers that need to distinguish that
+from a real all-ones value must check liveness another way.
+
+### 3.5 Hot-plug
 
 ```rust
 pub enum BusEvent {

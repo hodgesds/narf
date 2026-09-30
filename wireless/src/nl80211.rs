@@ -1,4 +1,6 @@
-//! Read-only `nl80211` generic-netlink family backed by the wireless registry.
+//! `nl80211` discovery and explicitly delegated station control.
+
+mod control;
 
 extern crate alloc;
 
@@ -30,6 +32,26 @@ const GENL_CMD_CAP_DO: u32 = 1 << 1;
 const GENL_CMD_CAP_DUMP: u32 = 1 << 2;
 const ENODEV: i32 = 19;
 const EOPNOTSUPP: i32 = 95;
+
+/// Report a driver's completed link-down transition. Called after dropping
+/// any network-registry lock; no device state is queried by the socket sink.
+pub fn notify_disconnect(name: &str, reason: u16) {
+    let Some(index) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(iface) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    push_attr(&mut attrs, 54, &reason.to_ne_bytes());
+    narf_net::netlink_generic::publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        iface.net_ns_id,
+        GenlReply { command: 48, attrs },
+    );
+}
 
 fn align(len: usize) -> usize {
     (len + 3) & !3
@@ -80,7 +102,11 @@ fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
     attrs
 }
 
-fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
+fn wiphy_attrs(
+    index: u32,
+    info: &crate::WirelessIfaceInfo,
+    iface: Option<&dyn crate::WirelessNetIface>,
+) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
     named_attr(
@@ -88,6 +114,65 @@ fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
         NL80211_ATTR_WIPHY_NAME,
         &alloc::format!("phy{index}"),
     );
+    let mut bands = Vec::new();
+    for band in &info.bands {
+        let band_id = match band.freq_mhz {
+            2400..=2500 => 0,
+            4900..=5900 => 1,
+            _ => continue,
+        };
+        let mut frequencies = Vec::new();
+        for (i, channel) in band.channels.iter().enumerate() {
+            let frequency = if band_id == 0 {
+                if *channel == 14 {
+                    2484
+                } else {
+                    2407 + channel * 5
+                }
+            } else {
+                5000 + channel * 5
+            };
+            let mut entry = Vec::new();
+            push_attr(&mut entry, 1, &frequency.to_ne_bytes());
+            push_attr(&mut frequencies, i as u16 | NLA_F_NESTED, &entry);
+        }
+        let mut body = Vec::new();
+        push_attr(&mut body, 1 | NLA_F_NESTED, &frequencies);
+        let rates: &[u32] = if band_id == 0 {
+            &[10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540]
+        } else {
+            &[60, 90, 120, 180, 240, 360, 480, 540]
+        };
+        let mut bitrates = Vec::new();
+        for (i, rate) in rates.iter().enumerate() {
+            let mut entry = Vec::new();
+            push_attr(&mut entry, 1, &rate.to_ne_bytes());
+            push_attr(&mut bitrates, i as u16 | NLA_F_NESTED, &entry);
+        }
+        push_attr(&mut body, 2 | NLA_F_NESTED, &bitrates);
+        if let Some(caps) = iface.and_then(|iface| iface.phy_capabilities(band.freq_mhz)) {
+            push_attr(&mut body, 3, &caps.ht[3..19]); // HT MCS set
+            push_attr(
+                &mut body,
+                4,
+                &u16::from_le_bytes(caps.ht[..2].try_into().unwrap()).to_ne_bytes(),
+            );
+            push_attr(&mut body, 5, &[caps.ht[2] & 3]);
+            push_attr(&mut body, 6, &[(caps.ht[2] >> 2) & 7]);
+            if let Some(vht) = caps.vht {
+                push_attr(&mut body, 7, &vht[4..12]);
+                push_attr(
+                    &mut body,
+                    8,
+                    &u32::from_le_bytes(vht[..4].try_into().unwrap()).to_ne_bytes(),
+                );
+            }
+        }
+        push_attr(&mut bands, band_id | NLA_F_NESTED, &body);
+    }
+    push_attr(&mut attrs, 22 | NLA_F_NESTED, &bands);
+    push_attr(&mut attrs, 43, &[16]); // max scan SSIDs
+    push_attr(&mut attrs, 56, &0u16.to_ne_bytes()); // no custom probe IEs
     let mut modes = Vec::new();
     if info.modes.contains(crate::iface::WirelessModes::STATION) {
         push_attr(&mut modes, NL80211_IFTYPE_STATION as u16, &[]);
@@ -111,6 +196,10 @@ fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
         NL80211_CMD_GET_WIPHY,
         NL80211_CMD_GET_INTERFACE,
         NL80211_CMD_GET_PROTOCOL_FEATURES,
+        32,
+        33,
+        46,
+        48,
     ]
     .iter()
     .enumerate()
@@ -130,11 +219,23 @@ fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
 }
 
 fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> {
+    handle_in(command, attrs, dump, 0)
+}
+
+fn in_namespace(iface: &dyn crate::WirelessNetIface, namespace: u64) -> bool {
+    narf_net::iface::lookup(iface.name())
+        .map(|i| i.net_ns_id)
+        .unwrap_or(0)
+        == namespace
+}
+
+fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<GenlReply>, i32> {
     let interfaces = crate::registry::list();
     let replies: Vec<GenlReply> = match command {
         NL80211_CMD_GET_WIPHY => interfaces
             .iter()
             .enumerate()
+            .filter(|(_, iface)| in_namespace(iface.as_ref(), namespace))
             .filter(|(index, _iface)| {
                 dump || find_attr(attrs, NL80211_ATTR_WIPHY).is_some_and(|raw| {
                     raw.len() == 4
@@ -143,14 +244,26 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
                     raw.strip_suffix(&[0]).unwrap_or(raw) == alloc::format!("phy{index}").as_bytes()
                 })
             })
-            .map(|(index, iface)| GenlReply {
-                command: NL80211_CMD_NEW_WIPHY,
-                attrs: wiphy_attrs(index as u32, &iface.get_wireless_info()),
+            .map(|(index, iface)| {
+                let mut attrs = wiphy_attrs(
+                    index as u32,
+                    &iface.get_wireless_info(),
+                    Some(iface.as_ref()),
+                );
+                if iface.supports_handshake_offload() {
+                    push_attr(&mut attrs, 217, &[0, 0x80]); // EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK
+                    push_attr(&mut attrs, 57, &0x000fac04u32.to_ne_bytes());
+                }
+                GenlReply {
+                    command: NL80211_CMD_NEW_WIPHY,
+                    attrs,
+                }
             })
             .collect(),
         NL80211_CMD_GET_INTERFACE => interfaces
             .iter()
             .enumerate()
+            .filter(|(_, iface)| in_namespace(iface.as_ref(), namespace))
             .filter(|(_index, iface)| {
                 dump || find_attr(attrs, NL80211_ATTR_IFINDEX).is_some_and(|raw| {
                     raw.len() == 4
@@ -195,6 +308,22 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
 
 const OPERATIONS: &[GenlOperation] = &[
     GenlOperation {
+        command: 32,
+        flags: GENL_CMD_CAP_DUMP,
+    },
+    GenlOperation {
+        command: 33,
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 46,
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 48,
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
         command: NL80211_CMD_GET_WIPHY,
         flags: GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP,
     },
@@ -209,6 +338,10 @@ const OPERATIONS: &[GenlOperation] = &[
 ];
 const GROUPS: &[GenlMulticastGroup] = &[
     GenlMulticastGroup {
+        name: "mlme",
+        id: 19,
+    },
+    GenlMulticastGroup {
         name: "config",
         id: 17,
     },
@@ -219,15 +352,20 @@ const GROUPS: &[GenlMulticastGroup] = &[
 ];
 
 pub fn register() -> bool {
-    narf_net::netlink_generic::register_family(GenlFamily {
+    let registered = narf_net::netlink_generic::register_family(GenlFamily {
         id: NL80211_FAMILY_ID,
         name: "nl80211",
         version: 1,
-        max_attr: NL80211_ATTR_SUPPORTED_IFTYPES as u32,
+        max_attr: 254,
         operations: OPERATIONS,
         groups: GROUPS,
         handler: handle,
-    })
+    });
+    if registered {
+        let _ =
+            narf_net::netlink_generic::register_context_handler(NL80211_FAMILY_ID, control::handle);
+    }
+    registered
 }
 
 #[cfg(test)]
@@ -248,7 +386,7 @@ mod tests {
                 eht_supported: false,
             },
         };
-        let attrs = wiphy_attrs(4, &info);
+        let attrs = wiphy_attrs(4, &info, None);
         assert!(attrs.windows(5).any(|window| window == b"phy4\0"));
         assert!(attrs
             .windows(info.base_mac.len())

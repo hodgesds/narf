@@ -60,6 +60,11 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
             sock.set_net_namespace(ns);
         }
     }
+    if domain == crate::socket::AF_NETLINK {
+        if let Some(owner) = crate::task::task_get(task) {
+            crate::network_daemon::delegate_socket(&owner, &sock);
+        }
+    }
     // PID 1 configures only the initial namespace's synthetic loopback during
     // early systemd boot. Keep the authority kernel-held and interface-bound:
     // no other route socket receives an ambient administrative capability.

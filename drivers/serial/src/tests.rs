@@ -205,3 +205,101 @@ fn smoke_lpss_uart_constructor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/serial/lpss", smoke_lpss_uart_constructor);
+
+// ── PCI serial ──────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_serial_class_matches_registered() -> TestResult {
+    use crate::pci_serial as ps;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    ps::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for prog_if in ps::SUPPORTED_PROG_IFS.iter().copied() {
+        let found = regs.iter().any(|m| {
+            matches!(
+                m.kind,
+                MatchKind::ClassFull {
+                    class: ps::PCI_CLASS_COMMUNICATION,
+                    subclass: ps::PCI_SUBCLASS_SERIAL,
+                    prog_if: p,
+                } if p == prog_if
+            )
+        });
+        if !found {
+            return TestResult::Fail("pci-serial class match missing a prog-IF");
+        }
+    }
+    // The MS-03's KT port is prog-IF 0x02.
+    if !ps::SUPPORTED_PROG_IFS.contains(&0x02) {
+        return TestResult::Fail("16550 prog-IF not claimed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/serial/pci",
+    smoke_pci_serial_class_matches_registered
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_serial_does_not_claim_whole_class() -> TestResult {
+    use crate::pci_serial as ps;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    ps::register_pci_driver();
+    // A bare `Class { class: 0x07 }` entry would also claim the two
+    // CSME HECI functions (07:80) on this board, which have their own
+    // driver. Every entry must pin the full triple.
+    let too_broad = registered_pci_drivers()
+        .iter()
+        .any(|m| matches!(m.kind, MatchKind::Class { class: 0x07, .. }));
+    if too_broad {
+        return TestResult::Fail("pci-serial registered a whole-base-class match");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/serial/pci",
+    smoke_pci_serial_does_not_claim_whole_class
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_serial_class_triple_decode() -> TestResult {
+    use crate::pci_serial as ps;
+    // lspci renders the MS-03's KT port as class 0700, prog-if 02.
+    let class = 0x0007_0002u32;
+    if ps::base_class_of(class) != 0x07 {
+        return TestResult::Fail("base class decoded wrong");
+    }
+    if ps::subclass_of(class) != 0x00 {
+        return TestResult::Fail("subclass decoded wrong");
+    }
+    if ps::prog_if_of(class) != 0x02 {
+        return TestResult::Fail("prog-IF decoded wrong");
+    }
+    if ps::prog_if_name(0x02) != "16550" || ps::prog_if_name(0x06) != "16950" {
+        return TestResult::Fail("prog-IF names wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("drivers/serial/pci", smoke_pci_serial_class_triple_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_serial_kt_quirks() -> TestResult {
+    use crate::pci_serial::UartQuirks;
+    let kt = UartQuirks::KT_IER_READS_ZERO | UartQuirks::KT_BUG_THRE;
+    if !kt.contains(UartQuirks::KT_IER_READS_ZERO) || !kt.contains(UartQuirks::KT_BUG_THRE) {
+        return TestResult::Fail("KT quirk bits do not compose");
+    }
+    if UartQuirks::NONE.contains(UartQuirks::KT_IER_READS_ZERO) {
+        return TestResult::Fail("NONE should contain no quirks");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("drivers/serial/pci", smoke_pci_serial_kt_quirks);

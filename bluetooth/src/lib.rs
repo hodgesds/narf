@@ -36,6 +36,10 @@ extern crate alloc;
 pub mod att;
 pub mod avdtp;
 pub mod avrcp;
+/// Intel PCIe-attached Bluetooth controllers (Lunar Lake onward).
+/// Needs the PCIe bus, so x86_64 only for now.
+#[cfg(target_arch = "x86_64")]
+pub mod btintel_pcie;
 pub mod btusb_quirks;
 pub mod classic;
 pub mod cmd_queue;
@@ -85,6 +89,22 @@ pub fn bootstrap_bluetooth_authority() -> Cap<Bluetooth, Grant> {
     Cap::<Bluetooth, Grant>::bootstrap()
 }
 
+/// Register the controller-firmware download.
+///
+/// Kept out of [`register_initcalls`] on purpose: it must run after
+/// the firmware registry has been populated, and `Stage::Late`
+/// initcalls run in registration order. `bare_main` calls this after
+/// `narf_firmware::register_initcalls()`, which is what puts it after
+/// the initramfs and rootfs firmware scans.
+#[cfg(target_arch = "x86_64")]
+pub fn register_firmware_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "btintel-pcie-firmware", || {
+        btintel_pcie::load_firmware();
+        InitResult::Ok
+    });
+}
+
 /// Stage::Late initcall registration. Stage 0 just registers a
 /// per-stage placeholder so the boot summary records that the
 /// Bluetooth subsystem is wired in; the actual USB transport bind
@@ -95,6 +115,11 @@ pub fn bootstrap_bluetooth_authority() -> Cap<Bluetooth, Grant> {
 /// register Bluetooth-specific syscalls.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "btintel-pcie", || {
+        btintel_pcie::register_pci_driver();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "bluetooth-stage0", || {
         // Stage 0: no work beyond registering the subsystem. A real
         // controller probed by the USB supervisor will print its own

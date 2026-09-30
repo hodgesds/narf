@@ -26,6 +26,9 @@
 extern crate alloc;
 
 pub mod intel_lpss;
+/// PCI-attached 8250/16550 ports, found by class match.
+#[cfg(target_arch = "x86_64")]
+pub mod pci_serial;
 pub mod pl011;
 pub mod probe;
 pub mod registry;
@@ -42,6 +45,11 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "serial-lpss", || {
         intel_lpss::probe_all();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "serial-pci", || {
+        pci_serial::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "serial-acpi", || {

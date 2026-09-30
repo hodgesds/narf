@@ -576,6 +576,7 @@ pub mod tests {
         let p2 = [0u8; 8];
         let p3 = [0u8; 4];
         let ucode = ParsedUcode {
+            api: Default::default(),
             header: UcodeHeader {
                 version: 0,
                 build: 0,
@@ -626,6 +627,7 @@ pub mod tests {
         // gen3 blob with no IML section → FwLoadError::NoIml.
         let p1 = [0u8; 16];
         let ucode = ParsedUcode {
+            api: Default::default(),
             header: UcodeHeader {
                 version: 0,
                 build: 0,

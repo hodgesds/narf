@@ -1940,18 +1940,31 @@ pub unsafe fn pm1_enter_sleep(slp_typ_a: u8, slp_typ_b: u8) {
         Some(p) => p,
         None => return,
     };
-    let val_a = ((slp_typ_a as u16 & 0x7) << 10) | 0x2000;
     if pm.pm1a_cnt != 0 {
         // SAFETY: PM1A_CNT_BLK address from a checksummed FADT;
         // caller has prepared sleep state per ACPI §16.
         // SAFETY: Valid memory or trusted environment
-        unsafe { narf_arch::x86_64::io_port::outw(pm.pm1a_cnt as u16, val_a) };
+        unsafe {
+            let port = pm.pm1a_cnt as u16;
+            let current = narf_arch::x86_64::io_port::inw(port);
+            narf_arch::x86_64::io_port::outw(port, pm1_sleep_control_value(current, slp_typ_a));
+        }
     }
     if pm.pm1b_cnt != 0 {
-        let val_b = ((slp_typ_b as u16 & 0x7) << 10) | 0x2000;
         // SAFETY: PM1B_CNT_BLK address from a checksummed FADT.
-        unsafe { narf_arch::x86_64::io_port::outw(pm.pm1b_cnt as u16, val_b) };
+        unsafe {
+            let port = pm.pm1b_cnt as u16;
+            let current = narf_arch::x86_64::io_port::inw(port);
+            narf_arch::x86_64::io_port::outw(port, pm1_sleep_control_value(current, slp_typ_b));
+        }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pm1_sleep_control_value(current: u16, slp_typ: u8) -> u16 {
+    const SLP_TYP_MASK: u16 = 0x1c00;
+    const SLP_EN: u16 = 0x2000;
+    (current & !(SLP_TYP_MASK | SLP_EN)) | ((slp_typ as u16 & 0x7) << 10) | SLP_EN
 }
 
 /// PM1 enable register bit positions (mirror PM1_STS_*; ACPI 6.5
@@ -2070,10 +2083,9 @@ pub unsafe fn reboot_via_fadt() -> bool {
 /// the namespace isn't loaded or `\_S5` is missing; on success
 /// the platform powers off and the call doesn't return.
 ///
-/// Common QEMU defaults are SLP_TYPa = 5, SLP_TYPb = 0; real
-/// firmware varies (Linux's acpi/sleep.c does the same AML walk).
-/// Until the AML walk lands here we accept caller-supplied values
-/// — the wrapper at narf-acpi-runtime side picks them.
+/// The sleep types are opaque platform encodings supplied by AML. In
+/// particular, QEMU q35 uses `(0, 0)` for S5 while older PC machine models
+/// commonly use 5. The caller must not reinterpret zero as S0.
 ///
 /// # Safety
 /// Platform powers off; caller must have flushed anything that

@@ -78,6 +78,23 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
 - Multi-queue is explicit. The consumer chooses queue affinity;
   default is "per-CPU queue" for hash-steered RX.
 
+The in-tree `Frame` owns a DMA buffer, payload offset and length. Its
+`tx_meta()` / `set_tx_meta(TxMeta)` and `rx_meta()` / `set_rx_meta(RxMeta)`
+accessors carry offload metadata with the same IPC ownership transfer.
+Constructors default to plain TX and unchecked RX. `payload_mut()` invalidates
+RX checksum results; decomposition into DMA parts discards metadata.
+
+`Interface::offloads() -> OffloadCapabilities` reports the implemented frame-ring
+profile: TCP/UDP TX checksum, RX checksum reporting, maximum TSO frame bytes
+(zero means unsupported), and VLAN insertion. The default advertises none.
+Producers must negotiate before setting `TxMeta`. Packets contain ordinary wire
+headers; drivers prepare hardware checksum seeds, validate lengths and reject
+unsupported requests rather than transmit partially checksummed packets.
+`RxMeta::csum_l3` means a verified IPv4 header checksum; IPv6 never sets it.
+`csum_l4` means verified TCP/UDP. Consumers verify in software whenever a flag
+is false. These fields describe the in-kernel frame-ring contract; they do not
+change the stack-daemon attach wire ABI.
+
 ### 3.3 Control-plane operations
 
 ```rust
@@ -101,6 +118,13 @@ pub fn stats   (iface: &Cap<NetIface, Read>) -> IfaceStats;
 Admin is deliberately separate from Rx/Tx: a stack daemon needs Rx+Tx but
 usually not Admin. `AdminHandle` binds the revocable authority to exactly one
 interface; every operation checks current cap validity before mutation.
+
+`stack::control_registered(&StackAttach)` validates the registered interface
+handle and daemon identity through `Cap::invoke`, returning an interface-bound
+`StackAttachReply` without changing frame routing. This supports a wireless
+control service alongside the existing IP stack. Its administrative handle
+retains both source grants and becomes unusable when either is revoked;
+creating it does not attach an XDP socket or consume interface frame rings.
 
 ### 3.4 Loopback
 
@@ -243,6 +267,22 @@ the netlink core owns generic headers, multipart termination, acknowledgements,
 and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
+
+Families may additionally register a `ContextHandler` receiving
+`RequestContext { net_ns_id, admin }`. `admin` is an optional, kernel-held
+interface-bound `AdminHandle`; the default reply builder supplies none.
+The socket bridge passes only explicitly delegated authority. Family
+mutations check its current validity, interface name and namespace before
+queueing work, and again when asynchronous work starts. Generic-netlink
+attributes cannot mint or substitute capabilities.
+`AdminHandle::authorize_interface(name, namespace)` performs this boundary
+check through `Cap::invoke`, including the current revocation epoch.
+
+`publish_event` frames a notification only for a registered family/group.
+Its installed socket sink filters by `NETLINK_GENERIC`, namespace and
+membership, queues at most 256 notifications per socket, and wakes readiness
+after releasing the queue lock. This is a bounded, best-effort multicast
+path; callers recover lost scan notifications by querying cached results.
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
 `inet_diag_req_v2` dumps for IPv4 and IPv6 TCP and UDP. It filters by the requested

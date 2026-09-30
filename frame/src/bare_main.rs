@@ -2961,6 +2961,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_fs_squashfs::register_initcalls();
             narf_drivers_fs_btrfs::register_initcalls();
             narf_drivers_platform::register_initcalls();
+            narf_drivers_serial::register_initcalls();
+            narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into
             // the system-power surface. Subscribers run in SCI
@@ -2995,6 +2997,65 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_initramfs::register_initcalls();
             narf_filesystem::register_initcalls();
             narf_firmware::register_initcalls();
+            // After the firmware scans above, so the Bluetooth
+            // controller's firmware download can find its blobs.
+            #[cfg(target_arch = "x86_64")]
+            narf_bluetooth::register_firmware_initcalls();
+            // Same ordering requirement: the RTL8127 PHY firmware
+            // patch has to run after the firmware scans above.
+            narf_drivers_net::register_late_firmware_initcalls();
+            // Bluetooth bring-up runs after the firmware download
+            // above has had its chance to register a transport, since
+            // Stage::Late runs in registration order.
+            narf_init::register(narf_init::Stage::Late, "bluetooth-bringup", || {
+                let cap = narf_bluetooth::bootstrap_bluetooth_authority();
+                let outcomes = narf_bluetooth::controller::bring_up_all(&cap);
+                if outcomes.is_empty() {
+                    return narf_init::InitResult::NotPresent;
+                }
+                for o in &outcomes {
+                    match &o.result {
+                        Ok(info) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  bluetooth: {} ready — BD_ADDR {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, \
+                                 HCI v{:#04x} rev {:#06x}, manufacturer {:#06x}, \
+                                 ACL {}x{} SCO {}x{}",
+                                o.transport,
+                                info.bd_addr[5],
+                                info.bd_addr[4],
+                                info.bd_addr[3],
+                                info.bd_addr[2],
+                                info.bd_addr[1],
+                                info.bd_addr[0],
+                                info.hci_version,
+                                info.hci_revision,
+                                info.manufacturer,
+                                info.acl_total_num,
+                                info.acl_data_mtu,
+                                info.sco_total_num,
+                                info.sco_data_mtu,
+                            );
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  bluetooth: {} bring-up failed: {:?}",
+                                o.transport,
+                                e
+                            );
+                        }
+                    }
+                }
+                // Report the stage honestly: a pass where every
+                // controller refused is a failure, not a success with
+                // a few log lines.
+                if outcomes.iter().any(|o| o.result.is_ok()) {
+                    narf_init::InitResult::Ok
+                } else {
+                    narf_init::InitResult::Error("no Bluetooth controller completed bring-up")
+                }
+            });
             narf_firmware_fw_cfg::register_initcalls();
             narf_firmware_smbios::register_initcalls();
             narf_firmware_fdt::register_initcalls();
@@ -4310,12 +4371,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
-    // Boot-smoke: real init flow + clean ACPI/isa-debug-exit shutdown.
+    // Boot-smoke: real init flow + a real platform power-off.
     // Drains queued async tasks (including measured-boot) for ~2 s so
-    // the boot log surfaces, then exits via the same port 0xF4 path
-    // the test harness uses. The xtask `boot-smoke` subcommand waits
-    // for QEMU to exit naturally + checks stdout for panic markers,
-    // rather than killing the child after a wall-clock timeout.
+    // the boot log surfaces, then enters ACPI S5 on x86_64 or invokes
+    // PSCI SYSTEM_OFF on aarch64. The xtask `boot-smoke` subcommand
+    // waits for QEMU to power off naturally + checks stdout for panic
+    // markers, rather than killing the child after a wall-clock timeout.
     #[cfg(feature = "boot-smoke")]
     {
         let _ = writeln!(console::Writer, "  boot-smoke: draining tasks...");
@@ -4323,13 +4384,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // at ~2 seconds so the boot log is fully emitted.
         let deadline = narf_time::Deadline::after_ms(2_000);
         narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
-        let _ = writeln!(console::PriorityWriter::<3>, "  boot-smoke: clean exit");
-        // SAFETY: exit_kernel never returns; this is the only post-
-        // boot action we're authorised to take.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            narf_arch::exit_kernel(0);
-        }
+        let _ = writeln!(
+            console::PriorityWriter::<3>,
+            "  boot-smoke: clean exit; requesting platform power-off"
+        );
+        narf_power::system::power_off();
     }
 
     // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
@@ -5321,6 +5380,11 @@ fn boot_userspace_init() {
                 // /dev/pts/N, round-trip "ping" / "pong" across
                 // the master/slave pair. Success token "pty-ok".
                 ("pty_smoke", narf_verification::NARF_PTY_SMOKE_ELF),
+                // VirGL 3D smoke — hand-rolled virgl command stream
+                // through renderD128 (surface + framebuffer + clear on
+                // the HOST GPU), pixels transferred back and verified.
+                // Success: `virgl3d-ok`; skips on a 2D-only host.
+                ("virgl3d_smoke", narf_verification::NARF_VIRGL3D_SMOKE_ELF),
                 // Framebuffer smoke — opens /dev/fb0, mmaps it
                 // MAP_SHARED, draws + reads back. Proves the
                 // device-mmap keystone end-to-end. Success: `fb-ok`.

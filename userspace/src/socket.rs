@@ -1700,7 +1700,7 @@ impl SocketFile {
     }
 
     pub fn delegate_netlink_admin(&self, admin: narf_net::AdminHandle) -> Result<(), SockError> {
-        if self.domain != AF_NETLINK || self.protocol != NETLINK_ROUTE {
+        if self.domain != AF_NETLINK || !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
             return Err(SockError::InvalidArg);
         }
         admin.check_live().map_err(|_| SockError::InvalidArg)?;
@@ -3778,6 +3778,40 @@ impl SocketFile {
         }
     }
 
+    fn broadcast_netlink_generic(net_ns_id: u64, group: u32, message: &[u8]) {
+        let targets: Vec<Arc<Self>> = {
+            let mut sockets = NETLINK_SOCKETS.lock();
+            sockets.retain(|weak| weak.strong_count() != 0);
+            sockets.iter().filter_map(Weak::upgrade).collect()
+        };
+        for socket in targets {
+            if socket.protocol != NETLINK_GENERIC
+                || socket.net_ns_id() != net_ns_id
+                || !socket.netlink_memberships.lock().contains(&group)
+            {
+                continue;
+            }
+            let queued = {
+                let mut state = socket.state.lock();
+                if let SocketState::NetlinkGeneric { replies } = &mut *state {
+                    if replies.len() >= 256 {
+                        false
+                    } else {
+                        replies.push_back(message.to_vec());
+                        socket.netlink_reply_groups.lock().push_back(group);
+                        true
+                    }
+                } else {
+                    false
+                }
+            };
+            if queued {
+                socket.wake_netlink_readable();
+            }
+        }
+        narf_net::readiness::notify(0);
+    }
+
     fn dispatch_netlink_generic(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
@@ -3787,11 +3821,17 @@ impl SocketFile {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
-                let mut replies = match narf_net::netlink_generic::build_replies_with_options(
+                narf_net::netlink_generic::install_event_sink(Self::broadcast_netlink_generic);
+                let admin = self.netlink_admin.lock().clone();
+                let mut replies = match narf_net::netlink_generic::build_replies_with_context(
                     buf,
                     narf_net::netlink_generic::ReplyOptions {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
                         cap_ack: self.netlink_cap_ack.load(Ordering::Acquire),
+                    },
+                    narf_net::netlink_generic::RequestContext {
+                        net_ns_id: self.net_ns_id(),
+                        admin: admin.as_ref(),
                     },
                 ) {
                     Ok(replies) => replies,
@@ -8940,6 +8980,60 @@ fn smoke_netlink_lists_high_membership_groups() -> TestResult {
     }
     TestResult::Pass
 }
+
+fn smoke_generic_multicast_namespace_and_membership() -> TestResult {
+    let wanted = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    let other_ns = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    let bystander = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    other_ns.set_net_ns_id(991);
+    for socket in [&wanted, &other_ns] {
+        if !matches!(
+            socket.handle_setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &18u32.to_ne_bytes()),
+            SocketOpResult::Ok(0)
+        ) {
+            return TestResult::Fail("generic multicast subscription failed");
+        }
+    }
+    let _ = wanted.handle_setsockopt(SOL_NETLINK, NETLINK_PKTINFO, &1u32.to_ne_bytes());
+    if wanted
+        .delegate_netlink_admin(narf_net::initial_loopback_admin())
+        .is_err()
+        || other_ns
+            .delegate_netlink_admin(narf_net::initial_loopback_admin())
+            .is_ok()
+    {
+        return TestResult::Fail("generic admin delegation ignored namespace");
+    }
+    SocketFile::broadcast_netlink_generic(0, 18, b"scan-complete");
+    let mut buffer = [0; 32];
+    if !matches!(
+        wanted.dispatch_op(SocketOp::Recv {
+            buf: &mut buffer,
+            flags: 0
+        }),
+        SocketOpResult::Received { n: 13, .. }
+    ) || &buffer[..13] != b"scan-complete"
+        || wanted.netlink_pktinfo() != Some(18)
+    {
+        return TestResult::Fail("generic event/pktinfo delivery failed");
+    }
+    for socket in [&other_ns, &bystander] {
+        if !matches!(
+            socket.dispatch_op(SocketOp::Recv {
+                buf: &mut buffer,
+                flags: 0
+            }),
+            SocketOpResult::Err(SockError::WouldBlock)
+        ) {
+            return TestResult::Fail("generic event crossed namespace/membership boundary");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_generic_multicast_namespace_and_membership
+);
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_lists_high_membership_groups

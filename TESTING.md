@@ -137,7 +137,8 @@ This:
 4. After the kernel-test phase completes, the xtask also runs a
    **boot-smoke** phase — a separate boot without `kernel-test` that
    exercises the real init flow and verifies the kernel reaches the
-   "boot ready" milestone before exiting cleanly. This catches
+   "boot ready" milestone before powering off through the architecture's
+   platform shutdown interface. This catches
    regressions that smokes miss because smokes test modules in
    isolation, not the full init flow.
 
@@ -153,9 +154,10 @@ cargo xtask boot-smoke --arch=x86_64
 
 Boots the kernel **without** the `kernel-test` feature — i.e. the real
 init flow — and watches stdout for panic markers + the success
-milestone. The kernel triggers a clean ACPI/isa-debug-exit shutdown
-after a ~2-second async-task drain. The xtask treats QEMU exit code 1
-(= isa-debug-exit success) as Pass and anything else as Fail.
+milestone. After a ~2-second async-task drain, the kernel enters ACPI S5
+on x86_64 or calls PSCI `SYSTEM_OFF` on aarch64. The xtask requires QEMU
+to power off naturally with exit code 0; the test-only x86 debug-exit
+status therefore cannot masquerade as a successful shutdown.
 
 Useful for catching regressions like the PCR-0 self-measure UB that
 kernel-test couldn't see (because it only ran in isolation, not in the

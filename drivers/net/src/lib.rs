@@ -43,6 +43,7 @@ pub mod mlx5;
 pub mod r8169;
 pub mod rtl8125;
 pub mod rtl8126;
+pub mod rtl8127;
 pub mod rtl8139;
 pub mod rtl_phy;
 pub mod tg3;
@@ -53,6 +54,22 @@ pub mod vmxnet3;
 // suite. Kept in its own module so a future `cfg(test_in_tree)`
 // or feature gate can drop them from production binaries.
 mod tests;
+
+/// Register the late PHY-firmware pass.
+///
+/// Kept out of [`register_initcalls`] because it must run after the
+/// firmware registry has been populated, and `Stage::Late` initcalls
+/// run in registration order — this crate registers before
+/// `narf-firmware` does. `bare_main` calls this after
+/// `narf_firmware::register_initcalls()`, which is what puts it after
+/// the initramfs and rootfs firmware scans.
+pub fn register_late_firmware_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "rtl8127-phy-firmware", || {
+        rtl8127::configure_phy_late();
+        InitResult::Ok
+    });
+}
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
@@ -79,6 +96,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "rtl8126", || {
         rtl8126::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtl8127", || {
+        rtl8127::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "mlx5", || {
@@ -132,6 +153,8 @@ pub enum NicModel {
     IntelIgb,
     /// Intel 82599 / X540 10-GbE — "ixgbe".
     IntelIxgbe,
+    /// Intel X710 / XL710 / XXV710 — "i40e".
+    IntelI40e,
     /// Mellanox ConnectX-4 / 5 / 6 — "mlx5_core".
     MellanoxMlx5,
     /// Realtek RTL8139 — legacy smoke target.
@@ -155,6 +178,7 @@ impl NicModel {
             NicModel::IntelE1000 => (0x8086, 0x100E),
             NicModel::IntelIgb => (0x8086, 0x10C9),
             NicModel::IntelIxgbe => (0x8086, 0x10B6),
+            NicModel::IntelI40e => (0x8086, 0x1572),
             NicModel::MellanoxMlx5 => (0x15B3, 0x1013),
             NicModel::RealtekRtl8139 => (0x10EC, 0x8139),
             NicModel::RealtekRtl8168 => (0x10EC, 0x8168),

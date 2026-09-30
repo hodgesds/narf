@@ -90,6 +90,25 @@ pub const MTL_7D45: u16 = 0x7D45;
 pub const MTL_7D55: u16 = 0x7D55;
 pub const MTL_7DD5: u16 = 0x7DD5;
 
+// Panther Lake (Xe3-LPG / "Xe3", Core Ultra Series 3 mobile). The
+// full SKU ladder Linux carries in `INTEL_PTL_IDS` — the H-series
+// parts the MS-03 ships (`0xB0A0` on a PTL-H444 host bridge) sit in
+// the middle of the same run, so the whole family lands together
+// rather than one board's DID in isolation.
+pub const PTL_B080: u16 = 0xB080;
+pub const PTL_B081: u16 = 0xB081;
+pub const PTL_B082: u16 = 0xB082;
+pub const PTL_B083: u16 = 0xB083;
+pub const PTL_B084: u16 = 0xB084;
+pub const PTL_B085: u16 = 0xB085;
+pub const PTL_B086: u16 = 0xB086;
+pub const PTL_B087: u16 = 0xB087;
+pub const PTL_B08F: u16 = 0xB08F;
+pub const PTL_B090: u16 = 0xB090;
+/// Panther Lake-H — the SKU on the Minisforum MS-03 (Core Ultra 5 336H).
+pub const PTL_B0A0: u16 = 0xB0A0;
+pub const PTL_B0B0: u16 = 0xB0B0;
+
 // ── BAR layout (TGL PRM Vol. 12 §"Memory Map and Configuration") ─
 
 /// `GTTMMADR` — Graphics Translation Table + Memory-Mapped
@@ -128,6 +147,10 @@ pub enum Generation {
     AlderLake,
     /// Meteor Lake — Xe-LPG (re-architected DDI + display power).
     MeteorLake,
+    /// Panther Lake — Xe3-LPG. Display is Xe3_LPD: the DDI block
+    /// moved again relative to Xe-LPG and the C10/C20 PHYs replace
+    /// the combo-PHY + DPLL pair Gen12 used.
+    PantherLake,
 }
 
 impl Generation {
@@ -138,7 +161,11 @@ impl Generation {
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
             Generation::TigerLake | Generation::AlderLake => Some(RegionGeneration::Gen12),
-            Generation::MeteorLake => None,
+            // Xe-LPG (MTL) and Xe3-LPG (PTL) both re-lay the BAR0
+            // register map; neither is covered by the Stage-0 Gen12
+            // region table, so callers get an empty region list
+            // rather than offsets that would address the wrong block.
+            Generation::MeteorLake | Generation::PantherLake => None,
         }
     }
 }
@@ -168,6 +195,8 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         ADL_S_4690 | ADL_S_4692 | ADL_S_4693 => (Generation::AlderLake, "alderlake-s"),
         RPL_S_A780 | RPL_S_A782 | RPL_S_A788 => (Generation::AlderLake, "raptorlake-s"),
         MTL_7D40 | MTL_7D45 | MTL_7D55 | MTL_7DD5 => (Generation::MeteorLake, "meteorlake"),
+        PTL_B080 | PTL_B081 | PTL_B082 | PTL_B083 | PTL_B084 | PTL_B085 | PTL_B086 | PTL_B087
+        | PTL_B08F | PTL_B090 | PTL_B0A0 | PTL_B0B0 => (Generation::PantherLake, "pantherlake"),
         _ => return None,
     };
     Some(ChipInfo {
@@ -358,8 +387,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // Activate backlight PWM if this is a supported generation.
     // Tiger Lake / Alder Lake / Raptor Lake all use the same BXT-style
-    // PWM registers.
-    if dev.chip.generation != Generation::MeteorLake {
+    // PWM registers. Meteor Lake (Xe-LPG) and Panther Lake (Xe3-LPG)
+    // are held back until their display register map is validated —
+    // both are typically panel-less in NARF's bring-up fleet, so the
+    // conservative default costs nothing on those boards.
+    if !matches!(
+        dev.chip.generation,
+        Generation::MeteorLake | Generation::PantherLake
+    ) {
         narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
     }
 
@@ -477,6 +512,18 @@ pub fn register_pci_driver() {
         ("intel-gpu-mtl-7D45", INTEL_VENDOR, MTL_7D45),
         ("intel-gpu-mtl-7D55", INTEL_VENDOR, MTL_7D55),
         ("intel-gpu-mtl-7DD5", INTEL_VENDOR, MTL_7DD5),
+        ("intel-gpu-ptl-B080", INTEL_VENDOR, PTL_B080),
+        ("intel-gpu-ptl-B081", INTEL_VENDOR, PTL_B081),
+        ("intel-gpu-ptl-B082", INTEL_VENDOR, PTL_B082),
+        ("intel-gpu-ptl-B083", INTEL_VENDOR, PTL_B083),
+        ("intel-gpu-ptl-B084", INTEL_VENDOR, PTL_B084),
+        ("intel-gpu-ptl-B085", INTEL_VENDOR, PTL_B085),
+        ("intel-gpu-ptl-B086", INTEL_VENDOR, PTL_B086),
+        ("intel-gpu-ptl-B087", INTEL_VENDOR, PTL_B087),
+        ("intel-gpu-ptl-B08F", INTEL_VENDOR, PTL_B08F),
+        ("intel-gpu-ptl-B090", INTEL_VENDOR, PTL_B090),
+        ("intel-gpu-ptl-B0A0", INTEL_VENDOR, PTL_B0A0),
+        ("intel-gpu-ptl-B0B0", INTEL_VENDOR, PTL_B0B0),
     ];
     for (name, v, d) in exact.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {

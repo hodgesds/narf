@@ -355,6 +355,25 @@ fn smoke_s3_parse_package_decodes_slp_typ() -> TestResult {
 }
 kernel_test_in!("power/suspend", smoke_s3_parse_package_decodes_slp_typ);
 
+fn smoke_power_s5_preserves_zero_firmware_encoding() -> TestResult {
+    use crate::system::{select_s5_sleep_types, QEMU_S5_SLP_TYPA, QEMU_S5_SLP_TYPB};
+
+    if select_s5_sleep_types(Some((0, 0))) != (0, 0) {
+        return TestResult::Fail("valid zero S5 firmware encoding was replaced");
+    }
+    if select_s5_sleep_types(Some((3, 4))) != (3, 4) {
+        return TestResult::Fail("non-zero S5 firmware encoding was changed");
+    }
+    if select_s5_sleep_types(None) != (QEMU_S5_SLP_TYPA, QEMU_S5_SLP_TYPB) {
+        return TestResult::Fail("missing S5 package did not use legacy fallback");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/system",
+    smoke_power_s5_preserves_zero_firmware_encoding
+);
+
 fn smoke_s3_enter_refuses_without_arm() -> TestResult {
     use crate::{suspend, Power};
     use narf_capabilities::{Cap, Invoke};

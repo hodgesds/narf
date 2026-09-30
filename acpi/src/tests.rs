@@ -8,6 +8,23 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_pm1_sleep_control_preserves_non_sleep_bits() -> TestResult {
+    let preserved = (1 << 0) | (1 << 2) | (1 << 9);
+    if crate::pm1_sleep_control_value(preserved | 0x3c00, 0) != preserved | 0x2000 {
+        return TestResult::Fail("zero SLP_TYP or PM1 control bits were not preserved");
+    }
+    if crate::pm1_sleep_control_value(preserved, 5) != preserved | 0x3400 {
+        return TestResult::Fail("non-zero SLP_TYP was encoded incorrectly");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "acpi/power",
+    smoke_acpi_pm1_sleep_control_preserves_non_sleep_bits
+);
+
 fn smoke_acpi_pptt_synthetic_decode() -> TestResult {
     use crate::{PpttCache, PpttCacheKind, PpttCpu};
     use alloc::vec::Vec;

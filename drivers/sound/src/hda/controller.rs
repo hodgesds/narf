@@ -57,6 +57,12 @@ pub const HDA_INTEL_COMET_LAKE_A: u16 = 0xA171;
 pub const HDA_INTEL_TIGER_LAKE_LP: u16 = 0xA0C8;
 pub const HDA_INTEL_ALDER_LAKE: u16 = 0x7AD0;
 pub const HDA_INTEL_METEOR_LAKE: u16 = 0x7E28;
+pub const HDA_INTEL_ARROW_LAKE: u16 = 0x7728;
+pub const HDA_INTEL_ARROW_LAKE_S: u16 = 0x7F50;
+pub const HDA_INTEL_LUNAR_LAKE_P: u16 = 0xA828;
+/// Panther Lake-H — Minisforum MS-03 `00:1f.3`.
+pub const HDA_INTEL_PANTHER_LAKE_H: u16 = 0xE328;
+pub const HDA_INTEL_PANTHER_LAKE: u16 = 0xE428;
 
 // ── HDA register block (HDA Spec §3.3) ──────────────────────────────
 

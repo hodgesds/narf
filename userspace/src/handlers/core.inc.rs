@@ -6678,6 +6678,7 @@ pub fn __test_set_dumpable_for_test(task: u64, dumpable: bool) {
 /// parent's `struct cred` wholesale; capabilities are transformed at
 /// EXECVE, not at fork).
 fn cap_fork(parent: u64, child: u64) {
+    crate::network_daemon::inherit(parent, child);
     let inherited = read_caps(parent);
     write_caps(child, inherited);
 }

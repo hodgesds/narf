@@ -8,9 +8,10 @@
 
 ## 0. References (public-only)
 
-All protocol code is derived from the references below. **No GPL or
-Linux `net/wireless/`, `net/mac80211/`, or vendor `wireless/`
-driver source material was consulted at any point.**
+The original protocol modules used the public references below. The
+current nl80211 integration also uses Linux UAPI definitions, and the
+iwlwifi hardware implementation uses the local Linux Intel firmware API
+headers and transport source under the repository's GPL-2.0 licensing.
 
 - **IEEE Std 802.11-2020** — Wireless LAN MAC and Physical Layer
   specifications. IEEE Standards Association.
@@ -57,7 +58,8 @@ driver source material was consulted at any point.**
 1. **Microkernel-Pure**: The kernel does not contain a full 802.11 stack. Management frames are passed to a userspace "Wireless Daemon" for complex logic (MLME).
 2. **Capability-Gated**: Discovery (scanning) is a distinct right from connectivity (association).
 3. **Zero-Copy Hot Path**: Data frames use the standard `net/spec` Narf-Rings; management frames use a separate `MgmtRing`.
-4. **Clean-Room Drivers**: Driver implementations must follow the clean-room protocol (no GPL source).
+4. **Documented hardware contracts**: Record the source of firmware wire
+   layouts and validate their version before use.
 
 ## 3. Public Interface
 
@@ -71,6 +73,29 @@ pub struct WirelessIfaceInfo {
     pub hw_caps: HwCaps,             // HT (802.11n), VHT (ac), HE (ax), EHT (be)
 }
 ```
+
+`WirelessNetIface::tx_ring_for_ac(AccessCategory)` exposes separate Ethernet
+producers for Background, BestEffort, Video and Voice. The default implementation
+returns the ordinary `Interface::tx_ring()` for drivers with one queue.
+The iwlwifi MLD implementation owns four Narf-Rings, each with an async TX
+consumer and its negotiated hardware queue. AP admission control may downgrade
+a class; non-WMM links use the best-effort hardware queue. The generic network
+interface's `tx_ring()` remains the BestEffort ring.
+
+`WirelessNetIface::phy_capabilities(band_mhz) -> Option<PhyCapabilities>`
+returns band-specific IEEE HT (26-byte) and optional VHT (12-byte) capability
+bodies. The default returns `None`. Band identifiers are 2400 and 5000 MHz.
+Drivers must restrict these capabilities to implemented PHY modes and their
+NVM/antenna limits; `HwCaps` remains a summary. The iwlwifi Sc profile exposes
+up to two streams, HT20/40 and VHT20/40/80, with firmware TX A-MPDU and host
+RX Block Ack reordering. Actual association intersects AP capabilities and
+regulatory permission before programming firmware.
+
+For nl80211 scans, a nonempty nested SSID list requests active scanning;
+empty SSID entries are wildcard probes and can coexist with directed SSIDs.
+`CONNECT` accepts an SSID with optional BSSID/frequency constraints. It selects
+the strongest matching Open/WPA2 BSS from the cache, or performs a bounded
+scan first, rechecking delegated authority before association.
 
 ### 3.2 Wireless Capabilities
 
@@ -99,12 +124,66 @@ The wireless subsystem registers the `nl80211` generic-netlink family through
 the `net/` family registry. Read-only `GET_WIPHY` and `GET_INTERFACE` point and
 dump requests enumerate the canonical wireless-interface registry and emit
 Linux `NEW_WIPHY` / `NEW_INTERFACE` records. Wiphy records carry a nested
+band description with HT/VHT capabilities, MCS sets, HT A-MPDU factor and
+density when supplied by `phy_capabilities()`. VHT is absent from the
+2.4 GHz band. Capability integers use native netlink byte order; IEEE MCS
+arrays retain their wire layout. Wiphy records also carry a nested
 `SUPPORTED_COMMANDS` list, and `GET_PROTOCOL_FEATURES` returns a zero bitmap
 instead of claiming optional split-dump behavior NARF does not implement.
-The family advertises only these implemented operations plus the `config` and
-`scan` multicast groups.
-Scan, association, key, and PHY mutations remain capability-gated native
-operations and are not accepted through ambient Linux netlink authority.
+The family also implements `TRIGGER_SCAN`, `GET_SCAN`, `CONNECT`, and
+`DISCONNECT`, plus the `config`, `scan`, and `mlme` multicast groups.
+Mutations require an explicitly delegated `AdminHandle` for the selected
+interface in the requesting socket's namespace. Missing, revoked,
+cross-interface or cross-namespace authority is rejected. Opening a Linux
+socket or supplying an attribute does not convey this authority.
+
+Mutating requests validate attributes, reserve one operation per interface,
+then run the native async method in the executor. Netlink ACK acknowledges
+acceptance; completion is a scan-results/aborted, connect-status, or
+disconnect event. Cancellation releases the operation reservation. Scan
+dumps are bounded to 256 BSS records and preserve original AP information
+elements through `WirelessNetIface::scan_information_elements`.
+Interface and wiphy queries are namespace-filtered; events use the same
+namespace and cannot follow an interface across a namespace move.
+Drivers that implement `reports_disconnect_events()` emit link-loss and
+local-teardown notifications themselves through `notify_disconnect`, so
+the control bridge does not emit a second local-disconnect event.
+
+The connect profile requires a scanned BSSID, SSID and 2.4/5 GHz frequency.
+Open networks need no key. WPA2 requires a 32-byte PMK, WPA version 2,
+PSK AKM, and CCMP-128 pairwise/group suites. Drivers opt in through
+`supports_handshake_offload()`; only those advertise the PSK four-way
+handshake offload feature. Required MFP, other ciphers/AKMs, arbitrary
+association IEs, random scan MACs and other unsupported mutation options
+are rejected. Scan execution is passive. Full wpa_supplicant/iw process
+interoperability remains a separate integration test.
+
+### 3.5 Deployment regulatory policy
+
+`reg::parse_policy` decodes an NRGD v1 policy; parsing alone conveys no
+authority. The iwlwifi probe optionally opens `wireless-regulatory.bin`
+through its trusted firmware-registry capability. It installs the policy
+only after the registry verifies its signature and the view identifies a
+signer. Unsigned policies are rejected even in unsigned-firmware builds.
+Deployment public keys are baked into the image with
+`NARF_FIRMWARE_TRUSTED_KEYS`; the firmware packer accepts a verified
+detached signature. No deployment country or signing key is chosen by
+the driver. The policy must be supplied by the image builder.
+Without a configured policy the interface may scan passively but cannot
+associate. This is a deployment-selected policy, not a bundled global
+regulatory database or a country inferred from AP advertisements.
+
+The byte format is `NRGD[4]`, version `u16=1`, uppercase country `[u8;2]`,
+rule count `u16`, reserved `u16=0`, followed by 1–64 rules of 16 bytes:
+start MHz `u32`, end MHz `u32`, maximum bandwidth MHz `u32`, power dBm
+`i8`, `RegFlags` `u8`, reserved `u16=0`. Integers are little-endian;
+unknown flags, malformed ranges and length mismatches are rejected.
+The driver intersects the selected host rule with firmware MCC permission
+and applies its power ceiling before transmitting association frames.
+
+For Stage 5 bring-up the iwlwifi driver currently hosts the station MLME
+and WPA2 state machine behind `WirelessNetIface`. The intended daemon
+split described below has not yet replaced that implementation.
 
 ## 4. Architecture: SoftMAC vs. FullMAC
 

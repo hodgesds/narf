@@ -177,6 +177,76 @@ pub(crate) struct VirtGpuResource {
     /// False only for synthetic lifecycle tests that never created a host
     /// resource and therefore require no RESOURCE_UNREF command.
     host_owned: bool,
+    /// Fence of the last EXECBUFFER that referenced this BO. VIRTGPU_WAIT
+    /// consults it the way Linux waits on the GEM object's reservation.
+    pub(crate) last_fence: narf_lib::sync::IrqSafeSpinLock<Option<Arc<VirtGpuFence>>>,
+}
+
+/// One driver-level fence shared by BO reservations, sync files, and binary
+/// syncobjs. The transport owns the completion bit; this wrapper supplies the
+/// two subsystem traits without making VFS depend on the VirtIO driver.
+#[derive(Debug)]
+pub(crate) struct VirtGpuFence {
+    transport: Arc<narf_drivers_virtio::gpu_pci::SubmittedFence>,
+    context: u64,
+}
+
+impl VirtGpuFence {
+    fn new(
+        transport: Arc<narf_drivers_virtio::gpu_pci::SubmittedFence>,
+        context: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self { transport, context })
+    }
+
+    fn is_device_signalled(&self) -> bool {
+        narf_drivers_virtio::gpu_pci::probed_device()
+            .map(|dev| dev.fence_signalled(&self.transport))
+            // A removed device cannot make further progress. Treat its
+            // abandoned fences as done so pollers do not wedge forever.
+            .unwrap_or(true)
+    }
+
+    fn wait_device(&self, timeout_ms: u64) -> bool {
+        narf_drivers_virtio::gpu_pci::probed_device()
+            .map(|dev| dev.wait_fence(&self.transport, timeout_ms))
+            .unwrap_or(true)
+    }
+}
+
+impl crate::drm::syncobj::DmaFence for VirtGpuFence {
+    fn is_signalled(&self) -> bool {
+        self.is_device_signalled()
+    }
+
+    fn wait(&self, timeout_ns: u64) -> bool {
+        if timeout_ns == 0 {
+            return self.is_device_signalled();
+        }
+        self.wait_device(timeout_ns.saturating_add(999_999) / 1_000_000)
+    }
+
+    fn signal(&self) {
+        self.transport.signal();
+    }
+
+    fn context(&self) -> Option<u64> {
+        Some(self.context)
+    }
+}
+
+impl narf_filesystem::DrmFence for VirtGpuFence {
+    fn is_signalled(&self) -> bool {
+        self.is_device_signalled()
+    }
+
+    fn wait(&self, timeout_ms: u64) -> bool {
+        self.wait_device(timeout_ms)
+    }
+
+    fn context(&self) -> Option<u64> {
+        Some(self.context)
+    }
 }
 
 impl core::fmt::Debug for VirtGpuResource {
@@ -256,6 +326,7 @@ pub(crate) fn test_virtgpu_resource(resource_id: u32, size: usize) -> Arc<VirtGp
         blob_mem: None,
         host3d_blob: false,
         host_owned: false,
+        last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
     })
 }
 
@@ -292,6 +363,11 @@ pub struct VirtGpuRenderState {
     /// Per-open DRM syncobj table (like Linux's per-DRM-file syncobj IDR). The
     /// DRM native context creates syncobjs during device init and rendering.
     syncobjs: narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
+    /// Successful FENCE_FD_OUT submissions awaiting fd installation, keyed by
+    /// the submitting task. The syscall layer consumes its own entry right
+    /// after dispatch, so concurrent ioctls sharing one DRM fd cannot attach
+    /// one another's sync_file fence.
+    pending_execbuf_fences: narf_lib::sync::IrqSafeSpinLock<Vec<(u64, Arc<VirtGpuFence>)>>,
 }
 
 impl core::fmt::Debug for VirtGpuRenderState {
@@ -312,7 +388,21 @@ impl VirtGpuRenderState {
             context_explicit_debug_name: AtomicBool::new(false),
             context_ready: AtomicBool::new(false),
             syncobjs: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
+            pending_execbuf_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
         }
+    }
+
+    /// Consume the calling task's FENCE_FD_OUT submission fence.
+    pub(crate) fn take_execbuf_fence(&self) -> Option<Arc<dyn narf_filesystem::DrmFence>> {
+        let task = narf_scheduler::current_task_id().raw();
+        let mut pending = self.pending_execbuf_fences.lock();
+        let index = pending.iter().rposition(|(owner, _)| *owner == task)?;
+        let (_, fence) = pending.swap_remove(index);
+        Some(fence)
+    }
+
+    pub(crate) fn execbuf_context(&self, ring_idx: u32) -> u64 {
+        (u64::from(self.ctx_id) << 32) | u64::from(ring_idx)
     }
 
     /// Ensure this open's render context exists on the device, creating it once
@@ -430,6 +520,7 @@ impl VirtGpuRenderState {
                 blob_mem: None,
                 host3d_blob: false,
                 host_owned: false,
+                last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
             true,
         );
@@ -444,6 +535,7 @@ impl VirtGpuRenderState {
                 blob_mem: None,
                 host3d_blob: false,
                 host_owned: true,
+                last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
             true,
         );
@@ -465,6 +557,7 @@ impl VirtGpuRenderState {
                 blob_mem: Some(blob_mem),
                 host3d_blob,
                 host_owned: true,
+                last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
             false,
         );
@@ -492,6 +585,7 @@ impl VirtGpuRenderState {
                 blob_mem: Some(narf_drivers_virtio::gpu_pci::BLOB_MEM_HOST3D),
                 host3d_blob: true,
                 host_owned: true,
+                last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
             false,
         );
@@ -507,6 +601,7 @@ impl VirtGpuRenderState {
                 blob_mem: Some(narf_drivers_virtio::gpu_pci::BLOB_MEM_HOST3D),
                 host3d_blob: true,
                 host_owned: true,
+                last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
             false,
         );
@@ -581,6 +676,68 @@ fn write_uapi<T: Copy>(arg: usize, value: T) -> Result<(), FsError> {
     };
     // SAFETY: see copy_out's contract; size is the fixed UAPI struct length.
     unsafe { copy_out(arg, bytes) }
+}
+
+#[derive(Copy, Clone)]
+pub(crate) struct ExecSyncobjDep {
+    pub(crate) handle: u32,
+    pub(crate) reset: bool,
+}
+
+/// Copy and validate one EXECBUFFER syncobj dependency array using Linux's
+/// extensible-stride rule: each entry is zero-initialized and then the first
+/// `min(stride, sizeof(entry))` bytes are copied from userspace.
+pub(crate) fn read_exec_syncobjs(
+    base: u64,
+    count: u32,
+    stride: u32,
+    output: bool,
+) -> Result<Vec<ExecSyncobjDep>, FsError> {
+    const MAX_SYNCOBJS: u32 = 4096;
+    const SYNCOBJ_RESET: u32 = 0x01;
+    let entry_size = core::mem::size_of::<crate::drm_uapi::DrmVirtGpuExecBufferSyncobjUapi>();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > MAX_SYNCOBJS || base == 0 || stride == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let copy_len = (stride as usize).min(entry_size);
+    let mut deps = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let offset = u64::from(index)
+            .checked_mul(u64::from(stride))
+            .ok_or(FsError::InvalidData)?;
+        let address = base.checked_add(offset).ok_or(FsError::InvalidData)?;
+        let address = usize::try_from(address).map_err(|_| FsError::InvalidData)?;
+        // Linux zero-fills the part omitted by a short extensible stride.
+        let mut wire = [0u8; 16];
+        // SAFETY: the user address and bounded byte count come from the UAPI;
+        // copy_in range-checks and SMAP-brackets the read.
+        let bytes = unsafe { copy_in(address, copy_len)? };
+        wire[..copy_len].copy_from_slice(&bytes);
+        let handle = u32::from_le_bytes(wire[0..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(wire[4..8].try_into().unwrap());
+        let point = u64::from_le_bytes(wire[8..16].try_into().unwrap());
+        // Timeline points are intentionally not advertised by NARF's binary
+        // syncobj implementation. Output flags must be zero; input supports
+        // only RESET, exactly like virtgpu_parse_{deps,post_deps}.
+        if point != 0 || (output && flags != 0) || (!output && flags & !SYNCOBJ_RESET != 0) {
+            return Err(FsError::InvalidData);
+        }
+        deps.push(ExecSyncobjDep {
+            handle,
+            reset: flags & SYNCOBJ_RESET != 0,
+        });
+    }
+    Ok(deps)
+}
+
+pub(crate) fn sync_dependency_needs_wait(
+    fence_context: Option<u64>,
+    submission_context: u64,
+) -> bool {
+    fence_context != Some(submission_context)
 }
 
 /// `DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB` — allocate a guest-page-backed blob
@@ -802,18 +959,23 @@ fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64
             Ok(0)
         }
         // SYNCOBJ_WAIT: drm_syncobj_wait { u64 handles, s64 timeout_nsec,
-        //   u32 count_handles, u32 flags, u32 first_signaled, u32 pad } (32 bytes).
-        // Non-blocking here (fast-path check only): NARF does not reschedule
-        // inside a syscall, so blocking under the per-fd lock is unsafe; an
-        // unsignalled wait returns EAGAIN.
+        //   u32 count_handles, u32 flags, u32 first_signaled, u32 pad,
+        //   u64 deadline_nsec } (40 bytes in the current UAPI).
         0xc3 => {
             // SAFETY: `arg` is the ioctl's user struct pointer; copy_in bounds
-            // the 32-byte read and SMAP-brackets it.
-            let bytes = unsafe { copy_in(arg, 32)? };
+            // the 40-byte read and SMAP-brackets it.
+            let bytes = unsafe { copy_in(arg, 40)? };
             let handles_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            let timeout_abs_ns = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
             let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
             let flags = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-            if count == 0 || count > 4096 || handles_ptr == 0 {
+            const WAIT_ALL: u32 = 1 << 0;
+            const WAIT_FOR_SUBMIT: u32 = 1 << 1;
+            if count == 0
+                || count > 4096
+                || handles_ptr == 0
+                || flags & !(WAIT_ALL | WAIT_FOR_SUBMIT) != 0
+            {
                 return Err(FsError::InvalidData);
             }
             // SAFETY: `handles_ptr` is the user handle-array pointer from the
@@ -823,8 +985,34 @@ fn handle_syncobj(nr: u32, arg: usize, state: &VirtGpuRenderState) -> Result<u64
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
                 .collect();
-            match state.syncobjs.lock().wait_handles(&ids, 0, flags) {
-                Ok(first) => {
+            let fences = state
+                .syncobjs
+                .lock()
+                .snapshot_fences(&ids)
+                .map_err(|_| FsError::InvalidData)?;
+            // WAIT_FOR_SUBMIT only changes the no-fence case. Output syncobjs
+            // are bound before EXECBUFFER returns, so ordinary Mesa waits
+            // arrive with a fence already present; an overlapping wait on an
+            // unbound object remains retryable rather than holding the table
+            // lock across the producer.
+            if fences.iter().any(Option::is_none) {
+                return Err(FsError::WouldBlock);
+            }
+            let now = narf_time::wall::monotonic_ns();
+            // Linux interprets this as an absolute CLOCK_MONOTONIC instant.
+            // A negative value is already expired; INT64_MAX is the ordinary
+            // userspace spelling of an effectively infinite wait, capped here
+            // by the same 15 s GPU-hang bound as VIRTGPU_WAIT.
+            let timeout_ns = u64::try_from(timeout_abs_ns)
+                .unwrap_or(0)
+                .saturating_sub(now)
+                .min(15_000_000_000);
+            match crate::drm::syncobj::SyncObjTable::wait_fences(&ids, &fences, timeout_ns, flags) {
+                Ok(first_handle) => {
+                    let first = ids
+                        .iter()
+                        .position(|handle| *handle == first_handle)
+                        .unwrap_or(0) as u32;
                     // SAFETY: writes 4 bytes to the `first_signaled` field at
                     // offset 24 of the ioctl struct; copy_out SMAP-brackets it.
                     unsafe { copy_out(arg + 24, &first.to_le_bytes())? };
@@ -1145,12 +1333,33 @@ fn dispatch_virtgpu_render_inner(
         DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => handle_transfer_3d(arg, state, true),
         DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => handle_transfer_3d(arg, state, false),
         DRM_IOCTL_VIRTGPU_WAIT => {
+            // `virtio_gpu_wait_ioctl`: NOWAIT tests the BO's reservation and
+            // reports EBUSY while work is outstanding; otherwise wait up to
+            // 15 s (Linux's DRM long timeout) and report EBUSY on expiry.
+            const VIRTGPU_WAIT_NOWAIT: u32 = 1;
             let req: DrmVirtGpuWaitUapi = read_uapi(arg)?;
-            let _resource = state.find(req.handle).ok_or(FsError::NotFound)?;
-            // ControlQ submissions are synchronous, so every surviving handle
-            // is already idle. Linux likewise returns success when its GEM
-            // reservation is signalled, regardless of unrelated flag bits.
-            Ok(0)
+            let resource = state.find(req.handle).ok_or(FsError::NotFound)?;
+            let fence = resource.last_fence.lock().clone();
+            let Some(fence) = fence else {
+                // Never referenced by a fenced submission — idle. The
+                // synchronous TRANSFER/CREATE paths complete before their
+                // ioctls return, so they leave no wait obligation.
+                return Ok(0);
+            };
+            if req.flags & VIRTGPU_WAIT_NOWAIT != 0 {
+                return if fence.is_device_signalled() {
+                    Ok(0)
+                } else {
+                    // FsError::Busy → EBUSY at the syscall layer, matching
+                    // Linux's dma_resv_test_signaled() == false path.
+                    Err(FsError::Busy)
+                };
+            }
+            if fence.wait_device(15_000) {
+                Ok(0)
+            } else {
+                Err(FsError::Busy)
+            }
         }
         DRM_IOCTL_VIRTGPU_GET_CAPS => {
             let req: DrmVirtGpuGetCapsUapi = read_uapi(arg)?;
@@ -1206,19 +1415,10 @@ fn dispatch_virtgpu_render_inner(
             const EXECBUF_RING_IDX: u32 = 0x04;
             const EXECBUF_KNOWN: u32 =
                 EXECBUF_FENCE_FD_IN | EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX;
-            // The DRM native context submits on a per-context ring
-            // (VIRTGPU_EXECBUF_RING_IDX). NARF's submit is synchronous, so the
-            // syscall layer represents FENCE_FD_OUT with an already-signalled
-            // sync-file fd and validates FENCE_FD_IN before dispatch reaches
-            // this driver-owned portion of the ioctl.
-            // Syncobj timelines have distinct fd-lifetime rules; reject those.
-            // syncobj_stride is only meaningful when in/out syncobjs are used;
-            // reject those (distinct fd-lifetime rules) but ignore a stray
-            // stride hint that libdrm may set with zero syncobjs.
-            if req.flags & !EXECBUF_KNOWN != 0
-                || req.num_in_syncobjs != 0
-                || req.num_out_syncobjs != 0
-            {
+            // The syscall layer validates/waits FENCE_FD_IN and reserves the
+            // FENCE_FD_OUT descriptor before dispatch. Binary syncobj arrays
+            // are handled below; non-zero timeline points remain unsupported.
+            if req.flags & !EXECBUF_KNOWN != 0 {
                 return Err(FsError::InvalidData);
             }
             if req.size as usize > VIRTGPU_EXECBUFFER_MAX_BYTES || req.num_bo_handles > 256 {
@@ -1233,10 +1433,53 @@ fn dispatch_virtgpu_render_inner(
             } else {
                 None
             };
+            let submission_context = state.execbuf_context(u32::from(ring_idx.unwrap_or(0)));
+            let in_syncobjs = read_exec_syncobjs(
+                req.in_syncobjs,
+                req.num_in_syncobjs,
+                req.syncobj_stride,
+                false,
+            )?;
+            let out_syncobjs = read_exec_syncobjs(
+                req.out_syncobjs,
+                req.num_out_syncobjs,
+                req.syncobj_stride,
+                true,
+            )?;
+            // Resolve every handle before submission. Clone the input fences
+            // so the IRQ-safe table lock is never held while waiting for GPU
+            // completion or for a pipeline slot.
+            let input_fences: Vec<Arc<dyn crate::drm::syncobj::DmaFence>> = {
+                let table = state.syncobjs.lock();
+                for dep in &out_syncobjs {
+                    table.get(dep.handle).map_err(|_| FsError::InvalidData)?;
+                }
+                in_syncobjs
+                    .iter()
+                    .map(|dep| {
+                        table
+                            .get(dep.handle)
+                            .map_err(|_| FsError::InvalidData)?
+                            .fence
+                            .clone()
+                            .ok_or(FsError::InvalidData)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            // Linux skips a synchronous wait when the dependency belongs to
+            // this exact ordered fence context; queue order already provides
+            // it. Foreign rings/devices are waited before the new job queues.
+            for fence in &input_fences {
+                if sync_dependency_needs_wait(fence.context(), submission_context)
+                    && !fence.wait(15_000_000_000)
+                {
+                    return Err(FsError::Busy);
+                }
+            }
             // Validate every referenced handle before touching the command
             // pointer. This makes the resource ownership check independent of
             // virgl command parsing (which belongs to the host renderer).
-            let mut _referenced: [Option<Arc<VirtGpuResource>>; 256] = [const { None }; 256];
+            let mut referenced: [Option<Arc<VirtGpuResource>>; 256] = [const { None }; 256];
             if req.num_bo_handles != 0 {
                 // SAFETY: the count is capped at 256 above, multiplication by
                 // four cannot overflow, and copy_in validates the entire
@@ -1246,7 +1489,7 @@ fn dispatch_virtgpu_render_inner(
                 for (index, chunk) in bytes.chunks_exact(4).enumerate() {
                     let handle =
                         u32::from_le_bytes(chunk.try_into().map_err(|_| FsError::InvalidData)?);
-                    _referenced[index] = Some(state.find(handle).ok_or(FsError::NotFound)?);
+                    referenced[index] = Some(state.find(handle).ok_or(FsError::NotFound)?);
                 }
             }
             // A size-0 execbuf is a valid ring "kick" for the native context
@@ -1261,8 +1504,54 @@ fn dispatch_virtgpu_render_inner(
                 Vec::new()
             };
             state.ensure_context(dev)?;
-            dev.submit_virgl(state.ctx_id, ring_idx, &commands)
-                .map_err(map_gpu_transport_error)?;
+            // Fenced, asynchronous submission: the ioctl returns once the
+            // stream is queued; the fence id signals when the host has
+            // executed it (Linux `virtio_gpu_execbuffer_ioctl`). The
+            // TRANSFER_*_HOST ioctls stay synchronous and UNfenced on
+            // purpose: the device processes the control queue in order, so
+            // by the time a transfer's own response arrives every earlier
+            // fenced submit has executed — the ordering argument that keeps
+            // this v1 safe without per-BO reservation objects.
+            let transport_fence = match dev.submit_virgl_fenced(state.ctx_id, ring_idx, &commands) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  drm: EXECBUFFER submit failed: {error:?}"
+                    );
+                    return Err(map_gpu_transport_error(error));
+                }
+            };
+            let fence = VirtGpuFence::new(transport_fence, submission_context);
+            // Publish the fence on every referenced BO (VIRTGPU_WAIT reads
+            // it) and on the open (FENCE_FD_OUT's sync_file reads it).
+            for resource in referenced.iter().flatten() {
+                *resource.last_fence.lock() = Some(fence.clone());
+            }
+            if req.flags & EXECBUF_FENCE_FD_OUT != 0 {
+                state
+                    .pending_execbuf_fences
+                    .lock()
+                    .push((narf_scheduler::current_task_id().raw(), fence.clone()));
+            }
+            // Publish the same hardware-backed fence to every output syncobj
+            // and consume RESET-marked inputs. Handles were prevalidated; if
+            // a racing DESTROY removed one meanwhile, it has no remaining
+            // userspace observer and can be skipped safely.
+            let sync_fence: Arc<dyn crate::drm::syncobj::DmaFence> = fence;
+            let mut table = state.syncobjs.lock();
+            for dep in &in_syncobjs {
+                if dep.reset {
+                    if let Ok(obj) = table.get_mut(dep.handle) {
+                        obj.fence = None;
+                    }
+                }
+            }
+            for dep in &out_syncobjs {
+                if let Ok(obj) = table.get_mut(dep.handle) {
+                    obj.replace_fence(sync_fence.clone());
+                }
+            }
             Ok(0)
         }
         DRM_IOCTL_GEM_CLOSE => {
@@ -1441,10 +1730,12 @@ pub fn dispatch_card(
         render,
         &client_caps,
         (!render).then_some(&events),
+        None,
     )
 }
 
 /// Stateful card dispatcher used by a real DRM open file.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_card_for_file(
     card_index: u32,
     open_id: u64,
@@ -1453,6 +1744,7 @@ pub(crate) fn dispatch_card_for_file(
     render: bool,
     client_caps: &DrmClientCaps,
     events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
 ) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
@@ -1482,7 +1774,9 @@ pub(crate) fn dispatch_card_for_file(
         // Atomic commit decodes into AtomicState directly — handled
         // here rather than through the generic dispatcher because the
         // dispatcher only carries the wire-format word.
-        IoctlCmd::ModeAtomic => handle_atomic(card_index, &mode_state, arg, &ctx, events),
+        IoctlCmd::ModeAtomic => {
+            handle_atomic(card_index, &mode_state, arg, &ctx, events, out_fences)
+        }
         // GETRESOURCES is special because the response has pointer
         // arrays the user supplied; we must write IDs into those.
         IoctlCmd::ModeGetResources => handle_getresources(&mode_state, arg, &ctx),
@@ -2051,6 +2345,11 @@ const PLANE_ID_BASE: u32 = 0x40;
 /// Property id of the plane "type" enum (a separate id space from objects).
 const PLANE_TYPE_PROP_ID: u32 = 0x50;
 const CRTC_ACTIVE_PROP_ID: u32 = 0x52;
+/// `OUT_FENCE_PTR` on a CRTC: a userspace `s32*` filled with a sync_file
+/// fd whose fence signals at the commit's simulated vblank.
+const CRTC_OUT_FENCE_PTR_PROP_ID: u32 = 0x60;
+/// `IN_FENCE_FD` on a plane: a sync_file fd (-1 = none) gating the flip.
+const PLANE_IN_FENCE_FD_PROP_ID: u32 = 0x5f;
 const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
 const CONNECTOR_CRTC_ID_PROP_ID: u32 = 0x54;
 const PLANE_FB_ID_PROP_ID: u32 = 0x55;
@@ -2307,6 +2606,20 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
             [0, u32::MAX as u64],
         )),
+        // Explicit-fencing pair (drm_atomic_uapi.c "Explicit Fencing
+        // Properties"): IN_FENCE_FD is a signed range accepting -1 (no
+        // fence) through INT_MAX; OUT_FENCE_PTR is a full-range integer
+        // carrying a userspace pointer.
+        PLANE_IN_FENCE_FD_PROP_ID => Some((
+            b"IN_FENCE_FD".as_slice(),
+            DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
+            [(-1i64) as u64, i32::MAX as u64],
+        )),
+        CRTC_OUT_FENCE_PTR_PROP_ID => Some((
+            b"OUT_FENCE_PTR".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+            [0, u64::MAX],
+        )),
         _ => None,
     };
     if let Some((name, flags, values)) = simple {
@@ -2461,6 +2774,7 @@ fn handle_obj_getproperties(
                     PLANE_CRTC_Y_PROP_ID,
                     PLANE_CRTC_W_PROP_ID,
                     PLANE_CRTC_H_PROP_ID,
+                    PLANE_IN_FENCE_FD_PROP_ID,
                 ],
                 vec![
                     DRM_PLANE_TYPE_PRIMARY,
@@ -2478,13 +2792,22 @@ fn handle_obj_getproperties(
                     crtc.y as u64,
                     width as u64,
                     height as u64,
+                    // IN_FENCE_FD reads back as -1 (never a live fd),
+                    // matching drm_atomic_plane_get_property.
+                    (-1i64) as u64,
                 ],
             )
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
             let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
             (
-                vec![CRTC_ACTIVE_PROP_ID, CRTC_MODE_ID_PROP_ID],
-                vec![crtc.enabled as u64, 0],
+                vec![
+                    CRTC_ACTIVE_PROP_ID,
+                    CRTC_MODE_ID_PROP_ID,
+                    CRTC_OUT_FENCE_PTR_PROP_ID,
+                ],
+                // OUT_FENCE_PTR reads back as 0 (write-only request),
+                // matching drm_atomic_crtc_get_property.
+                vec![crtc.enabled as u64, 0, 0],
             )
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
             let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;
@@ -2603,6 +2926,7 @@ fn handle_atomic(
     arg: usize,
     ctx: &DrmFileCtx,
     events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
 ) -> Result<u64, FsError> {
     // ATOMIC is a DRM_MASTER op (drm_ioctls[] marks DRM_MODE_ATOMIC
     // DRM_MASTER). Only the master may commit; reject render nodes and
@@ -2761,6 +3085,7 @@ fn handle_atomic(
                     src_y: crtc.y,
                     src_w: width,
                     src_h: height,
+                    in_fence_fd: None,
                 };
                 for (&prop, &value) in object_props.iter().zip(object_values) {
                     match prop {
@@ -2776,6 +3101,15 @@ fn handle_atomic(
                         PLANE_CRTC_Y_PROP_ID => plane.crtc_y = value as i64 as i32,
                         PLANE_CRTC_W_PROP_ID => plane.crtc_w = value as u32,
                         PLANE_CRTC_H_PROP_ID => plane.crtc_h = value as u32,
+                        PLANE_IN_FENCE_FD_PROP_ID => {
+                            let fd = value as i64;
+                            // Linux set_property: -1 clears, other negatives
+                            // are EINVAL, and the value must fit an s32.
+                            if fd < -1 || fd > i32::MAX as i64 {
+                                return Err(FsError::InvalidData);
+                            }
+                            plane.in_fence_fd = (fd >= 0).then_some(fd as i32);
+                        }
                         _ => return Err(FsError::InvalidData),
                     }
                 }
@@ -2823,6 +3157,11 @@ fn handle_atomic(
                                     bpp: 32,
                                 })
                             };
+                        }
+                        CRTC_OUT_FENCE_PTR_PROP_ID => {
+                            // A null pointer resets the request (Linux's
+                            // set_out_fence_for_crtc treats 0 as clear).
+                            crtc_state.out_fence_ptr = (value != 0).then_some(value);
                         }
                         _ => return Err(FsError::InvalidData),
                     }
@@ -2917,10 +3256,39 @@ fn handle_atomic(
                 .planes
                 .iter()
                 .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
+            // Advance the simulated vblank exactly once per affected CRTC;
+            // the PAGE_FLIP_EVENT and any OUT_FENCE_PTR on the same CRTC
+            // observe the same present instant.
+            fn present_at_for(
+                card: &mut crate::drm::card::Card,
+                presented: &mut alloc::vec::Vec<(u32, u64)>,
+                crtc_id: u32,
+            ) -> u64 {
+                if let Some(&(_, at)) = presented.iter().find(|(id, _)| *id == crtc_id) {
+                    return at;
+                }
+                let at = card.advance_vblank(crtc_id);
+                presented.push((crtc_id, at));
+                at
+            }
+            let mut presented: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
-                    card.queue_flip_event(queue, req.user_data, crtc_id)
+                    let at = present_at_for(&mut card, &mut presented, crtc_id);
+                    card.queue_flip_event_at(queue, req.user_data, crtc_id, at)
                         .map_err(|_| FsError::OutOfMemory)?;
+                }
+            }
+            // OUT_FENCE_PTR: hand (user pointer, vblank deadline) pairs to
+            // the per-open sink; the syscall layer mints the sync_file fds
+            // (fd tables are its domain) and writes them through the
+            // pointers after the ioctl returns success.
+            for crtc_state in &state.crtcs {
+                if let Some(ptr) = crtc_state.out_fence_ptr {
+                    let at = present_at_for(&mut card, &mut presented, crtc_state.id);
+                    if let Some(sink) = out_fences {
+                        sink.lock().push((ptr, at));
+                    }
                 }
             }
             active_plane.and_then(|(_, fb_id)| {

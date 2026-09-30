@@ -260,3 +260,75 @@ impl Controller {
         got.ok_or(BringupError::Transport(TransportError::Timeout))
     }
 }
+
+// ── Brought-up controller registry ──────────────────────────────────
+
+/// Controllers that have completed [`Controller::bring_up`].
+static CONTROLLERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<Arc<Controller>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Every controller brought up so far.
+pub fn controllers() -> alloc::vec::Vec<Arc<Controller>> {
+    CONTROLLERS.lock().clone()
+}
+
+/// Number of controllers that reached [`BringupPhase::Ready`].
+pub fn controller_count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
+/// Whether `transport` already backs a brought-up controller.
+///
+/// Compared by `Arc` pointer identity rather than by name: two
+/// controllers of the same kind share a transport name, and bringing
+/// the second one up is not a duplicate.
+fn already_brought_up(transport: &Arc<dyn HciTransport>) -> bool {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| Arc::ptr_eq(&c.transport, transport))
+}
+
+/// Outcome of one controller's bring-up, for the boot transcript.
+#[derive(Debug)]
+pub struct BringupOutcome {
+    /// The transport's name.
+    pub transport: &'static str,
+    /// What the bring-up sequence returned.
+    pub result: Result<ControllerInfo, BringupError>,
+}
+
+/// Run [`Controller::bring_up`] against every registered transport
+/// that does not already back a controller.
+///
+/// Idempotent: a transport that has already been brought up is
+/// skipped, so running this twice — or running it after a driver has
+/// brought up its own controller — does not reset a working adapter.
+///
+/// A failure on one transport does not stop the others: a dongle that
+/// does not answer should not keep an onboard controller offline.
+pub fn bring_up_all(cap: &Cap<Bluetooth, Grant>) -> alloc::vec::Vec<BringupOutcome> {
+    let mut out = alloc::vec::Vec::new();
+    for t in crate::transport::transports() {
+        if already_brought_up(&t) {
+            continue;
+        }
+        let name = t.name();
+        let controller = Arc::new(Controller::new(t));
+        let result = controller.bring_up(cap);
+        if result.is_ok() {
+            CONTROLLERS.lock().push(controller);
+        }
+        out.push(BringupOutcome {
+            transport: name,
+            result,
+        });
+    }
+    out
+}
+
+#[doc(hidden)]
+/// Test-only: drain the brought-up registry.
+pub fn __test_reset_controllers() {
+    CONTROLLERS.lock().clear();
+}

@@ -1321,7 +1321,7 @@ kernel_test_in!(
     smoke_net_ns_loopback_delivery_and_final_teardown
 );
 
-fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
+fn smoke_stack_admin_delegates_only_to_current_netlink_socket() -> TestResult {
     use narf_capabilities::{Cap, Invoke};
     use narf_net::{StackAttach, StackDaemon};
 
@@ -1329,6 +1329,13 @@ fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
     fn task_lookup() -> u64 {
         TASK
     }
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            crate::handlers::__test_reset_task_id_lookup();
+        }
+    }
+    let _cleanup = Cleanup;
 
     let iface_name = "lo.userspace-admin-delegate";
     narf_scheduler::__reset_queues_for_test();
@@ -1367,7 +1374,12 @@ fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
         crate::socket::NETLINK_ROUTE,
     );
     let inet = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
-    let (route_fd, inet_fd) = crate::fd::with_table(TASK, |table| {
+    let generic = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_NETLINK,
+        crate::socket::SOCK_RAW,
+        crate::socket::NETLINK_GENERIC,
+    );
+    let (route_fd, inet_fd, generic_fd) = crate::fd::with_table(TASK, |table| {
         let route_fd = table.open(crate::fd::FdEntry {
             ops: route.clone(),
             offset: 0,
@@ -1380,7 +1392,17 @@ fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
             flags: 0,
             status_flags: 0,
         });
-        (route_fd.expect("fixture fd"), inet_fd.expect("fixture fd"))
+        let generic_fd = table.open(crate::fd::FdEntry {
+            ops: generic.clone(),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        });
+        (
+            route_fd.expect("fixture fd"),
+            inet_fd.expect("fixture fd"),
+            generic_fd.expect("fixture fd"),
+        )
     })
     .expect("current task fd table");
 
@@ -1395,16 +1417,35 @@ fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
     if !route.__test_has_netlink_admin() {
         return TestResult::Fail("route socket did not retain delegated admin");
     }
+    if crate::delegate_stack_admin_to_generic_socket(route_fd, &reply)
+        != Err(crate::socket::SockError::InvalidArg)
+        || crate::delegate_stack_admin_to_route_socket(generic_fd, &reply)
+            != Err(crate::socket::SockError::InvalidArg)
+        || crate::delegate_stack_admin_to_generic_socket(inet_fd, &reply)
+            != Err(crate::socket::SockError::InvalidArg)
+    {
+        return TestResult::Fail("launcher bridge accepted the wrong socket protocol");
+    }
+    if crate::delegate_stack_admin_to_generic_socket(generic_fd, &reply).is_err()
+        || !generic.__test_has_netlink_admin()
+    {
+        return TestResult::Fail("generic socket did not retain delegated admin");
+    }
     if crate::delegate_stack_admin_to_route_socket(route_fd + 1000, &reply)
         != Err(crate::socket::SockError::BadFd)
     {
         return TestResult::Fail("delegation escaped the current task fd table");
     }
+    if crate::delegate_stack_admin_to_generic_socket(generic_fd + 1000, &reply)
+        != Err(crate::socket::SockError::BadFd)
+    {
+        return TestResult::Fail("generic delegation escaped the current task fd table");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "userspace/netlink",
-    smoke_stack_admin_delegates_only_to_current_route_socket
+    smoke_stack_admin_delegates_only_to_current_netlink_socket
 );
 
 // ── AF_INET datagram sockets on the wire ─────────────────────────────────────

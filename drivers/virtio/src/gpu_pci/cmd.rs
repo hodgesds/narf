@@ -50,6 +50,11 @@ pub const VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 
 pub const HDR_LEN: usize = 24;
 
+/// ctrl_hdr.flags bit: `fence_id` is meaningful. The device copies `flags`
+/// and `fence_id` into the RESPONSE header once the command has executed
+/// (VirtIO 1.2 §5.7.6.7), which is how completion is matched to a fence —
+/// Linux emits this from `virtgpu_fence.c::virtio_gpu_fence_emit`.
+pub const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
 /// ctrl_hdr.flags bit: `ring_idx` (byte at offset 20) is meaningful.
 pub const VIRTIO_GPU_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
@@ -434,13 +439,46 @@ pub const SUBMIT_3D_PREFIX_LEN: usize = HDR_LEN + 8;
 /// submission). `Some(r)` sets `VIRTIO_GPU_FLAG_INFO_RING_IDX` + the ring byte;
 /// `None` submits on the default ring (classic VirGL).
 pub fn build_submit_3d(out: &mut [u8], ctx_id: u32, ring_idx: Option<u8>, commands: &[u8]) {
+    write_submit_3d(out, ctx_id, ring_idx, None, commands);
+}
+
+/// Fenced `SUBMIT_3D`: additionally sets `VIRTIO_GPU_FLAG_FENCE` + `fence_id`
+/// so the device echoes both into the response header at completion. Ring
+/// selection composes with the fence flag exactly as in [`build_submit_3d`]
+/// (Linux sets INFO_RING_IDX and FENCE together for native-context submits).
+pub fn build_submit_3d_fenced(
+    out: &mut [u8],
+    ctx_id: u32,
+    ring_idx: Option<u8>,
+    fence_id: u64,
+    commands: &[u8],
+) {
+    write_submit_3d(out, ctx_id, ring_idx, Some(fence_id), commands);
+}
+
+fn write_submit_3d(
+    out: &mut [u8],
+    ctx_id: u32,
+    ring_idx: Option<u8>,
+    fence_id: Option<u64>,
+    commands: &[u8],
+) {
     assert!(out.len() >= SUBMIT_3D_PREFIX_LEN + commands.len());
-    let flags = if ring_idx.is_some() {
+    let mut flags = if ring_idx.is_some() {
         VIRTIO_GPU_FLAG_INFO_RING_IDX
     } else {
         0
     };
-    put_hdr(out, VIRTIO_GPU_CMD_SUBMIT_3D, flags, 0, ctx_id);
+    if fence_id.is_some() {
+        flags |= VIRTIO_GPU_FLAG_FENCE;
+    }
+    put_hdr(
+        out,
+        VIRTIO_GPU_CMD_SUBMIT_3D,
+        flags,
+        fence_id.unwrap_or(0),
+        ctx_id,
+    );
     if let Some(r) = ring_idx {
         // ctrl_hdr.ring_idx is the first byte of the 4-byte padding region.
         out[20] = r;

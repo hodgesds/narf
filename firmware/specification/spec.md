@@ -80,6 +80,20 @@ prevent:
 
 ## 3. Design principles
 
+Build configuration: `NARF_FIRMWARE_TRUSTED_KEYS` may name an absolute
+path to a text file containing one Ed25519 public key per line (64 hex
+digits; blank lines and `#` comments allowed, at most 32 distinct keys).
+The build rejects malformed, zero, or empty configured key sets. Omitting
+the variable embeds no keys. `register_initcalls()` installs these roots
+before firmware discovery, with SHA-256 public-key fingerprints. Runtime
+firmware files cannot add trust roots. These are public keys only.
+
+`cargo xtask pack-firmware --name NAME --payload FILE --signature SIG
+--public-key KEY` verifies a detached 64-byte Ed25519 signature over the
+32-byte BLAKE3 payload digest using a raw 32-byte public key, then writes
+`target/firmware/NAME`. Omitting both signing arguments retains the unsigned
+developer format. Signing/private-key custody happens outside xtask.
+
 1. **Caps in, bytes out.** A driver requests `Cap<FirmwareBlob,
    Read>` by canonical name; the registry returns either the
    cap or `NotFound`. The driver never sees a path, never
@@ -163,7 +177,7 @@ pub struct BlobView<'a> {
     /// Vendor-supplied version string, parsed from the blob's
     /// metadata. None if the format doesn't carry one.
     pub version: Option<&'a str>,
-    /// SHA-256 of the blob bytes. Recorded in the bound-driver
+    /// BLAKE3 of the blob bytes (historical field name). Recorded in the bound-driver
     /// inventory so kernel snapshots can correlate driver
     /// behaviour with firmware version.
     pub sha256:  [u8; 32],
@@ -308,15 +322,18 @@ Every blob carries an embedded signature trailer:
 +----------------------------+
 |  Ed25519 signature (64 B)   |
 |  signer fingerprint (32 B)  |
-|  metadata length (4 B LE)   |
 |  metadata (variable)        |
+|  metadata length (4 B LE)   |
 |  trailing magic 'NRFW' (4 B)|
 +----------------------------+
 ```
 
-Verification: hash the `raw firmware bytes` with SHA-256, then
-verify the signature against the signer's public key, then check
-the signer fingerprint against the trusted-firmware-signers list.
+Verification: hash the `raw firmware bytes` with BLAKE3, then verify
+ordinary Ed25519 over that 32-byte digest using the trusted public key
+selected by its SHA-256 fingerprint. The historical `sha256` identity
+field also contains BLAKE3; the unversioned format cannot change this
+algorithm without a migration. Metadata is advisory and is not signed.
+Security-sensitive policy fields must live in the authenticated payload.
 
 The signers list lives in the kernel image as a build-time
 constant (mirrors trusted-driver-signers from

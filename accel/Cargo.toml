@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 narf-lib = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
+narf-bus = { path = "../bus" }
+narf-console = { path = "../console" }
+narf-drivers = { path = "../drivers" }
+narf-init = { path = "../init" }
 narf-ipc = { path = "../ipc" }
 narf-io = { path = "../io" }
 narf-net = { path = "../net" }

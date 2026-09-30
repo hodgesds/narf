@@ -161,6 +161,22 @@ Drivers implementing `RuntimePm` can be autosuspended after an
 idle timeout, with wake on the next request. Gated behind
 `Cap<Device, PmControl>`.
 
+### 3.6 System transitions
+
+```rust
+pub fn reboot() -> !;
+pub fn power_off() -> !;
+```
+
+On x86_64, `power_off` evaluates `\_S5_` and writes the firmware-provided
+SLP_TYPa/b values to PM1 control with SLP_EN. Sleep types are opaque
+platform encodings: `(0, 0)` is valid and must not be replaced merely because
+it is zero. A legacy `(5, 0)` fallback is used only when `_S5` cannot be
+evaluated. PM1 writes preserve every non-sleep control bit. On aarch64,
+`power_off` invokes PSCI `SYSTEM_OFF` through the architecture-selected HVC or
+SMC conduit. Both entry points halt forever if the platform call unexpectedly
+returns.
+
 **Why two quiesce variants.** A driver that has only a single
 `quiesce` method must conservatively assume power loss, which means
 running the full save sequence on every retention-class suspend —

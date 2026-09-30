@@ -14,6 +14,16 @@ current test results.
 | 4 · Compatibility | In-tree shell gate met; compatibility continues | Interactive `echo hello world` follows serial IRQ → input ring → shell → UART. Linux-compatible musl programs, storage, networking, and graphics have additional QEMU proofs. The original relibc-specific criterion is not the closure proof. |
 | 5 · Silicon | In progress | Driver and diagnostic foundations exist; the selected AMD laptop end-to-end gate has not been demonstrated. |
 
+## i40e MSI-X and offloads
+
+The i40e runtime connects dedicated admin/queue MSI-X routes to bounded async
+completion tasks. Frame rings carry TCP/UDP checksum and TCP TSO requests plus
+RX checksum results. Owned TX DMA survives partial completion; invalid heads,
+AQ timeouts and fatal causes fail the PF safely. See `drivers/net/` §3.1 for
+the supported profile and recovery limits. Descriptor, checksum, IPC metadata
+and interrupt-race smokes run under QEMU on both architectures. Physical X710
+validation remains pending; the development host is a live router.
+
 ## Exercised paths
 
 - **Kernel on QEMU:** `cargo xtask run` and `cargo xtask test` support x86_64
@@ -59,6 +69,25 @@ current test results.
    Wi-Fi, and persistent NVMe storage. AMDGPU, ACPI EC, I²C-HID,
    wireless, TSC calibration, and framebuffer diagnostics have foundations
    in-tree, but the complete gate remains open.
+   The iwlwifi Sc/BE211 work now includes an MLD station path with owned
+   firmware/PNVM boot DMA, RFH receive rings, command/data TX queues,
+   MSI-X completion delivery, active/passive scans, Open/WPA2-PSK association,
+   CCMP replay protection and pairwise/group rekey, WMM/four AC rings,
+   HT20/40 and VHT20/40/80 negotiation (up to two spatial streams),
+   firmware rate adaptation and TX A-MPDU completion, RX Block Ack
+   negotiation/reordering, standalone RX A-MSDU deaggregation,
+   TX queue backpressure, and kernel Ethernet
+   routing. Software regressions cover wire layouts,
+   malformed completions, DMA ownership, authenticated EAPOL retries,
+   channel-span limits, BA sequence wrap and replay checks after reordering.
+   Delegated nl80211 scan/connect controls and signed deployment regulatory
+   policy loading are wired in, with build-time public-key provisioning
+   and detached-signature firmware packing. Explicit network-service launch
+   now delegates interface authority before the process runs, including to
+   its ordinary netlink sockets and forked children, while preserving IP
+   frame ownership. Boot service selection, silicon validation and real
+   supplicant interoperability remain open. See
+   [the implemented driver contract](drivers/wireless/specification/spec.md#31-implemented-iwlwifi-mld-station-profile).
 2. **Compatibility and desktop:** extend tested Linux ABI and graphical
    application coverage on QEMU. Use runnable cases in
    [docs/DESKTOP_LINUX_PLAN.md](docs/DESKTOP_LINUX_PLAN.md) and the feature
