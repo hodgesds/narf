@@ -512,6 +512,10 @@ pub struct DeviceNode {
     pub push_count: AtomicU32,
     /// Count of dropped events (diagnostic).
     pub drop_count: AtomicU32,
+    /// Alt / SysRq held on THIS keyboard — Linux keeps them in the per-handle
+    /// `struct sysrq_state`, so a modifier held on one keyboard never arms
+    /// another.
+    sysrq: SysrqState,
 }
 
 impl core::fmt::Debug for DeviceNode {
@@ -533,10 +537,11 @@ static DISPATCH_WAKE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 // ── Magic SysRq ─────────────────────────────────────────────────────
 //
-// Linux `drivers/tty/sysrq.c`: while Alt and SysRq are held, the next key
-// press is a SysRq command (Alt+SysRq+T dumps every task's state) and is not
-// delivered to userspace. Recognised here, at the one event chokepoint every
-// keyboard shares. The command runs OUTSIDE interrupt context: dispatch is
+// Linux `drivers/tty/sysrq.c`: while Alt and SysRq are held on a keyboard, its
+// next key press is a SysRq command (Alt+SysRq+T dumps every task's state)
+// and is not delivered to userspace. Recognised here, at the one event
+// chokepoint every keyboard shares; the held-key state is per device
+// (`sysrq_connect` allocates one `sysrq_state` per keyboard). The command runs OUTSIDE interrupt context: dispatch is
 // called from IRQs, and a task dump takes locks the interrupted code may
 // hold, so this only records the request; `take_sysrq_request` hands it to
 // a sleep pump.
@@ -545,35 +550,50 @@ const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTALT: u16 = 100;
 const KEY_SYSRQ: u16 = 99;
 
-static SYSRQ_ALT: AtomicU32 = AtomicU32::new(0);
-static SYSRQ_HELD: AtomicBool = AtomicBool::new(false);
-/// Pending command key code (0 = none).
+/// Pending command key code (0 = none). Global: a command acts on the whole
+/// system, whichever keyboard issued it.
 static SYSRQ_PENDING: AtomicU32 = AtomicU32::new(0);
 
-/// Track Alt/SysRq and record a command. Returns `true` when the event is a
-/// SysRq command key the caller must swallow.
-fn sysrq_filter(code: u16, value: i32) -> bool {
-    match code {
-        KEY_LEFTALT | KEY_RIGHTALT => {
-            let bit = if code == KEY_LEFTALT { 1 } else { 2 };
-            if value == 0 {
-                SYSRQ_ALT.fetch_and(!bit, Ordering::AcqRel);
-            } else {
-                SYSRQ_ALT.fetch_or(bit, Ordering::AcqRel);
+/// One keyboard's Alt / SysRq state (Linux `struct sysrq_state`).
+struct SysrqState {
+    /// Bit 0: left Alt held, bit 1: right Alt held.
+    alt: AtomicU32,
+    held: AtomicBool,
+}
+
+impl SysrqState {
+    const fn new() -> Self {
+        Self {
+            alt: AtomicU32::new(0),
+            held: AtomicBool::new(false),
+        }
+    }
+
+    /// Track Alt/SysRq and record a command. Returns `true` when the event
+    /// is a SysRq command key the caller must swallow.
+    fn filter(&self, code: u16, value: i32) -> bool {
+        match code {
+            KEY_LEFTALT | KEY_RIGHTALT => {
+                let bit = if code == KEY_LEFTALT { 1 } else { 2 };
+                if value == 0 {
+                    self.alt.fetch_and(!bit, Ordering::AcqRel);
+                } else {
+                    self.alt.fetch_or(bit, Ordering::AcqRel);
+                }
+                false
             }
-            false
-        }
-        KEY_SYSRQ => {
-            SYSRQ_HELD.store(value != 0, Ordering::Release);
-            false
-        }
-        _ if SYSRQ_HELD.load(Ordering::Acquire) && SYSRQ_ALT.load(Ordering::Acquire) != 0 => {
-            if value == 1 {
-                SYSRQ_PENDING.store(u32::from(code), Ordering::Release);
+            KEY_SYSRQ => {
+                self.held.store(value != 0, Ordering::Release);
+                false
             }
-            true
+            _ if self.held.load(Ordering::Acquire) && self.alt.load(Ordering::Acquire) != 0 => {
+                if value == 1 {
+                    SYSRQ_PENDING.store(u32::from(code), Ordering::Release);
+                }
+                true
+            }
+            _ => false,
         }
-        _ => false,
     }
 }
 
@@ -623,6 +643,7 @@ impl DeviceNode {
             inner: IrqSafeSpinLock::new(DeviceNodeInner::new()),
             push_count: AtomicU32::new(0),
             drop_count: AtomicU32::new(0),
+            sysrq: SysrqState::new(),
         }
     }
 
@@ -635,7 +656,7 @@ impl DeviceNode {
         if !self.alive.load(Ordering::Acquire) {
             return false;
         }
-        if ev.type_ == EventType::Key && sysrq_filter(ev.code, ev.value) {
+        if ev.type_ == EventType::Key && self.sysrq.filter(ev.code, ev.value) {
             // Linux's sysrq input handler swallows the command key.
             return true;
         }
