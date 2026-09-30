@@ -5744,6 +5744,16 @@ fn boot_userspace_init() {
                     "tiocgptpeer_glibc",
                     narf_verification::NARF_TIOCGPTPEER_SMOKE_GLIBC_ELF,
                 ),
+                // A pty slave's owner and mode can be changed (sudo's
+                // get_pty chowns the slave it just opened).
+                (
+                    "pts_chown_smoke",
+                    narf_verification::NARF_PTS_CHOWN_SMOKE_ELF,
+                ),
+                (
+                    "pts_chown_glibc",
+                    narf_verification::NARF_PTS_CHOWN_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.

@@ -73,6 +73,16 @@ pub const TIOCSPTLCK: u32 = 0x40045431;
 /// `_IO('T', 0x41)` (include/uapi/asm-generic/ioctls.h): no direction or size
 /// bits — `flags` is passed by value.
 pub const TIOCGPTPEER: u32 = 0x5441;
+/// Identity of the devpts `ptmx` clone node, which every master fd reports:
+/// Linux opens `/dev/pts/ptmx` (NARF's `/dev/ptmx` is a symlink to it) and the
+/// master's `struct file` stays on that inode, so `fstat(master)` is the
+/// node's own `stat`. `fs/devpts/inode.c::mknod_ptmx` gives it the mounter's
+/// fsuid/fsgid (root for systemd's mount) and `S_IFCHR | opts->ptmxmode`;
+/// NARF's global devpts has root owners and the 0666 mode a symlinked
+/// `/dev/ptmx` needs (`Documentation/filesystems/devpts.rst`).
+const PTMX_NODE_PERMS: u16 = 0o666;
+const PTMX_NODE_OWNERS: (u32, u32) = (0, 0);
+
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
@@ -670,6 +680,16 @@ pub struct Pty {
     pub(crate) uid: AtomicU32,
     /// Group of the slave node — `current_fsgid()` at ptmx-open time.
     pub(crate) gid: AtomicU32,
+    /// Permission bits of the slave node. devpts pts inodes have no
+    /// `setattr` of their own, so `chown`/`chmod` land in `simple_setattr`
+    /// and the inode keeps the new values for the pty's lifetime — the owner
+    /// in `uid`/`gid` above, the mode here. sudo's `get_pty` fails outright
+    /// unless `chown(slave, ttyuid, ttygid)` succeeds.
+    // LINUX-GAP: `devpts_pty_new` starts from the mount's `mode=` option
+    // (DEVPTS_DEFAULT_MODE 0600; systemd mounts `mode=620,gid=5`). Mount
+    // options are not parsed (see the module header), so every pty starts at
+    // systemd's 0620.
+    pub(crate) perms: AtomicU32,
 
     /// How many `PtySlave` handles are currently open, and whether one ever
     /// was. Together these are the HANGUP condition: a master read may only
@@ -1328,6 +1348,7 @@ impl Pty {
             index,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
+            perms: AtomicU32::new(0o620),
             // Linux: ptmx_open() starts with the slave locked. unlockpt()
             // clears via TIOCSPTLCK(0) before the slave can be opened.
             locked: AtomicBool::new(true),
@@ -2222,7 +2243,7 @@ impl FileOps for PtyMaster {
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o620,
+                perms: PTMX_NODE_PERMS,
             },
             mtime_cycles: 0,
         }
@@ -2236,8 +2257,10 @@ impl FileOps for PtyMaster {
         0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
     }
 
+    /// The master reports the `ptmx` node it was opened through — see
+    /// [`PTMX_NODE_OWNERS`].
     fn owners(&self) -> (u32, u32) {
-        (0, 5)
+        PTMX_NODE_OWNERS
     }
 
     /// Wave-76: PtyMaster identifies itself via the FileOps hook so
@@ -2682,7 +2705,7 @@ impl FileOps for PtySlave {
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o620,
+                perms: self.pty.perms.load(Ordering::Acquire) as u16,
             },
             mtime_cycles: 0,
         }
@@ -2704,6 +2727,24 @@ impl FileOps for PtySlave {
             self.pty.uid.load(Ordering::Acquire),
             self.pty.gid.load(Ordering::Acquire),
         )
+    }
+
+    /// `chown(2)` on `/dev/pts/N` — devpts has no `setattr`, so Linux's
+    /// `simple_setattr` stores the new owner on the pts inode. The syscall
+    /// layer has already applied `setattr_prepare`'s `chown_ok`/`chgrp_ok`
+    /// and resolved `-1` to the current ids.
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        self.pty.uid.store(uid, Ordering::Release);
+        self.pty.gid.store(gid, Ordering::Release);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// `chmod(2)` on `/dev/pts/N`: `simple_setattr` stores the mode bits.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.pty
+            .perms
+            .store(u32::from(perms & 0o7777), Ordering::Release);
+        Box::pin(async { Ok(()) })
     }
 
     /// Wave-76: slave-side ioctls.
@@ -2991,7 +3032,7 @@ impl FileOps for DevPtmx {
             mode: Mode {
                 file_type: FileType::Special,
                 // cdev 5:2 in Linux (major 5, minor 2)
-                perms: 0o666,
+                perms: PTMX_NODE_PERMS,
             },
             mtime_cycles: 0,
         }
@@ -3015,6 +3056,10 @@ impl FileOps for DevPtmx {
 
     fn ino(&self) -> u64 {
         0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        PTMX_NODE_OWNERS
     }
 }
 
