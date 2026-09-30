@@ -8,6 +8,14 @@
 //      to (0.25, 0.5, 0.75, 1.0)
 //   3. TRANSFER_FROM_HOST_3D the rendered texture into the guest pages
 //   4. VIRTGPU_WAIT, VIRTGPU_MAP + mmap, verify the cleared pixels
+//   5. draw a fullscreen triangle from a classic RESOURCE_CREATE vertex buffer
+//   6. draw it again from a HOST3D blob vertex buffer, created the way Mesa's
+//      virgl winsys creates MAP_PERSISTENT buffers (RESOURCE_CREATE_BLOB with
+//      an embedded PIPE_RESOURCE_CREATE, then MAP + mmap to fill it). Linux's
+//      virtio_gpu_gem_object_open CTX_ATTACHes every new handle, blobs
+//      included; a blob the context never had attached is "Illegal resource"
+//      to virglrenderer and the draw is dropped (skipped without host-visible
+//      blob support)
 //
 // Constant provenance (do not guess these):
 //   - virgl protocol: mesa src/virtio/virtio-gpu/virgl_protocol.h
@@ -54,6 +62,12 @@ struct vg_transfer {
 };
 struct vg_wait { uint32_t handle, flags; };
 struct vg_get_caps { uint32_t cap_set_id, cap_set_ver; uint64_t addr; uint32_t size, pad; };
+struct vg_resource_create_blob {
+    uint32_t blob_mem, blob_flags, bo_handle, res_handle;
+    uint64_t size;
+    uint32_t pad, cmd_size;
+    uint64_t cmd, blob_id;
+};
 
 #define VIRTGPU_MAP IOC_RW(0x41, sizeof(struct vg_map))
 #define VIRTGPU_EXECBUFFER IOC_RW(0x42, sizeof(struct vg_execbuffer))
@@ -62,8 +76,13 @@ struct vg_get_caps { uint32_t cap_set_id, cap_set_ver; uint64_t addr; uint32_t s
 #define VIRTGPU_TRANSFER_FROM_HOST IOC_RW(0x46, sizeof(struct vg_transfer))
 #define VIRTGPU_WAIT IOC_RW(0x48, sizeof(struct vg_wait))
 #define VIRTGPU_GET_CAPS IOC_RW(0x49, sizeof(struct vg_get_caps))
+#define VIRTGPU_RESOURCE_CREATE_BLOB IOC_RW(0x4a, sizeof(struct vg_resource_create_blob))
 
 #define PARAM_3D_FEATURES 1
+#define PARAM_RESOURCE_BLOB 3
+#define PARAM_HOST_VISIBLE 4
+#define BLOB_MEM_HOST3D 2
+#define BLOB_FLAG_USE_MAPPABLE 1
 
 // ── VirGL protocol ──
 #define VIRGL_CMD0(cmd, obj, len) ((cmd) | ((obj) << 8) | ((uint32_t)(len) << 16))
@@ -76,6 +95,7 @@ struct vg_get_caps { uint32_t cap_set_id, cap_set_ver; uint64_t addr; uint32_t s
 #define CCMD_DRAW_VBO 8
 #define CCMD_RESOURCE_INLINE_WRITE 9
 #define CCMD_BIND_SHADER 31
+#define CCMD_PIPE_RESOURCE_CREATE 48
 #define OBJ_BLEND 1
 #define OBJ_RASTERIZER 2
 #define OBJ_DSA 3
@@ -85,6 +105,8 @@ struct vg_get_caps { uint32_t cap_set_id, cap_set_ver; uint64_t addr; uint32_t s
 
 #define VIRGL_FORMAT_B8G8R8A8_UNORM 1
 #define VIRGL_FORMAT_R32G32B32A32_FLOAT 31
+#define VIRGL_FORMAT_R8_UNORM 64
+#define VIRGL_RESOURCE_FLAG_MAP_PERSISTENT (1u << 1)
 #define PIPE_BUFFER 0
 #define PIPE_TEXTURE_2D 2
 #define PIPE_BIND_RENDER_TARGET (1u << 1)
@@ -412,6 +434,114 @@ int main(void)
     printf("virgl3d: draw bgra=%02x%02x%02x%02x\n", px[0], px[1], px[2], px[3]);
     if (check_pixels(px, 0, 255, 0, 255, "draw"))
         return 1;
+
+    // ── Phase 3: the same draw from a HOST3D blob vertex buffer ──
+    uint64_t has_blob = 0, has_host_visible = 0;
+    struct vg_getparam gb = { .param = PARAM_RESOURCE_BLOB,
+                              .value = (uint64_t)(uintptr_t)&has_blob };
+    struct vg_getparam gh = { .param = PARAM_HOST_VISIBLE,
+                              .value = (uint64_t)(uintptr_t)&has_host_visible };
+    if (ioctl(fd, VIRTGPU_GETPARAM, &gb) || ioctl(fd, VIRTGPU_GETPARAM, &gh) ||
+        !has_blob || !has_host_visible) {
+        printf("virgl3d: blob phase skipped (resource_blob=%u host_visible=%u)\n",
+               (unsigned)has_blob, (unsigned)has_host_visible);
+    } else {
+        // virgl_drm_winsys_resource_create_blob: a page-sized MAPPABLE HOST3D
+        // blob whose host object the embedded PIPE_RESOURCE_CREATE describes.
+        const uint32_t blob_id = 1;
+        uint32_t pc[12] = { 0 };
+        pc[0] = VIRGL_CMD0(CCMD_PIPE_RESOURCE_CREATE, 0, 11);
+        pc[1] = PIPE_BUFFER;                       // TARGET
+        pc[2] = VIRGL_FORMAT_R8_UNORM;             // FORMAT
+        pc[3] = PIPE_BIND_VERTEX_BUFFER;           // BIND
+        pc[4] = 4096;                              // WIDTH (bytes)
+        pc[5] = 1;                                 // HEIGHT
+        pc[6] = 1;                                 // DEPTH
+        pc[7] = 1;                                 // ARRAY_SIZE
+        pc[8] = 0;                                 // LAST_LEVEL
+        pc[9] = 0;                                 // NR_SAMPLES
+        pc[10] = VIRGL_RESOURCE_FLAG_MAP_PERSISTENT; // FLAGS
+        pc[11] = blob_id;                          // BLOB_ID
+        struct vg_resource_create_blob bb = {
+            .blob_mem = BLOB_MEM_HOST3D,
+            .blob_flags = BLOB_FLAG_USE_MAPPABLE,
+            .size = 4096,
+            .cmd_size = sizeof(pc),
+            .cmd = (uint64_t)(uintptr_t)pc,
+            .blob_id = blob_id,
+        };
+        if (ioctl(fd, VIRTGPU_RESOURCE_CREATE_BLOB, &bb)) {
+            printf("virgl3d-fail blob-create errno=%d\n", errno);
+            return 1;
+        }
+        struct vg_map bm = { .handle = bb.bo_handle };
+        if (ioctl(fd, VIRTGPU_MAP, &bm)) {
+            printf("virgl3d-fail blob-map errno=%d\n", errno);
+            return 1;
+        }
+        void *bp = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bm.offset);
+        if (bp == MAP_FAILED) {
+            printf("virgl3d-fail blob-mmap errno=%d\n", errno);
+            return 1;
+        }
+        const float bverts[12] = { -1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1 };
+        memcpy(bp, bverts, sizeof(bverts));
+
+        // Clear to red first, so a dropped draw is visible as red.
+        static uint32_t bc[64];
+        unsigned k = 0;
+        bc[k++] = VIRGL_CMD0(CCMD_CLEAR, 0, 8);
+        bc[k++] = PIPE_CLEAR_COLOR0;
+        bc[k++] = f2u(1.0f);
+        bc[k++] = f2u(0.0f);
+        bc[k++] = f2u(0.0f);
+        bc[k++] = f2u(1.0f);
+        bc[k++] = 0;
+        bc[k++] = 0;
+        bc[k++] = 0;
+        bc[k++] = VIRGL_CMD0(CCMD_SET_VERTEX_BUFFERS, 0, 3);
+        bc[k++] = 16;            // stride
+        bc[k++] = 0;             // offset
+        bc[k++] = bb.res_handle;
+        // Shaders, vertex elements, blend/DSA/rasterizer, viewport and
+        // framebuffer are context state from phase 2.
+        bc[k++] = VIRGL_CMD0(CCMD_DRAW_VBO, 0, 12);
+        bc[k++] = 0;
+        bc[k++] = 3;
+        bc[k++] = PIPE_PRIM_TRIANGLES;
+        bc[k++] = 0;
+        bc[k++] = 1;
+        bc[k++] = 0;
+        bc[k++] = 0;
+        bc[k++] = 0;
+        bc[k++] = 0;
+        bc[k++] = 0;
+        bc[k++] = 2;
+        bc[k++] = 0;
+        uint32_t bbos[2] = { rc.bo_handle, bb.bo_handle };
+        struct vg_execbuffer eb3 = {
+            .size = k * 4,
+            .command = (uint64_t)(uintptr_t)bc,
+            .bo_handles = (uint64_t)(uintptr_t)bbos,
+            .num_bo_handles = 2,
+            .fence_fd = -1,
+        };
+        if (ioctl(fd, VIRTGPU_EXECBUFFER, &eb3)) {
+            printf("virgl3d-fail blob-draw-execbuffer errno=%d\n", errno);
+            return 1;
+        }
+        if (ioctl(fd, VIRTGPU_TRANSFER_FROM_HOST, &tf)) {
+            printf("virgl3d-fail blob-draw-transfer errno=%d\n", errno);
+            return 1;
+        }
+        if (ioctl(fd, VIRTGPU_WAIT, &wt)) {
+            printf("virgl3d-fail blob-draw-wait errno=%d\n", errno);
+            return 1;
+        }
+        printf("virgl3d: blob draw bgra=%02x%02x%02x%02x\n", px[0], px[1], px[2], px[3]);
+        if (check_pixels(px, 0, 255, 0, 255, "blob-draw"))
+            return 1;
+    }
 
     // The serial harness matches its expect token only when a newline
     // follows immediately, so the token line stays fixed and bare.
