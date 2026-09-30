@@ -5608,6 +5608,17 @@ fn boot_userspace_init() {
                     "proc_fd_magiclink_glibc",
                     narf_verification::NARF_PROC_FD_MAGICLINK_SMOKE_GLIBC_ELF,
                 ),
+                // pthread_create with explicit sched attrs (glibc applies them
+                // with sched_setscheduler(new_tid)) + sibling-tid sched_* calls,
+                // also inside a new PID namespace (Qt's QThread::start).
+                (
+                    "pthread_sched_smoke",
+                    narf_verification::NARF_PTHREAD_SCHED_SMOKE_ELF,
+                ),
+                (
+                    "pthread_sched_glibc",
+                    narf_verification::NARF_PTHREAD_SCHED_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.
