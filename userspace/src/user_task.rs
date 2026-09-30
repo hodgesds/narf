@@ -264,10 +264,10 @@ pub struct UserTaskCtx {
     /// and skips the fold when set (matching the longjmp paths, which
     /// never reach the fold at all).
     pub parked_in_syscall: core::sync::atomic::AtomicBool,
-    /// The syscall this task entered most recently: NARF syscall id, then
-    /// its six arguments (the registers Linux keeps in `pt_regs`). Read by
-    /// the SysRq task dump; relaxed stores on entry, never on the park path.
-    pub last_syscall: [AtomicU64; 7],
+    /// Top of this task's own kernel stack (0 when it has none): where its
+    /// trap/syscall register frame lives while it is parked, Linux's
+    /// `task_pt_regs()`. Written once, the first time the task runs.
+    pub kernel_stack_top: AtomicU64,
     /// Non-zero while this task is parked in a blocked F_SETLKW: the
     /// lock-table key it waits on. `park_should_block` registers the
     /// task's waker on `fd::locks`' per-key waiter queue through this,
@@ -521,7 +521,130 @@ impl Default for UserTaskCtx {
     }
 }
 
+/// Syscall number + six arguments from a parked task's saved registers (see
+/// [`UserTaskCtx::blocked_syscall`] for the layouts). `top` is the task's own
+/// kernel stack top, or 0; `state` is its longjmp-model [`UserState`] buffer.
+///
+/// # Safety
+/// A non-zero `top` must be a live kernel stack top whose topmost frame is
+/// the task's user trap snapshot; `state` must point at a readable
+/// `UserState`-sized buffer.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u64; 7]> {
+    use narf_arch::x86_64::trap_frame::TrapFrame;
+    use narf_arch::x86_64::user_mode::UserState as X86State;
+    if top != 0 {
+        // SAFETY: the caller's contract; the words below `top` are on the
+        // task's kernel stack.
+        let last = unsafe { core::ptr::read_volatile((top - 8) as *const u64) };
+        if last & 3 == 3 && last <= 0xffff {
+            // `int 0x80`: a TrapFrame ends at `top` (its last word is SS).
+            let f = top - core::mem::size_of::<TrapFrame>() as u64;
+            // SAFETY: as above.
+            let t = unsafe { core::ptr::read_volatile(f as *const TrapFrame) };
+            return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9]);
+        }
+        // `syscall`: UserState below the 16-byte domain snapshot.
+        let f = top - 16 - core::mem::size_of::<X86State>() as u64;
+        // SAFETY: as above.
+        let st = unsafe { core::ptr::read_volatile(f as *const X86State) };
+        return (st.valid == 1).then_some([st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9]);
+    }
+    // SAFETY: the caller's contract on `state`.
+    let st = unsafe { core::ptr::read_volatile(state as *const X86State) };
+    (st.valid != 0).then_some([st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9])
+}
+
+/// aarch64 counterpart of the x86_64 decoder above.
+///
+/// # Safety
+/// As for the x86_64 version.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u64; 7]> {
+    use narf_arch::aarch64::trap_frame::TrapFrame;
+    use narf_arch::aarch64::user_mode::UserState as A64State;
+    if top != 0 {
+        let f = top - core::mem::size_of::<TrapFrame>() as u64;
+        // SAFETY: the caller's contract; the frame is on the task's stack.
+        let t = unsafe { core::ptr::read_volatile(f as *const TrapFrame) };
+        return Some([t.x8, t.x0, t.x1, t.x2, t.x3, t.x4, t.x5]);
+    }
+    // SAFETY: the caller's contract on `state`.
+    let st = unsafe { core::ptr::read_volatile(state as *const A64State) };
+    (st.valid != 0).then_some([
+        st.x[8], st.x[0], st.x[1], st.x[2], st.x[3], st.x[4], st.x[5],
+    ])
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) unsafe fn saved_syscall_regs(_top: u64, _state: *const u8) -> Option<[u64; 7]> {
+    None
+}
+
 impl UserTaskCtx {
+    /// The syscall this task is blocked in: its NARF syscall id, then its six
+    /// arguments — Linux `task_current_syscall()`, which decodes a blocked
+    /// task's saved registers on demand rather than recording every entry.
+    ///
+    /// `None` unless the task is parked in a syscall. A parked syscall
+    /// re-executes on wake, so its saved registers still hold the number
+    /// (x86_64 `rax`, aarch64 `x8`) and the six arguments. Where they are
+    /// depends on how the task entered and parked, exactly like Linux's
+    /// `task_pt_regs()` (the register frame at the top of the task's kernel
+    /// stack):
+    ///
+    /// - own-stack task, x86_64 `syscall`: the asm entry builds a
+    ///   [`UserState`](narf_arch::x86_64::user_mode::UserState) at
+    ///   `top - 16 - 152` (below a 16-byte domain snapshot whose last word is
+    ///   the 0..=2 domain kind);
+    /// - own-stack task, x86_64 `int 0x80`: the CPU and `common_trap` build a
+    ///   [`TrapFrame`](narf_arch::x86_64::trap_frame::TrapFrame) ending at
+    ///   `top`, whose last word is the user SS (RPL 3) — which is how the two
+    ///   are told apart;
+    /// - own-stack task, aarch64: the vector entry builds the 816-byte
+    ///   [`TrapFrame`](narf_arch::aarch64::trap_frame::TrapFrame) at
+    ///   `top - 816`;
+    /// - no own stack (the longjmp model): the snapshot the trap path saved
+    ///   into [`Self::state`].
+    ///
+    /// Like Linux, the parked flag is re-checked after the copy: a task that
+    /// woke meanwhile may be rewriting its frame, and reads as not blocked.
+    pub fn blocked_syscall(&self) -> Option<[u64; 7]> {
+        if !self.parked_in_syscall.load(Ordering::Acquire) {
+            return None;
+        }
+        let top = self.kernel_stack_top.load(Ordering::Acquire);
+        // SAFETY: `top` is this task's own kernel stack top, recorded on its
+        // stack by `record_kernel_stack_top`; while it is parked the frame
+        // below it is its trap snapshot. `state` is the longjmp-model
+        // snapshot. Volatile copies tolerate a concurrent rewrite by a task
+        // that just woke, which the re-check below discards.
+        let regs = unsafe { saved_syscall_regs(top, self.state.get() as *const u8) }?;
+        if !self.parked_in_syscall.load(Ordering::Acquire) {
+            return None;
+        }
+        Some([
+            u64::from(crate::syscall::syscall_number(regs[0] as u32)),
+            regs[1],
+            regs[2],
+            regs[3],
+            regs[4],
+            regs[5],
+            regs[6],
+        ])
+    }
+
+    /// Record this task's kernel stack top the first time its future runs on
+    /// it (the stack never moves for the task's lifetime). 0 = no own stack.
+    fn record_kernel_stack_top(&self) {
+        if self.kernel_stack_top.load(Ordering::Relaxed) == 0 {
+            self.kernel_stack_top.store(
+                narf_scheduler::stackful::current_stackful_stack_top(),
+                Ordering::Release,
+            );
+        }
+    }
+
     /// Construct a fresh context with all state zeroed.
     pub fn new() -> Self {
         Self {
@@ -552,7 +675,7 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_rusage_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
-            last_syscall: [const { AtomicU64::new(0) }; 7],
+            kernel_stack_top: AtomicU64::new(0),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
             sigwait_interrupted: core::sync::atomic::AtomicBool::new(false),
@@ -2687,6 +2810,7 @@ impl core::future::Future for UserTaskFuture {
         // valid slots.
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
+        this.task.uctx.record_kernel_stack_top();
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Activate the user AS. `addr_space.activate()` does the
@@ -3290,6 +3414,7 @@ impl core::future::Future for UserTaskFuture {
         // Publish per-task pointers the trap path consults.
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
+        this.task.uctx.record_kernel_stack_top();
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Linux schedule_tail performs this only after switching to the new

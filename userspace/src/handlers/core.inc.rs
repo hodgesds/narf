@@ -14105,17 +14105,12 @@ pub fn sysrq_show_tasks() {
         let mut comm = [0u8; 16];
         let n = proc_comm_of_task_into(tid, &mut comm);
         let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
-        let info = crate::user_task::with_user_task_ctx(tid, |u| {
-            let r: [u64; 7] = core::array::from_fn(|i| u.last_syscall[i].load(Ordering::Relaxed));
-            (u.parked_in_syscall.load(Ordering::Acquire), r)
-        });
-        match info {
-            Some((parked, r)) => {
+        match crate::user_task::with_user_task_ctx(tid, |u| u.blocked_syscall()) {
+            Some(Some(r)) => {
                 let name = crate::syscall::syscall_name(r[0] as u32).unwrap_or("?");
                 let _ = writeln!(
                     w,
-                    "sysrq: tid={tid} pid={pid} comm={comm} {} {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
-                    if parked { "BLOCKED-IN" } else { "last" },
+                    "sysrq: tid={tid} pid={pid} comm={comm} BLOCKED-IN {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
                     r[1],
                     r[2],
                     r[3],
@@ -14123,6 +14118,9 @@ pub fn sysrq_show_tasks() {
                     r[5],
                     r[6],
                 );
+            }
+            Some(None) => {
+                let _ = writeln!(w, "sysrq: tid={tid} pid={pid} comm={comm} RUNNING");
             }
             None => {
                 let _ = writeln!(w, "sysrq: tid={tid} pid={pid} comm={comm} (kernel/no user context)");

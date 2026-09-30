@@ -3546,7 +3546,6 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let table = unsafe { &*p };
     let version = syscall_version(num);
     let raw_n = syscall_number(num);
-    record_syscall_entry(raw_n, ctx.args());
     if let Some(variant) = Syscall::from_raw(raw_n) {
         #[cfg(feature = "syscall-trace")]
         if syscall_trace_relevant(variant) {
@@ -3873,21 +3872,6 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
     kernel_syscall_entry_plain_with_state(num, args, core::ptr::null_mut())
 }
 
-/// Remember the syscall this task is entering, for the SysRq task dump.
-#[inline]
-fn record_syscall_entry(num: u32, args: &SyscallArgs) {
-    if let Some(u) = crate::user_task::current_user_task() {
-        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomics only.
-        let r = unsafe { &(*u).last_syscall };
-        r[0].store(u64::from(num), Ordering::Relaxed);
-        for (slot, v) in r[1..].iter().zip([
-            args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
-        ]) {
-            slot.store(v, Ordering::Relaxed);
-        }
-    }
-}
-
 /// The name of NARF syscall id `num`, if a table is installed.
 pub fn syscall_name(num: u32) -> Option<&'static str> {
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
@@ -3904,7 +3888,6 @@ pub fn kernel_syscall_entry_plain_with_state(
     args: &SyscallArgs,
     user_state: *mut u8,
 ) -> SyscallReturn {
-    record_syscall_entry(num, args);
     let n = match Syscall::from_raw(num) {
         Some(v) => v,
         None => {

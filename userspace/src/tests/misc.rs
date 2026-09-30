@@ -3704,3 +3704,118 @@ fn smoke_proc_fd_hook_resolves_processid_to_taskid() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_proc_fd_hook_resolves_processid_to_taskid);
+
+// Linux `task_current_syscall()` / SysRq-T: a blocked task's syscall is
+// decoded from the register frame its entry path left at the top of its
+// kernel stack (`task_pt_regs()`), never recorded per syscall. One case per
+// frame layout, built at the offsets the entry asm uses.
+fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
+    use crate::user_task::UserTaskCtx;
+    use core::sync::atomic::Ordering;
+
+    // A 16-byte-aligned stand-in for the task's kernel stack.
+    #[repr(C, align(16))]
+    struct Stack([u8; 4096]);
+    let mut stack = alloc::boxed::Box::new(Stack([0; 4096]));
+    let top = stack.0.as_mut_ptr() as u64 + 4096;
+    let want = |num: u64| {
+        [
+            u64::from(crate::syscall::syscall_number(num as u32)),
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+        ]
+    };
+
+    let uc = UserTaskCtx::new();
+    // Not parked: nothing to report, whatever the frame says.
+    if uc.blocked_syscall().is_some() {
+        return TestResult::Fail("a task that is not parked reported a blocked syscall");
+    }
+    uc.parked_in_syscall.store(true, Ordering::Release);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_arch::x86_64::trap_frame::TrapFrame;
+        use narf_arch::x86_64::user_mode::UserState;
+        // Longjmp model (no own stack): the snapshot in `state`.
+        // SAFETY: `state` is a UserState-sized buffer owned by `uc`.
+        let st = unsafe { &mut *uc.state.get() };
+        (st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9) =
+            (7, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
+        st.valid = 1;
+        if uc.blocked_syscall() != Some(want(7)) {
+            return TestResult::Fail("the longjmp-model snapshot was not decoded");
+        }
+
+        // `syscall` entry: UserState at top - 16 - 152, domain kind 0 above.
+        uc.kernel_stack_top.store(top, Ordering::Release);
+        let us = (top - 16 - core::mem::size_of::<UserState>() as u64) as *mut UserState;
+        // SAFETY: inside `stack`, suitably aligned.
+        unsafe {
+            (*us).rax = 232;
+            ((*us).rdi, (*us).rsi, (*us).rdx) = (0x11, 0x22, 0x33);
+            ((*us).r10, (*us).r8, (*us).r9) = (0x44, 0x55, 0x66);
+            (*us).valid = 1;
+        }
+        if uc.blocked_syscall() != Some(want(232)) {
+            return TestResult::Fail("the syscall-entry UserState frame was not decoded");
+        }
+        // SAFETY: as above.
+        unsafe { (*us).valid = 0 };
+        if uc.blocked_syscall().is_some() {
+            return TestResult::Fail("an unpopulated syscall-entry frame was reported");
+        }
+
+        // `int 0x80`: a TrapFrame ending at `top`, its last word the user SS.
+        let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+        // SAFETY: inside `stack`, suitably aligned.
+        unsafe {
+            (*tf).rax = 202;
+            ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
+            ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
+            (*tf).ss = 0x1b;
+        }
+        if uc.blocked_syscall() != Some(want(202)) {
+            return TestResult::Fail("the int 0x80 TrapFrame was not decoded");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_arch::aarch64::trap_frame::TrapFrame;
+        use narf_arch::aarch64::user_mode::UserState;
+        // SAFETY: `state` is a UserState-sized buffer owned by `uc`.
+        let st = unsafe { &mut *uc.state.get() };
+        st.x[8] = 63;
+        st.x[..6].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        st.valid = 1;
+        if uc.blocked_syscall() != Some(want(63)) {
+            return TestResult::Fail("the longjmp-model snapshot was not decoded");
+        }
+        // Vector entry: the 816-byte TrapFrame at top - 816.
+        uc.kernel_stack_top.store(top, Ordering::Release);
+        let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+        // SAFETY: inside `stack`, suitably aligned.
+        unsafe {
+            (*tf).x8 = 98;
+            ((*tf).x0, (*tf).x1, (*tf).x2) = (0x11, 0x22, 0x33);
+            ((*tf).x3, (*tf).x4, (*tf).x5) = (0x44, 0x55, 0x66);
+        }
+        if uc.blocked_syscall() != Some(want(98)) {
+            return TestResult::Fail("the vector-entry TrapFrame was not decoded");
+        }
+    }
+
+    // Woke up: no longer reported, even with a valid frame in place.
+    uc.parked_in_syscall.store(false, Ordering::Release);
+    if uc.blocked_syscall().is_some() {
+        return TestResult::Fail("a task that woke still reported a blocked syscall");
+    }
+    drop(stack);
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_blocked_syscall_decodes_saved_registers);
