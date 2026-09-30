@@ -31,6 +31,8 @@ narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
 narf-net          = { path = "../../net" }
 narf-bluetooth    = { path = "../../bluetooth" }
+narf-firmware     = { path = "../../firmware" }
+narf-drivers-video = { path = "../video" }
 narf-power        = { path = "../../power" }
 narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }

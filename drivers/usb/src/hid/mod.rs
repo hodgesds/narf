@@ -206,6 +206,7 @@ pub fn find_boot_keyboard(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> 
                         ep_addr,
                         max_packet: mps,
                         kind: EndpointKind::InterruptIn,
+                        interval: cfg[i + 6],
                     });
                 }
             }
@@ -235,15 +236,14 @@ impl BootKeyboard {
         //   wValue: 0 (Boot protocol)
         //   wIndex: interface number
         //   wLength: 0
-        let mut nothing = [0u8; 0];
         xhci_dev
-            .control_in(
+            .control_out(
                 slot_id,
                 0x21,
                 HID_REQ_SET_PROTOCOL,
                 HID_BOOT_PROTOCOL,
                 interface_num as u16,
-                &mut nothing,
+                &[],
             )
             .await
             .map_err(|_| HidError::SetProtocolFailed)?;
@@ -256,13 +256,13 @@ impl BootKeyboard {
         // don't implement the request); SET_PROTOCOL was the
         // load-bearing call.
         let _ = xhci_dev
-            .control_in(
+            .control_out(
                 slot_id,
                 0x21,
                 HID_REQ_SET_IDLE,
                 0, // (duration<<8) | reportID — both zero
                 interface_num as u16,
-                &mut nothing,
+                &[],
             )
             .await;
         // Pre-arm the interrupt-IN endpoint with one Normal TRB so
@@ -754,15 +754,14 @@ async fn bind_kbd_addressed_slot(
     // is the entire reason the keyboard pipeline was silent
     // on real-HW boots while QEMU's lax xhci stack worked.
     // bmRequestType: Host-to-Device | Standard | Device = 0x00.
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| {

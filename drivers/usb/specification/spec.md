@@ -2,8 +2,9 @@
 
 ## Sources (public only)
 
-All driver code is derived strictly from the references below.
-**No GPL Linux source consulted.**
+Class and host-controller code uses the public standards below. Since NARF's
+2026-05-20 relicense to GPL-2.0-or-later, explicitly identified driver paths
+also consult upstream Linux GPL sources.
 
 ### EHCI host controller (USB 2.0)
 - "Enhanced Host Controller Interface Specification for Universal
@@ -110,7 +111,80 @@ All driver code is derived strictly from the references below.
   §A.1.1 (format tags), §A.2 (format type codes), §2.2.5 (Type-I
   PCM format descriptor layout).
 
+### Qualcomm WCN6855 Bluetooth over USB
+
+- **Linux `drivers/bluetooth/btusb.c`** — GPL-2.0-only, Qualcomm USB setup
+  path: vendor requests `GET_TARGET_VERSION` / `CHECK_STATUS`, split
+  control-header + endpoint-2 bulk firmware download, WCN6855 ROM table, and
+  runtime rampatch/NVM naming. Consulted under NARF's GPL-2.0-or-later license.
+
+## 3. Public interface
+
+- `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed)` binds an
+  addressed hub and retains its negotiated speed plus Device Descriptor
+  protocol so xHCI can set the multiple-TT bit correctly.
+- `HubDescriptor::tt_think_time()` returns the USB 2.0
+  `wHubCharacteristics[6:5]` encoding used directly in a low/full-speed
+  child's xHCI Slot Context.
+- `Xhci::address_device_with(..., Topology)` retains the topology for later
+  Evaluate Context operations; marking a downstream device as a hub must not
+  erase its route string or parent-TT fields.
+- `EndpointConfig` retains raw USB `wMaxPacketSize` and `bInterval` values.
+  `Xhci::configure_endpoints` translates USB 2.0 periodic endpoints into xHCI
+  Max Packet, Max Burst, Interval, CErr, and Max ESIT Payload fields using the
+  addressed slot's negotiated speed.
+- `Xhci::control_in` accepts only SETUP packets with the device-to-host
+  direction bit set; `Xhci::control_out` accepts only host-to-device requests.
+  Payload-bearing class requests (including HID `SET_REPORT`) must use the
+  matching method so the xHCI Data Stage has the correct direction.
+- `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
+  endpoint with its owning interface and alternate setting.
+  `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
+  alternate that satisfies the PROBE-accepted payload, and
+  `negotiate_and_activate_video_stream(xhci, device_index, desired)` runs the
+  26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
+  the accepted endpoint, issues `SET_INTERFACE`, and starts an IRQ-driven
+  packet/frame pump into the camera's registered `/dev/video<N>` queue.
+- `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
+  config)` binds the standard Bluetooth USB interface. For a recognised
+  WCN6855 ID it completes the Qualcomm USB firmware/status protocol before
+  running the full mandatory HCI sequence, adopting the ready controller, and
+  publishing `/sys/class/bluetooth/hci<N>`. Firmware is selected from the
+  verified registry using the controller-reported ROM/RAM/board identity.
+
 ## Scope
+
+### Target laptop USB profile (silicon validation pending)
+
+| USB ID | Device | In-tree path | Remaining validation |
+|---|---|---|---|
+| `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
+| `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
+| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Production-sign the imported firmware and validate the full sequence on silicon |
+| `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
+
+The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
+the host controller and are not matched as downstream USB devices.
+
+### WCN6855 firmware staging
+
+For bring-up, import the Qualcomm tree and place both the generic WCN6855
+files and the QCA2066 board-ID fallback in the initramfs:
+
+```sh
+cargo xtask import-firmware --vendor qca --clean
+cargo xtask image --arch=x86_64 \
+  --initramfs-firmware 'qca/*' \
+  --initramfs-firmware 'qca/QCA2066/*'
+```
+
+The second glob is required for board IDs `030a`/`030b`; firmware globs are
+single-directory patterns, so `qca/*` does not cross into `qca/QCA2066/`.
+`import-firmware` produces developer-only unsigned NARF trailers, while the
+production image must use externally generated signatures and a configured
+`NARF_FIRMWARE_TRUSTED_KEYS` set. The two-pattern bundle was boot-validated
+with 146 Qualcomm entries and a successful `firmware-scan-initramfs` pass;
+the USB download itself remains a target-silicon gate.
 
 ### Landed
 - **xHCI** (`xhci`): MMIO bring-up, BAR mapping, command/event ring
@@ -130,8 +204,10 @@ All driver code is derived strictly from the references below.
   wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
   READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
-- **Hub** (`hub`): basic hub class enumeration so devices behind
-  a hub are visible.
+- **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
+  Device Descriptor protocol, TT think-time propagation, and downstream
+  route addressing so low/full-speed devices behind high-speed hubs are
+  visible.
 - **UVC stream** (`uvc_stream`): clean-room payload-header
   encoder + decoder for the per-isoch-transaction UVC header
   (bHeaderLength + Bit Field Header), with optional PTS (LE u32)
@@ -139,15 +215,20 @@ All driver code is derived strictly from the references below.
   `FrameReassembler` turns FID toggles into "new frame started" /
   "end of frame" / "error" steps the host driver feeds into the
   buffer manager.
-- **UVC 1.5** (`uvc`): UVC descriptor parser. VC HEADER (bcdUVC,
+- **UVC 1.5** (`uvc`): UVC descriptor parser and USB 2.0 streaming-alternate
+  activation. VC HEADER (bcdUVC,
   clock frequency, controlled VS interfaces), INPUT_TERMINAL with
   the camera-specific extension (objective focal length range,
   controls bitmap), OUTPUT_TERMINAL, PROCESSING_UNIT, VS
   INPUT_HEADER (with the per-format control bitmap list), VS
   FORMAT_UNCOMPRESSED with 16-byte Format-GUIDs (YUY2, NV12), VS
   FRAME_UNCOMPRESSED with both discrete and continuous frame-
-  interval forms, VS FORMAT_MJPEG. Pure descriptor decode — pairs
-  with a future isochronous/bulk video data path.
+  interval forms, VS FORMAT_MJPEG. Bind retains each VideoStreaming alternate's
+  endpoint and bandwidth metadata; the negotiation path performs PROBE/COMMIT,
+  configures the smallest fitting isochronous alternate, and issues
+  SET_INTERFACE. Its capture task reassembles UVC payloads and delivers complete
+  frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation and
+  bulk-streaming orchestration remain follow-ups.
 - **UAC1** (`uac`): USB Audio Class 1.0 descriptor parser. AC
   HEADER, INPUT_TERMINAL, OUTPUT_TERMINAL, FEATURE_UNIT (per-channel
   control bitmaps), AS_GENERAL, Type-I FORMAT_TYPE (discrete sample-
@@ -181,6 +262,7 @@ All driver code is derived strictly from the references below.
 
 ### Out of scope (deferred)
 - UAC2 / UAC3 (newer protocol byte; descriptor layouts differ).
-- Isochronous endpoint scheduling on xHCI (lands when an audio data
-  path is exercised end-to-end).
-- USB Video Class (UVC) — webcam support.
+- End-to-end UAC audio streaming; the xHCI periodic endpoint machinery now
+  exists, but the audio sample pump is still pending.
+- Non-QCA Bluetooth vendor firmware protocols (Intel, Realtek, MediaTek,
+  Broadcom).

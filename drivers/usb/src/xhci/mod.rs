@@ -275,7 +275,7 @@ pub struct Topology {
     pub parent_hub_port: u8,
     /// TT Think Time (§6.2.2 dword2[17:16]) — 0/1/2/3 = 8/16/24/32
     /// FS bit-times. Only meaningful for an LS/FS device behind a
-    /// multi-TT high-speed hub.
+    /// high-speed hub.
     pub tt_think_time: u8,
 }
 
@@ -381,6 +381,13 @@ pub enum XhciError {
     BadPort,
     /// PORTSC.PR (port reset) never cleared.
     PortResetTimeout,
+}
+
+/// Return whether the SETUP packet requests a device-to-host data direction.
+/// Kept as a small pure helper so the control-transfer API contract is covered
+/// by the in-kernel test harness without constructing an MMIO controller.
+pub(crate) const fn control_request_is_in(bm_request_type: u8) -> bool {
+    bm_request_type & 0x80 != 0
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -506,6 +513,10 @@ pub struct Device {
     pub slot_id: u8,
     pub port: u8,
     pub speed: PortSpeed,
+    /// Route and parent-TT metadata used to address this slot. Kept so
+    /// Evaluate Context updates (notably marking a downstream hub) do
+    /// not accidentally erase its route string.
+    pub topology: Topology,
     pub max_packet_ep0: u16,
     /// Device Context — 32-byte slot ctx + 31 × 32-byte EP ctx.
     /// Lives at DCBAA[slot_id]; engine-owned post-Address Device.
@@ -586,17 +597,37 @@ impl EndpointKind {
             EndpointKind::BulkIn | EndpointKind::InterruptIn | EndpointKind::IsochIn
         )
     }
+
+    fn is_periodic(self) -> bool {
+        matches!(
+            self,
+            EndpointKind::InterruptIn
+                | EndpointKind::InterruptOut
+                | EndpointKind::IsochIn
+                | EndpointKind::IsochOut
+        )
+    }
+
+    fn is_isochronous(self) -> bool {
+        matches!(self, EndpointKind::IsochIn | EndpointKind::IsochOut)
+    }
 }
 
 /// Caller-supplied endpoint description for `configure_endpoints`.
 /// `ep_addr` matches the `bEndpointAddress` byte from the USB
 /// endpoint descriptor (low 4 bits = endpoint number, bit 7 = IN
-/// direction). `max_packet` matches `wMaxPacketSize`.
+/// direction). `max_packet` retains the raw USB `wMaxPacketSize`
+/// value so high-speed periodic endpoints keep bits 12:11 (the
+/// additional transactions per microframe). `interval` is the raw
+/// USB `bInterval`; [`Xhci::configure_endpoints`] translates it to
+/// the xHCI Endpoint Context encoding using the addressed slot's
+/// negotiated speed.
 #[derive(Copy, Clone, Debug)]
 pub struct EndpointConfig {
     pub ep_addr: u8,
     pub max_packet: u16,
     pub kind: EndpointKind,
+    pub interval: u8,
 }
 
 impl EndpointConfig {
@@ -606,6 +637,87 @@ impl EndpointConfig {
         let in_bit = if self.kind.is_in() { 1 } else { 0 };
         (num * 2) + in_bit
     }
+}
+
+/// Values written to the scheduling-related Endpoint Context fields.
+/// Kept as a small pure translation so descriptor edge cases can be
+/// regression-tested without a live controller.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndpointContextParams {
+    pub max_packet: u16,
+    pub max_burst: u8,
+    pub interval: u8,
+    pub max_esit_payload: u32,
+    pub error_count: u8,
+}
+
+/// Translate USB 2.0 endpoint-descriptor scheduling fields to xHCI
+/// Endpoint Context fields (xHCI 1.2 §6.2.3.4–6.2.3.8).
+///
+/// SuperSpeed companion descriptors carry additional burst/mult data
+/// and are deliberately outside this USB-2 target path; callers for a
+/// SuperSpeed periodic endpoint must grow `EndpointConfig` first.
+pub(crate) fn endpoint_context_params(
+    speed: PortSpeed,
+    ep: EndpointConfig,
+) -> Option<EndpointContextParams> {
+    let max_packet = ep.max_packet & 0x07ff;
+    if max_packet == 0 {
+        return None;
+    }
+
+    let periodic = ep.kind.is_periodic();
+    let max_burst = if speed == PortSpeed::High && periodic {
+        ((ep.max_packet >> 11) & 0x03) as u8
+    } else {
+        0
+    };
+    // USB 2.0 reserves the 0b11 additional-transaction encoding.
+    if max_burst == 3 {
+        return None;
+    }
+
+    let interval = if periodic {
+        match speed {
+            PortSpeed::High | PortSpeed::Super | PortSpeed::SuperPlus => {
+                if !(1..=16).contains(&ep.interval) {
+                    return None;
+                }
+                ep.interval - 1
+            }
+            PortSpeed::Full if ep.kind.is_isochronous() => {
+                if !(1..=16).contains(&ep.interval) {
+                    return None;
+                }
+                ep.interval + 2
+            }
+            PortSpeed::Full | PortSpeed::Low => {
+                if ep.interval == 0 {
+                    return None;
+                }
+                // FS/LS interrupt bInterval is in milliseconds. Convert
+                // bInterval*8 microframes to the nearest lower power of two.
+                let microframes = u32::from(ep.interval) * 8;
+                (31 - microframes.leading_zeros()) as u8
+            }
+        }
+    } else {
+        0
+    };
+
+    let max_esit_payload = if periodic {
+        u32::from(max_packet) * (u32::from(max_burst) + 1)
+    } else {
+        0
+    };
+    Some(EndpointContextParams {
+        max_packet,
+        max_burst,
+        interval,
+        max_esit_payload,
+        // xHCI requires CErr=0 for isoch and recommends 3 otherwise.
+        error_count: if ep.kind.is_isochronous() { 0 } else { 3 },
+    })
 }
 
 impl core::fmt::Debug for Xhci {
@@ -2397,7 +2509,7 @@ impl Xhci {
         //   dword2[15:8]  TT Port Number on the parent hub.
         //   dword2[17:16] TT Think Time (0..3 = 8/16/24/32 FS bit
         //                 times) — only meaningful if the parent is
-        //                 a multi-TT hub.
+        //                 a high-speed hub.
         let slot_d0 = (1u32 << 27)              // Context Entries = 1
                     | ((speed as u32) << 20)    // Speed
                     | (topology.route_string & 0x000F_FFFF); // Route String
@@ -2502,6 +2614,7 @@ impl Xhci {
             slot_id,
             port,
             speed,
+            topology,
             max_packet_ep0: mps,
             _device_ctx: dev_ctx,
             ctrl_tr,
@@ -2552,6 +2665,8 @@ impl Xhci {
     ///     bit (`1<<25`).
     ///   - Slot dword1: re-stamped with Root Hub Port Number plus
     ///     Number of Ports in bits[31:24].
+    ///   - Slot dword2: preserves the parent Transaction Translator
+    ///     metadata for a low/full-speed hub behind a high-speed hub.
     pub async fn mark_as_hub(
         &self,
         slot_id: u8,
@@ -2561,13 +2676,13 @@ impl Xhci {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
-        let (speed, port) = {
+        let (speed, port, topology) = {
             let g = self.devices.lock();
             let d = g
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
-            (d.speed, d.port)
+            (d.speed, d.port, d.topology)
         };
 
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
@@ -2589,11 +2704,14 @@ impl Xhci {
             );
         }
 
-        let mut slot_d0 = (1u32 << 27) | ((speed as u32) << 20) | (1u32 << 26); // Hub
-        if multi_tt {
-            slot_d0 |= 1u32 << 25; // MTT
-        }
-        let slot_d1 = ((port as u32) << 16) | ((num_ports as u32) << 24);
+        let slot_d0 =
+            slot::encode_slot_ctx_dword0(topology.route_string, speed as u8, multi_tt, true, 1);
+        let slot_d1 = slot::encode_slot_ctx_dword1(0, port, num_ports);
+        let slot_d2 = slot::encode_slot_ctx_dword2(
+            topology.parent_hub_slot_id,
+            topology.parent_hub_port,
+            topology.tt_think_time,
+        );
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
@@ -2603,6 +2721,10 @@ impl Xhci {
             core::ptr::write_volatile(
                 narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
                 slot_d1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx + 8).kernel_mut_ptr::<u32>(),
+                slot_d2,
             );
         }
         compiler_fence(Ordering::SeqCst);
@@ -2815,6 +2937,11 @@ impl Xhci {
         w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
+        if !control_request_is_in(bm_request_type) {
+            // Internal call-site contract violation: a control-IN
+            // transfer must set the USB SETUP direction bit.
+            return Err(XhciError::CmdFailed(0xF8));
+        }
         if out.len() != usize::from(w_value) && out.is_empty() {
             // Allow the caller to ask for any byte-count that fits
             // a u16; w_length is just the SETUP-packet field.
@@ -2951,6 +3078,11 @@ impl Xhci {
         w_index: u16,
         data: &[u8],
     ) -> Result<usize, XhciError> {
+        if control_request_is_in(bm_request_type) {
+            // Internal call-site contract violation: a control-OUT
+            // transfer must clear the USB SETUP direction bit.
+            return Err(XhciError::CmdFailed(0xF8));
+        }
         if data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
@@ -3118,6 +3250,15 @@ impl Xhci {
             return Ok(());
         }
 
+        let speed = {
+            let devices = self.devices.lock();
+            devices
+                .get(slot_id as usize)
+                .and_then(|device| device.as_ref())
+                .map(|device| device.speed)
+                .ok_or(XhciError::CmdFailed(0xFD))?
+        };
+
         // Allocate Input Context (4 KiB, zeroed). Layout matches
         // address_device — Input Control at 0, Slot Ctx at one
         // stride, per-EP Ctx at `stride * (1 + dci - 1)` =
@@ -3151,6 +3292,7 @@ impl Xhci {
             if !(2..=31).contains(&dci) {
                 return Err(XhciError::CmdFailed(0xFB));
             }
+            let params = endpoint_context_params(speed, ep).ok_or(XhciError::CmdFailed(0xFB))?;
             max_dci = max_dci.max(dci as u32);
             add_mask |= 1 << dci;
 
@@ -3199,20 +3341,32 @@ impl Xhci {
             // = 32 (CSZ=0) or 64 (CSZ=1).
             let cs = self.context_stride();
             let ep_ctx = input_phys + cs * (1 + dci as u64);
-            let ep_d1 = (3 << 1)                                    // Error Count = 3
-                      | (ep.kind.ep_type() << 3)                    // EP Type
-                      | ((ep.max_packet as u32) << 16); // MaxPacketSize
+            let ep_d0 =
+                ((params.interval as u32) << 16) | (((params.max_esit_payload >> 16) & 0xff) << 24);
+            let ep_d1 = ((params.error_count as u32) << 1)
+                | (ep.kind.ep_type() << 3)
+                | ((params.max_burst as u32) << 8)
+                | ((params.max_packet as u32) << 16);
             let trdp_lo = (tr_phys as u32) | 1; // DCS=1
             let trdp_hi = (tr_phys >> 32) as u32;
             // Average TRB length — spec recommends `max_packet / 2`
             // for bulk; 8 for control. We use 8 as a safe default
             // for everything except isoch.
             let avg_trb = match ep.kind {
-                EndpointKind::IsochIn | EndpointKind::IsochOut => ep.max_packet as u32,
+                EndpointKind::IsochIn | EndpointKind::IsochOut => params.max_esit_payload,
+                EndpointKind::InterruptIn | EndpointKind::InterruptOut => {
+                    u32::from(params.max_packet)
+                }
                 _ => 8u32,
             };
+            let ep_d4 =
+                avg_trb.min(u32::from(u16::MAX)) | ((params.max_esit_payload & 0xffff) << 16);
             // SAFETY: identity-mapped DMA; offset in-page.
             unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ep_ctx).kernel_mut_ptr::<u32>(),
+                    ep_d0,
+                );
                 core::ptr::write_volatile(
                     narf_memory::PhysAddr::new(ep_ctx + 4).kernel_mut_ptr::<u32>(),
                     ep_d1,
@@ -3227,12 +3381,12 @@ impl Xhci {
                 );
                 core::ptr::write_volatile(
                     narf_memory::PhysAddr::new(ep_ctx + 16).kernel_mut_ptr::<u32>(),
-                    avg_trb,
+                    ep_d4,
                 );
             }
             new_eps.push(EndpointState {
                 dci,
-                max_packet: ep.max_packet,
+                max_packet: params.max_packet,
                 kind: ep.kind,
                 tr,
                 dma_buf,

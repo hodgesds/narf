@@ -755,7 +755,12 @@ pub fn find_ccid_endpoints(cfg: &[u8], iface_offset: usize) -> Result<CcidEndpoi
                     } else {
                         EndpointKind::BulkOut
                     };
-                    let ec = EndpointConfig { ep_addr, max_packet, kind };
+                    let ec = EndpointConfig {
+                        ep_addr,
+                        max_packet,
+                        kind,
+                        interval: 0,
+                    };
                     if dir_in && bulk_in.is_none() {
                         bulk_in = Some(ec);
                     } else if !dir_in && bulk_out.is_none() {
@@ -768,6 +773,7 @@ pub fn find_ccid_endpoints(cfg: &[u8], iface_offset: usize) -> Result<CcidEndpoi
                             ep_addr,
                             max_packet,
                             kind: EndpointKind::InterruptIn,
+                            interval: cfg[i + 6],
                         });
                     }
                 }
@@ -809,15 +815,14 @@ pub async fn try_bind_ccid_already_addressed(
     let eps = find_ccid_endpoints(cfg, iface_off)?;
 
     // Step 3: SET_CONFIGURATION (USB 2.0 §9.4.7).
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             STD_REQ_SET_CONFIGURATION,
             eps.config_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| CcidError::Transfer)?;

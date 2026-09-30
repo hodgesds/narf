@@ -5,8 +5,9 @@ Clean-room implementation of the Bluetooth Host Controller Interface
 
 ## Sources (public only)
 
-All code is derived from the references below. **No GPL / Linux
-Bluetooth subsystem source material was consulted at any point.**
+Protocol codecs are derived from the public standards below. Since NARF's
+2026-05-20 relicense to GPL-2.0-or-later, the hardware-facing transport and
+vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 
 ### HCI
 
@@ -163,6 +164,20 @@ Bluetooth subsystem source material was consulted at any point.**
   USB-IF, August 2002.
   Class 0xE0 (Wireless Controller), Subclass 0x01 (RF Controller),
   Protocol 0x01 (Bluetooth Programming Interface).
+- **Linux `drivers/bluetooth/btusb.c` and `btqca.c`** — GPL-2.0-only;
+  endpoint binding, vendor-family identification, and firmware-name/protocol
+  metadata. Consulted under NARF's GPL-2.0-or-later license.
+
+## Public interface
+
+- `controller::bring_up_all(cap)` runs the mandatory synchronous HCI sequence
+  for transports registered before the Stage::Late bring-up initcall.
+- `controller::register_ready_transport(transport, info)` adopts a controller
+  whose late-discovered driver completed that same sequence on a native async
+  transport path. Registration is idempotent by transport identity and returns
+  the stable `hci<N>` ordinal.
+- `sysfs_bridge::register_hci_controller(index, info, connections)` publishes
+  a ready controller under `/sys/class/bluetooth/hci<N>`.
 
 ## Scope
 
@@ -244,13 +259,15 @@ Bluetooth subsystem source material was consulted at any point.**
   Mode + Boot Keyboard / Boot Mouse Reports for hosts that fall back
   to boot protocol. Boot-report encoders for the canonical 8-byte
   keyboard and 3-byte mouse layouts.
+- **USB transport + quirks** (`usb_transport` / `btusb_quirks`): standard
+  Wireless Controller class matching, HCI USB framing, vendor-family lookup,
+  firmware candidates, and WCN6855 target identity `10ab:9309`. The concrete
+  endpoint/DFU implementation lives in `narf-drivers-usb`; late USB discovery
+  adopts its completed async bring-up through `register_ready_transport`.
 
 ### Out of scope (deliberate)
-- GATT, SMP, SDP, RFCOMM — sit on top of L2CAP+ATT and land in
-  follow-on crates.
-- Specific controller quirks (vendor patches via VS_HCI commands).
-- Real USB transport hookup — lands once `narf-drivers-usb` exposes
-  bulk/interrupt endpoints to non-class-driver consumers.
+- Non-QCA vendor firmware protocols and Bluetooth policy daemons.
+- SCO/eSCO isochronous USB transport.
 
 ## Cap surface
 

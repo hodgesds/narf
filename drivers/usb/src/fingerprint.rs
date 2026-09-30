@@ -79,6 +79,7 @@ const USB_ID_TABLE: &[(u16, u16, FpVendor)] = &[
     (0x27C6, 0x533C, FpVendor::Goodix),
     (0x27C6, 0x5395, FpVendor::Goodix),
     (0x27C6, 0x55B4, FpVendor::Goodix),
+    (0x27C6, 0x6594, FpVendor::Goodix),
     // ELAN
     (0x04F3, 0x0903, FpVendor::Elan),
     (0x04F3, 0x0907, FpVendor::Elan),
@@ -179,6 +180,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkIn,
+                            interval: 0,
                         });
                     }
                     (2, false) if bulk_out.is_none() => {
@@ -186,6 +188,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkOut,
+                            interval: 0,
                         });
                     }
                     (3, true) if intr_in.is_none() => {
@@ -193,6 +196,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::InterruptIn,
+                            interval: cfg[i + 6],
                         });
                     }
                     _ => {}
@@ -279,7 +283,10 @@ impl FingerprintDevice {
     pub async fn read_response(&self, xhci: &Xhci, buf: &mut [u8]) -> Result<usize, FpError> {
         match self.vendor {
             FpVendor::Elan => {
-                // Arm interrupt-IN once, then busy-poll.
+                // Arm interrupt-IN once, then poll. `poll_interrupt_in`
+                // stages the next TRB after every completed transfer, so
+                // keep exactly one TRB outstanding for this endpoint's
+                // persistent DMA buffer.
                 if !self.armed.swap(true, Ordering::AcqRel) {
                     xhci.arm_interrupt_in(
                         self.slot_id,
@@ -291,15 +298,7 @@ impl FingerprintDevice {
                 let deadline = narf_time::Deadline::after_ms(500);
                 loop {
                     match xhci.poll_interrupt_in(self.slot_id, self.bulk_in_ep, buf) {
-                        Ok(Some(n)) => {
-                            // Re-arm for next call.
-                            let _ = xhci.arm_interrupt_in(
-                                self.slot_id,
-                                self.bulk_in_ep,
-                                self.in_max_packet.min(64) as u32,
-                            );
-                            return Ok(n);
-                        }
+                        Ok(Some(n)) => return Ok(n),
                         Ok(None) => {
                             if deadline.expired() {
                                 return Ok(0);
@@ -325,10 +324,19 @@ impl FingerprintDevice {
         if self.bulk_out_ep == 0 {
             return Err(FpError::EndpointsMissing);
         }
-        xhci.bulk_out(self.slot_id, self.bulk_out_ep, cmd)
+        let transferred = xhci
+            .bulk_out(self.slot_id, self.bulk_out_ep, cmd)
             .await
-            .map(|_| ())
-            .map_err(|_| FpError::EndpointConfig)
+            .map_err(|_| FpError::EndpointConfig)?;
+        require_full_transfer(transferred, cmd.len())
+    }
+}
+
+fn require_full_transfer(transferred: usize, expected: usize) -> Result<(), FpError> {
+    if transferred == expected {
+        Ok(())
+    } else {
+        Err(FpError::EndpointConfig)
     }
 }
 
@@ -457,15 +465,14 @@ pub async fn try_bind_fingerprint_already_addressed(
         FpEndpoints::Bulk { config_value, .. } => config_value,
         FpEndpoints::InterruptIn { config_value, .. } => config_value,
     };
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| FpError::SetConfiguration)?;
@@ -546,6 +553,7 @@ mod tests {
     fn classify_vid_pid_goodix() {
         assert_eq!(classify_vid_pid(0x27C6, 0x5110), Some(FpVendor::Goodix));
         assert_eq!(classify_vid_pid(0x27C6, 0x55B4), Some(FpVendor::Goodix));
+        assert_eq!(classify_vid_pid(0x27C6, 0x6594), Some(FpVendor::Goodix));
     }
 
     #[test]
@@ -577,7 +585,7 @@ mod tests {
 
     #[test]
     fn vendor_covers_all_goodix_pids() {
-        let goodix_pids = [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4];
+        let goodix_pids = [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594];
         for pid in goodix_pids {
             assert_eq!(
                 classify_vid_pid(0x27C6, pid),
@@ -719,5 +727,11 @@ mod tests {
             find_fp_endpoints(&cfg, FpVendor::Synaptics),
             Err(FpError::EndpointsMissing)
         ));
+    }
+
+    #[test]
+    fn command_write_requires_the_full_transfer() {
+        assert_eq!(require_full_transfer(64, 64), Ok(()));
+        assert_eq!(require_full_transfer(63, 64), Err(FpError::EndpointConfig));
     }
 }

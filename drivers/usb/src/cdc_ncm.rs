@@ -886,15 +886,14 @@ pub async fn try_bind_ncm_already_addressed(
 ) -> Result<usize, NcmError> {
     let comm_iface = find_ncm_comm_interface(cfg).ok_or(NcmError::NotNcm)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
-    let mut nothing = [0u8; 0];
     if xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .is_err()
@@ -984,6 +983,7 @@ pub fn find_ncm_bulk_endpoints(
                     ep_addr,
                     max_packet,
                     kind,
+                    interval: 0,
                 };
                 if is_in {
                     bulk_in = Some(cfg_ep);

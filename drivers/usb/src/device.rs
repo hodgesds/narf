@@ -316,6 +316,7 @@ pub fn bulk_in_ep(ep_num: u8, max_packet: u16) -> EndpointConfig {
         ep_addr: ep_num | 0x80,
         max_packet,
         kind: EndpointKind::BulkIn,
+        interval: 0,
     }
 }
 
@@ -324,6 +325,7 @@ pub fn bulk_out_ep(ep_num: u8, max_packet: u16) -> EndpointConfig {
         ep_addr: ep_num & 0x0F,
         max_packet,
         kind: EndpointKind::BulkOut,
+        interval: 0,
     }
 }
 
@@ -332,6 +334,7 @@ pub fn interrupt_in_ep(ep_num: u8, max_packet: u16) -> EndpointConfig {
         ep_addr: ep_num | 0x80,
         max_packet,
         kind: EndpointKind::InterruptIn,
+        interval: 1,
     }
 }
 
@@ -340,6 +343,7 @@ pub fn interrupt_out_ep(ep_num: u8, max_packet: u16) -> EndpointConfig {
         ep_addr: ep_num & 0x0F,
         max_packet,
         kind: EndpointKind::InterruptOut,
+        interval: 1,
     }
 }
 

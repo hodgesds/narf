@@ -151,6 +151,7 @@ pub fn find_hid_interface(cfg: &[u8]) -> Option<(u8, usize, EndpointConfig)> {
                                 ep_addr,
                                 max_packet: mps,
                                 kind: EndpointKind::InterruptIn,
+                                interval: cfg[i + 6],
                             },
                         ));
                     }
@@ -230,15 +231,14 @@ pub async fn try_bind_touchpad_already_addressed(
         return Err(HidError::NoInterruptIn);
     }
     let cfg_value = cfg[5];
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(HidError::Xhci)?;
@@ -257,13 +257,13 @@ pub async fn try_bind_touchpad_already_addressed(
     // we do it explicitly here. Reference: Linux `drivers/hid/usbhid/
     // usbhid.c:usbhid_start_interrupt_in_default`.
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             crate::hid::HID_REQ_SET_PROTOCOL,
             crate::hid::HID_REPORT_PROTOCOL,
             interface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(HidError::Xhci)?;
@@ -274,13 +274,13 @@ pub async fn try_bind_touchpad_already_addressed(
     // implement it STALL; SET_PROTOCOL above was the load-bearing
     // call). Mirrors `BootKeyboard::attach`.
     let _ = xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             RT_HOST_TO_DEV_CLASS_IFACE,
             crate::hid::HID_REQ_SET_IDLE,
             0,
             interface_num as u16,
-            &mut nothing,
+            &[],
         )
         .await;
 

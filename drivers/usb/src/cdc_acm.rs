@@ -368,6 +368,7 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<(u8, u8, EndpointConfig, Endpoi
                         } else {
                             EndpointKind::BulkOut
                         },
+                        interval: 0,
                     };
                     if ep_addr & 0x80 != 0 && bulk_in.is_none() {
                         bulk_in = Some(ep_cfg);
@@ -529,15 +530,14 @@ pub async fn try_bind_cdc_acm_already_addressed(
         return Err(CdcError::Truncated);
     }
     let cfg_value = cfg[5];
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| CdcError::Truncated)?;

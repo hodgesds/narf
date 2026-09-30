@@ -2523,6 +2523,159 @@ kernel_test_in!(
     smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface
 );
 
+fn smoke_usb_uvc_retains_streaming_alternates_and_selects_bandwidth() -> TestResult {
+    use crate::uvc::{
+        find_video_streaming_endpoints, select_video_streaming_iso_endpoint, UvcStreamingTransport,
+        USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+    };
+
+    let mut cfg = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 2, 1, 0, 0x80, 50]);
+    // VideoControl plus an interrupt endpoint: it must not be mistaken for video data.
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 1, USB_CLASS_VIDEO, 0x01, 0, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x84, 0x03, 0x10, 0x00, 8]);
+    // VideoStreaming alt 0 is the zero-bandwidth idle setting.
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        0,
+        0,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    // Alt 1: one 1024-byte transaction per microframe.
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        1,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x04, 1]);
+    // Alt 2: two 1024-byte transactions (wMaxPacketSize[12:11] = 1).
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        2,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x0c, 1]);
+    // Alt 3: three 1024-byte transactions (wMaxPacketSize[12:11] = 2).
+    cfg.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        3,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x14, 1]);
+    let total = cfg.len() as u16;
+    cfg[2..4].copy_from_slice(&total.to_le_bytes());
+
+    let endpoints = find_video_streaming_endpoints(&cfg);
+    if endpoints.len() != 3 {
+        return TestResult::Fail("UVC streaming alternate count wrong");
+    }
+    let high = endpoints[2];
+    if high.interface_number != 2
+        || high.alternate_setting != 3
+        || high.endpoint_address != 0x81
+        || high.dci != 3
+        || high.transport != UvcStreamingTransport::Isochronous
+        || high.max_packet_size != 1024
+        || high.transactions_per_interval != 3
+        || high.max_payload_size != 3072
+        || high.interval != 1
+    {
+        return TestResult::Fail("UVC high-bandwidth endpoint metadata wrong");
+    }
+    if select_video_streaming_iso_endpoint(&endpoints, 1500)
+        .map(|endpoint| endpoint.alternate_setting)
+        != Some(2)
+    {
+        return TestResult::Fail("UVC selector did not choose smallest fitting alternate");
+    }
+    if select_video_streaming_iso_endpoint(&endpoints, 2500)
+        .map(|endpoint| endpoint.alternate_setting)
+        != Some(3)
+    {
+        return TestResult::Fail("UVC selector did not choose high-bandwidth alternate");
+    }
+    if select_video_streaming_iso_endpoint(&endpoints, 3073).is_some() {
+        return TestResult::Fail("UVC selector accepted an undersized alternate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_retains_streaming_alternates_and_selects_bandwidth
+);
+
+fn smoke_xhci_translates_usb2_periodic_endpoint_schedule() -> TestResult {
+    use crate::xhci::{endpoint_context_params, EndpointConfig, EndpointKind, PortSpeed};
+
+    let high_bandwidth = EndpointConfig {
+        ep_addr: 0x81,
+        max_packet: 0x1400,
+        kind: EndpointKind::IsochIn,
+        interval: 1,
+    };
+    let Some(params) = endpoint_context_params(PortSpeed::High, high_bandwidth) else {
+        return TestResult::Fail("valid HS isoch endpoint was rejected");
+    };
+    if params.max_packet != 1024
+        || params.max_burst != 2
+        || params.interval != 0
+        || params.max_esit_payload != 3072
+        || params.error_count != 0
+    {
+        return TestResult::Fail("HS isoch endpoint context translation wrong");
+    }
+
+    let full_speed_interrupt = EndpointConfig {
+        ep_addr: 0x82,
+        max_packet: 8,
+        kind: EndpointKind::InterruptIn,
+        interval: 10,
+    };
+    let Some(params) = endpoint_context_params(PortSpeed::Full, full_speed_interrupt) else {
+        return TestResult::Fail("valid FS interrupt endpoint was rejected");
+    };
+    // 10 ms = 80 microframes; xHCI requires rounding down to 64 = 2^6.
+    if params.interval != 6 || params.max_burst != 0 || params.max_esit_payload != 8 {
+        return TestResult::Fail("FS interrupt interval translation wrong");
+    }
+
+    let reserved_burst = EndpointConfig {
+        max_packet: 0x1c00,
+        ..high_bandwidth
+    };
+    if endpoint_context_params(PortSpeed::High, reserved_burst).is_some() {
+        return TestResult::Fail("reserved USB2 high-bandwidth encoding accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_translates_usb2_periodic_endpoint_schedule
+);
+
 // ── Bring-up replication: input chain failure modes ───────────────
 //
 // These tests reproduce the failure modes we've hit on real
@@ -2778,6 +2931,120 @@ fn smoke_btusb_no_bluetooth_on_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/btusb", smoke_btusb_no_bluetooth_on_qemu);
 
+/// WCN6855 vendor version data is a fixed 20-byte little-endian record. The
+/// multi-NVM flag combines chip/platform bytes into the board-specific suffix.
+fn smoke_btusb_qca_version_and_board_id() -> TestResult {
+    use crate::btusb_qca::QcaVersion;
+
+    let mut raw = [0u8; 20];
+    raw[0..4].copy_from_slice(&0x0013_0201u32.to_le_bytes());
+    raw[4..8].copy_from_slice(&7u32.to_le_bytes());
+    raw[8..12].copy_from_slice(&0x400C_1211u32.to_le_bytes());
+    raw[12] = 0x01;
+    raw[13] = 0x0A;
+    raw[14..16].copy_from_slice(&0x8000u16.to_le_bytes());
+    let Some(version) = QcaVersion::decode(&raw) else {
+        return TestResult::Fail("WCN6855 version record did not decode");
+    };
+    if version.rom_version != 0x0013_0201 || version.board_id() != 0x010A {
+        return TestResult::Fail("WCN6855 version or board ID decoded incorrectly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_version_and_board_id);
+
+/// Runtime NVM selection includes both the GlobalFoundries variant and the
+/// board ID, while the rampatch is selected only by ROM version.
+fn smoke_btusb_qca_firmware_names() -> TestResult {
+    use crate::btusb_qca::{firmware_names, QcaVersion};
+
+    let names = firmware_names(QcaVersion {
+        rom_version: 0x0013_0201,
+        ram_version: 0x400C_1211,
+        chip_id: 0x01,
+        platform_id: 0x0A,
+        flag: 0x8000,
+        ..QcaVersion::default()
+    });
+    if names.rampatch != "qca/rampatch_usb_00130201.bin" {
+        return TestResult::Fail("WCN6855 rampatch name is wrong");
+    }
+    if names.nvm != "qca/nvm_usb_00130201_gf_010a.bin" {
+        return TestResult::Fail("WCN6855 NVM name is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_firmware_names);
+
+/// The rampatch header embeds high/low ROM halves followed by the patch
+/// revision. Reject a stale patch even when its ROM identity matches.
+fn smoke_btusb_qca_rampatch_validation() -> TestResult {
+    use crate::btusb_qca::{validate_rampatch_image, QcaError, QcaVersion};
+
+    let version = QcaVersion {
+        rom_version: 0x0013_0201,
+        patch_version: 6,
+        ..QcaVersion::default()
+    };
+    let mut image = [0u8; 40];
+    image[16..18].copy_from_slice(&0x0013u16.to_le_bytes());
+    image[18..20].copy_from_slice(&0x0201u16.to_le_bytes());
+    image[20..22].copy_from_slice(&7u16.to_le_bytes());
+    if validate_rampatch_image(&image, version).is_err() {
+        return TestResult::Fail("valid WCN6855 rampatch header rejected");
+    }
+    image[20..22].copy_from_slice(&6u16.to_le_bytes());
+    if validate_rampatch_image(&image, version) != Err(QcaError::FirmwareInvalid) {
+        return TestResult::Fail("stale WCN6855 rampatch accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_rampatch_validation);
+
+/// HCI Command Complete retains its leading Status byte. Keep the USB
+/// Stage-0 parser aligned with the shared Bluetooth controller parser.
+fn smoke_btusb_local_version_skips_status() -> TestResult {
+    use crate::btusb::{
+        apply_bd_addr_return, apply_buffer_size_return, controller_info_from_version_return,
+    };
+
+    let ret = [
+        0x00, // Status
+        0x0C, // HCI version 5.3
+        0x10, 0x00, // HCI revision 0x0010
+        0x0C, // LMP version
+        0xD7, 0x00, // Qualcomm company ID 0x00d7
+        0x34, 0x12, // LMP subversion 0x1234
+    ];
+    let info = match controller_info_from_version_return(&ret) {
+        Ok(info) => info,
+        Err(_) => return TestResult::Fail("valid Read Local Version response rejected"),
+    };
+    if info.hci_version != 0x0C
+        || info.hci_revision != 0x0010
+        || info.manufacturer != 0x00D7
+        || info.lmp_subversion != 0x1234
+    {
+        return TestResult::Fail("Read Local Version response shifted by status byte");
+    }
+    let mut info = info;
+    if apply_bd_addr_return(&mut info, &[0, 1, 2, 3, 4, 5, 6]).is_err()
+        || info.bd_addr != [1, 2, 3, 4, 5, 6]
+    {
+        return TestResult::Fail("Read BD_ADDR response decoded incorrectly");
+    }
+    if apply_buffer_size_return(&mut info, &[0, 0x40, 0x01, 0x20, 0x10, 0, 8, 0]).is_err()
+        || info.acl_data_mtu != 0x0140
+        || info.sco_data_mtu != 0x20
+        || info.acl_total_num != 16
+        || info.sco_total_num != 8
+    {
+        return TestResult::Fail("Read Buffer Size response decoded incorrectly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_local_version_skips_status);
+
 // ── fingerprint ────────────────────────────────────────────────────
 
 /// USB-ID table matches: all 16 VID/PID entries resolve to a vendor.
@@ -2790,6 +3057,7 @@ fn smoke_fp_usb_id_table_match() -> TestResult {
         // Goodix
         (0x27C6, 0x5110, FpVendor::Goodix),
         (0x27C6, 0x55B4, FpVendor::Goodix),
+        (0x27C6, 0x6594, FpVendor::Goodix),
         // ELAN
         (0x04F3, 0x0903, FpVendor::Elan),
         (0x04F3, 0x0C03, FpVendor::Elan),
@@ -2823,7 +3091,7 @@ fn smoke_fp_vendor_classifier() -> TestResult {
         }
     }
     // All Goodix PIDs
-    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4] {
+    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594] {
         if !matches!(classify_vid_pid(0x27C6, pid), Some(FpVendor::Goodix)) {
             return TestResult::Fail("Goodix PID not classified");
         }
@@ -2921,6 +3189,23 @@ fn smoke_fp_no_reader_on_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
+
+/// xHCI control helpers reject a method/SETUP direction mismatch. This is
+/// load-bearing for payload-carrying host-to-device requests such as HID
+/// SET_REPORT: routing one through `control_in` would otherwise DMA in the
+/// wrong direction and silently discard the keyboard LED report.
+fn smoke_xhci_control_direction_contract() -> TestResult {
+    use crate::xhci::control_request_is_in;
+
+    if control_request_is_in(0x00) || control_request_is_in(0x21) {
+        return TestResult::Fail("host-to-device request classified as control-IN");
+    }
+    if !control_request_is_in(0x80) || !control_request_is_in(0xA1) {
+        return TestResult::Fail("device-to-host request classified as control-OUT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_control_direction_contract);
 
 // ── ccid ────────────────────────────────────────────────────────────
 
@@ -3623,7 +3908,8 @@ kernel_test_in!(
 /// 2.
 fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
     use crate::xhci::slot::{
-        encode_slot_ctx_dword0, input_context_size, input_ctx_add_flag, input_ctx_drop_flag,
+        encode_slot_ctx_dword0, encode_slot_ctx_dword2, input_context_size, input_ctx_add_flag,
+        input_ctx_drop_flag,
     };
     // Add Slot Context: bit 0.
     if input_ctx_add_flag(0) != 1 {
@@ -3645,7 +3931,7 @@ fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
         return TestResult::Fail("DCI 3 drop flag must be bit 3");
     }
     // Slot Context dword0: route_string + speed + hub + ctx_entries.
-    let d0 = encode_slot_ctx_dword0(0x12345, 3, false, true, 5);
+    let d0 = encode_slot_ctx_dword0(0x12345, 3, true, true, 5);
     if (d0 & 0xFFFFF) != 0x12345 {
         return TestResult::Fail("route_string not in bits[19:0]");
     }
@@ -3655,8 +3941,15 @@ fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
     if (d0 & (1 << 26)) == 0 {
         return TestResult::Fail("HUB bit not set");
     }
+    if (d0 & (1 << 25)) == 0 {
+        return TestResult::Fail("MTT bit not set");
+    }
     if ((d0 >> 27) & 0x1F) != 5 {
         return TestResult::Fail("ctx_entries not in bits[31:27]");
+    }
+    let d2 = encode_slot_ctx_dword2(7, 1, 3);
+    if d2 & 0xFF != 7 || (d2 >> 8) & 0xFF != 1 || (d2 >> 16) & 0x3 != 3 {
+        return TestResult::Fail("parent TT slot context encoding mismatch");
     }
     // Input Context size — 32-byte and 64-byte variants.
     if input_context_size(false) != 32 + 32 + 31 * 32 {
@@ -4348,6 +4641,76 @@ fn smoke_usb_hub_descriptor_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/hub", smoke_usb_hub_descriptor_decode);
+
+/// The target 05e3:0610 Genesys hub advertises protocol 2 (one TT per
+/// port). A full-speed child such as 10ab:9309 must carry the parent
+/// slot, downstream port, and Hub Descriptor think time into its xHCI
+/// Slot Context; otherwise split transactions are scheduled against
+/// the wrong TT.
+fn smoke_usb_hub_multi_tt_child_topology() -> TestResult {
+    use crate::attach::route_tier;
+    use crate::hub::{HubDescriptor, UsbHub, HUB_PROTOCOL_MULTI_TT};
+    use crate::xhci::PortSpeed;
+
+    let hub = UsbHub {
+        slot_id: 7,
+        iface_num: 0,
+        descriptor: HubDescriptor {
+            num_ports: 4,
+            // TT think-time encoding 3 = 32 full-speed bit times.
+            characteristics: 3 << 5,
+            poweron_time_2ms: 50,
+            controller_current: 100,
+        },
+        speed: PortSpeed::High,
+        device_protocol: HUB_PROTOCOL_MULTI_TT,
+    };
+    if !hub.is_multi_tt() {
+        return TestResult::Fail("protocol 2 hub was not classified multi-TT");
+    }
+    if route_tier(0) != 0
+        || route_tier(0x0000F) != 1
+        || route_tier(0x00021) != 2
+        || route_tier(0xFEDCB) != 5
+    {
+        return TestResult::Fail("xHCI route tier decode mismatch");
+    }
+    let topology = hub.child_topology(0, 0, 1, PortSpeed::Full);
+    if topology.route_string != 1 {
+        return TestResult::Fail("downstream route string mismatch");
+    }
+    if topology.parent_hub_slot_id != 7 || topology.parent_hub_port != 1 {
+        return TestResult::Fail("parent TT slot/port missing");
+    }
+    if topology.tt_think_time != 3 {
+        return TestResult::Fail("hub TT think time not propagated");
+    }
+
+    let high_speed = hub.child_topology(0, 0, 2, PortSpeed::High);
+    if high_speed.parent_hub_slot_id != 0
+        || high_speed.parent_hub_port != 0
+        || high_speed.tt_think_time != 0
+    {
+        return TestResult::Fail("high-speed child incorrectly received TT metadata");
+    }
+
+    let full_speed_hub = UsbHub {
+        speed: PortSpeed::Full,
+        ..hub
+    };
+    if full_speed_hub.is_multi_tt() {
+        return TestResult::Fail("full-speed hub incorrectly classified multi-TT");
+    }
+    let no_translator = full_speed_hub.child_topology(0, 0, 1, PortSpeed::Low);
+    if no_translator.parent_hub_slot_id != 0
+        || no_translator.parent_hub_port != 0
+        || no_translator.tt_think_time != 0
+    {
+        return TestResult::Fail("full-speed hub incorrectly supplied TT metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_hub_multi_tt_child_topology);
 
 /// Hub Port Status decode: connection-change, over-current, and reset
 /// bits are at the correct positions in the 32-bit GET_STATUS word.

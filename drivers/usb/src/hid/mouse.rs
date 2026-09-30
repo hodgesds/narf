@@ -137,6 +137,7 @@ pub fn find_boot_mouse(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
                         ep_addr,
                         max_packet: mps,
                         kind: EndpointKind::InterruptIn,
+                        interval: cfg[i + 6],
                     });
                 }
             }
@@ -178,15 +179,14 @@ impl BootMouse {
         interface_num: u8,
         interrupt_in_ep: u8,
     ) -> Result<Self, HidError> {
-        let mut nothing = [0u8; 0];
         xhci_dev
-            .control_in(
+            .control_out(
                 slot_id,
                 0x21,
                 HID_REQ_SET_PROTOCOL,
                 HID_BOOT_PROTOCOL,
                 interface_num as u16,
-                &mut nothing,
+                &[],
             )
             .await
             .map_err(|_| HidError::SetProtocolFailed)?;
@@ -464,15 +464,14 @@ async fn bind_mouse_addressed_slot(
     // stays in Address state and class requests STALL. Same fix
     // as the kbd path picked up earlier.
     // bmRequestType: Host-to-Device | Standard | Device = 0x00.
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             crate::hid::STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(HidError::Xhci)?;

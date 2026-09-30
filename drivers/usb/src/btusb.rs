@@ -18,8 +18,9 @@
 //!   per NARF 2026-05-20 relicense to GPL-2.0-or-later. We mirror
 //!   the endpoint-discovery shape (bulk pair + interrupt-IN) and
 //!   the post-attach Reset / Read_Local_Version probe sequence.
-//!   We do *not* port the vendor-specific Intel / Broadcom /
-//!   Realtek bring-up quirks: that's Stage 1+.
+//! - **Linux `drivers/bluetooth/btusb.c` QCA USB setup** — GPL-2.0;
+//!   WCN6855 version/status control requests and split control/bulk
+//!   firmware download, including runtime firmware-name selection.
 //!
 //! ## Stage 0 scope
 //!
@@ -27,14 +28,16 @@
 //! 2. Walk the configuration descriptor for the bulk-IN/OUT ACL pair
 //!    and the interrupt-IN event endpoint.
 //! 3. Configure those endpoints + issue SET_CONFIGURATION.
-//! 4. Drive Stage-0 HCI bring-up directly against the xHCI async
-//!    transfer paths: Reset → Read_Local_Version.
-//! 5. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
-//! 6. Register an `HciTransport` against the slot for Stage-1+ users.
+//! 4. Apply required USB vendor firmware setup for recognised parts
+//!    (currently WCN6855) before exposing the HCI transport.
+//! 5. Drive mandatory HCI bring-up directly against the xHCI async
+//!    transfer paths: Reset → version → BD_ADDR → buffer sizes → event mask.
+//! 6. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
+//! 7. Register an `HciTransport` against the slot for Stage-1+ users.
 //!
 //! Out of scope for Stage 0: ACL data plane (L2CAP / GATT / pairing),
-//! SCO/eSCO isoch streaming, vendor firmware load, LE Advertising,
-//! BR/EDR Inquiry. Those land as separate stages.
+//! SCO/eSCO isoch streaming, non-QCA vendor firmware, LE Advertising,
+//! and BR/EDR Inquiry. Those land as separate stages.
 //!
 //! Why a per-driver async bring-up instead of routing through the
 //! existing `narf_bluetooth::controller::Controller::bring_up`:
@@ -45,7 +48,8 @@
 //! async dance using `xhci.control_out` / `xhci.poll_interrupt_in`
 //! directly, and the trait-based transport is registered afterwards
 //! for any caller that can drive it from a non-executor context
-//! (Stage-1+ ACL pumps).
+//! (Stage-1+ ACL pumps). The completed controller is adopted into the shared
+//! ready registry without rerunning synchronous bring-up.
 
 extern crate alloc;
 
@@ -55,7 +59,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_bluetooth::controller::ControllerInfo;
-use narf_bluetooth::event::{CommandComplete, EventCode};
+use narf_bluetooth::event::{CommandComplete, CommandStatus, EventCode};
 use narf_bluetooth::hci::{Command, Event};
 use narf_bluetooth::opcode as op;
 use narf_bluetooth::transport::{HciTransport, TransportError};
@@ -116,6 +120,8 @@ pub enum BtUsbError {
     /// HCI Command Complete return params were shorter than the spec
     /// requires for the issued opcode.
     ShortReturnParams,
+    /// A recognised controller's vendor firmware setup failed.
+    FirmwareSetup,
 }
 
 /// Walk a Configuration Descriptor for the *first* HCI interface and
@@ -171,6 +177,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::InterruptIn,
+                            interval: cfg[i + 6],
                         });
                     }
                     // Bulk-IN — ACL data.
@@ -179,6 +186,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkIn,
+                            interval: 0,
                         });
                     }
                     // Bulk-OUT — ACL data.
@@ -187,6 +195,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             ep_addr,
                             max_packet: mps,
                             kind: EndpointKind::BulkOut,
+                            interval: 0,
                         });
                     }
                     _ => {}
@@ -255,6 +264,7 @@ pub fn attached_count() -> usize {
 pub fn __test_reset() {
     BTUSB_DEVICES.lock().clear();
     narf_bluetooth::transport::__test_reset();
+    narf_bluetooth::controller::__test_reset_controllers();
 }
 
 /// `HciTransport` implementation backed by the xHCI control / bulk /
@@ -386,7 +396,6 @@ async fn send_command_and_await_complete(
     slot_id: u8,
     interface: u8,
     event_dci: u8,
-    event_max_packet: u16,
     opcode: u16,
     params: &[u8],
 ) -> Result<Vec<u8>, BtUsbError> {
@@ -403,13 +412,10 @@ async fn send_command_and_await_complete(
     .await
     .map_err(|_| BtUsbError::CommandTransfer)?;
 
-    // Re-arm the interrupt-IN endpoint and busy-poll until the
-    // controller posts a Transfer Event for it. The interrupt-IN
-    // path doesn't have an inline async wait; we poll-with-yield.
-    let len = event_max_packet.min(257) as u32;
-    xhci.arm_interrupt_in(slot_id, event_dci, len)
-        .map_err(|_| BtUsbError::CommandTransfer)?;
-
+    // The caller pre-arms interrupt-IN before the first command, and
+    // `poll_interrupt_in` re-arms it after every completion. Keep exactly
+    // one Event TRB outstanding; enqueueing another here would double-arm
+    // the endpoint and make two TRBs share its persistent DMA buffer.
     let deadline = narf_time::Deadline::after_ms(5_500);
     let mut buf = [0u8; 257];
     loop {
@@ -422,8 +428,14 @@ async fn send_command_and_await_complete(
                 // is success and re-loop (some controllers emit a
                 // dummy CommandStatus before CommandComplete).
                 if event.code == EventCode::CommandStatus as u8 {
-                    // Re-arm and continue polling for CommandComplete.
-                    let _ = xhci.arm_interrupt_in(slot_id, event_dci, len);
+                    let status = CommandStatus::parse(&event).ok_or(BtUsbError::EventTimeout)?;
+                    if status.opcode != opcode {
+                        return Err(BtUsbError::OpcodeMismatch);
+                    }
+                    if status.status != 0 {
+                        return Err(BtUsbError::BadStatus(status.status));
+                    }
+                    // `poll_interrupt_in` already re-armed the endpoint.
                     continue;
                 }
                 let cc = CommandComplete::parse(&event).ok_or(BtUsbError::EventTimeout)?;
@@ -447,6 +459,59 @@ async fn send_command_and_await_complete(
     }
 }
 
+/// Decode Read Local Version's Command Complete return parameters.
+/// The first byte is HCI Status; the eight-byte version payload follows.
+pub(crate) fn controller_info_from_version_return(
+    ret: &[u8],
+) -> Result<ControllerInfo, BtUsbError> {
+    if ret.len() < 9 {
+        return Err(BtUsbError::ShortReturnParams);
+    }
+    if ret[0] != 0 {
+        return Err(BtUsbError::BadStatus(ret[0]));
+    }
+    Ok(ControllerInfo {
+        bd_addr: [0; 6],
+        hci_version: ret[1],
+        hci_revision: u16::from_le_bytes([ret[2], ret[3]]),
+        lmp_version: ret[4],
+        manufacturer: u16::from_le_bytes([ret[5], ret[6]]),
+        lmp_subversion: u16::from_le_bytes([ret[7], ret[8]]),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn apply_bd_addr_return(
+    info: &mut ControllerInfo,
+    ret: &[u8],
+) -> Result<(), BtUsbError> {
+    if ret.len() < 7 {
+        return Err(BtUsbError::ShortReturnParams);
+    }
+    if ret[0] != 0 {
+        return Err(BtUsbError::BadStatus(ret[0]));
+    }
+    info.bd_addr.copy_from_slice(&ret[1..7]);
+    Ok(())
+}
+
+pub(crate) fn apply_buffer_size_return(
+    info: &mut ControllerInfo,
+    ret: &[u8],
+) -> Result<(), BtUsbError> {
+    if ret.len() < 8 {
+        return Err(BtUsbError::ShortReturnParams);
+    }
+    if ret[0] != 0 {
+        return Err(BtUsbError::BadStatus(ret[0]));
+    }
+    info.acl_data_mtu = u16::from_le_bytes([ret[1], ret[2]]);
+    info.sco_data_mtu = ret[3];
+    info.acl_total_num = u16::from_le_bytes([ret[4], ret[5]]);
+    info.sco_total_num = u16::from_le_bytes([ret[6], ret[7]]);
+    Ok(())
+}
+
 /// Post-address Bluetooth bind: caller has already issued port_reset +
 /// enable_slot + address_device. We pull the config descriptor, match
 /// the HCI interface + endpoints, configure them on the xHC, issue
@@ -457,6 +522,8 @@ async fn send_command_and_await_complete(
 pub async fn try_bind_btusb_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
+    vendor_id: u16,
+    product_id: u16,
     cfg: &[u8],
 ) -> Result<(), BtUsbError> {
     let eps = find_bt_endpoints(cfg)?;
@@ -472,15 +539,14 @@ pub async fn try_bind_btusb_already_addressed(
     // SET_CONFIGURATION before any class request (USB 2.0 §9.4.7) —
     // without it the controller's class-specific Setup transfer for
     // HCI_Reset would STALL.
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00, // bmRequestType: Host-to-Device, Standard, Device
             STD_REQ_SET_CONFIGURATION,
             eps.config_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| BtUsbError::SetConfiguration)?;
@@ -493,6 +559,41 @@ pub async fn try_bind_btusb_already_addressed(
     let acl_in_dci = ep_dci(eps.acl_in.ep_addr, /*is_in*/ true);
     let acl_out_dci = ep_dci(eps.acl_out.ep_addr, /*is_in*/ false);
 
+    if narf_bluetooth::btusb_quirks::identify(vendor_id, product_id)
+        == Some(narf_bluetooth::btusb_quirks::Quirk::QualcommWcn6855)
+    {
+        match crate::btusb_qca::setup_wcn6855(xhci_dev, slot_id, acl_out_dci).await {
+            Ok(version) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-qca: {:04x}:{:04x} ROM {:#010x}, patch {:#010x}",
+                    vendor_id,
+                    product_id,
+                    version.rom_version,
+                    version.patch_version,
+                );
+            }
+            Err(error) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-qca: {:04x}:{:04x} setup failed: {:?}",
+                    vendor_id,
+                    product_id,
+                    error,
+                );
+                return Err(BtUsbError::FirmwareSetup);
+            }
+        }
+    }
+
+    // Keep one interrupt-IN Event transfer outstanding across the whole
+    // mandatory command sequence. Every successful poll re-arms it.
+    xhci_dev
+        .arm_interrupt_in(slot_id, event_dci, eps.event_in.max_packet.min(257) as u32)
+        .map_err(|_| BtUsbError::CommandTransfer)?;
+
     // HCI_Reset (§7.3.2) — no parameters, no return params beyond
     // status. After this the controller is in a defined post-reset
     // state and discards any in-flight ACL / SCO traffic.
@@ -501,40 +602,61 @@ pub async fn try_bind_btusb_already_addressed(
         slot_id,
         eps.interface,
         event_dci,
-        eps.event_in.max_packet,
         op::HCI_RESET,
         &[],
     )
     .await?;
 
     // HCI_Read_Local_Version_Information (§7.4.1) — returns
-    // HCI_Version (1) + HCI_Revision (2) + LMP_Version (1) +
-    // Manufacturer_Name (2) + LMP_Subversion (2).
+    // Status (1) + HCI_Version (1) + HCI_Revision (2) +
+    // LMP_Version (1) + Manufacturer_Name (2) + LMP_Subversion (2).
     let ret = send_command_and_await_complete(
         xhci_dev,
         slot_id,
         eps.interface,
         event_dci,
-        eps.event_in.max_packet,
         op::HCI_READ_LOCAL_VERSION,
         &[],
     )
     .await?;
-    if ret.len() < 8 {
-        return Err(BtUsbError::ShortReturnParams);
-    }
-    let info = ControllerInfo {
-        bd_addr: [0; 6],
-        hci_version: ret[0],
-        hci_revision: u16::from_le_bytes([ret[1], ret[2]]),
-        lmp_version: ret[3],
-        manufacturer: u16::from_le_bytes([ret[4], ret[5]]),
-        lmp_subversion: u16::from_le_bytes([ret[6], ret[7]]),
-        ..Default::default()
-    };
+    let mut info = controller_info_from_version_return(&ret)?;
+
+    let ret = send_command_and_await_complete(
+        xhci_dev,
+        slot_id,
+        eps.interface,
+        event_dci,
+        op::HCI_READ_BD_ADDR,
+        &[],
+    )
+    .await?;
+    apply_bd_addr_return(&mut info, &ret)?;
+
+    let ret = send_command_and_await_complete(
+        xhci_dev,
+        slot_id,
+        eps.interface,
+        event_dci,
+        op::HCI_READ_BUFFER_SIZE,
+        &[],
+    )
+    .await?;
+    apply_buffer_size_return(&mut info, &ret)?;
+
+    // Default host event mask used by the shared controller bring-up.
+    let event_mask = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
+    let _ = send_command_and_await_complete(
+        xhci_dev,
+        slot_id,
+        eps.interface,
+        event_dci,
+        op::HCI_SET_EVENT_MASK,
+        &event_mask,
+    )
+    .await?;
 
     // Register a sync-context transport for Stage-1+ callers (L2CAP
-    // pump, ACL data plane). Stage-0 itself is done: every command
+    // pump, ACL data plane). Mandatory bring-up is done: every command
     // it issued used the async helper above.
     let transport: Arc<dyn HciTransport> = Arc::new(UsbHciTransport {
         slot_id,
@@ -546,6 +668,8 @@ pub async fn try_bind_btusb_already_addressed(
         armed: AtomicBool::new(true), // already armed by the bring-up
     });
     narf_bluetooth::transport::register(transport.clone());
+    let hci_index = narf_bluetooth::controller::register_ready_transport(transport.clone(), info);
+    let _ = narf_bluetooth::sysfs_bridge::register_hci_controller(hci_index, info, &[]);
 
     {
         use core::fmt::Write as _;

@@ -208,6 +208,43 @@ kernel_test_in!(
     smoke_controller_bringup_drives_mandatory_sequence
 );
 
+/// A late async driver may complete the mandatory command sequence itself and
+/// adopt the transport without the synchronous controller reissuing Reset.
+fn smoke_register_ready_transport_is_idempotent() -> TestResult {
+    use crate::controller::{
+        __test_reset_controllers, bring_up_all, controller_count, register_ready_transport,
+        ControllerInfo,
+    };
+
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+    let transport: Arc<dyn crate::transport::HciTransport> =
+        Arc::new(LoopbackTransport::new("async-ready"));
+    crate::transport::register(transport.clone());
+    let info = ControllerInfo {
+        hci_version: 0x0C,
+        manufacturer: 0x00D7,
+        ..ControllerInfo::default()
+    };
+    if register_ready_transport(transport.clone(), info) != 0
+        || register_ready_transport(transport, info) != 0
+        || controller_count() != 1
+    {
+        return TestResult::Fail("ready transport registration was not idempotent");
+    }
+    let cap = crate::bootstrap_bluetooth_authority();
+    if !bring_up_all(&cap).is_empty() {
+        return TestResult::Fail("bring_up_all reran an adopted ready transport");
+    }
+    crate::transport::__test_reset();
+    __test_reset_controllers();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/controller",
+    smoke_register_ready_transport_is_idempotent
+);
+
 fn smoke_bring_up_propagates_bad_status() -> TestResult {
     use crate::bootstrap_bluetooth_authority;
     use crate::controller::BringupError;
@@ -3493,6 +3530,9 @@ fn smoke_btusb_quirks_identification() -> TestResult {
     if identify(0x0489, 0xe0cd) != Some(Quirk::QualcommWcn6855) {
         return TestResult::Fail("Qualcomm WCN6855 not matched");
     }
+    if identify(0x10ab, 0x9309) != Some(Quirk::QualcommWcn6855) {
+        return TestResult::Fail("USI WCN6855 (10ab:9309) not matched");
+    }
     if identify(0x0e8d, 0x7922) != Some(Quirk::MediaTek) {
         return TestResult::Fail("MediaTek MT7922 not matched");
     }
@@ -3543,6 +3583,14 @@ fn smoke_btusb_firmware_paths_per_quirk() -> TestResult {
     }
     if firmware_paths(Quirk::QualcommWcn6855).is_empty() {
         return TestResult::Fail("Qualcomm firmware list empty");
+    }
+    if firmware_paths(Quirk::QualcommWcn6855)
+        .iter()
+        .all(|(patch, nvm)| {
+            *patch != "rampatch_usb_00130201.bin" || *nvm != Some("nvm_usb_00130201.bin")
+        })
+    {
+        return TestResult::Fail("WCN6855 USB 2.1 firmware pair missing");
     }
     if !firmware_paths(Quirk::Csr).is_empty() {
         return TestResult::Fail("CSR firmware list should be empty (on-chip)");

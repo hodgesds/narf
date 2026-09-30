@@ -734,6 +734,18 @@ fn smoke_wbdi_recogniser_rejects_non_wbdi() -> TestResult {
 
 kernel_test_in!("drivers/input/wbdi", smoke_wbdi_recogniser_rejects_non_wbdi);
 
+/// The target Goodix MOC reader uses a vendor-class interface without
+/// requiring an MS OS WBDI compatible-ID descriptor, so its VID/PID
+/// must remain in the explicit fingerprint table.
+fn smoke_wbdi_known_goodix_6594() -> TestResult {
+    if crate::wbdi::is_known_fingerprint_vid_pid(0x27C6, 0x6594) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("Goodix 27c6:6594 missing from fingerprint table")
+    }
+}
+kernel_test_in!("drivers/input/wbdi", smoke_wbdi_known_goodix_6594);
+
 // ── I2C-HID ────────────────────────────────────────────────────────
 //
 // Mock I2cBus implementation that records every transfer and lets
