@@ -1136,12 +1136,18 @@ event. The audited command matrix and remaining gaps live in
 DRM ioctl handling that creates process descriptors remains in the syscall
 layer even when request validation and submission are driver-owned. VirtIO-GPU
 `EXECBUFFER(FENCE_FD_OUT)` reserves a descriptor before submission, installs
-an already-signalled sync-file description with `FD_CLOEXEC` after synchronous
-completion, and then copies the descriptor number to the ioctl structure.
-`FENCE_FD_IN` resolves and type-checks the supplied description first;
-negative or non-sync-file descriptors return `EINVAL`, and descriptor-table
-exhaustion returns `EMFILE` without submitting work. Installation precedes the
-final user copy, matching Linux's observable lifetime if that copy faults.
+a sync-file description backed by the driver's exact asynchronous submission
+fence with `FD_CLOEXEC`, and then copies the descriptor number to the ioctl
+structure. `FENCE_FD_IN` resolves and type-checks the supplied description
+first; same-context/ring dependencies rely on device queue ordering, while
+foreign contexts wait responsively with the GPU hang bound. Negative or
+non-sync-file descriptors return `EINVAL`, and descriptor-table exhaustion
+returns `EMFILE` without submitting work. Installation precedes the final user
+copy, matching Linux's observable lifetime if that copy faults.
+Device-backed sync-file poll publishes a bounded 1 ms completion-reap deadline
+until the fence signals, because the VirtIO control queue has no userspace
+waker. Time-backed sync files continue publishing their deadline after expiry
+until readiness is observed, preventing a due-between-scan-and-park lost wake.
 
 Linux perf wire definitions are owned by the separate
 `narf-linux-perf-uapi` crate, transcribed through `PERF_ATTR_SIZE_VER9` from

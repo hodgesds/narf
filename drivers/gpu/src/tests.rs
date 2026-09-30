@@ -4959,6 +4959,14 @@ fn smoke_drm_flip_event_vblank_paced() -> TestResult {
     if !events.has_deliverable_event(first_at) {
         return TestResult::Fail("first flip not deliverable at its own vblank");
     }
+    // The expired deadline remains visible until read. This closes poll's
+    // scan-to-park race: if the event becomes due just after a scan reported
+    // no readiness, the subsequent deadline lookup must force an immediate
+    // retry instead of returning None and permitting an infinite park.
+    match events.next_event_deadline_ns(first_at) {
+        Some(d) if d == first_at => {}
+        _ => return TestResult::Fail("due flip stopped publishing its deadline before read"),
+    }
     if events.pop_deliverable_event(first_at).is_none() {
         return TestResult::Fail("first flip did not pop at its vblank");
     }
@@ -5442,13 +5450,15 @@ fn smoke_drm_syncobj_signal_then_wait() -> TestResult {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("create"),
     };
-    tbl.get_mut(h)
-        .unwrap()
-        .replace_fence(crate::drm::syncobj::BinaryFence::new());
+    let old_fence = crate::drm::syncobj::BinaryFence::new();
+    tbl.get_mut(h).unwrap().replace_fence(old_fence.clone());
     let ids = [h];
     tbl.signal_handles(&ids).unwrap();
     if !tbl.get(h).unwrap().is_signalled() {
         return TestResult::Fail("not signalled after signal_handles");
+    }
+    if crate::drm::syncobj::DmaFence::is_signalled(old_fence.as_ref()) {
+        return TestResult::Fail("signal_handles signalled the replaced shared fence");
     }
     match tbl.wait_handles(&ids, 1_000_000, SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
         Ok(_) => TestResult::Pass,
@@ -5531,6 +5541,66 @@ fn smoke_drm_syncobj_reset_clears_fence() -> TestResult {
 kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_reset_clears_fence);
 
 // ── DRM atomic modeset smokes ─────────────────────────────────────────
+
+fn smoke_virtgpu_execbuffer_syncobj_wire_arrays() -> TestResult {
+    let mut wire = [0u8; 32];
+    wire[0..4].copy_from_slice(&7u32.to_le_bytes());
+    wire[16..20].copy_from_slice(&9u32.to_le_bytes());
+    wire[20..24].copy_from_slice(&1u32.to_le_bytes());
+    let deps = match crate::drm_ioctl_bridge::read_exec_syncobjs(wire.as_ptr() as u64, 2, 16, false)
+    {
+        Ok(deps) => deps,
+        Err(_) => return TestResult::Fail("valid execbuffer syncobj array rejected"),
+    };
+    if deps.len() != 2
+        || deps[0].handle != 7
+        || deps[0].reset
+        || deps[1].handle != 9
+        || !deps[1].reset
+    {
+        return TestResult::Fail("execbuffer syncobj descriptors decoded incorrectly");
+    }
+    // Linux's extensible-record rule zero-fills fields beyond a short stride.
+    let short = [11u32.to_le_bytes(), 0u32.to_le_bytes()].concat();
+    let short_dep =
+        match crate::drm_ioctl_bridge::read_exec_syncobjs(short.as_ptr() as u64, 1, 8, false) {
+            Ok(deps) => deps,
+            Err(_) => return TestResult::Fail("short syncobj stride rejected"),
+        };
+    if short_dep[0].handle != 11 || short_dep[0].reset {
+        return TestResult::Fail("short syncobj stride was not zero-extended");
+    }
+    // Output dependencies accept neither RESET nor timeline points.
+    if crate::drm_ioctl_bridge::read_exec_syncobjs(wire.as_ptr() as u64 + 16, 1, 16, true).is_ok() {
+        return TestResult::Fail("output syncobj accepted RESET");
+    }
+    wire[20..24].copy_from_slice(&0u32.to_le_bytes());
+    wire[24..32].copy_from_slice(&1u64.to_le_bytes());
+    if crate::drm_ioctl_bridge::read_exec_syncobjs(wire.as_ptr() as u64 + 16, 1, 16, true).is_ok() {
+        return TestResult::Fail("binary output syncobj accepted a timeline point");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_virtgpu_execbuffer_syncobj_wire_arrays
+);
+
+fn smoke_virtgpu_syncobj_same_context_preserves_pipeline() -> TestResult {
+    if crate::drm_ioctl_bridge::sync_dependency_needs_wait(Some(0x1234), 0x1234) {
+        return TestResult::Fail("same-ring dependency would serialize the pipeline");
+    }
+    if !crate::drm_ioctl_bridge::sync_dependency_needs_wait(Some(0x1235), 0x1234)
+        || !crate::drm_ioctl_bridge::sync_dependency_needs_wait(None, 0x1234)
+    {
+        return TestResult::Fail("foreign dependency skipped its wait");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_virtgpu_syncobj_same_context_preserves_pipeline
+);
 
 fn make_test_card_for_atomic() -> crate::drm::card::Card {
     use crate::drm::card::{

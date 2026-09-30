@@ -130,6 +130,12 @@ pub struct DriCardFile {
     /// this opener's address space, so it must never be visible to another
     /// compositor across a greeter-to-session handoff.
     events: narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>,
+    /// `OUT_FENCE_PTR` results of the last atomic commit: (user pointer,
+    /// vblank deadline ns) pairs. The syscall layer drains these via
+    /// [`FileOps::drm_take_out_fences`] right after the ioctl returns and
+    /// mints the sync_file fds — fd tables belong to that layer, exactly
+    /// like EXECBUFFER's FENCE_FD_OUT.
+    pending_out_fences: narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -163,6 +169,7 @@ impl DriCardFile {
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
+            pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
         })
     }
 
@@ -176,6 +183,7 @@ impl DriCardFile {
         let result = mode_state
             .lock()
             .queue_flip_event(&mut self.events.lock(), user_data, crtc_id)
+            .map(|_present_at| ())
             .map_err(|_| FsError::OutOfMemory);
         result
     }
@@ -243,8 +251,10 @@ impl FileOps for DriCardFile {
     /// containing this DRM fd clamps its park wake-up to this deadline (see
     /// `poll.rs::poll_nearest_deadline`), so a compositor waiting for
     /// flip-complete sleeps until the vblank and then wakes — the mechanism that
-    /// throttles its repaint loop to the mode's refresh rate. `None` when no
-    /// event is pending or the front event is already due (reported readable).
+    /// throttles its repaint loop to the mode's refresh rate. An already-due
+    /// front event keeps returning its expired deadline until read: this closes
+    /// the scan-to-park race where readiness changes just before the deadline
+    /// lookup and no later edge exists to wake an infinite poll.
     fn poll_deadline(&self) -> Option<u64> {
         let now = narf_time::wall::monotonic_ns();
         self.events.lock().next_event_deadline_ns(now)
@@ -263,6 +273,21 @@ impl FileOps for DriCardFile {
     /// heals within the ~10 ms backstop, so no explicit wake is required.
     fn readiness_notifies(&self) -> bool {
         true
+    }
+
+    /// Drain the (user pointer, vblank deadline) pairs the last atomic
+    /// commit's OUT_FENCE_PTR properties produced. See the field docs.
+    fn drm_take_out_fences(&self) -> Vec<(u64, u64)> {
+        core::mem::take(&mut *self.pending_out_fences.lock())
+    }
+
+    /// Consume this task's pending fenced-EXECBUFFER fence for FENCE_FD_OUT.
+    fn drm_execbuf_fence(&self) -> Option<Arc<dyn narf_filesystem::DrmFence>> {
+        self.virtgpu.take_execbuf_fence()
+    }
+
+    fn drm_execbuf_context(&self, ring_idx: u32) -> Option<u64> {
+        Some(self.virtgpu.execbuf_context(ring_idx))
     }
 
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -360,6 +385,7 @@ impl FileOps for DriCardFile {
             /*render*/ false,
             &self.client_caps,
             Some(&self.events),
+            Some(&self.pending_out_fences),
         )
     }
 
@@ -740,6 +766,7 @@ impl FileOps for DriRenderFile {
             /*render*/ true,
             &self.client_caps,
             None,
+            None,
         )
     }
 
@@ -748,6 +775,15 @@ impl FileOps for DriRenderFile {
     /// node, not the card node, for its GBM/EGL context).
     fn as_drm_render_index(&self) -> Option<u32> {
         Some(self.index)
+    }
+
+    /// Consume this task's pending fenced-EXECBUFFER fence for FENCE_FD_OUT.
+    fn drm_execbuf_fence(&self) -> Option<Arc<dyn narf_filesystem::DrmFence>> {
+        self.virtgpu.take_execbuf_fence()
+    }
+
+    fn drm_execbuf_context(&self, ring_idx: u32) -> Option<u64> {
+        Some(self.virtgpu.execbuf_context(ring_idx))
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {

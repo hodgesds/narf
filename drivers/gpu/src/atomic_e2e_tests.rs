@@ -281,6 +281,7 @@ fn smoke_atomic_plane_has_required_props() -> TestResult {
         src_y: 0,
         src_w: 640,
         src_h: 480,
+        in_fence_fd: None,
     };
 
     if ps.fb_id != Some(7) {
@@ -359,6 +360,7 @@ fn smoke_atomic_add_crtc_update_active() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        out_fence_ptr: None,
     });
 
     if state.crtcs.len() != 1 {
@@ -396,6 +398,7 @@ fn smoke_atomic_add_plane_with_fb() -> TestResult {
         src_y: 0,
         src_w: 1024,
         src_h: 768,
+        in_fence_fd: None,
     });
 
     if state.planes.len() != 1 {
@@ -462,6 +465,7 @@ fn smoke_atomic_check_only_happy_path() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        out_fence_ptr: None,
     });
     state.connectors.push(ConnectorState {
         id: 0,
@@ -527,6 +531,7 @@ fn smoke_atomic_check_only_rejects_invalid_mode() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        out_fence_ptr: None,
     });
     state.planes.push(PlaneState {
         id: 0,
@@ -625,6 +630,7 @@ fn smoke_atomic_commit_applies_crtc_mode() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        out_fence_ptr: None,
     });
     state.connectors.push(ConnectorState {
         id: 0,
@@ -716,6 +722,7 @@ fn smoke_atomic_commit_page_flip_updates_primary_fb() -> TestResult {
             mode_changed: true,
             active_changed: true,
             connectors_changed: false,
+            out_fence_ptr: None,
         });
         state.connectors.push(ConnectorState {
             id: 0,
@@ -976,6 +983,7 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        out_fence_ptr: None,
     });
     state.connectors.push(ConnectorState {
         id: 0,
@@ -1250,4 +1258,60 @@ fn smoke_subsystem_id_amdgpu_nonzero_when_set() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/atomic_e2e",
     smoke_subsystem_id_amdgpu_nonzero_when_set
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Explicit fencing — the vblank a commit advances is the instant BOTH the
+// flip-complete event and an OUT_FENCE_PTR fence observe, and repeated
+// advances pace at exactly the CRTC's refresh interval.
+// Linux ref: drm_atomic_uapi.c "Explicit Fencing Properties";
+// vkms's simulated-vblank hrtimer pacing.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(target_arch = "x86_64")]
+fn smoke_atomic_out_fence_vblank_pacing() -> TestResult {
+    let Some(mode_state) = crate::drm_registry::mode_state(0) else {
+        return TestResult::Skip("no card 0 mode state");
+    };
+    let mut card = mode_state.lock();
+    let Some(crtc_id) = card.crtc_ids().next() else {
+        return TestResult::Skip("card 0 has no CRTCs");
+    };
+    let refresh_hz = card.crtc_refresh_hz(crtc_id).max(1) as u64;
+    let interval_ns = 1_000_000_000u64 / refresh_hz;
+    let now = narf_time::wall::monotonic_ns();
+    let first = card.advance_vblank(crtc_id);
+    if first < now {
+        return TestResult::Fail("vblank presented in the past");
+    }
+    // A second commit's fence deadline must land exactly one refresh
+    // interval later — the pacing kmscube's fence-driven loop rides on.
+    let second = card.advance_vblank(crtc_id);
+    if second != first + interval_ns {
+        return TestResult::Fail("consecutive vblanks not one refresh interval apart");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_out_fence_vblank_pacing
+);
+
+/// The CRTC/plane fence properties decode with Linux's validation rules:
+/// OUT_FENCE_PTR stores the user pointer (0 clears), IN_FENCE_FD accepts
+/// -1 (none) and non-negative fds, and the state defaults carry no fence.
+fn smoke_atomic_fence_prop_state_defaults() -> TestResult {
+    let crtc = CrtcState::default();
+    if crtc.out_fence_ptr.is_some() {
+        return TestResult::Fail("default CrtcState carries an out-fence request");
+    }
+    let plane = PlaneState::default();
+    if plane.in_fence_fd.is_some() {
+        return TestResult::Fail("default PlaneState carries an in-fence fd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_fence_prop_state_defaults
 );

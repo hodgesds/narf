@@ -2,12 +2,27 @@
 use super::*;
 use alloc::boxed::Box;
 
-/// A completed VirtIO-GPU dma-fence exposed through Linux's `sync_file` fd
-/// ABI.  NARF's control-queue submission is synchronous, so every fence is
-/// already signalled when EXECBUFFER returns; it is nevertheless a distinct
-/// file type so a later `VIRTGPU_EXECBUF_FENCE_FD_IN` can reject arbitrary
-/// descriptors exactly like `sync_file_get_fence()` does on Linux.
-struct DrmSyncFile;
+/// A dma-fence exposed through Linux's `sync_file` fd ABI.
+///
+/// Two producers exist today. `VIRTGPU_EXECBUF_FENCE_FD_OUT` fences are
+/// DEVICE fences: `fence` holds the exact driver-owned completion object for
+/// the asynchronous submission (a driver that produced no fence falls back
+/// to the pre-signalled `deadline_ns == 0` form). `OUT_FENCE_PTR` fences from an
+/// atomic commit signal at the commit's SIMULATED VBLANK: the deadline is a
+/// `CLOCK_MONOTONIC` instant, `poll` reports readable once it passes, and
+/// `poll_deadline` clamps a parked poll's wake-up to it — the same
+/// time-based pacing the DRM card fd's flip events use. It is a distinct
+/// file type so `VIRTGPU_EXECBUF_FENCE_FD_IN` (and the atomic `IN_FENCE_FD`
+/// property) can reject arbitrary descriptors exactly like
+/// `sync_file_get_fence()` does on Linux.
+struct DrmSyncFile {
+    /// Fence signal time (CLOCK_MONOTONIC ns); 0 = signalled at creation.
+    /// Consulted only when `fence` is `None`.
+    deadline_ns: u64,
+    /// Device-fence mode. The completion object is shared with BO WAIT and
+    /// syncobj consumers, so every ABI observes the same submission state.
+    fence: Option<Arc<dyn narf_filesystem::DrmFence>>,
+}
 
 impl narf_filesystem::FileOps for DrmSyncFile {
     fn read<'a>(
@@ -39,12 +54,104 @@ impl narf_filesystem::FileOps for DrmSyncFile {
     }
 
     fn poll_readiness(&self) -> u32 {
-        narf_filesystem::POLL_IN
+        let signalled = match &self.fence {
+            Some(fence) => fence.is_signalled(),
+            None => narf_time::wall::monotonic_ns() >= self.deadline_ns,
+        };
+        if signalled {
+            narf_filesystem::POLL_IN
+        } else {
+            0
+        }
+    }
+
+    /// Unsignalled TIME-BASED fence: a parked poll clamps its wake-up to the
+    /// signal time (see `poll.rs::poll_nearest_deadline`), so a compositor
+    /// sleeping on an atomic out-fence wakes at the vblank. Device completion
+    /// has no interrupt-waker yet, so publish a short re-poll deadline that
+    /// drives the control-queue completion reap without busy-spinning.
+    fn poll_deadline(&self) -> Option<u64> {
+        if self.fence.is_some() {
+            return Some(narf_time::wall::monotonic_ns().saturating_add(1_000_000));
+        }
+        // Keep publishing an expired non-zero deadline until poll observes the
+        // signalled level. Otherwise expiry between poll's readiness scan and
+        // this lookup produces `None`, and the caller can park forever with no
+        // future edge to wake it. Zero is the permanently pre-signalled form.
+        (self.deadline_ns != 0).then_some(self.deadline_ns)
+    }
+
+    /// Parkable readiness source. Device-fence completion is discovered by
+    /// the one-millisecond `poll_deadline` recheck above; time-based fences
+    /// wake at their exact deadline.
+    fn readiness_notifies(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use super::*;
+    use narf_filesystem::{DrmFence, FileOps};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    struct PendingFence;
+
+    impl DrmFence for PendingFence {
+        fn is_signalled(&self) -> bool {
+            false
+        }
+
+        fn wait(&self, _timeout_ms: u64) -> bool {
+            false
+        }
+
+        fn context(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn smoke_drm_sync_file_poll_deadlines_close_lost_wake_races() -> TestResult {
+        let device = DrmSyncFile {
+            deadline_ns: 0,
+            fence: Some(Arc::new(PendingFence)),
+        };
+        let before = narf_time::wall::monotonic_ns();
+        let Some(repoll) = FileOps::poll_deadline(&device) else {
+            return TestResult::Fail("device fence has no completion re-poll deadline");
+        };
+        if repoll < before.saturating_add(1_000_000) {
+            return TestResult::Fail("device fence re-poll deadline is not in the future");
+        }
+
+        // An expired non-zero time fence must retain its deadline until the
+        // readiness scan observes it. Returning None here strands a poll when
+        // expiry races the scan-to-park window.
+        let expired = DrmSyncFile {
+            deadline_ns: 1,
+            fence: None,
+        };
+        if FileOps::poll_deadline(&expired) != Some(1) {
+            return TestResult::Fail("expired time fence stopped publishing its deadline");
+        }
+
+        let signalled = DrmSyncFile {
+            deadline_ns: 0,
+            fence: None,
+        };
+        if FileOps::poll_deadline(&signalled).is_some() {
+            return TestResult::Fail("pre-signalled time fence published a deadline");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "syscall_abi",
+        smoke_drm_sync_file_poll_deadlines_close_lost_wake_races
+    );
 }
 
 // `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
@@ -844,7 +951,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         if flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0 {
             let in_fence = i32::from_ne_bytes(execbuf[28..32].try_into().unwrap());
-            let valid_sync_file = u32::try_from(in_fence)
+            let sync_file = u32::try_from(in_fence)
                 .ok()
                 .and_then(|fence_fd| {
                     fd::with_table(task, |table| {
@@ -856,13 +963,40 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     fence_ops
                         .as_any()
                         .and_then(|any| any.downcast_ref::<DrmSyncFile>())
-                        .map(|_| ())
-                })
-                .is_some();
-            if !valid_sync_file {
+                        .map(|sync_file| (sync_file.deadline_ns, sync_file.fence.clone()))
+                });
+            let Some((deadline_ns, device_fence)) = sync_file else {
                 // Linux's sync_file_get_fence() deliberately folds both a bad
                 // fd and a non-sync-file fd into EINVAL for this ioctl.
                 ctx.set_return(errno_ret(EINVAL));
+                return;
+            };
+            let ring_idx = if flags & VIRTGPU_EXECBUF_RING_IDX != 0 {
+                u32::from_ne_bytes(execbuf[32..36].try_into().unwrap())
+            } else {
+                0
+            };
+            let same_context = device_fence.as_ref().is_some_and(|fence| {
+                fence.context().is_some()
+                    && fence.context() == ops.drm_execbuf_context(ring_idx)
+            });
+            let signalled = if same_context {
+                // This ring is ordered: queueing the later EXECBUFFER carries
+                // the dependency without serializing the async pipeline.
+                true
+            } else if let Some(fence) = device_fence {
+                fence.wait(15_000)
+            } else {
+                narf_scheduler::responsive_spin_until(
+                    || narf_time::wall::monotonic_ns() >= deadline_ns,
+                    narf_time::Deadline::after_ms(15_000),
+                )
+            };
+            if !signalled {
+                // Bound a wedged/foreign GPU wait so an ioctl cannot hang the
+                // kernel indefinitely. This matches VIRTGPU_WAIT's busy
+                // timeout policy in the driver bridge.
+                ctx.set_return(errno_ret(EBUSY));
                 return;
             }
         }
@@ -870,10 +1004,53 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
 
     let ioctl_result = ops.ioctl(cmd, arg);
     if ioctl_result.is_ok() {
+        // Atomic OUT_FENCE_PTR: the DRM bridge recorded one (user pointer,
+        // vblank deadline) pair per requesting CRTC; mint the sync_file fds
+        // here and write them through the pointers, in commit order. Linux
+        // pre-allocates the fds before committing; NARF's commit has already
+        // applied by this point, so descriptor exhaustion surfaces as EMFILE
+        // with the commit in effect — the fence request, not the commit, is
+        // what fails (document over pre-scan: the ioctl arrays would need a
+        // second full decode up here to reserve ahead of dispatch).
+        const DRM_IOCTL_MODE_ATOMIC: u32 = 0xc038_64bc;
+        if cmd == DRM_IOCTL_MODE_ATOMIC {
+            for (user_ptr, deadline_ns) in ops.drm_take_out_fences() {
+                let Some(reservation) = fd::reserve(task) else {
+                    ctx.set_return(errno_ret(EMFILE));
+                    return;
+                };
+                let fence_fd = reservation
+                    .install(fd::FdEntry {
+                        ops: Arc::new(DrmSyncFile {
+                            deadline_ns,
+                            fence: None,
+                        }),
+                        offset: 0,
+                        flags: fd::FD_CLOEXEC,
+                        status_flags: 0,
+                    })
+                    .expect("reserved atomic out-fence fd disappeared");
+                let fence_bytes = (fence_fd as i32).to_ne_bytes();
+                // SAFETY: `user_ptr` is the OUT_FENCE_PTR property value the
+                // caller provided — an `s32*` in its own address space; the
+                // uaccess helper validates the 4-byte destination range.
+                if unsafe { copy_to_user(user_ptr, &fence_bytes) }.is_err() {
+                    ctx.set_return(errno_ret(EFAULT));
+                    return;
+                }
+            }
+        }
         if let Some(reservation) = out_fence {
+            // Back the sync_file with the EXECBUFFER's device fence when the
+            // driver produced one; a driver without fenced submission keeps
+            // the pre-signalled fallback (deadline 0).
+            let fence = ops.drm_execbuf_fence();
             let fence_fd = reservation
                 .install(fd::FdEntry {
-                    ops: Arc::new(DrmSyncFile),
+                    ops: Arc::new(DrmSyncFile {
+                        deadline_ns: 0,
+                        fence,
+                    }),
                     offset: 0,
                     flags: fd::FD_CLOEXEC,
                     status_flags: 0,
@@ -1126,6 +1303,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // master. Without this arm the direct ioctl path folds Busy into
             // the blanket -EINVAL below, giving the wrong errno.
             ctx.set_return(errno_ret(EBUSY));
+        }
+        Err(narf_filesystem::FsError::WouldBlock)
+            if cmd & 0xff == 0xc3
+                && (ops.as_drm_card_index().is_some() || ops.as_drm_render_index().is_some()) =>
+        {
+            // DRM_SYNCOBJ_WAIT reports an expired absolute timeout as ETIME,
+            // not the EAGAIN used by nonblocking file readiness.
+            ctx.set_return(errno_ret(62)); // ETIME
         }
         Err(_) => {
             ctx.set_return(errno_ret(EINVAL));

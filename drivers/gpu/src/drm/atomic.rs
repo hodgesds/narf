@@ -107,6 +107,11 @@ pub struct CrtcState {
     pub active_changed: bool,
     /// Was the connector binding changed?
     pub connectors_changed: bool,
+    /// `OUT_FENCE_PTR` — a userspace `s32*` the commit writes a sync_file
+    /// fd into; the fence signals at this commit's simulated vblank.
+    /// `None` when the commit did not request an out-fence (a value of 0
+    /// resets/ignores the request, as Linux treats a null pointer).
+    pub out_fence_ptr: Option<u64>,
 }
 
 impl CrtcState {
@@ -148,6 +153,12 @@ pub struct PlaneState {
     pub src_y: u32,
     pub src_w: u32,
     pub src_h: u32,
+    /// `IN_FENCE_FD` — a sync_file fd the commit must not present before,
+    /// or `None` (-1 on the wire) for no fence. GPU fences are signalled
+    /// by construction under NARF's synchronous controlq, so the commit
+    /// records the fd for ABI completeness; the syscall layer owns fd
+    /// validation.
+    pub in_fence_fd: Option<i32>,
 }
 
 // ── AtomicState ────────────────────────────────────────────────────────
