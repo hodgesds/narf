@@ -1,10 +1,9 @@
 //! Per-domain heap for module allocations.
 //!
-//! Module *images* carry their domain's MTE tag (`module_text`), so a pointer
-//! into one derived from another domain faults. Their *allocations* did not:
-//! `narf_kmalloc` returns ordinary kernel heap memory, which is plain Normal
-//! and unchecked, so a module's buffers were reachable from every domain. This
-//! closes that for the one allocation path modules have.
+//! Module images cannot carry an MTE allocation tag: instruction fetch and
+//! PC-relative rodata references do not propagate one. Module *allocations*
+//! can, and `narf_kmalloc` routes active module domains here so their buffers
+//! are not reachable through another domain's pointer.
 //!
 //! # Two mechanisms, one shape
 //!

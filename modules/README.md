@@ -14,7 +14,8 @@ This crate provides:
     every module a load resolves symbols from.
   * `/proc/modules` and `/sys/module/<name>/` adapters.
   * `init_module` / `finit_module` / `delete_module` syscall bodies.
-  * Cap-gated signature-verification hook.
+  * Ed25519-over-BLAKE3 signatures with a build-time trusted-key store.
+  * Bounded LZ4 module envelopes, authenticated before decompression.
 
 Module images are mapped by `narf_memory::module_text` into a dedicated
 kernel VA window with per-region W^X — text RX, rodata RO, data RW — and
@@ -22,10 +23,13 @@ the writable linear-map alias of the text closed. The window sits within
 the arch's call range of kernel text, which is what lets rustc's
 PC-relative call relocations resolve; see that module's docs.
 
-**Domain placement is named but not enforced.** `target_domain=` resolves
-to a `DomainId` that nothing yet reads: images are mapped W^X, but a
-module can still address any kernel memory. DESIGN.md §2 has the two
-steps needed to close that.
+`target_domain=` is enforced at module entry. On x86_64, image pages carry
+the selected protection key and entry dispatches through the active PKS or
+PCID backend. On MTE-capable aarch64, module-owned heap allocations are
+tagged and checked while the scope is active; the executable image itself is
+plain Normal memory because PC-relative code/rodata references cannot carry
+allocation tags. Kernel core remains reachable so exported calls work; see
+DESIGN.md §2 for the exact boundary.
 
 See:
 
@@ -48,7 +52,7 @@ Boot integration: `frame/src/bare_main.rs` calls
   * `modules-abi` at `Stage::Subsys` — registers the driver-domain name
     aliases, registers the kernel ABI surface with KSYMTAB, derives and
     publishes the kernel ABI hash from that surface, and installs the
-    default signature verifier.
+    fail-closed Ed25519 verifier and build-time trust roots.
   * `modules-sysfs` at `Stage::Fs` — installs `/proc/modules` and
     `/sys/kernel/abi_hash`.
 
@@ -91,4 +95,27 @@ cargo xtask build-module --package <crate> \
 This compiles the crate, takes its own object members out of the
 `staticlib` archive, and `ld -r`s them into the single relocatable object
 the loader wants — merging the per-static `.modinfo` sections in the
-process. No test loads one yet; see DESIGN.md's open questions.
+process. `cargo xtask test` stages the reference object in the initramfs and
+loads, executes, and unloads it on both architecture paths when QEMU is
+available.
+
+Add `--compress` to wrap the ABI-stamped ELF in a versioned `.ko.lz4`
+envelope. The loader caps both compressed and decompressed lengths at 32 MiB.
+
+Production kernels read trusted raw Ed25519 public keys from the absolute
+path in `NARF_MODULE_TRUSTED_KEYS` at build time. Build the final raw or
+compressed bytes, sign `BLAKE3(the complete file)`, then attach the detached
+64-byte signature and its 32-byte raw public key:
+
+```sh
+cargo xtask build-module --package <crate> --arch x86_64 \
+  --kernel-abi 0x1f3a90c2 --compress --out module.ko.lz4
+# Produce module.sig over BLAKE3(module.ko.lz4) with the release signer.
+cargo xtask attach-module-signature --module module.ko.lz4 \
+  --signature module.sig --public-key module.pub
+```
+
+Unsigned modules fail closed unless the developer/CI-only
+`module-allow-unsigned` feature is explicit. For compressed modules the fixed
+`NRFM` trailer authenticates the `NRFCMOD` header and compressed bytes before
+the bounded LZ4 decoder runs.

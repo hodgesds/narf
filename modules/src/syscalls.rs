@@ -177,7 +177,6 @@ impl ModuleSyscallError {
                 | ModuleSyscallError::Load(LoadError::NoSymbols)
                 | ModuleSyscallError::Load(LoadError::BadSection(_))
                 | ModuleSyscallError::Load(LoadError::MissingInit)
-                | ModuleSyscallError::Load(LoadError::SignatureRejected(_))
                 // An image built for another architecture is definitively
                 // not a module this kernel could ever load — the same class
                 // as a foreign Linux `.ko`.
@@ -192,9 +191,15 @@ impl ModuleSyscallError {
     ///   * `-EBADF = -9` — invalid image.
     ///   * `-EINVAL = -22` — manifest / arch / sig rejection.
     ///   * `-EKEYREJECTED = -129` — signature rejected.
+    ///   * `-ENOEXEC = -8` — malformed/unsupported compressed envelope.
+    ///   * `-ENOMEM = -12` — compressed output allocation failed.
     pub fn to_errno(&self) -> i32 {
         match self {
             ModuleSyscallError::Load(LoadError::SignatureRejected(_)) => -129,
+            ModuleSyscallError::Load(LoadError::Compression(
+                crate::compression::CompressionError::OutOfMemory,
+            )) => -12,
+            ModuleSyscallError::Load(LoadError::Compression(_)) => -8,
             ModuleSyscallError::Load(LoadError::Header(_)) => -8,
             ModuleSyscallError::Load(LoadError::Manifest(_)) => -22,
             ModuleSyscallError::Load(LoadError::Domain(_)) => -22,

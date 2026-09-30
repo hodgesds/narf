@@ -1117,14 +1117,14 @@ fn smoke_two_modules_dep_refcount() -> TestResult {
 }
 kernel_test_in!("modules/lifecycle", smoke_two_modules_dep_refcount);
 
-fn smoke_signature_default_accepts() -> TestResult {
+fn smoke_signature_accept_all_policy() -> TestResult {
     crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
     match crate::sign::verify(&[0u8; 32]) {
         crate::sign::VerifyDecision::Allow => TestResult::Pass,
         _ => TestResult::Fail("default verifier should allow"),
     }
 }
-kernel_test_in!("modules/sign", smoke_signature_default_accepts);
+kernel_test_in!("modules/sign", smoke_signature_accept_all_policy);
 
 fn smoke_signature_install_rejecter() -> TestResult {
     #[derive(Debug)]
@@ -1144,6 +1144,208 @@ fn smoke_signature_install_rejecter() -> TestResult {
     }
 }
 kernel_test_in!("modules/sign", smoke_signature_install_rejecter);
+
+fn smoke_loader_rejects_recognized_module_signature() -> TestResult {
+    #[derive(Debug)]
+    struct AlwaysReject;
+    impl crate::sign::ModuleVerifier for AlwaysReject {
+        fn verify(&self, _: &[u8]) -> crate::sign::VerifyDecision {
+            crate::sign::VerifyDecision::Reject("test")
+        }
+    }
+
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let modinfo = format!(
+        "name=signed_gate\nversion=0.1\nlicense=GPL-2.0-or-later\nauthor=t\ndescription=d\ntarget_domain=scratch\nkernel_abi=0x{abi:08x}\n"
+    );
+    let image = ElfBuilder::new_native()
+        .modinfo(modinfo.as_bytes())
+        .text(&[0u8; 16])
+        .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
+        .build();
+    crate::sign::install_verifier(alloc::boxed::Box::new(AlwaysReject));
+    let outcome = crate::loader::load_image(&image);
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
+    match outcome {
+        Err(crate::loader::LoadError::SignatureRejected("test")) => TestResult::Pass,
+        _ => TestResult::Fail("recognized NARF module bypassed signature policy"),
+    }
+}
+kernel_test_in!(
+    "modules/sign",
+    smoke_loader_rejects_recognized_module_signature
+);
+
+fn smoke_ed25519_module_signature_and_tamper() -> TestResult {
+    // Public test vector shared with the firmware verifier: Ed25519 over the
+    // BLAKE3 digest of "abc". No production private key is embedded.
+    const PUBLIC: [u8; 32] = [
+        33, 82, 248, 209, 155, 121, 29, 36, 69, 50, 66, 225, 95, 46, 171, 108, 183, 207, 250, 123,
+        106, 94, 211, 0, 151, 150, 14, 6, 152, 129, 219, 18,
+    ];
+    const FINGERPRINT: [u8; 32] = [
+        48, 151, 226, 222, 226, 203, 74, 52, 181, 56, 64, 205, 183, 5, 174, 215, 16, 103, 195, 111,
+        104, 219, 14, 15, 85, 156, 63, 63, 160, 67, 49, 95,
+    ];
+    const SIGNATURE: [u8; 64] = [
+        218, 183, 132, 15, 164, 211, 68, 93, 89, 43, 166, 255, 251, 82, 232, 95, 148, 136, 165,
+        219, 224, 227, 24, 245, 89, 32, 211, 5, 171, 3, 54, 144, 22, 197, 138, 230, 208, 224, 203,
+        63, 194, 149, 40, 212, 190, 124, 167, 128, 84, 171, 136, 65, 229, 190, 29, 78, 226, 91,
+        129, 50, 133, 165, 24, 15,
+    ];
+
+    crate::sign::__reset_for_test();
+    crate::sign::install_build_trusted_signers();
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::Ed25519Verifier));
+    let mut image = b"abc".to_vec();
+    image.extend_from_slice(&SIGNATURE);
+    image.extend_from_slice(&FINGERPRINT);
+    image.extend_from_slice(&crate::sign::MODULE_TRAILER_VERSION.to_le_bytes());
+    image.extend_from_slice(&crate::sign::MODULE_TRAILER_ALG_ED25519_BLAKE3.to_le_bytes());
+    image.extend_from_slice(&crate::sign::MODULE_TRAILER_MAGIC);
+
+    if !matches!(
+        crate::sign::verify(&image),
+        crate::sign::VerifyDecision::Reject(_)
+    ) {
+        return TestResult::Fail("untrusted module signer was accepted");
+    }
+    crate::sign::register_trusted_signer(FINGERPRINT, PUBLIC);
+    if crate::sign::verify(&image) != crate::sign::VerifyDecision::Allow {
+        return TestResult::Fail("trusted independent module signature was rejected");
+    }
+    image[0] ^= 1;
+    let tamper = crate::sign::verify(&image);
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
+    match tamper {
+        crate::sign::VerifyDecision::Reject(_) => TestResult::Pass,
+        crate::sign::VerifyDecision::Allow => {
+            TestResult::Fail("tampered signed module was accepted")
+        }
+    }
+}
+kernel_test_in!("modules/sign", smoke_ed25519_module_signature_and_tamper);
+
+fn smoke_signed_compressed_envelope_authenticates_exact_bytes() -> TestResult {
+    // Public vector generated from a deterministic test-only signer over the
+    // exact NRFCMOD v1 envelope for the literal-only LZ4 block "abc".
+    const PUBLIC: [u8; 32] = [
+        248, 12, 204, 220, 228, 174, 28, 7, 174, 32, 138, 42, 223, 153, 163, 16, 174, 66, 7, 224,
+        48, 111, 160, 35, 97, 16, 176, 104, 39, 187, 184, 208,
+    ];
+    const FINGERPRINT: [u8; 32] = [
+        249, 147, 191, 38, 97, 200, 168, 13, 30, 192, 152, 164, 159, 111, 176, 29, 57, 67, 154, 29,
+        93, 98, 149, 169, 174, 67, 89, 80, 2, 101, 54, 218,
+    ];
+    const SIGNATURE: [u8; 64] = [
+        50, 136, 107, 90, 101, 16, 50, 109, 187, 193, 82, 89, 70, 72, 40, 174, 208, 159, 133, 58,
+        217, 126, 241, 252, 135, 226, 160, 141, 104, 5, 229, 116, 89, 255, 53, 31, 190, 40, 124,
+        251, 65, 52, 96, 168, 148, 174, 69, 14, 167, 206, 0, 198, 182, 220, 99, 158, 4, 191, 226,
+        171, 14, 135, 21, 15,
+    ];
+
+    let mut image = match crate::compression::envelope_lz4(3, &[0x30, b'a', b'b', b'c']) {
+        Ok(image) => image,
+        Err(_) => return TestResult::Fail("could not construct signed compression vector"),
+    };
+    image.extend_from_slice(&SIGNATURE);
+    image.extend_from_slice(&FINGERPRINT);
+    image.extend_from_slice(&crate::sign::MODULE_TRAILER_VERSION.to_le_bytes());
+    image.extend_from_slice(&crate::sign::MODULE_TRAILER_ALG_ED25519_BLAKE3.to_le_bytes());
+    image.extend_from_slice(&crate::sign::MODULE_TRAILER_MAGIC);
+
+    crate::sign::__reset_for_test();
+    crate::sign::install_build_trusted_signers();
+    crate::sign::register_trusted_signer(FINGERPRINT, PUBLIC);
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::Ed25519Verifier));
+    if crate::sign::verify(&image) != crate::sign::VerifyDecision::Allow {
+        return TestResult::Fail("signed compressed envelope was rejected");
+    }
+
+    // The declared decompressed length is inside the signature. Altering it
+    // must fail authentication before the loader could allocate that length.
+    image[16] ^= 1;
+    let tamper = crate::sign::verify(&image);
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
+    match tamper {
+        crate::sign::VerifyDecision::Reject(_) => TestResult::Pass,
+        crate::sign::VerifyDecision::Allow => {
+            TestResult::Fail("tampered compressed-module header was accepted")
+        }
+    }
+}
+kernel_test_in!(
+    "modules/sign",
+    smoke_signed_compressed_envelope_authenticates_exact_bytes
+);
+
+fn smoke_compressed_module_round_trip_is_bounded() -> TestResult {
+    let plain = vec![0x5au8; 96 * 1024];
+    let mut compressed = vec![0u8; narf_memory::compress::lz4_max_compressed_len(plain.len())];
+    let written = match narf_memory::compress::lz4_encode(&plain, &mut compressed) {
+        Ok(written) => written,
+        Err(_) => return TestResult::Fail("LZ4 encode failed"),
+    };
+    compressed.truncate(written);
+    let envelope = match crate::compression::envelope_lz4(plain.len(), &compressed) {
+        Ok(envelope) => envelope,
+        Err(_) => return TestResult::Fail("module compression envelope rejected valid lengths"),
+    };
+    let decoded = match crate::compression::decompress(&envelope) {
+        Ok(decoded) => decoded,
+        Err(_) => return TestResult::Fail("module compression envelope failed to decode"),
+    };
+    if decoded != plain {
+        return TestResult::Fail("compressed module payload did not round-trip");
+    }
+
+    let mut oversized = envelope;
+    oversized[16..20]
+        .copy_from_slice(&((crate::compression::MAX_MODULE_FILE_BYTES as u32) + 1).to_le_bytes());
+    match crate::compression::decompress(&oversized) {
+        Err(crate::compression::CompressionError::TooLarge) => TestResult::Pass,
+        _ => TestResult::Fail("oversized decompressed length was not rejected before allocation"),
+    }
+}
+kernel_test_in!(
+    "modules/compression",
+    smoke_compressed_module_round_trip_is_bounded
+);
+
+fn smoke_compressed_module_authenticates_before_decompression() -> TestResult {
+    #[derive(Debug)]
+    struct AlwaysReject;
+    impl crate::sign::ModuleVerifier for AlwaysReject {
+        fn verify(&self, _: &[u8]) -> crate::sign::VerifyDecision {
+            crate::sign::VerifyDecision::Reject("compression ordering")
+        }
+    }
+
+    // This is a correctly-framed envelope containing a deliberately invalid
+    // LZ4 stream. Signature rejection must win; observing Compression here
+    // would mean untrusted bytes reached the decoder first.
+    let envelope = match crate::compression::envelope_lz4(64, &[0xff]) {
+        Ok(envelope) => envelope,
+        Err(_) => return TestResult::Fail("could not construct compression ordering fixture"),
+    };
+    crate::sign::install_verifier(alloc::boxed::Box::new(AlwaysReject));
+    let outcome = crate::loader::load_image(&envelope);
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
+    match outcome {
+        Err(crate::loader::LoadError::SignatureRejected("compression ordering")) => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("compressed module reached decoder before authentication"),
+    }
+}
+kernel_test_in!(
+    "modules/compression",
+    smoke_compressed_module_authenticates_before_decompression
+);
 
 // ───────────────────────────────────────────────────────────────────
 // Helpers
@@ -1274,9 +1476,19 @@ fn smoke_real_module_failures_are_not_foreign() -> TestResult {
     // Failures that happen only *after* an image is recognised as a
     // NARF module must NOT be swallowed as success.
     let already = ModuleSyscallError::Load(LoadError::AlreadyLoaded(String::from("dup")));
+    let signature = ModuleSyscallError::Load(LoadError::SignatureRejected("test"));
+    let compression = ModuleSyscallError::Load(LoadError::Compression(
+        crate::compression::CompressionError::Truncated,
+    ));
     let not_found = ModuleSyscallError::NotFound;
     if already.is_foreign_image() {
         return TestResult::Fail("AlreadyLoaded must not classify as foreign");
+    }
+    if signature.is_foreign_image() || signature.to_errno() != -129 {
+        return TestResult::Fail("signature rejection must surface as EKEYREJECTED");
+    }
+    if compression.is_foreign_image() || compression.to_errno() != -8 {
+        return TestResult::Fail("claimed compressed module failure must surface as ENOEXEC");
     }
     if not_found.is_foreign_image() {
         return TestResult::Fail("NotFound must not classify as foreign");

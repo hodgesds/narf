@@ -119,6 +119,9 @@ fn smoke_module_load_real_ko_round_trip() -> TestResult {
                 E::Load(LoadError::Manifest(_)) => "sys_init_module: .modinfo rejected",
                 E::Load(LoadError::Domain(_)) => "sys_init_module: unknown target_domain",
                 E::Load(LoadError::SignatureRejected(_)) => "sys_init_module: signature rejected",
+                E::Load(LoadError::Compression(_)) => {
+                    "sys_init_module: compressed envelope rejected"
+                }
                 E::Load(LoadError::NoSymbols) => "sys_init_module: no symbols",
                 E::Load(LoadError::MissingInit) => "sys_init_module: no narf_module_init",
                 E::Load(LoadError::AlreadyLoaded(_)) => "sys_init_module: already loaded",

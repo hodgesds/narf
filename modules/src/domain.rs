@@ -1,10 +1,10 @@
 //! Domain placement for loaded modules.
 //!
 //! Every NARF module declares a `target_domain=<name>` in its
-//! manifest. The loader maps the module's text + rodata into that
-//! domain's PKS-protected region (read-execute from in-domain,
-//! no-access from out-of-domain) and the data + bss into the same
-//! domain's RW region.
+//! manifest. x86_64 image pages carry that domain's protection key and entry
+//! activates PKS or PCID isolation. On MTE-capable aarch64, executable image
+//! pages remain plain Normal memory while module-owned heap allocations carry
+//! the resolved domain tag.
 //!
 //! Concretely, the kernel maintains a `name -> DomainId` table that
 //! drivers populate at boot. The loader consults the table to pick

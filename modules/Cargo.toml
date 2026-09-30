@@ -22,8 +22,15 @@ narf-time         = { path = "../time" }
 narf-capabilities = { path = "../capabilities" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-filesystem   = { path = "../filesystem" }
+narf-initramfs    = { path = "../initramfs" }
+narf-crypto       = { path = "../crypto" }
 
 [lints]
 workspace = true
 
 [features]
+default = []
+# Developer / CI escape hatch for raw, unsigned `.ko` images. Production
+# builds leave this disabled and require a valid trailer from a configured
+# trusted signer.
+module-allow-unsigned = []

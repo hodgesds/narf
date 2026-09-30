@@ -1,4 +1,4 @@
-//! Top-level module loader: parse → verify → allocate → relocate →
+//! Top-level module loader: identify → verify → allocate → relocate →
 //! resolve init/exit → register in registry.
 //!
 //! Linux ref: `linux/kernel/module/main.c::load_module` (`main.c:3358`)
@@ -34,6 +34,9 @@ use crate::symbols::{kernel_abi, ModuleId};
 pub enum LoadError {
     /// Signature verification rejected the image.
     SignatureRejected(&'static str),
+    /// A claimed compressed-module envelope was malformed, unsupported, or
+    /// exceeded the fixed decompression bound.
+    Compression(crate::compression::CompressionError),
     /// ELF header decode failed.
     Header(HeaderError),
     /// `.modinfo` parse failed.
@@ -62,6 +65,12 @@ pub enum LoadError {
 impl From<HeaderError> for LoadError {
     fn from(e: HeaderError) -> Self {
         LoadError::Header(e)
+    }
+}
+
+impl From<crate::compression::CompressionError> for LoadError {
+    fn from(e: crate::compression::CompressionError) -> Self {
+        LoadError::Compression(e)
     }
 }
 
@@ -155,12 +164,38 @@ impl Module {
 /// Top-level load entry point. Walks the image through every stage
 /// and returns the populated Module on success.
 pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
-    // 1. Signature verification first — Linux model.
+    let stored_size = image.len();
+
+    if crate::compression::is_compressed(image) {
+        // The envelope magic is itself an explicit NARF-format claim. Verify
+        // the exact on-disk header + compressed bytes before trusting either
+        // declared length or invoking the decoder. The NRFM trailer, when
+        // present, sits outside the authenticated payload it describes.
+        verify_recognized_image(image)?;
+        let compressed = sign::payload_after_verify(image).map_err(LoadError::SignatureRejected)?;
+        let elf = crate::compression::decompress(compressed)?;
+        let (hdr, manifest) = identify_elf(&elf)?;
+        return load_identified_elf(&elf, stored_size, hdr, manifest);
+    }
+
+    // Raw ELF retains the Linux-compatibility distinction: minimally identify
+    // it first, so a foreign Linux `.ko` can remain a no-op while a recognised
+    // NARF module with a bad signature surfaces EKEYREJECTED.
+    let (hdr, manifest) = identify_elf(image)?;
+    verify_recognized_image(image)?;
+    let elf = sign::payload_after_verify(image).map_err(LoadError::SignatureRejected)?;
+    load_identified_elf(elf, stored_size, hdr, manifest)
+}
+
+fn verify_recognized_image(image: &[u8]) -> Result<(), LoadError> {
     if let crate::sign::VerifyDecision::Reject(reason) = sign::verify(image) {
         return Err(LoadError::SignatureRejected(reason));
     }
+    Ok(())
+}
 
-    // 2. ELF header validation, then architecture. The relocator applies
+fn identify_elf(image: &[u8]) -> Result<(Elf64Header, Manifest), LoadError> {
+    // ELF header validation, then architecture. The relocator applies
     //    x86_64 or aarch64 relocations purely on `e_machine`, so without this
     //    check a foreign-arch `.ko` relocates "successfully" and faults on its
     //    first instruction instead of being rejected at load.
@@ -172,18 +207,26 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         });
     }
 
-    // 3. Collect `.modinfo` and parse the manifest.
     let modinfo_bytes = collect_modinfo(image, &hdr);
     if modinfo_bytes.is_empty() {
         return Err(LoadError::Manifest(ManifestError::Missing));
     }
     let abi = kernel_abi();
     let manifest = Manifest::parse(&modinfo_bytes, abi)?;
+    Ok((hdr, manifest))
+}
 
-    // 4. Resolve target domain.
+fn load_identified_elf(
+    image: &[u8],
+    stored_size: usize,
+    hdr: Elf64Header,
+    manifest: Manifest,
+) -> Result<Arc<Module>, LoadError> {
+    // Authentication has completed before this point. Only now may
+    // authority-bearing manifest fields affect allocation or execution.
     let domain_id = domain::resolve(&manifest.target_domain)?;
 
-    // 5. W^X invariant check on every loadable section.
+    // W^X invariant check on every loadable section.
     for (i, shdr, name) in enumerate_sections(image, &hdr) {
         let _ = i;
         if (shdr.sh_flags & SHF_ALLOC) == 0 {
@@ -195,10 +238,10 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         }
     }
 
-    // 6. Symbol table.
+    // Symbol table.
     let symtab_pair = find_symtab(image, &hdr).ok_or(LoadError::NoSymbols)?;
 
-    // 7. Plan the image layout, then map it. Sections are grouped by the
+    // Plan the image layout, then map it. Sections are grouped by the
     //    permission they will end up with so each region is page-aligned and
     //    can be sealed with a single `protect` call.
     let layout = plan_layout(image, &hdr)?;
@@ -207,7 +250,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
     // has always produced this id; nothing consumed it until now.
     let mut mem = module_text::alloc(layout.total_pages, domain_id).map_err(LoadError::Image)?;
 
-    // 8. Everything past this point can fail with the image already mapped,
+    // Everything past this point can fail with the image already mapped,
     //    so it runs in a helper whose `Err` unmaps before propagating —
     //    otherwise a failed load leaks both frames and module VA.
     let built = build_image(image, &hdr, &manifest, &layout, &mut mem, symtab_pair);
@@ -232,7 +275,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         id: crate::symbols::alloc_module_id(),
         manifest,
         domain: domain_id,
-        image_size: image.len(),
+        image_size: stored_size,
         image: IrqSafeSpinLock::new(Some(mem)),
         placements,
         init_addr,
@@ -477,11 +520,10 @@ fn build_image(
     for &(idx, off, size) in &layout.sections {
         let shdr = parse_section(bytes, hdr, idx)
             .map_err(|_| LoadError::BadSection("unreadable section"))?;
-        // Tagged base: module code must derive every pointer into its own
-        // image from an address carrying the domain's MTE tag, or its accesses
-        // fault once TCF is Sync. Safe for relocation arithmetic because
-        // `apply_aarch64` untags both operands of every displacement form.
-        // No-op off aarch64 / without MTE.
+        // `entry_base` is intentionally untagged on aarch64. A branch or
+        // PC-relative ADRP does not carry an MTE allocation tag, so tagging
+        // executable image pages would make ordinary module rodata accesses
+        // fault. Domain-owned heap allocations are tagged separately.
         let va = mem.entry_base() + off;
         // SAFETY: `plan_layout` sized the image to cover `[off, off + size)`,
         // and every page is still `Rw` — nothing has been sealed yet.

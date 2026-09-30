@@ -255,6 +255,12 @@ firmware-allow-unsigned = [
     "narf-firmware/firmware-allow-unsigned",
     "narf-verification?/firmware-allow-unsigned",
 ]
+# Developer / CI-only equivalent for raw `.ko` fixtures. Production builds
+# omit this feature and the module loader requires a trusted Ed25519 trailer.
+module-allow-unsigned = [
+    "narf-modules/module-allow-unsigned",
+    "narf-verification?/module-allow-unsigned",
+]
 # Run the narf-verification kernel-test harness instead of the async demo.
 # Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
 kernel-test  = [

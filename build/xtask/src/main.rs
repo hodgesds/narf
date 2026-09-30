@@ -78,6 +78,9 @@ enum Cmd {
     /// Cross-compile a kernel-module crate into a single relocatable
     /// object — the NARF equivalent of a `.ko`.
     BuildModule(BuildModuleArgs),
+    /// Verify and append an Ed25519 trailer to an already-built raw or
+    /// compressed module image.
+    AttachModuleSignature(AttachModuleSignatureArgs),
     /// Cross-compile and boot under QEMU as a real init pass (no
     /// kernel-test feature), parsing serial output for panic markers
     /// and known success markers. Catches regressions that smoke
@@ -2264,6 +2267,35 @@ struct BuildModuleArgs {
     /// a running kernel with `cat /sys/kernel/abi_hash` and pass it here.
     #[arg(long)]
     kernel_abi: Option<String>,
+
+    /// Wrap the final ABI-stamped ELF in NARF's bounded LZ4 module envelope.
+    /// The default output suffix becomes `.ko.lz4` unless `--out` is given.
+    #[arg(long)]
+    compress: bool,
+
+    /// Detached Ed25519 signature (64 raw bytes) over
+    /// BLAKE3(the exact raw ELF or compressed envelope written before the
+    /// signature trailer).
+    #[arg(long, requires = "public_key")]
+    signature: Option<PathBuf>,
+
+    /// Ed25519 public key (32 raw bytes). Its SHA-256 fingerprint is stored
+    /// in the fixed NARF module trailer.
+    #[arg(long, requires = "signature")]
+    public_key: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct AttachModuleSignatureArgs {
+    /// Raw `.ko` or compressed `.ko.lz4` to update in place.
+    #[arg(long)]
+    module: PathBuf,
+    /// Detached Ed25519 signature (64 raw bytes) over BLAKE3(module bytes).
+    #[arg(long)]
+    signature: PathBuf,
+    /// Ed25519 public key (32 raw bytes).
+    #[arg(long)]
+    public_key: PathBuf,
 }
 
 /// Overwrite the `kernel_abi=0x........` value inside a `.ko`'s `.modinfo`.
@@ -2339,6 +2371,268 @@ fn stamp_kernel_abi(ko: &Path, value: u32) -> Result<()> {
     bytes[at..at + 8].copy_from_slice(replacement.as_bytes());
     std::fs::write(ko, &bytes).with_context(|| format!("write {}", ko.display()))?;
     Ok(())
+}
+
+const MODULE_TRAILER_MAGIC: &[u8; 4] = b"NRFM";
+const MODULE_TRAILER_VERSION: u16 = 1;
+const MODULE_TRAILER_ALG_ED25519_BLAKE3: u16 = 1;
+const MODULE_COMPRESSION_MAGIC: &[u8; 8] = b"NRFCMOD\0";
+const MODULE_COMPRESSION_VERSION: u16 = 1;
+const MODULE_COMPRESSION_LZ4: u16 = 1;
+const MODULE_COMPRESSION_HEADER_LEN: usize = 24;
+const MAX_MODULE_FILE_BYTES: usize = 32 * 1024 * 1024;
+const LZ4_MIN_MATCH: usize = 4;
+
+fn push_lz4_len(out: &mut Vec<u8>, mut len: usize) {
+    while len >= 255 {
+        out.push(255);
+        len -= 255;
+    }
+    out.push(len as u8);
+}
+
+/// Small host-side LZ4 block encoder for module artifacts.
+///
+/// It deliberately recognises only byte runs (offset 1). ELF padding and BSS
+/// metadata contain enough long zero runs to make that useful, while keeping
+/// the build tool independent of kernel crates and external `lz4` binaries.
+/// The output is standard LZ4 block format and the kernel uses its existing,
+/// fully general bounded decoder.
+fn lz4_encode_module(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len() / 255 + 16);
+    let mut anchor = 0usize;
+    let mut cursor = 1usize;
+    // LZ4 requires a final literal run of at least five bytes and the last
+    // match to begin at least twelve bytes before the end.
+    let match_limit = input.len().saturating_sub(5);
+    let match_start_limit = input.len().saturating_sub(12);
+
+    while cursor < match_start_limit {
+        if input[cursor] != input[cursor - 1] {
+            cursor += 1;
+            continue;
+        }
+        let mut match_len = 1usize;
+        while cursor + match_len < match_limit && input[cursor + match_len] == input[cursor - 1] {
+            match_len += 1;
+        }
+        if match_len < LZ4_MIN_MATCH {
+            cursor += match_len;
+            continue;
+        }
+
+        let literal_len = cursor - anchor;
+        let token_at = out.len();
+        out.push(0);
+        if literal_len >= 15 {
+            out[token_at] = 0xf0;
+            push_lz4_len(&mut out, literal_len - 15);
+        } else {
+            out[token_at] = (literal_len as u8) << 4;
+        }
+        out.extend_from_slice(&input[anchor..cursor]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+
+        let match_code = match_len - LZ4_MIN_MATCH;
+        if match_code >= 15 {
+            out[token_at] |= 0x0f;
+            push_lz4_len(&mut out, match_code - 15);
+        } else {
+            out[token_at] |= match_code as u8;
+        }
+        anchor = cursor + match_len;
+        cursor = anchor.saturating_add(1);
+    }
+
+    let literal_len = input.len() - anchor;
+    if literal_len >= 15 {
+        out.push(0xf0);
+        push_lz4_len(&mut out, literal_len - 15);
+    } else {
+        out.push((literal_len as u8) << 4);
+    }
+    out.extend_from_slice(&input[anchor..]);
+    out
+}
+
+fn compress_module(ko: &Path) -> Result<()> {
+    let plain = std::fs::read(ko).with_context(|| format!("read {}", ko.display()))?;
+    if plain.is_empty() || plain.len() > MAX_MODULE_FILE_BYTES {
+        bail!(
+            "module ELF must be 1..={MAX_MODULE_FILE_BYTES} bytes before compression, got {}",
+            plain.len()
+        );
+    }
+    let compressed = lz4_encode_module(&plain);
+    if compressed.len() > MAX_MODULE_FILE_BYTES {
+        bail!(
+            "compressed module exceeds {MAX_MODULE_FILE_BYTES}-byte input bound: {}",
+            compressed.len()
+        );
+    }
+
+    let plain_len = u32::try_from(plain.len()).context("module ELF length does not fit u32")?;
+    let compressed_len =
+        u32::try_from(compressed.len()).context("compressed module length does not fit u32")?;
+    let mut envelope = Vec::with_capacity(MODULE_COMPRESSION_HEADER_LEN + compressed.len());
+    envelope.extend_from_slice(MODULE_COMPRESSION_MAGIC);
+    envelope.extend_from_slice(&MODULE_COMPRESSION_VERSION.to_le_bytes());
+    envelope.extend_from_slice(&MODULE_COMPRESSION_LZ4.to_le_bytes());
+    envelope.extend_from_slice(&(MODULE_COMPRESSION_HEADER_LEN as u32).to_le_bytes());
+    envelope.extend_from_slice(&plain_len.to_le_bytes());
+    envelope.extend_from_slice(&compressed_len.to_le_bytes());
+    envelope.extend_from_slice(&compressed);
+    std::fs::write(ko, envelope).with_context(|| format!("write compressed {}", ko.display()))?;
+    Ok(())
+}
+
+fn attach_module_signature(
+    payload: &mut Vec<u8>,
+    signature: &[u8; 64],
+    public_key: &[u8; 32],
+) -> Result<()> {
+    use sha2::Digest;
+    let digest = blake3::hash(payload);
+    let key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+        .map_err(|_| anyhow!("invalid Ed25519 public key"))?;
+    key.verify_strict(
+        digest.as_bytes(),
+        &ed25519_dalek::Signature::from_bytes(signature),
+    )
+    .map_err(|_| anyhow!("detached module signature does not match payload and public key"))?;
+    payload.extend_from_slice(signature);
+    payload.extend_from_slice(&sha2::Sha256::digest(public_key));
+    payload.extend_from_slice(&MODULE_TRAILER_VERSION.to_le_bytes());
+    payload.extend_from_slice(&MODULE_TRAILER_ALG_ED25519_BLAKE3.to_le_bytes());
+    payload.extend_from_slice(MODULE_TRAILER_MAGIC);
+    Ok(())
+}
+
+fn sign_module(ko: &Path, signature: &Path, public_key: &Path) -> Result<()> {
+    let signature_bytes = std::fs::read(signature)
+        .with_context(|| format!("read module signature {}", signature.display()))?;
+    let public_key_bytes = std::fs::read(public_key)
+        .with_context(|| format!("read module public key {}", public_key.display()))?;
+    let signature: [u8; 64] = signature_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow!("module signature must be 64 raw bytes, got {}", bytes.len())
+    })?;
+    let public_key: [u8; 32] = public_key_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow!(
+            "module public key must be 32 raw bytes, got {}",
+            bytes.len()
+        )
+    })?;
+    let mut image = std::fs::read(ko).with_context(|| format!("read {}", ko.display()))?;
+    if image.ends_with(MODULE_TRAILER_MAGIC) {
+        bail!(
+            "{} already has a NARF module signature trailer",
+            ko.display()
+        );
+    }
+    attach_module_signature(&mut image, &signature, &public_key)?;
+    std::fs::write(ko, image).with_context(|| format!("write signed {}", ko.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod module_signature_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn decode_lz4(input: &[u8], expected: usize) -> Option<Vec<u8>> {
+        let mut output = Vec::with_capacity(expected);
+        let mut cursor = 0usize;
+        while cursor < input.len() {
+            let token = *input.get(cursor)?;
+            cursor += 1;
+            let mut literal_len = (token >> 4) as usize;
+            if literal_len == 15 {
+                loop {
+                    let extra = *input.get(cursor)? as usize;
+                    cursor += 1;
+                    literal_len = literal_len.checked_add(extra)?;
+                    if extra != 255 {
+                        break;
+                    }
+                }
+            }
+            let literal_end = cursor.checked_add(literal_len)?;
+            output.extend_from_slice(input.get(cursor..literal_end)?);
+            cursor = literal_end;
+            if cursor == input.len() {
+                break;
+            }
+            let offset =
+                u16::from_le_bytes([*input.get(cursor)?, *input.get(cursor + 1)?]) as usize;
+            cursor += 2;
+            if offset == 0 || offset > output.len() {
+                return None;
+            }
+            let mut match_len = (token & 0x0f) as usize;
+            if match_len == 15 {
+                loop {
+                    let extra = *input.get(cursor)? as usize;
+                    cursor += 1;
+                    match_len = match_len.checked_add(extra)?;
+                    if extra != 255 {
+                        break;
+                    }
+                }
+            }
+            match_len += LZ4_MIN_MATCH;
+            for _ in 0..match_len {
+                let byte = output[output.len() - offset];
+                output.push(byte);
+            }
+        }
+        (output.len() == expected).then_some(output)
+    }
+
+    #[test]
+    fn signature_trailer_authenticates_exact_module_payload() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+        let public = key.verifying_key().to_bytes();
+        let mut image = b"module payload".to_vec();
+        let signature = key.sign(blake3::hash(&image).as_bytes()).to_bytes();
+        attach_module_signature(&mut image, &signature, &public).unwrap();
+
+        let trailer = &image[b"module payload".len()..];
+        assert_eq!(trailer.len(), 104);
+        assert_eq!(&trailer[..64], &signature);
+        assert_eq!(&trailer[100..], MODULE_TRAILER_MAGIC);
+
+        let mut changed = b"changed payload".to_vec();
+        assert!(attach_module_signature(&mut changed, &signature, &public).is_err());
+    }
+
+    #[test]
+    fn compressed_envelope_is_bounded_lz4_and_round_trips() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "narf-module-compress-{}-{}.ko",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let plain = vec![0x5a; 128 * 1024];
+        std::fs::write(&path, &plain).unwrap();
+        compress_module(&path).unwrap();
+        let envelope = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(&envelope[..8], MODULE_COMPRESSION_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(envelope[16..20].try_into().unwrap()) as usize,
+            plain.len()
+        );
+        let compressed_len = u32::from_le_bytes(envelope[20..24].try_into().unwrap()) as usize;
+        assert_eq!(
+            envelope.len(),
+            MODULE_COMPRESSION_HEADER_LEN + compressed_len
+        );
+        assert!(compressed_len < plain.len());
+        let decoded = decode_lz4(&envelope[MODULE_COMPRESSION_HEADER_LEN..], plain.len()).unwrap();
+        assert_eq!(decoded, plain);
+    }
 }
 
 /// Build a module crate into the single relocatable object the loader wants.
@@ -2481,10 +2775,10 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         bail!("`ar x` failed to extract members of {}", archive.display());
     }
 
-    let out = args
-        .out
-        .clone()
-        .unwrap_or_else(|| out_dir.join(format!("{stem}.ko")));
+    let out = args.out.clone().unwrap_or_else(|| {
+        let suffix = if args.compress { ".ko.lz4" } else { ".ko" };
+        out_dir.join(format!("{stem}{suffix}"))
+    });
     let (linker, linker_args) = module_linker(root)?;
     let mut link = Command::new(&linker);
     link.args(&linker_args).arg("-r").arg("-o").arg(&out);
@@ -2509,6 +2803,16 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
             .with_context(|| format!("--kernel-abi {raw} is not a 32-bit hex value"))?;
         stamp_kernel_abi(&out, value)?;
         println!("xtask build-module: stamped kernel_abi=0x{value:08x}");
+    }
+
+    if args.compress {
+        compress_module(&out)?;
+        println!("xtask build-module: wrapped module in bounded LZ4 envelope");
+    }
+
+    if let (Some(signature), Some(public_key)) = (&args.signature, &args.public_key) {
+        sign_module(&out, signature, public_key)?;
+        println!("xtask build-module: attached verified Ed25519 signature");
     }
 
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
@@ -2698,30 +3002,50 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
     // Best-effort throughout. A failure here leaves the guest without the file
     // and its smokes skip, exactly as on an image built without it.
     if args.features.contains("kernel-test") {
-        let ko_args = BuildModuleArgs {
-            arch: args.arch,
-            package: "narf-test-module".into(),
-            out: None,
-            kernel_abi: None,
+        let build_fixture = |compress| {
+            let ko_args = BuildModuleArgs {
+                arch: args.arch,
+                package: "narf-test-module".into(),
+                out: None,
+                kernel_abi: None,
+                compress,
+                signature: None,
+                public_key: None,
+            };
+            build_module(&ko_args, &root).and_then(|ko| Ok(std::fs::read(&ko)?))
         };
-        match build_module(&ko_args, &root).and_then(|ko| Ok(std::fs::read(&ko)?)) {
-            Ok(bytes) => {
-                let cpio = encode_cpio_newc(&[("lib/modules/narf_test_module.ko", &bytes)]);
-                let p = out_dir.join("initramfs-kernel-test.cpio");
-                match std::fs::write(&p, &cpio) {
-                    Ok(()) => {
+        let mut fixtures: Vec<(&str, Vec<u8>)> = Vec::new();
+        match build_fixture(false) {
+            Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko", bytes)),
+            Err(e) => println!("xtask: raw test module unavailable ({e})"),
+        }
+        match build_fixture(true) {
+            Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4", bytes)),
+            Err(e) => println!("xtask: compressed test module unavailable ({e})"),
+        }
+
+        if !fixtures.is_empty() {
+            let entries: Vec<(&str, &[u8])> = fixtures
+                .iter()
+                .map(|(name, bytes)| (*name, bytes.as_slice()))
+                .collect();
+            let cpio = encode_cpio_newc(&entries);
+            let p = out_dir.join("initramfs-kernel-test.cpio");
+            match std::fs::write(&p, &cpio) {
+                Ok(()) => {
+                    for (name, bytes) in &fixtures {
                         println!(
-                            "xtask: staged test module ({} bytes) -> guest /lib/modules/narf_test_module.ko",
-                            bytes.len()
+                            "xtask: staged test module ({} bytes) -> guest /{}",
+                            bytes.len(),
+                            name
                         );
-                        if let Ok(mut g) = TEST_INITRD.lock() {
-                            *g = Some(p);
-                        }
                     }
-                    Err(e) => println!("xtask: could not write test-module initramfs ({e})"),
+                    if let Ok(mut g) = TEST_INITRD.lock() {
+                        *g = Some(p);
+                    }
                 }
+                Err(e) => println!("xtask: could not write test-module initramfs ({e})"),
             }
-            Err(e) => println!("xtask: test module unavailable ({e}); its smokes will skip"),
         }
     }
 
@@ -8245,6 +8569,9 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
             package: "narf-test-module".into(),
             out: None,
             kernel_abi: None,
+            compress: false,
+            signature: None,
+            public_key: None,
         };
         match build_module(&ko_args, &root) {
             Ok(path) => match std::fs::read(&path) {
@@ -9692,6 +10019,14 @@ fn main() -> Result<()> {
             build_module(&args, &workspace_root()?)?;
             Ok(())
         }
+        Cmd::AttachModuleSignature(args) => {
+            sign_module(&args.module, &args.signature, &args.public_key)?;
+            println!(
+                "xtask attach-module-signature: attached verified Ed25519 trailer to {}",
+                args.module.display()
+            );
+            Ok(())
+        }
         Cmd::Run(args) => run_cmd(&args),
         Cmd::Test(test) => {
             let TestArgs {
@@ -9724,6 +10059,7 @@ fn main() -> Result<()> {
                 } else if !smoke_args.features.contains("kernel-test") {
                     smoke_args.features.push_str(",kernel-test");
                 }
+                ensure_feature(&mut smoke_args.features, "module-allow-unsigned");
                 // Gate on the kernel-test runner's exit status: a failing
                 // smoke makes the runner exit_kernel(1), which this fails on.
                 run_cmd_inner(&smoke_args, true)?;
