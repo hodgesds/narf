@@ -283,7 +283,10 @@ impl FingerprintDevice {
     pub async fn read_response(&self, xhci: &Xhci, buf: &mut [u8]) -> Result<usize, FpError> {
         match self.vendor {
             FpVendor::Elan => {
-                // Arm interrupt-IN once, then busy-poll.
+                // Arm interrupt-IN once, then poll. `poll_interrupt_in`
+                // stages the next TRB after every completed transfer, so
+                // keep exactly one TRB outstanding for this endpoint's
+                // persistent DMA buffer.
                 if !self.armed.swap(true, Ordering::AcqRel) {
                     xhci.arm_interrupt_in(
                         self.slot_id,
@@ -295,15 +298,7 @@ impl FingerprintDevice {
                 let deadline = narf_time::Deadline::after_ms(500);
                 loop {
                     match xhci.poll_interrupt_in(self.slot_id, self.bulk_in_ep, buf) {
-                        Ok(Some(n)) => {
-                            // Re-arm for next call.
-                            let _ = xhci.arm_interrupt_in(
-                                self.slot_id,
-                                self.bulk_in_ep,
-                                self.in_max_packet.min(64) as u32,
-                            );
-                            return Ok(n);
-                        }
+                        Ok(Some(n)) => return Ok(n),
                         Ok(None) => {
                             if deadline.expired() {
                                 return Ok(0);
@@ -329,10 +324,19 @@ impl FingerprintDevice {
         if self.bulk_out_ep == 0 {
             return Err(FpError::EndpointsMissing);
         }
-        xhci.bulk_out(self.slot_id, self.bulk_out_ep, cmd)
+        let transferred = xhci
+            .bulk_out(self.slot_id, self.bulk_out_ep, cmd)
             .await
-            .map(|_| ())
-            .map_err(|_| FpError::EndpointConfig)
+            .map_err(|_| FpError::EndpointConfig)?;
+        require_full_transfer(transferred, cmd.len())
+    }
+}
+
+fn require_full_transfer(transferred: usize, expected: usize) -> Result<(), FpError> {
+    if transferred == expected {
+        Ok(())
+    } else {
+        Err(FpError::EndpointConfig)
     }
 }
 
@@ -461,15 +465,14 @@ pub async fn try_bind_fingerprint_already_addressed(
         FpEndpoints::Bulk { config_value, .. } => config_value,
         FpEndpoints::InterruptIn { config_value, .. } => config_value,
     };
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00,
             STD_REQ_SET_CONFIGURATION,
             cfg_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| FpError::SetConfiguration)?;
@@ -724,5 +727,11 @@ mod tests {
             find_fp_endpoints(&cfg, FpVendor::Synaptics),
             Err(FpError::EndpointsMissing)
         ));
+    }
+
+    #[test]
+    fn command_write_requires_the_full_transfer() {
+        assert_eq!(require_full_transfer(64, 64), Ok(()));
+        assert_eq!(require_full_transfer(63, 64), Err(FpError::EndpointConfig));
     }
 }
