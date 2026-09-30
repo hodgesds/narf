@@ -21,6 +21,17 @@ fn path_of(name: &str) -> alloc::vec::Vec<u8> {
     p
 }
 
+/// Make sure `/sys/kernel/mm/transparent_hugepage` exists.
+///
+/// Boot populates it, but the filesystem sysfs smokes run earlier in the same
+/// kernel image and call `sysfs::__reset_for_test()`, rebuilding only the
+/// part of the tree each case needs; the last one leaves no `kernel/mm`, and
+/// every open below would be ENOENT. `populate_kernel_dir` is idempotent
+/// (`get_or_create_child`), so on an intact tree this changes nothing.
+fn thp_fixture() {
+    narf_filesystem::sysfs::populate_kernel_dir();
+}
+
 /// open(O_WRONLY) + write(value), as systemd's write_string_file does.
 fn write_knob(name: &str, value: &[u8]) -> Option<i64> {
     let path = path_of(name);
@@ -58,6 +69,7 @@ fn read_knob(name: &str) -> Option<alloc::string::String> {
 /// back in Linux's bracketed / numeric form.
 fn smoke_abi_thp_knobs_writable_pos() -> TestResult {
     with_setup(|| {
+        thp_fixture();
         let restore = |r: Result<(), &'static str>| {
             let _ = write_knob("defrag", b"never\n");
             let _ = write_knob("enabled", b"never\n");
@@ -115,6 +127,7 @@ kernel_test_in!("syscall_abi", smoke_abi_thp_knobs_writable_pos);
 /// nothing.
 fn smoke_abi_thp_knobs_reject_neg() -> TestResult {
     with_setup(|| {
+        thp_fixture();
         let before = read_knob("defrag");
         for bad in [&b"bogus"[..], b"defer+madvise\n\n", b" never", b"Never"] {
             if write_knob("defrag", bad) != Some(EINVAL) {
