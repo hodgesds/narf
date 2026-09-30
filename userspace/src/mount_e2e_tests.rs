@@ -2230,16 +2230,14 @@ fn smoke_move_mount_relocates() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_move_mount_relocates);
 
-// ── Smoke 14: pseudo-fs double-mount is idempotent (single entry) ──
-// The registry supports mount stacking for real binds/overmounts (see
-// smoke_registry_overmount_stacks), but the sys_mount pseudo-fs arm
-// deliberately DEDUPS API filesystems: re-mounting a tmpfs onto an
-// already-mounted target short-circuits to success BEFORE reaching the
-// registry, so it reports ok and leaves exactly ONE entry for that path
-// (NARF's pseudo-fs are shared singletons; stacking identical views is
-// pointless). This runs the pseudo-fs arm, not the stacking path.
-// Linux ref: fs/namespace.c:do_new_mount (repeated API-fs mount).
-fn smoke_double_mount_idempotent() -> TestResult {
+// ── Smoke 14: a second tmpfs mount on the same path stacks ─────────
+// Linux attaches every new filesystem on top of whatever is mounted at the
+// target: do_new_mount → do_add_mount refuses only when the top mount there
+// already has the same superblock (-EBUSY), and a fresh tmpfs is always a new
+// superblock. So the second mount succeeds, the path carries two mounts, and
+// one umount pops the upper one and leaves the lower one in place.
+// Linux ref: fs/namespace.c:do_add_mount.
+fn smoke_double_mount_stacks() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
     // buffers. `validate_user_range` confines a real syscall to the user half,
@@ -2250,31 +2248,95 @@ fn smoke_double_mount_idempotent() -> TestResult {
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 
-    let _ = unmount_for_test("/dbl");
+    while unmount_for_test("/dbl").is_ok() {}
+    let count = || {
+        narf_filesystem::registry()
+            .list()
+            .iter()
+            .filter(|p| p.as_str() == "/dbl")
+            .count()
+    };
 
     if !mount_ok(b"tmpfs\0", b"/dbl\0", b"tmpfs\0", 0) {
         return TestResult::Fail("first mount /dbl failed");
     }
-    // Second mount of the same fstype at the same path: idempotent success.
     let second_ok = mount_ok(b"tmpfs\0", b"/dbl\0", b"tmpfs\0", 0);
-
-    // Exactly one entry for /dbl (no stacking / duplicate).
-    let count = narf_filesystem::registry()
-        .list()
-        .iter()
-        .filter(|p| p.as_str() == "/dbl")
-        .count();
+    let stacked = count();
+    let popped = unmount_for_test("/dbl").is_ok();
+    let left = count();
 
     crate::handlers::__test_root_dir_reset();
-    let _ = unmount_for_test("/dbl");
+    while unmount_for_test("/dbl").is_ok() {}
 
-    if second_ok && count == 1 {
-        TestResult::Pass
+    if !second_ok {
+        TestResult::Fail("a second tmpfs mount onto a mounted path must succeed")
+    } else if stacked != 2 {
+        TestResult::Fail("a second tmpfs mount must stack (two registry entries)")
+    } else if !popped || left != 1 {
+        TestResult::Fail("umount must pop only the upper tmpfs")
     } else {
-        TestResult::Fail("tmpfs double-mount must be idempotent (ok, single registry entry)")
+        TestResult::Pass
     }
 }
-kernel_test_in!("userspace/mount", smoke_double_mount_idempotent);
+kernel_test_in!("userspace/mount", smoke_double_mount_stacks);
+
+// ── Smoke 14b: umount2 pops a mount stacked over a core API fs ─────
+// The global /proc, /sys, /dev and cgroup2 are boot singletons NARF keeps
+// mounted (a global umount of one is a no-op). That keep-mounted rule is for
+// the singleton alone: a filesystem stacked on top of one is an ordinary
+// mount, and umount2 of the path must pop it (fs/namespace.c:do_umount on the
+// top mount of the path), not answer success and leave it in place.
+fn smoke_umount_pops_mount_stacked_over_api_fs() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_10);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    while unmount_for_test("/stk_api").is_ok() {}
+    let count = || {
+        narf_filesystem::registry()
+            .list()
+            .iter()
+            .filter(|p| p.as_str() == "/stk_api")
+            .count()
+    };
+
+    if !mount_ok(b"sysfs\0", b"/stk_api\0", b"sysfs\0", 0) {
+        return TestResult::Fail("mount sysfs at /stk_api failed");
+    }
+    if !mount_ok(b"tmpfs\0", b"/stk_api\0", b"tmpfs\0", 0) {
+        while unmount_for_test("/stk_api").is_ok() {}
+        return TestResult::Fail("mount tmpfs over /stk_api failed");
+    }
+    let stacked = count();
+    let mut u = StubCtx {
+        args: unmount_args(b"/stk_api\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut u);
+    let umount_ok = matches!(u.ret, Some(r) if r.value == 0);
+    let left = count();
+
+    crate::handlers::__test_root_dir_reset();
+    while unmount_for_test("/stk_api").is_ok() {}
+
+    if stacked != 2 {
+        TestResult::Fail("tmpfs over sysfs must stack (two registry entries)")
+    } else if !umount_ok || left != 1 {
+        TestResult::Fail("umount2 must pop the tmpfs stacked over the sysfs mount")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_umount_pops_mount_stacked_over_api_fs
+);
 
 // ── Smoke 15: propagation-only mount is a no-op success ────────────
 // mount(NULL, target, NULL, MS_SLAVE|MS_REC) / MS_PRIVATE changes only the

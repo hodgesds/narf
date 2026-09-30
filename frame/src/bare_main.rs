@@ -5764,6 +5764,16 @@ fn boot_userspace_init() {
                     "devpts_instances_glibc",
                     narf_verification::NARF_DEVPTS_INSTANCES_SMOKE_GLIBC_ELF,
                 ),
+                // A second mount of a pseudo filesystem on an occupied
+                // mountpoint stacks a new mount (tmpfs, devpts).
+                (
+                    "overmount_pseudo_smoke",
+                    narf_verification::NARF_OVERMOUNT_PSEUDO_SMOKE_ELF,
+                ),
+                (
+                    "overmount_pseudo_glibc",
+                    narf_verification::NARF_OVERMOUNT_PSEUDO_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.

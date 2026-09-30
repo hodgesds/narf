@@ -3707,6 +3707,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("pts_chown_glibc", "pts-chown-ok"),
         ("devpts_instances_smoke", "devpts-instances-ok"),
         ("devpts_instances_glibc", "devpts-instances-ok"),
+        ("overmount_pseudo_smoke", "overmount-pseudo-ok"),
+        ("overmount_pseudo_glibc", "overmount-pseudo-ok"),
         // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
         ("setuid_exec_smoke", "setuid-exec-ok"),
         ("setuid_exec_glibc", "setuid-exec-ok"),

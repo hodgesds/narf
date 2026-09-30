@@ -510,43 +510,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Idempotent pseudo-filesystem mount. An init system mounts the API
-    // filesystems (/proc, /sys, /dev, /run, ...) unconditionally at startup.
-    // NARF's Stage::Late `mnt-dev-bind` makes procfs/sysfs/devfs reachable in
-    // the selected root before PID 1 runs; userspace mounts writable runtime
-    // filesystems itself. NARF has no mount stacking, so a re-mount of an
-    // already-provided pseudo-fs target reports success (matching Linux, which
-    // stacks and succeeds) rather than erroring. Scoped to the fstypes
-    // `mount_api::build_fs` recognizes (the in-memory / synthetic filesystems)
-    // so bind / block-device mounts keep their real handling (a bind onto an
-    // existing path is a distinct op).
-    // The fstype→backend dispatch lives in the linux-compat-only mount_api;
-    // the mount(2) syscall itself is only wired under linux-compat, so the
-    // non-linux-compat build just needs this to compile (no pseudo-fs there).
-    let is_pseudo_fs = {
-        let (uid, gid) = current_fs_ids();
-        match crate::mount_api::build_fs_with_options(fstype.as_str(), data.as_str(), uid, gid) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(narf_filesystem::FsError::NoSpace) => {
-                ctx.set_return(errno_ret(ENOSPC));
-                return;
-            }
-            Err(narf_filesystem::FsError::Unsupported) => {
-                ctx.set_return(errno_ret(EOPNOTSUPP));
-                return;
-            }
-            Err(_) => {
-                ctx.set_return(einval);
-                return;
-            }
-        }
-    };
-    if is_pseudo_fs && current_mount_list().iter().any(|m| m == &target) {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
     let auth = narf_filesystem::bootstrap_mount_authority();
     let domain = narf_lib::id::DomainId::DRIVER_0;
 

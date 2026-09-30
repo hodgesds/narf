@@ -122,10 +122,12 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     }
 
     // Protect the core API pseudo-filesystems from destructive unmount ONLY in
-    // the GLOBAL registry. NARF has no mount stacking: the global /proc, /sys,
-    // /dev (and cgroup2) are single shared instances the chroot's Stage::Late
-    // `mnt-dev-bind` provides and everything depends on, so a global umount is a
-    // keep-mounted no-op.
+    // the GLOBAL registry: the global /proc, /sys, /dev (and cgroup2) are single
+    // shared instances the chroot's Stage::Late `mnt-dev-bind` provides and
+    // everything depends on, so a global umount of one is a keep-mounted no-op.
+    // That covers the singleton alone — the sole mount at its path. Anything
+    // stacked on top of it is an ordinary mount and umount pops it, as Linux's
+    // do_umount pops the top mount of the path.
     //
     // A task with a PRIVATE mount namespace (every systemd service sandbox, after
     // unshare(CLONE_NEWNS)) must NOT get that no-op: `ns.unmount` only pops that
@@ -137,16 +139,16 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // sd-executor hung before execve and the Type=notify unit timed out (userdbd,
     // and every service with PrivateDevices=/ProtectProc=/etc.).
     let private_ns = current_mount_namespace();
+    let at_target: alloc::vec::Vec<_> = current_mount_list_with_names()
+        .into_iter()
+        .filter(|(path, _)| path == &target)
+        .collect();
     let protected = private_ns.is_none()
-        && current_mount_list_with_names()
-            .into_iter()
-            .any(|(path, name)| {
-                path == target
-                    && matches!(
-                        name.as_str(),
-                        "procfs" | "sysfs" | "devfs" | "devtmpfs" | "cgroup2" | "cgroupfs"
-                    )
-            });
+        && at_target.len() == 1
+        && matches!(
+            at_target[0].1.as_str(),
+            "procfs" | "sysfs" | "devfs" | "devtmpfs" | "cgroup2" | "cgroupfs"
+        );
     if protected {
         ctx.set_return(SyscallReturn::ok(0));
         return;
