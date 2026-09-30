@@ -591,9 +591,11 @@ async fn dispatch_after_address(
         // `find_bt_endpoints` walks the config blob; if no matching
         // interface is present it returns NotBluetooth and we fall
         // through to the unknown-class log.
-        if crate::btusb::try_bind_btusb_already_addressed(xhci_dev, slot_id, &cfg_blob)
-            .await
-            .is_ok()
+        if crate::btusb::try_bind_btusb_already_addressed(
+            xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
+        )
+        .await
+        .is_ok()
         {
             return AttachOutcome::Bluetooth;
         }

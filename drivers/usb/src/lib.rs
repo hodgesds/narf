@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod attach;
 pub mod btusb;
+mod btusb_qca;
 pub mod bulk;
 pub mod ccid;
 pub mod cdc;

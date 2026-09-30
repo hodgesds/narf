@@ -2931,6 +2931,76 @@ fn smoke_btusb_no_bluetooth_on_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/btusb", smoke_btusb_no_bluetooth_on_qemu);
 
+/// WCN6855 vendor version data is a fixed 20-byte little-endian record. The
+/// multi-NVM flag combines chip/platform bytes into the board-specific suffix.
+fn smoke_btusb_qca_version_and_board_id() -> TestResult {
+    use crate::btusb_qca::QcaVersion;
+
+    let mut raw = [0u8; 20];
+    raw[0..4].copy_from_slice(&0x0013_0201u32.to_le_bytes());
+    raw[4..8].copy_from_slice(&7u32.to_le_bytes());
+    raw[8..12].copy_from_slice(&0x400C_1211u32.to_le_bytes());
+    raw[12] = 0x01;
+    raw[13] = 0x0A;
+    raw[14..16].copy_from_slice(&0x8000u16.to_le_bytes());
+    let Some(version) = QcaVersion::decode(&raw) else {
+        return TestResult::Fail("WCN6855 version record did not decode");
+    };
+    if version.rom_version != 0x0013_0201 || version.board_id() != 0x010A {
+        return TestResult::Fail("WCN6855 version or board ID decoded incorrectly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_version_and_board_id);
+
+/// Runtime NVM selection includes both the GlobalFoundries variant and the
+/// board ID, while the rampatch is selected only by ROM version.
+fn smoke_btusb_qca_firmware_names() -> TestResult {
+    use crate::btusb_qca::{firmware_names, QcaVersion};
+
+    let names = firmware_names(QcaVersion {
+        rom_version: 0x0013_0201,
+        ram_version: 0x400C_1211,
+        chip_id: 0x01,
+        platform_id: 0x0A,
+        flag: 0x8000,
+        ..QcaVersion::default()
+    });
+    if names.rampatch != "qca/rampatch_usb_00130201.bin" {
+        return TestResult::Fail("WCN6855 rampatch name is wrong");
+    }
+    if names.nvm != "qca/nvm_usb_00130201_gf_010a.bin" {
+        return TestResult::Fail("WCN6855 NVM name is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_firmware_names);
+
+/// The rampatch header embeds high/low ROM halves followed by the patch
+/// revision. Reject a stale patch even when its ROM identity matches.
+fn smoke_btusb_qca_rampatch_validation() -> TestResult {
+    use crate::btusb_qca::{validate_rampatch_image, QcaError, QcaVersion};
+
+    let version = QcaVersion {
+        rom_version: 0x0013_0201,
+        patch_version: 6,
+        ..QcaVersion::default()
+    };
+    let mut image = [0u8; 40];
+    image[16..18].copy_from_slice(&0x0013u16.to_le_bytes());
+    image[18..20].copy_from_slice(&0x0201u16.to_le_bytes());
+    image[20..22].copy_from_slice(&7u16.to_le_bytes());
+    if validate_rampatch_image(&image, version).is_err() {
+        return TestResult::Fail("valid WCN6855 rampatch header rejected");
+    }
+    image[20..22].copy_from_slice(&6u16.to_le_bytes());
+    if validate_rampatch_image(&image, version) != Err(QcaError::FirmwareInvalid) {
+        return TestResult::Fail("stale WCN6855 rampatch accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_qca_rampatch_validation);
+
 // ── fingerprint ────────────────────────────────────────────────────
 
 /// USB-ID table matches: all 16 VID/PID entries resolve to a vendor.

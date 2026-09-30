@@ -16,7 +16,8 @@
 //! - `drivers/bluetooth/btrtl.c` — Realtek firmware-load sequence
 //!   (read ROM version via H4 vendor pkt, fetch `rtl_bt/rtl8761*.bin`
 //!   + `rtl_bt/rtl8761*_config.bin`, send via vendor command 0xFC20).
-//! - `drivers/bluetooth/btqca.c` — Qualcomm WCN6855 NVM/firmware load.
+//! - `drivers/bluetooth/btusb.c` — Qualcomm WCN6855 USB DFU load
+//!   (vendor control requests for metadata/header, then bulk-OUT).
 //! - `drivers/bluetooth/btmtk.{c,h}` — MediaTek 7921/7922 firmware
 //!   load via WMT command sequence.
 //!
@@ -42,7 +43,7 @@ pub enum Quirk {
     Intel,
     /// Realtek RTL8761/RTL8852 — vendor command 0xFC20 / 0xFC6D.
     Realtek,
-    /// Qualcomm WCN6855 — NVM + RAM patch via vendor cmd 0xFC00.
+    /// Qualcomm WCN6855 — USB DFU header + bulk-OUT patch/NVM load.
     QualcommWcn6855,
     /// MediaTek MT7921 / MT7922 — WMT command 0xFC6F.
     MediaTek,
@@ -133,6 +134,11 @@ pub const QUIRK_TABLE: &[QuirkMatch] = &[
         product: 0xe0e0,
         quirk: Quirk::QualcommWcn6855,
     },
+    QuirkMatch {
+        vendor: 0x10ab,
+        product: 0x9309,
+        quirk: Quirk::QualcommWcn6855,
+    }, // USI WCN6855 2.1 bring-up target
     // MediaTek MT7921 / MT7922 (Phoenix HawkPoint1 default).
     QuirkMatch {
         vendor: 0x0e8d,
@@ -213,9 +219,12 @@ pub fn firmware_paths(quirk: Quirk) -> Vec<(&'static str, Option<&'static str>)>
             out.push(("rtl8761bu_fw.bin", Some("rtl8761bu_config.bin")));
         }
         Quirk::QualcommWcn6855 => {
-            // NVM+RAM patch pair, per btqca.
-            out.push(("hpnv21.bin", None));
-            out.push(("hpbtfw21.tlv", None));
+            // USB rampatch + NVM pairs. Runtime code selects by the
+            // controller-reported ROM version and may add `_gf` and
+            // board-ID suffixes to the NVM basename.
+            out.push(("rampatch_usb_00130100.bin", Some("nvm_usb_00130100.bin")));
+            out.push(("rampatch_usb_00130200.bin", Some("nvm_usb_00130200.bin")));
+            out.push(("rampatch_usb_00130201.bin", Some("nvm_usb_00130201.bin")));
         }
         Quirk::MediaTek => {
             // BT_RAM_CODE_MT*.bin per btmtk WMT load.

@@ -2,8 +2,9 @@
 
 ## Sources (public only)
 
-All driver code is derived strictly from the references below.
-**No GPL Linux source consulted.**
+Class and host-controller code uses the public standards below. Since NARF's
+2026-05-20 relicense to GPL-2.0-or-later, explicitly identified driver paths
+also consult upstream Linux GPL sources.
 
 ### EHCI host controller (USB 2.0)
 - "Enhanced Host Controller Interface Specification for Universal
@@ -110,6 +111,13 @@ All driver code is derived strictly from the references below.
   §A.1.1 (format tags), §A.2 (format type codes), §2.2.5 (Type-I
   PCM format descriptor layout).
 
+### Qualcomm WCN6855 Bluetooth over USB
+
+- **Linux `drivers/bluetooth/btusb.c`** — GPL-2.0-only, Qualcomm USB setup
+  path: vendor requests `GET_TARGET_VERSION` / `CHECK_STATUS`, split
+  control-header + endpoint-2 bulk firmware download, WCN6855 ROM table, and
+  runtime rampatch/NVM naming. Consulted under NARF's GPL-2.0-or-later license.
+
 ## 3. Public interface
 
 - `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed)` binds an
@@ -133,6 +141,11 @@ All driver code is derived strictly from the references below.
   26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
   the accepted endpoint, issues `SET_INTERFACE`, and starts an IRQ-driven
   packet/frame pump into the camera's registered `/dev/video<N>` queue.
+- `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
+  config)` binds the standard Bluetooth USB interface. For a recognised
+  WCN6855 ID it completes the Qualcomm USB firmware/status protocol before
+  issuing HCI Reset and registering the transport. Firmware is selected from
+  the verified registry using the controller-reported ROM/RAM/board identity.
 
 ## Scope
 
@@ -142,7 +155,7 @@ All driver code is derived strictly from the references below.
 |---|---|---|---|
 | `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
 | `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
-| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Standard Wireless Controller `e0/01/01` endpoint discovery and Stage-0 HCI transport | Firmware/vendor setup and live HCI Reset/Read Local Version on silicon |
+| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, then HCI Reset/Read Local Version and transport registration | Stage the matching signed firmware and validate the full sequence on silicon |
 | `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
@@ -224,7 +237,7 @@ the host controller and are not matched as downstream USB devices.
 
 ### Out of scope (deferred)
 - UAC2 / UAC3 (newer protocol byte; descriptor layouts differ).
-- Isochronous endpoint scheduling on xHCI (lands when an audio data
-  path is exercised end-to-end).
-- End-to-end USB Video Class capture (alternate-setting negotiation,
-  isochronous endpoint scheduling, and userspace frame delivery).
+- End-to-end UAC audio streaming; the xHCI periodic endpoint machinery now
+  exists, but the audio sample pump is still pending.
+- Non-QCA Bluetooth vendor firmware protocols (Intel, Realtek, MediaTek,
+  Broadcom).

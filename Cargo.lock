@@ -1528,6 +1528,7 @@ dependencies = [
  "narf-drivers",
  "narf-drivers-video",
  "narf-filesystem",
+ "narf-firmware",
  "narf-hid",
  "narf-init",
  "narf-input",

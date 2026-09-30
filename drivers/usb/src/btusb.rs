@@ -18,8 +18,9 @@
 //!   per NARF 2026-05-20 relicense to GPL-2.0-or-later. We mirror
 //!   the endpoint-discovery shape (bulk pair + interrupt-IN) and
 //!   the post-attach Reset / Read_Local_Version probe sequence.
-//!   We do *not* port the vendor-specific Intel / Broadcom /
-//!   Realtek bring-up quirks: that's Stage 1+.
+//! - **Linux `drivers/bluetooth/btusb.c` QCA USB setup** — GPL-2.0;
+//!   WCN6855 version/status control requests and split control/bulk
+//!   firmware download, including runtime firmware-name selection.
 //!
 //! ## Stage 0 scope
 //!
@@ -27,14 +28,16 @@
 //! 2. Walk the configuration descriptor for the bulk-IN/OUT ACL pair
 //!    and the interrupt-IN event endpoint.
 //! 3. Configure those endpoints + issue SET_CONFIGURATION.
-//! 4. Drive Stage-0 HCI bring-up directly against the xHCI async
+//! 4. Apply required USB vendor firmware setup for recognised parts
+//!    (currently WCN6855) before exposing the HCI transport.
+//! 5. Drive Stage-0 HCI bring-up directly against the xHCI async
 //!    transfer paths: Reset → Read_Local_Version.
-//! 5. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
-//! 6. Register an `HciTransport` against the slot for Stage-1+ users.
+//! 6. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
+//! 7. Register an `HciTransport` against the slot for Stage-1+ users.
 //!
 //! Out of scope for Stage 0: ACL data plane (L2CAP / GATT / pairing),
-//! SCO/eSCO isoch streaming, vendor firmware load, LE Advertising,
-//! BR/EDR Inquiry. Those land as separate stages.
+//! SCO/eSCO isoch streaming, non-QCA vendor firmware, LE Advertising,
+//! and BR/EDR Inquiry. Those land as separate stages.
 //!
 //! Why a per-driver async bring-up instead of routing through the
 //! existing `narf_bluetooth::controller::Controller::bring_up`:
@@ -116,6 +119,8 @@ pub enum BtUsbError {
     /// HCI Command Complete return params were shorter than the spec
     /// requires for the issued opcode.
     ShortReturnParams,
+    /// A recognised controller's vendor firmware setup failed.
+    FirmwareSetup,
 }
 
 /// Walk a Configuration Descriptor for the *first* HCI interface and
@@ -460,6 +465,8 @@ async fn send_command_and_await_complete(
 pub async fn try_bind_btusb_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
+    vendor_id: u16,
+    product_id: u16,
     cfg: &[u8],
 ) -> Result<(), BtUsbError> {
     let eps = find_bt_endpoints(cfg)?;
@@ -475,15 +482,14 @@ pub async fn try_bind_btusb_already_addressed(
     // SET_CONFIGURATION before any class request (USB 2.0 §9.4.7) —
     // without it the controller's class-specific Setup transfer for
     // HCI_Reset would STALL.
-    let mut nothing = [0u8; 0];
     xhci_dev
-        .control_in(
+        .control_out(
             slot_id,
             0x00, // bmRequestType: Host-to-Device, Standard, Device
             STD_REQ_SET_CONFIGURATION,
             eps.config_value as u16,
             0,
-            &mut nothing,
+            &[],
         )
         .await
         .map_err(|_| BtUsbError::SetConfiguration)?;
@@ -495,6 +501,35 @@ pub async fn try_bind_btusb_already_addressed(
     let event_dci = ep_dci(eps.event_in.ep_addr, /*is_in*/ true);
     let acl_in_dci = ep_dci(eps.acl_in.ep_addr, /*is_in*/ true);
     let acl_out_dci = ep_dci(eps.acl_out.ep_addr, /*is_in*/ false);
+
+    if narf_bluetooth::btusb_quirks::identify(vendor_id, product_id)
+        == Some(narf_bluetooth::btusb_quirks::Quirk::QualcommWcn6855)
+    {
+        match crate::btusb_qca::setup_wcn6855(xhci_dev, slot_id, acl_out_dci).await {
+            Ok(version) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-qca: {:04x}:{:04x} ROM {:#010x}, patch {:#010x}",
+                    vendor_id,
+                    product_id,
+                    version.rom_version,
+                    version.patch_version,
+                );
+            }
+            Err(error) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-qca: {:04x}:{:04x} setup failed: {:?}",
+                    vendor_id,
+                    product_id,
+                    error,
+                );
+                return Err(BtUsbError::FirmwareSetup);
+            }
+        }
+    }
 
     // HCI_Reset (§7.3.2) — no parameters, no return params beyond
     // status. After this the controller is in a defined post-reset
