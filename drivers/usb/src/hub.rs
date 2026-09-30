@@ -42,11 +42,16 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::xhci::{self, Xhci};
+use crate::xhci::{self, PortSpeed, Topology, Xhci};
 
 // ── Class triple ───────────────────────────────────────────────────
 
 pub const HUB_INTERFACE_CLASS: u8 = 0x09;
+
+/// High-speed hub device protocol: one shared Transaction Translator.
+pub const HUB_PROTOCOL_SINGLE_TT: u8 = 0x01;
+/// High-speed hub device protocol: one Transaction Translator per port.
+pub const HUB_PROTOCOL_MULTI_TT: u8 = 0x02;
 
 // ── Class-specific request encodings ───────────────────────────────
 
@@ -131,6 +136,13 @@ impl HubDescriptor {
             controller_current: buf[6],
         })
     }
+
+    /// Hub Descriptor `wHubCharacteristics[6:5]`, encoded exactly as
+    /// xHCI Slot Context `TT Think Time[1:0]`: 0/1/2/3 means
+    /// 8/16/24/32 full-speed bit times.
+    pub const fn tt_think_time(self) -> u8 {
+        ((self.characteristics >> 5) & 0x3) as u8
+    }
 }
 
 /// One bound hub.
@@ -139,6 +151,11 @@ pub struct UsbHub {
     pub slot_id: u8,
     pub iface_num: u8,
     pub descriptor: HubDescriptor,
+    /// Speed negotiated between this hub and its upstream port.
+    pub speed: PortSpeed,
+    /// Device Descriptor `bDeviceProtocol`. A high-speed hub reports
+    /// 1 for a shared TT and 2 for one TT per downstream port.
+    pub device_protocol: u8,
 }
 
 /// Walk a Configuration Descriptor tree looking for the first
@@ -164,7 +181,13 @@ impl UsbHub {
     /// Bind to an already-addressed USB hub slot. Issues
     /// GET_DESCRIPTOR(Hub) so `descriptor` is populated, then
     /// powers on every downstream port.
-    pub async fn attach(xhci_dev: &Xhci, slot_id: u8, iface_num: u8) -> Result<Self, HubError> {
+    pub async fn attach(
+        xhci_dev: &Xhci,
+        slot_id: u8,
+        iface_num: u8,
+        device_protocol: u8,
+        speed: PortSpeed,
+    ) -> Result<Self, HubError> {
         // GET_DESCRIPTOR(Hub) — bmRequestType 0xA0, value
         // (HUB_DESC_TYPE << 8), index 0.
         let mut desc_buf = [0u8; 16];
@@ -202,7 +225,35 @@ impl UsbHub {
             slot_id,
             iface_num,
             descriptor,
+            speed,
+            device_protocol,
         })
+    }
+
+    /// Whether this is a high-speed multiple-TT hub.
+    pub const fn is_multi_tt(&self) -> bool {
+        matches!(self.speed, PortSpeed::High) && self.device_protocol == HUB_PROTOCOL_MULTI_TT
+    }
+
+    /// Build the xHCI route metadata for a child on this hub. Low- and
+    /// full-speed children need the parent slot/port and TT think time;
+    /// high-speed and faster children use only the route string.
+    pub(crate) fn child_topology(
+        &self,
+        parent_route: u32,
+        parent_tier: u32,
+        hub_port: u8,
+        child_speed: PortSpeed,
+    ) -> Topology {
+        let mut topology = Topology::for_downstream(parent_route, parent_tier, hub_port);
+        if matches!(self.speed, PortSpeed::High)
+            && matches!(child_speed, PortSpeed::Low | PortSpeed::Full)
+        {
+            topology.parent_hub_slot_id = self.slot_id;
+            topology.parent_hub_port = hub_port;
+            topology.tt_think_time = self.descriptor.tt_think_time();
+        }
+        topology
     }
 
     /// Read the 4-byte port status word for `port` (1-indexed).

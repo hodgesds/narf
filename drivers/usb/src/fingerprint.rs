@@ -79,6 +79,7 @@ const USB_ID_TABLE: &[(u16, u16, FpVendor)] = &[
     (0x27C6, 0x533C, FpVendor::Goodix),
     (0x27C6, 0x5395, FpVendor::Goodix),
     (0x27C6, 0x55B4, FpVendor::Goodix),
+    (0x27C6, 0x6594, FpVendor::Goodix),
     // ELAN
     (0x04F3, 0x0903, FpVendor::Elan),
     (0x04F3, 0x0907, FpVendor::Elan),
@@ -546,6 +547,7 @@ mod tests {
     fn classify_vid_pid_goodix() {
         assert_eq!(classify_vid_pid(0x27C6, 0x5110), Some(FpVendor::Goodix));
         assert_eq!(classify_vid_pid(0x27C6, 0x55B4), Some(FpVendor::Goodix));
+        assert_eq!(classify_vid_pid(0x27C6, 0x6594), Some(FpVendor::Goodix));
     }
 
     #[test]
@@ -577,7 +579,7 @@ mod tests {
 
     #[test]
     fn vendor_covers_all_goodix_pids() {
-        let goodix_pids = [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4];
+        let goodix_pids = [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594];
         for pid in goodix_pids {
             assert_eq!(
                 classify_vid_pid(0x27C6, pid),

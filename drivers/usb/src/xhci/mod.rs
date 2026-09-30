@@ -275,7 +275,7 @@ pub struct Topology {
     pub parent_hub_port: u8,
     /// TT Think Time (§6.2.2 dword2[17:16]) — 0/1/2/3 = 8/16/24/32
     /// FS bit-times. Only meaningful for an LS/FS device behind a
-    /// multi-TT high-speed hub.
+    /// high-speed hub.
     pub tt_think_time: u8,
 }
 
@@ -506,6 +506,10 @@ pub struct Device {
     pub slot_id: u8,
     pub port: u8,
     pub speed: PortSpeed,
+    /// Route and parent-TT metadata used to address this slot. Kept so
+    /// Evaluate Context updates (notably marking a downstream hub) do
+    /// not accidentally erase its route string.
+    pub topology: Topology,
     pub max_packet_ep0: u16,
     /// Device Context — 32-byte slot ctx + 31 × 32-byte EP ctx.
     /// Lives at DCBAA[slot_id]; engine-owned post-Address Device.
@@ -2397,7 +2401,7 @@ impl Xhci {
         //   dword2[15:8]  TT Port Number on the parent hub.
         //   dword2[17:16] TT Think Time (0..3 = 8/16/24/32 FS bit
         //                 times) — only meaningful if the parent is
-        //                 a multi-TT hub.
+        //                 a high-speed hub.
         let slot_d0 = (1u32 << 27)              // Context Entries = 1
                     | ((speed as u32) << 20)    // Speed
                     | (topology.route_string & 0x000F_FFFF); // Route String
@@ -2502,6 +2506,7 @@ impl Xhci {
             slot_id,
             port,
             speed,
+            topology,
             max_packet_ep0: mps,
             _device_ctx: dev_ctx,
             ctrl_tr,
@@ -2552,6 +2557,8 @@ impl Xhci {
     ///     bit (`1<<25`).
     ///   - Slot dword1: re-stamped with Root Hub Port Number plus
     ///     Number of Ports in bits[31:24].
+    ///   - Slot dword2: preserves the parent Transaction Translator
+    ///     metadata for a low/full-speed hub behind a high-speed hub.
     pub async fn mark_as_hub(
         &self,
         slot_id: u8,
@@ -2561,13 +2568,13 @@ impl Xhci {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
-        let (speed, port) = {
+        let (speed, port, topology) = {
             let g = self.devices.lock();
             let d = g
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
-            (d.speed, d.port)
+            (d.speed, d.port, d.topology)
         };
 
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
@@ -2589,11 +2596,14 @@ impl Xhci {
             );
         }
 
-        let mut slot_d0 = (1u32 << 27) | ((speed as u32) << 20) | (1u32 << 26); // Hub
-        if multi_tt {
-            slot_d0 |= 1u32 << 25; // MTT
-        }
-        let slot_d1 = ((port as u32) << 16) | ((num_ports as u32) << 24);
+        let slot_d0 =
+            slot::encode_slot_ctx_dword0(topology.route_string, speed as u8, multi_tt, true, 1);
+        let slot_d1 = slot::encode_slot_ctx_dword1(0, port, num_ports);
+        let slot_d2 = slot::encode_slot_ctx_dword2(
+            topology.parent_hub_slot_id,
+            topology.parent_hub_port,
+            topology.tt_think_time,
+        );
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
@@ -2603,6 +2613,10 @@ impl Xhci {
             core::ptr::write_volatile(
                 narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
                 slot_d1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx + 8).kernel_mut_ptr::<u32>(),
+                slot_d2,
             );
         }
         compiler_fence(Ordering::SeqCst);

@@ -110,7 +110,31 @@ All driver code is derived strictly from the references below.
   §A.1.1 (format tags), §A.2 (format type codes), §2.2.5 (Type-I
   PCM format descriptor layout).
 
+## 3. Public interface
+
+- `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed)` binds an
+  addressed hub and retains its negotiated speed plus Device Descriptor
+  protocol so xHCI can set the multiple-TT bit correctly.
+- `HubDescriptor::tt_think_time()` returns the USB 2.0
+  `wHubCharacteristics[6:5]` encoding used directly in a low/full-speed
+  child's xHCI Slot Context.
+- `Xhci::address_device_with(..., Topology)` retains the topology for later
+  Evaluate Context operations; marking a downstream device as a hub must not
+  erase its route string or parent-TT fields.
+
 ## Scope
+
+### Target laptop USB profile (silicon validation pending)
+
+| USB ID | Device | In-tree path | Remaining validation |
+|---|---|---|---|
+| `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
+| `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
+| `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Standard Wireless Controller `e0/01/01` endpoint discovery and Stage-0 HCI transport | Firmware/vendor setup and live HCI Reset/Read Local Version on silicon |
+| `30c9:00cd` | Luxvisions integrated camera | Generic UVC VideoControl bind and descriptor parsing | Alternate-setting selection and end-to-end isochronous video capture |
+
+The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
+the host controller and are not matched as downstream USB devices.
 
 ### Landed
 - **xHCI** (`xhci`): MMIO bring-up, BAR mapping, command/event ring
@@ -130,8 +154,10 @@ All driver code is derived strictly from the references below.
   wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
   READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
-- **Hub** (`hub`): basic hub class enumeration so devices behind
-  a hub are visible.
+- **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
+  Device Descriptor protocol, TT think-time propagation, and downstream
+  route addressing so low/full-speed devices behind high-speed hubs are
+  visible.
 - **UVC stream** (`uvc_stream`): clean-room payload-header
   encoder + decoder for the per-isoch-transaction UVC header
   (bHeaderLength + Bit Field Header), with optional PTS (LE u32)
@@ -183,4 +209,5 @@ All driver code is derived strictly from the references below.
 - UAC2 / UAC3 (newer protocol byte; descriptor layouts differ).
 - Isochronous endpoint scheduling on xHCI (lands when an audio data
   path is exercised end-to-end).
-- USB Video Class (UVC) — webcam support.
+- End-to-end USB Video Class capture (alternate-setting negotiation,
+  isochronous endpoint scheduling, and userspace frame delivery).

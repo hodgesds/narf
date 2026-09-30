@@ -42,7 +42,7 @@ use crate::fingerprint;
 use crate::hid;
 use crate::hid::mouse;
 use crate::hub::{self, UsbHub};
-use crate::xhci::{self, PortSpeed, Topology, Xhci};
+use crate::xhci::{self, PortSpeed, Xhci};
 
 /// USB Device Class triple values we recognise (§9.6.1 of USB 2.0).
 const DEV_CLASS_HUB: u8 = 0x09;
@@ -159,6 +159,19 @@ pub struct HubBinding {
 /// tier-(N-1) hub that hosts them, so a downstream walk in registry
 /// order always processes a parent before its children).
 pub static HUBS: IrqSafeSpinLock<Vec<HubBinding>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Number of populated 4-bit hops in an xHCI route string. A hub on a
+/// root-hub port has route zero/tier zero; a hub reached through port N
+/// of that hub has one populated nibble and tier one.
+pub(crate) const fn route_tier(route_string: u32) -> u32 {
+    let route = route_string & 0x000F_FFFF;
+    if route == 0 {
+        0
+    } else {
+        let significant_bits = 32 - route.leading_zeros();
+        significant_bits.div_ceil(4)
+    }
+}
 
 /// Idle window before the supervisor suspends a downstream port,
 /// in nanoseconds. 30 seconds matches Linux's
@@ -320,26 +333,14 @@ pub async fn try_attach_via_hub(
         Ok(s) => s,
         Err(_) => return AttachOutcome::UnknownClass,
     };
-    let mut topology = Topology::for_downstream(parent_route, parent_tier, hub_port);
+    let topology = parent.child_topology(parent_route, parent_tier, hub_port, speed);
     // For an LS/FS device attached to a high-speed hub, the
     // controller needs the parent hub's slot ID + the port the
     // device sits on (xHCI 1.2 §6.2.2 dword2[7:0] / [15:8]) so it
     // can route Transaction-Translator traffic correctly. HS+
-    // devices leave these fields zero. We only know the parent's
-    // own speed indirectly here — the parent_hub_speed is whatever
-    // the hub itself negotiated; for the typical "USB 2.0 hub" case
-    // it's High and the LS/FS-via-HS path applies. Set the TT
-    // fields whenever the *child* is LS/FS — safe, since they're
-    // ignored for HS+ children even when populated.
-    if matches!(speed, PortSpeed::Low | PortSpeed::Full) {
-        topology.parent_hub_slot_id = parent.slot_id;
-        topology.parent_hub_port = hub_port;
-        // TT think time: 0 = 8 FS bit times. Sufficient for
-        // single-TT hubs (the USB 2.0 default). Multi-TT hubs
-        // advertise a different value via wHubCharacteristics
-        // bits[6:5] — we don't decode that yet, so leave 0 and
-        // accept the conservative think-time.
-    }
+    // devices leave these fields zero. UsbHub retains its negotiated
+    // upstream speed, so child_topology only supplies TT metadata
+    // when the parent is High and the child is Low/Full.
     if xhci_dev
         .address_device_with(slot_id, parent_root_port, speed, topology)
         .await
@@ -377,17 +378,18 @@ async fn dispatch_after_address(
     // Also capture idVendor (+8) and idProduct (+10) for explicit
     // VID/PID matches (fingerprint readers with vendor class 0xFF
     // that don't advertise MS OS 2.0 WBDI descriptors).
-    let (dev_class, dev_vid, dev_pid) = match xhci_dev.get_device_descriptor(slot_id).await {
-        Ok(d) => {
-            let vid = u16::from_le_bytes([d[8], d[9]]);
-            let pid = u16::from_le_bytes([d[10], d[11]]);
-            (d[4], vid, pid)
-        }
-        Err(_) => {
-            let _ = xhci_dev.disable_slot(slot_id).await;
-            return AttachOutcome::UnknownClass;
-        }
-    };
+    let (dev_class, dev_protocol, dev_vid, dev_pid) =
+        match xhci_dev.get_device_descriptor(slot_id).await {
+            Ok(d) => {
+                let vid = u16::from_le_bytes([d[8], d[9]]);
+                let pid = u16::from_le_bytes([d[10], d[11]]);
+                (d[4], d[6], vid, pid)
+            }
+            Err(_) => {
+                let _ = xhci_dev.disable_slot(slot_id).await;
+                return AttachOutcome::UnknownClass;
+            }
+        };
 
     if dev_class == DEV_CLASS_HUB {
         // Pull the configuration descriptor to find the hub
@@ -442,7 +444,7 @@ async fn dispatch_after_address(
             let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
         }
-        let bound = match UsbHub::attach(xhci_dev, slot_id, iface).await {
+        let bound = match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed).await {
             Ok(b) => b,
             Err(_) => {
                 let _ = xhci_dev.disable_slot(slot_id).await;
@@ -454,26 +456,25 @@ async fn dispatch_after_address(
         // enumeration (xHCI 1.2 §6.2.2 dword0[26], dword1[31:24]).
         // Failure here isn't fatal — most controllers tolerate it.
         let _ = xhci_dev
-            .mark_as_hub(slot_id, bound.descriptor.num_ports, /*mtt*/ false)
+            .mark_as_hub(slot_id, bound.descriptor.num_ports, bound.is_multi_tt())
             .await;
         // Tier of THIS hub = number of 4-bit nibbles already
         // populated in `this_route`. For a tier-0 hub the route is
         // 0 and tier is 0; downstream-of-hub devices will use
         // tier+1 when calling `Topology::for_downstream`.
-        let tier = this_route.leading_zeros().wrapping_sub(12) / 4;
-        // For root-hub-attached hubs `this_route` is 0 → leading
-        // zeros above wraps; clamp to 0 in that case.
-        let tier = if this_route == 0 { 0 } else { tier };
+        let tier = route_tier(this_route);
         let _ = port; // port retained for parity with via_hub log-dedup
         {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "  usb-hub: attached on root_port={} route=0x{:05x} tier={} num_ports={}",
+                "  usb-hub: attached on root_port={} route=0x{:05x} tier={} num_ports={} multi_tt={} tt={}",
                 root_port,
                 this_route,
                 tier,
-                bound.descriptor.num_ports
+                bound.descriptor.num_ports,
+                bound.is_multi_tt(),
+                bound.descriptor.tt_think_time(),
             );
         }
         HUBS.lock().push(HubBinding {

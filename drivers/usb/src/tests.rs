@@ -2790,6 +2790,7 @@ fn smoke_fp_usb_id_table_match() -> TestResult {
         // Goodix
         (0x27C6, 0x5110, FpVendor::Goodix),
         (0x27C6, 0x55B4, FpVendor::Goodix),
+        (0x27C6, 0x6594, FpVendor::Goodix),
         // ELAN
         (0x04F3, 0x0903, FpVendor::Elan),
         (0x04F3, 0x0C03, FpVendor::Elan),
@@ -2823,7 +2824,7 @@ fn smoke_fp_vendor_classifier() -> TestResult {
         }
     }
     // All Goodix PIDs
-    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4] {
+    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594] {
         if !matches!(classify_vid_pid(0x27C6, pid), Some(FpVendor::Goodix)) {
             return TestResult::Fail("Goodix PID not classified");
         }
@@ -3623,7 +3624,8 @@ kernel_test_in!(
 /// 2.
 fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
     use crate::xhci::slot::{
-        encode_slot_ctx_dword0, input_context_size, input_ctx_add_flag, input_ctx_drop_flag,
+        encode_slot_ctx_dword0, encode_slot_ctx_dword2, input_context_size, input_ctx_add_flag,
+        input_ctx_drop_flag,
     };
     // Add Slot Context: bit 0.
     if input_ctx_add_flag(0) != 1 {
@@ -3645,7 +3647,7 @@ fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
         return TestResult::Fail("DCI 3 drop flag must be bit 3");
     }
     // Slot Context dword0: route_string + speed + hub + ctx_entries.
-    let d0 = encode_slot_ctx_dword0(0x12345, 3, false, true, 5);
+    let d0 = encode_slot_ctx_dword0(0x12345, 3, true, true, 5);
     if (d0 & 0xFFFFF) != 0x12345 {
         return TestResult::Fail("route_string not in bits[19:0]");
     }
@@ -3655,8 +3657,15 @@ fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
     if (d0 & (1 << 26)) == 0 {
         return TestResult::Fail("HUB bit not set");
     }
+    if (d0 & (1 << 25)) == 0 {
+        return TestResult::Fail("MTT bit not set");
+    }
     if ((d0 >> 27) & 0x1F) != 5 {
         return TestResult::Fail("ctx_entries not in bits[31:27]");
+    }
+    let d2 = encode_slot_ctx_dword2(7, 1, 3);
+    if d2 & 0xFF != 7 || (d2 >> 8) & 0xFF != 1 || (d2 >> 16) & 0x3 != 3 {
+        return TestResult::Fail("parent TT slot context encoding mismatch");
     }
     // Input Context size — 32-byte and 64-byte variants.
     if input_context_size(false) != 32 + 32 + 31 * 32 {
@@ -4348,6 +4357,76 @@ fn smoke_usb_hub_descriptor_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/hub", smoke_usb_hub_descriptor_decode);
+
+/// The target 05e3:0610 Genesys hub advertises protocol 2 (one TT per
+/// port). A full-speed child such as 10ab:9309 must carry the parent
+/// slot, downstream port, and Hub Descriptor think time into its xHCI
+/// Slot Context; otherwise split transactions are scheduled against
+/// the wrong TT.
+fn smoke_usb_hub_multi_tt_child_topology() -> TestResult {
+    use crate::attach::route_tier;
+    use crate::hub::{HubDescriptor, UsbHub, HUB_PROTOCOL_MULTI_TT};
+    use crate::xhci::PortSpeed;
+
+    let hub = UsbHub {
+        slot_id: 7,
+        iface_num: 0,
+        descriptor: HubDescriptor {
+            num_ports: 4,
+            // TT think-time encoding 3 = 32 full-speed bit times.
+            characteristics: 3 << 5,
+            poweron_time_2ms: 50,
+            controller_current: 100,
+        },
+        speed: PortSpeed::High,
+        device_protocol: HUB_PROTOCOL_MULTI_TT,
+    };
+    if !hub.is_multi_tt() {
+        return TestResult::Fail("protocol 2 hub was not classified multi-TT");
+    }
+    if route_tier(0) != 0
+        || route_tier(0x0000F) != 1
+        || route_tier(0x00021) != 2
+        || route_tier(0xFEDCB) != 5
+    {
+        return TestResult::Fail("xHCI route tier decode mismatch");
+    }
+    let topology = hub.child_topology(0, 0, 1, PortSpeed::Full);
+    if topology.route_string != 1 {
+        return TestResult::Fail("downstream route string mismatch");
+    }
+    if topology.parent_hub_slot_id != 7 || topology.parent_hub_port != 1 {
+        return TestResult::Fail("parent TT slot/port missing");
+    }
+    if topology.tt_think_time != 3 {
+        return TestResult::Fail("hub TT think time not propagated");
+    }
+
+    let high_speed = hub.child_topology(0, 0, 2, PortSpeed::High);
+    if high_speed.parent_hub_slot_id != 0
+        || high_speed.parent_hub_port != 0
+        || high_speed.tt_think_time != 0
+    {
+        return TestResult::Fail("high-speed child incorrectly received TT metadata");
+    }
+
+    let full_speed_hub = UsbHub {
+        speed: PortSpeed::Full,
+        ..hub
+    };
+    if full_speed_hub.is_multi_tt() {
+        return TestResult::Fail("full-speed hub incorrectly classified multi-TT");
+    }
+    let no_translator = full_speed_hub.child_topology(0, 0, 1, PortSpeed::Low);
+    if no_translator.parent_hub_slot_id != 0
+        || no_translator.parent_hub_port != 0
+        || no_translator.tt_think_time != 0
+    {
+        return TestResult::Fail("full-speed hub incorrectly supplied TT metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_hub_multi_tt_child_topology);
 
 /// Hub Port Status decode: connection-change, over-current, and reset
 /// bits are at the correct positions in the 32-bit GET_STATUS word.
