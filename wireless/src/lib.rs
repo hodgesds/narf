@@ -39,6 +39,12 @@ pub enum WirelessRight {
 /// A specialized network interface supporting 802.11 operations.
 #[async_trait]
 pub trait WirelessNetIface: Interface {
+    /// Actual supported HT/VHT capabilities for a band (2400 or 5000 MHz).
+    /// Missing capabilities are never inferred from another band's flags.
+    fn phy_capabilities(&self, _band_mhz: u32) -> Option<iface::PhyCapabilities> {
+        None
+    }
+
     /// Per-access-category Ethernet producer. Drivers without separate
     /// queues preserve compatibility by returning their default TX ring.
     fn tx_ring_for_ac(

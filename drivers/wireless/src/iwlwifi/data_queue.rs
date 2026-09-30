@@ -1,4 +1,5 @@
-//! AX210+ unaggregated TX queue. The allocation command exposes DMA
+//! AX210+ TX queue with single-frame and cumulative Block Ack completion.
+//! The allocation command exposes DMA
 //! addresses, so the queue must be retained even if that command times out.
 
 use alloc::{vec, vec::Vec};
@@ -19,6 +20,8 @@ pub struct DataQueue {
     byte_counts: DmaBuffer,
     pending: Vec<Option<DmaBuffer>>,
     id: Option<u16>,
+    station_tid: Option<(u8, u8)>,
+    aggregated: bool,
     read: u16,
     write: u16,
 }
@@ -30,12 +33,14 @@ impl DataQueue {
             byte_counts: dma_alloc(2048)?,
             pending: (0..DEPTH).map(|_| None).collect(),
             id: None,
+            station_tid: None,
+            aggregated: false,
             read: 0,
             write: 0,
         })
     }
 
-    pub fn configure(&self, station: u8, tid: u8) -> Result<[u8; 36], &'static str> {
+    pub fn configure(&mut self, station: u8, tid: u8) -> Result<[u8; 36], &'static str> {
         if station >= 32 || tid > 16 {
             return Err("invalid TX station/TID");
         }
@@ -45,7 +50,50 @@ impl DataQueue {
         put32(&mut bytes, 16, DEPTH.ilog2() - 3);
         put64(&mut bytes, 20, self.byte_counts.dma_addr().raw());
         put64(&mut bytes, 28, self.descriptors.dma_addr().raw());
+        self.station_tid = Some((station, tid));
         Ok(bytes)
+    }
+
+    pub fn enable_aggregation(&mut self) {
+        self.aggregated = self.station_tid.is_some_and(|(_, tid)| tid < 8);
+    }
+
+    pub fn validate_ba(&self, station: u8, tid: u8, ssn: u16) -> Result<(), &'static str> {
+        if !self.aggregated || self.station_tid != Some((station, tid)) {
+            return Err("BA completion for unnegotiated station/TID");
+        }
+        self.validate_reclaim(ssn)
+    }
+
+    fn validate_reclaim(&self, ssn: u16) -> Result<(), &'static str> {
+        let count = ssn.wrapping_sub(self.read) as usize;
+        if count > self.write.wrapping_sub(self.read) as usize || count >= DEPTH {
+            return Err("TX reclaim outside outstanding interval");
+        }
+        for offset in 0..count {
+            if self.pending[(self.read as usize + offset) & (DEPTH - 1)].is_none() {
+                return Err("TX reclaim for unowned descriptor");
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the whole interval before releasing any device-owned buffer.
+    pub fn reclaim(&mut self, ssn: u16) -> Result<(), &'static str> {
+        self.validate_reclaim(ssn)?;
+        while self.read != ssn {
+            self.pending[self.read as usize & (DEPTH - 1)] = None;
+            self.read = self.read.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    pub fn has_completed(&self, ssn: u16) -> bool {
+        self.read.wrapping_sub(ssn) < 0x8000
+    }
+
+    pub fn next_completion(&self) -> u16 {
+        self.read.wrapping_add(1)
     }
 
     pub fn activate(&mut self, response: &[u8]) -> Result<u16, &'static str> {
@@ -153,23 +201,22 @@ impl DataQueue {
     }
 
     /// Validate the entire reclaim interval before dropping any DMA.
-    /// This path deliberately never requests aggregation; one status
-    /// describes one frame, and its SSN must advance exactly one slot.
+    /// A legacy queue advances one slot. An aggregated queue's single-frame
+    /// retry can retire an interval containing earlier acknowledged frames.
     pub fn complete(&mut self, response: &[u8]) -> Result<(u16, bool), &'static str> {
         if response.len() != 48 || response[0] != 1 {
             return Err("invalid unaggregated TX response");
         }
         let id = u16::from_le_bytes(response[36..38].try_into().unwrap());
         let ssn = u32::from_le_bytes(response[44..48].try_into().unwrap()) as u16;
-        if self.id != Some(id) || self.read == self.write || ssn != self.read.wrapping_add(1) {
+        if self.id != Some(id)
+            || self.read == self.write
+            || ssn == self.read
+            || (!self.aggregated && ssn != self.read.wrapping_add(1))
+        {
             return Err("TX completion outside outstanding interval");
         }
-        let slot = self.read as usize & (DEPTH - 1);
-        if self.pending[slot].is_none() {
-            return Err("TX completion for unowned slot");
-        }
-        self.pending[slot] = None;
-        self.read = ssn;
+        self.reclaim(ssn)?;
         Ok((ssn, response[40] == 1))
     }
 }

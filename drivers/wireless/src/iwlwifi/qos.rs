@@ -1,4 +1,4 @@
-//! WMM negotiation, AP EDCA parameters and four unaggregated TX queues.
+//! WMM negotiation, AP EDCA parameters and four access-category TX queues.
 //! Firmware AC order is BK, BE, VI, VO (fw/api/mac.h).
 
 use super::boot_context::{put16, put32};

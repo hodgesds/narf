@@ -9,7 +9,11 @@ pub struct Rates {
     pub basic: u16,
 }
 impl Rates {
-    pub fn parse(mut ies: &[u8], channel: u8) -> Result<Self, &'static str> {
+    pub fn parse(ies: &[u8], channel: u8) -> Result<Self, &'static str> {
+        Self::parse_for_phy(ies, channel, 0)
+    }
+
+    pub fn parse_for_phy(mut ies: &[u8], channel: u8, mode: u8) -> Result<Self, &'static str> {
         let allowed = if channel == 14 {
             0xf
         } else if channel <= 13 {
@@ -28,6 +32,10 @@ impl Rates {
             let bytes = &ies[2..2 + ies[1] as usize];
             if matches!(ies[0], 1 | 50) {
                 for &rate in bytes {
+                    // HT/VHT BSS membership selectors are not bitrates.
+                    if (rate == 0xff && mode >= 1) || (rate == 0xfe && mode >= 2) {
+                        continue;
+                    }
                     let bit = RATES
                         .iter()
                         .position(|&value| value == rate & 0x7f)
@@ -94,7 +102,7 @@ impl Rates {
         }
         let mut out = [0; 44];
         put32(&mut out, 0, 1); // station mask
-        out[10] = chains as u8; // legacy, 20MHz, no SGI/HT/aggregation
+        out[10] = chains as u8; // baseline; negotiated HT/VHT fields applied later
         put16(&mut out, 14, self.supported);
         put16(&mut out, 40, 4095);
         Ok(out)

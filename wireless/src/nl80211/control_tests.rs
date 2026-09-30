@@ -31,6 +31,15 @@ impl Interface for InterfaceStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for InterfaceStub {
+    fn phy_capabilities(&self, band: u32) -> Option<crate::iface::PhyCapabilities> {
+        let mut ht = [0; 26];
+        ht[..5].copy_from_slice(&[0x6e, 0, 0x13, 0xff, 0xff]);
+        ht[15] = 1;
+        Some(crate::iface::PhyCapabilities {
+            ht,
+            vht: (band == 5000).then_some([0x20, 0, 0x80, 1, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]),
+        })
+    }
     fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
         crate::WirelessIfaceInfo {
             base_name: self.name().into(),
@@ -67,6 +76,48 @@ impl crate::WirelessNetIface for InterfaceStub {
         Err(crate::WirelessError::NotSupported)
     }
 }
+
+fn smoke_nl80211_band_ht_vht_attributes() -> TestResult {
+    let iface = InterfaceStub {
+        name: "wlan-phy-test",
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    };
+    let mut info = crate::WirelessNetIface::get_wireless_info(&iface);
+    info.bands = alloc::vec![
+        crate::iface::WirelessBand {
+            freq_mhz: 2400,
+            channels: alloc::vec![1, 6, 11]
+        },
+        crate::iface::WirelessBand {
+            freq_mhz: 5000,
+            channels: alloc::vec![36, 40]
+        },
+    ];
+    let attrs = wiphy_attrs(7, &info, Some(&iface));
+    let bands = find_attr(&attrs, 22 | NLA_F_NESTED).unwrap();
+    for band_id in 0..=1 {
+        let band = find_attr(bands, band_id | NLA_F_NESTED).unwrap();
+        if find_attr(band, 3).is_none_or(|mcs| mcs.len() != 16 || mcs[..2] != [0xff; 2])
+            || find_attr(band, 4) != Some(&0x6eu16.to_ne_bytes()[..])
+            || find_attr(band, 5) != Some(&[3][..])
+            || find_attr(band, 6) != Some(&[4][..])
+        {
+            return TestResult::Fail("nl80211 HT capability/MCS/AMPDU fields");
+        }
+        if band_id == 0 {
+            if find_attr(band, 7).is_some() || find_attr(band, 8).is_some() {
+                return TestResult::Fail("VHT incorrectly advertised in 2.4 GHz band");
+            }
+        } else if find_attr(band, 7) != Some(&[0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0][..])
+            || find_attr(band, 8) != Some(&0x01800020u32.to_ne_bytes()[..])
+        {
+            return TestResult::Fail("nl80211 VHT capability/MCS fields");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_band_ht_vht_attributes);
 
 fn smoke_nl80211_attribute_and_security_validation() -> TestResult {
     let mut bytes = Vec::new();

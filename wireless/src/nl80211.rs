@@ -102,7 +102,11 @@ fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
     attrs
 }
 
-fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
+fn wiphy_attrs(
+    index: u32,
+    info: &crate::WirelessIfaceInfo,
+    iface: Option<&dyn crate::WirelessNetIface>,
+) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
     named_attr(
@@ -146,6 +150,24 @@ fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
             push_attr(&mut bitrates, i as u16 | NLA_F_NESTED, &entry);
         }
         push_attr(&mut body, 2 | NLA_F_NESTED, &bitrates);
+        if let Some(caps) = iface.and_then(|iface| iface.phy_capabilities(band.freq_mhz)) {
+            push_attr(&mut body, 3, &caps.ht[3..19]); // HT MCS set
+            push_attr(
+                &mut body,
+                4,
+                &u16::from_le_bytes(caps.ht[..2].try_into().unwrap()).to_ne_bytes(),
+            );
+            push_attr(&mut body, 5, &[caps.ht[2] & 3]);
+            push_attr(&mut body, 6, &[(caps.ht[2] >> 2) & 7]);
+            if let Some(vht) = caps.vht {
+                push_attr(&mut body, 7, &vht[4..12]);
+                push_attr(
+                    &mut body,
+                    8,
+                    &u32::from_le_bytes(vht[..4].try_into().unwrap()).to_ne_bytes(),
+                );
+            }
+        }
         push_attr(&mut bands, band_id | NLA_F_NESTED, &body);
     }
     push_attr(&mut attrs, 22 | NLA_F_NESTED, &bands);
@@ -223,7 +245,11 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
                 })
             })
             .map(|(index, iface)| {
-                let mut attrs = wiphy_attrs(index as u32, &iface.get_wireless_info());
+                let mut attrs = wiphy_attrs(
+                    index as u32,
+                    &iface.get_wireless_info(),
+                    Some(iface.as_ref()),
+                );
                 if iface.supports_handshake_offload() {
                     push_attr(&mut attrs, 217, &[0, 0x80]); // EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK
                     push_attr(&mut attrs, 57, &0x000fac04u32.to_ne_bytes());
@@ -360,7 +386,7 @@ mod tests {
                 eht_supported: false,
             },
         };
-        let attrs = wiphy_attrs(4, &info);
+        let attrs = wiphy_attrs(4, &info, None);
         assert!(attrs.windows(5).any(|window| window == b"phy4\0"));
         assert!(attrs
             .windows(info.base_mac.len())

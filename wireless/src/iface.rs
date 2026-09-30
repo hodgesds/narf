@@ -41,6 +41,13 @@ pub struct HwCaps {
     pub eht_supported: bool,
 }
 
+/// Band-specific IEEE capability bodies, also used for nl80211 wiphy data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhyCapabilities {
+    pub ht: [u8; 26],
+    pub vht: Option<[u8; 12]>,
+}
+
 pub type WirelessIface = dyn crate::WirelessNetIface;
 
 /// WMM queue identity, in firmware-independent BK/BE/VI/VO order.

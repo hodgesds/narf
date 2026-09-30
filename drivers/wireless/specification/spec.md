@@ -77,8 +77,12 @@ Firmware command versions are checked before version-specific layouts are
 used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
 
 - `get_wireless_info()` reports the real hardware MAC and NVM-enabled
-  2.4/5 GHz channels, station mode, and legacy rates. HT/VHT/HE/EHT are
-  not advertised by this station implementation.
+  2.4/5 GHz channels and station mode. NVM antenna masks and SKU flags
+  constrain HT/VHT to at most two spatial streams; MIMO-disabled SKUs
+  advertise one. `phy_capabilities(band_mhz)` supplies HT capability bodies
+  for 2.4/5 GHz and VHT for 5 GHz to nl80211 and active probe templates.
+  HE/EHT are not advertised. HT registration requires supported firmware
+  Block Ack command/notification versions.
 - `scan()` runs bounded passive or active scans, applies SSID/channel filters,
   and retains at most 256 BSS records. Association selects a matching
   cached BSSID/SSID/channel. Active scans emit wildcard or up to 20 directed
@@ -87,10 +91,20 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
   probe bitmap; DFS and disallowed channels remain passive. The lowest
   applicable power limit is programmed before scanning. Without a host
   policy all channels remain passive.
-- `associate()` configures a 20 MHz PHY/link/peer, allocates management
+- `associate()` configures a negotiated PHY/link/peer, allocates management
   and data queues, authenticates, and associates. Supported/basic rates are
   intersected with the AP; mandatory unsupported PHY/rate selectors are
-  rejected. TLC v6 adapts data rates within that intersection. WMM negotiation
+  rejected. HT supports 20/40 MHz and VHT supports 20/40/80 MHz, with
+  common MCS masks, short guard intervals, peer LDPC reception, SMPS and
+  HT protection programmed into TLC v6, peer and link commands. VHT MCS9
+  is excluded at 20 MHz for the supported one/two-stream profile.
+  Association responses confirm capabilities and can narrow the negotiated
+  profile. A subsequent beacon that changes the negotiated PHY constraints
+  closes the controlled port and requires reassociation; live channel/PHY
+  migration is not implemented. All occupied 20 MHz channels and the complete channel span must
+  satisfy host and firmware regulatory limits, including bandwidth and power;
+  the response's final span is revalidated. TLC v6 adapts data rates within
+  that intersection. WMM negotiation
   enables BK/BE/VI/VO hardware queues with AP EDCA parameters and QoS headers.
   DSCP classifies kernel traffic; explicit AC rings preserve daemon priorities.
   Categories requiring admission control downgrade to an admitted category.
@@ -108,7 +122,21 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
   PTK until authenticated M3 succeeds. Key replacement drains TX and discards
   RX captured across the transition before
   resetting replay state. Identical key material is never reinstalled.
-- `disassociate()` closes the port, removes TX queues and the peer,
+- HT/VHT TX A-MPDU setup and retries are firmware-managed. Compressed BA
+  notifications retire validated cumulative TX intervals. RX immediate
+  Block Ack sessions negotiate up to 64 MPDUs per TID, with at most eight
+  sessions. ADDBA/DELBA, firmware BAID v2 allocation/removal, BAR and frame
+  release notifications drive host reordering across 12-bit sequence wrap.
+  Holes release after 100 ms; nonzero negotiated inactivity timeouts tear
+  down sessions. Authentication/admission precedes buffering; ordered
+  delivery advances CCMP packet numbers. Key changes discard buffered
+  old-key MPDUs. Repeated ADDBA requests preserve an existing matching
+  session. Control work is bounded and restricted to the associated AP.
+  Firmware-deaggregated standalone A-MSDUs require ordered subframe indices;
+  equal PNs are allowed only within the same key's aggregate. A-MSDU inside
+  A-MPDU and host TX A-MSDU construction are not negotiated.
+- `disassociate()` closes the port, removes RX BA sessions, drains TX,
+  removes TX queues and the peer,
   deactivates/detaches the link, and removes the PHY. Cancellation or a
   transport error leaves the interface down; the next scan/associate
   resets hardware before accepting another operation.
@@ -118,7 +146,8 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
 
 The best-effort Ethernet path is registered with both the capability frame
 registry and the kernel interface registry. It converts Ethernet and
-unfragmented, nonaggregated 802.11 frames. Synchronous network waits can
+unfragmented 802.11 frames after any required reordering/deaggregation.
+Synchronous network waits can
 drain RX without polling the executor recursively. Background work uses an
 async mutex and MSI-X completion waits with bounded watchdog timers; it does
 not hold an IRQ-safe lock across an await. RX queue 0 and non-RX causes use
@@ -131,7 +160,7 @@ credit. Credit waits drain DMA under the async mutex and fail the transport
 after a bounded timeout; only validated completions release descriptors.
 Shutdown masks device and PCI delivery and synchronizes handlers
 before releasing their cookie/vector; restart restores IVAR/UMAC routing.
-Aggregation, HT/VHT/HE/EHT, 6 GHz, roaming, and suspend/resume remain outside
+160/80+80 MHz, HE/EHT, 6 GHz, roaming, and suspend/resume remain outside
 this station profile (advanced PHY/offloads are assigned to Stage 6).
 
 ### 3.2 DMA lifetime and completion contract
@@ -144,8 +173,12 @@ Descriptor writes precede doorbells through a DMA visibility barrier.
 
 Command and data payloads remain allocated until a validated completion.
 Command replies must match the outstanding command and sequence; unsolicited
-notifications cannot reclaim command DMA. The unaggregated TX response must
-advance exactly one owned descriptor. A timeout never frees DMA on its own.
+notifications cannot reclaim command DMA. Legacy TX responses advance
+exactly one owned descriptor. Aggregated queues accept cumulative compressed
+BA and single-frame retry completions. Every queue/station/TID and every
+reclaimed descriptor is validated before any DMA is released; malformed
+multi-queue reports cannot partially reclaim buffers. A timeout never frees
+DMA on its own.
 Reset/drop releases resources only after the hardware DMA-stop handshake
 and PCI bus-master disable succeed; otherwise allocations are quarantined.
 Firmware sections, boot context, scratch, and PNVM remain owned throughout
