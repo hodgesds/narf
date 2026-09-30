@@ -87,6 +87,7 @@ pub enum KeyAlg {
     ChaCha20Poly1305 = 0x04,
     Hkdf = 0x05,
     AesXts256 = 0x06,
+    AesXts128 = 0x07,
 }
 
 /// Marker trait every algorithm tag implements; the constant lets the
@@ -140,6 +141,13 @@ impl KeyAlgorithm for AesXts256 {
     const ALG: KeyAlg = KeyAlg::AesXts256;
 }
 
+/// Type-level marker: AES-128-XTS for block-level encryption.
+#[derive(Copy, Clone, Debug)]
+pub struct AesXts128;
+impl KeyAlgorithm for AesXts128 {
+    const ALG: KeyAlg = KeyAlg::AesXts128;
+}
+
 /// Phantom-typed key handle. The actual key bytes live behind the cap
 /// table in `DomainId::KEYS` (spec §5); this struct never carries
 /// secret material directly.
@@ -170,6 +178,8 @@ pub enum CryptoError {
     KeyUnavailable,
     /// Output buffer too small for the requested operation.
     InsufficientOutputBuffer,
+    /// Input length or data-unit size is invalid for the primitive.
+    InvalidInput,
     /// Primitive backend disabled at compile time (e.g. no_std-broken
     /// dependency stubbed out). Should never fire in a well-configured
     /// build.
@@ -299,7 +309,81 @@ pub fn hkdf_expand(
     Ok(out)
 }
 
-// ── AES-256-XTS (Block encryption) ───────────────────────────────────
+// ── AES-XTS (block encryption) ──────────────────────────────────────
+
+fn valid_xts_area(data: &[u8], sector_size: usize) -> bool {
+    if sector_size < 16 || !sector_size.is_power_of_two() || data.len() < 16 {
+        return false;
+    }
+    let final_unit = data.len() % sector_size;
+    final_unit == 0 || final_unit >= 16
+}
+
+/// AES-XTS-128 encryption using two 128-bit keys.
+///
+/// `sector_id` is encoded little-endian as the Linux `plain64` tweak for the
+/// first encryption sector. `sector_size` is the data-unit size, and must be a
+/// power of two of at least one AES block. A final short data unit is accepted
+/// only when it contains at least one AES block, as required for XTS
+/// ciphertext stealing.
+pub fn aes_xts_128_encrypt(
+    cap: &Cap<Key<AesXts128>, Grant>,
+    key_bytes: &[u8; 32],
+    sector_id: u64,
+    sector_size: usize,
+    data: &mut [u8],
+) -> Result<(), CryptoError> {
+    cap.check_live()?;
+    if !valid_xts_area(data, sector_size) {
+        return Err(CryptoError::InvalidInput);
+    }
+
+    use aes::cipher::KeyInit;
+    use aes::Aes128;
+    use xts_mode::{get_tweak_default, Xts128};
+
+    let cipher_1 =
+        Aes128::new_from_slice(&key_bytes[..16]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_2 =
+        Aes128::new_from_slice(&key_bytes[16..]).map_err(|_| CryptoError::BackendUnavailable)?;
+    Xts128::new(cipher_1, cipher_2).encrypt_area(
+        data,
+        sector_size,
+        sector_id.into(),
+        get_tweak_default,
+    );
+    Ok(())
+}
+
+/// AES-XTS-128 decryption; see [`aes_xts_128_encrypt`] for tweak semantics.
+pub fn aes_xts_128_decrypt(
+    cap: &Cap<Key<AesXts128>, Grant>,
+    key_bytes: &[u8; 32],
+    sector_id: u64,
+    sector_size: usize,
+    data: &mut [u8],
+) -> Result<(), CryptoError> {
+    cap.check_live()?;
+    if !valid_xts_area(data, sector_size) {
+        return Err(CryptoError::InvalidInput);
+    }
+
+    use aes::cipher::KeyInit;
+    use aes::Aes128;
+    use xts_mode::{get_tweak_default, Xts128};
+
+    let cipher_1 =
+        Aes128::new_from_slice(&key_bytes[..16]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_2 =
+        Aes128::new_from_slice(&key_bytes[16..]).map_err(|_| CryptoError::BackendUnavailable)?;
+    Xts128::new(cipher_1, cipher_2).decrypt_area(
+        data,
+        sector_size,
+        sector_id.into(),
+        get_tweak_default,
+    );
+    Ok(())
+}
 
 /// AES-XTS-256 encryption. `key_bytes` must be 64 bytes (two 256-bit keys).
 /// `sector_id` is encoded little-endian as the `plain64` tweak for the first
@@ -310,7 +394,21 @@ pub fn aes_xts_256_encrypt(
     sector_id: u64,
     data: &mut [u8],
 ) -> Result<(), CryptoError> {
+    aes_xts_256_encrypt_with_sector_size(cap, key_bytes, sector_id, 512, data)
+}
+
+/// AES-XTS-256 encryption with an explicit data-unit size.
+pub fn aes_xts_256_encrypt_with_sector_size(
+    cap: &Cap<Key<AesXts256>, Grant>,
+    key_bytes: &[u8; 64],
+    sector_id: u64,
+    sector_size: usize,
+    data: &mut [u8],
+) -> Result<(), CryptoError> {
     cap.check_live()?;
+    if !valid_xts_area(data, sector_size) {
+        return Err(CryptoError::InvalidInput);
+    }
 
     use aes::cipher::KeyInit;
     use aes::Aes256;
@@ -327,7 +425,7 @@ pub fn aes_xts_256_encrypt(
     // size, not the AES block size. Passing 16 here used to restart the tweak
     // for every AES block, which round-tripped internally but was not dm-crypt
     // compatible. Reference: ~/git/linux/drivers/md/dm-crypt.c
-    xts.encrypt_area(data, 512, sector_id.into(), get_tweak_default);
+    xts.encrypt_area(data, sector_size, sector_id.into(), get_tweak_default);
 
     Ok(())
 }
@@ -341,7 +439,21 @@ pub fn aes_xts_256_decrypt(
     sector_id: u64,
     data: &mut [u8],
 ) -> Result<(), CryptoError> {
+    aes_xts_256_decrypt_with_sector_size(cap, key_bytes, sector_id, 512, data)
+}
+
+/// AES-XTS-256 decryption with an explicit data-unit size.
+pub fn aes_xts_256_decrypt_with_sector_size(
+    cap: &Cap<Key<AesXts256>, Grant>,
+    key_bytes: &[u8; 64],
+    sector_id: u64,
+    sector_size: usize,
+    data: &mut [u8],
+) -> Result<(), CryptoError> {
     cap.check_live()?;
+    if !valid_xts_area(data, sector_size) {
+        return Err(CryptoError::InvalidInput);
+    }
 
     use aes::cipher::KeyInit;
     use aes::Aes256;
@@ -353,7 +465,7 @@ pub fn aes_xts_256_decrypt(
         Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
     let xts = Xts128::new(cipher_1, cipher_2);
 
-    xts.decrypt_area(data, 512, sector_id.into(), get_tweak_default);
+    xts.decrypt_area(data, sector_size, sector_id.into(), get_tweak_default);
 
     Ok(())
 }

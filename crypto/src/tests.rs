@@ -144,6 +144,36 @@ fn smoke_crypto_aes_xts_nist_vector() -> TestResult {
 }
 kernel_test_in!("crypto", smoke_crypto_aes_xts_nist_vector);
 
+fn smoke_crypto_aes_xts_128_nist_vector() -> TestResult {
+    // NIST CAVP XTSGenAES128.rsp, ENCRYPT COUNT=1.
+    use crate::{aes_xts_128_decrypt, aes_xts_128_encrypt, AesXts128, Key};
+    use narf_capabilities::{Cap, Grant};
+
+    let key: [u8; 32] = [
+        0xa3, 0xe4, 0x0d, 0x5b, 0xd4, 0xb6, 0xbb, 0xed, 0xb2, 0xd1, 0x8c, 0x70, 0x0a, 0xd2, 0xdb,
+        0x22, 0x10, 0xc8, 0x11, 0x90, 0x64, 0x6d, 0x67, 0x3c, 0xbc, 0xa5, 0x3f, 0x13, 0x3e, 0xab,
+        0x37, 0x3c,
+    ];
+    let plaintext: [u8; 16] = [
+        0x20, 0xe0, 0x71, 0x94, 0x05, 0x99, 0x3f, 0x09, 0xa6, 0x6a, 0xe5, 0xbb, 0x50, 0x0e, 0x56,
+        0x2c,
+    ];
+    let expected: [u8; 16] = [
+        0x74, 0x62, 0x35, 0x51, 0x21, 0x02, 0x16, 0xac, 0x92, 0x6b, 0x96, 0x50, 0xb6, 0xd3, 0xfa,
+        0x52,
+    ];
+    let cap = Cap::<Key<AesXts128>, Grant>::bootstrap();
+    let mut data = plaintext;
+    if aes_xts_128_encrypt(&cap, &key, 141, 16, &mut data).is_err() || data != expected {
+        return TestResult::Fail("AES-128-XTS encryption mismatched NIST vector");
+    }
+    if aes_xts_128_decrypt(&cap, &key, 141, 16, &mut data).is_err() || data != plaintext {
+        return TestResult::Fail("AES-128-XTS decryption mismatched NIST vector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("crypto", smoke_crypto_aes_xts_128_nist_vector);
+
 fn smoke_crypto_blake3_known_answer() -> TestResult {
     use crate::blake3_hash;
 

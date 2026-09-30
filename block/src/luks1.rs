@@ -49,7 +49,7 @@ pub enum Luks1Hash {
 }
 
 impl Luks1Hash {
-    fn digest_len(self) -> usize {
+    pub(crate) fn digest_len(self) -> usize {
         match self {
             Self::Sha1 => 20,
             Self::Sha256 => 32,
@@ -434,7 +434,7 @@ pub(crate) fn unlock(
     Err(Luks1Error::WrongPassphrase)
 }
 
-fn pbkdf2(
+pub(crate) fn pbkdf2(
     hash: Luks1Hash,
     password: &[u8],
     salt: &[u8],
@@ -545,7 +545,7 @@ fn hash_into(hash: Luks1Hash, prefix: &[u8], data: &[u8], out: &mut [u8; 64]) {
     }
 }
 
-fn af_merge(
+pub(crate) fn af_merge(
     hash: Luks1Hash,
     material: &[u8],
     key_bytes: usize,
@@ -560,7 +560,11 @@ fn af_merge(
         xor_in_place(&mut state, stripe);
         diffuse(hash, &state, &mut diffused);
         core::mem::swap(&mut state, &mut diffused);
-        diffused.zeroize();
+        // `Zeroize for Vec<T>` also clears the Vec's length. The AF loop needs
+        // this scratch allocation on every stripe, so wipe its bytes without
+        // changing its shape. Clearing here made any slot with >2 stripes
+        // panic on the next diffuse (real LUKS uses 4000).
+        diffused.fill(0);
     }
     xor_in_place(
         &mut state,
@@ -585,7 +589,7 @@ fn xor_in_place(left: &mut [u8], right: &[u8]) {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }

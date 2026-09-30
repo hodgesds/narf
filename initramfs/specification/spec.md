@@ -244,6 +244,16 @@ pub fn is_staged() -> bool;
 pub fn register_initcalls();
 ```
 
+When `rd.luks.key=/path` is present, the Early-stage initcall also installs a
+LUKS passphrase provider backed by that exact regular-file entry in the staged,
+measured CPIO archive. `rd.luks.uuid=<uuid>` optionally restricts the provider
+to one container (`luks-` prefix accepted). The keyfile is capped at 64 KiB,
+copied into zeroizing storage for each unlock attempt, and interpreted as raw
+bytes without newline stripping. No keyfile policy is installed when the
+command-line option is absent. Zeroization covers the per-attempt copy; the
+measured, read-only source bytes remain in the permanently staged initramfs and
+therefore should be treated as a boot-lifetime secret.
+
 ## 6. Migration plan from the current state
 
 Today `Initramfs` lives in `narf-filesystem` as a public type;

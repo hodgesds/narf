@@ -38,8 +38,8 @@ use crate::BlockIoError;
 /// partition scanner is already registering the child device. It is not a
 /// filesystem or encryption probe: the owning layer still validates and opens
 /// the complete format later. FAT serials use Linux's eight-hex-digit form;
-/// ext and LUKS1 UUIDs use their canonical forms.
-fn discover_fs_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
+/// ext, LUKS1, and LUKS2 UUIDs use their canonical forms.
+pub fn discover_volume_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     let lba_bytes = dev.lba_size() as usize;
     if lba_bytes < 512 {
         return None;
@@ -48,6 +48,9 @@ fn discover_fs_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
     let mut boot = alloc::vec![0u8; lba_bytes];
     if dev.read(0, 1, &mut boot).is_ok() {
         if let Some(uuid) = crate::luks1::probe_uuid(&boot) {
+            return Some(uuid);
+        }
+        if let Some(uuid) = crate::luks2::probe_uuid(&boot) {
             return Some(uuid);
         }
         let fat_serial_offset = if boot.get(82..90) == Some(b"FAT32   ".as_slice()) {
@@ -506,7 +509,7 @@ pub fn scan_and_register_partitions(
                 gpt_type_guid: format_guid(&p.type_guid),
                 partlabel: p.name.clone(),
                 partuuid: format_guid(&p.partition_guid),
-                fs_uuid: discover_fs_uuid(sub.as_ref()).unwrap_or_default(),
+                fs_uuid: discover_volume_uuid(sub.as_ref()).unwrap_or_default(),
             };
             register_block_device_with_meta(static_name, sub, Some(meta));
             registered.push(name);

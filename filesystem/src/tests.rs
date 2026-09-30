@@ -1890,15 +1890,19 @@ kernel_test_in!(
 );
 
 fn smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry() -> TestResult {
-    use crate::root_mount::{try_mount_root, RootMountError, __reset_for_test};
+    use crate::root_mount::{try_mount_root_with, RootMountError, __reset_for_test};
     use crate::MountPoint;
     use narf_capabilities::{Cap, Grant};
     __reset_for_test();
     // No FS factories registered → walker can't find a mount even
     // if block devices have known FS magic.
     let auth: Cap<MountPoint, Grant> = Cap::bootstrap();
-    match try_mount_root(&auth) {
-        Err(RootMountError::NoFactory(_)) | Err(RootMountError::NoMountable) => TestResult::Pass,
+    // This test covers factory exhaustion, independent of any `root=` selector
+    // the QEMU harness may have supplied for its own boot disk.
+    match try_mount_root_with(&auth, None) {
+        Err(RootMountError::NoFactory(_))
+        | Err(RootMountError::NoMountable)
+        | Err(RootMountError::LuksUnlock(_)) => TestResult::Pass,
         Ok(_) => TestResult::Fail("no factories must NOT yield a mount"),
         Err(other) => {
             let _ = other;

@@ -1,9 +1,9 @@
 # narf-block-encrypted — Specification
 
-> Status: **v0.2** (Stage 5 implementation).
+> Status: **v0.3** (Stage 5 implementation).
 > 
-> Transparent block-level encryption (AES-256-XTS) for native NARF volumes
-> and read/write interoperability with existing LUKS1 volumes.
+> Transparent block-level encryption (AES-XTS) for native NARF volumes and
+> read/write interoperability with existing LUKS1/LUKS2 volumes.
 
 ## 1. Purpose & scope
 
@@ -16,12 +16,16 @@
   Volume Key (VK) only if the system TCB is in a verified state.
 - **LUKS1 unlock**: Strict parsing, bounded PBKDF2 work, anti-forensic stripe
   merge, volume-key authentication, and a payload-offset block adapter.
+- **LUKS2 unlock**: Redundant checksummed metadata selection, bounded JSON
+  parsing, PBKDF2 or Argon2i/Argon2id key derivation, anti-forensic merge,
+  digest authentication, and segment-offset/tweak mapping.
 
 **Does NOT own:**
 - Concrete block drivers (NVMe, VirtIO).
 - Filesystem-level encryption (e.g. per-file encryption).
 - Hardware-specific crypto offload (uses `narf-crypto` software primitives).
-- LUKS2, keyslot creation/deletion, or LUKS formatting.
+- Keyslot creation/deletion, LUKS formatting, metadata repair, integrity
+  profiles, or in-progress reencryption activation.
 - Passphrase acquisition policy (early console, keyfile, or TPM); boot owns it.
 
 ## 2. On-disk Metadata Format (Header)
@@ -62,6 +66,23 @@ pub fn EncryptedBlockDevice::open_luks1_with_policy(
     passphrase: &[u8],
     policy: Luks1UnlockPolicy,
 ) -> Result<EncryptedBlockDevice, Luks1Error>;
+pub fn EncryptedBlockDevice::open_luks2(
+    inner: Arc<dyn BlockDeviceSync>,
+    passphrase: &[u8],
+) -> Result<EncryptedBlockDevice, Luks2Error>;
+pub fn EncryptedBlockDevice::open_luks2_with_policy(
+    inner: Arc<dyn BlockDeviceSync>,
+    passphrase: &[u8],
+    policy: Luks2UnlockPolicy,
+) -> Result<EncryptedBlockDevice, Luks2Error>;
+pub fn load_header(inner: &dyn BlockDeviceSync) -> Result<Luks2Header, Luks2Error>;
+pub fn install_luks_passphrase_provider(provider: LuksPassphraseProvider);
+pub fn probe_luks_volume(
+    inner: &dyn BlockDeviceSync,
+) -> Result<Option<LuksVolumeInfo>, LuksOpenError>;
+pub fn open_luks_with_provider(
+    inner: Arc<dyn BlockDeviceSync>,
+) -> Result<EncryptedBlockDevice, LuksOpenError>;
 ```
 
 The supported compatibility profile is LUKS version 1, `aes`,
@@ -77,16 +98,49 @@ or any keyslot allocation over 16 MiB. Callers may lower the work bounds, but
 raising them is an explicit availability tradeoff. Parsing and open are
 read-only with respect to LUKS metadata.
 
+### 3.2 Existing LUKS2 volumes
+
+Both metadata copies are read and authenticated with their declared SHA-256
+or SHA-512 checksum; the valid copy with the greatest sequence ID is selected
+without modifying the disk. The supported activation profile is a single
+normal `crypt` segment using `aes-xts-plain64`, 512/1024/2048/4096-byte
+encryption sectors, and a 32-byte AES-128-XTS or 64-byte AES-256-XTS volume
+key. Keyslots use the LUKS1 AF layout with 4000 stripes and PBKDF2-HMAC or
+Argon2i/Argon2id. Candidate keys must pass their bound PBKDF2 digest before
+the mapping is returned.
+
+Unknown mandatory requirements, integrity profiles, linear/multi-segment
+reencryption states, and priority-zero keyslots in automatic mode are rejected.
+The default policy caps PBKDF2 iterations, per-slot and aggregate Argon2
+memory/time work, Argon2 lanes, keyslot area size, and the number of automatic
+attempts. Loading and opening never repair stale metadata or write either
+header.
+
+### 3.3 Boot credential seam
+
+Boot orchestration installs one `LuksPassphraseProvider` callback. The block
+layer probes the non-secret LUKS version/UUID, calls the provider without
+holding its registry lock, and keeps the returned passphrase in
+`Zeroizing<Vec<u8>>` only through KDF/keyslot authentication. The initramfs
+integration supplies an opt-in measured keyfile provider with
+`rd.luks.key=/path` and optional `rd.luks.uuid=<uuid>` selection. Keyfile bytes
+are consumed exactly; text decoding and newline stripping are forbidden.
+
 ## 4. Operation: Read/Write Flow
 
 - **Read(LBA, N)**:
-  1. Read `N` sectors from the underlying device at `LBA + 8` (skipping 
-     header sectors).
-  2. Decrypt each sector using AES-256-XTS with `sector_id = LBA + i`.
+  1. Expose logical blocks of `max(inner LBA size, encryption-sector size)`;
+     translate each visible block into the corresponding underlying LBAs at
+     the authenticated segment offset.
+  2. Decrypt each encryption sector using AES-128-XTS or AES-256-XTS and the
+     `plain64` data-unit number derived from `iv_tweak` plus its 512-byte
+     dm-crypt sector offset.
   3. Return plaintext to the caller.
 - **Write(LBA, N)**:
-  1. Encrypt each sector using AES-256-XTS with `sector_id = LBA + i`.
-  2. Write `N` sectors to the underlying device at `LBA + 8`.
+  1. Encrypt each complete visible block with the same authenticated geometry
+     and tweak mapping.
+  2. Translate it to one or more underlying LBAs and write ciphertext at the
+     segment offset. Partial encryption-sector I/O is never exposed.
 
 ## 5. Security Properties
 
@@ -108,15 +162,18 @@ read-only with respect to LUKS metadata.
 ## 6. Dependencies
 
 - `narf-block`: For `BlockDeviceSync` trait.
-- `narf-crypto`: For AES-256-XTS primitives.
+- `narf-crypto`: For AES-128/256-XTS and SHA primitives.
 - `narf-tpm`: For PCR-based unsealing.
 - `capabilities`: For `TpmCap` and `BlockCap`.
 - `zeroize`: For passphrase-derived keys, decrypted AF material, and digest
   scratch storage.
+- `argon2`: For LUKS2 Argon2i/Argon2id KDFs with caller-owned zeroized memory.
+- `serde` / `serde_json`: For typed LUKS2 metadata decoding.
 
 ## 7. References
 
 - LUKS1 On-Disk Format Specification, cryptsetup project.
+- LUKS2 On-Disk Format Specification, cryptsetup project.
 - cryptsetup `lib/luks1/af.c` for the interoperable AF merge/diffuse layout.
 - `~/git/linux/drivers/md/dm-crypt.c` for `plain64` little-endian sector IVs
   and the default 512-byte encryption-sector behavior.

@@ -34,6 +34,7 @@ pub mod encrypted;
 pub mod fs_detect;
 pub mod io_scheduler;
 pub mod luks1;
+pub mod luks2;
 pub mod mq;
 pub mod noop;
 pub mod opal;
