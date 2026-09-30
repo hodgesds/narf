@@ -35,12 +35,17 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let _position_guard = match poll_blocking(description.position_lock.lock()) {
-        Some(guard) => guard,
-        None => {
-            ctx.set_return(errno_ret(EIO));
-            return;
+    // Linux `fdget_pos`: only FMODE_ATOMIC_POS files lock their position.
+    let _position_guard = if description.locks_position(ops.as_ref()) {
+        match poll_blocking(description.position_lock.lock()) {
+            Some(guard) => Some(guard),
+            None => {
+                ctx.set_return(errno_ret(EIO));
+                return;
+            }
         }
+    } else {
+        None
     };
     let current = description.offset();
     // Pipes, FIFOs and sockets are not seekable: `fs/pipe.c`'s

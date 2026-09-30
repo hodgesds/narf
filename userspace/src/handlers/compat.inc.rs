@@ -1610,6 +1610,95 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
     fn nonblock_read_eagain(&self) -> bool {
         self.inner.nonblock_read_eagain()
     }
+
+    // Everything below is the terminal's behaviour, not the /dev/tty node's
+    // metadata, so it must come from the terminal itself. Linux's /dev/tty
+    // open (`tty_open` → `tty_open_current_tty`) hands back a struct file on
+    // the controlling tty's own tty_struct: its reads block and wake, it is
+    // pollable, and TIOCSPGRP / TIOCSCTTY act on that terminal. Without these
+    // a blocking read had no readiness source to park on and failed EAGAIN
+    // (sudo / su password prompts).
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        self.inner.readiness()
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        self.inner.readiness_notifies()
+    }
+
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.inner.arm_readiness(task_id, interest, waker)
+    }
+
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.inner.arm_readiness_exclusive(task_id, interest, waker)
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.inner.arm_readiness_persistent(id, interest, waker)
+    }
+
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        self.inner.disarm_readiness(task_id)
+    }
+
+    fn can_poll(&self) -> bool {
+        self.inner.can_poll()
+    }
+
+    fn poll_deadline(&self) -> Option<u64> {
+        self.inner.poll_deadline()
+    }
+
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsIoctlReply> {
+        self.inner.ioctl_async(cmd, arg, input, out_size)
+    }
+
+    fn flush<'a>(&'a self) -> narf_filesystem::FsFuture<'a, ()> {
+        self.inner.flush()
+    }
+
+    fn has_flush(&self) -> bool {
+        self.inner.has_flush()
+    }
+
+    fn tty_session(&self) -> Option<u64> {
+        self.inner.tty_session()
+    }
+
+    fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool {
+        self.inner.set_tty_fg_pgrp(pgrp)
+    }
+
+    fn tty_acquire_controlling(
+        &self,
+        arg: usize,
+        readable: bool,
+    ) -> Result<bool, narf_filesystem::FsError> {
+        self.inner.tty_acquire_controlling(arg, readable)
+    }
 }
 
 /// Test-only: install a directory fd for `path` in `task`'s fd table

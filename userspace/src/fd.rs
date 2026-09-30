@@ -16,7 +16,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -61,6 +61,9 @@ pub(crate) struct OpenFileDescription {
     /// on Linux.
     status_flags: AtomicU32,
     pub(crate) position_lock: narf_lib::mutex::Mutex<()>,
+    /// Linux `FMODE_ATOMIC_POS`, cached on first use: 0 unknown, 1 set, 2 clear.
+    /// See [`OpenFileDescription::locks_position`].
+    atomic_pos: AtomicU8,
     /// Index into the bounded inode/FileOps append-lock shard table.
     append_lock_index: usize,
     /// Linux `file::f_owner` analogue. Ownership, configured signal and the
@@ -174,6 +177,34 @@ fn append_lock_index(ops: &Arc<dyn FileOps>) -> usize {
 }
 
 impl OpenFileDescription {
+    /// Whether read/write/lseek serialize on this description's position —
+    /// Linux `fdget_pos()`, which takes `f_pos_lock` only for files with
+    /// `FMODE_ATOMIC_POS`. `do_dentry_open` sets that for regular files and
+    /// directories alone: anon-inode files (eventfd, signalfd, timerfd,
+    /// inotify, pidfd, ...), ttys, sockets and pipes never lock their
+    /// position. Taking the lock anyway deadlocks a blocking reader against
+    /// a writer sharing its description: the reader parks holding it (its
+    /// syscall frame stays alive on its own stack) while a fork child's
+    /// `write()` to the same eventfd waits on it forever.
+    ///
+    /// Decided from the file type on first use and cached — the type of an
+    /// open file never changes — and first use is outside any fd-table lock,
+    /// so a `stat()` that has to consult its backend cannot stall the table.
+    pub(crate) fn locks_position(&self, ops: &dyn FileOps) -> bool {
+        match self.atomic_pos.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let atomic = matches!(
+                    ops.stat().mode.file_type,
+                    narf_filesystem::FileType::File | narf_filesystem::FileType::Dir
+                );
+                self.atomic_pos
+                    .store(if atomic { 1 } else { 2 }, Ordering::Relaxed);
+                atomic
+            }
+        }
+    }
     /// This description's identity, used as the owner of its OFD locks.
     ///
     /// The same address `Arc::as_ptr` yields, and the same address `Drop`
@@ -566,6 +597,7 @@ impl FdTable {
             }),
             status_flags: AtomicU32::new(entry.status_flags),
             position_lock: narf_lib::mutex::Mutex::new(()),
+            atomic_pos: AtomicU8::new(0),
             append_lock_index: append_lock_index(&entry.ops),
             fasync: IrqSafeSpinLock::new(FasyncConfig {
                 owner: FasyncOwner::None,

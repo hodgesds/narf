@@ -154,7 +154,8 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         note_console_reader(task);
     }
 
-    let _position_guard = if endpoint.ops.is_stream() {
+    // Linux `fdget_pos`: only FMODE_ATOMIC_POS files lock their position.
+    let _position_guard = if !endpoint.description.locks_position(endpoint.ops.as_ref()) {
         None
     } else {
         match poll_blocking(endpoint.description.position_lock.lock()) {
@@ -235,7 +236,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 Err(TransactionalReadError::WouldBlock) if total == 0 => {
-                    if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() {
+                    if endpoint.nonblocking() {
                         ctx.set_return(errno_ret(EAGAIN));
                         return;
                     }
@@ -253,19 +254,26 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             }
         }
         let mut staging = alloc::vec![0u8; want];
-        // A non-blocking read on a stream/char device must never park: poll the
-        // read future once and map Pending to WouldBlock, so the O_NONBLOCK /
-        // nonblock_read_eagain path below returns EAGAIN. An ops whose read()
-        // future returns Pending-when-empty (e.g. an evdev node libinput reads
-        // O_NONBLOCK) would otherwise park in `poll_blocking` BEFORE that check,
-        // bypassing it — hanging a compositor's input loop (kwin never returns
-        // to its event loop, so it never presents a frame). Regular files are
-        // excluded: they never EAGAIN on read, and their read future may need
-        // several non-parking polls to fill from the page cache.
-        let nonblock_stream = endpoint.nonblocking()
-            && (endpoint.ops.is_stream() || endpoint.ops.nonblock_read_eagain());
+        // Poll the read future ONCE (Pending → WouldBlock) instead of
+        // spin-pumping it in `poll_blocking` when either
+        //   - the description is O_NONBLOCK on a stream/char device: it must
+        //     never park; or
+        //   - the source is a `nonblock_read_eagain` one (pty, eventfd,
+        //     timerfd, signalfd, evdev, mqueue), which answers a read at once
+        //     — data or WouldBlock — so a pump only burns its iteration budget
+        //     before reporting the same WouldBlock. An evdev read future is
+        //     Pending-when-empty; pumping it is what once hung kwin's input
+        //     loop before its event loop could present a frame.
+        // Regular files keep the pump: they never EAGAIN, and their read
+        // future may need several non-parking polls to fill from the page
+        // cache. The empty case below then returns EAGAIN only for an
+        // O_NONBLOCK description and parks until readable otherwise — Linux
+        // `n_tty_read`, `eventfd_read`, `timerfd_read`, `signalfd_read` and
+        // `evdev_read` all test `file->f_flags & O_NONBLOCK`.
+        let poll_once_only = endpoint.ops.nonblock_read_eagain()
+            || (endpoint.nonblocking() && endpoint.ops.is_stream());
         let read_fut = endpoint.ops.read(offset, &mut staging);
-        let outcome = if nonblock_stream {
+        let outcome = if poll_once_only {
             poll_once(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
         } else {
             poll_blocking(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
@@ -296,7 +304,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() {
+                if endpoint.nonblocking() {
                     ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }

@@ -3697,6 +3697,10 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("fd_inherit_exec_glibc", "fd-inherit-exec-ok"),
         ("xserver_epoll_wake_smoke", "xserver-epoll-wake-ok"),
         ("xserver_epoll_wake_glibc", "xserver-epoll-wake-ok"),
+        ("dev_tty_read_smoke", "dev-tty-read-ok"),
+        ("dev_tty_read_glibc", "dev-tty-read-ok"),
+        ("blocking_read_waits_smoke", "blocking-read-waits-ok"),
+        ("blocking_read_waits_glibc", "blocking-read-waits-ok"),
         // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
         ("setuid_exec_smoke", "setuid-exec-ok"),
         ("setuid_exec_glibc", "setuid-exec-ok"),

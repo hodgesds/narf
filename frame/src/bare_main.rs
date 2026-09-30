@@ -5714,6 +5714,26 @@ fn boot_userspace_init() {
                     "xserver_epoll_wake_glibc",
                     narf_verification::NARF_XSERVER_EPOLL_WAKE_SMOKE_GLIBC_ELF,
                 ),
+                // A blocking read of /dev/tty waits for the line (sudo / su
+                // password prompts), independent of another fd's O_NONBLOCK.
+                (
+                    "dev_tty_read_smoke",
+                    narf_verification::NARF_DEV_TTY_READ_SMOKE_ELF,
+                ),
+                (
+                    "dev_tty_read_glibc",
+                    narf_verification::NARF_DEV_TTY_READ_SMOKE_GLIBC_ELF,
+                ),
+                // A blocking read on an empty pty / eventfd / timerfd /
+                // signalfd waits for data; only O_NONBLOCK gets EAGAIN.
+                (
+                    "blocking_read_waits_smoke",
+                    narf_verification::NARF_BLOCKING_READ_WAITS_SMOKE_ELF,
+                ),
+                (
+                    "blocking_read_waits_glibc",
+                    narf_verification::NARF_BLOCKING_READ_WAITS_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.
