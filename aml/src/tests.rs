@@ -1888,9 +1888,9 @@ fn smoke_aml_evaluate_s5_against_qemu_dsdt() -> TestResult {
     // After boot-time `parse_namespace`, `evaluate_s5()`
     // returns Some with the platform's SLP_TYPa/b values. The
     // namespace exposes `\_S5_` at the root scope on every
-    // ACPI 2.0+ firmware; QEMU q35 ships a degenerate
-    // `Package(0,0,0,0)` (which the production power-off
-    // path rewrites to QEMU defaults — see frame/bare_main).
+    // ACPI 2.0+ firmware. QEMU q35 intentionally ships
+    // `Package(0,0,0,0)`: SLP_TYP is an opaque platform encoding,
+    // so zero is its valid S5 value and must reach PM1_CNT unchanged.
     //
     // SLP_TYP is a 3-bit field per ACPI 6.5 §16.1.6.
     let (typa, typb) = match crate::evaluate_s5() {

@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
-agent = "OpenAI Codex GPT-6"
-prompt_hash = "41e6585e62132f466a7f5971f5be5a8258f58a5e88ee41215b4798538d5e85a8"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "53c7f9acca0c19fe98a33a4faf28c9b0738ebe78139bc7b752e397314574f043"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1265,3 +1265,16 @@ argument = "Frame changes only wire the procfs per-open factory and register the
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Linux compatibility credentials retain kernel-global UID/GID identity across namespace entry. Procfs files capture namespace Arc references and opener credentials after VFS permission checks; map writes retain one-shot validation, namespace capability checks and parent capability constraints. Opener grants cannot grow when the task changes credentials, and ancestor traversal cannot confer authority into a sibling branch. Native capability and domain checks are unchanged. Regressions cover inherited identity, mapped syscall IDs, descriptor target pinning, file offsets, opener capability changes and nested namespace authority."
+
+# Real platform power-off in the verification-only boot-smoke path.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit changes only the terminal action of the boot-smoke feature from a test-only QEMU exit device to the existing power subsystem entry point. The feature remains absent from production builds; it adds no authority, capability, mapping, domain transition, scheduler state, or trusted subsystem and cannot return to continue execution after shutdown is requested."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The ACPI fix consumes only firmware-validated AML sleep-type scalars and the checksummed FADT PM1 address, preserves unrelated PM1 control bits, and performs no userspace-memory access, capability operation, mapping change, domain transition, frame ownership transfer, or scheduler action. Zero remains a platform encoding rather than being reinterpreted as authority-bearing state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The aarch64 shutdown path delegates the existing PSCI function ids to the architecture-owned conduit dispatcher already used for PSCI probing. It removes duplicate raw SMC assembly, transfers no memory or capability authority, and preserves the terminal halt-on-return behavior."

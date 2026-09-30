@@ -54,6 +54,11 @@ and CI compiler-cache integration.
   captured and print concise summaries. A failure or timeout emits a bounded
   64-KiB diagnostic tail. Child timeouts use polling rather than process-wide
   signal handlers, so sandboxed runners remain supported.
+- `cargo xtask boot-smoke --arch=<arch>` accepts success only when the guest
+  emits its clean-exit marker and QEMU then exits naturally with status zero
+  through ACPI S5 on x86_64 or PSCI `SYSTEM_OFF` on aarch64. The x86
+  `isa-debug-exit` test device returns status one and therefore cannot satisfy
+  this platform-shutdown gate.
 - `XTASK_QEMU_SERIAL_LOG=/path/to/serial.log` optionally copies the kernel-test
   QEMU stdout stream to a host file while tests run. The file is truncated at
   the start of that phase; normal concise summaries and timeout diagnostics

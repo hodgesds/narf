@@ -4371,12 +4371,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
-    // Boot-smoke: real init flow + clean ACPI/isa-debug-exit shutdown.
+    // Boot-smoke: real init flow + a real platform power-off.
     // Drains queued async tasks (including measured-boot) for ~2 s so
-    // the boot log surfaces, then exits via the same port 0xF4 path
-    // the test harness uses. The xtask `boot-smoke` subcommand waits
-    // for QEMU to exit naturally + checks stdout for panic markers,
-    // rather than killing the child after a wall-clock timeout.
+    // the boot log surfaces, then enters ACPI S5 on x86_64 or invokes
+    // PSCI SYSTEM_OFF on aarch64. The xtask `boot-smoke` subcommand
+    // waits for QEMU to power off naturally + checks stdout for panic
+    // markers, rather than killing the child after a wall-clock timeout.
     #[cfg(feature = "boot-smoke")]
     {
         let _ = writeln!(console::Writer, "  boot-smoke: draining tasks...");
@@ -4384,13 +4384,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // at ~2 seconds so the boot log is fully emitted.
         let deadline = narf_time::Deadline::after_ms(2_000);
         narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
-        let _ = writeln!(console::PriorityWriter::<3>, "  boot-smoke: clean exit");
-        // SAFETY: exit_kernel never returns; this is the only post-
-        // boot action we're authorised to take.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            narf_arch::exit_kernel(0);
-        }
+        let _ = writeln!(
+            console::PriorityWriter::<3>,
+            "  boot-smoke: clean exit; requesting platform power-off"
+        );
+        narf_power::system::power_off();
     }
 
     // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
