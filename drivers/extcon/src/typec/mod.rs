@@ -115,6 +115,20 @@ pub enum DataRole {
     Dual,
 }
 
+/// Connector state reported by an ACPI UCSI PPM. Pin assignment can be
+/// unavailable; publishing DP presence must not invent a mux configuration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareState {
+    pub orientation: Orientation,
+    pub power_role: PowerRole,
+    pub data_role: DataRole,
+    pub connected: bool,
+    pub usb: bool,
+    pub displayport: bool,
+    pub usb4: bool,
+    pub audio: bool,
+}
+
 // ── TypecConnector ─────────────────────────────────────────────────
 
 /// One USB Type-C receptacle.
@@ -173,6 +187,30 @@ const SUPPORTED: [Cable; CABLE_COUNT] = [
 const CABLE_COUNT: usize = 9;
 
 impl TypecConnector {
+    /// Publish firmware-owned state without programming a host-controlled mux.
+    /// All subscriber callbacks run after releasing the connector lock.
+    pub fn update_firmware(&self, state: FirmwareState) {
+        {
+            let mut g = self.inner.lock();
+            g.orientation = state.orientation;
+            g.power_role = state.power_role;
+            g.data_role = state.data_role;
+            if !state.connected {
+                g.alt_modes.clear();
+            }
+        }
+        self.update_cable_state(
+            Cable::UsbHost,
+            state.connected && state.usb && state.data_role == DataRole::Host,
+        );
+        self.update_cable_state(
+            Cable::Usb,
+            state.connected && state.usb && state.data_role == DataRole::Device,
+        );
+        self.update_cable_state(Cable::Dp, state.connected && state.displayport);
+        self.update_cable_state(Cable::ThunderboltDock, state.connected && state.usb4);
+        self.update_cable_state(Cable::Headphone, state.connected && state.audio);
+    }
     /// Create a new Type-C connector with `name` as its stable
     /// identifier.
     pub fn new(name: &'static str) -> Self {

@@ -21,6 +21,10 @@ narf-init         = { path = "../../init" }
 narf-console      = { path = "../../console" }
 narf-drivers-i2c  = { path = "../i2c" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-aml          = { path = "../../aml" }
+narf-memory       = { path = "../../memory" }
+narf-drivers-extcon = { path = "../extcon" }
+narf-power        = { path = "../../power" }
 
 [features]
 kernel-test = []

@@ -99,18 +99,27 @@ static PHASE: AtomicU8 = AtomicU8::new(SuspendPhase::Idle as u8);
 /// platforms with armed S3.
 pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
     cap.invoke(NoopOp)?;
-    let prev = PHASE.swap(SuspendPhase::FreezingUserspace as u8, Ordering::AcqRel);
-    if prev != SuspendPhase::Idle as u8 {
-        // Put it back — we're bailing on the transition.
-        PHASE.store(prev, Ordering::Release);
+    if PHASE
+        .compare_exchange(
+            SuspendPhase::Idle as u8,
+            SuspendPhase::FreezingUserspace as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
         return Err(SuspendError::AlreadySuspending);
     }
     PHASE.store(SuspendPhase::QuiescingDrivers as u8, Ordering::Release);
-    // Fan out to every registered device PM handler in reverse
-    // registration order. Failures here are logged but don't abort
-    // the suspend chain — we want partial progress so the resume
-    // path can roll back whatever did suspend successfully.
-    let _suspend_report = crate::device_pm::suspend_all_devices();
+    // Finish the fan-out so every driver gets a chance to quiesce, but never
+    // power off with an outstanding DMA/mailbox transaction. Roll back partial
+    // progress before returning to the caller, who can retry later.
+    if !crate::device_pm::suspend_all_devices().ok() {
+        PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
+        let _ = crate::device_pm::resume_all_devices();
+        PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+        return Err(SuspendError::Aborted);
+    }
     // Blank the framebuffer + park the console hook so the FB
     // driver can repaint cleanly on resume.
     invoke_fb_suspend();
@@ -138,7 +147,7 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
         let armed = REAL_SLEEP_ARMED.load(Ordering::Acquire)
             || PRODUCTION_S3_ENABLED.load(Ordering::Acquire);
         if s3_supported() && armed {
-            match arm_s3_resume(cap) {
+            match enter_s3_prepared(cap) {
                 Ok(()) => {
                     PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
                     let _ = crate::device_pm::resume_all_devices();
@@ -466,30 +475,16 @@ pub fn __test_parse_s3(buf: &[u8]) -> Option<S3SlpTyp> {
     parse_s3_package(buf)
 }
 
-/// Top-level S3 orchestrator: do everything required to enter S3
-/// AND have a working resume path before we touch PM1.
-///
-/// Sequence:
-///   1. Verify `\_S3_` is decodable.
-///   2. Snapshot CPU state via `s3_resume::save_resume_context`.
-///   3. setjmp the caller frame into `S3_CALLER_JMP` — when wake
-///      happens, the trampoline → continuation → longjmp will
-///      return us here with `S3_RESUMED_SENTINEL`.
-///   4. Resolve `s3_wake_entry`'s phys + write it to FACS via
-///      `acpi::arm_s3_waking_vector`.
-///   5. Fan out device suspend handlers in reverse order.
-///   6. Issue `\_PTS(3)` then PM1 SLP_TYP|SLP_EN. CPU stops here.
-///   7. On wake, the trampoline restores GDT/IDT/CR3/RSP, runs
-///      the device-resume hook, then longjmps back to setjmp's
-///      caller with `S3_RESUMED_SENTINEL`. Step 3's branch fires;
-///      we return `Ok(())`.
-///
-/// Returns `Ok(())` on a clean suspend+resume cycle, an error
-/// from `SuspendError` otherwise. Until the trampoline arms
-/// safely (FACS_PHYS resolved, RESUME_CONTEXT_PHYS resolved),
-/// returns `NotImplemented` without touching PM1.
+/// Compatibility entry point for the complete suspend/resume orchestrator.
+/// Uses the same capability, driver-quiesce and platform validation as `suspend`.
 #[cfg(target_arch = "x86_64")]
 pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
+    suspend(cap)
+}
+
+/// Called only after the outer orchestrator successfully quiesced all drivers.
+#[cfg(target_arch = "x86_64")]
+fn enter_s3_prepared(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
     cap.invoke(NoopOp)?;
     let slp = s3_slp_typ().ok_or(SuspendError::NotImplemented)?;
     // Snapshot CPU state.
@@ -583,8 +578,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
         // when it errors.
         return Err(SuspendError::Aborted);
     }
-    // Fan out device suspend handlers in reverse-registration order.
-    let _ = crate::device_pm::suspend_all_devices();
+    // The outer orchestrator already suspended the devices exactly once.
     PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
     // `\_PTS(3)` — platform-specific quiesce AML.
     let _ = narf_aml::eval::evaluate_method("\\_PTS", &[narf_aml::Value::Integer(3)]);
@@ -608,37 +602,10 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     Err(SuspendError::NotImplemented)
 }
 
-/// Enter S3. Calls `\_PTS(3)` and writes the SLP_TYP|SLP_EN bits to
-/// PM1A_CNT (and PM1B_CNT when present). Returns
-/// `SuspendError::NotImplemented` when the resume trampoline isn't
-/// armed (production today); returns `Ok(())` if the chipset accepted
-/// the write. The function does not return when the CPU actually
-/// goes to sleep — callers see a fresh `init` path on resume.
+/// Request S3 through the full suspend/resume pipeline, including driver
+/// quiescing. Returns NotImplemented unless supported and explicitly armed.
 pub fn s3_enter(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
-    cap.invoke(NoopOp)?;
-    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
-    let slp = s3_slp_typ().ok_or(SuspendError::NotImplemented)?;
-
-    // `\_PTS(slp_state)` runs platform-specific quiesce AML (turns
-    // off LEDs, parks devices firmware controls, etc.).
-    let _ = narf_aml::eval::evaluate_method("\\_PTS", &[narf_aml::Value::Integer(3)]);
-
-    // Without a real-mode resume trampoline the system would never
-    // come back. Refuse to enter unless explicitly armed via either
-    // the test back-door or the production opt-in.
-    if !REAL_SLEEP_ARMED.load(Ordering::Acquire) && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire) {
-        return Err(SuspendError::NotImplemented);
-    }
-
-    PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: `\_PTS(3)` has been invoked above; the `s3_supported`
-    // check on entry guarantees PM1A_CNT is populated.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        narf_acpi::pm1_enter_sleep(slp.slp_typ_a, slp.slp_typ_b);
-    }
-    Ok(())
+    suspend(cap)
 }
 
 // ── IRQ-source mask snapshot ────────────────────────────────────────

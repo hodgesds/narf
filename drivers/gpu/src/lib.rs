@@ -132,6 +132,7 @@ pub mod amdgpu_dccg;
 pub mod amdgpu_dcn;
 pub mod amdgpu_ddc;
 pub mod amdgpu_discovery;
+pub mod amdgpu_dmub;
 pub mod amdgpu_dpm;
 pub mod amdgpu_gfx;
 pub mod amdgpu_gmc;
@@ -157,6 +158,7 @@ pub mod amdgpu_smu_v12;
 pub mod amdgpu_smu_v13;
 pub mod amdgpu_ucode;
 pub mod amdgpu_ucode_header;
+pub mod amdgpu_usbc;
 pub mod amdgpu_video;
 pub mod amdgpu_vmhub_regs;
 pub mod amdgpu_vmid;
@@ -241,6 +243,7 @@ pub fn register_initcalls() {
         intel_gpu_dp_bridge::register_bridge();
         InitResult::Ok
     });
+    narf_init::register(Stage::Late, "amdgpu-usbc", amdgpu_usbc::start);
     narf_init::register(Stage::Device, "gpu-backlight", || {
         backlight::init_backlight_initcall();
         InitResult::Ok

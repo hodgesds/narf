@@ -476,6 +476,8 @@ pub enum AmdgpuError {
     /// wrong (IP discovery missing MP1) or SMU firmware never
     /// loaded (PSP issue upstream).
     SmuBringUpFailed,
+    /// The native Type-C runtime owns the live DMUB mailbox.
+    DisplayFirmwareBusy,
 }
 
 // ── Driver state ───────────────────────────────────────────────────
@@ -863,6 +865,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
+        if crate::amdgpu_usbc::owns_dmub() {
+            return Err(AmdgpuError::DisplayFirmwareBusy);
+        }
         // Prefer the discovery-driven MP0 base (true for every
         // Navi2+ / Phoenix / Strix chip); fall back to the
         // hardcoded per-family table for Vega / Navi1.
@@ -1115,6 +1120,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
+        if crate::amdgpu_usbc::owns_dmub() {
+            return Err(AmdgpuError::DisplayFirmwareBusy);
+        }
         // Fall through to the single-blob path for chips whose IP
         // enumeration we haven't audited yet. Preserves the
         // pre-multi-IP behaviour without forcing every PCI ID to
@@ -1745,11 +1753,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// yet (e.g. pre-firmware-load).
 static SAVED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static PM_SUSPENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     if !is_probed() {
         return Ok(());
     }
+    if !crate::amdgpu_usbc::suspend() {
+        return Err(narf_power::device_pm::DeviceSuspendError::Busy);
+    }
+    PM_SUSPENDED.store(true, core::sync::atomic::Ordering::Release);
     // 1. Snapshot the current Mode so resume re-programs it.
     let mode = with_controller(|d| d.current_mode());
     if let Some(Some(m)) = mode {
@@ -1781,7 +1794,7 @@ fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendEr
 }
 
 fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
-    if !is_probed() {
+    if !is_probed() || !PM_SUSPENDED.swap(false, core::sync::atomic::Ordering::AcqRel) {
         return Ok(());
     }
     // 1. Re-arm SMU mailbox with a TEST_MESSAGE echo. The PSP
@@ -1822,6 +1835,7 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
             unsafe { d.set_mode(mode) }
         });
     }
+    crate::amdgpu_usbc::resume();
     Ok(())
 }
 

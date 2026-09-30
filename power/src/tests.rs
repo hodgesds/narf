@@ -2901,3 +2901,35 @@ fn smoke_watchdog_sysfs_bootstatus() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/watchdog", smoke_watchdog_sysfs_bootstatus);
+
+fn suspend_busy_driver_aborts_and_rolls_back() -> TestResult {
+    use crate::device_pm::{__reset_for_test, register_device_pm};
+    use crate::suspend::{self, SuspendError, SuspendPhase};
+    __reset_for_test();
+    suspend::__test_reset();
+    PM_SEQ.store(0, TestOrdering::Release);
+    PM_FAIL_FLAG.store(0, TestOrdering::Release);
+    register_device_pm(
+        "prepared",
+        smoke_pm_record_a_suspend,
+        smoke_pm_record_a_resume,
+    );
+    register_device_pm("busy", smoke_pm_fail_suspend, smoke_pm_fail_resume);
+    let cap = narf_capabilities::Cap::<crate::Power, narf_capabilities::Invoke>::bootstrap();
+    let outcome = suspend::suspend(&cap);
+    let phase = suspend::current_phase();
+    let prepared = PM_SEQ.load(TestOrdering::Acquire);
+    let busy = PM_FAIL_FLAG.load(TestOrdering::Acquire);
+    __reset_for_test();
+    if outcome != Err(SuspendError::Aborted)
+        || phase != SuspendPhase::Idle
+        || prepared != 11
+        || busy != 1
+    {
+        return TestResult::Fail(
+            "busy driver must abort before platform sleep and resume prepared devices once",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", suspend_busy_driver_aborts_and_rolls_back);

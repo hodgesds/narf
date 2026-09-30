@@ -8,9 +8,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_tb_register_all_known_ids() -> TestResult {
     // Every known Thunderbolt device ID must land in the match
-    // table as an exact VendorDevice entry — class match (USB4
-    // host = 0x0C0340) alone is too coarse on AMD silicon which
-    // ships a different controller family at the same class.
+    // table as an exact VendorDevice entry alongside the generic USB4 match.
     use crate::nhi;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
@@ -177,11 +175,11 @@ kernel_test_in!("drivers/thunderbolt/nhi", smoke_tb_sku_name_round_trip);
 fn smoke_tb_covers_user_cited_ids() -> TestResult {
     // Explicit assertion that the device IDs from the bring-up
     // brief land in the table: the user-cited 9A1B / 9A1D (TGL),
-    // 463F / 466D (ADL), 7EB3 (RPL-P / MTL-M variant), and 5781
+    // 463E / 466D (ADL), 7EB2 (MTL-M), and 5781
     // (Barlow Ridge 80G). If any one of these drops out, real
     // HW probably regresses silently.
     use crate::nhi;
-    for did in [0x9A1Bu16, 0x9A1D, 0x463F, 0x466D, 0x7EB3, 0x5781] {
+    for did in [0x9A1Bu16, 0x9A1D, 0x463E, 0x466D, 0x7EB2, 0x5781] {
         if nhi::sku_name(did).is_none() {
             return TestResult::Fail("thunderbolt: brief-cited DID missing from table");
         }

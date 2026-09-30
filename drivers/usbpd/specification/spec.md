@@ -1,45 +1,70 @@
-# narf-drivers-usbpd — Type-C Port Controller drivers
+# USB-C port drivers — specification
 
-Clean-room implementations of TCPC chips that implement
-`narf_usbpd::tcpc::Tcpc`.
+## 1. Purpose & scope
 
-## References (public-only)
+Provide firmware-owned UCSI connectors and host-owned Type-C port controller
+(TCPC) drivers. UCSI/firmware owns PD policy and the mux on ACPI laptops;
+raw TCPC drivers supply the physical transport to `narf_usbpd::tcpc`.
 
-All driver code is derived strictly from public silicon datasheets.
-No GPL or Linux kernel source consulted.
+## 2. Assumptions
 
-### TPS65987DDH (Texas Instruments)
+UCSI requires an enabled ACPI `PNP0CA0`, a valid shared-memory `_CRS`, and
+revision-1 `_DSM` read/write functions. PCI NHI enumeration alone does not
+establish UCSI availability. Raw TCPC probing is suppressed when a PNP0CA0
+exists to avoid competing with firmware for the same controller.
 
-- **TPS65987DDH/TPS65987DDK Host Interface Technical Reference
-  Manual**, TI document SLVUBH2A.
-  <https://www.ti.com/lit/ug/slvubh2a/slvubh2a.pdf>
-  - §2 (host-interface model: register file + 4CC command channel).
-  - §3 (full register map — VID/DID/Mode/Type-C Status/Cmd1/Data1/
-    Active Contract PDO/RDO/RX-TX Source-Sink Caps).
-  - §4 (4CC command codes and payload semantics).
-- **TPS65987DDH datasheet**, TI document SLVSEX0F.
-  <https://www.ti.com/lit/ds/symlink/tps65987ddh.pdf>
-- USB Type-C 2.2 §4 (CC pin meanings the on-chip firmware enforces).
+## 3. Public interface
 
-### FUSB302B (ON Semiconductor)
+- `ucsi::Transport` supplies bounded version, CCI, control and message accesses.
+- `ucsi::Ppm<T>` owns and serializes async reset, initialization, polling and
+  mode selection. Known UCSI versions 1.0/1.1/1.2/2.0/2.1/3.0 are accepted.
+- `ucsi::connectors()` returns `Connector` snapshots keyed by `(ppm, number)`.
+  `available` distinguishes a working PPM from transport failure. Snapshots
+  expose connection/data/power state, firmware CAM/SVID/VDO, and orientation
+  only when the UCSI version reports it. UCSI numbers are never GPU indices.
+- `ucsi::register_observer(Arc<dyn ConnectorObserver>)` delivers the current
+  snapshot and changes in task context, with no registry lock held.
+- `Ppm::set_mode` requires firmware's alternate-mode override feature,
+  validates PPM/connector identity and refreshes connection/mode support.
+  Its mode-specific configuration is a Configure VDO, not a lane count.
+- UCSI publishes `extcon::typec::FirmwareState` without programming a host mux.
+- Existing TCPC drivers register `Arc<dyn Tcpc>`; production I2C drivers retain
+  their granted `Cap<I2cBus, Write>` and use capability-checked operations.
 
-- **FUSB302B Programmable USB Type-C Controller w/ PD** —
-  ON Semi document FUSB302B/D, Rev. 6 (Sept 2017).
-  https://www.onsemi.com/download/data-sheet/pdf/fusb302b-d.pdf
-  - §"Register Description" — register map (0x01..0x43).
-  - §"BMC PHY" — TX/RX FIFO token encoding for SOP framing.
-  - §"Functional Description" — CC sense, role programming, IRQ
-    causes, hard/soft reset.
-- **USB Type-C Cable and Connector Specification 2.2** (USB-IF) —
-  CC pin sense thresholds (Rd/Rp termination meanings).
-- **USB Power Delivery 3.1** (USB-IF) — PD frame layout the FIFO
-  consumes. The protocol layer lives in `narf-usbpd`; this driver
-  only handles physical-layer framing.
+## 4. Invariants
 
-## Cap surface
+A single task owns each PPM. Command completion and acknowledgement complete
+before another command starts; command errors still receive an ACK. Connector
+changes are preserved independently. Transport/ACK failure or cancelled
+commands poison the PPM until reset. Shared-memory accesses and all firmware
+lengths/connector indices are checked. Failed workers publish unavailable
+state, retry reset at bounded intervals, and stop after three failures.
 
-Drivers register `Arc<dyn Tcpc>` with `narf_usbpd::tcpc` at probe
-time; the TCPM polls `cc_status()` and drives `transmit/receive`.
-Production-bound TCPCs hold an `Cap<I2cBus, Write>` they were
-handed at probe; the test fakes route through an in-memory mock
-register file.
+PM gates prevent AML/shared-memory access during suspend; in-flight commands
+return Busy to the system suspend caller. Resume requests a PPM reinitialization.
+No hardware polling holds a spinlock or runs a custom busy-spin loop.
+
+## 5. Architecture notes
+
+The ACPI transport maps firmware RAM write-back, uses volatile little-endian
+accesses and fences, and polls `_DSM` every 100 ms as a Notify fallback.
+The protocol and fake-device tests run on x86_64 and aarch64.
+
+## 6. Dependencies and references
+
+`aml`, `memory`, `scheduler`, `time`, `power`, `drivers/extcon`, `drivers/i2c`,
+`usbpd`, `capabilities`. UCSI register layouts/handshakes were checked against
+`/usr/src/linux/drivers/usb/typec/ucsi/{ucsi.h,ucsi.c,ucsi_acpi.c,displayport.c}`.
+The existing TPS65987 driver references TI SLVUBH2A/SLVSEX0F; FUSB302 references
+ON Semiconductor FUSB302B/D and USB Type-C/PD specifications.
+
+## 7. Stage assignment
+
+Stage 5 laptop connector integration. Fake transports test status versions,
+command/ACK sequencing, event preservation and failure poisoning. Physical
+Lenovo firmware has not been exercised by this change.
+
+## 8. Open work
+
+ACPI Notify-driven wakeups, broader platform quirks and role-swap interfaces.
+GPU source modesetting and native USB4 tunneling are separate subsystems.
