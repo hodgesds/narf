@@ -214,7 +214,7 @@ mod tests {
         // Simulate card returning SW1=0x61, SW2=0x08.
         let card_resp = [0x61u8, 0x08];
         let (data, sw1, sw2) = decode_response(&card_resp).unwrap();
-        assert_eq!(data, &[]);
+        assert!(data.is_empty());
         assert_eq!(sw1, SW1_GET_RESPONSE);
         assert_eq!(sw2, 0x08);
         // Build the chained GET_RESPONSE using the original CLA.
