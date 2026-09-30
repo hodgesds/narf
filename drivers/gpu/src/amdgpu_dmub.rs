@@ -7,6 +7,96 @@ use crate::amdgpu::AmdGpu;
 use core::sync::atomic::{fence, Ordering};
 use narf_bus::MmioRegion;
 
+use super::amdgpu_dmub_firmware as firmware;
+use alloc::vec::Vec;
+use narf_capabilities::{Cap, CapError, CapOp, Read};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirmwareError {
+    Unsupported,
+    Registry(narf_firmware::FirmwareError),
+    Image(firmware::Error),
+}
+
+/// An immutable copy read through firmware capabilities. Holding it does not mean
+/// the GPU is running the image; only the eventual boot handshake can do that.
+#[derive(Debug)]
+pub struct Firmware {
+    bytes: Vec<u8>,
+}
+
+struct OpenFirmware;
+impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenFirmware {
+    type Output = Result<Vec<u8>, FirmwareError>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self::Output, CapError> {
+        let blob = match narf_firmware::open(firmware::DCN314_FIRMWARE, cap) {
+            Ok(blob) => blob,
+            Err(error) => return Ok(Err(FirmwareError::Registry(error))),
+        };
+        blob.invoke(CopyFirmware)
+    }
+}
+struct CopyFirmware;
+impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyFirmware {
+    type Output = Result<Vec<u8>, FirmwareError>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareBlob, Read>,
+    ) -> Result<Self::Output, CapError> {
+        Ok((|| {
+            let view = narf_firmware::view_of(cap).map_err(FirmwareError::Registry)?;
+            // Validate sizes before allocating; no borrowed registry slice
+            // escapes the capability invocation into later staging work.
+            firmware::Image::parse(view.bytes).map_err(FirmwareError::Image)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(view.bytes.len())
+                .map_err(|_| FirmwareError::Registry(narf_firmware::FirmwareError::OutOfMemory))?;
+            bytes.extend_from_slice(view.bytes);
+            Ok(bytes)
+        })())
+    }
+}
+impl Firmware {
+    /// Choose firmware from exact IP discovery, independently of the coarse
+    /// PCI family table. DCN 3.5 requires a different hardware boot sequence.
+    pub fn open(
+        gpu: &AmdGpu,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, FirmwareError> {
+        dcn314_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let bytes = authority.invoke(OpenFirmware).map_err(|_| {
+            FirmwareError::Registry(narf_firmware::FirmwareError::AuthorityRevoked)
+        })??;
+        Ok(Self { bytes })
+    }
+    /// Borrow the validated copy, without retaining a registry memory view.
+    /// This is data already read, not authority to replace running firmware.
+    pub fn image(&self) -> Result<firmware::Image<'_>, FirmwareError> {
+        firmware::Image::parse(&self.bytes).map_err(FirmwareError::Image)
+    }
+    pub fn prepare<'a>(&'a self, vbios: &'a [u8]) -> Result<firmware::Prepared<'a>, FirmwareError> {
+        self.image()?
+            .prepare_dcn314(vbios)
+            .map_err(FirmwareError::Image)
+    }
+}
+
+fn dcn314_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
+    let mut blocks = gpu
+        .ip_blocks
+        .iter()
+        .filter(|b| b.hw_id == crate::amdgpu_discovery::HW_ID_DCN && b.instance == 0);
+    let ip = blocks.next().ok_or(Error::Unsupported)?;
+    if blocks.next().is_some() || (ip.major, ip.minor, ip.revision) != (3, 1, 4) {
+        return Err(Error::Unsupported);
+    }
+    Ok(ip)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -41,12 +131,8 @@ impl Dmub {
     /// Caller exclusively owns the GPU's DMUB mailbox for the returned
     /// object's lifetime, including power management and firmware replacement.
     pub unsafe fn attach(gpu: &AmdGpu) -> Result<Self, Error> {
-        let ip = gpu
-            .ip_blocks
-            .iter()
-            .find(|b| b.hw_id == crate::amdgpu_discovery::HW_ID_DCN && b.instance == 0)
-            .ok_or(Error::Unsupported)?;
-        if (ip.major, ip.minor, ip.revision) != (3, 1, 4) || ip.num_bases < 3 {
+        let ip = dcn314_ip(gpu)?;
+        if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
         let base = ip.base_addrs[2] as u64 * 4;
@@ -371,6 +457,76 @@ fn aux_reply(reply: &[u8; 64], action: u8, data: &mut [u8]) -> Result<(), Error>
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn dmub_firmware_requires_exact_discovery_and_live_authority() -> TestResult {
+        use crate::amdgpu::{ChipInfo, Family, AMD_VENDOR, PHOENIX_HAWKPOINT1};
+        use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
+        let region = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 0,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let mut gpu = AmdGpu {
+            fb_bar: region,
+            regs: region,
+            chip: ChipInfo {
+                vid: AMD_VENDOR,
+                did: PHOENIX_HAWKPOINT1,
+                family: Family::Phoenix,
+                asic: "phoenix",
+                fw_name: "amdgpu/unused.bin",
+                fw_list: &[],
+            },
+            vram: Default::default(),
+            mode: None,
+            fw_loaded: false,
+            ip_blocks: alloc::vec![],
+        };
+        let (write, read) = narf_firmware::bootstrap_authority();
+        write.revoke();
+        if !matches!(Firmware::open(&gpu, &read), Err(FirmwareError::Unsupported)) {
+            return TestResult::Fail("PCI family used as a substitute for DCN discovery");
+        }
+        let ip = IpBlock {
+            hw_id: HW_ID_DCN,
+            instance: 0,
+            major: 3,
+            minor: 1,
+            revision: 4,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: [0; MAX_BASE_ADDRS],
+            num_bases: 3,
+        };
+        gpu.ip_blocks.push(ip);
+        if !matches!(
+            Firmware::open(&gpu, &read),
+            Err(FirmwareError::Registry(
+                narf_firmware::FirmwareError::AuthorityRevoked
+            ))
+        ) {
+            return TestResult::Fail("firmware preparation ignored revoked registry authority");
+        }
+        gpu.ip_blocks.push(ip);
+        if dcn314_ip(&gpu).is_ok() {
+            return TestResult::Fail("ambiguous DCN discovery accepted");
+        }
+        gpu.ip_blocks.pop();
+        gpu.ip_blocks[0].minor = 5;
+        gpu.ip_blocks[0].revision = 0;
+        if !matches!(Firmware::open(&gpu, &read), Err(FirmwareError::Unsupported)) {
+            return TestResult::Fail("DCN35 used the DCN314 firmware path");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu-dmub",
+        dmub_firmware_requires_exact_discovery_and_live_authority
+    );
+
     fn dmub_mailbox_completion_wrap_and_cancel() -> TestResult {
         use core::{
             future::Future,

@@ -46,6 +46,33 @@ infrastructure (Phase B).
 
 ### AMD DCN 3.1.4 USB-C display transport
 
+`amdgpu_dmub::Firmware::open(&AmdGpu, &Cap<FirmwareRegistry, Read>)`
+selects `amdgpu/dcn_3_1_4_dmcub.bin` from exact DCN IP discovery, rejecting
+missing, duplicate or unsupported DCN instances. It does not use the coarse
+PCI family's firmware list. The firmware registry owns authentication.
+Registry lookup and copying the bounded image use `Cap::invoke`; the returned
+object owns an immutable copy, so no registry memory borrow survives the read.
+It contains data already read, not authority to replace running firmware.
+
+`amdgpu_dmub_firmware::Image::parse` validates the v1.0 container bounds,
+splits the PSP-signed payload from the executable and BSS/data, and locates
+legacy or combined DAL metadata with 256/512-byte PSP footers. It rejects
+missing metadata and unbounded state/trace sizes. The header CRC field is
+not treated as authentication. `Firmware::prepare(vbios)` produces the
+DCN314 seven-window layout with 256-byte region starts, 64-byte sizes and
+4096-byte total alignment. Separate BSS/shared-state mappings remain
+unsupported for this hardware path. The caller supplies a compatible,
+validated VBIOS; preparation checks its storage size, not ATOM semantics.
+
+`Prepared::stage` initializes an ordinary RAM buffer, copying executable and
+VBIOS data and zeroing padding, stack, mailboxes, trace and state. It rejects
+a short buffer before writing anything. `Layout::place` checks page alignment,
+48-bit GPU addresses and aperture bounds; it computes addresses without
+allocating VRAM or proving exclusive ownership. These APIs perform no MMIO
+and do not mark firmware as loaded. The cold-boot loader must still reserve
+VRAM, stop DMCUB before replacing its memory, upload/flush the image, program
+the correct windows and verify firmware boot completion.
+
 `amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
 mailbox and GPU power/firmware ownership for its lifetime. It requires exact
 DCN 3.1.4 IP discovery, running DAL firmware and bounded VRAM inbox/outbox
@@ -63,7 +90,8 @@ This transport **does not load DAL firmware, program source encoders, train
 DisplayPort links or expose new active DRM/KMS scanouts**. A successful sink
 read or USB4 tunnel does not prove monitor output. Cold-boot firmware loading,
 VRAM allocation and native external-display modesetting remain open.
-The implementation references local Linux `dmub_cmd.h`, `dmub_dcn31.c`,
+The implementation references local Linux `amdgpu_ucode.h`,
+`amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c` and DCN 3.1.4 register headers.
 
 ### VirtIO-GPU rendering
