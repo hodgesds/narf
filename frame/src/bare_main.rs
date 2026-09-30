@@ -5734,6 +5734,16 @@ fn boot_userspace_init() {
                     "blocking_read_waits_glibc",
                     narf_verification::NARF_BLOCKING_READ_WAITS_SMOKE_GLIBC_ELF,
                 ),
+                // TIOCGPTPEER (Linux `_IO('T', 0x41)`) opens a master's slave,
+                // as openpty() and sudo's use_pty do.
+                (
+                    "tiocgptpeer_smoke",
+                    narf_verification::NARF_TIOCGPTPEER_SMOKE_ELF,
+                ),
+                (
+                    "tiocgptpeer_glibc",
+                    narf_verification::NARF_TIOCGPTPEER_SMOKE_GLIBC_ELF,
+                ),
                 // execve of a set-user-ID / set-group-ID binary: the
                 // credential transition, AT_SECURE, dumpability, and every
                 // guard (nosuid, no_new_privs, chroot), musl + glibc.

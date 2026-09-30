@@ -660,11 +660,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // the caller's table. The fd-allocation side lives here (not in the
     // filesystem crate), so we hijack the dispatch before delegating.
     if cmd == narf_filesystem::devfs_pty::TIOCGPTPEER {
+        // `tty_ioctl` handles TIOCGPTPEER for every tty and `ptm_open_peer`
+        // refuses anything but a pty master with EIO
+        // (`if (tty->driver != ptm_driver) return -EIO;`). A file that is no
+        // tty never reaches `tty_ioctl`: vfs_ioctl answers ENOTTY.
         let idx = match ops.as_pty_master_index() {
             Some(i) => i,
             None => {
-                // Not a master fd — ENOTTY (Linux semantics).
-                ctx.set_return(errno_ret(ENOTTY));
+                let errno = if ops.tty_id().is_some() { EIO } else { ENOTTY };
+                ctx.set_return(errno_ret(errno));
                 return;
             }
         };
@@ -681,13 +685,17 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             }
         };
         let ops_dyn: Arc<dyn narf_filesystem::FileOps> = slave;
+        // `FD_ADD(flags, dentry_open(slave, flags))`: O_CLOEXEC becomes the
+        // new descriptor's FD_CLOEXEC, and the open file description keeps
+        // the access mode and the F_SETFL bits (O_NONBLOCK, O_APPEND, ...)
+        // exactly as open(2) would — `do_dentry_open` drops O_CREAT/O_EXCL/
+        // O_NOCTTY/O_TRUNC, and O_CLOEXEC is not a file status flag.
+        let open_flags = arg as u32;
         let new_fd = fd::install(task, fd::FdEntry {
                 ops: ops_dyn,
                 offset: 0,
-                // `arg` carries open(2) flags from glibc (O_RDWR | O_NOCTTY |
-                // O_CLOEXEC). We mirror the CLOEXEC bit; the rest are no-ops.
-                flags: if (arg as u32) & 0o2000000 != 0 { 1 } else { 0 },
-                status_flags: arg as u32,
+                flags: if open_flags & fd::O_CLOEXEC != 0 { fd::FD_CLOEXEC } else { 0 },
+                status_flags: open_flags & (fd::O_ACCMODE | fd::O_SETFL_MASK),
             });
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),

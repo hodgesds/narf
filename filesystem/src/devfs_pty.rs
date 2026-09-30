@@ -70,7 +70,9 @@ pub const TIOCGPTN: u32 = 0x80045430;
 pub const TIOCSPTLCK: u32 = 0x40045431;
 /// `ioctl(master_fd, TIOCGPTPEER, flags)` — open a fresh slave fd. Handled
 /// by the syscall layer because fd allocation lives in userspace::fd.
-pub const TIOCGPTPEER: u32 = 0x40045441;
+/// `_IO('T', 0x41)` (include/uapi/asm-generic/ioctls.h): no direction or size
+/// bits — `flags` is passed by value.
+pub const TIOCGPTPEER: u32 = 0x5441;
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.

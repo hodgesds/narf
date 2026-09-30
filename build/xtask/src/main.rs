@@ -3701,6 +3701,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("dev_tty_read_glibc", "dev-tty-read-ok"),
         ("blocking_read_waits_smoke", "blocking-read-waits-ok"),
         ("blocking_read_waits_glibc", "blocking-read-waits-ok"),
+        ("tiocgptpeer_smoke", "tiocgptpeer-ok"),
+        ("tiocgptpeer_glibc", "tiocgptpeer-ok"),
         // set-user-ID exec: credentials, AT_SECURE, dumpability, guards.
         ("setuid_exec_smoke", "setuid-exec-ok"),
         ("setuid_exec_glibc", "setuid-exec-ok"),
