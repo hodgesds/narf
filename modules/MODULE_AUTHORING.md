@@ -33,6 +33,27 @@ architecture-comparison overview, see the workspace-root
 > The source's own `kernel_abi=` line is a placeholder; `--kernel-abi`
 > overwrites it in place.
 >
+> Production kernels require an Ed25519 signature. Configure their trusted
+> raw public keys with the absolute build-time path
+> `NARF_MODULE_TRUSTED_KEYS`, one 64-hex-digit key per line. Have the release
+> signer sign the exact final raw or compressed module bytes. For a compressed
+> production module, build the envelope first and attach the signature second:
+>
+> ```sh
+> cargo xtask build-module --package <your-crate> --arch x86_64 \
+>   --kernel-abi 0x1f3a90c2 --compress --out module.ko.lz4
+> # Produce module.sig over BLAKE3(module.ko.lz4) with the release signer.
+> cargo xtask attach-module-signature --module module.ko.lz4 \
+>   --signature module.sig --public-key module.pub
+> ```
+>
+> xtask verifies the detached signature before writing the fixed `NRFM`
+> trailer. The signature covers the compressed `NRFCMOD` header and LZ4 bytes,
+> so production kernels authenticate before allocating the bounded (32 MiB
+> maximum) output buffer or running the decompressor. Unsigned modules are
+> accepted only by kernels built with the explicit developer/CI
+> `module-allow-unsigned` feature.
+>
 > One live limitation: a module that uses `core` beyond what the
 > compiler inlines comes out with undefined references nothing can
 > satisfy. Keep to the exported ABI and your own code for now. See

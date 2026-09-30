@@ -9,13 +9,9 @@
 //! and `/sys/module/<name>/`, hold a refcount, attempt unload, drop
 //! the refcount, and confirm clean teardown end-to-end.
 //!
-//! These smokes do exactly that. They synthesize a small ELF in
-//! memory rather than relying on a cross-compiled `.ko`: the
-//! payload value is exercising the LOADER, not the toolchain, and
-//! in-memory synthesis keeps the QEMU smoke runner self-contained.
-//! The reference `narf-test-module` crate at
-//! `modules/test-module/` mirrors the same shape so out-of-tree
-//! authors have a working starting point.
+//! The focused smokes synthesize small ELF images in memory. The final smoke
+//! also loads the rustc-built `narf-test-module.ko` staged by xtask, so the
+//! compiler/linker's genuine relocation output is exercised on both arches.
 //!
 //! Linux refs for the equivalent test path:
 //!   * `tools/testing/selftests/kmod/kmod.sh` — the userspace driver
@@ -732,6 +728,121 @@ fn e2e_cap_gate_blocks_undeclared() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/e2e", e2e_cap_gate_blocks_undeclared);
+
+// ── Smoke 8: rustc-built `.ko` load → execute → unload ─────────────────
+
+fn e2e_real_rust_module_loads_raw_and_compressed() -> TestResult {
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("no staged initramfs for real module smoke");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/narf_test_module.ko")
+    else {
+        return TestResult::Skip("narf_test_module.ko was not staged");
+    };
+
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::Ed25519Verifier));
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+
+    // xtask also stages its own compressed artifact. It still carries the
+    // zero ABI placeholder, so a successful decode must reach the manifest
+    // and fail specifically with AbiMismatch. This cross-checks xtask's small
+    // host encoder against the kernel's independent bounded LZ4 decoder.
+    let Some((_, staged_compressed)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/narf_test_module.ko.lz4")
+    else {
+        return TestResult::Skip("narf_test_module.ko.lz4 was not staged");
+    };
+    match crate::loader::load_image(staged_compressed) {
+        Err(crate::loader::LoadError::Manifest(crate::manifest::ManifestError::AbiMismatch {
+            ..
+        })) => {}
+        Err(crate::loader::LoadError::Compression(_)) => {
+            return TestResult::Fail("xtask-compressed module did not decode in kernel");
+        }
+        _ => return TestResult::Fail("xtask-compressed fixture did not reach ABI validation"),
+    }
+
+    // xtask cannot know the live export-table hash while compiling the test
+    // fixture, so it stages the fixed-width zero placeholder. Stamp the test
+    // copy in memory exactly as `xtask build-module --kernel-abi` does.
+    let mut image = staged.to_vec();
+    const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
+    let Some(value_at) = image
+        .windows(PLACEHOLDER.len())
+        .position(|window| window == PLACEHOLDER)
+        .map(|start| start + b"kernel_abi=0x".len())
+    else {
+        return TestResult::Fail("real module has no ABI placeholder");
+    };
+    let stamped = format!("{abi:08x}");
+    image[value_at..value_at + 8].copy_from_slice(stamped.as_bytes());
+
+    let module = match sys_init_module(&image) {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("rustc-built module failed to load or execute init"),
+    };
+    if module.name() != "test_module" {
+        return TestResult::Fail("rustc-built module manifest name mismatch");
+    }
+    if module.domain != narf_lib::id::DomainId::SCRATCH {
+        return TestResult::Fail("target_domain was not enforced as SCRATCH");
+    }
+    if *module.state.lock() != crate::lifecycle::ModuleState::Live {
+        return TestResult::Fail("rustc-built module did not reach Live");
+    }
+    if module.base_addr() == 0 || module.total_size() == 0 {
+        return TestResult::Fail("rustc-built module was not mapped");
+    }
+    if !crate::registry::contains("test_module") {
+        return TestResult::Fail("rustc-built module missing from registry");
+    }
+    drop(module);
+    if sys_delete_module("test_module").is_err() {
+        return TestResult::Fail("rustc-built module exit/unload failed");
+    }
+    if crate::registry::contains("test_module") {
+        return TestResult::Fail("rustc-built module remained registered after unload");
+    }
+
+    // Exercise the same genuine rustc/linker output through the compressed
+    // path. Compress only after stamping the live ABI: the envelope is the
+    // exact payload a production signer authenticates.
+    let mut compressed =
+        alloc::vec![0u8; narf_memory::compress::lz4_max_compressed_len(image.len())];
+    let compressed_len = match narf_memory::compress::lz4_encode(&image, &mut compressed) {
+        Ok(len) => len,
+        Err(_) => return TestResult::Fail("real module LZ4 compression failed"),
+    };
+    compressed.truncate(compressed_len);
+    let envelope = match crate::compression::envelope_lz4(image.len(), &compressed) {
+        Ok(envelope) => envelope,
+        Err(_) => return TestResult::Fail("real module compression envelope failed"),
+    };
+    let module = match sys_init_module(&envelope) {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("compressed rustc-built module failed to load"),
+    };
+    if module.domain != narf_lib::id::DomainId::SCRATCH
+        || *module.state.lock() != crate::lifecycle::ModuleState::Live
+        || module.image_size != envelope.len()
+    {
+        return TestResult::Fail("compressed module lost domain, state, or stored-size metadata");
+    }
+    drop(module);
+    if sys_delete_module("test_module").is_err() {
+        return TestResult::Fail("compressed rustc-built module failed to unload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_real_rust_module_loads_raw_and_compressed);
 
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.

@@ -112,6 +112,7 @@ narf-libc-validate = ["user-mode-e2e"]
 # unsigned firmware blobs. Kept separate from user-mode-e2e so ordinary EL0
 # tests retain production signature policy.
 firmware-allow-unsigned = ["narf-firmware/firmware-allow-unsigned"]
+module-allow-unsigned = ["narf-modules/module-allow-unsigned"]
 
 [lints]
 workspace = true

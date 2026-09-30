@@ -1,6 +1,7 @@
 //! NARF loadable kernel modules.
 //!
-//! Runtime-loadable Rust modules: parse a relocatable ELF64,
+//! Runtime-loadable Rust modules: authenticate and optionally decompress a
+//! bounded module envelope, parse a relocatable ELF64,
 //! resolve undefined symbols against the kernel's exported symbol
 //! table (cap-gated), apply per-arch relocations, call the module's
 //! `narf_module_init`, and register the module in a per-name registry
@@ -38,6 +39,7 @@
 
 extern crate alloc;
 
+pub mod compression;
 pub mod domain;
 pub mod elf;
 pub mod kabi;
@@ -172,7 +174,8 @@ pub fn register_initcalls() {
         domain::install_standard_domains();
         kabi::register_all();
         symbols::set_kernel_abi(symbols::compute_abi_hash());
-        sign::install_verifier(alloc::boxed::Box::new(sign::AcceptAll));
+        sign::install_build_trusted_signers();
+        sign::install_verifier(alloc::boxed::Box::new(sign::Ed25519Verifier));
         InitResult::Ok
     });
 

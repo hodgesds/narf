@@ -199,16 +199,10 @@ pub fn apply_aarch64(
     let place = target_addr.wrapping_add(loc as u64);
     // Displacement forms use these; absolute forms use `val` raw.
     //
-    // A module image relocated for MTE sits at a VA carrying its domain's tag
-    // (bits 59:56), while a kernel symbol carries the untagged 15. Subtracting
-    // one from the other is off by `(15 - tag) << 56` -- not a small error:
-    // every CALL26 overflows its +/-128 MiB bound, every call demands a PLT
-    // veneer, the PLT exhausts, and the load is refused. That is what the
-    // first attempt at tagged module images actually hit.
-    //
-    // Absolute forms deliberately keep the tag: ABS64 and MOVW_UABS_G3 are how
-    // a module's own pointers acquire it, which is what makes its data
-    // accesses match the granules `module_text::alloc` wrote.
+    // Canonicalise displacement operands. Module images are currently
+    // untagged because PC-relative instruction/rodata references cannot carry
+    // MTE allocation tags; the helper still accepts tagged inputs safely.
+    // Absolute forms preserve the caller-supplied address verbatim.
     let val_u = untag_kernel(val);
     let place_u = untag_kernel(place);
     match ty {

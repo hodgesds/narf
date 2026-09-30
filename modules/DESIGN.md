@@ -23,22 +23,18 @@ three syscalls.
 
 Known gaps, each expanded where it belongs below:
 
-  * **No test loads a real `.ko` yet.** `cargo xtask build-module` now
-    produces one for either architecture — extracting the crate's own
-    members from the `staticlib` archive and `ld -r`-ing them into a
-    single relocatable object with merged sections. What is still
-    missing is a smoke that loads one. `--kernel-abi` stamps the
-    running kernel's hash into the built object, so the pieces are
-    there; what is not is the plumbing to get a `.ko` in front of the
-    kernel under test — either in the initramfs for a smoke to
-    `finit_module`, or embedded at build time. Until then every smoke
-    still synthesizes its ELF.
   * **Driver domains isolate modules from each other, not from kernel
-    core**, and only on x86_64. See §2.
-  * **Signature verification accepts everything.** The hook is real; the
-    installed verifier is `AcceptAll`.
+    core.** x86_64 enforces image/data placement through PKS or PCID;
+    MTE-capable aarch64 enforces tagged module allocations but cannot tag the
+    PC-relative executable image. See §2.
   * **A task preempted inside module code can resume on unmapped
     text.** See §6.
+
+The QEMU harness stages a rustc-built reference `.ko`; an in-kernel smoke
+loads it, executes its real relocated init/exit code, checks its
+`target_domain`, and unloads it. Authentication is fail-closed
+Ed25519-over-BLAKE3 with build-time public-key provisioning; unsigned images
+require the explicit developer/CI feature.
 
 ## Where NARF deviates from Linux
 
@@ -63,18 +59,15 @@ API path because the kernel refuses to wire the pointer in.
 
 ### 2. Domain placement
 
-Every NARF module declares a `target_domain=<name>` in its
-manifest. The loader maps the module's text + rodata into the
-PKS-isolated region for that domain (read-execute from in-domain,
-no-access from out-of-domain) and the data + bss into the same
-domain's RW region.
+Every NARF module declares a `target_domain=<name>` in its manifest. The
+loader resolves it before mapping and records the resulting `DomainId` on the
+image. `invoke_init` / `invoke_exit` bracket module code with that domain.
 
-**Status on x86_64: enforced, in one direction.** Every page of a
-module's image carries its `DomainId` in the PTE protection-key field
-(bits 59..=62), and `invoke_init` / `invoke_exit` bracket the module's
-own code with `pks::enter_domain`, which narrows `IA32_PKRS` so only two
-of the sixteen domains are reachable: the kernel's, and the module's.
-The other fourteen fault.
+**Status on x86_64: enforced, in one direction.** Every image page carries
+the selected protection key. Entry dispatches through the active
+`DomainPrimitive`: PKS narrows `IA32_PKRS`; PCID switches to the domain's
+PML4 clone. In either backend the kernel and selected module domain remain
+reachable while other driver domains fault.
 
 So a module cannot reach another driver domain's memory — deliberately
 or by accident. Linux has no equivalent; a misbehaving driver there can
@@ -88,25 +81,17 @@ kernel call a module makes — and the cost has to be measured before it
 is anyone's default. It is the remaining half of this section, not a
 detail.
 
-The scope is entered per module ENTRY (init, exit), not per call, which
-is what makes the price two MSR writes per entry rather than two per
-crossing. It restores unconditionally: a narrowed PKRS left behind would
-deny the rest of the kernel fourteen domains, and the resulting fault
-would land nowhere near the module that caused it.
+The scope is entered per module entry (init, exit), not per exported-kernel
+call, and restores unconditionally.
 
-**aarch64 enforces none of this.** Its `DomainPrimitive` backend is MTE,
-which tags by allocation rather than by a page-table field, so there is
-no leaf for the key to travel in. The loader still resolves and records
-the domain; only the enforcement is absent, and the smoke covering it is
-`cfg`-gated to x86_64 rather than pretending otherwise.
-
-Two prior claims in this file were wrong and are worth naming, because
-both read as descriptions of working code. `PtFlags::pk` and `pk_of` had
-existed with **no callers at all**, so every module page carried key 0 —
-all sixteen domains were one domain and `target_domain=` selected
-nothing. And the enforcement was described as needing a domain-tagged
-*frame pool*; it does not. Frames are ordinary buddy frames. What
-carries the domain is the page-table entry.
+**aarch64 enforces allocation domains, not executable-image tags.** With MTE
+present, `narf_kmalloc` uses the per-domain heap, entry clears `PSTATE.TCO`
+and enables synchronous checks, and cross-domain or untagged accesses to
+those allocations fault. Module image pages remain plain Normal memory:
+instruction fetch and PC-relative rodata pointers do not carry allocation
+tags, so tagging the image makes ordinary compiler-generated ADRP references
+fault. The image is still private and W^X-sealed. Without MTE, aarch64 has no
+domain-enforcement fallback today.
 
 ### 3. Versioned ABI
 
@@ -228,16 +213,25 @@ veneer is needed. If the window ever moves further, Linux's
                  └────────┬────────┘
                           │ image bytes
                           ▼
-                  ┌──────────────┐
-                  │ sign::verify │  cap-gated; default no-op
-                  └──────┬───────┘
-                         ▼
                 ┌─────────────────┐
-                │ elf::parse_*    │  Elf64 + section walk
+                │ format dispatch │  raw ELF or NRFCMOD v1
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
-                │ manifest::parse │  .modinfo + kernel_abi check
+                │ sign::verify    │  compressed: before allocation/decode
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ LZ4 decode      │  compressed only; exact 32 MiB bound
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ elf + manifest  │  raw identifies before signature for
+                │ identify        │  Linux-.ko compatibility classification
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ sign::verify    │  raw only; compressed already verified
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
@@ -304,12 +298,15 @@ only briefly between layout completion and `invoke_init`.
 
 There are three trust tiers:
 
-  1. **Signature-verified.** A `sign::verify` hook (cap-gated by a
-     `ModuleVerify` cap when wired) gates the entire load. Phase 1
-     ships a no-op verifier and an `AcceptAll` default. Ed25519
-     verification is on the near roadmap — the hook contract is
-     stable so the implementation can land without breaking the
-     loader.
+  1. **Signature-verified.** Production boot installs the Ed25519 verifier.
+     A fixed trailer carries an Ed25519 signature over `BLAKE3(payload)` and
+     the SHA-256 fingerprint of a public key provisioned at build time through
+     `NARF_MODULE_TRUSTED_KEYS`. Payload is either the raw ABI-stamped ELF or
+     the complete `NRFCMOD` header + compressed LZ4 bytes. Compressed input is
+     authenticated before its lengths are trusted or the decoder runs.
+     Missing, unknown, malformed, and invalid signatures fail closed. Unsigned
+     images require the explicit developer/CI-only `module-allow-unsigned`
+     feature.
 
   2. **Cap-mediated.** Symbols can require caps. A module that
      wants `narf_block::register_block_device` must declare
@@ -488,18 +485,7 @@ asserts:
 
 ## Open questions / future phases
 
-  * **Ed25519 signature verification.** The hook is in place; the
-    implementation slots into `sign::install_verifier(...)`.
-  * **Loading a real `.ko` in a test.** The build exists
-    (`cargo xtask build-module`, with `--kernel-abi` to stamp the
-    running kernel's hash). What is missing is getting the object in
-    front of the kernel under test — shipping it in the initramfs for a
-    smoke to `finit_module`, which also means the test run has to build
-    the module, boot once to read the hash, and rebuild. Until then,
-    tests exercise the loader but not rustc's actual relocation output.
-    This should be the next thing done.
-
-    Note also that a module using anything from `core` the compiler
+  * **Rust `core` object inclusion.** A module using anything from `core` the compiler
     does not inline will come out with undefined references that
     neither KSYMTAB nor the object satisfies. Linux links the needed
     `core` objects into each Rust module; `build_module` does not yet.

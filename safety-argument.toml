@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "53c7f9acca0c19fe98a33a4faf28c9b0738ebe78139bc7b752e397314574f043"
+prompt_hash = "bd432d66ea10cb07244d67fb76feb9e03d378a3ccaaedca52ef97e8da0f99c8a"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1278,3 +1278,18 @@ argument = "The ACPI fix consumes only firmware-validated AML sleep-type scalars
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The aarch64 shutdown path delegates the existing PSCI function ids to the architecture-owned conduit dispatcher already used for PSCI probing. It removes duplicate raw SMC assembly, transfers no memory or capability authority, and preserves the terminal halt-on-return behavior."
+
+# Runtime module authentication/validation.
+# Human security review remains mandatory for the frame/memory manifest and
+# documentation touch; this argument is not a substitute for that review.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change is feature forwarding only: it lets the verification kernel opt into raw unsigned module fixtures while production builds retain fail-closed Ed25519 module policy. It adds no executable TCB code, trusted subsystem, runtime authority, mapping, domain transition, or scheduler state. The memory change corrects a module-domain comment and changes no executable code."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The raw-module path minimally identifies a NARF ELF and validates its bounded manifest before signature policy solely to preserve foreign-Linux-module compatibility; no executable mapping, relocation, capability resolution, or module entry occurs before Ed25519 verification. A compressed NRFCMOD claim is authenticated over its exact header and compressed bytes before declared lengths are trusted, output is allocated, or the bounded LZ4 decoder runs. Both compressed and decompressed sizes are capped at 32 MiB. Signature rejection is no longer swallowed as a foreign-image success, runtime trust-root mutation is crate-private, the verification cap is cached during boot rather than bootstrapped in the load path, unsigned acceptance is compile-time explicit, and target-domain mapping plus entry scope remain authoritative."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L44"
+argument = "The real rustc-built module smoke proves the image executes init and exit only inside its declared SCRATCH domain and that the registry/image are torn down afterward. It does not broaden the documented kernel-core exception or claim stronger aarch64 protection than MTE-tagged module allocations provide."

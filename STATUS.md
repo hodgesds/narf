@@ -44,6 +44,14 @@ validation remains pending; the development host is a live router.
   libdrm, and a multi-client Wayland path have runnable demonstrations.
   VirtGPU VirGL ioctls and presentation paths are implemented in-tree;
   this does not establish native AMDGPU display on a laptop.
+- **Runtime modules:** xtask builds and stages a real rustc `.ko`; the kernel
+  smoke stamps the live export-table ABI, resolves the compiler's native
+  relocation against `narf_printk`, executes init/exit in the declared
+  `target_domain`, and unloads it. Production policy verifies a fixed
+  Ed25519-over-BLAKE3 trailer against build-time public keys; unsigned modules
+  require an explicit developer/CI feature. Versioned LZ4 module envelopes are
+  bounded to 32 MiB and authenticated before decompression. The SMP unload
+  grace period remains open.
 - **Boot media:** `cargo xtask image` builds boot media and `iso-boot`
   checks UEFI boot in QEMU. These are distinct from a successful USB boot
   on the target laptops.
