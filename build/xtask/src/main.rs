@@ -2853,7 +2853,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
 /// Failure: any panic marker, OR timeout without all success markers.
 fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     // Force the `boot-smoke` feature on so the kernel triggers a clean
-    // ACPI / isa-debug-exit shutdown after the real init flow drains.
+    // ACPI S5 / PSCI SYSTEM_OFF transition after the real init flow drains.
     // Same pattern as the kernel-test harness — no kill-after-timeout
     // race; QEMU exits naturally on success or stays alive on hang.
     let mut args = args.clone();
@@ -2977,7 +2977,7 @@ fn wait_for_boot_smoke(
         transcript
     });
 
-    // Wait for QEMU to exit naturally (kernel calls exit_kernel),
+    // Wait for QEMU to exit naturally after the guest powers itself off,
     // OR force-kill on timeout.
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     let (status, timed_out) = loop {
@@ -3006,7 +3006,7 @@ fn wait_for_boot_smoke(
     if timed_out {
         emit_serial_tail(&transcript);
         bail!(
-            "xtask {label}: kernel did not call exit_kernel within {}s — possible boot hang",
+            "xtask {label}: kernel did not power off within {}s — possible boot hang",
             timeout_secs
         );
     }
@@ -3014,17 +3014,10 @@ fn wait_for_boot_smoke(
         emit_serial_tail(&transcript);
         bail!("xtask {label}: QEMU exited without the kernel clean-exit marker");
     }
-    // Clean-exit status is arch-dependent:
-    //  * x86_64 uses `isa-debug-exit` (port I/O), which encodes
-    //    `(code << 1) | 1` into QEMU's exit status — so a kernel
-    //    exit code of 0 yields QEMU status 1.
-    //  * aarch64 has no `isa-debug-exit`; the kernel shuts down via
-    //    PSCI or semihosting `SYS_EXIT`, and QEMU exits naturally
-    //    with status 0.
-    let expected = match arch {
-        Arch::X86_64 => Some(1),
-        Arch::Aarch64 => Some(0),
-    };
+    // ACPI S5 and PSCI SYSTEM_OFF both make QEMU exit naturally with status
+    // zero. This deliberately differs from the test-only x86 isa-debug-exit
+    // status (1), so accidentally falling back to exit_kernel cannot pass.
+    let expected = Some(0);
     if status.code() != expected {
         emit_serial_tail(&transcript);
         bail!(

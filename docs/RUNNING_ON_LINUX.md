@@ -231,11 +231,12 @@ cargo xtask test --arch=x86_64
 cargo xtask boot-smoke --arch=x86_64
 ```
 
-Forces the `boot-smoke` feature on (clean ACPI/isa-debug-exit shutdown
-after init drains), streams serial output, and fails on any panic
+Forces the `boot-smoke` feature on (ACPI S5 on x86_64 or PSCI
+`SYSTEM_OFF` on aarch64 after init drains), streams serial output, and fails on any panic
 marker (`*** KERNEL PANIC ***`, `panicked at`, `double fault`, `general
 protection`, `kernel page fault`, `unsafe precondition`) or on a timeout
-without a clean exit. Timeout: `XTASK_BOOT_SMOKE_TIMEOUT_SECS` (default 90).
+without a natural QEMU power-off. Timeout: `XTASK_BOOT_SMOKE_TIMEOUT_SECS`
+(default 300 seconds).
 
 ### 4.3 The linux-compat demo binaries
 
@@ -421,7 +422,7 @@ handlers in `build/xtask/src/main.rs`:
 | `NARF_QEMU_EXTRA` | extra whitespace-separated QEMU args (e.g. `-gdb tcp::1234`) | unset |
 | `XTASK_QEMU_APPEND` | kernel cmdline via multiboot2 `-append` | unset |
 | `XTASK_QEMU_TIMEOUT_SECS` | `run` watchdog | `600` |
-| `XTASK_BOOT_SMOKE_TIMEOUT_SECS` | `boot-smoke` timeout | `90` |
+| `XTASK_BOOT_SMOKE_TIMEOUT_SECS` | `boot-smoke` timeout | `300` |
 | `XTASK_RI_PROMPT_TIMEOUT_SECS` | `run-interactive` prompt wait | `120` |
 | `XTASK_RI_ECHO_TIMEOUT_SECS` | `run-interactive` per-command wait | `120` |
 
