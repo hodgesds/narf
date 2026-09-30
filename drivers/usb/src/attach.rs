@@ -75,8 +75,8 @@ pub enum AttachOutcome {
     /// Iso streaming path is a follow-up.
     AudioClass,
     /// Device bound as a USB Video Class device (webcam). Slot
-    /// stays alive; entry in `uvc::UVC_DEVICES`. Iso frame ring is
-    /// a follow-up.
+    /// stays alive; entry in `uvc::UVC_DEVICES` and a `/dev/video<N>`
+    /// node are registered. Streaming starts after PROBE/COMMIT.
     VideoClass,
     /// Device bound as a CDC-NCM ethernet adapter (USB-Ethernet
     /// dongle, tethered phone). Slot stays alive; entry in

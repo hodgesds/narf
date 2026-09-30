@@ -131,7 +131,8 @@ All driver code is derived strictly from the references below.
   alternate that satisfies the PROBE-accepted payload, and
   `negotiate_and_activate_video_stream(xhci, device_index, desired)` runs the
   26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
-  the accepted endpoint, and issues `SET_INTERFACE`.
+  the accepted endpoint, issues `SET_INTERFACE`, and starts an IRQ-driven
+  packet/frame pump into the camera's registered `/dev/video<N>` queue.
 
 ## Scope
 
@@ -142,7 +143,7 @@ All driver code is derived strictly from the references below.
 | `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
 | `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
 | `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Standard Wireless Controller `e0/01/01` endpoint discovery and Stage-0 HCI transport | Firmware/vendor setup and live HCI Reset/Read Local Version on silicon |
-| `30c9:00cd` | Luxvisions integrated camera | Generic UVC VideoControl bind, PROBE/COMMIT negotiation, streaming-alternate selection, and USB 2.0 high-bandwidth xHCI endpoint programming | Validate negotiation and end-to-end isochronous video capture on silicon |
+| `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
 the host controller and are not matched as downstream USB devices.
@@ -187,8 +188,9 @@ the host controller and are not matched as downstream USB devices.
   interval forms, VS FORMAT_MJPEG. Bind retains each VideoStreaming alternate's
   endpoint and bandwidth metadata; the negotiation path performs PROBE/COMMIT,
   configures the smallest fitting isochronous alternate, and issues
-  SET_INTERFACE.
-  Continuous capture and bulk-streaming orchestration remain follow-ups.
+  SET_INTERFACE. Its capture task reassembles UVC payloads and delivers complete
+  frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation and
+  bulk-streaming orchestration remain follow-ups.
 - **UAC1** (`uac`): USB Audio Class 1.0 descriptor parser. AC
   HEADER, INPUT_TERMINAL, OUTPUT_TERMINAL, FEATURE_UNIT (per-channel
   control bitmaps), AS_GENERAL, Type-I FORMAT_TYPE (discrete sample-

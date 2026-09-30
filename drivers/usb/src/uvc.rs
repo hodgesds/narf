@@ -126,6 +126,8 @@ pub enum UvcError {
     ProbeFailed,
     /// SET_CUR(COMMIT) failed for the device-accepted stream parameters.
     CommitFailed,
+    /// The xHCI data path failed while capturing an isochronous packet.
+    CaptureFailed,
 }
 
 fn check_cs(buf: &[u8], expect: u8) -> Result<(), UvcError> {
@@ -677,7 +679,7 @@ pub struct UvcDevice {
     /// `bInterfaceNumber` of the VideoControl interface.
     pub vc_iface: u8,
     /// Primary `bInterfaceNumber` of the VideoStreaming interface.
-    pub vs_iface: Option<u8>,
+    pub vs_iface: u8,
     /// Every bulk/isochronous IN endpoint found on a VideoStreaming
     /// alternate setting. Bind retains these until PROBE/COMMIT tells
     /// the driver how much payload bandwidth to request.
@@ -685,6 +687,10 @@ pub struct UvcDevice {
     /// Endpoint whose xHCI context has been configured and whose
     /// alternate setting has been selected, if streaming is active.
     pub active_stream: Option<UvcStreamingEndpoint>,
+    /// `/dev/video<N>` minor registered for this camera.
+    pub video_node: usize,
+    /// Prevents duplicate capture tasks when a caller repeats negotiation.
+    pub capture_pump_running: bool,
 }
 
 /// System-wide registry of bound UVC devices.
@@ -757,7 +763,8 @@ pub async fn try_bind_video_already_addressed(
         return Err(UvcError::SetConfigFailed);
     }
     let streaming_endpoints = find_video_streaming_endpoints(cfg);
-    let vs_iface = find_video_streaming_interface(cfg);
+    let vs_iface = find_video_streaming_interface(cfg).ok_or(UvcError::NoStreamingEndpoint)?;
+    let video_node = narf_drivers_video::devfs_bridge::register_video("USB Video Device");
     let mut g = UVC_DEVICES.lock();
     let idx = g.len();
     g.push(UvcDevice {
@@ -766,6 +773,8 @@ pub async fn try_bind_video_already_addressed(
         vs_iface,
         streaming_endpoints,
         active_stream: None,
+        video_node,
+        capture_pump_running: false,
     });
     Ok(idx)
 }
@@ -902,7 +911,7 @@ pub async fn activate_video_stream(
     let (slot_id, endpoint) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
-        let vs_iface = device.vs_iface.ok_or(UvcError::NoStreamingEndpoint)?;
+        let vs_iface = device.vs_iface;
         if let Some(active) = device.active_stream {
             let selected = select_video_streaming_iso_endpoint_for_interface(
                 &device.streaming_endpoints,
@@ -972,10 +981,7 @@ pub async fn negotiate_and_activate_video_stream(
     let (slot_id, vs_iface) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
-        (
-            device.slot_id,
-            device.vs_iface.ok_or(UvcError::NoStreamingEndpoint)?,
-        )
+        (device.slot_id, device.vs_iface)
     };
     let request_type_out = crate::control::RT_DIR_OUT
         | crate::control::RT_TYPE_CLASS
@@ -1026,10 +1032,90 @@ pub async fn negotiate_and_activate_video_stream(
         .map_err(|_| UvcError::CommitFailed)?;
 
     let endpoint = activate_video_stream(xhci_dev, idx, accepted.max_payload_transfer_size).await?;
+    start_video_capture_pump(idx);
     Ok(UvcNegotiatedStream {
         control: accepted,
         endpoint,
     })
+}
+
+/// Spawn the packet-to-frame pump once for an activated camera. Completed
+/// frames are delivered to the camera's registered `/dev/video<N>` queue.
+fn start_video_capture_pump(idx: usize) {
+    let should_spawn = {
+        let mut devices = UVC_DEVICES.lock();
+        let Some(device) = devices.get_mut(idx) else {
+            return;
+        };
+        if device.capture_pump_running {
+            false
+        } else {
+            device.capture_pump_running = true;
+            true
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+    narf_scheduler::spawn(async move {
+        let result = pump_video_frames(idx).await;
+        if result.is_err() {
+            let _ = core::fmt::write(
+                &mut narf_console::Writer,
+                format_args!("  usb-uvc: capture pump stopped for device {idx}\n"),
+            );
+        }
+        if let Some(device) = UVC_DEVICES.lock().get_mut(idx) {
+            device.capture_pump_running = false;
+        }
+    });
+}
+
+/// Continuously receive UVC payloads, reassemble frames, and enqueue them on
+/// the corresponding V4L2-style devfs node. The task sleeps in xHCI's event
+/// future between packets; it does not poll the controller in a spin loop.
+async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
+    let (slot_id, endpoint, video_node) = {
+        let devices = UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
+        (
+            device.slot_id,
+            device.active_stream.ok_or(UvcError::NoStreamingEndpoint)?,
+            device.video_node,
+        )
+    };
+    let controller = crate::xhci::controller().ok_or(UvcError::CaptureFailed)?;
+    let packet_size = usize::try_from(endpoint.max_payload_size)
+        .unwrap_or(4096)
+        .clamp(1, 4096);
+    let mut packet = alloc::vec![0u8; packet_size];
+    let mut reassembler = UvcFrameReassembler::new();
+    let mut consecutive_errors = 0u8;
+
+    loop {
+        match controller
+            .isoch_in(slot_id, endpoint.dci, &mut packet)
+            .await
+        {
+            Ok(received) if received != 0 => {
+                consecutive_errors = 0;
+                if reassembler.push(&packet[..received]) == ReassemblerOutcome::FrameComplete {
+                    let frame = reassembler.take_frame();
+                    let device = narf_drivers_video::devfs_bridge::get_device(video_node)
+                        .ok_or(UvcError::CaptureFailed)?;
+                    device.lock().push_frame(frame);
+                }
+            }
+            Ok(_) => narf_scheduler::yield_now().await,
+            Err(_) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                if consecutive_errors >= 8 {
+                    return Err(UvcError::CaptureFailed);
+                }
+                narf_scheduler::yield_now().await;
+            }
+        }
+    }
 }
 
 /// Pull one iso-IN packet (video frame fragment) from the bound
