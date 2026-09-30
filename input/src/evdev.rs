@@ -531,6 +531,66 @@ impl core::fmt::Debug for DeviceNode {
 /// Stored as `fn() as usize`.
 static DISPATCH_WAKE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
+// ── Magic SysRq ─────────────────────────────────────────────────────
+//
+// Linux `drivers/tty/sysrq.c`: while Alt and SysRq are held, the next key
+// press is a SysRq command (Alt+SysRq+T dumps every task's state) and is not
+// delivered to userspace. Recognised here, at the one event chokepoint every
+// keyboard shares. The command runs OUTSIDE interrupt context: dispatch is
+// called from IRQs, and a task dump takes locks the interrupted code may
+// hold, so this only records the request; `take_sysrq_request` hands it to
+// a sleep pump.
+
+const KEY_LEFTALT: u16 = 56;
+const KEY_RIGHTALT: u16 = 100;
+const KEY_SYSRQ: u16 = 99;
+
+static SYSRQ_ALT: AtomicU32 = AtomicU32::new(0);
+static SYSRQ_HELD: AtomicBool = AtomicBool::new(false);
+/// Pending command key code (0 = none).
+static SYSRQ_PENDING: AtomicU32 = AtomicU32::new(0);
+
+/// Track Alt/SysRq and record a command. Returns `true` when the event is a
+/// SysRq command key the caller must swallow.
+fn sysrq_filter(code: u16, value: i32) -> bool {
+    match code {
+        KEY_LEFTALT | KEY_RIGHTALT => {
+            let bit = if code == KEY_LEFTALT { 1 } else { 2 };
+            if value == 0 {
+                SYSRQ_ALT.fetch_and(!bit, Ordering::AcqRel);
+            } else {
+                SYSRQ_ALT.fetch_or(bit, Ordering::AcqRel);
+            }
+            false
+        }
+        KEY_SYSRQ => {
+            SYSRQ_HELD.store(value != 0, Ordering::Release);
+            false
+        }
+        _ if SYSRQ_HELD.load(Ordering::Acquire) && SYSRQ_ALT.load(Ordering::Acquire) != 0 => {
+            if value == 1 {
+                SYSRQ_PENDING.store(u32::from(code), Ordering::Release);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Take a pending SysRq command, as the `KEY_*` code of its command key
+/// (`KEY_T` = 20 for "show task states").
+pub fn take_sysrq_request() -> Option<u16> {
+    match SYSRQ_PENDING.swap(0, Ordering::AcqRel) {
+        0 => None,
+        c => Some(c as u16),
+    }
+}
+
+/// Queue a SysRq command by key code (the `/proc/sysrq-trigger` path).
+pub fn request_sysrq(code: u16) {
+    SYSRQ_PENDING.store(u32::from(code), Ordering::Release);
+}
+
 /// Install the post-dispatch wake callback (typically
 /// `narf_net::readiness::notify`). Called once during boot.
 pub fn set_dispatch_wake_hook(f: fn()) {
@@ -574,6 +634,10 @@ impl DeviceNode {
     pub fn dispatch(&self, ev: EvdevEvent) -> bool {
         if !self.alive.load(Ordering::Acquire) {
             return false;
+        }
+        if ev.type_ == EventType::Key && sysrq_filter(ev.code, ev.value) {
+            // Linux's sysrq input handler swallows the command key.
+            return true;
         }
         let mut g = self.inner.lock();
         let before = g.ring.len();

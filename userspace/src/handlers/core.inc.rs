@@ -12705,6 +12705,13 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn wait_init() {
+    // Once per boot: wait_init runs again on every test reset, and the pump
+    // registry has a fixed number of slots.
+    static SYSRQ_PUMP_REGISTERED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_scheduler::sleep_pumps::register(sysrq_pump);
+    }
     *PARENT_OF.lock() = Some(BTreeMap::new());
     parent_child_counts_init();
     crate::ptrace::ptrace_init();
@@ -14073,6 +14080,55 @@ fn orphanize_children_of(parent_tid: u64) {
             }
         }
     }
+}
+
+/// Run a pending Magic SysRq command (`narf_input::evdev::take_sysrq_request`)
+/// outside interrupt context. Only `t` (show task states) is implemented.
+fn sysrq_pump() {
+    const KEY_T: u16 = 20;
+    if narf_input::evdev::take_sysrq_request() == Some(KEY_T) {
+        sysrq_show_tasks();
+    }
+}
+
+/// Linux SysRq-T (`show_state`): one line per task with its state and, for a
+/// task parked in a syscall, which syscall and arguments it is blocked in.
+/// Costs nothing until requested, so it can be used on a wedged system
+/// without changing its timing.
+pub fn sysrq_show_tasks() {
+    use core::fmt::Write as _;
+    let mut w = narf_console::Writer;
+    let tasks = crate::task::snapshot_identities();
+    let _ = writeln!(w, "sysrq: show task states ({} tasks)", tasks.len());
+    for (tid, pid) in tasks {
+        let mut comm = [0u8; 16];
+        let n = proc_comm_of_task_into(tid, &mut comm);
+        let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+        let info = crate::user_task::with_user_task_ctx(tid, |u| {
+            let r: [u64; 7] = core::array::from_fn(|i| u.last_syscall[i].load(Ordering::Relaxed));
+            (u.parked_in_syscall.load(Ordering::Acquire), r)
+        });
+        match info {
+            Some((parked, r)) => {
+                let name = crate::syscall::syscall_name(r[0] as u32).unwrap_or("?");
+                let _ = writeln!(
+                    w,
+                    "sysrq: tid={tid} pid={pid} comm={comm} {} {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
+                    if parked { "BLOCKED-IN" } else { "last" },
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    r[6],
+                );
+            }
+            None => {
+                let _ = writeln!(w, "sysrq: tid={tid} pid={pid} comm={comm} (kernel/no user context)");
+            }
+        }
+    }
+    let _ = writeln!(w, "sysrq: end of task states");
 }
 
 /// Exit observer running AFTER `on_child_exit` (parent notification

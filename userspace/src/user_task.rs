@@ -264,6 +264,10 @@ pub struct UserTaskCtx {
     /// and skips the fold when set (matching the longjmp paths, which
     /// never reach the fold at all).
     pub parked_in_syscall: core::sync::atomic::AtomicBool,
+    /// The syscall this task entered most recently: NARF syscall id, then
+    /// its six arguments (the registers Linux keeps in `pt_regs`). Read by
+    /// the SysRq task dump; relaxed stores on entry, never on the park path.
+    pub last_syscall: [AtomicU64; 7],
     /// Non-zero while this task is parked in a blocked F_SETLKW: the
     /// lock-table key it waits on. `park_should_block` registers the
     /// task's waker on `fd::locks`' per-key waiter queue through this,
@@ -548,6 +552,7 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_rusage_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
+            last_syscall: [const { AtomicU64::new(0) }; 7],
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
             sigwait_interrupted: core::sync::atomic::AtomicBool::new(false),
