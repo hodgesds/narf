@@ -487,7 +487,9 @@ int main(void)
         const float bverts[12] = { -1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1 };
         memcpy(bp, bverts, sizeof(bverts));
 
-        // Clear to red first, so a dropped draw is visible as red.
+        // Clear to red in its own submission and read red back, so the green
+        // below can only come from this draw (not from phase 2's leftover
+        // pixels) and a dropped draw reads red.
         static uint32_t bc[64];
         unsigned k = 0;
         bc[k++] = VIRGL_CMD0(CCMD_CLEAR, 0, 8);
@@ -499,6 +501,31 @@ int main(void)
         bc[k++] = 0;
         bc[k++] = 0;
         bc[k++] = 0;
+        struct vg_execbuffer ebc = {
+            .size = k * 4,
+            .command = (uint64_t)(uintptr_t)bc,
+            .fence_fd = -1,
+        };
+        if (ioctl(fd, VIRTGPU_EXECBUFFER, &ebc)) {
+            printf("virgl3d-fail blob-clear-execbuffer errno=%d\n", errno);
+            return 1;
+        }
+        if (ioctl(fd, VIRTGPU_TRANSFER_FROM_HOST, &tf)) {
+            printf("virgl3d-fail blob-clear-transfer errno=%d\n", errno);
+            return 1;
+        }
+        if (ioctl(fd, VIRTGPU_WAIT, &wt)) {
+            printf("virgl3d-fail blob-clear-wait errno=%d\n", errno);
+            return 1;
+        }
+        if (check_pixels(px, 0, 0, 255, 255, "blob-clear"))
+            return 1;
+
+        // The blob is a resource of this context only once it is attached
+        // (Linux attaches every GEM object at handle creation); unattached,
+        // virglrenderer rejects it as an "Illegal resource" and drops the
+        // draw.
+        k = 0;
         bc[k++] = VIRGL_CMD0(CCMD_SET_VERTEX_BUFFERS, 0, 3);
         bc[k++] = 16;            // stride
         bc[k++] = 0;             // offset
