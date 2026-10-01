@@ -253,11 +253,35 @@ like a NACK. `disable` detaches the stream frontend only once the PHY is
 confirmed off; a caller must also stop the timing generator and HUBP before
 releasing scanout memory.
 
+`amdgpu_dcn_clk::ClockManager::new` is unsafe: it claims the DCN314 display
+clock mailbox, which is a distinct interface from the GFX SMU's even though
+both live on MP1 — C2PMSG_67/83/91 against the power driver's 66/82/90, and
+the VBIOSSMC message set rather than PPSMC. Holding it grants no
+power-management authority, so the caller must also keep the GFX driver off
+those registers. `start().await` proves the mailbox answers, then publishes a
+pool reservation to firmware and reads back the DPM table; the buffer is zeroed
+first so firmware that writes nothing cannot pass as a valid table. Level
+counts outside 1..8, clock values outside Linux's 1 < MHz < 100000 range and
+missing DF p-states all fail closed, and no clock can be requested until the
+table is latched. `update(requested, safe_to_lower, consumers)` applies Linux's
+order: DTBCLK before the clocks that need it, the DCFCLK floor and deep-sleep
+floor, DISPCLK, then the global DPPCLK and its per-DPP dividers — dividers
+first when the global clock drops, so no pipe is ever fed a clock above what
+its divider was programmed for. Requests above the firmware's own DPM ceiling
+are refused rather than clamped, DPPCLK keeps Linux's 100 MHz floor, and a BIOS
+that left DCFCLK DPM disabled refuses the two floor messages without aborting
+the modeset, since the boot clock already satisfies the request. The DCCG
+dividers and the DMCUB clock notification are supplied by the caller through
+`Consumers`, because neither the DCCG bank nor the firmware mailbox belongs to
+this module. DPREFCLK and DTBCLK are the fixed 600 MHz DCN314 sources; spread
+spectrum is not enabled.
+
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
-USB4 tunnel or trained link does not prove monitor output: the DCCG clocks,
-OTG timing, HUBP/DPP/MPC/OPP pipeline, DIG stream encoder, scanout allocation
-and KMS attachment remain open, and no code path yet lights an external panel.
+trained link or clock update does not prove monitor output: bandwidth and
+watermark derivation, the DCCG dividers, OTG timing, the HUBP/DPP/MPC/OPP
+pipeline, the DIG stream encoder, scanout allocation and KMS attachment remain
+open, and no code path yet lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,

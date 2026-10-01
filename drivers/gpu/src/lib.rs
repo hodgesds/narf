@@ -130,6 +130,7 @@ pub mod amdgpu_cp_fw;
 pub mod amdgpu_dc;
 pub mod amdgpu_dccg;
 pub mod amdgpu_dcn;
+pub mod amdgpu_dcn_clk;
 pub mod amdgpu_ddc;
 pub mod amdgpu_dio;
 pub mod amdgpu_discovery;
