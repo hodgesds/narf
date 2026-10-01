@@ -276,12 +276,40 @@ dividers and the DMCUB clock notification are supplied by the caller through
 this module. DPREFCLK and DTBCLK are the fixed 600 MHz DCN314 sources; spread
 spectrum is not enabled.
 
+`amdgpu_dml` derives the geometry, buffer and clock requirements Linux gets
+from DML, using `dcn3_14_ip`/`dcn3_14_soc` parameters and the
+`display_mode_vba_314.c` algorithms. It computes in fixed point rather than
+DML's `double`, because kernel floating point is unavailable: `x86_64`'s
+soft-float target and `arch/x86_64/kernel_ctx.rs` deliberately keep no FP state
+across a kernel context switch, and the aarch64 switch preserves no `d8..d15`
+either. Rounding is therefore chosen per quantity instead of inherited —
+required clocks, latencies and watermarks round up, buffer capacity and lines
+held in the detile buffer round down — and arithmetic saturates toward a larger
+requirement rather than wrapping or trapping. Formulas are rearranged where
+DML's ordering would build a tiny intermediate and divide by it; the arithmetic
+is equivalent and the magnitudes are chosen to stay exact.
+
+Scope is one plane on one pipe: packed linear RGB, no DCC, no chroma
+subsampling, no ODM combine, no MPC split, no DSC and no writeback — the surface
+shape the boot handoff already accepts. `Config::geometry` returns the swath
+width, its 256-byte-request upper bound, the swath height and the DET
+allocation, refusing a viewport that exceeds the detile buffer, the linear
+8192-pixel swath ceiling or the line buffer instead of approximating it.
+`Config::requirements` returns DISPCLK, DPPCLK and the deep-sleep DCFCLK floor
+already rounded to frequencies the DFS dividers can produce, plus the plane's
+read bandwidth. DISPCLK keeps DML's ramping margin where the DPM ceiling allows
+it and drops to the unramped requirement otherwise, so no mode is refused for a
+margin; a requirement above the ceiling is reported rather than clamped, leaving
+the refusal to the caller. Bandwidth, watermark and prefetch derivation, and the
+RQ/DLG/TTU register encoding, are not implemented yet.
+
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
-trained link or clock update does not prove monitor output: bandwidth and
-watermark derivation, the DCCG dividers, OTG timing, the HUBP/DPP/MPC/OPP
-pipeline, the DIG stream encoder, scanout allocation and KMS attachment remain
-open, and no code path yet lights an external panel.
+trained link, clock update or mode calculation does not prove monitor output:
+watermark and prefetch derivation, RQ/DLG/TTU encoding, the DCCG dividers, OTG
+timing, the HUBP/DPP/MPC/OPP pipeline, the DIG stream encoder, scanout
+allocation and KMS attachment remain open, and no code path yet lights an
+external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
