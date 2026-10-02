@@ -54,6 +54,7 @@ fn table_words() -> [u32; (TABLE_SIZE / 4) as usize] {
     for index in 0..2 {
         words[56 + index * 4] = 800 + index as u32 * 400; // FClk
         words[57 + index * 4] = 800 + index as u32 * 400; // MemClk
+        words[59 + index * 4] = 1; // WckRatio 1:2
     }
     words[72] = u32::from_le_bytes([3, 3, 3, 3]);
     words[73] = 2;
@@ -207,6 +208,10 @@ fn dcn_clk_dpm_table_is_zeroed_published_and_validated() -> TestResult {
         || (levels.display_levels, levels.df_pstates) != (3, 2)
     {
         return TestResult::Fail("parsed DPM levels");
+    }
+    // Double data rate times the 1:2 WCK ratio: 1200 MHz becomes 4800 MT/s.
+    if levels.max_dram_speed_mts() != 4800 {
+        return TestResult::Fail("DRAM data rate");
     }
     // Firmware that writes nothing must not look like a usable table.
     let (_pool, mut engine) = fixture();

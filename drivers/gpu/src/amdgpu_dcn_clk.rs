@@ -72,6 +72,8 @@ pub struct Levels {
     pub socclk: [u32; LEVELS],
     pub fclk: [u32; DF_PSTATES],
     pub memclk: [u32; DF_PSTATES],
+    /// `WCK_RATIO_*` as the firmware reports it: 0 is 1:1, 1 is 1:2, 2 is 1:4.
+    pub wck_ratio: [u8; DF_PSTATES],
     pub dcfclk_levels: u8,
     pub display_levels: u8,
     pub socclk_levels: u8,
@@ -100,6 +102,22 @@ impl Levels {
     }
     pub fn max_memclk_khz(&self) -> u32 {
         ceiling(&self.memclk, self.df_pstates) * 1000
+    }
+    /// The DRAM data rate DML wants, in MT/s: twice the memory clock for
+    /// double data rate, times the WCK ratio. Taken from the p-state with the
+    /// highest resulting rate, which is the one a modeset will run at.
+    pub fn max_dram_speed_mts(&self) -> u32 {
+        (0..self.df_pstates as usize)
+            .map(|index| {
+                let ratio = match self.wck_ratio[index] {
+                    1 => 2,
+                    2 => 4,
+                    _ => 1,
+                };
+                self.memclk[index].saturating_mul(2).saturating_mul(ratio)
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 /// The clock state the pipeline requires. DTBCLK is only needed by DP2.0 and
@@ -361,6 +379,7 @@ fn parse(words: &[u32; (TABLE_SIZE / 4) as usize]) -> Result<Levels, Error> {
         socclk: array(24),
         fclk: [0; DF_PSTATES],
         memclk: [0; DF_PSTATES],
+        wck_ratio: [0; DF_PSTATES],
         dcfclk_levels: counts as u8,
         display_levels: (counts >> 8) as u8,
         socclk_levels: (counts >> 16) as u8,
@@ -371,6 +390,8 @@ fn parse(words: &[u32; (TABLE_SIZE / 4) as usize]) -> Result<Levels, Error> {
     for index in 0..DF_PSTATES {
         levels.fclk[index] = words[56 + index * 4];
         levels.memclk[index] = words[57 + index * 4];
+        // Each 16-byte p-state entry ends with WckRatio and three spare bytes.
+        levels.wck_ratio[index] = words[59 + index * 4] as u8;
     }
     let enabled = [
         (levels.dcfclk_levels, &levels.dcfclk[..]),

@@ -93,14 +93,19 @@ output formatter and DisplayPort stream encoder are all programmed, and a
 bring-up sequence drives them in the enable-stream order, trains the link, and
 unblanks the pipe, encoder and formatter last. A completed stream publishes its
 scanout for the framebuffer layer to adopt.
-**External monitor output is still not complete:** the platform inventory the
-sequence needs is not obtained yet — the VBIOS display-object route, the memory
-channel configuration, the DCHUB reference clock and the DENTIST VCO. The
-memory configuration sets every watermark and the reference clock scales every
-latency register, so none may be defaulted; until they are read, nothing calls
-the bring-up sequence and no code path lights an external panel. Firmware replay
-over suspend also remains open. Physical Lenovo 50ee USB-C/USB4 validation is
-pending, and none of this path has run on silicon.
+The platform inventory the sequence needs is now read from the platform's own
+tables: the display topology and each connector's transmitter and hot-plug line,
+the memory type, channel count and data rate, the DCHUB reference clock and the
+DENTIST VCO. None of it is defaulted — the memory configuration multiplies into
+every watermark and the reference clock scales every latency register — and a
+table that is missing, the wrong revision or self-inconsistent fails closed. A
+native DisplayPort route is derived and validated against the board rather than
+trusted from the sink's index.
+**External monitor output is still not complete:** nothing calls the bring-up
+sequence yet, and a tunnelled USB4 sink still needs a link-encoder pool to assign
+its transmitter, which VBIOS cannot answer for. Firmware replay over suspend also
+remains open. Physical Lenovo 50ee USB-C/USB4 validation is pending, and none of
+this path has run on silicon.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 

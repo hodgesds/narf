@@ -455,22 +455,53 @@ way; it is also a policy decision that belongs to the framebuffer layer, since a
 published scanout only means a stream is running, not that the console should
 move to it.
 
-**The platform inventory this needs does not exist yet.** `Pipeline::new`
-requires a `Route` derived from this GPU's VBIOS display-object table or the
-DPIA allocator, and `Platform` requires the memory channel count and width, the
-DCHUB reference clock and the DENTIST VCO. None of those is currently obtained:
-the memory configuration sets every watermark, the reference clock scales every
-latency register, and the VCO decides which clocks exist, so none may be
-defaulted. Until they are, nothing calls `enable`, and no code path lights an
-external panel. None of this pipeline has run on silicon.
+`amdgpu_dcn_inventory` reads the platform constants and topology the bring-up
+needs, from the platform's own tables. None of it is defaulted: the memory
+configuration multiplies straight into every watermark, the DCHUB reference clock
+scales every latency register, and the DENTIST VCO decides which frequencies the
+dividers can produce, so a plausible guess at any of them yields a picture that
+tears under load rather than an error. A table that is missing, the wrong
+revision or self-inconsistent fails closed.
+
+`display_paths` walks `display_object_info_table_v1_4`, decoding each path's
+connector kind and instance, the transmitter its first encoder drives — UNIPHY
+and its numbered siblings each carry two, selected by the enum id — and the
+hot-plug line from the connector's record list. A path whose encoder or connector
+is not one this drives is skipped, since a board may wire other things alongside
+its DisplayPort connectors, but a table with nothing readable is refused. The
+record walk is bounded and fails closed to "unassigned" on a truncated, cyclic or
+out-of-range list rather than inventing a line. `memory_config` takes the type
+and channel count from `atom_integrated_system_info_v2_*` and the data rate from
+the firmware's own DPM table, deriving the channel width from the memory type as
+Linux does; a zero channel count is refused rather than replaced with Linux's
+substitute of four. `dchub_refclk_khz` comes from
+`atom_display_controller_info_v4_*`, keeping Linux's documented 27 MHz reference
+when the table reports zero. `dentist_vco_khz` reads the PLL feedback multiplier
+as 8.16 fixed point against the 48 MHz DFS reference; the CLK block is absent
+from the IP discovery table so its base is hardcoded as Linux hardcodes it, which
+is exactly why the result is range-checked before being believed.
+
+`route_for_sink` derives a link route and validates it against the board rather
+than trusting the sink's index. A native sink's DMUB link instance *is* its
+transmitter, so the topology confirms that transmitter is wired to a DisplayPort
+connector — a USB-C port carrying DP alt-mode appears as one — and supplies its
+hot-plug line; a transmitter the board wired to something else is refused. A
+tunnelled sink is refused outright: its transmitter is assigned from a
+link-encoder pool at stream time rather than fixed by the board, and no such pool
+exists here, so VBIOS cannot answer for it. `Pipeline::for_sink` and
+`Pipeline::platform` feed these into the bring-up, so a caller no longer
+assembles a route by hand.
+
+**Nothing calls `enable` yet.** The inventory can now answer for a native
+DisplayPort sink, but arming the bring-up on a laptop whose display pipeline has
+never been exercised is a separate decision, and tunnelled sinks still need the
+link-encoder pool. None of this pipeline has run on silicon.
 
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output: the platform inventory the sequence needs — the VBIOS
-display-object route, the memory configuration, the DCHUB reference clock and the
-DENTIST VCO — is not obtained yet, so nothing calls the sequence and no code path
-lights an external panel.
+prove monitor output: nothing calls the bring-up sequence yet, and tunnelled
+sinks still need a link-encoder pool, so no code path lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,

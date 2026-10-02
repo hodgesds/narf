@@ -11,6 +11,7 @@ use crate::{
     amdgpu_dcn_clk::{self as clk, ClockManager},
     amdgpu_dcn_dccg::{Dccg, Divider, SinglePipe},
     amdgpu_dcn_hubp::{Hubp, Surface},
+    amdgpu_dcn_inventory as inventory,
     amdgpu_dcn_otg::{GlobalSync, Otg},
     amdgpu_dcn_plane::{Dpp, Encoding, Mpc, Opp},
     amdgpu_dcn_stream::{Depth, Stream},
@@ -45,6 +46,8 @@ pub enum Error {
     Mode(dml::Error),
     Hardware(clk::Error),
     Link(crate::amdgpu_dp_training::Error),
+    /// The platform's own tables could not answer for something.
+    Inventory(inventory::Error),
 }
 impl From<dml::Error> for Error {
     fn from(error: dml::Error) -> Self {
@@ -241,6 +244,44 @@ impl Pipeline {
                 streaming: false,
             })
         }
+    }
+    /// Construct the pipeline for a discovered sink, deriving its route from the
+    /// board's own display topology instead of leaving the caller to assemble
+    /// one. The stream frontend is the route's, so the DIG that carries the
+    /// stream is the one the board wired to that connector.
+    ///
+    /// # Safety
+    /// Same contract as [`Pipeline::new`], except that the route is derived here
+    /// rather than supplied, so the caller no longer has to guarantee it came
+    /// from the VBIOS — only that `vbios` is this device's validated snapshot.
+    pub unsafe fn for_sink(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        pipe: u8,
+        vbios: &[u8],
+        sink: &crate::amdgpu_usbc::Sink,
+    ) -> Result<Self, Error> {
+        let paths = inventory::display_paths(vbios).map_err(Error::Inventory)?;
+        let route = inventory::route_for_sink(&paths, sink, pipe).map_err(Error::Inventory)?;
+        // SAFETY: forwarded unchanged; the route is now board-derived.
+        unsafe { Self::new(gpu, authority, pool, pipe, route) }
+    }
+    /// Read the platform constants this pipeline needs. Only valid after
+    /// [`Pipeline::start`], since the memory data rate comes from the DPM table.
+    ///
+    /// # Safety
+    /// Caller holds matching PCI authority and a permanent register mapping, and
+    /// `vbios` must be this device's validated snapshot.
+    pub unsafe fn platform(
+        &self,
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        vbios: &[u8],
+    ) -> Result<Platform, Error> {
+        let levels = self.clocks.levels().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded unchanged from this function's contract.
+        unsafe { inventory::platform(gpu, authority, vbios, &levels) }.map_err(Error::Inventory)
     }
     pub fn streaming(&self) -> bool {
         self.streaming

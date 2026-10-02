@@ -134,6 +134,7 @@ pub mod amdgpu_dcn_clk;
 pub mod amdgpu_dcn_dccg;
 pub mod amdgpu_dcn_display;
 pub mod amdgpu_dcn_hubp;
+pub mod amdgpu_dcn_inventory;
 pub mod amdgpu_dcn_otg;
 pub mod amdgpu_dcn_plane;
 pub mod amdgpu_dcn_stream;
