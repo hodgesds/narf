@@ -98,11 +98,16 @@ impl Fx {
     }
 }
 /// `dml_ceil(value, multiple)`.
-fn ceil_multiple(value: u64, multiple: u64) -> u64 {
+pub(crate) fn ceil_multiple(value: u64, multiple: u64) -> u64 {
     if multiple == 0 {
         return value;
     }
     value.div_ceil(multiple).saturating_mul(multiple)
+}
+/// Integer log2 of a power of two, floored. DML's `dml_log2` is only applied to
+/// power-of-two sizes in the paths this port uses.
+pub(crate) fn log2_floor(value: u64) -> u32 {
+    value.max(1).ilog2()
 }
 /// `dml_floor(value, multiple)`.
 fn floor_multiple(value: u64, multiple: u64) -> u64 {
@@ -142,6 +147,17 @@ const DOWNSPREAD_TENTHS: i64 = 5;
 const MIN_DCFCLK_FACTOR_HUNDREDTHS: i64 = 115;
 /// Linear surfaces are limited by the detile buffer, not the DPP line store.
 const MAX_SWATH_WIDTH_LINEAR: u64 = 8192;
+/// `gpuvm_min_page_size_bytes` and `dpte_buffer_size_in_pte_reqs_luma`.
+pub(crate) const GPUVM_MIN_PAGE_BYTES: u64 = 4096;
+pub(crate) const DPTE_BUFFER_IN_PTE_REQS_LUMA: u64 = 64;
+/// `pixel_chunk_size_kbytes`, `meta_chunk_size_kbytes` and the minimum chunk
+/// sizes the RQ registers encode, in bytes.
+pub(crate) const CHUNK_BYTES: u64 = 8192;
+pub(crate) const MIN_CHUNK_BYTES: u64 = 1024;
+pub(crate) const META_CHUNK_BYTES: u64 = 2048;
+pub(crate) const MIN_META_CHUNK_BYTES: u64 = 256;
+pub(crate) const DPTE_GROUP_BYTES: u64 = 2048;
+pub(crate) const MPTE_GROUP_BYTES: u64 = 2048;
 /// `get_vco_frequency_from_reg` fallback. The caller should pass the measured
 /// DENTIST VCO instead of assuming this.
 pub const DEFAULT_DENTIST_VCO_KHZ: u32 = 3_600_000;
@@ -186,8 +202,24 @@ pub struct Timing {
     pub pixel_clock_khz: u32,
     pub h_active: u32,
     pub h_total: u32,
+    pub h_front_porch: u32,
     pub v_active: u32,
     pub v_total: u32,
+    pub v_front_porch: u32,
+}
+impl Timing {
+    /// The blanking that follows the front porch, which is what the DLG's
+    /// blank-end fields count: sync plus back porch.
+    pub fn h_blank_end(&self) -> u32 {
+        self.h_total
+            .saturating_sub(self.h_active)
+            .saturating_sub(self.h_front_porch)
+    }
+    pub fn v_blank_end(&self) -> u32 {
+        self.v_total
+            .saturating_sub(self.v_active)
+            .saturating_sub(self.v_front_porch)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plane {
@@ -197,6 +229,8 @@ pub struct Plane {
     pub surface_height: u32,
     pub viewport_width: u32,
     pub viewport_height: u32,
+    /// Surface pitch in pixels; the linear PTE row height depends on it.
+    pub pitch: u32,
     /// Scaler taps. One tap each means the scaler is bypassed.
     pub h_taps: u32,
     pub v_taps: u32,
@@ -252,6 +286,16 @@ impl Config {
             || p.viewport_height == 0
             || p.surface_width < p.viewport_width
             || p.surface_height < p.viewport_height
+        {
+            return Err(Error::Invalid);
+        }
+        if p.pitch < p.surface_width {
+            return Err(Error::Invalid);
+        }
+        if t.h_front_porch == 0
+            || t.v_front_porch == 0
+            || t.h_front_porch >= t.h_total - t.h_active
+            || t.v_front_porch >= t.v_total - t.v_active
         {
             return Err(Error::Invalid);
         }

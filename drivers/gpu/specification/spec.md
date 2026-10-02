@@ -320,20 +320,53 @@ exactly as DML compares them. The schedule uses the exact fractional
 scaler-to-OPTC delay; only the register fields quantise, and they round up so
 the timing generator is told about at least the delay that exists.
 
+`amdgpu_dml_regs::Registers::new` encodes the RQ, DLG and TTU registers from
+that math, following `display_rq_dlg_calc_314.c`. Every field has a fixed width
+and an implied binary point, and a value that does not fit is refused rather
+than truncated: a wrapped latency register does not degrade the picture, it
+underflows the pipe. The 14-bit QoS high watermark holds four line times and so
+binds the DCHUB-reference-to-pixel-clock ratio well below the U4.19 ratio
+field's own limit; because a blank end is always shorter than a line, that
+13-bit field can never overflow first. `dchub_refclk_khz` is the reference every
+DLG and TTU field is expressed in and comes from the VBIOS firmware-info crystal
+frequency, not from any display clock. The linear page-table geometry follows
+from the pitch: a 64-byte request returns eight PTEs of a 4 KiB page, and a
+pitch leaving fewer than eight PTE rows in the request buffer is refused.
+MIN_DST_Y_NEXT_START follows DML's final pass, which uses the maximum VStartup
+rather than the one the prefetch search settled on — the earlier of the two.
+Fields this configuration cannot produce stay at the values DML yields for an
+absent surface, which the module states rather than omits.
+
+`amdgpu_dcn_dccg::Dccg::new` is unsafe: it claims the DCN314 clock generator's
+register bank, which is base index 1 of the DCN IP rather than the index 2 the
+HUBP, OTG, DIG and DMCUB banks use. Holding it grants no display clock mailbox —
+the global DISPCLK and DPPCLK still belong to the clock manager, and this only
+divides them. `set_pixel_rate_div` programs one OTG's three-bit divider pair; a
+DisplayPort 8b/10b stream with one pixel per container and no ODM combine
+divides by one then four, and the divide-by-four code is 3, not 4.
+`update_dpp_dto` programs a pipe's DPPCLK divider as a phase over a full 8-bit
+modulo, rounded up so the pipe is never starved, and refuses a request above the
+global clock. A pipe with no reference clock or a zero request is parked rather
+than left on a stale ratio. `set_dp_stream_clock` routes a DPIA's stream clock by
+DPIA index, never a UCSI connector number. `resync_dio_fifo` copies the divider
+DENTIST is really running into the request field so the DIO FIFOs restart
+against the live divider. `SinglePipe` satisfies the clock manager's `Consumers`
+for one pipe, adopting each new global DPPCLK as the divider reference; the DMCUB
+clock notification stays with the loader, which owns that mailbox.
+
 `Config::requirements` returns DISPCLK, DPPCLK and the deep-sleep DCFCLK floor
 already rounded to frequencies the DFS dividers can produce, plus the plane's
 read bandwidth. DISPCLK keeps DML's ramping margin where the DPM ceiling allows
 it and drops to the unramped requirement otherwise, so no mode is refused for a
 margin; a requirement above the ceiling is reported rather than clamped, leaving
-the refusal to the caller. The RQ/DLG/TTU register encoding is not implemented
-yet.
+the refusal to the caller.
 
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
-trained link, clock update or mode calculation does not prove monitor output:
-RQ/DLG/TTU encoding, the DCCG dividers, OTG timing, the HUBP/DPP/MPC/OPP
-pipeline, the DIG stream encoder, scanout allocation and KMS attachment remain
-open, and no code path yet lights an external panel.
+trained link, clock update, mode calculation or programmed divider does not
+prove monitor output: OTG timing, the HUBP/DPP/MPC/OPP pipeline, the DIG stream
+encoder, scanout allocation and KMS attachment remain open, and no code path yet
+lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,

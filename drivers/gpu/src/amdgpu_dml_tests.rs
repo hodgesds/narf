@@ -6,8 +6,10 @@ fn timing_1080p() -> Timing {
         pixel_clock_khz: 148_500,
         h_active: 1920,
         h_total: 2200,
+        h_front_porch: 88,
         v_active: 1080,
         v_total: 1125,
+        v_front_porch: 4,
     }
 }
 fn plane_1080p() -> Plane {
@@ -17,6 +19,7 @@ fn plane_1080p() -> Plane {
         surface_height: 1080,
         viewport_width: 1920,
         viewport_height: 1080,
+        pitch: 1920,
         h_taps: 1,
         v_taps: 1,
     }
@@ -121,6 +124,7 @@ fn dml_geometry_refuses_shapes_the_buffers_cannot_hold() -> TestResult {
     config.timing.h_total = 9500;
     config.plane.surface_width = 9000;
     config.plane.viewport_width = 9000;
+    config.plane.pitch = 9000;
     if config.geometry() != Err(Error::ViewportTooLarge) {
         return TestResult::Fail("swath wider than the detile buffer accepted");
     }
@@ -131,6 +135,7 @@ fn dml_geometry_refuses_shapes_the_buffers_cannot_hold() -> TestResult {
     config.plane.v_taps = 8;
     config.plane.surface_width = 8192;
     config.plane.viewport_width = 8192;
+    config.plane.pitch = 8192;
     config.timing.h_active = 8192;
     config.timing.h_total = 8500;
     if config.geometry() != Err(Error::ViewportTooLarge) {
@@ -179,6 +184,7 @@ fn dml_geometry_refuses_shapes_the_buffers_cannot_hold() -> TestResult {
             plane: Plane {
                 viewport_width: 1920 * 7,
                 surface_width: 1920 * 7,
+                pitch: 1920 * 7,
                 ..plane_1080p()
             },
             ..config_1080p()
@@ -245,6 +251,7 @@ fn dml_upscaling_raises_dppclk_above_the_pixel_rate() -> TestResult {
     let mut config = config_1080p();
     config.plane.viewport_width = 3840;
     config.plane.surface_width = 3840;
+    config.plane.pitch = 3840;
     config.plane.viewport_height = 2160;
     config.plane.surface_height = 2160;
     config.plane.h_taps = 4;
@@ -461,9 +468,18 @@ fn dml_prefetch_refuses_a_vblank_that_cannot_hold_it() -> TestResult {
     let wm = config.watermarks(&memory_ddr5(), &clocks).unwrap();
     // A vblank below DML's minimum VStartup cannot be scheduled at all.
     let mut tight = config;
-    tight.timing.v_total = tight.timing.v_active + 4;
+    tight.timing.v_total = tight.timing.v_active + 6;
+    tight.timing.v_front_porch = 2;
     if tight.prefetch(&geometry, &clocks, &wm) != Err(Error::ViewportTooLarge) {
         return TestResult::Fail("tiny vblank accepted");
+    }
+    // A front porch that consumes the whole blank leaves no blank end at all,
+    // which is a malformed timing rather than an unschedulable one.
+    let mut degenerate = config;
+    degenerate.timing.v_total = degenerate.timing.v_active + 4;
+    degenerate.timing.v_front_porch = 4;
+    if degenerate.prefetch(&geometry, &clocks, &wm) != Err(Error::Invalid) {
+        return TestResult::Fail("front porch consuming the blank accepted");
     }
     // Enough vblank to clear the VStartup floor, but a deep-sleep clock far too
     // slow to cover the fixed DCHUB delays pushes TSetup and TCalc past the
