@@ -132,6 +132,7 @@ pub mod amdgpu_dccg;
 pub mod amdgpu_dcn;
 pub mod amdgpu_dcn_clk;
 pub mod amdgpu_dcn_dccg;
+pub mod amdgpu_dcn_otg;
 pub mod amdgpu_ddc;
 pub mod amdgpu_dio;
 pub mod amdgpu_discovery;

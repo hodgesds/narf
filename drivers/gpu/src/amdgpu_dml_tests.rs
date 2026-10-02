@@ -7,9 +7,13 @@ fn timing_1080p() -> Timing {
         h_active: 1920,
         h_total: 2200,
         h_front_porch: 88,
+        h_sync_width: 44,
         v_active: 1080,
         v_total: 1125,
         v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
     }
 }
 fn plane_1080p() -> Plane {
@@ -470,6 +474,8 @@ fn dml_prefetch_refuses_a_vblank_that_cannot_hold_it() -> TestResult {
     let mut tight = config;
     tight.timing.v_total = tight.timing.v_active + 6;
     tight.timing.v_front_porch = 2;
+    // Sync still has to fit in the blanking that remains.
+    tight.timing.v_sync_width = 2;
     if tight.prefetch(&geometry, &clocks, &wm) != Err(Error::ViewportTooLarge) {
         return TestResult::Fail("tiny vblank accepted");
     }
@@ -498,19 +504,29 @@ fn dml_prefetch_refuses_a_vblank_that_cannot_hold_it() -> TestResult {
     // the 668 us nominal blank, which is 45 lines here, not by the actual one.
     let mut roomy = config;
     roomy.timing.v_total = roomy.timing.v_active + 200;
-    let generous = roomy.prefetch(&geometry, &clocks, &wm).unwrap();
+    let Ok(generous) = roomy.prefetch(&geometry, &clocks, &wm) else {
+        return TestResult::Fail("wider vblank rejected");
+    };
     if generous.max_v_startup != 44 {
         return TestResult::Fail("nominal vblank did not bound VStartup");
     }
-    // A shorter line does fit more lines into that same nominal blank.
+    // A shorter line does fit more lines into that same nominal blank. The
+    // horizontal blanking has to shrink with the line, not just the active.
     let mut dense = config;
     dense.timing.v_total = dense.timing.v_active + 200;
     dense.timing.h_total = 1100;
     dense.timing.h_active = 1000;
+    dense.timing.h_front_porch = 20;
+    dense.timing.h_sync_width = 10;
     dense.plane.viewport_width = 1000;
     dense.plane.surface_width = 1000;
-    let dense_geometry = dense.geometry().unwrap();
-    let packed = dense.prefetch(&dense_geometry, &clocks, &wm).unwrap();
+    let (Ok(dense_geometry), Ok(_)) = (dense.geometry(), dense.watermarks(&memory_ddr5(), &clocks))
+    else {
+        return TestResult::Fail("shorter line rejected");
+    };
+    let Ok(packed) = dense.prefetch(&dense_geometry, &clocks, &wm) else {
+        return TestResult::Fail("shorter line prefetch rejected");
+    };
     if packed.max_v_startup <= 44 {
         return TestResult::Fail("shorter line did not raise max VStartup");
     }

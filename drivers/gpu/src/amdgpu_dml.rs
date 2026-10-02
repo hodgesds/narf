@@ -203,9 +203,15 @@ pub struct Timing {
     pub h_active: u32,
     pub h_total: u32,
     pub h_front_porch: u32,
+    pub h_sync_width: u32,
     pub v_active: u32,
     pub v_total: u32,
     pub v_front_porch: u32,
+    pub v_sync_width: u32,
+    /// Sync polarity as the sink's mode declares it. The timing generator
+    /// programs the inverse, since its field means "negative".
+    pub h_sync_positive: bool,
+    pub v_sync_positive: bool,
 }
 impl Timing {
     /// The blanking that follows the front porch, which is what the DLG's
@@ -296,6 +302,14 @@ impl Config {
             || t.v_front_porch == 0
             || t.h_front_porch >= t.h_total - t.h_active
             || t.v_front_porch >= t.v_total - t.v_active
+        {
+            return Err(Error::Invalid);
+        }
+        // Sync has to fit inside the blanking that follows the front porch.
+        if t.h_sync_width == 0
+            || t.v_sync_width == 0
+            || t.h_sync_width > t.h_blank_end()
+            || t.v_sync_width > t.v_blank_end()
         {
             return Err(Error::Invalid);
         }

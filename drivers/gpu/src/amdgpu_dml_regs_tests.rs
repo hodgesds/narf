@@ -13,9 +13,13 @@ fn config_1080p() -> Config {
             h_active: 1920,
             h_total: 2200,
             h_front_porch: 88,
+            h_sync_width: 44,
             v_active: 1080,
             v_total: 1125,
             v_front_porch: 4,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
         },
         plane: Plane {
             format: Format::Rgb32,

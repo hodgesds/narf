@@ -361,12 +361,29 @@ it and drops to the unramped requirement otherwise, so no mode is refused for a
 margin; a requirement above the ceiling is reported rather than clamped, leaving
 the refusal to the caller.
 
+`amdgpu_dcn_otg::Otg::new` is unsafe: it claims one OTG instance, its ODM
+segment and its vertical timing generator. `program_timing` writes the mode —
+counters hold one less than each total, blank starts after active plus front
+porch and ends an active region later, sync starts at zero and runs for its
+width, and the polarity field is the inverse of what the mode declares because
+it means "negative". V_TOTAL_MIN and V_TOTAL_MAX are pinned to V_TOTAL so a
+variable-refresh range left by firmware cannot retime the stream. One OPP segment
+feeds the generator with the other three parked, no horizontal timing division
+and no memory split. Counts that do not fit their 15-bit fields, a VStartup past
+ten bits or a zero VStartup are refused. Retiming a running generator is refused
+rather than allowed to tear. `enable` brings the vertical timing generator up
+before the master enable and leaves the request disabled until the blank's first
+line; `disable` parks every segment, drops the master enable, stops the timing
+generator and waits for the block to report idle rather than assuming it.
+Pixel blanking is deliberately absent: from DCN2 onwards a stream is blanked by
+the OPP's display pattern generator, not by the timing generator.
+
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output: OTG timing, the HUBP/DPP/MPC/OPP pipeline, the DIG stream
-encoder, scanout allocation and KMS attachment remain open, and no code path yet
-lights an external panel.
+prove monitor output: the HUBP/DPP/MPC/OPP pipeline, the DIG stream encoder,
+scanout allocation and KMS attachment remain open, and no code path yet lights
+an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
