@@ -1549,6 +1549,37 @@ fn populate_thp_dir(mm: &Arc<Kobject>) {
 /// hex words, high word first) for the CPUs whose SRAT proximity
 /// domain is `node`. Empty mask renders as a single "0".
 /// Linux ref: `node_read_cpumap` (drivers/base/node.c).
+/// A CPU mask the way Linux prints `%*pb` over `nbits` bits (lib/vsprintf.c
+/// `bitmap_string`): 32-bit chunks, high chunk first, comma-separated, each
+/// chunk zero-padded to its own width — the leading chunk carries only
+/// `nbits % 32` bits, so 16 CPUs print `ffff` and 40 print `ff,ffffffff`.
+/// Every cpumask file (`Cpus_allowed`, node `cpumap`, the topology masks)
+/// is sized by `nr_cpu_ids`; libnuma relies on them agreeing.
+pub fn cpumask_pb(mask: u128, nbits: u32) -> String {
+    let mut out = String::new();
+    let mut chunksz = nbits & 31;
+    if chunksz == 0 {
+        chunksz = 32;
+    }
+    let mut start = i64::from(nbits.div_ceil(32) * 32) - 32;
+    while start >= 0 {
+        let chunkmask = (1u64 << chunksz) - 1;
+        let val = if start < 128 {
+            (mask >> start) as u64 & chunkmask
+        } else {
+            0
+        };
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let width = chunksz.div_ceil(4) as usize;
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{val:0width$x}"));
+        chunksz = 32;
+        start -= 32;
+    }
+    out
+}
+
 fn node_cpumap_string(node: u32) -> String {
     let mut mask: u128 = 0;
     for cpu in 0..128u32 {
@@ -1556,12 +1587,7 @@ fn node_cpumap_string(node: u32) -> String {
             mask |= 1u128 << cpu;
         }
     }
-    // 128 bits → four 32-bit words, high first, comma-joined.
-    let w3 = (mask >> 96) as u32;
-    let w2 = (mask >> 64) as u32;
-    let w1 = (mask >> 32) as u32;
-    let w0 = mask as u32;
-    format!("{:08x},{:08x},{:08x},{:08x}\n", w3, w2, w1, w0)
+    format!("{}\n", cpumask_pb(mask, smp::cpu_count().max(1)))
 }
 
 /// Build a Linux-style CPU list string ("0-7", "8-15", …) for the
@@ -1867,22 +1893,15 @@ fn cpu_range_string(n: u32) -> String {
     }
 }
 
-/// Build a Linux-style comma-grouped 32-bit hex mask for a single CPU `cpu`
-/// in the same format as [[node_cpumap_string]] (four 32-bit words, high
-/// word first, zero-padded). This is what Linux emits for
-/// `topology/core_cpus` / `thread_siblings`.
+/// The `%*pb` mask of a single CPU `cpu` over `nr_cpu_ids` bits — what
+/// Linux emits for `topology/core_cpus` / `thread_siblings`.
 /// Linux ref: `drivers/base/cpu.c` `show_cpumap`.
 fn single_cpu_mask_string(cpu: u32) -> String {
-    // 128-bit wide mask (matches the NUMA cpumap helper): bit `cpu` set.
     let mask: u128 = 1u128 << (cpu & 127);
-    let w3 = (mask >> 96) as u32;
-    let w2 = (mask >> 64) as u32;
-    let w1 = (mask >> 32) as u32;
-    let w0 = mask as u32;
-    format!("{:08x},{:08x},{:08x},{:08x}\n", w3, w2, w1, w0)
+    format!("{}\n", cpumask_pb(mask, smp::cpu_count().max(1)))
 }
 
-/// Build a Linux-style comma-grouped 32-bit hex mask for all CPUs in [0, n).
+/// The `%*pb` mask of all CPUs in [0, n) over `n` bits.
 /// Used for `topology/package_cpus`.
 /// Linux ref: `drivers/base/cpu.c` `show_cpumap`.
 fn all_cpus_mask_string(n: u32) -> String {
@@ -1893,11 +1912,7 @@ fn all_cpus_mask_string(n: u32) -> String {
     } else {
         (1u128 << n_capped) - 1
     };
-    let w3 = (mask >> 96) as u32;
-    let w2 = (mask >> 64) as u32;
-    let w1 = (mask >> 32) as u32;
-    let w0 = mask as u32;
-    format!("{:08x},{:08x},{:08x},{:08x}\n", w3, w2, w1, w0)
+    format!("{}\n", cpumask_pb(mask, n.max(1)))
 }
 
 /// Populate `/sys/devices/system/cpu/` with the Linux CPU topology subtree.

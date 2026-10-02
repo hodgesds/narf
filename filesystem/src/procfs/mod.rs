@@ -2952,18 +2952,10 @@ fn render_status(info: &ProcTaskInfo) -> String {
     );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp_filters:\t0\n"));
-    // Linux sizes the mask by `nr_cpu_ids`, not by the value, so every
-    // process on one machine renders the same width — which is what lets
-    // a reader compare two of them by eye.
-    let groups = (info.nr_cpus.max(1)).div_ceil(32).max(1) as usize;
-    let mut mask = String::new();
-    for group in (0..groups).rev() {
-        if !mask.is_empty() {
-            mask.push(',');
-        }
-        let word = (info.cpus_allowed >> (group * 32)) as u32;
-        let _ = core::fmt::Write::write_fmt(&mut mask, format_args!("{word:08x}"));
-    }
+    // Linux prints `%*pb` over `nr_cpu_ids` bits (not the mask's value), so
+    // every process on one machine renders the same width — libnuma sizes
+    // its CPU bitmap from it and then parses the node cpumaps against it.
+    let mask = crate::sysfs::cpumask_pb(u128::from(info.cpus_allowed), info.nr_cpus.max(1));
     let _ = core::fmt::Write::write_fmt(
         &mut s,
         format_args!(
@@ -3709,9 +3701,10 @@ fn smoke_status_cpus_allowed_list_collapses_ranges() -> TestResult {
     if !body.contains("Cpus_allowed_list:\t0-3,7") {
         return TestResult::Fail("Cpus_allowed_list did not collapse ranges");
     }
-    // The mask is sized by the CPU COUNT, not by the value — one 32-bit
-    // group here, so every process on this machine renders the same width.
-    if !body.contains("Cpus_allowed:\t0000008f") {
+    // The mask is Linux `%*pb` over the CPU COUNT, not the value: 8 CPUs
+    // render two hex digits, so every process on this machine has the same
+    // width (libnuma sizes its CPU bitmap from it).
+    if !body.contains("Cpus_allowed:\t8f\n") {
         return TestResult::Fail("Cpus_allowed mask width or value is wrong");
     }
     // A wider machine gets a second group, high word first.
@@ -3720,8 +3713,17 @@ fn smoke_status_cpus_allowed_list_collapses_ranges() -> TestResult {
         nr_cpus: 64,
         ..sample_task_info()
     };
-    if !render_status(&wide).contains("Cpus_allowed:\t00000002,00000000") {
+    if !render_status(&wide).contains("Cpus_allowed:\t00000002,00000000\n") {
         return TestResult::Fail("a >32-CPU mask is not rendered as comma-separated groups");
+    }
+    // 40 CPUs: the leading chunk carries only the top 8 bits.
+    let forty = ProcTaskInfo {
+        cpus_allowed: 1u64 << 33,
+        nr_cpus: 40,
+        ..sample_task_info()
+    };
+    if !render_status(&forty).contains("Cpus_allowed:\t02,00000000\n") {
+        return TestResult::Fail("a 40-CPU mask's leading chunk is not 2 hex digits");
     }
     TestResult::Pass
 }

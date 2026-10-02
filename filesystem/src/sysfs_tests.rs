@@ -670,7 +670,7 @@ kernel_test_in!("filesystem", smoke_sysfs_kobject_emit_uevent);
 //   10. online/possible/present render valid range strings
 //   11. cpu0 and cpuN dirs exist per count; cpu0 has no `online` attr
 //   12. topology attrs render correct values
-//   13. hex mask format matches the NUMA cpumap style (comma-grouped 32-bit words)
+//   13. hex masks are Linux %*pb over nr_cpu_ids bits
 
 /// Test 10: online/possible/present render valid range strings.
 ///
@@ -844,11 +844,16 @@ fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_sysfs_cpu_topology_attrs);
 
-/// Test 13: hex mask format matches NUMA cpumap style (comma-grouped 32-bit words).
+/// Test 13: hex masks are Linux `%*pb` over `nr_cpu_ids` bits — 32-bit
+/// chunks high first, the leading chunk only as wide as its bits need.
 ///
-/// For cpu2 (bit 2 set): `core_cpus` == "00000000,00000000,00000000,00000004\n".
-/// For 4 CPUs total:  `package_cpus` == "00000000,00000000,00000000,0000000f\n".
-/// Linux ref: `node_read_cpumap` (drivers/base/node.c).
+/// For cpu2 of 4 (bit 2 set): `core_cpus` == "4\n".
+/// For 4 CPUs total:          `package_cpus` == "f\n".
+/// For 40 CPUs total:         `package_cpus` == "ff,ffffffff\n".
+/// libnuma sizes its CPU bitmap from `Cpus_allowed` and rejects a wider
+/// `cpumap` ("Cannot parse cpumap"), so the widths must agree.
+/// Linux ref: `bitmap_string` (lib/vsprintf.c), `show_cpumap`
+/// (drivers/base/topology.c), `node_read_cpumap` (drivers/base/node.c).
 fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     crate::sysfs::__reset_for_test();
     // Scoped — see smoke_sysfs_cpu_range_attrs.
@@ -869,7 +874,7 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     };
 
     // cpu2 → bit 2 set → word 0 = 0x4.
-    let expected_core = "00000000,00000000,00000000,00000004\n";
+    let expected_core = "4\n";
     for attr in &["core_cpus", "thread_siblings"] {
         match cpu2_topo.attr_show(attr) {
             Some(ref s) if s == expected_core => {}
@@ -882,7 +887,7 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     }
 
     // 4 CPUs → bits 0-3 set → word 0 = 0xf.
-    let expected_pkg = "00000000,00000000,00000000,0000000f\n";
+    let expected_pkg = "f\n";
     match cpu2_topo.attr_show("package_cpus") {
         Some(ref s) if s == expected_pkg => {}
         Some(ref s) => {
@@ -892,16 +897,47 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
         None => return TestResult::Fail("package_cpus missing"),
     }
 
-    // Also verify the format is the 4-word comma-separated format
-    // (not a bare integer): must contain exactly 3 commas.
-    let comma_count = expected_core.chars().filter(|&c| c == ',').count();
-    if comma_count != 3 {
-        return TestResult::Fail("cpumap format: expected 3 commas (4 words)");
+    // 40 CPUs: an 8-bit leading chunk, then a full 32-bit one.
+    crate::sysfs::__reset_for_test();
+    narf_lib::smp::set_cpu_count(40);
+    crate::sysfs::populate_cpu_devices();
+    let pkg40 = crate::sysfs::sysfs_root()
+        .get_child("devices")
+        .and_then(|d| d.get_child("system"))
+        .and_then(|s| s.get_child("cpu"))
+        .and_then(|c| c.get_child("cpu0"))
+        .and_then(|c| c.get_child("topology"))
+        .and_then(|t| t.attr_show("package_cpus"));
+    if pkg40.as_deref() != Some("ff,ffffffff\n") {
+        return TestResult::Fail("package_cpus for 40 CPUs is not \"ff,ffffffff\"");
     }
 
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
+
+/// The shared `%*pb` formatter behind every cpumask file (topology masks,
+/// node `cpumap`, `Cpus_allowed`), case by case against Linux
+/// `bitmap_string`.
+fn smoke_sysfs_cpumask_pb_format() -> TestResult {
+    let cases: [(u128, u32, &str); 8] = [
+        (0, 0, ""),
+        (0xf, 4, "f"),
+        (0x4, 4, "4"),
+        (0xffff, 16, "ffff"),
+        (0xffff_ffff, 32, "ffffffff"),
+        (1, 33, "0,00000001"),
+        (1u128 << 33, 40, "02,00000000"),
+        (u128::MAX, 128, "ffffffff,ffffffff,ffffffff,ffffffff"),
+    ];
+    for (mask, nbits, want) in cases {
+        if crate::sysfs::cpumask_pb(mask, nbits) != want {
+            return TestResult::Fail("cpumask_pb does not match Linux bitmap_string");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_sysfs_cpumask_pb_format);
 
 /// Linux perf discovers PMU type numbers and raw-event bitfields through
 /// `/sys/bus/event_source/devices`.
