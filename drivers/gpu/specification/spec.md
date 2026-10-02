@@ -295,21 +295,45 @@ shape the boot handoff already accepts. `Config::geometry` returns the swath
 width, its 256-byte-request upper bound, the swath height and the DET
 allocation, refusing a viewport that exceeds the detile buffer, the linear
 8192-pixel swath ceiling or the line buffer instead of approximating it.
+`Config::watermarks` returns the urgent, p-state-change, stutter and Z8 stutter
+watermarks in microseconds, leaving the reference-clock scaling to the register
+layer. Each is a latency plus the shared extra latency, which itself is the
+round-trip ping and arbiter delay over DCFCLK plus the reordering allowance and
+this pipe's pixel chunk over the return bandwidth. Return bandwidth is the
+smaller of what the fabric/SDP port and the DRAM can deliver after urgent
+latency; it depends on the memory channel count, width and speed, which the
+caller must supply from VBIOS integrated info and the DPM table rather than a
+default. The WM_A entry of Linux's per-memory-type table overrides the three
+non-Z8 latencies, so DDR5 and LPDDR5 differ; the Z8 times stay from the SOC
+bounding box. GPUVM and HostVM are both off for a kernel-owned physical scanout,
+so the page-table terms are zero rather than estimated.
+
+`Config::prefetch` returns the prefetch schedule. It retries from DML's minimum
+VStartup upward, as the mode-support loop does, and reports the first line count
+that fits, or refuses the mode. TWait is taken at prefetch mode 0, which keeps
+DRAM p-state change allowed and is therefore the longest wait and the largest
+requirement, so a schedule that fits also fits the shallower modes. VStartup is
+bounded by the nominal vertical blank, not the actual one. With no page-table or
+meta bytes the four candidate prefetch bandwidths collapse to the two whose
+numerators survive, and the optimised and equation-driven schedules are compared
+exactly as DML compares them. The schedule uses the exact fractional
+scaler-to-OPTC delay; only the register fields quantise, and they round up so
+the timing generator is told about at least the delay that exists.
+
 `Config::requirements` returns DISPCLK, DPPCLK and the deep-sleep DCFCLK floor
 already rounded to frequencies the DFS dividers can produce, plus the plane's
 read bandwidth. DISPCLK keeps DML's ramping margin where the DPM ceiling allows
 it and drops to the unramped requirement otherwise, so no mode is refused for a
 margin; a requirement above the ceiling is reported rather than clamped, leaving
-the refusal to the caller. Bandwidth, watermark and prefetch derivation, and the
-RQ/DLG/TTU register encoding, are not implemented yet.
+the refusal to the caller. The RQ/DLG/TTU register encoding is not implemented
+yet.
 
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update or mode calculation does not prove monitor output:
-watermark and prefetch derivation, RQ/DLG/TTU encoding, the DCCG dividers, OTG
-timing, the HUBP/DPP/MPC/OPP pipeline, the DIG stream encoder, scanout
-allocation and KMS attachment remain open, and no code path yet lights an
-external panel.
+RQ/DLG/TTU encoding, the DCCG dividers, OTG timing, the HUBP/DPP/MPC/OPP
+pipeline, the DIG stream encoder, scanout allocation and KMS attachment remain
+open, and no code path yet lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
