@@ -281,9 +281,26 @@ impl Pipeline {
         sink: &crate::amdgpu_usbc::Sink,
     ) -> Result<Self, Error> {
         let paths = inventory::display_paths(vbios).map_err(Error::Inventory)?;
-        let route = inventory::route_for_sink(&paths, sink, pipe).map_err(Error::Inventory)?;
-        // SAFETY: forwarded unchanged; the route is now board-derived.
-        unsafe { Self::new(gpu, authority, pool, pipe, route) }
+        let routes = inventory::routes_for_sink(&paths, sink, pipe).map_err(Error::Inventory)?;
+        // A native sink has exactly one route; a tunnelled one borrows a
+        // transmitter, so the candidates are tried in preference order. The busy
+        // probe comes first because building a pipeline reserves pool memory, and
+        // a rejected candidate must not cost any.
+        let mut refused = Error::Inventory(inventory::Error::Unsupported);
+        for route in routes {
+            // SAFETY: live PCI authority and a permanent register mapping.
+            match unsafe { inventory::transmitter_busy(gpu, &authority, route.backend) } {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(error) => return Err(Error::Inventory(error)),
+            }
+            // SAFETY: forwarded unchanged; the route is now board-derived.
+            match unsafe { Self::new(gpu, authority, pool, pipe, route) } {
+                Ok(pipeline) => return Ok(pipeline),
+                Err(error) => refused = error,
+            }
+        }
+        Err(refused)
     }
     /// Read the platform constants this pipeline needs. Only valid after
     /// [`Pipeline::start`], since the memory data rate comes from the DPM table.
@@ -468,6 +485,8 @@ impl Pipeline {
             lanes: 4,
             pixel_clock_khz: timing.pixel_clock_khz,
             bits_per_pixel: depth.bits_per_pixel() as u8,
+            // `train` overwrites this from the route, which is the authority on
+            // whether the link is tunnelled.
             dpia: false,
         };
         let settings = self.source.train(loader, sink_caps, limits).await?;

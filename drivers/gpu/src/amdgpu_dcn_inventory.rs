@@ -51,6 +51,13 @@ const RECORD_END: u8 = 0xff;
 const MAX_RECORDS: usize = 64;
 /// There are six HPD lines, and the ATOM selector is one-based.
 const MAX_HPD: u8 = 6;
+/// `num_dig_link_enc` for DCN314, and its four tunnelling endpoints.
+pub const DIG_COUNT: u8 = 5;
+pub const DPIA_COUNT: u8 = 4;
+/// `DIG0_DIG_BE_EN_CNTL`, per-DIG stride 0x100, at DCN base index 2. Bit zero
+/// says the backend is already driving a link.
+const DIG_BE_EN_CNTL: u64 = 0x20b2;
+const DIG_STRIDE: u64 = 0x100;
 /// `atom_dmi_t17_mem_type_def`: DDR5 is 34 and LPDDR5 is 35.
 const MEM_TYPE_DDR5: u8 = 34;
 const MEM_TYPE_LPDDR5: u8 = 35;
@@ -304,31 +311,106 @@ pub fn memory_config(vbios: &[u8], levels: &Levels) -> Result<Memory, Error> {
 /// A tunnelled sink is refused: its transmitter is assigned from a link-encoder
 /// pool at stream time rather than fixed by the board, and no such pool exists
 /// here yet. VBIOS cannot answer for it.
-pub fn route_for_sink(
+pub fn routes_for_sink(
     paths: &[Path],
     sink: &crate::amdgpu_usbc::Sink,
     frontend: u8,
-) -> Result<crate::amdgpu_dio::Route, Error> {
-    if sink.channel != crate::amdgpu_dmub::Channel::Legacy {
+) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
+    let mut routes = Vec::new();
+    match sink.channel {
+        crate::amdgpu_dmub::Channel::Legacy => {
+            let path = paths
+                .iter()
+                .find(|path| {
+                    path.transmitter == sink.instance
+                        && matches!(
+                            path.connector,
+                            Connector::DisplayPort | Connector::EmbeddedDisplayPort
+                        )
+                })
+                .ok_or(Error::Unsupported)?;
+            routes.try_reserve_exact(1).map_err(|_| Error::Invalid)?;
+            routes.push(crate::amdgpu_dio::Route {
+                channel: sink.channel,
+                aux: sink.instance,
+                backend: path.transmitter,
+                frontend,
+                hpd: path.hpd,
+            });
+        }
+        crate::amdgpu_dmub::Channel::Dpia => {
+            if sink.instance >= DPIA_COUNT {
+                return Err(Error::Invalid);
+            }
+            routes
+                .try_reserve_exact(DIG_COUNT as usize)
+                .map_err(|_| Error::Invalid)?;
+            // Transmitters the board wired to no connector come first: borrowing
+            // one of those cannot deprive a later native plug of its fixed
+            // transmitter. The wired ones follow, usable while their own
+            // connector is idle.
+            for wired in [false, true] {
+                for dig in 0..DIG_COUNT {
+                    if paths.iter().any(|path| path.transmitter == dig) != wired {
+                        continue;
+                    }
+                    routes.push(crate::amdgpu_dio::Route {
+                        channel: sink.channel,
+                        aux: sink.instance,
+                        backend: dig,
+                        // A tunnelled link has no board hot-plug line; the
+                        // tunnel itself reports presence.
+                        frontend,
+                        hpd: 0,
+                    });
+                }
+            }
+        }
+    }
+    if routes.is_empty() {
         return Err(Error::Unsupported);
     }
-    let path = paths
-        .iter()
-        .find(|path| {
-            path.transmitter == sink.instance
-                && matches!(
-                    path.connector,
-                    Connector::DisplayPort | Connector::EmbeddedDisplayPort
-                )
-        })
-        .ok_or(Error::Unsupported)?;
-    Ok(crate::amdgpu_dio::Route {
-        channel: sink.channel,
-        aux: sink.instance,
-        backend: path.transmitter,
-        frontend,
-        hpd: path.hpd,
-    })
+    Ok(routes)
+}
+
+/// Whether a transmitter's backend is already driving a link.
+///
+/// Borrowing a transmitter for a tunnelled link must not steal one that is
+/// already carrying a stream — the panel's, at boot. This is the cheap probe
+/// that lets a candidate be rejected before a whole pipeline is built for it;
+/// the link encoder re-checks the same bit when it is actually claimed, which
+/// closes the gap between the two.
+///
+/// # Safety
+/// Caller holds matching PCI authority and a permanent register mapping.
+pub unsafe fn transmitter_busy(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+    dig: u8,
+) -> Result<bool, Error> {
+    if dig >= DIG_COUNT {
+        return Err(Error::Invalid);
+    }
+    let base = crate::amdgpu_psp_ring::bank(
+        gpu,
+        crate::amdgpu_discovery::HW_ID_DCN,
+        &[(3, 1, 4)],
+        2,
+        (DIG_BE_EN_CNTL + (DIG_COUNT as u64 - 1) * DIG_STRIDE) as u32,
+    )
+    .map_err(|_| Error::Unsupported)?;
+    let regs: MmioRegion = gpu.regs;
+    let offset = (base + (DIG_BE_EN_CNTL + dig as u64 * DIG_STRIDE) * 4) as u64;
+    let value = authority
+        .invoke(Op(|| {
+            // SAFETY: the bank bounds every DIG instance.
+            unsafe { regs.read32(offset) }
+        }))
+        .map_err(|_| Error::Revoked)?;
+    if value == u32::MAX {
+        return Err(Error::DeviceGone);
+    }
+    Ok(value & 1 != 0)
 }
 
 struct Op<F>(F);

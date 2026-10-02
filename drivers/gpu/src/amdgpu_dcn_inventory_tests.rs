@@ -391,11 +391,15 @@ fn inventory_route_is_validated_against_the_board() -> TestResult {
         edid: Vec::new(),
     };
     // A native sink's DMUB link instance is its transmitter; the topology
-    // confirms it and supplies the hot-plug line.
-    let route = match route_for_sink(&paths, &sink(crate::amdgpu_dmub::Channel::Legacy, 0), 2) {
-        Ok(route) => route,
+    // confirms it and supplies the hot-plug line. There is exactly one route.
+    let routes = match routes_for_sink(&paths, &sink(crate::amdgpu_dmub::Channel::Legacy, 0), 2) {
+        Ok(routes) => routes,
         Err(_) => return TestResult::Fail("native route rejected"),
     };
+    if routes.len() != 1 {
+        return TestResult::Fail("native sink offered more than one route");
+    }
+    let route = routes[0];
     if route.backend != 0 || route.aux != 0 || route.hpd != 1 || route.frontend != 2 {
         return TestResult::Fail("native route");
     }
@@ -404,32 +408,29 @@ fn inventory_route_is_validated_against_the_board() -> TestResult {
     }
     // A transmitter the board wired to nothing we can drive is refused rather
     // than driven on the strength of the sink's index alone.
-    if route_for_sink(&paths, &sink(crate::amdgpu_dmub::Channel::Legacy, 1), 0)
-        != Err(Error::Unsupported)
-    {
-        return TestResult::Fail("unwired transmitter accepted");
-    }
-    if route_for_sink(&paths, &sink(crate::amdgpu_dmub::Channel::Legacy, 5), 0)
-        != Err(Error::Unsupported)
-    {
-        return TestResult::Fail("transmitter with no path accepted");
-    }
-    // A tunnelled sink's transmitter is assigned at stream time, not by the
-    // board, so VBIOS cannot answer for it.
-    if route_for_sink(&paths, &sink(crate::amdgpu_dmub::Channel::Dpia, 0), 0)
-        != Err(Error::Unsupported)
-    {
-        return TestResult::Fail("tunnelled route derived from VBIOS");
+    for instance in [1u8, 5] {
+        if routes_for_sink(
+            &paths,
+            &sink(crate::amdgpu_dmub::Channel::Legacy, instance),
+            0,
+        )
+        .err()
+            != Some(Error::Unsupported)
+        {
+            return TestResult::Fail("unwired transmitter accepted");
+        }
     }
     // A board whose connector is neither DisplayPort nor eDP is not this path.
     let mut hdmi = Image::new();
     hdmi.paths(&[(0x3503, 0x2101)]);
     let hdmi_paths = display_paths(hdmi.bytes()).unwrap();
-    if route_for_sink(
+    if routes_for_sink(
         &hdmi_paths,
         &sink(crate::amdgpu_dmub::Channel::Legacy, 0),
         0,
-    ) != Err(Error::Unsupported)
+    )
+    .err()
+        != Some(Error::Unsupported)
     {
         return TestResult::Fail("HDMI connector accepted as a DisplayPort route");
     }
@@ -438,4 +439,64 @@ fn inventory_route_is_validated_against_the_board() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_route_is_validated_against_the_board
+);
+
+fn inventory_tunnelled_sinks_borrow_an_unwired_transmitter_first() -> TestResult {
+    // The fixture wires transmitters 0 and 3; 1, 2 and 4 are spare.
+    let image = Image::new();
+    let paths = display_paths(image.bytes()).unwrap();
+    let sink = crate::amdgpu_usbc::Sink {
+        channel: crate::amdgpu_dmub::Channel::Dpia,
+        instance: 2,
+        dpcd: [0; 16],
+        edid: Vec::new(),
+    };
+    let routes = match routes_for_sink(&paths, &sink, 1) {
+        Ok(routes) => routes,
+        Err(_) => return TestResult::Fail("tunnelled sink offered no route"),
+    };
+    // Every transmitter is a candidate, but the spare ones come first so
+    // borrowing cannot deprive a later native plug of its fixed transmitter.
+    if routes.len() != DIG_COUNT as usize {
+        return TestResult::Fail("candidate count");
+    }
+    let order: Vec<u8> = routes.iter().map(|route| route.backend).collect();
+    if order != [1, 2, 4, 0, 3] {
+        return TestResult::Fail("candidate order");
+    }
+    for route in &routes {
+        // The tunnel reports presence, so there is no board hot-plug line, and
+        // the AUX index is the tunnelling endpoint rather than a transmitter.
+        if route.hpd != 0 || route.aux != 2 || route.frontend != 1 {
+            return TestResult::Fail("tunnelled route fields");
+        }
+        if route.channel != crate::amdgpu_dmub::Channel::Dpia {
+            return TestResult::Fail("tunnelled route channel");
+        }
+    }
+    // A board that wires nothing leaves every transmitter spare.
+    let mut bare = Image::new();
+    bare.paths(&[(0x3505, 0x2103)]);
+    let bare_paths = display_paths(bare.bytes()).unwrap();
+    let bare_order: Vec<u8> = routes_for_sink(&bare_paths, &sink, 0)
+        .unwrap()
+        .iter()
+        .map(|route| route.backend)
+        .collect();
+    if bare_order != [0, 1, 2, 3, 4] {
+        return TestResult::Fail("candidate order with one wired transmitter");
+    }
+    // There are four tunnelling endpoints; a fifth is not one.
+    let beyond = crate::amdgpu_usbc::Sink {
+        instance: DPIA_COUNT,
+        ..sink
+    };
+    if routes_for_sink(&paths, &beyond, 0).err() != Some(Error::Invalid) {
+        return TestResult::Fail("out-of-range tunnelling endpoint accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_tunnelled_sinks_borrow_an_unwired_transmitter_first
 );

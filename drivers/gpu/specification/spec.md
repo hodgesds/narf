@@ -481,16 +481,30 @@ as 8.16 fixed point against the 48 MHz DFS reference; the CLK block is absent
 from the IP discovery table so its base is hardcoded as Linux hardcodes it, which
 is exactly why the result is range-checked before being believed.
 
-`route_for_sink` derives a link route and validates it against the board rather
+`routes_for_sink` derives link routes and validates them against the board rather
 than trusting the sink's index. A native sink's DMUB link instance *is* its
 transmitter, so the topology confirms that transmitter is wired to a DisplayPort
 connector — a USB-C port carrying DP alt-mode appears as one — and supplies its
-hot-plug line; a transmitter the board wired to something else is refused. A
-tunnelled sink is refused outright: its transmitter is assigned from a
-link-encoder pool at stream time rather than fixed by the board, and no such pool
-exists here, so VBIOS cannot answer for it. `Pipeline::for_sink` and
-`Pipeline::platform` feed these into the bring-up, so a caller no longer
-assembles a route by hand.
+hot-plug line; a transmitter the board wired to something else is refused, and
+there is exactly one route.
+
+A tunnelled sink has no board-wired transmitter, so it borrows one. All five DIGs
+are candidates, ordered so that transmitters the board wired to no connector come
+first: borrowing one of those cannot deprive a later native plug of its fixed
+transmitter. A wired transmitter is still usable while its own connector is idle,
+which the hardware itself decides — `transmitter_busy` reads the backend enable
+bit, and the link encoder re-checks the same bit when the transmitter is actually
+claimed, closing the gap between the two. The probe comes before any pipeline is
+built, because building one reserves pool memory and a rejected candidate must
+not cost any. A tunnelled route carries no hot-plug line, since the tunnel
+reports presence itself, and its AUX index is the tunnelling endpoint rather than
+a transmitter. `Pipeline::for_sink` and `Pipeline::platform` feed these into the
+bring-up, so a caller no longer assembles a route by hand.
+
+A tunnelled stream additionally needs DTBCLK and its endpoint's stream clock
+routed, which the bring-up requests and programs. It does **not** negotiate USB4
+bandwidth allocation: the tunnel must already carry enough for the mode, which is
+the USB4 driver's business, not this one's.
 
 The Late worker arms the bring-up once per boot, on the first discovered sink
 the board can answer for. It claims only a pipe whose hub pixel pipe is blanked
@@ -514,16 +528,15 @@ scanout does not move the console to it: `narf_fb::adopt_external_scanout` is a
 pull, and whether the console or a compositor should follow is that layer's
 policy, not this driver's.
 
-Tunnelled sinks are still not driven — their transmitter needs a link-encoder
-pool — and none of this pipeline has run on silicon.
+None of this pipeline has run on silicon.
 
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output. The Late worker now arms the sequence for a native
-DisplayPort sink, but tunnelled sinks still need a link-encoder pool, a brought-up
-stream shows black until a layer that owns console policy adopts it, and nothing
-here has been confirmed on silicon.
+prove monitor output. The Late worker now arms the sequence for a native or
+tunnelled DisplayPort sink, but a brought-up stream shows black until a layer that
+owns console policy adopts it, USB4 bandwidth allocation is not negotiated, and
+nothing here has been confirmed on silicon.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
