@@ -9,7 +9,8 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     // musl's `openat(AT_FDCWD, "...", O_RDONLY, 0)` hit our
     // handler with arg2 = O_RDONLY = 0 → zero-length path →
     // EINVAL on every open. See [[project_narf_native_vs_linux_abis]].)
-    let dirfd = args.arg0 as i64;
+    // `dirfd` is an int: only the low 32 bits of the register count.
+    let dirfd = i64::from(args.arg0 as u32 as i32);
     let path_uptr = args.arg1;
     let flags = args.arg2;
     let mode = args.arg3 as u32;
