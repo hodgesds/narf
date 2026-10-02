@@ -378,12 +378,40 @@ generator and waits for the block to report idle rather than assuming it.
 Pixel blanking is deliberately absent: from DCN2 onwards a stream is blanked by
 the OPP's display pattern generator, not by the timing generator.
 
+`amdgpu_dcn_hubp::Hubp::new` is unsafe: it claims one hub pixel pipe, whose
+scanout memory the caller must keep reserved until the pipe is blanked.
+`program` writes the surface and the pacing together, because deadlines derived
+for one surface do not hold for another: the request sizes, deadlines and
+throttle thresholds all come from `amdgpu_dml_regs`, never from constants. The
+pitch register holds one less than the pitch, the format code is not the bit
+depth, and the primary address's low half is written last because that is what
+arms it. A surface off a 256-byte request boundary, past the pipe's 48-bit
+addressing, at address zero, or narrower than its own viewport is refused. The
+chroma request sizes are cleared rather than left behind, so a previous owner's
+chroma plane cannot keep fetching. `blank` waits for the pipe's outstanding
+requests to retire before reporting success, so scanout memory is never released
+with a fetch in flight; a power-gated pipe reads back zero and needs no wait,
+and a pipe that never retires times out rather than being called blanked.
+
+`amdgpu_dcn_plane` programs the rest of the plane path. The DPP and OPP banks are
+DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe
+clock, sets the converter format and bypasses the scaler outright rather than
+programming unity taps, with the recout and combiner size matching the active
+area. `Mpc::mux_plane` binds one combiner to one DPP and one OPP and points that
+OPP's output mux at it, with the bottom select parked so a stale value cannot
+blend another pipe's output in, and opaque passthrough with no alpha;
+`release` unroutes both ends. `Opp::program` leaves truncation, spatial dither
+and frame randomisation off so the plane's depth passes through, and sizes the
+pattern generator to the stream so a blanked stream covers the whole screen.
+`Opp::set_blank` is where a stream is blanked: painting the pattern generator
+black over the active area, and unblanking by disabling the generator outright
+as DCN2 onwards requires rather than selecting a passthrough pattern.
+
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output: the HUBP/DPP/MPC/OPP pipeline, the DIG stream encoder,
-scanout allocation and KMS attachment remain open, and no code path yet lights
-an external panel.
+prove monitor output: the DIG stream encoder, scanout allocation and KMS
+attachment remain open, and no code path yet lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
