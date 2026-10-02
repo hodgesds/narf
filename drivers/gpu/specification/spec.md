@@ -492,16 +492,38 @@ exists here, so VBIOS cannot answer for it. `Pipeline::for_sink` and
 `Pipeline::platform` feed these into the bring-up, so a caller no longer
 assembles a route by hand.
 
-**Nothing calls `enable` yet.** The inventory can now answer for a native
-DisplayPort sink, but arming the bring-up on a laptop whose display pipeline has
-never been exercised is a separate decision, and tunnelled sinks still need the
-link-encoder pool. None of this pipeline has run on silicon.
+The Late worker arms the bring-up once per boot, on the first discovered sink
+the board can answer for. It claims only a pipe whose hub pixel pipe is blanked
+and whose timing generator is stopped — the same two signals the boot inventory
+uses to decide a surface is in use — so claiming one cannot disturb the internal
+panel. The reserved surface is zeroed before any pixel is sent, because a
+reservation comes back holding whatever was in that VRAM. A failure leaves the
+display alone: `enable` has already torn its own stream down, and what remains is
+the attach-only behaviour that was there before.
+
+The attempt is deliberately one-shot. The clock manager publishes a table buffer
+to firmware, so a retried failure would quarantine another reservation each time,
+and re-running a sequence that failed once is unlikely to do better. A sink whose
+EDID declares no usable mode does not spend the attempt. Suspend stops the stream
+before the firmware, since a pipe left fetching across a GPU suspend would read
+scanout memory the resume path has not re-established; there is no replay, so the
+stream does not come back on resume.
+
+A brought-up stream shows black until something draws to it. Publishing the
+scanout does not move the console to it: `narf_fb::adopt_external_scanout` is a
+pull, and whether the console or a compositor should follow is that layer's
+policy, not this driver's.
+
+Tunnelled sinks are still not driven — their transmitter needs a link-encoder
+pool — and none of this pipeline has run on silicon.
 
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output: nothing calls the bring-up sequence yet, and tunnelled
-sinks still need a link-encoder pool, so no code path lights an external panel.
+prove monitor output. The Late worker now arms the sequence for a native
+DisplayPort sink, but tunnelled sinks still need a link-encoder pool, a brought-up
+stream shows black until a layer that owns console policy adopts it, and nothing
+here has been confirmed on silicon.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,

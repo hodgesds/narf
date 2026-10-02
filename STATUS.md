@@ -101,11 +101,16 @@ every watermark and the reference clock scales every latency register — and a
 table that is missing, the wrong revision or self-inconsistent fails closed. A
 native DisplayPort route is derived and validated against the board rather than
 trusted from the sink's index.
-**External monitor output is still not complete:** nothing calls the bring-up
-sequence yet, and a tunnelled USB4 sink still needs a link-encoder pool to assign
-its transmitter, which VBIOS cannot answer for. Firmware replay over suspend also
-remains open. Physical Lenovo 50ee USB-C/USB4 validation is pending, and none of
-this path has run on silicon.
+The Late worker now arms the bring-up once per boot for the first native
+DisplayPort sink the board can answer for, claiming only a pipe that is blanked
+with its timing generator stopped and zeroing the surface before any pixel is
+sent. A failure leaves the display alone and falls back to the previous
+attach-only behaviour; suspend stops the stream before the firmware.
+**External monitor output is still not complete:** a tunnelled USB4 sink needs a
+link-encoder pool to assign its transmitter, which VBIOS cannot answer for; a
+brought-up stream shows black until a layer that owns console policy adopts the
+published scanout; and firmware replay over suspend remains open. Physical Lenovo
+50ee USB-C/USB4 validation is pending, and none of this path has run on silicon.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 

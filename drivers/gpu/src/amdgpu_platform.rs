@@ -2,6 +2,9 @@
 //! ATOM; live scanouts and cursors are inventoried before allocating VRAM.
 use crate::{
     amdgpu::AmdGpu,
+    amdgpu_dcn_display::{timing_from_edid, Pipeline, Scanout},
+    amdgpu_dcn_stream::Depth,
+    amdgpu_dml::Format,
     amdgpu_dmub::Firmware,
     amdgpu_dmub_boot::{Error, Loader},
     amdgpu_vram::Pool,
@@ -213,10 +216,144 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
     .ok_or(Error::Unsupported)?
 }
 
+/// A hub pixel pipe is free when it is blanked and its timing generator is
+/// stopped; claiming one that is not would disturb a live scanout. These are the
+/// same two signals the boot inventory uses to decide a surface is in use.
+fn idle_pipe(mut state: impl FnMut(u8) -> (u32, u32)) -> Option<u8> {
+    for pipe in 0..4u8 {
+        let (blank, master) = state(pipe);
+        // An all-ones read is a vanished device, not an idle pipe.
+        if blank == u32::MAX || master == u32::MAX {
+            return None;
+        }
+        if blank & 1 != 0 && master & 1 == 0 {
+            return Some(pipe);
+        }
+    }
+    None
+}
+fn free_pipe(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Option<u8> {
+    use crate::amdgpu_discovery as ip;
+    let hubp = crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, &[(3, 1, 4)], 2, 0x8c7).ok()?;
+    let otg = crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, &[(3, 1, 4)], 2, 0x1cc1).ok()?;
+    cap.invoke(Op(|| {
+        idle_pipe(|pipe| {
+            // SAFETY: both banks are bounded above for all four instances.
+            unsafe {
+                (
+                    gpu.regs.read32(hubp + (0x5f3 + pipe as u64 * 0xdc) * 4),
+                    gpu.regs.read32(otg + (0x1b41 + pipe as u64 * 0x80) * 4),
+                )
+            }
+        })
+    }))
+    .ok()
+    .flatten()
+}
+
+/// Bring up the first sink the board can answer for. Attempted once per boot:
+/// the clock manager publishes a table buffer to firmware, so a retried failure
+/// would quarantine another reservation each time, and re-running a sequence
+/// that has already failed once is unlikely to do better.
+async fn arm(display: &mut Display, sinks: &[crate::amdgpu_usbc::Sink]) {
+    use core::fmt::Write as _;
+    if display.attempted || display.stream.is_some() {
+        return;
+    }
+    let Some(cap) = crate::amdgpu::pci_authority() else {
+        return;
+    };
+    for sink in sinks {
+        // A mode the sink does not declare, or one this pipeline cannot drive,
+        // is not a reason to mark the attempt spent.
+        let Ok(block) = narf_edid::Block::parse(&sink.edid) else {
+            continue;
+        };
+        let Some(detailed) = block.preferred_mode() else {
+            continue;
+        };
+        let Ok(timing) = timing_from_edid(&detailed) else {
+            continue;
+        };
+        let pool = display.pool.clone();
+        let Some(Some((mut pipeline, pipe))) = crate::amdgpu::with_controller(|gpu| {
+            let pipe = free_pipe(gpu, &cap)?;
+            // SAFETY: the pipe is idle, the pool is this driver's, and the route
+            // is derived from the retained VBIOS snapshot for this device.
+            let pipeline = unsafe {
+                Pipeline::for_sink(gpu, cap, &pool, pipe, gpu.vbios.as_ref()?.bytes(), sink)
+            }
+            .ok()?;
+            Some((pipeline, pipe))
+        }) else {
+            continue;
+        };
+        display.attempted = true;
+        let Ok(mut scanout) = Scanout::reserve(&pool, &timing, Format::Rgb32) else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu-usbc: no VRAM for a {}x{} scanout",
+                timing.h_active,
+                timing.v_active
+            );
+            return;
+        };
+        // Black, not whatever this VRAM held, before any pixel is sent.
+        scanout.clear().await;
+        let brought_up = async {
+            pipeline.start().await?;
+            let platform = crate::amdgpu::with_controller(|gpu| {
+                // SAFETY: live PCI authority and the retained VBIOS snapshot.
+                unsafe {
+                    pipeline
+                        .platform(gpu, &cap, gpu.vbios.as_ref()?.bytes())
+                        .ok()
+                }
+            })
+            .flatten()
+            .ok_or(crate::amdgpu_dcn_display::Error::Unsupported)?;
+            pipeline
+                .enable(
+                    &mut display.loader,
+                    &scanout,
+                    &timing,
+                    &platform,
+                    Depth::Bpc8,
+                    sink.dpcd,
+                )
+                .await
+        }
+        .await;
+        match brought_up {
+            Ok(()) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu-usbc: external {}x{} stream on pipe {pipe}",
+                    timing.h_active,
+                    timing.v_active
+                );
+                display.stream = Some((pipeline, scanout));
+            }
+            Err(error) => {
+                // enable() already tore the stream back down, so the existing
+                // attach-only behaviour is what remains.
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu-usbc: external modeset failed, display left alone: {error:?}"
+                );
+            }
+        }
+        return;
+    }
+}
+
 struct Display {
     loader: Loader,
     // Every future scanout allocation must share this pool.
-    _pool: Arc<Pool>,
+    pool: Arc<Pool>,
+    /// The scanout outlives the pipe that fetches from it.
+    stream: Option<(Pipeline, Scanout)>,
+    attempted: bool,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
@@ -233,7 +370,9 @@ pub(crate) fn start() -> bool {
     }
     *owner = Some(Display {
         loader,
-        _pool: pool,
+        pool,
+        stream: None,
+        attempted: false,
     });
     drop(owner);
     crate::amdgpu_usbc::observe_connectors();
@@ -265,7 +404,13 @@ pub(crate) fn start() -> bool {
                     guard.as_mut().unwrap().loader.discover_sinks().await
                 };
                 match result {
-                    Ok(found) => crate::amdgpu_usbc::publish_sinks(found),
+                    Ok(found) => {
+                        {
+                            let mut guard = DISPLAY.lock().await;
+                            arm(guard.as_mut().unwrap(), &found).await;
+                        }
+                        crate::amdgpu_usbc::publish_sinks(found);
+                    }
                     Err(error) => {
                         use core::fmt::Write as _;
                         crate::amdgpu_usbc::publish_sinks(Vec::new());
@@ -296,7 +441,17 @@ pub(crate) fn suspend() -> bool {
     if narf_scheduler::current_task_id().raw() != 0 {
         return false;
     }
-    narf_scheduler::block_on_spin(display.loader.stop()).is_ok()
+    let Display { loader, stream, .. } = display;
+    // Stop the stream before the firmware: a pipe left fetching across a GPU
+    // suspend would read scanout memory the resume path has not re-established.
+    // There is no replay yet, so the attempt is not refreshed for resume.
+    if let Some((pipeline, _)) = stream.as_mut() {
+        if narf_scheduler::block_on_spin(pipeline.disable(loader)).is_err() {
+            return false;
+        }
+    }
+    *stream = None;
+    narf_scheduler::block_on_spin(loader.stop()).is_ok()
 }
 pub(crate) fn resume() -> bool {
     let Some(mut guard) = DISPLAY.try_lock() else {
@@ -375,5 +530,26 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/vram",
         platform_inventory_retains_latched_surfaces_and_cursor
+    );
+    fn platform_only_claims_a_blanked_and_stopped_pipe() -> TestResult {
+        // Pipe 0 is fetching, pipe 1 is blanked but its generator still runs,
+        // pipe 2 is genuinely idle.
+        let state = [(0, 1), (1, 1), (1, 0), (1, 0)];
+        if idle_pipe(|pipe| state[pipe as usize]) != Some(2) {
+            return TestResult::Fail("claimed a pipe that was not idle");
+        }
+        // Every pipe busy means there is nothing to claim.
+        if idle_pipe(|_| (0, 1)).is_some() || idle_pipe(|_| (1, 1)).is_some() {
+            return TestResult::Fail("claimed a busy pipe");
+        }
+        // A vanished device is not four idle pipes.
+        if idle_pipe(|_| (u32::MAX, u32::MAX)).is_some() || idle_pipe(|_| (1, u32::MAX)).is_some() {
+            return TestResult::Fail("claimed a pipe on a vanished device");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/vram",
+        platform_only_claims_a_blanked_and_stopped_pipe
     );
 }

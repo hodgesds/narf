@@ -152,6 +152,24 @@ impl Scanout {
     pub fn size(&self) -> u64 {
         self.reservation.size()
     }
+    /// Zero the surface. A reservation comes back holding whatever was in that
+    /// VRAM, so without this a newly enabled stream shows garbage rather than
+    /// black. Yields every page: a 4K surface is tens of megabytes.
+    pub async fn clear(&mut self) {
+        let mapping = self.reservation.mapping();
+        let mut offset = 0;
+        while offset + 4 <= mapping.len {
+            // SAFETY: the pool holds a permanent CPU mapping of this range, and
+            // the reservation is ours until it is dropped.
+            unsafe { mapping.write32(offset, 0) };
+            offset += 4;
+            if offset % 4096 == 0 {
+                narf_scheduler::yield_now().await;
+            }
+        }
+        // The pipe must not fetch ahead of these writes.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
     /// The surface as a generic framebuffer, addressed by the host-physical
     /// address of its mapping — the same convention the boot framebuffer uses.
     /// Publishing it is not the same as attaching it to a console.

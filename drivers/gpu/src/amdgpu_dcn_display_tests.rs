@@ -199,3 +199,54 @@ kernel_test_in!(
     "drivers/gpu/dcn-display",
     display_publishes_no_scanout_until_a_stream_runs
 );
+
+fn display_scanout_clear_blacks_the_surface() -> TestResult {
+    // A pool over real memory, so the clear writes somewhere observable.
+    const SIZE: usize = 8192;
+    let mut backing = alloc::vec![0xffu8; SIZE];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x1000_0000),
+        virt: backing.as_mut_ptr() as u64,
+        len: SIZE as u64,
+        kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
+    };
+    // SAFETY: the pool's mapping is this buffer, which outlives every use below.
+    let pool = unsafe { Pool::from_owned_range(map, 0x2_0000_0000) }.unwrap();
+    // A small surface: 64 pixels of 4 bytes is already a whole request.
+    let timing = Timing {
+        pixel_clock_khz: 25_000,
+        h_active: 64,
+        h_total: 80,
+        h_front_porch: 4,
+        h_sync_width: 4,
+        v_active: 4,
+        v_total: 8,
+        v_front_porch: 1,
+        v_sync_width: 1,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let Ok(mut scanout) = Scanout::reserve(&pool, &timing, Format::Rgb32) else {
+        return TestResult::Fail("small scanout rejected");
+    };
+    // The pool allocates whole pages, so the reservation is a page even though
+    // the surface itself is 64 * 4 bytes across four lines.
+    let bytes = scanout.size() as usize;
+    if bytes != 4096 {
+        return TestResult::Fail("scanout size");
+    }
+    narf_scheduler::block_on_spin(scanout.clear());
+    // The whole reservation is black, not just the lines the mode uses, and
+    // nothing past it was touched.
+    if backing[..bytes].iter().any(|byte| *byte != 0) {
+        return TestResult::Fail("surface not cleared");
+    }
+    if backing[bytes..].iter().any(|byte| *byte != 0xff) {
+        return TestResult::Fail("clear wrote past the reservation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-display",
+    display_scanout_clear_blacks_the_surface
+);
