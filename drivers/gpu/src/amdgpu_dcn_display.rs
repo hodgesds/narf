@@ -395,8 +395,7 @@ impl Pipeline {
         self.opp.set_blank(true)?;
 
         // 4. The pipe, still blanked, with the deadlines this surface needs.
-        self.hubp
-            .program(&scanout.surface(), timing, &plan.registers)?;
+        self.hubp.program(&scanout.surface(), &plan.registers)?;
         self.hubp.blank().await?;
 
         // 5. Start the timing generator. It now sends blanked frames, which is

@@ -1,5 +1,7 @@
 use super::*;
-use crate::amdgpu_dml::{ClockState, Config, Memory, MemoryKind, Plane, DEFAULT_DENTIST_VCO_KHZ};
+use crate::amdgpu_dml::{
+    ClockState, Config, Memory, MemoryKind, Plane, Timing, DEFAULT_DENTIST_VCO_KHZ,
+};
 use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 

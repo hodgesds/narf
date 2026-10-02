@@ -8,10 +8,7 @@
 //! The pacing values come from [`crate::amdgpu_dml_regs`], never from constants:
 //! a HUBP programmed with someone else's deadlines underflows.
 use crate::{
-    amdgpu::AmdGpu,
-    amdgpu_dcn_clk::Error,
-    amdgpu_discovery as discovery,
-    amdgpu_dml::{Format, Timing},
+    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_discovery as discovery, amdgpu_dml::Format,
     amdgpu_dml_regs::Registers,
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
@@ -250,10 +247,11 @@ impl<I: Io> Engine<I> {
         // The low half last: writing it is what arms the new address.
         self.set(DCSURF_PRIMARY_SURFACE_ADDRESS, surface.address as u32)
     }
-    /// `hubp2_vready_at_or_After_vsync`.
-    fn program_vready(&mut self, timing: &Timing, registers: &Registers) -> Result<(), Error> {
+    /// `hubp2_vready_at_or_After_vsync`. The condition is the same one the DLG
+    /// encoding already evaluated, so it is taken from there rather than
+    /// recomputed from the timing and risking the two disagreeing.
+    fn program_vready(&mut self, registers: &Registers) -> Result<(), Error> {
         let value = u32::from(registers.dlg.vready_after_vcount0 != 0);
-        let _ = timing;
         self.update(DCHUBP_CNTL, 1 << 8, value << 8)
     }
     /// `hubp2_set_blank_regs`. Blanking waits for the pipe's outstanding
@@ -326,14 +324,9 @@ impl Hubp {
     }
     /// Program the surface and the pacing that goes with it. The two belong
     /// together: deadlines derived for one surface do not hold for another.
-    pub fn program(
-        &mut self,
-        surface: &Surface,
-        timing: &Timing,
-        registers: &Registers,
-    ) -> Result<(), Error> {
+    pub fn program(&mut self, surface: &Surface, registers: &Registers) -> Result<(), Error> {
         self.0.program_pacing(registers)?;
-        self.0.program_vready(timing, registers)?;
+        self.0.program_vready(registers)?;
         self.0.program_surface(surface)
     }
     /// Blank the pipe, waiting for its outstanding requests to retire.
