@@ -407,11 +407,31 @@ pattern generator to the stream so a blanked stream covers the whole screen.
 black over the active area, and unblanking by disabling the generator outright
 as DCN2 onwards requires rather than selecting a passthrough pattern.
 
+`amdgpu_dcn_stream::Stream::new` is unsafe: it claims one DisplayPort stream
+frontend, whose link encoder the caller must keep trained for as long as it
+streams. This is the stream half of the DIO; the link half — transmitter enable,
+training patterns and drive levels — is `amdgpu_dio`. `program` writes the main
+stream attributes the sink reads to lay the pixels out: uncompressed RGB at the
+given depth, sRGB full range, the totals, the active start (sync plus back porch,
+the same count the timing generator uses as its blank end), the sync widths with
+the polarity fields inverted because they mean "negative", and the active size.
+A timing whose front porch and sync exceed its blank, whose active exceeds its
+total, or whose counts pass 15 bits is refused. It then seeds the M/N rate ratio
+from the link-rate code the training settled on, disabling the generator while M
+and N are written because auto-measurement needs a full symbol cycle to take
+over, and refusing a stream faster than its link rather than programming a
+wrapped ratio. `unblank` stops the stream, resets the steering FIFO so a mode
+transition's overflow cannot persist, lets the logic prime and then enables;
+the hardware starts sending at the next vblank edge. Reprogramming a live stream
+is refused, and both blank and unblank wait for the encoder to confirm it
+stopped rather than assuming it did.
+
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output: the DIG stream encoder, scanout allocation and KMS
-attachment remain open, and no code path yet lights an external panel.
+prove monitor output: scanout allocation, the enable-stream sequence that drives
+these blocks in order, and KMS attachment remain open, and no code path yet
+lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,
