@@ -167,6 +167,44 @@ fn smoke_abi_time_getrusage_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_getrusage_neg);
 
+fn smoke_abi_time_getrusage_who_is_int() -> TestResult {
+    with_setup(|| {
+        // `who` is a C int (SYSCALL_DEFINE2(getrusage, int, who, ...)): only
+        // the low 32 bits count. A caller passing RUSAGE_CHILDREN (-1) through
+        // a 32-bit register leaves the upper half zero (0x0000_0000_ffff_ffff);
+        // fish's `time` builtin did, and unwrapped the EINVAL NARF returned.
+        let mut ru = [0u8; 144];
+        for (who, what) in [
+            (
+                0x0000_0000_ffff_ffffu64,
+                "getrusage(RUSAGE_CHILDREN as u32) should return 0",
+            ),
+            (
+                0x1234_5678_0000_0001u64,
+                "getrusage(RUSAGE_THREAD, high bits set) should return 0",
+            ),
+            (
+                0xffff_ffff_0000_0000u64,
+                "getrusage(RUSAGE_SELF, high bits set) should return 0",
+            ),
+        ] {
+            if call(Syscall::Getrusage.raw(), a1(who, ru.as_mut_ptr() as u64)) != Some(0) {
+                return Err(what);
+            }
+        }
+        // Low 32 bits = 99: still an unknown `who`.
+        if call(
+            Syscall::Getrusage.raw(),
+            a1(0xffff_ffff_0000_0063, ru.as_mut_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("getrusage(who low bits 99) should return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_getrusage_who_is_int);
+
 // Regression: getrusage(RUSAGE_SELF) / times() must report the task's
 // REAL accumulated CPU time, not wall-clock uptime. NARF used to return
 // monotonic_ns() (uptime since boot) for every process, which inflated
