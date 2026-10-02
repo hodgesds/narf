@@ -426,11 +426,50 @@ the hardware starts sending at the next vblank edge. Reprogramming a live stream
 is refused, and both blank and unblank wait for the encoder to confirm it
 stopped rather than assuming it did.
 
+`amdgpu_dcn_display` is the bring-up sequence and owns no registers of its own.
+`timing_from_edid` converts a sink's detailed timing into the shared `Timing`,
+refusing interlaced modes, modes past the linear swath ceiling, and EDID whose
+front porch and sync do not fit their own blanking — the last as malformed data
+rather than an unsupported mode. `Scanout::reserve` takes a linear surface from
+the display pool with its pitch rounded out to a whole 256-byte request, so a
+line never straddles a partial one; dropping it returns the memory, so it must
+outlive every pipe fetching from it. `Pipeline::plan` derives the clocks, the
+HUBP registers and the global sync without touching hardware, and refuses a mode
+needing more than the firmware's own DPM ceiling before any register is written.
+
+`Pipeline::enable` drives the blocks in Linux's enable-stream order, and the
+order is the substance: clocks and dividers, then timing, then the plane
+programmed and deliberately blanked, then the pipe with this surface's
+deadlines, then the timing generator — which from that point sends blanked
+frames, which is what a sink needs to see during training — then link training,
+then the stream attributes at the rate training settled on, and only then the
+pipe, encoder and formatter unblanked in that order so the sink never sees a
+frame the pipe was not yet fetching for. A failure at any step tears the stream
+back down rather than leaving a block fetching from memory the caller is about
+to release, and teardown continues past a failing step for the same reason.
+
+A completed enable publishes the surface through `active_scanout`, and
+`narf_fb::adopt_external_scanout` pulls it. Adoption is a pull because the
+framebuffer crate already calls into this driver and the dependency runs one
+way; it is also a policy decision that belongs to the framebuffer layer, since a
+published scanout only means a stream is running, not that the console should
+move to it.
+
+**The platform inventory this needs does not exist yet.** `Pipeline::new`
+requires a `Route` derived from this GPU's VBIOS display-object table or the
+DPIA allocator, and `Platform` requires the memory channel count and width, the
+DCHUB reference clock and the DENTIST VCO. None of those is currently obtained:
+the memory configuration sets every watermark, the reference clock scales every
+latency register, and the VCO decides which clocks exist, so none may be
+defaulted. Until they are, nothing calls `enable`, and no code path lights an
+external panel. None of this pipeline has run on silicon.
+
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output: scanout allocation, the enable-stream sequence that drives
-these blocks in order, and KMS attachment remain open, and no code path yet
+prove monitor output: the platform inventory the sequence needs — the VBIOS
+display-object route, the memory configuration, the DCHUB reference clock and the
+DENTIST VCO — is not obtained yet, so nothing calls the sequence and no code path
 lights an external panel.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,

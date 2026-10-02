@@ -82,12 +82,25 @@ DisplayPort link training and the DIO link encoder are implemented: async
 transaction, fall back only on recovery/equalization failure, clamp lanes to
 the reported Type-C pin assignment, and leave a transparent USB4 DPIA to train
 its own remote PHY.
-**External monitor output is still not complete:** nothing yet drives the
-stream pipeline — DCCG clocks, OTG timing, the HUBP/DPP/MPC/OPP path, the DIG
-stream encoder, scanout allocation and KMS attachment all remain open, so no
-code path lights an external panel. Firmware replay over suspend also remains
-open. Physical Lenovo 50ee USB-C/USB4 validation is pending, and none of this
-path has run on silicon.
+The DCN314 stream pipeline is now implemented end to end. A fixed-point port
+of DML derives the detile geometry, the required clocks, the urgent, p-state and
+stutter watermarks and the prefetch schedule, and encodes them into the HUBP
+request, latency and throttle registers, refusing any value a field cannot hold.
+The display clock manager latches the firmware's own DPM table and applies
+clocks in Linux's order; the clock generator divides them per pipe and routes a
+tunnelled stream's clock. The timing generator, hub pixel pipe, DPP, combiner,
+output formatter and DisplayPort stream encoder are all programmed, and a
+bring-up sequence drives them in the enable-stream order, trains the link, and
+unblanks the pipe, encoder and formatter last. A completed stream publishes its
+scanout for the framebuffer layer to adopt.
+**External monitor output is still not complete:** the platform inventory the
+sequence needs is not obtained yet — the VBIOS display-object route, the memory
+channel configuration, the DCHUB reference clock and the DENTIST VCO. The
+memory configuration sets every watermark and the reference clock scales every
+latency register, so none may be defaulted; until they are read, nothing calls
+the bring-up sequence and no code path lights an external panel. Firmware replay
+over suspend also remains open. Physical Lenovo 50ee USB-C/USB4 validation is
+pending, and none of this path has run on silicon.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 

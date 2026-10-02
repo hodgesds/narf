@@ -109,7 +109,9 @@ pub(crate) fn ceil_multiple(value: u64, multiple: u64) -> u64 {
 pub(crate) fn log2_floor(value: u64) -> u32 {
     value.max(1).ilog2()
 }
-/// `dml_floor(value, multiple)`.
+/// `dml_floor(value, multiple)`. Only the rounding tests need it: every
+/// production path here rounds outward.
+#[cfg(feature = "kernel-test")]
 fn floor_multiple(value: u64, multiple: u64) -> u64 {
     if multiple == 0 {
         return value;

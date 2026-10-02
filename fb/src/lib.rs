@@ -419,6 +419,29 @@ pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
     *GENERIC_FB.lock() = Some(fb);
 }
 
+/// Adopt the external DisplayPort scanout the AMD display pipeline publishes,
+/// if one is streaming, replacing the generic framebuffer the console draws to.
+///
+/// The pipeline cannot call into this crate — this crate already calls into it,
+/// and the dependency only runs one way — so adoption is a pull rather than a
+/// push. It is also deliberately a decision made here: a scanout is published
+/// only once a stream is actually running, but whether the console should move
+/// to it is a policy question this layer owns.
+///
+/// Returns whether a scanout was adopted. The boot framebuffer recorded for the
+/// display handoff is left alone, so a later teardown can still find it.
+pub fn adopt_external_scanout() -> bool {
+    let Some(fb) = narf_drivers_gpu::amdgpu_dcn_display::active_scanout() else {
+        return false;
+    };
+    if fb.addr == 0 || fb.width == 0 || fb.height == 0 || fb.pitch == 0 {
+        return false;
+    }
+    GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
+    *GENERIC_FB.lock() = Some(fb);
+    true
+}
+
 /// Rebase the generic-FB's base address to a remapped virt (e.g.
 /// the WC ioremap result). Preserves width/height/pitch/bpp;
 /// future `framebuffer()` calls will return a Framebuffer that
