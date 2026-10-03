@@ -12,6 +12,7 @@ repository.workspace = true
 # on any other target this crate is empty and pulls in no Reverie crate.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 narf-console = { path = "../console" }
+narf-filesystem = { path = "../filesystem" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 narf-lib = { path = "../lib" }
 narf-memory = { path = "../memory" }

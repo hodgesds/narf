@@ -12,6 +12,7 @@ use core::fmt::Write as _;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use narf_console::Writer;
+use narf_filesystem::{FileOps, FsError, FsFuture, Stat};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{AddressSpace, PhysAddr, RegionPerms};
@@ -51,6 +52,81 @@ const WAITER_BUDGET_CYCLES: u64 = 30_000_000_000;
 struct Root {
     task_id: u64,
     pid: u64,
+}
+
+/// The kernel task id of the parent [`run_guest_with`] gives the root when it
+/// is asked to reap it. No task has this id: task ids and pids are small
+/// integers allocated upward from 1.
+const HARNESS_PARENT: u64 = 0x7ffe_0001;
+/// Linux `__WALL`: wait for a child whatever its exit signal. The harness
+/// parent publishes the root with exit signal 0, so nothing signals a parent
+/// that has no signal state.
+const LINUX_WALL: u32 = 0x4000_0000;
+
+/// How the run's root ended, as its reaping parent saw it.
+#[derive(Clone, Copy)]
+struct RootReap {
+    /// The wait status the kernel's reap returned to the harness parent: the
+    /// same `call_wait_child_check` a blocking `wait4(pid, &status, __WALL)`
+    /// makes.
+    wstatus: i32,
+    /// The termination status staged for the root when its exit was
+    /// announced, read without consuming it; `None` if nothing was staged.
+    staged: Option<i32>,
+}
+
+/// Sentinels for [`ROOT_REAPED`] and [`ROOT_STAGED`], outside the `i32` range.
+const NOT_SEEN: i64 = i64::MIN;
+const OTHER_CHILD_REAPED: i64 = i64::MIN + 1;
+const NOTHING_STAGED: i64 = i64::MIN + 2;
+/// The root's wait status, once the harness waiter has reaped it.
+static ROOT_REAPED: AtomicI64 = AtomicI64::new(NOT_SEEN);
+/// The pid whose staged termination [`record_root_termination`] reads.
+static ROOT_WATCH: AtomicU64 = AtomicU64::new(0);
+static ROOT_STAGED: AtomicI64 = AtomicI64::new(NOT_SEEN);
+
+/// Removes what the harness parent left once it has reaped the root.
+///
+/// The reap itself drops the root's link to the parent and the parent's child
+/// count. It leaves the parent's now-empty pending-exit queue, and charges
+/// the root's CPU time to the parent's child-CPU row. Returns the nanoseconds
+/// that row held.
+fn release_harness_parent(root_pid: u64) -> Result<u64, &'static str> {
+    use narf_userspace::handlers::{
+        __test_clear_pending_exits, __test_parent_link, account_reaped_child,
+    };
+    let linked = __test_parent_link(root_pid).is_some();
+    let mut status = 0i32;
+    let queued = narf_userspace::user_task::call_wait_child_check(
+        HARNESS_PARENT,
+        -1,
+        LINUX_WALL,
+        &mut status,
+    );
+    __test_clear_pending_exits(HARNESS_PARENT);
+    // With parent 0 this charges nobody; it drops the row's own CPU entries.
+    let charged = account_reaped_child(0, HARNESS_PARENT);
+    if linked {
+        return Err("the root's link to the harness parent survived the reap");
+    }
+    if queued != 0 {
+        return Err("the harness parent still had a reapable child after the root");
+    }
+    if account_reaped_child(0, HARNESS_PARENT) != 0 {
+        return Err("harness parent child-CPU row survived teardown");
+    }
+    Ok(charged)
+}
+
+/// Thread-exit observer: reads the root's staged termination status. Thread
+/// observers run before the process observer that consumes it for the reap.
+fn record_root_termination(pid: u64, _tid: u64) {
+    if pid != ROOT_WATCH.load(Ordering::Acquire) {
+        return;
+    }
+    let staged =
+        narf_userspace::handlers::peek_pending_termination(pid).map_or(NOTHING_STAGED, i64::from);
+    let _ = ROOT_STAGED.compare_exchange(NOT_SEEN, staged, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Grace periods [`run_guest`] may drive while reclaiming a run's address
@@ -125,12 +201,27 @@ fn reclaim_run(spaces: &[Weak<AddressSpace>], frames: &[PhysAddr]) -> Result<(),
 /// in the live syscall table, until every task it created has been reaped.
 ///
 /// `register` runs after the root task has its Linux identity and before it
-/// is runnable.
+/// is runnable. The root is an orphan, which the kernel releases at exit.
 fn run_guest(
     elf: &[u8],
     interceptor: Box<dyn SyscallInterceptor>,
     register: impl FnOnce(Root) -> Result<(), &'static str>,
 ) -> Result<Root, &'static str> {
+    run_guest_with(elf, interceptor, register, false).map(|(root, _)| root)
+}
+
+/// [`run_guest`], optionally with a reaping parent.
+///
+/// With `reap_root`, the root is published as a child of [`HARNESS_PARENT`]
+/// before it runs, so its exit queues a wait status for that parent instead
+/// of releasing it; the harness waiter then reaps it through the kernel's
+/// wait path and returns what that reap reported.
+fn run_guest_with(
+    elf: &[u8],
+    interceptor: Box<dyn SyscallInterceptor>,
+    register: impl FnOnce(Root) -> Result<(), &'static str>,
+    reap_root: bool,
+) -> Result<(Root, Option<RootReap>), &'static str> {
     use narf_userspace::syscall::__verification_clear_global as clear_global;
     use narf_userspace::{install_core_syscalls, install_global, install_task_id_lookup};
 
@@ -153,6 +244,12 @@ fn run_guest(
     EXITED_SPACES.lock().clear();
     RECLAIMED_SPACES.store(0, Ordering::Release);
     narf_userspace::user_task::register_thread_exit_observer(record_exiting_space);
+    ROOT_REAPED.store(NOT_SEEN, Ordering::Release);
+    ROOT_WATCH.store(0, Ordering::Release);
+    ROOT_STAGED.store(NOT_SEEN, Ordering::Release);
+    if reap_root {
+        narf_userspace::user_task::register_thread_exit_observer(record_root_termination);
+    }
     let original_as_lookup = narf_userspace::address_space_lookup();
     narf_userspace::install_address_space_lookup(|| {
         narf_scheduler::current_address_space()
@@ -224,6 +321,13 @@ fn run_guest(
         teardown(original_cr3);
         return Err(reason);
     }
+    let reap_pid = if reap_root {
+        ROOT_WATCH.store(pid, Ordering::Release);
+        narf_userspace::handlers::__test_parent_of_set_with_signal(pid, HARNESS_PARENT, 0);
+        pid
+    } else {
+        0
+    };
     pending.spawn();
 
     static WAITER_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
@@ -231,7 +335,22 @@ fn run_guest(
     let deadline = narf_time::Instant::now().plus_cycles(WAITER_BUDGET_CYCLES);
     narf_scheduler::spawn(async move {
         loop {
-            if narf_scheduler::live_user_task_count() <= live_before {
+            if reap_pid != 0 && ROOT_REAPED.load(Ordering::Acquire) == NOT_SEEN {
+                let mut status = 0i32;
+                let reaped = narf_userspace::user_task::call_wait_child_check(
+                    HARNESS_PARENT,
+                    reap_pid as i64,
+                    LINUX_WALL,
+                    &mut status,
+                );
+                if reaped == reap_pid as i64 {
+                    ROOT_REAPED.store(i64::from(status), Ordering::Release);
+                } else if reaped != 0 {
+                    ROOT_REAPED.store(OTHER_CHILD_REAPED, Ordering::Release);
+                }
+            }
+            let root_done = reap_pid == 0 || ROOT_REAPED.load(Ordering::Acquire) != NOT_SEEN;
+            if root_done && narf_scheduler::live_user_task_count() <= live_before {
                 return;
             }
             if narf_time::Instant::now() >= deadline {
@@ -242,18 +361,46 @@ fn run_guest(
         }
     });
     narf_scheduler::run_until_empty();
+    // Before `teardown`, whose wait-table reset would hide a leftover link.
+    let released = if reap_root {
+        Some(release_harness_parent(reap_pid))
+    } else {
+        None
+    };
     teardown(original_cr3);
 
     if WAITER_TIMED_OUT.load(Ordering::Acquire) != 0 {
         return Err("the guest's tasks were not reaped within the budget");
     }
+    let reap = if reap_root {
+        let wstatus = match ROOT_REAPED.load(Ordering::Acquire) {
+            NOT_SEEN => return Err("the harness parent's wait never reaped the root"),
+            OTHER_CHILD_REAPED => {
+                return Err("the harness parent's wait reaped a task other than the root")
+            }
+            status => status as i32,
+        };
+        let staged = match ROOT_STAGED.load(Ordering::Acquire) {
+            NOT_SEEN => return Err("the root's exit never reached the thread-exit observers"),
+            NOTHING_STAGED => None,
+            status => Some(status as i32),
+        };
+        let charged = released.ok_or("the harness parent was never released")??;
+        let _ = writeln!(
+            Writer,
+            "    harness parent released; child-CPU row held {charged} ns"
+        );
+        Some(RootReap { wstatus, staged })
+    } else {
+        None
+    };
     let spaces = core::mem::take(&mut *EXITED_SPACES.lock());
     if !spaces.iter().any(|space| space.ptr_eq(&root_space)) {
         return Err("the root task's exit did not report its address space");
     }
     reclaim_run(&spaces, &root_frames)?;
     RECLAIMED_SPACES.store(spaces.len() as u64, Ordering::Release);
-    Ok(root)
+    Ok((root, reap))
 }
 
 /// Runs `elf` with Tool `T` hosted for the whole process tree.
@@ -562,13 +709,140 @@ kernel_test_in!(
     reverie_narf_passthrough_runs_guest_unchanged
 );
 
+/// Wraps the root's fd-1 console file: forwards every call to it unchanged and
+/// keeps a copy of the bytes its `write` accepted.
+///
+/// The serial line is not byte evidence of the guest's output: the console
+/// writer emits each byte as a `char`, so a byte above 0x7f leaves as two, and
+/// the line interleaves the guest's bytes with everything else the kernel
+/// prints. The copy is taken where the guest's `write` hands its bytes to the
+/// console file.
+struct StdoutTap {
+    console: Arc<dyn FileOps>,
+    captured: IrqSafeSpinLock<Vec<u8>>,
+}
+
+impl FileOps for StdoutTap {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        self.console.read(offset, buf)
+    }
+
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let accepted = self.console.write(offset, buf);
+        Box::pin(async move {
+            let n = accepted.await?;
+            self.captured.lock().extend_from_slice(&buf[..n]);
+            Ok(n)
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        self.console.stat()
+    }
+
+    fn block_on_input(&self) -> bool {
+        self.console.block_on_input()
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        self.console.poll_readiness()
+    }
+
+    fn tty_id(&self) -> Option<u32> {
+        self.console.tty_id()
+    }
+
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        self.console.tty_fg_pgrp()
+    }
+
+    fn tty_tostop(&self) -> bool {
+        self.console.tty_tostop()
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        self.console.ioctl(cmd, arg)
+    }
+}
+
+/// Puts a [`StdoutTap`] in front of `task_id`'s fd 1, which must still be the
+/// console file of a fresh descriptor table: one object behind fds 1 and 2,
+/// a character device, the boot console's tty.
+fn tap_stdout(task_id: u64) -> Result<Arc<StdoutTap>, &'static str> {
+    narf_userspace::fd::with_table(task_id, |table| {
+        let (Some(stdout), Some(stderr)) = (table.get(1), table.get(2)) else {
+            return Err("the root's descriptor table has no fd 1 or fd 2");
+        };
+        if !Arc::ptr_eq(&stdout.ops, &stderr.ops)
+            || stdout.ops.stat().mode.file_type != narf_filesystem::FileType::Special
+            || stdout.ops.tty_id() != Some(narf_filesystem::TTY_ID_CONSOLE)
+        {
+            return Err("the root's fd 1 is not the fresh table's console file");
+        }
+        let mut entry = stdout.clone();
+        let tap = Arc::new(StdoutTap {
+            console: entry.ops.clone(),
+            captured: IrqSafeSpinLock::new(Vec::new()),
+        });
+        entry.ops = tap.clone();
+        table.set(1, entry);
+        Ok(tap)
+    })
+    .ok_or("the root's descriptor table was unavailable")?
+}
+
 /// The N cell of the Linux/Narf parity comparison: the shared canonical-trace
 /// Tool, unchanged, writes its records to the kernel console. This is the
 /// only test that emits canonical records.
+///
+/// It also prints the cell's other two observables, each exactly once, for
+/// the external comparator: the bytes the guest wrote to fd 1, captured by a
+/// [`StdoutTap`], and the root's wait status as its reaping parent received
+/// it. Their expected values live in the comparator, not here.
 fn reverie_narf_canonical_trace_cell() -> TestResult {
     result_of((|| {
-        let (interceptor, root) = run_hosted::<CanonicalTrace<ConsoleSink>>(CANONICAL_GUEST, ())?;
-        check_teardown(&interceptor, root, 1, 0)?;
+        let interceptor = ReverieInterceptor::<CanonicalTrace<ConsoleSink>>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let mut tap = None;
+        let (root, reap) = run_guest_with(
+            CANONICAL_GUEST,
+            interceptor.boxed(),
+            |root| {
+                tap = Some(tap_stdout(root.task_id)?);
+                interceptor
+                    .host_root(root.task_id)
+                    .map_err(|_| "register_root refused the root task")
+            },
+            true,
+        )?;
+        let tap = tap.ok_or("the root's fd 1 was never tapped")?;
+        let reap = reap.ok_or("the run did not reap its root")?;
+        let captured = tap.captured.lock().clone();
+        let mut line = alloc::string::String::new();
+        for byte in &captured {
+            let _ = write!(line, "{byte:02x}");
+        }
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL stdout-capture=fd1-tap bytes={} hex={line}",
+            captured.len()
+        );
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL exit wstatus={:#06x} source=harness-parent-wait-reap",
+            reap.wstatus
+        );
+        if reap.staged != Some(reap.wstatus) {
+            let _ = writeln!(Writer, "    staged termination {:?}", reap.staged);
+            return Err("the reaped wait status differs from the termination staged at exit");
+        }
+        let exits = check_teardown(&interceptor, root, 1, reap.wstatus)?;
+        if exits.len() != 1 || !exits[0].process_exited {
+            return Err("the root's exit did not end its process in the host");
+        }
+        if reap.wstatus != 0 {
+            return Err("the root did not exit 0");
+        }
         Ok(TestResult::Pass)
     })())
 }

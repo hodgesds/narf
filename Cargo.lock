@@ -2493,6 +2493,7 @@ name = "reverie-narf-adapter"
 version = "0.0.0"
 dependencies = [
  "narf-console",
+ "narf-filesystem",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
