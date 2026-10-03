@@ -355,8 +355,9 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
     /// yield is busy: the task stays runnable, and `narf_scheduler::spawn`
     /// pins it to the boot CPU, which does not idle while it runs.
     ///
-    /// Before each poll, the task stops, dropping the future unfinished, if
-    /// either holds:
+    /// `start` is called once, when the task first runs, whatever the rules
+    /// below say; they apply to the future it returns. Before each poll, the
+    /// task stops, dropping the future unfinished, if either holds:
     /// * the run is over: the root was hosted (see [`Self::host_root`]) and
     ///   no hosted task is left. The last task's exit hooks may still be
     ///   running on another CPU; they are polled once, so none can wait for
@@ -367,8 +368,17 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
     /// An aborted run needs no rule of its own: the abort kills every hosted
     /// process, so the run is over once they have exited.
     ///
-    /// The future runs on the scheduler's own page tables, not on any hosted
-    /// task's, so a [`crate::NarfMemory`] it uses reaches no guest memory.
+    /// Until a root is hosted only the second rule applies, so a caller that
+    /// starts a background future and then hosts no root, because
+    /// [`Self::host_root`] failed say, must drop every handle to this
+    /// interceptor; otherwise the task keeps the boot CPU busy for good. The
+    /// boot host (`boot.rs`) keeps a handle in the syscall table for the
+    /// life of the boot, so boot code may start a background future only
+    /// after `host_root` has succeeded.
+    ///
+    /// No user task is running while the future is polled: it runs on the
+    /// kernel's own page tables, not on any hosted task's, and every access
+    /// through a [`crate::NarfMemory`] it uses is refused with `EFAULT`.
     pub fn spawn_background<F>(&self, start: F) -> BackgroundTask
     where
         F: for<'a> FnOnce(&'a T::GlobalState) -> BackgroundFuture<'a> + Send + 'static,

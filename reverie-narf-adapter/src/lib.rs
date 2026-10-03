@@ -162,14 +162,19 @@
 //!   (`reverie_narf_background_future_releases_a_waiting_callback`).
 //! * The task stops, dropping the future unfinished, once the run is over:
 //!   the root was hosted and no hosted task is left. A future started after
-//!   that is never polled (`reverie_narf_background_future_ends_with_the_run`).
+//!   that is never polled, though the closure that makes it still runs once
+//!   (`reverie_narf_background_future_ends_with_the_run`).
 //!   An aborted run ends this way too, once the abort's `SIGKILL` has ended
 //!   every hosted process.
 //! * The task also stops once every handle to the interceptor is gone, the
 //!   only rule before a root is hosted
 //!   (`reverie_narf_background_future_ends_when_every_handle_is_dropped`).
-//! * The future runs on the scheduler's own page tables, so a `NarfMemory`
-//!   used there reaches no guest's memory.
+//!   Nothing else can stop it: a caller whose root is never hosted must drop
+//!   every handle, or the task keeps the boot CPU busy for good, and the
+//!   boot host keeps one for the life of the boot.
+//! * No user task is running while the future is polled, so every access
+//!   through a `NarfMemory` used there is refused with `EFAULT`, touching no
+//!   memory (`reverie_narf_memory_outside_a_task_is_refused`).
 //!
 //! **vDSO calls.** Installing the interceptor for a Tool subscribed to any
 //! one of `clock_gettime`, `gettimeofday`, `time` or `getcpu` routes all four

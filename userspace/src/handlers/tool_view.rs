@@ -41,24 +41,40 @@ pub fn linux_task_ids(task: u64) -> Option<LinuxTaskIds> {
 /// Copies `dst.len()` bytes from user address `src` of the current address
 /// space. Returns the Linux errno on failure.
 ///
+/// Refuses with `EFAULT`, touching no memory, when no user task is running
+/// on this CPU. A kernel task, such as a Tool's background future, runs on
+/// the kernel's own page tables, which hold no user memory; under the
+/// `nosmp` boot flag they still map the AP trampoline pages
+/// (`narf_memory::mmu::AP_TRAMPOLINE_EXEC_BASE`), which a user copy would
+/// otherwise reach.
+///
 /// # Safety
 ///
-/// The active address space must be the one of the task whose memory the
-/// caller means to read, as it is for the duration of that task's syscall
-/// interception. Must not be called from IRQ context.
+/// When a user task is running, the active address space must be the one
+/// of the task whose memory the caller means to read, as it is for the
+/// duration of that task's syscall interception. Must not be called from
+/// IRQ context.
 pub unsafe fn read_current_user(dst: &mut [u8], src: u64) -> Result<(), u64> {
-    // SAFETY: forwarded verbatim from this function's contract.
+    if crate::user_task::current_user_task().is_none() {
+        return Err(crate::errno::EFAULT as u64);
+    }
+    // SAFETY: a user task is running; the rest is forwarded verbatim from
+    // this function's contract.
     unsafe { super::copy_from_user(dst, src) }
 }
 
 /// Copies `src` to user address `dst` of the current address space. Returns
-/// the Linux errno on failure.
+/// the Linux errno on failure, and refuses as [`read_current_user`] does
+/// when no user task is running.
 ///
 /// # Safety
 ///
 /// Same contract as [`read_current_user`].
 pub unsafe fn write_current_user(dst: u64, src: &[u8]) -> Result<(), u64> {
-    // SAFETY: forwarded verbatim from this function's contract.
+    if crate::user_task::current_user_task().is_none() {
+        return Err(crate::errno::EFAULT as u64);
+    }
+    // SAFETY: as in `read_current_user`.
     unsafe { super::copy_to_user(dst, src) }
 }
 

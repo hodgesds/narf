@@ -23,7 +23,7 @@ use narf_userspace::syscall::{
     NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
     SyscallReturn,
 };
-use reverie::syscalls::{Addr, MemoryAccess, Sysno};
+use reverie::syscalls::{Addr, AddrMut, MemoryAccess, Sysno};
 use reverie::{Pid, Tool};
 use reverie_narf_core::{KernelServices, NarfSyscallOutcome, OriginalSyscallError};
 use reverie_narf_tools::canonical::CanonicalTrace;
@@ -38,7 +38,7 @@ use crate::interceptor::{
     BackgroundEnd, BackgroundFuture, BackgroundTask, ConsoleSink, ReverieInterceptor,
     TaskExitRecord,
 };
-use crate::services::{map_native_outcome, NarfKernelServices};
+use crate::services::{map_native_outcome, NarfKernelServices, NarfMemory};
 
 static CANONICAL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_CANONICAL"));
 static PROBE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PROBE"));
@@ -3559,6 +3559,165 @@ fn reverie_narf_background_future_ends_when_every_handle_is_dropped() -> TestRes
     })())
 }
 reverie_narf_test!(reverie_narf_background_future_ends_when_every_handle_is_dropped);
+
+/// The root task whose `write` [`MemoryKeeper`] watches.
+static KEEPER_TASK: AtomicU64 = AtomicU64::new(0);
+/// The memory handle [`MemoryKeeper`] kept, and the flag it sets once it has.
+static KEPT_MEMORY: IrqSafeSpinLock<Option<NarfMemory>> = IrqSafeSpinLock::new(None);
+static MEMORY_KEPT: AtomicBool = AtomicBool::new(false);
+/// The kept handle read the canonical message in the root's own callback.
+static KEPT_READ_MESSAGE: AtomicBool = AtomicBool::new(false);
+/// Polls of [`probe_kept_memory`]'s wait for [`MEMORY_KEPT`].
+static KEEP_POLLS: AtomicU64 = AtomicU64::new(0);
+/// What [`probe_kept_memory`] saw: whether the page tables it ran on map the
+/// AP trampoline's first page, and what the kept handle's read and write of
+/// that page returned (bytes copied, or `-errno`; `i64::MIN` until it ran).
+static OUTSIDE_MAPPED: AtomicBool = AtomicBool::new(false);
+static OUTSIDE_READ: AtomicI64 = AtomicI64::new(i64::MIN);
+static OUTSIDE_WRITE: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Keeps the memory handle of the root's first `write`, as a Tool might keep
+/// one in its global state, once the handle has read the canonical message
+/// there.
+struct MemoryKeeper;
+
+impl SyscallInterceptor for MemoryKeeper {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        let task_id = invocation.task_id;
+        if task_id != KEEPER_TASK.load(Ordering::Acquire)
+            || invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK != LINUX_WRITE
+            || MEMORY_KEPT.load(Ordering::Acquire)
+        {
+            return SyscallInterception::Continue;
+        }
+        let Some(ids) = tool_view::linux_task_ids(task_id) else {
+            return SyscallInterception::Continue;
+        };
+        let memory =
+            NarfKernelServices::new(native, task_id, ids, Some(invocation.raw_number)).memory();
+        let mut message = [0u8; 16];
+        let read = Addr::<u8>::from_raw(CANONICAL_MESSAGE_ADDR as usize)
+            .ok_or(reverie::syscalls::Errno::EFAULT)
+            .and_then(|addr| memory.read_exact(addr, &mut message));
+        KEPT_READ_MESSAGE.store(
+            read.is_ok() && &message == CANONICAL_MESSAGE,
+            Ordering::Release,
+        );
+        *KEPT_MEMORY.lock() = Some(memory);
+        MEMORY_KEPT.store(true, Ordering::Release);
+        SyscallInterception::Continue
+    }
+}
+
+/// A background future that waits for [`MemoryKeeper`]'s handle, then reads,
+/// and writes back, the first byte of the AP trampoline through it
+/// (`narf_memory::mmu::AP_TRAMPOLINE_EXEC_BASE`): a user-range address that
+/// the kernel's own page tables map in a `nosmp` boot.
+fn probe_kept_memory(_: &()) -> BackgroundFuture<'_> {
+    Box::pin(async {
+        if !wait_for(&MEMORY_KEPT, &KEEP_POLLS, false).await {
+            return;
+        }
+        let Some(mut memory) = *KEPT_MEMORY.lock() else {
+            return;
+        };
+        let base = narf_memory::mmu::AP_TRAMPOLINE_EXEC_BASE;
+        // SAFETY: reading CR3 has no side effects, and the live root it
+        // names is reachable through the direct map.
+        let mapped = unsafe {
+            narf_memory::paging::translate(
+                narf_memory::paging::read_cr3(),
+                narf_memory::VirtAddr::new(base),
+            )
+        }
+        .is_some();
+        // The byte the page holds, so that a write which does reach it
+        // stores what is already there.
+        let byte = if mapped {
+            // SAFETY: the page is mapped in the live root, and nothing
+            // unmaps it while this task runs.
+            unsafe { core::ptr::read_volatile(base as usize as *const u8) }
+        } else {
+            0
+        };
+        let mut buf = [0u8; 1];
+        let read = Addr::<u8>::from_raw(base as usize)
+            .ok_or(reverie::syscalls::Errno::EFAULT)
+            .and_then(|addr| memory.read(addr, &mut buf));
+        let write = AddrMut::<u8>::from_raw(base as usize)
+            .ok_or(reverie::syscalls::Errno::EFAULT)
+            .and_then(|addr| memory.write(addr, &[byte]));
+        let outcome = |result: Result<usize, reverie::syscalls::Errno>| match result {
+            Ok(n) => n as i64,
+            Err(errno) => -i64::from(errno.into_raw()),
+        };
+        OUTSIDE_MAPPED.store(mapped, Ordering::Release);
+        OUTSIDE_READ.store(outcome(read), Ordering::Release);
+        OUTSIDE_WRITE.store(outcome(write), Ordering::Release);
+    })
+}
+
+/// A memory handle kept from a task's callback and used where no user task
+/// is running, in a background future, is refused with `EFAULT` and touches
+/// no memory, even at an address the page tables it runs on map: the
+/// canonical guest runs under [`MemoryKeeper`], whose handle first reads the
+/// guest's message in the root's own `write`, and [`probe_kept_memory`],
+/// started beside it, reads and writes the AP trampoline through that handle.
+///
+/// Only a `nosmp` boot leaves the trampoline mapped in the kernel's page
+/// tables (`narf_memory::mmu::drop_ap_trampoline_window`), so only there
+/// would an access that was not refused succeed; in any other boot it
+/// faults, and this test passes either way. The `mapped` it prints says
+/// which.
+fn reverie_narf_memory_outside_a_task_is_refused() -> TestResult {
+    KEEPER_TASK.store(0, Ordering::Release);
+    *KEPT_MEMORY.lock() = None;
+    for flag in [&MEMORY_KEPT, &KEPT_READ_MESSAGE, &OUTSIDE_MAPPED] {
+        flag.store(false, Ordering::Release);
+    }
+    KEEP_POLLS.store(0, Ordering::Release);
+    OUTSIDE_READ.store(i64::MIN, Ordering::Release);
+    OUTSIDE_WRITE.store(i64::MIN, Ordering::Release);
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<Answer>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let mut background = None;
+        run_guest(CANONICAL_GUEST, Box::new(MemoryKeeper), |root| {
+            KEEPER_TASK.store(root.task_id, Ordering::Release);
+            background = Some(interceptor.spawn_background(probe_kept_memory));
+            Ok(())
+        })?;
+        let end = background.and_then(|task| task.end());
+        let kept = KEPT_READ_MESSAGE.load(Ordering::Acquire);
+        let polls = KEEP_POLLS.load(Ordering::Acquire);
+        let mapped = OUTSIDE_MAPPED.load(Ordering::Acquire);
+        let read = OUTSIDE_READ.load(Ordering::Acquire);
+        let write = OUTSIDE_WRITE.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    kept handle read the message {kept}; background polls {polls} end {end:?}; \
+             trampoline mapped {mapped}, read {read}, write {write}"
+        );
+        if !kept {
+            return Err("the kept handle did not read the message in the root's callback");
+        }
+        if end != Some(BackgroundEnd::Completed) || read == i64::MIN {
+            return Err("the background future did not probe the kept handle");
+        }
+        if read != -14 {
+            return Err("a read outside a task was not refused with EFAULT");
+        }
+        if write != -14 {
+            return Err("a write outside a task was not refused with EFAULT");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_memory_outside_a_task_is_refused);
 
 // ── vDSO calls reach the Tool─────────────────────────────────────────────
 
