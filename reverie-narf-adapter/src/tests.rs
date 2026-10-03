@@ -644,6 +644,9 @@ fn run_hosted<T: Tool + 'static>(
 /// The checks every hosted run must pass: the root was reaped with
 /// `root_status`, every hosted task's exit reached the host exactly once, and
 /// the host tore every task down.
+///
+/// The root's status is checked before the exit count, so a run whose root
+/// ended with the wrong status fails on that, whatever else went wrong.
 fn check_teardown<T: Tool + 'static>(
     interceptor: &ReverieInterceptor<T>,
     root: Root,
@@ -651,6 +654,16 @@ fn check_teardown<T: Tool + 'static>(
     root_status: i32,
 ) -> Result<Vec<TaskExitRecord>, &'static str> {
     let exits = interceptor.exits();
+    let root_exit = exits.iter().find(|exit| exit.task_id == root.task_id);
+    if let Some(root_exit) = root_exit {
+        if root_exit.tid != Pid::from_raw(root.pid as i32) {
+            return Err("the root's exit was reported under a tid other than its Linux pid");
+        }
+        if root_exit.wstatus != root_status {
+            let _ = writeln!(Writer, "    root wstatus {:#x}", root_exit.wstatus);
+            return Err("the root exited with an unexpected status");
+        }
+    }
     if exits.len() != expected_exits {
         let _ = writeln!(
             Writer,
@@ -676,15 +689,8 @@ fn check_teardown<T: Tool + 'static>(
         }
         return Err("the host did not see every task exit exactly once");
     }
-    let Some(root_exit) = exits.iter().find(|exit| exit.task_id == root.task_id) else {
+    if root_exit.is_none() {
         return Err("the root task's exit never reached the host");
-    };
-    if root_exit.tid != Pid::from_raw(root.pid as i32) {
-        return Err("the root's exit was reported under a tid other than its Linux pid");
-    }
-    if root_exit.wstatus != root_status {
-        let _ = writeln!(Writer, "    root wstatus {:#x}", root_exit.wstatus);
-        return Err("the root exited with an unexpected status");
     }
     if interceptor.host().live_threads() != 0 || interceptor.host().live_processes() != 0 {
         return Err("the host still tracks tasks after every task exited");
@@ -2055,6 +2061,18 @@ impl SignalTables {
         narf_userspace::signal_init();
         Self(before)
     }
+
+    /// As [`Self::init`], and also creates the per-task handler tables
+    /// (`narf_userspace::sigaction_init`), for a guest that installs a
+    /// handler: without them its `rt_sigaction` fails with `EINVAL`. Tables
+    /// that already exist are kept as they are.
+    fn init_with_handlers() -> Self {
+        let tables = Self::init();
+        if !tables.0.sigactions {
+            narf_userspace::sigaction_init();
+        }
+        tables
+    }
 }
 
 impl Drop for SignalTables {
@@ -2720,6 +2738,311 @@ fn reverie_narf_lifecycle_spawn_is_refused() -> TestResult {
     result_of(outcome)
 }
 reverie_narf_test!(reverie_narf_lifecycle_spawn_is_refused);
+
+// ── Contained fatals abort the hosted tree ───────────────────────────────
+
+/// How many tasks [`ParkInThreadStart`] saw start, and what its setup
+/// injects in the second one returned ([`NOT_SEEN`] until they returned).
+static PARK_START_COUNT: AtomicU64 = AtomicU64::new(0);
+static PARK_START_MMAP: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static PARK_START_PIPE: AtomicI64 = AtomicI64::new(NOT_SEEN);
+/// Set if the Tool's blocking `poll` ever returned to it.
+static PARK_START_POLL_RETURNED: AtomicBool = AtomicBool::new(false);
+
+const LINUX_PROT_READ_WRITE: usize = 0x3;
+const LINUX_MAP_PRIVATE_ANONYMOUS: usize = 0x22;
+const LINUX_POLLIN: i16 = 0x1;
+
+/// A raw x86_64 syscall for a Tool to inject.
+fn raw_syscall(nr: reverie::syscalls::Sysno, args: [usize; 6]) -> reverie::syscalls::Syscall {
+    use reverie::syscalls::{Syscall, SyscallArgs};
+    Syscall::from_raw(
+        nr,
+        SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
+    )
+}
+
+/// In the second task's `handle_thread_start` (the fork guest's child),
+/// creates a pipe and injects a non-tail `poll` on its empty read end, which
+/// blocks. A lifecycle callback has no syscall to park, so the host reports
+/// `NarfFatal::InjectParked`.
+#[derive(Debug, Default, Clone, Copy)]
+struct ParkInThreadStart;
+
+impl ParkInThreadStart {
+    async fn park<T: reverie::Guest<Self>>(guest: &mut T) {
+        let mmap = [
+            0,
+            4096,
+            LINUX_PROT_READ_WRITE,
+            LINUX_MAP_PRIVATE_ANONYMOUS,
+            usize::MAX,
+            0,
+        ];
+        let page = raw_result(
+            guest
+                .inject(raw_syscall(reverie::syscalls::Sysno::mmap, mmap))
+                .await,
+        );
+        PARK_START_MMAP.store(page, Ordering::Release);
+        if page <= 0 {
+            return;
+        }
+        let page = page as usize;
+        let pipe2 = [page, 0, 0, 0, 0, 0];
+        let pipe = raw_result(
+            guest
+                .inject(raw_syscall(reverie::syscalls::Sysno::pipe2, pipe2))
+                .await,
+        );
+        PARK_START_PIPE.store(pipe, Ordering::Release);
+        if pipe != 0 {
+            return;
+        }
+        let mut memory = guest.memory();
+        let mut fds = [0u8; 8];
+        let Some(fds_at) = Addr::<u8>::from_raw(page) else {
+            return;
+        };
+        if memory.read_exact(fds_at, &mut fds).is_err() {
+            return;
+        }
+        let read_end = i32::from_ne_bytes([fds[0], fds[1], fds[2], fds[3]]);
+        // struct pollfd { int fd; short events; short revents; }
+        let mut pollfd = [0u8; 8];
+        pollfd[..4].copy_from_slice(&read_end.to_ne_bytes());
+        pollfd[4..6].copy_from_slice(&LINUX_POLLIN.to_ne_bytes());
+        let Some(pollfd_at) = reverie::syscalls::AddrMut::<u8>::from_raw(page + 8) else {
+            return;
+        };
+        if memory.write_exact(pollfd_at, &pollfd).is_err() {
+            return;
+        }
+        let poll = [page + 8, 1, 20, 0, 0, 0];
+        let _ = guest
+            .inject(raw_syscall(reverie::syscalls::Sysno::poll, poll))
+            .await;
+        PARK_START_POLL_RETURNED.store(true, Ordering::Release);
+    }
+}
+
+#[reverie::tool]
+impl Tool for ParkInThreadStart {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_thread_start<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::Error> {
+        if PARK_START_COUNT.fetch_add(1, Ordering::AcqRel) == 1 {
+            Self::park(guest).await;
+        }
+        Ok(())
+    }
+}
+
+/// A Tool fatal in a lifecycle callback stops only the hosted process tree,
+/// as Linux kills a tracee whose tracer dies (`PTRACE_O_EXITKILL`): a
+/// blocking inject from the fork guest child's `handle_thread_start` makes
+/// the host report `InjectParked`, the interceptor logs that reason and kills
+/// every hosted process with `SIGKILL`, so the root (in `wait4`) and the
+/// child both die of signal 9 and every exit still reaches the host. The
+/// kernel keeps running: a second hosted run afterwards completes normally.
+fn reverie_narf_parked_inject_in_thread_start_aborts_the_tree() -> TestResult {
+    PARK_START_COUNT.store(0, Ordering::Release);
+    PARK_START_MMAP.store(NOT_SEEN, Ordering::Release);
+    PARK_START_PIPE.store(NOT_SEEN, Ordering::Release);
+    PARK_START_POLL_RETURNED.store(false, Ordering::Release);
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<ParkInThreadStart>(FORK_GUEST, ())?;
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    starts {} mmap {:#x} pipe2 {} poll returned {} abort reason {reason:?}",
+            PARK_START_COUNT.load(Ordering::Acquire),
+            PARK_START_MMAP.load(Ordering::Acquire),
+            PARK_START_PIPE.load(Ordering::Acquire),
+            PARK_START_POLL_RETURNED.load(Ordering::Acquire),
+        );
+        if PARK_START_MMAP.load(Ordering::Acquire) <= 0
+            || PARK_START_PIPE.load(Ordering::Acquire) != 0
+        {
+            return Err("the Tool's setup injects in handle_thread_start failed");
+        }
+        if PARK_START_POLL_RETURNED.load(Ordering::Acquire) {
+            return Err("the blocking inject returned to the Tool");
+        }
+        let named = reason.as_deref().is_some_and(|reason| {
+            reason.contains("handle_thread_start") && reason.contains("InjectParked")
+        });
+        if !named {
+            return Err("the run was not aborted with the InjectParked reason");
+        }
+        let exits = check_teardown(&interceptor, root, 2, LINUX_SIGKILL)?;
+        if exits
+            .iter()
+            .any(|exit| exit.task_id != root.task_id && exit.wstatus != LINUX_SIGKILL)
+        {
+            return Err("the child did not die of SIGKILL");
+        }
+        check_kernel_still_hosts()?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_parked_inject_in_thread_start_aborts_the_tree);
+
+/// After an aborted run, the kernel still hosts a Tool: the canonical guest
+/// runs under [`PassThrough`] and exits 0.
+fn check_kernel_still_hosts() -> Result<(), &'static str> {
+    let (interceptor, root) = run_hosted::<PassThrough>(CANONICAL_GUEST, ())?;
+    if interceptor.abort_reason().is_some() {
+        return Err("a run after the abort was aborted too");
+    }
+    check_teardown(&interceptor, root, 1, 0)?;
+    Ok(())
+}
+
+static SIGPARK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_SIGPARK"));
+
+const LINUX_SIGUSR1: u32 = 10;
+
+/// How many `read`s [`InjectAfterInterruption`] saw, what its parked inject
+/// returned ([`NOT_SEEN`] until it returned), and whether the inject after
+/// it ever returned.
+static SIGPARK_READS: AtomicU64 = AtomicU64::new(0);
+static SIGPARK_INTERRUPTED: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static SIGPARK_AFTER_RETURNED: AtomicBool = AtomicBool::new(false);
+/// Armed by the Tool just before its blocking inject; the park observer
+/// disarms it and raises `SIGUSR1` once.
+static SIGPARK_ARMED: AtomicBool = AtomicBool::new(false);
+static SIGPARK_RAISED: AtomicU64 = AtomicU64::new(0);
+/// Every syscall number [`InjectAfterInterruption`] was handed, in order.
+static SIGPARK_SEEN: IrqSafeSpinLock<Vec<i32>> = IrqSafeSpinLock::new(Vec::new());
+
+/// At the sigpark guest's blocking `read`, runs the read as a non-tail inject,
+/// which parks; [`RaiseOnPark`] sends the guest `SIGUSR1` while it is parked.
+/// The guest's handler enters `getpid`, so the inject returns `ERESTARTSYS`,
+/// and the Tool then injects `getpid`: a transition after the interruption.
+#[derive(Debug, Default, Clone, Copy)]
+struct InjectAfterInterruption;
+
+#[reverie::tool]
+impl Tool for InjectAfterInterruption {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        SIGPARK_SEEN.lock().push(syscall.number().id());
+        if syscall.number() == reverie::syscalls::Sysno::read
+            && SIGPARK_READS.fetch_add(1, Ordering::AcqRel) == 0
+        {
+            SIGPARK_ARMED.store(true, Ordering::Release);
+            let parked = raw_result(guest.inject(syscall).await);
+            SIGPARK_INTERRUPTED.store(parked, Ordering::Release);
+            let _ = guest.inject(reverie::syscalls::Getpid::new()).await;
+            SIGPARK_AFTER_RETURNED.store(true, Ordering::Release);
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// Installs the kernel's descriptor-park observer so that the task whose
+/// inject [`InjectAfterInterruption`] armed gets `SIGUSR1` once, on its own
+/// kernel path after its waker is armed and before it stops running
+/// (`narf_userspace::handlers::__verification_swap_fd_park_observer`). The
+/// previous observer is restored when this is dropped.
+struct RaiseOnPark(Option<fn(u64)>);
+
+impl RaiseOnPark {
+    fn install() -> Self {
+        SIGPARK_ARMED.store(false, Ordering::Release);
+        SIGPARK_RAISED.store(0, Ordering::Release);
+        Self(
+            narf_userspace::handlers::__verification_swap_fd_park_observer(Some(
+                raise_sigusr1_on_park,
+            )),
+        )
+    }
+}
+
+impl Drop for RaiseOnPark {
+    fn drop(&mut self) {
+        narf_userspace::handlers::__verification_swap_fd_park_observer(self.0);
+    }
+}
+
+fn raise_sigusr1_on_park(task_id: u64) {
+    if task_id == 0 || !SIGPARK_ARMED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    narf_userspace::handlers::raise_signal_pending(task_id, LINUX_SIGUSR1);
+    narf_userspace::handlers::wake_signal(task_id);
+    SIGPARK_RAISED.fetch_add(1, Ordering::AcqRel);
+}
+
+/// A Tool that runs another syscall after a signal interrupted its parked
+/// inject stops only the hosted process tree: the host reports
+/// `TransitionAfterInterruption`, the interceptor logs that reason and kills
+/// the guest with `SIGKILL`, and the guest dies of signal 9 inside its
+/// handler instead of completing its `read` and exiting 0. The kernel keeps
+/// running: a second hosted run afterwards completes normally.
+fn reverie_narf_transition_after_interruption_aborts_the_tree() -> TestResult {
+    SIGPARK_READS.store(0, Ordering::Release);
+    SIGPARK_INTERRUPTED.store(NOT_SEEN, Ordering::Release);
+    SIGPARK_AFTER_RETURNED.store(false, Ordering::Release);
+    SIGPARK_SEEN.lock().clear();
+    let _signal_tables = SignalTables::init_with_handlers();
+    let observer = RaiseOnPark::install();
+    let outcome = run_hosted::<InjectAfterInterruption>(SIGPARK_GUEST, ());
+    drop(observer);
+    result_of((|| {
+        let (interceptor, root) = outcome?;
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    seen {:?} reads {} raised {} interrupted inject {} inject after {} abort reason {reason:?}",
+            SIGPARK_SEEN.lock().clone(),
+            SIGPARK_READS.load(Ordering::Acquire),
+            SIGPARK_RAISED.load(Ordering::Acquire),
+            SIGPARK_INTERRUPTED.load(Ordering::Acquire),
+            SIGPARK_AFTER_RETURNED.load(Ordering::Acquire),
+        );
+        for exit in interceptor.exits() {
+            let _ = writeln!(
+                Writer,
+                "    exit tid {} wstatus {:#x}",
+                exit.tid.as_raw(),
+                exit.wstatus
+            );
+        }
+        if SIGPARK_RAISED.load(Ordering::Acquire) != 1 {
+            return Err("the Tool's inject never parked on the pipe");
+        }
+        if SIGPARK_INTERRUPTED.load(Ordering::Acquire) != -LINUX_ERESTARTSYS {
+            return Err("the interrupted inject did not return -ERESTARTSYS");
+        }
+        if SIGPARK_AFTER_RETURNED.load(Ordering::Acquire) {
+            return Err("the inject after the interruption returned to the Tool");
+        }
+        let named = reason.as_deref().is_some_and(|reason| {
+            reason.contains("handle_syscall") && reason.contains("TransitionAfterInterruption")
+        });
+        if !named {
+            return Err("the run was not aborted with the TransitionAfterInterruption reason");
+        }
+        check_teardown(&interceptor, root, 1, LINUX_SIGKILL)?;
+        check_kernel_still_hosts()?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_transition_after_interruption_aborts_the_tree);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 

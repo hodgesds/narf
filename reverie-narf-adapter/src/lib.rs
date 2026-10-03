@@ -56,23 +56,48 @@
 //!
 //! ## Run aborts
 //!
-//! Every `NarfFatal` returned to the interceptor goes to `fatal`, which
-//! **panics the kernel**. The panic handler (`console::panic_sink`) logs the
-//! panic and halts, so it stops the kernel, not just the hosted process
-//! tree. The kinds that a Tool or a guest can reach:
+//! Every `NarfFatal` returned to the interceptor goes to
+//! `ReverieInterceptor::fatal`, which sorts it with `fatal_kind` (an
+//! exhaustive match, so a new variant must be sorted before the adapter
+//! builds).
+//!
+//! **Contained: the run is aborted, the kernel keeps running.** A fatal that
+//! a Tool, or a guest driving a Tool, can cause stops only the hosted process
+//! tree, as Linux kills a tracee whose tracer dies (`PTRACE_O_EXITKILL`).
+//! The interceptor logs `reverie-narf: aborting the hosted process tree
+//! after <callback>: <fatal>` on the console, keeps that first reason
+//! (`ReverieInterceptor::abort_reason`), and sends `SIGKILL` to every hosted
+//! process (`tool_view::kill_process_sigkill`). A hosted task that reaches
+//! the interceptor again, or is created later, is killed there and runs no
+//! Tool callback (`kill_if_aborted`); a syscall that the abort interrupted
+//! returns `-EINTR`, which the task never sees because its `SIGKILL` is
+//! delivered first. Each hosted process is reaped with wait status 9
+//! (`SIGKILL`), and every exit still reaches the host, so the Tool's exit
+//! hooks run. No other process is signalled.
 //!
 //! | Fatal | Cause | Can the guest trigger it? |
 //! |---|---|---|
 //! | `Tool(Error)` | The Tool returned an error that is not an errno. | Only through a Tool that turns guest input into such an error. |
 //! | `InvalidErrno` | The Tool returned an errno outside `1..=4095`. | No; Tool only. |
-//! | `InjectParked`, in a lifecycle callback | A non-tail inject parked the task (a blocking `read`, say). No guest syscall exists to re-execute. | Yes, given a Tool that makes a blocking inject there, because the guest controls whether the call would block. |
+//! | `PostExec(Errno)` | `handle_post_exec` failed. | Only through a Tool that fails on guest input. |
+//! | `InjectParked`, in a lifecycle callback | A non-tail inject parked the task (a blocking `poll`, say). No guest syscall exists to re-execute. | Yes, given a Tool that makes a blocking inject there, because the guest controls whether the call would block (`reverie_narf_parked_inject_in_thread_start_aborts_the_tree`). |
 //! | `ToolSuspended` | The Tool's future was pending without a terminal transition and without a parked inject. | No; Tool only. |
-//! | `TransitionAfterInterruption` | After a signal interrupted its parked inject (which returned `ERESTARTSYS`), the Tool ran another syscall. | Yes, given such a Tool: a signal sent during the parked inject is enough. |
-//! | `ContinuationKernelMismatch` | A continuation resumed with a different memory type. | No. This adapter has one memory type (`NarfMemory`). |
+//! | `TransitionAfterInterruption` | After a signal interrupted its parked inject (which returned `ERESTARTSYS`), the Tool ran another syscall. | Yes, given such a Tool: a signal sent during the parked inject is enough (`reverie_narf_transition_after_interruption_aborts_the_tree`). |
+//! | `TransitionAfterTerminal` | The Tool ran a syscall after its callback's terminal transition. | No; Tool only. |
+//! | `TailInjectOutsideSyscall` | A lifecycle callback tail-injected a syscall that returned. | No; Tool only. |
+//! | `DaemonizeRefused(Errno)` | The kernel refused the Tool's daemonize request. | No; Tool only. |
 //!
-//! The other variants (`UnknownTask`, `DuplicateTask`, `RecursiveEntry`,
-//! `ExitDuringCallback`, re-execution mismatches, and so on) are kernel/host
-//! invariant violations, not guest or Tool inputs.
+//! **Invariant: the kernel panics.** A fatal that means the kernel or the
+//! host broke its own contract leaves no state that can be trusted, so
+//! `fatal` panics (`reverie-narf fatal in <callback>: <fatal>`). The panic
+//! handler (`console::panic_sink`) logs it and halts the kernel. These are
+//! `OriginalAlreadyExecuted`, `ContinuationKernelMismatch` (this adapter has
+//! one memory type, `NarfMemory`), `UnexpectedReexecution`,
+//! `ReexecutionMismatch`, `RecursiveEntry`, `UnknownTask`, `DuplicateTask`,
+//! `CreatedTaskMismatch`, `ExitDuringCallback` and `ProcessToolShared`.
+//! `UnsupportedSubscription`, `UnsupportedThreadOwnership` and
+//! `UnsupportedSignalDequeues` are refused by `NarfToolHost::new`, before
+//! any guest runs; `ReverieInterceptor::new` returns them as errors.
 //!
 //! ## Differences from reverie-ptrace
 //!
@@ -145,9 +170,12 @@
 //! ## Limits of the in-kernel tests
 //!
 //! * **`signal_init()`.** Kernel-test boots do not set up the signal tables,
-//!   so a raise there is silently dropped. The three signal tests create them
+//!   so a raise there is silently dropped. The five signal tests create them
 //!   with `narf_userspace::signal_init()` through a guard (`SignalTables`)
-//!   that removes, on every return path, the tables it created. Other
+//!   that removes, on every return path, the tables it created. The one
+//!   whose guest installs a handler also creates the handler tables
+//!   (`SignalTables::init_with_handlers`, `narf_userspace::sigaction_init()`);
+//!   without them `rt_sigaction` returns `EINVAL`. Other
 //!   reverie-narf tests run without signal delivery, unless an earlier
 //!   subsystem's test in the same boot left the tables set up.
 //! * **Leak check.** Every reverie-narf test is registered through

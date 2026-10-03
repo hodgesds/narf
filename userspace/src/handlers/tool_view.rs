@@ -81,6 +81,17 @@ pub fn auxv_pairs(pid: u64) -> Vec<(u64, u64)> {
     pairs
 }
 
+/// Kills process `pid` (root namespace) with `SIGKILL`, as `kill(pid,
+/// SIGKILL)` from the kernel: every live thread of the process gets the
+/// signal and is woken. Returns `false` when no such process exists.
+///
+/// A backend uses it to abort the process tree it hosts, as Linux kills a
+/// tracee whose tracer exits with `PTRACE_O_EXITKILL`. It sends no signal to
+/// any process the backend does not name, and leaves the kernel running.
+pub fn kill_process_sigkill(pid: u64) -> bool {
+    super::kill_process(pid, 9)
+}
+
 /// The wait status the kernel will report for process `pid`'s termination,
 /// if one has been staged, without consuming it.
 pub fn pending_termination(pid: u64) -> Option<i32> {

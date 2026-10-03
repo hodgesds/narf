@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_userspace::handlers::tool_view;
@@ -72,6 +73,10 @@ struct Inner<T: Tool> {
     /// Scheduler task id to Linux thread ID of every task the host tracks.
     hosted: IrqSafeSpinLock<BTreeMap<u64, Pid>>,
     exits: IrqSafeSpinLock<Vec<TaskExitRecord>>,
+    /// Set once a contained fatal has aborted the run (see [`FatalKind`]).
+    aborted: AtomicBool,
+    /// The first abort's reason, as logged.
+    abort_reason: IrqSafeSpinLock<Option<String>>,
 }
 
 /// Hosts Tool `T` for one run at Narf's syscall dispatcher.
@@ -111,13 +116,62 @@ const VDSO_SYSCALLS: [Sysno; 4] = [
     Sysno::getcpu,
 ];
 
-/// Stops the run on a fatal host error.
+/// Linux `EINTR`: what a hosted syscall of an aborted run returns. The
+/// task never sees it, because its pending `SIGKILL` is delivered first on
+/// the syscall's return path.
+const LINUX_EINTR: i64 = 4;
+
+/// What a [`NarfFatal`] stops.
 ///
-/// Every [`NarfFatal`] means the core refused to guess what the Tool or the
-/// kernel meant; resuming the task could let it observe a result the Tool did
-/// not produce, so the kernel stops instead.
-fn fatal(context: &str, error: NarfFatal) -> ! {
-    panic!("reverie-narf fatal in {context}: {error:?}")
+/// Every `NarfFatal` means the core refused to guess what the Tool or the
+/// kernel meant, so no hosted task may resume as if nothing had happened.
+/// What a Tool or a guest can cause stops only the hosted process tree; a
+/// broken kernel or host invariant stops the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FatalKind {
+    /// The Tool misbehaved, or the guest drove a Tool into a state the
+    /// backend cannot host. The run is aborted: every hosted process is
+    /// killed with `SIGKILL`, and the kernel keeps running.
+    Contained,
+    /// The kernel or the host broke an invariant, so no state can be
+    /// trusted. The kernel panics.
+    Invariant,
+}
+
+/// Sorts each [`NarfFatal`] into what it stops. The match is exhaustive, so a
+/// new variant must be sorted here before the adapter builds.
+fn fatal_kind(error: &NarfFatal) -> FatalKind {
+    match error {
+        NarfFatal::ToolSuspended
+        | NarfFatal::Tool(_)
+        | NarfFatal::InvalidErrno(_)
+        | NarfFatal::TransitionAfterTerminal
+        | NarfFatal::InjectParked { .. }
+        | NarfFatal::TransitionAfterInterruption
+        | NarfFatal::DaemonizeRefused(_)
+        | NarfFatal::PostExec(_)
+        | NarfFatal::TailInjectOutsideSyscall => FatalKind::Contained,
+        NarfFatal::OriginalAlreadyExecuted
+        | NarfFatal::ContinuationKernelMismatch
+        | NarfFatal::UnexpectedReexecution
+        | NarfFatal::ReexecutionMismatch { .. }
+        | NarfFatal::RecursiveEntry(_)
+        | NarfFatal::UnknownTask(_)
+        | NarfFatal::DuplicateTask(_)
+        | NarfFatal::CreatedTaskMismatch(_)
+        | NarfFatal::ExitDuringCallback(_)
+        | NarfFatal::ProcessToolShared(_)
+        // Refused by `NarfToolHost::new`, before any guest runs.
+        | NarfFatal::UnsupportedSubscription
+        | NarfFatal::UnsupportedThreadOwnership
+        | NarfFatal::UnsupportedSignalDequeues => FatalKind::Invariant,
+    }
+}
+
+/// The result a hosted syscall of an aborted run returns (see
+/// [`LINUX_EINTR`]).
+fn aborted_return() -> SyscallInterception {
+    SyscallInterception::Complete(SyscallReturn::ok((-LINUX_EINTR) as u64))
 }
 
 fn request_of(invocation: &SyscallInvocation) -> NarfSyscallRequest {
@@ -139,8 +193,73 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
                 host: Host::<T>::new(config)?,
                 hosted: IrqSafeSpinLock::new(BTreeMap::new()),
                 exits: IrqSafeSpinLock::new(Vec::new()),
+                aborted: AtomicBool::new(false),
+                abort_reason: IrqSafeSpinLock::new(None),
             }),
         })
+    }
+
+    /// Why the run was aborted, if it was: the reason logged for the first
+    /// contained fatal.
+    pub fn abort_reason(&self) -> Option<String> {
+        self.inner.abort_reason.lock().clone()
+    }
+
+    /// Handles a fatal the host returned for `context`: aborts the run for a
+    /// [`FatalKind::Contained`] one, panics for an invariant violation.
+    fn fatal(&self, context: &str, error: NarfFatal) {
+        match fatal_kind(&error) {
+            FatalKind::Invariant => panic!("reverie-narf fatal in {context}: {error:?}"),
+            FatalKind::Contained => self.abort(context, error),
+        }
+    }
+
+    /// Aborts the run: logs the reason, and kills every hosted process with
+    /// `SIGKILL`, as Linux kills a tracee whose tracer dies. Tasks the host
+    /// adopts later are killed when they next reach the interceptor (see
+    /// [`Self::kill_if_aborted`]). The host keeps tracking every task, so each
+    /// exit still reaches [`NarfToolHost::task_exited`].
+    fn abort(&self, context: &str, error: NarfFatal) {
+        let reason = alloc::format!(
+            "reverie-narf: aborting the hosted process tree after {context}: {error:?}"
+        );
+        let mut line = reason.clone();
+        line.push('\n');
+        narf_console::write_str(&line);
+        {
+            let mut slot = self.inner.abort_reason.lock();
+            if slot.is_none() {
+                *slot = Some(reason);
+            }
+        }
+        self.inner.aborted.store(true, Ordering::Release);
+        // Copy the task ids out first: the identity lookup takes the
+        // kernel's task maps, which must not nest inside `hosted`.
+        let tasks: Vec<u64> = self.inner.hosted.lock().keys().copied().collect();
+        let mut pids: Vec<u64> = tasks
+            .into_iter()
+            .filter_map(|task_id| tool_view::linux_task_ids(task_id).map(|ids| ids.pid))
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        for pid in pids {
+            tool_view::kill_process_sigkill(pid);
+        }
+    }
+
+    /// After an abort, kills hosted task `task_id`'s process and reports
+    /// `true`, so the caller runs nothing of the Tool's for it. This covers a
+    /// task created after the abort's kill, and a task whose own `exit` would
+    /// otherwise still run (the dispatcher never withholds an exit unless
+    /// `SIGKILL` is already pending on the task).
+    fn kill_if_aborted(&self, task_id: u64) -> bool {
+        if !self.inner.aborted.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(ids) = tool_view::linux_task_ids(task_id) {
+            tool_view::kill_process_sigkill(ids.pid);
+        }
+        true
     }
 
     /// Registers the run's root task, which must already have its Linux
@@ -228,6 +347,9 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
         if self.hosted_tid(invocation.task_id).is_none() {
             return SyscallInterception::Continue;
         }
+        if self.kill_if_aborted(invocation.task_id) {
+            return aborted_return();
+        }
         let request = request_of(invocation);
         let entry = if invocation.park_reexecution {
             SyscallEntry::reexecution(request)
@@ -246,31 +368,37 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
             // The transition that took the context already ran through the
             // kernel-owned capability; the dispatcher publishes its outcome.
             Ok(Disposition::ContextManaged) => SyscallInterception::Continue,
-            Err(error) => fatal("handle_syscall", error),
+            Err(error) => {
+                self.fatal("handle_syscall", error);
+                // The task's `SIGKILL` is delivered on this syscall's return
+                // path. If a transition of the callback took the context (a
+                // parked inject, say), the dispatcher keeps that instead.
+                aborted_return()
+            }
         }
     }
 
     fn on_task_start(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
-        if self.hosted_tid(task_id).is_none() {
+        if self.hosted_tid(task_id).is_none() || self.kill_if_aborted(task_id) {
             return;
         }
         let mut kernel = self.services(task_id, native, None);
         let outcome = self.inner.host.handle_thread_start(&mut kernel);
         self.adopt_created(&mut kernel);
         if let Err(error) = outcome {
-            fatal("handle_thread_start", error);
+            self.fatal("handle_thread_start", error);
         }
     }
 
     fn on_task_exec(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
-        if self.hosted_tid(task_id).is_none() {
+        if self.hosted_tid(task_id).is_none() || self.kill_if_aborted(task_id) {
             return;
         }
         let mut kernel = self.services(task_id, native, None);
         let outcome = self.inner.host.handle_post_exec(&mut kernel);
         self.adopt_created(&mut kernel);
         if let Err(error) = outcome {
-            fatal("handle_post_exec", error);
+            self.fatal("handle_post_exec", error);
         }
     }
 
@@ -290,7 +418,7 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
                 process_wstatus,
                 process_exited: exit.process_exited,
             }),
-            Err(error) => fatal("task_exited", error),
+            Err(error) => self.fatal("task_exited", error),
         }
     }
 }
