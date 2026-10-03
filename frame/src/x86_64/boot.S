@@ -230,7 +230,8 @@ _start:
     mov [pml4 + 511 * 8], eax                   /* PML4[511] */
 
     /* PDPT[0..3] = 0..3 GiB | (P | RW | PS) — identity 0..4 GiB.
-     * PDPT[510]  = 0 | (P | RW | PS)         — higher-half = phys 0..1 GiB. */
+     * PDPT[510] is not set here: the slid kernel window below points it at
+     * pd_kernel_lo, whose 2 MiB leaves map phys [0, 1 GiB - slide). */
     mov dword ptr [pdpt + 0 * 8],     0x00000083  /* 0..1 GiB */
     mov dword ptr [pdpt + 1 * 8],     0x40000083  /* 1..2 GiB */
     mov dword ptr [pdpt + 2 * 8],     0x80000083  /* 2..3 GiB */

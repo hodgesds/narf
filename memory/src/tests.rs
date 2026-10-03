@@ -16085,12 +16085,12 @@ kernel_test_in!(
     smoke_kernel_window_does_not_alias_buddy_frames
 );
 
-/// Positive control for the demotion: the AP trampoline window is still
-/// executable, at 4 KiB granularity, and the page just past it is not.
+/// After SMP bring-up and `drop_ap_trampoline_window`, every 4 KiB page of
+/// the AP trampoline window is unmapped, or mapped read-only and
+/// non-executable.
 ///
-/// Without the second half this would pass just as well if the whole first
-/// 2 MiB had been left executable — 256× more RWX than the SIPI vector needs,
-/// at a fixed and famous address.
+/// Not a positive control: nothing here checks that the window was executable
+/// while APs booted, or looks at any page outside the window.
 #[cfg(target_arch = "x86_64")]
 fn smoke_ap_trampoline_window_is_unmapped_after_smp() -> TestResult {
     use crate::mmu::{AP_TRAMPOLINE_EXEC_BASE, AP_TRAMPOLINE_EXEC_LEN};
