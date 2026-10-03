@@ -448,6 +448,12 @@ _start_rust_entry:
  * block, so that block is mapped too — it also holds `.boot`, which is
  * harmless here: this window is never used to execute `.boot`, and the block
  * is PXN|UXN unless it overlaps kernel text.
+ *
+ * Whole blocks mean the window also maps RAM that is not image: the head
+ * 0x4000_0000 .. KERNEL_LOAD_BASE (inside the text block, so RWX here) and the
+ * tail __kernel_end .. page_up_2M(__kernel_end). `bare_main` therefore keeps
+ * `kaslr::image_window_phys_bounds()` — exactly this range — out of the frame
+ * allocator; `aarch64.ld` asserts the fixed start below matches it.
  */
 build_image_l2:
     lsr  x3, x3, #21            /* slide in 2 MiB units -> index offset */

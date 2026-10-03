@@ -129,6 +129,33 @@ pub fn image_phys_bounds() -> (u64, u64) {
     (b[0], b[1])
 }
 
+/// Granule of the kernel image window's leaves: one 2 MiB block/page.
+pub const IMAGE_WINDOW_LEAF: u64 = 1 << 21;
+
+/// Physical span the kernel image window maps: [`image_phys_bounds`] rounded
+/// OUT to [`IMAGE_WINDOW_LEAF`].
+///
+/// The window is built from whole 2 MiB leaves on both arches (`init_mmu` on
+/// x86_64, `build_image_l2` in `frame/src/aarch64/boot.S`), so it maps every
+/// byte of the leaf holding the image's first byte and of the leaf holding
+/// its last, not only the image. The slack is ordinary RAM, and a frame the
+/// buddy owns there has a present, writable kernel alias at
+/// `kernel_virt_base() + phys` — on aarch64 the first block is executable as
+/// well, because it overlaps kernel text.
+///
+/// This is therefore the range the frame allocator must never be given, and
+/// it is what `bare_main` excludes. Excluding only [`image_phys_bounds`] was
+/// the bug: the window and the reservation were derived from the same image
+/// bounds with different rounding.
+#[inline]
+pub fn image_window_phys_bounds() -> (u64, u64) {
+    let (start, end) = image_phys_bounds();
+    (
+        start & !(IMAGE_WINDOW_LEAF - 1),
+        end.next_multiple_of(IMAGE_WINDOW_LEAF),
+    )
+}
+
 /// Physical address of an in-image kernel-virtual address.
 ///
 /// Use this instead of subtracting a hardcoded base: the constant is right

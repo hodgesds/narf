@@ -248,8 +248,12 @@ unsafe fn set_alias_writable(phys: u64, len: u64, writable: bool) -> Result<(), 
 /// Every kernel VA at which `phys` is reachable, derived from the same rules
 /// `init_mmu` builds the windows by rather than from a guess:
 ///
-/// * `KERNEL_VIRT_BASE + phys` — PML4[511]/PDPT[510] aliases phys 0..1 GiB,
-///   which is where a small-RAM boot does all of its buddy allocation.
+/// * `kernel_virt_base() + phys` — PML4[511]/PDPT[510], but only for `phys`
+///   inside `kernel_window_phys_range()`: the image rounded out to 2 MiB.
+///   `bare_main` keeps that range out of the frame allocator, so a buddy- or
+///   hugepage-backed pack is not expected to have this alias; the check is
+///   kept so a regression fails the seal visibly rather than leaving a
+///   writable alias behind.
 /// * `KERNEL_DIRECT_MAP_BASE | phys` — the direct map, once `init_mmu` has
 ///   activated it.
 ///

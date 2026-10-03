@@ -1374,7 +1374,14 @@ pub unsafe extern "C" fn _start_rust(
             // symbols hold physical values, and referencing them from
             // kernel-half code needs a PC-relative page reference across
             // ~512 GiB, which aarch64 ADRP cannot make.
-            let (kstart, kend) = narf_memory::kaslr::image_phys_bounds();
+            //
+            // The WINDOW's bounds, not the image's: the higher-half image
+            // window maps whole 2 MiB leaves, so the slack before the image's
+            // first byte and after its last is mapped present and writable at
+            // `kernel_virt_base() + phys` (and, on aarch64, executable in the
+            // block that overlaps text). Reserving only the image bytes handed
+            // that slack to the buddy with a live kernel alias.
+            let (kstart, kend) = narf_memory::kaslr::image_window_phys_bounds();
 
             let regions: alloc::vec::Vec<narf_memory::UsableRegion> = info
                 .memory_map

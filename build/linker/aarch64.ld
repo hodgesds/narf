@@ -279,3 +279,14 @@ ASSERT(__boot_end <= __text_start - KIMAGE_VOFFSET,
 ASSERT(KIMAGE_VOFFSET + __kernel_end + KASLR_SLIDE_MASK <= MODULE_VA_BASE_LD,
        "linker: image + KASLR_SLIDE_MASK reaches the module window — lower the mask \
 or move MODULE_VA_BASE (and module_text::MODULE_VA_BASE with it)")
+
+/* `build_image_l2` (frame/src/aarch64/boot.S) maps the image window from the
+ * fixed physical address 0x4000_0000 in 2 MiB blocks, and the frame allocator
+ * reserves `kaslr::image_window_phys_bounds()` — the image rounded OUT to
+ * 2 MiB. Those two agree only while the image's first byte lies in the block
+ * that starts at 0x4000_0000; if it moved, the boot map would cover RAM the
+ * reservation no longer protects, re-creating a writable (and, in the text
+ * block, executable) kernel alias of buddy frames. */
+ASSERT((KERNEL_LOAD_BASE & ~0x1FFFFF) == 0x40000000,
+       "linker: KERNEL_LOAD_BASE left the 2 MiB block build_image_l2 maps from \
+— update build_image_l2's start address with it")

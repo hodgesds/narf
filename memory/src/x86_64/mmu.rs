@@ -89,8 +89,9 @@ struct EarlyPageTables {
     /// Demotion of that PD's first 2 MiB into 4-KiB leaves, so the AP
     /// trampoline window can be executable at page granularity.
     pt_lo_0: PageTable,
-    /// Demotion of the higher-half kernel window (phys 0..1 GiB) into
-    /// 2-MiB leaves, so only the kernel's own text stays executable.
+    /// The higher-half kernel image window's PD: 2-MiB leaves over
+    /// `kernel_window_phys_range()`, so only the kernel's own text stays
+    /// executable.
     pd_hi_kernel: PageTable,
     /// PDPT for the FIRST direct-map chunk (physical [0, 512 GiB) at
     /// `KERNEL_DIRECT_MAP_BASE`) — i.e. the whole direct map on every
@@ -197,13 +198,20 @@ const fn overlaps(base: u64, len: u64, lo: u64, hi: u64) -> bool {
     base < hi && lo < base + len
 }
 
-/// How many 2 MiB leaves the kernel window covers: the image, rounded up.
+/// Physical `[start, end)` the kernel window maps: the image rounded out to
+/// 2 MiB leaves ([`crate::kaslr::image_window_phys_bounds`]).
 ///
-/// Clamped to a full PD so a pathologically large image cannot run past the
-/// slot and into the module text window above it.
-pub fn kernel_window_leaves() -> u64 {
-    let end = crate::kaslr::image_phys_bounds().1;
-    (end.next_multiple_of(1 << 21) >> 21).min(512)
+/// It used to be `[0, roundup(image end))`: the loop started at physical 0,
+/// so the window also mapped the 15 MiB between the 1 MiB low reservation and
+/// `KERNEL_LOAD_BASE` (16 MiB) — RAM that `init_from_map` donates to the buddy
+/// — present and writable at `kernel_virt_base() + phys`.
+///
+/// `end` is clamped to one PD (1 GiB) so a pathologically large image cannot
+/// run past the slot and into the module text window above it.
+pub fn kernel_window_phys_range() -> (u64, u64) {
+    let (start, end) = crate::kaslr::image_window_phys_bounds();
+    let end = end.min(1u64 << 30);
+    (start.min(end), end)
 }
 
 /// Whether the kernel window maps `phys`.
@@ -213,7 +221,8 @@ pub fn kernel_window_leaves() -> u64 {
 /// present leaf, which fails the seal — and a failed seal is reported as
 /// "the image could not be mapped".
 pub fn kernel_window_covers(phys: u64) -> bool {
-    phys < (kernel_window_leaves() << 21)
+    let (start, end) = kernel_window_phys_range();
+    (start..end).contains(&phys)
 }
 
 /// True if a leaf covering `[phys, phys + len)` must be executable through the
@@ -334,14 +343,14 @@ fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
 ///     [`identity_leaf_needs_exec`]; the first 1 GiB is demoted to 2-MiB
 ///     leaves and its first 2 MiB again to 4-KiB leaves so those two
 ///     exceptions can be stated at page granularity.
-///   * PML4[511] → a second PDPT whose PDPT[510] maps
-///     `0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_C000_0000` to physical
-///     `0x0..0x4000_0000`. This is the higher-half window the linker
-///     script places `.text/.rodata/.data/.bss` into — the same physical
-///     pages become reachable at both low and high virtual addresses.
-///     Demoted to 2-MiB leaves and NX outside `[__kernel_start,
-///     __text_end)`, because a 1-GiB RWX block here aliases the whole of
-///     a small machine's buddy arena and would undo the identity map's NX.
+///   * PML4[511] → a second PDPT whose PDPT[510] is the higher-half kernel
+///     image window the linker script places `.text/.rodata/.data/.bss`
+///     into: `kernel_virt_base() + P` for P in [`kernel_window_phys_range`]
+///     — the image rounded out to 2 MiB leaves, and nothing else. NX
+///     outside `[__kernel_start, __text_end)`. `bare_main` keeps that whole
+///     range out of the frame allocator, so no buddy frame has an alias
+///     here; it once mapped all of physical `0..1 GiB`, and then
+///     `0..roundup(image end)`, both of which aliased buddy RAM.
 ///
 ///   * PML4[384 + i] → the high-half **kernel direct map**: one PDPT
 ///     per 512 GiB of installed RAM (`max_ram_phys`), each mapping
@@ -558,8 +567,9 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             write_identity::<PageTableEntry>(slot, entry);
         }
 
-        // High-half PML4[511] + PDPT[510] → phys 0..1 GiB.
-        // Virtual 0xFFFF_FFFF_8000_0000 + x maps to physical 0 + x.
+        // High-half PML4[511] + PDPT[510] → the kernel image window.
+        // Virtual `kernel_virt_base() + x` maps to physical `x`, for `x` in
+        // `kernel_window_phys_range()` only (see the loop below).
         let pml4_hi_entry = PageTableEntry::new(pdpt_hi_addr, flags_ptr);
         let pml4_hi_slot = PhysAddr::new(pml4_addr.raw() + (HIGHER_HALF_PML4_INDEX as u64) * 8);
         write_identity::<PageTableEntry>(pml4_hi_slot, pml4_hi_entry);
@@ -585,8 +595,7 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // would extend into PDPT[511], which is the module text window — and
         // an overlap there kills the boot at this exact CR3 load with no
         // output, because the fault handler disappears along with everything
-        // else. The alias therefore covers phys [0, 1 GiB - slide); the top
-        // `slide` bytes are reachable through the direct map instead.
+        // else. The `pd_index >= 512` guard below enforces the clamp.
         let slide = crate::kaslr::KERNEL_SLIDE.load(core::sync::atomic::Ordering::Relaxed);
         write_identity::<PageTableEntry>(
             PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8),
@@ -608,8 +617,16 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // the window no longer has to be both the image's home and a fixed
         // alias of the first GiB, which is a pair of requirements no single
         // 1 GiB PD can satisfy at once.
-        for two_mb in 0u64..kernel_window_leaves() {
-            let phys = two_mb << 21;
+        //
+        // The image, and not physical 0 up to its end. This loop used to run
+        // `0..roundup(image end)`, which re-created a smaller version of the
+        // same alias: everything between the 1 MiB low reservation and
+        // `KERNEL_LOAD_BASE` is buddy RAM, and it was mapped present and
+        // writable here. `kernel_window_phys_range` is the image rounded out
+        // to whole 2 MiB leaves, and `bare_main` reserves exactly that range
+        // from the frame allocator, so the leaves' slack is never handed out.
+        let (window_start, window_end) = kernel_window_phys_range();
+        for phys in (window_start..window_end).step_by(1 << 21) {
             let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
             if !kernel_window_leaf_needs_exec(phys, 1 << 21) {
                 flags |= PtFlags::NO_EXEC;
