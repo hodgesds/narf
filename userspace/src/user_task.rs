@@ -1486,15 +1486,30 @@ pub fn register_process_exit_observer(o: ExitObserver) {
 /// `signal->live`). Must be called EXACTLY ONCE per task exit, or the
 /// count under/over-shoots.
 pub fn notify_task_exited(pid: u64, tid: u64) {
+    // With no group exit, the process's wait status is its last thread's own
+    // exit code. A thread that finds itself the only live one is exactly the
+    // last (no sibling is left to clone), so it stages its code here, where
+    // the thread observers and the interceptor see it; two threads exiting
+    // together both miss this, and the one whose decrement ends the group
+    // stages its code below instead.
+    let own = crate::handlers::take_thread_exit(tid);
+    if let Some(status) = own {
+        if crate::handlers::thread_group_live_count(pid) <= 1 {
+            crate::handlers::stage_last_thread_exit(pid, status);
+        }
+    }
     // The interceptor hears of the exit first, while the group's live count
     // and the staged termination status still describe this exit.
-    crate::syscall::notify_interceptor_task_exit(tid, pid);
+    crate::syscall::notify_interceptor_task_exit(tid, pid, own);
     let thread = THREAD_EXIT_OBSERVERS.lock().clone();
     for o in thread.iter() {
         o(pid, tid);
     }
     let (group_dead, was_multithreaded) = crate::handlers::thread_group_live_dec_state(pid);
     if group_dead {
+        if let Some(status) = own {
+            crate::handlers::stage_last_thread_exit(pid, status);
+        }
         let process = PROCESS_EXIT_OBSERVERS.lock().clone();
         for o in process.iter() {
             o(pid, tid);

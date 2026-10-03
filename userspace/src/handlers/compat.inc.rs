@@ -13599,6 +13599,7 @@ pub(crate) use {
     handler_sys_execve::sys_execve,
     handler_sys_execveat::sys_execveat,
     handler_sys_exit_group::sys_exit_group,
+    handler_sys_exit_task::exit_current_task,
     handler_sys_exit_task::sys_exit_task,
     handler_sys_fadvise64::sys_fadvise64,
     handler_sys_fallocate::sys_fallocate,

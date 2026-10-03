@@ -2,6 +2,15 @@
 use super::*;
 
 pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
+    exit_current_task(ctx, false);
+}
+
+/// Ends the calling thread with the code in arg0. `group` is true for
+/// `exit_group`, whose code becomes the process's wait status (the first
+/// group exit wins). A thread's `exit` records only its own status; if it is
+/// the group's last thread, `notify_task_exited` stages that as the
+/// process's status.
+pub(crate) fn exit_current_task(ctx: &mut dyn TrapContext, group: bool) {
     let exit_code = ctx.args().arg0 as u32;
     let wstatus = (exit_code & 0xff) << 8;
     let tid = current_task_id();
@@ -20,7 +29,15 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
             wstatus
         );
     }
-    stage_pending_termination(pid, wstatus as i32);
+    stage_thread_exit(tid, wstatus as i32);
+    if group {
+        stage_pending_termination(pid, wstatus as i32);
+    } else {
+        // A CLONE_VFORK child that exits without exec'ing releases its
+        // parent (see `stage_pending_termination`).
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        vfork_child_release(pid);
+    }
     // Robust-futex owner-died walk — in-task context, before teardown
     // (see terminate_current_task).
     robust_list_exit_walk(tid);

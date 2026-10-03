@@ -10882,10 +10882,19 @@ pub fn deliver_pending_stop(ctx: &mut dyn TrapContext, _syscall_no: u32) -> bool
 /// pushes the encoded status into PENDING_EXITS so wait4 sees
 /// `WIFSIGNALED + WTERMSIG(signum)`.
 ///
-/// Absent entry → on_child_exit records `0` (normal exit), which is
-/// what sys_exit_task callers want today (exit-code threading is a
-/// separate follow-on).
+/// It holds the process's wait status as Linux computes it: the first
+/// group exit (`exit_group`, a fatal signal, a kill) wins; with none, the
+/// last thread's own `exit` code, which `notify_task_exited` stages when
+/// that thread exits (Linux's `synchronize_group_exit`). Absent entry →
+/// on_child_exit records `0`.
 static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// task id → the wait status of the thread's own exit: its `exit` or
+/// `exit_group` code. A thread ended by its group's exit or by a signal has
+/// no entry and reports its group's status. Staged in `sys_exit_task`, taken
+/// by `notify_task_exited`, swept by `release_task_tables`.
+static THREAD_EXIT_STATUS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn wait_init() {
@@ -10896,6 +10905,7 @@ pub fn wait_init() {
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
+    *THREAD_EXIT_STATUS.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     // THREAD-scoped (every thread exit): release this thread's fd-table
     // ref + job-control state, then sweep its per-task tables and
@@ -11014,6 +11024,7 @@ pub fn __test_wait_reset() {
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
+    *THREAD_EXIT_STATUS.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::__test_wait_child_waker_reset();
 }
@@ -11027,12 +11038,11 @@ pub fn encode_signaled_status(signum: u32, core_dumped: bool) -> i32 {
     lo | core
 }
 
-/// Stage a signal-induced termination status for `task`. The exit
-/// observer drains this when the task transitions to Exited and
-/// uses it as the wstatus reported to wait4. Idempotent: if a
-/// status is already staged (e.g. SIGSEGV racing SIGTERM), the
-/// first one wins — that's the signal that actually killed the
-/// task.
+/// Stage a group termination status (`exit_group`, a fatal signal, a kill)
+/// for process `task`. The exit observer drains this when the process
+/// transitions to Exited and uses it as the wstatus reported to wait4.
+/// Idempotent: if a status is already staged (e.g. SIGSEGV racing SIGTERM),
+/// the first one wins — that's the exit that actually killed the group.
 pub fn stage_pending_termination(task: u64, status: i32) {
     // A CLONE_VFORK child that exits WITHOUT exec'ing (e.g. posix_spawn's child
     // _exit on exec failure, or a kill) must still release the parent suspended
@@ -11045,6 +11055,31 @@ pub fn stage_pending_termination(task: u64, status: i32) {
     if let Some(m) = g.as_mut() {
         m.entry(task).or_insert(status);
     }
+}
+
+/// Stage the last thread's own exit status as process `pid`'s wait status,
+/// unless a group exit already staged one: with no group exit, Linux reports
+/// the status of the thread that exits last (`synchronize_group_exit`).
+pub(crate) fn stage_last_thread_exit(pid: u64, status: i32) {
+    if let Some(m) = PENDING_TERMINATION.lock().as_mut() {
+        m.entry(pid).or_insert(status);
+    }
+}
+
+/// Record the wait status of thread `tid`'s own `exit` or `exit_group`.
+pub(crate) fn stage_thread_exit(tid: u64, status: i32) {
+    if let Some(m) = THREAD_EXIT_STATUS.lock().as_mut() {
+        m.insert(tid, status);
+    }
+}
+
+/// Take the wait status of thread `tid`'s own `exit` or `exit_group`, if it
+/// made one; a thread ended by its group's exit or by a signal has none.
+pub(crate) fn take_thread_exit(tid: u64) -> Option<i32> {
+    THREAD_EXIT_STATUS
+        .lock()
+        .as_mut()
+        .and_then(|m| m.remove(&tid))
 }
 
 /// The wait status staged for `pid` by [`stage_pending_termination`], without
@@ -11748,6 +11783,9 @@ fn release_task_tables(tid: u64) {
     // copy that escaped this table fails its next `check_live` — the grant
     // cannot outlive the task that was given it.
     narf_memory::wx::revoke_jit(tid);
+    if let Some(m) = THREAD_EXIT_STATUS.lock().as_mut() {
+        m.remove(&tid);
+    }
     // Signal state.
     pending_signal_bits_remove(tid);
     signal_bits_remove(&SIGNAL_READABLE_GEN, tid);

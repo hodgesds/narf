@@ -28,6 +28,11 @@ pub(crate) fn sys_exit_group(ctx: &mut dyn TrapContext) {
             );
         }
     }
+    // The group's status is staged before its siblings are sent SIGKILL, so
+    // a sibling that dies first cannot stage SIGKILL as the process's status
+    // (the first group exit wins); each zapped sibling reports this code, as
+    // Linux's zapped threads exit with `group_exit_code`.
+    stage_pending_termination(pid, (((ctx.args().arg0 as u32) & 0xff) << 8) as i32);
     zap_thread_group(tid, pid);
-    sys_exit_task(ctx);
+    exit_current_task(ctx, true);
 }

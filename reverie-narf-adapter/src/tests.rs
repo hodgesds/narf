@@ -43,6 +43,7 @@ static RING_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RING"));
 static BADFRAME_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_BADFRAME"));
 static REAPER_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_REAPER"));
 static VDSO_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_VDSO"));
+static MTEXIT_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_MTEXIT"));
 
 /// The single argument every guest is started with, as Linux starts a program
 /// with `argv[0]`. A non-empty argv makes the loader lay out the full SysV
@@ -777,7 +778,7 @@ impl SyscallInterceptor for ServicesProbe {
         SyscallInterception::Continue
     }
 
-    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32) {
+    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32, _process_wstatus: i32) {
         if task_id == PROBE_TASK.load(Ordering::Acquire) {
             PROBE_EXIT.store(i64::from(wstatus), Ordering::Release);
         }
@@ -1199,8 +1200,9 @@ impl SyscallInterceptor for ParkWatch {
         self.inner.on_task_exec(task_id, native);
     }
 
-    fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32) {
-        self.inner.on_task_exit(task_id, pid, wstatus);
+    fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32, process_wstatus: i32) {
+        self.inner
+            .on_task_exit(task_id, pid, wstatus, process_wstatus);
     }
 }
 
@@ -1745,7 +1747,7 @@ impl SyscallInterceptor for BadFrameProbe {
         SyscallInterception::Continue
     }
 
-    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32) {
+    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32, _process_wstatus: i32) {
         if task_id != 0 && task_id == BADFRAME_CHILD.load(Ordering::Acquire) {
             BADFRAME_CHILD_WSTATUS.store(i64::from(wstatus), Ordering::Release);
         }
@@ -2156,6 +2158,133 @@ fn reverie_narf_vdso_calls_reach_the_tool() -> TestResult {
     })())
 }
 kernel_test_in!("reverie-narf", reverie_narf_vdso_calls_reach_the_tool);
+
+// ── Thread and process exit statuses ─────────────────────────────────────
+
+/// Every exit hook [`ExitStatuses`] saw: `(is_thread, tid or pid, raw wait
+/// status)`, in the order the host delivered them.
+static EXIT_STATUS_LOG: IrqSafeSpinLock<Vec<(bool, i32, i32)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Records the status each `on_exit_thread` and `on_exit_process` receives
+/// and runs every syscall unchanged.
+#[derive(Debug, Default, Clone, Copy)]
+struct ExitStatuses;
+
+#[reverie::tool]
+impl Tool for ExitStatuses {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        tid: Pid,
+        _global_state: &G,
+        _thread_state: Self::ThreadState,
+        exit_status: reverie::ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        EXIT_STATUS_LOG
+            .lock()
+            .push((true, tid.as_raw(), exit_status.into_raw()));
+        Ok(())
+    }
+
+    async fn on_exit_process<G: reverie::GlobalRPC<Self::GlobalState>>(
+        self,
+        pid: Pid,
+        _global_state: &G,
+        exit_status: reverie::ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        EXIT_STATUS_LOG
+            .lock()
+            .push((false, pid.as_raw(), exit_status.into_raw()));
+        Ok(())
+    }
+}
+
+/// `on_exit_thread` receives the thread's own exit status and
+/// `on_exit_process` the status `wait4` reports for the process, as
+/// reverie-ptrace delivers them (each thread's own `waitpid` status, and the
+/// leader's for the process). The guest (`guests/mtexit_x86_64.S`) forks a
+/// child whose leader calls `exit(3)` before its thread calls `exit(5)`, so
+/// the child's status is 5, the last thread's code (the parent checks this
+/// with `wait4`); then the root's thread calls `exit(6)` before the root calls
+/// `exit_group(7)`, so the root process's status is 7.
+fn reverie_narf_thread_and_process_exit_statuses() -> TestResult {
+    EXIT_STATUS_LOG.lock().clear();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<ExitStatuses>(MTEXIT_GUEST, ())?;
+        let log = EXIT_STATUS_LOG.lock().clone();
+        for (thread, id, status) in &log {
+            let kind = if *thread { "thread" } else { "process" };
+            let _ = writeln!(Writer, "    on_exit_{kind} {id} status {status:#x}");
+        }
+        let root_pid = root.pid as i32;
+        let exits = check_teardown(&interceptor, root, 4, 0x700)?;
+        let threads: Vec<(usize, i32, i32)> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, (thread, _, _))| *thread)
+            .map(|(at, (_, id, status))| (at, *id, *status))
+            .collect();
+        let processes: Vec<(usize, i32, i32)> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, (thread, _, _))| !*thread)
+            .map(|(at, (_, id, status))| (at, *id, *status))
+            .collect();
+        if threads.len() != 4 || processes.len() != 2 {
+            return Err("the Tool did not see four thread exits and two process exits");
+        }
+        let thread_with = |status: i32| threads.iter().find(|entry| entry.2 == status).copied();
+        let (Some(child_leader), Some(child_thread), Some(root_thread), Some(root_leader)) = (
+            thread_with(0x300),
+            thread_with(0x500),
+            thread_with(0x600),
+            thread_with(0x700),
+        ) else {
+            return Err("a thread's on_exit_thread did not carry its own exit code");
+        };
+        if root_leader.1 != root_pid {
+            return Err("the root's exit_group(7) reached a thread other than the root");
+        }
+        let Some(child_process) = processes.iter().find(|entry| entry.1 == child_leader.1) else {
+            return Err("the child process's exit never reached on_exit_process");
+        };
+        if child_process.2 != 0x500 {
+            return Err(
+                "on_exit_process did not carry the child's wait4 status (its last thread's 5)",
+            );
+        }
+        let Some(root_process) = processes.iter().find(|entry| entry.1 == root_pid) else {
+            return Err("the root process's exit never reached on_exit_process");
+        };
+        if root_process.2 != 0x700 {
+            return Err("on_exit_process did not carry the root's exit_group status");
+        }
+        if child_process.0 < child_leader.0.max(child_thread.0)
+            || root_process.0 < root_thread.0.max(root_leader.0)
+        {
+            return Err("a process's exit reached the Tool before one of its threads' exits");
+        }
+        // The interceptor's records bind the same (tid, status) pairs the
+        // Tool saw; Linux tids are reused once reaped, so compare as sets.
+        let mut recorded: Vec<(i32, i32)> = exits
+            .iter()
+            .map(|exit| (exit.tid.as_raw(), exit.wstatus))
+            .collect();
+        let mut seen: Vec<(i32, i32)> = threads.iter().map(|entry| (entry.1, entry.2)).collect();
+        recorded.sort_unstable();
+        seen.sort_unstable();
+        if recorded != seen {
+            return Err("the interceptor recorded thread statuses the Tool did not see");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_thread_and_process_exit_statuses
+);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 

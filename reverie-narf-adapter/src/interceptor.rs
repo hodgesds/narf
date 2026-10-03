@@ -55,8 +55,11 @@ pub struct TaskExitRecord {
     pub task_id: u64,
     /// Root-namespace Linux thread ID.
     pub tid: Pid,
-    /// The `wait4` status the kernel reported.
+    /// The thread's own wait status, as the kernel reported it.
     pub wstatus: i32,
+    /// The process's `wait4` status as staged when the thread exited; final
+    /// for its last thread.
+    pub process_wstatus: i32,
     /// Whether this was its process's last thread.
     pub process_exited: bool,
 }
@@ -271,19 +274,20 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
         }
     }
 
-    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32) {
+    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32, process_wstatus: i32) {
         let Some(tid) = self.inner.hosted.lock().remove(&task_id) else {
             return;
         };
-        match self
-            .inner
-            .host
-            .task_exited(tid, ExitStatus::from_raw(wstatus))
-        {
+        match self.inner.host.task_exited(
+            tid,
+            ExitStatus::from_raw(wstatus),
+            ExitStatus::from_raw(process_wstatus),
+        ) {
             Ok(exit) => self.inner.exits.lock().push(TaskExitRecord {
                 task_id,
                 tid,
                 wstatus,
+                process_wstatus,
                 process_exited: exit.process_exited,
             }),
             Err(error) => fatal("task_exited", error),

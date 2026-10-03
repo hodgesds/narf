@@ -321,9 +321,17 @@ pub trait SyscallInterceptor: Send + Sync {
 
     /// Called exactly once when task `task_id` of process `pid` has finished,
     /// before the kernel's exit observers tear down its state, and never while
-    /// an interceptor callback for that task is running. `wstatus` is the
-    /// `wait4` status the kernel will report for the task.
-    fn on_task_exit(&self, _task_id: u64, _pid: u64, _wstatus: i32) {}
+    /// an interceptor callback for that task is running.
+    ///
+    /// `wstatus` is the thread's own wait status: the code of its own `exit`
+    /// or `exit_group`, or, for a thread ended by its group's exit or by a
+    /// signal, the group's status. `process_wstatus` is the status `wait4`
+    /// will report for process `pid` if this thread is the group's last: the
+    /// first group exit's status, else this thread's own. For a thread that
+    /// is not the last it is provisional. The two differ when a thread calls
+    /// `exit(5)` before the leader's `exit_group(7)`: 5 and then 7 for the
+    /// leader and the process.
+    fn on_task_exit(&self, _task_id: u64, _pid: u64, _wstatus: i32, _process_wstatus: i32) {}
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3999,11 +4007,15 @@ pub(crate) fn notify_interceptor_task_exec(task_id: u64) {
 }
 
 /// Announces task `task_id`'s exit to the installed interceptor, if any.
-pub(crate) fn notify_interceptor_task_exit(task_id: u64, pid: u64) {
+/// `own` is the wait status of the task's own `exit` or `exit_group`, if it
+/// made one.
+pub(crate) fn notify_interceptor_task_exit(task_id: u64, pid: u64, own: Option<i32>) {
     if let Some((_, interceptor)) = installed_interceptor() {
         PARK_RECORDS.lock().remove(&task_id);
-        let wstatus = crate::handlers::peek_pending_termination(pid).unwrap_or(0);
-        interceptor.on_task_exit(task_id, pid, wstatus);
+        let staged = crate::handlers::peek_pending_termination(pid);
+        let wstatus = own.or(staged).unwrap_or(0);
+        let process_wstatus = staged.or(own).unwrap_or(0);
+        interceptor.on_task_exit(task_id, pid, wstatus, process_wstatus);
     }
 }
 
