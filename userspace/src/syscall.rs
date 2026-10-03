@@ -23,6 +23,7 @@
 //! Unregistered numbers surface `NarfStatus::InvalidOp` (value =
 //! 1 on the wire — `InvalidOp` discriminant in `abi::NarfStatus`).
 
+use crate::instruction::InstructionDispatchError;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -281,6 +282,18 @@ pub trait NativeSyscallTransition {
     /// stays pending until the callback has returned.
     fn wait_for_repoll(&mut self) -> NativeRepollWait {
         NativeRepollWait::Unsupported
+    }
+
+    /// Whether the task is already dead in all but name: `SIGKILL` is pending
+    /// on it (its own `kill`, a signal from elsewhere, or a sibling's
+    /// `exit_group`), or a transition staged its `SIGKILL` termination. Once
+    /// `true`, it stays `true` for the rest of the callback.
+    ///
+    /// Only the capability lent to
+    /// [`InstructionInterceptor::on_instruction_deferred`](crate::InstructionInterceptor::on_instruction_deferred)
+    /// answers. The syscall and lifecycle capabilities answer `false`.
+    fn task_killed(&self) -> bool {
+        false
     }
 }
 
@@ -3860,18 +3873,57 @@ fn callback_task_killed(task_id: u64) -> bool {
         || crate::user_task::staged_termination_signal(task_id) == Some(9)
 }
 
-/// Switches the user task running an interceptor callback out to the
-/// executor, which runs it again after its peers. Returns whether it did.
+/// The signal gate of a transition that task `task_id`'s interceptor callback
+/// requests (see [`DispatchNativeTransition::signal_gate`]). Sets
+/// `context_managed` when the task is killed.
+fn callback_signal_gate(
+    task_id: u64,
+    variant: Option<Syscall>,
+    context_managed: &mut bool,
+) -> Option<NativeSyscallOutcome> {
+    if callback_task_killed(task_id) {
+        *context_managed = true;
+        return Some(NativeSyscallOutcome::ContextManaged);
+    }
+    if ends_task_context(variant) {
+        return None;
+    }
+    let bit = crate::handlers::withhold_terminating_signal(task_id)?;
+    if !crate::user_task::withhold_signal(task_id, bit) {
+        // No open hold to restore it from: leave the signal pending.
+        crate::handlers::restore_withheld_signals(task_id, bit);
+        return None;
+    }
+    Some(NativeSyscallOutcome::Returned(crate::errno::to_ret(
+        crate::errno::ERESTARTSYS,
+    )))
+}
+
+/// Whether the user task running an interceptor callback can be switched out
+/// to the executor, which runs it again after its peers.
 ///
 /// Only in the own-stack model, where the syscall runs on the task's own
 /// kernel stack: the callback's frame then stays in place while the task is
 /// switched out, as it does when an injected syscall parks
 /// (`own_stack_block`), and may resume on another CPU.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn yield_callback_task() -> bool {
+fn callback_can_switch_out() -> bool {
     narf_scheduler::stackful::user_own_stack_enabled()
         && crate::user_task::current_user_task().is_some()
-        && narf_scheduler::cooperative_yield()
+}
+
+/// No architecture without the own-stack model can switch a callback out.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn callback_can_switch_out() -> bool {
+    false
+}
+
+/// Switches the user task running an interceptor callback out to the
+/// executor, which runs it again after its peers. Returns whether it did.
+/// See [`callback_can_switch_out`].
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn yield_callback_task() -> bool {
+    callback_can_switch_out() && narf_scheduler::cooperative_yield()
 }
 
 /// No architecture without the own-stack model can switch a callback out.
@@ -3911,22 +3963,7 @@ impl DispatchNativeTransition<'_, '_> {
     /// the signal still pending, and one that succeeds replaces the image
     /// after the callback, unless the signal terminates the task first.
     fn signal_gate(&mut self, variant: Option<Syscall>) -> Option<NativeSyscallOutcome> {
-        if callback_task_killed(self.task_id) {
-            self.context_managed = true;
-            return Some(NativeSyscallOutcome::ContextManaged);
-        }
-        if ends_task_context(variant) {
-            return None;
-        }
-        let bit = crate::handlers::withhold_terminating_signal(self.task_id)?;
-        if !crate::user_task::withhold_signal(self.task_id, bit) {
-            // No open hold to restore it from: leave the signal pending.
-            crate::handlers::restore_withheld_signals(self.task_id, bit);
-            return None;
-        }
-        Some(NativeSyscallOutcome::Returned(crate::errno::to_ret(
-            crate::errno::ERESTARTSYS,
-        )))
+        callback_signal_gate(self.task_id, variant, &mut self.context_managed)
     }
 
     /// Runs one transition the interceptor's callback requested, through
@@ -4061,6 +4098,151 @@ impl NativeSyscallTransition for LifecycleTransition<'_> {
     }
 }
 
+/// Native capability lent to a deferred instruction callback
+/// ([`crate::InstructionInterceptor::on_instruction_deferred`]), which has no
+/// intercepted syscall and no syscall frame: the trap frame belongs to the
+/// instruction. Its injects run as a lifecycle callback's do, on a context
+/// that carries only their arguments, behind the same signal gate and
+/// killed-task check as a syscall callback's (see
+/// [`DispatchNativeTransition::signal_gate`]).
+struct InstructionTransition<'table> {
+    table: Option<&'table SyscallTable>,
+    context_managed: bool,
+    task_id: u64,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    entry_state: Option<narf_scheduler::UserState>,
+}
+
+impl NativeSyscallTransition for InstructionTransition<'_> {
+    fn execute_original(&mut self) -> Result<NativeSyscallOutcome, NativeSyscallOriginalError> {
+        Err(NativeSyscallOriginalError::AlreadyExecuted)
+    }
+
+    fn execute_injected(&mut self, request: NativeSyscallRequest) -> NativeSyscallOutcome {
+        if self.context_managed {
+            return NativeSyscallOutcome::ContextManaged;
+        }
+        let version = syscall_version(request.raw_number);
+        let variant = Syscall::from_raw(syscall_number(request.raw_number));
+        if let Some(outcome) =
+            callback_signal_gate(self.task_id, variant, &mut self.context_managed)
+        {
+            return outcome;
+        }
+        let Some(table) = self.table else {
+            return NativeSyscallOutcome::Returned(SyscallReturn::not_implemented());
+        };
+        if ends_task_context(variant) || creates_task(variant) {
+            // No syscall frame exists to exit from or exec into, and none for
+            // a new task to start from: refuse without running anything.
+            return NativeSyscallOutcome::Returned(SyscallReturn::not_implemented());
+        }
+        let mut ctx = ArgsOnlyCtx::new(request.args, core::ptr::null_mut());
+        let mut capture = InterceptCtx::new(&mut ctx, request.args);
+        table.dispatch_native(variant, version, &mut capture);
+        let outcome = match capture.result {
+            Some(result) => NativeSyscallOutcome::Returned(result),
+            None => NativeSyscallOutcome::ContextManaged,
+        };
+        // A transition that killed its own task (`kill(getpid(), SIGKILL)`)
+        // never returns to the callback, as in `run_gated`.
+        if outcome == NativeSyscallOutcome::ContextManaged || callback_task_killed(self.task_id) {
+            self.context_managed = true;
+            return NativeSyscallOutcome::ContextManaged;
+        }
+        outcome
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn entry_user_state(&self) -> Option<narf_scheduler::UserState> {
+        self.entry_state
+    }
+
+    /// As [`DispatchNativeTransition`]'s: a kill pending once the task runs
+    /// again takes the task's context.
+    fn wait_for_repoll(&mut self) -> NativeRepollWait {
+        if !yield_callback_task() {
+            return NativeRepollWait::Unsupported;
+        }
+        if callback_task_killed(self.task_id) {
+            self.context_managed = true;
+            return NativeRepollWait::Killed;
+        }
+        NativeRepollWait::Yielded
+    }
+
+    fn task_killed(&self) -> bool {
+        callback_task_killed(self.task_id)
+    }
+}
+
+/// Runs `callback`, the deferred instruction callback of task `task_id`
+/// ([`crate::InstructionInterceptor::on_instruction_deferred`]), with an
+/// [`InstructionTransition`], and returns its answer with whether a
+/// transition took the task's context.
+///
+/// `ctx` is the context of the trap on the instruction. The callback never
+/// sees it: the kernel saves the task's registers from it for
+/// [`NativeSyscallTransition::entry_user_state`], and runs through it
+/// whatever the task's spawn hold deferred to the callback's return, as
+/// [`SyscallTable::dispatch_intercepted`] does. A staged termination does not
+/// return in the own-stack model; where it does, the context counts as taken.
+///
+/// Fails with [`InstructionDispatchError::DeferUnsupported`] unless the task
+/// can be switched out (see [`callback_can_switch_out`]), and with
+/// [`InstructionDispatchError::Reentrant`] if the task already holds a spawn
+/// hold, which no trap from user mode can do.
+pub(crate) fn run_instruction_callback<R>(
+    ctx: &mut dyn TrapContext,
+    task_id: u64,
+    callback: impl FnOnce(&mut dyn NativeSyscallTransition) -> R,
+) -> Result<(R, bool), InstructionDispatchError> {
+    if !callback_can_switch_out() {
+        return Err(InstructionDispatchError::DeferUnsupported);
+    }
+    let Some(hold) = crate::user_task::SpawnHold::try_open(task_id) else {
+        return Err(InstructionDispatchError::Reentrant);
+    };
+    // An instruction delivered between a syscall's park and its re-execution
+    // ends that park: the syscall's next entry is a new one, as it is for a
+    // host that drops its own record of the park here.
+    PARK_RECORDS.lock().remove(&task_id);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let entry_state = {
+        let mut state = narf_scheduler::UserState::default();
+        // SAFETY: `state` is a live, exclusively borrowed `UserState`, the
+        // exact layout `save_user_state` writes.
+        let saved =
+            unsafe { ctx.save_user_state(&mut state as *mut narf_scheduler::UserState as *mut u8) };
+        saved.then_some(state)
+    };
+    let mut native = InstructionTransition {
+        table: installed_table(),
+        context_managed: false,
+        task_id,
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        entry_state,
+    };
+    let value = callback(&mut native);
+    let context_managed = native.context_managed;
+    let released = hold.release();
+    if released.termination.is_none() {
+        crate::handlers::restore_withheld_signals(task_id, released.withheld);
+    }
+    if let Some((signum, core_dumped)) = released.termination {
+        crate::handlers::terminate_current_task(ctx, task_id, signum, core_dumped);
+        return Ok((value, true));
+    }
+    let vfork_wait = released.vfork_wait;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some((child_pid, parent_pid)) = vfork_wait {
+        crate::handlers::vfork_parent_wait(ctx, child_pid, parent_pid);
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = vfork_wait;
+    Ok((value, context_managed))
+}
+
 /// Width of the syscall instruction a park-to-re-execute handler rewinds over.
 #[cfg(target_arch = "aarch64")]
 const SYSCALL_INSN_LEN: u64 = 4;
@@ -4100,15 +4282,42 @@ fn take_park_reexecution(task_id: u64, raw_number: u32, args: &SyscallArgs, ip: 
     }
 }
 
-/// The installed table and its interceptor, if any.
-fn installed_interceptor() -> Option<(&'static SyscallTable, &'static dyn SyscallInterceptor)> {
+/// Records that task `task_id` parked syscall `raw_number` with `args`,
+/// entered at `instruction_pointer`, as an intercepted syscall that parked to
+/// re-execute does. A verification test seeds the record this way to observe
+/// which events end the park.
+#[cfg(feature = "verification-test-reset")]
+#[doc(hidden)]
+pub fn __verification_record_park(
+    task_id: u64,
+    instruction_pointer: u64,
+    raw_number: u32,
+    args: SyscallArgs,
+) {
+    PARK_RECORDS.lock().insert(
+        task_id,
+        ParkRecord {
+            instruction_pointer,
+            raw_number,
+            args: args_array(&args),
+        },
+    );
+}
+
+/// The installed table, if any.
+fn installed_table() -> Option<&'static SyscallTable> {
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
         return None;
     }
     // SAFETY: `p` was published by `install_global` from a leaked Box and is
     // never freed while installed; see `kernel_syscall_entry`.
-    let table: &'static SyscallTable = unsafe { &*p };
+    Some(unsafe { &*p })
+}
+
+/// The installed table and its interceptor, if any.
+fn installed_interceptor() -> Option<(&'static SyscallTable, &'static dyn SyscallInterceptor)> {
+    let table = installed_table()?;
     let interceptor = table.interceptor.as_deref()?;
     Some((table, interceptor))
 }

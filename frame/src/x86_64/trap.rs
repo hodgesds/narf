@@ -1462,51 +1462,47 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                     narf_userspace::InstructionResult::Rdtsc { value }
                 }
             };
-            let result = match narf_userspace::dispatch_instruction(instruction, frame.rip, native)
-            {
-                Ok(Some(result)) => result,
+            match narf_userspace::dispatch_instruction(instruction, frame.rip, native) {
+                Ok(narf_userspace::InstructionDispatch::Completed(result)) => {
+                    write_instruction_result(frame, instruction, result);
+                    frame.rip = frame.rip.wrapping_add(length);
+                }
                 // NARF never disables the user TSC (PR_GET_TSC reports
                 // PR_TSC_ENABLE), so a trapped family that no interceptor
                 // subscribes completes natively without entering the tool.
                 // CR4.TSD cannot trap RDTSC and RDTSCP separately.
-                Ok(None) => native(),
-                Err(error) => {
-                    let _ = writeln!(
-                        TrapWriter,
-                        "instruction interceptor failed closed at rip={:#x}: {:?}",
-                        frame.rip, error
-                    );
-                    panic!("instruction interceptor failed closed");
+                Ok(narf_userspace::InstructionDispatch::Unsubscribed) => {
+                    write_instruction_result(frame, instruction, native());
+                    frame.rip = frame.rip.wrapping_add(length);
                 }
-            };
-            match (instruction, result) {
-                (
-                    narf_userspace::NondeterministicInstruction::Rdtsc,
-                    narf_userspace::InstructionResult::Rdtsc { value },
-                ) => {
-                    frame.rax = value as u32 as u64;
-                    frame.rdx = (value >> 32) as u32 as u64;
+                // The deferred callback runs here, on the task's own kernel
+                // stack (#GP has no IST), with IRQs still masked: the int 0x80
+                // syscall path runs interceptor callbacks masked too. It may
+                // switch the task out, and the task may resume on another CPU
+                // (`masked_trap_park`), with `frame` still in place.
+                Ok(narf_userspace::InstructionDispatch::Deferred(call)) => {
+                    let rip = frame.rip;
+                    let mut ctx = X86TrapContext::from_instruction_trap(frame);
+                    match call.complete(&mut ctx, native) {
+                        Ok(narf_userspace::DeferredCompletion::Completed(result)) => {
+                            write_instruction_result(ctx.frame, instruction, result);
+                            ctx.frame.rip = rip.wrapping_add(length);
+                        }
+                        // A transition took the task's context: write nothing
+                        // and leave RIP on the instruction.
+                        Ok(narf_userspace::DeferredCompletion::Reexecute) => {}
+                        Err(error) => instruction_failed_closed(rip, &error),
+                    }
+                    // The callback's transitions may have left a signal
+                    // pending (a `SIGKILL` among them), as a syscall's return
+                    // path would deliver it. SYSCALL_NUM_NONE: the trapped
+                    // instruction is not a syscall, so nothing restarts.
+                    if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                        hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+                    }
                 }
-                (
-                    narf_userspace::NondeterministicInstruction::Rdtscp,
-                    narf_userspace::InstructionResult::Rdtscp { value, aux },
-                ) => {
-                    frame.rax = value as u32 as u64;
-                    frame.rdx = (value >> 32) as u32 as u64;
-                    frame.rcx = aux as u64;
-                }
-                _ => {
-                    // `dispatch_instruction` already rejects a result of the
-                    // wrong family; reaching here is a dispatcher defect.
-                    let _ = writeln!(
-                        TrapWriter,
-                        "instruction interceptor failed closed at rip={:#x}: result family mismatch",
-                        frame.rip
-                    );
-                    panic!("instruction interceptor failed closed");
-                }
+                Err(error) => instruction_failed_closed(frame.rip, &error),
             }
-            frame.rip = frame.rip.wrapping_add(length);
             return;
         }
     }
@@ -2045,6 +2041,54 @@ impl<'a> X86TrapContext<'a> {
         };
         Self { frame, args }
     }
+
+    /// A trapped instruction carries no syscall arguments.
+    fn from_instruction_trap(frame: &'a mut TrapFrame) -> Self {
+        Self {
+            frame,
+            args: SyscallArgs::default(),
+        }
+    }
+}
+
+/// Write a trapped timestamp instruction's result to the registers the
+/// instruction writes.
+fn write_instruction_result(
+    frame: &mut TrapFrame,
+    instruction: narf_userspace::NondeterministicInstruction,
+    result: narf_userspace::InstructionResult,
+) {
+    match (instruction, result) {
+        (
+            narf_userspace::NondeterministicInstruction::Rdtsc,
+            narf_userspace::InstructionResult::Rdtsc { value },
+        ) => {
+            frame.rax = value as u32 as u64;
+            frame.rdx = (value >> 32) as u32 as u64;
+        }
+        (
+            narf_userspace::NondeterministicInstruction::Rdtscp,
+            narf_userspace::InstructionResult::Rdtscp { value, aux },
+        ) => {
+            frame.rax = value as u32 as u64;
+            frame.rdx = (value >> 32) as u32 as u64;
+            frame.rcx = aux as u64;
+        }
+        // `dispatch_instruction` and `DeferredInstructionCall::complete`
+        // already reject a result of the wrong family; reaching here is a
+        // dispatcher defect.
+        _ => instruction_failed_closed(frame.rip, &"result family mismatch"),
+    }
+}
+
+/// Halt on an instruction the interceptor path cannot complete as asked.
+fn instruction_failed_closed(rip: u64, error: &dyn core::fmt::Debug) -> ! {
+    let _ = writeln!(
+        TrapWriter,
+        "instruction interceptor failed closed at rip={:#x}: {:?}",
+        rip, error
+    );
+    panic!("instruction interceptor failed closed");
 }
 
 impl<'a> TrapContext for X86TrapContext<'a> {

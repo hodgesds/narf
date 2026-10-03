@@ -6228,6 +6228,994 @@ kernel_test_in!(
     smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces
 );
 
+/// Deferred RDTSC callbacks
+/// ([`narf_userspace::InstructionInterceptor::on_instruction_deferred`]) on a
+/// scheduled user task: what the callback's transitions answer, the syscall
+/// park a delivered instruction ends, and a `SIGKILL` raised in the callback
+/// ending the task at the trap instead of letting it run on.
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+mod deferred_rdtsc_e2e {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_scheduler::{Affinity, CpuId, TaskSpec};
+    use narf_userspace::instruction::{
+        __verification_clear_instruction_interceptor, try_install_instruction_interceptor,
+        DeferredInstruction, InstructionInterception, InstructionInterceptor,
+        InstructionInvocation, InstructionResult, InstructionSubscriptions,
+        NondeterministicInstruction,
+    };
+    use narf_userspace::syscall::{
+        NativeRepollWait, __verification_clear_global, __verification_record_park,
+    };
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_task_id_lookup, NativeSyscallOriginalError,
+        NativeSyscallOutcome, NativeSyscallRequest, NativeSyscallTransition, Syscall, SyscallArgs,
+        SyscallInterception, SyscallInterceptor, SyscallInvocation, SyscallReturn, SyscallTable,
+        UserProcess,
+    };
+
+    use super::{kernel_test_in, TestResult};
+
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    /// Unknown to the table: `Probe` records `arg0` and completes it.
+    const PROBE_NR: u32 = 0x3fff;
+    /// Unknown to the table: `Probe` seeds the park record `arg0` names.
+    const SEED_NR: u32 = 0x3ffe;
+    /// Unknown to the table: `Probe` returns 1 while the first guest's
+    /// deferred callback waits for the second guest, else 0.
+    const GATE_NR: u32 = 0x3ffd;
+    const MAX_PROBES: usize = 8;
+    const RDTSC_MAGIC: u64 = 0x1122_3344_5566_7788;
+    /// The value the second guest's RDTSC completes with at entry.
+    const OTHER_MAGIC: u64 = 0x0b0b_0b0b_0b0b_0b0b;
+    /// Repolls the first guest's deferred callback makes before it gives up
+    /// on the second guest.
+    const MAX_WAITS: usize = 10_000;
+    const RBX_MARK: u32 = 0x5eed_0b0b;
+    const MARK_A: u32 = 0x0a11_ce0a;
+    const MARK_B: u32 = 0x0a11_ce0b;
+    const MARK_AFTER_KILL: u32 = 0x0dea_d001;
+    /// About 10 s at 3 GHz.
+    const WAITER_BUDGET_CYCLES: u64 = 30_000_000_000;
+
+    /// The callback script `Deferrer` follows.
+    const SCRIPT_TRANSITIONS: u64 = 1;
+    const SCRIPT_KILLED_ELSEWHERE: u64 = 2;
+    const SCRIPT_TWO_GUESTS: u64 = 3;
+
+    // Checks the callbacks make. `FAILURE` holds the first that failed, as an
+    // index into `FAILURES`; 0 is none.
+    const PROBE_TASK: usize = 1;
+    const SEED_UNSCRIPTED: usize = 2;
+    const ENTRY_UNSCRIPTED: usize = 3;
+    const ENTRY_PAST_SCRIPT: usize = 4;
+    const ORIGINAL_RAN: usize = 5;
+    const ENTRY_STATE: usize = 6;
+    const LIVE_KILLED: usize = 7;
+    const GETPID: usize = 8;
+    const EXECVE_RAN: usize = 9;
+    const EXIT_RAN: usize = 10;
+    const CLONE_RAN: usize = 11;
+    const REPOLL_YIELD: usize = 12;
+    const RETURN_VALUE: usize = 13;
+    const KILL_RETURNED: usize = 14;
+    const NOT_KILLED: usize = 15;
+    const RAN_AFTER_KILL: usize = 16;
+    const REPOLL_KILLED: usize = 17;
+    const NO_PROCESS: usize = 18;
+    const EXIT_REFUSED_WHEN_KILLED: usize = 19;
+    const CALL_UNSCRIPTED: usize = 20;
+    const OTHER_OUTSIDE_WAIT: usize = 21;
+    const OTHER_NOT_RUN: usize = 22;
+    const FAILURES: [&str; 23] = [
+        "",
+        "a probe ran on a task other than the guest",
+        "a seed named no scripted park",
+        "an RDTSC trapped on another task or at an unscripted address",
+        "an RDTSC trapped after the script's last",
+        "execute_original ran for a trapped instruction",
+        "entry_user_state is not the register file at the trap",
+        "task_killed reported a live guest killed",
+        "an injected getpid did not return the guest's pid",
+        "an injected execve was not refused with -ENOSYS",
+        "an injected exit was not refused with -ENOSYS",
+        "an injected clone3 was not refused with -ENOSYS",
+        "wait_for_repoll did not yield to the waiter",
+        "on_instruction_return saw a value other than the callback's",
+        "the guest's injected kill of itself returned to the callback",
+        "task_killed did not report the killed guest",
+        "an inject ran after the guest was killed",
+        "wait_for_repoll did not report the killed guest",
+        "kill_process_sigkill found no guest process",
+        "a killed guest's injected exit was refused before the signal gate answered",
+        "a deferred call or return the script does not have",
+        "the second guest's RDTSC trapped outside the first guest's deferred wait",
+        "the second guest's RDTSC did not complete while the first guest's callback waited",
+    ];
+
+    static SCRIPT: AtomicU64 = AtomicU64::new(0);
+    static TASK: AtomicU64 = AtomicU64::new(0);
+    static PID: AtomicU64 = AtomicU64::new(0);
+    static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PROBES: [AtomicU64; MAX_PROBES] = [const { AtomicU64::new(0) }; MAX_PROBES];
+    /// Bit `i`: probe `i` entered as the re-execution of a parked syscall.
+    static PROBE_PARKED: AtomicU64 = AtomicU64::new(0);
+    /// The guest's stack pointer at probe 0. The guest never moves it.
+    static USER_RSP: AtomicU64 = AtomicU64::new(0);
+    /// Seed `i` records a park of the probe of `SEED_MARKS[i]` entered at
+    /// `SEED_IPS[i]`, as that probe parking to re-execute would.
+    static SEED_IPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static SEED_MARKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static SEEDS: AtomicUsize = AtomicUsize::new(0);
+    static EXITS: AtomicUsize = AtomicUsize::new(0);
+    /// `RDTSC_IPS[i]`: the address of the RDTSC of deferred call `i`.
+    static RDTSC_IPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static ENTERS: AtomicUsize = AtomicUsize::new(0);
+    static DEFERS: AtomicUsize = AtomicUsize::new(0);
+    static RETURNS: AtomicUsize = AtomicUsize::new(0);
+    static NATIVE_BEFORE: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_VALUE: AtomicU64 = AtomicU64::new(0);
+    static NATIVE_AFTER: AtomicU64 = AtomicU64::new(0);
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+    static KILLED: AtomicBool = AtomicBool::new(false);
+    static FAILURE: AtomicUsize = AtomicUsize::new(0);
+    static WAITER_ERROR: AtomicU64 = AtomicU64::new(0);
+    /// The second guest of `SCRIPT_TWO_GUESTS`, and the value it probed.
+    static TASK_B: AtomicU64 = AtomicU64::new(0);
+    static OTHER_PROBE: AtomicU64 = AtomicU64::new(0);
+    /// Set while the first guest's deferred callback waits for the second.
+    static IN_WAIT: AtomicBool = AtomicBool::new(false);
+    /// Set once the second guest's RDTSC has completed.
+    static OTHER_DONE: AtomicBool = AtomicBool::new(false);
+
+    fn fail(check: usize) {
+        let _ = FAILURE.compare_exchange(0, check, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn reset(script: u64) {
+        SCRIPT.store(script, Ordering::Release);
+        for atomic in [
+            &TASK,
+            &PID,
+            &PROBE_PARKED,
+            &USER_RSP,
+            &NATIVE_BEFORE,
+            &NATIVE_VALUE,
+            &NATIVE_AFTER,
+            &TICKS,
+            &WAITER_ERROR,
+            &TASK_B,
+            &OTHER_PROBE,
+        ] {
+            atomic.store(0, Ordering::Release);
+        }
+        for atomic in PROBES
+            .iter()
+            .chain(SEED_IPS.iter())
+            .chain(SEED_MARKS.iter())
+            .chain(RDTSC_IPS.iter())
+        {
+            atomic.store(0, Ordering::Release);
+        }
+        for atomic in [
+            &PROBE_COUNT,
+            &SEEDS,
+            &EXITS,
+            &ENTERS,
+            &DEFERS,
+            &RETURNS,
+            &FAILURE,
+        ] {
+            atomic.store(0, Ordering::Release);
+        }
+        for flag in [&KILLED, &IN_WAIT, &OTHER_DONE] {
+            flag.store(false, Ordering::Release);
+        }
+    }
+
+    struct Probe;
+    impl SyscallInterceptor for Probe {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn NativeSyscallTransition,
+        ) -> SyscallInterception {
+            match invocation.raw_number {
+                PROBE_NR if invocation.task_id == TASK_B.load(Ordering::Acquire) => {
+                    OTHER_PROBE.store(invocation.args.arg0, Ordering::Release);
+                    SyscallInterception::Complete(SyscallReturn::ok(0))
+                }
+                GATE_NR => SyscallInterception::Complete(SyscallReturn::ok(u64::from(
+                    IN_WAIT.load(Ordering::Acquire),
+                ))),
+                PROBE_NR => {
+                    if invocation.task_id != TASK.load(Ordering::Acquire) {
+                        fail(PROBE_TASK);
+                    }
+                    let index = PROBE_COUNT.fetch_add(1, Ordering::AcqRel);
+                    if index < MAX_PROBES {
+                        PROBES[index].store(invocation.args.arg0, Ordering::Release);
+                        if invocation.park_reexecution {
+                            PROBE_PARKED.fetch_or(1 << index, Ordering::AcqRel);
+                        }
+                    }
+                    if index == 0 {
+                        USER_RSP.store(invocation.stack_pointer, Ordering::Release);
+                    }
+                    SyscallInterception::Complete(SyscallReturn::ok(0))
+                }
+                SEED_NR => {
+                    let seed = invocation.args.arg0 as usize;
+                    match SEED_IPS.get(seed).map(|ip| ip.load(Ordering::Acquire)) {
+                        Some(ip) if ip != 0 => {
+                            SEEDS.fetch_add(1, Ordering::AcqRel);
+                            __verification_record_park(
+                                invocation.task_id,
+                                ip,
+                                PROBE_NR,
+                                SyscallArgs {
+                                    arg0: SEED_MARKS[seed].load(Ordering::Acquire),
+                                    ..SyscallArgs::default()
+                                },
+                            );
+                        }
+                        _ => fail(SEED_UNSCRIPTED),
+                    }
+                    SyscallInterception::Complete(SyscallReturn::ok(0))
+                }
+                number
+                    if number == Syscall::ExitTask.raw()
+                        && (invocation.task_id == TASK.load(Ordering::Acquire)
+                            || invocation.task_id == TASK_B.load(Ordering::Acquire)) =>
+                {
+                    EXITS.fetch_add(1, Ordering::AcqRel);
+                    SyscallInterception::Continue
+                }
+                _ => SyscallInterception::Continue,
+            }
+        }
+    }
+
+    struct Deferrer;
+    // SAFETY: `on_instruction_enter` and `on_instruction_return` only update
+    // lock-free atomics and read the TSC. `on_instruction_deferred` runs under
+    // its own contract: it injects syscalls, kills the guest and waits.
+    unsafe impl InstructionInterceptor for Deferrer {
+        fn subscriptions(&self) -> InstructionSubscriptions {
+            InstructionSubscriptions::RDTSC
+        }
+
+        fn on_instruction_enter(
+            &self,
+            invocation: &InstructionInvocation,
+        ) -> InstructionInterception {
+            let call = ENTERS.fetch_add(1, Ordering::AcqRel) + 1;
+            let expected_ip = RDTSC_IPS
+                .get(call)
+                .map_or(0, |ip| ip.load(Ordering::Acquire));
+            if expected_ip == 0 {
+                // A guest that should be dead ran on: let it reach its next
+                // probe.
+                fail(ENTRY_PAST_SCRIPT);
+                return InstructionInterception::Continue;
+            }
+            if SCRIPT.load(Ordering::Acquire) == SCRIPT_TWO_GUESTS && call == 2 {
+                // The second guest's RDTSC, trapped on the CPU where the
+                // first guest's deferred callback waits: completed here.
+                if invocation.task_id != TASK_B.load(Ordering::Acquire)
+                    || invocation.instruction_pointer != expected_ip
+                {
+                    fail(ENTRY_UNSCRIPTED);
+                }
+                if !IN_WAIT.load(Ordering::Acquire) {
+                    fail(OTHER_OUTSIDE_WAIT);
+                }
+                return InstructionInterception::Complete(InstructionResult::Rdtsc {
+                    value: OTHER_MAGIC,
+                });
+            }
+            if invocation.task_id != TASK.load(Ordering::Acquire)
+                || invocation.instruction != NondeterministicInstruction::Rdtsc
+                || invocation.instruction_pointer != expected_ip
+            {
+                fail(ENTRY_UNSCRIPTED);
+            }
+            InstructionInterception::Defer
+        }
+
+        fn on_instruction_deferred(
+            &self,
+            invocation: &InstructionInvocation,
+            native: &mut dyn NativeSyscallTransition,
+        ) -> DeferredInstruction {
+            let call = DEFERS.fetch_add(1, Ordering::AcqRel) + 1;
+            match (SCRIPT.load(Ordering::Acquire), call) {
+                (SCRIPT_TRANSITIONS, 1) => transitions_of_a_live_task(invocation, native),
+                (SCRIPT_TRANSITIONS, 2) => {
+                    NATIVE_BEFORE.store(narf_arch::x86_64::tsc::rdtsc(), Ordering::Release);
+                    DeferredInstruction::Native
+                }
+                (SCRIPT_TRANSITIONS, 3) => kill_through_inject(native),
+                (SCRIPT_KILLED_ELSEWHERE, 1) => killed_elsewhere(native),
+                (SCRIPT_TWO_GUESTS, 1) => wait_for_the_other_guest(native),
+                _ => {
+                    fail(CALL_UNSCRIPTED);
+                    DeferredInstruction::Native
+                }
+            }
+        }
+
+        fn on_instruction_return(
+            &self,
+            invocation: &InstructionInvocation,
+            result: InstructionResult,
+        ) -> InstructionResult {
+            let call = RETURNS.fetch_add(1, Ordering::AcqRel) + 1;
+            match (SCRIPT.load(Ordering::Acquire), call, result) {
+                // Either guest's; the second guest's returns first.
+                (SCRIPT_TWO_GUESTS, 1 | 2, InstructionResult::Rdtsc { value }) => {
+                    let other = invocation.task_id == TASK_B.load(Ordering::Acquire);
+                    if value != if other { OTHER_MAGIC } else { RDTSC_MAGIC } {
+                        fail(RETURN_VALUE);
+                    }
+                    if other {
+                        OTHER_DONE.store(true, Ordering::Release);
+                    }
+                    InstructionResult::Rdtsc {
+                        value: value.wrapping_add(1),
+                    }
+                }
+                (SCRIPT_TRANSITIONS, 1, InstructionResult::Rdtsc { value }) => {
+                    if value != RDTSC_MAGIC {
+                        fail(RETURN_VALUE);
+                    }
+                    InstructionResult::Rdtsc {
+                        value: value.wrapping_add(1),
+                    }
+                }
+                (SCRIPT_TRANSITIONS, 2, InstructionResult::Rdtsc { value }) => {
+                    NATIVE_VALUE.store(value, Ordering::Release);
+                    NATIVE_AFTER.store(narf_arch::x86_64::tsc::rdtsc(), Ordering::Release);
+                    InstructionResult::Rdtsc {
+                        value: value.wrapping_add(1),
+                    }
+                }
+                _ => {
+                    fail(CALL_UNSCRIPTED);
+                    result
+                }
+            }
+        }
+    }
+
+    fn request(syscall: Syscall, args: SyscallArgs) -> NativeSyscallRequest {
+        NativeSyscallRequest::new(syscall.raw(), args)
+    }
+
+    fn refused(outcome: NativeSyscallOutcome) -> bool {
+        outcome == NativeSyscallOutcome::Returned(SyscallReturn::not_implemented())
+    }
+
+    /// Deferred call 1 of `SCRIPT_TRANSITIONS`: each transition of a live
+    /// task, then a completed value. It stops at the first failed check, so
+    /// an inject that a missing refusal would let run is never reached.
+    fn transitions_of_a_live_task(
+        invocation: &InstructionInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> DeferredInstruction {
+        let completed =
+            DeferredInstruction::Complete(InstructionResult::Rdtsc { value: RDTSC_MAGIC });
+        if !matches!(
+            native.execute_original(),
+            Err(NativeSyscallOriginalError::AlreadyExecuted)
+        ) {
+            fail(ORIGINAL_RAN);
+            return completed;
+        }
+        let at_trap = native.entry_user_state().is_some_and(|state| {
+            state.rip == invocation.instruction_pointer
+                && state.rbx == u64::from(RBX_MARK)
+                && state.rsp == USER_RSP.load(Ordering::Acquire)
+        });
+        if !at_trap {
+            fail(ENTRY_STATE);
+            return completed;
+        }
+        if native.task_killed() {
+            fail(LIVE_KILLED);
+            return completed;
+        }
+        let pid = PROBES[0].load(Ordering::Acquire);
+        if native.execute_injected(request(Syscall::GetPid, SyscallArgs::default()))
+            != NativeSyscallOutcome::Returned(SyscallReturn::ok(pid))
+        {
+            fail(GETPID);
+            return completed;
+        }
+        // A null path and a null clone_args: were the refusal missing, these
+        // would fail with -EFAULT and -EINVAL, never replace the image or
+        // create a task. The exit is reached only after the execve's refusal.
+        if !refused(native.execute_injected(request(Syscall::Execve, SyscallArgs::default()))) {
+            fail(EXECVE_RAN);
+            return completed;
+        }
+        if !refused(native.execute_injected(request(Syscall::ExitTask, SyscallArgs::default()))) {
+            fail(EXIT_RAN);
+            return completed;
+        }
+        if !refused(native.execute_injected(request(Syscall::Clone3, SyscallArgs::default()))) {
+            fail(CLONE_RAN);
+            return completed;
+        }
+        let ticks = TICKS.load(Ordering::Acquire);
+        if !matches!(native.wait_for_repoll(), NativeRepollWait::Yielded)
+            || TICKS.load(Ordering::Acquire) == ticks
+        {
+            fail(REPOLL_YIELD);
+        }
+        completed
+    }
+
+    /// Deferred call 3 of `SCRIPT_TRANSITIONS`: the guest kills itself
+    /// through an inject. The value is ignored.
+    fn kill_through_inject(native: &mut dyn NativeSyscallTransition) -> DeferredInstruction {
+        let ignored = DeferredInstruction::Complete(InstructionResult::Rdtsc { value: 0 });
+        if native.task_killed() {
+            fail(LIVE_KILLED);
+        }
+        let pid = PID.load(Ordering::Acquire);
+        if pid == 0 {
+            // kill(0) would signal the whole process group.
+            fail(NO_PROCESS);
+            return ignored;
+        }
+        let kill = native.execute_injected(request(
+            Syscall::Kill,
+            SyscallArgs {
+                arg0: pid,
+                arg1: 9,
+                ..SyscallArgs::default()
+            },
+        ));
+        KILLED.store(true, Ordering::Release);
+        if kill != NativeSyscallOutcome::ContextManaged {
+            fail(KILL_RETURNED);
+        }
+        if !native.task_killed() {
+            fail(NOT_KILLED);
+        }
+        if native.execute_injected(request(Syscall::GetPid, SyscallArgs::default()))
+            != NativeSyscallOutcome::ContextManaged
+        {
+            fail(RAN_AFTER_KILL);
+        }
+        if !matches!(native.wait_for_repoll(), NativeRepollWait::Killed) {
+            fail(REPOLL_KILLED);
+        }
+        ignored
+    }
+
+    /// Deferred call 1 of `SCRIPT_KILLED_ELSEWHERE`: the kernel kills the
+    /// guest outside any transition, so no transition has answered
+    /// `ContextManaged` yet. An exit injected next must meet the signal gate
+    /// before the refusal of exits. The value is ignored.
+    fn killed_elsewhere(native: &mut dyn NativeSyscallTransition) -> DeferredInstruction {
+        let ignored = DeferredInstruction::Complete(InstructionResult::Rdtsc { value: 0 });
+        if native.task_killed() {
+            fail(LIVE_KILLED);
+            return ignored;
+        }
+        let pid = PID.load(Ordering::Acquire);
+        if pid == 0 || !narf_userspace::handlers::tool_view::kill_process_sigkill(pid) {
+            fail(NO_PROCESS);
+            return ignored;
+        }
+        KILLED.store(true, Ordering::Release);
+        if !native.task_killed() {
+            fail(NOT_KILLED);
+        }
+        if native.execute_injected(request(Syscall::ExitTask, SyscallArgs::default()))
+            != NativeSyscallOutcome::ContextManaged
+        {
+            fail(EXIT_REFUSED_WHEN_KILLED);
+        }
+        if native.execute_injected(request(Syscall::GetPid, SyscallArgs::default()))
+            != NativeSyscallOutcome::ContextManaged
+        {
+            fail(RAN_AFTER_KILL);
+        }
+        ignored
+    }
+
+    /// Deferred call 1 of `SCRIPT_TWO_GUESTS`: the first guest's callback
+    /// repolls until the second guest, pinned to the same CPU, has trapped
+    /// its RDTSC and had it completed.
+    fn wait_for_the_other_guest(native: &mut dyn NativeSyscallTransition) -> DeferredInstruction {
+        IN_WAIT.store(true, Ordering::Release);
+        let mut waits = 0;
+        while !OTHER_DONE.load(Ordering::Acquire) {
+            if waits == MAX_WAITS {
+                fail(OTHER_NOT_RUN);
+                break;
+            }
+            waits += 1;
+            if !matches!(native.wait_for_repoll(), NativeRepollWait::Yielded) {
+                fail(REPOLL_YIELD);
+                break;
+            }
+        }
+        IN_WAIT.store(false, Ordering::Release);
+        DeferredInstruction::Complete(InstructionResult::Rdtsc { value: RDTSC_MAGIC })
+    }
+
+    /// A straight-line guest program at `CODE_VADDR`.
+    struct Guest(Vec<u8>);
+
+    impl Guest {
+        /// The address of the next instruction.
+        fn here(&self) -> u64 {
+            CODE_VADDR + self.0.len() as u64
+        }
+
+        fn emit(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+
+        /// `mov r32, imm32`, whose opcode is `opcode` (`B8+r`).
+        fn mov_imm(&mut self, opcode: u8, imm: u32) {
+            self.0.push(opcode);
+            self.0.extend_from_slice(&imm.to_le_bytes());
+        }
+
+        /// Fast syscall `number`, with RDI as it is and every other argument
+        /// register zero. Returns the address after the `syscall`, the entry
+        /// address the kernel records for it.
+        fn syscall(&mut self, number: u32) -> u64 {
+            // xor esi,esi; xor edx,edx; xor r10d,r10d; xor r8d,r8d; xor r9d,r9d
+            self.emit(&[
+                0x31, 0xF6, 0x31, 0xD2, 0x45, 0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9,
+            ]);
+            self.mov_imm(0xB8, number); // mov eax,number
+            self.emit(&[0x0F, 0x05]); // syscall
+            self.here()
+        }
+
+        /// Probes `value`. Returns the probe's entry address.
+        fn probe(&mut self, value: u32) -> u64 {
+            self.mov_imm(0xBF, value); // mov edi,value
+            self.syscall(PROBE_NR)
+        }
+
+        /// Probes RAX.
+        fn probe_rax(&mut self) {
+            self.emit(&[0x48, 0x89, 0xC7]); // mov rdi,rax
+            self.syscall(PROBE_NR);
+        }
+
+        /// Probes the guest's own pid.
+        fn probe_pid(&mut self) {
+            self.syscall(Syscall::GetPid.raw());
+            self.probe_rax();
+        }
+
+        /// Seeds the park record `SEED_IPS[seed]` names.
+        fn seed(&mut self, seed: u32) {
+            self.mov_imm(0xBF, seed); // mov edi,seed
+            self.syscall(SEED_NR);
+        }
+
+        /// Yields the CPU until the gate syscall returns nonzero.
+        fn wait_for_gate(&mut self) {
+            let top = self.0.len();
+            self.syscall(GATE_NR);
+            self.emit(&[0x85, 0xC0, 0x75, 0]); // test eax,eax; jnz past the loop
+            let past_jnz = self.0.len();
+            self.syscall(Syscall::Yield.raw());
+            let back = top as isize - (self.0.len() as isize + 2);
+            self.emit(&[0xEB, back as i8 as u8]); // jmp top
+            self.0[past_jnz - 1] = (self.0.len() - past_jnz) as u8;
+        }
+
+        /// RDTSC, then EDX:EAX joined in RAX. Returns the RDTSC's address.
+        fn rdtsc(&mut self) -> u64 {
+            let at = self.here();
+            // rdtsc; shl rdx,32; or rax,rdx
+            self.emit(&[0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0]);
+            at
+        }
+
+        /// ExitTask(0), then spin.
+        fn exit(&mut self) {
+            self.mov_imm(0xBF, 0); // mov edi,0
+            self.mov_imm(0xB8, Syscall::ExitTask.raw()); // mov eax,ExitTask
+            self.emit(&[0xCD, 0x80, 0xEB, 0xFE]); // int 0x80; jmp $
+        }
+    }
+
+    /// A fresh user address space with `code` at `CODE_VADDR` and a stack
+    /// page at `STACK_VADDR`.
+    fn load_guest(code: &[u8]) -> Result<AddressSpace, &'static str> {
+        if code.len() > 0x1000 {
+            return Err("the guest program exceeds its page");
+        }
+        // SAFETY: this test exclusively owns the fresh address space until the
+        // scheduled task exits.
+        let address_space =
+            unsafe { AddressSpace::new_for_user() }.map_err(|_| "new_for_user failed")?;
+        let code_frame = narf_memory::alloc_frame()
+            .map_err(|_| "alloc code frame")?
+            .start_address();
+        let stack_frame = narf_memory::alloc_frame()
+            .map_err(|_| "alloc stack frame")?
+            .start_address();
+        if address_space
+            .map_region(Region {
+                base: VirtAddr::new(CODE_VADDR),
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+                phys: alloc::vec![code_frame],
+            })
+            .is_err()
+            || address_space
+                .map_region(Region {
+                    base: VirtAddr::new(STACK_VADDR),
+                    len: 0x1000,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: alloc::vec![stack_frame],
+                })
+                .is_err()
+        {
+            return Err("map user regions failed");
+        }
+        // SAFETY: the frame is exclusively owned and the program fits one page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                code_frame.kernel_mut_ptr::<u8>(),
+                code.len(),
+            );
+        }
+        // SAFETY: materialize publishes the complete mappings above.
+        if unsafe { address_space.materialize() }.is_err() {
+            return Err("materialize failed");
+        }
+        Ok(address_space)
+    }
+
+    /// Runs `code` as a user task pinned to this CPU, under `Probe` and
+    /// `Deferrer`, until the scheduler has reaped it.
+    fn run_guest(code: &[u8]) -> Result<(), &'static str> {
+        run_guests(&[code])
+    }
+
+    /// Runs one or two guest programs as user tasks pinned to this CPU, under
+    /// `Probe` and `Deferrer`, until the scheduler has reaped them all. The
+    /// first runs as `TASK` with pid `PID`, the second as `TASK_B`.
+    fn run_guests(codes: &[&[u8]]) -> Result<(), &'static str> {
+        if codes.is_empty() || codes.len() > 2 {
+            return Err("run_guests takes one or two guests");
+        }
+        __verification_clear_global();
+        __verification_clear_instruction_interceptor();
+        narf_userspace::user_task::__test_clear_hooks();
+        let cpu = narf_lib::percpu::current_cpu();
+        let original_cr3: u64;
+        // SAFETY: snapshot the kernel address space for defensive test cleanup.
+        unsafe {
+            core::arch::asm!("mov {value}, cr3", value = out(reg) original_cr3,
+                options(nostack, preserves_flags));
+        }
+        let mut address_spaces = Vec::new();
+        for code in codes {
+            address_spaces.push(load_guest(code)?);
+        }
+
+        let mut table = SyscallTable::new();
+        install_core_syscalls(&mut table);
+        if table.install_interceptor(Box::new(Probe)).is_err() {
+            return Err("syscall interceptor install failed");
+        }
+        install_global(table);
+        if try_install_instruction_interceptor(Box::new(Deferrer)).is_err() {
+            __verification_clear_global();
+            return Err("instruction interceptor install failed");
+        }
+        // Kernel-test boots skip the boot-time signal init, and without its
+        // tables a raised SIGKILL finds no pending-bit map and is dropped.
+        // Tables this test creates are removed again once the guest is reaped.
+        let signal_tables = narf_userspace::handlers::__test_signal_tables_state();
+        narf_userspace::signal_init();
+        if !signal_tables.sigactions {
+            narf_userspace::sigaction_init();
+        }
+        install_task_id_lookup(|| narf_scheduler::current_task_id().raw());
+        narf_scheduler::__reset_queues_for_test();
+        narf_userspace::install_user_task_hooks();
+        let live_before = narf_scheduler::live_user_task_count();
+        let mut pids = Vec::new();
+        let mut pending = Vec::new();
+        for (address_space, task_slot) in address_spaces.into_iter().zip([&TASK, &TASK_B]) {
+            let pid = narf_userspace::alloc_pid();
+            let pid_raw = pid.raw();
+            let process = UserProcess {
+                pid,
+                address_space: Arc::new(address_space),
+                entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
+                stack_top: VirtAddr::new(STACK_VADDR + 0x1000),
+                fs_base: None,
+                entry_arg: None,
+                loaded_mappings: Vec::new(),
+                auxv: Vec::new(),
+            };
+            // Pinned here, so the waiter below runs while the guests are
+            // switched out, and every TSC read of a deferred call is on one
+            // CPU.
+            let mut spec = TaskSpec::user_task();
+            spec.affinity = Affinity::pinned(CpuId(cpu as u32));
+            let prepared = narf_userspace::user_task::prepare_user_process_initial(process, spec);
+            let task = prepared.task_id().raw();
+            // The injected getpid and kill resolve a guest through this mapping.
+            narf_userspace::handlers::register_pid_task_mapping(pid_raw, task);
+            task_slot.store(task, Ordering::Release);
+            pids.push(pid_raw);
+            pending.push(prepared);
+        }
+        PID.store(pids[0], Ordering::Release);
+        for prepared in pending {
+            let _ = prepared.spawn();
+        }
+
+        // The waiter, pinned beside the guests, keeps this CPU's executor
+        // alive until they are reaped; it runs only while no guest runs. Past
+        // its budget it kills the guests, so a failure leaves no live task
+        // behind, and waits once more.
+        let mut deadline = narf_time::Instant::now().plus_cycles(WAITER_BUDGET_CYCLES);
+        let mut waiter = TaskSpec::unthrottled();
+        waiter.affinity = Affinity::pinned(CpuId(cpu as u32));
+        narf_scheduler::spawn_with_spec(
+            async move {
+                let mut killed_here = false;
+                loop {
+                    TICKS.fetch_add(1, Ordering::AcqRel);
+                    let ended = killed_here
+                        || KILLED.load(Ordering::Acquire)
+                        || EXITS.load(Ordering::Acquire) != 0;
+                    if ended && narf_scheduler::live_user_task_count() <= live_before {
+                        return;
+                    }
+                    if narf_time::Instant::now() >= deadline {
+                        if killed_here {
+                            WAITER_ERROR.store(3, Ordering::Release);
+                            return;
+                        }
+                        let code = if KILLED.load(Ordering::Acquire) { 2 } else { 1 };
+                        WAITER_ERROR.store(code, Ordering::Release);
+                        for &pid in &pids {
+                            let _ = narf_userspace::handlers::tool_view::kill_process_sigkill(pid);
+                        }
+                        killed_here = true;
+                        deadline = narf_time::Instant::now().plus_cycles(WAITER_BUDGET_CYCLES);
+                    }
+                    narf_scheduler::yield_now().await;
+                }
+            },
+            waiter,
+        );
+
+        narf_scheduler::run_until_empty();
+
+        // SAFETY: restore the kernel CR3 and kernel-GS state after the user task
+        // has exited, matching the neighbouring scheduled-user smokes.
+        unsafe {
+            core::arch::asm!("mov cr3, {value}", value = in(reg) original_cr3,
+                options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
+        narf_userspace::user_task::__test_clear_hooks();
+        narf_userspace::handlers::__test_reset_task_id_lookup();
+        __verification_clear_instruction_interceptor();
+        __verification_clear_global();
+        // Only with no user task live: a guest the waiter could not reap
+        // keeps the tables it may still use.
+        if narf_scheduler::live_user_task_count() <= live_before {
+            narf_userspace::handlers::__test_restore_signal_tables(signal_tables);
+        }
+        Ok(())
+    }
+
+    /// The first failure the callbacks or the waiter recorded, if any.
+    fn recorded_failure() -> Option<&'static str> {
+        match FAILURE.load(Ordering::Acquire) {
+            0 => {}
+            check => return Some(FAILURES.get(check).copied().unwrap_or("unknown check")),
+        }
+        match WAITER_ERROR.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some("the guest was neither killed nor exited within the budget"),
+            2 => Some("the killed guest was not reaped within the budget"),
+            _ => Some("the guest was not reaped even after the waiter killed it"),
+        }
+    }
+
+    /// Three deferred RDTSCs on one guest. The first answers each transition
+    /// of a live task (the refused injects among them) and completes a value;
+    /// its delivery ends the syscall park seeded just before it. The second
+    /// completes natively after the callback. The third kills the guest
+    /// through an inject, and the guest must die at that RDTSC.
+    fn smoke_deferred_rdtsc_transitions_park_and_self_kill() -> TestResult {
+        reset(SCRIPT_TRANSITIONS);
+        let mut guest = Guest(Vec::new());
+        guest.probe_pid(); // probe 0
+        guest.seed(1);
+        let mark_a = guest.probe(MARK_A); // probe 1: re-executes seed 1's park
+        guest.seed(2);
+        guest.mov_imm(0xBB, RBX_MARK); // mov ebx,RBX_MARK
+        let first = guest.rdtsc();
+        guest.emit(&[0x48, 0x89, 0xC3]); // mov rbx,rax
+        let mark_b = guest.probe(MARK_B); // probe 2: the RDTSC ended seed 2's park
+        guest.emit(&[0x48, 0x89, 0xDF]); // mov rdi,rbx
+        guest.syscall(PROBE_NR); // probe 3: the first RDTSC's value
+        let second = guest.rdtsc();
+        guest.probe_rax(); // probe 4: the second RDTSC's value
+        let third = guest.rdtsc();
+        guest.probe(MARK_AFTER_KILL);
+        guest.exit();
+        SEED_IPS[1].store(mark_a, Ordering::Release);
+        SEED_MARKS[1].store(u64::from(MARK_A), Ordering::Release);
+        SEED_IPS[2].store(mark_b, Ordering::Release);
+        SEED_MARKS[2].store(u64::from(MARK_B), Ordering::Release);
+        for (slot, ip) in RDTSC_IPS[1..].iter().zip([first, second, third]) {
+            slot.store(ip, Ordering::Release);
+        }
+
+        if let Err(reason) = run_guest(&guest.0) {
+            return TestResult::Fail(reason);
+        }
+        if let Some(reason) = recorded_failure() {
+            return TestResult::Fail(reason);
+        }
+        if ENTERS.load(Ordering::Acquire) != 3
+            || DEFERS.load(Ordering::Acquire) != 3
+            || RETURNS.load(Ordering::Acquire) != 2
+        {
+            return TestResult::Fail("the guest did not trap three RDTSCs and complete two");
+        }
+        if SEEDS.load(Ordering::Acquire) != 2 || PROBE_COUNT.load(Ordering::Acquire) != 5 {
+            return TestResult::Fail("the guest did not run exactly its seeds and probes");
+        }
+        let probe = |index: usize| PROBES[index].load(Ordering::Acquire);
+        if probe(0) == 0 || probe(1) != u64::from(MARK_A) || probe(2) != u64::from(MARK_B) {
+            return TestResult::Fail("the guest's probes ran out of order");
+        }
+        let parked = PROBE_PARKED.load(Ordering::Acquire);
+        if parked & (1 << 1) == 0 {
+            return TestResult::Fail("a seeded park was not seen as the probe's re-execution");
+        }
+        if parked & !(1 << 1) != 0 {
+            return TestResult::Fail("a syscall park outlived the delivered RDTSC after it");
+        }
+        if probe(3) != RDTSC_MAGIC.wrapping_add(1) {
+            return TestResult::Fail("the deferred value did not reach the guest");
+        }
+        let native = NATIVE_VALUE.load(Ordering::Acquire);
+        if native < NATIVE_BEFORE.load(Ordering::Acquire)
+            || native > NATIVE_AFTER.load(Ordering::Acquire)
+            || probe(4) != native.wrapping_add(1)
+        {
+            return TestResult::Fail("a deferred Native did not read the TSC after the callback");
+        }
+        if !KILLED.load(Ordering::Acquire) || EXITS.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("the guest was not killed at its third RDTSC");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "verification/instruction-defer",
+        smoke_deferred_rdtsc_transitions_park_and_self_kill
+    );
+
+    /// A guest the kernel kills during its deferred RDTSC callback, outside
+    /// any transition: an exit the callback injects must answer
+    /// `ContextManaged` from the signal gate rather than be refused, and the
+    /// guest must die at that RDTSC.
+    fn smoke_deferred_rdtsc_killed_elsewhere_meets_signal_gate_first() -> TestResult {
+        reset(SCRIPT_KILLED_ELSEWHERE);
+        let mut guest = Guest(Vec::new());
+        guest.probe_pid(); // probe 0
+        let first = guest.rdtsc();
+        guest.probe(MARK_AFTER_KILL);
+        guest.exit();
+        RDTSC_IPS[1].store(first, Ordering::Release);
+
+        if let Err(reason) = run_guest(&guest.0) {
+            return TestResult::Fail(reason);
+        }
+        if let Some(reason) = recorded_failure() {
+            return TestResult::Fail(reason);
+        }
+        if ENTERS.load(Ordering::Acquire) != 1
+            || DEFERS.load(Ordering::Acquire) != 1
+            || RETURNS.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("the killed guest's RDTSC completed or trapped again");
+        }
+        if PROBE_COUNT.load(Ordering::Acquire) != 1 {
+            return TestResult::Fail("the killed guest ran on past its RDTSC");
+        }
+        if !KILLED.load(Ordering::Acquire) || EXITS.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("the guest was not killed at its RDTSC");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "verification/instruction-defer",
+        smoke_deferred_rdtsc_killed_elsewhere_meets_signal_gate_first
+    );
+
+    /// While one guest's deferred RDTSC callback waits, a second guest pinned
+    /// to the same CPU traps an RDTSC, which is completed at entry. The CPU's
+    /// instruction flag must not stay held across the callback: the second
+    /// trap would find it held and fail closed.
+    fn smoke_deferred_rdtsc_wait_lets_another_guest_trap_on_its_cpu() -> TestResult {
+        reset(SCRIPT_TWO_GUESTS);
+        let mut first = Guest(Vec::new());
+        let first_rdtsc = first.rdtsc();
+        first.probe_rax(); // the first guest's only probe
+        first.exit();
+        let mut second = Guest(Vec::new());
+        second.wait_for_gate();
+        let second_rdtsc = second.rdtsc();
+        second.probe_rax(); // `OTHER_PROBE`
+        second.exit();
+        RDTSC_IPS[1].store(first_rdtsc, Ordering::Release);
+        RDTSC_IPS[2].store(second_rdtsc, Ordering::Release);
+
+        if let Err(reason) = run_guests(&[&first.0, &second.0]) {
+            return TestResult::Fail(reason);
+        }
+        if let Some(reason) = recorded_failure() {
+            return TestResult::Fail(reason);
+        }
+        if ENTERS.load(Ordering::Acquire) != 2
+            || DEFERS.load(Ordering::Acquire) != 1
+            || RETURNS.load(Ordering::Acquire) != 2
+        {
+            return TestResult::Fail(
+                "the guests did not trap one RDTSC each, only the first deferred",
+            );
+        }
+        if OTHER_PROBE.load(Ordering::Acquire) != OTHER_MAGIC.wrapping_add(1) {
+            return TestResult::Fail("the second guest did not read its completed value");
+        }
+        if PROBE_COUNT.load(Ordering::Acquire) != 1
+            || PROBES[0].load(Ordering::Acquire) != RDTSC_MAGIC.wrapping_add(1)
+        {
+            return TestResult::Fail("the first guest did not read its deferred value");
+        }
+        if EXITS.load(Ordering::Acquire) != 2 {
+            return TestResult::Fail("the guests did not both exit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "verification/instruction-defer",
+        smoke_deferred_rdtsc_wait_lets_another_guest_trap_on_its_cpu
+    );
+}
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestResult {
     // Two IRQ-masked acknowledgement spins waiting on each other: the AP is a

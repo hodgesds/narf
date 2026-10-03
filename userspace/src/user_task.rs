@@ -3706,10 +3706,12 @@ pub fn __test_kernel_reentries() -> u64 {
 
 /// An open spawn hold for one creating task. See the section comment above.
 ///
-/// There is no `Drop` guard. The one opener, `dispatch_intercepted`, has no
+/// There is no `Drop` guard. Neither opener, `dispatch_intercepted` for a
+/// syscall nor `run_instruction_callback` for a deferred instruction, has a
 /// return path between `try_open` and `release`: the interceptor call either
-/// returns or panics, and a task's exit or exec from inside the call is
-/// context-managed, so it runs only after `release`. The one way out of that span without `release` is a
+/// returns or panics, and a task's exit, exec or termination from inside the
+/// call runs only after `release` (the instruction opener refuses an exit or
+/// exec outright). The one way out of that span without `release` is a
 /// kernel panic, which halts the kernel (the kernel does not unwind), so a
 /// guard's `drop` would never run either. A hold that outlives its call is
 /// caught instead by [`__test_open_spawn_holds`] and [`KERNEL_REENTRIES`].
@@ -3723,7 +3725,8 @@ impl SpawnHold {
     /// interceptor call. `None` if `creator` already holds one: it is inside
     /// an interceptor call now, so the entry asking is kernel code running a
     /// syscall on its behalf, not the guest (see `dispatch_intercepted`).
-    /// Each `None` is counted in [`KERNEL_REENTRIES`].
+    /// Each `None` is counted in [`KERNEL_REENTRIES`]. No instruction traps
+    /// from inside a call, so `run_instruction_callback` fails closed on one.
     pub(crate) fn try_open(creator: u64) -> Option<Self> {
         let mut holds = SPAWN_HOLDS.lock();
         if holds.contains_key(&creator) {

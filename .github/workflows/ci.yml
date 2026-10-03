@@ -847,7 +847,8 @@ jobs:
       # online. The rendezvous test also needs an AP: the AP's TLB-shootdown
       # wait and this CPU's remote-call wait must be forced onto each other.
       # The own-stack execve test runs here because it needs a scheduled
-      # user task, which only `user-mode-e2e` builds can create.
+      # user task, which only `user-mode-e2e` builds can create, and so do
+      # the deferred RDTSC tests: their callbacks switch the guests out.
       # A Skip is not coverage, so the step fails unless each named test
       # prints `[ OK ]` and the suite summary reports zero skips.
       - name: cargo xtask test — interception, SMP 2 (skip is failure)
@@ -860,7 +861,7 @@ jobs:
         run: |
           set -o pipefail
           cargo xtask test --arch=x86_64 --features user-mode-e2e --hw-profile minimal \
-            --subsystem verification/syscall-entry,verification/interception-migration,verification/smp-rendezvous,verification/own-stack-exec \
+            --subsystem verification/syscall-entry,verification/interception-migration,verification/smp-rendezvous,verification/own-stack-exec,verification/instruction-defer \
             2>&1 | tee interception-smp2.log
           for t in \
             'verification/syscall-entry / smoke_frame_x86_64_user_mode_fast_syscall_interceptor' \
@@ -875,7 +876,10 @@ jobs:
             'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_defers_concurrent_user_spawn' \
             'verification/interception-migration / smoke_scheduled_user_interception_survives_ap_migration' \
             'verification/smp-rendezvous / smoke_remote_call_completes_while_target_waits_for_shootdown_ack' \
-            'verification/own-stack-exec / smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces'
+            'verification/own-stack-exec / smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces' \
+            'verification/instruction-defer / smoke_deferred_rdtsc_transitions_park_and_self_kill' \
+            'verification/instruction-defer / smoke_deferred_rdtsc_killed_elsewhere_meets_signal_gate_first' \
+            'verification/instruction-defer / smoke_deferred_rdtsc_wait_lets_another_guest_trap_on_its_cpu'
           do
             grep -qF "[ OK ] $t" interception-smp2.log || { echo "::error::not OK: $t"; exit 1; }
           done

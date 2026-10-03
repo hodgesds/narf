@@ -3,8 +3,11 @@
 //! The architecture trap path remains the sole owner of register mutation and
 //! instruction advancement. An interceptor receives an immutable invocation,
 //! may select native emulation or a typed completed value, and may replace only
-//! the result of that same instruction kind.
+//! the result of that same instruction kind. It may also defer that decision
+//! to a callback that runs off the masked entry path and can inject syscalls,
+//! as a syscall interceptor's entry callback can.
 
+use crate::syscall::{NativeSyscallTransition, TrapContext};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -97,6 +100,20 @@ pub enum InstructionInterception {
     Continue,
     /// Skip native emulation and use this typed result.
     Complete(InstructionResult),
+    /// Decide later, in [`InstructionInterceptor::on_instruction_deferred`],
+    /// after this entry callback has returned and the CPU's instruction flag
+    /// is released.
+    Defer,
+}
+
+/// Decision of [`InstructionInterceptor::on_instruction_deferred`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeferredInstruction {
+    /// Execute the kernel's native emulation exactly once.
+    Native,
+    /// Skip native emulation and use this typed result.
+    Complete(InstructionResult),
 }
 
 /// An interceptor returned a value for a different instruction family.
@@ -113,6 +130,10 @@ pub enum InstructionDispatchError {
     Reentrant,
     /// The interceptor returned a result for a different instruction family.
     ResultMismatch(InstructionResultMismatch),
+    /// The interceptor deferred an instruction where the kernel cannot run a
+    /// deferred callback: the own-stack execution model is off, or no user
+    /// task is current.
+    DeferUnsupported,
 }
 
 /// Process-global nondeterministic-instruction policy.
@@ -123,12 +144,16 @@ pub enum InstructionDispatchError {
 /// architecture-owned.
 /// # Safety
 ///
-/// Methods execute synchronously from an architecture exception handler with
-/// ordinary interrupts masked. Implementations must not allocate, park, await,
-/// take a sleepable lock, re-enter guest execution, or recursively dispatch an
-/// intercepted instruction. Mutable state must use preallocated IRQ-safe,
+/// Methods other than
+/// [`on_instruction_deferred`](Self::on_instruction_deferred) execute
+/// synchronously from an architecture exception handler with ordinary
+/// interrupts masked and the executing CPU's instruction flag held.
+/// Implementations must not allocate, park, await, take a sleepable lock,
+/// re-enter guest execution, or recursively dispatch an intercepted
+/// instruction there. Mutable state they use must be preallocated IRQ-safe,
 /// lock-free storage. Violating these requirements can deadlock or corrupt the
-/// interrupted task.
+/// interrupted task. `on_instruction_deferred` has its own contract, stated on
+/// the method.
 pub unsafe trait InstructionInterceptor: Send + Sync {
     /// Instruction families this interceptor owns for its entire lifetime.
     ///
@@ -136,9 +161,46 @@ pub unsafe trait InstructionInterceptor: Send + Sync {
     /// the published kernel slot and is never queried from a trap handler.
     fn subscriptions(&self) -> InstructionSubscriptions;
 
-    /// Select native emulation or a completed value.
+    /// Select native emulation or a completed value, or defer the choice to
+    /// [`on_instruction_deferred`](Self::on_instruction_deferred).
     fn on_instruction_enter(&self, _invocation: &InstructionInvocation) -> InstructionInterception {
         InstructionInterception::Continue
+    }
+
+    /// Complete an instruction that
+    /// [`on_instruction_enter`](Self::on_instruction_enter) deferred.
+    ///
+    /// Exempt from the masked contract above. This runs after
+    /// `on_instruction_enter` has returned and the CPU's instruction flag is
+    /// released, on the trapping task's own kernel stack, as
+    /// [`SyscallInterceptor::on_syscall_enter`](crate::SyscallInterceptor::on_syscall_enter)
+    /// does, with IRQs still masked. It may allocate, inject syscalls through
+    /// `native`, and wait (through
+    /// [`NativeSyscallTransition::wait_for_repoll`] or an inject that blocks),
+    /// so it may resume on another CPU. It must not call
+    /// [`dispatch_instruction`].
+    ///
+    /// `native` has no syscall of its own:
+    /// [`execute_original`](NativeSyscallTransition::execute_original) returns
+    /// [`AlreadyExecuted`](crate::NativeSyscallOriginalError::AlreadyExecuted);
+    /// an inject that would exit the task, replace its image or create a task
+    /// returns `-ENOSYS` without running;
+    /// [`entry_user_state`](NativeSyscallTransition::entry_user_state) is the
+    /// register file at the trap; and
+    /// [`task_killed`](NativeSyscallTransition::task_killed) answers.
+    ///
+    /// If a transition took the task's context (it returned
+    /// [`ContextManaged`](crate::NativeSyscallOutcome::ContextManaged)), the
+    /// answer is ignored: no register is written, the instruction pointer is
+    /// not advanced, `on_instruction_return` is not called, and the task
+    /// executes the instruction again if it returns to user mode at all.
+    /// Otherwise `on_instruction_return` follows, under the masked contract.
+    fn on_instruction_deferred(
+        &self,
+        _invocation: &InstructionInvocation,
+        _native: &mut dyn NativeSyscallTransition,
+    ) -> DeferredInstruction {
+        DeferredInstruction::Native
     }
 
     /// Observe and optionally replace a result of the same typed family.
@@ -161,6 +223,27 @@ static GLOBAL_INTERCEPTOR: AtomicPtr<InstructionInterceptorSlot> =
 
 static IN_INSTRUCTION_CALLBACK: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// The executing CPU's instruction flag, held while a masked callback runs.
+struct CallbackGuard(&'static AtomicBool);
+
+impl CallbackGuard {
+    /// Take the executing CPU's flag, or `None` if a callback on this CPU
+    /// already holds it.
+    fn try_take() -> Option<Self> {
+        let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+        let flag = &IN_INSTRUCTION_CALLBACK[cpu];
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(Self(flag))
+    }
+}
+
+impl Drop for CallbackGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Publish the kernel-lifetime instruction interceptor exactly once.
 ///
@@ -281,41 +364,143 @@ pub fn activate_current_cpu_instruction_interception() {
     narf_arch::x86_64::cr::activate_requested_user_instruction_interception();
 }
 
+/// `result` if it belongs to the `expected` family.
+fn check_family(
+    expected: NondeterministicInstruction,
+    result: InstructionResult,
+) -> Result<InstructionResult, InstructionDispatchError> {
+    if result.instruction() == expected {
+        Ok(result)
+    } else {
+        Err(InstructionDispatchError::ResultMismatch(
+            InstructionResultMismatch {
+                expected,
+                actual: result.instruction(),
+            },
+        ))
+    }
+}
+
+/// How [`dispatch_instruction`] handled a trapped instruction.
+#[derive(Debug)]
+#[must_use]
+pub enum InstructionDispatch {
+    /// No interceptor subscribed to this family, and no tool code ran.
+    Unsubscribed,
+    /// The interceptor completed the instruction with this result.
+    Completed(InstructionResult),
+    /// The interceptor deferred the instruction, and the CPU's instruction
+    /// flag is released. The architecture completes it with
+    /// [`DeferredInstructionCall::complete`].
+    Deferred(DeferredInstructionCall),
+}
+
+/// An instruction whose interceptor deferred its decision to
+/// [`InstructionInterceptor::on_instruction_deferred`].
+///
+/// The architecture trap owner must [`complete`](Self::complete) it before the
+/// task returns to user mode.
+#[must_use = "a deferred instruction must be completed"]
+pub struct DeferredInstructionCall {
+    invocation: InstructionInvocation,
+    slot: &'static InstructionInterceptorSlot,
+}
+
+impl core::fmt::Debug for DeferredInstructionCall {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeferredInstructionCall")
+            .field("invocation", &self.invocation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How [`DeferredInstructionCall::complete`] ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeferredCompletion {
+    /// Write this result back and advance past the instruction.
+    Completed(InstructionResult),
+    /// A transition of the deferred callback took the task's context. Write
+    /// nothing and leave the instruction pointer at the instruction, which the
+    /// task executes again if it returns to user mode.
+    Reexecute,
+}
+
+impl DeferredInstructionCall {
+    /// The invocation the interceptor deferred.
+    pub fn invocation(&self) -> &InstructionInvocation {
+        &self.invocation
+    }
+
+    /// Run [`InstructionInterceptor::on_instruction_deferred`], then
+    /// [`InstructionInterceptor::on_instruction_return`] unless a transition
+    /// took the task's context.
+    ///
+    /// `ctx` is the trap's own context. The callback's transitions never see
+    /// it: the kernel only saves the task's registers from it and, when a
+    /// transition staged the task's termination, terminates the task through
+    /// it, in which case this call does not return in the own-stack model.
+    /// `native` runs at most once, only after [`DeferredInstruction::Native`],
+    /// on the CPU the task runs on by then.
+    pub fn complete<F>(
+        self,
+        ctx: &mut dyn TrapContext,
+        native: F,
+    ) -> Result<DeferredCompletion, InstructionDispatchError>
+    where
+        F: FnOnce() -> InstructionResult,
+    {
+        let interceptor = self.slot.interceptor.as_ref();
+        let invocation = self.invocation;
+        let (decision, context_managed) =
+            crate::syscall::run_instruction_callback(ctx, invocation.task_id, |transition| {
+                interceptor.on_instruction_deferred(&invocation, transition)
+            })?;
+        if context_managed {
+            return Ok(DeferredCompletion::Reexecute);
+        }
+        let result = match decision {
+            DeferredInstruction::Native => native(),
+            DeferredInstruction::Complete(result) => result,
+        };
+        let result = check_family(invocation.instruction, result)?;
+        // The callback may have waited and resumed on another CPU: take the
+        // flag of the CPU the task runs on now.
+        let Some(_callback_guard) = CallbackGuard::try_take() else {
+            return Err(InstructionDispatchError::Reentrant);
+        };
+        let result = interceptor.on_instruction_return(&invocation, result);
+        check_family(invocation.instruction, result).map(DeferredCompletion::Completed)
+    }
+}
+
 /// Dispatch a trapped instruction through the installed interceptor.
 ///
-/// Returns `None` without entering the tool when no interceptor subscribed to
-/// this family. The architecture then completes the instruction natively:
-/// x86 CR4.TSD traps `RDTSC` and `RDTSCP` together, and NARF never disables
-/// the user TSC, so an unsubscribed timestamp family behaves as if untrapped.
-/// `native` runs at most once and only after `Continue`.
+/// Returns [`InstructionDispatch::Unsubscribed`] without entering the tool
+/// when no interceptor subscribed to this family. The architecture then
+/// completes the instruction natively: x86 CR4.TSD traps `RDTSC` and `RDTSCP`
+/// together, and NARF never disables the user TSC, so an unsubscribed
+/// timestamp family behaves as if untrapped. `native` runs at most once and
+/// only after `Continue`. After `Defer` the CPU's flag is released before this
+/// returns [`InstructionDispatch::Deferred`], whose
+/// [`complete`](DeferredInstructionCall::complete) takes its own native
+/// emulation.
 pub fn dispatch_instruction<F>(
     instruction: NondeterministicInstruction,
     instruction_pointer: u64,
     native: F,
-) -> Result<Option<InstructionResult>, InstructionDispatchError>
+) -> Result<InstructionDispatch, InstructionDispatchError>
 where
     F: FnOnce() -> InstructionResult,
 {
     let Some(slot) = global_interceptor() else {
-        return Ok(None);
+        return Ok(InstructionDispatch::Unsubscribed);
     };
     if !slot.subscriptions.contains(instruction) {
-        return Ok(None);
+        return Ok(InstructionDispatch::Unsubscribed);
     }
-    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
-    if IN_INSTRUCTION_CALLBACK[cpu]
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let Some(callback_guard) = CallbackGuard::try_take() else {
         return Err(InstructionDispatchError::Reentrant);
-    }
-    struct CallbackGuard(&'static AtomicBool);
-    impl Drop for CallbackGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
-        }
-    }
-    let _callback_guard = CallbackGuard(&IN_INSTRUCTION_CALLBACK[cpu]);
+    };
     let interceptor = slot.interceptor.as_ref();
     let invocation = InstructionInvocation {
         instruction,
@@ -325,25 +510,19 @@ where
     let result = match interceptor.on_instruction_enter(&invocation) {
         InstructionInterception::Continue => native(),
         InstructionInterception::Complete(result) => result,
+        InstructionInterception::Defer => {
+            // The deferred callback may wait and resume on another CPU, so it
+            // must not run under this CPU's flag.
+            drop(callback_guard);
+            return Ok(InstructionDispatch::Deferred(DeferredInstructionCall {
+                invocation,
+                slot,
+            }));
+        }
     };
-    if result.instruction() != instruction {
-        return Err(InstructionDispatchError::ResultMismatch(
-            InstructionResultMismatch {
-                expected: instruction,
-                actual: result.instruction(),
-            },
-        ));
-    }
+    let result = check_family(instruction, result)?;
     let result = interceptor.on_instruction_return(&invocation, result);
-    if result.instruction() != instruction {
-        return Err(InstructionDispatchError::ResultMismatch(
-            InstructionResultMismatch {
-                expected: instruction,
-                actual: result.instruction(),
-            },
-        ));
-    }
-    Ok(Some(result))
+    check_family(instruction, result).map(InstructionDispatch::Completed)
 }
 
 #[doc(hidden)]

@@ -122,10 +122,10 @@ mod tests;
 
 pub use instruction::{
     activate_current_cpu_instruction_interception, dispatch_instruction,
-    instruction_interception_enabled, try_install_instruction_interceptor,
-    InstructionDispatchError, InstructionInterception, InstructionInterceptor,
-    InstructionInvocation, InstructionResult, InstructionResultMismatch, InstructionSubscriptions,
-    NondeterministicInstruction,
+    instruction_interception_enabled, try_install_instruction_interceptor, DeferredCompletion,
+    DeferredInstruction, DeferredInstructionCall, InstructionDispatch, InstructionDispatchError,
+    InstructionInterception, InstructionInterceptor, InstructionInvocation, InstructionResult,
+    InstructionResultMismatch, InstructionSubscriptions, NondeterministicInstruction,
 };
 pub use interp::{lookup_interpreter, register_interpreter};
 
