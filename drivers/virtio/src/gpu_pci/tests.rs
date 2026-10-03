@@ -35,11 +35,13 @@ kernel_test_in!(
 );
 
 fn smoke_virtio_gpu_virgl_command_capacity() -> TestResult {
-    // Direct Linux/CachyOS traces show these pre-resource screen-init streams;
-    // NARF's former one-page staging buffer rejected all three.
-    for size in [4_136, 9_504, 18_412] {
+    // Direct Linux/CachyOS traces show these pre-resource screen-init streams
+    // (NARF's former one-page staging buffer rejected all three), and Mesa
+    // flushes a full VIRGL_MAX_CMDBUF_DWORDS = 64 Ki + 1024 dword buffer in one
+    // SUBMIT_3D (NARF's former 64 KiB staging-buffer bound rejected it).
+    for size in [4_136, 9_504, 18_412, ((64 * 1024) + 1024) * 4] {
         if !super::virgl_command_fits(size) {
-            return TestResult::Fail("Mesa VirGL initialization command does not fit");
+            return TestResult::Fail("a Mesa VirGL command buffer does not fit");
         }
     }
     if super::virgl_command_fits(super::MAX_VIRGL_COMMAND_BYTES + 1) {

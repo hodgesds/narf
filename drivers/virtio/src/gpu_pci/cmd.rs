@@ -464,6 +464,22 @@ fn write_submit_3d(
     commands: &[u8],
 ) {
     assert!(out.len() >= SUBMIT_3D_PREFIX_LEN + commands.len());
+    build_submit_3d_header(out, ctx_id, ring_idx, fence_id, commands.len() as u32);
+    out[32..32 + commands.len()].copy_from_slice(commands);
+}
+
+/// The `SUBMIT_3D` header and submit body alone (`SUBMIT_3D_PREFIX_LEN`
+/// bytes) for a `command_len`-byte stream that travels in its own
+/// descriptor(s), as Linux `virtio_gpu_cmd_submit` sends it: the device reads
+/// a request's device-readable descriptors as one concatenated buffer.
+pub fn build_submit_3d_header(
+    out: &mut [u8],
+    ctx_id: u32,
+    ring_idx: Option<u8>,
+    fence_id: Option<u64>,
+    command_len: u32,
+) {
+    assert!(out.len() >= SUBMIT_3D_PREFIX_LEN);
     let mut flags = if ring_idx.is_some() {
         VIRTIO_GPU_FLAG_INFO_RING_IDX
     } else {
@@ -483,9 +499,8 @@ fn write_submit_3d(
         // ctrl_hdr.ring_idx is the first byte of the 4-byte padding region.
         out[20] = r;
     }
-    out[24..28].copy_from_slice(&(commands.len() as u32).to_le_bytes());
+    out[24..28].copy_from_slice(&command_len.to_le_bytes());
     out[28..32].copy_from_slice(&0u32.to_le_bytes());
-    out[32..32 + commands.len()].copy_from_slice(commands);
 }
 
 /// `RESOURCE_CREATE_BLOB` fixed header length (before the inline mem-entry
