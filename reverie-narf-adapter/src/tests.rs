@@ -816,8 +816,8 @@ fn result_of(outcome: Result<TestResult, &'static str>) -> TestResult {
 /// The kernel-global switches that a reverie-narf test may change while it
 /// runs, and must restore before the next test: the signal tables
 /// (`narf_userspace::signal_init` and `sigaction_init`), the vDSO clock
-/// routing, the vDSO image registration, and user-task SMP placement with
-/// work stealing.
+/// routing, the vDSO image registration, user-task SMP placement with work
+/// stealing, and the kernel's instruction interceptor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct GlobalSwitches {
     signal_tables: narf_userspace::handlers::SignalTablesState,
@@ -825,6 +825,7 @@ struct GlobalSwitches {
     vdso_registered: bool,
     user_task_smp: bool,
     work_stealing: bool,
+    instruction_interceptor: bool,
 }
 
 impl GlobalSwitches {
@@ -835,6 +836,11 @@ impl GlobalSwitches {
             vdso_registered: narf_userspace::vdso::vdso_registered(),
             user_task_smp: narf_scheduler::user_task_smp_enabled(),
             work_stealing: narf_scheduler::work_stealing_enabled(),
+            instruction_interceptor: narf_userspace::instruction_interception_enabled(
+                narf_userspace::NondeterministicInstruction::Rdtsc,
+            ) || narf_userspace::instruction_interception_enabled(
+                narf_userspace::NondeterministicInstruction::Rdtscp,
+            ),
         }
     }
 }
@@ -842,10 +848,16 @@ impl GlobalSwitches {
 /// Runs one registered reverie-narf test and fails it by name if it left any
 /// [`GlobalSwitches`] changed, whatever the test itself returned. A leaked
 /// switch changes what every later test in the boot exercises, so the leak
-/// is reported even when the test passed.
+/// is reported even when the test passed. The exception is a test that
+/// failed after a panic was reported: its own failure names the cause, the
+/// runner stops after it, so no later test runs, and `run_rdtsc` then
+/// leaves the interceptor installed on purpose.
 fn leak_checked(test: fn() -> TestResult) -> TestResult {
     let before = GlobalSwitches::read();
     let result = test();
+    if narf_console::panic_reported() && matches!(result, TestResult::Fail(_)) {
+        return result;
+    }
     let after = GlobalSwitches::read();
     if after.signal_tables != before.signal_tables {
         let _ = writeln!(
@@ -854,6 +866,11 @@ fn leak_checked(test: fn() -> TestResult) -> TestResult {
             before.signal_tables, after.signal_tables
         );
         return TestResult::Fail("the test left the signal tables set up");
+    }
+    // Before the clock routing, which an installed interceptor also
+    // changes, so a leaked interceptor is reported as such.
+    if after.instruction_interceptor != before.instruction_interceptor {
+        return TestResult::Fail("the test left an instruction interceptor installed");
     }
     if after.clocks_route_through_syscalls != before.clocks_route_through_syscalls {
         return TestResult::Fail("the test left the vDSO clock routing changed");
@@ -5171,60 +5188,81 @@ fn raw_syscall(nr: reverie::syscalls::Sysno, args: [usize; 6]) -> reverie::sysca
 #[derive(Debug, Default, Clone, Copy)]
 struct ParkInThreadStart;
 
+/// Injects, from any callback of `guest`, an `mmap` of one page, a `pipe2`
+/// into it, and a non-tail `poll` of the pipe's empty read end with a 20 ms
+/// timeout, which parks the task: a `poll` of a descriptor with a timeout
+/// takes the kernel's park path, where one of no descriptors waits out its
+/// timeout in place and returns. Stores the `mmap` and `pipe2` results as they
+/// arrive, and whether the `poll` returned.
+async fn park_on_empty_pipe<Tl: Tool, T: reverie::Guest<Tl>>(
+    guest: &mut T,
+    mmap_result: &AtomicI64,
+    pipe_result: &AtomicI64,
+    poll_returned: &AtomicBool,
+) {
+    let mmap = [
+        0,
+        4096,
+        LINUX_PROT_READ_WRITE,
+        LINUX_MAP_PRIVATE_ANONYMOUS,
+        usize::MAX,
+        0,
+    ];
+    let page = raw_result(
+        guest
+            .inject(raw_syscall(reverie::syscalls::Sysno::mmap, mmap))
+            .await,
+    );
+    mmap_result.store(page, Ordering::Release);
+    if page <= 0 {
+        return;
+    }
+    let page = page as usize;
+    let pipe2 = [page, 0, 0, 0, 0, 0];
+    let pipe = raw_result(
+        guest
+            .inject(raw_syscall(reverie::syscalls::Sysno::pipe2, pipe2))
+            .await,
+    );
+    pipe_result.store(pipe, Ordering::Release);
+    if pipe != 0 {
+        return;
+    }
+    let mut memory = guest.memory();
+    let mut fds = [0u8; 8];
+    let Some(fds_at) = Addr::<u8>::from_raw(page) else {
+        return;
+    };
+    if memory.read_exact(fds_at, &mut fds).is_err() {
+        return;
+    }
+    let read_end = i32::from_ne_bytes([fds[0], fds[1], fds[2], fds[3]]);
+    // struct pollfd { int fd; short events; short revents; }
+    let mut pollfd = [0u8; 8];
+    pollfd[..4].copy_from_slice(&read_end.to_ne_bytes());
+    pollfd[4..6].copy_from_slice(&LINUX_POLLIN.to_ne_bytes());
+    let Some(pollfd_at) = reverie::syscalls::AddrMut::<u8>::from_raw(page + 8) else {
+        return;
+    };
+    if memory.write_exact(pollfd_at, &pollfd).is_err() {
+        return;
+    }
+    let poll = [page + 8, 1, 20, 0, 0, 0];
+    let _ = guest
+        .inject(raw_syscall(reverie::syscalls::Sysno::poll, poll))
+        .await;
+    poll_returned.store(true, Ordering::Release);
+}
+
 impl ParkInThreadStart {
     async fn park<T: reverie::Guest<Self>>(guest: &mut T) {
-        let mmap = [
-            0,
-            4096,
-            LINUX_PROT_READ_WRITE,
-            LINUX_MAP_PRIVATE_ANONYMOUS,
-            usize::MAX,
-            0,
-        ];
-        let page = raw_result(
-            guest
-                .inject(raw_syscall(reverie::syscalls::Sysno::mmap, mmap))
-                .await,
-        );
-        PARK_START_MMAP.store(page, Ordering::Release);
-        if page <= 0 {
-            return;
-        }
-        let page = page as usize;
-        let pipe2 = [page, 0, 0, 0, 0, 0];
-        let pipe = raw_result(
-            guest
-                .inject(raw_syscall(reverie::syscalls::Sysno::pipe2, pipe2))
-                .await,
-        );
-        PARK_START_PIPE.store(pipe, Ordering::Release);
-        if pipe != 0 {
-            return;
-        }
-        let mut memory = guest.memory();
-        let mut fds = [0u8; 8];
-        let Some(fds_at) = Addr::<u8>::from_raw(page) else {
-            return;
-        };
-        if memory.read_exact(fds_at, &mut fds).is_err() {
-            return;
-        }
-        let read_end = i32::from_ne_bytes([fds[0], fds[1], fds[2], fds[3]]);
-        // struct pollfd { int fd; short events; short revents; }
-        let mut pollfd = [0u8; 8];
-        pollfd[..4].copy_from_slice(&read_end.to_ne_bytes());
-        pollfd[4..6].copy_from_slice(&LINUX_POLLIN.to_ne_bytes());
-        let Some(pollfd_at) = reverie::syscalls::AddrMut::<u8>::from_raw(page + 8) else {
-            return;
-        };
-        if memory.write_exact(pollfd_at, &pollfd).is_err() {
-            return;
-        }
-        let poll = [page + 8, 1, 20, 0, 0, 0];
-        let _ = guest
-            .inject(raw_syscall(reverie::syscalls::Sysno::poll, poll))
-            .await;
-        PARK_START_POLL_RETURNED.store(true, Ordering::Release);
+        park_on_empty_pipe(
+            guest,
+            &PARK_START_MMAP,
+            &PARK_START_PIPE,
+            &PARK_START_POLL_RETURNED,
+        )
+        .await;
     }
 }
 
@@ -5654,3 +5692,593 @@ fn reverie_narf_pml4_1_window_is_user_address_space() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_pml4_1_window_is_user_address_space);
+
+// ── RDTSC events ─────────────────────────────────────────────────────────
+
+static RDTSC_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RDTSC"));
+static RDTSCKILL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RDTSCKILL"));
+
+/// The first value [`RdtscCounter`] hands out. Both halves are nonzero, so
+/// the guest's EDX comes from the Tool as well as its EAX.
+const RDTSC_FIRST: u64 = (1 << 32) | 0x4b00;
+/// The high half of every `aux` that [`RdtscFromTool`] returns; the low
+/// half is the value's low 16 bits, so no two are equal, and none is the 0
+/// that ECX holds when no `aux` is delivered.
+const RDTSC_AUX_TAG: u32 = 0x5a17_0000;
+/// The six words the RDTSC guest writes to fd 1, in one write.
+const RDTSC_REPORT_LEN: usize = 48;
+
+/// Requests [`RdtscCounter`] served, and polls of the waits in
+/// [`RdtscFromTool`]'s callbacks, which end once [`RDTSC_GO`] is set.
+static RDTSC_RPCS: AtomicU64 = AtomicU64::new(0);
+static RDTSC_POLLS: AtomicU64 = AtomicU64::new(0);
+static RDTSC_GO: AtomicBool = AtomicBool::new(false);
+/// What [`RdtscFromTool`] logged, one line per event, in order.
+static RDTSC_LINES: IrqSafeSpinLock<Vec<alloc::string::String>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Clears what the RDTSC Tools record, before a run.
+fn reset_rdtsc() {
+    RDTSC_RPCS.store(0, Ordering::Release);
+    RDTSC_POLLS.store(0, Ordering::Release);
+    RDTSC_GO.store(true, Ordering::Release);
+    RDTSC_LINES.lock().clear();
+}
+
+/// The line [`RdtscFromTool`] logs for one event.
+fn rdtsc_line(instruction: &str, tsc: u64, aux: Option<u32>) -> alloc::string::String {
+    match aux {
+        Some(aux) => alloc::format!("handle_rdtsc: {instruction} returned {tsc:#x} aux {aux:#x}"),
+        None => alloc::format!("handle_rdtsc: {instruction} returned {tsc:#x}"),
+    }
+}
+
+/// Hands out [`RDTSC_FIRST`], then one more for each request, and counts the
+/// requests in [`RDTSC_RPCS`].
+#[derive(Debug)]
+struct RdtscCounter(AtomicU64);
+
+impl Default for RdtscCounter {
+    fn default() -> Self {
+        Self(AtomicU64::new(RDTSC_FIRST))
+    }
+}
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for RdtscCounter {
+    type Request = u64;
+    type Response = u64;
+    type Config = ();
+
+    async fn init_global_state(_: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, _: u64) -> u64 {
+        RDTSC_RPCS.fetch_add(1, Ordering::AcqRel);
+        self.0.fetch_add(1, Ordering::AcqRel)
+    }
+}
+
+/// Answers every `rdtsc` and `rdtscp` with the next value of
+/// [`RdtscCounter`], asked for over RPC, and each `rdtscp` whose value is
+/// even also with an `aux` of [`RDTSC_AUX_TAG`] and the value's low 16
+/// bits; one whose value is odd gets no `aux`. Each callback
+/// waits once before it answers: the wait is pending on its first poll, so
+/// the task waits and the callback is polled again. It logs each event, and
+/// subscribes to nothing else, so the guest's syscalls run untouched.
+#[derive(Debug, Default, Clone, Copy)]
+struct RdtscFromTool;
+
+#[reverie::tool]
+impl Tool for RdtscFromTool {
+    type GlobalState = RdtscCounter;
+    type ThreadState = ();
+
+    fn subscriptions(_: &()) -> reverie::Subscription {
+        let mut subscription = reverie::Subscription::none();
+        subscription.rdtsc();
+        subscription
+    }
+
+    async fn handle_rdtsc_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        request: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, reverie::Errno> {
+        let tsc = guest.send_rpc(0).await;
+        let _ = wait_for(&RDTSC_GO, &RDTSC_POLLS, true).await;
+        let (instruction, aux) = match request {
+            reverie::Rdtsc::Tsc => ("rdtsc", None),
+            reverie::Rdtsc::Tscp => (
+                "rdtscp",
+                ((tsc & 1) == 0).then_some(RDTSC_AUX_TAG | (tsc as u32 & 0xffff)),
+            ),
+        };
+        let line = rdtsc_line(instruction, tsc, aux);
+        let _ = writeln!(Writer, "    {line}");
+        RDTSC_LINES.lock().push(line);
+        Ok(reverie::RdtscResult { tsc, aux })
+    }
+}
+
+/// What a run of [`run_rdtsc`] leaves to check.
+struct RdtscRun<T: Tool + 'static> {
+    interceptor: ReverieInterceptor<T>,
+    root: Root,
+    reap: Option<RootReap>,
+    /// What the root wrote to its fd 1.
+    stdout: Vec<u8>,
+}
+
+/// Runs `elf` under `T` built with [`ReverieInterceptor::with_rdtsc`], with
+/// the [`crate::RdtscInterceptor`] it returns installed in the kernel, the
+/// root's fd 1 behind a capture-only [`StdoutTap`], the root hosted unless
+/// `host` is false, and `reaper` as in [`run_guest_with`]. The kernel's
+/// interceptor is cleared once the run is over, whatever its outcome, so no
+/// later test traps, except after a panic. A panicked CPU halts with
+/// interrupts masked and stays online, so it never acknowledges the
+/// clear's rendezvous, which waits for every online CPU. The run then
+/// fails without the clear, and the runner stops after this test
+/// (`narf_console::panic_reported`).
+fn run_rdtsc<T: Tool + 'static>(
+    elf: &[u8],
+    config: <T::GlobalState as reverie::GlobalTool>::Config,
+    host: bool,
+    reaper: Option<&[u8]>,
+) -> Result<RdtscRun<T>, &'static str> {
+    let (interceptor, rdtsc) = ReverieInterceptor::<T>::with_rdtsc(config, T::new)
+        .map_err(|_| "NarfToolHost::new_delivering_rdtsc refused the Tool")?;
+    let rdtsc =
+        rdtsc.ok_or("with_rdtsc returned no RDTSC interceptor for a Tool that subscribed")?;
+    if narf_userspace::try_install_instruction_interceptor(Box::new(rdtsc)).is_err() {
+        return Err("the kernel refused the RDTSC interceptor");
+    }
+    let mut tap = None;
+    let run = run_guest_with(
+        elf,
+        interceptor.boxed(),
+        |root| {
+            tap = Some(tap_console(root.task_id, false)?);
+            if !host {
+                return Ok(());
+            }
+            interceptor
+                .host_root(root.task_id)
+                .map_err(|_| "register_root refused the root task")
+        },
+        reaper,
+    );
+    if narf_console::panic_reported() {
+        return Err("a CPU panicked while the guest ran (KERNEL PANIC above)");
+    }
+    narf_userspace::instruction::__verification_clear_instruction_interceptor();
+    let (root, reap) = run?;
+    let stdout = tap
+        .ok_or("the root's fd 1 was never tapped")?
+        .captured
+        .lock()
+        .clone();
+    Ok(RdtscRun {
+        interceptor,
+        root,
+        reap,
+        stdout,
+    })
+}
+
+/// The six words of the RDTSC guest's report.
+fn rdtsc_report(stdout: &[u8]) -> Result<[u64; 6], &'static str> {
+    if stdout.len() != RDTSC_REPORT_LEN {
+        return Err("the RDTSC guest did not write its 48-byte report exactly once");
+    }
+    let mut words = [0u64; 6];
+    for (word, bytes) in words.iter_mut().zip(stdout.chunks_exact(8)) {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(bytes);
+        *word = u64::from_le_bytes(raw);
+    }
+    Ok(words)
+}
+
+/// The RDTSC parity cell. A Tool's values replace the counter as under
+/// reverie-ptrace, whose `handle_rdtsc_event` result goes to EDX:EAX, and
+/// for `rdtscp` its `aux`, or 0, to ECX. The RDTSC guest's two `rdtsc` and
+/// two `rdtscp` each reach [`RdtscFromTool`] once, in order; each callback
+/// asks the global counter over RPC and waits once before it answers. The
+/// cell binds the Tool's log, the guest's stdout and its exit: the Tool
+/// logged exactly the four events, the guest wrote exactly the four values,
+/// the first `rdtscp`'s `aux` and a 0 for the second, which got none, and
+/// it exited 0 because each pair was consecutive, which the native counter
+/// never is.
+fn reverie_narf_rdtsc_values_come_from_the_tool() -> TestResult {
+    reset_rdtsc();
+    result_of((|| {
+        let run = run_rdtsc::<RdtscFromTool>(RDTSC_GUEST, (), true, None)?;
+        let lines = RDTSC_LINES.lock().clone();
+        let rpcs = RDTSC_RPCS.load(Ordering::Acquire);
+        let polls = RDTSC_POLLS.load(Ordering::Acquire);
+        let reason = run.interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    rpcs {rpcs} polls {polls} stdout {:x?} abort reason {reason:?}",
+            run.stdout
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        // RDTSC_FIRST is even: the first rdtscp's value is even and gets an
+        // aux, the second's is odd and gets none.
+        let aux = RDTSC_AUX_TAG | ((RDTSC_FIRST + 2) as u32 & 0xffff);
+        let expected = [
+            rdtsc_line("rdtsc", RDTSC_FIRST, None),
+            rdtsc_line("rdtsc", RDTSC_FIRST + 1, None),
+            rdtsc_line("rdtscp", RDTSC_FIRST + 2, Some(aux)),
+            rdtsc_line("rdtscp", RDTSC_FIRST + 3, None),
+        ];
+        if lines != expected {
+            return Err("the Tool did not log exactly the guest's four events, in order");
+        }
+        if rpcs != 4 {
+            return Err("the global counter did not serve exactly one request per event");
+        }
+        if polls != 8 {
+            return Err("a callback was not polled again after its task waited");
+        }
+        let words = rdtsc_report(&run.stdout)?;
+        if words[..4] != [0, 1, 2, 3].map(|k| RDTSC_FIRST + k) {
+            return Err("the guest did not read the Tool's values in EDX:EAX");
+        }
+        if words[4] != u64::from(aux) {
+            return Err("the guest's rdtscp did not read the Tool's aux in ECX");
+        }
+        // The guest's RCX still held the first rdtscp's aux, and the value
+        // in EDX:EAX, checked above, shows the Tool completed the second.
+        if words[5] != 0 {
+            return Err("the guest's rdtscp did not read 0 in ECX where the Tool gave no aux");
+        }
+        check_teardown(&run.interceptor, run.root, 1, 0)?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_rdtsc_values_come_from_the_tool);
+
+/// A task the host does not track executes `rdtsc` and `rdtscp` natively
+/// while the RDTSC interceptor is installed. The RDTSC guest, not hosted,
+/// reads the hardware counter and never reaches the Tool, so no pair is
+/// consecutive and it exits 1, as its reaping parent sees.
+fn reverie_narf_unhosted_rdtsc_runs_natively() -> TestResult {
+    reset_rdtsc();
+    result_of((|| {
+        let run = run_rdtsc::<RdtscFromTool>(RDTSC_GUEST, (), false, Some(REAPER_GUEST))?;
+        let reap = run.reap.ok_or("the run did not reap its root")?;
+        let lines = RDTSC_LINES.lock().len();
+        let rpcs = RDTSC_RPCS.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    lines {lines} rpcs {rpcs} reaped {} wstatus {:#x} stdout {:x?}",
+            reap.reaped_pid, reap.wstatus, run.stdout
+        );
+        if lines != 0 || rpcs != 0 {
+            return Err("the Tool saw an unhosted task's instruction");
+        }
+        let words = rdtsc_report(&run.stdout)?;
+        let tool_values = RDTSC_FIRST..RDTSC_FIRST + 4;
+        if words[..4]
+            .iter()
+            .any(|word| *word == 0 || tool_values.contains(word))
+        {
+            return Err("the unhosted guest did not read the native counter");
+        }
+        if reap.reaped_pid != run.root.pid as i64 || reap.wstatus != 1 << 8 {
+            return Err("the unhosted guest did not exit 1");
+        }
+        if !run.interceptor.exits().is_empty() {
+            return Err("the host saw an unhosted task's exit");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_unhosted_rdtsc_runs_natively);
+
+/// [`KillWait`], with the child's `getuid` replaced by an `rdtsc` whose
+/// callback waits for [`KILLWAIT_NEVER`] ([`killwait_child`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct RdtscKillWait;
+
+#[reverie::tool]
+impl Tool for RdtscKillWait {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_: &()) -> reverie::Subscription {
+        let mut subscription = reverie::Subscription::all_syscalls();
+        subscription.rdtsc();
+        subscription
+    }
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        if syscall.number().id() as u32 == LINUX_GETGID {
+            return Ok(killwait_parent().await);
+        }
+        guest.tail_inject(syscall).await
+    }
+
+    async fn handle_rdtsc_event<T: reverie::Guest<Self>>(
+        &self,
+        _: &mut T,
+        _: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, reverie::Errno> {
+        let tsc = killwait_child(&KILLWAIT_NEVER).await as u64;
+        Ok(reverie::RdtscResult { tsc, aux: None })
+    }
+}
+
+/// A task killed while its RDTSC callback waits for another task dies at
+/// the instruction without the callback going on, as one whose syscall
+/// callback waits does ([`reverie_narf_kill_ends_a_waiting_callback`]): the
+/// kill-during-wait guest with an `rdtsc` in the child ([`RdtscKillWait`]);
+/// see [`check_killed_wait`].
+fn reverie_narf_kill_ends_a_waiting_rdtsc_callback() -> TestResult {
+    reset_killwait();
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let run = run_rdtsc::<RdtscKillWait>(RDTSCKILL_GUEST, (), true, None)?;
+        check_killed_wait(&run.interceptor, run.root)?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_kill_ends_a_waiting_rdtsc_callback);
+
+/// Callbacks of [`RdtscKillSelf`] that started, went on past their `kill`,
+/// and had their future dropped.
+static RDTSC_KILL_REACHED: AtomicU64 = AtomicU64::new(0);
+static RDTSC_KILL_AFTER: AtomicU64 = AtomicU64::new(0);
+static RDTSC_KILL_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Injects `kill(self, SIGKILL)` from its RDTSC callback.
+#[derive(Debug, Default, Clone, Copy)]
+struct RdtscKillSelf;
+
+#[reverie::tool]
+impl Tool for RdtscKillSelf {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_: &()) -> reverie::Subscription {
+        let mut subscription = reverie::Subscription::none();
+        subscription.rdtsc();
+        subscription
+    }
+
+    async fn handle_rdtsc_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        _: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, reverie::Errno> {
+        let _mark = CountDrop(&RDTSC_KILL_DROPPED);
+        RDTSC_KILL_REACHED.fetch_add(1, Ordering::AcqRel);
+        let kill = reverie::syscalls::Kill::new()
+            .with_pid(guest.pid().as_raw())
+            .with_sig(LINUX_SIGKILL);
+        let _ = guest.inject(kill).await;
+        RDTSC_KILL_AFTER.fetch_add(1, Ordering::AcqRel);
+        Ok(reverie::RdtscResult {
+            tsc: RDTSC_FIRST,
+            aux: None,
+        })
+    }
+}
+
+/// A task killed by its own injected `kill` inside an RDTSC callback runs
+/// nothing more, as inside a syscall callback
+/// ([`reverie_narf_sigkill_in_callback_matches_ptrace`]): the `kill` never
+/// returns to the Tool, the callback's future is dropped exactly once, the
+/// run is not aborted, the guest writes nothing, and it dies of SIGKILL with
+/// its spawn hold released. The kernel's answer to
+/// `KernelServices::killed` is what tells the host that the callback ended
+/// because the task is dying, not because the Tool failed.
+fn reverie_narf_kill_injected_in_rdtsc_ends_the_task() -> TestResult {
+    for counter in [&RDTSC_KILL_REACHED, &RDTSC_KILL_AFTER, &RDTSC_KILL_DROPPED] {
+        counter.store(0, Ordering::Release);
+    }
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let run = run_rdtsc::<RdtscKillSelf>(RDTSC_GUEST, (), true, None)?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let reached = RDTSC_KILL_REACHED.load(Ordering::Acquire);
+        let after = RDTSC_KILL_AFTER.load(Ordering::Acquire);
+        let dropped = RDTSC_KILL_DROPPED.load(Ordering::Acquire);
+        let reason = run.interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    reached {reached} after {after} dropped {dropped} holds {holds:?} \
+             stdout {} bytes abort reason {reason:?}",
+            run.stdout.len()
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callback");
+        }
+        if reached != 1 {
+            return Err("the Tool's RDTSC callback did not start exactly once");
+        }
+        if after != 0 {
+            return Err("the killed task's callback went on past its kill");
+        }
+        if dropped != 1 {
+            return Err("the killed task's callback future was not dropped exactly once");
+        }
+        if !run.stdout.is_empty() {
+            return Err("the killed guest ran on to its write");
+        }
+        check_teardown(&run.interceptor, run.root, 1, LINUX_SIGKILL)?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_kill_injected_in_rdtsc_ends_the_task);
+
+/// What the setup injects of [`RdtscPark`] (`mmap`, `pipe2`) returned, and
+/// whether its blocking inject returned to it.
+static RDTSC_PARK_MMAP: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static RDTSC_PARK_PIPE: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static RDTSC_PARK_RETURNED: AtomicBool = AtomicBool::new(false);
+
+/// Makes a blocking inject from its RDTSC callback: a 20 ms `poll` of an
+/// empty pipe ([`park_on_empty_pipe`]), which parks.
+#[derive(Debug, Default, Clone, Copy)]
+struct RdtscPark;
+
+#[reverie::tool]
+impl Tool for RdtscPark {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_: &()) -> reverie::Subscription {
+        let mut subscription = reverie::Subscription::none();
+        subscription.rdtsc();
+        subscription
+    }
+
+    async fn handle_rdtsc_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        _: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, reverie::Errno> {
+        park_on_empty_pipe(
+            guest,
+            &RDTSC_PARK_MMAP,
+            &RDTSC_PARK_PIPE,
+            &RDTSC_PARK_RETURNED,
+        )
+        .await;
+        Ok(reverie::RdtscResult {
+            tsc: RDTSC_FIRST,
+            aux: None,
+        })
+    }
+}
+
+/// A blocking inject in an RDTSC callback stops only the hosted process
+/// tree, as one in a lifecycle callback does
+/// ([`reverie_narf_parked_inject_in_thread_start_aborts_the_tree`]): no
+/// guest syscall exists to re-execute, so the host reports `InjectParked`,
+/// and the interceptor logs that reason and kills the tree with SIGKILL
+/// before the guest runs on. The kernel keeps running: a later hosted run
+/// completes normally.
+fn reverie_narf_parked_inject_in_rdtsc_aborts_the_tree() -> TestResult {
+    RDTSC_PARK_MMAP.store(NOT_SEEN, Ordering::Release);
+    RDTSC_PARK_PIPE.store(NOT_SEEN, Ordering::Release);
+    RDTSC_PARK_RETURNED.store(false, Ordering::Release);
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let run = run_rdtsc::<RdtscPark>(RDTSC_GUEST, (), true, None)?;
+        let mmap = RDTSC_PARK_MMAP.load(Ordering::Acquire);
+        let pipe = RDTSC_PARK_PIPE.load(Ordering::Acquire);
+        let returned = RDTSC_PARK_RETURNED.load(Ordering::Acquire);
+        let reason = run.interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    mmap {mmap:#x} pipe2 {pipe} poll returned {returned} stdout {} bytes abort reason {reason:?}",
+            run.stdout.len()
+        );
+        if mmap <= 0 || pipe != 0 {
+            return Err("the Tool's setup injects in handle_rdtsc_event failed");
+        }
+        if returned {
+            return Err("the blocking inject returned to the Tool");
+        }
+        let named = reason.as_deref().is_some_and(|reason| {
+            reason.contains("handle_rdtsc") && reason.contains("InjectParked")
+        });
+        if !named {
+            return Err("the run was not aborted with the InjectParked reason");
+        }
+        if !run.stdout.is_empty() {
+            return Err("the aborted guest ran on to its write");
+        }
+        check_teardown(&run.interceptor, run.root, 1, LINUX_SIGKILL)?;
+        check_kernel_still_hosts()?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_parked_inject_in_rdtsc_aborts_the_tree);
+
+/// Fails every RDTSC event with `EPERM`.
+#[derive(Debug, Default, Clone, Copy)]
+struct RdtscFails;
+
+#[reverie::tool]
+impl Tool for RdtscFails {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_: &()) -> reverie::Subscription {
+        let mut subscription = reverie::Subscription::none();
+        subscription.rdtsc();
+        subscription
+    }
+
+    async fn handle_rdtsc_event<T: reverie::Guest<Self>>(
+        &self,
+        _: &mut T,
+        _: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, reverie::Errno> {
+        Err(reverie::Errno::EPERM)
+    }
+}
+
+/// A Tool that fails an RDTSC event stops only the hosted process tree: the
+/// instruction has no value, so the host reports `Rdtsc`, and the
+/// interceptor logs that reason and kills the tree with SIGKILL before the
+/// guest runs on.
+fn reverie_narf_rdtsc_tool_errno_aborts_the_tree() -> TestResult {
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let run = run_rdtsc::<RdtscFails>(RDTSC_GUEST, (), true, None)?;
+        let reason = run.interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    stdout {} bytes abort reason {reason:?}",
+            run.stdout.len()
+        );
+        let named = reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("handle_rdtsc") && reason.contains("Rdtsc("));
+        if !named {
+            return Err("the run was not aborted with the Rdtsc reason");
+        }
+        if !run.stdout.is_empty() {
+            return Err("the aborted guest ran on to its write");
+        }
+        check_teardown(&run.interceptor, run.root, 1, LINUX_SIGKILL)?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_rdtsc_tool_errno_aborts_the_tree);
+
+/// [`ReverieInterceptor::with_rdtsc`] gives no RDTSC interceptor for a Tool
+/// that does not subscribe to RDTSC events, so its caller installs none and
+/// the Tool's guests never trap: installed, it would send every hosted
+/// task's `rdtsc` to a host that refuses the event as an invariant
+/// (`NarfFatal::UnexpectedRdtsc`). [`Answer`] keeps Reverie's default
+/// subscription, every syscall and no RDTSC.
+fn reverie_narf_with_rdtsc_gives_no_interceptor_without_a_subscription() -> TestResult {
+    result_of((|| {
+        let (_interceptor, rdtsc) = ReverieInterceptor::<Answer>::with_rdtsc((), Answer::new)
+            .map_err(|_| "NarfToolHost::new_delivering_rdtsc refused a syscall-only Tool")?;
+        if rdtsc.is_some() {
+            return Err(
+                "with_rdtsc returned an RDTSC interceptor for a Tool that did not subscribe",
+            );
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_with_rdtsc_gives_no_interceptor_without_a_subscription);

@@ -12,7 +12,10 @@
 //! * [`IrqSpinTaskLock`] is the host's task-table lock;
 //! * [`ReverieInterceptor`] is the [`narf_userspace::syscall::SyscallInterceptor`]
 //!   that owns the host and forwards syscall entries and task lifecycle
-//!   events to it.
+//!   events to it;
+//! * [`RdtscInterceptor`] is the [`narf_userspace::InstructionInterceptor`]
+//!   that forwards hosted tasks' `rdtsc` and `rdtscp` to the same host, for
+//!   a Tool that subscribes to RDTSC events (see "RDTSC events" below).
 //!
 //! There is no IPC, ptrace emulation, signal or binary rewriting: the kernel
 //! calls the interceptor, the interceptor polls the Tool's future on the
@@ -35,7 +38,8 @@
 //!
 //! ## Refused when the run is configured
 //!
-//! * **CPUID and RDTSC subscriptions.** `NarfToolHost::new` returns
+//! * **CPUID subscriptions, and RDTSC subscriptions outside
+//!   [`ReverieInterceptor::with_rdtsc`].** `NarfToolHost::new` returns
 //!   `NarfFatal::UnsupportedSubscription`, so [`ReverieInterceptor::new`]
 //!   fails and no guest runs. Host-owned threads
 //!   (`UnsupportedThreadOwnership`) and signal-dequeue observation
@@ -48,6 +52,13 @@
 //! * **fs_base and gs_base.** `KernelServices::regs` reports `fs_base`,
 //!   `gs_base` and the `ds`/`es`/`fs`/`gs` selectors as 0. A Tool that
 //!   reads them gets 0, not the guest's TLS base.
+//! * **RDTSC events, when the [`RdtscInterceptor`] is not installed.**
+//!   [`ReverieInterceptor::with_rdtsc`] returns it for a Tool that
+//!   subscribed, and the caller must install it before the guest runs.
+//!   Nothing checks that it did, or that the install succeeded; if not,
+//!   the Tool gets no RDTSC event, and every `rdtsc` reads the hardware
+//!   counter. The kernel keeps an installed interceptor for its lifetime,
+//!   so only the first such run of a boot can install one.
 //!
 //! ## Refused inside a callback
 //!
@@ -59,8 +70,8 @@
 //!
 //! ## Run aborts
 //!
-//! Every `NarfFatal` returned to the interceptor goes to
-//! `ReverieInterceptor::fatal`, which sorts it with `fatal_kind` (an
+//! Every `NarfFatal` returned to either interceptor goes to their shared
+//! `fatal` (`interceptor.rs`), which sorts it with `fatal_kind` (an
 //! exhaustive match, so a new variant must be sorted before the adapter
 //! builds).
 //!
@@ -87,8 +98,11 @@
 //! | `ToolSuspended` | The Tool's future was pending without a terminal transition and without a parked inject, where the kernel cannot let the task wait: in a hook that is polled once, or outside the own-stack execution model (see "Waiting callbacks"). | No; Tool only. |
 //! | `TransitionAfterInterruption` | After a signal interrupted its parked inject (which returned `ERESTARTSYS`), the Tool ran another syscall. | Yes, given such a Tool: a signal sent during the parked inject is enough (`reverie_narf_transition_after_interruption_aborts_the_tree`). |
 //! | `TransitionAfterTerminal` | The Tool ran a syscall after its callback's terminal transition. | No; Tool only. |
-//! | `TailInjectOutsideSyscall` | A lifecycle callback tail-injected a syscall that returned. | No; Tool only. |
+//! | `TailInjectOutsideSyscall` | A lifecycle or RDTSC callback tail-injected a syscall that returned. | No; Tool only. |
 //! | `DaemonizeRefused(Errno)` | The kernel refused the Tool's daemonize request. | No; Tool only. |
+//! | `Rdtsc(Errno)` | `handle_rdtsc_event` failed with an errno while the task was not ending. | Only through a Tool that fails on guest input (`reverie_narf_rdtsc_tool_errno_aborts_the_tree`). |
+//! | `RdtscContextManaged` | An RDTSC callback's transition took the task's context although the task was not killed (`KernelServices::killed`, which answers only for `SIGKILL`): a tail inject parked it, or an inject ended its context, as an injected `rt_sigreturn` does: with no signal frame to restore, the kernel stages a `SIGSEGV`. | Only through a Tool that makes such a transition. |
+//! | `InjectParked`, in an RDTSC callback | As in a lifecycle callback: no guest syscall exists to re-execute. | Yes, given a Tool that makes a blocking inject there (`reverie_narf_parked_inject_in_rdtsc_aborts_the_tree`). |
 //!
 //! **Invariant: the kernel panics.** A fatal that means the kernel or the
 //! host broke its own contract leaves no state that can be trusted, so
@@ -101,14 +115,59 @@
 //! stop after the current test once a panic is reported
 //! (`console::panic_reported`, `verification`'s `stop_after_panic`), and
 //! the hosted-test waiter stops waiting for the guest's tasks, so such a
-//! run ends in bounded time with a named `[FAIL]`. These are
+//! run ends in bounded time with a named `[FAIL]`. It does not if the
+//! panic halted the CPU that runs the test runner, or if that CPU then
+//! waits for the halted one, on a lock it held or on a rendezvous of every
+//! online CPU (which is why `run_rdtsc` skips its interceptor clear after
+//! a panic): such a run ends only at the QEMU timeout. These are
 //! `OriginalAlreadyExecuted`, `ContinuationKernelMismatch` (this adapter has
 //! one memory type, `NarfMemory`), `UnexpectedReexecution`,
 //! `ReexecutionMismatch`, `RecursiveEntry`, `UnknownTask`, `DuplicateTask`,
-//! `CreatedTaskMismatch`, `ExitDuringCallback` and `ProcessToolShared`.
+//! `CreatedTaskMismatch`, `ExitDuringCallback`, `ProcessToolShared` and
+//! `UnexpectedRdtsc` (an RDTSC event reached a host that does not deliver
+//! them, which [`ReverieInterceptor::with_rdtsc`] rules out).
 //! `UnsupportedSubscription`, `UnsupportedThreadOwnership` and
 //! `UnsupportedSignalDequeues` are refused by `NarfToolHost::new`, before
 //! any guest runs; `ReverieInterceptor::new` returns them as errors.
+//!
+//! ## RDTSC events
+//!
+//! A Tool that subscribes to RDTSC events (`Subscription::rdtsc`) runs under
+//! [`ReverieInterceptor::with_rdtsc`], which also returns the
+//! [`RdtscInterceptor`] for the kernel's instruction interceptor slot. The
+//! caller installs it with
+//! [`narf_userspace::try_install_instruction_interceptor`] before any guest
+//! task exists; the kernel refuses while a user task is live, once an
+//! interceptor is installed, and on SMP without a remote barrier.
+//! Installing it sets CR4.TSD on every CPU, so every task's `rdtsc` and
+//! `rdtscp` traps, and routes the vDSO's clock reads through their
+//! syscalls, so no guest reads the native counter through the vDSO while
+//! its `rdtsc` is the Tool's. The kernel keeps the slot, and the host with
+//! it, for its lifetime; a normal boot installs none.
+//!
+//! * A task the host does not track executes the instruction natively.
+//! * A hosted task's `rdtsc` or `rdtscp` becomes `handle_rdtsc_event`
+//!   (`Rdtsc::Tsc` or `Rdtsc::Tscp`), run on the task's own kernel stack. The
+//!   Tool may inject syscalls and wait for other tasks, as in a syscall
+//!   callback, a kill during the wait included
+//!   (`reverie_narf_kill_ends_a_waiting_rdtsc_callback`). The Tool's value
+//!   completes the instruction: `tsc` in EDX:EAX, and for `rdtscp` also `aux`
+//!   in ECX, or 0 if it gave none, as reverie-ptrace does
+//!   (`reverie_narf_rdtsc_values_come_from_the_tool`).
+//! * An injected `fork`, `vfork`, `clone`, `clone3`, `exit`, `exit_group`,
+//!   `execve` or `execveat` returns `-ENOSYS` without running, as in a
+//!   lifecycle callback. An inject that blocks aborts the run: with
+//!   `InjectParked` if it is not a tail inject, because there is no guest
+//!   syscall to re-execute, and with `RdtscContextManaged` if it is. An
+//!   injected `rt_sigreturn`, tail or not, also aborts the run with
+//!   `RdtscContextManaged`: the callback has no signal frame to restore, so
+//!   the kernel stages a `SIGSEGV` and the inject ends the task's context.
+//! * A task that is killed during the callback, by its own injected `kill`
+//!   or by another task, dies before it returns to user mode, so the guest
+//!   never sees the instruction's result
+//!   (`reverie_narf_kill_injected_in_rdtsc_ends_the_task`). The kernel
+//!   answers `KernelServices::killed` there, which the core asks before it
+//!   treats a callback without a value, or a Tool errno, as a failure.
 //!
 //! ## Differences from reverie-ptrace
 //!
@@ -349,7 +408,7 @@ mod tests;
 #[cfg(target_arch = "x86_64")]
 pub use interceptor::{
     BackgroundEnd, BackgroundFuture, BackgroundTask, ConsoleSink, IrqSpinTaskLock,
-    ReverieInterceptor, TaskExitRecord,
+    RdtscInterceptor, ReverieInterceptor, TaskExitRecord,
 };
 #[cfg(target_arch = "x86_64")]
 pub use services::{map_native_outcome, NarfKernelServices, NarfMemory};

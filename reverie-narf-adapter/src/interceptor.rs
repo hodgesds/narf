@@ -16,10 +16,15 @@ use narf_userspace::syscall::{
     NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
     SyscallReturn,
 };
+use narf_userspace::{
+    DeferredInstruction, InstructionInterception, InstructionInterceptor, InstructionInvocation,
+    InstructionResult, InstructionSubscriptions, NondeterministicInstruction,
+};
 use reverie::syscalls::Sysno;
-use reverie::{ExitStatus, GlobalTool, Pid, Tool};
+use reverie::{ExitStatus, GlobalTool, Pid, Rdtsc, Tool};
 use reverie_narf_core::{
-    Disposition, NarfFatal, NarfSyscallRequest, NarfToolHost, SyscallEntry, TaskLock, TaskTable,
+    Disposition, NarfFatal, NarfSyscallRequest, NarfToolHost, RdtscOutcome, SyscallEntry, TaskLock,
+    TaskTable,
 };
 use reverie_narf_tools::LineSink;
 
@@ -95,6 +100,80 @@ impl<T: Tool> Inner<T> {
             return Some(BackgroundEnd::HandlesDropped);
         }
         None
+    }
+
+    /// Handles a fatal the host returned for `context`: aborts the run for a
+    /// [`FatalKind::Contained`] one, panics for an invariant violation.
+    fn fatal(&self, context: &str, error: NarfFatal) {
+        match fatal_kind(&error) {
+            FatalKind::Invariant => panic!("reverie-narf fatal in {context}: {error:?}"),
+            FatalKind::Contained => self.abort(context, error),
+        }
+    }
+
+    /// Aborts the run: logs the reason, and kills every hosted process with
+    /// `SIGKILL`, as Linux kills a tracee whose tracer dies. Tasks the host
+    /// adopts later are killed when they next reach the interceptor (see
+    /// [`Self::kill_if_aborted`]). The host keeps tracking every task, so each
+    /// exit still reaches [`NarfToolHost::task_exited`].
+    fn abort(&self, context: &str, error: NarfFatal) {
+        let reason = alloc::format!(
+            "reverie-narf: aborting the hosted process tree after {context}: {error:?}"
+        );
+        let mut line = reason.clone();
+        line.push('\n');
+        narf_console::write_str(&line);
+        {
+            let mut slot = self.abort_reason.lock();
+            if slot.is_none() {
+                *slot = Some(reason);
+            }
+        }
+        self.aborted.store(true, Ordering::Release);
+        // Copy the task ids out first: the identity lookup takes the
+        // kernel's task maps, which must not nest inside `hosted`.
+        let tasks: Vec<u64> = self.hosted.lock().keys().copied().collect();
+        let mut pids: Vec<u64> = tasks
+            .into_iter()
+            .filter_map(|task_id| tool_view::linux_task_ids(task_id).map(|ids| ids.pid))
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        for pid in pids {
+            tool_view::kill_process_sigkill(pid);
+        }
+    }
+
+    /// After an abort, kills hosted task `task_id`'s process and reports
+    /// `true`, so the caller runs nothing of the Tool's for it. This covers a
+    /// task created after the abort's kill; a task that was in user mode on
+    /// another CPU when the kill was sent, which the kill does not
+    /// interrupt, if its next kernel entry is a trapped `rdtsc`; and a task
+    /// whose own `exit` would otherwise still run (the dispatcher never
+    /// withholds an exit unless `SIGKILL` is already pending on the task).
+    fn kill_if_aborted(&self, task_id: u64) -> bool {
+        if !self.aborted.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(ids) = tool_view::linux_task_ids(task_id) {
+            tool_view::kill_process_sigkill(ids.pid);
+        }
+        true
+    }
+
+    fn hosted_tid(&self, task_id: u64) -> Option<Pid> {
+        self.hosted.lock().get(&task_id).copied()
+    }
+
+    fn services<'a>(
+        &self,
+        task_id: u64,
+        native: &'a mut dyn NativeSyscallTransition,
+        raw_number: Option<u32>,
+    ) -> NarfKernelServices<'a> {
+        let ids = tool_view::linux_task_ids(task_id)
+            .expect("reverie-narf hosted task lost its Linux identity");
+        NarfKernelServices::new(native, task_id, ids, raw_number)
     }
 }
 
@@ -203,7 +282,9 @@ fn fatal_kind(error: &NarfFatal) -> FatalKind {
         | NarfFatal::TransitionAfterInterruption
         | NarfFatal::DaemonizeRefused(_)
         | NarfFatal::PostExec(_)
-        | NarfFatal::TailInjectOutsideSyscall => FatalKind::Contained,
+        | NarfFatal::TailInjectOutsideSyscall
+        | NarfFatal::Rdtsc(_)
+        | NarfFatal::RdtscContextManaged => FatalKind::Contained,
         NarfFatal::OriginalAlreadyExecuted
         | NarfFatal::ContinuationKernelMismatch
         | NarfFatal::UnexpectedReexecution
@@ -214,6 +295,9 @@ fn fatal_kind(error: &NarfFatal) -> FatalKind {
         | NarfFatal::CreatedTaskMismatch(_)
         | NarfFatal::ExitDuringCallback(_)
         | NarfFatal::ProcessToolShared(_)
+        // Only a host built with `NarfToolHost::new_delivering_rdtsc`, whose
+        // Tool subscribed, gets RDTSC events (`ReverieInterceptor::with_rdtsc`).
+        | NarfFatal::UnexpectedRdtsc
         // Refused by `NarfToolHost::new`, before any guest runs.
         | NarfFatal::UnsupportedSubscription
         | NarfFatal::UnsupportedThreadOwnership
@@ -250,9 +334,43 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
         config: Config<T>,
         new_tool: fn(Pid, &Config<T>) -> T,
     ) -> Result<Self, NarfFatal> {
-        Ok(Self {
+        Ok(Self::from_host(
+            Host::<T>::new(config)?.with_tool_constructor(new_tool),
+        ))
+    }
+
+    /// [`Self::with_tool_constructor`], for a Tool that may subscribe to
+    /// RDTSC events. The host is built with
+    /// [`NarfToolHost::new_delivering_rdtsc`]. If the Tool's subscription for
+    /// `config` includes RDTSC events, the second value is the
+    /// [`RdtscInterceptor`] that delivers them; otherwise it is `None`, and
+    /// the host delivers none.
+    ///
+    /// The caller installs the interceptor with
+    /// [`narf_userspace::try_install_instruction_interceptor`] before any
+    /// guest task exists, and must not run the guest if that fails: the
+    /// Tool would then miss every event it subscribed to. Nothing checks
+    /// either (see "Silently absent" in the crate documentation). The
+    /// kernel keeps an installed interceptor for its lifetime, so only the
+    /// first such run of a boot can install one.
+    pub fn with_rdtsc(
+        config: Config<T>,
+        new_tool: fn(Pid, &Config<T>) -> T,
+    ) -> Result<(Self, Option<RdtscInterceptor<T>>), NarfFatal> {
+        let delivers = T::subscriptions(&config).has_rdtsc();
+        let this = Self::from_host(
+            Host::<T>::new_delivering_rdtsc(config)?.with_tool_constructor(new_tool),
+        );
+        let rdtsc = delivers.then(|| RdtscInterceptor {
+            inner: this.inner.clone(),
+        });
+        Ok((this, rdtsc))
+    }
+
+    fn from_host(host: Host<T>) -> Self {
+        Self {
             inner: Arc::new(Inner {
-                host: Host::<T>::new(config)?.with_tool_constructor(new_tool),
+                host,
                 hosted: IrqSafeSpinLock::new(BTreeMap::new()),
                 root_hosted: AtomicBool::new(false),
                 exits: IrqSafeSpinLock::new(Vec::new()),
@@ -260,70 +378,13 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
                 abort_reason: IrqSafeSpinLock::new(None),
             }),
             handles: Arc::new(()),
-        })
+        }
     }
 
     /// Why the run was aborted, if it was: the reason logged for the first
     /// contained fatal.
     pub fn abort_reason(&self) -> Option<String> {
         self.inner.abort_reason.lock().clone()
-    }
-
-    /// Handles a fatal the host returned for `context`: aborts the run for a
-    /// [`FatalKind::Contained`] one, panics for an invariant violation.
-    fn fatal(&self, context: &str, error: NarfFatal) {
-        match fatal_kind(&error) {
-            FatalKind::Invariant => panic!("reverie-narf fatal in {context}: {error:?}"),
-            FatalKind::Contained => self.abort(context, error),
-        }
-    }
-
-    /// Aborts the run: logs the reason, and kills every hosted process with
-    /// `SIGKILL`, as Linux kills a tracee whose tracer dies. Tasks the host
-    /// adopts later are killed when they next reach the interceptor (see
-    /// [`Self::kill_if_aborted`]). The host keeps tracking every task, so each
-    /// exit still reaches [`NarfToolHost::task_exited`].
-    fn abort(&self, context: &str, error: NarfFatal) {
-        let reason = alloc::format!(
-            "reverie-narf: aborting the hosted process tree after {context}: {error:?}"
-        );
-        let mut line = reason.clone();
-        line.push('\n');
-        narf_console::write_str(&line);
-        {
-            let mut slot = self.inner.abort_reason.lock();
-            if slot.is_none() {
-                *slot = Some(reason);
-            }
-        }
-        self.inner.aborted.store(true, Ordering::Release);
-        // Copy the task ids out first: the identity lookup takes the
-        // kernel's task maps, which must not nest inside `hosted`.
-        let tasks: Vec<u64> = self.inner.hosted.lock().keys().copied().collect();
-        let mut pids: Vec<u64> = tasks
-            .into_iter()
-            .filter_map(|task_id| tool_view::linux_task_ids(task_id).map(|ids| ids.pid))
-            .collect();
-        pids.sort_unstable();
-        pids.dedup();
-        for pid in pids {
-            tool_view::kill_process_sigkill(pid);
-        }
-    }
-
-    /// After an abort, kills hosted task `task_id`'s process and reports
-    /// `true`, so the caller runs nothing of the Tool's for it. This covers a
-    /// task created after the abort's kill, and a task whose own `exit` would
-    /// otherwise still run (the dispatcher never withholds an exit unless
-    /// `SIGKILL` is already pending on the task).
-    fn kill_if_aborted(&self, task_id: u64) -> bool {
-        if !self.inner.aborted.load(Ordering::Acquire) {
-            return false;
-        }
-        if let Some(ids) = tool_view::linux_task_ids(task_id) {
-            tool_view::kill_process_sigkill(ids.pid);
-        }
-        true
     }
 
     /// Registers the run's root task, which must already have its Linux
@@ -414,21 +475,6 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
         Box::new(self.clone())
     }
 
-    fn hosted_tid(&self, task_id: u64) -> Option<Pid> {
-        self.inner.hosted.lock().get(&task_id).copied()
-    }
-
-    fn services<'a>(
-        &self,
-        task_id: u64,
-        native: &'a mut dyn NativeSyscallTransition,
-        raw_number: Option<u32>,
-    ) -> NarfKernelServices<'a> {
-        let ids = tool_view::linux_task_ids(task_id)
-            .expect("reverie-narf hosted task lost its Linux identity");
-        NarfKernelServices::new(native, task_id, ids, raw_number)
-    }
-
     fn adopt_created(&self, kernel: &mut NarfKernelServices<'_>) {
         let created = kernel.take_created();
         if !created.is_empty() {
@@ -485,10 +531,10 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
         invocation: &SyscallInvocation,
         native: &mut dyn NativeSyscallTransition,
     ) -> SyscallInterception {
-        if self.hosted_tid(invocation.task_id).is_none() {
+        if self.inner.hosted_tid(invocation.task_id).is_none() {
             return SyscallInterception::Continue;
         }
-        if self.kill_if_aborted(invocation.task_id) {
+        if self.inner.kill_if_aborted(invocation.task_id) {
             return aborted_return();
         }
         let request = request_of(invocation);
@@ -497,7 +543,9 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
         } else {
             SyscallEntry::new(request)
         };
-        let mut kernel = self.services(invocation.task_id, native, Some(invocation.raw_number));
+        let mut kernel =
+            self.inner
+                .services(invocation.task_id, native, Some(invocation.raw_number));
         let disposition = self.inner.host.handle_syscall(&mut kernel, entry);
         // A created task is held back from the scheduler until this callback
         // returns, so adopting it here precedes its first instruction.
@@ -510,7 +558,7 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
             // kernel-owned capability; the dispatcher publishes its outcome.
             Ok(Disposition::ContextManaged) => SyscallInterception::Continue,
             Err(error) => {
-                self.fatal("handle_syscall", error);
+                self.inner.fatal("handle_syscall", error);
                 // The task's `SIGKILL` is delivered on this syscall's return
                 // path. If a transition of the callback took the context (a
                 // parked inject, say), the dispatcher keeps that instead.
@@ -520,26 +568,26 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
     }
 
     fn on_task_start(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
-        if self.hosted_tid(task_id).is_none() || self.kill_if_aborted(task_id) {
+        if self.inner.hosted_tid(task_id).is_none() || self.inner.kill_if_aborted(task_id) {
             return;
         }
-        let mut kernel = self.services(task_id, native, None);
+        let mut kernel = self.inner.services(task_id, native, None);
         let outcome = self.inner.host.handle_thread_start(&mut kernel);
         self.adopt_created(&mut kernel);
         if let Err(error) = outcome {
-            self.fatal("handle_thread_start", error);
+            self.inner.fatal("handle_thread_start", error);
         }
     }
 
     fn on_task_exec(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
-        if self.hosted_tid(task_id).is_none() || self.kill_if_aborted(task_id) {
+        if self.inner.hosted_tid(task_id).is_none() || self.inner.kill_if_aborted(task_id) {
             return;
         }
-        let mut kernel = self.services(task_id, native, None);
+        let mut kernel = self.inner.services(task_id, native, None);
         let outcome = self.inner.host.handle_post_exec(&mut kernel);
         self.adopt_created(&mut kernel);
         if let Err(error) = outcome {
-            self.fatal("handle_post_exec", error);
+            self.inner.fatal("handle_post_exec", error);
         }
     }
 
@@ -559,7 +607,97 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
                 process_wstatus,
                 process_exited: exit.process_exited,
             }),
-            Err(error) => self.fatal("task_exited", error),
+            Err(error) => self.inner.fatal("task_exited", error),
+        }
+    }
+}
+
+/// Delivers the `rdtsc` and `rdtscp` instructions of hosted tasks to the Tool
+/// of a [`ReverieInterceptor`] built with [`ReverieInterceptor::with_rdtsc`],
+/// as Narf's [`InstructionInterceptor`].
+///
+/// Once the interceptor is installed
+/// ([`narf_userspace::try_install_instruction_interceptor`]), the kernel traps
+/// every task's `rdtsc` and `rdtscp`, hosted or not, and calls it. Every trap
+/// is deferred, because finding the trapping task among the hosted ones takes
+/// a spin lock, which the masked [`InstructionInterceptor::on_instruction_enter`]
+/// must not take. The deferred callback runs on the trapping task's own
+/// kernel stack, as a syscall callback does.
+///
+/// A task the host does not track executes the instruction natively. A
+/// hosted task's event goes to [`NarfToolHost::handle_rdtsc`], and the Tool's
+/// value completes the instruction: the counter in EDX:EAX and, for `rdtscp`,
+/// the Tool's `aux` in ECX, or 0 if it gave none, as reverie-ptrace does.
+///
+/// If the task is ending (the host answers `RdtscOutcome::ContextManaged`),
+/// the guest never sees the answer, because the task dies before it returns
+/// to user mode: if a transition of the callback took the task's context,
+/// the kernel writes nothing and leaves RIP on the instruction; otherwise
+/// it executes the instruction natively and then delivers the pending
+/// `SIGKILL`. A fatal the host returns is handled as in a syscall callback:
+/// a contained one aborts the run, and the instruction executes natively
+/// unless a transition took the task's context. The task never sees a
+/// result either way, because the abort's `SIGKILL` is delivered first.
+///
+/// The kernel keeps an installed interceptor for its lifetime, and with it
+/// the run's host.
+pub struct RdtscInterceptor<T: Tool> {
+    inner: Arc<Inner<T>>,
+}
+
+impl<T: Tool> core::fmt::Debug for RdtscInterceptor<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RdtscInterceptor").finish_non_exhaustive()
+    }
+}
+
+// SAFETY: `on_instruction_enter` and `on_instruction_return`, the two
+// callbacks under the masked contract, keep the trait's defaults or return a
+// constant: neither allocates, takes a lock or touches the guest. Everything
+// else runs in `on_instruction_deferred`, which the contract exempts.
+unsafe impl<T: Tool + 'static> InstructionInterceptor for RdtscInterceptor<T> {
+    fn subscriptions(&self) -> InstructionSubscriptions {
+        InstructionSubscriptions::RDTSC.union(InstructionSubscriptions::RDTSCP)
+    }
+
+    fn on_instruction_enter(&self, _: &InstructionInvocation) -> InstructionInterception {
+        InstructionInterception::Defer
+    }
+
+    fn on_instruction_deferred(
+        &self,
+        invocation: &InstructionInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> DeferredInstruction {
+        let task_id = invocation.task_id;
+        if self.inner.hosted_tid(task_id).is_none() || self.inner.kill_if_aborted(task_id) {
+            return DeferredInstruction::Native;
+        }
+        let request = match invocation.instruction {
+            NondeterministicInstruction::Rdtsc => Rdtsc::Tsc,
+            NondeterministicInstruction::Rdtscp => Rdtsc::Tscp,
+            // Not subscribed; the kernel delivers only what the interceptor
+            // subscribed to.
+            _ => return DeferredInstruction::Native,
+        };
+        // The kernel refuses a task-creating inject here with `-ENOSYS`, so
+        // there is no created task to adopt.
+        let mut kernel = self.inner.services(task_id, native, None);
+        match self.inner.host.handle_rdtsc(&mut kernel, request) {
+            Ok(RdtscOutcome::Complete(result)) => DeferredInstruction::Complete(match request {
+                Rdtsc::Tsc => InstructionResult::Rdtsc { value: result.tsc },
+                Rdtsc::Tscp => InstructionResult::Rdtscp {
+                    value: result.tsc,
+                    aux: result.aux.unwrap_or(0),
+                },
+            }),
+            // The task is ending and dies before it returns to user mode, so
+            // the guest never sees the answer.
+            Ok(RdtscOutcome::ContextManaged) => DeferredInstruction::Native,
+            Err(error) => {
+                self.inner.fatal("handle_rdtsc", error);
+                DeferredInstruction::Native
+            }
         }
     }
 }

@@ -171,7 +171,7 @@ impl<'a> NarfKernelServices<'a> {
     /// Services for scheduler task `task_id`, whose Linux identity is `ids`.
     ///
     /// `raw_number` is the intercepted syscall's wire number, or `None` for a
-    /// lifecycle callback, which has no syscall.
+    /// lifecycle or RDTSC callback, which has no syscall.
     pub fn new(
         native: &'a mut dyn NativeSyscallTransition,
         task_id: u64,
@@ -313,5 +313,16 @@ impl KernelServices for NarfKernelServices<'_> {
             NativeRepollWait::Killed => RepollWait::Killed,
             NativeRepollWait::Unsupported => RepollWait::Unsupported,
         }
+    }
+
+    /// The kernel's answer: whether `SIGKILL` is pending on the task, or a
+    /// transition staged its `SIGKILL` termination. The core asks in
+    /// `NarfToolHost::handle_rdtsc`, and in any callback for an inject whose
+    /// transition took the task's context. Only the capability of a deferred
+    /// instruction callback answers; the syscall and lifecycle capabilities
+    /// answer `false`, as the default does, so their injects are handled as
+    /// before the core asked.
+    fn killed(&self) -> bool {
+        self.native.task_killed()
     }
 }
