@@ -5800,8 +5800,9 @@ static SIGPARK_SEEN: IrqSafeSpinLock<Vec<i32>> = IrqSafeSpinLock::new(Vec::new()
 
 /// At the sigpark guest's blocking `read`, runs the read as a non-tail inject,
 /// which parks; [`RaiseOnPark`] sends the guest `SIGUSR1` while it is parked.
-/// The guest's handler enters `getpid`, so the inject returns `ERESTARTSYS`,
-/// and the Tool then injects `getpid`: a transition after the interruption.
+/// The kernel reports the signal to the Tool before it delivers it, which
+/// interrupts the parked inject: it returns `ERESTARTSYS`, and the Tool then
+/// injects `getpid`, a transition after the interruption.
 #[derive(Debug, Default, Clone, Copy)]
 struct InjectAfterInterruption;
 
@@ -5865,11 +5866,13 @@ fn raise_sigusr1_on_park(task_id: u64) {
 }
 
 /// A Tool that runs another syscall after a signal interrupted its parked
-/// inject stops only the hosted process tree: the host reports
-/// `TransitionAfterInterruption`, the interceptor logs that reason and kills
-/// the guest with `SIGKILL`, and the guest dies of signal 9 inside its
-/// handler instead of completing its `read` and exiting 0. The kernel keeps
-/// running: a second hosted run afterwards completes normally.
+/// inject stops only the hosted process tree. The interruption happens when
+/// the kernel reports `SIGUSR1` to the Tool, before the handler runs, so the
+/// host's `handle_signal` reports `TransitionAfterInterruption`; the
+/// interceptor logs that reason, holds the signal and kills the guest with
+/// `SIGKILL`, and the guest dies of signal 9 instead of running its handler,
+/// completing its `read` and exiting 0. The kernel keeps running: a second
+/// hosted run afterwards completes normally.
 fn reverie_narf_transition_after_interruption_aborts_the_tree() -> TestResult {
     SIGPARK_READS.store(0, Ordering::Release);
     SIGPARK_INTERRUPTED.store(NOT_SEEN, Ordering::Release);
@@ -5909,10 +5912,13 @@ fn reverie_narf_transition_after_interruption_aborts_the_tree() -> TestResult {
             return Err("the inject after the interruption returned to the Tool");
         }
         let named = reason.as_deref().is_some_and(|reason| {
-            reason.contains("handle_syscall") && reason.contains("TransitionAfterInterruption")
+            reason.contains("handle_signal") && reason.contains("TransitionAfterInterruption")
         });
         if !named {
             return Err("the run was not aborted with the TransitionAfterInterruption reason");
+        }
+        if SIGPARK_SEEN.lock().contains(&(Sysno::getpid.id())) {
+            return Err("the guest's handler ran after the abort");
         }
         check_teardown(&interceptor, root, 1, LINUX_SIGKILL)?;
         check_kernel_still_hosts()?;
@@ -5920,6 +5926,110 @@ fn reverie_narf_transition_after_interruption_aborts_the_tree() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_transition_after_interruption_aborts_the_tree);
+
+// ── Signal events and reapable processes ──────────────────────────────────
+
+static SIGHOOK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_SIGHOOK"));
+
+/// Every signal [`SuppressUsr2`] was asked about, in order.
+static SIGHOOK_SEEN: IrqSafeSpinLock<Vec<i32>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Records every signal it is asked about, and delivers each one except
+/// `SIGUSR2`, which it suppresses.
+#[derive(Debug, Default, Clone, Copy)]
+struct SuppressUsr2;
+
+#[reverie::tool]
+impl Tool for SuppressUsr2 {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_signal_event<T: reverie::Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        signal: reverie::Signal,
+    ) -> Result<Option<reverie::Signal>, reverie::Errno> {
+        SIGHOOK_SEEN.lock().push(signal as i32);
+        if signal == reverie::Signal::SIGUSR2 {
+            return Ok(None);
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// The kernel asks the Tool about a signal before it delivers it to a hosted
+/// task, where the task returns from the syscall that made it pending, and
+/// does what the Tool answers: the sighook guest's `SIGUSR1`, which the Tool
+/// returns, runs its handler once; its `SIGUSR2`, which the Tool suppresses,
+/// is discarded and its handler never runs. The guest checks both and exits
+/// 0.
+fn reverie_narf_signals_reach_the_tool_before_delivery() -> TestResult {
+    SIGHOOK_SEEN.lock().clear();
+    let _signal_tables = SignalTables::init_with_handlers();
+    let outcome = run_hosted::<SuppressUsr2>(SIGHOOK_GUEST, ());
+    result_of((|| {
+        let (interceptor, root) = outcome?;
+        let seen = SIGHOOK_SEEN.lock().clone();
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(Writer, "    signals seen {seen:?} abort reason {reason:?}");
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        check_teardown(&interceptor, root, 1, 0)?;
+        if seen
+            != [
+                reverie::Signal::SIGUSR1 as i32,
+                reverie::Signal::SIGUSR2 as i32,
+            ]
+        {
+            return Err("the Tool was not asked about SIGUSR1 and then SIGUSR2, once each");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_signals_reach_the_tool_before_delivery);
+
+/// Every Linux pid [`record_reapable`] was handed, in order.
+static REAPABLE_PIDS: IrqSafeSpinLock<Vec<i32>> = IrqSafeSpinLock::new(Vec::new());
+
+fn record_reapable(_global: &<CounterLocal as Tool>::GlobalState, pid: Pid) {
+    REAPABLE_PIDS.lock().push(pid.as_raw());
+}
+
+/// The kernel reports each hosted process reapable once, after its last
+/// thread's exit reached the host, and the adapter passes each report to the
+/// reporter set with `report_reapable_processes`, under the process's Linux
+/// pid: the fork guest's fork child, vfork child and root are reported once
+/// each, in the order their exits reached the host.
+fn reverie_narf_reapable_processes_are_reported_once() -> TestResult {
+    REAPABLE_PIDS.lock().clear();
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<CounterLocal>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        interceptor.report_reapable_processes(record_reapable);
+        let root = run_guest(FORK_GUEST, interceptor.boxed(), |root| {
+            interceptor
+                .host_root(root.task_id)
+                .map_err(|_| "register_root refused the root task")
+        })?;
+        let exits = check_teardown(&interceptor, root, 3, 0)?;
+        let reported = REAPABLE_PIDS.lock().clone();
+        let processes = exits
+            .iter()
+            .filter(|exit| exit.process_exited)
+            .map(|exit| exit.tid.as_raw())
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            Writer,
+            "    reapable {reported:?} process exits {processes:?}"
+        );
+        if reported != processes {
+            return Err("the reporter did not see each process's Linux pid once, in exit order");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_reapable_processes_are_reported_once);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 
