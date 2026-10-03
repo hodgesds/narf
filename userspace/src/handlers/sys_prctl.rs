@@ -419,8 +419,10 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             //
             // NARF has no per-task timestamp-fault mode, so PR_TSC_SIGSEGV
             // is refused with EINVAL. CR4.TSD is armed only kernel-wide, by
-            // an installed instruction interceptor, and that completes the
-            // read rather than raising SIGSEGV. PR_TSC_ENABLE is the mode
+            // an installed instruction interceptor, which completes the exact
+            // unprefixed RDTSC/RDTSCP encodings rather than raising SIGSEGV;
+            // only the undecoded forms (prefixed, unreadable) still fault,
+            // and they do so for every task. PR_TSC_ENABLE is the mode
             // PR_GET_TSC above reports, so it succeeds. No Linux matches
             // this: x86 accepts both modes, and `kernel/sys.c` without
             // SET_TSC_CTL refuses GET and ENABLE too.

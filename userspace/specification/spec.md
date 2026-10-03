@@ -413,8 +413,10 @@ and performs critical-section aborts across preemption and CPU migration;
 returning success without those semantics is forbidden on preemptive SMP.
 `PR_SET_TSC` accepts only `PR_TSC_ENABLE`, the mode `PR_GET_TSC` reports;
 `PR_TSC_SIGSEGV` fails with `EINVAL` because NARF has no per-task
-timestamp-fault mode and an installed instruction interceptor completes
-timestamp reads rather than raising `SIGSEGV`. No Linux configuration has this
+timestamp-fault mode: an installed instruction interceptor completes the exact
+unprefixed encodings rather than raising `SIGSEGV`, and the other forms that
+still fault do so for every task while it is installed, not for a task that
+asked. No Linux configuration has this
 combination: x86 Linux accepts `PR_TSC_SIGSEGV`, and Linux without timestamp
 control refuses `PR_GET_TSC` and `PR_TSC_ENABLE` as well. The refusal is
 deliberate. A caller that needs timestamp reads to fault, such as Reverie's
