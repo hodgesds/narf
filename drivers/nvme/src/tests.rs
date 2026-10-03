@@ -216,6 +216,134 @@ fn smoke_nvme_io_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_io_round_trip);
 
+fn smoke_nvme_timed_out_io_does_not_desync_queue() -> TestResult {
+    // Regression for the 2026-09 btrfs-write-smoke flake. A polled I/O
+    // that times out is not cancelled: QEMU (like real hardware) still
+    // completes it and posts its CQE at the head of the CQ. The driver
+    // used to return CompletionTimeout without accounting for that CQE,
+    // so the NEXT command read the abandoned command's completion as
+    // its own and returned before its data had arrived, one slot behind
+    // from then on. Force a timeout on a healthy device (timeout 0),
+    // then require that later reads return their own data.
+    use crate::{Controller, NvmeError};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::{alloc_coherent, DmaBuffer};
+    use narf_lib::id::DomainId;
+    // SAFETY: as in smoke_nvme_io_round_trip: boot-time kernel-test with
+    // the allocator online; ECAM_DEFAULT_BASE is identity-mapped.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if ctrl.create_io_queue().is_err() {
+        return TestResult::Fail("Controller::create_io_queue failed");
+    }
+    if ctrl.lba_bytes != 512 {
+        return TestResult::Fail("expected 512-byte LBAs on QEMU default");
+    }
+    let alloc = || alloc_coherent(4096, DomainId::DRIVER_0).ok();
+    let (Some(wbuf), Some(abandoned_buf), Some(rbuf)) = (alloc(), alloc(), alloc()) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    // LBAs 2 and 3 (bytes 1024..2048) sit inside the first MiB that
+    // btrfs never uses, next to the LBA 0 that smoke_nvme_io_round_trip
+    // already scribbles on.
+    let pattern = |lba: u64, i: usize| (i as u8) ^ (lba as u8).wrapping_mul(0x5B) ^ 0xA5;
+    let fill = |buf: &DmaBuffer, f: &dyn Fn(usize) -> u8| {
+        for i in 0..512usize {
+            // SAFETY: 4 KiB coherent DMA buffer; i < 512.
+            unsafe { core::ptr::write_volatile(buf.cpu_mut_ptr::<u8>().add(i), f(i)) };
+        }
+    };
+    let holds = |buf: &DmaBuffer, lba: u64| {
+        (0..512usize).all(|i| {
+            // SAFETY: 4 KiB coherent DMA buffer; i < 512.
+            let v = unsafe { core::ptr::read_volatile(buf.cpu_ptr::<u8>().add(i)) };
+            v == pattern(lba, i)
+        })
+    };
+    for lba in [2u64, 3] {
+        fill(&wbuf, &|i| pattern(lba, i));
+        if ctrl.write_lba(lba, 1, &wbuf).is_err() {
+            return TestResult::Fail("seeding write failed");
+        }
+    }
+
+    // Force one timeout. With a 0 ms bound the wait gives up unless the
+    // CQE is already there on the first look, which QEMU (it services
+    // the doorbell asynchronously) essentially never achieves; retry a
+    // bounded number of times so a lucky fast completion is not a
+    // false failure.
+    ctrl.__test_set_io_timeout_ms(0);
+    let mut forced = false;
+    for _ in 0..256 {
+        match ctrl.read_lba(2, 1, &abandoned_buf) {
+            Err(NvmeError::CompletionTimeout) => {
+                forced = true;
+                break;
+            }
+            Ok(()) => continue,
+            Err(_) => {
+                ctrl.__test_reset_io_timeout();
+                return TestResult::Fail("read at 0 ms timeout failed with a non-timeout error");
+            }
+        }
+    }
+    ctrl.__test_reset_io_timeout();
+    if !forced {
+        return TestResult::Fail("could not force a completion timeout in 256 tries");
+    }
+    if ctrl.abandoned_io() != 1 {
+        return TestResult::Fail("timed-out command was not recorded as abandoned");
+    }
+
+    // Every later read must return its own data, not the abandoned
+    // command's completion. Alternate LBAs so an off-by-one queue shows
+    // up as the other LBA's pattern (or as a never-filled buffer).
+    for k in 0..8u64 {
+        let lba = 3 - (k & 1);
+        fill(&rbuf, &|_| 0);
+        match ctrl.read_lba(lba, 1, &rbuf) {
+            Ok(()) => {}
+            Err(NvmeError::CompletionMismatch { .. }) => {
+                return TestResult::Fail("read after a timeout got another command's completion");
+            }
+            Err(_) => return TestResult::Fail("read after a timeout failed"),
+        }
+        if !holds(&rbuf, lba) {
+            return TestResult::Fail("read after a timeout returned the wrong data");
+        }
+    }
+    if ctrl.abandoned_io() != 0 {
+        return TestResult::Fail("abandoned command was never reaped");
+    }
+    // The abandoned read's buffer was the device's until the reap;
+    // it must hold LBA 2 now.
+    if !holds(&abandoned_buf, 2) {
+        return TestResult::Fail("abandoned read never completed into its buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_timed_out_io_does_not_desync_queue
+);
+
 fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     // 8-KiB transfer (16 LBAs at 512 B) across a 2-page PRP-list:
     // exercises the PRP1 + PRP2 = pages[1] short-list path. Ensures
