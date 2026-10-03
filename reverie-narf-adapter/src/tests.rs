@@ -212,17 +212,76 @@ fn staged_of(slot: &AtomicI64, missing: &'static str) -> Result<Option<i32>, &'s
 /// Reclaiming a task takes a grace period, and the address-space destructor
 /// it runs may retire more, which a later one reclaims. With the guest's
 /// tasks on several CPUs, a peer CPU may also be running one of those
-/// destructors at the moment this CPU checks: a space's `Weak` count reads 0
-/// as soon as its `Drop` starts, and the COW counts of its frames fall while
-/// `Drop` runs. So the budget is time, not a count of grace periods, which
-/// complete immediately when every peer is idle.
+/// destructors at the moment this CPU checks, and the COW counts of its
+/// frames fall while it runs. So the budget is time, not a count of grace
+/// periods, which complete immediately when every peer is idle.
 const RECLAIM_BUDGET_NS: u64 = 4_000_000_000;
 /// Budget for one grace period.
 const RECLAIM_GRACE_PERIOD_NS: u64 = 1_000_000_000;
 
+/// An address space a run must reclaim.
+struct RunSpace {
+    /// Tells whether anything still holds the space.
+    space: Weak<AddressSpace>,
+    /// [`AddressSpace::identity`], which [`record_dropped_space`] records
+    /// once the space's destructor has finished.
+    identity: u64,
+}
+
+impl RunSpace {
+    fn of(space: &Arc<AddressSpace>) -> Self {
+        Self {
+            space: Arc::downgrade(space),
+            identity: space.identity(),
+        }
+    }
+}
+
 /// Every distinct address space a task of the current run exited from: the
 /// root's and each forked or vforked child's.
-static EXITED_SPACES: IrqSafeSpinLock<Vec<Weak<AddressSpace>>> = IrqSafeSpinLock::new(Vec::new());
+static EXITED_SPACES: IrqSafeSpinLock<Vec<RunSpace>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Identities of the address spaces whose destructor finished while a
+/// [`DropRecorder`] was installed.
+static DROPPED_SPACES: IrqSafeSpinLock<Vec<u64>> = IrqSafeSpinLock::new(Vec::new());
+
+/// The address-space drop hook while a [`DropRecorder`] is installed: records
+/// that the space's destructor has finished, then retires what the boot's
+/// hook retires.
+fn record_dropped_space(identity: u64) {
+    DROPPED_SPACES.lock().push(identity);
+    narf_userspace::drop_mapped_file_address_space(identity);
+}
+
+/// Records the identity of every address space whose destructor finishes
+/// while it lives, through the memory crate's address-space drop hook, which
+/// `AddressSpace::drop` calls last. Dropping it puts back
+/// `narf_userspace::drop_mapped_file_address_space`, the hook a boot without
+/// `idt-selftest` installs (`frame/src/bare_main.rs`) and the only one
+/// installed anywhere.
+struct DropRecorder;
+
+impl DropRecorder {
+    fn install() -> Self {
+        DROPPED_SPACES.lock().clear();
+        narf_memory::install_address_space_drop_hook(record_dropped_space);
+        Self
+    }
+
+    /// Whether the destructor of the address space with `identity` has
+    /// finished.
+    fn dropped(&self, identity: u64) -> bool {
+        DROPPED_SPACES.lock().contains(&identity)
+    }
+}
+
+impl Drop for DropRecorder {
+    fn drop(&mut self) {
+        narf_memory::install_address_space_drop_hook(
+            narf_userspace::drop_mapped_file_address_space,
+        );
+    }
+}
 
 /// Kernel re-entries (a syscall run by kernel code on a task's behalf while
 /// that task's own syscall is still in its interceptor call) the next
@@ -252,12 +311,10 @@ fn record_exiting_space(_pid: u64, _tid: u64) {
     let Some(space) = narf_scheduler::current_address_space() else {
         return;
     };
+    let exited = RunSpace::of(&space);
     let mut spaces = EXITED_SPACES.lock();
-    if !spaces
-        .iter()
-        .any(|seen| seen.as_ptr() == Arc::as_ptr(&space))
-    {
-        spaces.push(Arc::downgrade(&space));
+    if !spaces.iter().any(|seen| seen.identity == exited.identity) {
+        spaces.push(exited);
     }
 }
 
@@ -273,9 +330,9 @@ fn exited_space_count() -> u64 {
     RECLAIMED_SPACES.load(Ordering::Acquire)
 }
 
-/// Waits until nothing of a finished run is left: every address space its
-/// tasks exited from has been dropped, and no frame of the root image still
-/// has a recorded COW owner.
+/// Waits until nothing of a finished run is left: the destructor of every
+/// address space its tasks exited from has finished, and no frame of the root
+/// image still has a recorded COW owner.
 ///
 /// A reaped task is not yet reclaimed. The scheduler retires its stackful
 /// continuation through RCU, and that continuation owns the future holding the
@@ -286,9 +343,23 @@ fn exited_space_count() -> u64 {
 /// here; otherwise the spaces survive into the next test, still sharing COW
 /// frames, and any reset of the COW table in between turns their eventual
 /// frees into double frees.
-fn reclaim_run(spaces: &[Weak<AddressSpace>], frames: &[PhysAddr]) -> Result<(), &'static str> {
+///
+/// A space counts as reclaimed when its destructor has finished, not when
+/// nothing holds it any more: its strong count reaches 0 before
+/// `AddressSpace::drop` starts. On another CPU, that destructor shoots down
+/// the space's PCID on every CPU that may hold translations for it, possibly
+/// this one, and waits for each to acknowledge before it releases the frames
+/// the space maps. This CPU runs the harness with interrupts masked, so it
+/// acknowledges only inside `narf_rcu::sync_until`; returning while the
+/// destructor waits would leave those frames held into the next test.
+/// [`reverie_narf_reclaim_waits_for_a_destructor_on_another_cpu`] is that case.
+fn reclaim_run(
+    drops: &DropRecorder,
+    spaces: &[RunSpace],
+    frames: &[PhysAddr],
+) -> Result<(), &'static str> {
     let reclaimed = || {
-        spaces.iter().all(|space| space.strong_count() == 0)
+        spaces.iter().all(|space| drops.dropped(space.identity))
             && frames
                 .iter()
                 .all(|frame| narf_memory::frame::cow::count(*frame) == 0)
@@ -298,7 +369,13 @@ fn reclaim_run(spaces: &[Weak<AddressSpace>], frames: &[PhysAddr]) -> Result<(),
         let now = narf_time::monotonic_ns();
         if now >= budget_end {
             return Err(
-                "the guest's address spaces or COW frames outlived the reclaim budget after its tasks were reaped",
+                if spaces.iter().any(|space| space.space.strong_count() > 0) {
+                    "an address space of the guest was still held when the reclaim budget ran out after its tasks were reaped"
+                } else if spaces.iter().any(|space| !drops.dropped(space.identity)) {
+                    "an address space's destructor had not finished when the reclaim budget ran out after the guest's tasks were reaped"
+                } else {
+                    "a frame of the root image still had a COW owner when the reclaim budget ran out after the guest's tasks were reaped"
+                },
             );
         }
         let deadline = now.saturating_add(RECLAIM_GRACE_PERIOD_NS).min(budget_end);
@@ -402,6 +479,7 @@ fn run_guest_with(
     narf_userspace::handlers::__test_wait_reset();
     narf_userspace::handlers::wait_init();
     EXITED_SPACES.lock().clear();
+    let drops = DropRecorder::install();
     EXIT_CPUS.store(0, Ordering::Release);
     RECLAIMED_SPACES.store(0, Ordering::Release);
     narf_userspace::user_task::register_thread_exit_observer(record_exiting_space);
@@ -463,7 +541,7 @@ fn run_guest_with(
             }
         };
     let pid = process.pid.raw();
-    let root_space = Arc::downgrade(&process.address_space);
+    let root_space = RunSpace::of(&process.address_space);
     let root_frames = process
         .address_space
         .regions_snapshot()
@@ -628,7 +706,9 @@ fn run_guest_with(
         EXIT_CPUS.load(Ordering::Acquire)
     );
     let mut spaces = core::mem::take(&mut *EXITED_SPACES.lock());
-    let root_exited_in_image = spaces.iter().any(|space| space.ptr_eq(&root_space));
+    let root_exited_in_image = spaces
+        .iter()
+        .any(|space| space.identity == root_space.identity);
     if ROOT_EXECS.load(Ordering::Acquire) {
         // The root replaced its image, so it exited from the new space; the
         // loaded one must still be reclaimed.
@@ -639,7 +719,7 @@ fn run_guest_with(
     } else if !root_exited_in_image {
         return Err("the root task's exit did not report its address space");
     }
-    reclaim_run(&spaces, &root_frames)?;
+    reclaim_run(&drops, &spaces, &root_frames)?;
     RECLAIMED_SPACES.store(spaces.len() as u64, Ordering::Release);
     Ok((root, reap))
 }
@@ -3350,6 +3430,156 @@ fn reverie_narf_vdso_calls_reach_the_tool() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_vdso_calls_reach_the_tool);
+
+// ── Reclaiming an address space torn down on another CPU ─────────────────
+
+/// How long [`reverie_narf_reclaim_waits_for_a_destructor_on_another_cpu`]
+/// gives the other CPU to start dropping the address space, and to finish its
+/// destructor once this CPU acknowledges.
+const PEER_DROP_BUDGET_NS: u64 = 2_000_000_000;
+/// How long the same test watches, while this CPU acknowledges nothing, for
+/// the destructor to finish without it.
+const PEER_DROP_STALL_NS: u64 = 50_000_000;
+
+/// Masks interrupts on this CPU and reports whether they were enabled.
+fn mask_interrupts() -> bool {
+    let rflags: u64;
+    // SAFETY: CPL=0; the caller hands the result to `restore_interrupts`.
+    unsafe {
+        core::arch::asm!("pushfq", "cli", "pop {0}", out(reg) rflags, options());
+    }
+    rflags & (1 << 9) != 0
+}
+
+/// Undoes [`mask_interrupts`].
+fn restore_interrupts(were_enabled: bool) {
+    if were_enabled {
+        // SAFETY: CPL=0; puts back the state `mask_interrupts` found.
+        unsafe { core::arch::asm!("sti", options()) };
+    }
+}
+
+/// [`reclaim_run`] returns only once the destructor of each address space has
+/// finished, also when that destructor runs on another CPU and waits for this
+/// one.
+///
+/// A task on another CPU drops the last reference to an address space whose
+/// lifetime PCID this CPU may hold translations for, which
+/// `AddressSpace::activate` publishes before a CPU loads the space, while this
+/// CPU runs with interrupts masked, as the harness does. The destructor shoots
+/// the PCID down on this CPU and waits for the acknowledgement before it
+/// releases the frames the space maps, so the space is no longer held but not
+/// yet torn down.
+/// Once `reclaim_run` returns, the vDSO code frames the space mapped must be
+/// back at the count they had before it mapped them. Counting the space
+/// reclaimed as soon as nothing holds it returns at once, with the destructor
+/// still waiting.
+fn reverie_narf_reclaim_waits_for_a_destructor_on_another_cpu() -> TestResult {
+    let harness = narf_lib::percpu::current_cpu();
+    let others = narf_lib::smp::online_bitmap() & !(1u64 << harness);
+    if others == 0 {
+        return TestResult::Skip("one CPU online: no other CPU to drop the address space on");
+    }
+    let peer = others.trailing_zeros();
+    if narf_verification::NARF_VDSO_ELF.is_empty() {
+        return TestResult::Fail("the kernel was built without a vDSO image");
+    }
+    // An earlier test may have left a peer waiting on this CPU; acknowledge
+    // it, so that the peer is free to run the task below.
+    if !narf_rcu::sync_until(narf_time::monotonic_ns().saturating_add(RECLAIM_GRACE_PERIOD_NS)) {
+        return TestResult::Fail("an RCU grace period did not elapse within 1 s before the test");
+    }
+    // Kernel-test boots skip the boot-time vDSO registration.
+    let _vdso = VdsoRegistration::register();
+    let drops = DropRecorder::install();
+    // SAFETY: paging and the frame allocator are live in the kernel-test
+    // environment.
+    let space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(space) => Arc::new(space),
+        Err(_) => return TestResult::Fail("a user address space could not be created"),
+    };
+    let tag = space.translation_tag();
+    if tag == 0 {
+        return TestResult::Skip("no lifetime PCID: the destructor waits for no other CPU");
+    }
+    if narf_userspace::vdso::map_into(&space).is_none() {
+        return TestResult::Fail("the vDSO did not map into a fresh address space");
+    }
+    // The vDSO code frames are the masters every mapping shares, with one COW
+    // reference per mapping.
+    let masters = space
+        .regions_snapshot()
+        .into_iter()
+        .filter(|region| region.base.as_u64() >= narf_userspace::vdso::VDSO_MAP_BASE)
+        .filter(|region| !region.perms.contains(RegionPerms::SHARED))
+        .flat_map(|region| region.phys)
+        .filter(|frame| frame.raw() != 0)
+        .collect::<Vec<_>>();
+    if masters.is_empty() {
+        return TestResult::Fail("the vDSO mapping has no code frame");
+    }
+    let counts = || {
+        masters
+            .iter()
+            .map(|frame| narf_memory::frame::cow::count(*frame))
+            .collect::<Vec<_>>()
+    };
+    let mapped = counts();
+    let released = mapped
+        .iter()
+        .map(|count| count.saturating_sub(1))
+        .collect::<Vec<_>>();
+    let run_space = RunSpace::of(&space);
+    narf_memory::tlb_shootdown::set_active_as(harness as u32, tag);
+
+    let were_enabled = mask_interrupts();
+    let mut dropper = TaskSpec::kernel_any();
+    dropper.affinity = Affinity::pinned(CpuId(peer));
+    narf_scheduler::spawn_with_spec(async move { drop(space) }, dropper);
+    let outcome = (|| {
+        let give_up = narf_time::monotonic_ns().saturating_add(PEER_DROP_BUDGET_NS);
+        while run_space.space.strong_count() != 0 {
+            if narf_time::monotonic_ns() >= give_up {
+                return Err("the other CPU did not start dropping the address space within 2 s");
+            }
+            core::hint::spin_loop();
+        }
+        let watch_end = narf_time::monotonic_ns().saturating_add(PEER_DROP_STALL_NS);
+        while narf_time::monotonic_ns() < watch_end {
+            core::hint::spin_loop();
+        }
+        if counts() != mapped || drops.dropped(run_space.identity) {
+            return Err(
+                "the destructor finished without this CPU acknowledging, so the test shows nothing",
+            );
+        }
+        reclaim_run(&drops, core::slice::from_ref(&run_space), &[])?;
+        if counts() != released {
+            return Err(
+                "reclaim_run returned while the destructor on the other CPU still held the vDSO code frames",
+            );
+        }
+        Ok(TestResult::Pass)
+    })();
+    // Whatever happened above, let the destructor finish before the vDSO
+    // registration is dropped.
+    let give_up = narf_time::monotonic_ns().saturating_add(PEER_DROP_BUDGET_NS);
+    while counts() != released && narf_time::monotonic_ns() < give_up {
+        let _ = narf_rcu::sync_until(give_up);
+    }
+    restore_interrupts(were_enabled);
+    let _ = writeln!(
+        Writer,
+        "    PCID {tag} dropped on CPU {peer} (harness CPU {harness}); vDSO code frame counts: {mapped:?} mapped, {released:?} released, {:?} now",
+        counts()
+    );
+    // `leak_checked` reports a registration left behind instead of this.
+    if let Err(reason) = outcome {
+        let _ = writeln!(Writer, "    {reason}");
+    }
+    result_of(outcome)
+}
+reverie_narf_test!(reverie_narf_reclaim_waits_for_a_destructor_on_another_cpu);
 
 // ── Thread and process exit statuses ─────────────────────────────────────
 
