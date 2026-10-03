@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use narf_console::Writer;
 use narf_filesystem::{FileOps, FsError, FsFuture, Stat};
-use narf_kernel_test::{TestResult, kernel_test_in};
+use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{AddressSpace, PhysAddr, RegionPerms};
 use narf_scheduler::{Affinity, CpuId, TaskSpec};
@@ -31,7 +31,7 @@ use reverie_narf_tools::passthrough::PassThrough;
 use reverie_narf_tools::probe::Probe;
 
 use crate::interceptor::{ConsoleSink, ReverieInterceptor, TaskExitRecord};
-use crate::services::{NarfKernelServices, map_native_outcome};
+use crate::services::{map_native_outcome, NarfKernelServices};
 
 static CANONICAL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_CANONICAL"));
 static PROBE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PROBE"));
@@ -1428,7 +1428,7 @@ impl SyscallInterceptor for HoldProbe {
                 let parent = tool_view::linux_task_ids(task_id)
                     .map(|ids| tool_view::auxv_pairs(ids.pid))
                     .unwrap_or_default();
-                if parent.is_empty() || tool_view::auxv_pairs(created.linux_pid as u64) != parent {
+                if parent.is_empty() || tool_view::auxv_pairs(created.linux_pid) != parent {
                     HOLD_FAILURES.fetch_or(1 << 5, Ordering::AcqRel);
                 }
             }

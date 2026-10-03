@@ -773,8 +773,8 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 
 #[cfg(feature = "kernel-test")]
 mod current_user_task_source_tests {
-    use super::{CurrentTaskSource, current_user_task_source};
-    use narf_kernel_test::{TestResult, kernel_test_in};
+    use super::{current_user_task_source, CurrentTaskSource};
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
     /// C1 regression. In the own-stack model `current_user_task` must resolve
     /// the current `UserTaskCtx` ONLY from the scheduler-published owner
