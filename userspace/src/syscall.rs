@@ -4805,15 +4805,22 @@ impl SyscallReturn {
     /// Linux-ABI value placed in the guest's primary result register.
     ///
     /// This is the Rust counterpart of the x86_64 fast-syscall epilogue: an
-    /// `Ok` status preserves `value`, while every Narf-native error status
-    /// folds to `-EINVAL`. The epilogue separately restores the guest's saved
+    /// `Ok` status preserves `value`; a Narf-native error status preserves a
+    /// `value` that is already a Linux negative errno (`[-4095, -1]`, as in
+    /// [`Self::not_implemented`]'s -ENOSYS) and otherwise folds to `-EINVAL`.
+    /// The int 0x80 and aarch64 entries publish `value` unchanged, which
+    /// agrees with this for every constructor in this file: only
+    /// `not_implemented` pairs a non-`Ok` status with a nonzero value. The
+    /// epilogue separately restores the guest's saved
     /// argument registers, so this signed value is the complete result seen by
     /// a Linux-ABI caller. In-kernel interposition adapters must use this
     /// conversion rather than discarding `status` and republishing `value` as
     /// an unconditional success.
     pub const fn linux_abi_result(self) -> i64 {
+        let value = self.value as i64;
         match self.status {
-            abi::NarfStatus::Ok => self.value as i64,
+            abi::NarfStatus::Ok => value,
+            _ if -4095 <= value && value <= -1 => value,
             _ => -22,
         }
     }
@@ -5885,8 +5892,11 @@ mod interception_kernel_tests {
         if SyscallReturn::ok((-38i64) as u64).linux_abi_result() != -38 {
             return TestResult::Fail("Ok status did not preserve the signed Linux value");
         }
-        if SyscallReturn::not_implemented().linux_abi_result() != -22
-            || SyscallReturn::invalid_op().linux_abi_result() != -22
+        if SyscallReturn::not_implemented().linux_abi_result() != -38 {
+            return TestResult::Fail("not_implemented did not report -ENOSYS to a Linux caller");
+        }
+        if SyscallReturn::invalid_op().linux_abi_result() != -22
+            || SyscallReturn::oom().linux_abi_result() != -22
         {
             return TestResult::Fail("non-Ok status did not match the architecture -EINVAL fold");
         }

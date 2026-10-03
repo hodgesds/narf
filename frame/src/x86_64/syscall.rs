@@ -262,12 +262,18 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // expecting rdx to survive the syscall — the reload below
         // restores it.
         //
-        // Fold: if status != OK, set rax = -EINVAL (-22) so
-        // userspace sees a negative-errno error per Linux
-        // semantics. Otherwise rax already holds value.
+        // Fold: if status != OK and value is not already a Linux
+        // negative errno ([-4095, -1]), set rax = -EINVAL (-22) so
+        // userspace sees a negative-errno error per Linux semantics.
+        // A non-OK status that carries an errno keeps it: this is how
+        // `SyscallReturn::not_implemented()` reports -ENOSYS, matching
+        // the int 0x80 and aarch64 entries, which publish the value
+        // unchanged. `SyscallReturn::linux_abi_result` mirrors this.
         "test edx, edx",                       // status (rdx) == 0 (OK)?
         "jz 2f",                               // status == OK: keep rax = value
-        "mov rax, -22",                        // status != OK: rax = -EINVAL
+        "cmp rax, -4095",                      // value in [-4095, -1]?
+        "jae 2f",                              // (unsigned) yes: keep the errno
+        "mov rax, -22",                        // otherwise: rax = -EINVAL
         "2:",
         // Preserve the folded result before the domain restore reuses RAX/RDX.
         "mov [rsp + 112], rax",
