@@ -90,7 +90,13 @@ enum Cmd {
     /// Cross-compile and boot the mounted /mnt rootfs's
     /// `/lib/systemd/systemd` as REAL PID 1 (sets the `systemd_pid1`
     /// kernel cmdline flag, which makes boot-init spawn the chroot
-    /// launcher as the first user task instead of NARF init/getty).
+    /// launcher as the first user task instead of NARF init/getty). Enables
+    /// the QEMU user-network configuration so the distro sees vnet0 at
+    /// 10.0.2.15/24 with the SLIRP gateway at 10.0.2.2.
+    /// XTASK_SYSTEMD_PID1_NET_CHECK=1 additionally asserts the network
+    /// WORKS: a host-side listener answers the rootfs's narf-net-check
+    /// gate through SLIRP and the gate's verdict line is the run's
+    /// success/failure marker.
     /// Streams + captures serial for a timeout, then kills QEMU and
     /// prints a digest of systemd's output. Requires a systemd rootfs
     /// disk at `target/narf-vblk.img`. Timeout via
@@ -718,6 +724,48 @@ fn emit_serial_line(writer: &mut impl Write, line: &str) {
 #[cfg(test)]
 mod systemd_marker_tests {
     use super::*;
+
+    #[test]
+    fn systemd_pid1_build_enables_qemu_network() {
+        let cli = Cli::try_parse_from(["xtask", "systemd-pid1", "--features", "user-requested"])
+            .expect("systemd-pid1 CLI must parse");
+        let Cmd::SystemdPid1(mut args) = cli.cmd else {
+            panic!("systemd-pid1 subcommand parsed as another variant");
+        };
+
+        configure_systemd_pid1_build(&mut args);
+        let features: Vec<&str> = args.features.split(',').collect();
+        for expected in [
+            "user-requested",
+            "boot-init",
+            "cgroup-all",
+            "firmware-allow-unsigned",
+            "qemu-net",
+            "container",
+        ] {
+            assert!(features.contains(&expected), "missing feature {expected}");
+        }
+    }
+
+    #[test]
+    fn systemd_pid1_cmdline_threads_flags_without_duplicates() {
+        assert_eq!(systemd_pid1_cmdline("", None), "systemd_pid1");
+        assert_eq!(
+            systemd_pid1_cmdline("console=ttyS0", None),
+            "console=ttyS0 systemd_pid1"
+        );
+        // Caller already asked for PID 1 — don't double the token.
+        assert_eq!(systemd_pid1_cmdline("systemd_pid1", None), "systemd_pid1");
+        assert_eq!(
+            systemd_pid1_cmdline("", Some(18080)),
+            "systemd_pid1 narf_net_check narf_net_check_port=18080"
+        );
+        // A caller-pinned port wins over the listener's.
+        assert_eq!(
+            systemd_pid1_cmdline("narf_net_check_port=7 narf_net_check", Some(18080)),
+            "narf_net_check_port=7 narf_net_check systemd_pid1"
+        );
+    }
 
     struct WouldBlockWriter;
 
@@ -3373,12 +3421,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         bail!("xtask systemd-pid1: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
     let mut args = args.clone();
-    // boot-init compiles boot_userspace_init (which honours systemd_pid1);
-    // cgroup-all makes /sys/fs/cgroup a real cgroup2fs (systemd's hard
-    // gate); firmware-allow-unsigned mirrors the run-interactive boot.
-    ensure_feature(&mut args.features, "boot-init");
-    ensure_feature(&mut args.features, "cgroup-all");
-    ensure_feature(&mut args.features, "firmware-allow-unsigned");
+    configure_systemd_pid1_build(&mut args);
 
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
@@ -3389,21 +3432,33 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
 
-    // Thread `systemd_pid1` onto the kernel cmdline (multiboot2 -append),
-    // preserving any caller-provided XTASK_QEMU_APPEND. Set BEFORE
-    // qemu_args() runs — it reads XTASK_QEMU_APPEND.
-    let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
-    let combined = if existing
-        .split_ascii_whitespace()
-        .any(|t| t == "systemd_pid1")
-    {
-        existing
-    } else if existing.is_empty() {
-        "systemd_pid1".to_string()
+    // XTASK_SYSTEMD_PID1_NET_CHECK=1 turns the boot into a network
+    // acceptance run: a host-side listener answers the in-guest
+    // `narf-net-check` gate through the SLIRP gateway, and the gate's
+    // single verdict line becomes the run's success/failure contract.
+    let net_check = std::env::var("XTASK_SYSTEMD_PID1_NET_CHECK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let net_check_port = if net_check {
+        let port = spawn_net_check_listener()?;
+        println!(
+            "xtask systemd-pid1: net-check listener on 127.0.0.1:{port} \
+             (guest fetches http://10.0.2.2:{port}/)"
+        );
+        Some(port)
     } else {
-        format!("{existing} systemd_pid1")
+        None
     };
-    std::env::set_var("XTASK_QEMU_APPEND", combined);
+
+    // Thread `systemd_pid1` (and the opt-in net-check tokens) onto the
+    // kernel cmdline (multiboot2 -append), preserving any caller-provided
+    // XTASK_QEMU_APPEND. Set BEFORE qemu_args() runs — it reads
+    // XTASK_QEMU_APPEND.
+    let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+    std::env::set_var(
+        "XTASK_QEMU_APPEND",
+        systemd_pid1_cmdline(&existing, net_check_port),
+    );
 
     let out_dir = cargo_build(&args, &root)?;
     let kernel = out_dir.join(&args.package);
@@ -3427,12 +3482,16 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
+    // The net-check gate prints exactly one verdict line; key the run's
+    // pass/fail to it unless the caller pinned explicit markers.
     let success_marker = std::env::var("XTASK_SYSTEMD_PID1_SUCCESS_MARKER")
         .ok()
-        .filter(|marker| !marker.is_empty());
+        .filter(|marker| !marker.is_empty())
+        .or_else(|| net_check.then(|| "NARF-NET-CHECK: OK".to_string()));
     let failure_marker = std::env::var("XTASK_SYSTEMD_PID1_FAILURE_MARKER")
         .ok()
-        .filter(|marker| !marker.is_empty());
+        .filter(|marker| !marker.is_empty())
+        .or_else(|| net_check.then(|| "NARF-NET-CHECK: FAIL".to_string()));
 
     println!(
         "xtask systemd-pid1: launching {} {} (capturing serial for {}s)",
@@ -3576,6 +3635,76 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         lines.len()
     );
     Ok(())
+}
+
+/// Add the kernel features required by a distro PID-1 boot under QEMU.
+///
+/// `qemu-net` publishes the static address and default route matching QEMU's
+/// user-mode network.  Without it the virtio NIC exists, but the distro boot
+/// has no usable off-box route unless a privileged network daemon happens to
+/// configure one.
+fn configure_systemd_pid1_build(args: &mut BuildArgs) {
+    // boot-init compiles boot_userspace_init (which honours systemd_pid1);
+    // cgroup-all makes /sys/fs/cgroup a real cgroup2fs (systemd's hard
+    // gate); firmware-allow-unsigned mirrors the run-interactive boot;
+    // container turns on the namespace layer so systemd sandboxing
+    // (PrivateNetwork= and friends) gets a real CLONE_NEWNET with an
+    // isolated loopback instead of EINVAL.
+    ensure_feature(&mut args.features, "boot-init");
+    ensure_feature(&mut args.features, "cgroup-all");
+    ensure_feature(&mut args.features, "firmware-allow-unsigned");
+    ensure_feature(&mut args.features, "qemu-net");
+    ensure_feature(&mut args.features, "container");
+}
+
+/// Thread `systemd_pid1` — and, for net-check runs, the `narf_net_check`
+/// gate flag plus its listener port — onto the kernel cmdline without
+/// duplicating tokens the caller already provided.
+fn systemd_pid1_cmdline(existing: &str, net_check_port: Option<u16>) -> String {
+    let mut tokens: Vec<String> = existing
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect();
+    if !tokens.iter().any(|t| t == "systemd_pid1") {
+        tokens.push("systemd_pid1".to_string());
+    }
+    if let Some(port) = net_check_port {
+        if !tokens.iter().any(|t| t == "narf_net_check") {
+            tokens.push("narf_net_check".to_string());
+        }
+        if !tokens.iter().any(|t| t.starts_with("narf_net_check_port=")) {
+            tokens.push(format!("narf_net_check_port={port}"));
+        }
+    }
+    tokens.join(" ")
+}
+
+/// Serve the fixed token the in-guest `narf-net-check` gate fetches through
+/// the SLIRP gateway (guest `10.0.2.2:<port>` lands on host
+/// `127.0.0.1:<port>` — no hostfwd needed for guest-to-host). Returns the
+/// bound port; the accept loop runs on a detached thread for the life of
+/// the xtask process.
+fn spawn_net_check_listener() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("xtask systemd-pid1: cannot bind the net-check listener")?;
+    let port = listener.local_addr()?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Drain the request head so curl sees an orderly exchange,
+            // then answer with the token the gate compares against.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = "narf-net-ok";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    Ok(port)
 }
 
 /// Boot the kernel under QEMU with `boot-init` on, then drive the
