@@ -1109,11 +1109,16 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // pointers. Writes are rare next to reads; clearing 8 entries is cheap.
         self.indirect_cache.lock().clear();
         // Direct block writes bypass the page-cache writeback path, so they
-        // must invalidate cached clean data before changing the device. Take
-        // the fill lock so the clear can't race a concurrent miss-fill into
-        // re-inserting a now-stale page.
+        // must invalidate the cached pages they overwrite before changing the
+        // device — only those: dropping the whole cache on every write made
+        // each later read on the volume go back to the device. The cache is
+        // keyed by device page (`read_block`: inode 0, page_off = byte offset
+        // / PAGE_SIZE). Take the fill lock so the invalidation can't race a
+        // concurrent miss-fill into re-inserting a now-stale page.
         let _fill = self.fill_lock.lock().await;
-        self.page_cache.clear();
+        let first_page = byte_off / PAGE_SIZE as u64;
+        let end_page = (byte_off + src.len() as u64).div_ceil(PAGE_SIZE as u64);
+        self.page_cache.invalidate_range(0, 0, first_page, end_page);
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {

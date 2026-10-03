@@ -829,6 +829,112 @@ fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
     }
     TestResult::Pass
 }
+
+/// A block write invalidates only the cache pages it covers. The volume used
+/// to drop its whole clean page cache on every `write_byte_range`, so each
+/// small metadata or data write forced every later read on the volume back to
+/// the device — a Plasma login writing its caches to an ext4 home re-read
+/// plasmashell's libraries page by page and sat on a black screen for minutes.
+fn smoke_ext2_block_write_invalidates_only_its_pages() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_block::{
+        ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
+        CancelResult, LbaRange,
+    };
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    struct CountingBlock {
+        inner: Arc<RamBlockDevice>,
+        reads: AtomicUsize,
+    }
+
+    impl BlockDevice for CountingBlock {
+        fn logical_block_size(&self) -> u32 {
+            self.inner.logical_block_size()
+        }
+        fn physical_block_size(&self) -> u32 {
+            self.inner.physical_block_size()
+        }
+        fn capacity_blocks(&self) -> u64 {
+            self.inner.capacity_blocks()
+        }
+        fn supports(&self, feature: BlockFeature) -> bool {
+            self.inner.supports(feature)
+        }
+        fn submit(
+            &self,
+            request: BlockRequest,
+        ) -> impl core::future::Future<Output = BlockCompletion> + Send {
+            if matches!(request.op, BlockOp::Read) {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.submit(request)
+        }
+        fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.flush()
+        }
+        fn discard(&self, range: LbaRange) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.discard(range)
+        }
+        fn cancel(&self, tag: u64) -> impl core::future::Future<Output = CancelResult> + Send {
+            self.inner.cancel(tag)
+        }
+    }
+
+    const BS: u64 = 1024;
+    let device = Arc::new(CountingBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
+        reads: AtomicUsize::new(0),
+    });
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let mut buf = [0u8; 10];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) {
+        return TestResult::Fail("first read failed");
+    }
+
+    // The file's data is block 10: 4 KiB page 2 (blocks 8-11). Block 20 is
+    // page 5, which the file does not touch.
+    if !matches!(
+        poll_once(volume.write_byte_range(20 * BS, &[0xa5; 16])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write to an unrelated block failed");
+    }
+    let reads_before = device.reads.load(Ordering::Relaxed);
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) || &buf != b"page cache" {
+        return TestResult::Fail("read after an unrelated write failed");
+    }
+    if device.reads.load(Ordering::Relaxed) != reads_before {
+        return TestResult::Fail("a write to another page evicted the file's cached block");
+    }
+
+    // A write over the file's own block must not leave the old bytes cached.
+    if !matches!(
+        poll_once(volume.write_byte_range(10 * BS, b"PAGE")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write over the file's block failed");
+    }
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) || &buf != b"PAGE cache" {
+        return TestResult::Fail("a write over a cached block left the stale bytes visible");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_block_write_invalidates_only_its_pages
+);
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_page_cache_reuses_1k_data_block

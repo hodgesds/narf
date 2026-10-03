@@ -737,8 +737,52 @@ impl PageCache {
         self.inner.lock().folios.len()
     }
 
-    /// Invalidate every resident page. Filesystems with direct block writes
-    /// use this when they cannot identify the exact affected cache key.
+    /// Invalidate every folio of `(fs_id, inode)` that overlaps pages
+    /// `[first_page, end_page)` — Linux `invalidate_mapping_pages` over the
+    /// range a direct write just changed on the device. A multi-page folio
+    /// that straddles either end goes as a whole. Pages outside the range
+    /// stay cached. Returns the number of base pages dropped.
+    pub fn invalidate_range(
+        &self,
+        fs_id: u32,
+        inode: u64,
+        first_page: u64,
+        end_page: u64,
+    ) -> usize {
+        if first_page >= end_page {
+            return 0;
+        }
+        let lo = PageKey {
+            fs_id,
+            inode,
+            page_off: first_page,
+        };
+        let hi = PageKey {
+            fs_id,
+            inode,
+            page_off: end_page,
+        };
+        let mut g = self.inner.lock();
+        let mut victims: Vec<PageKey> = g.folios.range(lo..hi).map(|(k, _)| *k).collect();
+        if let Some(head) = Self::containing_folio_key(&g, lo) {
+            if head != lo {
+                victims.push(head);
+            }
+        }
+        let mut dropped = 0;
+        for key in victims {
+            if let Some(slot) = g.folios.remove(&key) {
+                let pages = slot.folio.page_count();
+                g.resident_pages = g.resident_pages.saturating_sub(pages);
+                dropped += pages;
+            }
+        }
+        // The CLOCK queue keeps the removed keys; eviction drops a key whose
+        // folio is gone when it reaches it.
+        dropped
+    }
+
+    /// Invalidate every resident page.
     pub fn clear(&self) {
         let mut g = self.inner.lock();
         g.folios.clear();
