@@ -132,6 +132,34 @@ pub fn __clear_for_test(cpu: u32) {
     REQUESTS[source].va.store(0, Ordering::Relaxed);
 }
 
+/// Test-only helper: the tag `source` has pending for `cpu`, or `None` when
+/// that source has nothing pending there. A source's lane is not reused until
+/// every target acknowledges it, so while the bit stays set the tag names the
+/// request the bit announces.
+#[doc(hidden)]
+pub fn __pending_tag_from(cpu: u32, source: u32) -> Option<u16> {
+    let target = (cpu as usize).min(MAX_CPUS - 1);
+    let source = (source as usize).min(MAX_CPUS - 1);
+    if PENDING_SENDERS[target].load(Ordering::Acquire) & (1u64 << source) == 0 {
+        return None;
+    }
+    Some(REQUESTS[source].tag.load(Ordering::Relaxed))
+}
+
+/// Test-only helper: service only the `sources` requests pending for this
+/// CPU and leave every other source pending. Lets a test that holds a request
+/// pending on purpose still acknowledge unrelated traffic.
+///
+/// # Safety
+/// As [`poll_pending_shootdown`].
+#[doc(hidden)]
+pub unsafe fn __service_sources_for_test(sources: u64) {
+    let target = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    let claimed = PENDING_SENDERS[target].fetch_and(!sources, Ordering::AcqRel) & sources;
+    // SAFETY: forwarded; `claimed` was taken from this CPU's bitmap.
+    unsafe { service_claimed(target, claimed) };
+}
+
 /// Read this CPU's accumulated shootdown count.
 pub fn ack_count(cpu: u32) -> u64 {
     IPI_STATS[(cpu as usize).min(MAX_CPUS - 1)]
@@ -266,7 +294,18 @@ unsafe fn apply_request(va: u64, pages: u64, tag: u16) {
 #[inline]
 pub unsafe fn on_shootdown_irq() {
     let target = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
-    let mut sources = PENDING_SENDERS[target].swap(0, Ordering::AcqRel);
+    let sources = PENDING_SENDERS[target].swap(0, Ordering::AcqRel);
+    // SAFETY: forwarded; the sources were claimed from this CPU's bitmap.
+    unsafe { service_claimed(target, sources) };
+}
+
+/// Apply and acknowledge the requests of `sources`, already claimed from
+/// `PENDING_SENDERS[target]`.
+///
+/// # Safety
+/// As [`on_shootdown_irq`]; `target` is the executing CPU.
+#[inline]
+unsafe fn service_claimed(target: usize, mut sources: u64) {
     while sources != 0 {
         let source = sources.trailing_zeros() as usize;
         sources &= sources - 1;

@@ -5700,6 +5700,16 @@ fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestRes
     // CPUs wait forever and the suite fails at the QEMU timeout. Nothing
     // here depends on timing. The pass criteria do not name which spin broke
     // the cycle.
+    //
+    // This CPU's masked wait must still acknowledge the AP's other requests,
+    // or it deadlocks by itself: an AP that shoots down for an unrelated
+    // reason, such as cleanup an earlier test left behind, waits for this CPU
+    // with IRQs masked, and cannot start the task, or publish the test's
+    // request, until its lane is free. The AP therefore sends one
+    // unrelated request first, so every run crosses that case, and the wait
+    // services whatever the AP's lane holds until it holds the test's
+    // request. Other CPUs' requests can stay pending: their senders poll
+    // for requests while they wait, so they never hold up the AP.
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use narf_interrupts::x86_64::ipi;
 
@@ -5707,6 +5717,8 @@ fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestRes
     // it is a valid PCID. A single-context flush is always a correct
     // invalidation, whichever address space owns the PCID.
     const TAG: u16 = 0x0A5A;
+    // The unrelated request the AP sends first; valid for the same reasons.
+    const EARLIER_TAG: u16 = 0x0A5B;
     static SHOT: AtomicBool = AtomicBool::new(false);
     static SHOT_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
     static CALLED_ON: AtomicU64 = AtomicU64::new(0);
@@ -5736,7 +5748,7 @@ fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestRes
             return Err(TestResult::Skip("needs an online AP"));
         }
         let target = peers.trailing_zeros() as usize;
-        if ipi::pending_tag(caller as u32) == TAG {
+        if ipi::__pending_tag_from(caller as u32, target as u32) == Some(TAG) {
             return Err(TestResult::Fail(
                 "a request with the test tag was already pending",
             ));
@@ -5746,17 +5758,43 @@ fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestRes
         narf_scheduler::spawn_with_spec(
             async move {
                 SHOT_CPU.store(narf_lib::percpu::current_cpu(), Ordering::Release);
-                // SAFETY: CPL=0 with the shootdown IPI installed at boot; the
-                // request is a correct invalidation (see TAG).
-                unsafe { ipi::shoot_tag_only_mask(TAG, 1u64 << caller) };
+                // SAFETY: CPL=0 with the shootdown IPI installed at boot; both
+                // requests are correct invalidations (see TAG).
+                unsafe {
+                    ipi::shoot_tag_only_mask(EARLIER_TAG, 1u64 << caller);
+                    ipi::shoot_tag_only_mask(TAG, 1u64 << caller);
+                }
                 SHOT.store(true, Ordering::Release);
             },
             spec,
         );
         let deadline = narf_time::Instant::now().plus_cycles(BUDGET_CYCLES);
-        while ipi::pending_tag(caller as u32) != TAG {
+        let target_bit = 1u64 << target;
+        let mut earlier_serviced = 0u64;
+        loop {
+            match ipi::__pending_tag_from(caller as u32, target as u32) {
+                Some(TAG) => break,
+                // The AP's lane cannot carry the test's request until this
+                // CPU acknowledges what it holds now, so servicing it here
+                // cannot consume the test's request.
+                Some(_) => {
+                    // SAFETY: CPL=0; services only the AP's pending request.
+                    unsafe { ipi::__service_sources_for_test(target_bit) };
+                    earlier_serviced += 1;
+                }
+                None => {}
+            }
             if narf_time::Instant::now() >= deadline {
-                return Ok((caller, target, false, false, 0));
+                let _ = writeln!(
+                    Writer,
+                    "    rendezvous expiry: caller={} target={} task_cpu={} ap_pending_tag={:?} earlier_serviced={}",
+                    caller,
+                    target,
+                    SHOT_CPU.load(Ordering::Acquire) as isize,
+                    ipi::__pending_tag_from(caller as u32, target as u32),
+                    earlier_serviced,
+                );
+                return Ok((caller, target, false, false, 0, earlier_serviced));
             }
             core::hint::spin_loop();
         }
@@ -5764,9 +5802,9 @@ fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestRes
         // SAFETY: record_cpu only updates an atomic bitmap.
         let called = unsafe { narf_lib::smp::remote_call(1u64 << target, record_cpu) };
         let acks = ipi::ack_count(caller as u32).wrapping_sub(acks_before);
-        Ok((caller, target, true, called, acks))
+        Ok((caller, target, true, called, acks, earlier_serviced))
     });
-    let (caller, target, observed, called, acks) = match outcome {
+    let (caller, target, observed, called, acks, earlier_serviced) = match outcome {
         Ok(v) => v,
         Err(result) => return result,
     };
@@ -5781,6 +5819,11 @@ fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestRes
     }
     if !observed {
         return TestResult::Fail("the AP's shootdown request was never seen pending");
+    }
+    // The AP publishes the test's request only after this CPU acknowledged
+    // the earlier one inside the masked wait.
+    if earlier_serviced == 0 {
+        return TestResult::Fail("the masked wait never serviced the AP's earlier request");
     }
     // Printed, not asserted: the test requires the cycle to be broken, not
     // which spin broke it, so the h1-removed negative control ties it to
