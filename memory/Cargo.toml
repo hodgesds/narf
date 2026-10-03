@@ -20,8 +20,10 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 [features]
 default = []
 
-# Test-only path counters used by the distributed kernel smoke suite.
-kernel-test = []
+# Test-only path counters used by the distributed kernel smoke suite. Also
+# enables narf-arch's test-only TLBI VAE1IS operand recorder, which the
+# memory smoke `smoke_aarch64_tlbi_operand_masks_va_high_bits` reads.
+kernel-test = ["narf-arch/kernel-test"]
 
 # Linux-compat surfaces (mprotect with split/merge, madvise, etc.).
 # Enabled by default so modern allocators (jemalloc, mimalloc) and JIT

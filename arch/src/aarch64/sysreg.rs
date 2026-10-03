@@ -475,23 +475,6 @@ pub unsafe fn tlb_flush_all() {
     compiler_fence(Ordering::SeqCst);
 }
 
-/// Invalidate TLB by virtual address for EL1.
-///
-/// # Safety
-/// Issues a privileged `TLBI VAAE1`; the caller must execute at EL1 and
-/// pass a virtual address whose stale translations are safe to drop.
-#[inline]
-pub unsafe fn tlb_flush_page(virt_addr: u64) {
-    compiler_fence(Ordering::SeqCst);
-    // SAFETY: TLBI VAAE1 is legal at EL1. Shifts VA by 12 as required.
-    unsafe {
-        asm!("tlbi vaae1, {v}", "dsb nsh", "isb",
-             v = in(reg) (virt_addr >> 12),
-             options(nostack, preserves_flags));
-    }
-    compiler_fence(Ordering::SeqCst);
-}
-
 /// Instruction Synchronization Barrier.
 ///
 /// # Safety
@@ -512,7 +495,43 @@ pub unsafe fn isb() {
 // Spec: `memory/specification/asid-pcid-isolation.md` §3.2.
 //
 // `TLBI ASIDE1IS` operand layout: bits[63:48] = ASID, rest reserved.
-// `TLBI VAE1IS` operand layout: bits[63:48] = ASID, bits[43:0] = VA[55:12].
+// `TLBI VAE1IS` operand layout: bits[63:48] = ASID, bits[47:44] = TTL
+// (zero), bits[43:0] = VA[55:12]; built by [`tlbi_va_operand`].
+
+/// Operand of a TLBI by-VA instruction, as Linux builds it in
+/// `__TLBI_VADDR(addr, asid)`: `((addr >> 12) & GENMASK_ULL(43, 0)) |
+/// (asid << 48)`.
+///
+/// VA[55:12] goes in bits 43:0. Bits 47:44 are the TTL level hint (FEAT_TTL)
+/// and stay zero, meaning "no hint". Bits 63:48 carry the ASID; the all-ASID
+/// forms (VAAE1IS, VAALE1IS) ignore it, and callers of those pass 0.
+///
+/// The mask is what matters for an address with any of bits 63:56 set: a
+/// TTBR1 address (all ones there) or a TTBR0 address carrying a top-byte tag.
+/// `va >> 12` alone moves those bits into bits 51:44, and a 48-bit mask
+/// still keeps VA[59:56] in bits 47:44. Either way the TTL is nonzero, which
+/// on a CPU implementing FEAT_TTL names a translation granule and level that
+/// may not match the entry, and the architecture then does not require that
+/// entry to be invalidated.
+#[inline]
+pub const fn tlbi_va_operand(va: u64, asid: u16) -> u64 {
+    ((va >> 12) & ((1u64 << 44) - 1)) | ((asid as u64) << 48)
+}
+
+/// Last operand each CPU passed to TLBI VAE1IS through
+/// [`tlbi_va_asid_inner_shareable`].
+#[cfg(feature = "kernel-test")]
+static LAST_VAE1IS_OPERAND: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Test-only: the last operand this CPU passed to TLBI VAE1IS through
+/// [`tlbi_va_asid_inner_shareable`]. Read it with interrupts masked since the
+/// call.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __last_vae1is_operand_for_test() -> u64 {
+    LAST_VAE1IS_OPERAND[narf_lib::percpu::current_cpu()].load(Ordering::Relaxed)
+}
 
 /// Invalidate every TLB entry tagged with `asid` across all CPUs in
 /// the inner-shareable domain.
@@ -540,13 +559,17 @@ pub unsafe fn tlbi_asid_inner_shareable(asid: u16) {
 /// Invalidate the TLB entry for `va` tagged with `asid` across the
 /// inner-shareable domain.
 ///
+/// `va` may be any aarch64 virtual address; only VA[55:12] reaches the
+/// operand (see [`tlbi_va_operand`]).
+///
 /// # Safety
-/// EL1; `va` is a canonical aarch64 virtual address (low half).
+/// EL1.
 #[inline]
 pub unsafe fn tlbi_va_asid_inner_shareable(asid: u16, va: u64) {
     compiler_fence(Ordering::SeqCst);
-    // VAE1IS encoding: bits[43:0] = VA[55:12], bits[63:48] = ASID.
-    let operand = ((asid as u64) << 48) | ((va >> 12) & 0x0000_FFFF_FFFF_FFFF);
+    let operand = tlbi_va_operand(va, asid);
+    #[cfg(feature = "kernel-test")]
+    LAST_VAE1IS_OPERAND[narf_lib::percpu::current_cpu()].store(operand, Ordering::Relaxed);
     // SAFETY: TLBI VAE1IS is legal at EL1.
     unsafe {
         asm!(

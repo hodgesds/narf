@@ -1710,9 +1710,11 @@ kernel_test_in!("memory", smoke_aarch64_paging_scatter_and_range_unmap);
 ///
 /// QEMU does not act on TTL, so no invalidation-effect test here could fail
 /// for the unmasked operand; the encoding is the honest check. The first
-/// half pins `tlbi_va_operand` on a TTBR1 and a TTBR0 address; the second
-/// runs both production helpers and compares the operand each actually
-/// issued (recorded per CPU just before the TLBI) with the masked encoding.
+/// half pins `tlbi_va_operand` on a TTBR1, a TTBR0 and a top-byte-tagged
+/// TTBR0 address; the second runs the three production by-VA helpers
+/// (VAAE1IS, the VAALE1IS range, and the ASID-tagged VAE1IS) and compares
+/// the operand each actually issued (recorded per CPU just before the TLBI)
+/// with the masked encoding.
 #[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
 fn smoke_aarch64_tlbi_operand_masks_va_high_bits() -> TestResult {
     use crate::aarch64::paging::{
@@ -1738,6 +1740,12 @@ fn smoke_aarch64_tlbi_operand_masks_va_high_bits() -> TestResult {
     if tlbi_va_operand(KVA, 0xBEEF) != 0xBEEF_0FFF_F7FF_8000 {
         return TestResult::Fail("TLBI operand does not place the ASID in bits 63:48");
     }
+    // A top-byte-tagged TTBR0 address: VA[59:56] = 0xA, which a 48-bit mask
+    // would keep in the TTL field as 0xA000_0001_2345.
+    const TAGGED_UVA: u64 = 0x0A00_0000_1234_5000;
+    if tlbi_va_operand(TAGGED_UVA, 0x5A) != 0x005A_0000_0001_2345 {
+        return TestResult::Fail("TLBI operand for a tagged TTBR0 address carries VA[59:56]");
+    }
 
     // The production helpers. Invalidating a translation that is live (or
     // absent) only costs a refetch. Interrupts stay masked from each call to
@@ -1759,6 +1767,26 @@ fn smoke_aarch64_tlbi_operand_masks_va_high_bits() -> TestResult {
     if range_last != tlbi_va_operand(KVA + 4096, 0) {
         return TestResult::Fail(
             "TLBI VAALE1IS range was issued with an unmasked operand for a TTBR1 address",
+        );
+    }
+
+    // The ASID-tagged VAE1IS helper that `tlb_shootdown::apply_local` uses.
+    // Both addresses have VA[59:56] nonzero, so a 48-bit mask shows up here.
+    const ASID: u16 = 0x5A;
+    let (kernel_op, tagged_op) = narf_lib::sync::without_interrupts(|| {
+        use narf_arch::aarch64::sysreg::{
+            __last_vae1is_operand_for_test, tlbi_va_asid_inner_shareable,
+        };
+        // SAFETY: as above; this only drops cached copies for ASID 0x5A.
+        unsafe { tlbi_va_asid_inner_shareable(ASID, KVA) };
+        let kernel_op = __last_vae1is_operand_for_test();
+        // SAFETY: as above.
+        unsafe { tlbi_va_asid_inner_shareable(ASID, TAGGED_UVA) };
+        (kernel_op, __last_vae1is_operand_for_test())
+    });
+    if kernel_op != tlbi_va_operand(KVA, ASID) || tagged_op != tlbi_va_operand(TAGGED_UVA, ASID) {
+        return TestResult::Fail(
+            "TLBI VAE1IS was issued with an operand that carries VA[59:56] into the TTL field",
         );
     }
     TestResult::Pass

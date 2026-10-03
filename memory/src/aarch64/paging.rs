@@ -53,23 +53,9 @@ pub fn __teardown_batch_counts_for_test() -> (u64, u64) {
     )
 }
 
-/// Operand of a TLBI by-VA instruction, as Linux builds it in
-/// `__TLBI_VADDR(addr, asid)`: `((addr >> 12) & GENMASK_ULL(43, 0)) |
-/// (asid << 48)`.
-///
-/// VA[55:12] goes in bits 43:0. Bits 47:44 are the TTL level hint (FEAT_TTL)
-/// and stay zero, meaning "no hint". Bits 63:48 carry the ASID; the all-ASID
-/// forms (VAAE1IS, VAALE1IS) ignore it, and callers of those pass 0.
-///
-/// The mask is what matters for a TTBR1 address. Its bits 63:56 are all
-/// ones, so `va >> 12` alone puts ones into bits 51:44: a nonzero TTL, which
-/// on a CPU implementing FEAT_TTL names a translation granule and level that
-/// may not match the entry, and the architecture then does not require that
-/// entry to be invalidated.
-#[inline]
-pub(crate) const fn tlbi_va_operand(va: u64, asid: u16) -> u64 {
-    ((va >> 12) & ((1u64 << 44) - 1)) | ((asid as u64) << 48)
-}
+/// TLBI by-VA operand encoding, shared with the ASID-tagged VAE1IS helper in
+/// `narf_arch` so every by-VA TLBI in the kernel masks the VA the same way.
+pub(crate) use narf_arch::aarch64::sysreg::tlbi_va_operand;
 
 /// Last TLBI operand each CPU issued through the two by-VA helpers below.
 #[cfg(feature = "kernel-test")]
