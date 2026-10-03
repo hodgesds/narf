@@ -6,7 +6,7 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_init_stages_run_in_order() -> TestResult {
-    use crate::{__reset_for_test, register, run_all_through, InitResult, Stage};
+    use crate::{__reset_for_test, register, run_stage, InitResult, Stage};
     use core::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     static EARLY_RAN: AtomicU32 = AtomicU32::new(0);
@@ -45,7 +45,9 @@ fn smoke_init_stages_run_in_order() -> TestResult {
     register(Stage::Device, "device", device);
     register(Stage::Core, "core", core);
 
-    run_all_through(Stage::Late);
+    for s in Stage::ALL {
+        run_stage(s);
+    }
 
     let e = EARLY_RAN.load(Ordering::SeqCst);
     let c = CORE_RAN.load(Ordering::SeqCst);

@@ -76,7 +76,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// Iteration order. Used by `run_all_through`.
+    /// Iteration order. The boot loop in `bare_main` runs the stages in
+    /// this order and feeds each result to [`record_boot_stage`].
     pub const ALL: [Stage; 8] = [
         Stage::Early,
         Stage::Core,
@@ -455,19 +456,6 @@ pub fn run_stage(stage: Stage) -> StageStats {
     }
     REGISTRY.stats.lock()[i] = stats;
     stats
-}
-
-/// Convenience: run every stage from `Early` through and including
-/// `last_stage`. Returns the accumulated stats per stage.
-pub fn run_all_through(last_stage: Stage) -> [StageStats; 8] {
-    let mut out = [StageStats::default(); 8];
-    for s in Stage::ALL {
-        if (s as u8) > (last_stage as u8) {
-            break;
-        }
-        out[s as usize] = run_stage(s);
-    }
-    out
 }
 
 /// Read the most-recent stats for a stage without re-running it.
