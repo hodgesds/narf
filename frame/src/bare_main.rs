@@ -600,7 +600,11 @@ fn setup_pcid_domains() {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
+pub unsafe extern "C" fn _start_rust(
+    raw: RawBootInfo,
+    #[cfg(target_arch = "aarch64")] boot_stack_lo_phys: u64,
+    #[cfg(target_arch = "aarch64")] boot_stack_hi_phys: u64,
+) -> ! {
     // Status-panel diag: first non-firmware phase. set_phase is a
     // single atomic store — safe from very-early boot before any
     // allocator is alive.
@@ -631,6 +635,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     {
         // PL011 at QEMU virt's MMIO base.
         console::early_init(PhysAddr::new(0x0900_0000), UartKind::Pl011);
+        // First thing with a console: everything after this, the heap
+        // included, trusts that the BSP's stack is memory nothing else owns.
+        aarch64::assert_on_boot_stack(boot_stack_lo_phys, boot_stack_hi_phys);
     }
 
     let _ = writeln!(

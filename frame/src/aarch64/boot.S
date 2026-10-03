@@ -387,6 +387,19 @@ _start_rust_entry:
     ldr  x0, =stack_top_virt
     mov  sp, x0
 
+    /* The boot stack's physical bounds, for `_start_rust` to check SP against
+     * (`aarch64::assert_on_boot_stack`). `adrp` is PC-relative and this code
+     * still runs at its load address through the identity map, so these are
+     * physical addresses computed by the hardware -- the same derivation
+     * `smp_entry.S` uses for an AP's stack. No KASLR relocation record covers
+     * them, which is what makes them a check on the `stack_top_virt` literal
+     * above rather than a second copy of it: that literal is patched by the
+     * slide whenever `xtask`'s relocation extractor says its value moves. */
+    adrp x2, stack_bottom
+    add  x2, x2, #:lo12:stack_bottom
+    adrp x3, stack_top
+    add  x3, x3, #:lo12:stack_top
+
     mov x0, #0xfeed
     movk x0, #0xd00d, lsl #16
     mov x1, x19
@@ -405,7 +418,7 @@ _start_rust_entry:
      * problem is avoidable. A literal loaded with `ldr =` gets a real
      * R_AARCH64_ABS64 record, which the relocation table already carries.
      *
-     * x16 is IP0, the register a veneer is allowed to clobber, and x0/x1 hold
+     * x16 is IP0, the register a veneer is allowed to clobber, and x0-x3 hold
      * the arguments. */
     ldr x16, =_start_rust
     blr x16
