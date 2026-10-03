@@ -3031,6 +3031,136 @@ fn reverie_narf_waiting_callbacks_meet_through_global_state() -> TestResult {
 }
 reverie_narf_test!(reverie_narf_waiting_callbacks_meet_through_global_state);
 
+/// The request [`StartRendezvous`]'s thread start sends.
+const MEET_START: u64 = 3;
+
+/// Where [`StartRendezvous`]'s thread start and syscall callback meet.
+#[derive(Debug, Default)]
+struct StartMeeting {
+    /// Thread starts so far; the first is the root's.
+    starts: AtomicU64,
+    /// The child's thread start has begun its wait.
+    child_started: AtomicBool,
+    /// The parent's callback has seen the child's start.
+    parent_done: AtomicBool,
+    /// A wait gave up.
+    gave_up: AtomicBool,
+    /// Polls of the child's start's wait and of the parent's wait.
+    child_polls: AtomicU64,
+    parent_polls: AtomicU64,
+}
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for StartMeeting {
+    type Request = u64;
+    type Response = i64;
+    type Config = ();
+
+    async fn init_global_state(_: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, request: u64) -> i64 {
+        if request == MEET_START {
+            if self.starts.fetch_add(1, Ordering::AcqRel) == 0 {
+                // The root's start, before the fork: nothing to meet.
+                return 0;
+            }
+            self.child_started.store(true, Ordering::Release);
+            if wait_for(&self.parent_done, &self.child_polls, true).await {
+                return 0;
+            }
+        } else if wait_for(&self.child_started, &self.parent_polls, false).await {
+            self.parent_done.store(true, Ordering::Release);
+            return MEET_PARENT_VALUE;
+        }
+        self.gave_up.store(true, Ordering::Release);
+        WAIT_GAVE_UP
+    }
+}
+
+/// Meets the rendezvous guest's child's thread start and its parent's
+/// `getgid` through [`StartMeeting`], as Detcore's thread start waits for
+/// its scheduler to admit the thread. The child's start is pending once
+/// whatever the order, then waits until the parent's `getgid` has seen it
+/// begin; the parent's `getgid` waits for the child's start. The child's
+/// `getuid` and the parent's `getgid` return the guest's values without
+/// running the syscall, and everything else is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct StartRendezvous;
+
+#[reverie::tool]
+impl Tool for StartRendezvous {
+    type GlobalState = StartMeeting;
+    type ThreadState = ();
+
+    async fn handle_thread_start<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::Error> {
+        guest.send_rpc(MEET_START).await;
+        Ok(())
+    }
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        match syscall.number().id() as u32 {
+            LINUX_GETUID => Ok(MEET_CHILD_VALUE),
+            LINUX_GETGID => Ok(guest.send_rpc(MEET_PARENT).await),
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// A thread start waits for another task: the rendezvous guest's child's
+/// start waits until the parent's `getgid` callback has seen it begin, and
+/// both tasks then run to exit 0. The child's start is pending at least
+/// once in any order, so the host must let the task wait before its first
+/// user instruction and poll the start again; a host that cannot aborts the
+/// run with `ToolSuspended`.
+fn reverie_narf_thread_start_waits_for_another_task() -> TestResult {
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<StartRendezvous>(RENDEZVOUS_GUEST, ())?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let meeting = interceptor.host().global();
+        let starts = meeting.starts.load(Ordering::Acquire);
+        let child_polls = meeting.child_polls.load(Ordering::Acquire);
+        let parent_polls = meeting.parent_polls.load(Ordering::Acquire);
+        let gave_up = meeting.gave_up.load(Ordering::Acquire);
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    starts {starts} child polls {child_polls} parent polls {parent_polls} \
+             gave up {gave_up} holds {holds:?} abort reason {reason:?}"
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callbacks");
+        }
+        if gave_up {
+            return Err("a wait gave up");
+        }
+        if starts != 2 {
+            return Err("the host did not start exactly the root and its child");
+        }
+        if child_polls < 2 {
+            return Err("the child's thread start was not polled again after it was pending");
+        }
+        let exits = check_teardown(&interceptor, root, 2, 0)?;
+        if exits.iter().any(|exit| exit.wstatus != 0) {
+            return Err("a task of the rendezvous guest did not exit 0");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_thread_start_waits_for_another_task);
+
 /// Whether the kill-during-wait guest's child callback has started waiting;
 /// the flag [`KillWait`]'s child waits for, which nothing sets, and the one
 /// [`KillRelease`]'s parent sets once its `kill` has run; how often the

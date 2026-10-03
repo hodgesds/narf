@@ -201,12 +201,16 @@
 //! * A task that the waiting callback created is held off the run queues
 //!   until the callback returns (`SpawnHold`), so a callback that waits for
 //!   its own child waits until the Tool gives up or the task is killed.
-//! * Only syscall callbacks wait, and only in the own-stack execution model,
-//!   which production enables in `install_user_task_hooks`. Elsewhere the
-//!   callback ends as `ToolSuspended` (see "Run aborts"): in the legacy
-//!   model, and in the hooks that are polled once, which are
-//!   `handle_thread_start`, `handle_post_exec`, the exit hooks, the poll
-//!   after a signal interrupted a parked inject, and `init_global_state`.
+//! * `handle_thread_start` and `handle_post_exec` wait the same way, as
+//!   Detcore's thread start waits for its scheduler to admit the thread
+//!   (`reverie_narf_thread_start_waits_for_another_task`). A task killed
+//!   while its thread start waits is not stopped before its first user
+//!   instruction: it dies of the signal at its next entry to the kernel.
+//! * Callbacks wait only in the own-stack execution model, which production
+//!   enables in `install_user_task_hooks`. Elsewhere the callback ends as
+//!   `ToolSuspended` (see "Run aborts"): in the legacy model, and in the
+//!   hooks that are polled once, which are the exit hooks, the poll after a
+//!   signal interrupted a parked inject, and `init_global_state`.
 //!
 //! **Background futures.** Under reverie-ptrace, a global state with work
 //! of its own spawns it on the tracer's tokio runtime, as Detcore's

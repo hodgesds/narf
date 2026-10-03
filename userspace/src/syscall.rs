@@ -201,7 +201,7 @@ pub enum NativeRepollWait {
     /// interceptor has returned.
     Killed,
     /// This capability cannot wait, so nothing happened: it has no user task
-    /// to switch out (a lifecycle callback, the legacy execution model).
+    /// to switch out (the legacy execution model).
     Unsupported,
 }
 
@@ -367,12 +367,17 @@ pub trait SyscallInterceptor: Send + Sync {
     ///
     /// `native` runs injected requests only; it has no original syscall and
     /// refuses transitions that would exit the task or replace its image.
+    /// The callback may wait for other tasks
+    /// ([`NativeSyscallTransition::wait_for_repoll`]), as a syscall callback
+    /// may. A task killed during such a wait is not stopped before its first
+    /// user instruction: it dies at its next entry to the kernel.
     fn on_task_start(&self, _task_id: u64, _native: &mut dyn NativeSyscallTransition) {}
 
     /// Called after a successful exec has installed the new image and before
     /// its first instruction runs, with the new address space active.
     ///
-    /// `native` has the same restrictions as in [`Self::on_task_start`].
+    /// `native` has the same restrictions as in [`Self::on_task_start`], and
+    /// the callback may wait as it may there.
     fn on_task_exec(&self, _task_id: u64, _native: &mut dyn NativeSyscallTransition) {}
 
     /// Called exactly once when task `task_id` of process `pid` has finished,
@@ -4063,10 +4068,11 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
 }
 
 /// Native capability lent to a lifecycle callback, which has no intercepted
-/// syscall and no live syscall frame.
+/// syscall and no live syscall frame. It waits as a syscall callback's does.
 struct LifecycleTransition<'table> {
     table: &'table SyscallTable,
     context_managed: bool,
+    task_id: u64,
 }
 
 impl NativeSyscallTransition for LifecycleTransition<'_> {
@@ -4095,6 +4101,19 @@ impl NativeSyscallTransition for LifecycleTransition<'_> {
                 NativeSyscallOutcome::ContextManaged
             }
         }
+    }
+
+    /// As [`DispatchNativeTransition`]'s: a kill pending once the task runs
+    /// again takes the task's context, so no later transition runs.
+    fn wait_for_repoll(&mut self) -> NativeRepollWait {
+        if !yield_callback_task() {
+            return NativeRepollWait::Unsupported;
+        }
+        if callback_task_killed(self.task_id) {
+            self.context_managed = true;
+            return NativeRepollWait::Killed;
+        }
+        NativeRepollWait::Yielded
     }
 }
 
@@ -4332,6 +4351,7 @@ pub(crate) fn notify_interceptor_task_start(task_id: u64) {
         let mut native = LifecycleTransition {
             table,
             context_managed: false,
+            task_id,
         };
         interceptor.on_task_start(task_id, &mut native);
     }
@@ -4343,6 +4363,7 @@ pub(crate) fn notify_interceptor_task_exec(task_id: u64) {
         let mut native = LifecycleTransition {
             table,
             context_managed: false,
+            task_id,
         };
         interceptor.on_task_exec(task_id, &mut native);
     }

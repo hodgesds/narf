@@ -2466,7 +2466,7 @@ dependencies = [
 [[package]]
 name = "reverie-core"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie?rev=82da27552bcd1c5c207cfcc8c09965792a892b1b#82da27552bcd1c5c207cfcc8c09965792a892b1b"
+source = "git+https://github.com/rrnewton/reverie?rev=c6c047b63e82dab57943cb9215413e1c14f465cf#c6c047b63e82dab57943cb9215413e1c14f465cf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2483,7 +2483,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie?rev=82da27552bcd1c5c207cfcc8c09965792a892b1b#82da27552bcd1c5c207cfcc8c09965792a892b1b"
+source = "git+https://github.com/rrnewton/reverie?rev=c6c047b63e82dab57943cb9215413e1c14f465cf#c6c047b63e82dab57943cb9215413e1c14f465cf"
 dependencies = [
  "syscalls",
 ]
@@ -2510,7 +2510,7 @@ dependencies = [
 [[package]]
 name = "reverie-narf-core"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie?rev=82da27552bcd1c5c207cfcc8c09965792a892b1b#82da27552bcd1c5c207cfcc8c09965792a892b1b"
+source = "git+https://github.com/rrnewton/reverie?rev=c6c047b63e82dab57943cb9215413e1c14f465cf#c6c047b63e82dab57943cb9215413e1c14f465cf"
 dependencies = [
  "async-trait",
  "reverie-core",
@@ -2519,7 +2519,7 @@ dependencies = [
 [[package]]
 name = "reverie-narf-tools"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie?rev=82da27552bcd1c5c207cfcc8c09965792a892b1b#82da27552bcd1c5c207cfcc8c09965792a892b1b"
+source = "git+https://github.com/rrnewton/reverie?rev=c6c047b63e82dab57943cb9215413e1c14f465cf#c6c047b63e82dab57943cb9215413e1c14f465cf"
 dependencies = [
  "reverie-core",
  "serde",
@@ -2529,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie?rev=82da27552bcd1c5c207cfcc8c09965792a892b1b#82da27552bcd1c5c207cfcc8c09965792a892b1b"
+source = "git+https://github.com/rrnewton/reverie?rev=c6c047b63e82dab57943cb9215413e1c14f465cf#c6c047b63e82dab57943cb9215413e1c14f465cf"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
@@ -2539,7 +2539,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie?rev=82da27552bcd1c5c207cfcc8c09965792a892b1b#82da27552bcd1c5c207cfcc8c09965792a892b1b"
+source = "git+https://github.com/rrnewton/reverie?rev=c6c047b63e82dab57943cb9215413e1c14f465cf#c6c047b63e82dab57943cb9215413e1c14f465cf"
 dependencies = [
  "bitflags 2.13.2",
  "derive_more",
