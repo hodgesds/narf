@@ -270,6 +270,109 @@ fn smoke_smp_shootdown_storm_trap_stacks_hold() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/ipi", smoke_smp_shootdown_storm_trap_stacks_hold);
 
+/// A CPU whose executor keeps dispatching a runnable task with IRQs masked
+/// must still acknowledge a peer's TLB shootdown. The sender waits for the
+/// acknowledgement without a timeout and with its own IRQs masked, so a
+/// target that only acknowledges from the IPI handler wedges the sender's CPU
+/// for as long as the target stays busy.
+///
+/// This CPU masks IRQs explicitly and runs a task that yields until the
+/// peer's shootdown returns, so its executor never reaches the idle path
+/// (the only place it re-enables IRQs). A peer CPU sends one shootdown aimed
+/// only at this CPU. On a timeout the test drains the request itself, so the
+/// peer is released before the failure is reported.
+#[cfg(target_arch = "x86_64")]
+fn smoke_masked_busy_executor_acknowledges_peer_shootdown() -> TestResult {
+    use crate::x86_64::ipi;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_scheduler::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+
+    const NOT_STARTED: u32 = 0;
+    const SENDING: u32 = 1;
+    const ACKNOWLEDGED: u32 = 2;
+    static PEER: AtomicU32 = AtomicU32::new(NOT_STARTED);
+    static TIMED_OUT: AtomicU32 = AtomicU32::new(0);
+
+    let me = narf_lib::percpu::current_cpu() as u32;
+    let online = narf_lib::smp::online_bitmap();
+    let Some(peer) = (0..narf_lib::smp::cpu_count().min(64))
+        .find(|cpu| *cpu != me && online & (1u64 << cpu) != 0)
+    else {
+        return TestResult::Skip("UP boot — no peer CPU to send the shootdown");
+    };
+    PEER.store(NOT_STARTED, Ordering::Release);
+    TIMED_OUT.store(0, Ordering::Release);
+    // `run_until_empty` below returns only once this CPU's queue is empty.
+    // Start from empty queues, as the other smokes that build their own task
+    // graph do: a boot that ran no earlier test of that kind (a run filtered
+    // to this subsystem) still holds the boot-time kernel loops on this CPU,
+    // and they never finish.
+    narf_scheduler::__reset_queues_for_test();
+
+    let irqs_were_enabled = narf_arch::interrupts_enabled();
+    // SAFETY: CPL=0; restored below. No IRQ-driven event is awaited while
+    // masked: the only wake this CPU needs is its own yielding task.
+    unsafe { narf_arch::disable_interrupts() };
+
+    let mut sender = TaskSpec::kernel_any();
+    sender.affinity = Affinity::pinned(CpuId(peer));
+    spawn_with_spec(
+        async move {
+            PEER.store(SENDING, Ordering::Release);
+            // SAFETY: x2APIC and the shootdown vector are live; the mapping
+            // is unchanged, so the requested INVLPG is conservative.
+            unsafe { ipi::shoot_range_mask(0xFFFF_FFFF_8000_4000, 1, 0, 1u64 << (me & 63)) };
+            PEER.store(ACKNOWLEDGED, Ordering::Release);
+        },
+        sender,
+    );
+
+    let deadline = narf_time::Instant::now().plus_cycles(narf_time::ns_to_cycles(2_000_000_000));
+    let give_up = narf_time::Instant::now().plus_cycles(narf_time::ns_to_cycles(10_000_000_000));
+    let mut waiter = TaskSpec::unthrottled();
+    waiter.affinity = Affinity::pinned(CpuId(me));
+    spawn_with_spec(
+        async move {
+            while PEER.load(Ordering::Acquire) != ACKNOWLEDGED {
+                if TIMED_OUT.load(Ordering::Acquire) == 0 && narf_time::Instant::now() >= deadline {
+                    TIMED_OUT.store(1, Ordering::Release);
+                }
+                if PEER.load(Ordering::Acquire) == NOT_STARTED
+                    && narf_time::Instant::now() >= give_up
+                {
+                    TIMED_OUT.store(2, Ordering::Release);
+                    return;
+                }
+                if TIMED_OUT.load(Ordering::Acquire) != 0 {
+                    // Release the peer so the suite can continue.
+                    // SAFETY: CPL=0; consumes only this CPU's pending requests.
+                    unsafe { ipi::poll_pending_shootdown() };
+                }
+                narf_scheduler::yield_now().await;
+            }
+        },
+        waiter,
+    );
+    narf_scheduler::run_until_empty();
+
+    if irqs_were_enabled {
+        // SAFETY: restores the state found on entry.
+        unsafe { narf_arch::enable_interrupts() };
+    }
+    match TIMED_OUT.load(Ordering::Acquire) {
+        0 => TestResult::Pass,
+        2 => TestResult::Fail("the peer CPU never ran the task pinned to it"),
+        _ => TestResult::Fail(
+            "a busy executor with IRQs masked did not acknowledge a peer's shootdown within 2 s",
+        ),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_masked_busy_executor_acknowledges_peer_shootdown
+);
+
 // ── relocated from verification ──
 
 #[cfg(target_arch = "x86_64")]

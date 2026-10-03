@@ -4972,6 +4972,15 @@ pub fn run_until_empty() {
         // YieldTimeout) keeps ready > 0 and would otherwise
         // starve deferred wakes forever.
         let _ = narf_lib::deferred_wake::drain_and_wake();
+        // Acknowledge a peer's TLB shootdown or membarrier request every
+        // round. This loop may run with IRQs masked for as long as some task
+        // stays runnable: a kernel-test harness CPU starts with IF=0, and an
+        // AP that parked a user task inherits the pre-iretq `cli`. IRQs are
+        // re-enabled only on the idle path below, which an always-runnable
+        // task (a waiter that yields until a count drops) never reaches.
+        // Without this, the IPI stays latched and the sender spins forever
+        // with IRQs masked, holding its CPU and every task queued there.
+        narf_lib::sync::service_masked_cross_cpu_requests();
         // Fold any cross-core wakes (Linux `sched_ttwu_pending`) into READY
         // before snapshotting the round so a task a remote CPU pushed onto our
         // wake list dispatches THIS round rather than waiting for the next one.

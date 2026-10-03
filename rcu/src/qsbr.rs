@@ -451,6 +451,12 @@ pub fn sync_until(deadline_ns: u64) -> bool {
         // This CPU's own quiescent state is ours to declare; peers reach
         // theirs at their executor poll boundaries.
         report_quiescent();
+        // A caller may wait here with IRQs masked, and a peer may be
+        // waiting on this CPU in turn: a TLB shootdown sent while that peer
+        // drops the last reference to an address space spins, IRQs masked,
+        // until this CPU acknowledges. Service it before every check, so a
+        // caller that loops over short waits still acknowledges it.
+        narf_lib::sync::service_masked_cross_cpu_requests();
         if all_cpus_past(target) {
             break;
         }

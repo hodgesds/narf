@@ -6312,6 +6312,83 @@ kernel_test_in!(
     smoke_remote_call_completes_while_target_waits_for_shootdown_ack
 );
 
+/// A CPU waiting for an RCU grace period with IRQs masked must acknowledge a
+/// peer's TLB shootdown. A peer that drops the last reference to an address
+/// space shoots down, IRQs masked, and waits without a timeout; if the waiter
+/// here only acknowledges from the IPI handler, the peer's CPU stays wedged
+/// and whatever it was freeing (the space, its COW frames) is never released.
+///
+/// This CPU masks IRQs explicitly and then only calls `rcu::sync_until` with
+/// short deadlines, the loop a reclaiming caller runs. A peer CPU sends one
+/// shootdown aimed only at this CPU. On a timeout the test drains the request
+/// itself, so the peer is released before the failure is reported.
+#[cfg(target_arch = "x86_64")]
+fn smoke_rcu_sync_until_acknowledges_peer_shootdown() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_interrupts::x86_64::ipi;
+
+    const NOT_STARTED: u32 = 0;
+    const SENDING: u32 = 1;
+    const ACKNOWLEDGED: u32 = 2;
+    static PEER: AtomicU32 = AtomicU32::new(NOT_STARTED);
+
+    let outcome = narf_lib::sync::without_interrupts(|| {
+        let me = narf_lib::percpu::current_cpu();
+        let peers = narf_lib::smp::online_bitmap() & !(1u64 << me);
+        if peers == 0 {
+            return Err(TestResult::Skip("needs an online AP"));
+        }
+        let peer = peers.trailing_zeros();
+        PEER.store(NOT_STARTED, Ordering::Release);
+        let mut spec = narf_scheduler::TaskSpec::kernel_any();
+        spec.affinity = narf_scheduler::Affinity::pinned(narf_scheduler::CpuId(peer));
+        narf_scheduler::spawn_with_spec(
+            async move {
+                PEER.store(SENDING, Ordering::Release);
+                // SAFETY: CPL=0 with the shootdown IPI installed at boot; the
+                // mapping is unchanged, so the INVLPG is conservative.
+                unsafe { ipi::shoot_range_mask(0xFFFF_FFFF_8000_4000, 1, 0, 1u64 << me) };
+                PEER.store(ACKNOWLEDGED, Ordering::Release);
+            },
+            spec,
+        );
+        let deadline = narf_time::monotonic_ns().saturating_add(2_000_000_000);
+        while PEER.load(Ordering::Acquire) != ACKNOWLEDGED {
+            let now = narf_time::monotonic_ns();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let _ = narf_rcu::sync_until(now.saturating_add(1_000_000).min(deadline));
+        }
+        Ok(true)
+    });
+    let acknowledged = match outcome {
+        Ok(acknowledged) => acknowledged,
+        Err(result) => return result,
+    };
+    if !acknowledged {
+        // Release the peer before reporting, so the suite can continue.
+        let give_up = narf_time::monotonic_ns().saturating_add(10_000_000_000);
+        while PEER.load(Ordering::Acquire) != ACKNOWLEDGED && narf_time::monotonic_ns() < give_up {
+            // SAFETY: CPL=0; consumes only this CPU's pending shootdown requests.
+            unsafe { ipi::poll_pending_shootdown() };
+            core::hint::spin_loop();
+        }
+        if PEER.load(Ordering::Acquire) == NOT_STARTED {
+            return TestResult::Fail("the peer CPU never ran the task pinned to it");
+        }
+        return TestResult::Fail(
+            "an RCU grace-period wait with IRQs masked did not acknowledge a peer's shootdown within 2 s",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "verification/smp-rendezvous",
+    smoke_rcu_sync_until_acknowledges_peer_shootdown
+);
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Full end-to-end: build a user AS with a code + stack page,

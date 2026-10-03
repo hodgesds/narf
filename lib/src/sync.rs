@@ -76,6 +76,24 @@ pub(crate) fn run_lock_spin_hook() {
     }
 }
 
+/// Service the cross-CPU requests that a peer waits on without a timeout
+/// (TLB shootdowns and `membarrier(2)` rendezvous), whatever this CPU's
+/// interrupt state.
+///
+/// Both senders spin until every target acknowledges, and a target normally
+/// acknowledges from the IPI handler. A CPU that keeps IRQs masked for an
+/// unbounded time, such as an executor dispatching an always-runnable task
+/// while it runs with IF=0, never takes that IPI, so its peer spins forever.
+/// Such a loop calls this at each safe point. The cost is one acquire load
+/// per request kind when nothing is pending.
+///
+/// Must be called at CPL=0 from a context that holds no lock that a remote
+/// `membarrier` action may take, the same contract as a lock spin.
+#[inline]
+pub fn service_masked_cross_cpu_requests() {
+    run_lock_spin_hook();
+}
+
 // ──────────────────────────────────────────────────────────────────
 // IRQ-state typestate markers
 // ──────────────────────────────────────────────────────────────────
