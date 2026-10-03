@@ -1651,12 +1651,89 @@ impl Tool for ExecWatch {
     }
 }
 
+static DEFER_ROOT: AtomicU64 = AtomicU64::new(0);
+/// The task whose execve callback is running, 0 outside it.
+static DEFER_IN_CALLBACK: AtomicU64 = AtomicU64::new(0);
+/// Bit 0: `on_task_exec` arrived inside the execve callback; bit 1: after it
+/// returned; bit 2: the callback's `execute_original` was not
+/// `Ok(ContextManaged)`.
+static DEFER_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// A raw interceptor that runs the exec guest's execve from inside its
+/// callback and records whether the exec happened before the callback
+/// returned. It never enters the Reverie host, whose re-entry guard would
+/// panic the kernel if the dispatcher ran the exec inside the callback.
+struct ExecDeferralProbe;
+
+impl SyscallInterceptor for ExecDeferralProbe {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        let number = invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
+        let task_id = invocation.task_id;
+        if number != 59 || task_id != DEFER_ROOT.load(Ordering::Acquire) {
+            return SyscallInterception::Continue;
+        }
+        DEFER_IN_CALLBACK.store(task_id, Ordering::Release);
+        let outcome = native.execute_original();
+        DEFER_IN_CALLBACK.store(0, Ordering::Release);
+        if outcome != Ok(NativeSyscallOutcome::ContextManaged) {
+            DEFER_SEEN.fetch_or(1 << 2, Ordering::AcqRel);
+        }
+        SyscallInterception::Continue
+    }
+
+    fn on_task_exec(&self, task_id: u64, _native: &mut dyn NativeSyscallTransition) {
+        if task_id != DEFER_ROOT.load(Ordering::Acquire) {
+            return;
+        }
+        let bit = if DEFER_IN_CALLBACK.load(Ordering::Acquire) == task_id {
+            1 << 0
+        } else {
+            1 << 1
+        };
+        DEFER_SEEN.fetch_or(bit, Ordering::AcqRel);
+    }
+}
+
+/// [`run_hosted`] on the exec guest, after checking with
+/// [`ExecDeferralProbe`] that an execve an interceptor callback runs is
+/// deferred until the callback has returned. A dispatcher that ran it inside
+/// the callback would otherwise surface only as the host's re-entry panic.
+/// The caller mounts the exec target and sets [`ROOT_EXECS`].
+fn run_hosted_exec<T: Tool + 'static>(
+    config: <T::GlobalState as reverie::GlobalTool>::Config,
+) -> Result<(ReverieInterceptor<T>, Root), &'static str> {
+    DEFER_ROOT.store(0, Ordering::Release);
+    DEFER_IN_CALLBACK.store(0, Ordering::Release);
+    DEFER_SEEN.store(0, Ordering::Release);
+    let run = run_guest(EXEC_GUEST, Box::new(ExecDeferralProbe), |root| {
+        DEFER_ROOT.store(root.task_id, Ordering::Release);
+        Ok(())
+    });
+    // Checked before the run's own result: an exec run inside the callback
+    // may also break the run's teardown checks.
+    let seen = DEFER_SEEN.load(Ordering::Acquire);
+    if seen & 1 != 0 {
+        return Err("execve ran inside the interceptor callback instead of after it returned");
+    }
+    run?;
+    if seen != 1 << 1 {
+        let _ = writeln!(Writer, "    exec deferral probe saw {seen:#x}");
+        return Err("the deferred execve did not reach on_task_exec once, after the callback");
+    }
+    run_hosted::<T>(EXEC_GUEST, config)
+}
+
 /// A hosted task's successful execve runs after the Tool callback that
 /// requested it has returned (the dispatcher's deferred transition), the Tool
 /// then gets its post-exec callback in the new image (`on_task_exec`), and
 /// the new image's syscalls reach the Tool: execve, post-exec, write, exit.
 /// The new image's auxiliary vector replaces the old one in the kernel's
-/// record and the Tool's view.
+/// record and the Tool's view. The deferral itself is checked first, by a
+/// raw interceptor ([`run_hosted_exec`]).
 fn reverie_narf_exec_defers_and_reaches_post_exec() -> TestResult {
     EXEC_LOG.lock().clear();
     EXEC_AUXV.store(0, Ordering::Release);
@@ -1670,7 +1747,7 @@ fn reverie_narf_exec_defers_and_reaches_post_exec() -> TestResult {
     };
     ROOT_EXECS.store(true, Ordering::Release);
     let outcome = (|| {
-        let (interceptor, root) = run_hosted::<ExecWatch>(EXEC_GUEST, ())?;
+        let (interceptor, root) = run_hosted_exec::<ExecWatch>(())?;
         let exits = check_teardown(&interceptor, root, 1, 0)?;
         if !exits[0].process_exited {
             return Err("the root's exit did not end its process in the host");
@@ -2720,7 +2797,7 @@ fn reverie_narf_lifecycle_spawn_is_refused() -> TestResult {
     };
     ROOT_EXECS.store(true, Ordering::Release);
     let outcome = (|| {
-        let (interceptor, root) = run_hosted::<LifecycleSpawns>(EXEC_GUEST, ())?;
+        let (interceptor, root) = run_hosted_exec::<LifecycleSpawns>(())?;
         let log = core::mem::take(&mut *LIFECYCLE_SPAWN_LOG.lock());
         let _ = writeln!(Writer, "    lifecycle spawn log {log:?}");
         check_teardown(&interceptor, root, 1, 0)?;
