@@ -5157,6 +5157,86 @@ kernel_test_in!(
 );
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_x86_64_vdso_timestamp_reset_keeps_syscall_interceptor_routing() -> TestResult {
+    // The counter-ordering smoke drops the timestamp-trap reason while its
+    // RDTSC interceptor stays installed. That reset must clear only its own
+    // reason: with a published syscall interceptor that asks for the guest's
+    // vDSO calls, the clocks must stay on syscalls through the reset and the
+    // instruction teardown, and return to the counter only when the table
+    // itself is cleared.
+    use narf_userspace::{
+        install_global, instruction::__verification_clear_instruction_interceptor,
+        syscall::__verification_clear_global as __test_clear_global,
+        try_install_instruction_interceptor, vdso, InstructionInterceptor,
+        InstructionSubscriptions, SyscallInterceptor, SyscallTable,
+    };
+
+    struct VdsoCallsProbe;
+    impl SyscallInterceptor for VdsoCallsProbe {
+        fn intercepts_vdso_calls(&self) -> bool {
+            true
+        }
+    }
+
+    struct RdtscProbe;
+    // SAFETY: the probe has no callback state; the default callbacks return
+    // `Continue` and the native value without allocating or blocking.
+    unsafe impl InstructionInterceptor for RdtscProbe {
+        fn subscriptions(&self) -> InstructionSubscriptions {
+            InstructionSubscriptions::RDTSC
+        }
+    }
+
+    __test_clear_global();
+    __verification_clear_instruction_interceptor();
+    if vdso::clocks_route_through_syscalls() {
+        return TestResult::Fail("vDSO clocks used syscalls before any interceptor");
+    }
+    let mut table = SyscallTable::new();
+    if table
+        .install_interceptor(alloc::boxed::Box::new(VdsoCallsProbe))
+        .is_err()
+    {
+        return TestResult::Fail("vDSO-calls syscall interceptor installation failed");
+    }
+    install_global(table);
+    let routed = vdso::clocks_route_through_syscalls();
+    if try_install_instruction_interceptor(alloc::boxed::Box::new(RdtscProbe)).is_err() {
+        __test_clear_global();
+        return TestResult::Fail("RDTSC interceptor installation failed");
+    }
+    vdso::__verification_restore_counter_clocks();
+    let kept_after_reset = vdso::clocks_route_through_syscalls();
+    __verification_clear_instruction_interceptor();
+    let kept_after_teardown = vdso::clocks_route_through_syscalls();
+    __test_clear_global();
+    let restored = !vdso::clocks_route_through_syscalls();
+
+    if !routed {
+        return TestResult::Fail("publishing a vDSO-calls interceptor did not route the clocks");
+    }
+    if !kept_after_reset {
+        return TestResult::Fail(
+            "the timestamp reset dropped the syscall interceptor's routing reason",
+        );
+    }
+    if !kept_after_teardown {
+        return TestResult::Fail(
+            "the instruction teardown dropped the syscall interceptor's routing reason",
+        );
+    }
+    if !restored {
+        return TestResult::Fail("clearing the table did not restore the vDSO counter path");
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/syscall-entry",
+    smoke_x86_64_vdso_timestamp_reset_keeps_syscall_interceptor_routing
+);
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_x86_64_instruction_interceptor_install_requires_no_live_user_task() -> TestResult {
     // Installation publishes the slot, switches the vDSO clocks and arms each
     // CPU in separate steps, so it is specified as a pre-guest operation. With

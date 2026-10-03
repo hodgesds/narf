@@ -870,6 +870,7 @@ jobs:
             'verification/syscall-entry / smoke_x86_64_vdso_clocks_use_syscalls_under_timestamp_interception' \
             'verification/syscall-entry / smoke_x86_64_vdso_getcpu_uses_syscall_under_timestamp_interception' \
             'verification/syscall-entry / smoke_x86_64_vdso_counter_reads_are_ordered' \
+            'verification/syscall-entry / smoke_x86_64_vdso_timestamp_reset_keeps_syscall_interceptor_routing' \
             'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_requires_no_live_user_task' \
             'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_defers_concurrent_user_spawn' \
             'verification/interception-migration / smoke_scheduled_user_interception_survives_ap_migration' \
