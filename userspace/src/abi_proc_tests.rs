@@ -755,6 +755,26 @@ fn smoke_abi_proc_set_tid_address_nonzero() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_set_tid_address_nonzero);
 
+fn smoke_abi_proc_set_tid_address_returns_gettid() -> TestResult {
+    with_setup(|| {
+        // Linux returns the caller's thread ID, which gettid also returns
+        // and which for a group leader is its PID; musl keeps it as the
+        // thread's tid. The scheduler TaskId must not leak through it.
+        const TASK: u64 = 0xBEEF;
+        const PID: u64 = 0xCAFE;
+        set_task(TASK);
+        crate::handlers::register_pid_task_mapping(PID, TASK);
+        let tid = call(Syscall::SetTidAddress.raw(), a0(0));
+        let gettid = call(Syscall::Gettid.raw(), a0(0));
+        set_task(FAKE_TASK);
+        match (tid, gettid) {
+            (Some(tid), Some(gettid)) if tid == PID as i64 && tid == gettid => Ok(()),
+            _ => Err("set_tid_address did not return the caller's gettid value"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_set_tid_address_returns_gettid);
+
 // ── capget(2) / capset(2) — capability-set round-trip ──
 
 fn smoke_abi_proc_capset_capget_pos() -> TestResult {
