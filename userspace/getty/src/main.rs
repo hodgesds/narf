@@ -38,6 +38,9 @@ const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
 /// `c_lflag` ECHO bit (asm-generic termbits); c_lflag is at wire offset 12.
 const L_ECHO: u32 = 0x0000_0008;
+/// `read` returns -EINTR when a signal interrupts it before any byte
+/// arrives; such a read is retried.
+const EINTR: isize = 4;
 
 /// Write `bytes` to fd 1 (the console), looping on short writes.
 unsafe fn write_console(bytes: &[u8]) {
@@ -69,6 +72,9 @@ unsafe fn read_line(buf: &mut [u8]) -> usize {
         // SAFETY: 1-byte read into a stack buffer; the console blocks until
         // a byte (or a completed line in cooked mode) is available.
         let n = unsafe { libc::posix_read(0, b.as_mut_ptr() as *mut _, 1) };
+        if n == -EINTR {
+            continue;
+        }
         if n <= 0 {
             break; // EOF / error — return what we have
         }
@@ -124,6 +130,9 @@ unsafe fn check_credentials(user: &[u8], pass: &[u8]) -> bool {
         let n = unsafe {
             libc::posix_read(fd, buf.as_mut_ptr().add(total) as *mut _, buf.len() - total)
         };
+        if n == -EINTR {
+            continue;
+        }
         if n <= 0 {
             break;
         }

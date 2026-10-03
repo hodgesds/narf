@@ -1077,6 +1077,10 @@ fn socktest_run(fd: i32) {
 /// every worker thread.
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// `read` returns -EINTR when a signal interrupts it before any byte
+/// arrives; such a read is retried.
+const EINTR: isize = 4;
+
 const PROMPT: &[u8] = b"narf> ";
 const NEWLINE: &[u8] = b"\n";
 
@@ -1129,6 +1133,9 @@ unsafe fn read_byte(fd: i32) -> Option<u8> {
         let n = unsafe { libc::posix_read(fd, buf.as_mut_ptr() as *mut _, 1) };
         if n == 1 {
             return Some(buf[0]);
+        }
+        if n == -EINTR {
+            continue;
         }
         if n < 0 {
             return None;
