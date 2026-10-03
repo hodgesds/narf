@@ -569,6 +569,40 @@ fn smoke_socket_so_bindtodevice_round_trip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_so_bindtodevice_round_trip);
 
+/// Regression: the SO_BINDTODEVICE unbind must not depend on test order.
+///
+/// `smoke_userspace_setuid_setgid_round_trip` calls `setuid(1234)` on the
+/// harness task, and `cap_emulate_setxuid` clears the task's permitted and
+/// effective sets when it leaves root. Its cleanup used to reset only the
+/// uid/gid registry, so the harness task stayed at uid 0 with NO
+/// capabilities. When link order then ran the round-trip above after it, the
+/// unbind of an already-bound socket hit the CAP_NET_RAW gate of
+/// `sock_bindtoindex_locked` and answered EPERM ("an empty device name must
+/// unbind"). Run the two back to back so the leak fails here by name on
+/// every build instead of only on builds whose link order happens to place
+/// them in that sequence.
+fn smoke_socket_so_bindtodevice_unbind_after_setuid_round_trip() -> TestResult {
+    // Start from the default, privileged harness credential so this test
+    // is independent of whatever ran before it.
+    crate::handlers::__test_caps_reset();
+    if super::misc::smoke_userspace_setuid_setgid_round_trip() != TestResult::Pass {
+        return TestResult::Fail("setuid/setgid round-trip precondition failed");
+    }
+    if !crate::handlers::task_capable(
+        crate::handlers::current_task_id(),
+        crate::handlers::CAP_NET_RAW,
+    ) {
+        return TestResult::Fail(
+            "the setuid/setgid round-trip leaked its capability drop into the harness task",
+        );
+    }
+    smoke_socket_so_bindtodevice_round_trip()
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_so_bindtodevice_unbind_after_setuid_round_trip
+);
+
 /// sockaddr_in with invalid family rejected by Connect.
 fn smoke_socket_sockaddr_invalid_family_rejected() -> TestResult {
     let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_STREAM);

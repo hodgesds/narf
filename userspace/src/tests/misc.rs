@@ -772,7 +772,7 @@ fn smoke_userspace_process_id_and_aux() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_process_id_and_aux);
 
-fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
+pub(super) fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         uidgid_init, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -802,11 +802,29 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
         fn set_rip(&mut self, _rip: u64) {}
     }
 
+    // `setuid(1234)` below runs `cap_emulate_setxuid` on the HARNESS task:
+    // leaving root clears its permitted and effective capability sets, and
+    // that lives in CAP_TABLE, not in the uid/gid registry. Resetting only
+    // the ids afterwards left every later test on the same boot running as
+    // a root-uid task with no capabilities — e.g. the SO_BINDTODEVICE
+    // unbind, which needs CAP_NET_RAW on a bound socket, answered EPERM
+    // whenever link order put that test after this one. Restore the whole
+    // credential, on every exit path.
+    struct RestoreCredentials;
+    impl Drop for RestoreCredentials {
+        fn drop(&mut self) {
+            crate::handlers::__test_uidgid_reset();
+            crate::handlers::__test_caps_reset();
+            __test_clear_global();
+        }
+    }
+
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
     uidgid_init();
+    let _restore = RestoreCredentials;
 
     fn call(s: Syscall, arg0: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
@@ -849,8 +867,6 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
         return TestResult::Fail("setuid did not stick");
     }
 
-    crate::handlers::__test_uidgid_reset();
-    __test_clear_global();
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_userspace_setuid_setgid_round_trip);
