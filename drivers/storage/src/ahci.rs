@@ -378,8 +378,7 @@ impl Ahci {
     /// constructed BEFORE the doorbell write — an IRQ landing
     /// between doorbell and waiter-construction would let the
     /// baseline fire-count capture a post-IRQ value and hang the
-    /// await forever (see `interrupts/src/wait.rs` and the matching
-    /// fix in `drivers/nvme/src/lib.rs::submit_io_irq_async`).
+    /// await forever (see `interrupts/src/wait.rs`).
     ///
     /// # Safety
     /// Caller owns the HBA + the named port exclusively;

@@ -6512,8 +6512,8 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
 /// context**: any sync subsystem (BlockDeviceSync, FsOps' sync
 /// wrappers, the eventual VFS sync paths) that wants to call into
 /// an already-async driver path. Drivers should expose async
-/// functions (e.g. NVMe's submit_io_irq_async) and let block_on
-/// bridge instead of every driver hand-rolling spin loops.
+/// functions and let block_on bridge instead of every driver
+/// hand-rolling spin loops.
 ///
 /// **Constraints:**
 /// - Caller MUST NOT hold any `IrqSafeSpinLock`. Those locks

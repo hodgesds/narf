@@ -140,10 +140,11 @@ should drop the lock, capture any owned data (clone an `Arc`, copy a
 phys address), then `block_on(...)`. Use `block_on_spin` if you can't.
 
 **Same rule applies inside the awaited future.** Async driver
-functions that `block_on` is supposed to bridge to (e.g. NVMe's
-`submit_io_irq_async`) currently take `&mut Controller` via an
-`IrqSafeSpinLock` guard for their *entire* duration — which means
-the IRQ wake they're waiting for can never fire. The migration is
+functions that `block_on` is supposed to bridge to must not hold an
+`IrqSafeSpinLock` guard (for example a `&mut Controller`) for their
+*entire* duration — if they do, the IRQ wake they're waiting for can
+never fire. (NVMe's former `submit_io_irq_async` did exactly this and
+was removed unused.) The migration is
 **not** "wrap existing sync code in block_on"; it's:
 
 1. Convert per-driver lock from `IrqSafeSpinLock` to a regular
@@ -196,8 +197,8 @@ FB / serial console for the wait duration. The unified primitives
 let drivers hand the wait off to a single mechanism that ticks
 sleep_pumps + idles cleanly.
 
-**Per-driver migration is bespoke.** Drivers expose async functions
-(e.g. NVMe's `submit_io_irq_async`); their sync wrappers
+**Per-driver migration is bespoke.** Drivers expose async functions;
+their sync wrappers
 (`BlockDeviceSync::read`/`write`) call `block_on(...)` after dropping
 their per-driver locks. Don't sweep `spin_tick` everywhere — the
 abstraction lives in `block_on`, not in every driver.
