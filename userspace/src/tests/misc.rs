@@ -2867,12 +2867,24 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
         fn set_rip(&mut self, _rip: u64) {}
     }
 
+    // The caller must be a real (non-zero) task. sys_setpgid treats TaskId 0
+    // as "no such process" (-ESRCH), which is right for production, where a
+    // syscall always has a scheduled caller. This test used to borrow whatever
+    // lookup an earlier test had left installed, so it passed or failed
+    // depending on link order: run first, the caller was 0 and setpgid(0, 7)
+    // returned -ESRCH. Install our own caller and remove it on every exit.
+    const CALLER: u64 = 0x5047_0001;
+    fn caller_lookup() -> u64 {
+        CALLER
+    }
+
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
     crate::handlers::__test_pgid_reset();
     init_per_task_state();
+    crate::install_task_id_lookup(caller_lookup);
 
     fn call(s: Syscall, arg0: u64, arg1: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
@@ -2887,11 +2899,16 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
         ctx.ret
     }
 
-    // Default pgid == pid (which is 0 for the test harness's
-    // current_task_id).
+    // Default pgid == pid. CALLER has no registered ProcessId, so getpid
+    // reports the TaskId itself and `pid` is also the key the tables use.
     let pid = call(Syscall::GetPid, 0, 0).map(|r| r.value).unwrap_or(!0);
+    if pid != CALLER {
+        crate::handlers::__test_reset_task_id_lookup();
+        return TestResult::Fail("getpid did not report the installed caller");
+    }
     let p0 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if p0 != pid {
+        crate::handlers::__test_reset_task_id_lookup();
         return TestResult::Fail("default pgid != pid");
     }
 
@@ -2911,6 +2928,7 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     let p1 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if p1 != 7 {
         crate::task::release_task(GROUP_MEMBER);
+        crate::handlers::__test_reset_task_id_lookup();
         return TestResult::Fail("setpgid(7) did not stick");
     }
 
@@ -2919,6 +2937,7 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     let _ = call(Syscall::Setpgid, 0, 0);
     let p2 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     crate::task::release_task(GROUP_MEMBER);
+    crate::handlers::__test_reset_task_id_lookup();
     if p2 != pid {
         return TestResult::Fail("setpgid(0,0) did not resolve to pid");
     }
