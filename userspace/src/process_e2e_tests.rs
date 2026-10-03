@@ -1483,6 +1483,197 @@ kernel_test_in!(
     smoke_park_exit_drops_futex_waiter_moved_by_requeue
 );
 
+/// The x86_64 legacy poll must leave the futex park on EVERY resume to
+/// userspace, including one that finds the park deadline already cleared
+/// (finding D19 of the ccae23ca deterministic review). `wake_signal` clears
+/// an untimed wait's deadline, and so does `wake_one_inner` for readiness,
+/// IPC and futex wakes, but neither touches the futex queue. Every
+/// `futex_park_leave` in `legacy_poll_park` used to sit inside
+/// `if deadline != 0`, so the next poll skipped all of them and resumed the
+/// task into userspace with its entry still queued. A later
+/// `FUTEX_WAKE(word, 1)` was then spent on that entry instead of a real
+/// waiter.
+///
+/// Drives the production legacy park decision (`legacy_poll_park`, the body
+/// `UserTaskFuture::poll` runs before entering user mode) with own-stack mode
+/// disabled, as that path only runs then, and restores the mode afterwards.
+/// T parks an untimed FUTEX_WAIT on word1, a signal wakes it through the
+/// production `wake_signal`, and the next poll resumes it. T must then hold no
+/// registration and no futex target, and `FUTEX_WAKE(word1, 1)` must reach
+/// W, which has a higher tid, so a stale T entry is exactly the one a
+/// one-waiter wake would pop.
+#[cfg(target_arch = "x86_64")]
+fn smoke_legacy_poll_resume_leaves_futex_park() -> TestResult {
+    use crate::handlers::{
+        __test_futex_drop_task_waiters_racing, __test_futex_has_task_waiter,
+        __test_futex_task_index, futex_gen, futex_register_waiter, futex_wake_waiters_for_test,
+        wake_signal, with_kernel_buffers,
+    };
+    use crate::user_task::__test_legacy_poll_park;
+    use core::sync::atomic::AtomicU32;
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: &Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: the vtable matches the Arc<AtomicU32> representation.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(counter.clone()) as *const (),
+                &VTAB,
+            ))
+        }
+    }
+
+    const T: u64 = 0xF4_10;
+    const W: u64 = 0xF4_20;
+    // A readable futex word on this stack; `with_kernel_buffers` lets the
+    // park check's word re-validation read it.
+    let word: u32 = 7;
+    let word1 = &word as *const u32 as u64;
+
+    // The legacy poll path runs only with own-stack mode off. Turn it off the
+    // way `__test_clear_hooks` does and put back whatever mode we found.
+    let own_stack_was_on = narf_scheduler::stackful::user_own_stack_enabled();
+    #[cfg(feature = "kernel-test")]
+    narf_scheduler::stackful::__reset_user_own_stack_for_test();
+
+    let t_task = crate::task::Task::new_registered(T, T + 1);
+    let w_task = crate::task::Task::new_registered(W, W + 1);
+    let t_fired = Arc::new(AtomicU32::new(0));
+    let w_fired = Arc::new(AtomicU32::new(0));
+    let t_waker = counting_waker(&t_fired);
+    let cx = Context::from_waker(&t_waker);
+    let mut sleep_handle = None;
+    let uc = &t_task.uctx;
+
+    let finish = |sleep_handle: &mut Option<_>, result: TestResult| -> TestResult {
+        if let Some(h) = sleep_handle.take() {
+            narf_scheduler::narf_time::timer_wheel::cancel(h);
+        }
+        let _ = futex_wake_waiters_for_test(word1, u32::MAX);
+        __test_futex_drop_task_waiters_racing(T, |_| {});
+        __test_futex_drop_task_waiters_racing(W, |_| {});
+        crate::handlers::drop_signal_waker(T);
+        crate::task::release_task(T);
+        crate::task::release_task(W);
+        if own_stack_was_on {
+            narf_scheduler::stackful::enable_user_own_stack();
+        }
+        result
+    };
+    if narf_scheduler::stackful::user_own_stack_enabled() {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: own-stack mode is still on"),
+        );
+    }
+
+    // T enters an untimed FUTEX_WAIT(word1, 7) exactly as `sys_futex`
+    // publishes it, and the legacy poll registers it and parks.
+    uc.futex_namespace.store(0, Ordering::Release);
+    uc.futex_uaddr.store(word1, Ordering::Release);
+    uc.futex_val.store(7, Ordering::Release);
+    uc.futex_park_gen.store(futex_gen(word1), Ordering::Release);
+    uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+    let parked = with_kernel_buffers(|| __test_legacy_poll_park(T, uc, &mut sleep_handle, &cx));
+    if !parked || __test_futex_task_index(T).as_slice() != [word1] {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: the legacy poll did not register T on word1 and park"),
+        );
+    }
+
+    // A signal for T: `wake_signal` clears the untimed deadline and fires the
+    // signal waker the park registered. It does not touch the futex queue.
+    wake_signal(T);
+    if uc.sleep_deadline_ns.load(Ordering::Acquire) != 0
+        || __test_futex_task_index(T).as_slice() != [word1]
+    {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: wake_signal did not clear only the park deadline"),
+        );
+    }
+
+    // The re-poll resumes T into userspace.
+    if with_kernel_buffers(|| __test_legacy_poll_park(T, uc, &mut sleep_handle, &cx)) {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: the legacy poll did not resume T after its deadline cleared"),
+        );
+    }
+    let indexed = __test_futex_task_index(T);
+    let resident = __test_futex_has_task_waiter(T);
+    let target = uc.futex_uaddr.load(Ordering::Acquire);
+    if !indexed.is_empty() || resident || target != 0 {
+        narf_console::klog!(
+            "    legacy resume: indexed={} resident={} futex_uaddr={:#x}",
+            indexed.len(),
+            resident,
+            target
+        );
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail(
+                "the legacy poll resumed T into userspace with a cleared deadline while its \
+                 futex registration stayed queued",
+            ),
+        );
+    }
+
+    // W, a real waiter, parks on word1; one wake must reach it.
+    futex_register_waiter(word1, W, counting_waker(&w_fired));
+    let t_before = t_fired.load(Ordering::Acquire);
+    let woken = futex_wake_waiters_for_test(word1, 1);
+    let t_hits = t_fired.load(Ordering::Acquire) - t_before;
+    let w_hits = w_fired.load(Ordering::Acquire);
+    if woken != 1 || w_hits != 1 || t_hits != 0 {
+        narf_console::klog!(
+            "    legacy resume: woken={} t_fired={} w_fired={}",
+            woken,
+            t_hits,
+            w_hits
+        );
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail(
+                "FUTEX_WAKE(word1, 1) was spent on the resumed task's stale entry instead of \
+                 waking the real waiter W",
+            ),
+        );
+    }
+    let result = finish(&mut sleep_handle, TestResult::Pass);
+    drop(t_task);
+    drop(w_task);
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_legacy_poll_resume_leaves_futex_park
+);
+
 /// The exit-time robust-futex walk reads fully user-controlled pointers
 /// with a fixup-less `copy_from_user`, gated by a "is this mapped?" probe.
 /// That probe MUST consult the hardware page tables, not the region (VMA)

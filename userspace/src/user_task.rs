@@ -2100,11 +2100,24 @@ impl UserTaskFuture {
 /// user mode. Returns `true` when the poll must return `Pending` now, and
 /// `false` when it should fall through to resume the task in userspace.
 ///
+/// Both `false` returns leave the futex park (`futex_park_leave`), so the
+/// task never re-enters userspace from this path while it still holds a futex
+/// registration. The deadline-reached/signal-pending exit leaves inside the
+/// `deadline != 0` block. A resume that finds `deadline == 0` leaves in the
+/// `else` arm; that is the resume after `wake_signal` or `wake_one_inner`
+/// cleared the deadline from outside, and neither of those touches the futex
+/// queue. The seven self-wake exits that return `true` (sigwait hit, pending
+/// signal, latched io wake, epoll ready, poll files ready, sem ready, msg
+/// ready) also leave before returning, and so does the `Wake` outcome of
+/// `futex_park_register_and_check`. That is not needed for correctness, since
+/// the next poll finds `deadline == 0` and leaves in the `else` arm; it drops
+/// the entry before the self-wake instead of one poll later. The two
+/// remaining `true` returns (infinite park, finite park on the timer wheel)
+/// keep the task parked and keep its registration.
+///
 /// Split out of `poll` (which passes `current_task_id()`, constant for the
 /// whole poll) only so a kernel test can drive this exact decision without
-/// entering user mode. The body is the former inline block with only these
-/// renames: `this.task.uctx` -> `uctx`, `this.sleep_handle` -> `sleep_handle`,
-/// `current_task_id()` -> `task_id`, and `return Poll::Pending` -> `return true`.
+/// entering user mode.
 #[cfg(target_arch = "x86_64")]
 fn legacy_poll_park(
     task_id: u64,
@@ -2368,6 +2381,15 @@ fn legacy_poll_park(
         if let Some(h) = sleep_handle.take() {
             narf_scheduler::narf_time::timer_wheel::cancel(h);
         }
+    } else {
+        // Resume with no park deadline: either nothing parked, or a wake
+        // cleared the deadline from outside without touching the futex queue
+        // (`wake_signal` for an untimed wait or a sigwait, `wake_one_inner`
+        // for readiness/IPC/futex wakes). The task is about to re-enter
+        // userspace, so it must not keep a futex registration: a later
+        // `FUTEX_WAKE(1)` on that word would be spent on it instead of a real
+        // waiter. `futex_park_leave` is idempotent (no rows -> no-op).
+        crate::handlers::futex_park_leave(uctx, task_id);
     }
     false
 }

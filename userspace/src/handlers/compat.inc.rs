@@ -7720,8 +7720,9 @@ fn futex_drop_task_waiter_at(task_id: u64, key: FutexKey) {
 const FUTEX_EXIT_CHASE_LIMIT: u32 = 8;
 
 /// Remove every futex waker `task_id` still has queued. The ONE removal
-/// algorithm: task exit teardown calls it directly and every park-loop exit
-/// reaches it through [`futex_park_leave`].
+/// algorithm: task exit teardown (`release_task_tables`) calls it directly,
+/// and the park-loop exits listed on [`futex_park_leave`] reach it through
+/// that function.
 fn futex_drop_task_waiters(task_id: u64) {
     futex_drop_task_waiters_racing(task_id, |_| {});
 }
@@ -7731,9 +7732,26 @@ fn futex_drop_task_waiters(task_id: u64) {
 /// requeue rewrites only after it has already moved the waker), then clear
 /// the context's futex target.
 ///
-/// Every park-loop exit that returns the task to userspace calls this. The
-/// task then holds no registration while it runs, so a later `FUTEX_WAKE`
-/// cannot be spent on a stale entry for a task that is not waiting.
+/// Callers, which between them cover every park-loop exit that returns a
+/// task to userspace after it registered a futex waker:
+///   - Own-stack path: `park_should_block_for` on every `false` return of the
+///     park decision, and `own_stack_park`'s net-io break, which returns
+///     without re-running that decision.
+///   - x86_64 legacy path (`legacy_poll_park` in `UserTaskFuture::poll`): the
+///     deadline-reached/signal-pending exit, the resume with `deadline == 0`
+///     (the deadline was cleared by `wake_signal` or `wake_one_inner`, which
+///     do not touch the futex queue), and the seven self-wake exits.
+///   - Both paths: every `Wake` outcome of `futex_park_register_and_check`.
+///
+/// Not callers: the aarch64 legacy poll registers no futex waker, so it has
+/// nothing to leave (its `futex_uaddr` is cleared on the next `sys_futex`
+/// entry). `own_stack_park`'s two breaks for "no stackful executor" and "no
+/// current user task" run before the decision and do not call it. Task exit
+/// calls [`futex_drop_task_waiters`] directly.
+///
+/// After a leave the task holds no registration while it runs, so a later
+/// `FUTEX_WAKE` cannot be spent on a stale entry for a task that is not
+/// waiting.
 ///
 /// ORDER MATTERS: drop first, clear second. A concurrent
 /// [`futex_requeue_retarget`] writes the target fields only while holding the
