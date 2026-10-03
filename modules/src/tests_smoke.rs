@@ -1754,3 +1754,144 @@ kernel_test_in!(
     "modules/va_reuse",
     smoke_module_text_va_reuse_not_stale_in_domain_pcid
 );
+
+/// The same staleness on a peer CPU: `module_text::free` has to drop the
+/// domain-PCID entries on every CPU, not only its own.
+///
+/// A peer populates its TLB under the domain's PCID, this CPU frees the image,
+/// and the peer then reads the reused VA from inside the domain again. The
+/// peer receives only the unmap's INVLPG, which retires entries for the PCID
+/// it is running at that moment (the kernel's), so without the cross-CPU
+/// flush it reaches the old frames. The single-CPU smoke above cannot see
+/// that: its local flush alone makes it pass.
+fn smoke_module_text_va_reuse_not_stale_in_peer_domain_pcid() -> TestResult {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        TestResult::Skip("PCID domain enforcer is x86_64-only")
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use narf_lib::id::DomainId;
+        use narf_memory::module_text;
+
+        if narf_arch::x86_64::pks::is_active() || !narf_arch::x86_64::pcid::is_active() {
+            return TestResult::Skip("domain entry does not switch PCID on this CPU");
+        }
+        let here = narf_lib::percpu::current_cpu();
+        let peers = narf_lib::smp::online_bitmap() & !(1u64 << here);
+        if peers == 0 {
+            return TestResult::Skip("needs an online peer CPU");
+        }
+        let peer = peers.trailing_zeros() as usize;
+
+        fn fill(img: &mut module_text::ModuleImage, bytes: [u8; 2]) {
+            // SAFETY: freshly allocated, still Rw, and exclusively ours.
+            let s = unsafe { img.as_mut_slice() };
+            s[..4096].fill(bytes[0]);
+            s[4096..8192].fill(bytes[1]);
+        }
+        // Read the first byte of both pages from inside the domain, on `peer`,
+        // and wait for the answer. `None` if the peer never ran the read.
+        fn read_in_domain_on(peer: usize, vas: [u64; 2]) -> Option<[u8; 2]> {
+            static DONE: AtomicBool = AtomicBool::new(false);
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            DONE.store(false, Ordering::Release);
+            let mut spec = narf_scheduler::TaskSpec::kernel_any();
+            spec.affinity = narf_scheduler::Affinity::pinned(narf_scheduler::CpuId(peer as u32));
+            narf_scheduler::spawn_with_spec(
+                async move {
+                    let scope = crate::domain::enter(DomainId::SCRATCH);
+                    // SAFETY: both pages are mapped Rw in the shared module
+                    // window, which every domain's PML4 clone reaches.
+                    let r = unsafe {
+                        [
+                            core::ptr::read_volatile(vas[0] as *const u8),
+                            core::ptr::read_volatile(vas[1] as *const u8),
+                        ]
+                    };
+                    crate::domain::exit(scope);
+                    let on_peer = narf_lib::percpu::current_cpu() == peer;
+                    SEEN.store(
+                        u32::from(r[0]) | (u32::from(r[1]) << 8) | (u32::from(on_peer) << 16),
+                        Ordering::Release,
+                    );
+                    DONE.store(true, Ordering::Release);
+                },
+                spec,
+            );
+            // 3e10 cycles is about 10 s at 3 GHz.
+            let deadline = narf_time::Instant::now().plus_cycles(30_000_000_000);
+            while !DONE.load(Ordering::Acquire) {
+                if narf_time::Instant::now() >= deadline {
+                    return None;
+                }
+                core::hint::spin_loop();
+            }
+            let v = SEEN.load(Ordering::Acquire);
+            (v >> 16 == 1).then_some([v as u8, (v >> 8) as u8])
+        }
+
+        let Ok(mut first) = module_text::alloc(2, DomainId::SCRATCH) else {
+            return TestResult::Fail("module_text::alloc(2) failed");
+        };
+        fill(&mut first, [0xA1, 0xB2]);
+        let first_base = first.entry_base();
+        let first_phys = [
+            module_text::__page_phys_for_test(&first, 0),
+            module_text::__page_phys_for_test(&first, 1),
+        ];
+        // Populates the peer's TLB under the domain's PCID.
+        let Some(seen_first) = read_in_domain_on(peer, [first.page_va(0), first.page_va(1)]) else {
+            // The read may still run; leak the image rather than unmap it
+            // under the peer.
+            core::mem::forget(first);
+            return TestResult::Fail("the peer never ran the first read");
+        };
+        let freed_on = narf_lib::percpu::current_cpu();
+        // SAFETY: nothing executes from, or keeps a pointer into, the image;
+        // the peer's read has finished.
+        unsafe { module_text::free(first) };
+        if seen_first != [0xA1, 0xB2] {
+            return TestResult::Fail("the peer read the first image back wrong from its domain");
+        }
+        if freed_on == peer {
+            return TestResult::Skip("the free ran on the peer; nothing crossed CPUs");
+        }
+
+        let Ok(mut second) = module_text::alloc(2, DomainId::SCRATCH) else {
+            return TestResult::Fail("module_text::alloc(2) failed on reuse");
+        };
+        fill(&mut second, [0xC3, 0xD4]);
+        let same_va = second.entry_base() == first_base;
+        let same_frames = [
+            module_text::__page_phys_for_test(&second, 0),
+            module_text::__page_phys_for_test(&second, 1),
+        ] == first_phys;
+        let Some(seen_second) = read_in_domain_on(peer, [second.page_va(0), second.page_va(1)])
+        else {
+            core::mem::forget(second);
+            return TestResult::Fail("the peer never ran the second read");
+        };
+        // SAFETY: as above.
+        unsafe { module_text::free(second) };
+
+        if !same_va {
+            return TestResult::Skip("module VA was not reused; nothing to go stale");
+        }
+        if seen_second != [0xC3, 0xD4] {
+            return TestResult::Fail(
+                "a peer read the reused module VA through the previous image's frame from \
+                 inside the domain (module_text::free left its domain-PCID entries)",
+            );
+        }
+        if same_frames {
+            return TestResult::Skip("both pages got their old frames back; cannot discriminate");
+        }
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "modules/va_reuse",
+    smoke_module_text_va_reuse_not_stale_in_peer_domain_pcid
+);
