@@ -4177,7 +4177,12 @@ pub unsafe extern "C" fn _start_rust(
     // the test harness uses. The xtask `boot-smoke` subcommand waits
     // for QEMU to exit naturally + checks stdout for panic markers,
     // rather than killing the child after a wall-clock timeout.
-    #[cfg(feature = "boot-smoke")]
+    //
+    // Not compiled with `kernel-test`: the harness block above never
+    // returns, so this block would be dead code there. frame/Cargo.toml
+    // documents the two features as mutually exclusive, with kernel-test
+    // taking the harness path; this cfg states that precedence.
+    #[cfg(all(feature = "boot-smoke", not(feature = "kernel-test")))]
     {
         let _ = writeln!(console::Writer, "  boot-smoke: draining tasks...");
         // Same async-runtime spin pattern as run_async_demo, capped
