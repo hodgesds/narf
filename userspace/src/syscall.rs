@@ -200,8 +200,7 @@ pub enum NativeRepollWait {
     /// interceptor has returned.
     Killed,
     /// This capability cannot wait, so nothing happened: it has no user task
-    /// to switch out (a lifecycle callback, the legacy execution model), or
-    /// a transition already took the task's context.
+    /// to switch out (a lifecycle callback, the legacy execution model).
     Unsupported,
 }
 
