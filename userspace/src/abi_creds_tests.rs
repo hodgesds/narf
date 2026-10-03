@@ -187,6 +187,30 @@ fn smoke_abi_creds_current_ucred_task_cache() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_current_ucred_task_cache);
 
+/// The harness task is the one `setup` registers, whatever held its tid
+/// before. Tids come from one counter for the whole image, and process
+/// smokes leave unreaped fork children registered, so an earlier test can
+/// leave tid `FAKE_TASK` held by a task with another pid. The ucred test
+/// above then read that task's pid and failed, depending only on how many
+/// tasks earlier subsystems had created.
+fn smoke_abi_harness_replaces_a_leftover_task_at_its_tid() -> TestResult {
+    const LEFTOVER_PID: u64 = 4;
+    crate::task::release_task(FAKE_TASK);
+    let _leftover = crate::task::Task::new_registered(FAKE_TASK, LEFTOVER_PID);
+    with_setup(|| {
+        let (pid, _, _) = crate::task::__test_cached_identity(FAKE_TASK)
+            .ok_or("missing harness Task credential mirror")?;
+        if pid != FAKE_TASK {
+            return Err("setup kept a leftover task registered at the harness tid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_harness_replaces_a_leftover_task_at_its_tid
+);
+
 /// `(uid_t)-1` — "leave this id alone" in the set*re*id / set*res*id family.
 const NOCHANGE: u64 = u32::MAX as u64;
 

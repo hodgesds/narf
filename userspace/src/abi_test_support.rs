@@ -184,10 +184,15 @@ pub fn setup() {
     crate::handlers::register_pid_task_mapping(FAKE_TASK, FAKE_TASK);
     // Refcounted-task registry entry: tkill/tgkill/kill now report
     // ESRCH for tids the registry doesn't know, so the harness task
-    // must exist like a real spawned task would.
-    if crate::task::task_get(FAKE_TASK).is_none() {
-        let _ = crate::task::Task::new_registered(FAKE_TASK, FAKE_TASK);
-    }
+    // must exist like a real spawned task would. Register a fresh one every
+    // test rather than keep whatever holds tid FAKE_TASK: tids come from one
+    // counter for the whole image, and process smokes that fork without
+    // reaping leave their children registered, so after enough earlier tests
+    // tid 99 can be such a child (seen as pid 4 after the reverie-narf and
+    // userspace subsystems), and the harness task would report that child's
+    // pid and credentials.
+    crate::task::release_task(FAKE_TASK);
+    let _ = crate::task::Task::new_registered(FAKE_TASK, FAKE_TASK);
 }
 
 pub fn teardown() {
