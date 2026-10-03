@@ -117,6 +117,55 @@ fn smoke_init_error_continues_to_next_call() -> TestResult {
 }
 kernel_test_in!("init", smoke_init_error_continues_to_next_call);
 
+/// A direct `run_stage` error is recorded in that stage's returned
+/// stats (name + message) but never reaches the boot-loop error record
+/// that fails boot-smoke and kernel-test; only `record_boot_stage`
+/// feeds that record, and `BootErrors::add` keeps the first failure.
+fn smoke_init_synthetic_error_stays_out_of_boot_errors() -> TestResult {
+    use crate::{
+        __reset_for_test, boot_errors, register, run_stage, BootErrors, InitResult, Stage,
+    };
+    fn ok() -> InitResult {
+        InitResult::Ok
+    }
+    fn first() -> InitResult {
+        InitResult::Error("first synthetic")
+    }
+    fn second() -> InitResult {
+        InitResult::Error("second synthetic")
+    }
+
+    let before = boot_errors();
+    __reset_for_test();
+    register(Stage::Device, "ok", ok);
+    register(Stage::Device, "first", first);
+    register(Stage::Device, "second", second);
+    let s = run_stage(Stage::Device);
+    __reset_for_test();
+    if s.error != 2 || s.first_error_name != "first" || s.first_error_msg != "first synthetic" {
+        return TestResult::Fail("first error not recorded in StageStats");
+    }
+    if boot_errors() != before {
+        return TestResult::Fail("direct run_stage leaked into boot_errors");
+    }
+    let mut acc = BootErrors::default();
+    acc.add(Stage::Core, &crate::StageStats::default());
+    if acc != BootErrors::default() {
+        return TestResult::Fail("error-free stage changed BootErrors");
+    }
+    acc.add(Stage::Device, &s);
+    acc.add(Stage::Late, &s);
+    if acc.count != 4
+        || acc.first_stage != Stage::Device.name()
+        || acc.first_name != "first"
+        || acc.first_msg != "first synthetic"
+    {
+        return TestResult::Fail("BootErrors::add did not keep the first failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("init", smoke_init_synthetic_error_stays_out_of_boot_errors);
+
 fn smoke_init_records_cycle_totals() -> TestResult {
     use crate::{__reset_for_test, register, run_stage, InitResult, Stage};
     fn slow() -> InitResult {

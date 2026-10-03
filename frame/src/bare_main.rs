@@ -3993,9 +3993,27 @@ pub unsafe extern "C" fn _start_rust(
                 if (s as u8) > (last_stage as u8) {
                     break;
                 }
-                let _ = narf_init::run_stage(s);
+                // Only this loop feeds the boot error record; init
+                // self-tests that call `run_stage` directly do not.
+                let st = narf_init::run_stage(s);
+                narf_init::record_boot_stage(s, &st);
             }
             let _ = narf_init::print_summary(&mut console::Writer);
+            {
+                let e = narf_init::boot_errors();
+                if e.count == 0 {
+                    let _ = writeln!(console::Writer, "  init: boot initcall errors: 0");
+                } else {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  init: boot initcall errors: {} (first: {} / {}: {})",
+                        e.count,
+                        e.first_stage,
+                        e.first_name,
+                        e.first_msg
+                    );
+                }
+            }
             // Status-panel diag: initcalls done; flip the phase to
             // Userspace so the panel shows the kernel reached its
             // final boot phase (scheduler, executors, sleep_pumps).
@@ -4218,6 +4236,23 @@ pub unsafe extern "C" fn _start_rust(
         // at ~2 seconds so the boot log is fully emitted.
         let deadline = narf_time::Deadline::after_ms(2_000);
         narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
+        // A boot initcall that returned `InitResult::Error` fails the
+        // smoke: name it, skip the clean-exit marker, exit nonzero.
+        let e = narf_init::boot_errors();
+        if e.count != 0 {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-smoke: FAILED: {} boot initcall error(s); first: {} / {}: {}",
+                e.count,
+                e.first_stage,
+                e.first_name,
+                e.first_msg
+            );
+            // SAFETY: terminal action of the boot-smoke run.
+            unsafe {
+                narf_arch::exit_kernel(1);
+            }
+        }
         let _ = writeln!(console::Writer, "  boot-smoke: clean exit");
         // SAFETY: exit_kernel never returns; this is the only post-
         // boot action we're authorised to take.

@@ -173,6 +173,62 @@ pub struct StageStats {
     /// but `bare_main` surfaces this in the boot summary so a
     /// regression doesn't go unnoticed.
     pub over_budget: u32,
+    /// Name of the first initcall in this stage that returned
+    /// `InitResult::Error`, or `""` when `error == 0`.
+    pub first_error_name: &'static str,
+    /// Message of that first error, or `""` when `error == 0`.
+    pub first_error_msg: &'static str,
+}
+
+/// Initcall errors accumulated across the *boot* stage loop only.
+///
+/// `run_stage` never writes this: the boot loop in `bare_main` feeds
+/// each stage's returned [`StageStats`] into [`record_boot_stage`].
+/// Self-tests that call `run_stage` directly (for example the
+/// deliberate `Error("synthetic")` in `smoke_init_error_continues_to_next_call`)
+/// therefore cannot reach it, and `__reset_for_test` leaves it alone.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BootErrors {
+    /// Total `InitResult::Error` results across every recorded stage.
+    pub count: u32,
+    /// Stage of the first recorded error, or `""` when `count == 0`.
+    pub first_stage: &'static str,
+    /// Initcall name of the first recorded error.
+    pub first_name: &'static str,
+    /// Message of the first recorded error.
+    pub first_msg: &'static str,
+}
+
+impl BootErrors {
+    /// Fold one stage's results in. Keeps the earliest failure.
+    pub fn add(&mut self, stage: Stage, s: &StageStats) {
+        if s.error == 0 {
+            return;
+        }
+        if self.count == 0 {
+            self.first_stage = stage.name();
+            self.first_name = s.first_error_name;
+            self.first_msg = s.first_error_msg;
+        }
+        self.count = self.count.saturating_add(s.error);
+    }
+}
+
+static BOOT_ERRORS: IrqSafeSpinLock<BootErrors> = IrqSafeSpinLock::new(BootErrors {
+    count: 0,
+    first_stage: "",
+    first_name: "",
+    first_msg: "",
+});
+
+/// Record one boot-loop stage result. Only the boot loop calls this.
+pub fn record_boot_stage(stage: Stage, s: &StageStats) {
+    BOOT_ERRORS.lock().add(stage, s);
+}
+
+/// Initcall errors from the boot stage loop (see [`BootErrors`]).
+pub fn boot_errors() -> BootErrors {
+    *BOOT_ERRORS.lock()
 }
 
 /// Optional hook for emitting "init: stage X / call Y -> Z" lines.
@@ -224,6 +280,8 @@ const EMPTY_STATS: StageStats = StageStats {
     max_cycles: 0,
     max_name: "",
     over_budget: 0,
+    first_error_name: "",
+    first_error_msg: "",
 };
 
 static REGISTRY: Registry = Registry {
@@ -376,6 +434,10 @@ pub fn run_stage(stage: Stage) -> StageStats {
                 }
             }
             InitResult::Error(msg) => {
+                if stats.error == 0 {
+                    stats.first_error_name = ic.name;
+                    stats.first_error_msg = msg;
+                }
                 stats.error += 1;
                 let mut buf = [0u8; 256];
                 let mut w = TruncatingWriter::new(&mut buf);

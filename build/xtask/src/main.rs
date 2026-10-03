@@ -2870,9 +2870,13 @@ fn wait_for_boot_smoke(
         .stdout
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
-    let reader_handle = std::thread::spawn(move || -> (Option<String>, bool) {
+    // The kernel prints this instead of the clean-exit marker when a
+    // boot initcall returned an error (frame/src/bare_main.rs).
+    const FAILED_MARKER: &str = "boot-smoke: FAILED";
+    let reader_handle = std::thread::spawn(move || -> (Option<String>, Option<String>, bool) {
         let reader = BufReader::new(stdout);
         let mut panic_line = None;
+        let mut failed_line = None;
         let mut clean_exit_seen = false;
         for line in reader.lines() {
             let line = match line {
@@ -2881,11 +2885,14 @@ fn wait_for_boot_smoke(
             };
             println!("{line}");
             clean_exit_seen |= line.contains("boot-smoke: clean exit");
+            if failed_line.is_none() && line.contains(FAILED_MARKER) {
+                failed_line = Some(line.clone());
+            }
             if panic_line.is_none() && panic_markers.iter().any(|m| line.contains(m)) {
                 panic_line = Some(line);
             }
         }
-        (panic_line, clean_exit_seen)
+        (panic_line, failed_line, clean_exit_seen)
     });
 
     // Wait for QEMU to exit naturally (kernel calls exit_kernel),
@@ -2899,12 +2906,15 @@ fn wait_for_boot_smoke(
             child.wait()?
         }
     };
-    let (panic_line, clean_exit_seen) = reader_handle
+    let (panic_line, failed_line, clean_exit_seen) = reader_handle
         .join()
         .map_err(|_| anyhow!("xtask {label}: serial-reader thread panicked"))?;
 
     if let Some(p) = panic_line {
         bail!("xtask {label}: kernel panic during boot — '{}'", p);
+    }
+    if let Some(f) = failed_line {
+        bail!("xtask {label}: boot initcall failure — '{}'", f.trim());
     }
     if timed_out {
         bail!(

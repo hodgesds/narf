@@ -121,6 +121,28 @@ fn run_leak_checked(t: &KernelTest) -> TestResult {
     }
 }
 
+/// Named pseudo-test `init / boot-initcalls`: fails when the boot stage
+/// loop recorded any `InitResult::Error` (see `narf_init::BootErrors`).
+///
+/// Every `run_*` entry point prints and counts it before the selected
+/// tests, so a `--subsystem` filter cannot hide a failed boot initcall.
+/// It reads the boot-loop record, not the per-stage stats, so init
+/// self-tests that call `run_stage` directly (and deliberately fail an
+/// initcall) do not affect it.
+fn boot_initcalls_check() -> Option<narf_init::BootErrors> {
+    let e = narf_init::boot_errors();
+    if e.count == 0 {
+        let _ = writeln!(Writer, "  [ OK ] init / boot-initcalls");
+        return None;
+    }
+    let _ = writeln!(
+        Writer,
+        "  [FAIL] init / boot-initcalls: {} boot initcall error(s); first: {} / {}: {}",
+        e.count, e.first_stage, e.first_name, e.first_msg
+    );
+    Some(e)
+}
+
 /// Run every registered test, print results to the console, return a
 /// summary. Intended to be called from the kernel's `_start_rust`
 /// during CI builds (feature-gated by consumers).
@@ -132,13 +154,18 @@ fn run_leak_checked(t: &KernelTest) -> TestResult {
 pub fn run_all() -> Summary {
     let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test harness ──────────────────────────");
+    let boot = boot_initcalls_check();
     let ts = tests();
     if ts.is_empty() {
         let _ = writeln!(Writer, "  (no tests registered)");
-        return Summary::AllOk;
+        return if boot.is_some() {
+            Summary::SomeFailed
+        } else {
+            Summary::AllOk
+        };
     }
-    let mut pass = 0usize;
-    let mut fail = 0usize;
+    let mut pass = usize::from(boot.is_none());
+    let mut fail = usize::from(boot.is_some());
     let mut skip = 0usize;
     let mut current: &'static str = "";
 
@@ -153,6 +180,10 @@ pub fn run_all() -> Summary {
     let mut failed: [(&'static str, &'static str, &'static str); MAX_FAILED_RECORD] =
         [("", "", ""); MAX_FAILED_RECORD];
     let mut failed_n: usize = 0;
+    if let Some(e) = boot {
+        failed[0] = ("init/boot-initcalls", e.first_name, e.first_msg);
+        failed_n = 1;
+    }
 
     for t in ts {
         // Subsystem header — printed when we transition.
@@ -236,8 +267,9 @@ pub fn run_all() -> Summary {
 pub fn run_subsystem(wanted: &str) -> Summary {
     let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test ({}) ──", wanted);
-    let mut pass = 0usize;
-    let mut fail = 0usize;
+    let boot = boot_initcalls_check();
+    let mut pass = usize::from(boot.is_none());
+    let mut fail = usize::from(boot.is_some());
     let mut skip = 0usize;
     for t in tests() {
         if t.subsystem != wanted {
@@ -326,8 +358,9 @@ fn subsystem_selected(have: &str, want: &str) -> bool {
 pub fn run_subsystems(wanted: &[&str]) -> Summary {
     let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test (filtered: {}) ──", wanted.len());
-    let mut pass = 0usize;
-    let mut fail = 0usize;
+    let boot = boot_initcalls_check();
+    let mut pass = usize::from(boot.is_none());
+    let mut fail = usize::from(boot.is_some());
     let mut skip = 0usize;
     for t in tests() {
         if !wanted.iter().any(|w| subsystem_selected(t.subsystem, w)) {

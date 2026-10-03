@@ -738,6 +738,112 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_io_msix_irq_driven);
 
+/// An interrupt on the queue's vector that is not this command's
+/// completion must not complete it: `submit_io_irq` has to wait for the
+/// CQE phase tag, or it returns before the DMA and leaves the queue one
+/// slot behind. The hook dispatches a synthetic fire right after the
+/// doorbell, before QEMU (which services the doorbell asynchronously)
+/// can have posted the CQE.
+fn smoke_nvme_irq_spurious_fire_does_not_complete_io() -> TestResult {
+    use crate::{Controller, IoOpcode, NvmeError};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::{alloc_coherent, DmaBuffer};
+    use narf_lib::id::DomainId;
+    // SAFETY: same as `smoke_nvme_io_msix_irq_driven`.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    match ctrl.create_io_queues_msix(&dev_cap, 1) {
+        Ok(0) | Err(_) => return TestResult::Fail("create_io_queues_msix failed"),
+        Ok(_) => {}
+    }
+    let (Ok(wbuf), Ok(rbuf)) = (
+        alloc_coherent(4096, DomainId::DRIVER_0),
+        alloc_coherent(4096, DomainId::DRIVER_0),
+    ) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    let pattern = |lba: u64, i: usize| (i as u8).wrapping_mul(13) ^ (lba as u8).wrapping_mul(0x5b);
+    let fill = |buf: &DmaBuffer, f: &dyn Fn(usize) -> u8| {
+        for i in 0..512usize {
+            // SAFETY: 4 KiB coherent DMA buffer; i < 512.
+            unsafe { core::ptr::write_volatile(buf.cpu_mut_ptr::<u8>().add(i), f(i)) };
+        }
+    };
+    let holds = |buf: &DmaBuffer, lba: u64| {
+        (0..512usize).all(|i| {
+            // SAFETY: 4 KiB coherent DMA buffer; i < 512.
+            let v = unsafe { core::ptr::read_volatile(buf.cpu_ptr::<u8>().add(i)) };
+            v == pattern(lba, i)
+        })
+    };
+
+    // SAFETY: APIC is initialised; MSI lands in our IDT vector.
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
+    Controller::__test_spurious_irq(true);
+    let mut verdict = TestResult::Pass;
+    'io: for lba in [4u64, 5] {
+        fill(&wbuf, &|i| pattern(lba, i));
+        if ctrl
+            .submit_io_irq(IoOpcode::Write as u8, lba, 1, &wbuf)
+            .is_err()
+        {
+            verdict = TestResult::Fail("write with a spurious interrupt failed");
+            break 'io;
+        }
+    }
+    // Alternate LBAs so a queue left one slot behind shows up as the
+    // other LBA's data or an unfilled buffer.
+    if matches!(verdict, TestResult::Pass) {
+        for k in 0..8u64 {
+            let lba = 4 + (k & 1);
+            fill(&rbuf, &|_| 0);
+            match ctrl.submit_io_irq(IoOpcode::Read as u8, lba, 1, &rbuf) {
+                Ok(()) => {}
+                Err(NvmeError::CompletionMismatch { .. }) => {
+                    verdict = TestResult::Fail("read got another command's completion");
+                    break;
+                }
+                Err(_) => {
+                    verdict = TestResult::Fail("read with a spurious interrupt failed");
+                    break;
+                }
+            }
+            if !holds(&rbuf, lba) {
+                verdict = TestResult::Fail("spurious interrupt completed a read before its DMA");
+                break;
+            }
+        }
+    }
+    Controller::__test_spurious_irq(false);
+    // SAFETY: counterpart to the enable_interrupts above.
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    verdict
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_irq_spurious_fire_does_not_complete_io
+);
+
 fn smoke_nvme_multi_queue_granted() -> TestResult {
     if !narf_lib::smp::is_online(1) {
         // I/O queue pairs scale with the online CPU count; a 1-vCPU

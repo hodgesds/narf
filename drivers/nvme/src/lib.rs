@@ -1762,26 +1762,36 @@ impl Controller {
             bar0.write32(io.sq_db_off(), io.sq_tail as u32);
         }
 
+        if TEST_SPURIOUS_IRQ.load(Ordering::Relaxed) {
+            // Test hook: a fire on this vector that is not this
+            // command's completion (see `__test_spurious_irq`).
+            narf_interrupts::on_irq(v);
+        }
+
         // Wait for MSI-X delivery — the dispatch table's fire_count
-        // bumps from the ISR. As a defensive belt-and-braces check
-        // we also bail if the CQE phase flips first (e.g. if the
-        // interrupt got lost; QEMU has been observed to do this on
+        // bumps from the ISR — or for the CQE phase to flip first (if
+        // the interrupt got lost; QEMU has been observed to do this on
         // hot reset paths). responsive_spin_until ticks sleep_pumps
-        // so the FB cursor / serial drain stay alive. Wall-clock
-        // budget 5 s — well clear of typical sub-ms NVMe I/O
-        // completion latency, finite enough to surface a wedged
-        // controller.
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                if narf_interrupts::fire_count(v) > baseline {
-                    return true;
-                }
-                // SAFETY: cq_buf is a live identity-mapped DMA page.
-                let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-                (cqe.status & 1) == (io.cq_phase & 1)
-            },
-            narf_time::Deadline::after_ms(io.timeout_ms),
+        // so the FB cursor / serial drain stay alive. The bound is the
+        // queue's I/O timeout (IO_TIMEOUT_MS).
+        let deadline = narf_time::Deadline::after_ms(io.timeout_ms);
+        let posted = || {
+            // SAFETY: cq_buf is a live identity-mapped DMA page.
+            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+            (cqe.status & 1) == (io.cq_phase & 1)
+        };
+        let _ = narf_scheduler::responsive_spin_until(
+            || narf_interrupts::fire_count(v) > baseline || posted(),
+            deadline,
         );
+        // The interrupt only wakes us: it can be spurious, or late
+        // from an earlier command on this vector. Consuming the head
+        // slot before its phase tag flips would return a stale entry
+        // as this command's completion and leave the queue one slot
+        // behind. The phase tag is the completion, so wait for it to
+        // the same deadline, and look once more after the deadline for
+        // the same reason as `wait_cqe`.
+        let done = posted() || narf_scheduler::responsive_spin_until(&posted, deadline) || posted();
         if !done {
             // Still owned by the controller; see Queue::reap_abandoned.
             io.abandoned += 1;
@@ -1800,6 +1810,12 @@ impl Controller {
             bar0.write32(io.cq_db_off(), io.cq_head as u32);
         }
 
+        if cqe.cid != cid {
+            return Err(NvmeError::CompletionMismatch {
+                expected: cid,
+                got: cqe.cid,
+            });
+        }
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
             return Err(NvmeError::CommandFailed {
@@ -1808,6 +1824,15 @@ impl Controller {
             });
         }
         Ok(())
+    }
+
+    /// Test hook: make [`Controller::submit_io_irq`] dispatch one
+    /// synthetic interrupt on its vector right after ringing the SQ
+    /// doorbell, before the device can have posted the completion.
+    /// Production code never calls this.
+    #[doc(hidden)]
+    pub fn __test_spurious_irq(on: bool) {
+        TEST_SPURIOUS_IRQ.store(on, Ordering::Relaxed);
     }
 
     /// Async sibling of `submit_io_irq`. Submits the command,
@@ -2161,6 +2186,9 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
         core::ptr::write_volatile(base.add(index as usize), *sqe);
     }
 }
+
+/// See [`Controller::__test_spurious_irq`].
+static TEST_SPURIOUS_IRQ: AtomicBool = AtomicBool::new(false);
 
 /// Read the CQ entry at `index` without polling. Used by the
 /// MSI-X-driven path which tracks completion via fire_count instead.
