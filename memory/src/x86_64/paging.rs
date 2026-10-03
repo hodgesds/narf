@@ -1628,57 +1628,92 @@ pub unsafe fn protect_4kb(
 /// vmalloc slot every address space copies by value). Returns true if a PT was
 /// freed. A no-op (returns false) on huge leaves or an already-empty subtree.
 ///
+/// This frees the table in the same breath as it detaches it, with no
+/// invalidation in between. The caller's earlier per-leaf INVLPGs do not close
+/// that gap: until the PD entry is cleared it is still present, and a CPU may
+/// cache a present PD entry in its paging-structure caches even when every PTE
+/// under it is clear (SDM Vol 3 §4.10.3), for example through a speculative
+/// walk. Such an entry keeps pointing at the freed frame after it is reused.
+/// A caller that needs the table frame to be unreachable before it returns to
+/// the buddy must use [`detach_empty_kernel_pt`], invalidate, and only then
+/// free, as `module_text` does.
+///
 /// # Safety
 /// `root` must be the live kernel root. The caller MUST have already unmapped
-/// every present leaf in this PT with a GLOBAL INVLPG (as `unmap_4kb` does):
-/// INVLPG invalidates the paging-structure caches for the address on all CPUs,
-/// so once every leaf is flushed, no CPU can walk the freed PT frame after it
-/// is reused.
+/// every present leaf in this PT with a GLOBAL INVLPG (as `unmap_4kb` does).
 pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
+    // SAFETY: forwarded contract.
+    let Some((pt, pd)) = (unsafe { detach_empty_kernel_pt(root, virt) }) else {
+        return false;
+    };
+    crate::frame::free_frame(pt);
+    if let Some(pd) = pd {
+        crate::frame::free_frame(pd);
+    }
+    true
+}
+
+/// Detach, but do NOT free, the level-1 page table (PT) covering `virt` in the
+/// kernel root when it holds no present leaves: clear its PD entry and
+/// unregister it. If that empties the PD too, detach the PD from the PDPT the
+/// same way. Returns the detached PT frame and, when the cascade ran, the PD
+/// frame; `None` when nothing was detached (huge leaves, an absent subtree, or
+/// a PT that still holds a leaf).
+///
+/// The frames are still owned by the caller and must not go back to the buddy
+/// until every CPU has dropped every cached path through the cleared entries:
+/// a present PD entry may have been cached (SDM Vol 3 §4.10.3) at any time up
+/// to the clear, under any PCID. The PDPT is never detached: it is the
+/// reserved slot's shared child that every address space copies.
+///
+/// # Safety
+/// `root` must be the live kernel root, and every present leaf in this PT must
+/// already be unmapped.
+pub unsafe fn detach_empty_kernel_pt(
+    root: PhysAddr,
+    virt: VirtAddr,
+) -> Option<(crate::frame::PhysFrame, Option<crate::frame::PhysFrame>)> {
     let _guard = pt_lock_for(root).lock();
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: root is identity-reachable and the mutation lock is held.
     let pml4 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
     let pml4e = pml4.entries[idx.pml4];
     if !pml4e.is_present() {
-        return false;
+        return None;
     }
     // SAFETY: a present PML4 entry names an identity-reachable PDPT. The PDPT
     // itself is the shared, boot-reserved kernel vmalloc slot and is never
-    // freed here, so this borrow is const.
+    // detached here.
     let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
     let pdpte = pdpt.entries[idx.pdpt];
     if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
-        return false;
+        return None;
     }
     // SAFETY: a present, non-huge PDPT entry names an identity-reachable PD.
     let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
     let pde = pd.entries[idx.pd];
     if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
-        return false;
+        return None;
     }
     let pt_phys = pde.addr();
     // SAFETY: a present, non-huge PD entry names an identity-reachable PT.
     let pt = unsafe { &*pt_phys.kernel_ptr::<PageTable>() };
     if pt.entries.iter().any(|e| e.is_present()) {
-        return false;
+        return None;
     }
-    // Detach and free the now-empty PT. The caller's per-leaf global INVLPGs
-    // already flushed the paging-structure caches covering this range, so the
-    // freed frame cannot be walked into after reuse.
     pd.entries[idx.pd] = PageTableEntry::EMPTY;
     crate::frame::__pagetable_unregister(pt_phys.raw());
-    crate::frame::free_frame(crate::frame::PhysFrame::new(pt_phys));
-    // Cascade: if that emptied the PD too, free it and clear its PDPT entry.
-    // Stop at the PDPT — it is the reserved slot's shared child every address
-    // space copies, so it must persist.
+    // Cascade: if that emptied the PD too, detach it from the PDPT. Stop at
+    // the PDPT — it is the reserved slot's shared child every address space
+    // copies, so it must persist.
+    let mut pd_frame = None;
     if !pd.entries.iter().any(|e| e.is_present()) {
         let pd_phys = pdpte.addr();
         pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
         crate::frame::__pagetable_unregister(pd_phys.raw());
-        crate::frame::free_frame(crate::frame::PhysFrame::new(pd_phys));
+        pd_frame = Some(crate::frame::PhysFrame::new(pd_phys));
     }
-    true
+    Some((crate::frame::PhysFrame::new(pt_phys), pd_frame))
 }
 
 /// Detach (but do NOT free) the level-1 PT covering `virt` when it holds no

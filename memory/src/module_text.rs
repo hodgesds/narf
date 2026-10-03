@@ -100,6 +100,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -785,8 +786,39 @@ fn page_phys(root: PhysAddr, va: u64) -> Option<u64> {
     unsafe { crate::paging::translate(root, VirtAddr::new(va)) }.map(|p| p.raw() & !0xFFFu64)
 }
 
-/// Unmap and release the first `count` pages of the run at `base`, then free
+/// Invalidation tickets for the module window. [`invalidate_module_range_all_cpus`]
+/// takes ticket `STARTED + 1` before it invalidates and publishes it in `DONE`
+/// once every CPU has finished. A frame retired when `STARTED` read `t` may go
+/// back to the buddy only once `DONE > t`: some invalidation that began after
+/// the retirement has completed everywhere.
+static INVALIDATIONS_STARTED: AtomicU64 = AtomicU64::new(0);
+static INVALIDATIONS_DONE: AtomicU64 = AtomicU64::new(0);
+/// Frames `release_retired` withheld from the buddy because no invalidation
+/// had completed since they were retired. They are leaked, which is harmless;
+/// handing them out while a CPU can still reach them is not. Nonzero only if
+/// [`unmap_and_free`]'s ordering is broken.
+static RELEASES_WITHHELD: AtomicUsize = AtomicUsize::new(0);
+/// Page-table frames `release_retired` returned to the buddy. Lets the smoke
+/// prove that its free actually took the table path.
+static TABLES_RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+/// Unmap and release the first `count` pages of the run at `base`, and reclaim
 /// any last-level page table the range leaves empty.
+///
+/// The order is what makes the reclaim safe:
+/// 1. unmap every leaf;
+/// 2. detach every last-level table the range empties (and a parent the
+///    detach empties), without freeing it;
+/// 3. invalidate on every CPU, in every PCID/ASID;
+/// 4. only then return leaf frames and table frames to the buddy.
+///
+/// Step 2 before step 3 matters for the tables. A CPU may cache a present
+/// directory entry in its paging-structure caches (x86_64, SDM Vol 3 §4.10.3)
+/// or walk cache (aarch64) even when every entry under it is clear, and may do
+/// so speculatively at any moment until the entry is cleared. Module leaves are
+/// non-GLOBAL and module code runs under its domain's PCID, so an entry cached
+/// under that PCID survives an invalidation that ran before the detach, and a
+/// walk through it would read the freed table frame after its reuse.
 ///
 /// # Safety
 /// `[base, base + count*4096)` must be pages this module mapped.
@@ -802,6 +834,44 @@ unsafe fn unmap_and_free(base: u64, count: usize) {
             }
         }
     }
+    let leaves_retired_at = INVALIDATIONS_STARTED.load(Ordering::SeqCst);
+
+    // Detach now-empty last-level tables, once per 2 MiB granule, and keep
+    // them. Each carries the ticket read right after its own detach, so the
+    // release check follows the detach wherever it sits. The shared top
+    // levels are never detached.
+    let mut tables: Vec<(PhysFrame, u64)> = Vec::new();
+    for granule in granules(base, count) {
+        // SAFETY: every leaf in the range was unmapped above.
+        let detached =
+            unsafe { crate::paging::detach_empty_kernel_pt(root, VirtAddr::new(granule)) };
+        if let Some((pt, parent)) = detached {
+            let at = INVALIDATIONS_STARTED.load(Ordering::SeqCst);
+            tables.push((pt, at));
+            if let Some(parent) = parent {
+                tables.push((parent, at));
+            }
+        }
+    }
+
+    invalidate_module_range_all_cpus(base, count);
+
+    release_retired(frames, leaves_retired_at, tables);
+}
+
+/// Base of every 2 MiB granule that `[base, base + count*4096)` touches.
+fn granules(base: u64, count: usize) -> impl Iterator<Item = u64> {
+    let end = base + (count as u64) * 4096;
+    let first = base & !0x1F_FFFFu64;
+    (0..)
+        .map(move |k: u64| first + k * 0x20_0000)
+        .take_while(move |g| count != 0 && *g < end)
+}
+
+/// Drop every cached translation and every cached paging-structure entry for
+/// the module range, on every CPU, then publish the ticket.
+fn invalidate_module_range_all_cpus(base: u64, count: usize) {
+    let ticket = INVALIDATIONS_STARTED.fetch_add(1, Ordering::SeqCst) + 1;
     // Module leaves are non-GLOBAL, and `unmap_4kb`'s INVLPG (local and on
     // every peer) drops them only for the PCID each CPU is running at that
     // moment (SDM Vol 3 §4.10.4.1). Module code runs under its domain's PCID —
@@ -810,28 +880,50 @@ unsafe fn unmap_and_free(base: u64, count: usize) {
     // unmap, tagged with that PCID. The next module mapped at this VA gets the
     // same frames back in a different order, and re-entering the domain then
     // fetches through the stale entry into whichever frame now holds some
-    // other page of the new image. Drop every non-global entry in every PCID,
-    // on every CPU, before any frame or page table goes back to the buddy.
-    // Linux reaches the same point via `invalidate_other_asid()` for its
-    // non-global (PTI) kernel mappings.
+    // other page of the new image. Drop every non-global entry, and with them
+    // the paging-structure caches, in every PCID on every CPU. Linux reaches
+    // the same point via `invalidate_other_asid()` for its non-global (PTI)
+    // kernel mappings.
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: CPL=0; synchronous — returns after every peer has acked.
-    unsafe {
-        crate::paging::flush_user_tlb_all_cpus();
+    {
+        let _ = (base, count);
+        // SAFETY: CPL=0; synchronous — returns after every peer has acked.
+        unsafe { crate::paging::flush_user_tlb_all_cpus() };
     }
-    for phys in frames {
-        crate::frame::free_frame(PhysFrame::new(phys));
+    // `unmap_4kb` already broadcast a last-level-inclusive TLBI VAAE1IS per
+    // leaf, but a walk-cache entry for a table descriptor detached after those
+    // can remain. One broadcast TLBI VAAE1IS per granule (all ASIDs, all
+    // levels of the walk) drops it.
+    #[cfg(target_arch = "aarch64")]
+    for granule in granules(base, count) {
+        // SAFETY: the descriptors covering `granule` were updated (leaves
+        // unmapped, tables detached) before this call.
+        unsafe {
+            crate::paging::tlb_invalidate_va_all_asids_inner_shareable(VirtAddr::new(granule))
+        };
     }
-    // Reclaim now-empty last-level tables, once per 2 MiB granule. Every leaf
-    // above was unmapped and every PCID flushed on every CPU, so no CPU can
-    // still walk a table we free here. The shared PDPT/PD levels are kept.
-    if count != 0 {
-        let end = base + (count as u64) * 4096;
-        let mut granule = base & !0x1F_FFFFu64;
-        while granule < end {
-            // SAFETY: the range's leaves were unmapped and flushed above.
-            let _ = unsafe { crate::paging::free_empty_pt(root, VirtAddr::new(granule)) };
-            granule += 0x20_0000;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = (base, count);
+    INVALIDATIONS_DONE.fetch_max(ticket, Ordering::SeqCst);
+}
+
+/// Return retired frames to the buddy, but only those an invalidation has
+/// covered since they were retired. Anything else is withheld and counted.
+fn release_retired(leaves: Vec<PhysAddr>, leaves_retired_at: u64, tables: Vec<(PhysFrame, u64)>) {
+    let done = INVALIDATIONS_DONE.load(Ordering::SeqCst);
+    if done > leaves_retired_at {
+        for phys in leaves {
+            crate::frame::free_frame(PhysFrame::new(phys));
+        }
+    } else if !leaves.is_empty() {
+        RELEASES_WITHHELD.fetch_add(leaves.len(), Ordering::SeqCst);
+    }
+    for (table, at) in tables {
+        if done > at {
+            crate::frame::free_frame(table);
+            TABLES_RELEASED.fetch_add(1, Ordering::SeqCst);
+        } else {
+            RELEASES_WITHHELD.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -1308,6 +1400,45 @@ fn smoke_module_text_alloc_free_conserves_frames() -> TestResult {
 kernel_test_in!(
     "memory/module_text",
     smoke_module_text_alloc_free_conserves_frames
+);
+
+/// Freeing an image must hand its page tables back only after an invalidation
+/// that began after they were detached has finished on every CPU.
+///
+/// 1024 pages always contain one whole aligned 2 MiB granule, so the free
+/// empties at least one last-level table that this image alone populated, and
+/// `unmap_and_free` must detach and reclaim it. `release_retired` withholds any
+/// frame whose retirement no completed invalidation follows; this fails if it
+/// had to, or if no table was reclaimed at all.
+///
+/// Limits: this checks the order of the steps through the ticket each one
+/// takes. It cannot observe a paging-structure cache or walk cache directly;
+/// no emulator used here exposes one deterministically. It also cannot tell
+/// whether the invalidation primitive itself reaches every PCID.
+fn smoke_module_text_free_releases_tables_after_invalidation() -> TestResult {
+    let withheld_before = RELEASES_WITHHELD.load(Ordering::SeqCst);
+    let tables_before = TABLES_RELEASED.load(Ordering::SeqCst);
+    match alloc(1024, DomainId::SCRATCH) {
+        // SAFETY: nothing was executed from the image.
+        Ok(img) => unsafe { free(img) },
+        Err(_) => return TestResult::Fail("module_text::alloc(1024) failed"),
+    }
+    let withheld = RELEASES_WITHHELD.load(Ordering::SeqCst) - withheld_before;
+    let tables = TABLES_RELEASED.load(Ordering::SeqCst) - tables_before;
+    if withheld != 0 {
+        return TestResult::Fail(
+            "module free retired a frame or page table after its last invalidation; \
+             it would have reached the buddy before the flush that follows its detach",
+        );
+    }
+    if tables == 0 {
+        return TestResult::Fail("freeing a 1024-page module image reclaimed no page table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_free_releases_tables_after_invalidation
 );
 
 /// The guard page must be genuinely absent, not merely reserved in the

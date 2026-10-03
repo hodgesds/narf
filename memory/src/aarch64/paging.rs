@@ -1451,11 +1451,48 @@ pub unsafe fn protect_4kb(root: PhysAddr, virt: VirtAddr, flags: PtFlags) -> Res
 /// by every address space). Returns true if a table was freed. A no-op on block
 /// descriptors or an already-empty subtree.
 ///
+/// This frees the table in the same breath as it detaches it, with no TLBI in
+/// between. The caller's earlier per-leaf TLBIs do not close that gap: until
+/// the L2 descriptor is cleared it is still a valid table descriptor, and a PE
+/// may cache it in its walk cache (for example through a speculative walk)
+/// after those TLBIs. A caller that needs the table frame to be unreachable
+/// before it returns to the buddy must use [`detach_empty_kernel_pt`], issue a
+/// broadcast TLBI by VA over the range, and only then free, as `module_text`
+/// does.
+///
 /// # Safety
 /// `root` must be the live kernel root. The caller MUST have already unmapped
-/// every valid leaf in this L3 with a broadcast TLBI (as `unmap_4kb` does), so
-/// no CPU can walk the freed table frame after it is reused.
+/// every valid leaf in this L3 with a broadcast TLBI (as `unmap_4kb` does).
 pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
+    // SAFETY: forwarded contract.
+    let Some((l3, l2)) = (unsafe { detach_empty_kernel_pt(root, virt) }) else {
+        return false;
+    };
+    crate::frame::free_frame(l3);
+    if let Some(l2) = l2 {
+        crate::frame::free_frame(l2);
+    }
+    true
+}
+
+/// Detach, but do NOT free, the last-level (L3) table covering `virt` in the
+/// kernel root when it holds no valid entries: clear its L2 descriptor and
+/// unregister it. If that empties the L2 too, detach the L2 from the L1 the
+/// same way. Returns the detached L3 frame and, when the cascade ran, the L2
+/// frame; `None` when nothing was detached.
+///
+/// The frames are still owned by the caller and must not go back to the buddy
+/// until a broadcast TLBI by VA covering the range has completed: a walk cache
+/// may hold the cleared descriptors until then. The L1 under the reserved L0
+/// slot is never detached; every address space shares it.
+///
+/// # Safety
+/// `root` must be the live kernel root, and every valid leaf in this L3 must
+/// already be unmapped.
+pub unsafe fn detach_empty_kernel_pt(
+    root: PhysAddr,
+    virt: VirtAddr,
+) -> Option<(crate::frame::PhysFrame, Option<crate::frame::PhysFrame>)> {
     let _guard = pt_lock_for(root).lock();
     let idx = WalkIndices::from_virt(virt);
     // A descriptor is a table iff its low two bits are 0b11 (valid + table);
@@ -1464,35 +1501,32 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     let l0 = unsafe { &*root.kernel_mut_ptr::<PageTable>() };
     let l0e = l0.entries[idx.l0];
     if (l0e.0 & 0b11) != 0b11 {
-        return false;
+        return None;
     }
     // The L1 under the reserved L0 slot is shared by every address space and is
-    // never freed here, so this borrow is const.
+    // never detached here.
     // SAFETY: a table descriptor names a kernel-reachable L1.
     let l1 = unsafe { &mut *l0e.addr().kernel_mut_ptr::<PageTable>() };
     let l1e = l1.entries[idx.l1];
     if (l1e.0 & 0b11) != 0b11 {
-        return false;
+        return None;
     }
     // SAFETY: a table descriptor names a kernel-reachable L2.
     let l2 = unsafe { &mut *l1e.addr().kernel_mut_ptr::<PageTable>() };
     let l2e = l2.entries[idx.l2];
     if (l2e.0 & 0b11) != 0b11 {
-        return false;
+        return None;
     }
     let l3_phys = l2e.addr();
     // SAFETY: a table descriptor names a kernel-reachable L3.
     let l3 = unsafe { &*l3_phys.kernel_mut_ptr::<PageTable>() };
     if l3.entries.iter().any(|e| e.is_valid()) {
-        return false;
+        return None;
     }
-    // Detach and free the now-empty L3. The caller's per-leaf broadcast TLBIs
-    // already invalidated the walk caches covering this range.
     l2.entries[idx.l2] = PageTableEntry::EMPTY;
     crate::frame::__pagetable_unregister(l3_phys.raw());
-    crate::frame::free_frame(crate::frame::PhysFrame::new(l3_phys));
-    // Cascade: if that emptied the L2 too, free it and clear its L1 entry. Stop
-    // at the L1 — it is the reserved L0 slot's shared child and must persist.
+    // Cascade: if that emptied the L2 too, detach it from the L1. Stop at the
+    // L1 — it is the reserved L0 slot's shared child and must persist.
     //
     // The L2's own address comes from `l1e` — the entry in its PARENT that
     // names it. `l2e` is an entry *inside* the L2 and names the L3, so using
@@ -1504,13 +1538,14 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     // handed to two owners at once. It surfaces far away as a slab free-block
     // canary of 0x0 (`ensure_next_table` zeroes a fresh table) with a lone
     // page-table descriptor at offset 0 of the block's page.
+    let mut l2_frame = None;
     if !l2.entries.iter().any(|e| e.is_valid()) {
         let l2_phys = l1e.addr();
         l1.entries[idx.l1] = PageTableEntry::EMPTY;
         crate::frame::__pagetable_unregister(l2_phys.raw());
-        crate::frame::free_frame(crate::frame::PhysFrame::new(l2_phys));
+        l2_frame = Some(crate::frame::PhysFrame::new(l2_phys));
     }
-    true
+    Some((crate::frame::PhysFrame::new(l3_phys), l2_frame))
 }
 
 /// Remove one leaf with this root's mutation lock already held.
