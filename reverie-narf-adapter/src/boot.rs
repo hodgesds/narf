@@ -75,13 +75,19 @@
 //!
 //! Detcore prints no count of its own. Its scheduler reports its milestones
 //! to the boot, which prints each as
-//! `reverie-narf-boot: detcore scheduler: <milestone>` except the one after
-//! every scheduling turn, which it counts. Its line in the report is that
+//! `reverie-narf-boot: detcore scheduler: <milestone>` except one, which it
+//! counts. The scheduler reports that one once, after its first completed
+//! scheduling turn, so the count is 1 once a turn has completed and 0
+//! before; it is not the number of turns. Its line in the report is that
 //! count, as it stands when the report is printed:
 //!
 //! ```text
 //! detcore-scheduler turns=<N>
 //! ```
+//!
+//! Detcore's `eprintln!` output, such as the report of a terminal deadlock
+//! that it prints before it stops the run, goes to the console one line at
+//! a time as `detcore-stderr: <line>`. Without a sink it would be dropped.
 //!
 //! # The tally
 //!
@@ -314,6 +320,7 @@ const DETCORE_CONFIG: &str = include_str!("detcore-config.json");
 /// its interceptor, the kernel would keep the RDTSC interceptor, with a host
 /// that hosts no task: each `rdtsc` would trap and then run natively.
 fn install_detcore(table: &mut SyscallTable) -> Result<BootHost, String> {
+    detcore_std::io::set_stderr_sink(detcore_stderr);
     let mut config: detcore::Config = serde_json::from_str(DETCORE_CONFIG)
         .map_err(|error| format!("its configuration does not parse: {error}"))?;
     // As `hermit run` does with the configuration it parses.
@@ -347,15 +354,25 @@ fn install_detcore(table: &mut SyscallTable) -> Result<BootHost, String> {
     )
 }
 
-/// The milestone Detcore's scheduler reports after each scheduling turn
-/// (`sched_loop_inner` in `detcore/src/scheduler.rs`).
+/// The milestone Detcore's scheduler reports once, after its first
+/// completed scheduling turn (`sched_loop_inner` in
+/// `detcore/src/scheduler.rs`).
 const DETCORE_TURN: &str = "completed a deterministic scheduling turn";
 
-/// The scheduling turns Detcore's scheduler has reported.
+/// How many times Detcore's scheduler has reported [`DETCORE_TURN`]: 0 or 1.
 static DETCORE_TURNS: AtomicU64 = AtomicU64::new(0);
 
-/// The observer of Detcore's scheduler: counts its turns and prints its
-/// other milestones.
+/// The sink behind Detcore's `eprintln!`: prints each line on the console as
+/// `detcore-stderr: <line>`.
+fn detcore_stderr(args: core::fmt::Arguments<'_>) {
+    let text = format!("{args}");
+    for line in text.lines() {
+        ConsoleSink::emit(&format!("detcore-stderr: {line}"));
+    }
+}
+
+/// The observer of Detcore's scheduler: counts [`DETCORE_TURN`] and prints
+/// its other milestones.
 fn observe_detcore_scheduler(milestone: &'static str) {
     if milestone == DETCORE_TURN {
         DETCORE_TURNS.fetch_add(1, Ordering::Relaxed);

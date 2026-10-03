@@ -2730,6 +2730,7 @@ dependencies = [
 name = "reverie-narf-adapter"
 version = "0.0.0"
 dependencies = [
+ "detcore-std",
  "hermit-detcore",
  "narf-console",
  "narf-filesystem",

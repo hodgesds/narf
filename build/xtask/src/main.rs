@@ -7721,7 +7721,11 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
                     "Detcore's scheduler completed no scheduling turn",
                 ));
             }
-            uncounted = Some(format!("detcore ran {turns} scheduling turns"));
+            // Detcore's scheduler reports its turn milestone once, so a
+            // count above 0 says only that it completed a turn.
+            uncounted = Some(String::from(
+                "Detcore's scheduler completed a scheduling turn",
+            ));
             (None, None)
         }
         _ => return Err(format!("no report check for tool `{tool}`")),
@@ -8978,9 +8982,9 @@ mod detcore_report_tests {
     #[test]
     fn a_report_with_turns_is_accepted_without_a_count() {
         assert_eq!(
-            check_reverie_report(&serial("37", TALLY), "detcore"),
+            check_reverie_report(&serial("1", TALLY), "detcore"),
             Ok(String::from(
-                "detcore ran 37 scheduling turns; expected-events (11 entries - 1 \
+                "Detcore's scheduler completed a scheduling turn; expected-events (11 entries - 1 \
                  re-executions - 0 native-only) = the sum of 2 tasks' events; 2 tasks exited \
                  (0 unstarted), 2 processes"
             ))
@@ -9003,12 +9007,12 @@ mod detcore_report_tests {
         );
         let hosted = TALLY.replace("adapter-hosted=0", "adapter-hosted=1");
         assert_eq!(
-            check_reverie_report(&serial("37", &hosted), "detcore"),
+            check_reverie_report(&serial("1", &hosted), "detcore"),
             Err(format!("the adapter still hosts tasks: `{hosted}`"))
         );
         let short = TALLY.replace("expected-events=10", "expected-events=9");
         assert_eq!(
-            check_reverie_report(&serial("37", &short), "detcore"),
+            check_reverie_report(&serial("1", &short), "detcore"),
             Err(format!("the tally's arithmetic is wrong: `{short}`"))
         );
     }
