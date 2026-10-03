@@ -206,6 +206,8 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
     // they differ exactly where the boot stub reaches into the kernel half.
     let symtab = symbol_values(&bytes, &sections)?;
 
+    let image = image_extent(&sections, base);
+
     let mut table = RelocTable::default();
     let mut skipped_low = 0usize;
     // Kernel-half absolute fields deliberately left unpatched because the
@@ -249,7 +251,7 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
             // Where the encoded value points. `sh_link` names the symbol table
             // this relocation section indexes.
             let sym_value = symtab.get(&(sh_link, r_sym)).copied().unwrap_or(0);
-            let value_moves = sym_value.wrapping_add(addend) >= base || sym_value >= base;
+            let value_moves = value_moves(&image, sym_value, addend);
 
             if e_machine == EM_AARCH64 {
                 match (r_type, field_moves, value_moves) {
@@ -377,6 +379,39 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
     Ok(table)
 }
 
+/// The VA extent of the kernel-half image: every allocated section at or
+/// above `base`, end inclusive so a one-past-the-end symbol still counts.
+/// A slide moves exactly this range and nothing else.
+///
+/// "At or above `base`" is not the same thing on aarch64. There the linear
+/// map (`KERNEL_VIRT_BASE`, 0xFFFF_FF80_0000_0000) sits ABOVE the image
+/// offset, so a value in it also compares `>= base` — yet the linear map
+/// does not move with the image. `boot.S`'s `ldr x0, =stack_top_virt`
+/// (`stack_top + KERNEL_VIRT_BASE`) was slid on that basis, which put the
+/// BSP's boot stack on the linear alias of `stack_top + slide`: the
+/// kernel's own text/data for small slides, and buddy-owned RAM for larger
+/// ones, so the stack and whatever the buddy placed there overwrote each
+/// other at random. Bound the test by the image itself.
+fn image_extent(
+    sections: &[(u32, u64, u64, u64, u64, u32, u32, u64)],
+    base: u64,
+) -> std::ops::RangeInclusive<u64> {
+    let (lo, hi) = sections
+        .iter()
+        .filter(|s| s.1 & SHF_ALLOC != 0 && s.2 >= base && s.4 != 0)
+        .fold((u64::MAX, 0u64), |(lo, hi), s| {
+            (lo.min(s.2), hi.max(s.2.saturating_add(s.4)))
+        });
+    lo..=hi
+}
+
+/// Whether a relocation encoding `sym_value + addend` points at something the
+/// slide moves. Either form counts: a symbol in the image with an addend that
+/// steps past its end is still an image address.
+fn value_moves(image: &std::ops::RangeInclusive<u64>, sym_value: u64, addend: u64) -> bool {
+    image.contains(&sym_value.wrapping_add(addend)) || image.contains(&sym_value)
+}
+
 /// Section that holds the table in the linked image.
 const RELOC_SECTION: &str = ".kaslr_relocs";
 
@@ -474,4 +509,38 @@ fn symbol_values(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A linked aarch64 kernel's allocated sections (`readelf -S`), reduced to
+    /// what `image_extent` reads: `sh_flags`, `sh_addr`, `sh_size`. `.boot`
+    /// sits at its load address; the image at `KIMAGE_VOFFSET + phys`.
+    fn aarch64_sections() -> Vec<(u32, u64, u64, u64, u64, u32, u32, u64)> {
+        let alloc = |addr: u64, size: u64| (1, SHF_ALLOC, addr, 0, size, 0, 0, 0);
+        vec![
+            alloc(0x4008_0000, 0x1_9200),             // .boot
+            alloc(0xFFFF_FF7F_C009_A000, 0xE5_A418),  // .text
+            alloc(0xFFFF_FF7F_C18C_1000, 0x315_3C50), // .bss
+            alloc(0xFFFF_FF7F_C4A1_4C60, 0x10),       // .ap_boot_syms, last
+            (2, 0, 0, 0, 0x1000, 0, 0, 0),            // .symtab: not loaded
+        ]
+    }
+
+    #[test]
+    fn aarch64_linear_map_above_the_image_does_not_move() {
+        let image = image_extent(&aarch64_sections(), KIMAGE_VOFFSET_AARCH64);
+        let end = 0xFFFF_FF7F_C4A1_4C70;
+        // `stack_top_virt`: the linear alias of the boot stack, above `base`
+        // but outside the image. Sliding it is what moved the BSP's SP off
+        // its own stack.
+        assert!(!value_moves(&image, 0xFFFF_FF80_4009_9000, 0));
+        // A physical constant such as `__kernel_start` stays put too.
+        assert!(!value_moves(&image, 0x4008_0000, 0));
+        // In the image, and one past its end (`__kernel_end`-style symbols).
+        assert!(value_moves(&image, 0xFFFF_FF7F_C009_A000, 0x40));
+        assert!(value_moves(&image, end, 0));
+    }
 }
