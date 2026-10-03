@@ -1203,3 +1203,11 @@ argument = "Timestamp interception adds one scalar clock-mode word to the existi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The synchronous cross-CPU call's IRQ-masked acknowledgement spin now runs the existing lock-spin servicing (pending barrier actions, then the installed TLB-shootdown poll) instead of pending barrier actions alone. That servicing already runs from every IrqSafeSpinLock spin with arbitrary locks held, so no code runs in a new context: the shootdown poll only invalidates this CPU's TLB for requests already published to it and acknowledges them, and barrier actions keep their static fn() contract, nesting deferral, and acknowledge-after-run order. The TLB-shootdown code itself is unchanged: publication, target selection, invalidation scope, completion bitmaps, and the unbounded wait before frame reuse. The change removes a mutual wait in which one CPU, releasing a last address-space reference, waited for a shootdown acknowledgement from a CPU that was itself waiting, interrupts masked, for that CPU's remote-call acknowledgement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit only links the untrusted reverie-narf-adapter crate behind the opt-in, x86_64-only reverie-narf-poc feature and forwards frame's existing kernel-test feature to it, so its distributed tests reach verification kernels. No frame code, authority, mapping, domain transition, capability or scheduling state changes, the adapter joins no TCB member, and a build without the feature links no adapter or Reverie code."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The adapter reads and writes guest memory only through the userspace crate's existing checked user-copy primitives on the address space of the task whose syscall trapped, the same path native syscall handlers use for that task's pointers; a bad guest address yields EFAULT. It adds no kernel mapping, frame ownership, capability or domain right, and every native transition it asks for runs the ordinary handler with the calling task's identity."

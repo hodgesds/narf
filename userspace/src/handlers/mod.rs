@@ -44,3 +44,5 @@ pub(crate) use crate::errno::*;
 // fragments into child modules would widen that internal visibility.
 include!("core.inc.rs");
 include!("compat.inc.rs");
+
+pub mod tool_view;

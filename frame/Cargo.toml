@@ -100,6 +100,7 @@ narf-bpf-idle        = { path = "../bpf-idle", optional = true }
 narf-bpf-leds        = { path = "../bpf-leds", optional = true }
 narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
+reverie-narf-adapter = { path = "../reverie-narf-adapter", optional = true }
 
 [features]
 # Profiling: emit a `perf stat`-style line (per-CPU narf_lib::perf software
@@ -291,6 +292,7 @@ kernel-test  = [
     "narf-arch/kernel-test",
     "narf-scheduler/kernel-test",
     "narf-userspace/kernel-test",
+    "reverie-narf-adapter?/kernel-test",
     "bpf",
 ]
 # In-kernel BPF smokes (`cargo xtask test --subsystem bpf`).
@@ -342,6 +344,11 @@ narf-libc-validate = ["user-mode-e2e", "narf-verification/narf-libc-validate"]
 # surface is unconditional now, so boot-init only needs narf-verification
 # for the init/shell ELF build path.
 boot-init = ["dep:narf-verification", "narf-verification/boot-init"]
+# Link the in-kernel Reverie backend (reverie-narf-adapter), which hosts an
+# unmodified reverie::Tool at the syscall dispatcher, and, in kernel-test
+# builds, its `reverie-narf` tests. x86_64-only: the adapter is empty on
+# other targets because Reverie's no-std syscall layer is x86_64-only.
+reverie-narf-poc = ["dep:reverie-narf-adapter"]
 
 [lints]
 workspace = true

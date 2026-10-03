@@ -135,6 +135,15 @@ pub struct SyscallInvocation {
     pub instruction_pointer: u64,
     /// User stack pointer captured at entry.
     pub stack_pointer: u64,
+    /// True when this entry re-executes a syscall whose previous entry by the
+    /// same task parked by rewinding the user instruction pointer over the
+    /// syscall instruction, with the same number and arguments.
+    ///
+    /// A park-to-re-execute handler (a blocking read, futex wait or sleep)
+    /// leaves no return value and resumes by re-issuing the same syscall. An
+    /// interceptor that already observed the first entry uses this flag to
+    /// re-run the parked transition instead of observing the syscall again.
+    pub park_reexecution: bool,
 }
 
 /// Result of the entry half of a syscall interceptor.
@@ -200,10 +209,49 @@ impl NativeSyscallRequest {
 /// Both operations bypass interception, so a Reverie `Guest::inject`
 /// implementation can use them from inside the Tool callback without recursively
 /// trapping its own injected syscall.
+///
+/// A transition that exits the task or replaces its image (`exit`,
+/// `exit_group`, `execve`, `execveat`) never runs inside the interceptor
+/// callback. The call reports [`NativeSyscallOutcome::ContextManaged`] at once
+/// and the dispatcher runs the recorded request on the live context after the
+/// interceptor has returned, so the task's exit is announced (through
+/// [`SyscallInterceptor::on_task_exit`]) only once no callback is running for
+/// it. A failed exec therefore returns its errno to the task without the
+/// interceptor observing it.
 pub trait NativeSyscallTransition {
     fn execute_original(&mut self) -> Result<NativeSyscallOutcome, NativeSyscallOriginalError>;
 
     fn execute_injected(&mut self, request: NativeSyscallRequest) -> NativeSyscallOutcome;
+
+    /// The next task created by a transition of this capability that has not
+    /// been reported yet. Each created task is reported at most once.
+    ///
+    /// The kernel holds every task created during an interceptor callback
+    /// back from the scheduler until that callback has returned, so the
+    /// interceptor can register the task before its first instruction runs.
+    fn take_created_task(&mut self) -> Option<CreatedNativeTask> {
+        None
+    }
+
+    /// The task's user register file as it was at syscall entry, before any
+    /// transition ran, or `None` when the entry path carries no user frame.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn entry_user_state(&self) -> Option<narf_scheduler::UserState> {
+        None
+    }
+}
+
+/// A task created by a transition during one interceptor callback.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CreatedNativeTask {
+    /// Scheduler task id of the new task.
+    pub task_id: u64,
+    /// Root-namespace Linux thread ID of the new task.
+    pub linux_tid: u64,
+    /// Root-namespace Linux process ID of the new task.
+    pub linux_pid: u64,
+    /// True when the new task joined the creator's thread group.
+    pub thread: bool,
 }
 
 /// First-class middleware at NARF's live syscall dispatcher.
@@ -244,6 +292,25 @@ pub trait SyscallInterceptor: Send + Sync {
     ///
     /// This callback cannot fabricate a return or mutate the trap frame.
     fn on_syscall_context_managed(&self, _invocation: &SyscallInvocation) {}
+
+    /// Called once per task, with the task's address space active, before its
+    /// first user instruction runs (a fresh image or a fork/clone child).
+    ///
+    /// `native` runs injected requests only; it has no original syscall and
+    /// refuses transitions that would exit the task or replace its image.
+    fn on_task_start(&self, _task_id: u64, _native: &mut dyn NativeSyscallTransition) {}
+
+    /// Called after a successful exec has installed the new image and before
+    /// its first instruction runs, with the new address space active.
+    ///
+    /// `native` has the same restrictions as in [`Self::on_task_start`].
+    fn on_task_exec(&self, _task_id: u64, _native: &mut dyn NativeSyscallTransition) {}
+
+    /// Called exactly once when task `task_id` of process `pid` has finished,
+    /// before the kernel's exit observers tear down its state, and never while
+    /// an interceptor callback for that task is running. `wstatus` is the
+    /// `wait4` status the kernel will report for the task.
+    fn on_task_exit(&self, _task_id: u64, _pid: u64, _wstatus: i32) {}
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3537,6 +3604,10 @@ struct InterceptCtx<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
     result: Option<SyscallReturn>,
+    /// Also publish a normal return to the live context. Set only for a
+    /// deferred transition, which runs after the interceptor has returned and
+    /// owns the live context.
+    forward: bool,
 }
 
 impl<'a> InterceptCtx<'a> {
@@ -3545,6 +3616,7 @@ impl<'a> InterceptCtx<'a> {
             inner,
             args,
             result: None,
+            forward: false,
         }
     }
 }
@@ -3556,6 +3628,9 @@ impl TrapContext for InterceptCtx<'_> {
 
     fn set_return(&mut self, ret: SyscallReturn) {
         self.result = Some(ret);
+        if self.forward {
+            self.inner.set_return(ret);
+        }
     }
 
     fn user_rsp(&self) -> u64 {
@@ -3601,6 +3676,25 @@ impl TrapContext for InterceptCtx<'_> {
     }
 }
 
+/// A context-ending transition recorded for the dispatcher to run after the
+/// interceptor callback has returned.
+#[derive(Copy, Clone)]
+struct DeferredTransition {
+    variant: Option<Syscall>,
+    version: u8,
+    args: SyscallArgs,
+}
+
+/// Whether `variant` exits the task or replaces its image, so that running it
+/// inside an interceptor callback would end the task's context under the
+/// callback.
+fn ends_task_context(variant: Option<Syscall>) -> bool {
+    matches!(
+        variant,
+        Some(Syscall::ExitTask | Syscall::ExitGroup | Syscall::Execve | Syscall::Execveat)
+    )
+}
+
 struct DispatchNativeTransition<'table, 'ctx> {
     table: &'table SyscallTable,
     variant: Option<Syscall>,
@@ -3609,6 +3703,41 @@ struct DispatchNativeTransition<'table, 'ctx> {
     ctx: &'ctx mut dyn TrapContext,
     original_outcome: Option<NativeSyscallOutcome>,
     context_managed: bool,
+    task_id: u64,
+    deferred: Option<DeferredTransition>,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    entry_state: Option<narf_scheduler::UserState>,
+}
+
+impl DispatchNativeTransition<'_, '_> {
+    /// Runs one native transition on the live context, deferring a
+    /// context-ending one until the interceptor has returned.
+    fn run(
+        &mut self,
+        variant: Option<Syscall>,
+        version: u8,
+        args: SyscallArgs,
+    ) -> NativeSyscallOutcome {
+        if ends_task_context(variant) {
+            self.deferred = Some(DeferredTransition {
+                variant,
+                version,
+                args,
+            });
+            self.context_managed = true;
+            return NativeSyscallOutcome::ContextManaged;
+        }
+        let mut capture = InterceptCtx::new(self.ctx, args);
+        self.table.dispatch_native(variant, version, &mut capture);
+        let outcome = match capture.result {
+            Some(result) => NativeSyscallOutcome::Returned(result),
+            None => NativeSyscallOutcome::ContextManaged,
+        };
+        if outcome == NativeSyscallOutcome::ContextManaged {
+            self.context_managed = true;
+        }
+        outcome
+    }
 }
 
 impl DispatchNativeTransition<'_, '_> {
@@ -3639,17 +3768,8 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
         if self.context_managed {
             return Err(NativeSyscallOriginalError::ContextManaged);
         }
-        let mut capture = InterceptCtx::new(self.ctx, self.args);
-        self.table
-            .dispatch_native(self.variant, self.version, &mut capture);
-        let outcome = match capture.result {
-            Some(result) => NativeSyscallOutcome::Returned(result),
-            None => NativeSyscallOutcome::ContextManaged,
-        };
+        let outcome = self.run(self.variant, self.version, self.args);
         self.original_outcome = Some(outcome);
-        if outcome == NativeSyscallOutcome::ContextManaged {
-            self.context_managed = true;
-        }
         Ok(outcome)
     }
 
@@ -3659,16 +3779,139 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
         }
         let version = syscall_version(request.raw_number);
         let variant = Syscall::from_raw(syscall_number(request.raw_number));
-        let mut capture = InterceptCtx::new(self.ctx, request.args);
-        self.table.dispatch_native(variant, version, &mut capture);
-        let outcome = match capture.result {
-            Some(result) => NativeSyscallOutcome::Returned(result),
-            None => NativeSyscallOutcome::ContextManaged,
-        };
-        if outcome == NativeSyscallOutcome::ContextManaged {
-            self.context_managed = true;
+        self.run(variant, version, request.args)
+    }
+
+    fn take_created_task(&mut self) -> Option<CreatedNativeTask> {
+        crate::user_task::take_held_spawn_record(self.task_id)
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn entry_user_state(&self) -> Option<narf_scheduler::UserState> {
+        self.entry_state
+    }
+}
+
+/// Native capability lent to a lifecycle callback, which has no intercepted
+/// syscall and no live syscall frame.
+struct LifecycleTransition<'table> {
+    table: &'table SyscallTable,
+    context_managed: bool,
+}
+
+impl NativeSyscallTransition for LifecycleTransition<'_> {
+    fn execute_original(&mut self) -> Result<NativeSyscallOutcome, NativeSyscallOriginalError> {
+        Err(NativeSyscallOriginalError::AlreadyExecuted)
+    }
+
+    fn execute_injected(&mut self, request: NativeSyscallRequest) -> NativeSyscallOutcome {
+        if self.context_managed {
+            return NativeSyscallOutcome::ContextManaged;
         }
-        outcome
+        let version = syscall_version(request.raw_number);
+        let variant = Syscall::from_raw(syscall_number(request.raw_number));
+        if ends_task_context(variant) {
+            // No frame exists to exit from or exec into here: refuse without
+            // running anything.
+            return NativeSyscallOutcome::Returned(SyscallReturn::not_implemented());
+        }
+        let mut ctx = ArgsOnlyCtx::new(request.args, core::ptr::null_mut());
+        let mut capture = InterceptCtx::new(&mut ctx, request.args);
+        self.table.dispatch_native(variant, version, &mut capture);
+        match capture.result {
+            Some(result) => NativeSyscallOutcome::Returned(result),
+            None => {
+                self.context_managed = true;
+                NativeSyscallOutcome::ContextManaged
+            }
+        }
+    }
+}
+
+/// Width of the syscall instruction a park-to-re-execute handler rewinds over.
+#[cfg(target_arch = "aarch64")]
+const SYSCALL_INSN_LEN: u64 = 4;
+#[cfg(not(target_arch = "aarch64"))]
+const SYSCALL_INSN_LEN: u64 = 2;
+
+/// The syscall a task's previous intercepted entry parked to re-execute.
+#[derive(Copy, Clone)]
+struct ParkRecord {
+    instruction_pointer: u64,
+    raw_number: u32,
+    args: [u64; 6],
+}
+
+fn args_array(args: &SyscallArgs) -> [u64; 6] {
+    [
+        args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+    ]
+}
+
+/// Parked syscalls by scheduler task id. Maintained only while an interceptor
+/// is installed, so the uninstrumented dispatch path never touches it.
+static PARK_RECORDS: narf_lib::sync::IrqSafeSpinLock<
+    alloc::collections::BTreeMap<u64, ParkRecord>,
+> = narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Consumes `task_id`'s park record and reports whether this entry
+/// re-executes exactly that parked syscall.
+fn take_park_reexecution(task_id: u64, raw_number: u32, args: &SyscallArgs, ip: u64) -> bool {
+    match PARK_RECORDS.lock().remove(&task_id) {
+        Some(record) => {
+            record.instruction_pointer == ip
+                && record.raw_number == raw_number
+                && record.args == args_array(args)
+        }
+        None => false,
+    }
+}
+
+/// The installed table and its interceptor, if any.
+fn installed_interceptor() -> Option<(&'static SyscallTable, &'static dyn SyscallInterceptor)> {
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `p` was published by `install_global` from a leaked Box and is
+    // never freed while installed; see `kernel_syscall_entry`.
+    let table: &'static SyscallTable = unsafe { &*p };
+    let interceptor = table.interceptor.as_deref()?;
+    Some((table, interceptor))
+}
+
+/// Announces task `task_id`'s start to the installed interceptor, if any.
+///
+/// x86_64-only: its one caller is the x86_64 `UserTaskFuture::poll`, and no
+/// other target hosts an interceptor yet (the Reverie adapter is empty there).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn notify_interceptor_task_start(task_id: u64) {
+    if let Some((table, interceptor)) = installed_interceptor() {
+        let mut native = LifecycleTransition {
+            table,
+            context_managed: false,
+        };
+        interceptor.on_task_start(task_id, &mut native);
+    }
+}
+
+/// Announces task `task_id`'s successful exec to the installed interceptor.
+pub(crate) fn notify_interceptor_task_exec(task_id: u64) {
+    if let Some((table, interceptor)) = installed_interceptor() {
+        let mut native = LifecycleTransition {
+            table,
+            context_managed: false,
+        };
+        interceptor.on_task_exec(task_id, &mut native);
+    }
+}
+
+/// Announces task `task_id`'s exit to the installed interceptor, if any.
+pub(crate) fn notify_interceptor_task_exit(task_id: u64, pid: u64) {
+    if let Some((_, interceptor)) = installed_interceptor() {
+        PARK_RECORDS.lock().remove(&task_id);
+        let wstatus = crate::handlers::peek_pending_termination(pid).unwrap_or(0);
+        interceptor.on_task_exit(task_id, pid, wstatus);
     }
 }
 
@@ -5070,27 +5313,54 @@ impl SyscallTable {
             return;
         };
 
+        let args = *ctx.args();
+        let task_id = crate::handlers::current_task_id();
+        let instruction_pointer = ctx.rip();
         let invocation = SyscallInvocation {
             raw_number,
             version,
             syscall: variant,
-            args: *ctx.args(),
-            task_id: crate::handlers::current_task_id(),
-            instruction_pointer: ctx.rip(),
+            args,
+            task_id,
+            instruction_pointer,
             stack_pointer: ctx.user_rsp(),
+            park_reexecution: take_park_reexecution(
+                task_id,
+                raw_number,
+                &args,
+                instruction_pointer,
+            ),
         };
-        let outcome = {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let entry_state = {
+            let mut state = narf_scheduler::UserState::default();
+            // SAFETY: `state` is a live, exclusively borrowed `UserState`,
+            // the exact layout `save_user_state` writes.
+            let saved = unsafe {
+                ctx.save_user_state(&mut state as *mut narf_scheduler::UserState as *mut u8)
+            };
+            saved.then_some(state)
+        };
+        // Tasks created during the callback stay off the run queues until it
+        // returns, so the interceptor registers them before they can run.
+        let hold = crate::user_task::SpawnHold::open(task_id);
+        let (outcome, deferred) = {
             let mut native = DispatchNativeTransition {
                 table: self,
                 variant,
                 version,
-                args: invocation.args,
+                args,
                 ctx,
                 original_outcome: None,
                 context_managed: false,
+                task_id,
+                deferred: None,
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                entry_state,
             };
             let control = interceptor.on_syscall_enter(&invocation, &mut native);
-            native.resolve(control)
+            let outcome = native.resolve(control);
+            (outcome, native.deferred)
         };
         match outcome {
             NativeSyscallOutcome::Returned(result) => {
@@ -5099,6 +5369,30 @@ impl SyscallTable {
             NativeSyscallOutcome::ContextManaged => {
                 interceptor.on_syscall_context_managed(&invocation);
             }
+        }
+        let vfork_wait = hold.release();
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if let Some((child_pid, parent_pid)) = vfork_wait {
+            crate::handlers::vfork_parent_wait(ctx, child_pid, parent_pid);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = vfork_wait;
+        if let Some(deferred) = deferred {
+            let mut live = InterceptCtx::new(ctx, deferred.args);
+            live.forward = true;
+            self.dispatch_native(deferred.variant, deferred.version, &mut live);
+        }
+        if outcome == NativeSyscallOutcome::ContextManaged
+            && ctx.rip() == instruction_pointer.wrapping_sub(SYSCALL_INSN_LEN)
+        {
+            PARK_RECORDS.lock().insert(
+                task_id,
+                ParkRecord {
+                    instruction_pointer,
+                    raw_number,
+                    args: args_array(&args),
+                },
+            );
         }
     }
 

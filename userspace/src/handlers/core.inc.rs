@@ -10269,66 +10269,79 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // registered pre-spawn, so if the child already released we fall straight
     // through. Own-stack park: infinite deadline, woken by `vfork_child_release`
     // → `wake_signal`; SIGKILL (pending bit 9) still breaks the wait.
-    if flags & CLONE_VFORK != 0 {
-        if let Some(uctx) = crate::user_task::current_user_task() {
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                // SAFETY: the in-flight parent task's poller-pinned UserTaskCtx;
-                // single-CPU cooperative execution — no concurrent &mut.
-                let uc = unsafe { &*uctx };
-                // SAFETY: `uc.state` is this task's poller-pinned save area and
-                // `uc.exit_reason` its resume-disposition cell; single-CPU
-                // cooperative execution means no concurrent access.
-                unsafe {
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+    // Inside a syscall interceptor callback the child is held off the run
+    // queues until the callback returns, so the dispatcher runs this wait
+    // after it has published the child instead.
+    if flags & CLONE_VFORK != 0
+        && !crate::user_task::defer_vfork_wait(child_visible_pid, parent_pid)
+    {
+        vfork_parent_wait(ctx, child_visible_pid, parent_pid);
+    }
+}
+
+/// Suspends a `CLONE_VFORK` parent until child `child_visible_pid` execs or
+/// exits, or until SIGKILL is pending for `parent_pid`. `ctx` is the parent's
+/// live syscall context, whose return value is already set.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn vfork_parent_wait(ctx: &mut dyn TrapContext, child_visible_pid: u64, parent_pid: u64) {
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            // SAFETY: the in-flight parent task's poller-pinned UserTaskCtx;
+            // single-CPU cooperative execution — no concurrent &mut.
+            let uc = unsafe { &*uctx };
+            // SAFETY: `uc.state` is this task's poller-pinned save area and
+            // `uc.exit_reason` its resume-disposition cell; single-CPU
+            // cooperative execution means no concurrent access.
+            unsafe {
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            }
+            loop {
+                // Arm the park before testing the wait-table predicate.
+                // vfork_child_release removes the row before clearing this
+                // deadline, closing the final check-to-sleep race.
+                uc.sleep_deadline_ns
+                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                if !vfork_is_pending(child_visible_pid) {
+                    break;
                 }
-                loop {
-                    // Arm the park before testing the wait-table predicate.
-                    // vfork_child_release removes the row before clearing this
-                    // deadline, closing the final check-to-sleep race.
-                    uc.sleep_deadline_ns
-                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
-                    if !vfork_is_pending(child_visible_pid) {
-                        break;
+                if (signal_pending_bits(parent_pid) & (1 << 9)) != 0 {
+                    // SIGKILL pending: abandon the wait; drop the stale entry
+                    // so a later reuse of this pid can't wake a dead parent.
+                    VFORK_WAIT
+                        .lock()
+                        .as_mut()
+                        .map(|m| m.remove(&child_visible_pid));
+                    break;
+                }
+                crate::user_task::own_stack_park();
+            }
+            uc.sleep_deadline_ns
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !narf_scheduler::stackful::user_own_stack_enabled() {
+            if let Some(hook) = crate::user_task::yield_hook() {
+                // aarch64 uses the polling-future path: keep the parent's
+                // saved syscall return parked until vfork_child_release calls
+                // wake_signal and clears this infinite deadline.
+                // SAFETY: uctx is the live poller-owned context and hook
+                // longjmps back through its installed JmpBuf.
+                let uc = unsafe { &*uctx };
+                uc.sleep_deadline_ns
+                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                if vfork_is_pending(child_visible_pid) {
+                    // SAFETY: `uc` and the legacy JmpBuf remain live for this
+                    // poll; the hook diverges back to that saved continuation.
+                    unsafe {
+                        ctx.save_user_state(uc.state.get() as *mut u8);
+                        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                        hook(uctx);
                     }
-                    if (signal_pending_bits(parent_pid) & (1 << 9)) != 0 {
-                        // SIGKILL pending: abandon the wait; drop the stale entry
-                        // so a later reuse of this pid can't wake a dead parent.
-                        VFORK_WAIT
-                            .lock()
-                            .as_mut()
-                            .map(|m| m.remove(&child_visible_pid));
-                        break;
-                    }
-                    crate::user_task::own_stack_park();
                 }
                 uc.sleep_deadline_ns
                     .store(0, core::sync::atomic::Ordering::Release);
-            }
-            #[cfg(target_arch = "aarch64")]
-            if !narf_scheduler::stackful::user_own_stack_enabled() {
-                if let Some(hook) = crate::user_task::yield_hook() {
-                    // aarch64 uses the polling-future path: keep the parent's
-                    // saved syscall return parked until vfork_child_release calls
-                    // wake_signal and clears this infinite deadline.
-                    // SAFETY: uctx is the live poller-owned context and hook
-                    // longjmps back through its installed JmpBuf.
-                    let uc = unsafe { &*uctx };
-                    uc.sleep_deadline_ns
-                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
-                    if vfork_is_pending(child_visible_pid) {
-                        // SAFETY: `uc` and the legacy JmpBuf remain live for this
-                        // poll; the hook diverges back to that saved continuation.
-                        unsafe {
-                            ctx.save_user_state(uc.state.get() as *mut u8);
-                            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                            hook(uctx);
-                        }
-                    }
-                    uc.sleep_deadline_ns
-                        .store(0, core::sync::atomic::Ordering::Release);
-                }
             }
         }
     }
@@ -11013,6 +11026,17 @@ pub fn stage_pending_termination(task: u64, status: i32) {
     if let Some(m) = g.as_mut() {
         m.entry(task).or_insert(status);
     }
+}
+
+/// The wait status staged for `pid` by [`stage_pending_termination`], without
+/// consuming it. The exit observer still drains the entry for `wait4`; this
+/// read lets an interception backend report the same status at the moment the
+/// task's exit is announced, before the observers run.
+pub fn peek_pending_termination(pid: u64) -> Option<i32> {
+    PENDING_TERMINATION
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&pid).copied())
 }
 
 fn take_pending_termination(task: u64) -> Option<i32> {

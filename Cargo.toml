@@ -55,6 +55,7 @@ members = [
     "scmi",
     "observability",
     "userspace",
+    "reverie-narf-adapter",
     "user-runtime",
     "drivers/nvme",
     "drivers/net",

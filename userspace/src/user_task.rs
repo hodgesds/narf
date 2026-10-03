@@ -1486,6 +1486,9 @@ pub fn register_process_exit_observer(o: ExitObserver) {
 /// `signal->live`). Must be called EXACTLY ONCE per task exit, or the
 /// count under/over-shoots.
 pub fn notify_task_exited(pid: u64, tid: u64) {
+    // The interceptor hears of the exit first, while the group's live count
+    // and the staged termination status still describe this exit.
+    crate::syscall::notify_interceptor_task_exit(tid, pid);
     let thread = THREAD_EXIT_OBSERVERS.lock().clone();
     for o in thread.iter() {
         o(pid, tid);
@@ -2031,6 +2034,21 @@ pub struct UserTaskFuture {
     /// address space is active, immediately before its first userspace entry,
     /// matching Linux schedule_tail().
     set_child_tid: Option<u64>,
+    /// Lifecycle event still to be announced to an installed syscall
+    /// interceptor before the next entry into user mode.
+    lifecycle: Option<LifecycleEvent>,
+}
+
+/// A task lifecycle transition announced to the syscall interceptor from the
+/// poll, once the task's address space is active and before user mode runs.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LifecycleEvent {
+    /// The task is about to execute its first user instruction.
+    Start,
+    /// The task completed an exec (legacy longjmp model only; the own-stack
+    /// model announces exec from the exec path itself).
+    Exec,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2070,6 +2088,7 @@ impl UserTaskFuture {
             sleep_handle: None,
             fpu: FpuArea::reset_boxed(),
             set_child_tid: None,
+            lifecycle: Some(LifecycleEvent::Start),
         }
     }
 
@@ -2123,6 +2142,7 @@ impl UserTaskFuture {
             sleep_handle: None,
             fpu,
             set_child_tid: None,
+            lifecycle: Some(LifecycleEvent::Start),
         }
     }
 
@@ -2752,6 +2772,19 @@ impl core::future::Future for UserTaskFuture {
         // task's mm. Taking the slot makes a fault one-shot as well: put_user
         // failure does not make clone fail and is not retried.
         complete_set_child_tid(&mut this.set_child_tid, &this.task);
+        // An installed syscall interceptor hears of the task's start (or a
+        // legacy-model exec) with the task's address space active and before
+        // its first user instruction, so a Tool's per-thread setup precedes
+        // the thread's first intercepted syscall.
+        match this.lifecycle.take() {
+            Some(LifecycleEvent::Start) => {
+                crate::syscall::notify_interceptor_task_start(crate::handlers::current_task_id())
+            }
+            Some(LifecycleEvent::Exec) => {
+                crate::syscall::notify_interceptor_task_exec(crate::handlers::current_task_id())
+            }
+            None => {}
+        }
         // Program the per-task TLS thread pointer. Done after CR3
         // is in place — `IA32_FS_BASE` doesn't depend on the
         // page-table root, but pairing the writes here keeps the
@@ -3019,6 +3052,7 @@ impl core::future::Future for UserTaskFuture {
                 this.process.stack_top = narf_memory::VirtAddr::new(req.stack_top);
                 this.process.fs_base = req.fs_base;
                 this.state = TaskState::Initial;
+                this.lifecycle = Some(LifecycleEvent::Exec);
             }
             // Repoll — the next iteration runs the Initial-state
             // path which calls activate() on the new AS and
@@ -3577,8 +3611,137 @@ impl PendingUserProcess {
     }
 
     /// Publish this fully initialized task to the scheduler.
+    ///
+    /// While the creating task is inside an interceptor call (a
+    /// [`SpawnHold`] is open for it), the child is queued instead and
+    /// published only when that call returns; see [`SpawnHold`].
     pub fn spawn(self) -> narf_scheduler::TaskId {
+        if SPAWN_HOLD_COUNT.load(Ordering::Acquire) != 0 {
+            let creator = crate::handlers::current_task_id();
+            // Only the creator opens and releases its own hold, so the hold
+            // cannot close between this check and the queueing below.
+            if SPAWN_HOLDS.lock().contains_key(&creator) {
+                return hold_spawn(creator, self);
+            }
+        }
+        self.publish()
+    }
+
+    fn publish(self) -> narf_scheduler::TaskId {
         narf_scheduler::spawn_user(self.id, self.future, self.spec, self.addr_space)
+    }
+}
+
+// ── Spawn holds for syscall interception ────────────────────────────
+//
+// A syscall-interception Tool that runs a fork, vfork or clone on a task's
+// behalf must learn about the child, and register it, before the child can
+// execute a single instruction: otherwise the child's first syscall could
+// reach the interceptor for a task the Tool does not know. The dispatcher
+// opens a hold for the creating task around every interceptor call; a child
+// created while it is open is queued with its identity record and published
+// only when the hold is released, after the interceptor call has returned.
+// A vfork parent's wait for its child is deferred to the same point, since
+// waiting inside the call would wait for a child that cannot yet run.
+
+struct HeldSpawns {
+    /// Children created by the holding task, in creation order.
+    children: alloc::vec::Vec<PendingUserProcess>,
+    /// One identity record per held child, consumed by the interceptor.
+    records: alloc::collections::VecDeque<crate::syscall::CreatedNativeTask>,
+    /// `(child_visible_pid, parent_pid)` of a vfork whose wait was deferred.
+    vfork_wait: Option<(u64, u64)>,
+}
+
+static SPAWN_HOLDS: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, HeldSpawns>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Number of open holds; lets the common, uninterecepted spawn skip the map.
+static SPAWN_HOLD_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// An open spawn hold for one creating task. See the section comment above.
+#[must_use = "a spawn hold must be released, or its children never run"]
+pub(crate) struct SpawnHold {
+    creator: u64,
+}
+
+impl SpawnHold {
+    /// Open a hold for `creator`, the scheduler task about to enter an
+    /// interceptor call.
+    pub(crate) fn open(creator: u64) -> Self {
+        let mut holds = SPAWN_HOLDS.lock();
+        let previous = holds.insert(
+            creator,
+            HeldSpawns {
+                children: alloc::vec::Vec::new(),
+                records: alloc::collections::VecDeque::new(),
+                vfork_wait: None,
+            },
+        );
+        assert!(previous.is_none(), "nested spawn hold for task {creator}");
+        SPAWN_HOLD_COUNT.fetch_add(1, Ordering::AcqRel);
+        Self { creator }
+    }
+
+    /// Close the hold: publish every held child in creation order and return
+    /// the deferred vfork wait, if any, which the caller must now perform.
+    pub(crate) fn release(self) -> Option<(u64, u64)> {
+        let held = SPAWN_HOLDS.lock().remove(&self.creator);
+        SPAWN_HOLD_COUNT.fetch_sub(1, Ordering::AcqRel);
+        let held = held?;
+        for child in held.children {
+            child.publish();
+        }
+        held.vfork_wait
+    }
+}
+
+fn hold_spawn(creator: u64, child: PendingUserProcess) -> narf_scheduler::TaskId {
+    let id = child.id;
+    // Identity lookups take the handlers' shard locks; resolve them before
+    // taking the hold map's lock.
+    let creator_pid = crate::handlers::task_to_pid_raw(creator);
+    let record = crate::handlers::tool_view::linux_task_ids(id.raw()).map(|ids| {
+        let thread = creator_pid == Some(ids.pid);
+        crate::syscall::CreatedNativeTask {
+            task_id: id.raw(),
+            linux_tid: if thread { ids.tid } else { ids.pid },
+            linux_pid: ids.pid,
+            thread,
+        }
+    });
+    let mut holds = SPAWN_HOLDS.lock();
+    let held = holds
+        .get_mut(&creator)
+        .expect("spawn hold closed by a task other than its creator");
+    if let Some(record) = record {
+        held.records.push_back(record);
+    }
+    held.children.push(child);
+    id
+}
+
+/// Take the oldest unreported child record of `creator`'s open hold.
+pub(crate) fn take_held_spawn_record(creator: u64) -> Option<crate::syscall::CreatedNativeTask> {
+    if SPAWN_HOLD_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    SPAWN_HOLDS.lock().get_mut(&creator)?.records.pop_front()
+}
+
+/// Defer the current task's vfork wait to the release of its open hold.
+/// Returns `false`, leaving the caller to wait now, when no hold is open.
+pub(crate) fn defer_vfork_wait(child_visible_pid: u64, parent_pid: u64) -> bool {
+    if SPAWN_HOLD_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let creator = crate::handlers::current_task_id();
+    match SPAWN_HOLDS.lock().get_mut(&creator) {
+        Some(held) => {
+            held.vfork_wait = Some((child_visible_pid, parent_pid));
+            true
+        }
+        None => false,
     }
 }
 

@@ -1974,6 +1974,10 @@ fn do_execve_resolved(
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(new_as);
         drop(prev_slot_as);
+        // The exec has succeeded and cannot fail from here on: announce it
+        // to an installed syscall interceptor, in the new image's address
+        // space and before the new image's first instruction.
+        crate::syscall::notify_interceptor_task_exec(task);
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.

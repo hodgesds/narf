@@ -1,0 +1,32 @@
+[package]
+name = "reverie-narf-adapter"
+description = "Narf kernel side of the one-address-space Reverie backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Everything Reverie-facing is x86_64-only: reverie-syscalls without std is
+# defined only for x86_64 (`compile_error!` in reverie-syscalls/src/lib.rs), so
+# on any other target this crate is empty and pulls in no Reverie crate.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+narf-console = { path = "../console" }
+narf-kernel-test = { path = "../verification/kernel-test" }
+narf-lib = { path = "../lib" }
+narf-scheduler = { path = "../scheduler" }
+narf-time = { path = "../time" }
+narf-userspace = { path = "../userspace" }
+# One exact commit of the Reverie fork. `default-features = false` keeps
+# Reverie's `std` feature off; nothing in this workspace turns it on.
+reverie = { package = "reverie-core", git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023", default-features = false }
+reverie-narf-core = { git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023", default-features = false }
+reverie-narf-tools = { git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023", default-features = false }
+
+[features]
+# Registers the adapter's in-kernel tests (subsystem `reverie-narf`) and
+# assembles the guests they run. Enabled by frame's `kernel-test`.
+kernel-test = ["narf-userspace/verification-test-reset"]
+
+[lints]
+workspace = true

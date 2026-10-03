@@ -95,9 +95,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arrayref"
@@ -124,9 +124,18 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
+version = "2.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "blake2"
@@ -280,6 +289,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "convert_case"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,6 +359,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "derive_more"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9b99b9cbbe49445b21764dc0625032a89b145a2642e67603e1c936f5458d05"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7330aeadfbe296029522e6c40f315320aba36fc43a5b3632f3795348f3bd22"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -574,7 +614,7 @@ name = "narf-accel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bitflags",
+ "bitflags 2.13.2",
  "futures",
  "narf-capabilities",
  "narf-io",
@@ -1796,6 +1836,7 @@ dependencies = [
  "narf-userspace",
  "narf-verification",
  "narf-wireless",
+ "reverie-narf-adapter",
 ]
 
 [[package]]
@@ -1832,7 +1873,7 @@ name = "narf-i3c"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bitflags",
+ "bitflags 2.13.2",
  "futures",
  "narf-capabilities",
  "narf-io",
@@ -2292,7 +2333,7 @@ name = "narf-wireless"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bitflags",
+ "bitflags 2.13.2",
  "futures",
  "narf-capabilities",
  "narf-crypto",
@@ -2306,6 +2347,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "never-say-never"
+version = "6.6.666"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2316,6 +2363,12 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pin-project-lite"
@@ -2402,6 +2455,97 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
+name = "raw-cpuid"
+version = "10.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c297679cb867470fa8c9f67dbba74a78d78e3e98d7cf2b08d6d71540f797332"
+dependencies = [
+ "bitflags 1.3.2",
+]
+
+[[package]]
+name = "reverie-core"
+version = "0.2.0"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitflags 2.13.2",
+ "never-say-never",
+ "raw-cpuid",
+ "reverie-process",
+ "reverie-syscalls",
+ "serde",
+ "syscalls",
+ "thiserror",
+]
+
+[[package]]
+name = "reverie-memory"
+version = "0.2.0"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+dependencies = [
+ "syscalls",
+]
+
+[[package]]
+name = "reverie-narf-adapter"
+version = "0.0.0"
+dependencies = [
+ "narf-console",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
+ "narf-time",
+ "narf-userspace",
+ "reverie-core",
+ "reverie-narf-core",
+ "reverie-narf-tools",
+]
+
+[[package]]
+name = "reverie-narf-core"
+version = "0.2.0"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+dependencies = [
+ "async-trait",
+ "reverie-core",
+]
+
+[[package]]
+name = "reverie-narf-tools"
+version = "0.2.0"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+dependencies = [
+ "reverie-core",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "reverie-process"
+version = "0.2.0"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+dependencies = [
+ "bitflags 2.13.2",
+ "serde",
+ "syscalls",
+]
+
+[[package]]
+name = "reverie-syscalls"
+version = "0.2.0"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+dependencies = [
+ "bitflags 2.13.2",
+ "derive_more",
+ "paste",
+ "reverie-memory",
+ "serde",
+ "syscalls",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2429,6 +2573,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -2462,6 +2607,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_repr"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d3b1629de253c70a0508c3899572da79ca359fdab27c7920ff00406df418906"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2522,6 +2678,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "syscalls"
+version = "0.6.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43d0e35dc7d73976a53c7e6d7d177ef804a0c0ee774ec77bcc520c2216fd7cbe"
+dependencies = [
+ "serde",
+ "serde_repr",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "pin-project-lite",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2532,6 +2734,18 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "universal-hash"
