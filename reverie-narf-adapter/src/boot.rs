@@ -93,10 +93,14 @@
 //! * A task is a member if it is the root, or if a member's `fork`, `vfork`,
 //!   `clone` or `clone3` returned its Linux thread ID. The dispatcher keeps a
 //!   task created during an interceptor call off the run queues until that
-//!   call's `on_syscall_return` has run, so the return is always seen before
-//!   the child starts. Membership is keyed by scheduler task id, which the
-//!   scheduler never reuses; Linux process IDs are reused, because
-//!   `alloc_pid` hands out the lowest free one.
+//!   call's `on_syscall_return` has run, so the return is seen before the
+//!   child starts, unless the callback waits after creating the child, as
+//!   Detcore's does: the wait lets the child start. A task that starts, or
+//!   exits, before the syscall that created it has returned is a member if
+//!   the kernel reports it as a thread of a live member process or a child
+//!   process of one, and that return then adds nothing. Membership is keyed
+//!   by scheduler task id, which the scheduler never reuses; Linux process
+//!   IDs are reused, because `alloc_pid` hands out the lowest free one.
 //! * Every syscall entry of a member counts. The Tool sees one syscall event
 //!   per entry except for two kinds: a park re-execution resumes the Tool call
 //!   already in flight, and the core runs a new entry natively, without an
@@ -537,6 +541,10 @@ struct Members {
     /// Linux thread IDs that a member's fork-like syscall returned, whose
     /// task has neither started nor exited yet.
     unstarted: BTreeSet<u64>,
+    /// Linux thread IDs of member tasks that started or exited before the
+    /// fork-like syscall that created them returned, which must not then
+    /// count them as unstarted. One stays here if that return is never seen.
+    early: BTreeSet<u64>,
     /// Live member tasks by scheduler task id.
     live: BTreeMap<u64, Live>,
     /// Live member tasks per Linux process ID.
@@ -583,17 +591,39 @@ impl Members {
             }
             true
         } else if let Some(ids) = ids.filter(|ids| self.unstarted.remove(&ids.tid)) {
-            self.tasks_exited += 1;
-            self.exited_unstarted += 1;
-            self.exited.push((Some(ids.tid), 0));
-            // A process's first task has its process ID as its thread ID.
-            if ids.tid == ids.pid {
-                self.processes += 1;
-            }
+            self.exit_unstarted(ids);
+            true
+        } else if let Some(ids) = ids.filter(|ids| self.created_by_member(ids)) {
+            // Exited before the syscall that created it returned.
+            self.early.insert(ids.tid);
+            self.exit_unstarted(ids);
             true
         } else {
             false
         }
+    }
+
+    /// Records the exit of a member task, whose Linux identity is `ids`,
+    /// that never started.
+    fn exit_unstarted(&mut self, ids: LinuxTaskIds) {
+        self.tasks_exited += 1;
+        self.exited_unstarted += 1;
+        self.exited.push((Some(ids.tid), 0));
+        // A process's first task has its process ID as its thread ID.
+        if ids.tid == ids.pid {
+            self.processes += 1;
+        }
+    }
+
+    /// Whether the kernel reports the task whose Linux identity is `ids` as
+    /// a thread of a live member process or a child process of one. A task
+    /// that starts or exits before the fork-like syscall that created it has
+    /// returned is a member if so.
+    fn created_by_member(&self, ids: &LinuxTaskIds) -> bool {
+        self.live_per_process.contains_key(&ids.pid)
+            || ids
+                .ppid
+                .is_some_and(|ppid| self.live_per_process.contains_key(&ppid))
     }
 
     /// Whether the hosted tree has ended: the root's process has exited and
@@ -844,7 +874,9 @@ impl<T: Tool + 'static> SyscallInterceptor for Tally<T> {
         let child = result.linux_abi_result();
         if child > 0 && creates_task(invocation.raw_number) {
             let mut members = self.state.members.lock();
-            if members.live.contains_key(&invocation.task_id) {
+            if !members.early.remove(&(child as u64))
+                && members.live.contains_key(&invocation.task_id)
+            {
                 members.unstarted.insert(child as u64);
             }
         }
@@ -862,6 +894,10 @@ impl<T: Tool + 'static> SyscallInterceptor for Tally<T> {
             let mut members = self.state.members.lock();
             let is_root = members.root.is_some_and(|(root, _)| root == task_id);
             if is_root || members.unstarted.remove(&ids.tid) {
+                members.start(task_id, ids.pid);
+            } else if members.created_by_member(&ids) {
+                // Started before the syscall that created it returned.
+                members.early.insert(ids.tid);
                 members.start(task_id, ids.pid);
             }
         }

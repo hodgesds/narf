@@ -1,8 +1,10 @@
 //! The per-entry [`KernelServices`] a hosted Tool callback runs against.
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use narf_lib::sync::IrqSafeSpinLock;
 use narf_userspace::handlers::tool_view::{self, LinuxTaskIds};
 use narf_userspace::syscall::{
     CreatedNativeTask, NativeRepollWait, NativeSyscallOriginalError, NativeSyscallOutcome,
@@ -140,6 +142,9 @@ pub struct NarfKernelServices<'a> {
     ids: LinuxTaskIds,
     raw_number: Option<u32>,
     created: Vec<(u64, Pid)>,
+    /// Where a wait adopts the created tasks before it lets them start
+    /// (see [`Self::adopting_into`]).
+    adopt: Option<&'a IrqSafeSpinLock<BTreeMap<u64, Pid>>>,
 }
 
 impl core::fmt::Debug for NarfKernelServices<'_> {
@@ -162,7 +167,8 @@ impl core::fmt::Debug for NarfKernelServices<'_> {
 // `wait_for_repoll` switches the task out, and the task may resume on another
 // CPU, but no other task reaches its stack meanwhile, and nothing here is
 // per-CPU state. So the borrowed transition is reached only by its own task,
-// and never after the call returns.
+// and never after the call returns. The adoption target is a lock the
+// interceptor shares with every task.
 unsafe impl Send for NarfKernelServices<'_> {}
 // SAFETY: as above; no shared reference escapes the synchronous poll.
 unsafe impl Sync for NarfKernelServices<'_> {}
@@ -184,7 +190,17 @@ impl<'a> NarfKernelServices<'a> {
             ids,
             raw_number,
             created: Vec::new(),
+            adopt: None,
         }
+    }
+
+    /// These services, adopting into `hosted` before each wait the tasks
+    /// this entry's transitions created, and then letting them start (see
+    /// [`KernelServices::wait_for_repoll`]). Without it a created task
+    /// starts only once the callback has returned.
+    pub fn adopting_into(mut self, hosted: &'a IrqSafeSpinLock<BTreeMap<u64, Pid>>) -> Self {
+        self.adopt = Some(hosted);
+        self
     }
 
     /// Scheduler task id of the task this entry belongs to.
@@ -193,7 +209,8 @@ impl<'a> NarfKernelServices<'a> {
     }
 
     /// The scheduler task ids and Linux thread IDs of the tasks this entry's
-    /// transitions created, in creation order.
+    /// transitions created, in creation order, that a wait has not adopted
+    /// already.
     pub fn take_created(&mut self) -> Vec<(u64, Pid)> {
         core::mem::take(&mut self.created)
     }
@@ -307,7 +324,27 @@ impl KernelServices for NarfKernelServices<'_> {
         Err(Errno::ENOSYS)
     }
 
+    /// With an adoption target ([`NarfKernelServices::adopting_into`]), the
+    /// tasks this entry's transitions created are first adopted into it and
+    /// then let start ([`NativeSyscallTransition::release_created_tasks`]),
+    /// since the callback may be waiting for one of them: Detcore's parent
+    /// waits in `create_child_thread` for a scheduler turn, which needs the
+    /// child's thread start to have begun. The core has registered each of
+    /// them by now, because it registers a created task right after the
+    /// transition that created it and waits only between two polls, so a
+    /// child still starts only once the host tracks it.
     fn wait_for_repoll(&mut self) -> RepollWait {
+        if let Some(hosted) = self.adopt {
+            if !self.created.is_empty() {
+                {
+                    let mut hosted = hosted.lock();
+                    for (task_id, tid) in self.created.drain(..) {
+                        hosted.insert(task_id, tid);
+                    }
+                }
+                self.native.release_created_tasks();
+            }
+        }
         match self.native.wait_for_repoll() {
             NativeRepollWait::Yielded => RepollWait::Yielded,
             NativeRepollWait::Killed => RepollWait::Killed,

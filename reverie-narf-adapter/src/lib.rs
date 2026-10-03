@@ -198,9 +198,16 @@
 //!   (`reverie_narf_kill_ends_a_waiting_callback`); its task is stopped at
 //!   the syscall's entry, so the syscall does not run there either. Every
 //!   other signal stays pending until the callback has returned.
-//! * A task that the waiting callback created is held off the run queues
-//!   until the callback returns (`SpawnHold`), so a callback that waits for
-//!   its own child waits until the Tool gives up or the task is killed.
+//! * A task that a callback created is held off the run queues
+//!   (`SpawnHold`) until the callback returns or, if it waits after creating
+//!   the task, until it first waits. The core has registered the task by
+//!   then, and the wait adopts it into the host before letting it start
+//!   (`NarfKernelServices::wait_for_repoll`). So a callback may wait for its
+//!   own child, as Detcore's parent waits in `create_child_thread` for a
+//!   scheduler turn that needs the child's thread start
+//!   (`reverie_narf_fork_callback_waits_for_its_child`). Under
+//!   reverie-ptrace the child's thread start can run as soon as the fork has
+//!   returned to the tracer, beside the rest of the parent's callback.
 //! * `handle_thread_start` and `handle_post_exec` wait the same way, as
 //!   Detcore's thread start waits for its scheduler to admit the thread
 //!   (`reverie_narf_thread_start_waits_for_another_task`). A task killed
@@ -269,10 +276,11 @@
 //!   share memory.
 //! * `clone(CLONE_VFORK)` run inside a Tool callback, whether as the original
 //!   or as an inject, holds the child off the run queues until the callback
-//!   returns. The parent's vfork wait is deferred until then
-//!   (`defer_vfork_wait`). So the parent's inject returns the child's TID
-//!   immediately, and the rest of the parent's callback runs before the
-//!   child's `handle_thread_start` and before any of the child's syscalls.
+//!   returns or first waits (see "Waiting callbacks"). The parent's vfork
+//!   wait is deferred until the callback returns (`defer_vfork_wait`). So
+//!   the parent's inject returns the child's TID immediately, and the rest
+//!   of the parent's callback, up to its first wait, runs before the child's
+//!   `handle_thread_start` and before any of the child's syscalls.
 //!   Under reverie-ptrace the inject returns only after
 //!   `PTRACE_EVENT_VFORK_DONE`, which comes after the child's thread start
 //!   and its syscalls up to its exec or exit. The guest-visible order is

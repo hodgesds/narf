@@ -2337,6 +2337,112 @@ fn reverie_narf_spawn_hold_and_vfork_wait() -> TestResult {
 }
 reverie_narf_test!(reverie_narf_spawn_hold_and_vfork_wait);
 
+static RELEASE_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Root forks the probe handled.
+static RELEASE_FORKS: AtomicU64 = AtomicU64::new(0);
+/// Bitmask of failed checks; 0 when all held.
+static RELEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// A raw interceptor on the fork guest. For the root's fork it runs the
+/// original inside the callback and asks the kernel to let the child start
+/// ([`NativeSyscallTransition::release_created_tasks`]) before and after it
+/// takes the child's record: the child must stay held until its record has
+/// been taken, and then be published at once, exactly once.
+struct ReleaseProbe;
+
+impl SyscallInterceptor for ReleaseProbe {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        let number = invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
+        if invocation.task_id != RELEASE_ROOT.load(Ordering::Acquire) || number != LINUX_FORK {
+            return SyscallInterception::Continue;
+        }
+        RELEASE_FORKS.fetch_add(1, Ordering::AcqRel);
+        let admitted = narf_scheduler::user_tasks_admitted();
+        let child = match native.execute_original() {
+            Ok(NativeSyscallOutcome::Returned(result)) => result.linux_abi_result(),
+            _ => {
+                RELEASE_FAILURES.fetch_or(1 << 0, Ordering::AcqRel);
+                return SyscallInterception::Continue;
+            }
+        };
+        // Its record not taken yet, the child stays held.
+        native.release_created_tasks();
+        if narf_scheduler::user_tasks_admitted() != admitted {
+            RELEASE_FAILURES.fetch_or(1 << 1, Ordering::AcqRel);
+        }
+        let reported = native
+            .take_created_task()
+            .is_some_and(|created| created.linux_pid as i64 == child && !created.thread);
+        if !reported {
+            RELEASE_FAILURES.fetch_or(1 << 2, Ordering::AcqRel);
+        }
+        // Every record taken: the first release publishes the child, and the
+        // second has nothing left to publish.
+        native.release_created_tasks();
+        native.release_created_tasks();
+        if narf_scheduler::user_tasks_admitted() != admitted + 1 {
+            RELEASE_FAILURES.fetch_or(1 << 3, Ordering::AcqRel);
+        }
+        SyscallInterception::Continue
+    }
+}
+
+/// A child held for the interceptor callback that created it is published
+/// before the callback returns once the interceptor has taken its record
+/// and asks for its release, and not before; the fork guest then runs to
+/// exit 0 as it does without the release.
+fn reverie_narf_release_publishes_a_reported_child() -> TestResult {
+    RELEASE_ROOT.store(0, Ordering::Release);
+    RELEASE_FORKS.store(0, Ordering::Release);
+    RELEASE_FAILURES.store(0, Ordering::Release);
+    result_of((|| {
+        let (root, reap) = run_guest_with(
+            FORK_GUEST,
+            Box::new(ReleaseProbe),
+            |root| {
+                RELEASE_ROOT.store(root.task_id, Ordering::Release);
+                Ok(())
+            },
+            Some(REAPER_GUEST),
+        )?;
+        let wstatus = reap
+            .ok_or("the run did not reap its root")?
+            .root_wstatus(root)?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let failures = RELEASE_FAILURES.load(Ordering::Acquire);
+        let forks = RELEASE_FORKS.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    release failures {failures:#x} forks {forks} holds {holds:?}"
+        );
+        if forks != 1 || failures & (1 << 0) != 0 {
+            return Err("the probe did not run the root's fork exactly once");
+        }
+        if failures & (1 << 1) != 0 {
+            return Err("a child was published before the interceptor took its record");
+        }
+        if failures & (1 << 2) != 0 {
+            return Err("the forked child was not reported with its pid");
+        }
+        if failures & (1 << 3) != 0 {
+            return Err("a reported child was not published exactly once when released");
+        }
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callbacks");
+        }
+        if wstatus != 0 {
+            let _ = writeln!(Writer, "    root wstatus {wstatus:#x}");
+            return Err("the fork guest did not exit 0");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_release_publishes_a_reported_child);
+
 // ── Kernel-internal re-entry ──────────────────────────────────────────────
 
 /// Narf's ring bootstrap and ring kick (guests/ring_x86_64.S).
@@ -3160,6 +3266,149 @@ fn reverie_narf_thread_start_waits_for_another_task() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_thread_start_waits_for_another_task);
+
+/// The request [`ForkWaitsForChild`]'s parent sends once its fork has run.
+const MEET_FORKED: u64 = 4;
+
+/// Where [`ForkWaitsForChild`]'s fork callback and its child's thread start
+/// meet.
+#[derive(Debug, Default)]
+struct ForkMeeting {
+    /// Thread starts so far: the root's, the fork child's, the vfork
+    /// child's.
+    starts: AtomicU64,
+    /// The fork child's thread start has begun.
+    child_started: AtomicBool,
+    /// The parent's fork callback has seen the child's start.
+    parent_done: AtomicBool,
+    /// A wait gave up.
+    gave_up: AtomicBool,
+    /// Polls of the parent's wait and of the child's start's wait.
+    parent_polls: AtomicU64,
+    child_polls: AtomicU64,
+}
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for ForkMeeting {
+    type Request = u64;
+    type Response = i64;
+    type Config = ();
+
+    async fn init_global_state(_: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, request: u64) -> i64 {
+        if request == MEET_START {
+            if self.starts.fetch_add(1, Ordering::AcqRel) != 1 {
+                // The root's start, before the fork, or the vfork child's,
+                // after the meeting: nothing to meet.
+                return 0;
+            }
+            self.child_started.store(true, Ordering::Release);
+            if wait_for(&self.parent_done, &self.child_polls, true).await {
+                return 0;
+            }
+        } else if wait_for(&self.child_started, &self.parent_polls, false).await {
+            self.parent_done.store(true, Ordering::Release);
+            return 0;
+        }
+        self.gave_up.store(true, Ordering::Release);
+        WAIT_GAVE_UP
+    }
+}
+
+/// Runs the fork guest's fork inside the callback and then waits, through
+/// [`ForkMeeting`], until the child's thread start has begun, as Detcore's
+/// parent waits in `create_child_thread` for a scheduler turn that needs
+/// the child's thread start. The child's start waits until the parent has
+/// seen it, as Detcore's waits for its scheduler to admit it. The callback
+/// returns the fork's result either way; everything else, the vfork
+/// included, is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct ForkWaitsForChild;
+
+#[reverie::tool]
+impl Tool for ForkWaitsForChild {
+    type GlobalState = ForkMeeting;
+    type ThreadState = ();
+
+    async fn handle_thread_start<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::Error> {
+        guest.send_rpc(MEET_START).await;
+        Ok(())
+    }
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        if syscall.number() != Sysno::fork {
+            guest.tail_inject(syscall).await
+        }
+        let child = guest.inject(syscall).await?;
+        guest.send_rpc(MEET_FORKED).await;
+        Ok(child)
+    }
+}
+
+/// A fork callback waits for its own child: the fork guest's parent runs
+/// its fork inside the callback and then waits until the child's thread
+/// start has begun, which itself waits until the parent has seen it. The
+/// child starts while the parent's callback waits, because the host adopts
+/// it and lets it start at the wait; a host that held it until the callback
+/// returned would leave both waits to give up. The tree then ends as the
+/// guest expects: the children exit 7 (fork) and 9 (vfork), the root 0.
+fn reverie_narf_fork_callback_waits_for_its_child() -> TestResult {
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<ForkWaitsForChild>(FORK_GUEST, ())?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let meeting = interceptor.host().global();
+        let starts = meeting.starts.load(Ordering::Acquire);
+        let parent_polls = meeting.parent_polls.load(Ordering::Acquire);
+        let child_polls = meeting.child_polls.load(Ordering::Acquire);
+        let gave_up = meeting.gave_up.load(Ordering::Acquire);
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    starts {starts} parent polls {parent_polls} child polls {child_polls} \
+             gave up {gave_up} holds {holds:?} abort reason {reason:?}"
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callbacks");
+        }
+        if gave_up {
+            return Err(
+                "a wait gave up: the child did not start while its parent's callback waited",
+            );
+        }
+        if starts != 3 {
+            return Err("the host did not start exactly the root and its two children");
+        }
+        if parent_polls < 2 {
+            return Err("the parent's callback saw its child start without waiting");
+        }
+        let exits = check_teardown(&interceptor, root, 3, 0)?;
+        let children = exits
+            .iter()
+            .filter(|exit| exit.task_id != root.task_id)
+            .map(|exit| exit.wstatus)
+            .collect::<Vec<_>>();
+        if children != [0x0700, 0x0900] {
+            let _ = writeln!(Writer, "    child wstatus {children:x?}");
+            return Err("the children did not exit 7 (fork) then 9 (vfork)");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_fork_callback_waits_for_its_child);
 
 /// Whether the kill-during-wait guest's child callback has started waiting;
 /// the flag [`KillWait`]'s child waits for, which nothing sets, and the one

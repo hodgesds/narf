@@ -259,11 +259,22 @@ pub trait NativeSyscallTransition {
     /// been reported yet. Each created task is reported at most once.
     ///
     /// The kernel holds every task created during an interceptor callback
-    /// back from the scheduler until that callback has returned, so the
+    /// back from the scheduler until that callback has returned, or until
+    /// the interceptor releases it ([`Self::release_created_tasks`]), so the
     /// interceptor can register the task before its first instruction runs.
     fn take_created_task(&mut self) -> Option<CreatedNativeTask> {
         None
     }
+
+    /// Lets the tasks this callback's transitions have created so far start
+    /// now, before the callback returns, if [`Self::take_created_task`] has
+    /// reported every one of them; otherwise does nothing. An interceptor
+    /// calls it once it has registered those tasks, before it waits
+    /// ([`Self::wait_for_repoll`]) for something that may need one of them
+    /// to run, such as the new task's own first callback. What else the
+    /// kernel defers to the callback's return, a vfork parent's wait for its
+    /// child among it, still waits for the return.
+    fn release_created_tasks(&mut self) {}
 
     /// The task's user register file as it was at syscall entry, before any
     /// transition ran, or `None` when the entry path carries no user frame.
@@ -4039,6 +4050,10 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
 
     fn take_created_task(&mut self) -> Option<CreatedNativeTask> {
         crate::user_task::take_held_spawn_record(self.task_id)
+    }
+
+    fn release_created_tasks(&mut self) {
+        crate::user_task::release_reported_spawns(self.task_id);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

@@ -3629,7 +3629,8 @@ impl PendingUserProcess {
     ///
     /// While the creating task is inside an interceptor call (a
     /// [`SpawnHold`] is open for it), the child is queued instead and
-    /// published only when that call returns; see [`SpawnHold`].
+    /// published when that call returns, or earlier if the interceptor
+    /// releases it (`release_reported_spawns`); see [`SpawnHold`].
     pub fn spawn(self) -> narf_scheduler::TaskId {
         if SPAWN_HOLD_COUNT.load(Ordering::Acquire) != 0 {
             let creator = crate::handlers::current_task_id();
@@ -3655,15 +3656,23 @@ impl PendingUserProcess {
 // reach the interceptor for a task the Tool does not know. The dispatcher
 // opens a hold for the creating task around every interceptor call; a child
 // created while it is open is queued with its identity record and published
-// only when the hold is released, after the interceptor call has returned.
-// A vfork parent's wait for its child is deferred to the same point, since
-// waiting inside the call would wait for a child that cannot yet run.
+// when the hold is released, after the interceptor call has returned. An
+// interceptor that has taken every held child's record, and so could
+// register each one, may have them published earlier, while its call still
+// runs (`release_reported_spawns`): a call that waits for another task may
+// be waiting for the child itself. A vfork parent's wait for its child is
+// deferred to the release, since waiting inside the call would wait for a
+// child that may not be able to run yet.
 
 struct HeldSpawns {
     /// Children created by the holding task, in creation order.
     children: alloc::vec::Vec<PendingUserProcess>,
     /// One identity record per held child, consumed by the interceptor.
     records: alloc::collections::VecDeque<crate::syscall::CreatedNativeTask>,
+    /// Held children whose identity could not be resolved, so that no
+    /// record reports them. While there is one, no child is published
+    /// before the release.
+    unrecorded: usize,
     /// `(child_visible_pid, parent_pid)` of a vfork whose wait was deferred.
     vfork_wait: Option<(u64, u64)>,
     /// `(signum, core_dumped)` of a termination of the holding task that a
@@ -3739,6 +3748,7 @@ impl SpawnHold {
             HeldSpawns {
                 children: alloc::vec::Vec::new(),
                 records: alloc::collections::VecDeque::new(),
+                unrecorded: 0,
                 vfork_wait: None,
                 termination: None,
                 withheld: 0,
@@ -3748,8 +3758,9 @@ impl SpawnHold {
         Some(Self { creator })
     }
 
-    /// Close the hold: publish every held child in creation order and return
-    /// what was deferred to this point, which the caller must now perform.
+    /// Close the hold: publish every child still held, in creation order,
+    /// and return what was deferred to this point, which the caller must now
+    /// perform.
     pub(crate) fn release(self) -> ReleasedHold {
         let held = SPAWN_HOLDS.lock().remove(&self.creator);
         SPAWN_HOLD_COUNT.fetch_sub(1, Ordering::AcqRel);
@@ -3857,8 +3868,9 @@ fn hold_spawn(creator: u64, child: PendingUserProcess) -> narf_scheduler::TaskId
     let held = holds
         .get_mut(&creator)
         .expect("spawn hold closed by a task other than its creator");
-    if let Some(record) = record {
-        held.records.push_back(record);
+    match record {
+        Some(record) => held.records.push_back(record),
+        None => held.unrecorded += 1,
     }
     held.children.push(child);
     id
@@ -3870,6 +3882,32 @@ pub(crate) fn take_held_spawn_record(creator: u64) -> Option<crate::syscall::Cre
         return None;
     }
     SPAWN_HOLDS.lock().get_mut(&creator)?.records.pop_front()
+}
+
+/// Publish, in creation order, the children `creator`'s open hold has
+/// queued so far, if the interceptor has taken every one's record
+/// ([`take_held_spawn_record`]); otherwise publish none. The hold stays
+/// open, and what else it defers (a vfork wait, a termination, withheld
+/// signals) still waits for its release. Returns how many were published.
+///
+/// Only the creator calls this, from inside its interceptor call, as only
+/// it opens, fills and releases its hold.
+pub(crate) fn release_reported_spawns(creator: u64) -> usize {
+    if SPAWN_HOLD_COUNT.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let children = match SPAWN_HOLDS.lock().get_mut(&creator) {
+        Some(held) if held.records.is_empty() && held.unrecorded == 0 => {
+            core::mem::take(&mut held.children)
+        }
+        _ => return 0,
+    };
+    let published = children.len();
+    // Outside the hold map's lock, as in `SpawnHold::release`.
+    for child in children {
+        child.publish();
+    }
+    published
 }
 
 /// Whether `task` has a spawn hold open, i.e. is inside an interceptor call.

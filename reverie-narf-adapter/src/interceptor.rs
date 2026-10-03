@@ -166,14 +166,14 @@ impl<T: Tool> Inner<T> {
     }
 
     fn services<'a>(
-        &self,
+        &'a self,
         task_id: u64,
         native: &'a mut dyn NativeSyscallTransition,
         raw_number: Option<u32>,
     ) -> NarfKernelServices<'a> {
         let ids = tool_view::linux_task_ids(task_id)
             .expect("reverie-narf hosted task lost its Linux identity");
-        NarfKernelServices::new(native, task_id, ids, raw_number)
+        NarfKernelServices::new(native, task_id, ids, raw_number).adopting_into(&self.hosted)
     }
 }
 
@@ -576,7 +576,9 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
                 .services(invocation.task_id, native, Some(invocation.raw_number));
         let disposition = self.inner.host.handle_syscall(&mut kernel, entry);
         // A created task is held back from the scheduler until this callback
-        // returns, so adopting it here precedes its first instruction.
+        // returns, or until the callback waits, which adopts it first (see
+        // `NarfKernelServices::wait_for_repoll`); either way it is adopted
+        // before its first instruction.
         self.adopt_created(&mut kernel);
         match disposition {
             Ok(Disposition::Complete(value)) => {
