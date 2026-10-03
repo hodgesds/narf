@@ -1550,18 +1550,34 @@ fn smoke_scheduler_replace_address_space_without_slot_returns_it() -> TestResult
             "replacement for an unqueued id kept a reference to the AS",
         ),
     ];
+    // A replacement that wrongly stored may have published the AS in a
+    // pending or queued slot, which `__reset_queues_for_test` clears, and in
+    // this CPU's active-AS cell, which it leaves alone. Discard both before
+    // failing so the defect this smoke detects does not leak into later
+    // tests, and report any reference that survived the cleanup.
+    fn discard_and_fail(addr_space: &Arc<AddressSpace>, why: &'static str) -> TestResult {
+        crate::__reset_queues_for_test();
+        let stale = {
+            let mut active = crate::active_user_as_slot().lock();
+            if active.as_ref().is_some_and(|a| Arc::ptr_eq(a, addr_space)) {
+                active.take()
+            } else {
+                None
+            }
+        };
+        drop(stale);
+        let survivors = Arc::strong_count(addr_space) - 1;
+        let msg = alloc::format!("{why}; {survivors} reference(s) survived cleanup");
+        TestResult::Fail(alloc::boxed::Box::leak(msg.into_boxed_str()))
+    }
     for (id, claimed, kept) in cases {
         match crate::replace_address_space(id, Arc::clone(&addr_space)) {
             Err(back) if Arc::ptr_eq(&back, &addr_space) => drop(back),
             Err(_) => return TestResult::Fail("no-slot replacement returned a different AS"),
-            Ok(_) => {
-                crate::__reset_queues_for_test();
-                return TestResult::Fail(claimed);
-            }
+            Ok(_) => return discard_and_fail(&addr_space, claimed),
         }
         if Arc::strong_count(&addr_space) != 1 {
-            crate::__reset_queues_for_test();
-            return TestResult::Fail(kept);
+            return discard_and_fail(&addr_space, kept);
         }
     }
     TestResult::Pass
