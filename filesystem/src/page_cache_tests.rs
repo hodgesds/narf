@@ -305,3 +305,54 @@ kernel_test_in!(
     "filesystem/page_cache",
     smoke_page_cache_rejects_misaligned_and_overlapping_folios
 );
+
+/// `invalidate_range` drops exactly the folios of one `(fs_id, inode)` that
+/// overlap the page range — a multi-page folio straddling an end goes whole —
+/// and leaves neighbours and other inodes cached.
+fn smoke_page_cache_invalidate_range_is_exact() -> TestResult {
+    let cache = PageCache::with_capacity(0);
+    let other = |page_off| PageKey {
+        fs_id: 0,
+        inode: 7,
+        page_off,
+    };
+    for p in [0u64, 1, 2, 3, 6] {
+        cache.insert_folio(key(p), clean_folio(p as u8));
+        cache.insert_folio(other(p), clean_folio(0xee));
+    }
+    // An order-1 folio over pages 4-5 straddles the range's start (5).
+    if !cache.insert_folio(key(4), clean_order_folio(1, 4)) {
+        return TestResult::Fail("order-1 folio at page 4 was not inserted");
+    }
+    // Drop [1, 3) and [5, 6).
+    let dropped = cache.invalidate_range(0, 0, 1, 3) + cache.invalidate_range(0, 0, 5, 6);
+    if dropped != 4 {
+        return TestResult::Fail("expected pages 1, 2 and the 4-5 folio (4 pages) dropped");
+    }
+    for (p, kept) in [
+        (0, true),
+        (1, false),
+        (2, false),
+        (3, true),
+        (4, false),
+        (5, false),
+        (6, true),
+    ] {
+        if cache.lookup_folio(key(p)).is_some() != kept {
+            return TestResult::Fail("invalidate_range kept or dropped the wrong page");
+        }
+    }
+    for p in [0u64, 1, 2, 3, 6] {
+        if cache.lookup_folio(other(p)).is_none() {
+            return TestResult::Fail("invalidate_range touched another inode's pages");
+        }
+    }
+    if cache.invalidate_range(0, 0, 3, 3) != 0 || cache.lookup_folio(key(3)).is_none() {
+        return TestResult::Fail("an empty range must drop nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_invalidate_range_is_exact
+);

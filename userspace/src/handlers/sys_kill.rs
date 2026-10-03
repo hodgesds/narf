@@ -3,7 +3,8 @@ use super::*;
 
 pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let spec = args.arg0 as i64;
+    // `pid` is a pid_t: only the low 32 bits of the register count.
+    let spec = i64::from(args.arg0 as u32 as i32);
     let signum = args.arg1 as u32;
     let einval = errno_ret(EINVAL);
     let esrch = errno_ret(ESRCH);

@@ -17,6 +17,20 @@ fn smoke_abi_signal_kill_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_pos);
 
+// `pid` is a pid_t (SYSCALL_DEFINE2(kill, pid_t, pid, int, sig)): only the
+// low 32 bits count. A pid with stray upper bits names the same process, so
+// the null-signal probe of ourselves succeeds; NARF read the full register
+// and answered ESRCH for a pid of 4 billion.
+fn smoke_abi_signal_kill_pid_is_int() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Kill.raw(), a1((1u64 << 32) | FAKE_TASK, 0)) != Some(0) {
+            return Err("kill(pid with high bits set, 0) should probe the low-32-bit pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_kill_pid_is_int);
+
 // POSIX null signal: `kill(pid, 0)` does existence/permission checking only
 // and queues NOTHING. Regression for the stress-ng bug where a parent probing
 // a child's liveness with kill(child, 0) set pending bit 0, which the delivery

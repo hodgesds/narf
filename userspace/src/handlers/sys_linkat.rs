@@ -62,7 +62,8 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
     // O_TMPFILE materialisation, form 1: AT_EMPTY_PATH + empty oldpath →
     // olddirfd is the O_TMPFILE fd whose anonymous inode gets named.
     if flags & AT_EMPTY_PATH != 0 && old_raw.is_empty() {
-        let src_fd = args.arg0 as i64;
+        // `olddirfd` is an int: only the low 32 bits of the register count.
+        let src_fd = i64::from(args.arg0 as u32 as i32);
         if src_fd < 0 {
             ctx.set_return(errno_ret(EBADF));
             return;

@@ -333,9 +333,10 @@ pub(crate) fn test_virtgpu_resource(resource_id: u32, size: usize) -> Arc<VirtGp
 struct VirtGpuHandle {
     handle: u32,
     resource: Arc<VirtGpuResource>,
-    /// Classic resources and PRIME imports were explicitly CTX_ATTACHed;
-    /// blob creation associates ownership in its header and is not detached
-    /// through CTX_DETACH on handle close.
+    /// The resource was CTX_ATTACHed to this open's context when the handle
+    /// was created (classic resources, blobs and PRIME imports alike, as
+    /// Linux's virtio_gpu_gem_object_open does), so closing the handle sends
+    /// CTX_DETACH.
     attached: bool,
 }
 
@@ -548,6 +549,7 @@ impl VirtGpuRenderState {
         backing: GuestBacking,
         blob_mem: u32,
         host3d_blob: bool,
+        attached: bool,
     ) {
         self.bind(
             handle,
@@ -559,7 +561,7 @@ impl VirtGpuRenderState {
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
-            false,
+            attached,
         );
     }
 
@@ -572,6 +574,7 @@ impl VirtGpuRenderState {
         window_phys: u64,
         offset: u64,
         size: u64,
+        attached: bool,
     ) {
         self.bind(
             handle,
@@ -587,12 +590,18 @@ impl VirtGpuRenderState {
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
-            false,
+            attached,
         );
     }
 
     /// Record a host-only blob (e.g. non-mappable VRAM) — no CPU mapping.
-    pub(crate) fn insert_host_only(&self, handle: u32, resource_id: u32, size: u64) {
+    pub(crate) fn insert_host_only(
+        &self,
+        handle: u32,
+        resource_id: u32,
+        size: u64,
+        attached: bool,
+    ) {
         self.bind(
             handle,
             Arc::new(VirtGpuResource {
@@ -603,7 +612,7 @@ impl VirtGpuRenderState {
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
             }),
-            false,
+            attached,
         );
     }
 
@@ -791,6 +800,12 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
     }
     let handle = state.allocate_handle();
     let resource_id = NEXT_VIRTGPU_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    // Linux attaches every GEM object to the opener's VirGL context when its
+    // handle is created (virtio_gpu_gem_object_open), blobs included, and
+    // detaches it on handle close. virglrenderer resolves a resource named in
+    // a context's command stream only through that context's attached set, so
+    // an unattached blob is an "Illegal resource" to the context that made it.
+    let attach = dev.virgl_enabled();
     match req.blob_mem {
         // Guest-page backed: allocate coherent DMA and attach it as the backing.
         BLOB_MEM_GUEST | BLOB_MEM_HOST3D_GUEST => {
@@ -813,6 +828,7 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
                 backing,
                 req.blob_mem,
                 req.blob_mem == BLOB_MEM_HOST3D_GUEST,
+                attach,
             );
         }
         // Host-allocated (host3d). Create the host resource; only USE_MAPPABLE
@@ -836,13 +852,20 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
                     .ok_or(FsError::OutOfMemory)?;
                 dev.map_blob(resource_id, offset)
                     .map_err(|_| FsError::InvalidData)?;
-                state.insert_host_visible(handle, resource_id, base, offset, req.size);
+                state.insert_host_visible(handle, resource_id, base, offset, req.size, attach);
             } else {
-                state.insert_host_only(handle, resource_id, req.size);
+                state.insert_host_only(handle, resource_id, req.size, attach);
             }
         }
 
         _ => return Err(FsError::InvalidData),
+    }
+    if attach {
+        if let Err(error) = dev.attach_virgl_resource(state.ctx_id, resource_id) {
+            // Not attached, so no detach: dropping the binding unrefs it.
+            drop(state.take(handle));
+            return Err(map_gpu_transport_error(error));
+        }
     }
     req.bo_handle = handle;
     req.res_handle = resource_id;

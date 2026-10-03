@@ -829,6 +829,264 @@ fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
     }
     TestResult::Pass
 }
+
+/// A block write invalidates only the cache pages it covers. The volume used
+/// to drop its whole clean page cache on every `write_byte_range`, so each
+/// small metadata or data write forced every later read on the volume back to
+/// the device — a Plasma login writing its caches to an ext4 home re-read
+/// plasmashell's libraries page by page and sat on a black screen for minutes.
+fn smoke_ext2_block_write_invalidates_only_its_pages() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_block::{
+        ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
+        CancelResult, LbaRange,
+    };
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    struct CountingBlock {
+        inner: Arc<RamBlockDevice>,
+        reads: AtomicUsize,
+    }
+
+    impl BlockDevice for CountingBlock {
+        fn logical_block_size(&self) -> u32 {
+            self.inner.logical_block_size()
+        }
+        fn physical_block_size(&self) -> u32 {
+            self.inner.physical_block_size()
+        }
+        fn capacity_blocks(&self) -> u64 {
+            self.inner.capacity_blocks()
+        }
+        fn supports(&self, feature: BlockFeature) -> bool {
+            self.inner.supports(feature)
+        }
+        fn submit(
+            &self,
+            request: BlockRequest,
+        ) -> impl core::future::Future<Output = BlockCompletion> + Send {
+            if matches!(request.op, BlockOp::Read) {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.submit(request)
+        }
+        fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.flush()
+        }
+        fn discard(&self, range: LbaRange) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.discard(range)
+        }
+        fn cancel(&self, tag: u64) -> impl core::future::Future<Output = CancelResult> + Send {
+            self.inner.cancel(tag)
+        }
+    }
+
+    const BS: u64 = 1024;
+    let device = Arc::new(CountingBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
+        reads: AtomicUsize::new(0),
+    });
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let mut buf = [0u8; 10];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) {
+        return TestResult::Fail("first read failed");
+    }
+
+    // The file's data is block 10: 4 KiB page 2 (blocks 8-11). Block 20 is
+    // page 5, which the file does not touch.
+    if !matches!(
+        poll_once(volume.write_byte_range(20 * BS, &[0xa5; 16])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write to an unrelated block failed");
+    }
+    let reads_before = device.reads.load(Ordering::Relaxed);
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) || &buf != b"page cache" {
+        return TestResult::Fail("read after an unrelated write failed");
+    }
+    if device.reads.load(Ordering::Relaxed) != reads_before {
+        return TestResult::Fail("a write to another page evicted the file's cached block");
+    }
+
+    // A write over the file's own block must not leave the old bytes cached.
+    if !matches!(
+        poll_once(volume.write_byte_range(10 * BS, b"PAGE")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write over the file's block failed");
+    }
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) || &buf != b"PAGE cache" {
+        return TestResult::Fail("a write over a cached block left the stale bytes visible");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_block_write_invalidates_only_its_pages
+);
+/// A page-cache miss holds only its own page's fill lock, and a write never
+/// waits for fills: with a read of one page stalled at the device, a write to
+/// another page completes at once. The fill lock used to be volume-wide and
+/// the write took it for its whole device round trip, so one slow miss
+/// stalled every write (and every other miss) on the volume. A fill that read
+/// a page before a write landed must still not cache those old bytes.
+fn smoke_ext2_write_does_not_wait_for_a_stalled_fill() -> TestResult {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_block::{
+        ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
+        CancelResult, LbaRange,
+    };
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    /// Holds every read at the device while `held` is set.
+    struct GatedBlock {
+        inner: Arc<RamBlockDevice>,
+        held: AtomicBool,
+    }
+
+    impl BlockDevice for GatedBlock {
+        fn logical_block_size(&self) -> u32 {
+            self.inner.logical_block_size()
+        }
+        fn physical_block_size(&self) -> u32 {
+            self.inner.physical_block_size()
+        }
+        fn capacity_blocks(&self) -> u64 {
+            self.inner.capacity_blocks()
+        }
+        fn supports(&self, feature: BlockFeature) -> bool {
+            self.inner.supports(feature)
+        }
+        fn submit(
+            &self,
+            request: BlockRequest,
+        ) -> impl core::future::Future<Output = BlockCompletion> + Send {
+            let gated = matches!(request.op, BlockOp::Read);
+            async move {
+                if gated {
+                    core::future::poll_fn(|_| {
+                        if self.held.load(Ordering::Acquire) {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        }
+                    })
+                    .await;
+                }
+                self.inner.submit(request).await
+            }
+        }
+        fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.flush()
+        }
+        fn discard(&self, range: LbaRange) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.discard(range)
+        }
+        fn cancel(&self, tag: u64) -> impl core::future::Future<Output = CancelResult> + Send {
+            self.inner.cancel(tag)
+        }
+    }
+
+    fn noop_waker() -> Waker {
+        fn raw() -> RawWaker {
+            unsafe fn clone(_: *const ()) -> RawWaker {
+                raw()
+            }
+            unsafe fn noop(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        // SAFETY: every vtable function is a no-op or rebuilds the same
+        // RawWaker; the null data pointer is never dereferenced.
+        unsafe { Waker::from_raw(raw()) }
+    }
+
+    const BS: u64 = 1024;
+    let device = Arc::new(GatedBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
+        held: AtomicBool::new(false),
+    });
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Stall a miss on block 40 (page 10, which nothing has read) at the
+    // device.
+    device.held.store(true, Ordering::Release);
+    let mut buf = [0u8; BS as usize];
+    let mut fill = Box::pin(volume.read_block(40, &mut buf));
+    if fill.as_mut().poll(&mut cx).is_ready() {
+        return TestResult::Fail("the gated read completed without the device");
+    }
+
+    // Whole, aligned 512-byte sectors, so the writes need no read-modify-write
+    // read (which the gate would hold).
+    let sector = [0xa5u8; 512];
+    let mut page_sector = [0xa5u8; 512];
+    page_sector[..4].copy_from_slice(b"PAGE");
+    // A write to another page (block 20, page 5) must not wait for it.
+    let mut other = Box::pin(volume.write_byte_range(20 * BS, &sector));
+    match other.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(())) => {}
+        Poll::Ready(Err(_)) => return TestResult::Fail("write to another page failed"),
+        Poll::Pending => return TestResult::Fail("a write waited behind a stalled fill"),
+    }
+    // A write over the page being filled lands while the fill is stalled.
+    let mut over = Box::pin(volume.write_byte_range(40 * BS, &page_sector));
+    if !matches!(over.as_mut().poll(&mut cx), Poll::Ready(Ok(()))) {
+        return TestResult::Fail("write over the filling page did not complete");
+    }
+
+    // Release the device; the stalled fill finishes with whatever it read.
+    device.held.store(false, Ordering::Release);
+    let mut finished = false;
+    for _ in 0..16 {
+        if let Poll::Ready(r) = fill.as_mut().poll(&mut cx) {
+            if r.is_err() {
+                return TestResult::Fail("the stalled read failed");
+            }
+            finished = true;
+            break;
+        }
+    }
+    drop(fill);
+    if !finished {
+        return TestResult::Fail("the stalled read never finished after release");
+    }
+
+    // Whatever the racing fill read must not have been cached over the write.
+    let mut after = [0u8; BS as usize];
+    if !matches!(poll_once(volume.read_block(40, &mut after)), Some(Ok(_)))
+        || &after[..4] != b"PAGE"
+    {
+        return TestResult::Fail("a fill that raced a write cached the old bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_write_does_not_wait_for_a_stalled_fill
+);
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_page_cache_reuses_1k_data_block

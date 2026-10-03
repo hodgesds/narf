@@ -3,7 +3,10 @@ use super::*;
 
 pub(crate) fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let who = args.arg0 as i64;
+    // `who` is a C int (SYSCALL_DEFINE2(getrusage, int, who, ...)): only the
+    // low 32 bits count, so a -1 passed through a 32-bit register is
+    // RUSAGE_CHILDREN whatever the upper half holds.
+    let who = i64::from(args.arg0 as u32 as i32);
     let out = args.arg1;
     // RUSAGE_SELF (0) → this task's own CPU time; RUSAGE_CHILDREN (-1) →
     // accumulated reaped-children CPU time; RUSAGE_THREAD (1) → per-thread,
