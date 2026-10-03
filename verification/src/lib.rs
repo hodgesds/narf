@@ -2383,9 +2383,14 @@ fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
     if udata_access & 0x10 == 0 {
         return TestResult::Fail("user-data descriptor S bit not set");
     }
-    // Writable-data type: low nibble 0x2 (data + writable).
-    if udata_access & 0x0F != 0x02 {
-        return TestResult::Fail("user-data descriptor type != writable data");
+    // Writable-data type with the Accessed bit preset: low nibble 0x3
+    // (data + writable + accessed), Linux's `__USER_DS` type. The CPU sets
+    // the Accessed bit itself the first time a user task loads the selector,
+    // so a table built without it reads 0x2 before the first user task and
+    // 0x3 after; the preset makes the byte the same whenever this runs.
+    if udata_access & 0x0F != 0x03 {
+        let _ = writeln!(Writer, "    user-data access byte {udata_access:#04x}");
+        return TestResult::Fail("user-data descriptor type != writable accessed data");
     }
 
     let ucode_access = read_access(6);
@@ -2395,9 +2400,11 @@ fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
     if ucode_access & 0x10 == 0 {
         return TestResult::Fail("user-code descriptor S bit not set");
     }
-    // Exec/read code type: low nibble 0xA (code + readable).
-    if ucode_access & 0x0F != 0x0A {
-        return TestResult::Fail("user-code descriptor type != exec/readable code");
+    // Exec/read code type with the Accessed bit preset: low nibble 0xB
+    // (code + readable + accessed), Linux's `__USER_CS` type.
+    if ucode_access & 0x0F != 0x0B {
+        let _ = writeln!(Writer, "    user-code access byte {ucode_access:#04x}");
+        return TestResult::Fail("user-code descriptor type != exec/readable accessed code");
     }
 
     // Kernel code descriptor (index 1) must still be DPL=0.

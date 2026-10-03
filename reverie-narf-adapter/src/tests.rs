@@ -707,11 +707,13 @@ fn result_of(outcome: Result<TestResult, &'static str>) -> TestResult {
 /// The kernel-global switches that a reverie-narf test may change while it
 /// runs, and must restore before the next test: the signal tables
 /// (`narf_userspace::signal_init` and `sigaction_init`), the vDSO clock
-/// routing, and user-task SMP placement with work stealing.
+/// routing, the vDSO image registration, and user-task SMP placement with
+/// work stealing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct GlobalSwitches {
     signal_tables: narf_userspace::handlers::SignalTablesState,
     clocks_route_through_syscalls: bool,
+    vdso_registered: bool,
     user_task_smp: bool,
     work_stealing: bool,
 }
@@ -721,6 +723,7 @@ impl GlobalSwitches {
         Self {
             signal_tables: narf_userspace::handlers::__test_signal_tables_state(),
             clocks_route_through_syscalls: narf_userspace::vdso::clocks_route_through_syscalls(),
+            vdso_registered: narf_userspace::vdso::vdso_registered(),
             user_task_smp: narf_scheduler::user_task_smp_enabled(),
             work_stealing: narf_scheduler::work_stealing_enabled(),
         }
@@ -745,6 +748,9 @@ fn leak_checked(test: fn() -> TestResult) -> TestResult {
     }
     if after.clocks_route_through_syscalls != before.clocks_route_through_syscalls {
         return TestResult::Fail("the test left the vDSO clock routing changed");
+    }
+    if after.vdso_registered != before.vdso_registered {
+        return TestResult::Fail("the test left the vDSO image registered");
     }
     if after.user_task_smp != before.user_task_smp {
         return TestResult::Fail("the test left user-task SMP placement changed");
@@ -2394,6 +2400,43 @@ impl Tool for VdsoCalls {
     }
 }
 
+/// Registers the vDSO image for one test and, if this guard is what
+/// registered it, unregisters it again on every return path. Kernel-test
+/// boots skip the boot-time registration, and while an image is registered
+/// every process the loader builds maps the vDSO and gets `AT_SYSINFO_EHDR`,
+/// which changes the stack and region layout that later loader tests check
+/// (`smoke_userspace_load_user_process_builds_runnable_image` and
+/// `smoke_userspace_load_user_process_with_interp`).
+struct VdsoRegistration {
+    registered_here: bool,
+}
+
+impl VdsoRegistration {
+    fn register() -> Self {
+        let before = narf_userspace::vdso::vdso_registered();
+        narf_userspace::vdso::register_vdso_image(
+            narf_verification::NARF_VDSO_ELF,
+            narf_scheduler::narf_time::cycles_per_ns(),
+        );
+        Self {
+            registered_here: !before,
+        }
+    }
+}
+
+impl Drop for VdsoRegistration {
+    fn drop(&mut self) {
+        if !self.registered_here {
+            return;
+        }
+        // A refusal leaves the image registered, which `leak_checked`
+        // then reports by name.
+        if let Err(why) = narf_userspace::vdso::__verification_unregister_vdso_image() {
+            let _ = writeln!(Writer, "    vDSO unregistration refused: {why}");
+        }
+    }
+}
+
 /// With a Reverie interceptor installed for a Tool subscribed to the vDSO's
 /// syscalls, a guest that calls the vDSO's `clock_gettime`, `gettimeofday`,
 /// `time` and `getcpu` (found through `AT_SYSINFO_EHDR`, as a libc finds
@@ -2412,10 +2455,7 @@ fn reverie_narf_vdso_calls_reach_the_tool() -> TestResult {
         return TestResult::Fail("the kernel was built without a vDSO image");
     }
     // Kernel-test boots skip the boot-time vDSO registration.
-    narf_userspace::vdso::register_vdso_image(
-        narf_verification::NARF_VDSO_ELF,
-        narf_scheduler::narf_time::cycles_per_ns(),
-    );
+    let _vdso = VdsoRegistration::register();
     result_of((|| {
         if narf_userspace::vdso::clocks_route_through_syscalls() {
             return Err("vDSO clocks already used syscalls before the interceptor");

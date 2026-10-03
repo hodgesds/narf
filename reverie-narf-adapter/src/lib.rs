@@ -152,8 +152,12 @@
 //!   subsystem's test in the same boot left the tables set up.
 //! * **Leak check.** Every reverie-narf test is registered through
 //!   `reverie_narf_test!`, which fails the test by name if it left the signal
-//!   tables, the vDSO clock routing, user-task SMP placement or work stealing
-//!   different from how it found them.
+//!   tables, the vDSO clock routing, the vDSO image registration, user-task
+//!   SMP placement or work stealing different from how it found them. The
+//!   vDSO test registers the image itself (kernel-test boots skip the boot
+//!   registration) and unregisters it afterwards, because every process
+//!   loaded while it is registered maps the vDSO, which changes the loader
+//!   tests' stack and region layout.
 //! * **Reclaim scope.** After each run, the test harness's `reclaim_run`
 //!   checks two things: every address space the guest's tasks exited from
 //!   was dropped, and the root image's private frames reached a COW count of

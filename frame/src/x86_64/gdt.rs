@@ -33,6 +33,15 @@ pub const UDATA_SEL: u16 = 0x28 | 3; // index 5, RPL=3 → 0x2B
 /// User-code selector (RPL = 3) — long-mode code at DPL=3.
 pub const UCODE_SEL: u16 = 0x30 | 3; // index 6, RPL=3 → 0x33
 
+/// Kernel-code descriptor: long mode, DPL 0, exec/read, Accessed preset.
+const KCODE_DESC: u64 = 0x00af_9b00_0000_ffff;
+/// Kernel-data descriptor: present, writable, Accessed preset.
+const KDATA_DESC: u64 = 0x00cf_9300_0000_ffff;
+/// User-data descriptor: present, writable, DPL 3, Accessed preset.
+const UDATA_DESC: u64 = 0x00cf_f300_0000_ffff;
+/// User-code descriptor: long mode, DPL 3, exec/read, Accessed preset.
+const UCODE_DESC: u64 = 0x00af_fb00_0000_ffff;
+
 /// IST slot assignments, STAGE1.md Wave 2 #7.
 pub const IST_NMI: u8 = 1;
 pub const IST_DF: u8 = 2;
@@ -200,10 +209,18 @@ pub unsafe fn init() {
 
     // ── build GDT descriptors ──
     //
-    // Kernel code (long mode): L=1, P=1, DPL=0, S=1, Type=exec/read.
-    //   0x00af_9a00_0000_ffff
-    // Kernel data (present, writable): cosmetic in long mode.
-    //   0x00cf_9200_0000_ffff
+    // Every code and data descriptor is built with its Accessed bit (type
+    // bit 0) already set, as Linux builds its GDT (`_DESC_ACCESSED` in
+    // `_DESC_CODE`/`_DESC_DATA`, arch/x86/include/asm/desc_defs.h). The CPU
+    // sets that bit itself, by writing the GDT, the first time it loads a
+    // descriptor whose bit is clear: an IRETQ to user mode loads SS and CS
+    // from the table, so without the preset the descriptor bytes would
+    // change the first time a user task ran. With it they never change.
+    //
+    // Kernel code (long mode): L=1, P=1, DPL=0, S=1, Type=exec/read/accessed.
+    //   0x00af_9b00_0000_ffff
+    // Kernel data (present, writable, accessed): cosmetic in long mode.
+    //   0x00cf_9300_0000_ffff
     // TSS descriptor (system; 16 bytes):
     //   low:  type=0x9 (available 64-bit TSS), P=1, limit=sizeof(TSS)-1,
     //         base[31:0] stitched in.
@@ -219,21 +236,21 @@ pub unsafe fn init() {
         | (((tss_base >> 24) & 0xFF) << 56);
     let tss_hi: u64 = tss_base >> 32;
 
-    // User-code (long mode, DPL=3): L=1, P=1, DPL=3, S=1, Type=exec/read.
-    //   0x00af_fa00_0000_ffff     (same as kernel code but DPL=3 → byte 5: 0xFA)
-    // User-data (present, writable, DPL=3): cosmetic in long mode.
-    //   0x00cf_f200_0000_ffff
+    // User-code (long mode, DPL=3): L=1, P=1, DPL=3, S=1, Type=exec/read/accessed.
+    //   0x00af_fb00_0000_ffff     (same as kernel code but DPL=3 → byte 5: 0xFB)
+    // User-data (present, writable, accessed, DPL=3): cosmetic in long mode.
+    //   0x00cf_f300_0000_ffff
     //
     // SAFETY: single-threaded boot path, no prior readers.
     unsafe {
         let gdt = core::ptr::addr_of_mut!(GDT).cast::<u64>();
         gdt.add(0).write(0); // null
-        gdt.add(1).write(0x00af_9a00_0000_ffff); // kernel code  (0x08)
-        gdt.add(2).write(0x00cf_9200_0000_ffff); // kernel data  (0x10)
+        gdt.add(1).write(KCODE_DESC); // kernel code  (0x08)
+        gdt.add(2).write(KDATA_DESC); // kernel data  (0x10)
         gdt.add(3).write(tss_lo); // TSS lo       (0x18)
         gdt.add(4).write(tss_hi); // TSS hi       (0x20)
-        gdt.add(5).write(0x00cf_f200_0000_ffff); // user data    (0x28 | 3)
-        gdt.add(6).write(0x00af_fa00_0000_ffff); // user code    (0x30 | 3)
+        gdt.add(5).write(UDATA_DESC); // user data    (0x28 | 3)
+        gdt.add(6).write(UCODE_DESC); // user code    (0x30 | 3)
     }
 
     // ── LGDT ──
@@ -458,12 +475,12 @@ pub unsafe fn init_ap() -> (u64, u64) {
 
         let gdt = core::ptr::addr_of_mut!((*block).gdt).cast::<u64>();
         gdt.add(0).write(0);
-        gdt.add(1).write(0x00af_9a00_0000_ffff); // kernel code (0x08)
-        gdt.add(2).write(0x00cf_9200_0000_ffff); // kernel data (0x10)
+        gdt.add(1).write(KCODE_DESC); // kernel code (0x08)
+        gdt.add(2).write(KDATA_DESC); // kernel data (0x10)
         gdt.add(3).write(tss_lo); // TSS lo      (0x18)
         gdt.add(4).write(tss_hi); // TSS hi      (0x20)
-        gdt.add(5).write(0x00cf_f200_0000_ffff); // user data  (0x28|3)
-        gdt.add(6).write(0x00af_fa00_0000_ffff); // user code  (0x30|3)
+        gdt.add(5).write(UDATA_DESC); // user data  (0x28|3)
+        gdt.add(6).write(UCODE_DESC); // user code  (0x30|3)
 
         // LGDT this AP's table.
         let ptr = Pseudo {

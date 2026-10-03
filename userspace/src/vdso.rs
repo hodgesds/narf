@@ -156,6 +156,49 @@ pub fn register_vdso_image(bytes: &[u8], cycles_per_ns: u32) {
     });
 }
 
+/// Whether a vDSO image is registered, so that every process loaded from
+/// now on maps it and gets `AT_SYSINFO_EHDR`.
+pub fn vdso_registered() -> bool {
+    VDSO.lock().is_some()
+}
+
+/// Undo [`register_vdso_image`] for a verification test that registered the
+/// image in a kernel-test boot, which skips the boot-time registration.
+/// While an image is registered, every process the loader builds maps the
+/// vDSO and gets `AT_SYSINFO_EHDR`, so a registration left behind changes the
+/// layout that every later loader test sees.
+///
+/// Refuses, leaving the image registered, unless no address space maps it:
+/// each master frame must hold exactly the two references it held after
+/// registration (its implicit owner and the permanent reference), and the
+/// vvar frame none. Otherwise frees the masters and the vvar page.
+#[cfg(feature = "verification-test-reset")]
+#[doc(hidden)]
+pub fn __verification_unregister_vdso_image() -> Result<(), &'static str> {
+    use narf_memory::frame::cow;
+    let mut g = VDSO.lock();
+    let Some(img) = g.as_ref() else {
+        return Ok(());
+    };
+    if img.vdso_frames.iter().any(|&f| cow::count(f) != 2) {
+        return Err("a vDSO master frame is still mapped");
+    }
+    if cow::count(img.vvar_frame) != 0 {
+        return Err("the vvar frame carries a COW reference");
+    }
+    let Some(img) = g.take() else {
+        return Ok(());
+    };
+    drop(g);
+    for f in img.vdso_frames {
+        // Drop the permanent reference, then the implicit owner's.
+        let _ = cow::dec_ref(f);
+        narf_memory::free_frame(narf_memory::PhysFrame::new(f));
+    }
+    narf_memory::free_frame(narf_memory::PhysFrame::new(img.vvar_frame));
+    Ok(())
+}
+
 /// Publish a new realtime offset (called from `clock_settime`). Seqlock-
 /// guarded so the vDSO never reads a torn value.
 pub fn update_wall_offset(offset_ns: i64) {
