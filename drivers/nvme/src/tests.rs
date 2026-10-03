@@ -2336,3 +2336,465 @@ fn smoke_nvme_controller_slot_is_stable() -> TestResult {
     }
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_controller_slot_is_stable);
+
+// ── Abandoned-command smokes ─────────────────────────────────────────
+//
+// Each smoke below brings up its own controller (the last one installs
+// it as the block device's) and drives one path of the abandoned-command
+// bookkeeping in `Queue`: a reap that times out, a completion-id
+// mismatch that resets the queue, a reset that fails, and the transfer
+// of a timed-out block request's buffer from its cap to the queue.
+
+/// Bring up a controller with one polled I/O queue on QEMU's NVMe
+/// device. `Err` carries the smoke's result (skip or fail).
+fn abandon_smoke_controller() -> Result<crate::Controller, TestResult> {
+    use crate::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: as in smoke_nvme_io_round_trip: boot-time kernel-test with
+    // the allocator online; ECAM_DEFAULT_BASE is identity-mapped.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let dev = devices()
+        .iter()
+        .find(|d| {
+            matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+        })
+        .copied()
+        .ok_or(TestResult::Skip("no QEMU NVMe controller"))?;
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = claim_device_cap(&authority, dev.addr)
+        .map_err(|_| TestResult::Fail("claim_device_cap failed"))?;
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return Err(TestResult::Fail("Controller::bring_up failed"));
+    }
+    if ctrl.create_io_queue().is_err() {
+        return Err(TestResult::Fail("Controller::create_io_queue failed"));
+    }
+    if ctrl.lba_bytes != 512 {
+        return Err(TestResult::Fail("expected 512-byte LBAs on QEMU default"));
+    }
+    Ok(ctrl)
+}
+
+/// Sector pattern for `lba`, byte `i` (LBAs 2 and 3, as in
+/// smoke_nvme_timed_out_io_does_not_desync_queue).
+fn abandon_pattern(lba: u64, i: usize) -> u8 {
+    (i as u8) ^ (lba as u8).wrapping_mul(0x5B) ^ 0xA5
+}
+
+fn abandon_fill(buf: &narf_io::DmaBuffer, f: &dyn Fn(usize) -> u8) {
+    for i in 0..512usize {
+        // SAFETY: 4 KiB coherent DMA buffer; i < 512.
+        unsafe { core::ptr::write_volatile(buf.cpu_mut_ptr::<u8>().add(i), f(i)) };
+    }
+}
+
+fn abandon_holds(buf: &narf_io::DmaBuffer, lba: u64) -> bool {
+    (0..512usize).all(|i| {
+        // SAFETY: 4 KiB coherent DMA buffer; i < 512.
+        let v = unsafe { core::ptr::read_volatile(buf.cpu_ptr::<u8>().add(i)) };
+        v == abandon_pattern(lba, i)
+    })
+}
+
+/// Seed LBAs 2 and 3 with their patterns.
+fn abandon_seed(ctrl: &mut crate::Controller, wbuf: &narf_io::DmaBuffer) -> Result<(), TestResult> {
+    for lba in [2u64, 3] {
+        abandon_fill(wbuf, &|i| abandon_pattern(lba, i));
+        if ctrl.write_lba(lba, 1, wbuf).is_err() {
+            return Err(TestResult::Fail("seeding write failed"));
+        }
+    }
+    Ok(())
+}
+
+/// Time out one read of LBA 2 into `buf` with a 0 ms bound, then restore
+/// the timeout. Retried, as in
+/// smoke_nvme_timed_out_io_does_not_desync_queue, because QEMU can
+/// complete before the first look.
+fn abandon_force_timeout(
+    ctrl: &mut crate::Controller,
+    buf: &narf_io::DmaBuffer,
+) -> Result<(), TestResult> {
+    use crate::NvmeError;
+    ctrl.__test_set_io_timeout_ms(0);
+    let mut r = Err(TestResult::Fail(
+        "could not force a completion timeout in 256 tries",
+    ));
+    for _ in 0..256 {
+        match ctrl.read_lba(2, 1, buf) {
+            Err(NvmeError::CompletionTimeout) => {
+                r = Ok(());
+                break;
+            }
+            Ok(()) => continue,
+            Err(_) => {
+                r = Err(TestResult::Fail(
+                    "read at 0 ms timeout failed with a non-timeout error",
+                ));
+                break;
+            }
+        }
+    }
+    ctrl.__test_reset_io_timeout();
+    r
+}
+
+/// After a timed-out read's abandoned record was dropped (its CQE still
+/// coming), read LBA 3 until the untracked completion surfaces as a
+/// `CompletionMismatch`. A read that completes first must carry its own
+/// data.
+fn abandon_read_until_mismatch(
+    ctrl: &mut crate::Controller,
+    rbuf: &narf_io::DmaBuffer,
+) -> Result<(), TestResult> {
+    use crate::NvmeError;
+    for _ in 0..4 {
+        abandon_fill(rbuf, &|_| 0);
+        match ctrl.read_lba(3, 1, rbuf) {
+            Err(NvmeError::CompletionMismatch { .. }) => return Ok(()),
+            Ok(()) if abandon_holds(rbuf, 3) => continue,
+            Ok(()) => {
+                return Err(TestResult::Fail(
+                    "read behind a forgotten command returned the wrong data",
+                ))
+            }
+            Err(_) => {
+                return Err(TestResult::Fail(
+                    "read behind a forgotten command failed without a mismatch",
+                ))
+            }
+        }
+    }
+    Err(TestResult::Fail(
+        "forgotten command's completion never surfaced as a mismatch",
+    ))
+}
+
+fn smoke_nvme_reap_timeout_is_distinct_and_submits_nothing() -> TestResult {
+    // An abandoned command that still does not complete must fail the
+    // NEXT request with ReapTimeout naming the abandoned command, and
+    // that request must not be submitted: it is not the command that
+    // timed out, and submitting it would pair it with the abandoned
+    // command's completion. A phantom abandoned record (never
+    // submitted, so no completion can arrive) makes the reap time out
+    // on demand.
+    use crate::NvmeError;
+    let mut ctrl = match abandon_smoke_controller() {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Ok(buf) = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    let Some(before) = ctrl.__test_io_queue_state(0) else {
+        return TestResult::Fail("no I/O queue");
+    };
+    const PHANTOM: u16 = 0xBEEF;
+    ctrl.__test_inject_phantom_abandoned(0, PHANTOM);
+    ctrl.__test_set_io_timeout_ms(0);
+    let r = ctrl.read_lba(2, 1, &buf);
+    ctrl.__test_reset_io_timeout();
+    let Some(after) = ctrl.__test_io_queue_state(0) else {
+        return TestResult::Fail("no I/O queue");
+    };
+    match r {
+        Err(NvmeError::ReapTimeout {
+            qid: 1,
+            cid: PHANTOM,
+        }) => {}
+        Err(NvmeError::CompletionTimeout) => {
+            return TestResult::Fail("reap timeout surfaced as CompletionTimeout");
+        }
+        _ => {
+            return TestResult::Fail(
+                "read behind an unreapable command did not fail with ReapTimeout",
+            )
+        }
+    }
+    if after.sq_tail != before.sq_tail || after.next_cid != before.next_cid {
+        return TestResult::Fail("a command was submitted behind an unreaped abandoned command");
+    }
+    if after.abandoned != 1 {
+        return TestResult::Fail("the unreaped abandoned record was lost");
+    }
+    // Drop the phantom; the queue must serve requests again.
+    ctrl.__test_forget_abandoned(0);
+    if ctrl.read_lba(2, 1, &buf).is_err() {
+        return TestResult::Fail("read after dropping the phantom failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_reap_timeout_is_distinct_and_submits_nothing
+);
+
+fn smoke_nvme_completion_mismatch_resets_queue() -> TestResult {
+    // A completion the host cannot account for (here: a timed-out read
+    // whose abandoned record was dropped) leaves the host one slot
+    // behind the controller. The mismatching request must fail, and the
+    // queue must be reset (Delete and recreate SQ and CQ) so that every
+    // later request gets its own completion and data again.
+    use crate::{NvmeError, QueueHealth};
+    let mut ctrl = match abandon_smoke_controller() {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let alloc = || narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).ok();
+    let (Some(wbuf), Some(lost_buf), Some(rbuf)) = (alloc(), alloc(), alloc()) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    if let Err(r) = abandon_seed(&mut ctrl, &wbuf) {
+        return r;
+    }
+    if let Err(r) = abandon_force_timeout(&mut ctrl, &lost_buf) {
+        return r;
+    }
+    ctrl.__test_forget_abandoned(0);
+    if let Err(r) = abandon_read_until_mismatch(&mut ctrl, &rbuf) {
+        return r;
+    }
+    let Some(s) = ctrl.__test_io_queue_state(0) else {
+        return TestResult::Fail("no I/O queue");
+    };
+    if s.resets != 1 || s.health != QueueHealth::Live || s.abandoned != 0 {
+        return TestResult::Fail("mismatch did not reset the queue");
+    }
+    // Alternate LBAs so an off-by-one queue shows up as the other LBA's
+    // pattern (or as a never-filled buffer).
+    for k in 0..8u64 {
+        let lba = 3 - (k & 1);
+        abandon_fill(&rbuf, &|_| 0);
+        match ctrl.read_lba(lba, 1, &rbuf) {
+            Ok(()) => {}
+            Err(NvmeError::CompletionMismatch { .. }) => {
+                return TestResult::Fail(
+                    "read after the queue reset got another command's completion",
+                );
+            }
+            Err(_) => return TestResult::Fail("read after the queue reset failed"),
+        }
+        if !abandon_holds(&rbuf, lba) {
+            return TestResult::Fail("read after the queue reset returned the wrong data");
+        }
+    }
+    let Some(s) = ctrl.__test_io_queue_state(0) else {
+        return TestResult::Fail("no I/O queue");
+    };
+    if s.resets != 1 || s.health != QueueHealth::Live || s.abandoned != 0 {
+        return TestResult::Fail("queue did not stay in sync after its reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_completion_mismatch_resets_queue);
+
+fn smoke_nvme_failed_queue_reset_fails_closed() -> TestResult {
+    // If the reset after a mismatch fails, the queue must fail closed:
+    // Failed, the mismatching command kept as abandoned (the controller
+    // still owns its buffer), and every later request refused with
+    // QueueDesynced without anything being submitted.
+    use crate::{Controller, NvmeError, QueueHealth};
+    let mut ctrl = match abandon_smoke_controller() {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let alloc = || narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).ok();
+    let (Some(wbuf), Some(lost_buf), Some(rbuf)) = (alloc(), alloc(), alloc()) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    if let Err(r) = abandon_seed(&mut ctrl, &wbuf) {
+        return r;
+    }
+    if let Err(r) = abandon_force_timeout(&mut ctrl, &lost_buf) {
+        return r;
+    }
+    ctrl.__test_forget_abandoned(0);
+    Controller::__test_fail_queue_reset(true);
+    let r = abandon_read_until_mismatch(&mut ctrl, &rbuf);
+    Controller::__test_fail_queue_reset(false);
+    if let Err(r) = r {
+        return r;
+    }
+    let result = (|| {
+        let Some(before) = ctrl.__test_io_queue_state(0) else {
+            return TestResult::Fail("no I/O queue");
+        };
+        if before.health != QueueHealth::Failed || before.resets != 0 {
+            return TestResult::Fail("failed reset did not leave the queue Failed");
+        }
+        if before.abandoned != 1 {
+            return TestResult::Fail("mismatching command was not kept as abandoned");
+        }
+        if !matches!(
+            ctrl.read_lba(2, 1, &rbuf),
+            Err(NvmeError::QueueDesynced { qid: 1 })
+        ) {
+            return TestResult::Fail("failed queue accepted a read");
+        }
+        if !matches!(
+            ctrl.write_lba(2, 1, &wbuf),
+            Err(NvmeError::QueueDesynced { qid: 1 })
+        ) {
+            return TestResult::Fail("failed queue accepted a write");
+        }
+        if !matches!(
+            ctrl.reap_abandoned(),
+            Err(NvmeError::QueueDesynced { qid: 1 })
+        ) {
+            return TestResult::Fail("reap on a failed queue did not report it");
+        }
+        let Some(after) = ctrl.__test_io_queue_state(0) else {
+            return TestResult::Fail("no I/O queue");
+        };
+        if after != before {
+            return TestResult::Fail("a failed queue's state changed while refusing requests");
+        }
+        TestResult::Pass
+    })();
+    // The failed queue is still live on the device and its rings may yet
+    // be written; leak them (and every buffer the test handed it) rather
+    // than free memory the device may DMA into. The next smoke's
+    // bring_up resets the controller.
+    core::mem::forget(ctrl);
+    core::mem::forget(rbuf);
+    core::mem::forget(lost_buf);
+    result
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_failed_queue_reset_fails_closed);
+
+fn smoke_nvme_abandoned_buffer_moves_to_queue() -> TestResult {
+    // A block request that times out leaves its buffer with the
+    // controller, which may still DMA into it. The caller must lose it:
+    // its cap stops resolving (so it cannot be filled or resubmitted),
+    // while the queue keeps the pages alive until the command is reaped
+    // and then frees them. Single-page and PRP-list (3-page) requests,
+    // through NvmeBlockDevice as a filesystem submits them.
+    use crate::NvmeBlockDevice;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
+    use narf_capabilities::{Cap, CapKind, CapSlot, Read, Rights};
+    use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister};
+    use narf_lib::id::DomainId;
+
+    fn poll_once<F: Future>(mut f: F) -> Option<F::Output> {
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        // SAFETY: vtable holds null-pointer-clean stubs.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
+        let mut ctx = Context::from_waker(&waker);
+        // SAFETY: f is owned + pinned to a stack temporary.
+        let pinned = unsafe { Pin::new_unchecked(&mut f) };
+        match pinned.poll(&mut ctx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    let ctrl = match abandon_smoke_controller() {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    // As in smoke_nvme_block_device_async_round_trip: the other smokes
+    // reset the device under the installed controller, so install ours.
+    crate::install_controller(ctrl);
+    // Never hold the guard across `submit`: it takes the same gate.
+    let set_timeout = |ms: Option<u64>| {
+        let Some(mut g) = crate::probed_controller() else {
+            return false;
+        };
+        match ms {
+            Some(ms) => g.__test_set_io_timeout_ms(ms),
+            None => g.__test_reset_io_timeout(),
+        }
+        true
+    };
+    let dev = NvmeBlockDevice;
+    let mut result = TestResult::Pass;
+    'sizes: for pages in [1usize, 3] {
+        let mut forced = false;
+        for _ in 0..256 {
+            let Ok(buf) = alloc_coherent(pages * 4096, DomainId::DRIVER_0) else {
+                result = TestResult::Fail("alloc_coherent failed");
+                break 'sizes;
+            };
+            let cap = register_with_cap(buf);
+            let Some(arc) = resolve_cap(&cap) else {
+                result = TestResult::Fail("fresh cap did not resolve");
+                break 'sizes;
+            };
+            let weak = alloc::sync::Arc::downgrade(&arc);
+            drop(arc);
+            // SAFETY: as in smoke_nvme_block_device_async_round_trip: the
+            // same live slot as `cap`, narrowed to Read.
+            let read_cap = unsafe {
+                let s = cap.slot();
+                Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
+                    s.generation,
+                    s.index,
+                    Read::BITS,
+                    CapKind::DmaBuffer as u32,
+                ))
+            };
+            let req = BlockRequest {
+                op: BlockOp::Read,
+                lba: 0,
+                blocks: (pages * 8) as u32,
+                buffer: read_cap,
+                qos: QosHint::Latency,
+                user_tag: 0,
+            };
+            if !set_timeout(Some(0)) {
+                result = TestResult::Fail("no installed controller");
+                break 'sizes;
+            }
+            let comp = poll_once(dev.submit(req));
+            if !set_timeout(None) {
+                result = TestResult::Fail("no installed controller");
+                break 'sizes;
+            }
+            let Some(comp) = comp else {
+                result = TestResult::Fail("submit returned Pending");
+                break 'sizes;
+            };
+            if comp.result.is_ok() {
+                // Completed before the first look; try again.
+                unregister(cap);
+                continue;
+            }
+            forced = true;
+            if resolve_cap(&cap).is_some() {
+                result = TestResult::Fail("cap still resolves after its command was abandoned");
+                break 'sizes;
+            }
+            if weak.upgrade().is_none() {
+                result = TestResult::Fail("abandoned command's buffer was freed under the device");
+                break 'sizes;
+            }
+            let reaped = crate::probed_controller().map(|mut g| g.reap_abandoned());
+            if !matches!(reaped, Some(Ok(()))) {
+                result = TestResult::Fail("reaping the abandoned block request failed");
+                break 'sizes;
+            }
+            if weak.upgrade().is_some() {
+                result = TestResult::Fail("reaped command's buffer was never released");
+                break 'sizes;
+            }
+            break;
+        }
+        if !forced {
+            result = TestResult::Fail("could not force a block request timeout in 256 tries");
+            break;
+        }
+    }
+    let _ = set_timeout(None);
+    result
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_abandoned_buffer_moves_to_queue);

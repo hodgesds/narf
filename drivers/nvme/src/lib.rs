@@ -83,9 +83,29 @@ pub enum NvmeError {
     /// from the command just submitted: the host's view of the queue
     /// no longer matches the controller's. The driver refuses to hand
     /// another command's completion (and buffer contents) to a caller.
+    /// The submitted command is recorded as abandoned (its buffers stay
+    /// alive) and the queue becomes [`QueueHealth::Desynced`]; an I/O
+    /// queue is then reset (see [`QueueHealth`]).
     CompletionMismatch {
         expected: u16,
         got: u16,
+    },
+    /// A command this queue stopped waiting for earlier (`cid`) has still
+    /// not completed within the queue's timeout. The command the caller
+    /// asked for was NOT submitted: until the abandoned command's
+    /// completion is consumed, the next completion at the queue head
+    /// would be mistaken for the new command's.
+    ReapTimeout {
+        qid: u16,
+        cid: u16,
+    },
+    /// Queue `qid` is not [`QueueHealth::Live`] and could not be brought
+    /// back: its host view no longer matches the controller's, and the
+    /// queue reset failed (or, for the admin queue, is not possible
+    /// without re-initialising the controller). Nothing was submitted.
+    /// See [`QueueHealth::Failed`].
+    QueueDesynced {
+        qid: u16,
     },
     /// `bring_up` hasn't run yet — admin queue isn't programmed.
     NotReady,
@@ -400,6 +420,53 @@ impl core::fmt::Debug for Controller {
     }
 }
 
+/// Buffers a submitted command's DMA may still touch. Handed to
+/// [`Queue::submit_with`]; dropped when the command's completion is
+/// consumed, and moved into [`Queue::abandoned`] if the host stops
+/// waiting first, so the pages cannot be recycled under a late DMA.
+#[derive(Debug, Default)]
+struct KeepAlive {
+    /// The data buffer, when the driver was handed shared ownership of
+    /// it (the block-layer path). Borrowed-buffer entry points such as
+    /// [`Controller::read_lba`] pass `None`; their caller owns it.
+    data: Option<alloc::sync::Arc<DmaBuffer>>,
+    /// The PRP-list page of a multi-page transfer, which the driver
+    /// allocates and the controller reads.
+    prp_list: Option<DmaBuffer>,
+}
+
+/// A command the host stopped waiting for, still owned by the controller.
+#[derive(Debug)]
+struct Abandoned {
+    cid: u16,
+    keep: KeepAlive,
+}
+
+/// Whether the host's view of a queue matches the controller's.
+///
+/// - `Live`: in sync; commands may be submitted.
+/// - `Desynced`: a completion arrived that the host cannot account for
+///   (a command id that is neither the command just submitted nor an
+///   abandoned one). Every later completion on the queue would be read
+///   from the wrong slot, so the queue accepts nothing until it is
+///   reset. For an I/O queue the controller resets it at once (Delete
+///   SQ, Delete CQ, recreate at the same addresses: see
+///   `reset_io_queue`); the Delete SQ completes or aborts every command
+///   still outstanding on it, which also releases the abandoned set.
+/// - `Failed`: the reset failed, or the queue is the admin queue, which
+///   cannot be reset short of re-initialising the controller. The queue
+///   refuses every submission with [`NvmeError::QueueDesynced`] and
+///   keeps its abandoned commands' buffers alive forever. A failed I/O
+///   queue also stops the whole controller (see
+///   [`Controller::reap_abandoned`]): an abandoned command on it may
+///   still read or write a buffer shared with other queues.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QueueHealth {
+    Live,
+    Desynced,
+    Failed,
+}
+
 /// One NVMe SQ/CQ pair tracked by the host. Same shape across admin
 /// and I/O queues; the only difference is the qid + depth.
 ///
@@ -422,17 +489,67 @@ struct Queue {
     /// Next command id to assign (monotonic, wraps at u16).
     next_cid: u16,
     /// Commands submitted on this queue whose completion the host stopped
-    /// waiting for. The controller still owns each one: it will post a CQE
-    /// for it at `cq_head`, and until that CQE is consumed the next command's
-    /// completion would be read from the wrong slot. See
-    /// [`Queue::reap_abandoned`].
-    abandoned: u16,
+    /// waiting for, oldest first. The controller still owns each one: it
+    /// will post a CQE for it at `cq_head` and may still DMA into or out
+    /// of its buffers, which each entry keeps alive until that CQE is
+    /// consumed. See [`Queue::reap_abandoned`].
+    abandoned: Vec<Abandoned>,
+    /// See [`QueueHealth`].
+    health: QueueHealth,
+    /// Completed resets of this queue (see `reset_io_queue`).
+    resets: u32,
+    /// CDW11 of this queue's Create I/O CQ and Create I/O SQ commands,
+    /// replayed by `reset_io_queue`. Zero for the admin queue.
+    cq_cdw11: u32,
+    sq_cdw11: u32,
     /// Completion wait bound for this queue: [`ADMIN_TIMEOUT_MS`] for the
     /// admin queue, [`IO_TIMEOUT_MS`] for I/O queues.
     timeout_ms: u64,
 }
 
+impl Drop for Queue {
+    fn drop(&mut self) {
+        // The controller may still DMA for these commands; never hand
+        // their pages back.
+        for a in self.abandoned.drain(..) {
+            core::mem::forget(a.keep);
+        }
+    }
+}
+
 impl Queue {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        sq_buf: DmaBuffer,
+        cq_buf: DmaBuffer,
+        qid: u16,
+        depth: u16,
+        db_stride: u64,
+        timeout_ms: u64,
+        cq_cdw11: u32,
+        sq_cdw11: u32,
+    ) -> Self {
+        Self {
+            sq_buf,
+            cq_buf,
+            qid,
+            depth,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: 1, // first valid CQE has phase = 1
+            db_stride,
+            next_cid: 0,
+            // Reap-before-submit bounds the set to a few entries; reserve
+            // so recording one on an error path does not allocate.
+            abandoned: Vec::with_capacity(depth as usize),
+            health: QueueHealth::Live,
+            resets: 0,
+            cq_cdw11,
+            sq_cdw11,
+            timeout_ms,
+        }
+    }
+
     /// Doorbell offsets for this queue. NVMe layout: SQ tail at
     /// `0x1000 + 2*qid * stride`, CQ head at
     /// `0x1000 + (2*qid + 1) * stride`.
@@ -443,16 +560,57 @@ impl Queue {
         REG_DOORBELL_BASE + (2 * (self.qid as u64) + 1) * self.db_stride
     }
 
+    /// [`Queue::submit_with`] for a command whose buffers the caller owns.
+    ///
+    /// # Safety
+    /// Same contract as [`Queue::submit_with`].
+    unsafe fn submit(&mut self, bar0: &MmioRegion, sqe: Sqe) -> Result<Cqe, NvmeError> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.submit_with(bar0, sqe, KeepAlive::default()) }
+    }
+
     /// Submit `sqe` and synchronously poll for its completion.
     /// Auto-assigns the CID (overwrites the upper 16 bits of cdw0).
+    /// `keep` holds the buffers the command's DMA may touch; if the host
+    /// stops waiting before the completion arrives, they move to the
+    /// abandoned set instead of being dropped.
     ///
     /// # Safety
     /// The DMA buffers `sq_buf` / `cq_buf` are still mapped and the
     /// controller is enabled. The caller owns the queue (no other
     /// task posting concurrently — Stage-3 single-threaded).
-    unsafe fn submit(&mut self, bar0: &MmioRegion, mut sqe: Sqe) -> Result<Cqe, NvmeError> {
+    unsafe fn submit_with(
+        &mut self,
+        bar0: &MmioRegion,
+        sqe: Sqe,
+        keep: KeepAlive,
+    ) -> Result<Cqe, NvmeError> {
         // SAFETY: forwarded from this function's contract.
         unsafe { self.reap_abandoned(bar0)? };
+        // SAFETY: forwarded from this function's contract.
+        let cid = unsafe { self.post(bar0, sqe) };
+
+        // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
+        match unsafe { wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase, self.timeout_ms) } {
+            // SAFETY: forwarded contract; the CQE at the head is posted.
+            Ok(cqe) => unsafe { self.finish(bar0, cid, cqe, keep, (sqe.cdw0 & 0xFF) as u8) },
+            Err(e) => {
+                // The command is still the controller's: it will post a
+                // CQE at `cq_head` whenever it finishes. Remember that, so
+                // the next submission consumes it instead of mistaking it
+                // for its own completion.
+                self.abandon(cid, keep);
+                Err(e)
+            }
+        }
+    }
+
+    /// Assign the next command id to `sqe`, write it at the SQ tail and
+    /// ring the tail doorbell. Returns the command id.
+    ///
+    /// # Safety
+    /// Same contract as [`Queue::submit_with`].
+    unsafe fn post(&mut self, bar0: &MmioRegion, mut sqe: Sqe) -> u16 {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -468,38 +626,77 @@ impl Queue {
         unsafe {
             bar0.write32(self.sq_db_off(), self.sq_tail as u32);
         }
+        cid
+    }
 
-        // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
-        let cqe =
-            match unsafe { wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase, self.timeout_ms) } {
-                Ok(cqe) => cqe,
-                Err(e) => {
-                    // The command is still the controller's: it will post a
-                    // CQE at `cq_head` whenever it finishes. Remember that, so
-                    // the next submission consumes it instead of mistaking it
-                    // for its own completion.
-                    self.abandoned += 1;
-                    return Err(e);
-                }
-            };
-
+    /// Consume the posted CQE `cqe` at the head as the completion of
+    /// command `cid` (opcode `opcode`), whose buffers are `keep`.
+    ///
+    /// A different command id means the host's view of the queue no
+    /// longer matches the controller's: the head slot held someone
+    /// else's completion, and `cid` is still the controller's. Record it
+    /// as abandoned so its buffers stay alive, and mark the queue
+    /// [`QueueHealth::Desynced`] so nothing else is submitted until it
+    /// is reset.
+    ///
+    /// # Safety
+    /// Same contract as [`Queue::submit_with`]; `cqe` was read from the
+    /// head slot and its phase tag matched.
+    unsafe fn finish(
+        &mut self,
+        bar0: &MmioRegion,
+        cid: u16,
+        cqe: Cqe,
+        keep: KeepAlive,
+        opcode: u8,
+    ) -> Result<Cqe, NvmeError> {
         // SAFETY: identity-mapped MMIO doorbell; forwarded contract.
         unsafe { self.consume_cqe(bar0) };
 
         if cqe.cid != cid {
+            self.abandon(cid, keep);
+            self.desync();
             return Err(NvmeError::CompletionMismatch {
                 expected: cid,
                 got: cqe.cid,
             });
         }
+        // The command is complete: the controller is done with its buffers.
+        drop(keep);
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
             return Err(NvmeError::CommandFailed {
-                cmd: (sqe.cdw0 & 0xFF) as u8,
+                cmd: opcode,
                 status: nvme_status,
             });
         }
         Ok(cqe)
+    }
+
+    /// Record `cid` as still owned by the controller, keeping `keep`
+    /// alive until its completion is consumed.
+    fn abandon(&mut self, cid: u16, keep: KeepAlive) {
+        self.abandoned.push(Abandoned { cid, keep });
+    }
+
+    /// Mark the queue out of sync with the controller. The admin queue
+    /// cannot be reset on its own, so it fails outright.
+    fn desync(&mut self) {
+        self.health = if self.qid == 0 {
+            QueueHealth::Failed
+        } else {
+            QueueHealth::Desynced
+        };
+    }
+
+    /// `true` if an abandoned command on this queue holds `buf`.
+    fn holds(&self, buf: &alloc::sync::Arc<DmaBuffer>) -> bool {
+        self.abandoned.iter().any(|a| {
+            a.keep
+                .data
+                .as_ref()
+                .is_some_and(|d| alloc::sync::Arc::ptr_eq(d, buf))
+        })
     }
 
     /// Advance the CQ head past the entry at `cq_head` (flipping the
@@ -519,30 +716,139 @@ impl Queue {
     }
 
     /// Wait for, and discard, the completion of every command this queue
-    /// stopped waiting for.
+    /// stopped waiting for, releasing each one's buffers.
     ///
     /// A timed-out command is not cancelled by the timeout: the
     /// controller still finishes it, posts its CQE at the head slot, and
     /// DMAs into (or out of) its buffer. Until that CQE is consumed, the
     /// next command would read it as its own completion, one slot behind
     /// forever after, and the caller would copy out a buffer the device
-    /// had not filled yet. Every submission therefore reaps first. If
-    /// the abandoned command still does not complete within the queue's
-    /// timeout, this fails and nothing new is submitted.
+    /// had not filled yet. Every submission therefore reaps first.
+    ///
+    /// Fails, with nothing submitted, if the queue is not
+    /// [`QueueHealth::Live`] ([`NvmeError::QueueDesynced`]), if an
+    /// abandoned command still does not complete within the queue's
+    /// timeout ([`NvmeError::ReapTimeout`], naming the oldest), or if a
+    /// completion arrives for a command id that is not abandoned (the
+    /// queue becomes [`QueueHealth::Desynced`]).
     ///
     /// # Safety
-    /// Same contract as [`Queue::submit`].
+    /// Same contract as [`Queue::submit_with`].
     unsafe fn reap_abandoned(&mut self, bar0: &MmioRegion) -> Result<(), NvmeError> {
-        while self.abandoned > 0 {
+        if self.health != QueueHealth::Live {
+            return Err(NvmeError::QueueDesynced { qid: self.qid });
+        }
+        while let Some(oldest) = self.abandoned.first() {
+            let oldest = oldest.cid;
             // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
-            unsafe {
-                wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase, self.timeout_ms)?;
-                self.consume_cqe(bar0);
+            let cqe = match unsafe {
+                wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase, self.timeout_ms)
+            } {
+                Ok(cqe) => cqe,
+                Err(_) => {
+                    return Err(NvmeError::ReapTimeout {
+                        qid: self.qid,
+                        cid: oldest,
+                    })
+                }
+            };
+            // SAFETY: forwarded contract.
+            unsafe { self.consume_cqe(bar0) };
+            match self.abandoned.iter().position(|a| a.cid == cqe.cid) {
+                // Completed: the controller is done with its buffers.
+                Some(i) => drop(self.abandoned.remove(i)),
+                None => {
+                    self.desync();
+                    return Err(NvmeError::QueueDesynced { qid: self.qid });
+                }
             }
-            self.abandoned -= 1;
         }
         Ok(())
     }
+}
+
+/// Reset I/O queue `q` after it lost sync with the controller: Delete
+/// its SQ and CQ, zero both rings, and recreate them at the same
+/// addresses with the same parameters.
+///
+/// NVMe Base Spec 2.0c §5.6: the controller completes or aborts every
+/// command outstanding on an I/O SQ before completing its Delete, so
+/// once the Delete SQ has completed no abandoned command on it can DMA
+/// any more and the abandoned set is released. (QEMU's `nvme_del_sq`
+/// cancels outstanding requests synchronously.) Delete CQ must follow
+/// the SQ that feeds it (§5.5). Zeroing the CQ removes every stale
+/// entry, so the recreated queue starts at head 0 with phase 1, exactly
+/// like a fresh one.
+///
+/// On success the queue is [`QueueHealth::Live`] and empty; on failure
+/// it is [`QueueHealth::Failed`], keeps its abandoned buffers, and the
+/// error is [`NvmeError::QueueDesynced`].
+///
+/// # Safety
+/// `admin` is this controller's live admin queue, `bar0` its live BAR0,
+/// and `q` one of its I/O queues, all exclusively held by the caller.
+unsafe fn reset_io_queue(
+    admin: &mut Queue,
+    bar0: &MmioRegion,
+    q: &mut Queue,
+) -> Result<(), NvmeError> {
+    let fail = |q: &mut Queue| {
+        q.health = QueueHealth::Failed;
+        Err(NvmeError::QueueDesynced { qid: q.qid })
+    };
+    #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+    if TEST_FAIL_QUEUE_RESET.load(Ordering::Relaxed) {
+        return fail(q);
+    }
+    let qid = q.qid as u32;
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = AdminOpcode::DeleteSq as u32;
+    sqe.cdw10 = qid;
+    // SAFETY: forwarded contract.
+    if unsafe { admin.submit(bar0, sqe) }.is_err() {
+        return fail(q);
+    }
+    // Every command that was outstanding on the SQ is now completed or
+    // aborted: nothing will DMA into the abandoned buffers.
+    q.abandoned.clear();
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = AdminOpcode::DeleteCq as u32;
+    sqe.cdw10 = qid;
+    // SAFETY: forwarded contract.
+    if unsafe { admin.submit(bar0, sqe) }.is_err() {
+        return fail(q);
+    }
+    // SAFETY: both rings are live DMA buffers of this queue's size, and
+    // the controller no longer references either.
+    unsafe {
+        core::ptr::write_bytes(q.sq_buf.cpu_mut_ptr::<u8>(), 0, 64 * q.depth as usize);
+        core::ptr::write_bytes(q.cq_buf.cpu_mut_ptr::<u8>(), 0, 16 * q.depth as usize);
+    }
+    q.sq_tail = 0;
+    q.cq_head = 0;
+    q.cq_phase = 1;
+    let cdw10 = ((q.depth as u32 - 1) << 16) | qid;
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = AdminOpcode::CreateCq as u32;
+    sqe.prp1 = q.cq_buf.dma_addr().raw();
+    sqe.cdw10 = cdw10;
+    sqe.cdw11 = q.cq_cdw11;
+    // SAFETY: forwarded contract.
+    if unsafe { admin.submit(bar0, sqe) }.is_err() {
+        return fail(q);
+    }
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = AdminOpcode::CreateSq as u32;
+    sqe.prp1 = q.sq_buf.dma_addr().raw();
+    sqe.cdw10 = cdw10;
+    sqe.cdw11 = q.sq_cdw11;
+    // SAFETY: forwarded contract.
+    if unsafe { admin.submit(bar0, sqe) }.is_err() {
+        return fail(q);
+    }
+    q.health = QueueHealth::Live;
+    q.resets += 1;
+    Ok(())
 }
 
 /// Subset of the IDENTIFY CONTROLLER page we currently parse.
@@ -792,19 +1098,16 @@ impl Controller {
             }
         }
 
-        let mut admin = Queue {
+        let mut admin = Queue::new(
             sq_buf,
             cq_buf,
-            qid: 0,
-            depth: ADMIN_Q_DEPTH,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: 1, // first valid CQE has phase = 1
-            db_stride: caps.doorbell_stride(),
-            next_cid: 0,
-            abandoned: 0,
-            timeout_ms: ADMIN_TIMEOUT_MS,
-        };
+            0,
+            ADMIN_Q_DEPTH,
+            caps.doorbell_stride(),
+            ADMIN_TIMEOUT_MS,
+            0,
+            0,
+        );
 
         // ── 7. IDENTIFY CONTROLLER ────────────────────────────────
         let id_buf =
@@ -905,7 +1208,8 @@ impl Controller {
         sqe.cdw0 = AdminOpcode::CreateCq as u32;
         sqe.prp1 = cq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = ((iv as u32) << 16) | (ien << 1) | 1;
+        let cq_cdw11 = ((iv as u32) << 16) | (ien << 1) | 1;
+        sqe.cdw11 = cq_cdw11;
         // SAFETY: queue + bar live; CQ buffer is fresh DMA.
         unsafe {
             admin.submit(bar0, sqe)?;
@@ -919,7 +1223,8 @@ impl Controller {
         sqe.cdw0 = AdminOpcode::CreateSq as u32;
         sqe.prp1 = sq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
+        let sq_cdw11 = ((IO_QID as u32) << 16) | 1;
+        sqe.cdw11 = sq_cdw11;
         // SAFETY: queue + bar live.
         unsafe {
             admin.submit(bar0, sqe)?;
@@ -933,19 +1238,16 @@ impl Controller {
         if let Some(v) = irq_vec {
             self.io_irq_vectors.push(v);
         }
-        self.io_queues.push(Queue {
+        self.io_queues.push(Queue::new(
             sq_buf,
             cq_buf,
-            qid: IO_QID,
-            depth: IO_Q_DEPTH,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: 1,
-            db_stride: admin.db_stride,
-            next_cid: 0,
-            abandoned: 0,
-            timeout_ms: IO_TIMEOUT_MS,
-        });
+            IO_QID,
+            IO_Q_DEPTH,
+            admin.db_stride,
+            IO_TIMEOUT_MS,
+            cq_cdw11,
+            sq_cdw11,
+        ));
         self.io_queue_locks.push(IrqSafeSpinLock::new(()));
         Ok(())
     }
@@ -957,12 +1259,24 @@ impl Controller {
     /// `n_blocks` is encoded zero-based on the wire (NLB = blocks-1);
     /// the function takes the human-readable count.
     pub fn read_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer) -> Result<(), NvmeError> {
-        self.nvm_io(IoOpcode::Read as u8, lba, n_blocks, buf)
+        self.nvm_io(
+            IoOpcode::Read as u8,
+            lba,
+            n_blocks,
+            buf,
+            KeepAlive::default(),
+        )
     }
 
     /// Symmetric to `read_lba`: submit an NVM Write (`opcode = 0x01`).
     pub fn write_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer) -> Result<(), NvmeError> {
-        self.nvm_io(IoOpcode::Write as u8, lba, n_blocks, buf)
+        self.nvm_io(
+            IoOpcode::Write as u8,
+            lba,
+            n_blocks,
+            buf,
+            KeepAlive::default(),
+        )
     }
 
     /// Multi-page NVM Read covering `n_blocks` LBAs into the
@@ -984,7 +1298,13 @@ impl Controller {
         n_blocks: u16,
         pages: &[PhysAddr],
     ) -> Result<(), NvmeError> {
-        self.nvm_io_multipage(IoOpcode::Read as u8, lba, n_blocks, pages)
+        self.nvm_io_multipage(
+            IoOpcode::Read as u8,
+            lba,
+            n_blocks,
+            pages,
+            KeepAlive::default(),
+        )
     }
 
     /// Symmetric to `read_lba_pages`: submit an NVM Write covering
@@ -995,7 +1315,13 @@ impl Controller {
         n_blocks: u16,
         pages: &[PhysAddr],
     ) -> Result<(), NvmeError> {
-        self.nvm_io_multipage(IoOpcode::Write as u8, lba, n_blocks, pages)
+        self.nvm_io_multipage(
+            IoOpcode::Write as u8,
+            lba,
+            n_blocks,
+            pages,
+            KeepAlive::default(),
+        )
     }
 
     /// Ask the controller how many I/O submission + completion queue
@@ -1144,6 +1470,10 @@ impl Controller {
 
         for i in 0..granted {
             let qid = i + 1; // NVMe Base Spec §4.1.4: I/O qids ≥ 1
+                             // CDW11 of the Create CQ / Create SQ below (kept on the
+                             // queue so a reset can replay them).
+            let cq_cdw11 = ((i as u32) << 16) | (1 << 1) | 1;
+            let sq_cdw11 = ((qid as u32) << 16) | 1;
 
             // Per pair: CQ DMA first, then admin Create CQ, then
             // SQ DMA + Create SQ. CQ-before-SQ is required by
@@ -1170,7 +1500,7 @@ impl Controller {
                 sqe.cdw0 = AdminOpcode::CreateCq as u32;
                 sqe.prp1 = cq_phys;
                 sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (qid as u32);
-                sqe.cdw11 = ((i as u32) << 16) | (1 << 1) | 1;
+                sqe.cdw11 = cq_cdw11;
                 // SAFETY: admin queue + BAR live; CQ DMA fresh.
                 unsafe {
                     admin.submit(bar0, sqe)?;
@@ -1201,26 +1531,23 @@ impl Controller {
                 sqe.cdw0 = AdminOpcode::CreateSq as u32;
                 sqe.prp1 = sq_phys;
                 sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (qid as u32);
-                sqe.cdw11 = ((qid as u32) << 16) | 1;
+                sqe.cdw11 = sq_cdw11;
                 // SAFETY: admin queue + BAR live; SQ DMA fresh.
                 unsafe {
                     admin.submit(bar0, sqe)?;
                 }
             }
 
-            queues.push(Queue {
+            queues.push(Queue::new(
                 sq_buf,
                 cq_buf,
                 qid,
-                depth: IO_Q_DEPTH,
-                sq_tail: 0,
-                cq_head: 0,
-                cq_phase: 1,
-                db_stride: admin_stride,
-                next_cid: 0,
-                abandoned: 0,
-                timeout_ms: IO_TIMEOUT_MS,
-            });
+                IO_Q_DEPTH,
+                admin_stride,
+                IO_TIMEOUT_MS,
+                cq_cdw11,
+                sq_cdw11,
+            ));
         }
 
         // ── 5. Publish ────────────────────────────────────────
@@ -1754,18 +2081,9 @@ impl Controller {
         sqe.cdw12 = (n_blocks - 1) as u32;
 
         // Auto-CID + ring SQ tail doorbell.
-        let cid = io.next_cid;
-        io.next_cid = io.next_cid.wrapping_add(1);
-        sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
-        // SAFETY: queue is page-aligned; sq_tail bounded.
-        unsafe {
-            write_sqe(&io.sq_buf, io.sq_tail, &sqe);
-        }
-        io.sq_tail = (io.sq_tail + 1) % io.depth;
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe {
-            bar0.write32(io.sq_db_off(), io.sq_tail as u32);
-        }
+        // SAFETY: queue DMA + BAR live for the controller's lifetime;
+        // `&mut self` excludes concurrent submitters.
+        let cid = unsafe { io.post(bar0, sqe) };
 
         #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
         if TEST_SPURIOUS_IRQ.load(Ordering::Relaxed) {
@@ -1798,38 +2116,22 @@ impl Controller {
         // the same deadline, and look once more after the deadline for
         // the same reason as `wait_cqe`.
         let done = posted() || narf_scheduler::responsive_spin_until(&posted, deadline) || posted();
-        if !done {
+        // The caller owns `buf` (borrowed-buffer entry point), so there
+        // is nothing for the queue to keep alive.
+        let r = if done {
+            // SAFETY: same buffer; its phase tag matched above.
+            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+            // SAFETY: queue DMA + BAR live; the head CQE is posted.
+            unsafe { io.finish(bar0, cid, cqe, KeepAlive::default(), opcode) }.map(|_| ())
+        } else {
             // Still owned by the controller; see Queue::reap_abandoned.
-            io.abandoned += 1;
-            return Err(NvmeError::CompletionTimeout);
+            io.abandon(cid, KeepAlive::default());
+            Err(NvmeError::CompletionTimeout)
+        };
+        if r.is_err() {
+            self.reset_desynced();
         }
-
-        // Drain the CQE.
-        // SAFETY: same buffer.
-        let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-        io.cq_head = (io.cq_head + 1) % io.depth;
-        if io.cq_head == 0 {
-            io.cq_phase ^= 1;
-        }
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe {
-            bar0.write32(io.cq_db_off(), io.cq_head as u32);
-        }
-
-        if cqe.cid != cid {
-            return Err(NvmeError::CompletionMismatch {
-                expected: cid,
-                got: cqe.cid,
-            });
-        }
-        let nvme_status = cqe.status >> 1;
-        if nvme_status != 0 {
-            return Err(NvmeError::CommandFailed {
-                cmd: opcode,
-                status: nvme_status,
-            });
-        }
-        Ok(())
+        r
     }
 
     /// Test hook: make [`Controller::submit_io_irq`] dispatch one
@@ -1841,31 +2143,82 @@ impl Controller {
         TEST_SPURIOUS_IRQ.store(on, Ordering::Relaxed);
     }
 
-    /// Reap every abandoned (timed-out) command on every I/O queue.
+    /// Reap every abandoned (timed-out) command on every I/O queue, and
+    /// reset any queue that lost sync with the controller.
     ///
     /// Buffers are shared across queues (the block layer's scratch page
     /// is one buffer for the whole device), so a late DMA from a command
     /// abandoned on one queue can overwrite data that a command on
     /// another queue is carrying. Callers that fill a shared buffer
     /// before submitting call this first, while they hold the device's
-    /// request gate; every submission path calls it too.
+    /// request gate; every submission path calls it too. For the same
+    /// reason a [`QueueHealth::Failed`] queue fails this call, and so
+    /// every submission on the controller, with
+    /// [`NvmeError::QueueDesynced`].
     pub fn reap_abandoned(&mut self) -> Result<(), NvmeError> {
-        if self.io_queues.iter().all(|q| q.abandoned == 0) {
+        if self
+            .io_queues
+            .iter()
+            .all(|q| q.health == QueueHealth::Live && q.abandoned.is_empty())
+        {
             return Ok(());
         }
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
         for q in self.io_queues.iter_mut() {
-            // SAFETY: queue DMA + BAR live for the controller's lifetime;
-            // `&mut self` excludes concurrent submitters.
-            unsafe { q.reap_abandoned(bar0)? };
+            // A failed reset leaves the queue Failed, which the reap that
+            // follows reports.
+            if q.health == QueueHealth::Desynced {
+                // SAFETY: queue DMA + BAR live for the controller's
+                // lifetime; `&mut self` excludes concurrent submitters.
+                let _ = unsafe { reset_io_queue(admin, bar0, q) };
+            }
+            // SAFETY: as above.
+            let r = unsafe { q.reap_abandoned(bar0) };
+            if r.is_err() && q.health == QueueHealth::Desynced {
+                // The reap met a completion for no abandoned command.
+                // SAFETY: as above.
+                let _ = unsafe { reset_io_queue(admin, bar0, q) };
+                // SAFETY: as above.
+                unsafe { q.reap_abandoned(bar0)? };
+            } else {
+                r?;
+            }
         }
         Ok(())
+    }
+
+    /// Reset every [`QueueHealth::Desynced`] I/O queue now, so its
+    /// abandoned commands are released as early as possible. A failed
+    /// reset leaves the queue [`QueueHealth::Failed`].
+    fn reset_desynced(&mut self) {
+        let (Some(admin), Some(bar0)) = (self.admin.as_mut(), self.bar0_region.as_ref()) else {
+            return;
+        };
+        for q in self.io_queues.iter_mut() {
+            if q.health == QueueHealth::Desynced {
+                // SAFETY: as in `reap_abandoned`.
+                let _ = unsafe { reset_io_queue(admin, bar0, q) };
+            }
+        }
     }
 
     /// Number of I/O commands the driver stopped waiting for and has
     /// not yet reaped.
     pub fn abandoned_io(&self) -> u32 {
-        self.io_queues.iter().map(|q| q.abandoned as u32).sum()
+        self.io_queues
+            .iter()
+            .map(|q| q.abandoned.len() as u32)
+            .sum()
+    }
+
+    /// `true` if the controller still owns `buf`: an abandoned command
+    /// on some queue may yet DMA into or out of it.
+    fn device_owns(&self, buf: &alloc::sync::Arc<DmaBuffer>) -> bool {
+        self.io_queues
+            .iter()
+            .chain(self.admin.iter())
+            .any(|q| q.holds(buf))
     }
 
     /// Test hook: override the I/O completion timeout on every I/O
@@ -1886,12 +2239,59 @@ impl Controller {
         self.__test_set_io_timeout_ms(IO_TIMEOUT_MS);
     }
 
+    /// Test hook: drop I/O queue `qi`'s abandoned records without
+    /// consuming their completions, as a host that lost track of a
+    /// command would. Their buffers are leaked, never freed. Compiled
+    /// only in x86_64 kernel-test builds.
+    #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+    pub(crate) fn __test_forget_abandoned(&mut self, qi: usize) {
+        if let Some(q) = self.io_queues.get_mut(qi) {
+            for a in q.abandoned.drain(..) {
+                core::mem::forget(a.keep);
+            }
+        }
+    }
+
+    /// Test hook: record `cid` as abandoned on I/O queue `qi` although
+    /// it was never submitted, so the next reap waits for a completion
+    /// that cannot arrive. Compiled only in x86_64 kernel-test builds.
+    #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+    pub(crate) fn __test_inject_phantom_abandoned(&mut self, qi: usize, cid: u16) {
+        if let Some(q) = self.io_queues.get_mut(qi) {
+            q.abandon(cid, KeepAlive::default());
+        }
+    }
+
+    /// Test hook: make every queue reset fail before issuing any admin
+    /// command. Compiled only in x86_64 kernel-test builds.
+    #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+    pub(crate) fn __test_fail_queue_reset(on: bool) {
+        TEST_FAIL_QUEUE_RESET.store(on, Ordering::Relaxed);
+    }
+
+    /// Test hook: I/O queue `qi`'s bookkeeping. Compiled only in x86_64
+    /// kernel-test builds.
+    #[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+    pub(crate) fn __test_io_queue_state(&self, qi: usize) -> Option<IoQueueState> {
+        self.io_queues.get(qi).map(|q| IoQueueState {
+            sq_tail: q.sq_tail,
+            next_cid: q.next_cid,
+            health: q.health,
+            abandoned: q.abandoned.len(),
+            resets: q.resets,
+        })
+    }
+
+    /// Submit a single-PRP NVM command on a round-robin-picked I/O
+    /// queue and poll for its completion. `keep` holds the buffers the
+    /// command's DMA may touch (see [`KeepAlive`]).
     fn nvm_io(
         &mut self,
         opcode: u8,
         lba: u64,
         n_blocks: u16,
         buf: &DmaBuffer,
+        keep: KeepAlive,
     ) -> Result<(), NvmeError> {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
@@ -1917,22 +2317,24 @@ impl Controller {
         // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
         sqe.cdw12 = (n_blocks - 1) as u32;
         // SAFETY: io queue + bar are live; buf is identity-mapped DMA.
-        unsafe {
-            io.submit(bar0, sqe)?;
+        let r = unsafe { io.submit_with(bar0, sqe, keep) };
+        if r.is_err() {
+            self.reset_desynced();
         }
-        Ok(())
+        r.map(|_| ())
     }
 
     /// Multi-page PRP-list NVM I/O. See `read_lba_pages` for the
     /// public-API contract. The PRP-list buffer is allocated on
-    /// demand and held alive across `submit` so the controller's DMA
-    /// reads against it complete before the buffer drops.
+    /// demand and handed to the queue in `keep`, so it outlives the
+    /// controller's reads of it even if the host stops waiting.
     fn nvm_io_multipage(
         &mut self,
         opcode: u8,
         lba: u64,
         n_blocks: u16,
         pages: &[PhysAddr],
+        mut keep: KeepAlive,
     ) -> Result<(), NvmeError> {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
@@ -1957,19 +2359,12 @@ impl Controller {
 
         sqe.prp1 = pages[0].raw();
 
-        // Hold the PRP-list buffer across the submit so its DMA
-        // memory stays mapped for the controller. Dropped after
-        // `submit` returns (which is synchronous: it polls the CQ).
-        let _prp_list_keepalive: Option<DmaBuffer>;
-
         match pages.len() {
             1 => {
                 sqe.prp2 = 0;
-                _prp_list_keepalive = None;
             }
             2 => {
                 sqe.prp2 = pages[1].raw();
-                _prp_list_keepalive = None;
             }
             _ => {
                 // PRP-list with chaining: a single 4-KiB list page
@@ -1985,8 +2380,8 @@ impl Controller {
                     .map_err(|_| NvmeError::OutOfDmaMemory)?;
                 // SAFETY: alloc_coherent zero-fills + page-aligns the
                 // buffer; the kernel-mapped pointer stays valid for
-                // the buffer's lifetime, which we extend across the
-                // submit by binding to `_prp_list_keepalive`. NVMe
+                // the buffer's lifetime, which `keep` extends until the
+                // controller is done with the command. NVMe
                 // expects little-endian 8-byte phys addresses; on a
                 // little-endian target a plain `write_volatile<u64>`
                 // produces that layout.
@@ -1998,23 +2393,36 @@ impl Controller {
                     }
                 }
                 sqe.prp2 = buf.dma_addr().raw();
-                _prp_list_keepalive = Some(buf);
+                keep.prp_list = Some(buf);
             }
         }
 
         // SAFETY: io queue + bar are live; pages + the optional
         // PRP-list page are identity-mapped DMA owned by the caller
-        // / by `_prp_list_keepalive` respectively.
+        // / by `keep` respectively.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let r = unsafe { io.submit(bar0, sqe) };
-        if matches!(r, Err(NvmeError::CompletionTimeout)) {
-            // The controller may still read the PRP list for the
-            // abandoned command; never hand that page back.
-            core::mem::forget(_prp_list_keepalive);
+        let r = unsafe { io.submit_with(bar0, sqe, keep) };
+        if r.is_err() {
+            self.reset_desynced();
         }
         r.map(|_| ())
     }
 }
+
+/// Snapshot of one I/O queue's bookkeeping, for the smokes.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IoQueueState {
+    pub sq_tail: u16,
+    pub next_cid: u16,
+    pub health: QueueHealth,
+    pub abandoned: usize,
+    pub resets: u32,
+}
+
+/// See [`Controller::__test_fail_queue_reset`].
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+static TEST_FAIL_QUEUE_RESET: AtomicBool = AtomicBool::new(false);
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -2311,25 +2719,21 @@ fn nvme_submit_blocking(
     // use read_lba_pages / write_lba_pages (PRP1+PRP2 or PRP-list).
     let base_phys = buffer.phys_addr();
     let n_pages = total_bytes.div_ceil(PAGE_SIZE as usize);
-    // A timed-out command still owns its buffer: the controller may DMA
-    // into or out of it after we return. Leak one reference so those
-    // pages are never recycled under it.
-    let keep_on_timeout = |e: NvmeError| {
-        if e == NvmeError::CompletionTimeout {
-            core::mem::forget(buffer.clone());
-        }
-        map_nvme_err(e)
+    // The queue holds a reference to the buffer for as long as the
+    // controller may DMA into or out of it, including after the host
+    // stops waiting (see `KeepAlive`).
+    let keep = || KeepAlive {
+        data: Some(buffer.clone()),
+        prp_list: None,
     };
 
-    if n_pages == 1 {
+    let r = if n_pages == 1 {
         // Fast-path: single PRP, no allocation.
         match req.op {
-            BlockOp::Read => ctrl
-                .read_lba(req.lba, blocks, &buffer)
-                .map_err(keep_on_timeout),
-            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => ctrl
-                .write_lba(req.lba, blocks, &buffer)
-                .map_err(keep_on_timeout),
+            BlockOp::Read => ctrl.nvm_io(IoOpcode::Read as u8, req.lba, blocks, &buffer, keep()),
+            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => {
+                ctrl.nvm_io(IoOpcode::Write as u8, req.lba, blocks, &buffer, keep())
+            }
             BlockOp::Trim => Ok(()),
         }
     } else {
@@ -2344,15 +2748,25 @@ fn nvme_submit_blocking(
             pages.push(PhysAddr::new(base_phys.raw() + (i as u64) * PAGE_SIZE));
         }
         match req.op {
-            BlockOp::Read => ctrl
-                .read_lba_pages(req.lba, blocks, &pages)
-                .map_err(keep_on_timeout),
-            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => ctrl
-                .write_lba_pages(req.lba, blocks, &pages)
-                .map_err(keep_on_timeout),
+            BlockOp::Read => {
+                ctrl.nvm_io_multipage(IoOpcode::Read as u8, req.lba, blocks, &pages, keep())
+            }
+            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => {
+                ctrl.nvm_io_multipage(IoOpcode::Write as u8, req.lba, blocks, &pages, keep())
+            }
             BlockOp::Trim => Ok(()),
         }
+    };
+    if r.is_err() && ctrl.device_owns(&buffer) {
+        // The command was abandoned and the controller may still DMA
+        // into or out of the buffer. Ownership has moved to the queue's
+        // abandoned set: revoke the cap so the caller cannot resolve
+        // the buffer again, fill it, or submit it anew. The queue's
+        // reference keeps the pages alive until the command's
+        // completion is reaped, then frees them.
+        narf_io::unregister_by_index(req.buffer.slot().index);
     }
+    r.map_err(map_nvme_err)
 }
 
 fn map_nvme_err(e: NvmeError) -> BlockError {
