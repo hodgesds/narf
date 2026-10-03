@@ -1763,6 +1763,21 @@ fn do_execve_resolved(
 
     let task = current_task_id();
 
+    // The own-stack branch below applies the image inline and then drops every
+    // local reference to the new address space, leaving the task's scheduler
+    // slot as its only owner. Only the slot this CPU is running holds it that
+    // way (Step 5's in-poll outcome), so refuse here, while the caller's image
+    // and process state are still intact, unless `task` is that slot. Past
+    // this point the exec can no longer fail back.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if narf_scheduler::stackful::user_own_stack_enabled()
+        && (task == narf_scheduler::TaskId::NONE.raw()
+            || narf_scheduler::current_task_id().raw() != task)
+    {
+        ctx.set_return(errno_ret(ENOSYS));
+        return;
+    }
+
     // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
     // transition, applied to the file actually being executed and only
     // once the image is known good. `image_override` is a memfd/fd image
@@ -1885,9 +1900,11 @@ fn do_execve_resolved(
     if narf_scheduler::stackful::user_own_stack_enabled() {
         // Every local reference to the new AS, `new_proc`'s and `new_as`
         // below, is dropped before the jump, so the slot's is the only one
-        // left while the new image runs on it. If Step 5 stored nothing,
-        // the last drop would free page tables that are live in CR3. The
-        // exec is already past the point where it could fail back to the
+        // left while the new image runs on it. The check before the image
+        // load admitted only the task this CPU is running, so Step 5 took its
+        // in-poll branch and `Ok` here is that outcome. If Step 5 stored
+        // nothing, the last drop would free page tables that are live in CR3.
+        // The exec is already past the point where it could fail back to the
         // old image, so stop here, before any of those drops.
         let Ok(prev_slot_as) = slot_swap else {
             panic!("own-stack execve: task {task} has no scheduler slot to hold its new address space");
@@ -1896,9 +1913,9 @@ fn do_execve_resolved(
         let rsp = new_proc.stack_top.as_u64();
         #[cfg(target_arch = "x86_64")]
         let fs_base = new_proc.fs_base;
-        // The scheduler slot (PENDING_SLOT_AS entry from Step 5) holds the
-        // persistent reference that keeps the new AS alive while the task
-        // runs; this local clone only bridges the activate() below.
+        // The scheduler slot (the in-poll PENDING_SLOT_AS entry from Step 5)
+        // holds the persistent reference that keeps the new AS alive while
+        // the task runs; this local clone only bridges the activate() below.
         let new_as = new_proc.address_space.clone();
         // Borrow-holders first, then owners.
         drop(argv_refs);
@@ -1975,11 +1992,19 @@ fn do_execve_resolved(
     let uctx_ptr = match crate::user_task::current_user_task() {
         Some(p) => p,
         None => {
-            // No active user-task ctx — execve called outside a
-            // polling future (e.g. from a kernel-test stub). Bail
-            // without undoing Step 5: outside any poll it stored
-            // the new AS only if the stub's task id names a queued
-            // slot.
+            // No active user-task ctx, and own-stack mode is off (the
+            // own-stack branch above diverges), so only a kernel-test
+            // stub gets here. Bail without undoing Step 5, which may have
+            // stored the new AS:
+            //   - outside any poll, only if the stub's task id names a
+            //     queued slot, which then carries the new AS while its
+            //     task continues in the old image;
+            //   - inside the poll of a task with no user ctx, in this
+            //     CPU's ACTIVE_USER_AS and that task's pending slot
+            //     override, which keep the new AS until the task ends.
+            // Neither applies the image or frees a live root; the new AS
+            // just lives as long as its holder. No current caller reaches
+            // either: the stubs name no queued task and run outside polls.
             //
             // -ENOSYS, not the old `invalid_op()`. `invalid_op` leaves
             // `value` at 0, and 0 from execve means the exec SUCCEEDED —

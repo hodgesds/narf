@@ -2214,6 +2214,90 @@ kernel_test_in!(
 );
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResult {
+    // The own-stack exec applies the new image inline and leaves the task's
+    // scheduler slot as the only owner of its address space, which holds
+    // only when the caller is the task this CPU is running. Outside any poll
+    // the scheduler's current task is NONE, so a task id from the installed
+    // lookup names a task that is not running here: execve must refuse with
+    // -ENOSYS before it loads the image or changes the caller's process
+    // state, instead of halting the kernel at the post-load guard.
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    if narf_scheduler::current_task_id() != narf_scheduler::TaskId::NONE {
+        return TestResult::Fail("fixture drifted: test body ran inside a task poll");
+    }
+    static FAKE_TID: AtomicU64 = AtomicU64::new(0xC0DE_E0E5);
+    fn task_lookup() -> u64 {
+        FAKE_TID.load(Ordering::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lookup);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-own-stack",
+        narf_filesystem::MemFs::with_seeds("execve-own-stack", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        crate::syscall::__test_clear_global();
+        crate::handlers::__test_reset_task_id_lookup();
+        return TestResult::Fail("mount of execve FS failed");
+    }
+
+    // A distinctive argv[0]: an exec that got as far as Step 4 publishes its
+    // basename as the caller's comm.
+    let path = b"/execve-own-stack/prog\0";
+    let arg0 = b"/usr/bin/ownstackprobe\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    narf_scheduler::stackful::enable_user_own_stack();
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+    #[cfg(feature = "kernel-test")]
+    narf_scheduler::stackful::__reset_user_own_stack_for_test();
+
+    let comm = crate::handlers::proc_comm_of(FAKE_TID.load(Ordering::Relaxed));
+    if let Ok(h) = mounted {
+        let _ = narf_filesystem::registry().unmount(&h, "/execve-own-stack");
+    }
+    crate::syscall::__test_clear_global();
+    crate::handlers::__test_reset_task_id_lookup();
+    if ctx.ret != Some(errno_ret(ENOSYS)) {
+        return TestResult::Fail(
+            "own-stack execve for a task not running here did not return -ENOSYS",
+        );
+    }
+    if comm.as_deref() == Some("ownstackprobe") {
+        return TestResult::Fail(
+            "own-stack execve refused only after publishing the new image's comm",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_own_stack_execve_refuses_task_not_running_here
+);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_rejects_inline_elf_pointer() -> TestResult {
     // Legacy-ABI guard. execve was (elf_ptr, elf_len); it is now Linux
     // (path, argv, envp). Passing the ELF *bytes* as arg0 means the handler
