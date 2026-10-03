@@ -16576,22 +16576,39 @@ mod child_reap_signalfd_tests {
 
     /// Drive `on_child_exit` for a synthetic parent that has a signalfd watching
     /// `watch_mask` (sig_bit convention), armed epoll-style. Returns
-    /// `(waker_fire_count, reports_poll_in)`.
-    fn run_exit(parent: u64, child: u64, watch_mask: u64) -> (u32, bool) {
-        // A real parent's signal state is created at task creation
-        // (init_per_task_state → signal_init), which allocates its SIGNAL_PENDING
-        // bucket. This synthetic parent never went through that: on a boot where
-        // no earlier test happened to run signal_init, the bucket is None, so
-        // on_child_exit's `pending_signal_bits_update(parent)` returns None and
-        // takes the legacy `wake_signal`-only fallback that never fires the
-        // signalfd cell — the waker count stays 0. x86_64 masks it (a prior test
-        // seeded the bucket); aarch64's smaller, reordered set runs this case
-        // first and exposes it. Establish the initialised signal state a real
-        // parent has (and clear any prior case's leaked bits) up front.
+    /// `(waker_fire_count, reports_poll_in)`, or `Err` when the fixture could not
+    /// build the parent/child state a real fork publishes.
+    fn run_exit(parent: u64, child: u64, watch_mask: u64) -> Result<(u32, bool), &'static str> {
+        // A real parent's state is created before it can ever fork: the boot
+        // path runs `init_per_task_state`, which calls both `signal_init` (the
+        // SIGNAL_PENDING buckets) and `wait_init` (PARENT_OF and the other wait
+        // registries). A kernel-test boot never runs `init_per_task_state`
+        // (bare_main routes to the test harness instead of boot-init), so each
+        // registry stays `None` until some earlier test happens to initialise
+        // it, and which tests run earlier depends on link order and the
+        // `--subsystem`/feature selection.
+        //
+        // Both halves matter. With SIGNAL_PENDING `None`,
+        // `pending_signal_bits_update(parent)` returns `None` and on_child_exit
+        // takes the legacy `wake_signal`-only fallback. With PARENT_OF `None`,
+        // `parent_of_set_with_signal` below is a silent no-op, so
+        // `get_wait_recipient(child)` is `None` and on_child_exit takes its
+        // ORPHAN branch, which raises no SIGCHLD at all. The second is what
+        // failed `cargo xtask test --subsystem userspace --features
+        // cgroup-all,container`: no test ahead of this one there calls
+        // `wait_init`, `init_per_task_state` or `__test_wait_reset`. Build both
+        // registries up front, as the boot path does. `__test_wait_reset` is the
+        // data half of `wait_init`; it does not re-register the boot-once exit
+        // observers and hooks.
         super::signal_init();
+        super::__test_wait_reset();
         // What fork/exit set up before on_child_exit: the natural-parent link
         // with a SIGCHLD exit-signal, and the staged wstatus.
         super::parent_of_set_with_signal(child, parent, 17); // SIGCHLD
+        if super::get_wait_recipient(child) != Some(parent) {
+            return Err("fixture: child has no wait recipient (wait registry uninitialised); \
+                 on_child_exit would take the orphan path");
+        }
         super::stage_pending_termination(child, 0);
 
         let sfd = crate::io_mux::SignalFd::new(watch_mask, parent);
@@ -16604,15 +16621,37 @@ mod child_reap_signalfd_tests {
 
         let fired = count.load(Ordering::SeqCst);
         let ready = sfd.poll_readiness() & POLL_IN != 0;
-        // Best-effort residue drain (synthetic ids never collide with real ones).
+        // Retire the rows this fixture created, keyed by its synthetic ids: the
+        // staged status, the child link, the parent's reap entry, and the
+        // parent's pending SIGCHLD (bit, global pending-task count and queued
+        // siginfo). Left behind, they are residue for whatever runs next.
         let _ = super::take_pending_termination(child);
-        (fired, ready)
+        super::parent_of_remove(child);
+        if let Some(m) = super::PENDING_EXITS[super::pending_exit_shard(parent)]
+            .map
+            .lock()
+            .as_mut()
+        {
+            m.remove(&parent);
+        }
+        super::pending_signal_bits_remove(parent);
+        if let Some(m) = super::SIGQUEUE_INFO[super::sigqueue_bucket(parent)]
+            .values
+            .lock()
+            .as_mut()
+        {
+            m.retain(|&(t, _), _| t != parent);
+        }
+        Ok((fired, ready))
     }
 
     /// POSITIVE: a parent whose signalfd watches SIGCHLD must have that fd's
     /// epoll waker fired AND report POLL_IN after the child exits.
     fn smoke_on_child_exit_fires_parent_signalfd() -> TestResult {
-        let (fired, ready) = run_exit(0xC0DE_0001, 0xC0DE_0002, super::sig_bit(17));
+        let (fired, ready) = match run_exit(0xC0DE_0001, 0xC0DE_0002, super::sig_bit(17)) {
+            Ok(result) => result,
+            Err(why) => return TestResult::Fail(why),
+        };
         if fired == 0 {
             return TestResult::Fail(
                 "on_child_exit did not fire the parent's SIGCHLD signalfd waker (lost reap wake)",
@@ -16630,7 +16669,10 @@ mod child_reap_signalfd_tests {
     /// the fd's mask, so epoll delivers nothing even though `wake_signalfds`
     /// wakes every one of the task's signalfd waiters (a benign spurious wake).
     fn smoke_on_child_exit_unwatched_signalfd_not_ready() -> TestResult {
-        let (_fired, ready) = run_exit(0xC0DE_0011, 0xC0DE_0012, super::sig_bit(10));
+        let (_fired, ready) = match run_exit(0xC0DE_0011, 0xC0DE_0012, super::sig_bit(10)) {
+            Ok(result) => result,
+            Err(why) => return TestResult::Fail(why),
+        };
         if ready {
             return TestResult::Fail("SIGCHLD made a signalfd not watching it report POLL_IN");
         }
