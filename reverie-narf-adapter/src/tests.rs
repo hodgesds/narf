@@ -232,6 +232,12 @@ static EXITED_SPACES: IrqSafeSpinLock<Vec<Weak<AddressSpace>>> = IrqSafeSpinLock
 /// each run.
 static EXPECTED_KERNEL_REENTRIES: AtomicU64 = AtomicU64::new(0);
 
+/// Set by a test whose guest's tasks must share one CPU: the next
+/// [`run_guest_with`] then keeps the kernel-test placement, every guest task
+/// pinned to the boot CPU, instead of [`ProductionPlacement`]. Taken (reset)
+/// at the start of each run.
+static BOOT_CPU_PLACEMENT: AtomicBool = AtomicBool::new(false);
+
 /// The CPUs the current run's tasks exited on, one bit per CPU, printed
 /// after each run as evidence of where [`ProductionPlacement`] put them.
 static EXIT_CPUS: AtomicU64 = AtomicU64::new(0);
@@ -347,7 +353,7 @@ impl Drop for ProductionPlacement {
 /// Runs `elf` as a fresh scheduled user process with `interceptor` installed
 /// in the live syscall table, until every task it created has been reaped.
 /// The guest's tasks are placed as in production ([`ProductionPlacement`]),
-/// so they run on any online CPU.
+/// so they run on any online CPU, unless [`BOOT_CPU_PLACEMENT`] is set.
 ///
 /// `register` runs after the root task has its Linux identity and before it
 /// is runnable. The root is an orphan, which the kernel releases at exit.
@@ -378,6 +384,7 @@ fn run_guest_with(
     use narf_userspace::{install_core_syscalls, install_global, install_task_id_lookup};
 
     let expected_reentries = EXPECTED_KERNEL_REENTRIES.swap(0, Ordering::AcqRel);
+    let boot_cpu_placement = BOOT_CPU_PLACEMENT.swap(false, Ordering::AcqRel);
     let cpu = narf_lib::percpu::current_cpu();
     let original_cr3: u64;
     // SAFETY: reading CR3 has no side effects.
@@ -473,7 +480,7 @@ fn run_guest_with(
     let reentries_before = narf_userspace::user_task::__test_kernel_reentries();
     // Held until the function returns, which is after the run's last task
     // was reaped.
-    let _placement = ProductionPlacement::enable();
+    let _placement = (!boot_cpu_placement).then(ProductionPlacement::enable);
     let pending =
         narf_userspace::user_task::prepare_user_process_initial(process, TaskSpec::user_task());
     let task_id = pending.task_id().raw();
@@ -2757,7 +2764,430 @@ fn reverie_narf_sigkill_in_callback_matches_ptrace() -> TestResult {
 }
 reverie_narf_test!(reverie_narf_sigkill_in_callback_matches_ptrace);
 
-// ── vDSO calls reach the Tool ─────────────────────────────────────────────
+// ── Callbacks that wait for another task ──────────────────────────────────
+
+static RENDEZVOUS_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RENDEZVOUS"));
+static KILLWAIT_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_KILLWAIT"));
+
+const LINUX_GETUID: u32 = 102;
+const LINUX_GETGID: u32 = 104;
+/// How long a test callback waits for another task before it gives up: a
+/// fifth of [`WAITER_BUDGET_CYCLES`], so a wait that never ends fails the
+/// test with a named status rather than the harness's timeout.
+const CALLBACK_WAIT_CYCLES: u64 = WAITER_BUDGET_CYCLES / 5;
+/// What a test callback returns to the guest when its wait gave up
+/// (`-ETIMEDOUT`). No guest accepts it.
+const WAIT_GAVE_UP: i64 = -110;
+
+/// Pending on its first poll, without arranging a wakeup, and ready on the
+/// next: the host polls a pending callback again once its task has waited.
+#[derive(Default)]
+struct YieldOnce(bool);
+
+impl core::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        _: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            return core::task::Poll::Ready(());
+        }
+        self.0 = true;
+        core::task::Poll::Pending
+    }
+}
+
+/// Waits until `flag` is set and returns `true`, or `false` once
+/// [`CALLBACK_WAIT_CYCLES`] have passed. Counts in `polls` every poll of the
+/// wait, which is one pass of its loop. With `yield_first` the first pass is
+/// pending whatever the flag says, so the wait is polled at least twice.
+async fn wait_for(flag: &AtomicBool, polls: &AtomicU64, yield_first: bool) -> bool {
+    let deadline = narf_time::Deadline::after_cycles(CALLBACK_WAIT_CYCLES);
+    let mut check = !yield_first;
+    loop {
+        polls.fetch_add(1, Ordering::AcqRel);
+        if check {
+            if flag.load(Ordering::Acquire) {
+                return true;
+            }
+            if deadline.expired() {
+                return false;
+            }
+        }
+        check = true;
+        YieldOnce::default().await;
+    }
+}
+
+/// The requests [`Rendezvous`] sends from the child's and the parent's
+/// callback.
+const MEET_CHILD: u64 = 1;
+const MEET_PARENT: u64 = 2;
+/// What the rendezvous guest expects from `getuid` in the child and from
+/// `getgid` in the parent.
+const MEET_CHILD_VALUE: i64 = 0x5831;
+const MEET_PARENT_VALUE: i64 = 0x5931;
+
+/// Where the two callbacks of [`Rendezvous`] meet.
+#[derive(Debug, Default)]
+struct Meeting {
+    /// The child's callback has started.
+    child_arrived: AtomicBool,
+    /// The parent's callback has seen the child's start.
+    parent_done: AtomicBool,
+    /// Polls of the child's and of the parent's wait.
+    child_polls: AtomicU64,
+    parent_polls: AtomicU64,
+}
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for Meeting {
+    type Request = u64;
+    type Response = i64;
+    type Config = ();
+
+    async fn init_global_state(_: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, request: u64) -> i64 {
+        if request == MEET_CHILD {
+            self.child_arrived.store(true, Ordering::Release);
+            if wait_for(&self.parent_done, &self.child_polls, true).await {
+                return MEET_CHILD_VALUE;
+            }
+        } else if wait_for(&self.child_arrived, &self.parent_polls, false).await {
+            self.parent_done.store(true, Ordering::Release);
+            return MEET_PARENT_VALUE;
+        }
+        WAIT_GAVE_UP
+    }
+}
+
+/// Meets the rendezvous guest's two callbacks through [`Meeting`]. The
+/// child's `getuid` is pending once whatever the order, then waits until the
+/// parent's `getgid` has seen it start; the parent's `getgid` waits for the
+/// child's to start. Each returns its value to the guest without running the
+/// syscall, and everything else is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct Rendezvous;
+
+#[reverie::tool]
+impl Tool for Rendezvous {
+    type GlobalState = Meeting;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        match syscall.number().id() as u32 {
+            LINUX_GETUID => Ok(guest.send_rpc(MEET_CHILD).await),
+            LINUX_GETGID => Ok(guest.send_rpc(MEET_PARENT).await),
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// Two callbacks in different tasks wait for each other through the global
+/// state: the rendezvous guest's child and parent each get their value, the
+/// child exits 0, and the parent reaps it and exits 0. The child's callback
+/// is pending at least once in any order, so the host must let its task wait
+/// and poll the callback again; a host that cannot aborts the run with
+/// `ToolSuspended`. On one CPU, whichever callback waits first sees the other
+/// start only if its task gives up the CPU while it waits.
+fn reverie_narf_waiting_callbacks_meet_through_global_state() -> TestResult {
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<Rendezvous>(RENDEZVOUS_GUEST, ())?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let meeting = interceptor.host().global();
+        let child_polls = meeting.child_polls.load(Ordering::Acquire);
+        let parent_polls = meeting.parent_polls.load(Ordering::Acquire);
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    child polls {child_polls} parent polls {parent_polls} holds {holds:?} \
+             abort reason {reason:?}"
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callbacks");
+        }
+        if child_polls < 2 {
+            return Err("the child's callback was not polled again after it was pending");
+        }
+        let exits = check_teardown(&interceptor, root, 2, 0)?;
+        if exits.iter().any(|exit| exit.wstatus != 0) {
+            return Err("a task of the rendezvous guest did not exit 0");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_waiting_callbacks_meet_through_global_state);
+
+/// Whether the kill-during-wait guest's child callback has started waiting;
+/// the flag [`KillWait`]'s child waits for, which nothing sets, and the one
+/// [`KillRelease`]'s parent sets once its `kill` has run; how often the
+/// child's callback went on past its wait; how often its future was dropped;
+/// and the polls of the child's and of the parent's wait.
+static KILLWAIT_WAITING: AtomicBool = AtomicBool::new(false);
+static KILLWAIT_NEVER: AtomicBool = AtomicBool::new(false);
+static KILLWAIT_RELEASED: AtomicBool = AtomicBool::new(false);
+static KILLWAIT_AFTER: AtomicU64 = AtomicU64::new(0);
+static KILLWAIT_DROPPED: AtomicU64 = AtomicU64::new(0);
+static KILLWAIT_CHILD_POLLS: AtomicU64 = AtomicU64::new(0);
+static KILLWAIT_PARENT_POLLS: AtomicU64 = AtomicU64::new(0);
+/// What the kill-during-wait guest expects from `getgid` in the parent.
+const KILLWAIT_READY: i64 = 0x4b31;
+/// The status the kill-during-wait guest's child passes to `exit`.
+const KILLWAIT_CHILD_EXIT: usize = 119;
+
+const LINUX_KILL: u32 = 62;
+
+/// Counts one drop of the callback future that owns it in the counter it
+/// names.
+struct CountDrop(&'static AtomicU64);
+
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A callback of the kill-during-wait guest's child: marks itself waiting,
+/// waits for `release`, and counts that it went on past the wait. The guest's
+/// child exits [`KILLWAIT_CHILD_EXIT`] whatever its `getuid` returns.
+async fn killwait_child(release: &AtomicBool) -> i64 {
+    let _mark = CountDrop(&KILLWAIT_DROPPED);
+    KILLWAIT_WAITING.store(true, Ordering::Release);
+    let _ = wait_for(release, &KILLWAIT_CHILD_POLLS, false).await;
+    KILLWAIT_AFTER.fetch_add(1, Ordering::AcqRel);
+    WAIT_GAVE_UP
+}
+
+/// The kill-during-wait guest's parent `getgid`: waits until the child's
+/// callback is waiting, then returns [`KILLWAIT_READY`].
+async fn killwait_parent() -> i64 {
+    if wait_for(&KILLWAIT_WAITING, &KILLWAIT_PARENT_POLLS, false).await {
+        KILLWAIT_READY
+    } else {
+        WAIT_GAVE_UP
+    }
+}
+
+/// In the kill-during-wait guest, the child's `getuid` waits for
+/// [`KILLWAIT_NEVER`], and the parent's `getgid` waits until the child's is
+/// waiting ([`killwait_child`], [`killwait_parent`]). Everything else, the
+/// parent's `kill` included, is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct KillWait;
+
+#[reverie::tool]
+impl Tool for KillWait {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        match syscall.number().id() as u32 {
+            LINUX_GETUID => Ok(killwait_child(&KILLWAIT_NEVER).await),
+            LINUX_GETGID => Ok(killwait_parent().await),
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// [`KillWait`], except that the child's `getuid` waits for
+/// [`KILLWAIT_RELEASED`], and the parent's `kill` is injected from its
+/// callback, which sets that flag once the `kill` has run and then returns
+/// the `kill`'s result.
+#[derive(Debug, Default, Clone, Copy)]
+struct KillRelease;
+
+#[reverie::tool]
+impl Tool for KillRelease {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        match syscall.number().id() as u32 {
+            LINUX_GETUID => Ok(killwait_child(&KILLWAIT_RELEASED).await),
+            LINUX_GETGID => Ok(killwait_parent().await),
+            LINUX_KILL => {
+                let killed = guest.inject(syscall).await;
+                KILLWAIT_RELEASED.store(true, Ordering::Release);
+                Ok(killed?)
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// [`KillWait`], except that the child waits in its `exit` instead of its
+/// `getuid`: the `exit` waits for [`KILLWAIT_NEVER`] before it would run, and
+/// the `getuid` is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct KillInExit;
+
+#[reverie::tool]
+impl Tool for KillInExit {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        let (sysno, args) = syscall.into_parts();
+        match sysno.id() as u32 {
+            LINUX_EXIT if args.arg0 == KILLWAIT_CHILD_EXIT => {
+                let _ = killwait_child(&KILLWAIT_NEVER).await;
+                guest.tail_inject(syscall).await
+            }
+            LINUX_GETGID => Ok(killwait_parent().await),
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// Clears what the kill-during-wait Tools record, before a run.
+fn reset_killwait() {
+    for flag in [&KILLWAIT_WAITING, &KILLWAIT_NEVER, &KILLWAIT_RELEASED] {
+        flag.store(false, Ordering::Release);
+    }
+    for counter in [
+        &KILLWAIT_AFTER,
+        &KILLWAIT_DROPPED,
+        &KILLWAIT_CHILD_POLLS,
+        &KILLWAIT_PARENT_POLLS,
+    ] {
+        counter.store(0, Ordering::Release);
+    }
+}
+
+/// What a run of the kill-during-wait guest must show once it is over: the
+/// child's callback waited, never went on past its wait, and had its future
+/// dropped exactly once; the child died of SIGKILL, and the parent reaped it
+/// and exited 0.
+fn check_killed_wait<T: Tool + 'static>(
+    interceptor: &ReverieInterceptor<T>,
+    root: Root,
+) -> Result<(), &'static str> {
+    let holds = narf_userspace::user_task::__test_open_spawn_holds();
+    let waiting = KILLWAIT_WAITING.load(Ordering::Acquire);
+    let after = KILLWAIT_AFTER.load(Ordering::Acquire);
+    let dropped = KILLWAIT_DROPPED.load(Ordering::Acquire);
+    let child_polls = KILLWAIT_CHILD_POLLS.load(Ordering::Acquire);
+    let parent_polls = KILLWAIT_PARENT_POLLS.load(Ordering::Acquire);
+    let reason = interceptor.abort_reason();
+    let _ = writeln!(
+        Writer,
+        "    child polls {child_polls} parent polls {parent_polls} after wait {after} \
+         dropped {dropped} holds {holds:?} abort reason {reason:?}"
+    );
+    if reason.is_some() {
+        return Err("the run was aborted");
+    }
+    if holds != (0, 0) {
+        return Err("a spawn hold outlived the callbacks");
+    }
+    if !waiting || child_polls == 0 {
+        return Err("the child's callback never waited");
+    }
+    if after != 0 {
+        return Err("the killed child's callback went on past its wait");
+    }
+    if dropped != 1 {
+        return Err("the killed child's callback future was not dropped exactly once");
+    }
+    let exits = check_teardown(interceptor, root, 2, 0)?;
+    if exits
+        .iter()
+        .any(|exit| exit.task_id != root.task_id && exit.wstatus != LINUX_SIGKILL)
+    {
+        return Err("the child did not die of SIGKILL");
+    }
+    Ok(())
+}
+
+/// A task killed while its callback waits for another task dies without the
+/// callback going on, as one killed inside a callback does
+/// ([`reverie_narf_sigkill_in_callback_matches_ptrace`]). The kill-during-wait
+/// guest's parent kills its child with SIGKILL while the child's callback
+/// waits for a flag nothing sets ([`KillWait`]); see [`check_killed_wait`].
+fn reverie_narf_kill_ends_a_waiting_callback() -> TestResult {
+    reset_killwait();
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<KillWait>(KILLWAIT_GUEST, ())?;
+        check_killed_wait(&interceptor, root)?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_kill_ends_a_waiting_callback);
+
+/// A kill that lands while a waiting callback's task is switched out ends the
+/// wait before the callback is polled again, even if what it waits for came
+/// true meanwhile, as reverie-ptrace takes a task's exit over the Tool's
+/// wakeup when it sees both. The kill-during-wait guest's parent runs its
+/// `kill` from [`KillRelease`]'s callback, which then releases the child's
+/// wait. Both tasks run on the boot CPU ([`BOOT_CPU_PLACEMENT`]), and the
+/// kernel does not preempt a syscall's continuation, so the child runs next
+/// with its wait both killed and released; see [`check_killed_wait`].
+fn reverie_narf_kill_while_switched_out_ends_a_released_wait() -> TestResult {
+    reset_killwait();
+    let _signal_tables = SignalTables::init();
+    BOOT_CPU_PLACEMENT.store(true, Ordering::Release);
+    let outcome = (|| {
+        let (interceptor, root) = run_hosted::<KillRelease>(KILLWAIT_GUEST, ())?;
+        if EXIT_CPUS.load(Ordering::Acquire).count_ones() != 1 {
+            return Err("the guest's tasks did not all exit on one CPU");
+        }
+        check_killed_wait(&interceptor, root)?;
+        if !KILLWAIT_RELEASED.load(Ordering::Acquire) {
+            return Err("the parent's kill never ran from its callback");
+        }
+        Ok(TestResult::Pass)
+    })();
+    BOOT_CPU_PLACEMENT.store(false, Ordering::Release);
+    result_of(outcome)
+}
+reverie_narf_test!(reverie_narf_kill_while_switched_out_ends_a_released_wait);
+
+/// A killed wait never runs the syscall the callback was entered for, as a
+/// SIGKILL at a ptrace syscall-entry stop kills the task before its syscall
+/// runs. The kill-during-wait guest's child waits in its
+/// `exit(`[`KILLWAIT_CHILD_EXIT`]`)` ([`KillInExit`]) and still dies of
+/// SIGKILL; see [`check_killed_wait`].
+fn reverie_narf_kill_ends_a_wait_without_running_its_syscall() -> TestResult {
+    reset_killwait();
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<KillInExit>(KILLWAIT_GUEST, ())?;
+        check_killed_wait(&interceptor, root)?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_kill_ends_a_wait_without_running_its_syscall);
+
+// ── vDSO calls reach the Tool─────────────────────────────────────────────
 
 const LINUX_CLOCK_GETTIME: u32 = 228;
 const LINUX_GETTIMEOFDAY: u32 = 96;

@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 
 use narf_userspace::handlers::tool_view::{self, LinuxTaskIds};
 use narf_userspace::syscall::{
-    CreatedNativeTask, NativeSyscallOriginalError, NativeSyscallOutcome, NativeSyscallRequest,
-    NativeSyscallTransition, SyscallArgs,
+    CreatedNativeTask, NativeRepollWait, NativeSyscallOriginalError, NativeSyscallOutcome,
+    NativeSyscallRequest, NativeSyscallTransition, SyscallArgs,
 };
 use reverie::syscalls::{libc, Errno, IoSlice, IoSliceMut, MemoryAccess};
 use reverie::{Auxv, Pid};
 use reverie_narf_core::{
     CreatedTask, CreatedTaskKind, KernelServices, NarfSyscallOutcome, NarfSyscallRequest,
-    OriginalSyscallError,
+    OriginalSyscallError, RepollWait,
 };
 
 /// x86_64 Linux user code and stack segment selectors, as a ptrace tracer
@@ -56,9 +56,11 @@ fn pid(raw: u64) -> Pid {
 /// The current task's memory: the active user address space.
 ///
 /// Valid while the task it was obtained for is the one running, which holds
-/// for the whole callback. Every access goes through the kernel's checked
-/// user-copy primitives, so a bad address is an `EFAULT`, never a kernel
-/// access.
+/// whenever the core polls that task's callback, after a repoll wait too.
+/// The handle names no task: a copy kept in the global state and used from
+/// another task's callback reaches that task's address space. Every access
+/// goes through the kernel's checked user-copy primitives, so a bad address
+/// is an `EFAULT`, never a kernel access.
 #[derive(Clone, Copy, Debug)]
 pub struct NarfMemory {
     _private: (),
@@ -151,10 +153,13 @@ impl core::fmt::Debug for NarfKernelServices<'_> {
 // the duration of one interceptor call. The core lends it to the Tool's future
 // only while it polls that future, synchronously, on that stack; a future the
 // core keeps across a park holds no reference to it (reverie-narf-core's
-// `FrameSlot` is cleared on every exit from the poll). So the borrowed
-// transition is never reached from another CPU or after the call returns.
+// `FrameSlot` is cleared on every exit from the poll). Between two polls,
+// `wait_for_repoll` switches the task out, and the task may resume on another
+// CPU, but no other task reaches its stack meanwhile, and nothing here is
+// per-CPU state. So the borrowed transition is reached only by its own task,
+// and never after the call returns.
 unsafe impl Send for NarfKernelServices<'_> {}
-// SAFETY: as above; no shared reference escapes the single synchronous poll.
+// SAFETY: as above; no shared reference escapes the synchronous poll.
 unsafe impl Sync for NarfKernelServices<'_> {}
 
 impl<'a> NarfKernelServices<'a> {
@@ -295,5 +300,13 @@ impl KernelServices for NarfKernelServices<'_> {
         // Narf has no daemonize transition yet; the core turns this into a
         // named fatal error rather than pretending the task detached.
         Err(Errno::ENOSYS)
+    }
+
+    fn wait_for_repoll(&mut self) -> RepollWait {
+        match self.native.wait_for_repoll() {
+            NativeRepollWait::Yielded => RepollWait::Yielded,
+            NativeRepollWait::Killed => RepollWait::Killed,
+            NativeRepollWait::Unsupported => RepollWait::Unsupported,
+        }
     }
 }

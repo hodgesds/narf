@@ -14,12 +14,15 @@
 //!   that owns the host and forwards syscall entries and task lifecycle
 //!   events to it.
 //!
-//! There is no IPC, ptrace emulation, signal, binary rewriting or polling: the
-//! kernel calls the interceptor, the interceptor polls the Tool's future once
-//! per kernel entry, and every Tool-to-kernel operation is a direct call. A
-//! Tool whose inject parks the task (a blocking read, say) keeps its future in
-//! the host, which polls it again, on the task's own stack, when the kernel
-//! re-executes the parked syscall.
+//! There is no IPC, ptrace emulation, signal or binary rewriting: the kernel
+//! calls the interceptor, the interceptor polls the Tool's future on the
+//! trapping task's own stack, and every Tool-to-kernel operation is a direct
+//! call. A Tool whose inject parks the task (a blocking read, say) keeps its
+//! future in the host, which polls it again, on the task's own stack, when
+//! the kernel re-executes the parked syscall. A Tool future pending for any
+//! other reason is waiting for another task (through the global state, say):
+//! the task yields to its peers, and the host polls the future again each
+//! time the task runs (see "Waiting callbacks" below).
 //!
 //! The crate is x86_64-only because Reverie's syscall layer is defined
 //! without `std` only for x86_64; on any other target it is empty.
@@ -81,7 +84,7 @@
 //! | `InvalidErrno` | The Tool returned an errno outside `1..=4095`. | No; Tool only. |
 //! | `PostExec(Errno)` | `handle_post_exec` failed. | Only through a Tool that fails on guest input. |
 //! | `InjectParked`, in a lifecycle callback | A non-tail inject parked the task (a blocking `poll`, say). No guest syscall exists to re-execute. | Yes, given a Tool that makes a blocking inject there, because the guest controls whether the call would block (`reverie_narf_parked_inject_in_thread_start_aborts_the_tree`). |
-//! | `ToolSuspended` | The Tool's future was pending without a terminal transition and without a parked inject. | No; Tool only. |
+//! | `ToolSuspended` | The Tool's future was pending without a terminal transition and without a parked inject, where the kernel cannot let the task wait: in a hook that is polled once, or outside the own-stack execution model (see "Waiting callbacks"). | No; Tool only. |
 //! | `TransitionAfterInterruption` | After a signal interrupted its parked inject (which returned `ERESTARTSYS`), the Tool ran another syscall. | Yes, given such a Tool: a signal sent during the parked inject is enough (`reverie_narf_transition_after_interruption_aborts_the_tree`). |
 //! | `TransitionAfterTerminal` | The Tool ran a syscall after its callback's terminal transition. | No; Tool only. |
 //! | `TailInjectOutsideSyscall` | A lifecycle callback tail-injected a syscall that returned. | No; Tool only. |
@@ -108,6 +111,43 @@
 //! any guest runs; `ReverieInterceptor::new` returns them as errors.
 //!
 //! ## Differences from reverie-ptrace
+//!
+//! **Waiting callbacks.** A syscall callback whose Tool future is pending
+//! without a terminal transition, a parked inject or a failure is taken to
+//! wait for another task. Under reverie-ptrace its tracer task would sleep
+//! until the future's waker fires; here the host asks the kernel to let
+//! other tasks run (`NativeSyscallTransition::wait_for_repoll`) and polls the
+//! future again each time the task runs, woken or not, with no bound of its
+//! own (`reverie_narf_waiting_callbacks_meet_through_global_state`).
+//! * The wait is a busy yield. The task stays runnable, and the scheduler
+//!   runs it again after its peers, possibly on another CPU, so a CPU with
+//!   a waiting callback never idles.
+//! * Only `SIGKILL` ends a wait, including the one a sibling's `exit_group`
+//!   leaves pending. The kernel checks for it each time the task runs again,
+//!   so a kill that lands while the task is switched out ends the wait before
+//!   the Tool is polled again, even if what the Tool waited for came true
+//!   meanwhile (`reverie_narf_kill_while_switched_out_ends_a_released_wait`);
+//!   one that lands while the Tool is being polled ends the wait after the
+//!   task's next switch-out, unless that poll finishes the callback. The host
+//!   then drops the future at once, before the exit hooks run, and the task
+//!   dies of the signal once the interceptor has returned, without running
+//!   the syscall the callback was entered for
+//!   (`reverie_narf_kill_ends_a_wait_without_running_its_syscall`).
+//!   reverie-ptrace also drops it before the exit hooks, once its tracer sees
+//!   the task exit, because it races the Tool's run loop against the exit
+//!   event and takes the exit first when it sees both
+//!   (`reverie_narf_kill_ends_a_waiting_callback`); its task is stopped at
+//!   the syscall's entry, so the syscall does not run there either. Every
+//!   other signal stays pending until the callback has returned.
+//! * A task that the waiting callback created is held off the run queues
+//!   until the callback returns (`SpawnHold`), so a callback that waits for
+//!   its own child waits until the Tool gives up or the task is killed.
+//! * Only syscall callbacks wait, and only in the own-stack execution model,
+//!   which production enables in `install_user_task_hooks`. Elsewhere the
+//!   callback ends as `ToolSuspended` (see "Run aborts"): in the legacy
+//!   model, and in the hooks that are polled once, which are
+//!   `handle_thread_start`, `handle_post_exec`, the exit hooks, the poll
+//!   after a signal interrupted a parked inject, and `init_global_state`.
 //!
 //! **vDSO calls.** Installing the interceptor for a Tool subscribed to any
 //! one of `clock_gettime`, `gettimeofday`, `time` or `getcpu` routes all four
@@ -247,7 +287,10 @@
 //!   `TaskSpec::user_task` prefers (an application processor; on a two-CPU
 //!   machine, either CPU), a fork child goes where `fork_cpu` puts it, and
 //!   idle CPUs steal runnable guest tasks. Each run prints the CPUs its tasks
-//!   exited on. The pipe tests open their gate from the kernel's
+//!   exited on. A test whose guest's tasks must share one CPU sets
+//!   `BOOT_CPU_PLACEMENT` and keeps the kernel-test placement, every guest
+//!   task pinned to the boot CPU, and checks that its tasks exited on one
+//!   CPU. The pipe tests open their gate from the kernel's
 //!   descriptor-park observer, once the write has parked, so they do not
 //!   depend on where the parent and child run.
 //! * **Reclaim timing.** With guest tasks on several CPUs, a peer CPU can

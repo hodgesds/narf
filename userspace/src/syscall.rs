@@ -189,6 +189,22 @@ pub enum NativeSyscallOriginalError {
     ContextManaged,
 }
 
+/// How [`NativeSyscallTransition::wait_for_repoll`] ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeRepollWait {
+    /// The task was switched out so that other tasks could run, and it runs
+    /// again, possibly on another CPU.
+    Yielded,
+    /// The task was killed. The kernel owns its context: the callback must
+    /// run no further transition, and the task dies of `SIGKILL` once the
+    /// interceptor has returned.
+    Killed,
+    /// This capability cannot wait, so nothing happened: it has no user task
+    /// to switch out (a lifecycle callback, the legacy execution model), or
+    /// a transition already took the task's context.
+    Unsupported,
+}
+
 /// Raw syscall request for a nested native injection.
 #[derive(Copy, Clone, Debug)]
 pub struct NativeSyscallRequest {
@@ -254,6 +270,18 @@ pub trait NativeSyscallTransition {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn entry_user_state(&self) -> Option<narf_scheduler::UserState> {
         None
+    }
+
+    /// Lets other tasks run while the interceptor's callback waits for one
+    /// of them, and returns once this task runs again.
+    ///
+    /// The task stays runnable, so this is a busy wait: the scheduler runs
+    /// it again after its peers, possibly on another CPU. Only `SIGKILL`
+    /// (which a sibling's `exit_group` also leaves pending) ends a wait, with
+    /// [`NativeRepollWait::Killed`] once the task runs again. Any other signal
+    /// stays pending until the callback has returned.
+    fn wait_for_repoll(&mut self) -> NativeRepollWait {
+        NativeRepollWait::Unsupported
     }
 }
 
@@ -3833,6 +3861,26 @@ fn callback_task_killed(task_id: u64) -> bool {
         || crate::user_task::staged_termination_signal(task_id) == Some(9)
 }
 
+/// Switches the user task running an interceptor callback out to the
+/// executor, which runs it again after its peers. Returns whether it did.
+///
+/// Only in the own-stack model, where the syscall runs on the task's own
+/// kernel stack: the callback's frame then stays in place while the task is
+/// switched out, as it does when an injected syscall parks
+/// (`own_stack_block`), and may resume on another CPU.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn yield_callback_task() -> bool {
+    narf_scheduler::stackful::user_own_stack_enabled()
+        && crate::user_task::current_user_task().is_some()
+        && narf_scheduler::cooperative_yield()
+}
+
+/// No architecture without the own-stack model can switch a callback out.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn yield_callback_task() -> bool {
+    false
+}
+
 impl DispatchNativeTransition<'_, '_> {
     /// Answers a transition the interceptor's callback requests without
     /// running it, when a signal already decides the task's fate. This
@@ -3955,6 +4003,26 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn entry_user_state(&self) -> Option<narf_scheduler::UserState> {
         self.entry_state
+    }
+
+    /// A kill pending once the task runs again, whether it landed before or
+    /// during the wait, takes the task's context, as in
+    /// [`Self::signal_gate`]: no later transition runs, and neither does the
+    /// intercepted syscall once the callback has returned.
+    ///
+    /// A wait after a transition has taken the context is not refused: no
+    /// transition can run after it anyway, and reverie-narf-core never asks
+    /// for one, because it stops polling a callback once one of its
+    /// transitions has returned `ContextManaged`.
+    fn wait_for_repoll(&mut self) -> NativeRepollWait {
+        if !yield_callback_task() {
+            return NativeRepollWait::Unsupported;
+        }
+        if callback_task_killed(self.task_id) {
+            self.context_managed = true;
+            return NativeRepollWait::Killed;
+        }
+        NativeRepollWait::Yielded
     }
 }
 
