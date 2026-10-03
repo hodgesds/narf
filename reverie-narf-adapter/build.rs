@@ -9,7 +9,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const GUESTS: [(&str, &str); 11] = [
+const GUESTS: [(&str, &str); 12] = [
     ("canonical", "REVERIE_NARF_GUEST_CANONICAL"),
     ("probe", "REVERIE_NARF_GUEST_PROBE"),
     ("fork", "REVERIE_NARF_GUEST_FORK"),
@@ -21,6 +21,7 @@ const GUESTS: [(&str, &str); 11] = [
     ("reaper", "REVERIE_NARF_GUEST_REAPER"),
     ("vdso", "REVERIE_NARF_GUEST_VDSO"),
     ("mtexit", "REVERIE_NARF_GUEST_MTEXIT"),
+    ("rich", "REVERIE_NARF_GUEST_RICH"),
 ];
 
 fn main() {

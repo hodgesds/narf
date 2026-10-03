@@ -2506,3 +2506,96 @@ kernel_test_in!(
     "reverie-narf",
     reverie_narf_native_outcome_uses_linux_abi_fold
 );
+
+// ── Rich parity cell ──────────────────────────────────────────────────────
+
+/// The rich parity guest (guests/rich_x86_64.S): a fixed-address mapping,
+/// error returns, `sched_yield`, `mprotect` and `munmap`, each result
+/// reflected into a traced write.
+static RICH_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RICH"));
+
+/// Marks where the rich cell's canonical records may begin on the console.
+/// Its lines use their own `NARF-CELL-RICH` tag so that neither cell's
+/// extraction mistakes the other's observable lines for its own.
+const RICH_CELL_BEGIN: &str = "NARF-CELL-RICH begin test=reverie_narf_rich_trace_cell";
+/// Printed once the rich cell's run is over; every record precedes it.
+const RICH_CELL_RECORDS_END: &str = "NARF-CELL-RICH records-end";
+
+/// The rich N cell of the Linux/Narf parity comparison. It runs the rich
+/// guest under the same shared canonical-trace Tool and the same reaping
+/// parent as [`reverie_narf_canonical_trace_cell`], and prints the same three
+/// observables between its own markers. It is the second test that emits
+/// canonical records; the comparator skips each cell's records when deriving
+/// the other's. The expected values live in the comparator, not here.
+fn reverie_narf_rich_trace_cell() -> TestResult {
+    let _ = writeln!(Writer, "{RICH_CELL_BEGIN}");
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<CanonicalTrace<ConsoleSink>>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let mut tap = None;
+        let (root, reap) = run_guest_with(
+            RICH_GUEST,
+            interceptor.boxed(),
+            |root| {
+                tap = Some(tap_stdout(root.task_id)?);
+                interceptor
+                    .host_root(root.task_id)
+                    .map_err(|_| "register_root refused the root task")
+            },
+            Some(REAPER_GUEST),
+        )?;
+        let _ = writeln!(Writer, "{RICH_CELL_RECORDS_END}");
+        let tap = tap.ok_or("the root's fd 1 was never tapped")?;
+        let reap = reap.ok_or("the run did not reap its root")?;
+        let captured = tap.captured.lock().clone();
+        let mut line = alloc::string::String::new();
+        for byte in &captured {
+            let _ = write!(line, "{byte:02x}");
+        }
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL-RICH stdout-capture=fd1-tap bytes={} hex={line}",
+            captured.len()
+        );
+        if reap.reaped_pid != root.pid as i64 {
+            let _ = writeln!(
+                Writer,
+                "    reaping parent's wait4 returned {}",
+                reap.reaped_pid
+            );
+            return Err("the reaping parent's wait4 did not return the root's pid");
+        }
+        if reap.wstatus == REAPER_STATUS_SENTINEL {
+            return Err("the reaping parent's wait4 reaped the root but stored no status");
+        }
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL-RICH exit wstatus={:#06x} source=guest-parent-wait4",
+            reap.wstatus
+        );
+        if reap.second_wait != -LINUX_ECHILD {
+            let _ = writeln!(Writer, "    second wait4 returned {}", reap.second_wait);
+            return Err("the reaping parent's second wait4 did not report ECHILD");
+        }
+        if reap.parent_staged != Some(0) {
+            let _ = writeln!(Writer, "    reaping parent staged {:?}", reap.parent_staged);
+            return Err("the reaping parent did not exit 0");
+        }
+        if reap.parent.pid == root.pid {
+            return Err("the reaping parent and the root share a pid");
+        }
+        if reap.staged != Some(reap.wstatus) {
+            let _ = writeln!(Writer, "    staged termination {:?}", reap.staged);
+            return Err("the reaped wait status differs from the termination staged at exit");
+        }
+        let exits = check_teardown(&interceptor, root, 1, reap.wstatus)?;
+        if exits.len() != 1 || !exits[0].process_exited {
+            return Err("the root's exit did not end its process in the host");
+        }
+        if reap.wstatus != 0 {
+            return Err("the root did not exit 0");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!("reverie-narf", reverie_narf_rich_trace_cell);
