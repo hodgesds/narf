@@ -12091,6 +12091,8 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
         1 << 4,
     );
     r |= has(futex_has_task_waiter(tid), 1 << 5);
+    // The per-task futex index must drop its rows with the wakers they name.
+    r |= has(futex_task_index_has(tid), 1 << 13);
     r |= has(
         PROC_ARGV
             .lock()

@@ -1047,12 +1047,10 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     crate::handlers::raise_signal_pending(TID, 10); // SIGUSR1
     crate::handlers::register_signal_waker(TID, noop_waker());
     crate::handlers::register_io_waiter(TID, noop_waker());
-    // Park on the futex word the way sys_futex does: the park target goes in
-    // the task context first, and the park loop queues the waiter under that
-    // key. Exit drops the waiter by the task's park key, not by scanning
-    // every bucket, so the target must name the queued key.
-    task.uctx.futex_namespace.store(0, Ordering::Release);
-    task.uctx.futex_uaddr.store(FUTEX_UADDR, Ordering::Release);
+    // Queue a futex waiter with the task context's park key left at zero.
+    // Exit must find it anyway: teardown locates wakers through the per-task
+    // futex index, not the context's `futex_uaddr`, which a FUTEX_REQUEUE
+    // retargets only after moving the entry.
     crate::handlers::futex_register_waiter(FUTEX_UADDR, TID, noop_waker());
     crate::handlers::set_proc_argv(TID, &["victim"]);
     crate::handlers::set_proc_comm(TID, "victim");
@@ -1095,6 +1093,395 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_exit_sweeps_task_tables);
+
+/// Exit teardown must remove a futex waker that a concurrent `FUTEX_REQUEUE`
+/// has moved but not yet retargeted. The requeue moves the queue entry under
+/// both bucket locks, releases them, and only then rewrites the task
+/// context's `futex_uaddr`; exit used to pick its one key from that field, so
+/// an exit in the window read the OLD key, missed the moved waker, and left it
+/// resident (a leaked `Waker`, and a later `FUTEX_WAKE` on the destination
+/// word spent on a dead task). Each case drives the production phases
+/// (`futex_requeue_move`, `release_task_tables` or
+/// `futex_drop_task_waiters_racing`, `futex_requeue_retarget`) in a fixed
+/// order and then requires that the task has no waker anywhere, no index row,
+/// and that wakes on both words reach nothing.
+fn smoke_exit_drops_futex_waiter_moved_by_requeue() -> TestResult {
+    use crate::handlers::{
+        __test_futex_bucket_index, __test_futex_drop_task_waiters_racing,
+        __test_futex_has_task_waiter, __test_futex_requeue_move, __test_futex_requeue_retarget,
+        __test_futex_task_index, __test_futex_waiter_count, __test_release_task_tables,
+        futex_register_waiter, futex_wake_waiters_for_test, __TEST_FUTEX_EXIT_CHASE_LIMIT,
+    };
+    // The module-level `Arc` import is x86_64-only; this test runs on
+    // every architecture.
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU32;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: &Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: the vtable matches the Arc<AtomicU32> representation.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(counter.clone()) as *const (),
+                &VTAB,
+            ))
+        }
+    }
+
+    // Source and destination words no other test touches, in DIFFERENT
+    // buckets so the move takes the two-lock path.
+    const SRC: u64 = 0xF2_0000;
+    let Some(dst) = (1..64u64)
+        .map(|i| SRC + 4 * i)
+        .find(|&u| __test_futex_bucket_index(0, u) != __test_futex_bucket_index(0, SRC))
+    else {
+        return TestResult::Fail("no destination word in a different futex bucket");
+    };
+
+    // A parked victim as `sys_futex` leaves it: the context names SRC and the
+    // park loop has queued the waker under SRC.
+    struct Victim {
+        tid: u64,
+        fired: Arc<AtomicU32>,
+        task: Arc<crate::task::Task>,
+    }
+    let park = |tid: u64| -> Victim {
+        let task = crate::task::Task::new_registered(tid, tid + 1);
+        task.uctx.futex_namespace.store(0, Ordering::Release);
+        task.uctx.futex_uaddr.store(SRC, Ordering::Release);
+        let fired = Arc::new(AtomicU32::new(0));
+        futex_register_waiter(SRC, tid, counting_waker(&fired));
+        Victim { tid, fired, task }
+    };
+    // The lifecycle requirement, checked after every case: no waker queued
+    // anywhere, no index row, and wakes on both words reach nothing.
+    let settle = |v: Victim, case: &'static str| -> bool {
+        let resident = __test_futex_has_task_waiter(v.tid);
+        let indexed = !__test_futex_task_index(v.tid).is_empty();
+        let woken =
+            futex_wake_waiters_for_test(SRC, u32::MAX) + futex_wake_waiters_for_test(dst, u32::MAX);
+        let fired = v.fired.load(Ordering::Acquire);
+        // Drain whatever a failing case left so it cannot leak into later
+        // cases or tests.
+        __test_futex_drop_task_waiters_racing(v.tid, |_| {});
+        crate::task::release_task(v.tid);
+        drop(v.task);
+        if resident || indexed || woken != 0 || fired != 0 {
+            narf_console::klog!(
+                "    futex exit/requeue case '{}': resident={} indexed={} woken={} fired={}",
+                case,
+                resident,
+                indexed,
+                woken,
+                fired
+            );
+            return false;
+        }
+        true
+    };
+
+    // 1. move -> exit -> retarget: the window the finding names. Exit runs
+    //    the real per-task sweep while the context still names SRC.
+    let v = park(0xF2_10);
+    let (moved, gen2) = __test_futex_requeue_move(SRC, dst, 1);
+    if moved.as_slice() != [v.tid] || __test_futex_waiter_count(dst) != 1 {
+        let _ = settle(v, "setup");
+        return TestResult::Fail("requeue move phase did not move the parked waiter");
+    }
+    if v.task.uctx.futex_uaddr.load(Ordering::Acquire) != SRC {
+        let _ = settle(v, "setup");
+        return TestResult::Fail("context retargeted before the retarget phase");
+    }
+    __test_release_task_tables(v.tid);
+    __test_futex_requeue_retarget(&moved, dst, gen2, 0);
+    if !settle(v, "move->exit->retarget") {
+        return TestResult::Fail(
+            "exit in the requeue move->retarget window left the moved futex waiter resident",
+        );
+    }
+
+    // 2. exit before the move: the requeue then finds nothing to move.
+    let v = park(0xF2_20);
+    __test_release_task_tables(v.tid);
+    let (moved, gen2) = __test_futex_requeue_move(SRC, dst, 1);
+    __test_futex_requeue_retarget(&moved, dst, gen2, 0);
+    if !moved.is_empty() {
+        let _ = settle(v, "exit->move");
+        return TestResult::Fail("requeue moved a waiter that exit had already dropped");
+    }
+    if !settle(v, "exit->move") {
+        return TestResult::Fail("exit before a requeue move left a futex waiter resident");
+    }
+
+    // 3. move -> retarget -> exit: context and queue agree again.
+    let v = park(0xF2_30);
+    let (moved, gen2) = __test_futex_requeue_move(SRC, dst, 1);
+    __test_futex_requeue_retarget(&moved, dst, gen2, 0);
+    if v.task.uctx.futex_uaddr.load(Ordering::Acquire) != dst {
+        let _ = settle(v, "move->retarget->exit");
+        return TestResult::Fail("retarget phase did not point the context at the destination");
+    }
+    __test_release_task_tables(v.tid);
+    if !settle(v, "move->retarget->exit") {
+        return TestResult::Fail("exit after a completed requeue left the futex waiter resident");
+    }
+
+    // 4. The move lands INSIDE exit's own window: after exit reads the index
+    //    hint (SRC) and before it locks SRC's bucket. Exit must notice the
+    //    miss and chase the waker to its new key.
+    let v = park(0xF2_40);
+    let mut hints = alloc::vec::Vec::new();
+    let mut raced = 0usize;
+    __test_futex_drop_task_waiters_racing(v.tid, |uaddr| {
+        hints.push(uaddr);
+        if hints.len() == 1 {
+            raced = __test_futex_requeue_move(SRC, dst, 1).0.len();
+        }
+    });
+    if raced != 1 {
+        let _ = settle(v, "exit-window move");
+        return TestResult::Fail("the move racing exit's window found no waiter to move");
+    }
+    if hints.as_slice() != [SRC, dst] {
+        let _ = settle(v, "exit-window move");
+        return TestResult::Fail("exit did not chase the waker from SRC to its new key");
+    }
+    if !settle(v, "exit-window move") {
+        return TestResult::Fail(
+            "a requeue move inside exit's index->bucket window left the futex waiter resident",
+        );
+    }
+
+    // 5. A waker that moves on EVERY attempt: exit stops chasing after the
+    //    bounded number of attempts, freezes the buckets, and still drops it.
+    let v = park(0xF2_50);
+    let mut attempts = 0u32;
+    __test_futex_drop_task_waiters_racing(v.tid, |uaddr| {
+        attempts += 1;
+        let to = if uaddr == SRC { dst } else { SRC };
+        let _ = __test_futex_requeue_move(uaddr, to, 1);
+    });
+    if attempts != __TEST_FUTEX_EXIT_CHASE_LIMIT {
+        let _ = settle(v, "perpetual move");
+        return TestResult::Fail("exit did not bound its chase of a perpetually moving waker");
+    }
+    if !settle(v, "perpetual move") {
+        return TestResult::Fail("exit left a perpetually moving futex waiter resident");
+    }
+
+    // 6. Two registrations at once — the transient state a park-loop
+    //    registration on the stale word creates after a requeue moved the
+    //    task's earlier entry. Exit must drop both.
+    let v = park(0xF2_60);
+    futex_register_waiter(dst, v.tid, counting_waker(&v.fired));
+    __test_release_task_tables(v.tid);
+    if !settle(v, "two registrations") {
+        return TestResult::Fail("exit left one of two futex registrations resident");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_exit_drops_futex_waiter_moved_by_requeue
+);
+
+/// A park-loop exit must drop a futex waiter that a concurrent
+/// `FUTEX_REQUEUE` has moved but not yet retargeted, and the later retarget
+/// must not resurrect the park. The requeue moves the queue entry under both
+/// bucket locks and only afterwards rewrites the task context's
+/// `futex_uaddr`; the park loop's deadline/signal exits used to drop the
+/// entry named by that field, so an exit in the window dropped nothing (the
+/// entry had moved), and a later `FUTEX_WAKE(word2, 1)` was spent on the
+/// stale entry of a task that had already returned to userspace, while the
+/// real waiter slept on.
+///
+/// Drives the production functions in a fixed order: waiters A and B park on
+/// word1 (A through the real `park_should_block_for`, B through the
+/// production registrar); `futex_requeue_move` moves both to word2; A's park
+/// loop exits by deadline through the production exit path; then
+/// `futex_requeue_retarget` runs; then `FUTEX_WAKE(word2, 1)` must wake B,
+/// and A must hold no registration and no futex target. A's tid is below
+/// B's, so a stale A entry is exactly the one a one-waiter wake would pop.
+fn smoke_park_exit_drops_futex_waiter_moved_by_requeue() -> TestResult {
+    use crate::handlers::{
+        __test_futex_drop_task_waiters_racing, __test_futex_has_task_waiter,
+        __test_futex_requeue_move, __test_futex_requeue_retarget, __test_futex_task_index,
+        futex_gen, futex_register_waiter, futex_wake_waiters_for_test, with_kernel_buffers,
+    };
+    use crate::user_task::__test_park_should_block_for;
+    // The module-level `Arc` import is x86_64-only; this test runs on
+    // every architecture.
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU32;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: &Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: the vtable matches the Arc<AtomicU32> representation.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(counter.clone()) as *const (),
+                &VTAB,
+            ))
+        }
+    }
+
+    const A: u64 = 0xF3_10;
+    const B: u64 = 0xF3_20;
+    // Readable futex words on this stack; `with_kernel_buffers` lets the park
+    // check's word re-validation read them.
+    let words: [u32; 2] = [7, 9];
+    let word1 = &words[0] as *const u32 as u64;
+    let word2 = &words[1] as *const u32 as u64;
+    let a_task = crate::task::Task::new_registered(A, A + 1);
+    let b_task = crate::task::Task::new_registered(B, B + 1);
+    let a_fired = Arc::new(AtomicU32::new(0));
+    let b_fired = Arc::new(AtomicU32::new(0));
+    let a_waker = counting_waker(&a_fired);
+    let mut sleep_handle = None;
+    let uc = &a_task.uctx;
+
+    let finish = |sleep_handle: &mut Option<_>, result: TestResult| -> TestResult {
+        if let Some(h) = sleep_handle.take() {
+            narf_scheduler::narf_time::timer_wheel::cancel(h);
+        }
+        let _ = futex_wake_waiters_for_test(word1, u32::MAX);
+        let _ = futex_wake_waiters_for_test(word2, u32::MAX);
+        __test_futex_drop_task_waiters_racing(A, |_| {});
+        __test_futex_drop_task_waiters_racing(B, |_| {});
+        crate::handlers::drop_signal_waker(A);
+        crate::task::release_task(A);
+        crate::task::release_task(B);
+        result
+    };
+
+    // A enters FUTEX_WAIT(word1, 7) exactly as `sys_futex` publishes it, with
+    // an untimed wait, and the park loop registers it and blocks.
+    uc.futex_namespace.store(0, Ordering::Release);
+    uc.futex_uaddr.store(word1, Ordering::Release);
+    uc.futex_val.store(7, Ordering::Release);
+    uc.futex_park_gen.store(futex_gen(word1), Ordering::Release);
+    uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+    let blocked =
+        with_kernel_buffers(|| __test_park_should_block_for(A, uc, &a_waker, &mut sleep_handle));
+    if !blocked || __test_futex_task_index(A).as_slice() != [word1] {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: A's park loop did not register on word1 and block"),
+        );
+    }
+    // B waits on word1 too.
+    futex_register_waiter(word1, B, counting_waker(&b_fired));
+
+    // Requeue move phase: both waiters now sit under word2; A's context
+    // still names word1 because the retarget has not run.
+    let (moved, gen2) = __test_futex_requeue_move(word1, word2, 2);
+    let mut sorted = moved.clone();
+    sorted.sort_unstable();
+    if sorted.as_slice() != [A, B] || uc.futex_uaddr.load(Ordering::Acquire) != word1 {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: the requeue move did not move A and B to word2"),
+        );
+    }
+
+    // A's timed wait expires in the window: the park loop re-runs its
+    // decision with the deadline in the past and takes the production exit.
+    uc.sleep_deadline_ns.store(1, Ordering::Release);
+    if with_kernel_buffers(|| __test_park_should_block_for(A, uc, &a_waker, &mut sleep_handle)) {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("setup: A's park loop did not exit at an expired deadline"),
+        );
+    }
+
+    // Requeue retarget phase, after A has left.
+    __test_futex_requeue_retarget(&moved, word2, gen2, 9);
+
+    let woken = futex_wake_waiters_for_test(word2, 1);
+    let a_hits = a_fired.load(Ordering::Acquire);
+    let b_hits = b_fired.load(Ordering::Acquire);
+    if woken != 1 || b_hits != 1 || a_hits != 0 {
+        narf_console::klog!(
+            "    park-exit/requeue: woken={} a_fired={} b_fired={}",
+            woken,
+            a_hits,
+            b_hits
+        );
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail(
+                "FUTEX_WAKE(word2, 1) was spent on the park-exited task's stale entry \
+                 instead of waking the real waiter B",
+            ),
+        );
+    }
+    if !__test_futex_task_index(A).is_empty() || __test_futex_has_task_waiter(A) {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail("A left its futex park but kept a registration"),
+        );
+    }
+    if uc.futex_uaddr.load(Ordering::Acquire) != 0 {
+        return finish(
+            &mut sleep_handle,
+            TestResult::Fail(
+                "the requeue retarget resurrected futex_uaddr for a task that had left its park",
+            ),
+        );
+    }
+    let result = finish(&mut sleep_handle, TestResult::Pass);
+    drop(a_task);
+    drop(b_task);
+    result
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_park_exit_drops_futex_waiter_moved_by_requeue
+);
 
 /// The exit-time robust-futex walk reads fully user-controlled pointers
 /// with a fixup-less `copy_from_user`, gated by a "is this mapped?" probe.

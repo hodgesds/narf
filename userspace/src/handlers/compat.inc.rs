@@ -7574,31 +7574,245 @@ fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
     &FUTEX_WAITERS[futex_bucket_index(key)]
 }
 
+// ── Per-task futex registration index ─────────────────────────────────
+//
+// Authoritative record of WHERE each task's futex wakers sit:
+// `(task_id, key)` is present exactly when `FUTEX_WAITERS[bucket(key)]` holds
+// a waker for `task_id` under `key`. Exit teardown reads it instead of the
+// task context's `futex_uaddr`, which a `FUTEX_REQUEUE` retargets only AFTER
+// it has moved the queue entry and released the bucket locks — a window in
+// which the context still names the source word while the waker already
+// sits under the destination word.
+//
+// A task normally owns at most one registration, but it can transiently own
+// two: the park loop can load the source word, lose the race to a requeue
+// that moves its earlier entry to the destination, and then register on the
+// source (see `futex_park_register_and_check`). So the index is a SET of
+// keys per task, not a single slot.
+//
+// Invariant and locking:
+//   - `(tid, key)` is inserted or removed only while holding the bucket lock
+//     of `key`, in the same critical section that inserts or removes the
+//     waker. Anyone holding that bucket lock therefore sees the index and the
+//     bucket agree about `(tid, key)`.
+//   - Lock order: bucket lock(s) first, then the index shard lock. No path
+//     takes a bucket lock while holding a shard lock, and neither lock is
+//     held across `with_user_task_ctx` (the task registry lock).
+//   - Requeue holds BOTH bucket locks (ascending bucket order) while it moves
+//     entries, so it removes `(tid, src)` and inserts `(tid, dst)` inside one
+//     critical section that any reader of either key must wait out.
+//
+// Sharded by task id (ids are monotonic, so the low bits spread), so the
+// extra lock taken per register/drop/wake/move contends only with work on
+// tasks in the same shard, never globally.
+const FUTEX_TASK_INDEX_SHARDS: usize = 64;
+
+type FutexTaskIndexSet = alloc::collections::BTreeSet<(u64, FutexKey)>;
+
+#[repr(align(64))]
+struct FutexTaskIndexShard {
+    keys: narf_lib::sync::IrqSafeSpinLock<FutexTaskIndexSet>,
+}
+
+impl FutexTaskIndexShard {
+    const fn new() -> Self {
+        Self {
+            keys: narf_lib::sync::IrqSafeSpinLock::new(FutexTaskIndexSet::new()),
+        }
+    }
+}
+
+static FUTEX_TASK_INDEX: [FutexTaskIndexShard; FUTEX_TASK_INDEX_SHARDS] =
+    [const { FutexTaskIndexShard::new() }; FUTEX_TASK_INDEX_SHARDS];
+
+const FUTEX_KEY_MIN: FutexKey = FutexKey {
+    namespace: 0,
+    uaddr: 0,
+    node: i32::MIN,
+};
+const FUTEX_KEY_MAX: FutexKey = FutexKey {
+    namespace: u64::MAX,
+    uaddr: u64::MAX,
+    node: i32::MAX,
+};
+
+#[inline]
+fn futex_task_index_shard(task_id: u64) -> &'static FutexTaskIndexShard {
+    &FUTEX_TASK_INDEX[task_id as usize & (FUTEX_TASK_INDEX_SHARDS - 1)]
+}
+
+/// Record that `task_id` has a waker under `key`. `_bucket` is the locked
+/// contents of `key`'s bucket: the caller must hold that lock (it witnesses
+/// the lock order — bucket first, then shard).
+#[inline]
+fn futex_task_index_insert(_bucket: &FutexWaiterMap, task_id: u64, key: FutexKey) {
+    futex_task_index_shard(task_id)
+        .keys
+        .lock()
+        .insert((task_id, key));
+}
+
+/// Forget that `task_id` has a waker under `key`; same locking rule as
+/// [`futex_task_index_insert`]. Returns whether the index named it.
+#[inline]
+fn futex_task_index_remove(_bucket: &FutexWaiterMap, task_id: u64, key: FutexKey) -> bool {
+    futex_task_index_shard(task_id)
+        .keys
+        .lock()
+        .remove(&(task_id, key))
+}
+
+/// Does the index place `task_id` under `key`? Same locking rule as
+/// [`futex_task_index_insert`], so the answer is exact while the caller holds
+/// `key`'s bucket lock.
+#[inline]
+fn futex_task_index_contains(_bucket: &FutexWaiterMap, task_id: u64, key: FutexKey) -> bool {
+    futex_task_index_shard(task_id)
+        .keys
+        .lock()
+        .contains(&(task_id, key))
+}
+
+/// Some key under which the index says `task_id` has a waker. Read under the
+/// shard lock alone, so it is a HINT: by the time the caller locks that key's
+/// bucket the waker may have been woken or moved.
+fn futex_task_index_first(task_id: u64) -> Option<FutexKey> {
+    futex_task_index_shard(task_id)
+        .keys
+        .lock()
+        .range((task_id, FUTEX_KEY_MIN)..=(task_id, FUTEX_KEY_MAX))
+        .next()
+        .map(|&(_, key)| key)
+}
+
+/// Does the index hold any row for `task_id`? Residue probe.
+fn futex_task_index_has(task_id: u64) -> bool {
+    futex_task_index_first(task_id).is_some()
+}
+
+/// Drop `task_id`'s waker under `key` and its index row, whichever exist.
+///
+/// No confirm step is needed: under `key`'s bucket lock the waker is present
+/// under `key` exactly when the row `(tid, key)` is (both change only in one
+/// critical section of that lock). So removing both unconditionally is always
+/// consistent — if the hint was stale, both are already absent and this is a
+/// no-op, and a row for some OTHER key is untouched.
+fn futex_drop_task_waiter_at(task_id: u64, key: FutexKey) {
+    let mut values = futex_wait_bucket(key).values.lock();
+    if let Some(set) = values.get_mut(&key) {
+        set.remove(&task_id);
+        if set.is_empty() {
+            values.remove(&key);
+        }
+    }
+    futex_task_index_remove(&values, task_id, key);
+}
+
+/// Attempts before the teardown stops chasing a waker that concurrent
+/// requeues keep moving and instead freezes every bucket.
+///
+/// The value 8 is ARBITRARY, not derived. Correctness does not depend on it:
+/// the frozen fallback always terminates and always removes everything, so
+/// any value >= 0 is correct. Each miss requires a concurrent requeue to have
+/// moved this very task's waker between the hint read and the bucket lock, so
+/// in practice the first attempt succeeds; the limit only trades the cost of
+/// more targeted attempts against how often the all-buckets fallback runs.
+const FUTEX_EXIT_CHASE_LIMIT: u32 = 8;
+
+/// Remove every futex waker `task_id` still has queued. The ONE removal
+/// algorithm: task exit teardown calls it directly and every park-loop exit
+/// reaches it through [`futex_park_leave`].
 fn futex_drop_task_waiters(task_id: u64) {
-    // Targeted: the park loop is the only registrar, it registers exactly
-    // one key (the task's live `futex_uaddr`), and every non-stay exit from
-    // the loop drops that key — including the seqlock retarget path, whose
-    // requeue moves the entry AND the uaddr together. So at drop time every
-    // registration this task can own sits under its CURRENT park key. The
-    // old shape swept all 256 bucket locks per task exit; a 1000-thread
-    // exit storm hammered those global locks from every CPU at once.
-    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
-        let uaddr = uc.futex_uaddr.load(Ordering::Acquire);
-        (uaddr != 0).then(|| futex_key(uc.futex_namespace.load(Ordering::Acquire), uaddr))
-    });
-    match key {
-        Some(Some(key)) => futex_drop_waiter_key(key, task_id),
-        // Not parked: nothing registered, nothing to sweep.
-        Some(None) => {}
-        // Ctx already gone (racing teardown) — conservative full sweep.
-        None => {
-            for bucket in &FUTEX_WAITERS {
-                bucket.values.lock().retain(|_, waiters| {
-                    waiters.remove(&task_id);
-                    !waiters.is_empty()
-                });
+    futex_drop_task_waiters_racing(task_id, |_| {});
+}
+
+/// Leave a futex park: drop every registration `task_id` holds, found through
+/// the per-task index (never through the context's `futex_uaddr`, which a
+/// requeue rewrites only after it has already moved the waker), then clear
+/// the context's futex target.
+///
+/// Every park-loop exit that returns the task to userspace calls this. The
+/// task then holds no registration while it runs, so a later `FUTEX_WAKE`
+/// cannot be spent on a stale entry for a task that is not waiting.
+///
+/// ORDER MATTERS: drop first, clear second. A concurrent
+/// [`futex_requeue_retarget`] writes the target fields only while holding the
+/// destination bucket lock AND only if the index still places the task under
+/// the destination key. The drop removes that row under the same bucket lock.
+/// So either the retarget's critical section ran first (its stores are then
+/// overwritten by the clear below) or it runs after the drop (it sees no row
+/// and writes nothing). Clearing first would let a retarget that ran between
+/// the clear and the drop resurrect `futex_uaddr` for a task no longer in a
+/// futex wait, and a later non-futex park would register on that word.
+pub(crate) fn futex_park_leave(uc: &crate::user_task::UserTaskCtx, task_id: u64) {
+    futex_drop_task_waiters(task_id);
+    uc.futex_uaddr.store(0, Ordering::Release);
+    uc.futex_namespace.store(0, Ordering::Release);
+}
+
+/// [`futex_drop_task_waiters`] with a hook run between reading the index hint
+/// and locking that key's bucket — the window a concurrent `FUTEX_REQUEUE`
+/// can move the waiter through. Production passes a no-op; the interleaving
+/// regression uses it to make that race deterministic.
+///
+/// Targeted, not a sweep: the index names the (normally single) bucket to
+/// lock, so exit costs one shard read plus one bucket lock per registration,
+/// not all `FUTEX_BUCKET_COUNT` bucket locks (a 1000-thread exit storm used to
+/// hammer every bucket lock from every CPU). It no longer trusts the task
+/// context's `futex_uaddr`: that field is a park-loop routing hint, and a
+/// requeue rewrites it only after the queue move, so exit could read the old
+/// (or zero) key, miss the moved waker, and leave it resident forever.
+///
+/// Each attempt reads a hint, then drops at that key under its bucket lock,
+/// where the index and bucket agree exactly. A miss means the waker was woken
+/// (its row is gone) or moved (its row now names another key); the loop
+/// re-reads until the index has no row for the task, which — by the
+/// invariant — proves no waker remains. A waker that keeps moving is bounded
+/// by [`FUTEX_EXIT_CHASE_LIMIT`]; past it every bucket lock is taken in
+/// ascending order (requeue's order, so no deadlock), which stops all moves.
+fn futex_drop_task_waiters_racing(task_id: u64, mut between: impl FnMut(FutexKey)) {
+    for _ in 0..FUTEX_EXIT_CHASE_LIMIT {
+        let Some(key) = futex_task_index_first(task_id) else {
+            return;
+        };
+        between(key);
+        futex_drop_task_waiter_at(task_id, key);
+    }
+    futex_drop_task_waiters_frozen(task_id);
+}
+
+/// Slow path of [`futex_drop_task_waiters_racing`]: hold every bucket lock
+/// (ascending, as requeue takes its two) so no waker can move, then drop every
+/// indexed registration for `task_id`.
+fn futex_drop_task_waiters_frozen(task_id: u64) {
+    let mut buckets = alloc::vec::Vec::with_capacity(FUTEX_BUCKET_COUNT);
+    for bucket in &FUTEX_WAITERS {
+        buckets.push(bucket.values.lock());
+    }
+    let keys: alloc::vec::Vec<FutexKey> = {
+        let mut index = futex_task_index_shard(task_id).keys.lock();
+        let keys: alloc::vec::Vec<FutexKey> = index
+            .range((task_id, FUTEX_KEY_MIN)..=(task_id, FUTEX_KEY_MAX))
+            .map(|&(_, key)| key)
+            .collect();
+        for key in &keys {
+            index.remove(&(task_id, *key));
+        }
+        keys
+    };
+    for key in keys {
+        let values = &mut buckets[futex_bucket_index(key)];
+        if let Some(set) = values.get_mut(&key) {
+            set.remove(&task_id);
+            if set.is_empty() {
+                values.remove(&key);
             }
         }
+    }
+    // Release in reverse acquisition order: each guard restores the IRQ state
+    // saved when it was taken, so the first-acquired guard must drop last.
+    while let Some(guard) = buckets.pop() {
+        drop(guard);
     }
 }
 
@@ -7619,16 +7833,15 @@ pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker)
 }
 
 pub(crate) fn futex_register_waiter_key(key: FutexKey, task_id: u64, waker: core::task::Waker) {
-    futex_wait_bucket(key)
-        .values
-        .lock()
-        .entry(key)
-        .or_default()
-        .insert(task_id, waker);
+    let mut values = futex_wait_bucket(key).values.lock();
+    values.entry(key).or_default().insert(task_id, waker);
+    futex_task_index_insert(&values, task_id, key);
 }
 
-/// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
-/// woke for another reason — lost-wakeup re-poll, timeout, or exit).
+/// Remove `task_id`'s futex waker on `uaddr` without firing it, by key.
+/// No production park exit uses this: they leave through
+/// [`futex_park_leave`], which finds every registration through the per-task
+/// index rather than trusting a caller-supplied key.
 pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
     futex_drop_waiter_key(futex_key(0, uaddr), task_id);
 }
@@ -7636,9 +7849,12 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
     let mut values = futex_wait_bucket(key).values.lock();
     if let Some(set) = values.get_mut(&key) {
-        set.remove(&task_id);
+        let removed = set.remove(&task_id).is_some();
         if set.is_empty() {
             values.remove(&key);
+        }
+        if removed {
+            futex_task_index_remove(&values, task_id, key);
         }
     }
 }
@@ -7668,6 +7884,9 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
             if values.get(&key).is_some_and(|set| set.is_empty()) {
                 values.remove(&key);
             }
+            if let Some((tid, _)) = &waiter {
+                futex_task_index_remove(&values, *tid, key);
+            }
             waiter
         };
         if let Some((tid, waker)) = waiter {
@@ -7692,6 +7911,9 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
         }
         if set.is_empty() {
             values.remove(&key);
+        }
+        for (tid, _) in &out {
+            futex_task_index_remove(&values, *tid, key);
         }
         out
     };
@@ -7755,6 +7977,9 @@ fn futex_take_waiters(
     if set.is_empty() {
         values.remove(&key);
     }
+    for (tid, _) in &movers {
+        futex_task_index_remove(values, *tid, key);
+    }
     movers
 }
 
@@ -7768,6 +7993,9 @@ fn futex_insert_waiters(
     for (tid, waker) in movers {
         dst.insert(tid, waker);
         tids.push(tid);
+    }
+    for tid in &tids {
+        futex_task_index_insert(values, *tid, key);
     }
     tids
 }
@@ -7789,9 +8017,20 @@ fn futex_requeue_waiters_keyed(
     }
     // Destination-generation snapshot BEFORE the queue move (see above).
     let gen2 = futex_wake_counter_key(key2);
+    let moved = futex_requeue_move(key, key2, n_move);
+    futex_requeue_retarget(&moved, key2, uaddr2, gen2, new_val);
+    (woken, moved.len())
+}
+
+/// Move phase of [`futex_requeue_waiters_keyed`]: under both bucket locks
+/// (ascending bucket order), move up to `n_move` waiters from `key` to `key2`
+/// and move their per-task index rows with them. Returns the moved task ids.
+/// Split from the retarget phase only so the interleaving regression can run
+/// exit teardown between the two; production composes them back to back.
+fn futex_requeue_move(key: FutexKey, key2: FutexKey, n_move: u32) -> alloc::vec::Vec<u64> {
     let source_bucket = futex_bucket_index(key);
     let destination_bucket = futex_bucket_index(key2);
-    let moved: alloc::vec::Vec<u64> = if source_bucket == destination_bucket {
+    if source_bucket == destination_bucket {
         let mut values = FUTEX_WAITERS[source_bucket].values.lock();
         let movers = futex_take_waiters(&mut values, key, n_move);
         futex_insert_waiters(&mut values, key2, movers)
@@ -7807,7 +8046,18 @@ fn futex_requeue_waiters_keyed(
         let mut source = FUTEX_WAITERS[source_bucket].values.lock();
         let movers = futex_take_waiters(&mut source, key, n_move);
         futex_insert_waiters(&mut destination, key2, movers)
-    };
+    }
+}
+
+/// Retarget phase of [`futex_requeue_waiters_keyed`], run after the move with
+/// no bucket lock held.
+fn futex_requeue_retarget(
+    moved: &[u64],
+    key2: FutexKey,
+    uaddr2: u64,
+    gen2: u64,
+    new_val: u32,
+) {
     // Retarget each mover's park state OUTSIDE the table lock (the task
     // registry lock in with_user_task_ctx must never nest inside it).
     // Seqlocked against the mover's own park loop: bump to odd, store the
@@ -7819,17 +8069,36 @@ fn futex_requeue_waiters_keyed(
     // from strand to backstop instead of chaining wakes). The park loop
     // re-validates the sequence after registering and turns any movement
     // into a spurious return; musl re-checks the word in userspace.
-    for tid in &moved {
+    //
+    // Exit teardown and park-loop exits do not depend on this retarget:
+    // they find a mover through the per-task index, which the move phase
+    // already updated under both bucket locks.
+    //
+    // The stores are guarded: they happen only while holding `key2`'s bucket
+    // lock and only if the index still places the mover under `key2`. A
+    // mover whose park loop exited between the move and here (deadline,
+    // signal, wake) has already dropped that row under the same lock through
+    // `futex_park_leave`, so the retarget writes nothing and cannot resurrect
+    // `futex_uaddr` for a task that is no longer waiting. The same check
+    // skips a mover that exited and re-entered FUTEX_WAIT on another word, or
+    // that a later requeue moved on again. `with_user_task_ctx` has released
+    // the registry lock before the closure runs (it hands out an `Arc`), so
+    // taking the bucket lock inside it nests nothing under the bucket lock.
+    for tid in moved {
         crate::user_task::with_user_task_ctx(*tid, |uc| {
+            let values = futex_wait_bucket(key2).values.lock();
+            if !futex_task_index_contains(&values, *tid, key2) {
+                return;
+            }
             uc.futex_park_seq.fetch_add(1, Ordering::AcqRel);
             uc.futex_park_gen.store(gen2, Ordering::Release);
             uc.futex_val.store(new_val, Ordering::Release);
             uc.futex_namespace.store(key2.namespace, Ordering::Release);
             uc.futex_uaddr.store(uaddr2, Ordering::Release);
             uc.futex_park_seq.fetch_add(1, Ordering::Release);
+            drop(values);
         });
     }
-    (woken, moved.len())
 }
 
 /// Read the 4-byte futex word at user address `uaddr` in the CURRENT
@@ -7879,10 +8148,13 @@ pub(crate) fn futex_park_register_and_check(
     task_id: u64,
     waker: &core::task::Waker,
 ) -> FutexParkCheck {
-    let clear = |uc: &crate::user_task::UserTaskCtx| {
+    // Every Wake return leaves the park, so it drops ALL of the task's
+    // registrations through the index (`futex_park_leave`), not just the
+    // entry this call inserted: the task can also hold an entry a requeue
+    // already moved to the destination word (see the index notes above).
+    let leave = |uc: &crate::user_task::UserTaskCtx| {
         uc.sleep_deadline_ns.store(0, Ordering::Release);
-        uc.futex_uaddr.store(0, Ordering::Release);
-        uc.futex_namespace.store(0, Ordering::Release);
+        futex_park_leave(uc, task_id);
     };
     let seq_before = uc.futex_park_seq.load(Ordering::Acquire);
     let fu = uc.futex_uaddr.load(Ordering::Acquire);
@@ -7891,7 +8163,7 @@ pub(crate) fn futex_park_register_and_check(
     }
     if seq_before & 1 != 0 {
         // Retarget in flight: the fields are mid-rewrite.
-        clear(uc);
+        leave(uc);
         return FutexParkCheck::Wake;
     }
     let key = futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
@@ -7899,8 +8171,7 @@ pub(crate) fn futex_park_register_and_check(
     if uc.futex_park_seq.load(Ordering::Acquire) != seq_before {
         // A requeue retargeted us between the field loads and the
         // registration — the entry we just inserted names the stale word.
-        futex_drop_waiter_key(key, task_id);
-        clear(uc);
+        leave(uc);
         return FutexParkCheck::Wake;
     }
     let stay = futex_park_should_stay(
@@ -7912,8 +8183,7 @@ pub(crate) fn futex_park_register_and_check(
     if stay {
         FutexParkCheck::Stay
     } else {
-        futex_drop_waiter_key(key, task_id);
-        clear(uc);
+        leave(uc);
         FutexParkCheck::Wake
     }
 }
@@ -7964,6 +8234,54 @@ pub fn __test_futex_wake_counter_scoped(namespace: u64, uaddr: u64) -> u64 {
 #[doc(hidden)]
 pub fn __test_futex_requeue(uaddr: u64, uaddr2: u64, n_wake: u32, n_move: u32) -> (usize, usize) {
     futex_requeue_waiters(uaddr, uaddr2, n_wake, n_move, 0)
+}
+
+/// Test-only: the MOVE phase of a private-namespace-0 `FUTEX_REQUEUE`
+/// (`futex_requeue_move`, the production function), stopping before the
+/// retarget so a test can run exit teardown in the window between them.
+/// Returns the moved task ids and the destination-generation snapshot the
+/// production composition takes before its move.
+#[doc(hidden)]
+pub fn __test_futex_requeue_move(uaddr: u64, uaddr2: u64, n_move: u32) -> (alloc::vec::Vec<u64>, u64) {
+    let key2 = futex_key(0, uaddr2);
+    let gen2 = futex_wake_counter_key(key2);
+    (futex_requeue_move(futex_key(0, uaddr), key2, n_move), gen2)
+}
+
+/// Test-only: the RETARGET phase matching [`__test_futex_requeue_move`].
+#[doc(hidden)]
+pub fn __test_futex_requeue_retarget(moved: &[u64], uaddr2: u64, gen2: u64, new_val: u32) {
+    futex_requeue_retarget(moved, futex_key(0, uaddr2), uaddr2, gen2, new_val);
+}
+
+/// Test-only: exit teardown's futex step (`futex_drop_task_waiters_racing`,
+/// which production calls with a no-op hook), running `between(uaddr)` in the
+/// window after each index read and before that key's bucket is locked.
+#[doc(hidden)]
+pub fn __test_futex_drop_task_waiters_racing(task_id: u64, mut between: impl FnMut(u64)) {
+    futex_drop_task_waiters_racing(task_id, |key| between(key.uaddr));
+}
+
+/// Test-only: attempts exit teardown makes before freezing every bucket.
+#[doc(hidden)]
+pub const __TEST_FUTEX_EXIT_CHASE_LIMIT: u32 = FUTEX_EXIT_CHASE_LIMIT;
+
+/// Test-only: the uaddrs the per-task futex index places `task_id` under.
+#[doc(hidden)]
+pub fn __test_futex_task_index(task_id: u64) -> alloc::vec::Vec<u64> {
+    futex_task_index_shard(task_id)
+        .keys
+        .lock()
+        .range((task_id, FUTEX_KEY_MIN)..=(task_id, FUTEX_KEY_MAX))
+        .map(|&(_, key)| key.uaddr)
+        .collect()
+}
+
+/// Test-only: does `task_id` have a futex waker queued under ANY key? Scans
+/// the buckets themselves, independent of the per-task index.
+#[doc(hidden)]
+pub fn __test_futex_has_task_waiter(task_id: u64) -> bool {
+    futex_has_task_waiter(task_id)
 }
 
 /// Test hook: expose only bucket identity so the requeue smoke can guarantee
