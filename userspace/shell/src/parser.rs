@@ -98,6 +98,7 @@ pub enum Redir {
 /// and `Or` are modelled as flat linear chains up to `MAX_SEQUENCE`
 /// entries; see `AndOrChain`.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // the no_std shell has no allocator to box into
 pub enum Cmd {
     /// Empty — produced by empty input. Shell ignores it.
     Empty,
@@ -158,6 +159,7 @@ impl SimpleCmd {
 /// background command, an `&&` or `||` pair, or a pipeline.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // Background is reserved for `cmd ; othercmd &` parsing
+#[allow(clippy::large_enum_variant)] // the no_std shell has no allocator to box into
 pub enum SequenceEntry {
     Cmd(SimpleCmd),
     Pipeline {

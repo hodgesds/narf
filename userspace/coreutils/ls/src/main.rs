@@ -108,7 +108,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
     if argc <= 1 {
         // No arguments — list current directory ".".
         // SAFETY: Valid memory or trusted environment
-        return unsafe { list_dir(b".\0".as_ptr() as *const i8) };
+        return unsafe { list_dir(c".".as_ptr().cast()) };
     }
 
     let mut exit_code = 0i32;

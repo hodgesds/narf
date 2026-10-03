@@ -5211,7 +5211,6 @@ fn boot_userspace_init() {
     // returns a huge stat.
     async fn try_load_from_root(name: &'static str) -> Option<alloc::vec::Vec<u8>> {
         use alloc::sync::Arc;
-        use alloc::vec::Vec;
         use narf_filesystem::{registry, resolve_async, DirOps};
 
         let abs = alloc::format!("/{}", name);
@@ -5229,8 +5228,7 @@ fn boot_userspace_init() {
         if size == 0 || size > MAX_BIN {
             return None;
         }
-        let mut out = Vec::<u8>::with_capacity(size);
-        out.resize(size, 0);
+        let mut out = alloc::vec![0u8; size];
         // Loop until EOF or buf full — FileOps::read may return
         // short on cross-cluster boundaries.
         let mut filled = 0usize;

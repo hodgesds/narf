@@ -49,7 +49,7 @@ unsafe fn cstr_len(p: *const u8) -> usize {
 
 /// Return true if `bytes` consists entirely of ASCII decimal digits.
 fn all_digits(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && bytes.iter().all(|&b| b >= b'0' && b <= b'9')
+    !bytes.is_empty() && bytes.iter().all(|&b| b.is_ascii_digit())
 }
 
 /// Build a NUL-terminated path like `/proc/<pid>/comm` into `buf`.
@@ -132,7 +132,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Open /proc and enumerate numeric entries (live PIDs).
     // SAFETY: Valid memory or trusted environment
-    let dir = unsafe { libc::opendir(b"/proc\0".as_ptr() as *const i8) };
+    let dir = unsafe { libc::opendir(c"/proc".as_ptr().cast()) };
     if dir.is_null() {
         // SAFETY: Valid memory or trusted environment
         unsafe { write_stdout(b"ps: cannot open /proc\n"); }

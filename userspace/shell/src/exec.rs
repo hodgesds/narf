@@ -300,9 +300,7 @@ unsafe fn apply_one_redir(err_fd: i32, redir: &Redir) -> bool {
     pbuf[..n].copy_from_slice(&path.bytes[..n]);
     // pbuf[n] is already 0 (zero-initialised).
     // SAFETY: Valid memory or trusted environment
-    let opened = unsafe {
-        libc::posix_open(pbuf.as_ptr() as *const i8, flags as i32, mode as u32)
-    };
+    let opened = unsafe { libc::posix_open(pbuf.as_ptr() as *const i8, flags, mode as u32) };
     if opened < 0 {
         if err_fd >= 0 {
             // SAFETY: Valid memory or trusted environment
@@ -387,11 +385,9 @@ unsafe fn dispatch_builtin_inproc(fd: i32, sc: &SimpleCmd) -> i32 {
     let mut pos = 0usize;
     for i in 0..sc.argc {
         let w = &sc.argv[i];
-        if i > 0 {
-            if pos < line.len() {
-                line[pos] = b' ';
-                pos += 1;
-            }
+        if i > 0 && pos < line.len() {
+            line[pos] = b' ';
+            pos += 1;
         }
         let n = w.len.min(line.len() - pos);
         line[pos..pos + n].copy_from_slice(&w.bytes[..n]);
@@ -431,6 +427,8 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
     let mut fork_ok = true;
 
     // Create all pipes first.
+    // Kept as an index loop: take(count - 1) would clamp an unchecked `count`.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..count - 1 {
         let mut fds: [i32; 2] = [-1, -1];
         // SAFETY: Valid memory or trusted environment
@@ -454,6 +452,8 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
         }
         // Fall back: run stages in-process sequentially.
         let mut last = 0i32;
+        // Kept as an index loop: take(count) would clamp an unchecked `count`.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..count {
             // SAFETY: Valid memory or trusted environment
             last = unsafe { exec_simple(fd, &stages[i]) };
@@ -485,11 +485,15 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
                 unsafe { libc::dup2(pipes[i][1], 1); }
             }
             // Close all pipe fds in the child.
-            for j in 0..pipe_count {
+            for p in pipes.iter().take(pipe_count) {
                 // SAFETY: Valid memory or trusted environment
-                unsafe { libc::posix_close(pipes[j][0]); }
+                unsafe {
+                    libc::posix_close(p[0]);
+                }
                 // SAFETY: Valid memory or trusted environment
-                unsafe { libc::posix_close(pipes[j][1]); }
+                unsafe {
+                    libc::posix_close(p[1]);
+                }
             }
             // Apply redirections, then exec.
             // SAFETY: Valid memory or trusted environment
@@ -507,15 +511,21 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
     }
 
     // Parent: close all pipe fds.
-    for j in 0..pipe_count {
+    for p in pipes.iter().take(pipe_count) {
         // SAFETY: Valid memory or trusted environment
-        unsafe { libc::posix_close(pipes[j][0]); }
+        unsafe {
+            libc::posix_close(p[0]);
+        }
         // SAFETY: Valid memory or trusted environment
-        unsafe { libc::posix_close(pipes[j][1]); }
+        unsafe {
+            libc::posix_close(p[1]);
+        }
     }
 
     if fork_failed {
         // Reap whatever children were started.
+        // Kept as an index loop: take(count) would clamp an unchecked `count`.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..count {
             if child_pids[i] > 0 {
                 let mut ws = 0i32;
@@ -528,6 +538,8 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
 
     // Wait for all children; keep the last one's exit code.
     let mut last_exit = 0i32;
+    // Kept as an index loop: `count` is bounded only indirectly, by the fork loop.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..count {
         let mut ws = 0i32;
         // SAFETY: Valid memory or trusted environment

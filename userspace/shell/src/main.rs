@@ -52,11 +52,8 @@ fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
     // sa_family = 1 (AF_UNIX), little-endian u16
     buf[0] = 1;
     buf[1] = 0;
-    #[allow(clippy::needless_range_loop)]
     let n = core::cmp::min(path.len(), 108);
-    for i in 0..n {
-        buf[2 + i] = path[i];
-    }
+    buf[2..2 + n].copy_from_slice(&path[..n]);
     (2 + n) as u32
 }
 
@@ -135,12 +132,12 @@ fn condwait_run(fd: i32) {
         CONDWAIT_COND = libc::pthread_cond_t { _opaque: [0; 48] };
     }
     let mut tids = [0u64; N];
-    for i in 0..N {
+    for tid in tids.iter_mut() {
         let attr = core::ptr::null::<libc::pthread_attr_t>();
         // SAFETY: Valid memory or trusted environment
         let _ = unsafe {
             libc::pthread_create(
-                &mut tids[i] as *mut u64,
+                tid as *mut u64,
                 attr,
                 condwait_worker,
                 core::ptr::null_mut(),
@@ -159,9 +156,9 @@ fn condwait_run(fd: i32) {
         let _ = libc::pthread_cond_broadcast(&raw mut CONDWAIT_COND);
         let _ = libc::pthread_mutex_unlock(&raw mut CONDWAIT_MTX);
     }
-    for i in 0..N {
+    for &tid in tids.iter() {
         // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { libc::pthread_join(tids[i], core::ptr::null_mut()) };
+        let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
     }
     let hits = CONDWAIT_HITS.load(Ordering::SeqCst);
     let mut buf = [0u8; 12];
@@ -314,9 +311,7 @@ fn pidtest_run(fd: i32) {
     // (set_proc_comm seeded by bare_main when the boot-init
     // spawns it).
     // SAFETY: Valid memory or trusted environment
-    let pfd = unsafe {
-        libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
-    };
+    let pfd = unsafe { libc::posix_open(c"/proc/self/comm".as_ptr().cast(), 0, 0) };
     if pfd < 0 {
         // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: open(/proc/self/comm) failed\n"); }
@@ -340,9 +335,7 @@ fn pidtest_run(fd: i32) {
     // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::prctl(15 /* PR_SET_NAME */, newname.as_ptr() as u64, 0) };
     // SAFETY: Valid memory or trusted environment
-    let pfd = unsafe {
-        libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
-    };
+    let pfd = unsafe { libc::posix_open(c"/proc/self/comm".as_ptr().cast(), 0, 0) };
     let mut buf = [0u8; 64];
     // SAFETY: Valid memory or trusted environment
     let n = unsafe {
@@ -363,9 +356,7 @@ fn pidtest_run(fd: i32) {
     // /proc/self/maps — should have at least one line containing
     // [stack] or [heap] or [text].
     // SAFETY: Valid memory or trusted environment
-    let pfd = unsafe {
-        libc::posix_open(b"/proc/self/maps\0".as_ptr() as *const i8, 0, 0)
-    };
+    let pfd = unsafe { libc::posix_open(c"/proc/self/maps".as_ptr().cast(), 0, 0) };
     let mut mbuf = [0u8; 1024];
     // SAFETY: Valid memory or trusted environment
     let n = unsafe {
@@ -390,9 +381,7 @@ fn pidtest_run(fd: i32) {
     }
     // /proc/self/cmdline — should be "shell\0" (boot-init seeded).
     // SAFETY: Valid memory or trusted environment
-    let pfd = unsafe {
-        libc::posix_open(b"/proc/self/cmdline\0".as_ptr() as *const i8, 0, 0)
-    };
+    let pfd = unsafe { libc::posix_open(c"/proc/self/cmdline".as_ptr().cast(), 0, 0) };
     let mut cbuf = [0u8; 64];
     // SAFETY: Valid memory or trusted environment
     let n = unsafe {
@@ -407,9 +396,7 @@ fn pidtest_run(fd: i32) {
     }
     // Read /proc/self/stat — should start with our pid.
     // SAFETY: Valid memory or trusted environment
-    let pfd = unsafe {
-        libc::posix_open(b"/proc/self/stat\0".as_ptr() as *const i8, 0, 0)
-    };
+    let pfd = unsafe { libc::posix_open(c"/proc/self/stat".as_ptr().cast(), 0, 0) };
     if pfd < 0 {
         // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: open(/proc/self/stat) failed\n"); }
@@ -429,6 +416,8 @@ fn pidtest_run(fd: i32) {
     }
     // First field of stat is pid in ASCII.
     let mut pid_from_stat: u32 = 0;
+    // Kept as an index loop: take(n) would clamp an unchecked read() count.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n as usize {
         let b = sbuf[i];
         if b == b' ' { break; }
@@ -804,7 +793,7 @@ fn make_sockaddr_in(buf: &mut [u8; 16], port: u16, ip: u32) -> u32 {
     // ip (BE)
     let ib = ip.to_be_bytes();
     buf[4] = ib[0]; buf[5] = ib[1]; buf[6] = ib[2]; buf[7] = ib[3];
-    for i in 8..16 { buf[i] = 0; }
+    buf[8..].fill(0);
     16
 }
 
@@ -1099,9 +1088,9 @@ const LINE_BUF: usize = 256;
 /// Resolve the console fd. Tries `/dev/console`, then `/dev/tty`
 /// as a fallback. Returns `-1` if neither exists.
 unsafe fn open_console() -> i32 {
-    for path in [b"/dev/console\0".as_ptr(), b"/dev/tty\0".as_ptr()] {
+    for path in [c"/dev/console".as_ptr(), c"/dev/tty".as_ptr()] {
         // SAFETY: Valid memory or trusted environment
-        let fd = unsafe { libc::posix_open(path as *const i8, libc::O_RDWR, 0) };
+        let fd = unsafe { libc::posix_open(path.cast(), libc::O_RDWR, 0) };
         if fd >= 0 {
             return fd;
         }
@@ -1160,7 +1149,7 @@ unsafe fn read_byte(fd: i32) -> Option<u8> {
 }
 
 /// Strip leading whitespace + return the (command, rest) split.
-fn split_first<'a>(line: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+fn split_first(line: &[u8]) -> (&[u8], &[u8]) {
     let start = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
     let line = &line[start..];
     match line.iter().position(|&b| b == b' ') {
@@ -1639,6 +1628,8 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                             break;
                         }
                         bytes += n as u64;
+                        // Kept as an index loop: take(n) would clamp an unchecked read() count.
+                        #[allow(clippy::needless_range_loop)]
                         for i in 0..n as usize {
                             let b = buf[i];
                             if b == b'\n' {
@@ -1717,7 +1708,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // Also trim trailing whitespace + control chars.
         let path: &[u8] = {
             let mut end = path.len();
-            while end > 0 && (path[end - 1] == b' ' || path[end - 1] < 0x20) {
+            while end > 0 && (path[end - 1] <= b' ') {
                 end -= 1;
             }
             &path[..end]
@@ -1877,23 +1868,16 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 core::ptr::null_mut()
             }
             let mut tids = [0u64; 16];
-            for i in 0..n as usize {
+            for tid in tids.iter_mut().take(n as usize) {
                 let attr = core::ptr::null::<libc::pthread_attr_t>();
                 // SAFETY: Valid memory or trusted environment
                 let _rc = unsafe {
-                    libc::pthread_create(
-                        &mut tids[i] as *mut u64,
-                        attr,
-                        worker,
-                        core::ptr::null_mut(),
-                    )
+                    libc::pthread_create(tid as *mut u64, attr, worker, core::ptr::null_mut())
                 };
             }
-            for i in 0..n as usize {
+            for &tid in tids.iter().take(n as usize) {
                 // SAFETY: Valid memory or trusted environment
-                let _ = unsafe {
-                    libc::pthread_join(tids[i], core::ptr::null_mut())
-                };
+                let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
             }
             let total = COUNTER.load(core::sync::atomic::Ordering::SeqCst);
             let mut buf = [0u8; 16];
@@ -1963,7 +1947,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         let path = skip_ws(rest);
         let path: &[u8] = {
             let mut end = path.len();
-            while end > 0 && (path[end - 1] == b' ' || path[end - 1] < 0x20) {
+            while end > 0 && (path[end - 1] <= b' ') {
                 end -= 1;
             }
             &path[..end]
@@ -2012,7 +1996,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         let path = skip_ws(rest);
         let path: &[u8] = {
             let mut end = path.len();
-            while end > 0 && (path[end - 1] == b' ' || path[end - 1] < 0x20) {
+            while end > 0 && (path[end - 1] <= b' ') {
                 end -= 1;
             }
             &path[..end]
@@ -2320,6 +2304,8 @@ fn run_grep(fd: i32, rest: &[u8]) {
         if n <= 0 {
             break;
         }
+        // Kept as an index loop: take(n) would clamp an unchecked read() count.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n as usize {
             let b = buf[i];
             if b == b'\n' {
@@ -2438,7 +2424,7 @@ fn line_contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn trim_arg(s: &[u8]) -> &[u8] {
     let s = skip_ws(s);
     let mut end = s.len();
-    while end > 0 && (s[end - 1] == b' ' || s[end - 1] < 0x20) {
+    while end > 0 && (s[end - 1] <= b' ') {
         end -= 1;
     }
     &s[..end]
@@ -2503,11 +2489,11 @@ fn u32_to_decimal(mut v: u32, buf: &mut [u8]) -> &[u8] {
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        libc::puts(b"NARF shell -- type 'help' for commands.\n\0".as_ptr());
+        libc::puts(c"NARF shell -- type 'help' for commands.\n".as_ptr().cast());
 
         let fd = open_console();
         if fd < 0 {
-            libc::puts(b"shell: failed to open /dev/console\n\0".as_ptr());
+            libc::puts(c"shell: failed to open /dev/console\n".as_ptr().cast());
             return 1;
         }
 

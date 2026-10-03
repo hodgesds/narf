@@ -5,14 +5,14 @@
 //!
 //!   1. `setsid()`                  — become session + process-group leader.
 //!   2. `ioctl(0, TIOCSCTTY)`       — claim the console as the session's
-//!                                    controlling terminal.
+//!      controlling terminal.
 //!   3. `ioctl(0, TIOCSPGRP, &pgid)`— tcsetpgrp: foreground our group so we
-//!                                    can read the tty without SIGTTIN.
+//!      can read the tty without SIGTTIN.
 //!   4. login loop: prompt `login:`, read a username (echoed); prompt
 //!      `Password:`, read a password with ECHO disabled; verify against
 //!      `/etc/shadow`. Retry (with a delay) on failure.
 //!   5. `execve("/bin/shell")`      — the shell inherits session + ctty +
-//!                                    foreground pgrp.
+//!      foreground pgrp.
 //!
 //! Credentials live in `/etc/shadow` as salted SHA-256 hashes
 //! (`$n1$<salt>$<hexhash>`) — no plaintext on disk. The hashing + shadow
@@ -113,7 +113,7 @@ unsafe fn set_echo(on: bool) {
 /// getty only does the file I/O.
 unsafe fn check_credentials(user: &[u8], pass: &[u8]) -> bool {
     // SAFETY: NUL-terminated literal path; O_RDONLY = 0.
-    let fd = unsafe { libc::posix_open(b"/etc/shadow\0".as_ptr() as *const i8, 0, 0) };
+    let fd = unsafe { libc::posix_open(c"/etc/shadow".as_ptr().cast(), 0, 0) };
     if fd < 0 {
         return false;
     }
