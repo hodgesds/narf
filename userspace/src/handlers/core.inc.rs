@@ -16624,9 +16624,18 @@ mod child_reap_signalfd_tests {
         let fired = count.load(Ordering::SeqCst);
         let ready = sfd.poll_readiness() & POLL_IN != 0;
         // Retire the rows this fixture created, keyed by its synthetic ids: the
-        // staged status, the child link, the parent's reap entry, and the
-        // parent's pending SIGCHLD (bit, global pending-task count and queued
-        // siginfo). Left behind, they are residue for whatever runs next.
+        // staged status, the child link, the parent's reap entry, the parent's
+        // pending SIGCHLD (bit, global pending-task count and queued siginfo),
+        // its signal generations, and the signalfd's registry cell. Left
+        // behind, they are residue for whatever runs next.
+        //
+        // The signalfd cell is held weakly; drop the fd, then let
+        // `wake_signalfds` (the registry's only pruning path — task exit does
+        // not touch it) reap the dead cell and remove the parent's row.
+        drop(sfd);
+        crate::io_mux::wake_signalfds(parent);
+        super::signal_bits_remove(&super::SIGNAL_READABLE_GEN, parent);
+        super::signal_bits_remove(&super::SIGNAL_RAISE_GEN, parent);
         let _ = super::take_pending_termination(child);
         super::parent_of_remove(child);
         if let Some(m) = super::PENDING_EXITS[super::pending_exit_shard(parent)]
@@ -16644,7 +16653,61 @@ mod child_reap_signalfd_tests {
         {
             m.retain(|&(t, _), _| t != parent);
         }
+        for tid in [parent, child] {
+            if let Some(table) = residue_table(tid) {
+                narf_console::klog!("    child-reap fixture residue: tid={:#x} {}", tid, table);
+                return Err("fixture: cleanup left a row for its synthetic ids");
+            }
+        }
         Ok((fired, ready))
+    }
+
+    /// The first table (by name) that still holds a row for `tid`, among those
+    /// the child-reap path writes for the parent and child.
+    fn residue_table(tid: u64) -> Option<&'static str> {
+        if super::signal_bits_contains(&super::SIGNAL_PENDING, tid) {
+            return Some("SIGNAL_PENDING");
+        }
+        if super::signal_bits_contains(&super::SIGNAL_READABLE_GEN, tid) {
+            return Some("SIGNAL_READABLE_GEN");
+        }
+        if super::signal_bits_contains(&super::SIGNAL_RAISE_GEN, tid) {
+            return Some("SIGNAL_RAISE_GEN");
+        }
+        if crate::io_mux::__test_signalfd_cells_has_row(tid) {
+            return Some("SIGNALFD_CELLS");
+        }
+        if super::SIGQUEUE_INFO[super::sigqueue_bucket(tid)]
+            .values
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.keys().any(|&(t, _)| t == tid))
+        {
+            return Some("SIGQUEUE_INFO");
+        }
+        if super::PENDING_EXITS[super::pending_exit_shard(tid)]
+            .map
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid))
+        {
+            return Some("PENDING_EXITS");
+        }
+        if super::PARENT_OF
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid))
+        {
+            return Some("PARENT_OF");
+        }
+        if super::PENDING_TERMINATION
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid))
+        {
+            return Some("PENDING_TERMINATION");
+        }
+        None
     }
 
     /// POSITIVE: a parent whose signalfd watches SIGCHLD must have that fd's

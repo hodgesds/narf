@@ -415,6 +415,12 @@ pub fn wake_signalfds(task: u64) {
     }
 }
 
+/// Test-only: does the signalfd registry still hold a row for `task`?
+#[doc(hidden)]
+pub fn __test_signalfd_cells_has_row(task: u64) -> bool {
+    SIGNALFD_CELLS.lock().contains_key(&task)
+}
+
 /// `signalfd(2)` — receive signals as a `read` instead of as an
 /// async handler delivery. `read` returns one or more `signalfd_siginfo`
 /// records (128 B each).
