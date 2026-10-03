@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Waker};
+use core::task::{Context, Poll, Waker};
 
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_userspace::handlers::tool_view;
@@ -111,15 +111,21 @@ impl<T: Tool> Inner<T> {
         }
     }
 
-    /// Aborts the run: logs the reason, and kills every hosted process with
+    /// Aborts the run for a contained fatal the host returned for `context`
+    /// (see [`Self::abort_with`]).
+    fn abort(&self, context: &str, error: NarfFatal) {
+        self.abort_with(alloc::format!(
+            "reverie-narf: aborting the hosted process tree after {context}: {error:?}"
+        ));
+    }
+
+    /// Aborts the run: logs `reason`, and kills every hosted process with
     /// `SIGKILL`, as Linux kills a tracee whose tracer dies. Tasks the host
     /// adopts later are killed when they next reach the interceptor (see
     /// [`Self::kill_if_aborted`]). The host keeps tracking every task, so each
-    /// exit still reaches [`NarfToolHost::task_exited`].
-    fn abort(&self, context: &str, error: NarfFatal) {
-        let reason = alloc::format!(
-            "reverie-narf: aborting the hosted process tree after {context}: {error:?}"
-        );
+    /// exit still reaches [`NarfToolHost::task_exited`]. Only the first
+    /// abort's reason is kept.
+    fn abort_with(&self, reason: String) {
         let mut line = reason.clone();
         line.push('\n');
         narf_console::write_str(&line);
@@ -213,8 +219,11 @@ impl<T: Tool> core::fmt::Debug for ReverieInterceptor<T> {
 /// Why a task started by [`ReverieInterceptor::spawn_background`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundEnd {
-    /// Its future completed.
+    /// Its future completed with `Ok`.
     Completed,
+    /// Its future completed with an error, and the run was aborted with it
+    /// (see [`ReverieInterceptor::abort_reason`]).
+    Failed,
     /// The run was over first; the future was dropped unfinished.
     RunOver,
     /// Every handle to the interceptor was gone first; the future was
@@ -222,8 +231,9 @@ pub enum BackgroundEnd {
     HandlesDropped,
 }
 
-/// The future a background task polls, borrowing the run's global state.
-pub type BackgroundFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+/// The future a background task polls, borrowing the run's global state. An
+/// `Err` is the reason the run must stop: the task aborts the run with it.
+pub type BackgroundFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// A task started by [`ReverieInterceptor::spawn_background`]. The task runs
 /// on whether or not this is kept.
@@ -410,7 +420,8 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
     }
 
     /// Why the run was aborted, if it was: the reason logged for the first
-    /// contained fatal.
+    /// contained fatal or failed background future (see
+    /// [`Self::spawn_background`]).
     pub fn abort_reason(&self) -> Option<String> {
         self.inner.abort_reason.lock().clone()
     }
@@ -456,6 +467,12 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
     ///
     /// An aborted run needs no rule of its own: the abort kills every hosted
     /// process, so the run is over once they have exited.
+    ///
+    /// A future that completes with `Err(reason)` aborts the run with
+    /// `reason` (see [`Self::abort_reason`]) and ends the task as
+    /// [`BackgroundEnd::Failed`]. Detcore's scheduler fails that way when it
+    /// stops the run, for example with a deadlock report, since in the kernel
+    /// it cannot exit the process as the std build does.
     ///
     /// Until a root is hosted only the second rule applies, so a caller that
     /// starts a background future and then hosts no root, because
@@ -526,12 +543,16 @@ where
         if let Some(end) = inner.background_stop(handles) {
             return end;
         }
-        if future
+        match future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
-            .is_ready()
         {
-            return BackgroundEnd::Completed;
+            Poll::Ready(Ok(())) => return BackgroundEnd::Completed,
+            Poll::Ready(Err(reason)) => {
+                inner.abort_with(reason);
+                return BackgroundEnd::Failed;
+            }
+            Poll::Pending => {}
         }
         narf_scheduler::yield_now().await;
     }

@@ -32,7 +32,7 @@
   "fdinfo_unlisted_mount_ids": [],
   "sequentialize_threads": true,
   "runs_post_fork": "Child",
-  "passthru_opt": true,
+  "passthru_opt": false,
   "imprecise_timers": false,
   "chaos": false,
   "fuzz_futexes": false,

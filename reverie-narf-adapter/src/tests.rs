@@ -3711,12 +3711,26 @@ struct Relay {
 impl Relay {
     /// The background future: waits until the child's callback has started,
     /// then releases it. Pending on its first poll whatever the order.
-    async fn release_waiting_callback(&self) {
+    async fn release_waiting_callback(&self) -> Result<(), alloc::string::String> {
         if wait_for(&self.callback_started, &self.background_polls, true).await {
             self.released.store(true, Ordering::Release);
         }
+        Ok(())
+    }
+
+    /// A background future that fails, with [`BACKGROUND_FAILURE`], once the
+    /// child's callback has started, and leaves that callback waiting for a
+    /// release that never comes.
+    async fn fail_after_callback_started(&self) -> Result<(), alloc::string::String> {
+        if wait_for(&self.callback_started, &self.background_polls, true).await {
+            return Err(alloc::string::String::from(BACKGROUND_FAILURE));
+        }
+        Ok(())
     }
 }
+
+/// The reason [`Relay::fail_after_callback_started`] fails with.
+const BACKGROUND_FAILURE: &str = "reverie-narf test: the background future failed";
 
 #[reverie::global_tool]
 impl reverie::GlobalTool for Relay {
@@ -3807,6 +3821,48 @@ fn reverie_narf_background_future_releases_a_waiting_callback() -> TestResult {
 }
 reverie_narf_test!(reverie_narf_background_future_releases_a_waiting_callback);
 
+/// A background future that fails aborts the run with its reason, as
+/// Detcore's scheduler does when it stops the run (`run_detcore_scheduler`
+/// in `boot.rs`): the rendezvous guest's child `getuid` waits for a release
+/// [`Relay::fail_after_callback_started`] never gives, the future fails
+/// instead, and the interceptor kills every hosted process with `SIGKILL`,
+/// so the child (in its wait) and the root both die of signal 9, every exit
+/// still reaches the host, and the task ends as [`BackgroundEnd::Failed`].
+/// The kernel keeps running: a second hosted run afterwards completes
+/// normally.
+fn reverie_narf_failed_background_future_aborts_the_tree() -> TestResult {
+    let _signal_tables = SignalTables::init();
+    result_of((|| {
+        let (interceptor, root, background) =
+            run_hosted_with_background::<Relayed, _>(RENDEZVOUS_GUEST, (), |relay: &Relay| {
+                Box::pin(relay.fail_after_callback_started())
+            })?;
+        let relay = interceptor.host().global();
+        let background_polls = relay.background_polls.load(Ordering::Acquire);
+        let callback_polls = relay.callback_polls.load(Ordering::Acquire);
+        let end = background.end();
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    background polls {background_polls} callback polls {callback_polls} \
+             end {end:?} abort reason {reason:?}"
+        );
+        if end != Some(BackgroundEnd::Failed) {
+            return Err("the background task did not end as failed");
+        }
+        if reason.as_deref() != Some(BACKGROUND_FAILURE) {
+            return Err("the run was not aborted with the background future's reason");
+        }
+        let exits = check_teardown(&interceptor, root, 2, LINUX_SIGKILL)?;
+        if exits.iter().any(|exit| exit.wstatus != LINUX_SIGKILL) {
+            return Err("a task of the rendezvous guest did not die of SIGKILL");
+        }
+        check_kernel_still_hosts()?;
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_failed_background_future_aborts_the_tree);
+
 /// Answers the rendezvous guest's child `getuid` and parent `getgid` at
 /// once; everything else is tail-injected.
 #[derive(Debug, Default, Clone, Copy)]
@@ -3855,6 +3911,7 @@ fn wait_unreleased(_: &()) -> BackgroundFuture<'_> {
         let _mark = CountDrop(&BACKGROUND_DROPPED);
         let _ = wait_for(&BACKGROUND_NEVER, &BACKGROUND_POLLS, true).await;
         BACKGROUND_AFTER.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     })
 }
 
@@ -4016,10 +4073,10 @@ impl SyscallInterceptor for MemoryKeeper {
 fn probe_kept_memory(_: &()) -> BackgroundFuture<'_> {
     Box::pin(async {
         if !wait_for(&MEMORY_KEPT, &KEEP_POLLS, false).await {
-            return;
+            return Ok(());
         }
         let Some(mut memory) = *KEPT_MEMORY.lock() else {
-            return;
+            return Ok(());
         };
         let base = narf_memory::mmu::AP_TRAMPOLINE_EXEC_BASE;
         // SAFETY: reading CR3 has no side effects, and the live root it
@@ -4054,6 +4111,7 @@ fn probe_kept_memory(_: &()) -> BackgroundFuture<'_> {
         OUTSIDE_MAPPED.store(mapped, Ordering::Release);
         OUTSIDE_READ.store(outcome(read), Ordering::Release);
         OUTSIDE_WRITE.store(outcome(write), Ordering::Release);
+        Ok(())
     })
 }
 

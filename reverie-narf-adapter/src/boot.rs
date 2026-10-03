@@ -52,11 +52,12 @@
 //!   time. It runs in a kernel task beside the callbacks
 //!   ([`ReverieInterceptor::spawn_background`]), started once the root is
 //!   hosted, which Detcore's `init_for_external_scheduler` requires.
-//! * `passthru_opt`: Detcore subscribes to the syscalls its policy models or
-//!   refuses, and to the time syscalls and RDTSC, instead of to everything.
-//!   Everything includes CPUID, which Narf cannot deliver. A syscall outside
-//!   that set runs natively and is not charged virtual time.
-//! * `virtualize_cpuid` off, for the same reason.
+//! * `virtualize_cpuid` off: Narf cannot deliver CPUID events, and the host
+//!   refuses a Tool that subscribes to them
+//!   (`NarfFatal::UnsupportedSubscription`). With it and
+//!   `cpuid_virtualized_by_backend` off, Detcore does not subscribe to CPUID
+//!   (`subscriptions` in `detcore/src/lib.rs`), and the guest's `cpuid` runs
+//!   natively and sees the host's values.
 //! * `max_timeslice` none: Narf gives Detcore no performance counter to
 //!   preempt a thread with, so a thread runs until its next event.
 //! * `cancel_killed_thread_rpcs` on, as for Hermit's DBT and KVM backends:
@@ -66,8 +67,17 @@
 //!   `backend_supports_parked_write_signal_interruption` off: Hermit sets
 //!   them only for backends that do those things for Detcore.
 //!
-//! The epoch stays the library default, 2026-01-01T00:00:00Z, where
-//! `hermit run` would use the host's time when the run starts.
+//! `passthru_opt` stays off, the library default, so Detcore fails closed: it
+//! subscribes to every syscall and to RDTSC, and every syscall of a hosted
+//! task whose number Reverie's `Sysno` knows reaches Detcore and is charged
+//! virtual time.
+//!
+//! The epoch stays fixed at the library default, 2026-01-01T00:00:00Z, on
+//! purpose. `hermit run` samples the host's wall clock when the run starts
+//! instead; this backend keeps the fixed value so that every boot starts the
+//! guest's clock at the same time and two runs of the same commands can be
+//! compared byte for byte. Determinism matters more here than matching
+//! `hermit run`'s clock.
 //!
 //! Detcore virtualizes time, so the boot also installs the host's
 //! [`crate::RdtscInterceptor`] as the kernel's instruction interceptor, and
@@ -390,9 +400,21 @@ fn start_detcore_scheduler(host: &ReverieInterceptor<detcore::Detcore>) {
     host.spawn_background(run_detcore_scheduler);
 }
 
-/// Detcore's scheduler, on the run's global state.
+/// Detcore's scheduler, on the run's global state. When the scheduler stops
+/// the run (a `--stop-after-*` limit, a deadlock report, a replay stop), where
+/// the std build exits the process, the future fails with
+/// `DETCORE_FATAL_EXIT: <reason>` and the background task aborts the hosted
+/// tree with it.
 fn run_detcore_scheduler(global: &detcore::GlobalState) -> BackgroundFuture<'_> {
-    Box::pin(global.run_external_scheduler(Arc::new(observe_detcore_scheduler)))
+    Box::pin(async move {
+        global
+            .run_external_scheduler(Arc::new(observe_detcore_scheduler))
+            .await;
+        match global.fatal_exit_reason() {
+            Some(reason) => Err(format!("DETCORE_FATAL_EXIT: {reason}")),
+            None => Ok(()),
+        }
+    })
 }
 
 /// counter2's thread-exit reporter: prints the line counter2 writes to
