@@ -497,7 +497,9 @@ struct MuslDemoArgs {
 
     /// Host getty's process tree (the login shell and every case typed into
     /// it) under this Reverie Tool from reverie-examples (`counter1`,
-    /// `counter2` or `strace`): build with `reverie-narf-poc`, boot with
+    /// `counter2`, `strace` or `chaos`, which also takes the Linux binary's
+    /// flags as `chaos:<options>`, e.g. `chaos:no-interrupt` or
+    /// `chaos:skip=5,no-read`): build with `reverie-narf-poc`, boot with
     /// `reverie_tool=TOOL`, type `exit` after each boot's last case, and
     /// require the Tool's report from every boot (`reverie_narf_adapter::boot`).
     #[arg(long, value_name = "TOOL")]
@@ -3710,6 +3712,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     let reverie = args.reverie_tool.as_deref();
     let mut reports = ReverieReports::new();
     if let Some(tool) = reverie {
+        if let Err(why) = reverie_tool_spec(tool) {
+            bail!("--reverie-tool {tool}: {why}");
+        }
         ensure_feature(&mut build.features, "reverie-narf-poc");
         let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
         if existing
@@ -7494,9 +7499,88 @@ fn run_interactive_multi(
     Ok((passed, failed, failed_cases, report))
 }
 
-/// Checks one boot's serial output for the report of Reverie Tool `tool`,
-/// which hosted the login session (`reverie_narf_adapter::boot`), and returns
-/// the report's summary or why it is missing or wrong.
+/// chaos's options, as the kernel parses them from `reverie_tool=chaos:<options>`
+/// (`reverie_narf_adapter::boot::chaos_options`): the Linux binary's
+/// `--skip <N>`, `--no-read`, `--no-recv` and `--no-interrupt`.
+#[derive(Debug, Default, PartialEq)]
+struct ChaosOpts {
+    skip: u64,
+    no_read: bool,
+    no_recv: bool,
+    no_interrupt: bool,
+}
+
+impl ChaosOpts {
+    /// The options as the kernel prints them after chaos's installed line:
+    /// reverie's `ChaosOpts`, formatted with `{:?}`.
+    fn printed(&self) -> String {
+        format!(
+            "ChaosOpts {{ skip: {}, no_read: {}, no_recv: {}, no_interrupt: {} }}",
+            self.skip, self.no_read, self.no_recv, self.no_interrupt
+        )
+    }
+}
+
+/// The Reverie Tool a `--reverie-tool` value names and, for chaos, the
+/// options it gives, which are the defaults unless the value is
+/// `chaos:<options>`. `<options>` is one or more comma-separated words, each
+/// at most once: `skip=<N>` with `<N>` in decimal digits, `no-read`,
+/// `no-recv` and `no-interrupt`. The other Tools take no options. The kernel
+/// parses `reverie_tool=` by the same rules and refuses what they refuse
+/// (`reverie_narf_adapter::boot::install`); checking here refuses a bad value
+/// before any boot.
+fn reverie_tool_spec(spec: &str) -> Result<(&str, Option<ChaosOpts>), String> {
+    let (tool, options) = match spec.split_once(':') {
+        Some((tool, options)) => (tool, Some(options)),
+        None => (spec, None),
+    };
+    let options = match (tool, options) {
+        ("counter1" | "counter2" | "strace", None) => return Ok((tool, None)),
+        ("counter1" | "counter2" | "strace", Some(_)) => {
+            return Err(format!("{tool} takes no options"))
+        }
+        ("chaos", options) => options,
+        _ => {
+            return Err(String::from(
+                "no such tool (known: counter1, counter2, strace, chaos)",
+            ))
+        }
+    };
+    let mut opts = ChaosOpts::default();
+    let Some(options) = options else {
+        return Ok((tool, Some(opts)));
+    };
+    let mut given = std::collections::BTreeSet::new();
+    for word in options.split(',') {
+        let (name, value) = match word.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (word, None),
+        };
+        match (name, value) {
+            ("skip", Some(n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                opts.skip = n
+                    .parse()
+                    .map_err(|_| format!("chaos option {word} is out of range"))?;
+            }
+            ("no-read", None) => opts.no_read = true,
+            ("no-recv", None) => opts.no_recv = true,
+            ("no-interrupt", None) => opts.no_interrupt = true,
+            _ => {
+                return Err(format!(
+                    "no chaos option {word:?} (known: skip=<N>, no-read, no-recv, no-interrupt)"
+                ))
+            }
+        }
+        if !given.insert(name) {
+            return Err(format!("chaos option {name} given twice"));
+        }
+    }
+    Ok((tool, Some(opts)))
+}
+
+/// Checks one boot's serial output for the report of the Reverie Tool that
+/// hosted the login session (`reverie_narf_adapter::boot`), and returns the
+/// report's summary or why it is missing or wrong.
 ///
 /// The Tool's own count must equal the syscall events the kernel's tally
 /// expected it to see (every syscall entry of a hosted task, less park
@@ -7514,7 +7598,14 @@ fn run_interactive_multi(
 /// strace prints a line per syscall event instead of a count, and the report
 /// holds its lines ([`strace_output`]). Its count is its syscall lines, and
 /// [`check_strace_lines`] matches them to the tally's tasks.
-fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
+///
+/// chaos prints a line per syscall event too ([`chaos_output`]), and the
+/// kernel prints the options it runs chaos with, which must be the ones
+/// `spec` gives. Its count is its lines, and [`check_chaos_lines`] checks
+/// them against those options and the tally.
+///
+/// `spec` is the `--reverie-tool` value ([`reverie_tool_spec`]).
+fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
     fn matching<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
         lines
             .iter()
@@ -7531,6 +7622,7 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
             )),
         }
     }
+    let (tool, chaos_opts) = reverie_tool_spec(spec)?;
     let lines: Vec<&str> = serial.lines().map(|l| l.trim_end_matches('\r')).collect();
     single(
         &lines,
@@ -7546,10 +7638,23 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
             return Err(format!("the boot logged `{line}`"));
         }
     }
+    if let Some(opts) = &chaos_opts {
+        let prefix = "reverie-narf-boot: chaos options ";
+        let line = single(&lines, prefix)?;
+        let printed = &line[line.find(prefix).map_or(0, |at| at + prefix.len())..];
+        if printed != opts.printed() {
+            return Err(format!(
+                "the kernel runs chaos with `{printed}`; `{spec}` gives `{}`",
+                opts.printed()
+            ));
+        }
+    }
     // The Tool's own report line, as reverie-examples prints it on Linux:
     // its syscall count and, for counter2, its process and thread counts.
-    // strace has no such line; its count is its syscall lines.
+    // strace and chaos have no such line; strace's count is its syscall
+    // lines, and chaos's all its lines.
     let mut strace_lines = None;
+    let mut chaos_lines = None;
     let (counted, counter2_totals): (u64, Option<(u64, u64)>) = match tool {
         "counter1" => {
             let prefix = "counter1-global syscalls=";
@@ -7586,6 +7691,12 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
                 .filter(|line| matches!(line, StraceLine::Syscall { .. }))
                 .count() as u64;
             strace_lines = Some(output);
+            (counted, None)
+        }
+        "chaos" => {
+            let output = chaos_output(&lines)?;
+            let counted = output.len() as u64;
+            chaos_lines = Some(output);
             (counted, None)
         }
         _ => return Err(format!("no report check for tool `{tool}`")),
@@ -7717,6 +7828,10 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
         Some(output) => check_strace_lines(output, &by_task, processes)?,
         None => String::new(),
     };
+    let chaos_summary = match (&chaos_lines, &chaos_opts) {
+        (Some(output), Some(opts)) => check_chaos_lines(output, opts, &by_task, processes)?,
+        _ => String::new(),
+    };
     let by_task_sum: u64 = by_task.iter().map(|(_, events)| events).sum();
     if by_task_sum != expected {
         return Err(format!(
@@ -7727,7 +7842,8 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
     Ok(format!(
         "{tool} counted {counted} = expected-events ({entries} entries - {reexecutions} \
          re-executions - {native_only} native-only) = the sum of {} tasks' events; {exited} \
-         tasks exited ({} unstarted), {processes} processes{counter2_summary}{strace_summary}",
+         tasks exited ({} unstarted), {processes} processes{counter2_summary}{strace_summary}\
+         {chaos_summary}",
         by_task.len(),
         num("exited-unstarted")?,
     ))
@@ -7804,55 +7920,62 @@ fn parse_strace_line(line: &str) -> Option<StraceLine> {
     }
 }
 
-/// strace's lines from one boot's report, which prints them between
-/// `reverie-narf-boot: strace output lines=<L> dropped=<D>` and
-/// `reverie-narf-boot: strace output end` in a single console write
+/// The lines that Tool `tool`, one that prints with `eprintln!` (strace,
+/// chaos), printed in one boot. The report holds them between
+/// `reverie-narf-boot: <tool> output lines=<L> dropped=<D>` and
+/// `reverie-narf-boot: <tool> output end` in a single console write
 /// (`reverie_narf_adapter::boot`). There must be exactly L of them, none
-/// dropped, each of a form strace prints. A `Received signal` line is
-/// refused too: the Narf core delivers no signal events, so the checks here
-/// do not account for one.
-fn strace_output(lines: &[&str]) -> Result<Vec<StraceLine>, String> {
-    let header = "reverie-narf-boot: strace output lines=";
-    let end = "reverie-narf-boot: strace output end";
+/// dropped.
+fn tool_output<'l, 'a>(lines: &'l [&'a str], tool: &str) -> Result<&'l [&'a str], String> {
+    let header = format!("reverie-narf-boot: {tool} output lines=");
+    let end = format!("reverie-narf-boot: {tool} output end");
     let find = |needle: &str| -> Vec<usize> {
         (0..lines.len())
             .filter(|&at| lines[at].contains(needle))
             .collect()
     };
-    let (starts, ends) = (find(header), find(end));
+    let (starts, ends) = (find(header.as_str()), find(end.as_str()));
     let (&[start], &[stop]) = (starts.as_slice(), ends.as_slice()) else {
         return Err(format!(
-            "{} strace output headers and {} ends, expected 1 each",
+            "{} {tool} output headers and {} ends, expected 1 each",
             starts.len(),
             ends.len()
         ));
     };
     if stop < start || lines[stop] != end {
-        return Err(format!("strace's output does not end with `{end}`"));
+        return Err(format!("{tool}'s output does not end with `{end}`"));
     }
     let head = lines[start];
-    let counts = head[head.find(header).map_or(0, |at| at + header.len())..]
+    let counts = head[head.find(header.as_str()).map_or(0, |at| at + header.len())..]
         .split_once(" dropped=")
         .and_then(|(printed, dropped)| {
             Some((printed.parse::<u64>().ok()?, dropped.parse::<u64>().ok()?))
         });
     let Some((printed, dropped)) = counts else {
-        return Err(format!("bad strace output header `{head}`"));
+        return Err(format!("bad {tool} output header `{head}`"));
     };
     if dropped != 0 {
         return Err(format!(
-            "strace's output overflowed the report's buffer: {dropped} lines dropped after the \
+            "{tool}'s output overflowed the report's buffer: {dropped} lines dropped after the \
              first {printed}"
         ));
     }
     let body = &lines[start + 1..stop];
     if body.len() as u64 != printed {
         return Err(format!(
-            "the report has {} strace lines; its header says {printed}",
+            "the report has {} {tool} lines; its header says {printed}",
             body.len()
         ));
     }
-    body.iter()
+    Ok(body)
+}
+
+/// strace's lines from one boot's report ([`tool_output`]), each of a form
+/// strace prints. A `Received signal` line is refused too: the Narf core
+/// delivers no signal events, so the checks here do not account for one.
+fn strace_output(lines: &[&str]) -> Result<Vec<StraceLine>, String> {
+    tool_output(lines, "strace")?
+        .iter()
         .map(|line| {
             if line.starts_with("[pid ") && line.contains("] Received signal: ") {
                 return Err(format!(
@@ -7971,6 +8094,827 @@ fn check_strace_lines(
          lines equal the tally's events for it",
         output.len()
     ))
+}
+
+/// One line chaos printed, in a form `reverie-examples/chaos_tool.rs`
+/// prints: `[pid=<pid>, n=<n>] <call>` for a syscall event it runs
+/// unchanged, `SKIPPED [pid=<pid>, n=<n>] <call>` for one of a process's
+/// first `skip` events, and `[pid=<pid>, n=<n>] <call> = <value>` for a
+/// read, or a recvfrom unless `no-recv`, that it handled: failed with EINTR
+/// (`-4`) without running it, or ran, cut to one byte unless `no-read`, and
+/// shows with the arguments it ran it with. `<call>` is reverie's display of
+/// the syscall, `<name>(<arguments>)`.
+#[derive(Debug, PartialEq)]
+struct ChaosLine<'a> {
+    /// The line as chaos printed it.
+    text: &'a str,
+    /// The process ID.
+    pid: u64,
+    /// The event's number among its process's events, from 0.
+    n: u64,
+    /// Whether the line is marked `SKIPPED`.
+    skipped: bool,
+    /// The syscall's name.
+    name: &'a str,
+    /// The length argument and the value of a read or recvfrom chaos handled.
+    result: Option<(u64, i64)>,
+}
+
+/// Parses one of chaos's lines, or returns `None` if chaos prints nothing of
+/// that form.
+fn parse_chaos_line(text: &str) -> Option<ChaosLine<'_>> {
+    fn decimal(text: &str) -> Option<u64> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+    let (skipped, rest) = match text.strip_prefix("SKIPPED ") {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (pid, rest) = rest.strip_prefix("[pid=")?.split_once(", n=")?;
+    let (n, call) = rest.split_once("] ")?;
+    let (pid, n) = (decimal(pid)?, decimal(n)?);
+    let (name, _) = call.split_once('(')?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    // Every display ends with its closing parenthesis, and only a read or
+    // recvfrom chaos handled has a value after it. Their arguments are
+    // numbers, pointers and NULL, so they split at each ", ".
+    let result = if call.ends_with(')') {
+        None
+    } else {
+        let (call, value) = call.rsplit_once(" = ")?;
+        let arguments = call
+            .strip_prefix(name)?
+            .strip_prefix('(')?
+            .strip_suffix(')')?;
+        let fields: Vec<&str> = arguments.split(", ").collect();
+        let len = match (skipped, name, fields.as_slice()) {
+            (false, "read", [_, _, len]) | (false, "recvfrom", [_, _, len, _, _, _]) => {
+                decimal(len)?
+            }
+            _ => return None,
+        };
+        Some((len, value.parse::<i64>().ok()?))
+    };
+    Some(ChaosLine {
+        text,
+        pid,
+        n,
+        skipped,
+        name,
+        result,
+    })
+}
+
+/// chaos's lines from one boot's report ([`tool_output`]), each of a form
+/// chaos prints.
+fn chaos_output<'a>(lines: &[&'a str]) -> Result<Vec<ChaosLine<'a>>, String> {
+    tool_output(lines, "chaos")?
+        .iter()
+        .map(|&line| parse_chaos_line(line).ok_or_else(|| format!("chaos does not print `{line}`")))
+        .collect()
+}
+
+/// Checks chaos's lines against the options the kernel ran it with and the
+/// tally, and returns a summary.
+///
+/// Each line must be one chaos prints under `opts`: marked `SKIPPED` exactly
+/// for a process's first `skip` events, and with a value exactly for a read,
+/// or a recvfrom unless `no-recv`, that it handled. Such a recvfrom must be
+/// cut to one byte, and such a read must have failed with EINTR (unless
+/// `no-interrupt`) or, unless `no-read`, be cut to one byte. No value may
+/// exceed the length asked for.
+///
+/// chaos numbers each process's events from 0, and a process ID is reused
+/// only after every thread of the process that held it has exited, so a
+/// process ID's lines from each `n=0` on are one process's. Each process's
+/// numbers must be 0 to K-1, once each. No more processes may have lines
+/// than the tally counted, and no fewer than it counted less its tasks
+/// without events, which include every process without events.
+///
+/// A process that starts no thread (none of its lines is a clone with
+/// `CLONE_THREAD` or a clone3) runs one event at a time, so its lines must be
+/// in the order of their numbers, and K must be the tally's events for a task
+/// whose thread ID is the process ID, each task matched once. Unless
+/// `no-interrupt`, chaos fails such a process's first read with EINTR and
+/// then runs and fails its reads alternately, and a recvfrom it cuts makes
+/// the next read fail again; this holds only if each process's thread starts
+/// with state of its own. A multithreaded process's lines do not say which
+/// thread printed them, so its lines get only the checks above.
+fn check_chaos_lines(
+    output: &[ChaosLine],
+    opts: &ChaosOpts,
+    by_task: &[(String, u64)],
+    processes: u64,
+) -> Result<String, String> {
+    use std::collections::BTreeMap;
+    let (mut skipped, mut reads, mut failed, mut recvs) = (0u64, 0u64, 0u64, 0u64);
+    for line in output {
+        let text = line.text;
+        if line.skipped != (line.n < opts.skip) {
+            return Err(format!(
+                "`{text}` is {}marked SKIPPED, and chaos skips the first {} events of each \
+                 process",
+                if line.skipped { "" } else { "not " },
+                opts.skip
+            ));
+        }
+        let handled =
+            !line.skipped && (line.name == "read" || (line.name == "recvfrom" && !opts.no_recv));
+        let Some((len, value)) = line.result else {
+            if handled {
+                return Err(format!(
+                    "`{text}` has no value, and chaos prints one for every {} it handles",
+                    line.name
+                ));
+            }
+            skipped += u64::from(line.skipped);
+            continue;
+        };
+        if !handled {
+            return Err(format!(
+                "`{text}` has a value, which chaos prints only for a read or recvfrom it handles"
+            ));
+        }
+        if u64::try_from(value).is_ok_and(|bytes| bytes > len) {
+            return Err(format!("`{text}` returns more bytes than it asks for"));
+        }
+        if line.name == "recvfrom" {
+            recvs += 1;
+            if len > 1 {
+                return Err(format!(
+                    "`{text}` shows a recvfrom chaos did not cut to one byte"
+                ));
+            }
+            continue;
+        }
+        reads += 1;
+        failed += u64::from(value == -4);
+        let interrupted = !opts.no_interrupt && value == -4;
+        if !opts.no_read && !interrupted && len > 1 {
+            return Err(format!(
+                "`{text}` shows a read chaos did not cut to one byte{}",
+                if opts.no_interrupt {
+                    ""
+                } else {
+                    " or fail with EINTR"
+                }
+            ));
+        }
+    }
+    // Each process's lines, in the order chaos printed them.
+    let mut by_process: Vec<Vec<&ChaosLine>> = Vec::new();
+    let mut latest = BTreeMap::<u64, usize>::new();
+    for line in output {
+        if line.n == 0 {
+            latest.insert(line.pid, by_process.len());
+            by_process.push(vec![line]);
+            continue;
+        }
+        let Some(&at) = latest.get(&line.pid) else {
+            return Err(format!(
+                "`{}` is chaos's first line for pid {}, and chaos numbers a process's events \
+                 from 0",
+                line.text, line.pid
+            ));
+        };
+        by_process[at].push(line);
+    }
+    let started = by_process.len() as u64;
+    let eventless = by_task.iter().filter(|(_, events)| *events == 0).count() as u64;
+    if started > processes {
+        return Err(format!(
+            "chaos printed lines for {started} processes; the tally counted {processes}"
+        ));
+    }
+    if started + eventless < processes {
+        return Err(format!(
+            "chaos printed lines for {started} processes; the tally counted {processes}, and \
+             only {eventless} of its tasks had no events"
+        ));
+    }
+    // How many of the tally's tasks with each (thread ID, events) no process
+    // has matched yet.
+    let mut unmatched = BTreeMap::<(String, u64), u64>::new();
+    for pair in by_task {
+        *unmatched.entry(pair.clone()).or_default() += 1;
+    }
+    let mut single = 0u64;
+    for lines in &by_process {
+        let pid = lines[0].pid;
+        let mut numbers: Vec<u64> = lines.iter().map(|line| line.n).collect();
+        numbers.sort_unstable();
+        if let Some((want, &n)) = numbers
+            .iter()
+            .enumerate()
+            .find(|&(want, &n)| n != want as u64)
+        {
+            return Err(if want > 0 && numbers[want - 1] == n {
+                format!("chaos gave two events of a process {pid} the number n={n}")
+            } else {
+                format!(
+                    "chaos numbered a process {pid}'s {} events without n={want}",
+                    numbers.len()
+                )
+            });
+        }
+        let threaded = lines.iter().any(|line| {
+            line.name == "clone3" || (line.name == "clone" && line.text.contains("CLONE_THREAD"))
+        });
+        if threaded {
+            continue;
+        }
+        single += 1;
+        if let Some((at, line)) = lines
+            .iter()
+            .enumerate()
+            .find(|&(at, line)| line.n != at as u64)
+        {
+            return Err(format!(
+                "process {pid} starts no thread, so it runs one event at a time, but chaos \
+                 printed `{}` as its line {at}",
+                line.text
+            ));
+        }
+        let events = lines.len() as u64;
+        match unmatched.get_mut(&(pid.to_string(), events)) {
+            Some(left) if *left > 0 => *left -= 1,
+            _ => {
+                return Err(format!(
+                    "process {pid} starts no thread, so its {events} lines are the events of a \
+                     task {pid}, and the tally has no other task {pid} with {events} events"
+                ))
+            }
+        }
+        if opts.no_interrupt {
+            continue;
+        }
+        let mut interrupt = true;
+        for line in lines.iter().filter(|line| !line.skipped) {
+            let Some((len, value)) = line.result else {
+                continue;
+            };
+            if line.name == "recvfrom" {
+                interrupt = true;
+                continue;
+            }
+            if interrupt && value != -4 {
+                return Err(format!(
+                    "`{}` is not EINTR, and chaos fails a thread's first read, and each read \
+                     after one it ran or a recvfrom it cut, with EINTR",
+                    line.text
+                ));
+            }
+            if !interrupt && !opts.no_read && len > 1 {
+                return Err(format!(
+                    "`{}` is not cut to one byte, and chaos cuts each read after one it failed \
+                     with EINTR",
+                    line.text
+                ));
+            }
+            interrupt = !interrupt;
+        }
+    }
+    let alternation = if opts.no_interrupt {
+        ""
+    } else {
+        ", and their reads alternately failing with EINTR"
+    };
+    Ok(format!(
+        "; chaos printed {} lines: {skipped} SKIPPED, and {reads} reads ({failed} failing with \
+         EINTR) and {recvs} recvfroms it handled; each of {started} processes' lines number its \
+         events from 0 once each, and the {single} that start no thread have their lines in that \
+         order, as many as the tally's events for their task{alternation}",
+        output.len()
+    ))
+}
+
+#[cfg(test)]
+mod chaos_report_tests {
+    use super::{check_reverie_report, parse_chaos_line, reverie_tool_spec, ChaosLine, ChaosOpts};
+
+    /// chaos's lines, under its defaults, for a shell (process 2) that reads
+    /// a line, runs a command that execs cat, which reads to EOF, then a
+    /// command that starts a thread, and exits. The first child is process 3,
+    /// a task of 4 events. The second reuses process ID 3: its thread 4 reads
+    /// twice and exits, and its task 3 starts that thread, writes and exits,
+    /// 3 events each. Thread 4's second read waits for that write, so its
+    /// line follows the write's. Then the shell's task 2 exits after 7.
+    const BODY: [&str; 17] = [
+        "[pid=2, n=0] read(0, 0x10, 16) = -4",
+        "[pid=2, n=1] read(0, 0x10, 1) = 1",
+        "[pid=2, n=2] fork()",
+        "[pid=3, n=0] execve(0x20 -> \"/bin/cat\", 0x30, 0x40)",
+        "[pid=3, n=1] read(4, 0x50, 4096) = -4",
+        "[pid=3, n=2] read(4, 0x50, 1) = 0",
+        "[pid=3, n=3] exit_group(0)",
+        "[pid=2, n=3] wait4(-1, 0x60, WaitPidFlag(0x0), NULL)",
+        "[pid=2, n=4] fork()",
+        "[pid=3, n=0] clone(CloneFlags(CLONE_VM | CLONE_THREAD), 0x70, 0x80, 0x80, 0)",
+        "[pid=3, n=1] read(5, 0x90, 8) = -4",
+        "[pid=3, n=3] write(6, 0xa0, 1)",
+        "[pid=3, n=2] read(5, 0x90, 1) = 1",
+        "[pid=3, n=4] exit(0)",
+        "[pid=3, n=5] exit_group(0)",
+        "[pid=2, n=5] wait4(-1, 0x60, WaitPidFlag(0x0), NULL)",
+        "[pid=2, n=6] exit_group(0)",
+    ];
+    const TALLY: &str = "reverie-narf-boot: tally tool=chaos entries=18 reexecutions=1 \
+                         native-only=0 expected-events=17 tasks-started=4 tasks-exited=4 \
+                         exited-unstarted=0 processes=3 adapter-exits=4 adapter-hosted=0 \
+                         aborted=no";
+    const BY_TASK: &str = "3:4 4:3 3:3 2:7";
+    const DEFAULTS: &str =
+        "ChaosOpts { skip: 0, no_read: false, no_recv: false, no_interrupt: false }";
+
+    fn serial(options: &str, header: &str, body: &[&str], tally: &str, by_task: &str) -> String {
+        let mut out = format!(
+            "reverie-narf-boot: chaos installed at the syscall dispatcher\n\
+             reverie-narf-boot: chaos options {options}\n\
+             reverie-narf-boot: chaos hosts the process tree of pid 2 (task 18)\n\
+             narf> exit\n\
+             {header}\n"
+        );
+        for line in body {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("reverie-narf-boot: chaos output end\n");
+        out.push_str(tally);
+        out.push_str(&format!(
+            "\nreverie-narf-boot: events-by-task {by_task}\n\
+             reverie-narf-boot: syscalls-by-number 0:6 1:1 56:1 57:2 59:1 60:1 61:2 231:3 \
+             rest:0\n\
+             reverie-narf-boot: report end\n"
+        ));
+        out
+    }
+
+    fn report(
+        spec: &str,
+        options: &str,
+        body: &[&str],
+        tally: &str,
+        by_task: &str,
+    ) -> Result<String, String> {
+        let header = format!(
+            "reverie-narf-boot: chaos output lines={} dropped=0",
+            body.len()
+        );
+        check_reverie_report(&serial(options, &header, body, tally, by_task), spec)
+    }
+
+    fn check(body: &[&str]) -> Result<String, String> {
+        report("chaos", DEFAULTS, body, TALLY, BY_TASK)
+    }
+
+    fn refused(result: Result<String, String>, reason: &str) {
+        match result {
+            Err(e) => assert!(e.contains(reason), "refused for another reason: {e}"),
+            Ok(summary) => panic!("accepted: {summary}"),
+        }
+    }
+
+    #[test]
+    fn accepts_lines_that_match_the_options_and_the_tally() {
+        let summary = check(&BODY).unwrap();
+        assert!(
+            summary.contains(
+                "chaos printed 17 lines: 0 SKIPPED, and 6 reads (3 failing with EINTR) and 0 \
+                 recvfroms it handled; each of 3 processes' lines number its events from 0 once \
+                 each, and the 2 that start no thread have their lines in that order, as many as \
+                 the tally's events for their task, and their reads alternately failing with \
+                 EINTR"
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn parses_each_form_chaos_prints() {
+        let line = |text, pid, n, skipped, name, result| {
+            Some(ChaosLine {
+                text,
+                pid,
+                n,
+                skipped,
+                name,
+                result,
+            })
+        };
+        assert_eq!(
+            parse_chaos_line(BODY[0]),
+            line(BODY[0], 2, 0, false, "read", Some((16, -4)))
+        );
+        assert_eq!(
+            parse_chaos_line(BODY[5]),
+            line(BODY[5], 3, 2, false, "read", Some((1, 0)))
+        );
+        assert_eq!(
+            parse_chaos_line(BODY[3]),
+            line(BODY[3], 3, 0, false, "execve", None)
+        );
+        assert_eq!(
+            parse_chaos_line(BODY[7]),
+            line(BODY[7], 2, 3, false, "wait4", None)
+        );
+        let skipped = "SKIPPED [pid=2, n=0] read(0, 0x10, 16)";
+        assert_eq!(
+            parse_chaos_line(skipped),
+            line(skipped, 2, 0, true, "read", None)
+        );
+        let recv = "[pid=2, n=4] recvfrom(3, 0x10, 1, 0, NULL, NULL) = 1";
+        assert_eq!(
+            parse_chaos_line(recv),
+            line(recv, 2, 4, false, "recvfrom", Some((1, 1)))
+        );
+        for text in [
+            "[pid=2, n=1] read(0, 0x10, 1) = ?",
+            "SKIPPED [pid=2, n=1] read(0, 0x10, 1) = 1",
+            "[pid=2, n=1] write(1, 0x10, 1) = 1",
+            "[pid=2, n=x] fork()",
+            "[pid=, n=1] fork()",
+            "[pid=2, n=1] Fork()",
+            "[pid=2, n=1] read(0, 0x10, 1",
+            "[pid=2, n=1] fork() trailing",
+            "[pid 2] read(0, 0x10, 1) = 1",
+            "[pid=2, n=1] read(0, 1) = 1",
+            "[pid=2, n=1] read(0, 0x10, -1) = 1",
+            "[pid=2, n=1] recvfrom(3, 0x10, 1) = 1",
+        ] {
+            assert_eq!(parse_chaos_line(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_missing_line() {
+        let mut body = BODY.to_vec();
+        body.remove(7);
+        refused(
+            check(&body),
+            "chaos counted 16 syscall events; the tally expected 17",
+        );
+    }
+
+    #[test]
+    fn refuses_a_line_chaos_does_not_print() {
+        let mut body = BODY;
+        body[7] = "[pid 2] wait4(-1, 0x60, 0, 0x0) = 3";
+        refused(check(&body), "chaos does not print `[pid 2] wait4");
+    }
+
+    #[test]
+    fn refuses_dropped_lines() {
+        let dropped = "reverie-narf-boot: chaos output lines=17 dropped=1";
+        refused(
+            check_reverie_report(&serial(DEFAULTS, dropped, &BODY, TALLY, BY_TASK), "chaos"),
+            "chaos's output overflowed the report's buffer",
+        );
+    }
+
+    #[test]
+    fn refuses_a_number_given_twice() {
+        let mut body = BODY;
+        body[11] = "[pid=3, n=2] write(6, 0xa0, 1)";
+        refused(
+            check(&body),
+            "chaos gave two events of a process 3 the number n=2",
+        );
+    }
+
+    #[test]
+    fn refuses_a_child_numbered_on_from_its_parent() {
+        // What a child that took over its parent's count at fork prints.
+        let mut body = BODY;
+        body[3] = "[pid=3, n=3] execve(0x20 -> \"/bin/cat\", 0x30, 0x40)";
+        body[4] = "[pid=3, n=4] read(4, 0x50, 4096) = -4";
+        body[5] = "[pid=3, n=5] read(4, 0x50, 1) = 0";
+        body[6] = "[pid=3, n=6] exit_group(0)";
+        refused(check(&body), "is chaos's first line for pid 3");
+    }
+
+    #[test]
+    fn refuses_a_count_restarted_at_exec() {
+        let mut body = BODY;
+        body[4] = "[pid=3, n=0] read(4, 0x50, 4096) = -4";
+        body[5] = "[pid=3, n=1] read(4, 0x50, 1) = 0";
+        body[6] = "[pid=3, n=2] exit_group(0)";
+        refused(
+            check(&body),
+            "chaos printed lines for 4 processes; the tally counted 3",
+        );
+    }
+
+    #[test]
+    fn refuses_a_read_neither_cut_nor_failed() {
+        let mut body = BODY;
+        body[1] = "[pid=2, n=1] read(0, 0x10, 16) = 5";
+        refused(
+            check(&body),
+            "shows a read chaos did not cut to one byte or fail with EINTR",
+        );
+    }
+
+    #[test]
+    fn refuses_a_second_eintr_in_a_row() {
+        let mut body = BODY;
+        body[1] = "[pid=2, n=1] read(0, 0x10, 16) = -4";
+        refused(
+            check(&body),
+            "`[pid=2, n=1] read(0, 0x10, 16) = -4` is not cut to one byte",
+        );
+    }
+
+    #[test]
+    fn refuses_a_cut_read_where_eintr_is_due() {
+        let mut body = BODY;
+        body[4] = "[pid=3, n=1] read(4, 0x50, 1) = 1";
+        refused(
+            check(&body),
+            "`[pid=3, n=1] read(4, 0x50, 1) = 1` is not EINTR",
+        );
+    }
+
+    #[test]
+    fn checks_reads_against_no_interrupt() {
+        const NO_INTERRUPT: &str =
+            "ChaosOpts { skip: 0, no_read: false, no_recv: false, no_interrupt: true }";
+        let mut cut = BODY;
+        cut[0] = "[pid=2, n=0] read(0, 0x10, 1) = 1";
+        cut[4] = "[pid=3, n=1] read(4, 0x50, 1) = 1";
+        cut[10] = "[pid=3, n=1] read(5, 0x90, 1) = 1";
+        report("chaos:no-interrupt", NO_INTERRUPT, &cut, TALLY, BY_TASK).unwrap();
+        refused(
+            check(&cut),
+            "`[pid=2, n=0] read(0, 0x10, 1) = 1` is not EINTR",
+        );
+        // chaos run with its defaults although no-interrupt was asked for.
+        refused(
+            report("chaos:no-interrupt", NO_INTERRUPT, &BODY, TALLY, BY_TASK),
+            "`[pid=2, n=0] read(0, 0x10, 16) = -4` shows a read chaos did not cut to one byte",
+        );
+    }
+
+    #[test]
+    fn refuses_options_other_than_the_ones_asked_for() {
+        refused(
+            report("chaos:no-interrupt", DEFAULTS, &BODY, TALLY, BY_TASK),
+            "the kernel runs chaos with `ChaosOpts { skip: 0, no_read: false, no_recv: false, \
+             no_interrupt: false }`; `chaos:no-interrupt` gives `ChaosOpts { skip: 0, no_read: \
+             false, no_recv: false, no_interrupt: true }`",
+        );
+        let header = "reverie-narf-boot: chaos output lines=17 dropped=0";
+        let serial = serial(DEFAULTS, header, &BODY, TALLY, BY_TASK).replace(
+            "reverie-narf-boot: chaos options ",
+            "reverie-narf-boot: chaos ",
+        );
+        refused(
+            check_reverie_report(&serial, "chaos"),
+            "0 lines contain `reverie-narf-boot: chaos options `, expected 1",
+        );
+    }
+
+    #[test]
+    fn checks_skipped_lines_against_skip() {
+        const SKIP_2: &str =
+            "ChaosOpts { skip: 2, no_read: false, no_recv: false, no_interrupt: true }";
+        let spec = "chaos:skip=2,no-interrupt";
+        let body = [
+            "SKIPPED [pid=2, n=0] read(0, 0x10, 16)",
+            "SKIPPED [pid=2, n=1] read(0, 0x10, 16)",
+            "[pid=2, n=2] fork()",
+            "SKIPPED [pid=3, n=0] execve(0x20 -> \"/bin/cat\", 0x30, 0x40)",
+            "SKIPPED [pid=3, n=1] read(4, 0x50, 4096)",
+            "[pid=3, n=2] read(4, 0x50, 1) = 0",
+            "[pid=3, n=3] exit_group(0)",
+            "[pid=2, n=3] wait4(-1, 0x60, WaitPidFlag(0x0), NULL)",
+            "[pid=2, n=4] fork()",
+            "SKIPPED [pid=3, n=0] clone(CloneFlags(CLONE_VM | CLONE_THREAD), 0x70, 0x80, 0x80, 0)",
+            "SKIPPED [pid=3, n=1] read(5, 0x90, 8)",
+            "[pid=3, n=3] write(6, 0xa0, 1)",
+            "[pid=3, n=2] read(5, 0x90, 1) = 1",
+            "[pid=3, n=4] exit(0)",
+            "[pid=3, n=5] exit_group(0)",
+            "[pid=2, n=5] wait4(-1, 0x60, WaitPidFlag(0x0), NULL)",
+            "[pid=2, n=6] exit_group(0)",
+        ];
+        let summary = report(spec, SKIP_2, &body, TALLY, BY_TASK).unwrap();
+        assert!(
+            summary.contains("chaos printed 17 lines: 6 SKIPPED, and 2 reads"),
+            "{summary}"
+        );
+        let mut marked = body;
+        marked[2] = "SKIPPED [pid=2, n=2] fork()";
+        refused(
+            report(spec, SKIP_2, &marked, TALLY, BY_TASK),
+            "`SKIPPED [pid=2, n=2] fork()` is marked SKIPPED, and chaos skips the first 2 events",
+        );
+        let mut unmarked = body;
+        unmarked[1] = "[pid=2, n=1] read(0, 0x10, 1) = 1";
+        refused(
+            report(spec, SKIP_2, &unmarked, TALLY, BY_TASK),
+            "`[pid=2, n=1] read(0, 0x10, 1) = 1` is not marked SKIPPED",
+        );
+        refused(
+            check(&body),
+            "is marked SKIPPED, and chaos skips the first 0 events",
+        );
+    }
+
+    #[test]
+    fn checks_recvfrom_against_no_recv() {
+        const NO_RECV: &str =
+            "ChaosOpts { skip: 0, no_read: false, no_recv: true, no_interrupt: false }";
+        let mut cut = BODY;
+        cut[1] = "[pid=2, n=1] recvfrom(0, 0x10, 1, 0, NULL, NULL) = 1";
+        let summary = check(&cut).unwrap();
+        assert!(
+            summary.contains("5 reads (3 failing with EINTR) and 1 recvfroms"),
+            "{summary}"
+        );
+        refused(
+            report("chaos:no-recv", NO_RECV, &cut, TALLY, BY_TASK),
+            "has a value, which chaos prints only for a read or recvfrom it handles",
+        );
+        let mut uncut = BODY;
+        uncut[1] = "[pid=2, n=1] recvfrom(0, 0x10, 16, 0, NULL, NULL) = 16";
+        refused(
+            check(&uncut),
+            "shows a recvfrom chaos did not cut to one byte",
+        );
+        let mut unhandled = BODY;
+        unhandled[1] = "[pid=2, n=1] recvfrom(0, 0x10, 16, 0, NULL, NULL)";
+        report("chaos:no-recv", NO_RECV, &unhandled, TALLY, BY_TASK).unwrap();
+        refused(
+            check(&unhandled),
+            "has no value, and chaos prints one for every recvfrom it handles",
+        );
+        // A recvfrom chaos cuts makes the next read fail with EINTR, even
+        // after a read it failed.
+        let tally = "reverie-narf-boot: tally tool=chaos entries=4 reexecutions=0 \
+                     native-only=0 expected-events=4 tasks-started=1 tasks-exited=1 \
+                     exited-unstarted=0 processes=1 adapter-exits=1 adapter-hosted=0 \
+                     aborted=no";
+        let mut reset = [
+            "[pid=2, n=0] read(0, 0x10, 16) = -4",
+            "[pid=2, n=1] recvfrom(0, 0x10, 1, 0, NULL, NULL) = 1",
+            "[pid=2, n=2] read(0, 0x10, 16) = -4",
+            "[pid=2, n=3] exit_group(0)",
+        ];
+        report("chaos", DEFAULTS, &reset, tally, "2:4").unwrap();
+        reset[2] = "[pid=2, n=2] read(0, 0x10, 1) = 1";
+        refused(
+            report("chaos", DEFAULTS, &reset, tally, "2:4"),
+            "`[pid=2, n=2] read(0, 0x10, 1) = 1` is not EINTR",
+        );
+    }
+
+    #[test]
+    fn refuses_more_bytes_than_asked_for() {
+        let mut body = BODY;
+        body[1] = "[pid=2, n=1] read(0, 0x10, 1) = 2";
+        refused(check(&body), "returns more bytes than it asks for");
+    }
+
+    #[test]
+    fn requires_event_order_only_of_a_process_without_threads() {
+        let mut body = BODY;
+        body[9] = "[pid=3, n=0] clone3(0x70, 88)";
+        check(&body).unwrap();
+        body[9] = "[pid=3, n=0] clone(CloneFlags(CLONE_VM), 0x70, 0x80, 0x80, 0)";
+        refused(
+            check(&body),
+            "process 3 starts no thread, so it runs one event at a time, but chaos printed \
+             `[pid=3, n=3] write(6, 0xa0, 1)` as its line 2",
+        );
+    }
+
+    #[test]
+    fn bounds_the_processes_by_the_tally() {
+        let tally =
+            |processes: u64| TALLY.replace("processes=3", &format!("processes={processes}"));
+        refused(
+            report("chaos", DEFAULTS, &BODY, &tally(4), BY_TASK),
+            "chaos printed lines for 3 processes; the tally counted 4, and only 0 of its tasks \
+             had no events",
+        );
+        refused(
+            report("chaos", DEFAULTS, &BODY, &tally(2), BY_TASK),
+            "chaos printed lines for 3 processes; the tally counted 2",
+        );
+        // A fourth process, killed before its first event.
+        let killed = "reverie-narf-boot: tally tool=chaos entries=18 reexecutions=1 \
+                      native-only=0 expected-events=17 tasks-started=4 tasks-exited=5 \
+                      exited-unstarted=1 processes=4 adapter-exits=5 adapter-hosted=0 \
+                      aborted=no";
+        report("chaos", DEFAULTS, &BODY, killed, "3:4 4:3 5:0 3:3 2:7").unwrap();
+    }
+
+    #[test]
+    fn matches_a_process_without_threads_to_a_task() {
+        refused(
+            report("chaos", DEFAULTS, &BODY, TALLY, "3:5 4:3 3:2 2:7"),
+            "process 3 starts no thread, so its 4 lines are the events of a task 3, and the \
+             tally has no other task 3 with 4 events",
+        );
+    }
+
+    #[test]
+    fn parses_tool_values_as_the_kernel_does() {
+        let opts = |skip, no_read, no_recv, no_interrupt| {
+            Some(ChaosOpts {
+                skip,
+                no_read,
+                no_recv,
+                no_interrupt,
+            })
+        };
+        for (spec, tool, expected) in [
+            ("counter1", "counter1", None),
+            ("counter2", "counter2", None),
+            ("strace", "strace", None),
+            ("chaos", "chaos", opts(0, false, false, false)),
+            ("chaos:no-interrupt", "chaos", opts(0, false, false, true)),
+            ("chaos:no-read", "chaos", opts(0, true, false, false)),
+            ("chaos:no-recv", "chaos", opts(0, false, true, false)),
+            ("chaos:skip=0", "chaos", opts(0, false, false, false)),
+            (
+                "chaos:skip=3,no-interrupt",
+                "chaos",
+                opts(3, false, false, true),
+            ),
+            (
+                "chaos:no-recv,no-interrupt,skip=12,no-read",
+                "chaos",
+                opts(12, true, true, true),
+            ),
+            (
+                "chaos:skip=18446744073709551615",
+                "chaos",
+                opts(u64::MAX, false, false, false),
+            ),
+        ] {
+            assert_eq!(reverie_tool_spec(spec), Ok((tool, expected)), "{spec}");
+        }
+        let unknown = [
+            ("", ""),
+            ("no-read,", ""),
+            (",no-read", ""),
+            ("skip", "skip"),
+            ("skip=", "skip="),
+            ("skip=+3", "skip=+3"),
+            ("skip=-1", "skip=-1"),
+            ("skip=0x10", "skip=0x10"),
+            ("no-read=1", "no-read=1"),
+            ("No-Read", "No-Read"),
+            ("interrupt", "interrupt"),
+        ]
+        .map(|(options, word)| {
+            (
+                format!("chaos:{options}"),
+                format!(
+                    "no chaos option {word:?} (known: skip=<N>, no-read, no-recv, no-interrupt)"
+                ),
+            )
+        });
+        let other = [
+            (
+                "chaos:skip=18446744073709551616",
+                "chaos option skip=18446744073709551616 is out of range",
+            ),
+            ("chaos:no-read,no-read", "chaos option no-read given twice"),
+            (
+                "chaos:skip=1,no-recv,skip=1",
+                "chaos option skip given twice",
+            ),
+            ("strace:no-read", "strace takes no options"),
+            ("counter1:", "counter1 takes no options"),
+            (
+                "counter3",
+                "no such tool (known: counter1, counter2, strace, chaos)",
+            ),
+            (
+                "",
+                "no such tool (known: counter1, counter2, strace, chaos)",
+            ),
+            (
+                "Chaos",
+                "no such tool (known: counter1, counter2, strace, chaos)",
+            ),
+        ]
+        .map(|(spec, reason)| (spec.to_string(), reason.to_string()));
+        for (spec, reason) in unknown.into_iter().chain(other) {
+            assert_eq!(reverie_tool_spec(&spec), Err(reason), "{spec}");
+        }
+    }
 }
 
 #[cfg(test)]

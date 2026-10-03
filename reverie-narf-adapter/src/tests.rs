@@ -27,6 +27,7 @@ use reverie::syscalls::{Addr, MemoryAccess, Sysno};
 use reverie::{Pid, Tool};
 use reverie_narf_core::{KernelServices, NarfSyscallOutcome, OriginalSyscallError};
 use reverie_narf_tools::canonical::CanonicalTrace;
+use reverie_narf_tools::chaos;
 use reverie_narf_tools::counter1::CounterLocal;
 use reverie_narf_tools::counter2;
 use reverie_narf_tools::passthrough::PassThrough;
@@ -3472,6 +3473,465 @@ fn reverie_narf_strace_prints_each_event_and_exit() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_strace_prints_each_event_and_exit);
+
+// ── chaos: reads failed with EINTR or cut to one byte ────────────────────
+
+static CHAOS_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_CHAOS"));
+
+const LINUX_CLOSE: u32 = 3;
+const LINUX_RECVFROM: u32 = 45;
+const LINUX_SOCKETPAIR: u32 = 53;
+/// The chaos guest's pipe-T read end and write end (guests/chaos_x86_64.S
+/// fixes both).
+const CHAOS_T_READ_FD: u64 = 7;
+const CHAOS_T_WRITE_FD: u32 = 8;
+
+/// Every line chaos printed, in order, with the scheduler task that printed
+/// it.
+static CHAOS_LINES: IrqSafeSpinLock<Vec<(u64, alloc::string::String)>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// The task that entered a read of pipe T, or 0.
+static CHAOS_T_READER: AtomicU64 = AtomicU64::new(0);
+/// Entries the dispatcher flagged as re-executions of a read of pipe T.
+static CHAOS_T_REEXECUTIONS: AtomicU64 = AtomicU64::new(0);
+/// 0: pipe T not written; 1: written; 2: the write failed.
+static CHAOS_T_FILL: AtomicU64 = AtomicU64::new(0);
+
+fn record_chaos_line(line: &str) {
+    let task = narf_scheduler::current_task_id().raw();
+    CHAOS_LINES
+        .lock()
+        .push((task, alloc::string::String::from(line)));
+}
+
+/// Writes "tu" through task `task_id`'s pipe-T write end, which wakes the
+/// chaos guest's thread blocked reading pipe T. A two-byte write to the empty
+/// pipe completes on its first poll.
+fn fill_chaos_pipe(task_id: u64) -> bool {
+    let Some(Some(ops)) = narf_userspace::fd::with_table(task_id, |table| {
+        table.get(CHAOS_T_WRITE_FD).map(|entry| entry.ops.clone())
+    }) else {
+        return false;
+    };
+    let mut write = ops.write(0, b"tu");
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    matches!(write.as_mut().poll(&mut cx), core::task::Poll::Ready(Ok(2)))
+}
+
+/// Remembers which task entered a read of the chaos guest's pipe T, counts
+/// the re-executions of those reads, and forwards every call to the
+/// interceptor it wraps.
+///
+/// The thread's second read finds pipe T empty. chaos injects it cut to one
+/// byte, and the kernel parks the thread with chaos's call suspended at that
+/// inject. The kernel's descriptor-park observer runs once the read has armed
+/// its waker and before the thread stops running, and [`FillOnPark`] then
+/// writes "tu" into the pipe on the thread's own kernel path. The wake that
+/// write causes reaches the armed waker before the thread switches away, and
+/// the read is re-executed: the host runs the read chaos injected again and
+/// hands chaos its value.
+struct ChaosWatch {
+    inner: Box<dyn SyscallInterceptor>,
+}
+
+impl SyscallInterceptor for ChaosWatch {
+    fn intercepts_vdso_calls(&self) -> bool {
+        self.inner.intercepts_vdso_calls()
+    }
+
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        if invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK == LINUX_READ
+            && invocation.args.arg0 == CHAOS_T_READ_FD
+        {
+            if invocation.park_reexecution {
+                CHAOS_T_REEXECUTIONS.fetch_add(1, Ordering::AcqRel);
+            } else {
+                CHAOS_T_READER.store(invocation.task_id, Ordering::Release);
+            }
+        }
+        self.inner.on_syscall_enter(invocation, native)
+    }
+
+    fn on_syscall_return(
+        &self,
+        invocation: &SyscallInvocation,
+        result: SyscallReturn,
+    ) -> SyscallReturn {
+        self.inner.on_syscall_return(invocation, result)
+    }
+
+    fn on_syscall_context_managed(&self, invocation: &SyscallInvocation) {
+        self.inner.on_syscall_context_managed(invocation);
+    }
+
+    fn on_task_start(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
+        self.inner.on_task_start(task_id, native);
+    }
+
+    fn on_task_exec(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
+        self.inner.on_task_exec(task_id, native);
+    }
+
+    fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32, process_wstatus: i32) {
+        self.inner
+            .on_task_exit(task_id, pid, wstatus, process_wstatus);
+    }
+}
+
+/// Installs the kernel's descriptor-park observer for one chaos-guest run,
+/// and restores the previous observer when dropped. The observer writes "tu"
+/// into pipe T once, when the task [`ChaosWatch`] saw enter a read of pipe T
+/// parks (`narf_userspace::handlers::__verification_swap_fd_park_observer`).
+struct FillOnPark(Option<fn(u64)>);
+
+impl FillOnPark {
+    fn install() -> Self {
+        CHAOS_T_READER.store(0, Ordering::Release);
+        CHAOS_T_FILL.store(0, Ordering::Release);
+        Self(narf_userspace::handlers::__verification_swap_fd_park_observer(Some(fill_on_park)))
+    }
+}
+
+impl Drop for FillOnPark {
+    fn drop(&mut self) {
+        narf_userspace::handlers::__verification_swap_fd_park_observer(self.0);
+    }
+}
+
+fn fill_on_park(task_id: u64) {
+    if task_id == 0 || task_id != CHAOS_T_READER.load(Ordering::Acquire) {
+        return;
+    }
+    if CHAOS_T_FILL
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && !fill_chaos_pipe(task_id)
+    {
+        CHAOS_T_FILL.store(2, Ordering::Release);
+    }
+}
+
+/// A chaos line split into its process ID, its event number and the syscall
+/// as printed: `[pid=<pid>, n=<n>] <syscall>`. With the default options chaos
+/// prints no `SKIPPED` line, so that form is refused too.
+fn chaos_line(line: &str) -> Option<(i32, u64, &str)> {
+    let (pid, rest) = line.strip_prefix("[pid=")?.split_once(", n=")?;
+    let (n, call) = rest.split_once("] ")?;
+    Some((pid.parse().ok()?, n.parse().ok()?, call))
+}
+
+/// How chaos's line ends for a two-byte read it fails with EINTR, for one it
+/// cuts to one byte, and for the chaos guest's two-byte
+/// `recvfrom(fd, buf, 2, MSG_PEEK, NULL, NULL)` cut to one byte.
+const CHAOS_EINTR: &str = ", 2) = -4";
+const CHAOS_CUT: &str = ", 1) = 1";
+const CHAOS_PEEK_CUT: &str = ", 1, 2, NULL, NULL) = 1";
+
+/// The calls the chaos guest's root, thread and child make that chaos prints
+/// a value for, in order: each call's name and descriptor, and how its line
+/// ends.
+const CHAOS_ROOT_HANDLED: [(&str, u64, &str); 10] = [
+    ("read", 3, CHAOS_EINTR),
+    ("read", 3, CHAOS_CUT),
+    ("read", 3, CHAOS_EINTR),
+    ("read", 3, CHAOS_CUT),
+    ("read", 4, CHAOS_EINTR),
+    ("recvfrom", 4, CHAOS_PEEK_CUT),
+    ("read", 4, CHAOS_EINTR),
+    ("read", 4, CHAOS_CUT),
+    ("read", 4, CHAOS_EINTR),
+    ("read", 4, CHAOS_CUT),
+];
+const CHAOS_THREAD_HANDLED: [(&str, u64, &str); 4] = [
+    ("read", 7, CHAOS_EINTR),
+    ("read", 7, CHAOS_CUT),
+    ("read", 7, CHAOS_EINTR),
+    ("read", 7, CHAOS_CUT),
+];
+const CHAOS_CHILD_HANDLED: [(&str, u64, &str); 2] =
+    [("read", 5, CHAOS_EINTR), ("read", 5, CHAOS_CUT)];
+
+/// chaos, compiled from the source file reverie-examples builds its Linux
+/// binary from, fails the first read of each thread, and every other read
+/// after it, with EINTR without running it, cuts the reads in between and
+/// every recvfrom to one byte, and prints one line per syscall event. A
+/// recvfrom it cuts makes the thread's next read fail. Over the chaos guest
+/// (`guests/chaos_x86_64.S`), whose root, thread and forked child exit 0 only
+/// if each of their reads and the root's recvfrom returned what chaos makes
+/// of it:
+///
+/// * each task's lines name, in order, the syscalls the watch outside the
+///   Reverie interceptor saw the task make, which are the ones its assembly
+///   makes, one line each;
+/// * the lines with a value are, in order, each task's reads and the root's
+///   recvfrom. The reads alternate from each task's first between the read
+///   as made, with ` = -4`, and the read cut to one byte, with ` = 1`, and
+///   the recvfrom takes the place of a cut read: cut to one byte with its
+///   MSG_PEEK and null address arguments kept, with ` = 1`. The root reads
+///   fd 3 four times, then fd 4 once before its recvfrom of fd 4 and four
+///   times after it; the thread reads fd 7 four times and the child fd 5
+///   twice. The thread and the child start after a read of the root's that
+///   chaos failed, so their first reads fail only if chaos keeps a flag per
+///   thread and starts each new one clear. The guest also requires the cut
+///   read after the recvfrom to return the byte the recvfrom returned, which
+///   the socket still holds only if the call chaos ran kept the guest's
+///   MSG_PEEK;
+/// * the event numbers of each process's lines are 0 up to its number of
+///   events, each once: the root and its thread share one count, and the
+///   child, whose Tool is its own, starts from 0;
+/// * the thread's cut read of the empty pipe parked, and its one
+///   re-execution returned one byte although the pipe then held two, so the
+///   re-execution ran the read chaos cut, not the read the thread made.
+fn reverie_narf_chaos_interrupts_and_cuts_reads() -> TestResult {
+    WATCHED_ENTRIES.lock().clear();
+    WATCHED_EXITS.lock().clear();
+    CHAOS_LINES.lock().clear();
+    CHAOS_T_REEXECUTIONS.store(0, Ordering::Release);
+    reverie_narf_tools::set_eprintln_sink(record_chaos_line);
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<chaos::ChaosTool>::new(chaos::ChaosOpts::default())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let watch = ChaosWatch {
+            inner: Box::new(EntryWatch {
+                inner: interceptor.boxed(),
+            }),
+        };
+        let fill = FillOnPark::install();
+        let root = run_guest(CHAOS_GUEST, Box::new(watch), |root| {
+            interceptor
+                .host_root(root.task_id)
+                .map_err(|_| "register_root refused the root task")
+        })?;
+        drop(fill);
+        let (root_task, root_pid) = (root.task_id, root.pid as i32);
+        let lines = core::mem::take(&mut *CHAOS_LINES.lock());
+        for (task, line) in &lines {
+            let _ = writeln!(Writer, "    chaos: task {task}: {line}");
+        }
+        let exited = check_teardown(&interceptor, root, 3, 0)?;
+        if exited.iter().any(|exit| exit.wstatus != 0) {
+            return Err("a task of the chaos guest did not exit 0");
+        }
+        match CHAOS_T_FILL.load(Ordering::Acquire) {
+            1 => {}
+            0 => return Err("the thread's read of the empty pipe never parked"),
+            _ => return Err("the bytes could not be written into the thread's pipe"),
+        }
+        if CHAOS_T_REEXECUTIONS.load(Ordering::Acquire) != 1 {
+            return Err("the thread's parked read was not re-executed exactly once");
+        }
+        let entries = core::mem::take(&mut *WATCHED_ENTRIES.lock());
+        let exits = core::mem::take(&mut *WATCHED_EXITS.lock());
+        let mut parsed = Vec::with_capacity(lines.len());
+        for (task, line) in &lines {
+            let (pid, n, call) = chaos_line(line)
+                .ok_or("chaos printed a line not of the form [pid=<pid>, n=<n>] <syscall>")?;
+            parsed.push((*task, pid, n, call));
+        }
+        let mut child_pid = None;
+        for (task_id, ids) in &exits {
+            let Some((tid, pid)) = *ids else {
+                return Err("a task's Linux IDs were gone when its exit began");
+            };
+            // Each role: the calls chaos prints a value for, and whether its
+            // syscalls are the ones its assembly makes.
+            let numbers: Vec<u32> = entries
+                .iter()
+                .filter(|(task, _)| task == task_id)
+                .map(|(_, number)| *number)
+                .collect();
+            let (handled, made): (&[(&str, u64, &str)], bool) = if *task_id == root_task {
+                (
+                    &CHAOS_ROOT_HANDLED,
+                    with_futex_waits(
+                        &numbers,
+                        &[
+                            LINUX_PIPE2,
+                            LINUX_PIPE2,
+                            LINUX_PIPE2,
+                            LINUX_WRITE,
+                            LINUX_WRITE,
+                            LINUX_CLOSE,
+                            LINUX_CLOSE,
+                            LINUX_READ,
+                            LINUX_CLONE,
+                        ],
+                        &[
+                            LINUX_FORK,
+                            LINUX_WAIT4,
+                            LINUX_READ,
+                            LINUX_READ,
+                            LINUX_READ,
+                            LINUX_SOCKETPAIR,
+                            LINUX_WRITE,
+                            LINUX_READ,
+                            LINUX_RECVFROM,
+                            LINUX_READ,
+                            LINUX_READ,
+                            LINUX_READ,
+                            LINUX_READ,
+                            LINUX_EXIT_GROUP,
+                        ],
+                    ),
+                )
+            } else if pid == root_pid && tid != pid {
+                (
+                    &CHAOS_THREAD_HANDLED,
+                    numbers[..] == [LINUX_READ, LINUX_READ, LINUX_READ, LINUX_READ, LINUX_EXIT],
+                )
+            } else if pid != root_pid && tid == pid && child_pid.replace(pid).is_none() {
+                (
+                    &CHAOS_CHILD_HANDLED,
+                    numbers[..] == [LINUX_READ, LINUX_READ, LINUX_EXIT_GROUP],
+                )
+            } else {
+                return Err("the tree was not a root, a thread of it and a forked child");
+            };
+            if !made {
+                return Err("a task's syscalls are not the ones the guest's assembly makes");
+            }
+            let own: Vec<(i32, &str)> = parsed
+                .iter()
+                .filter(|(task, ..)| task == task_id)
+                .map(|&(_, pid, _, call)| (pid, call))
+                .collect();
+            if own.len() != numbers.len() {
+                return Err("a task's chaos lines are not one per syscall it made");
+            }
+            for ((line_pid, call), number) in own.iter().zip(&numbers) {
+                let named = Sysno::new(*number as usize).is_some_and(|sysno| {
+                    call.strip_prefix(sysno.name())
+                        .is_some_and(|rest| rest.starts_with('('))
+                });
+                if *line_pid != pid || !named {
+                    return Err("a chaos line does not name its process and the syscall made");
+                }
+            }
+            let valued: Vec<&str> = own
+                .iter()
+                .map(|&(_, call)| call)
+                .filter(|call| !call.ends_with(')'))
+                .collect();
+            let as_handled = valued.len() == handled.len()
+                && valued.iter().zip(handled).all(|(call, (name, fd, end))| {
+                    call.starts_with(&alloc::format!("{name}({fd}, ")) && call.ends_with(end)
+                });
+            if !as_handled {
+                return Err(
+                    "a task's lines with values are not its reads and recvfrom as chaos makes them",
+                );
+            }
+        }
+        let Some(child_pid) = child_pid else {
+            return Err("the tree was not a root, a thread of it and a forked child");
+        };
+        for pid in [root_pid, child_pid] {
+            let mut numbers: Vec<u64> = parsed
+                .iter()
+                .filter(|&&(_, line_pid, ..)| line_pid == pid)
+                .map(|&(_, _, n, _)| n)
+                .collect();
+            numbers.sort_unstable();
+            if !numbers.iter().copied().eq(0..numbers.len() as u64) {
+                return Err("a process's event numbers are not 0 up to its events, each once");
+            }
+        }
+        if parsed.len() != entries.len() {
+            return Err("chaos printed a line for a task outside the guest's tree");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_chaos_interrupts_and_cuts_reads);
+
+/// `reverie_tool=chaos:<options>` gives chaos the Linux binary's flags
+/// (`boot::chaos_options`): each accepted spelling yields exactly the
+/// `ChaosOpts` the binary builds from the same flags, and every other one is
+/// refused with its reason, before anything is installed.
+fn reverie_narf_boot_chaos_options() -> TestResult {
+    use crate::boot::chaos_options;
+    let opts = |skip, no_read, no_recv, no_interrupt| chaos::ChaosOpts {
+        skip,
+        no_read,
+        no_recv,
+        no_interrupt,
+    };
+    let accepted = [
+        (None, opts(0, false, false, false)),
+        (Some("no-interrupt"), opts(0, false, false, true)),
+        (Some("no-read"), opts(0, true, false, false)),
+        (Some("no-recv"), opts(0, false, true, false)),
+        (Some("skip=0"), opts(0, false, false, false)),
+        (Some("skip=3,no-interrupt"), opts(3, false, false, true)),
+        (
+            Some("no-recv,no-interrupt,skip=12,no-read"),
+            opts(12, true, true, true),
+        ),
+        (
+            Some("skip=18446744073709551615"),
+            opts(u64::MAX, false, false, false),
+        ),
+    ];
+    for (options, expected) in accepted {
+        if chaos_options(options).as_ref() != Ok(&expected) {
+            let _ = writeln!(
+                Writer,
+                "    options {options:?}: {:?}",
+                chaos_options(options)
+            );
+            return TestResult::Fail("chaos options were not the ones the flags name");
+        }
+    }
+    // Each spelling refused as naming no option, with the word refused.
+    let unknown = [
+        ("", ""),
+        ("no-read,", ""),
+        (",no-read", ""),
+        ("skip", "skip"),
+        ("skip=", "skip="),
+        ("skip=+3", "skip=+3"),
+        ("skip=-1", "skip=-1"),
+        ("skip=0x10", "skip=0x10"),
+        ("no-read=1", "no-read=1"),
+        ("No-Read", "No-Read"),
+        ("interrupt", "interrupt"),
+    ];
+    let refused = unknown
+        .map(|(options, word)| {
+            let reason = alloc::format!(
+                "no chaos option {word:?} (known: skip=<N>, no-read, no-recv, no-interrupt)"
+            );
+            (options, reason)
+        })
+        .into_iter()
+        .chain(
+            [
+                (
+                    "skip=18446744073709551616",
+                    "chaos option skip=18446744073709551616 is out of range",
+                ),
+                ("no-read,no-read", "chaos option no-read given twice"),
+                ("skip=1,no-recv,skip=1", "chaos option skip given twice"),
+            ]
+            .map(|(options, reason)| (options, alloc::string::String::from(reason))),
+        );
+    for (options, reason) in refused {
+        if chaos_options(Some(options)) != Err(reason) {
+            let _ = writeln!(
+                Writer,
+                "    options {options:?}: {:?}",
+                chaos_options(Some(options))
+            );
+            return TestResult::Fail("chaos options were accepted or refused for another reason");
+        }
+    }
+    TestResult::Pass
+}
+reverie_narf_test!(reverie_narf_boot_chaos_options);
 
 // ── Task creation from lifecycle callbacks ───────────────────────────────
 

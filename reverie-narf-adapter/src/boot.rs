@@ -7,13 +7,13 @@
 //! typed into that shell are hosted by the Tool. Without it frame calls
 //! nothing here, and the syscall table has no interceptor.
 //!
-//! The Tools are `counter1`, `counter2` and `strace`, compiled from the source
-//! files `reverie-examples` builds its Linux binaries from
-//! (`reverie_narf_tools::counter1`, `reverie_narf_tools::counter2` and
-//! `reverie_narf_tools::strace`). counter2 also keeps a count per thread and
-//! one per process, which reach its global totals through its exit hooks.
-//! When each hosted thread exits it prints the line it prints on Linux, where
-//! it writes it to stderr:
+//! The Tools are `counter1`, `counter2`, `strace` and `chaos`, compiled from
+//! the source files `reverie-examples` builds its Linux binaries from
+//! (`reverie_narf_tools::counter1`, `reverie_narf_tools::counter2`,
+//! `reverie_narf_tools::strace` and `reverie_narf_tools::chaos`). counter2
+//! also keeps a count per thread and one per process, which reach its global
+//! totals through its exit hooks. When each hosted thread exits it prints the
+//! line it prints on Linux, where it writes it to stderr:
 //!
 //! ```text
 //! counter2-local thread=<tid> syscalls=<n>
@@ -23,6 +23,21 @@
 //! it handles every syscall Reverie's `Sysno` knows. It prints, with
 //! `eprintln!`, a line for each syscall event and one for each thread's and
 //! each process's exit, which the report holds (see below).
+//!
+//! chaos fails the first read of each thread, and every other read after it,
+//! with `EINTR` without running it, cuts the reads in between and every
+//! `recvfrom` to at most one byte, and prints a line for each syscall event
+//! with `eprintln!`, which the report holds as it holds strace's. Its options
+//! are the Linux binary's flags, given after the name as comma-separated
+//! words: `reverie_tool=chaos:skip=<N>,no-read,no-recv,no-interrupt` in any
+//! order and any subset, for `--skip <N>`, `--no-read`, `--no-recv` and
+//! `--no-interrupt`. `reverie_tool=chaos` runs it with the binary's defaults.
+//! The other Tools take no options. After the installed line, chaos's options
+//! are printed as its `ChaosOpts`:
+//!
+//! ```text
+//! reverie-narf-boot: chaos options ChaosOpts { skip: <N>, no_read: <bool>, no_recv: <bool>, no_interrupt: <bool> }
+//! ```
 //!
 //! # The tally
 //!
@@ -70,9 +85,9 @@
 //!  [counter tool] Total system calls in process tree: <N>, from <P> processes, <T> thread(s).
 //! ```
 //!
-//! strace's launcher prints no such line. In its place the report has every
-//! line strace printed, in the order it printed them, formatted by the same
-//! code as on Linux:
+//! strace's and chaos's launchers print no such line. In its place the report
+//! has every line the Tool printed, in the order it printed them, formatted
+//! by the same code as on Linux. For strace:
 //!
 //! ```text
 //! reverie-narf-boot: strace output lines=<L> dropped=<D>
@@ -83,22 +98,36 @@
 //! reverie-narf-boot: strace output end
 //! ```
 //!
+//! and for chaos, where `<n>` counts the syscall events of process `<pid>`
+//! from 0:
+//!
+//! ```text
+//! reverie-narf-boot: chaos output lines=<L> dropped=<D>
+//! [pid=<pid>, n=<n>] <syscall>(<arguments>)
+//! [pid=<pid>, n=<n>] read(<arguments>) = <value>
+//! SKIPPED [pid=<pid>, n=<n>] <syscall>(<arguments>)
+//! ...
+//! reverie-narf-boot: chaos output end
+//! ```
+//!
 //! strace prints a syscall's line after the syscall has run, so the line for
 //! a command's `write` would follow the written bytes at once and, printed
 //! then, land inside the command's unfinished line of output. Held until the
-//! report, strace's output stays out of the console stream the shell and the
-//! commands write to, and a harness finds it whole. The buffer's capacity is
-//! reserved when the Tool is installed, so recording a line never allocates;
-//! once a line does not fit, it and every later line are dropped and counted
-//! in `D`, so the `L` lines printed are the first `L` strace printed.
+//! report, the Tool's output stays out of the console stream the shell and
+//! the commands write to, and a harness finds it whole. The buffer's capacity
+//! is reserved when the Tool is installed, so recording a line never
+//! allocates; once a line does not fit, it and every later line are dropped
+//! and counted in `D`, so the `L` lines printed are the first `L` the Tool
+//! printed.
 //!
 //! A harness compares N with `expected-events`; for strace, N is its syscall
-//! lines, all but the second line a failed `execve` prints. The
-//! events-by-task line has each member task's Linux thread ID and event
-//! count, in exit order (`?` for a thread ID the kernel no longer had); for
-//! counter2 the harness compares those pairs with the `counter2-local` lines,
-//! and for strace with its lines per thread ID. A number marked `*` in the
-//! by-number line runs natively, without a Tool event.
+//! lines, all but the second line a failed `execve` prints, and for chaos,
+//! which prints one line per event, all its lines. The events-by-task line
+//! has each member task's Linux thread ID and event count, in exit order (`?`
+//! for a thread ID the kernel no longer had); for counter2 the harness
+//! compares those pairs with the `counter2-local` lines, and for strace with
+//! its lines per thread ID. A number marked `*` in the by-number line runs
+//! natively, without a Tool event.
 //!
 //! A fork inside a nested PID namespace (frame's `container` feature) returns
 //! the child's inner PID, which the tally cannot match to the child's task.
@@ -123,7 +152,7 @@ use narf_userspace::syscall::{
 use reverie::syscalls::Sysno;
 use reverie::{GlobalTool, Pid, Tid, Tool};
 use reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
-use reverie_narf_tools::{counter1, counter2, strace, LineSink};
+use reverie_narf_tools::{chaos, counter1, counter2, strace, LineSink};
 
 use crate::interceptor::{ConsoleSink, ReverieInterceptor};
 
@@ -133,21 +162,30 @@ type Config<T> = <<T as Tool>::GlobalState as GlobalTool>::Config;
 const BY_NUMBER: usize = 512;
 
 /// Installs the Tool named `name` as `table`'s interceptor. Frame's boot-init
-/// calls it after assembling the table and before publishing it.
+/// calls it after assembling the table and before publishing it. `name` is
+/// the value of `reverie_tool=`: a Tool's name, and for chaos optionally a
+/// colon and its options ([`chaos_options`]).
 ///
-/// If `name` is not a known Tool, the host refuses the Tool, or the table
-/// already has an interceptor, it prints why and returns `None`, and `table`
-/// is unchanged.
+/// If `name` is not a known Tool, its options are not ones the Tool takes,
+/// the host refuses the Tool, or the table already has an interceptor, it
+/// prints why and returns `None`, and `table` is unchanged.
 pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
-    let installed = match name {
-        "counter1" => Tally::<counter1::CounterLocal>::install(
+    let (tool, options) = match name.split_once(':') {
+        Some((tool, options)) => (tool, Some(options)),
+        None => (name, None),
+    };
+    // The options a Tool runs with, printed once it is installed.
+    let mut options_line = None;
+    let installed = match (tool, options) {
+        ("counter1" | "counter2" | "strace", Some(_)) => Err(format!("{tool} takes no options")),
+        ("counter1", None) => Tally::<counter1::CounterLocal>::install(
             table,
             "counter1",
             (),
             <counter1::CounterLocal as Tool>::new,
             |host| format!("counter1-global syscalls={}", host.host().global().total()),
         ),
-        "counter2" => Tally::<counter2::CounterLocal>::install(
+        ("counter2", None) => Tally::<counter2::CounterLocal>::install(
             table,
             "counter2",
             (),
@@ -163,18 +201,29 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
                 )
             },
         ),
-        "strace" => {
-            open_strace_output();
+        ("strace", None) => {
+            open_tool_output();
             Tally::<strace::Strace>::install(
                 table,
                 "strace",
                 strace::Config::default(),
                 <strace::Strace as Tool>::new,
-                |_| take_strace_output(),
+                |_| take_tool_output("strace"),
             )
         }
+        ("chaos", options) => chaos_options(options).and_then(|config| {
+            options_line = Some(format!("{config:?}"));
+            open_tool_output();
+            Tally::<chaos::ChaosTool>::install(
+                table,
+                "chaos",
+                config,
+                <chaos::ChaosTool as Tool>::new,
+                |_| take_tool_output("chaos"),
+            )
+        }),
         _ => Err(String::from(
-            "no such tool (known: counter1, counter2, strace)",
+            "no such tool (known: counter1, counter2, strace, chaos)",
         )),
     };
     match installed {
@@ -183,6 +232,12 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
                 "reverie-narf-boot: {} installed at the syscall dispatcher",
                 boot.tool
             ));
+            if let Some(options) = options_line {
+                ConsoleSink::emit(&format!(
+                    "reverie-narf-boot: {} options {options}",
+                    boot.tool
+                ));
+            }
             Some(boot)
         }
         Err(reason) => {
@@ -200,11 +255,52 @@ fn print_counter2_thread_exit(tid: Tid, syscalls: u64) {
     ConsoleSink::emit(&format!("counter2-local thread={tid} syscalls={syscalls}"));
 }
 
-/// The bytes of strace's lines, newlines included, that the report can hold.
-const STRACE_OUTPUT_CAPACITY: usize = 256 << 10;
+/// chaos's options from `<options>` in `reverie_tool=chaos:<options>`, or the
+/// Linux binary's defaults without them.
+///
+/// `<options>` is one or more comma-separated words, each at most once:
+/// `skip=<N>` with `<N>` in decimal digits, `no-read`, `no-recv` and
+/// `no-interrupt`, for the binary's `--skip <N>`, `--no-read`, `--no-recv`
+/// and `--no-interrupt`. Anything else, an empty word included, is refused.
+pub(crate) fn chaos_options(options: Option<&str>) -> Result<chaos::ChaosOpts, String> {
+    let mut config = chaos::ChaosOpts::default();
+    let Some(options) = options else {
+        return Ok(config);
+    };
+    let mut given = BTreeSet::new();
+    for word in options.split(',') {
+        let (name, value) = match word.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (word, None),
+        };
+        match (name, value) {
+            ("skip", Some(n)) if !n.is_empty() && n.bytes().all(|byte| byte.is_ascii_digit()) => {
+                config.skip = n
+                    .parse()
+                    .map_err(|_| format!("chaos option {word} is out of range"))?;
+            }
+            ("no-read", None) => config.no_read = true,
+            ("no-recv", None) => config.no_recv = true,
+            ("no-interrupt", None) => config.no_interrupt = true,
+            _ => {
+                return Err(format!(
+                    "no chaos option {word:?} (known: skip=<N>, no-read, no-recv, no-interrupt)"
+                ));
+            }
+        }
+        if !given.insert(name) {
+            return Err(format!("chaos option {name} given twice"));
+        }
+    }
+    Ok(config)
+}
 
-/// strace's lines, held until the report.
-struct StraceOutput {
+/// The bytes of a Tool's lines, newlines included, that the report can hold.
+const TOOL_OUTPUT_CAPACITY: usize = 256 << 10;
+
+/// The lines of a Tool that prints with `eprintln!` (strace, chaos), held
+/// until the report.
+struct ToolOutput {
     /// The lines recorded, in order, each followed by a newline.
     text: String,
     /// The lines in `text`.
@@ -213,7 +309,7 @@ struct StraceOutput {
     dropped: u64,
 }
 
-impl StraceOutput {
+impl ToolOutput {
     const fn new(text: String) -> Self {
         Self {
             text,
@@ -223,20 +319,20 @@ impl StraceOutput {
     }
 }
 
-static STRACE_OUTPUT: IrqSafeSpinLock<StraceOutput> =
-    IrqSafeSpinLock::new(StraceOutput::new(String::new()));
+static TOOL_OUTPUT: IrqSafeSpinLock<ToolOutput> =
+    IrqSafeSpinLock::new(ToolOutput::new(String::new()));
 
-/// Reserves the buffer and makes it the sink of strace's `eprintln!`.
-fn open_strace_output() {
-    let text = String::with_capacity(STRACE_OUTPUT_CAPACITY);
-    *STRACE_OUTPUT.lock() = StraceOutput::new(text);
-    reverie_narf_tools::set_eprintln_sink(record_strace_line);
+/// Reserves the buffer and makes it the sink of the Tools' `eprintln!`.
+fn open_tool_output() {
+    let text = String::with_capacity(TOOL_OUTPUT_CAPACITY);
+    *TOOL_OUTPUT.lock() = ToolOutput::new(text);
+    reverie_narf_tools::set_eprintln_sink(record_tool_line);
 }
 
-/// strace's `eprintln!` sink: records `line` if it and every line before it
+/// The Tools' `eprintln!` sink: records `line` if it and every line before it
 /// fit in the reserved capacity, and otherwise counts it dropped.
-fn record_strace_line(line: &str) {
-    let mut output = STRACE_OUTPUT.lock();
+fn record_tool_line(line: &str) {
+    let mut output = TOOL_OUTPUT.lock();
     if output.dropped == 0 && output.text.capacity() - output.text.len() > line.len() {
         output.text.push_str(line);
         output.text.push('\n');
@@ -246,12 +342,12 @@ fn record_strace_line(line: &str) {
     }
 }
 
-/// strace's part of the report: the lines recorded, between a line with
-/// their count and a closing line.
-fn take_strace_output() -> String {
-    let output = core::mem::replace(&mut *STRACE_OUTPUT.lock(), StraceOutput::new(String::new()));
+/// The Tool's part of the report: the lines recorded, between a line with
+/// their count and a closing line, both naming `tool`.
+fn take_tool_output(tool: &str) -> String {
+    let output = core::mem::replace(&mut *TOOL_OUTPUT.lock(), ToolOutput::new(String::new()));
     format!(
-        "reverie-narf-boot: strace output lines={} dropped={}\n{}reverie-narf-boot: strace \
+        "reverie-narf-boot: {tool} output lines={} dropped={}\n{}reverie-narf-boot: {tool} \
          output end",
         output.lines, output.dropped, output.text
     )
