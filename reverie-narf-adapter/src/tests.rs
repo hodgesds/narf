@@ -539,6 +539,13 @@ fn run_guest_with(
                     WAITER_TIMED_OUT.store(1, Ordering::Release);
                     return;
                 }
+                // A panic on another CPU halts that CPU with the guest's
+                // tasks still held; stop waiting on them (see
+                // `narf_console::panic_reported`).
+                if narf_console::panic_reported() {
+                    WAITER_TIMED_OUT.store(2, Ordering::Release);
+                    return;
+                }
                 narf_scheduler::yield_now().await;
             }
         },
@@ -551,8 +558,10 @@ fn run_guest_with(
         .map(|(parent, _)| release_reaping_parent(parent.task_id, pid));
     teardown(original_cr3);
 
-    if WAITER_TIMED_OUT.load(Ordering::Acquire) != 0 {
-        return Err("the guest's tasks were not reaped within the budget");
+    match WAITER_TIMED_OUT.load(Ordering::Acquire) {
+        0 => {}
+        2 => return Err("a CPU panicked while the guest ran (KERNEL PANIC above)"),
+        _ => return Err("the guest's tasks were not reaped within the budget"),
     }
     let reentries = narf_userspace::user_task::__test_kernel_reentries() - reentries_before;
     if reentries != expected_reentries {

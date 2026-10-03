@@ -147,6 +147,27 @@ fn boot_initcalls_check() -> Option<narf_init::BootErrors> {
 /// summary. Intended to be called from the kernel's `_start_rust`
 /// during CI builds (feature-gated by consumers).
 ///
+/// Why a run stopped early: see [`stop_after_panic`].
+const PANIC_STOP_REASON: &str =
+    "a CPU panicked (KERNEL PANIC above) and stays halted; the remaining tests did not run";
+
+/// A panic halts only the panicking CPU (`narf_console::panic_sink`); the
+/// other CPUs run on, and the kernel wedges on the first lock, task or
+/// shootdown acknowledgement the halted CPU owed, which used to end the run
+/// only at the QEMU timeout. Once a panic has been reported, the runners stop
+/// after the current test with this named failure, so the run ends in bounded
+/// time with a summary that counts it.
+fn stop_after_panic(after: &str) -> bool {
+    if !narf_console::panic_reported() {
+        return false;
+    }
+    let _ = writeln!(
+        Writer,
+        "  [FAIL] kernel / panic: {PANIC_STOP_REASON} (stopped after {after})"
+    );
+    true
+}
+
 /// Output is grouped by `KernelTest::subsystem` so a failure inside
 /// one subsystem (driver / module / library) doesn't drown the
 /// others. Iteration order matches link order within each
@@ -232,6 +253,14 @@ pub fn run_all() -> Summary {
                 );
             }
         }
+        if stop_after_panic(t.name) {
+            if failed_n < MAX_FAILED_RECORD {
+                failed[failed_n] = ("kernel", "panic", PANIC_STOP_REASON);
+                failed_n += 1;
+            }
+            fail += 1;
+            break;
+        }
     }
     let _ = writeln!(
         Writer,
@@ -288,6 +317,10 @@ pub fn run_subsystem(wanted: &str) -> Summary {
                 let _ = writeln!(Writer, "  [skip] {}: {}", t.name, why);
                 skip += 1;
             }
+        }
+        if stop_after_panic(t.name) {
+            fail += 1;
+            break;
         }
     }
     let _ = writeln!(
@@ -379,6 +412,10 @@ pub fn run_subsystems(wanted: &[&str]) -> Summary {
                 let _ = writeln!(Writer, "  [skip] {} / {}: {}", t.subsystem, t.name, why);
                 skip += 1;
             }
+        }
+        if stop_after_panic(t.name) {
+            fail += 1;
+            break;
         }
     }
     let _ = writeln!(

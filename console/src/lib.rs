@@ -426,6 +426,19 @@ pub fn scanout_gen() -> usize {
     SCANOUT_GEN.load(Ordering::Acquire)
 }
 
+/// Set by [`panic_sink`] once it has written the first panic's report,
+/// just before the panicking CPU halts. The panic halts only that CPU; the
+/// others keep running, so the kernel-test harness reads this to stop rather
+/// than run further tests against a kernel with a halted CPU (whose held
+/// locks, tasks and shootdown acknowledgements never come).
+static PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// True once a panic has been reported and its CPU halted (see
+/// [`PANIC_REPORTED`]).
+pub fn panic_reported() -> bool {
+    PANIC_REPORTED.load(Ordering::Acquire)
+}
+
 /// Panic sink — no allocation, no re-entry, lock-free.
 ///
 /// Bypasses the regular `CONSOLE.lock` because the panicking
@@ -596,6 +609,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
         f(msg);
     }
 
+    PANIC_REPORTED.store(true, Ordering::Release);
     narf_arch::halt_forever();
 }
 

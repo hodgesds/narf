@@ -94,7 +94,11 @@
 //! (`halt_forever`). It does not stop the other CPUs, so on an SMP boot
 //! they keep running around the halted one, and any task or lock that
 //! CPU held is never released; a later panic on another CPU halts that
-//! CPU without logging (`IN_PANIC`). These are
+//! CPU without logging (`IN_PANIC`). The kernel-test runners therefore
+//! stop after the current test once a panic is reported
+//! (`console::panic_reported`, `verification`'s `stop_after_panic`), and
+//! the hosted-test waiter stops waiting for the guest's tasks, so such a
+//! run ends in bounded time with a named `[FAIL]`. These are
 //! `OriginalAlreadyExecuted`, `ContinuationKernelMismatch` (this adapter has
 //! one memory type, `NarfMemory`), `UnexpectedReexecution`,
 //! `ReexecutionMismatch`, `RecursiveEntry`, `UnknownTask`, `DuplicateTask`,
