@@ -238,15 +238,26 @@ impl ThreadId {
 // `on_child_exit` in handlers.rs so a `wait4`-reaped child's PID can
 // be reused by the next `fork`.
 //
-// Lowest-free policy: BTreeSet's first() is O(log n), and pid 1
-// stays sticky to init across its lifetime (it never exits). Linux
-// switched away from lowest-free in 2.4 for security-noise reasons
-// but the kernel-test surface here benefits from the predictability.
+// Cyclic policy, as Linux's `alloc_pid` (kernel/pid.c) allocates with
+// `idr_alloc_cyclic`: each allocation takes the lowest free id at or
+// after the cursor (one past the last id handed out), and once that
+// search passes PID_MAX it wraps to RESERVED_PIDS. A released id is
+// therefore not handed out again until the cursor comes back round, so
+// a reaped child's PID does not name the next fork's child. The order
+// is still a pure function of the alloc/release sequence, so it stays
+// deterministic. One difference from Linux remains: Linux never hands
+// out `pid_max` itself, where ids here run up to PID_MAX inclusive.
 
 /// Upper bound on mintable PIDs. Matches Linux's 32-bit-default
 /// `pid_max`. Promotion to a larger ceiling needs no ABI change —
 /// just bump this and the existing pool re-fills lazily.
 pub const PID_MAX: u64 = 32768;
+
+/// Where the cyclic search restarts once it has wrapped: Linux's
+/// `RESERVED_PIDS` (kernel/pid.c), which keeps init and the ids of
+/// early boot daemons out of reuse. Before the first wrap the search
+/// starts at 1, so init still gets PID 1.
+pub const RESERVED_PIDS: u64 = 300;
 
 /// Free-PID set. Lazily initialised on first `alloc_pid` /
 /// `release_pid` call so static-init ordering doesn't matter.
@@ -258,33 +269,66 @@ static PID_POOL: IrqSafeSpinLock<Option<BTreeSet<u64>>> = IrqSafeSpinLock::new(N
 /// watermark and advance it.
 static PID_WATERMARK: AtomicU64 = AtomicU64::new(1);
 
+/// One past the last id `alloc_pid` handed out: where its next search
+/// starts (Linux's `idr_next`). `alloc_pid_specific` leaves it alone,
+/// as Linux's `set_tid` path does.
+static PID_CURSOR: AtomicU64 = AtomicU64::new(1);
+
 fn pid_pool_init_if_needed(g: &mut Option<BTreeSet<u64>>) {
     if g.is_none() {
         *g = Some(BTreeSet::new());
     }
 }
 
-/// Allocate a fresh `ProcessId` — lowest free id in 1..=PID_MAX.
-/// Returns `ProcessId(0)` (kernel reserved) when the pool is fully
-/// exhausted — callers should treat that as ENOSPC-shaped failure.
+/// The lowest free id in `from..=PID_MAX`. An id is free if it was
+/// released (it is in `pool`, below the watermark) or never minted (at
+/// or above the watermark).
+fn lowest_free_pid_from(pool: &BTreeSet<u64>, watermark: u64, from: u64) -> Option<u64> {
+    // Only minted ids are released, so every id in the pool is below
+    // the watermark and comes before any never-minted id.
+    pool.range(from..)
+        .next()
+        .copied()
+        .or(Some(watermark.max(from)).filter(|&id| id <= PID_MAX))
+}
+
+/// Allocate a fresh `ProcessId` — the next free id in cyclic order
+/// (see "Cyclic policy" above). Returns `ProcessId(0)` (kernel
+/// reserved) when the pool is fully exhausted — callers should treat
+/// that as ENOSPC-shaped failure.
 #[inline]
 pub fn alloc_pid() -> ProcessId {
     let mut g = PID_POOL.lock();
     pid_pool_init_if_needed(&mut g);
     let pool = g.as_mut().expect("pool inited");
-    // Prefer a released id (smallest).
-    if let Some(&pid) = pool.iter().next() {
-        pool.remove(&pid);
-        return ProcessId(pid);
-    }
-    // Otherwise advance the watermark.
-    let next = PID_WATERMARK.fetch_add(1, Ordering::Relaxed);
-    if next == 0 || next > PID_MAX {
-        // Exhausted: roll back the watermark and report kernel-PID.
-        PID_WATERMARK.fetch_sub(1, Ordering::Relaxed);
+    let watermark = PID_WATERMARK.load(Ordering::Relaxed);
+    let cursor = PID_CURSOR.load(Ordering::Relaxed);
+    let start = if cursor > RESERVED_PIDS {
+        RESERVED_PIDS
+    } else {
+        1
+    };
+    let from = cursor.max(start);
+    let found = lowest_free_pid_from(pool, watermark, from).or_else(|| {
+        // Wrap, as `idr_alloc_cyclic` retries from its start.
+        (from > start)
+            .then(|| lowest_free_pid_from(pool, watermark, start))
+            .flatten()
+    });
+    let Some(pid) = found else {
         return ProcessId::KERNEL;
+    };
+    pool.remove(&pid);
+    if pid >= watermark {
+        // Ids skipped on the way to `pid` were never minted; record
+        // them as free so the watermark can move past them.
+        for skipped in watermark..pid {
+            pool.insert(skipped);
+        }
+        PID_WATERMARK.store(pid + 1, Ordering::Relaxed);
     }
-    ProcessId(next)
+    PID_CURSOR.store(pid + 1, Ordering::Relaxed);
+    ProcessId(pid)
 }
 
 /// Return `pid` to the free pool. Idempotent: a double-release is a
@@ -295,7 +339,7 @@ pub fn alloc_pid() -> ProcessId {
 /// Linux reports EINVAL for an out-of-range requested PID and EEXIST when
 /// that number is already allocated. Skipping the watermark publishes every
 /// intervening never-used PID into the free set so later ordinary allocations
-/// still choose the lowest available number.
+/// still find them free. The cyclic cursor does not move.
 pub(crate) fn alloc_pid_specific(raw: u64) -> Result<ProcessId, u64> {
     const EEXIST: u64 = 17;
     const EINVAL: u64 = 22;
@@ -344,6 +388,7 @@ pub fn release_pid(pid: ProcessId) {
 pub fn __test_reset_pid_pool() {
     *PID_POOL.lock() = Some(BTreeSet::new());
     PID_WATERMARK.store(1, Ordering::Relaxed);
+    PID_CURSOR.store(1, Ordering::Relaxed);
 }
 
 /// Test-only: force the watermark to a specific value. Used by

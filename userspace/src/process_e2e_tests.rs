@@ -4593,13 +4593,14 @@ kernel_test_in!(
 );
 // ── Wave-61 smokes: PID recycling ──────────────────────────────────
 //
-// Smoke 27: PID pool — released ids are recycled (lowest-free policy).
+// Smoke 27: PID pool — released ids are recycled (cyclic policy).
 // Smoke 28: PID pool — release of unallocated id (0 / out-of-range) is a no-op.
 // Smoke 29: PID pool — exhaustion returns ProcessId::KERNEL (sentinel).
 // Smoke 30: PID recycling through full fork+reap lifecycle.
 
-/// Smoke 27: spawn N pids, release them, then alloc again. The recycled
-/// pids must come back in lowest-free order.
+/// Smoke 27: released pids come back in cyclic order, as in Linux. A
+/// released id waits until the search wraps past PID_MAX, and the
+/// wrapped search restarts at RESERVED_PIDS, not at 1.
 fn smoke_wave61_pid_pool_recycles() -> TestResult {
     crate::__test_reset_pid_pool();
 
@@ -4612,19 +4613,29 @@ fn smoke_wave61_pid_pool_recycles() -> TestResult {
     }
 
     crate::release_pid(b);
-    let reused = crate::alloc_pid();
-    if reused.raw() != 2 {
+    let next = crate::alloc_pid();
+    if next.raw() != 4 {
         crate::__test_reset_pid_pool();
-        return TestResult::Fail("released pid 2 not reused");
+        return TestResult::Fail("released pid 2 reused before the wrap");
     }
 
-    crate::release_pid(a);
-    crate::release_pid(c);
+    // Jump to the last fresh id rather than allocate 32k of them.
+    crate::__test_set_pid_watermark(crate::PID_MAX);
+    if crate::alloc_pid().raw() != crate::PID_MAX {
+        crate::__test_reset_pid_pool();
+        return TestResult::Fail("last fresh pid was not PID_MAX");
+    }
+
+    // Wrapped: 400 and 500 come back in order, and 2, below
+    // RESERVED_PIDS, does not.
+    crate::release_pid(crate::ProcessId(500));
+    crate::release_pid(crate::ProcessId(400));
     let r1 = crate::alloc_pid();
     let r2 = crate::alloc_pid();
-    if r1.raw() != 1 || r2.raw() != 3 {
+    let r3 = crate::alloc_pid();
+    if r1.raw() != 400 || r2.raw() != 500 || r3 != crate::ProcessId::KERNEL {
         crate::__test_reset_pid_pool();
-        return TestResult::Fail("recycled pids out of order");
+        return TestResult::Fail("wrapped search did not restart at RESERVED_PIDS");
     }
 
     crate::__test_reset_pid_pool();
@@ -4732,13 +4743,14 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
         return TestResult::Fail("reaped pids not returned to pool");
     }
 
-    let recycled = crate::alloc_pid();
-    if recycled != c1 {
+    // Cyclic order: the next fork gets a fresh id, not a reaped one.
+    let next = crate::alloc_pid();
+    if next.raw() != c3.raw() + 1 {
         crate::__test_reset_pid_pool();
         __test_wait_reset();
         crate::syscall::__test_clear_global();
         crate::user_task::__test_clear_exit_observers();
-        return TestResult::Fail("recycled pid was not the smallest");
+        return TestResult::Fail("a reaped pid was reused before the wrap");
     }
 
     crate::__test_reset_pid_pool();
@@ -4974,8 +4986,9 @@ kernel_test_in!("userspace/process", smoke_wave61_pidfd_shared_state);
 /// occupant's exit state.
 ///
 /// The pidfd table is keyed by pid, and pids are reusable — NARF hands
-/// out the lowest free one, so the number a process gets is typically the
-/// one most recently freed. Without invalidation at `release_pid` the new
+/// them out cyclically, so a freed number comes back once the allocator
+/// wraps, or at once through clone3 `set_tid`. Without invalidation at
+/// `release_pid` the new
 /// process's pidfd is born POLLIN-readable, and a watcher that treats
 /// readable as "it exited" then calls `waitid(P_PIDFD, ., WEXITED)` with
 /// no WNOHANG — which blocks forever on a process that is very much

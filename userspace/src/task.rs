@@ -46,8 +46,8 @@ pub struct Task {
     /// monotonicity is the ABA-safety anchor for every tid-keyed
     /// table; do not introduce tid recycling.
     pub tid: u64,
-    /// POSIX pid (thread-group id). PIDs ARE reused (lowest-free
-    /// pool), so pid-keyed state must be cleaned at reap.
+    /// POSIX pid (thread-group id). PIDs ARE reused (cyclic pool,
+    /// see `alloc_pid`), so pid-keyed state must be cleaned at reap.
     pub pid: AtomicU64,
     /// Effective uid/gid packed as `uid | gid << 32` for the current-task
     /// credential fast path. Linux reaches these through the immutable `cred`

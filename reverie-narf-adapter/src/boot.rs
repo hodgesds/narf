@@ -106,7 +106,7 @@
 //!   the kernel reports it as a thread of a live member process or a child
 //!   process of one, and that return then adds nothing. Membership is keyed
 //!   by scheduler task id, which the scheduler never reuses; Linux process
-//!   IDs are reused, because `alloc_pid` hands out the lowest free one.
+//!   IDs are reused once `alloc_pid`'s cyclic search wraps past `PID_MAX`.
 //! * Every syscall entry of a member counts. The Tool sees one syscall event
 //!   per entry except for two kinds: a park re-execution resumes the Tool call
 //!   already in flight, and the core runs a new entry natively, without an
