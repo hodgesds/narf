@@ -9,6 +9,15 @@
 // clock_gettime syscall does, so results match bit-for-bit. Unsupported
 // clocks fall back to the real syscall.
 //
+// When the kernel publishes VVAR_CLOCK_MODE_SYSCALL (a timestamp instruction
+// interceptor is installed), every clock entry point issues its syscall
+// instead of reading the counter, like Linux's VDSO_CLOCKMODE_NONE, and
+// getcpu issues getcpu(2) instead of reading TSC_AUX with RDTSCP. An
+// interposing tool then sees each guest clock or CPU read as a syscall it can
+// virtualize, rather than as a counter read converted with the host scale or
+// the physical CPU number. Reverie's ptrace backend likewise replaces all
+// five vDSO entry points with their syscalls.
+//
 // The vvar page is mapped immediately before this object, so it lives at
 // `__ehdr_start - 4096` (a hidden, PC-relative reference — no GOT, no
 // runtime relocations).
@@ -24,7 +33,11 @@ struct vvar {
     int64_t wall_offset_ns; // realtime_ns = monotonic_ns + wall_offset_ns
     uint32_t mult; // cycles→ns fixed-point: ns = (cyc * mult) >> shift
     uint32_t shift; // == time crate C2N_MULT / C2N_SHIFT
+    uint32_t clock_mode; // VVAR_CLOCK_MODE_*
 };
+
+#define VVAR_CLOCK_MODE_COUNTER 0u
+#define VVAR_CLOCK_MODE_SYSCALL 1u
 
 struct vdso_timespec {
     int64_t tv_sec;
@@ -46,10 +59,14 @@ struct vdso_timeval {
 extern const char __ehdr_start[] __attribute__((visibility("hidden")));
 #define VVAR ((const volatile struct vvar *)(__ehdr_start - 4096))
 
+// An ordered counter read, as Linux's rdtsc_ordered(): LFENCE keeps RDTSC
+// from executing before the preceding vvar loads, so the counter value belongs
+// to the snapshot the seqlock validates. The "memory" clobber alone orders
+// only the compiler.
 static inline uint64_t read_cycles(void) {
 #if defined(__x86_64__)
     uint32_t lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)::"memory");
+    __asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi)::"memory");
     return ((uint64_t)hi << 32) | lo;
 #elif defined(__aarch64__)
     uint64_t v;
@@ -60,14 +77,23 @@ static inline uint64_t read_cycles(void) {
 #endif
 }
 
-// Read a stable (cycles_per_ns, wall_offset) snapshot under the seqlock,
-// then convert the current counter to nanoseconds. Returns 0 and stores ns
-// for a supported clock; returns -1 for clocks the fast path doesn't cover.
+// Read a stable (cycles_per_ns, wall_offset, mode) snapshot and, in counter
+// mode, the counter itself under the seqlock, then convert to nanoseconds.
+// Returns 0 and stores ns for a supported clock; returns -1 for clocks the
+// fast path doesn't cover and for every clock while the kernel requires the
+// syscall path.
+//
+// The counter is read inside the read section, as Linux does, so a snapshot
+// is only accepted if the mode it saw was still current after the read. The
+// kernel publishes SYSCALL mode before it arms the timestamp trap, so a
+// counter read that traps belongs to a snapshot whose sequence has already
+// changed; it is discarded and the retry takes the syscall path.
 static int vdso_now_ns(int clk, uint64_t *out_ns) {
     const volatile struct vvar *vv = VVAR;
     uint32_t cpns;
     int64_t off;
-    uint32_t mult, shift;
+    uint32_t mult, shift, mode;
+    uint64_t cyc = 0;
     for (;;) {
         uint32_t seq = __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE);
         if (seq & 1u) {
@@ -77,16 +103,22 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
         off = vv->wall_offset_ns;
         mult = vv->mult;
         shift = vv->shift;
+        mode = vv->clock_mode;
+        if (mode == VVAR_CLOCK_MODE_COUNTER) {
+            cyc = read_cycles();
+        }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (seq == __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE)) {
             break;
         }
     }
+    if (mode != VVAR_CLOCK_MODE_COUNTER) {
+        return -1; // no counter read: the syscall is the only clock source
+    }
     // Match the kernel's monotonic_ns() bit-for-bit: ns = (cyc * mult) >> shift
     // (exact to <1 ppm). The truncated cyc/cpns is only a pre-calibration
     // fallback — using it for an absolute deadline (TFD_TIMER_ABSTIME) skews
     // the wakeup by ~0.1·uptime against the kernel timerfd timebase.
-    uint64_t cyc = read_cycles();
     uint64_t ns;
     if (mult != 0) {
         ns = (uint64_t)(((unsigned __int128)cyc * mult) >> shift);
@@ -174,6 +206,14 @@ static int impl_clock_getres(int clk, struct vdso_timespec *res) {
 }
 
 static int impl_getcpu(unsigned *cpu, unsigned *node) {
+    // Under timestamp interception RDTSCP would expose the physical CPU
+    // number without the tool seeing a getcpu request, so every form is the
+    // syscall, as for the clocks. The mode is sticky and is published before
+    // any user task can run, so no seqlock snapshot is needed to read it.
+    const volatile struct vvar *vv = VVAR;
+    if (__atomic_load_n(&vv->clock_mode, __ATOMIC_ACQUIRE) != VVAR_CLOCK_MODE_COUNTER) {
+        return (int)vdso_syscall2(SYS_getcpu, (long)cpu, (long)node);
+    }
     if (!cpu && !node) {
         return 0;
     }

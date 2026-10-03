@@ -474,9 +474,12 @@ unsafe fn remote_call_inner(targets: u64, action: Option<fn()>) -> bool {
     // Two senders that pick each other as targets would otherwise wait
     // forever: both spin with IRQs masked, so neither can take the other's
     // IPI. Servicing our own inbox inside the spin breaks that cycle —
-    // the same reason the TLB shootdown sender polls.
+    // the same reason the TLB shootdown sender polls. A target may instead be
+    // a TLB-shootdown sender spinning, IRQs masked, for this CPU; its spin
+    // drains only shootdowns, so this one drains that shootdown too, through
+    // the lock-spin hook.
     while BARRIER_ACKED[source].load(Ordering::Acquire) & targets != targets {
-        service_pending_barriers();
+        crate::sync::run_lock_spin_hook();
         core::hint::spin_loop();
     }
 

@@ -304,6 +304,28 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// Live user-task count (processes + threads) for the fork-bomb guard.
 static LIVE_USER_TASKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Monotonic count of user tasks ever admitted to a run queue. Unlike
+/// [`LIVE_USER_TASKS`] it never decreases, so a caller holding
+/// [`UserAdmissionExclusion`] can check that no user task became runnable (and
+/// possibly exited) during its window.
+static USER_TASKS_ADMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// Set while a [`UserAdmissionExclusion`] is held. [`spawn_user`] reads it
+/// after counting the new task live, and the holder set it before reading the
+/// live count, both `SeqCst`: either the holder sees the new task and refuses,
+/// or the spawner sees the flag and defers admission.
+static USER_ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// User task slots spawned while admission was closed, with their target
+/// CPUs. Reopening admission clears [`USER_ADMISSION_CLOSED`] and takes this
+/// list under the same lock, so a spawner that rechecks the flag under the
+/// lock either sees it clear or leaves its slot where reopening finds it.
+static DEFERRED_USER_ADMISSIONS: IrqSafeSpinLock<alloc::vec::Vec<(usize, TaskSlot)>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// User task slots ever deferred by a closed admission gate.
+static USER_ADMISSIONS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
 /// Hard cap on concurrent user tasks. `fork`/`clone` return `EAGAIN` at the
 /// cap, containing a fork bomb before it exhausts kernel memory and the
 /// per-CPU ready queues (unbounded `VecDeque`s). Generous for real workloads;
@@ -319,14 +341,22 @@ struct NprocGuard;
 impl NprocGuard {
     #[inline]
     fn new() -> Self {
-        LIVE_USER_TASKS.fetch_add(1, Ordering::Relaxed);
+        // SeqCst: the admission gate's store-then-load pairing with
+        // `try_exclude_user_admission` (see `USER_ADMISSION_CLOSED`).
+        LIVE_USER_TASKS.fetch_add(1, Ordering::SeqCst);
         NprocGuard
     }
 }
 impl Drop for NprocGuard {
     #[inline]
     fn drop(&mut self) {
-        LIVE_USER_TASKS.fetch_sub(1, Ordering::Relaxed);
+        // Release: `TaskSlot` declares `nproc_guard` after the future and its
+        // address-space reference, so both are dropped before this. A reader
+        // that acquires a count this decrement produced sees that teardown.
+        // The `AddressSpace` itself can outlive the count: an executor
+        // handoff may still hold a reference, and dropping it then releases
+        // the ASID and may send a TLB shootdown.
+        LIVE_USER_TASKS.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -336,9 +366,88 @@ impl Drop for TaskSlot {
     }
 }
 
-/// Current number of live user tasks (processes + threads).
+/// Current number of live user tasks (processes + threads). A zero read
+/// happens after every counted task's slot teardown (see [`NprocGuard`]); it
+/// does not imply that the tasks' address spaces have been freed.
 pub fn live_user_task_count() -> usize {
-    LIVE_USER_TASKS.load(Ordering::Relaxed)
+    LIVE_USER_TASKS.load(Ordering::Acquire)
+}
+
+/// Number of user tasks admitted to a run queue since boot; never decreases.
+pub fn user_tasks_admitted() -> u64 {
+    USER_TASKS_ADMITTED.load(Ordering::SeqCst)
+}
+
+/// Number of user task spawns ever deferred by a closed admission gate.
+pub fn user_admissions_deferred() -> u64 {
+    USER_ADMISSIONS_DEFERRED.load(Ordering::SeqCst)
+}
+
+/// Exclusive hold on user-task admission, from [`try_exclude_user_admission`].
+///
+/// While it is held, [`spawn_user`] still creates and counts each new task
+/// but does not place it on a run queue; dropping the hold admits every
+/// deferred task on its chosen CPU. A spawner therefore never waits, so no
+/// lock its caller holds can deadlock the holder.
+#[derive(Debug)]
+#[must_use = "dropping the exclusion reopens user-task admission"]
+pub struct UserAdmissionExclusion {
+    _private: (),
+}
+
+/// Close user-task admission while no user task is live.
+///
+/// Returns `None`, with admission still open, if another holder exists or a
+/// user task is live or being spawned. Otherwise no user task can become
+/// runnable until the returned hold is dropped: a spawn that raced this call
+/// either made the live count nonzero before it was read here, or reads the
+/// closed flag and defers.
+pub fn try_exclude_user_admission() -> Option<UserAdmissionExclusion> {
+    if USER_ADMISSION_CLOSED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return None;
+    }
+    if LIVE_USER_TASKS.load(Ordering::SeqCst) != 0 {
+        reopen_user_admission();
+        return None;
+    }
+    Some(UserAdmissionExclusion { _private: () })
+}
+
+impl Drop for UserAdmissionExclusion {
+    fn drop(&mut self) {
+        reopen_user_admission();
+    }
+}
+
+fn reopen_user_admission() {
+    let deferred = {
+        let mut list = DEFERRED_USER_ADMISSIONS.lock();
+        USER_ADMISSION_CLOSED.store(false, Ordering::SeqCst);
+        core::mem::take(&mut *list)
+    };
+    for (cpu, slot) in deferred {
+        USER_TASKS_ADMITTED.fetch_add(1, Ordering::SeqCst);
+        enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
+    }
+}
+
+/// Place a new user task on `cpu`'s run queue, or defer it while a
+/// [`UserAdmissionExclusion`] is held. The slot's `NprocGuard` has already
+/// counted it live.
+fn admit_user_slot(cpu: usize, slot: TaskSlot) {
+    if USER_ADMISSION_CLOSED.load(Ordering::SeqCst) {
+        let mut list = DEFERRED_USER_ADMISSIONS.lock();
+        if USER_ADMISSION_CLOSED.load(Ordering::SeqCst) {
+            list.push((cpu, slot));
+            USER_ADMISSIONS_DEFERRED.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+    }
+    USER_TASKS_ADMITTED.fetch_add(1, Ordering::SeqCst);
+    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
 }
 
 /// Whether another user task may be spawned under [`MAX_USER_TASKS`]. `fork`
@@ -2379,6 +2488,13 @@ pub fn __reset_queues_for_test() {
         inbox.lock().clear();
         WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
     }
+    // Discard user tasks a closed admission gate left deferred, and reopen
+    // the gate, so neither carries over between tests.
+    {
+        let mut deferred = DEFERRED_USER_ADMISSIONS.lock();
+        USER_ADMISSION_CLOSED.store(false, Ordering::SeqCst);
+        deferred.clear();
+    }
     // A task can queue an in-poll exec replacement and then remain pending.
     // Tests that discard its slot must also discard that deferred owner or the
     // replacement address space leaks into the next test.
@@ -3582,7 +3698,7 @@ where
         nproc_guard: Some(NprocGuard::new()),
         vruntime: 0,
     };
-    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
+    admit_user_slot(cpu, slot);
     id
 }
 
@@ -3647,6 +3763,13 @@ pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
     for slot in ACTIVE_USER_AS.iter() {
         if let Some(addr_space) = slot.lock().clone() {
             push_unique(addr_space);
+        }
+    }
+    // A user task deferred by a closed admission gate is on no ready queue
+    // yet, but its address space already exists and will run once admitted.
+    for (_, slot) in DEFERRED_USER_ADMISSIONS.lock().iter() {
+        if let Some(ref addr_space) = slot.addr_space {
+            push_unique(addr_space.clone());
         }
     }
     out

@@ -93,8 +93,8 @@ decide trap ownership. CR4.TSD supplies the hardware trap: ring-3 `RDTSC` and
 `RDTSCP` both raise #GP while CPL0 retains native emulation, so subscribing to
 either family arms the trap for both. A trapped family that the published mask
 does not subscribe completes natively without entering the tool; this keeps
-the vDSO `getcpu` path, which reads the CPU number from `RDTSCP`'s auxiliary
-result, correct under an `RDTSC`-only tool. After publishing the slot, installation
+a guest's own `RDTSCP` auxiliary-value reads correct under an `RDTSC`-only
+tool. After publishing the slot, installation
 raises the monotonic kernel-wide trap request and synchronously applies it on
 every currently-online CPU before returning success. A missing SMP rendezvous
 rejects installation before publication. The request is also applied
@@ -105,6 +105,54 @@ task-to-task handoff. A return to ring 3 from a trap or syscall stays on the
 CPU on which the task entered the kernel, which one of these points or the
 installation rendezvous has already armed. CR4.TSD is sticky: no production
 path clears it once set.
+Installing an interceptor that subscribes a timestamp family also switches
+the vDSO clock entry points (`clock_gettime`, `gettimeofday`, `time`) to their
+syscalls, as Linux does with `VDSO_CLOCKMODE_NONE`. The kernel publishes the
+mode in the read-only vvar page under the clock-scale seqlock before it raises
+the trap request, and the switch is sticky like the request. The guest
+therefore has one time base, which a tool virtualizes through the clock
+syscalls; without the switch the vDSO would convert a tool-supplied counter
+value with the host scale while the clock syscall handlers read the native
+counter. The vDSO reads the counter inside the seqlock read section, so a
+snapshot that saw counter mode is accepted only if the sequence is unchanged
+after the counter read; a counter read that traps can only follow the mode
+publication, so its snapshot is discarded and the retry issues the syscall.
+`clock_getres` already uses the syscall. The same mode makes vDSO `getcpu`
+issue `getcpu(2)` instead of reading the CPU number from `RDTSCP`'s auxiliary
+value, so the tool sees the request as a syscall and no physical CPU number
+reaches the guest behind it, matching Reverie's ptrace backend, which replaces
+every vDSO entry with its syscall. In counter mode the vDSO orders each
+counter read after its preceding loads with `LFENCE`, as Linux's
+`rdtsc_ordered()` does.
+
+Installation is a pre-guest operation. Slot publication, the vDSO mode switch,
+the trap request, and the per-CPU rendezvous are separate steps, and a guest
+running between them could see some CPUs trap while others do not, or enter
+the tool from a vDSO read whose result is then discarded. Installation
+therefore first closes the scheduler's user-task admission gate, refusing
+before it publishes anything if a user task is live or another holder has
+closed it, and keeps the gate closed until every step has completed on every
+online CPU, including the call to the subscription method. A user task spawned
+meanwhile, by any CPU or by the interceptor itself, is created and counted live
+but is placed on its run queue only when the gate reopens; the spawner never
+waits. Reopening enqueues the deferred tasks in the order they were deferred;
+a spawn that races the reopening may be enqueued before them, as concurrent
+spawns on different CPUs already are ordered by host timing. The gate's closed flag and the live count are each written before the
+other is read, both sequentially consistent, so a concurrent spawn is either
+seen live and refuses installation or sees the gate closed and defers. The
+installer still stops the kernel if the monotonic count of admitted user tasks
+changed during the window, because publication cannot be rolled back.
+Installation linearizes at its successful return: no user task is runnable
+from the gate's closing until then, and every user task admitted afterwards,
+including the deferred ones, sees the syscall clock mode and first enters user mode on a CPU already armed, by the
+rendezvous or by one of the activation points above. Whether a spawn that
+races installation defers the task or makes installation refuse is itself host
+timing, and a refused installation leaves that task running without the tool:
+a deterministic caller installs before creating any guest and treats a refusal
+as fatal. Eligibility is
+kernel-global rather than per process: once installed, every ring-3 timestamp
+instruction on every CPU traps, and a tool that virtualizes only some
+processes filters by the task identity in the invocation.
 The frame owner decodes only the exact unprefixed opcodes `0f 31` and
 `0f 01 f9`, captures immutable task/RIP metadata, executes native emulation at
 most once under `Continue` or accepts a typed completed value, applies a

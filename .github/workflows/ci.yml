@@ -844,8 +844,10 @@ jobs:
       # this step no CI run executes these tests at all. SMP 2 is required:
       # the migration test moves a user task to an AP and needs the
       # destination CPU's CR4.TSD re-armed there, and it Skips when no AP is
-      # online. A Skip is not coverage, so the step fails unless each named
-      # test prints `[ OK ]` and the suite summary reports zero skips.
+      # online. The rendezvous test also needs an AP: the AP's TLB-shootdown
+      # wait and this CPU's remote-call wait must be forced onto each other.
+      # A Skip is not coverage, so the step fails unless each named test
+      # prints `[ OK ]` and the suite summary reports zero skips.
       - name: cargo xtask test — interception, SMP 2 (skip is failure)
         if: matrix.arch == 'x86_64'
         timeout-minutes: 25
@@ -856,13 +858,19 @@ jobs:
         run: |
           set -o pipefail
           cargo xtask test --arch=x86_64 --features user-mode-e2e --hw-profile minimal \
-            --subsystem verification/syscall-entry,verification/interception-migration \
+            --subsystem verification/syscall-entry,verification/interception-migration,verification/smp-rendezvous \
             2>&1 | tee interception-smp2.log
           for t in \
             'verification/syscall-entry / smoke_frame_x86_64_user_mode_fast_syscall_interceptor' \
             'verification/syscall-entry / smoke_frame_x86_64_user_mode_rdtscp_interceptor' \
             'verification/syscall-entry / smoke_x86_64_cr4_writes_keep_requested_tsd' \
-            'verification/interception-migration / smoke_scheduled_user_interception_survives_ap_migration'
+            'verification/syscall-entry / smoke_x86_64_vdso_clocks_use_syscalls_under_timestamp_interception' \
+            'verification/syscall-entry / smoke_x86_64_vdso_getcpu_uses_syscall_under_timestamp_interception' \
+            'verification/syscall-entry / smoke_x86_64_vdso_counter_reads_are_ordered' \
+            'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_requires_no_live_user_task' \
+            'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_defers_concurrent_user_spawn' \
+            'verification/interception-migration / smoke_scheduled_user_interception_survives_ap_migration' \
+            'verification/smp-rendezvous / smoke_remote_call_completes_while_target_waits_for_shootdown_ack'
           do
             grep -qF "[ OK ] $t" interception-smp2.log || { echo "::error::not OK: $t"; exit 1; }
           done

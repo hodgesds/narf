@@ -245,6 +245,11 @@ claims the inbox again before it returns. An action a sender runs inline has
 no such loop; its IRQ-masked outgoing lock keeps the interrupt latched, and its
 acknowledgement spin drains the inbox.
 
+The acknowledgement spin runs the lock-spin servicing: this inbox, then the
+installed TLB-shootdown poll. A target may be an x86 TLB-shootdown sender
+waiting, with interrupts masked, for this CPU; that wait drains only
+shootdowns, so without the poll neither CPU would ever be acknowledged.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a

@@ -53,15 +53,17 @@ pub fn contended_irq_lock(cpu: usize) -> usize {
 }
 
 /// Run the installed spin-wait hook if any. Tiny by design — one acquire load
-/// and an early return when nothing is wired (kernel-test, pre-boot, or the
-/// xAPIC fallback where shootdowns aren't broadcast).
+/// and an early return when nothing is wired (before the boot path installs
+/// the shootdown poll, or on aarch64, which installs none). The rendezvous
+/// acknowledgement spin in [`crate::smp`] calls this too, for the same reason;
+/// its freedom from deadlock against a shootdown sender depends on the poll
+/// being installed wherever the shootdown IPI is (the same x86_64 boot block).
 #[inline(always)]
-fn run_lock_spin_hook() {
+pub(crate) fn run_lock_spin_hook() {
     // The `membarrier(2)` rendezvous has the same stranding problem the
-    // installed shootdown hook solves, and one worse consequence: the sender
-    // does not give up. A CPU spinning here with IRQs masked cannot take the
-    // barrier IPI, so a peer waiting on its acknowledgement would spin
-    // forever. This lives in the crate rather than behind LOCK_SPIN_HOOK
+    // installed shootdown hook solves: neither sender gives up. A CPU
+    // spinning here with IRQs masked cannot take the barrier IPI, so a peer
+    // waiting on its acknowledgement would spin forever. This lives in the crate rather than behind LOCK_SPIN_HOOK
     // because the protocol is arch-neutral and must be drained on aarch64
     // too, which installs no hook. One relaxed load when nothing is pending.
     crate::smp::service_pending_barriers();

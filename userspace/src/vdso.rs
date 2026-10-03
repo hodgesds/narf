@@ -22,7 +22,7 @@
 //! neither double-freed on the second map nor released on process teardown.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{alloc_frame, AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
@@ -61,6 +61,16 @@ const VVAR_CPNS: usize = 4; // u32
 const VVAR_OFF: usize = 8; // i64
 const VVAR_MULT: usize = 16; // u32 — cycles→ns fixed-point multiplier
 const VVAR_SHIFT: usize = 20; // u32 — cycles→ns fixed-point shift
+const VVAR_CLOCK_MODE: usize = 24; // u32 — VVAR_CLOCK_MODE_* in vdso.c
+
+/// vDSO clock entry points read the counter (`VVAR_CLOCK_MODE_COUNTER`).
+const CLOCK_MODE_COUNTER: u32 = 0;
+/// vDSO clock entry points issue their syscall (`VVAR_CLOCK_MODE_SYSCALL`).
+const CLOCK_MODE_SYSCALL: u32 = 1;
+
+/// Mode published in the vvar page. Written only under [`VDSO`]'s lock so a
+/// concurrent [`update_wall_offset`] republishes the current value.
+static CLOCK_MODE: AtomicU32 = AtomicU32::new(CLOCK_MODE_COUNTER);
 
 struct VdsoImage {
     vvar_frame: PhysAddr,
@@ -146,6 +156,53 @@ pub fn update_wall_offset(offset_ns: i64) {
     }
 }
 
+/// Make every vDSO clock entry point, and `getcpu`, issue its syscall from
+/// now on.
+///
+/// Installing a timestamp instruction interceptor calls this before arming
+/// the trap, so a tool sees each guest clock read as a `clock_gettime`,
+/// `gettimeofday` or `time` syscall rather than as a counter read that the
+/// vDSO converts with the host scale, and each CPU query as `getcpu` rather
+/// than an `RDTSCP` that reveals the physical CPU. The mode is sticky, like
+/// the trap request, and is published under the vvar seqlock. Installation
+/// runs only while no user task is runnable, so no vDSO call is in flight
+/// across the switch; the vDSO also reads the counter inside its seqlock read
+/// section, so a counter read that follows the publication belongs to a
+/// snapshot that retries.
+pub fn route_clocks_through_syscalls() {
+    set_clock_mode(CLOCK_MODE_SYSCALL);
+}
+
+/// Whether vDSO clock entry points currently issue their syscall.
+pub fn clocks_route_through_syscalls() -> bool {
+    CLOCK_MODE.load(Ordering::Acquire) == CLOCK_MODE_SYSCALL
+}
+
+/// Restore the counter fast path. Only the verification reset of the
+/// instruction interceptor calls this.
+#[cfg(feature = "verification-test-reset")]
+pub(crate) fn __test_restore_counter_clocks() {
+    set_clock_mode(CLOCK_MODE_COUNTER);
+}
+
+/// Restore the counter fast path while a timestamp interceptor stays
+/// installed, so a verification smoke can trap the vDSO's own counter reads.
+#[cfg(feature = "verification-test-reset")]
+#[doc(hidden)]
+pub fn __verification_restore_counter_clocks() {
+    __test_restore_counter_clocks();
+}
+
+fn set_clock_mode(mode: u32) {
+    let g = VDSO.lock();
+    CLOCK_MODE.store(mode, Ordering::Release);
+    if let Some(img) = g.as_ref() {
+        let cpns = read_u32(img.vvar_frame, VVAR_CPNS);
+        let offset = read_i64(img.vvar_frame, VVAR_OFF);
+        write_vvar(img.vvar_frame, cpns.max(1), offset);
+    }
+}
+
 /// Map the vvar + vdso pages into `addr_space`. Returns the vDSO base vaddr
 /// for `AT_SYSINFO_EHDR`, or `None` if no vDSO is registered / mapping fails.
 pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
@@ -209,6 +266,11 @@ fn read_u32(frame: PhysAddr, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile((frame.kernel_ptr::<u8>()).add(off) as *const u32) }
 }
 
+fn read_i64(frame: PhysAddr, off: usize) -> i64 {
+    // SAFETY: identity-mapped vvar frame; off+8 <= 4096 and off is 8-aligned.
+    unsafe { core::ptr::read_volatile((frame.kernel_ptr::<u8>()).add(off) as *const i64) }
+}
+
 /// Write the vvar fields under a seqlock: bump seq to odd, store the
 /// payload, bump to even. Readers retry while seq is odd or changes.
 ///
@@ -229,6 +291,10 @@ fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
         core::ptr::write_volatile(base.add(VVAR_OFF) as *mut i64, offset_ns);
         core::ptr::write_volatile(base.add(VVAR_MULT) as *mut u32, mult);
         core::ptr::write_volatile(base.add(VVAR_SHIFT) as *mut u32, shift);
+        core::ptr::write_volatile(
+            base.add(VVAR_CLOCK_MODE) as *mut u32,
+            CLOCK_MODE.load(Ordering::Acquire),
+        );
         fence(Ordering::Release);
         core::ptr::write_volatile(seq_ptr, (seq | 1).wrapping_add(1)); // even
     }

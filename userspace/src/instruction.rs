@@ -164,14 +164,31 @@ static IN_INSTRUCTION_CALLBACK: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
 
 /// Publish the kernel-lifetime instruction interceptor exactly once.
 ///
-/// A losing concurrent caller retains ownership of its interceptor. Successful
-/// publication also activates the requested trap mechanism on every currently
-/// online CPU before returning. Schedulers must additionally call
+/// Installation is a pre-guest operation. Publication, the vDSO clock-mode
+/// switch, and the per-CPU trap activation are separate steps, so a guest
+/// running during them could see some CPUs trapping and others not, or a vDSO
+/// clock read that began before the switch. Installation therefore holds the
+/// scheduler's [`narf_scheduler::UserAdmissionExclusion`] from before
+/// [`InstructionInterceptor::subscriptions`] until every step is complete on
+/// every online CPU: a user task spawned in that window, including by the
+/// interceptor itself, is created but not made runnable until installation
+/// returns, so no guest observes any intermediate combination.
+///
+/// Returns the interceptor when another one is already published, when a user
+/// task is live or another admission exclusion is held, or when a multi-CPU
+/// timestamp trap has no SMP rendezvous. Whether a spawn racing this call is
+/// deferred or makes it refuse depends on host timing, and after a refusal
+/// that task runs uninstrumented; a deterministic caller installs before
+/// creating any guest and treats an `Err` as fatal. Schedulers must additionally call
 /// [`activate_current_cpu_instruction_interception`] before a newly-online CPU
 /// can return an instrumented task to user mode.
 pub fn try_install_instruction_interceptor(
     interceptor: Box<dyn InstructionInterceptor>,
 ) -> Result<(), Box<dyn InstructionInterceptor>> {
+    let Some(exclusion) = narf_scheduler::try_exclude_user_admission() else {
+        return Err(interceptor);
+    };
+    let admitted = narf_scheduler::user_tasks_admitted();
     let subscriptions = interceptor.subscriptions();
     #[cfg(target_arch = "x86_64")]
     if subscriptions.requires_timestamp_trap()
@@ -192,6 +209,13 @@ pub fn try_install_instruction_interceptor(
         Ordering::Acquire,
     ) {
         Ok(_) => {
+            // Route vDSO clock reads through syscalls before arming the trap:
+            // the vDSO would otherwise convert a (virtualized) counter read
+            // with the host scale, while the clock syscalls read the native
+            // counter, giving the guest two unrelated time bases.
+            if subscriptions.requires_timestamp_trap() {
+                crate::vdso::route_clocks_through_syscalls();
+            }
             #[cfg(target_arch = "x86_64")]
             if subscriptions.requires_timestamp_trap() {
                 narf_arch::x86_64::cr::request_user_rdtsc_interception();
@@ -210,6 +234,15 @@ pub fn try_install_instruction_interceptor(
                     "instruction interception rendezvous disappeared after preflight"
                 );
             }
+            // Every step above is complete on every online CPU. The exclusion
+            // kept any user task from becoming runnable meanwhile; check that
+            // it did, then admit the deferred tasks onto the installed state.
+            core::sync::atomic::fence(Ordering::SeqCst);
+            assert!(
+                narf_scheduler::user_tasks_admitted() == admitted,
+                "a user task was admitted during instruction interceptor installation"
+            );
+            drop(exclusion);
             Ok(())
         }
         Err(_) => {
@@ -337,6 +370,7 @@ pub(crate) fn __test_clear_instruction_interceptor() {
     // A CPU may already hold the loaded pointer, so test retirement never
     // reclaims the old allocation. Production has no public reset operation.
     let _retired = GLOBAL_INTERCEPTOR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    crate::vdso::__test_restore_counter_clocks();
 }
 
 #[cfg(feature = "verification-test-reset")]
