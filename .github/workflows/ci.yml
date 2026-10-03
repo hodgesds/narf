@@ -863,6 +863,7 @@ jobs:
           for t in \
             'verification/syscall-entry / smoke_frame_x86_64_user_mode_fast_syscall_interceptor' \
             'verification/syscall-entry / smoke_frame_x86_64_user_mode_rdtscp_interceptor' \
+            'verification/syscall-entry / smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path' \
             'verification/syscall-entry / smoke_x86_64_cr4_writes_keep_requested_tsd' \
             'verification/syscall-entry / smoke_x86_64_vdso_clocks_use_syscalls_under_timestamp_interception' \
             'verification/syscall-entry / smoke_x86_64_vdso_getcpu_uses_syscall_under_timestamp_interception' \

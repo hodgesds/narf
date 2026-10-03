@@ -161,6 +161,13 @@ zero-extended auxiliary value to RCX), and advances RIP by exactly the decoded
 length. Interceptors never receive a mutable trap
 frame. A mismatched result type or recursive callback fails closed by stopping
 the kernel rather than returning an uncontrolled value to the guest.
+A timestamp read that is not one of those exact encodings, such as the
+operand-size-prefixed `66 0f 31`, or whose bytes cannot be read, is not
+decoded. While an interceptor is installed it takes the ordinary synchronous
+#GP path and is delivered as `SIGSEGV`, where Linux would execute it; the tool
+is not entered. This is a stated incompatibility, not a hidden one, and the
+Reverie ptrace backend has the same boundary: it enables `PR_TSC_SIGSEGV` and
+emulates only the same exact encodings.
 
 `InstructionInterceptor` is an unsafe trait because callbacks execute
 synchronously in exception context. Its safety contract forbids allocation,
@@ -396,6 +403,11 @@ or retain NARF capabilities; authority remains capability-object based.
 `rseq(2)` returns `ENOSYS` until the kernel maintains the registered ABI area
 and performs critical-section aborts across preemption and CPU migration;
 returning success without those semantics is forbidden on preemptive SMP.
+`PR_SET_TSC` accepts only `PR_TSC_ENABLE`, the mode `PR_GET_TSC` reports;
+`PR_TSC_SIGSEGV` fails with `EINVAL`, as on Linux architectures without
+timestamp control, because NARF has no per-task timestamp-fault mode and an
+installed instruction interceptor completes timestamp reads rather than
+raising `SIGSEGV`.
 `SO_PEERSEC` and `SO_PEERPIDFD` report `ENOPROTOOPT` while NARF has no Linux
 Security Module label provider or retained peer pidfd; the compatibility layer
 never fabricates security identity. Supplementary groups are stored per task,

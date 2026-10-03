@@ -417,13 +417,15 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // PR_TSC_ENABLE = 1, PR_TSC_SIGSEGV = 2; anything else
             // (including 0) is EINVAL.
             //
-            // LINUX-GAP: NARF never disables rdtsc, so PR_TSC_SIGSEGV is
-            // accepted and ignored — a sandbox asking for rdtsc to fault
-            // is told it will and then still gets a working rdtsc. That is
-            // a silent divergence, but it matches what PR_GET_TSC above
-            // already reports, and rejecting it would break callers that
-            // only set it opportunistically.
-            if arg_a != 1 && arg_a != 2 {
+            // NARF has no per-task timestamp-fault mode, so PR_TSC_SIGSEGV
+            // is refused with EINVAL, as `kernel/sys.c` does on every
+            // architecture without SET_TSC_CTL. Accepting it would tell a
+            // sandbox that RDTSC now faults while RDTSC keeps working.
+            // CR4.TSD is armed only kernel-wide, by an installed instruction
+            // interceptor, and that completes the read rather than raising
+            // SIGSEGV. PR_TSC_ENABLE is the mode PR_GET_TSC above reports,
+            // so it succeeds.
+            if arg_a != 1 {
                 ctx.set_return(errno_ret(EINVAL));
                 return;
             }

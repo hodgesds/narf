@@ -2281,10 +2281,14 @@ fn smoke_abi_proc2_prctl_closed_value_sets_are_einval() -> TestResult {
         if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 3)) != Some(EINVAL) {
             return Err("PR_SET_TSC(3) must be -EINVAL");
         }
-        if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 1)) != Some(0)
-            || call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 2)) != Some(0)
-        {
-            return Err("PR_SET_TSC must accept PR_TSC_ENABLE and PR_TSC_SIGSEGV");
+        if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 1)) != Some(0) {
+            return Err("PR_SET_TSC must accept PR_TSC_ENABLE");
+        }
+        // NARF has no per-task timestamp-fault mode, so PR_TSC_SIGSEGV is
+        // the same closed-set refusal `kernel/sys.c` gives on architectures
+        // without SET_TSC_CTL; success would claim RDTSC now faults.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 2)) != Some(EINVAL) {
+            return Err("PR_SET_TSC(PR_TSC_SIGSEGV) must be -EINVAL");
         }
         // `kernel/seccomp.c::prctl_set_seccomp`: SECCOMP_MODE_STRICT (1)
         // and SECCOMP_MODE_FILTER (2) only, `default: return -EINVAL;`.

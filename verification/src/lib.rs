@@ -3836,6 +3836,267 @@ kernel_test_in!(
     smoke_frame_x86_64_user_mode_rdtscp_interceptor
 );
 
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path() -> TestResult {
+    // Enter real ring 3 with RDTSC subscribed. The exact `0f 31` enters the
+    // tool once and completes natively. The following `66 0f 31` still faults
+    // under CR4.TSD, but the frame owner does not decode it, so it must reach
+    // the ordinary synchronous-fault hook as #GP (SIGSEGV) at its own RIP
+    // without entering the tool. The recording hook resumes at a landing pad
+    // whose marker distinguishes it from the prefixed read having executed.
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        install_global, install_sync_signal_hook,
+        instruction::__verification_clear_instruction_interceptor, sync_signal_hook,
+        syscall::__verification_clear_global as __test_clear_global,
+        try_install_instruction_interceptor, vector_to_signum, InstructionInterception,
+        InstructionInterceptor, InstructionInvocation, InstructionResult, InstructionSubscriptions,
+        NondeterministicInstruction, SyncFaultInfo, Syscall, SyscallHandler, SyscallTable,
+        TrapContext,
+    };
+
+    type Hook = fn(&mut dyn TrapContext, u64, SyncFaultInfo) -> bool;
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    const PREFIXED_OFFSET: u64 = 2;
+    const LAND_OFFSET: u64 = 12;
+    const LANDED: u64 = 0x5E6F;
+    const FELL_THROUGH: u64 = 0x0BAD;
+    const SIGSEGV: u32 = 11;
+    static RDTSC_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static OTHER_INSTRUCTION_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    static FAULT_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
+    static FAULT_ADDR: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SEEN_MARKER: AtomicU64 = AtomicU64::new(0);
+    static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
+    static mut PREVIOUS_HOOK: Option<Hook> = None;
+    static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
+    };
+
+    struct RdtscProbe;
+    // SAFETY: every callback uses only preallocated atomics and typed values;
+    // it does not allocate, park, lock, await, or re-enter guest execution.
+    unsafe impl InstructionInterceptor for RdtscProbe {
+        fn subscriptions(&self) -> InstructionSubscriptions {
+            InstructionSubscriptions::RDTSC
+        }
+
+        fn on_instruction_enter(
+            &self,
+            invocation: &InstructionInvocation,
+        ) -> InstructionInterception {
+            if invocation.instruction == NondeterministicInstruction::Rdtsc {
+                RDTSC_ENTRIES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                OTHER_INSTRUCTION_ENTRIES.fetch_add(1, Ordering::Relaxed);
+            }
+            InstructionInterception::Continue
+        }
+
+        fn on_instruction_return(
+            &self,
+            _invocation: &InstructionInvocation,
+            result: InstructionResult,
+        ) -> InstructionResult {
+            result
+        }
+    }
+
+    fn recording(ctx: &mut dyn TrapContext, vector: u64, info: SyncFaultInfo) -> bool {
+        if FAULTS.fetch_add(1, Ordering::Relaxed) != 0 {
+            // A second user fault has no landing pad; let the ordinary
+            // delivery path report it.
+            return false;
+        }
+        FAULT_VECTOR.store(vector, Ordering::Relaxed);
+        FAULT_ADDR.store(info.addr, Ordering::Relaxed);
+        ctx.set_rip(CODE_VADDR + LAND_OFFSET);
+        true
+    }
+
+    fn restore_hook() {
+        // SAFETY: PREVIOUS_HOOK is written once before ring 3 and read here on
+        // the same CPU after the non-local return.
+        let previous = unsafe { PREVIOUS_HOOK };
+        install_sync_signal_hook(previous.unwrap_or(narf_userspace::default_sync_signal_delivery));
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP,
+            lj = sym user_mode_longjmp,
+        );
+    }
+
+    struct UnwindHandler;
+    impl SyscallHandler for UnwindHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
+            SEEN_MARKER.store(ctx.args().arg0, Ordering::Release);
+            let _ =
+                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
+        }
+    }
+
+    RDTSC_ENTRIES.store(0, Ordering::Relaxed);
+    OTHER_INSTRUCTION_ENTRIES.store(0, Ordering::Relaxed);
+    FAULTS.store(0, Ordering::Relaxed);
+    FAULT_VECTOR.store(u64::MAX, Ordering::Relaxed);
+    FAULT_ADDR.store(u64::MAX, Ordering::Relaxed);
+    SEEN_MARKER.store(0, Ordering::Relaxed);
+    __test_clear_global();
+    __verification_clear_instruction_interceptor();
+
+    let original_cr3: u64;
+    // SAFETY: read the active kernel address space so the non-local return can
+    // restore it after the user-mode side trip.
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3.store(original_cr3, Ordering::Release);
+
+    // SAFETY: JMP is dedicated storage for this single-threaded test.
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
+    if saved != 0 {
+        // SAFETY: restore the exact kernel CR3 and GS state saved before ring 3.
+        unsafe {
+            let cr3 = SAVED_CR3.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
+        restore_hook();
+        __test_clear_global();
+        __verification_clear_instruction_interceptor();
+        if SEEN_MARKER.load(Ordering::Acquire) == FELL_THROUGH {
+            return TestResult::Fail("prefixed RDTSC executed instead of faulting");
+        }
+        if SEEN_MARKER.load(Ordering::Acquire) != LANDED {
+            return TestResult::Fail("guest did not resume at the fault landing pad");
+        }
+        if FAULTS.load(Ordering::Acquire) != 1 {
+            return TestResult::Fail(
+                "prefixed RDTSC did not reach the sync-fault hook exactly once",
+            );
+        }
+        if FAULT_VECTOR.load(Ordering::Acquire) != 13 || vector_to_signum(13) != Some(SIGSEGV) {
+            return TestResult::Fail("prefixed RDTSC was not a #GP delivered as SIGSEGV");
+        }
+        if FAULT_ADDR.load(Ordering::Acquire) != CODE_VADDR + PREFIXED_OFFSET {
+            return TestResult::Fail("sync fault did not report the prefixed RDTSC address");
+        }
+        if RDTSC_ENTRIES.load(Ordering::Acquire) != 1
+            || OTHER_INSTRUCTION_ENTRIES.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("only the exact RDTSC may enter the interceptor");
+        }
+        return TestResult::Pass;
+    }
+
+    let mut table = SyscallTable::new();
+    table.install_raw(Syscall::Sleep, "prefixed-rdtsc-unwind", UnwindHandler);
+    install_global(table);
+    if try_install_instruction_interceptor(alloc::boxed::Box::new(RdtscProbe)).is_err() {
+        __test_clear_global();
+        return TestResult::Fail("RDTSC interceptor installation failed");
+    }
+
+    // SAFETY: the test owns this fresh user address space until longjmp.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    let code_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc code frame"),
+    };
+    let stack_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc stack frame"),
+    };
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
+
+    let sleep = Syscall::Sleep.raw().to_le_bytes();
+    let code: [u8; 26] = [
+        0x0F, 0x31, // rdtsc (exact; enters the tool)
+        0x66, 0x0F, 0x31, // o16 rdtsc (prefixed; must fault, not decode)
+        0xBF, 0xAD, 0x0B, 0x00, 0x00, // mov edi,FELL_THROUGH
+        0xEB, 0x05, // jmp over the landing pad's marker
+        0xBF, 0x6F, 0x5E, 0x00, 0x00, // LAND: mov edi,LANDED
+        0xB8, sleep[0], sleep[1], sleep[2], sleep[3], 0xCD, 0x80, // mov eax,Sleep; int 0x80
+        0x0F, 0x0B, // ud2
+    ];
+    // SAFETY: code_frame is exclusively owned and the copy fits one page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code.as_ptr(),
+            code_frame.kernel_mut_ptr::<u8>(),
+            code.len(),
+        );
+    }
+    // SAFETY: materialize publishes the complete mappings constructed above.
+    if unsafe { address_space.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+    if address_space.activate().is_err() {
+        return TestResult::Fail("activate failed");
+    }
+    // SAFETY: single writer before ring 3; restore_hook reads it afterwards.
+    unsafe {
+        PREVIOUS_HOOK = sync_signal_hook();
+    }
+    install_sync_signal_hook(recording);
+    // SAFETY: enter mapped ring-3 code with a mapped stack and IRQs disabled
+    // across the transition. Success returns only via resume_trampoline.
+    unsafe {
+        core::arch::asm!("cli");
+        user_mode_enter(CODE_VADDR, STACK_VADDR + 0x1000)
+    }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/syscall-entry",
+    smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path
+);
+
 /// While user RDTSC interception is requested, no CR4 write may clear CR4.TSD.
 /// A read-modify-write whose read preceded the arming rendezvous IPI writes a
 /// value without TSD; `write_cr4` must keep the bit, in the register and in
