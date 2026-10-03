@@ -343,9 +343,13 @@ long_mode_start:
      * #DF on the fault handler's own push.
      *
      * The alias is already live -- boot.S maps PML4[511] -> pdpt and
-     * pdpt[510] -> phys 0..1 GiB, and `init_mmu` keeps that same window
-     * through `pd_hi_kernel`, so `phys + KERNEL_VIRT_BASE` addresses the
-     * identical bytes both before and after the MMU handoff.
+     * pdpt[510] -> pd_kernel_lo, whose 2 MiB leaves map
+     * KERNEL_VIRT_BASE + slide + phys for phys in [0, 1 GiB - slide).
+     * `init_mmu` replaces that with `pd_hi_kernel`, which maps only the
+     * kernel image rounded out to 2 MiB (`kernel_window_phys_range`), at
+     * the same slid addresses. .boot.data lies inside the image, so
+     * `phys + KERNEL_VIRT_BASE + slide` addresses the identical stack bytes
+     * both before and after the MMU handoff.
      *
      * Done HERE, at the one point where the stack is empty: the handoff
      * pops are complete and Rust has not run, so no saved frame pointer

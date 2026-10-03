@@ -681,9 +681,11 @@ and the perf event layer, all of which are closed.
    __text_end)` and the AP-trampoline window, demoting 1 GiB → 2 MiB → 4 KiB
    at boot so those exceptions are stated at the granularity they need. The
    demotion is built *before* the CR3/`sctlr_el1` handoff, so it never splits
-   a live mapping. `memory/src/tests.rs` pins it: a buddy frame's identity
-   alias is proved non-executable, and the AP-trampoline window is proved
-   executable at 4 KiB granularity with the next page NX. The higher-half
+   a live mapping. `memory/src/tests.rs` pins the result: a buddy frame has
+   no identity alias, or only a non-executable one, and on x86_64, once SMP
+   bring-up has finished, every 4 KiB page of the AP-trampoline window is
+   unmapped, or mapped read-only and non-executable. No test checks that the
+   window is executable while APs boot. The higher-half
    kernel window gives a buddy frame no alias at all: it maps only the kernel
    image rounded out to 2 MiB leaves, `frame/src/bare_main.rs` keeps that
    whole range out of the frame allocator, and
