@@ -1489,13 +1489,56 @@ const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BA
 /// memfd copy). `path_owned` is then just the /proc/self/exe label.
 /// `sys_execve` (path from user) and `sys_execveat` (dirfd/AT_EMPTY_PATH)
 /// funnel through here.
+///
+/// The body is split at the exec's point of no return: [`prepare_exec`] does
+/// everything that can still fail back to the caller with an errno, and
+/// [`commit_exec`] replaces the caller's image. `ctx` decides when the commit
+/// runs ([`TrapContext::stage_exec`]): the capture context of an interceptor
+/// callback keeps the prepared exec, and the dispatcher commits it once the
+/// callback has returned, so the callback sees a failed exec's errno.
 fn do_execve_resolved(
+    ctx: &mut dyn TrapContext,
+    path_owned: alloc::string::String,
+    argv_uptr: u64,
+    envp_uptr: u64,
+    image_override: Option<alloc::vec::Vec<u8>>,
+) {
+    let Some(exec) = prepare_exec(ctx, path_owned, argv_uptr, envp_uptr, image_override) else {
+        return;
+    };
+    if let Some(exec) = ctx.stage_exec(exec) {
+        commit_exec(ctx, exec);
+    }
+}
+
+/// An execve prepared up to its point of no return by [`prepare_exec`]: the
+/// image is read and loaded into a fresh address space, and nothing of the
+/// caller has changed except its credentials and dumpability, which
+/// `exec_apply_credentials` sets before the load. [`commit_exec`] replaces
+/// the caller's image with it. Dropping it instead abandons the exec and
+/// frees the new address space; it does not undo the credential change.
+#[derive(Debug)]
+pub struct StagedExec {
+    task: u64,
+    new_proc: crate::process::UserProcess,
+    /// The argv the new image starts with, after any `#!` rewrite.
+    argv: alloc::vec::Vec<alloc::string::String>,
+    /// The binary actually mapped: the interpreter, for a script.
+    path: alloc::string::String,
+}
+
+/// The part of the execve body that can still fail back to the caller: the
+/// checks, the argv/envp copy, the image read (following `#!` lines), the
+/// set-user-ID transition and the load. On failure it sets the errno on
+/// `ctx` and returns `None`; the caller's image and process state are intact
+/// apart from the credentials noted at [`StagedExec`].
+fn prepare_exec(
     ctx: &mut dyn TrapContext,
     mut path_owned: alloc::string::String,
     argv_uptr: u64,
     envp_uptr: u64,
     mut image_override: Option<alloc::vec::Vec<u8>>,
-) {
+) -> Option<StagedExec> {
     // `fs/exec.c::do_execveat_common`, before the binary is even opened:
     //
     //     if ((current->flags & PF_NPROC_EXCEEDED) &&
@@ -1508,7 +1551,7 @@ fn do_execve_resolved(
     // same consolidation Linux relies on.
     if nproc_exceeded_blocks_exec(current_task_id()) {
         ctx.set_return(errno_ret(EAGAIN));
-        return;
+        return None;
     }
 
     // fexecve via the /proc/self/fd/N (or /proc/<pid>/fd/N) magic symlink:
@@ -1547,7 +1590,7 @@ fn do_execve_resolved(
         && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOEXEC != 0
     {
         ctx.set_return(errno_ret(EACCES)); // -EACCES
-        return;
+        return None;
     }
 
     // [VERIFY-PROBE] Unconditional (no trace feature, so it prints in a CLEAN
@@ -1576,7 +1619,7 @@ fn do_execve_resolved(
         None => {
             // Faulting argv array pointer → EFAULT.
             ctx.set_return(errno_ret(EFAULT));
-            return;
+            return None;
         }
     };
     let envp_strs = match copy_user_strarr(envp_uptr, 4096) {
@@ -1584,7 +1627,7 @@ fn do_execve_resolved(
         None => {
             // Faulting envp array pointer → EFAULT.
             ctx.set_return(errno_ret(EFAULT));
-            return;
+            return None;
         }
     };
     let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
@@ -1703,7 +1746,7 @@ fn do_execve_resolved(
         if bytes.len() < 64 {
             // Too small to be a valid ELF → ENOEXEC.
             ctx.set_return(errno_ret(ENOEXEC));
-            return;
+            return None;
         }
         elf_buf = bytes;
     } else {
@@ -1713,13 +1756,13 @@ fn do_execve_resolved(
                 Ok(b) => b,
                 Err(code) => {
                     ctx.set_return(SyscallReturn::ok(code as u64));
-                    return;
+                    return None;
                 }
             };
             if buf.len() >= 2 && &buf[..2] == b"#!" {
                 if depth >= 4 {
                     ctx.set_return(errno_ret(ELOOP)); // -ELOOP
-                    return;
+                    return None;
                 }
                 depth += 1;
                 followed_shebang = true;
@@ -1737,7 +1780,7 @@ fn do_execve_resolved(
                 if interp.is_empty() {
                     // Shebang with an empty interpreter name → ENOEXEC.
                     ctx.set_return(errno_ret(ENOEXEC));
-                    return;
+                    return None;
                 }
                 let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
                 new_argv.push(interp.into());
@@ -1753,7 +1796,7 @@ fn do_execve_resolved(
             if buf.len() < 64 {
                 // Too small for a valid ELF and not a shebang → ENOEXEC.
                 ctx.set_return(errno_ret(ENOEXEC));
-                return;
+                return None;
             }
             elf_buf = buf;
             break;
@@ -1763,19 +1806,19 @@ fn do_execve_resolved(
 
     let task = current_task_id();
 
-    // The own-stack branch below applies the image inline and then drops every
-    // local reference to the new address space, leaving the task's scheduler
-    // slot as its only owner. Only the slot this CPU is running holds it that
-    // way (Step 5's in-poll outcome), so refuse here, while the caller's image
-    // and process state are still intact, unless `task` is that slot. Past
-    // this point the exec can no longer fail back.
+    // commit_exec's own-stack branch applies the image inline and then drops
+    // every local reference to the new address space, leaving the task's
+    // scheduler slot as its only owner. Only the slot this CPU is running
+    // holds it that way (Step 5's in-poll outcome), so refuse here, while the
+    // caller's image and process state are still intact, unless `task` is
+    // that slot. Once commit_exec starts, the exec can no longer fail back.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled()
         && (task == narf_scheduler::TaskId::NONE.raw()
             || narf_scheduler::current_task_id().raw() != task)
     {
         ctx.set_return(errno_ret(ENOSYS));
-        return;
+        return None;
     }
 
     // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
@@ -1819,18 +1862,45 @@ fn do_execve_resolved(
         // process at rip=0 (#PF errcode 0x15, instruction fetch at 0).
         Err(crate::process::ProcessLoadError::InterpUnavailable) => {
             ctx.set_return(errno_ret(ENOENT)); // -ENOENT
-            return;
+            return None;
         }
         Err(_) => {
             // Malformed ELF (bad magic, unsupported class, etc.) → ENOEXEC.
             ctx.set_return(errno_ret(ENOEXEC));
-            return;
+            return None;
         }
     };
+    Some(StagedExec {
+        task,
+        new_proc,
+        argv: cur_argv,
+        path: cur_path,
+    })
+}
+
+/// Replaces the caller's image with `exec`, from the exec's point of no
+/// return on. It does not return, except with -ENOSYS where this kernel has
+/// no way to enter the new image (only a kernel-test stub gets there).
+pub(crate) fn commit_exec(ctx: &mut dyn TrapContext, exec: StagedExec) {
+    let StagedExec {
+        task,
+        new_proc,
+        argv: cur_argv,
+        path: cur_path,
+    } = exec;
+    // An interceptor callback's exec is kept until the callback has returned
+    // (`TrapContext::stage_exec`). Committed inside it, the jump into the new
+    // image would abandon the callback's frames and leave its spawn hold open.
+    assert!(
+        !crate::user_task::spawn_hold_open(task),
+        "execve committed inside an interceptor callback of task {task}"
+    );
+    let argv_refs: alloc::vec::Vec<&str> = cur_argv.iter().map(|s| s.as_str()).collect();
 
     // CLONE_VFORK release: this child is now replacing its image, so it no
     // longer needs the shared address space — wake a parent suspended in
-    // do_clone3's vfork park. (Load succeeded above, so the exec is committed.)
+    // do_clone3's vfork park. (prepare_exec loaded the image, so the exec is
+    // committed.)
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     vfork_child_release(task_to_pid_raw(task).unwrap_or(task));
 
@@ -1920,16 +1990,12 @@ fn do_execve_resolved(
         // holds the persistent reference that keeps the new AS alive while
         // the task runs; this local clone only bridges the activate() below.
         let new_as = new_proc.address_space.clone();
-        // Borrow-holders first, then owners.
+        // Borrow-holders first, then owners. The image buffer, the envp copy
+        // and the caller's own argv and path went with prepare_exec's frame.
         drop(argv_refs);
-        drop(envp_refs);
         drop(new_proc);
-        drop(elf_buf);
         drop(cur_argv);
         drop(cur_path);
-        drop(argv_strs);
-        drop(envp_strs);
-        drop(path_owned);
         let _ = new_as.activate();
         // Publish the new CR3 so a later preempt/park resume re-activates the
         // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
@@ -2060,14 +2126,9 @@ fn do_execve_resolved(
         // applies it.)
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(argv_refs);
-        drop(envp_refs);
         drop(new_proc);
-        drop(elf_buf);
         drop(cur_argv);
         drop(cur_path);
-        drop(argv_strs);
-        drop(envp_strs);
-        drop(path_owned);
         drop(slot_swap);
         // SAFETY: hook is a fn ptr installed at boot; uctx is live.
         unsafe { h(uctx_ptr) };

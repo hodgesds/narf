@@ -19,8 +19,9 @@ use narf_memory::{AddressSpace, PhysAddr, RegionPerms};
 use narf_scheduler::{Affinity, CpuId, TaskSpec};
 use narf_userspace::handlers::tool_view;
 use narf_userspace::syscall::{
-    NativeSyscallOutcome, NativeSyscallRequest, NativeSyscallTransition, SyscallInterception,
-    SyscallInterceptor, SyscallInvocation, SyscallReturn,
+    NativeSyscallOriginalError, NativeSyscallOutcome, NativeSyscallRequest,
+    NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
+    SyscallReturn,
 };
 use reverie::syscalls::{Addr, MemoryAccess, Sysno};
 use reverie::{Pid, Tool};
@@ -1592,7 +1593,9 @@ reverie_narf_test!(reverie_narf_parked_inject_resumes_the_tool);
 
 // ── Exec ──────────────────────────────────────────────────────────────────
 
-/// Where the exec test mounts the canonical guest (guests/exec_x86_64.S).
+/// Where the exec tests mount their targets: the canonical guest for
+/// guests/exec_x86_64.S, and the failed-exec targets for
+/// guests/execfail_x86_64.S.
 const EXEC_MOUNT: &str = "/rn-exec";
 /// Recorded by [`ExecWatch::handle_post_exec`].
 const POST_EXEC_MARK: u64 = u64::MAX;
@@ -1662,9 +1665,10 @@ static DEFER_IN_CALLBACK: AtomicU64 = AtomicU64::new(0);
 static DEFER_SEEN: AtomicU64 = AtomicU64::new(0);
 
 /// A raw interceptor that runs the exec guest's execve from inside its
-/// callback and records whether the exec happened before the callback
-/// returned. It never enters the Reverie host, whose re-entry guard would
-/// panic the kernel if the dispatcher ran the exec inside the callback.
+/// callback and records whether the new image replaced the old one before the
+/// callback returned. It never enters the Reverie host, whose re-entry guard
+/// would panic the kernel if the dispatcher replaced the image inside the
+/// callback.
 struct ExecDeferralProbe;
 
 impl SyscallInterceptor for ExecDeferralProbe {
@@ -1701,10 +1705,11 @@ impl SyscallInterceptor for ExecDeferralProbe {
 }
 
 /// [`run_hosted`] on the exec guest, after checking with
-/// [`ExecDeferralProbe`] that an execve an interceptor callback runs is
-/// deferred until the callback has returned. A dispatcher that ran it inside
-/// the callback would otherwise surface only as the host's re-entry panic.
-/// The caller mounts the exec target and sets [`ROOT_EXECS`].
+/// [`ExecDeferralProbe`] that the image replacement of an execve an
+/// interceptor callback runs is deferred until the callback has returned. A
+/// dispatcher that replaced the image inside the callback would otherwise
+/// surface only as a kernel panic. The caller mounts the exec target and sets
+/// [`ROOT_EXECS`].
 fn run_hosted_exec<T: Tool + 'static>(
     config: <T::GlobalState as reverie::GlobalTool>::Config,
 ) -> Result<(ReverieInterceptor<T>, Root), &'static str> {
@@ -1729,10 +1734,11 @@ fn run_hosted_exec<T: Tool + 'static>(
     run_hosted::<T>(EXEC_GUEST, config)
 }
 
-/// A hosted task's successful execve runs after the Tool callback that
-/// requested it has returned (the dispatcher's deferred transition), the Tool
-/// then gets its post-exec callback in the new image (`on_task_exec`), and
-/// the new image's syscalls reach the Tool: execve, post-exec, write, exit.
+/// A hosted task's successful execve replaces its image after the Tool
+/// callback that requested it has returned (the dispatcher's deferred commit),
+/// the Tool then gets its post-exec callback in the new image
+/// (`on_task_exec`), and the new image's syscalls reach the Tool: execve,
+/// post-exec, write, exit.
 /// The new image's auxiliary vector replaces the old one in the kernel's
 /// record and the Tool's view. The deferral itself is checked first, by a
 /// raw interceptor ([`run_hosted_exec`]).
@@ -1769,6 +1775,313 @@ fn reverie_narf_exec_defers_and_reaches_post_exec() -> TestResult {
     result_of(outcome)
 }
 reverie_narf_test!(reverie_narf_exec_defers_and_reaches_post_exec);
+
+// ── A failed exec ─────────────────────────────────────────────────────────
+
+static EXECFAIL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_EXECFAIL"));
+static NOINTERP_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_NOINTERP"));
+/// The failed-exec guest's "junk" target: long enough to be read as an ELF,
+/// with no ELF magic.
+const EXECFAIL_JUNK: &[u8] = &[0x41; 64];
+const LINUX_ENOENT: i64 = 2;
+const LINUX_ENOEXEC: i64 = 8;
+/// What the failed-exec guest's three execve calls return, in order.
+const EXECFAIL_RETURNS: [i64; 3] = [-LINUX_ENOENT, -LINUX_ENOEXEC, -LINUX_ENOENT];
+
+static EXECFAIL_ROOT: AtomicU64 = AtomicU64::new(0);
+/// What `execute_original` returned in each of the root's execve callbacks.
+static EXECFAIL_ORIGINALS: IrqSafeSpinLock<
+    Vec<Result<NativeSyscallOutcome, NativeSyscallOriginalError>>,
+> = IrqSafeSpinLock::new(Vec::new());
+/// How many times the root reached `on_task_exec`.
+static EXECFAIL_EXECS: AtomicU64 = AtomicU64::new(0);
+/// The root's wait status, -1 until its exit.
+static EXECFAIL_WSTATUS: AtomicI64 = AtomicI64::new(-1);
+
+/// A raw interceptor that runs each of the failed-exec guest's execve calls
+/// from inside its callback and records what `execute_original` returned. It
+/// also records whether the root reached `on_task_exec`, and its wait status.
+struct ExecFailureProbe;
+
+impl SyscallInterceptor for ExecFailureProbe {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        let number = invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
+        if number != 59 || invocation.task_id != EXECFAIL_ROOT.load(Ordering::Acquire) {
+            return SyscallInterception::Continue;
+        }
+        let outcome = native.execute_original();
+        EXECFAIL_ORIGINALS.lock().push(outcome);
+        SyscallInterception::Continue
+    }
+
+    fn on_task_exec(&self, task_id: u64, _native: &mut dyn NativeSyscallTransition) {
+        if task_id == EXECFAIL_ROOT.load(Ordering::Acquire) {
+            EXECFAIL_EXECS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32, _process_wstatus: i32) {
+        if task_id == EXECFAIL_ROOT.load(Ordering::Acquire) {
+            EXECFAIL_WSTATUS.store(i64::from(wstatus), Ordering::Release);
+        }
+    }
+}
+
+/// What each execve [`ExecFailWatch`] injected returned to it, as a Linux
+/// return value.
+static EXECFAIL_INJECTS: IrqSafeSpinLock<Vec<i64>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Injects each execve without a tail, records what the inject returned, and
+/// returns that to the guest. Tail-injects every other syscall.
+#[derive(Debug, Default, Clone, Copy)]
+struct ExecFailWatch;
+
+#[reverie::tool]
+impl Tool for ExecFailWatch {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        if syscall.number() != Sysno::execve {
+            guest.tail_inject(syscall).await
+        }
+        let result = guest.inject(syscall).await;
+        EXECFAIL_INJECTS.lock().push(match result {
+            Ok(value) => value,
+            Err(errno) => -i64::from(errno.into_raw()),
+        });
+        Ok(result?)
+    }
+}
+
+/// The failed-exec guest under [`ExecFailureProbe`]: each execve run inside
+/// the callback returns its errno there, none reaches `on_task_exec`, and the
+/// guest exits 0.
+fn execfail_under_probe() -> Result<(), &'static str> {
+    EXECFAIL_ROOT.store(0, Ordering::Release);
+    EXECFAIL_ORIGINALS.lock().clear();
+    EXECFAIL_EXECS.store(0, Ordering::Release);
+    EXECFAIL_WSTATUS.store(-1, Ordering::Release);
+    run_guest(EXECFAIL_GUEST, Box::new(ExecFailureProbe), |root| {
+        EXECFAIL_ROOT.store(root.task_id, Ordering::Release);
+        Ok(())
+    })?;
+    let originals = core::mem::take(&mut *EXECFAIL_ORIGINALS.lock());
+    let returned: Vec<Option<i64>> = originals
+        .iter()
+        .map(|outcome| match outcome {
+            Ok(NativeSyscallOutcome::Returned(result)) => Some(result.linux_abi_result()),
+            _ => None,
+        })
+        .collect();
+    if returned != EXECFAIL_RETURNS.map(Some) {
+        let _ = writeln!(Writer, "    execute_original returned {originals:?}");
+        return Err("an execve run inside the callback did not return its errno there");
+    }
+    if EXECFAIL_EXECS.load(Ordering::Acquire) != 0 {
+        return Err("a failed execve reached on_task_exec");
+    }
+    let wstatus = EXECFAIL_WSTATUS.load(Ordering::Acquire);
+    if wstatus != 0 {
+        let _ = writeln!(Writer, "    root wstatus {wstatus:#x}");
+        return Err("the guest did not get each execve's errno");
+    }
+    Ok(())
+}
+
+/// The failed-exec guest hosting [`ExecFailWatch`]: each execve the Tool
+/// injects returns its errno to the Tool, and the guest gets it.
+fn execfail_hosted() -> Result<(), &'static str> {
+    EXECFAIL_INJECTS.lock().clear();
+    let (interceptor, root) = run_hosted::<ExecFailWatch>(EXECFAIL_GUEST, ())?;
+    check_teardown(&interceptor, root, 1, 0)?;
+    let injects = core::mem::take(&mut *EXECFAIL_INJECTS.lock());
+    if injects != EXECFAIL_RETURNS {
+        let _ = writeln!(Writer, "    execve injects returned {injects:?}");
+        return Err("a Tool's inject of a failing execve did not return its errno");
+    }
+    Ok(())
+}
+
+/// The failed-exec guest hosting strace: after each execve line, strace
+/// prints the line it prints for an inject that failed, with that execve's
+/// errno, and then the exit and the thread's and process's exit lines.
+fn execfail_under_strace() -> Result<(), &'static str> {
+    STRACE_LINES.lock().clear();
+    reverie_narf_tools::set_eprintln_sink(record_strace_line);
+    let interceptor = ReverieInterceptor::<strace::Strace>::with_tool_constructor(
+        strace::Config::default(),
+        <strace::Strace as Tool>::new,
+    )
+    .map_err(|_| "NarfToolHost::new refused the Tool")?;
+    let root = run_guest(EXECFAIL_GUEST, interceptor.boxed(), |root| {
+        interceptor
+            .host_root(root.task_id)
+            .map_err(|_| "register_root refused the root task")
+    })?;
+    let root_pid = root.pid as i32;
+    check_teardown(&interceptor, root, 1, 0)?;
+    let lines = core::mem::take(&mut *STRACE_LINES.lock());
+    for line in &lines {
+        let _ = writeln!(Writer, "    strace: {line}");
+    }
+    let prefix = alloc::format!("[pid {root_pid}] ");
+    let calls: Vec<&str> = lines
+        .iter()
+        .map_while(|line| line.strip_prefix(prefix.as_str()))
+        .collect();
+    for (at, (path, errno)) in [
+        ("missing", "ENOENT"),
+        ("junk", "ENOEXEC"),
+        ("nointerp", "ENOENT"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let quoted = alloc::format!("\"/rn-exec/{path}\"");
+        if !calls
+            .get(2 * at)
+            .is_some_and(|call| call.starts_with("execve(") && call.contains(quoted.as_str()))
+        {
+            return Err("strace's execve lines do not name the guest's paths in order");
+        }
+        if calls.get(2 * at + 1).copied() != Some(alloc::format!("(execve) = {errno}").as_str()) {
+            return Err("strace did not print a failed execve's errno right after its execve line");
+        }
+    }
+    if calls[6..] != ["exit(0) = ?"] {
+        return Err("strace's last syscall line is not the guest's exit(0)");
+    }
+    if lines[calls.len()..]
+        != [
+            alloc::format!("Thread {root_pid} exited with status Exited(0)"),
+            alloc::format!("Process {root_pid} exited with status Exited(0)"),
+        ]
+    {
+        return Err("strace's exit lines do not follow the syscall lines with Exited(0)");
+    }
+    Ok(())
+}
+
+/// A hosted task's failed execve returns its errno to whoever ran it, and
+/// the task goes on in its old image. The failed-exec guest
+/// (guests/execfail_x86_64.S) execs a missing file, a file that is not an
+/// ELF and an ELF whose interpreter is missing, and exits 0 only if the calls
+/// return -ENOENT, -ENOEXEC and -ENOENT. It runs three times: under a raw
+/// interceptor that runs each execve inside its callback
+/// ([`execfail_under_probe`]), hosting a Tool that injects each
+/// ([`execfail_hosted`]), and hosting unmodified strace
+/// ([`execfail_under_strace`]). Each run is checked whatever the others
+/// found.
+fn reverie_narf_failed_exec_returns_its_errno() -> TestResult {
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let Ok(mounted) = narf_filesystem::registry().mount(
+        &auth,
+        EXEC_MOUNT,
+        narf_filesystem::MemFs::with_seeds(
+            "rn-exec",
+            &[("junk", EXECFAIL_JUNK), ("nointerp", NOINTERP_GUEST)],
+        ),
+    ) else {
+        return TestResult::Fail("mounting the failed-exec targets failed");
+    };
+    let outcomes = [
+        ("raw interceptor", execfail_under_probe()),
+        ("recording Tool", execfail_hosted()),
+        ("strace", execfail_under_strace()),
+    ];
+    let _ = narf_filesystem::registry().unmount(&mounted, EXEC_MOUNT);
+    let mut failure = None;
+    for (run, outcome) in outcomes {
+        if let Err(reason) = outcome {
+            let _ = writeln!(Writer, "    failed exec, {run}: {reason}");
+            failure.get_or_insert(reason);
+        }
+    }
+    match failure {
+        Some(reason) => TestResult::Fail(reason),
+        None => TestResult::Pass,
+    }
+}
+reverie_narf_test!(reverie_narf_failed_exec_returns_its_errno);
+
+/// strace over the exec guest, whose execve succeeds: the root's execve line
+/// names the exec target and no `(execve) = ` line follows it, since the
+/// inject of an exec that succeeds does not return. The exec'd canonical
+/// guest's write and exit follow under the same pid, then the thread's and
+/// the process's exit lines. strace prints the execve line before it injects
+/// the call, because an exec that succeeds replaces the memory the line
+/// reads.
+fn reverie_narf_strace_prints_a_successful_exec() -> TestResult {
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let Ok(mounted) = narf_filesystem::registry().mount(
+        &auth,
+        EXEC_MOUNT,
+        narf_filesystem::MemFs::with_seeds("rn-exec", &[("prog", CANONICAL_GUEST)]),
+    ) else {
+        return TestResult::Fail("mounting the exec target failed");
+    };
+    ROOT_EXECS.store(true, Ordering::Release);
+    let outcome = (|| {
+        STRACE_LINES.lock().clear();
+        reverie_narf_tools::set_eprintln_sink(record_strace_line);
+        let interceptor = ReverieInterceptor::<strace::Strace>::with_tool_constructor(
+            strace::Config::default(),
+            <strace::Strace as Tool>::new,
+        )
+        .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let root = run_guest(EXEC_GUEST, interceptor.boxed(), |root| {
+            interceptor
+                .host_root(root.task_id)
+                .map_err(|_| "register_root refused the root task")
+        })?;
+        let root_pid = root.pid as i32;
+        check_teardown(&interceptor, root, 1, 0)?;
+        let lines = core::mem::take(&mut *STRACE_LINES.lock());
+        for line in &lines {
+            let _ = writeln!(Writer, "    strace: {line}");
+        }
+        let prefix = alloc::format!("[pid {root_pid}] ");
+        let calls: Vec<&str> = lines
+            .iter()
+            .map_while(|line| line.strip_prefix(prefix.as_str()))
+            .collect();
+        if !calls
+            .first()
+            .is_some_and(|call| call.starts_with("execve(") && call.contains("\"/rn-exec/prog\""))
+        {
+            return Err("strace's first line is not an execve line naming the exec target");
+        }
+        let write = alloc::format!("write(1, {CANONICAL_MESSAGE_ADDR:#x}, 16) = 16");
+        if calls[1..] != [write.as_str(), "exit(0) = ?"] {
+            return Err(
+                "strace's lines after the execve are not the new image's write and exit(0)",
+            );
+        }
+        if lines[calls.len()..]
+            != [
+                alloc::format!("Thread {root_pid} exited with status Exited(0)"),
+                alloc::format!("Process {root_pid} exited with status Exited(0)"),
+            ]
+        {
+            return Err("strace's exit lines do not follow the syscall lines with Exited(0)");
+        }
+        Ok(TestResult::Pass)
+    })();
+    ROOT_EXECS.store(false, Ordering::Release);
+    let _ = narf_filesystem::registry().unmount(&mounted, EXEC_MOUNT);
+    result_of(outcome)
+}
+reverie_narf_test!(reverie_narf_strace_prints_a_successful_exec);
 
 // ── Spawn holds and the vfork wait ────────────────────────────────────────
 

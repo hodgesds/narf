@@ -111,6 +111,18 @@ pub trait TrapContext {
     /// no-op; real trap frames override it. Used to symbolize a faulting
     /// instruction's operands (e.g. a corrupted heap pointer held in r13/r15).
     fn dump_gprs(&self) {}
+
+    /// Offered an exec the execve body has prepared up to its point of no
+    /// return. Returning it (the default) has the body commit it at once. A
+    /// context that keeps it returns `None` and must commit or drop it
+    /// itself: an interceptor callback's capture context keeps it, and the
+    /// dispatcher commits it once the callback has returned.
+    fn stage_exec(
+        &mut self,
+        exec: crate::handlers::StagedExec,
+    ) -> Option<crate::handlers::StagedExec> {
+        Some(exec)
+    }
 }
 
 /// Immutable identity and register arguments for one syscall interception.
@@ -210,14 +222,18 @@ impl NativeSyscallRequest {
 /// implementation can use them from inside the Tool callback without recursively
 /// trapping its own injected syscall.
 ///
-/// A transition that exits the task or replaces its image (`exit`,
-/// `exit_group`, `execve`, `execveat`) never runs inside the interceptor
-/// callback. The call reports [`NativeSyscallOutcome::ContextManaged`] at once
-/// and the dispatcher runs the recorded request on the live context after the
-/// interceptor has returned, so the task's exit is announced (through
+/// A transition that exits the task (`exit`, `exit_group`) never runs inside
+/// the interceptor callback. The call reports
+/// [`NativeSyscallOutcome::ContextManaged`] at once and the dispatcher runs
+/// the recorded request on the live context after the interceptor has
+/// returned, so the task's exit is announced (through
 /// [`SyscallInterceptor::on_task_exit`]) only once no callback is running for
-/// it. A failed exec therefore returns its errno to the task without the
-/// interceptor observing it.
+/// it. An exec (`execve`, `execveat`) runs inside the callback up to its
+/// point of no return. One that fails before it returns its errno as
+/// [`NativeSyscallOutcome::Returned`], and the task continues in its old
+/// image. One that gets past it reports `ContextManaged`, and the dispatcher
+/// replaces the task's image once the interceptor has returned, announcing
+/// the new image through [`SyscallInterceptor::on_task_exec`].
 pub trait NativeSyscallTransition {
     fn execute_original(&mut self) -> Result<NativeSyscallOutcome, NativeSyscallOriginalError>;
 
@@ -3616,19 +3632,28 @@ impl TrapContext for IoAccountCtx<'_> {
     fn dump_gprs(&self) {
         self.inner.dump_gprs()
     }
+    fn stage_exec(
+        &mut self,
+        exec: crate::handlers::StagedExec,
+    ) -> Option<crate::handlers::StagedExec> {
+        self.inner.stage_exec(exec)
+    }
 }
 
 /// Transparent trap-context wrapper that records whether a handler published a
 /// normal return. Redirection and park paths deliberately remain
-/// `ContextManaged` instead of fabricating a value for an interceptor.
+/// `ContextManaged` instead of fabricating a value for an interceptor. An exec
+/// the handler prepares is kept, not committed, for the dispatcher to commit
+/// once the interceptor has returned.
 struct InterceptCtx<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
     result: Option<SyscallReturn>,
     /// Also publish a normal return to the live context. Set only for a
-    /// deferred transition, which runs after the interceptor has returned and
-    /// owns the live context.
+    /// deferred exit, which runs after the interceptor has returned and owns
+    /// the live context.
     forward: bool,
+    staged: Option<crate::handlers::StagedExec>,
 }
 
 impl<'a> InterceptCtx<'a> {
@@ -3638,6 +3663,7 @@ impl<'a> InterceptCtx<'a> {
             args,
             result: None,
             forward: false,
+            staged: None,
         }
     }
 }
@@ -3695,15 +3721,27 @@ impl TrapContext for InterceptCtx<'_> {
     fn dump_gprs(&self) {
         self.inner.dump_gprs()
     }
+
+    fn stage_exec(
+        &mut self,
+        exec: crate::handlers::StagedExec,
+    ) -> Option<crate::handlers::StagedExec> {
+        self.staged = Some(exec);
+        None
+    }
 }
 
-/// A context-ending transition recorded for the dispatcher to run after the
+/// A context-ending transition recorded for the dispatcher to finish after the
 /// interceptor callback has returned.
-#[derive(Copy, Clone)]
-struct DeferredTransition {
-    variant: Option<Syscall>,
-    version: u8,
-    args: SyscallArgs,
+enum DeferredTransition {
+    /// An exit or exit_group, which runs whole.
+    Exit {
+        variant: Option<Syscall>,
+        version: u8,
+        args: SyscallArgs,
+    },
+    /// An exec prepared inside the callback, which is committed.
+    Exec(crate::handlers::StagedExec),
 }
 
 /// Whether `variant` exits the task or replaces its image, so that running it
@@ -3714,6 +3752,12 @@ fn ends_task_context(variant: Option<Syscall>) -> bool {
         variant,
         Some(Syscall::ExitTask | Syscall::ExitGroup | Syscall::Execve | Syscall::Execveat)
     )
+}
+
+/// Whether `variant` exits the task. Unlike an exec, which can fail back to
+/// the task, it has no part that can run inside an interceptor callback.
+fn exits_task(variant: Option<Syscall>) -> bool {
+    matches!(variant, Some(Syscall::ExitTask | Syscall::ExitGroup))
 }
 
 /// Whether `variant` creates a task. A new task starts from a copy of its
@@ -3744,16 +3788,17 @@ struct DispatchNativeTransition<'table, 'ctx> {
 }
 
 impl DispatchNativeTransition<'_, '_> {
-    /// Runs one native transition on the live context, deferring a
-    /// context-ending one until the interceptor has returned.
+    /// Runs one native transition on the live context. An exit is deferred
+    /// whole until the interceptor has returned; an exec runs up to its point
+    /// of no return, and only the commit of one that gets there is deferred.
     fn run(
         &mut self,
         variant: Option<Syscall>,
         version: u8,
         args: SyscallArgs,
     ) -> NativeSyscallOutcome {
-        if ends_task_context(variant) {
-            self.deferred = Some(DeferredTransition {
+        if exits_task(variant) {
+            self.deferred = Some(DeferredTransition::Exit {
                 variant,
                 version,
                 args,
@@ -3763,6 +3808,11 @@ impl DispatchNativeTransition<'_, '_> {
         }
         let mut capture = InterceptCtx::new(self.ctx, args);
         self.table.dispatch_native(variant, version, &mut capture);
+        if let Some(exec) = capture.staged.take() {
+            self.deferred = Some(DeferredTransition::Exec(exec));
+            self.context_managed = true;
+            return NativeSyscallOutcome::ContextManaged;
+        }
         let outcome = match capture.result {
             Some(result) => NativeSyscallOutcome::Returned(result),
             None => NativeSyscallOutcome::ContextManaged,
@@ -3808,8 +3858,11 @@ impl DispatchNativeTransition<'_, '_> {
     ///   is pending again once the callback has returned (the ptrace backend
     ///   keeps it as its `pending_signal` and delivers it on resume).
     ///
-    /// A context-ending transition (exit, exec) is never withheld: it runs
-    /// after the callback anyway, and the task ends either way.
+    /// A context-ending transition (exit, exec) is never withheld. An exit
+    /// runs after the callback anyway, and the task ends either way. An exec
+    /// is prepared inside the callback: one that fails returns its errno with
+    /// the signal still pending, and one that succeeds replaces the image
+    /// after the callback, unless the signal terminates the task first.
     fn signal_gate(&mut self, variant: Option<Syscall>) -> Option<NativeSyscallOutcome> {
         if callback_task_killed(self.task_id) {
             self.context_managed = true;
@@ -5525,6 +5578,9 @@ impl SyscallTable {
             // A native syscall the callback ran terminated the task. Its
             // children are published now; nothing else of this syscall runs
             // (no vfork wait, no deferred transition, no park record).
+            // Termination need not return, so a staged exec's new image is
+            // freed first.
+            drop(deferred);
             crate::handlers::terminate_current_task(ctx, task_id, signum, core_dumped);
             return;
         }
@@ -5535,10 +5591,18 @@ impl SyscallTable {
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let _ = vfork_wait;
-        if let Some(deferred) = deferred {
-            let mut live = InterceptCtx::new(ctx, deferred.args);
-            live.forward = true;
-            self.dispatch_native(deferred.variant, deferred.version, &mut live);
+        match deferred {
+            Some(DeferredTransition::Exit {
+                variant,
+                version,
+                args,
+            }) => {
+                let mut live = InterceptCtx::new(ctx, args);
+                live.forward = true;
+                self.dispatch_native(variant, version, &mut live);
+            }
+            Some(DeferredTransition::Exec(exec)) => crate::handlers::commit_exec(ctx, exec),
+            None => {}
         }
         if outcome == NativeSyscallOutcome::ContextManaged
             && ctx.rip() == instruction_pointer.wrapping_sub(SYSCALL_INSN_LEN)
