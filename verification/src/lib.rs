@@ -6935,6 +6935,16 @@ mod deferred_rdtsc_e2e {
             at
         }
 
+        /// An RDTSC the guest must not run past. A second RDTSC follows it
+        /// directly and has no script entry, so if the guest runs on it
+        /// traps as past the script (`ENTRY_PAST_SCRIPT`) before any other
+        /// instruction runs. Returns the first RDTSC's address.
+        fn final_rdtsc(&mut self) -> u64 {
+            let at = self.here();
+            self.emit(&[0x0F, 0x31, 0x0F, 0x31]); // rdtsc; rdtsc
+            at
+        }
+
         /// ExitTask(0), then spin.
         fn exit(&mut self) {
             self.mov_imm(0xBF, 0); // mov edi,0
@@ -7342,12 +7352,12 @@ mod deferred_rdtsc_e2e {
     /// A guest whose deferred RDTSC callback sends it `SIGTERM`: the signal
     /// gate withholds the signal from the next inject, the callback
     /// completes a value, and the restored signal ends the guest at the
-    /// RDTSC with wait status 15.
+    /// RDTSC with wait status 15, before the instruction after it runs.
     fn smoke_deferred_rdtsc_withheld_sigterm_ends_guest_after_callback() -> TestResult {
         reset(SCRIPT_WITHHELD);
         let mut guest = Guest(Vec::new());
         guest.probe_pid(); // probe 0
-        let first = guest.rdtsc();
+        let first = guest.final_rdtsc();
         guest.probe_rax();
         guest.exit();
         RDTSC_IPS[1].store(first, Ordering::Release);
@@ -7383,12 +7393,13 @@ mod deferred_rdtsc_e2e {
     /// A guest whose deferred RDTSC callback injects `rt_sigreturn` with no
     /// signal frame: the forced `SIGSEGV` takes the task's context, so the
     /// inject after it does not run, and once the callback has returned the
-    /// guest dies of `SIGSEGV` at the RDTSC without completing it.
+    /// guest dies of `SIGSEGV` at the RDTSC without completing it, with the
+    /// core-dump flag the staged termination carries.
     fn smoke_deferred_rdtsc_bad_sigreturn_terminates_guest_after_callback() -> TestResult {
         reset(SCRIPT_BAD_SIGRETURN);
         let mut guest = Guest(Vec::new());
         guest.probe_pid(); // probe 0
-        let first = guest.rdtsc();
+        let first = guest.final_rdtsc();
         guest.probe(MARK_AFTER_KILL);
         guest.exit();
         RDTSC_IPS[1].store(first, Ordering::Release);
@@ -7408,12 +7419,15 @@ mod deferred_rdtsc_e2e {
         if PROBE_COUNT.load(Ordering::Acquire) != 1 || EXITS.load(Ordering::Acquire) != 0 {
             return TestResult::Fail("the terminated guest ran on past its RDTSC");
         }
-        // SIGSEGV, with or without the core-dump flag (0x80). Narf sets the
-        // flag whenever the signal's default action dumps core; Linux sets it
-        // only once a core is written, and the default RLIMIT_CORE of 0
-        // writes none.
-        if exit_wstatus().map(|wstatus| wstatus & !0x80) != Some(11) {
-            return TestResult::Fail("the guest did not die of SIGSEGV");
+        // SIGSEGV with the core-dump flag (0x80): Narf sets it whenever the
+        // signal's default action dumps core, and the undeferred
+        // `smoke_wave55_sigsegv_default_terminate_sets_wifsignaled`
+        // (userspace/src/process_e2e_tests.rs) requires it. Linux sets it
+        // only once a core is written, which a file core pattern with the
+        // default RLIMIT_CORE of 0 prevents; that divergence is Narf's, and
+        // both tests change if it is fixed.
+        if exit_wstatus() != Some(0x8b) {
+            return TestResult::Fail("the guest did not die of SIGSEGV with the core-dump flag");
         }
         if narf_userspace::user_task::__test_open_spawn_holds() != (0, 0) {
             return TestResult::Fail("a spawn hold outlived the deferred callback");
