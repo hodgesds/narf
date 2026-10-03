@@ -2229,6 +2229,15 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     // the refusal point -- would move the caller's euid to the owner and
     // clear its dumpable flag (a privileged exec is non-dumpable). The last
     // ones publish argv[0]'s basename as the caller's comm.
+    //
+    // The euid and dumpable checks mean something only if those writes land.
+    // A kernel-test boot runs the tests before `init_per_task_state`, so the
+    // credential and prctl tables stay uninitialised until some earlier test
+    // resets them; while they are, every credential or dumpable write is
+    // dropped and reads return the defaults, and an exec that applied the
+    // set-user-ID transition before refusing would still pass. The test
+    // therefore seeds both tables itself and proves a write is visible before
+    // it trusts either check.
     use core::sync::atomic::{AtomicU64, Ordering};
 
     let _kbuf = crate::handlers::kernel_buffers_guard();
@@ -2236,6 +2245,8 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     if narf_scheduler::current_task_id() != narf_scheduler::TaskId::NONE {
         return TestResult::Fail("fixture drifted: test body ran inside a task poll");
     }
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_prctl_reset();
     static FAKE_TID: AtomicU64 = AtomicU64::new(0xC0DE_E0E5);
     fn task_lookup() -> u64 {
         FAKE_TID.load(Ordering::Relaxed)
@@ -2246,7 +2257,9 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     install_global(t);
 
     // Everything the fixture seeds for FAKE_TID goes with it on every exit,
-    // including the exit taken when the mount fails.
+    // including the exit taken when the mount fails. The credential and prctl
+    // tables themselves stay initialised, holding no row for FAKE_TID, as
+    // every other test that resets them leaves them.
     let cleanup = |mounted: &Result<_, _>| {
         if let Ok(h) = mounted {
             let _ = narf_filesystem::registry().unmount(h, "/execve-own-stack");
@@ -2283,6 +2296,24 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
         c.ret
     }
 
+    // Both seeded tables must take a write for this task before the checks
+    // below can see one. The probe euid stays the caller's euid; it is not
+    // the image owner's, so the set-user-ID transition would still move it.
+    const PROBE_EUID: u32 = 4321;
+    let tid = FAKE_TID.load(Ordering::Relaxed);
+    crate::handlers::__test_set_uidgid_euid(tid, PROBE_EUID);
+    let euid_visible =
+        call(Syscall::Geteuid.raw(), 0, 0, 0) == Some(SyscallReturn::ok(u64::from(PROBE_EUID)));
+    crate::handlers::__test_set_dumpable_for_test(tid, false);
+    let dumpable_visible = !crate::handlers::__test_dumpable(tid);
+    if !euid_visible || !dumpable_visible {
+        cleanup(&mounted);
+        return TestResult::Fail(
+            "fixture: a credential or dumpable write for the caller was not visible, so the \
+             set-user-ID and dumpable checks could not observe an early transition",
+        );
+    }
+
     // Set-user-ID, owned by OWNER. chown first: it clears the set-ID bits.
     const OWNER: u64 = 4000;
     let path = b"/execve-own-stack/prog\0";
@@ -2290,7 +2321,6 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
         == Some(SyscallReturn::ok(0))
         && call(Syscall::Chmod.raw(), path.as_ptr() as u64, 0o4755, 0)
             == Some(SyscallReturn::ok(0));
-    let tid = FAKE_TID.load(Ordering::Relaxed);
     crate::handlers::__test_set_dumpable_for_test(tid, true);
     let euid_before = call(Syscall::Geteuid.raw(), 0, 0, 0);
     if !staged || euid_before.is_none() || euid_before == Some(SyscallReturn::ok(OWNER)) {
