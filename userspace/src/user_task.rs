@@ -3667,10 +3667,15 @@ pub(crate) struct SpawnHold {
 
 impl SpawnHold {
     /// Open a hold for `creator`, the scheduler task about to enter an
-    /// interceptor call.
-    pub(crate) fn open(creator: u64) -> Self {
+    /// interceptor call. `None` if `creator` already holds one: it is inside
+    /// an interceptor call now, so the entry asking is kernel code running a
+    /// syscall on its behalf, not the guest (see `dispatch_intercepted`).
+    pub(crate) fn try_open(creator: u64) -> Option<Self> {
         let mut holds = SPAWN_HOLDS.lock();
-        let previous = holds.insert(
+        if holds.contains_key(&creator) {
+            return None;
+        }
+        holds.insert(
             creator,
             HeldSpawns {
                 children: alloc::vec::Vec::new(),
@@ -3678,9 +3683,8 @@ impl SpawnHold {
                 vfork_wait: None,
             },
         );
-        assert!(previous.is_none(), "nested spawn hold for task {creator}");
         SPAWN_HOLD_COUNT.fetch_add(1, Ordering::AcqRel);
-        Self { creator }
+        Some(Self { creator })
     }
 
     /// Close the hold: publish every held child in creation order and return

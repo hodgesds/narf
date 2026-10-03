@@ -39,6 +39,7 @@ static FORK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_FORK"));
 static PIPE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PIPE"));
 static EXEC_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_EXEC"));
 static VFORK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_VFORK"));
+static RING_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RING"));
 
 /// The single argument every guest is started with, as Linux starts a program
 /// with `argv[0]`. A non-empty argv makes the loader lay out the full SysV
@@ -1345,6 +1346,89 @@ fn reverie_narf_spawn_hold_and_vfork_wait() -> TestResult {
     })())
 }
 kernel_test_in!("reverie-narf", reverie_narf_spawn_hold_and_vfork_wait);
+
+// ── Kernel-internal re-entry ──────────────────────────────────────────────
+
+/// Narf's ring bootstrap and ring kick (guests/ring_x86_64.S).
+const NARF_BOOTSTRAP: u32 = 0x4001;
+const NARF_RING_KICK: u32 = 0x4003;
+const LINUX_PIPE2: u32 = 293;
+const LINUX_READ: u32 = 0;
+
+static RING_ROOT: AtomicU64 = AtomicU64::new(0);
+static RING_LOG: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Records the number of every syscall the ring guest's task is intercepted
+/// for, and runs each natively.
+struct RingWatch;
+
+impl SyscallInterceptor for RingWatch {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        _native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        if invocation.task_id == RING_ROOT.load(Ordering::Acquire) {
+            RING_LOG
+                .lock()
+                .push(invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK);
+        }
+        SyscallInterception::Continue
+    }
+}
+
+/// A syscall the kernel performs on a task's behalf, re-entering the syscall
+/// dispatcher while the task's own intercepted syscall is still in its
+/// interceptor call, is not intercepted: the ring kick's bridged pipe write
+/// runs natively and completes, and the interceptor sees only the guest's own
+/// syscalls (Linux reports no syscall stop for io_uring's work either). The
+/// guest checks the completion and the bytes it reads back.
+fn reverie_narf_kernel_reentry_is_not_intercepted() -> TestResult {
+    RING_ROOT.store(0, Ordering::Release);
+    RING_LOG.lock().clear();
+    // Kernel-test boots skip the boot-time userspace init that creates the
+    // bootstrap registry (bare_main.rs calls `bootstrap_init` only on a real
+    // boot); the userspace ring tests create it the same way.
+    narf_userspace::bootstrap_init();
+    let rings_before = narf_userspace::handlers::bootstrap_live_count();
+    result_of((|| {
+        let (_, reap) = run_guest_with(
+            RING_GUEST,
+            Box::new(RingWatch),
+            |root| {
+                RING_ROOT.store(root.task_id, Ordering::Release);
+                Ok(())
+            },
+            true,
+        )?;
+        let reap = reap.ok_or("the run did not reap its root")?;
+        let log = core::mem::take(&mut *RING_LOG.lock());
+        if reap.wstatus != 0 {
+            let _ = writeln!(Writer, "    root wstatus {:#x} log {log:x?}", reap.wstatus);
+            return Err("the ring guest did not exit 0: its kernel-performed write failed a check");
+        }
+        if log
+            != [
+                LINUX_PIPE2,
+                NARF_BOOTSTRAP,
+                NARF_RING_KICK,
+                LINUX_READ,
+                LINUX_EXIT,
+            ]
+        {
+            let _ = writeln!(Writer, "    ring log {log:x?}");
+            return Err("the interceptor did not see exactly the guest's own syscalls");
+        }
+        if narf_userspace::handlers::bootstrap_live_count() != rings_before {
+            return Err("the ring guest's bootstrap rings outlived it");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_kernel_reentry_is_not_intercepted
+);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 

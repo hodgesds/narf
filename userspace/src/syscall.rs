@@ -5313,8 +5313,24 @@ impl SyscallTable {
             return;
         };
 
-        let args = *ctx.args();
         let task_id = crate::handlers::current_task_id();
+        // Tasks created during the callback stay off the run queues until it
+        // returns, so the interceptor registers them before they can run.
+        //
+        // A task that already holds one is inside an interceptor call, so
+        // this entry is not a guest syscall: kernel code is running a syscall
+        // on the task's behalf through the same entry point, as the ring kick
+        // does for each submission it bridges (sys_ring_kick ->
+        // abi_file_op_bridge -> kernel_syscall_entry). Linux reports no
+        // syscall stop for work the kernel performs on a task's behalf
+        // (io_uring submissions), so the interceptor gets no event either:
+        // the syscall runs natively, with no park record and no hold of its
+        // own, and the enclosing call's hold still covers any task it creates.
+        let Some(hold) = crate::user_task::SpawnHold::try_open(task_id) else {
+            self.dispatch_native(variant, version, ctx);
+            return;
+        };
+        let args = *ctx.args();
         let instruction_pointer = ctx.rip();
         let invocation = SyscallInvocation {
             raw_number,
@@ -5341,9 +5357,6 @@ impl SyscallTable {
             };
             saved.then_some(state)
         };
-        // Tasks created during the callback stay off the run queues until it
-        // returns, so the interceptor registers them before they can run.
-        let hold = crate::user_task::SpawnHold::open(task_id);
         let (outcome, deferred) = {
             let mut native = DispatchNativeTransition {
                 table: self,
