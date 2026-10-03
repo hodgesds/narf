@@ -2245,20 +2245,8 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     install_core_syscalls(&mut t);
     install_global(t);
 
-    let elf = build_minimal_elf_for_execve();
-    let auth = narf_filesystem::bootstrap_mount_authority();
-    let mounted = narf_filesystem::registry().mount(
-        &auth,
-        "/execve-own-stack",
-        narf_filesystem::MemFs::with_seeds("execve-own-stack", &[("prog", &elf)]),
-    );
-    if mounted.is_err() {
-        crate::syscall::__test_clear_global();
-        crate::handlers::__test_reset_task_id_lookup();
-        return TestResult::Fail("mount of execve FS failed");
-    }
-
-    // Everything the fixture seeds for FAKE_TID goes with it on every exit.
+    // Everything the fixture seeds for FAKE_TID goes with it on every exit,
+    // including the exit taken when the mount fails.
     let cleanup = |mounted: &Result<_, _>| {
         if let Ok(h) = mounted {
             let _ = narf_filesystem::registry().unmount(h, "/execve-own-stack");
@@ -2267,6 +2255,18 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
         crate::syscall::__test_clear_global();
         crate::handlers::__test_reset_task_id_lookup();
     };
+
+    let elf = build_minimal_elf_for_execve();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-own-stack",
+        narf_filesystem::MemFs::with_seeds("execve-own-stack", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        cleanup(&mounted);
+        return TestResult::Fail("mount of execve FS failed");
+    }
     fn call(nr: u32, a0: u64, a1: u64, a2: u64) -> Option<SyscallReturn> {
         let mut c = StubCtx {
             args: SyscallArgs {
@@ -2314,10 +2314,11 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
         },
         ret: None,
     };
-    narf_scheduler::stackful::enable_user_own_stack();
+    // Own-stack mode on for the exec only, then back to whatever mode this
+    // test found (not unconditionally off).
+    let own_stack_was_on = crate::user_task::__test_set_own_stack_mode(true);
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
-    #[cfg(feature = "kernel-test")]
-    narf_scheduler::stackful::__reset_user_own_stack_for_test();
+    crate::user_task::__test_set_own_stack_mode(own_stack_was_on);
 
     let comm = crate::handlers::proc_comm_of(tid);
     let euid_after = call(Syscall::Geteuid.raw(), 0, 0, 0);

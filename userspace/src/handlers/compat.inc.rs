@@ -7769,12 +7769,22 @@ fn futex_drop_task_waiters(task_id: u64) {
 ///     (the deadline was cleared by `wake_signal` or `wake_one_inner`, which
 ///     do not touch the futex queue), and the seven self-wake exits.
 ///   - Both paths: every `Wake` outcome of `futex_park_register_and_check`.
+///   - Wait entry: `sys_futex` for FUTEX_WAIT and FUTEX_WAIT_BITSET, and
+///     `futex_wait_core` for the futex2 `futex_wait` and `futex_waitv`, before
+///     the new wait publishes its target. This is the backstop for any exit
+///     the list above misses: whatever row survived one, the task's next wait
+///     drops it before its park loop can register.
 ///
 /// Not callers: the aarch64 legacy poll registers no futex waker, so it has
 /// nothing to leave (its `futex_uaddr` is cleared on the next `sys_futex`
 /// entry). `own_stack_park`'s two breaks for "no stackful executor" and "no
-/// current user task" run before the decision and do not call it. Task exit
-/// calls [`futex_drop_task_waiters`] directly.
+/// current user task" do not call it. On the first iteration they run before
+/// any registration. On a later iteration, after a resume, a registration
+/// from the earlier iteration would survive them; production is not known to
+/// reach them there (the executor publishes the stackful task before
+/// resuming it, and the loop re-installs `CURRENT`), and the wait-entry drop
+/// above removes such a row before the task's next wait. Task exit calls
+/// [`futex_drop_task_waiters`] directly.
 ///
 /// After a leave the task holds no registration while it runs, so a later
 /// `FUTEX_WAKE` cannot be spent on a stale entry for a task that is not
@@ -7906,6 +7916,11 @@ enum FutexParkRegistration {
 /// A concurrent wake or leave can remove the row just after the check; the
 /// task has then been woken, or is itself leaving, and returning `Moved`
 /// costs nothing.
+///
+/// Reading a row under another key as "moved" is sound only if every row the
+/// task holds belongs to its current wait. Every futex wait entry drops the
+/// task's rows before publishing its target (see [`futex_park_leave`]), so a
+/// row from an earlier wait cannot reach this check.
 fn futex_park_register_key(
     key: FutexKey,
     task_id: u64,
@@ -8326,6 +8341,14 @@ pub(crate) fn futex_park_register_and_check(
         // so validating would turn such a re-check into a spurious wake of a
         // task that is still correctly queued. The retarget will point the
         // context at the destination.
+        //
+        // This poll's `waker` is dropped here; only the waker the requeue
+        // moved can wake the task. That is safe only because every waker the
+        // executor hands this task resolves to the same per-slot wake cell
+        // (`make_waker(slot.awake.clone())`, scheduler/src/lib.rs), so an
+        // older waker still resumes the same slot even after the executor
+        // replaced `current_waker`. A waker that did not reach that cell
+        // would strand the moved task.
         return FutexParkCheck::Stay;
     }
     let stay = futex_park_should_stay(
@@ -8553,6 +8576,13 @@ fn futex_wait_core(
     park_cap_ns: u64,
     flags: u64,
 ) {
+    // Start the wait with no futex registration left over from an earlier
+    // one; see the same drop at `sys_futex` entry. `futex_park_leave` drops
+    // every row the task holds, then clears the target fields.
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: uctx is live for this trap; atomic fields.
+        futex_park_leave(unsafe { &*uctx }, current_task_id());
+    }
     // The address is validated ONLY here, by the shared funnel. This helper
     // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
     // kept reporting a spurious wake for a null word after the classic

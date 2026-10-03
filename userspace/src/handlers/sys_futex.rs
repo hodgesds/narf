@@ -44,11 +44,24 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     // Start each futex op from clean park state so a stale `futex_uaddr` left
     // by a prior wait (e.g. a wake that cleared only the deadline) can't make
     // the poll routine re-register on the old word.
+    //
+    // A wait op also drops every futex registration the task still holds,
+    // through `futex_park_leave` (drop first, then clear the fields). The
+    // park registrar treats any row under another key as "a requeue moved
+    // me" and stays parked without inserting a waker, so one stale row would
+    // make this wait unwakeable by FUTEX_WAKE. A task executing a syscall is
+    // not parked, and registrations exist only inside a park loop for the
+    // wait its own syscall published, so any row found here is stale. The
+    // drop is gated on a current user task, as the park itself is: a wait
+    // with no user task never publishes a target and never registers.
     if let Some(uctx) = crate::user_task::current_user_task() {
-        // SAFETY: uctx is live for this trap; atomic field.
-        unsafe {
-            (*uctx).futex_uaddr.store(0, Ordering::Release);
-            (*uctx).futex_namespace.store(0, Ordering::Release);
+        // SAFETY: uctx is live for this trap; atomic fields.
+        let uc = unsafe { &*uctx };
+        if matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
+            futex_park_leave(uc, current_task_id());
+        } else {
+            uc.futex_uaddr.store(0, Ordering::Release);
+            uc.futex_namespace.store(0, Ordering::Release);
         }
     }
     // Step 1: the timespec is decoded in the syscall wrapper, before

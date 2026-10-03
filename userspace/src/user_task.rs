@@ -1527,6 +1527,40 @@ pub fn __test_clear_hooks() {
     narf_scheduler::stackful::__reset_user_own_stack_for_test();
 }
 
+/// Test-only: set the own-stack mode alone and return the mode it replaced,
+/// so a test can put back exactly what it found. Leaves the scheduler's
+/// direct-handoff state alone, unlike [`__test_clear_hooks`]. Without the
+/// `kernel-test` feature the mode can only be switched on, as production
+/// boot does; a request to switch it off then changes nothing (no kernel
+/// test runs in that build).
+#[doc(hidden)]
+pub fn __test_set_own_stack_mode(on: bool) -> bool {
+    #[cfg(feature = "kernel-test")]
+    {
+        narf_scheduler::stackful::__set_user_own_stack_for_test(on)
+    }
+    #[cfg(not(feature = "kernel-test"))]
+    {
+        let was = narf_scheduler::stackful::user_own_stack_enabled();
+        if on {
+            narf_scheduler::stackful::enable_user_own_stack();
+        }
+        was
+    }
+}
+
+/// Test-only: install `hook` (or none) as the yield hook and return the one
+/// it replaced, so a test with its own longjmp hook can restore the old one.
+#[doc(hidden)]
+pub fn __test_swap_yield_hook(hook: Option<ExitHook>) -> Option<ExitHook> {
+    let prev = yield_hook();
+    match hook {
+        Some(h) => install_yield_hook(h),
+        None => YIELD_HOOK.store(core::ptr::null_mut(), Ordering::Release),
+    }
+    prev
+}
+
 /// Test-only reset of the execve hook (a test that installs its own
 /// longjmp hook must not leave it behind for later execve tests).
 #[doc(hidden)]

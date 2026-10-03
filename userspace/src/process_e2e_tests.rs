@@ -1862,11 +1862,22 @@ fn smoke_legacy_poll_resume_leaves_futex_park() -> TestResult {
     let word: u32 = 7;
     let word1 = &word as *const u32 as u64;
 
-    // The legacy poll path runs only with own-stack mode off. Turn it off the
-    // way `__test_clear_hooks` does and put back whatever mode we found.
-    let own_stack_was_on = narf_scheduler::stackful::user_own_stack_enabled();
+    // The legacy poll path runs only with own-stack mode off. Switch the mode
+    // alone and put back whatever mode we found. The scheduler's
+    // direct-handoff state is not this test's to clear
+    // (`__reset_user_own_stack_for_test` would clear every slot), so a
+    // sentinel seeded in an offline CPU's slot must survive the switch and
+    // the restore.
     #[cfg(feature = "kernel-test")]
-    narf_scheduler::stackful::__reset_user_own_stack_for_test();
+    const HANDOFF_PROBE_CPU: usize = narf_lib::percpu::MAX_CPUS - 1;
+    #[cfg(feature = "kernel-test")]
+    const HANDOFF_SENTINEL: u64 = 0x5EED_F00D_D1CE;
+    #[cfg(feature = "kernel-test")]
+    let handoff_found = narf_scheduler::stackful::__swap_direct_foreign_cycles_for_test(
+        HANDOFF_PROBE_CPU,
+        HANDOFF_SENTINEL,
+    );
+    let own_stack_was_on = crate::user_task::__test_set_own_stack_mode(false);
 
     let t_task = crate::task::Task::new_registered(T, T + 1);
     let w_task = crate::task::Task::new_registered(W, W + 1);
@@ -1887,8 +1898,19 @@ fn smoke_legacy_poll_resume_leaves_futex_park() -> TestResult {
         crate::handlers::drop_signal_waker(T);
         crate::task::release_task(T);
         crate::task::release_task(W);
-        if own_stack_was_on {
-            narf_scheduler::stackful::enable_user_own_stack();
+        crate::user_task::__test_set_own_stack_mode(own_stack_was_on);
+        #[cfg(feature = "kernel-test")]
+        {
+            let left = narf_scheduler::stackful::__swap_direct_foreign_cycles_for_test(
+                HANDOFF_PROBE_CPU,
+                handoff_found,
+            );
+            if left != HANDOFF_SENTINEL {
+                return TestResult::Fail(
+                    "the test's own-stack mode switch cleared DIRECT_HANDOFF state it does not \
+                     own",
+                );
+            }
         }
         result
     };
@@ -1982,6 +2004,316 @@ fn smoke_legacy_poll_resume_leaves_futex_park() -> TestResult {
 kernel_test_in!(
     "userspace/process",
     smoke_legacy_poll_resume_leaves_futex_park
+);
+
+/// Jump target for [`smoke_futex_wait_entry_drops_stale_registration`]'s
+/// stand-in yield hook.
+struct WaitEntryJmp(core::cell::UnsafeCell<narf_scheduler::JmpBuf>);
+// SAFETY: written only by that one test; the kernel-test runner runs one
+// test body at a time.
+unsafe impl Sync for WaitEntryJmp {}
+// SAFETY: `JmpBuf` is plain saved-register storage; all-zero is a valid
+// (unused) value, and setjmp fills it before any longjmp reads it.
+static WAIT_ENTRY_JMP: WaitEntryJmp =
+    WaitEntryJmp(core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }));
+
+/// Stand-in for the legacy poller's yield hook: longjmp straight back into
+/// the test, abandoning the wait syscall's frames the way the production
+/// hook abandons them into the polling routine.
+unsafe fn wait_entry_yield_hook(_uctx: *mut crate::user_task::UserTaskCtx) -> ! {
+    // SAFETY: the jmp buf was filled by the setjmp in the test body, whose
+    // frame is still live (it is waiting for this longjmp).
+    unsafe { narf_scheduler::longjmp(WAIT_ENTRY_JMP.0.get(), 1) }
+}
+
+/// Every futex wait op must start with no futex registration left from an
+/// earlier wait (finding D21 of the fb0a3768 review). The park registrar
+/// reads any row the task holds under another word as "a requeue moved me"
+/// and stays parked without queueing a waker, so one stale row would make
+/// the next wait unwakeable: FUTEX_WAKE on the word the task now waits on
+/// finds nobody.
+///
+/// For each wait entry point -- FUTEX_WAIT, FUTEX_WAIT_BITSET, futex2
+/// `futex_wait` and `futex_waitv` -- a synthetic task T gets a stale row on
+/// word A, then issues the real syscall through `kernel_syscall_entry` to
+/// wait on word B (legacy mode: the wait publishes its target and calls the
+/// yield hook, which longjmps back here). T's production park decision then
+/// runs, and a real FUTEX_WAKE(B, 1) must report one task woken and fire T's
+/// waker.
+///
+/// The futex2 ops park with a 50 ms cap (`FUTEX2_PARK_CAP_NS`). The test
+/// widens T's published deadline to infinite after the syscall returns, so
+/// a slow emulator cannot expire the park between the syscall and the wake
+/// and turn the check into a timeout; the registration under test does not
+/// depend on the deadline.
+fn smoke_futex_wait_entry_drops_stale_registration() -> TestResult {
+    use crate::handlers::{
+        __test_futex_drop_task_waiters_racing, __test_futex_task_index, futex_register_waiter,
+        futex_wake_waiters_for_test, with_kernel_buffers,
+    };
+    use crate::user_task::{
+        __test_park_should_block_for, clear_current, install_current, UserTaskCtx,
+    };
+    // The module-level `Arc` import is x86_64-only; this test runs on
+    // every architecture.
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU32;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: &Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: the vtable matches the Arc<AtomicU32> representation.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(counter.clone()) as *const (),
+                &VTAB,
+            ))
+        }
+    }
+
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX2_SIZE_U32: u64 = 0x02;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Entry {
+        Wait,
+        WaitBitset,
+        Futex2Wait,
+        Futex2Waitv,
+    }
+    const CASES: [(Entry, &str, u64); 4] = [
+        (Entry::Wait, "FUTEX_WAIT", 0xF6_10),
+        (Entry::WaitBitset, "FUTEX_WAIT_BITSET", 0xF6_20),
+        (Entry::Futex2Wait, "futex_wait", 0xF6_30),
+        (Entry::Futex2Waitv, "futex_waitv", 0xF6_40),
+    ];
+
+    static CUR_TID: AtomicU64 = AtomicU64::new(0);
+    fn task_lookup() -> u64 {
+        CUR_TID.load(Ordering::Relaxed)
+    }
+
+    // Readable futex words on this stack; the kernel-buffer opt-in lets the
+    // syscalls' copy-in and the park check's word re-validation read them.
+    let words: [u32; 2] = [0x51, 0x52];
+    let word_a = &words[0] as *const u32 as u64;
+    let word_b = &words[1] as *const u32 as u64;
+    let val_b = words[1] as u64;
+    // One `struct futex_waitv` {u64 val, u64 uaddr, u32 flags, u32 reserved}
+    // naming word B; both architectures are little-endian, so the third u64
+    // is `flags` with a zero `__reserved`.
+    let waitv: [u64; 3] = [val_b, word_b, FUTEX2_SIZE_U32];
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+    install_task_id_lookup(task_lookup);
+    // Legacy mode (the wait calls the yield hook), with this test's hook.
+    // Both are put back to what the test found.
+    let own_stack_was_on = crate::user_task::__test_set_own_stack_mode(false);
+    let hook_was = crate::user_task::__test_swap_yield_hook(Some(wait_entry_yield_hook));
+
+    let run_case = |entry: Entry, name: &str, tid: u64| -> Result<(), &'static str> {
+        CUR_TID.store(tid, Ordering::Relaxed);
+        let t_task = crate::task::Task::new_registered(tid, tid + 1);
+        let uc: &UserTaskCtx = &t_task.uctx;
+        let uctx_ptr = uc as *const UserTaskCtx as *mut UserTaskCtx;
+        let stale_fired = Arc::new(AtomicU32::new(0));
+        let t_fired = Arc::new(AtomicU32::new(0));
+        let t_waker = counting_waker(&t_fired);
+        let mut sleep: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle> = None;
+
+        let r = (|| -> Result<(), &'static str> {
+            // The stale row: T queued on word A from a wait it has left.
+            futex_register_waiter(word_a, tid, counting_waker(&stale_fired));
+            if __test_futex_task_index(tid).as_slice() != [word_a] {
+                return Err("setup: the stale row on word A was not seeded");
+            }
+            let (nr, args) = match entry {
+                Entry::Wait => (
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: word_b,
+                        arg1: FUTEX_WAIT,
+                        arg2: val_b,
+                        arg3: 0,
+                        arg4: 0,
+                        arg5: 0,
+                    },
+                ),
+                Entry::WaitBitset => (
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: word_b,
+                        arg1: FUTEX_WAIT_BITSET,
+                        arg2: val_b,
+                        arg3: 0,
+                        arg4: 0,
+                        arg5: 0xFFFF_FFFF,
+                    },
+                ),
+                Entry::Futex2Wait => (
+                    Syscall::FutexWait.raw(),
+                    SyscallArgs {
+                        arg0: word_b,
+                        arg1: val_b,
+                        arg2: 0xFFFF_FFFF,
+                        arg3: FUTEX2_SIZE_U32,
+                        arg4: 0,
+                        arg5: 0,
+                    },
+                ),
+                Entry::Futex2Waitv => (
+                    Syscall::FutexWaitv.raw(),
+                    SyscallArgs {
+                        arg0: waitv.as_ptr() as u64,
+                        arg1: 1,
+                        arg2: 0,
+                        arg3: 0,
+                        arg4: 0,
+                        arg5: 0,
+                    },
+                ),
+            };
+            let mut ctx = StubCtx { args, ret: None };
+            let ctx_ptr: *mut StubCtx = &mut ctx;
+            // IRQs masked across install_current -> syscall -> longjmp: the
+            // legacy CURRENT cell is per-CPU, and a migration in between
+            // would make the wait see no user task and skip the park.
+            let parked = narf_lib::sync::without_interrupts(|| {
+                install_current(uctx_ptr);
+                core::hint::black_box(ctx_ptr);
+                // SAFETY: WAIT_ENTRY_JMP is a valid JmpBuf; the yield hook
+                // longjmps back here while this frame is live.
+                let resumed = unsafe { narf_scheduler::setjmp(WAIT_ENTRY_JMP.0.get()) };
+                if resumed == 0 {
+                    // SAFETY: `ctx_ptr` points at `ctx`, live in the caller.
+                    kernel_syscall_entry(nr, unsafe { &mut *ctx_ptr });
+                    // The yield hook must have fired and longjmp'd past here.
+                    return false;
+                }
+                true
+            });
+            clear_current();
+            // SAFETY: `ctx_ptr` points at `ctx`; volatile because the
+            // syscall wrote it on the path the longjmp abandoned.
+            let ret = unsafe { core::ptr::read_volatile(&(*ctx_ptr).ret) };
+            if !parked || ret != Some(SyscallReturn::ok(0)) {
+                narf_console::klog!("    wait-entry {}: parked={} ret={:?}", name, parked, ret);
+                return Err("setup: the wait did not reach the yield hook with return 0");
+            }
+            if uc.futex_uaddr.load(Ordering::Acquire) != word_b {
+                return Err("setup: the wait did not publish word B as its target");
+            }
+            if matches!(entry, Entry::Futex2Wait | Entry::Futex2Waitv) {
+                uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+            }
+            if !with_kernel_buffers(|| __test_park_should_block_for(tid, uc, &t_waker, &mut sleep))
+            {
+                return Err("setup: T's park loop did not block on word B");
+            }
+            // The wake, through the production syscall.
+            let mut wake = StubCtx {
+                args: SyscallArgs {
+                    arg0: word_b,
+                    arg1: FUTEX_WAKE,
+                    arg2: 1,
+                    arg3: 0,
+                    arg4: 0,
+                    arg5: 0,
+                },
+                ret: None,
+            };
+            kernel_syscall_entry(Syscall::Futex.raw(), &mut wake);
+            let t_hits = t_fired.load(Ordering::Acquire);
+            if wake.ret != Some(SyscallReturn::ok(1)) || t_hits != 1 {
+                narf_console::klog!(
+                    "    wait-entry {}: FUTEX_WAKE(B, 1) returned {:?}, T woken {} times, T's \
+                     rows {:x?}",
+                    name,
+                    wake.ret,
+                    t_hits,
+                    __test_futex_task_index(tid).as_slice()
+                );
+                return Err(
+                    "a stale futex row on word A made the task's wait on word B unwakeable: \
+                     FUTEX_WAKE(B, 1) did not wake it",
+                );
+            }
+            if with_kernel_buffers(|| __test_park_should_block_for(tid, uc, &t_waker, &mut sleep)) {
+                return Err("T's park loop stayed parked after FUTEX_WAKE(B, 1)");
+            }
+            if !__test_futex_task_index(tid).is_empty() {
+                return Err("T kept a futex row after its park loop left");
+            }
+            Ok(())
+        })();
+
+        clear_current();
+        if let Some(h) = sleep.take() {
+            narf_scheduler::narf_time::timer_wheel::cancel(h);
+        }
+        for u in [word_a, word_b] {
+            let _ = futex_wake_waiters_for_test(u, u32::MAX);
+        }
+        __test_futex_drop_task_waiters_racing(tid, |_| {});
+        crate::handlers::drop_signal_waker(tid);
+        crate::task::release_task(tid);
+        drop(t_waker);
+        drop(t_task);
+        if r.is_err() {
+            narf_console::klog!("    wait-entry case {} failed", name);
+        }
+        r
+    };
+
+    // Every case runs, so one failing entry point does not hide another;
+    // the first failure is reported.
+    let mut result = Ok(());
+    for (entry, name, tid) in CASES {
+        let r = run_case(entry, name, tid);
+        if result.is_ok() {
+            result = r;
+        }
+    }
+
+    crate::user_task::__test_swap_yield_hook(hook_was);
+    crate::user_task::__test_set_own_stack_mode(own_stack_was_on);
+    crate::handlers::__test_reset_task_id_lookup();
+    crate::syscall::__test_clear_global();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_futex_wait_entry_drops_stale_registration
 );
 
 /// The exit-time robust-futex walk reads fully user-controlled pointers

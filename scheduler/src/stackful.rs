@@ -295,6 +295,29 @@ pub fn __reset_user_own_stack_for_test() {
     }
 }
 
+/// Set the own-stack latch alone and return its previous value.
+///
+/// Unlike [`__reset_user_own_stack_for_test`], this leaves every
+/// `DIRECT_HANDOFF` slot untouched, so a test can switch to the legacy path
+/// and back to the mode it found without clearing scheduler state it does not
+/// own.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __set_user_own_stack_for_test(on: bool) -> bool {
+    USE_OWN_STACK.swap(on, Ordering::AcqRel)
+}
+
+/// Swap `cpu`'s direct-handoff foreign-cycle count and return the old value.
+/// Lets a test seed a sentinel in an offline CPU's slot and check that its
+/// mode switches left `DIRECT_HANDOFF` alone.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __swap_direct_foreign_cycles_for_test(cpu: usize, cycles: u64) -> u64 {
+    DIRECT_HANDOFF[cpu]
+        .foreign_cycles
+        .swap(cycles, Ordering::AcqRel)
+}
+
 // Hooks for saving/restoring the CURRENT user task's FPU (x87/SSE) across a
 // `kernel_switch` out/in. The FPU area lives in userspace (`UserTaskFuture`),
 // so the scheduler drives it through these hooks rather than reaching across
