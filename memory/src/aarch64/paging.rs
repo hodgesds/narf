@@ -53,6 +53,56 @@ pub fn __teardown_batch_counts_for_test() -> (u64, u64) {
     )
 }
 
+/// Operand of a TLBI by-VA instruction, as Linux builds it in
+/// `__TLBI_VADDR(addr, asid)`: `((addr >> 12) & GENMASK_ULL(43, 0)) |
+/// (asid << 48)`.
+///
+/// VA[55:12] goes in bits 43:0. Bits 47:44 are the TTL level hint (FEAT_TTL)
+/// and stay zero, meaning "no hint". Bits 63:48 carry the ASID; the all-ASID
+/// forms (VAAE1IS, VAALE1IS) ignore it, and callers of those pass 0.
+///
+/// The mask is what matters for a TTBR1 address. Its bits 63:56 are all
+/// ones, so `va >> 12` alone puts ones into bits 51:44: a nonzero TTL, which
+/// on a CPU implementing FEAT_TTL names a translation granule and level that
+/// may not match the entry, and the architecture then does not require that
+/// entry to be invalidated.
+#[inline]
+pub(crate) const fn tlbi_va_operand(va: u64, asid: u16) -> u64 {
+    ((va >> 12) & ((1u64 << 44) - 1)) | ((asid as u64) << 48)
+}
+
+/// Last TLBI operand each CPU issued through the two by-VA helpers below.
+#[cfg(feature = "kernel-test")]
+static LAST_TLBI_OPERAND: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+#[cfg(feature = "kernel-test")]
+#[inline]
+fn record_tlbi_operand(op: u64) {
+    LAST_TLBI_OPERAND[narf_lib::percpu::current_cpu()]
+        .store(op, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only: the last operand this CPU passed to TLBI VAAE1IS or VAALE1IS
+/// through [`tlb_invalidate_va_all_asids_inner_shareable`] or the 4 KiB range
+/// helper. Read it with interrupts masked since the call.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __last_tlbi_operand_for_test() -> u64 {
+    LAST_TLBI_OPERAND[narf_lib::percpu::current_cpu()].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: run the private 4 KiB range invalidation helper.
+///
+/// # Safety
+/// As for the helper: the leaves in the range must already be updated.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub unsafe fn __tlb_invalidate_4kb_range_for_test(base: VirtAddr, pages: u64) {
+    // SAFETY: forwarded; same contract.
+    unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) }
+}
+
 /// A single 64-bit descriptor.
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
@@ -418,8 +468,11 @@ pub unsafe fn tlb_invalidate_va_all_asids_inner_shareable(virt: VirtAddr) {
     use core::sync::atomic::{compiler_fence, Ordering};
 
     compiler_fence(Ordering::SeqCst);
+    let op = tlbi_va_operand(virt.as_u64(), 0);
+    #[cfg(feature = "kernel-test")]
+    record_tlbi_operand(op);
     // SAFETY: TLBI at EL1 is always legal; the VA field is
-    // bits [43:0] of the operand (shifted-down by 12).
+    // bits [43:0] of the operand (see `tlbi_va_operand`).
     // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
@@ -427,7 +480,7 @@ pub unsafe fn tlb_invalidate_va_all_asids_inner_shareable(virt: VirtAddr) {
             "tlbi vaae1is, {a}",
             "dsb ish",
             "isb",
-            a = in(reg) (virt.as_u64() >> 12),
+            a = in(reg) op,
             options(nostack, preserves_flags),
         );
     }
@@ -451,10 +504,12 @@ unsafe fn tlb_invalidate_4kb_range_all_asids_inner_shareable(base: VirtAddr, pag
     #[cfg(feature = "kernel-test")]
     TLBI_BARRIER_SEQUENCES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: EL1 barrier and TLBI operations are unconditional. VAs are
-    // page-aligned by the caller and encoded shifted down by 12.
+    // page-aligned by the caller and encoded by `tlbi_va_operand`.
     unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
     for page in 0..pages {
-        let va_page = (base.as_u64() >> 12) + page;
+        let va_page = tlbi_va_operand(base.as_u64() + page * 4096, 0);
+        #[cfg(feature = "kernel-test")]
+        record_tlbi_operand(va_page);
         // SAFETY: as above — unconditional EL1 TLBI over a page-aligned VA.
         unsafe {
             asm!(

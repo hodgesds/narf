@@ -1702,6 +1702,70 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
 #[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
 kernel_test_in!("memory", smoke_aarch64_paging_scatter_and_range_unmap);
 
+/// TLBI by-VA operands must carry VA[55:12] in bits 43:0 and nothing from
+/// the VA's top bits above them, as Linux's `__TLBI_VADDR` builds them. A
+/// TTBR1 (kernel) address has bits 63:56 set; shifted down by 12 without a
+/// mask they land in the TTL hint (bits 47:44) and the ASID field, and a CPU
+/// implementing FEAT_TTL may then skip the entry the TLBI was meant to drop.
+///
+/// QEMU does not act on TTL, so no invalidation-effect test here could fail
+/// for the unmasked operand; the encoding is the honest check. The first
+/// half pins `tlbi_va_operand` on a TTBR1 and a TTBR0 address; the second
+/// runs both production helpers and compares the operand each actually
+/// issued (recorded per CPU just before the TLBI) with the masked encoding.
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+fn smoke_aarch64_tlbi_operand_masks_va_high_bits() -> TestResult {
+    use crate::aarch64::paging::{
+        __last_tlbi_operand_for_test, __tlb_invalidate_4kb_range_for_test,
+        tlb_invalidate_va_all_asids_inner_shareable, tlbi_va_operand,
+    };
+    use crate::VirtAddr;
+
+    // TTBR1: VA[55:12] = 0xFFF_F7FF_8000; bits 63:44 must all be clear.
+    const KVA: u64 = 0xFFFF_FF7F_F800_0000;
+    let k = tlbi_va_operand(KVA, 0);
+    if k != 0x0000_0FFF_F7FF_8000 || k >> 44 != 0 {
+        return TestResult::Fail(
+            "TLBI operand for a TTBR1 address carries VA top bits into the TTL/ASID fields",
+        );
+    }
+    // TTBR0 (52-bit VA): every VA bit up to 51 survives, nothing above.
+    const UVA: u64 = 0x000F_EDCB_A987_6000;
+    if tlbi_va_operand(UVA, 0) != 0x00FE_DCBA_9876 {
+        return TestResult::Fail("TLBI operand for a TTBR0 address lost or moved VA bits");
+    }
+    // The ASID goes in bits 63:48, above an untouched TTL field.
+    if tlbi_va_operand(KVA, 0xBEEF) != 0xBEEF_0FFF_F7FF_8000 {
+        return TestResult::Fail("TLBI operand does not place the ASID in bits 63:48");
+    }
+
+    // The production helpers. Invalidating a translation that is live (or
+    // absent) only costs a refetch. Interrupts stay masked from each call to
+    // the read, so no other TLBI on this CPU overwrites the record.
+    let (single, range_last) = narf_lib::sync::without_interrupts(|| {
+        // SAFETY: no descriptor was changed; the TLBI only drops cached
+        // copies of whatever the tables already say.
+        unsafe { tlb_invalidate_va_all_asids_inner_shareable(VirtAddr::new(KVA)) };
+        let single = __last_tlbi_operand_for_test();
+        // SAFETY: as above.
+        unsafe { __tlb_invalidate_4kb_range_for_test(VirtAddr::new(KVA), 2) };
+        (single, __last_tlbi_operand_for_test())
+    });
+    if single != tlbi_va_operand(KVA, 0) {
+        return TestResult::Fail(
+            "TLBI VAAE1IS was issued with an unmasked operand for a TTBR1 address",
+        );
+    }
+    if range_last != tlbi_va_operand(KVA + 4096, 0) {
+        return TestResult::Fail(
+            "TLBI VAALE1IS range was issued with an unmasked operand for a TTBR1 address",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+kernel_test_in!("memory", smoke_aarch64_tlbi_operand_masks_va_high_bits);
+
 #[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
 fn smoke_aarch64_paging_root_locks_are_sharded() -> TestResult {
     use crate::aarch64::paging::pt_lock_for;
