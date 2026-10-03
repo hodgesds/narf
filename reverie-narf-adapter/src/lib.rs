@@ -135,8 +135,12 @@
 //!    withheld.
 //! 7. Lifecycle callbacks (thread start, post-exec, exits) are not gated.
 //!    A SIGKILL there does not stop the inject from running.
-//! 8. Exit and exec transitions are never withheld. No test covers an
-//!    `exit_group` requested while a signal is withheld.
+//! 8. Exit and exec transitions are never withheld. After an injected
+//!    `kill(self, SIGTERM)`, an injected `exit_group(7)` runs: it does not
+//!    return, nothing after it runs, and the task exits with code 7
+//!    (`reverie_narf_exit_group_with_sigterm_pending_runs`). Under
+//!    reverie-ptrace the same `exit_group` returns `-ERESTARTSYS` without
+//!    running, the next inject runs, and the task dies of `SIGTERM`.
 //!
 //! ## Limits of the in-kernel tests
 //!

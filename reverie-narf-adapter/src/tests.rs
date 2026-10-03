@@ -1934,6 +1934,96 @@ kernel_test_in!(
     reverie_narf_sigterm_in_callback_matches_ptrace
 );
 
+/// What each inject of [`SigtermThenExitGroup`] returned ([`NOT_SEEN`] until
+/// it returned), and the guest's pid as the Tool saw it.
+static EXIT_GROUP_PID: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static EXIT_GROUP_KILL: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static EXIT_GROUP_EXIT: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static EXIT_GROUP_GETPID: AtomicI64 = AtomicI64::new(NOT_SEEN);
+
+/// At the canonical guest's `write`, sends the guest `SIGTERM` with an
+/// injected `kill`, then injects `exit_group(7)`, then `getpid`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SigtermThenExitGroup;
+
+#[reverie::tool]
+impl Tool for SigtermThenExitGroup {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        if syscall.number().id() as u32 == LINUX_WRITE {
+            let pid = guest.pid().as_raw();
+            EXIT_GROUP_PID.store(i64::from(pid), Ordering::Release);
+            let kill = reverie::syscalls::Kill::new()
+                .with_pid(pid)
+                .with_sig(LINUX_SIGTERM);
+            EXIT_GROUP_KILL.store(raw_result(guest.inject(kill).await), Ordering::Release);
+            let exit = reverie::syscalls::ExitGroup::new().with_status(7);
+            EXIT_GROUP_EXIT.store(raw_result(guest.inject(exit).await), Ordering::Release);
+            let getpid = reverie::syscalls::Getpid::new();
+            EXIT_GROUP_GETPID.store(raw_result(guest.inject(getpid).await), Ordering::Release);
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// An `exit_group` requested while a terminating signal is pending is where
+/// Narf and reverie-ptrace differ (backend contract, signal difference 8).
+/// Under ptrace (`reverie-ptrace/tests/inject_signal_parity.rs`,
+/// `exit_group_injected_while_sigterm_is_pending_returns_erestartsys_and_does_not_run`)
+/// the `exit_group` returns `-ERESTARTSYS` without running, the `getpid`
+/// after it runs, and the task dies of `SIGTERM`. Narf never withholds a
+/// context-ending transition, so here the `exit_group` runs: it does not
+/// return to the Tool, nothing after it runs, and the task exits with
+/// code 7.
+fn reverie_narf_exit_group_with_sigterm_pending_runs() -> TestResult {
+    for slot in [
+        &EXIT_GROUP_PID,
+        &EXIT_GROUP_KILL,
+        &EXIT_GROUP_EXIT,
+        &EXIT_GROUP_GETPID,
+    ] {
+        slot.store(NOT_SEEN, Ordering::Release);
+    }
+    init_signal_tables();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<SigtermThenExitGroup>(CANONICAL_GUEST, ())?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let pid = EXIT_GROUP_PID.load(Ordering::Acquire);
+        let kill = EXIT_GROUP_KILL.load(Ordering::Acquire);
+        let exit = EXIT_GROUP_EXIT.load(Ordering::Acquire);
+        let getpid = EXIT_GROUP_GETPID.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    pid {pid} kill {kill} exit_group {exit} getpid {getpid} holds {holds:?}"
+        );
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callback");
+        }
+        if pid <= 0 || kill != 0 {
+            return Err("the injected kill(self, SIGTERM) did not return 0");
+        }
+        if exit != NOT_SEEN {
+            return Err("the injected exit_group returned to the Tool");
+        }
+        if getpid != NOT_SEEN {
+            return Err("an inject after the exit_group ran");
+        }
+        check_teardown(&interceptor, root, 1, 7 << 8)?;
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_exit_group_with_sigterm_pending_runs
+);
+
 /// The guest's pid, whether the kill inject was issued, how many steps of
 /// [`SigkillInCallback`] ran after it, and how often its callback future was
 /// dropped.
