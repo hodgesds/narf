@@ -220,6 +220,14 @@ const RECLAIM_GRACE_PERIOD_NS: u64 = 1_000_000_000;
 /// root's and each forked or vforked child's.
 static EXITED_SPACES: IrqSafeSpinLock<Vec<Weak<AddressSpace>>> = IrqSafeSpinLock::new(Vec::new());
 
+/// Kernel re-entries (a syscall run by kernel code on a task's behalf while
+/// that task's own syscall is still in its interceptor call) the next
+/// [`run_guest_with`] expects its guest to make. Every other guest makes
+/// none, so any entry that finds its task already holding a spawn hold means
+/// a hold outlived its interceptor call. Taken (reset to 0) at the start of
+/// each run.
+static EXPECTED_KERNEL_REENTRIES: AtomicU64 = AtomicU64::new(0);
+
 /// The CPUs the current run's tasks exited on, one bit per CPU, printed
 /// after each run as evidence of where [`ProductionPlacement`] put them.
 static EXIT_CPUS: AtomicU64 = AtomicU64::new(0);
@@ -365,6 +373,7 @@ fn run_guest_with(
     use narf_userspace::syscall::__verification_clear_global as clear_global;
     use narf_userspace::{install_core_syscalls, install_global, install_task_id_lookup};
 
+    let expected_reentries = EXPECTED_KERNEL_REENTRIES.swap(0, Ordering::AcqRel);
     let cpu = narf_lib::percpu::current_cpu();
     let original_cr3: u64;
     // SAFETY: reading CR3 has no side effects.
@@ -457,6 +466,7 @@ fn run_guest_with(
         .filter(|frame| frame.raw() != 0)
         .collect::<Vec<_>>();
     let live_before = narf_scheduler::live_user_task_count();
+    let reentries_before = narf_userspace::user_task::__test_kernel_reentries();
     // Held until the function returns, which is after the run's last task
     // was reaped.
     let _placement = ProductionPlacement::enable();
@@ -543,6 +553,16 @@ fn run_guest_with(
 
     if WAITER_TIMED_OUT.load(Ordering::Acquire) != 0 {
         return Err("the guest's tasks were not reaped within the budget");
+    }
+    let reentries = narf_userspace::user_task::__test_kernel_reentries() - reentries_before;
+    if reentries != expected_reentries {
+        let _ = writeln!(
+            Writer,
+            "    {reentries} syscall entries ran without interception under an open spawn hold; the guest makes {expected_reentries} kernel re-entries"
+        );
+        return Err(
+            "syscall entries bypassed interception under an already open spawn hold, other than the guest's kernel re-entries",
+        );
     }
     let reap = match parent {
         None => None,
@@ -1841,6 +1861,8 @@ fn reverie_narf_kernel_reentry_is_not_intercepted() -> TestResult {
     narf_userspace::bootstrap_init();
     let rings_before = narf_userspace::handlers::bootstrap_live_count();
     result_of((|| {
+        // The kick bridges exactly one submission, the pipe write.
+        EXPECTED_KERNEL_REENTRIES.store(1, Ordering::Release);
         let (root, reap) = run_guest_with(
             RING_GUEST,
             Box::new(RingWatch),

@@ -3680,7 +3680,39 @@ static SPAWN_HOLDS: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap
 /// Number of open holds; lets the common, uninterecepted spawn skip the map.
 static SPAWN_HOLD_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Syscall entries that found their task already holding a spawn hold and so
+/// ran natively, without interception (the `None` of [`SpawnHold::try_open`]).
+///
+/// The only intended source is kernel code re-entering the dispatcher on a
+/// task's behalf while that task's own syscall is still in its interceptor
+/// call (the ring kick's bridged submissions). A hold that outlived its call
+/// would send every later syscall of its task down the same path, so a test
+/// that knows how many such re-entries its guest makes compares against this
+/// count to tell the two apart.
+static KERNEL_REENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Count one syscall entry that ran natively because its task already held a
+/// spawn hold (see [`KERNEL_REENTRIES`]).
+pub(crate) fn note_kernel_reentry() {
+    KERNEL_REENTRIES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Syscall entries so far that bypassed interception because their task
+/// already held a spawn hold (see [`KERNEL_REENTRIES`]). Monotonic.
+#[doc(hidden)]
+pub fn __test_kernel_reentries() -> u64 {
+    KERNEL_REENTRIES.load(Ordering::Acquire)
+}
+
 /// An open spawn hold for one creating task. See the section comment above.
+///
+/// There is no `Drop` guard. The one opener, `dispatch_intercepted`, has no
+/// return path between `try_open` and `release`: the interceptor call either
+/// returns or panics, and a task's exit or exec from inside the call is
+/// context-managed, so it runs only after `release`. The one way out of that span without `release` is a
+/// kernel panic, which halts the kernel (the kernel does not unwind), so a
+/// guard's `drop` would never run either. A hold that outlives its call is
+/// caught instead by [`__test_open_spawn_holds`] and [`KERNEL_REENTRIES`].
 #[must_use = "a spawn hold must be released, or its children never run"]
 pub(crate) struct SpawnHold {
     creator: u64,
@@ -3691,9 +3723,12 @@ impl SpawnHold {
     /// interceptor call. `None` if `creator` already holds one: it is inside
     /// an interceptor call now, so the entry asking is kernel code running a
     /// syscall on its behalf, not the guest (see `dispatch_intercepted`).
+    /// Each `None` is counted in [`KERNEL_REENTRIES`].
     pub(crate) fn try_open(creator: u64) -> Option<Self> {
         let mut holds = SPAWN_HOLDS.lock();
         if holds.contains_key(&creator) {
+            drop(holds);
+            note_kernel_reentry();
             return None;
         }
         holds.insert(

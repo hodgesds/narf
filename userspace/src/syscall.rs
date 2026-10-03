@@ -5456,6 +5456,8 @@ impl SyscallTable {
         // (io_uring submissions), so the interceptor gets no event either:
         // the syscall runs natively, with no park record and no hold of its
         // own, and the enclosing call's hold still covers any task it creates.
+        // `try_open` counts each such entry (`__test_kernel_reentries`), so a
+        // test can tell this case from a hold that outlived its call.
         let Some(hold) = crate::user_task::SpawnHold::try_open(task_id) else {
             self.dispatch_native(variant, version, ctx);
             return;
