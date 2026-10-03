@@ -49,13 +49,14 @@
 //!
 //! A hosted task's signal reaches the Tool's `handle_signal_event`
 //! (`NarfToolHost::handle_signal`) only where the task returns from a
-//! `syscall` instruction, the one delivery point where the task can wait for
-//! the Tool. The kernel delivers it once the Tool answers with the same
-//! signal, and discards it if the Tool suppresses it. A Tool that answers
-//! with another signal aborts the run. At every other delivery point (a
-//! timer interrupt that hit user mode, a page fault, a park in `poll` or
-//! `epoll`, an `int 0x80` return) the signal stays pending until the task's
-//! next syscall returns, so:
+//! syscall, made with the `syscall` instruction or with `int 0x80` (as
+//! Narf's own programs make every syscall): the delivery points where the
+//! task can wait for the Tool. The kernel delivers it once the Tool answers
+//! with the same signal, and discards it if the Tool suppresses it. A Tool
+//! that answers with another signal aborts the run. At every other delivery
+//! point (a timer interrupt that hit user mode, a page fault, a park in
+//! `poll` or `epoll`) the signal stays pending until the task's next
+//! syscall returns, so:
 //!
 //! * A hosted task that makes no syscalls receives no signal but `SIGKILL`,
 //!   which never goes to the Tool.

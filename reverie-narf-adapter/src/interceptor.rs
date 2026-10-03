@@ -712,8 +712,9 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
     }
 
     /// A hosted task's signal goes to [`NarfToolHost::handle_signal`] where
-    /// the task returns from a `syscall` instruction (the first call, without
-    /// a transition, answers [`SignalDelivery::Wait`]), and the kernel
+    /// the task returns from a syscall, made with the `syscall` instruction
+    /// or `int 0x80` (the first call, without a transition, answers
+    /// [`SignalDelivery::Wait`]), and the kernel
     /// delivers it once the Tool answers with the same signal. Everywhere
     /// else, where the task cannot wait for the Tool, the signal stays
     /// pending until the task's next syscall returns. A signal Reverie's

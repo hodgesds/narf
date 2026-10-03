@@ -418,9 +418,10 @@ pub trait SyscallInterceptor: Send + Sync {
     ///
     /// The kernel first calls it with `native` `None`, and the callback must
     /// answer at once. A callback that must wait before it can answer returns
-    /// [`SignalDelivery::Wait`]. Where the task returns from a `syscall`
-    /// instruction, with the syscall finished, on its own kernel stack, the
-    /// kernel then calls it again with `native` `Some`: the transition runs
+    /// [`SignalDelivery::Wait`]. Where the task returns from a finished
+    /// syscall (made with the `syscall` instruction or, on x86_64, with
+    /// `int 0x80`), on its own kernel stack, the kernel then calls it again
+    /// with `native` `Some`: the transition runs
     /// injected requests only, with the restrictions of
     /// [`Self::on_task_start`], and the callback may wait for other tasks
     /// ([`NativeSyscallTransition::wait_for_repoll`]). A syscall the task had
@@ -5008,8 +5009,9 @@ pub fn kernel_syscall_entry_plain_with_state(
         // timer IRQs keep landing at CPL=0. The no-timer common path is one
         // atomic load; the locked all-task scan runs only after a deadline.
         crate::handlers::timer_tick_raise_due_signals();
-        // The one delivery point where an interceptor's signal consult may
-        // wait (see `SyscallInterceptor::on_signal_delivery`).
+        // A delivery point where an interceptor's signal consult may wait,
+        // as is the x86_64 `int 0x80` return (see
+        // `SyscallInterceptor::on_signal_delivery`).
         crate::handlers::default_signal_delivery_at_syscall_return(&mut ctx);
         // TIF_NEED_RESCHED-at-syscall-exit: the tick only preempts at CPL=3, so
         // a syscall-dense task (e.g. stress-ng --sigrt's tight sigqueue loop)

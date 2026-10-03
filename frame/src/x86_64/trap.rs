@@ -1194,13 +1194,11 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         let num = frame.rax as u32;
         let mut ctx = X86TrapContext::from_int80(frame);
         narf_userspace::kernel_syscall_entry(num, &mut ctx);
-        // Signal-delivery hook: if a `narf_userspace`-side hook
-        // is installed and we're heading back to user (CS RPL=3,
-        // i.e. the syscall handler didn't redirect to kernel),
-        // give it a chance to rewrite the frame to land at a
-        // pending signal handler. The hook self-checks
-        // `returning_to_user` so a redirect-to-kernel handler
-        // (exit, longjmp) bypasses delivery cleanly.
+        // Signal delivery: if we're heading back to user (CS RPL=3,
+        // i.e. the syscall handler didn't redirect to kernel), rewrite
+        // the frame to land at a pending signal handler. Delivery
+        // self-checks `returning_to_user` so a redirect-to-kernel
+        // handler (exit, longjmp) bypasses it cleanly.
         //
         // SYSCALL_NUM_NONE, NOT `num`: `kernel_syscall_entry` has
         // already run this syscall to COMPLETION (a real value is
@@ -1219,10 +1217,13 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // completed syscall is never restarted. This is exactly
         // what the `syscall`-instruction completion path does
         // (`userspace/src/syscall.rs`, `SYSCALL_NUM_NONE`); the two
-        // gates must stay in parity.
-        if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
-            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
-        }
+        // gates must stay in parity, so both call the same function.
+        // It is also where an installed interceptor's signal consult
+        // may wait (`SyscallInterceptor::on_signal_delivery`). Narf's
+        // own programs (narf-libc) make every syscall with `int 0x80`:
+        // without the wait here, a signal the interceptor must wait to
+        // decide on would stay pending in them forever.
+        narf_userspace::handlers::default_signal_delivery_at_syscall_return(&mut ctx);
         return;
     }
 

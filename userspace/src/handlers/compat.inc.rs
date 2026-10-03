@@ -9142,10 +9142,10 @@ pub(crate) fn default_signal_delivery_restricted(
     default_signal_delivery_restricted_active(ctx, syscall_no, restrict, false)
 }
 
-/// `default_signal_delivery` on the return path of a completed `syscall`
-/// instruction: the one delivery point where an installed interceptor's
-/// signal consult may wait (see
-/// [`crate::SyscallInterceptor::on_signal_delivery`]).
+/// `default_signal_delivery` on the return path of a completed syscall,
+/// made with the `syscall` instruction or, on x86_64, with `int 0x80`: the
+/// delivery points where an installed interceptor's signal consult may wait
+/// (see [`crate::SyscallInterceptor::on_signal_delivery`]).
 #[inline]
 pub fn default_signal_delivery_at_syscall_return(ctx: &mut dyn TrapContext) -> bool {
     if !ctx.returning_to_user() {

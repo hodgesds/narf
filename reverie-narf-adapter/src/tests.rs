@@ -5930,12 +5930,14 @@ reverie_narf_test!(reverie_narf_transition_after_interruption_aborts_the_tree);
 // ── Signal events and reapable processes ──────────────────────────────────
 
 static SIGHOOK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_SIGHOOK"));
+static SIGINT80_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_SIGINT80"));
 
 /// Every signal [`SuppressUsr2`] was asked about, in order.
 static SIGHOOK_SEEN: IrqSafeSpinLock<Vec<i32>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Records every signal it is asked about, and delivers each one except
-/// `SIGUSR2`, which it suppresses.
+/// Records every signal it is asked about, waits once, as Detcore waits for
+/// its scheduler turn, and then delivers each one except `SIGUSR2`, which it
+/// suppresses.
 #[derive(Debug, Default, Clone, Copy)]
 struct SuppressUsr2;
 
@@ -5950,6 +5952,7 @@ impl Tool for SuppressUsr2 {
         signal: reverie::Signal,
     ) -> Result<Option<reverie::Signal>, reverie::Errno> {
         SIGHOOK_SEEN.lock().push(signal as i32);
+        YieldOnce::default().await;
         if signal == reverie::Signal::SIGUSR2 {
             return Ok(None);
         }
@@ -5964,9 +5967,27 @@ impl Tool for SuppressUsr2 {
 /// is discarded and its handler never runs. The guest checks both and exits
 /// 0.
 fn reverie_narf_signals_reach_the_tool_before_delivery() -> TestResult {
+    signals_reach_the_tool_before_delivery(SIGHOOK_GUEST)
+}
+reverie_narf_test!(reverie_narf_signals_reach_the_tool_before_delivery);
+
+/// As [`reverie_narf_signals_reach_the_tool_before_delivery`], for a guest
+/// that sends its signals with `int 0x80`, as Narf's own programs make every
+/// syscall: the kernel asks the Tool where the task returns from that trap,
+/// and the Tool's wait there switches the task out and back.
+fn reverie_narf_int80_signals_reach_the_tool_before_delivery() -> TestResult {
+    signals_reach_the_tool_before_delivery(SIGINT80_GUEST)
+}
+reverie_narf_test!(reverie_narf_int80_signals_reach_the_tool_before_delivery);
+
+/// Runs `guest`, a sighook guest, under [`SuppressUsr2`]: the guest exits 0
+/// only if its `SIGUSR1` handler ran once and its `SIGUSR2` handler never
+/// ran, and the Tool must have been asked about `SIGUSR1` and then
+/// `SIGUSR2`, once each.
+fn signals_reach_the_tool_before_delivery(guest: &[u8]) -> TestResult {
     SIGHOOK_SEEN.lock().clear();
     let _signal_tables = SignalTables::init_with_handlers();
-    let outcome = run_hosted::<SuppressUsr2>(SIGHOOK_GUEST, ());
+    let outcome = run_hosted::<SuppressUsr2>(guest, ());
     result_of((|| {
         let (interceptor, root) = outcome?;
         let seen = SIGHOOK_SEEN.lock().clone();
@@ -5987,7 +6008,6 @@ fn reverie_narf_signals_reach_the_tool_before_delivery() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-reverie_narf_test!(reverie_narf_signals_reach_the_tool_before_delivery);
 
 /// Every Linux pid [`record_reapable`] was handed, in order.
 static REAPABLE_PIDS: IrqSafeSpinLock<Vec<i32>> = IrqSafeSpinLock::new(Vec::new());
