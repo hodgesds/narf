@@ -1053,16 +1053,6 @@ fn reverie_narf_canonical_trace_cell() -> TestResult {
         let _ = writeln!(Writer, "{CELL_RECORDS_END}");
         let tap = tap.ok_or("the root's fd 1 was never tapped")?;
         let reap = reap.ok_or("the run did not reap its root")?;
-        let captured = tap.captured.lock().clone();
-        let mut line = alloc::string::String::new();
-        for byte in &captured {
-            let _ = write!(line, "{byte:02x}");
-        }
-        let _ = writeln!(
-            Writer,
-            "NARF-CELL stdout-capture=fd1-tap bytes={} hex={line}",
-            captured.len()
-        );
         if reap.reaped_pid != root.pid as i64 {
             let _ = writeln!(
                 Writer,
@@ -1074,11 +1064,6 @@ fn reverie_narf_canonical_trace_cell() -> TestResult {
         if reap.wstatus == REAPER_STATUS_SENTINEL {
             return Err("the reaping parent's wait4 reaped the root but stored no status");
         }
-        let _ = writeln!(
-            Writer,
-            "NARF-CELL exit wstatus={:#06x} source=guest-parent-wait4",
-            reap.wstatus
-        );
         if reap.second_wait != -LINUX_ECHILD {
             let _ = writeln!(Writer, "    second wait4 returned {}", reap.second_wait);
             return Err("the reaping parent's second wait4 did not report ECHILD");
@@ -1098,6 +1083,26 @@ fn reverie_narf_canonical_trace_cell() -> TestResult {
         if exits.len() != 1 || !exits[0].process_exited {
             return Err("the root's exit did not end its process in the host");
         }
+        // The observable lines come only after every in-kernel check above
+        // has passed, so a cell whose run failed those checks has no stdout
+        // or exit line for the comparator to extract. The exit value itself
+        // is the comparator's to judge, so it is printed before the value
+        // check below.
+        let captured = tap.captured.lock().clone();
+        let mut line = alloc::string::String::new();
+        for byte in &captured {
+            let _ = write!(line, "{byte:02x}");
+        }
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL stdout-capture=fd1-tap bytes={} hex={line}",
+            captured.len()
+        );
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL exit wstatus={:#06x} source=guest-parent-wait4",
+            reap.wstatus
+        );
         if reap.wstatus != 0 {
             return Err("the root did not exit 0");
         }
@@ -1314,8 +1319,14 @@ fn reverie_narf_parked_inject_resumes_the_tool() -> TestResult {
                 .map_err(|_| "register_root refused the root task")
         })?;
         let records = core::mem::take(&mut *CONTINUATION_RECORDS.lock());
+        // Printed without the canonical prefix: only the two parity cells may
+        // put that prefix on the console, between their begin and
+        // records-end lines, because the comparator extracts every prefixed
+        // line as a cell record.
+        let prefix = reverie_narf_tools::canonical::PREFIX;
         for record in &records {
-            let _ = writeln!(Writer, "    record {record}");
+            let body = record.strip_prefix(prefix).unwrap_or(record);
+            let _ = writeln!(Writer, "    record {body}");
         }
         let _ = writeln!(
             Writer,
@@ -1332,7 +1343,6 @@ fn reverie_narf_parked_inject_resumes_the_tool() -> TestResult {
             return Err("the parked one-byte write was not re-executed exactly once");
         }
         check_teardown(&interceptor, root, 2, 0)?;
-        let prefix = reverie_narf_tools::canonical::PREFIX;
         let enter = records.iter().position(|record| {
             record.starts_with(prefix)
                 && record.contains(" phase=enter nr=1 a0=4 ")
@@ -2547,16 +2557,6 @@ fn reverie_narf_rich_trace_cell() -> TestResult {
         let _ = writeln!(Writer, "{RICH_CELL_RECORDS_END}");
         let tap = tap.ok_or("the root's fd 1 was never tapped")?;
         let reap = reap.ok_or("the run did not reap its root")?;
-        let captured = tap.captured.lock().clone();
-        let mut line = alloc::string::String::new();
-        for byte in &captured {
-            let _ = write!(line, "{byte:02x}");
-        }
-        let _ = writeln!(
-            Writer,
-            "NARF-CELL-RICH stdout-capture=fd1-tap bytes={} hex={line}",
-            captured.len()
-        );
         if reap.reaped_pid != root.pid as i64 {
             let _ = writeln!(
                 Writer,
@@ -2568,11 +2568,6 @@ fn reverie_narf_rich_trace_cell() -> TestResult {
         if reap.wstatus == REAPER_STATUS_SENTINEL {
             return Err("the reaping parent's wait4 reaped the root but stored no status");
         }
-        let _ = writeln!(
-            Writer,
-            "NARF-CELL-RICH exit wstatus={:#06x} source=guest-parent-wait4",
-            reap.wstatus
-        );
         if reap.second_wait != -LINUX_ECHILD {
             let _ = writeln!(Writer, "    second wait4 returned {}", reap.second_wait);
             return Err("the reaping parent's second wait4 did not report ECHILD");
@@ -2592,6 +2587,26 @@ fn reverie_narf_rich_trace_cell() -> TestResult {
         if exits.len() != 1 || !exits[0].process_exited {
             return Err("the root's exit did not end its process in the host");
         }
+        // The observable lines come only after every in-kernel check above
+        // has passed, so a cell whose run failed those checks has no stdout
+        // or exit line for the comparator to extract. The exit value itself
+        // is the comparator's to judge, so it is printed before the value
+        // check below.
+        let captured = tap.captured.lock().clone();
+        let mut line = alloc::string::String::new();
+        for byte in &captured {
+            let _ = write!(line, "{byte:02x}");
+        }
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL-RICH stdout-capture=fd1-tap bytes={} hex={line}",
+            captured.len()
+        );
+        let _ = writeln!(
+            Writer,
+            "NARF-CELL-RICH exit wstatus={:#06x} source=guest-parent-wait4",
+            reap.wstatus
+        );
         if reap.wstatus != 0 {
             return Err("the root did not exit 0");
         }
