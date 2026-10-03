@@ -31,6 +31,52 @@ pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;
 pub fn exec_into(proc: &Process, arg0: &str, argv: &[&str], env: &[&str]);
 ```
 
+The live syscall table has one optional, first-class interception layer. A
+caller constructing `SyscallTable` may install exactly one owned
+`SyscallInterceptor` before publishing the table with `install_global`; a
+second installation is rejected and a published table never swaps interceptor
+identity. For every known or unknown wire number, the dispatcher snapshots the
+raw number (including version bits), canonical variant when one exists, six
+register arguments, task identity, user instruction pointer, and user stack
+pointer. It then invokes `on_syscall_enter`, executes the native handler at
+most once unless entry supplied a complete result, and invokes exactly one of
+`on_syscall_return` or `on_syscall_context_managed`. Interceptors receive only
+the immutable invocation snapshot, never the mutable trap context. A return
+callback may replace its exact `SyscallReturn`; the context-managed callback is
+observation-only, so a park/redirection cannot become a fabricated completion.
+Unknown syscalls traverse the same layer and retain Linux
+`-ENOSYS`/NARF `InvalidOp` unless the interceptor explicitly replaces them.
+
+Global publication is also one-shot. `try_install_global` uses atomic
+null-to-table publication, returns ownership of a rejected second table, and
+does not change the table or interceptor identity already observed by trap
+dispatchers. `install_global` is the boot convenience wrapper and panics on a
+duplicate. The production public interface has no removal or replacement
+operation. The crate-private test reset and explicitly feature-gated
+out-of-crate verification reset retire without reclaiming the old allocation
+because a concurrent dispatcher may already hold its pointer.
+
+On the x86-64 `syscall`-instruction path the required order is ptrace entry
+stop, interceptor entry, zero-or-one native handler invocation, the matching
+typed interceptor completion callback, ptrace exit stop for a genuinely
+completed call, pending timer/signal delivery, and the syscall-exit reschedule
+check. Known and unknown wire numbers share that outer lifecycle. A handler
+that rewinds the instruction pointer for re-execution remains context-managed
+and does not produce a ptrace exit stop. On the common trap path, kernel-time
+accounting brackets dispatch, read/write I/O accounting observes the final
+possibly replaced return, and architecture return hooks retain responsibility
+for signal delivery. Interception does not replace any of those kernel
+lifecycle owners.
+
+The interceptor object is shared directly by dispatcher calls on every CPU and
+must synchronize its own mutable state and filter task identities itself. Its
+ownership is deliberately process-global and in-address-space: this interface
+does not impose a queue, RPC channel, ptrace stop, signal trampoline, binary
+rewrite, or polling loop merely to share extension state. The initial contract
+is synchronous and does not itself authorize a userspace callback or an async
+wait; those require a separate task-lifetime and suspension interface rather
+than blocking or re-entering the scheduler from the syscall trap.
+
 `load_user_process_with_root` is the kernel-boot counterpart to an exec under
 an already-established process root: it resolves a filesystem-backed
 `PT_INTERP` beneath an explicit mounted-root prefix, and the caller installs

@@ -69,6 +69,10 @@ unix-latency-trace = []
 # a no-op, with no bypass code compiled at all) in every production build.
 kernel-test = []
 
+# Exposes the global syscall-table reset only to the out-of-crate kernel
+# verification harness. Production consumers never receive a public reset API.
+verification-test-reset = []
+
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's
 # `user-mode-e2e` feature drives the test-bin runner; this

@@ -2497,12 +2497,44 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
     use core::arch::asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        install_global, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallArgs, SyscallInterception, SyscallInterceptor, SyscallInvocation, SyscallReturn,
         SyscallTable,
     };
 
     static SEEN: AtomicU64 = AtomicU64::new(0);
+    static ENTERS: AtomicU64 = AtomicU64::new(0);
+    static RETURNS: AtomicU64 = AtomicU64::new(0);
+    static UNKNOWN: AtomicU64 = AtomicU64::new(0);
     SEEN.store(0, Ordering::Relaxed);
+    ENTERS.store(0, Ordering::Relaxed);
+    RETURNS.store(0, Ordering::Relaxed);
+    UNKNOWN.store(0, Ordering::Relaxed);
+
+    struct Probe;
+    impl SyscallInterceptor for Probe {
+        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            ENTERS.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall.is_none() {
+                UNKNOWN.fetch_add(1, Ordering::Relaxed);
+                SyscallInterception::Complete(SyscallReturn::ok(0xA11CE))
+            } else {
+                SyscallInterception::Continue
+            }
+        }
+
+        fn on_syscall_return(
+            &self,
+            invocation: &SyscallInvocation,
+            mut result: SyscallReturn,
+        ) -> SyscallReturn {
+            RETURNS.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall == Some(Syscall::Yield) {
+                result.value = result.value.wrapping_add(1);
+            }
+            result
+        }
+    }
 
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2510,6 +2542,11 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
         SEEN.store(args.arg0, Ordering::Relaxed);
         SyscallReturn::ok(args.arg0.wrapping_mul(2))
     });
+    if t.install_interceptor(alloc::boxed::Box::new(Probe))
+        .is_err()
+    {
+        return TestResult::Fail("int 0x80 interceptor installation failed");
+    }
     install_global(t);
 
     let mut value: u64;
@@ -2528,6 +2565,20 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
         );
     }
 
+    let mut unknown_value: u64;
+    let mut unknown_status: u64;
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        asm!(
+            "int 0x80",
+            inout("rax") 0x3fffu64 => unknown_value,
+            inout("rdi") 0xBADu64 => _,
+            out("rdx") unknown_status,
+            out("rcx") _,
+            out("r11") _,
+        );
+    }
+
     __test_clear_global();
 
     if SEEN.load(Ordering::Relaxed) != 0xC0FFEE {
@@ -2536,8 +2587,17 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
     if status != SyscallReturn::OK as u64 {
         return TestResult::Fail("status via rdx wasn't Ok");
     }
-    if value != 0xC0FFEE * 2 {
-        return TestResult::Fail("value via rax didn't round-trip");
+    if value != 0xC0FFEE * 2 + 1 {
+        return TestResult::Fail("interceptor's final int 0x80 result was not returned");
+    }
+    if unknown_status != SyscallReturn::OK as u64 || unknown_value != 0xA11CE {
+        return TestResult::Fail("interceptor did not complete unknown int 0x80 syscall");
+    }
+    if ENTERS.load(Ordering::Relaxed) != 2
+        || RETURNS.load(Ordering::Relaxed) != 2
+        || UNKNOWN.load(Ordering::Relaxed) != 1
+    {
+        return TestResult::Fail("int 0x80 interceptor callback accounting mismatch");
     }
     TestResult::Pass
 }
@@ -2554,12 +2614,44 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
     use core::arch::asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        install_global, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallArgs, SyscallInterception, SyscallInterceptor, SyscallInvocation, SyscallReturn,
         SyscallTable,
     };
 
     static SEEN: AtomicU64 = AtomicU64::new(0);
+    static ENTERS: AtomicU64 = AtomicU64::new(0);
+    static RETURNS: AtomicU64 = AtomicU64::new(0);
+    static UNKNOWN: AtomicU64 = AtomicU64::new(0);
     SEEN.store(0, Ordering::Relaxed);
+    ENTERS.store(0, Ordering::Relaxed);
+    RETURNS.store(0, Ordering::Relaxed);
+    UNKNOWN.store(0, Ordering::Relaxed);
+
+    struct Probe;
+    impl SyscallInterceptor for Probe {
+        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            ENTERS.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall.is_none() {
+                UNKNOWN.fetch_add(1, Ordering::Relaxed);
+                SyscallInterception::Complete(SyscallReturn::ok(0xA11CE))
+            } else {
+                SyscallInterception::Continue
+            }
+        }
+
+        fn on_syscall_return(
+            &self,
+            invocation: &SyscallInvocation,
+            mut result: SyscallReturn,
+        ) -> SyscallReturn {
+            RETURNS.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall == Some(Syscall::Yield) {
+                result.value = result.value.wrapping_add(1);
+            }
+            result
+        }
+    }
 
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2567,6 +2659,11 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
         SEEN.store(args.arg0, Ordering::Relaxed);
         SyscallReturn::ok(args.arg0.wrapping_mul(2))
     });
+    if t.install_interceptor(alloc::boxed::Box::new(Probe))
+        .is_err()
+    {
+        return TestResult::Fail("SVC interceptor installation failed");
+    }
     install_global(t);
 
     // Fire SVC from EL1. The vec.S sync-SPx slot dispatches into
@@ -2591,6 +2688,21 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
         );
     }
 
+    let mut unknown_value: u64 = 0xBAD;
+    let mut unknown_status: u64;
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        asm!(
+            "mov x8, #0x3fff",
+            "svc #0",
+            "mov {s}, x1",
+            s = out(reg) unknown_status,
+            inout("x0") unknown_value,
+            out("x1") _,
+            out("x8") _,
+        );
+    }
+
     __test_clear_global();
 
     if SEEN.load(Ordering::Relaxed) != 0xC0FFEE {
@@ -2599,8 +2711,17 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
     if status != SyscallReturn::OK as u64 {
         return TestResult::Fail("status returned through SVC wasn't Ok");
     }
-    if value != 0xC0FFEE * 2 {
-        return TestResult::Fail("value returned through SVC didn't round-trip");
+    if value != 0xC0FFEE * 2 + 1 {
+        return TestResult::Fail("interceptor's final SVC result was not returned");
+    }
+    if unknown_status != SyscallReturn::OK as u64 || unknown_value != 0xA11CE {
+        return TestResult::Fail("interceptor did not complete unknown SVC syscall");
+    }
+    if ENTERS.load(Ordering::Relaxed) != 2
+        || RETURNS.load(Ordering::Relaxed) != 2
+        || UNKNOWN.load(Ordering::Relaxed) != 1
+    {
+        return TestResult::Fail("SVC interceptor callback accounting mismatch");
     }
     TestResult::Pass
 }
@@ -2752,7 +2873,8 @@ mod aarch64_el0_preemption_e2e {
     use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_core_syscalls, install_global, install_user_task_hooks,
-        syscall::__test_clear_global, Syscall, SyscallTable, UserProcess,
+        syscall::__verification_clear_global as __test_clear_global, Syscall, SyscallTable,
+        UserProcess,
     };
 
     use super::{kernel_test_in, TestResult};
@@ -3095,6 +3217,185 @@ mod aarch64_el0_preemption_e2e {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
+    // Enter real ring 3 and issue the MSR-driven `syscall` instruction with an
+    // unknown raw number. The interceptor completes it with a magic value.
+    // User code then moves returned RAX into RDI and reports it through a known
+    // int-0x80 syscall whose handler redirects back to this harness.
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        install_global, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallHandler, SyscallInterception, SyscallInterceptor, SyscallInvocation, SyscallReturn,
+        SyscallTable, TrapContext,
+    };
+
+    const MAGIC: u64 = 0xA11CE;
+    static SEEN_RESULT: AtomicU64 = AtomicU64::new(0);
+    static FAST_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
+    static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
+    };
+
+    struct Probe;
+    impl SyscallInterceptor for Probe {
+        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            if invocation.raw_number == 0x3fff && invocation.syscall.is_none() {
+                FAST_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                SyscallInterception::Complete(SyscallReturn::ok(MAGIC))
+            } else {
+                SyscallInterception::Continue
+            }
+        }
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP,
+            lj = sym user_mode_longjmp,
+        );
+    }
+
+    struct UnwindHandler;
+    impl SyscallHandler for UnwindHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
+            SEEN_RESULT.store(ctx.args().arg0, Ordering::Release);
+            let _ =
+                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
+        }
+    }
+
+    SEEN_RESULT.store(0, Ordering::Relaxed);
+    FAST_ENTRIES.store(0, Ordering::Relaxed);
+    __test_clear_global();
+
+    let original_cr3: u64;
+    // SAFETY: read the active kernel address space so the non-local return can
+    // restore it after the user-mode side trip.
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3.store(original_cr3, Ordering::Release);
+
+    // SAFETY: JMP is dedicated storage for this single-threaded test.
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
+    if saved != 0 {
+        // SAFETY: restore the exact kernel CR3 and GS state saved before ring 3.
+        unsafe {
+            let cr3 = SAVED_CR3.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
+        __test_clear_global();
+        if FAST_ENTRIES.load(Ordering::Acquire) != 1 {
+            return TestResult::Fail("ring-3 syscall did not enter interceptor exactly once");
+        }
+        if SEEN_RESULT.load(Ordering::Acquire) != MAGIC {
+            return TestResult::Fail("ring-3 syscall did not receive interceptor result");
+        }
+        return TestResult::Pass;
+    }
+
+    let mut table = SyscallTable::new();
+    table.install_raw(Syscall::Sleep, "fast-syscall-unwind", UnwindHandler);
+    if table
+        .install_interceptor(alloc::boxed::Box::new(Probe))
+        .is_err()
+    {
+        return TestResult::Fail("fast-syscall interceptor installation failed");
+    }
+    install_global(table);
+
+    // SAFETY: the test owns this fresh user address space until longjmp.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    let code_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc code frame"),
+    };
+    let stack_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc stack frame"),
+    };
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
+
+    // mov eax,0x3fff; syscall; mov rdi,rax; mov eax,Sleep; int 0x80; ud2
+    let sleep = Syscall::Sleep.raw().to_le_bytes();
+    let code: [u8; 19] = [
+        0xB8, 0xFF, 0x3F, 0x00, 0x00, 0x0F, 0x05, 0x48, 0x89, 0xC7, 0xB8, sleep[0], sleep[1],
+        sleep[2], sleep[3], 0xCD, 0x80, 0x0F, 0x0B,
+    ];
+    // SAFETY: code_frame is exclusively owned and the copy fits one page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code.as_ptr(),
+            code_frame.kernel_mut_ptr::<u8>(),
+            code.len(),
+        );
+    }
+    // SAFETY: materialize publishes the complete mappings constructed above.
+    if unsafe { address_space.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+    if address_space.activate().is_err() {
+        return TestResult::Fail("activate failed");
+    }
+    // SAFETY: enter mapped ring-3 code with a mapped stack and IRQs disabled
+    // across the transition. Success returns only via resume_trampoline.
+    unsafe {
+        core::arch::asm!("cli");
+        user_mode_enter(CODE_VADDR, STACK_VADDR + 0x1000)
+    }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/syscall-entry",
+    smoke_frame_x86_64_user_mode_fast_syscall_interceptor
+);
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Full end-to-end: build a user AS with a code + stack page,
     // hand-assemble a tiny user program that issues `int 0x80`,
@@ -3108,8 +3409,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallHandler, SyscallTable,
-        TrapContext,
+        install_global, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallHandler, SyscallTable, TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
@@ -3291,8 +3592,8 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallHandler, SyscallTable,
-        TrapContext,
+        install_global, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallHandler, SyscallTable, TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
@@ -3534,8 +3835,8 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         clear_current_user_task, install_current_user_task, install_exit_hook, install_global,
-        install_yield_hook, syscall::__test_clear_global, Syscall, SyscallTable, UserTaskCtx,
-        EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
+        install_yield_hook, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallTable, UserTaskCtx, EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
@@ -3733,7 +4034,8 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_core_syscalls, install_global, install_user_task_hooks,
-        syscall::__test_clear_global, Syscall, SyscallTable, UserProcess,
+        syscall::__verification_clear_global as __test_clear_global, Syscall, SyscallTable,
+        UserProcess,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
@@ -3906,8 +4208,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallHandler, SyscallTable,
-        TrapContext,
+        install_global, syscall::__verification_clear_global as __test_clear_global, Syscall,
+        SyscallHandler, SyscallTable, TrapContext,
     };
 
     // The user code emits two syscalls:
@@ -5257,8 +5559,8 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
         clear_exit_landing, install_address_space_lookup, install_core_syscalls, install_global,
-        load_user_process_with, set_exit_landing, syscall::__test_clear_global, AuxEntry,
-        SyscallTable,
+        load_user_process_with, set_exit_landing,
+        syscall::__verification_clear_global as __test_clear_global, AuxEntry, SyscallTable,
     };
 
     static mut JMP2: UserModeJmpBuf = UserModeJmpBuf {
@@ -5507,8 +5809,8 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
         clear_exit_landing, install_address_space_lookup, install_core_syscalls, install_global,
-        load_user_process_with, set_exit_landing, syscall::__test_clear_global, AuxEntry,
-        SyscallTable,
+        load_user_process_with, set_exit_landing,
+        syscall::__verification_clear_global as __test_clear_global, AuxEntry, SyscallTable,
     };
 
     static mut JMP3: UserModeJmpBuf = UserModeJmpBuf {

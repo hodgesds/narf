@@ -17,12 +17,11 @@ pub use narf_capabilities::{Cap, Grant};
 pub use narf_filesystem::{bootstrap_mount_authority, registry, MemFs, MountPoint, TmpFs};
 pub use narf_kernel_test::{kernel_test_in, TestResult};
 
+pub(crate) use crate::syscall::__test_clear_global;
 pub use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
-pub use crate::{
-    fd, install_core_syscalls, install_global, install_task_id_lookup, syscall::__test_clear_global,
-};
+pub use crate::{fd, install_core_syscalls, install_global, install_task_id_lookup};
 
 // ── Linux errno wire values (negative, in `SyscallReturn.value`, status Ok) ──
 pub use crate::errno::wire::*;

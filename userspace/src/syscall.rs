@@ -113,6 +113,76 @@ pub trait TrapContext {
     fn dump_gprs(&self) {}
 }
 
+/// Immutable identity and register arguments for one syscall interception.
+///
+/// The record is copied at dispatcher entry, before either the interceptor or
+/// the native handler can alter the live trap context. `syscall` is `None` for
+/// an unknown wire number; unknown calls are deliberately observable so an
+/// interposition backend cannot silently lose Linux's `-ENOSYS` boundary.
+#[derive(Copy, Clone, Debug)]
+pub struct SyscallInvocation {
+    /// Exact wire value supplied by the task, including version bits.
+    pub raw_number: u32,
+    /// Decoded NARF syscall-ABI version.
+    pub version: u8,
+    /// Canonical syscall when the wire number is known.
+    pub syscall: Option<Syscall>,
+    /// Six register arguments captured at entry.
+    pub args: SyscallArgs,
+    /// NARF scheduler task identity active at entry.
+    pub task_id: u64,
+    /// User instruction pointer immediately after the trapping instruction.
+    pub instruction_pointer: u64,
+    /// User stack pointer captured at entry.
+    pub stack_pointer: u64,
+}
+
+/// Result of the entry half of a syscall interceptor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SyscallInterception {
+    /// Execute the native NARF handler exactly once.
+    Continue,
+    /// Skip the native handler and publish this result.
+    Complete(SyscallReturn),
+}
+
+/// First-class middleware at NARF's live syscall dispatcher.
+///
+/// An interceptor is owned by the immutable [`SyscallTable`] and is therefore
+/// installed before [`install_global`] publishes that table. The dispatcher
+/// calls `on_syscall_enter` once, executes the native handler at most once, and
+/// then calls exactly one typed completion callback. The same interceptor
+/// object is shared by all tasks, so process-global backend/tool state can
+/// remain direct shared state rather than being serialized through an IPC
+/// transport.
+///
+/// Implementations must synchronize their own mutable state and should filter
+/// by `task_id` when only part of the task set is instrumented. Interceptors
+/// never receive the mutable trap context: the dispatcher alone owns register,
+/// park, redirection, and signal state. A normal return may be replaced, while
+/// a context-managed park or redirection is observable but immutable.
+pub trait SyscallInterceptor: Send + Sync {
+    /// Observes one syscall before native dispatch and chooses whether it runs.
+    fn on_syscall_enter(&self, _invocation: &SyscallInvocation) -> SyscallInterception {
+        SyscallInterception::Continue
+    }
+
+    /// Observes one normally returning syscall and may replace its result.
+    fn on_syscall_return(
+        &self,
+        _invocation: &SyscallInvocation,
+        result: SyscallReturn,
+    ) -> SyscallReturn {
+        result
+    }
+
+    /// Observes a syscall whose native handler parked or redirected the task.
+    ///
+    /// This callback cannot fabricate a return or mutate the trap frame.
+    fn on_syscall_context_managed(&self, _invocation: &SyscallInvocation) {}
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub struct UserStateCtx<'a> {
     pub state: &'a mut narf_scheduler::UserState,
@@ -3375,6 +3445,96 @@ impl TrapContext for IoAccountCtx<'_> {
     fn set_rip(&mut self, rip: u64) {
         self.inner.set_rip(rip)
     }
+    fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
+        self.inner.redirect_to_user(entry_rip, entry_rsp)
+    }
+    unsafe fn save_user_state(&self, out: *mut u8) -> bool {
+        // SAFETY: the caller supplies the same output pointer and contract that
+        // the wrapped context requires.
+        unsafe { self.inner.save_user_state(out) }
+    }
+    fn returning_to_user(&self) -> bool {
+        self.inner.returning_to_user()
+    }
+    fn deliver_signal(&mut self, params: &SigDeliveryParams) -> bool {
+        self.inner.deliver_signal(params)
+    }
+    fn perform_sigreturn(&mut self, sc_vaddr: u64, is_rt: bool) -> bool {
+        self.inner.perform_sigreturn(sc_vaddr, is_rt)
+    }
+    fn dump_gprs(&self) {
+        self.inner.dump_gprs()
+    }
+}
+
+/// Transparent trap-context wrapper that records whether a handler published a
+/// normal return. Redirection and park paths deliberately remain
+/// `ContextManaged` instead of fabricating a value for an interceptor.
+struct InterceptCtx<'a> {
+    inner: &'a mut dyn TrapContext,
+    result: Option<SyscallReturn>,
+}
+
+impl<'a> InterceptCtx<'a> {
+    fn new(inner: &'a mut dyn TrapContext) -> Self {
+        Self {
+            inner,
+            result: None,
+        }
+    }
+}
+
+impl TrapContext for InterceptCtx<'_> {
+    fn args(&self) -> &SyscallArgs {
+        self.inner.args()
+    }
+
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.result = Some(ret);
+        self.inner.set_return(ret);
+    }
+
+    fn user_rsp(&self) -> u64 {
+        self.inner.user_rsp()
+    }
+
+    fn rip(&self) -> u64 {
+        self.inner.rip()
+    }
+
+    fn set_rip(&mut self, rip: u64) {
+        self.inner.set_rip(rip)
+    }
+
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        self.inner.redirect_to_kernel(rip, rsp)
+    }
+
+    fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
+        self.inner.redirect_to_user(entry_rip, entry_rsp)
+    }
+
+    unsafe fn save_user_state(&self, out: *mut u8) -> bool {
+        // SAFETY: the caller supplies the same output pointer and contract that
+        // the wrapped context requires.
+        unsafe { self.inner.save_user_state(out) }
+    }
+
+    fn returning_to_user(&self) -> bool {
+        self.inner.returning_to_user()
+    }
+
+    fn deliver_signal(&mut self, params: &SigDeliveryParams) -> bool {
+        self.inner.deliver_signal(params)
+    }
+
+    fn perform_sigreturn(&mut self, sc_vaddr: u64, is_rt: bool) -> bool {
+        self.inner.perform_sigreturn(sc_vaddr, is_rt)
+    }
+
+    fn dump_gprs(&self) {
+        self.inner.dump_gprs()
+    }
 }
 
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
@@ -3433,7 +3593,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                     inner: ctx,
                     ret: None,
                 };
-                table.dispatch_ctx_versioned(variant, version, &mut cap);
+                table.dispatch_intercepted(num, version, Some(variant), &mut cap);
                 let ret = cap.ret.map(|r| r.value as i64).unwrap_or(0);
                 let task = crate::handlers::current_task_id();
                 match class {
@@ -3441,7 +3601,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                     IoClass::Write => crate::handlers::io_account_write(task, ret),
                 }
             }
-            None => table.dispatch_ctx_versioned(variant, version, ctx),
+            None => table.dispatch_intercepted(num, version, Some(variant), ctx),
         }
         #[cfg(feature = "syscall-trace")]
         if syscall_trace_relevant(variant) {
@@ -3480,7 +3640,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // which is success. That is the answer userspace feature-probes with:
         // a runtime that calls `io_uring_setup` and gets 0 concludes io_uring
         // is available and that 0 is its ring fd.
-        ctx.set_return(SyscallReturn::not_implemented());
+        table.dispatch_intercepted(num, version, None, ctx);
     }
 }
 
@@ -3721,25 +3881,24 @@ pub fn kernel_syscall_entry_plain_with_state(
     args: &SyscallArgs,
     user_state: *mut u8,
 ) -> SyscallReturn {
-    let n = match Syscall::from_raw(num) {
-        Some(v) => v,
-        None => {
-            #[cfg(feature = "syscall-trace")]
-            {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "UNKNOWN_SYSCALL num={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
-                    num,
-                    args.arg0,
-                    args.arg1,
-                    args.arg2,
-                    args.arg3,
-                );
-            }
-            return SyscallReturn::not_implemented();
+    let version = syscall_version(num);
+    let raw_number = syscall_number(num);
+    let n = Syscall::from_raw(raw_number);
+    if n.is_none() {
+        #[cfg(feature = "syscall-trace")]
+        {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "UNKNOWN_SYSCALL num={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                num,
+                args.arg0,
+                args.arg1,
+                args.arg2,
+                args.arg3,
+            );
         }
-    };
+    }
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
         // No syscall table installed at all. Not the same condition as an
@@ -3754,6 +3913,7 @@ pub fn kernel_syscall_entry_plain_with_state(
     // installed, so the `&SyscallTable` is valid for this dispatch.
     // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
+    let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     // In errors-only mode still surface exit_group/exit ENTRY lines: a systemd
     // executor that fails sandbox setup calls exit_group(<EXIT_* category>)
     // instead of execve()'ing the service binary, so this one line names the
@@ -3765,28 +3925,32 @@ pub fn kernel_syscall_entry_plain_with_state(
     // flood the serial (slowing the very boot being traced) and bury the real
     // syscalls. A TRACE_LAST_PARK key matching this (tid,num) = a re-execution.
     #[cfg(feature = "syscall-trace")]
-    let trace_was_parked =
-        TRACE_LAST_PARK.load(core::sync::atomic::Ordering::Relaxed) == trace_park_key(num);
+    let trace_was_parked = n.is_some()
+        && TRACE_LAST_PARK.load(core::sync::atomic::Ordering::Relaxed) == trace_park_key(num);
     #[cfg(feature = "syscall-trace")]
-    let show_entry = syscall_trace_relevant(n)
-        && !trace_was_parked
-        && (!trace_errors_only() || is_sandbox_syscall(table.name_of(n)));
+    let show_entry = n
+        .map(|known| {
+            syscall_trace_relevant(known)
+                && !trace_was_parked
+                && (!trace_errors_only() || is_sandbox_syscall(table.name_of(known)))
+        })
+        .unwrap_or(false);
     #[cfg(feature = "syscall-trace")]
     if show_entry {
+        let known = n.expect("show_entry requires a known syscall");
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
             "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
             crate::handlers::current_task_id(),
-            table.name_of(n).unwrap_or("?"),
+            table.name_of(known).unwrap_or("?"),
             args.arg0,
             args.arg1,
             args.arg2,
             args.arg3,
         );
-        trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
+        trace_syscall_paths(table.name_of(known).unwrap_or("?"), args);
     }
-    let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     // PTRACE_SYSCALL entry-stop: if this task is traced and armed, stop it
     // BEFORE the syscall runs so the tracer can inspect orig_rax + args.
     // Only meaningful on the live musl path (a real user frame to park).
@@ -3801,7 +3965,7 @@ pub fn kernel_syscall_entry_plain_with_state(
     // by the 2-byte `syscall` width). Such a syscall has not completed, so it
     // must NOT fire an exit-stop — the re-issued syscall will trace again.
     let entry_rip = ctx.rip();
-    table.dispatch(n, &mut ctx);
+    table.dispatch_intercepted(num, version, n, &mut ctx);
     // Return-value half of the trace. Without it the log shows what was
     // ASKED but not what was ANSWERED, which is exactly what you need when
     // userspace takes a different branch than it does on Linux (an epoll
@@ -3819,27 +3983,29 @@ pub fn kernel_syscall_entry_plain_with_state(
         );
         // Suppress ONLY a re-execution that parked again; the first park and any
         // real return (including the wake) still log.
-        if syscall_trace_relevant(n) && !(parked_now && trace_was_parked) {
-            use core::fmt::Write as _;
-            let errors_only = trace_errors_only();
-            if !errors_only || is_reportable_syscall_error(r.value) {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
-                    crate::handlers::current_task_id(),
-                    table.name_of(n).unwrap_or("?"),
-                    r.value as i64,
-                    r.value,
-                    r.status,
-                    args.arg0,
-                    args.arg1,
-                    args.arg2,
-                    args.arg3,
-                );
-                // Errors-only mode suppresses the SYSC entry line, so decode the
-                // path args HERE to show which file/mount the failing op targeted.
-                if errors_only {
-                    trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
+        if let Some(known) = n {
+            if syscall_trace_relevant(known) && !(parked_now && trace_was_parked) {
+                use core::fmt::Write as _;
+                let errors_only = trace_errors_only();
+                if !errors_only || is_reportable_syscall_error(r.value) {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                        crate::handlers::current_task_id(),
+                        table.name_of(known).unwrap_or("?"),
+                        r.value as i64,
+                        r.value,
+                        r.status,
+                        args.arg0,
+                        args.arg1,
+                        args.arg2,
+                        args.arg3,
+                    );
+                    // Errors-only mode suppresses the SYSC entry line, so decode the
+                    // path args HERE to show which file/mount the failing op targeted.
+                    if errors_only {
+                        trace_syscall_paths(table.name_of(known).unwrap_or("?"), args);
+                    }
                 }
             }
         }
@@ -3896,7 +4062,7 @@ pub fn kernel_syscall_entry_plain_with_state(
         // sched_yield already either ceded to the executor or conservatively
         // established that there was no work to cede to. Avoid immediately
         // repeating its reschedule probe and clock read for the new/no-op slice.
-        if !matches!(n, Syscall::Yield) {
+        if n != Some(Syscall::Yield) {
             // SAFETY: the live user frame is returning from a completed syscall.
             unsafe {
                 narf_scheduler::stackful::maybe_resched_syscall_exit();
@@ -4559,9 +4725,43 @@ const _: () = {
 static GLOBAL_TABLE: AtomicPtr<SyscallTable> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize and publish the global syscall table.
+///
+/// Panics if a table is already published. Production publication is one-shot;
+/// use [`try_install_global`] when the caller must recover a rejected table.
 pub fn install_global(table: SyscallTable) {
+    assert!(
+        try_install_global(table).is_ok(),
+        "global syscall table already installed"
+    );
+}
+
+/// Atomically publishes the global table if no table has been installed.
+///
+/// The compare-and-exchange makes concurrent publication fail closed without
+/// changing the identity observed by dispatchers. Ownership of a rejected
+/// table is returned to the caller.
+///
+/// The test reset is deliberately not part of the production public API:
+///
+/// ```compile_fail
+/// narf_userspace::syscall::__test_clear_global();
+/// ```
+pub fn try_install_global(table: SyscallTable) -> Result<(), SyscallTable> {
     let ptr = Box::into_raw(Box::new(table));
-    GLOBAL_TABLE.store(ptr, Ordering::Release);
+    match GLOBAL_TABLE.compare_exchange(
+        core::ptr::null_mut(),
+        ptr,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            // SAFETY: publication failed, so no other thread can observe this
+            // freshly allocated pointer and ownership remains with this call.
+            let table = unsafe { *Box::from_raw(ptr) };
+            Err(table)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4575,6 +4775,7 @@ pub struct SyscallTable {
     handlers: Vec<Option<Box<dyn SyscallHandler>>>,
     versioned_handlers: Vec<(Syscall, u8, Box<dyn SyscallHandler>)>,
     names: Vec<(Syscall, &'static str)>,
+    interceptor: Option<Box<dyn SyscallInterceptor>>,
 }
 
 impl core::fmt::Debug for SyscallTable {
@@ -4597,6 +4798,7 @@ impl SyscallTable {
             handlers: Vec::new(),
             versioned_handlers: Vec::new(),
             names: Vec::new(),
+            interceptor: None,
         }
     }
 
@@ -4655,6 +4857,24 @@ impl SyscallTable {
         self.install(variant, Box::new(FnHandler(f)));
     }
 
+    /// Installs the table's sole syscall interceptor.
+    ///
+    /// Installation is intentionally one-shot: the table is assembled before
+    /// [`install_global`] publishes it and its interceptor identity cannot
+    /// change while tasks are dispatching through it. On duplicate
+    /// installation, ownership of the rejected interceptor is returned.
+    pub fn install_interceptor(
+        &mut self,
+        interceptor: Box<dyn SyscallInterceptor>,
+    ) -> Result<(), Box<dyn SyscallInterceptor>> {
+        if self.interceptor.is_some() {
+            Err(interceptor)
+        } else {
+            self.interceptor = Some(interceptor);
+            Ok(())
+        }
+    }
+
     pub fn install_raw_versioned<H: SyscallHandler + 'static>(
         &mut self,
         variant: Syscall,
@@ -4673,10 +4893,56 @@ impl SyscallTable {
 
     /// Lookup and execute handler for `variant`.
     pub fn dispatch(&self, variant: Syscall, ctx: &mut dyn TrapContext) {
-        self.dispatch_ctx_versioned(variant, 0, ctx);
+        self.dispatch_intercepted(variant.raw(), 0, Some(variant), ctx);
     }
 
     pub fn dispatch_ctx_versioned(&self, variant: Syscall, version: u8, ctx: &mut dyn TrapContext) {
+        self.dispatch_intercepted(syscall_pack(version, variant), version, Some(variant), ctx);
+    }
+
+    fn dispatch_intercepted(
+        &self,
+        raw_number: u32,
+        version: u8,
+        variant: Option<Syscall>,
+        ctx: &mut dyn TrapContext,
+    ) {
+        let Some(interceptor) = self.interceptor.as_deref() else {
+            self.dispatch_native(variant, version, ctx);
+            return;
+        };
+
+        let invocation = SyscallInvocation {
+            raw_number,
+            version,
+            syscall: variant,
+            args: *ctx.args(),
+            task_id: crate::handlers::current_task_id(),
+            instruction_pointer: ctx.rip(),
+            stack_pointer: ctx.user_rsp(),
+        };
+        let control = interceptor.on_syscall_enter(&invocation);
+        let result = {
+            let mut capture = InterceptCtx::new(ctx);
+            match control {
+                SyscallInterception::Continue => {
+                    self.dispatch_native(variant, version, &mut capture)
+                }
+                SyscallInterception::Complete(ret) => capture.set_return(ret),
+            }
+            capture.result
+        };
+        match result {
+            Some(result) => ctx.set_return(interceptor.on_syscall_return(&invocation, result)),
+            None => interceptor.on_syscall_context_managed(&invocation),
+        }
+    }
+
+    fn dispatch_native(&self, variant: Option<Syscall>, version: u8, ctx: &mut dyn TrapContext) {
+        let Some(variant) = variant else {
+            ctx.set_return(SyscallReturn::not_implemented());
+            return;
+        };
         narf_lib::perf::syscall();
         crate::perf_event::drain_irq_samples();
         if version != 0 {
@@ -4747,20 +5013,423 @@ where
     }
 }
 
+#[cfg(test)]
+mod interception_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct ProbeState {
+        entries: AtomicUsize,
+        exits: AtomicUsize,
+        raw_number: AtomicU32,
+        version: AtomicUsize,
+        first_arg: AtomicU64,
+        instruction_pointer: AtomicU64,
+        stack_pointer: AtomicU64,
+        unknown_entries: AtomicUsize,
+        context_managed_exits: AtomicUsize,
+    }
+
+    struct Probe(Arc<ProbeState>);
+
+    impl SyscallInterceptor for Probe {
+        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            self.0.entries.fetch_add(1, Ordering::Relaxed);
+            self.0
+                .raw_number
+                .store(invocation.raw_number, Ordering::Relaxed);
+            self.0
+                .version
+                .store(invocation.version as usize, Ordering::Relaxed);
+            self.0
+                .first_arg
+                .store(invocation.args.arg0, Ordering::Relaxed);
+            self.0
+                .instruction_pointer
+                .store(invocation.instruction_pointer, Ordering::Relaxed);
+            self.0
+                .stack_pointer
+                .store(invocation.stack_pointer, Ordering::Relaxed);
+            if invocation.syscall.is_none() {
+                self.0.unknown_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            SyscallInterception::Continue
+        }
+
+        fn on_syscall_return(
+            &self,
+            invocation: &SyscallInvocation,
+            mut result: SyscallReturn,
+        ) -> SyscallReturn {
+            self.0.exits.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall == Some(Syscall::GetPid) {
+                result.value = result.value.wrapping_add(1);
+            }
+            result
+        }
+
+        fn on_syscall_context_managed(&self, _invocation: &SyscallInvocation) {
+            self.0.context_managed_exits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct TestContext {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        rip: u64,
+        rsp: u64,
+    }
+
+    impl TrapContext for TestContext {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.ret = Some(ret);
+        }
+
+        fn user_rsp(&self) -> u64 {
+            self.rsp
+        }
+
+        fn rip(&self) -> u64 {
+            self.rip
+        }
+
+        fn set_rip(&mut self, rip: u64) {
+            self.rip = rip;
+        }
+
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn interceptor_observes_and_replaces_native_return() {
+        let state = Arc::new(ProbeState::default());
+        let mut table = SyscallTable::new();
+        table.install_fn(Syscall::GetPid, "getpid", |_| SyscallReturn::ok(41));
+        assert!(table
+            .install_interceptor(Box::new(Probe(Arc::clone(&state))))
+            .is_ok());
+
+        let mut context = TestContext {
+            args: SyscallArgs {
+                arg0: 0xfeed,
+                ..SyscallArgs::default()
+            },
+            rip: 0x1234,
+            rsp: 0x5678,
+            ..TestContext::default()
+        };
+        table.dispatch_ctx_versioned(Syscall::GetPid, 7, &mut context);
+
+        assert_eq!(context.ret, Some(SyscallReturn::ok(42)));
+        assert_eq!(state.entries.load(Ordering::Relaxed), 1);
+        assert_eq!(state.exits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.raw_number.load(Ordering::Relaxed),
+            syscall_pack(7, Syscall::GetPid)
+        );
+        assert_eq!(state.version.load(Ordering::Relaxed), 7);
+        assert_eq!(state.first_arg.load(Ordering::Relaxed), 0xfeed);
+        assert_eq!(state.instruction_pointer.load(Ordering::Relaxed), 0x1234);
+        assert_eq!(state.stack_pointer.load(Ordering::Relaxed), 0x5678);
+    }
+
+    #[test]
+    fn unknown_syscall_is_intercepted_and_remains_enosys() {
+        let state = Arc::new(ProbeState::default());
+        let mut table = SyscallTable::new();
+        assert!(table
+            .install_interceptor(Box::new(Probe(Arc::clone(&state))))
+            .is_ok());
+        let mut context = TestContext::default();
+
+        table.dispatch_intercepted(0x3fff, 0, None, &mut context);
+
+        assert_eq!(context.ret, Some(SyscallReturn::not_implemented()));
+        assert_eq!(state.unknown_entries.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn redirected_or_parked_path_is_not_given_a_fabricated_return() {
+        let state = Arc::new(ProbeState::default());
+        let mut table = SyscallTable::new();
+        table.install_raw_fn(Syscall::Yield, "yield", |_| {});
+        assert!(table
+            .install_interceptor(Box::new(Probe(Arc::clone(&state))))
+            .is_ok());
+        let mut context = TestContext::default();
+
+        table.dispatch(Syscall::Yield, &mut context);
+
+        assert_eq!(context.ret, None);
+        assert_eq!(state.context_managed_exits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn interceptor_installation_is_one_shot() {
+        let mut table = SyscallTable::new();
+        assert!(table
+            .install_interceptor(Box::new(Probe(Arc::new(ProbeState::default()))))
+            .is_ok());
+        assert!(table
+            .install_interceptor(Box::new(Probe(Arc::new(ProbeState::default()))))
+            .is_err());
+    }
+
+    #[test]
+    fn complete_skips_native_handler() {
+        struct CompleteProbe;
+        impl SyscallInterceptor for CompleteProbe {
+            fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+                if invocation.syscall == Some(Syscall::GetUid) {
+                    SyscallInterception::Complete(SyscallReturn::ok(77))
+                } else {
+                    SyscallInterception::Continue
+                }
+            }
+        }
+
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let native_calls_for_handler = Arc::clone(&native_calls);
+        let mut table = SyscallTable::new();
+        table.install_fn(Syscall::GetUid, "getuid", move |_| {
+            native_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(11)
+        });
+        assert!(table.install_interceptor(Box::new(CompleteProbe)).is_ok());
+
+        let mut context = TestContext::default();
+        table.dispatch(Syscall::GetUid, &mut context);
+
+        assert_eq!(context.ret, Some(SyscallReturn::ok(77)));
+        assert_eq!(native_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+mod interception_kernel_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Default)]
+    struct Counts {
+        entries: AtomicUsize,
+        exits: AtomicUsize,
+        unknown: AtomicUsize,
+        managed: AtomicUsize,
+        raw_number: AtomicU32,
+        version: AtomicUsize,
+        instruction_pointer: AtomicU64,
+        stack_pointer: AtomicU64,
+    }
+
+    struct Probe(Arc<Counts>);
+
+    impl SyscallInterceptor for Probe {
+        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            self.0.entries.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall.is_none() {
+                self.0.unknown.fetch_add(1, Ordering::Relaxed);
+            }
+            self.0
+                .raw_number
+                .store(invocation.raw_number, Ordering::Relaxed);
+            self.0
+                .version
+                .store(invocation.version as usize, Ordering::Relaxed);
+            self.0
+                .instruction_pointer
+                .store(invocation.instruction_pointer, Ordering::Relaxed);
+            self.0
+                .stack_pointer
+                .store(invocation.stack_pointer, Ordering::Relaxed);
+            SyscallInterception::Continue
+        }
+
+        fn on_syscall_return(
+            &self,
+            invocation: &SyscallInvocation,
+            mut result: SyscallReturn,
+        ) -> SyscallReturn {
+            self.0.exits.fetch_add(1, Ordering::Relaxed);
+            if invocation.syscall == Some(Syscall::GetPid) {
+                result.value = result.value.wrapping_add(1);
+            }
+            result
+        }
+
+        fn on_syscall_context_managed(&self, _invocation: &SyscallInvocation) {
+            self.0.managed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct Context {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+
+    impl TrapContext for Context {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.ret = Some(ret);
+        }
+
+        fn user_rsp(&self) -> u64 {
+            0x2000
+        }
+
+        fn rip(&self) -> u64 {
+            0x1000
+        }
+
+        fn set_rip(&mut self, _rip: u64) {}
+
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+    }
+
+    fn smoke_syscall_interceptor_contract() -> TestResult {
+        let counts = Arc::new(Counts::default());
+        let mut table = SyscallTable::new();
+        table.install_fn(Syscall::GetPid, "getpid", |_| SyscallReturn::ok(41));
+        table.install_raw_fn(Syscall::Yield, "yield", |_| {});
+        if table
+            .install_interceptor(Box::new(Probe(Arc::clone(&counts))))
+            .is_err()
+        {
+            return TestResult::Fail("first interceptor install was rejected");
+        }
+        if table
+            .install_interceptor(Box::new(Probe(Arc::new(Counts::default()))))
+            .is_ok()
+        {
+            return TestResult::Fail("second interceptor install replaced the first");
+        }
+
+        let mut native = Context::default();
+        table.dispatch_ctx_versioned(Syscall::GetPid, 7, &mut native);
+        if native.ret != Some(SyscallReturn::ok(42)) {
+            return TestResult::Fail("interceptor did not observe/replace native return");
+        }
+        if counts.raw_number.load(Ordering::Relaxed) != syscall_pack(7, Syscall::GetPid)
+            || counts.version.load(Ordering::Relaxed) != 7
+            || counts.instruction_pointer.load(Ordering::Relaxed) != 0x1000
+            || counts.stack_pointer.load(Ordering::Relaxed) != 0x2000
+        {
+            return TestResult::Fail("interceptor invocation snapshot was not exact");
+        }
+
+        let mut unknown = Context::default();
+        table.dispatch_intercepted(0x3fff, 0, None, &mut unknown);
+        if unknown.ret.map(|ret| ret.status) != Some(SyscallReturn::INVALID_OP) {
+            return TestResult::Fail("unknown syscall lost InvalidOp status");
+        }
+
+        let mut managed = Context::default();
+        table.dispatch(Syscall::Yield, &mut managed);
+        if managed.ret.is_some() {
+            return TestResult::Fail("context-managed path fabricated a return");
+        }
+
+        if counts.entries.load(Ordering::Relaxed) != 3
+            || counts.exits.load(Ordering::Relaxed) != 2
+            || counts.unknown.load(Ordering::Relaxed) != 1
+            || counts.managed.load(Ordering::Relaxed) != 1
+        {
+            return TestResult::Fail("interceptor entry/exit accounting mismatch");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_syscall_interceptor_complete_and_global_publication() -> TestResult {
+        struct CompleteProbe;
+        impl SyscallInterceptor for CompleteProbe {
+            fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+                if invocation.syscall == Some(Syscall::GetUid) {
+                    SyscallInterception::Complete(SyscallReturn::ok(77))
+                } else {
+                    SyscallInterception::Continue
+                }
+            }
+        }
+
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let native_calls_for_handler = Arc::clone(&native_calls);
+        let mut local = SyscallTable::new();
+        local.install_fn(Syscall::GetUid, "getuid", move |_| {
+            native_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(11)
+        });
+        if local.install_interceptor(Box::new(CompleteProbe)).is_err() {
+            return TestResult::Fail("complete interceptor installation failed");
+        }
+        let mut context = Context::default();
+        local.dispatch(Syscall::GetUid, &mut context);
+        if context.ret != Some(SyscallReturn::ok(77)) || native_calls.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("Complete did not skip the native handler exactly once");
+        }
+
+        __test_clear_global();
+        let mut first = SyscallTable::new();
+        first.install_fn(Syscall::GetPid, "getpid", |_| SyscallReturn::ok(17));
+        if try_install_global(first).is_err() {
+            return TestResult::Fail("first global publication was rejected");
+        }
+        let mut second = SyscallTable::new();
+        second.install_fn(Syscall::GetPid, "getpid", |_| SyscallReturn::ok(91));
+        if try_install_global(second).is_ok() {
+            __test_clear_global();
+            return TestResult::Fail("second global publication replaced the first");
+        }
+        let observed = kernel_syscall_entry_plain(Syscall::GetPid.raw(), &SyscallArgs::default());
+        __test_clear_global();
+        if observed != SyscallReturn::ok(17) {
+            return TestResult::Fail("rejected publication changed the active table identity");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!("userspace/syscall", smoke_syscall_interceptor_contract);
+    kernel_test_in!(
+        "userspace/syscall",
+        smoke_syscall_interceptor_complete_and_global_publication
+    );
+}
+
 // ── Test stubs ──────────────────────────────────────────────────────
 
 #[doc(hidden)]
-pub fn __test_clear_global() {
-    let ptr = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !ptr.is_null() {
-        // SAFETY: `ptr` is the non-null pointer atomically swapped out of
-        // `GLOBAL_TABLE`; it originated from `install_global`'s
-        // `Box::into_raw(Box::new(SyscallTable))`. The swap gives us
-        // exclusive ownership (no other thread can observe it now), so
-        // reconstituting and dropping the Box frees it exactly once.
-        // SAFETY: Valid memory or trusted environment
-        unsafe { drop(Box::from_raw(ptr)) };
-    }
+pub(crate) fn __test_clear_global() {
+    clear_global_for_tests();
+}
+
+#[cfg(feature = "verification-test-reset")]
+#[doc(hidden)]
+pub fn __verification_clear_global() {
+    clear_global_for_tests();
+}
+
+fn clear_global_for_tests() {
+    // Tests reset the singleton between isolated cases. A dispatcher may have
+    // loaded the old pointer immediately before this swap, so reclamation here
+    // would be a use-after-free. Deliberately leak the retired test table; the
+    // production API has no reset operation and retains its table for boot.
+    let _retired = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
 }
 
 #[cfg(feature = "kernel-test")]

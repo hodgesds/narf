@@ -57,7 +57,7 @@ narf-net        = { path = "../net" }
 narf-filesystem = { path = "../filesystem" }
 narf-power      = { path = "../power" }
 narf-observability = { path = "../observability" }
-narf-userspace  = { path = "../userspace" }
+narf-userspace  = { path = "../userspace", features = ["verification-test-reset"] }
 # Optional: pulled in only under `boot-init` so default builds
 # don't trigger the busybox download + make. Falls back to an
 # empty slice when musl-gcc isn't on the host (see busybox
