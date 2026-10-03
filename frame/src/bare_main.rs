@@ -4833,6 +4833,22 @@ fn boot_userspace_init() {
     // Syscall table.
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
+    // `reverie_tool=<name>` hosts getty's process tree (the login session and
+    // every command typed into it) under the named Reverie Tool, installed as
+    // the table's interceptor (`reverie_narf_adapter::boot`). Without the flag
+    // no interceptor is installed.
+    #[cfg(feature = "reverie-narf-poc")]
+    let reverie_boot = match narf_boot::args().value("reverie_tool") {
+        Some(_) if narf_boot::args().has_flag("systemd_pid1") => {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: reverie_tool ignored: systemd_pid1 has no login session to host"
+            );
+            None
+        }
+        Some(name) => reverie_narf_adapter::boot::install(&mut t, name),
+        None => None,
+    };
     install_global(t);
 
     // The handlers reach `current_task_id()` then look up its
@@ -5063,6 +5079,65 @@ fn boot_userspace_init() {
         // load_user_process_with uses above.
         narf_userspace::handlers::set_proc_argv(tid.raw(), argv);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
+        true
+    }
+
+    // Like `spawn_one`, but makes the process the root of the tree the boot's
+    // Reverie Tool hosts before its first instruction runs. If the host
+    // refuses it, the process is not spawned.
+    #[cfg(feature = "reverie-narf-poc")]
+    fn spawn_one_hosted(
+        name: &'static str,
+        bytes: &[u8],
+        host: &reverie_narf_adapter::boot::BootHost,
+    ) -> bool {
+        if bytes.is_empty() {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: {name}: ELF is empty — skipping"
+            );
+            return false;
+        }
+        let argv = [name];
+        // SAFETY: as in `spawn_one_argv`.
+        let proc = match unsafe { load_user_process_with(bytes, &argv, &[], &[]) } {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  boot-init: {name}: load_user_process_with failed: {e:?}"
+                );
+                return false;
+            }
+        };
+        let pid = proc.pid;
+        let entry = proc.entry.0.as_u64();
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: spawning {name} pid={} entry={:#x}",
+            pid.raw(),
+            entry
+        );
+        let pending = narf_userspace::user_task::prepare_user_process_initial(
+            proc,
+            narf_scheduler::TaskSpec::unthrottled(),
+        );
+        let tid = pending.task_id();
+        // The host reads the task's Linux identity.
+        narf_userspace::handlers::register_pid_task_mapping(pid.raw(), tid.raw());
+        if let Err(reason) = host.host_root(tid.raw()) {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: {name}: the Reverie host refused it: {reason}; not spawned"
+            );
+            let _ = narf_userspace::task::release_task(tid.raw());
+            return false;
+        }
+        #[cfg(feature = "cgroup")]
+        narf_filesystem::cgroupfs::attach_to_root(pid.raw());
+        narf_userspace::handlers::set_proc_argv(tid.raw(), &argv);
+        narf_userspace::handlers::set_proc_comm(tid.raw(), name);
+        pending.spawn();
         true
     }
 
@@ -5735,6 +5810,13 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
     // `/bin/shell`, so the shell runs with real job control. `baked_shell`
     // is seeded at `/bin/shell` (above) for getty's execve.
     let _ = baked_shell;
+    #[cfg(feature = "reverie-narf-poc")]
+    if let Some(host) = &reverie_boot {
+        spawn_one_hosted("getty", narf_verification::NARF_GETTY_ELF, host);
+    } else {
+        spawn_one("getty", narf_verification::NARF_GETTY_ELF);
+    }
+    #[cfg(not(feature = "reverie-narf-poc"))]
     spawn_one("getty", narf_verification::NARF_GETTY_ELF);
 
     // Off-box network serving smoke (opt-in `qemu-net`): auto-spawn the

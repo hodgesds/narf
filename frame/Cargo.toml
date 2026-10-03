@@ -347,7 +347,9 @@ narf-libc-validate = ["user-mode-e2e", "narf-verification/narf-libc-validate"]
 boot-init = ["dep:narf-verification", "narf-verification/boot-init"]
 # Link the in-kernel Reverie backend (reverie-narf-adapter), which hosts an
 # unmodified reverie::Tool at the syscall dispatcher, and, in kernel-test
-# builds, its `reverie-narf` tests. x86_64-only: the adapter is empty on
+# builds, its `reverie-narf` tests. With boot-init, the kernel command line
+# `reverie_tool=<name>` hosts getty's process tree under the named Tool; the
+# table has no interceptor without it. x86_64-only: the adapter is empty on
 # other targets because Reverie's no-std syscall layer is x86_64-only.
 reverie-narf-poc = ["dep:reverie-narf-adapter"]
 

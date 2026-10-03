@@ -494,6 +494,18 @@ struct MuslDemoArgs {
     /// boot it, so no group re-compiles the kernel.
     #[arg(long, value_name = "PATH")]
     prebuilt: Option<String>,
+
+    /// Host getty's process tree (the login shell and every case typed into
+    /// it) under this unmodified Reverie Tool (`counter1`): build with
+    /// `reverie-narf-poc`, boot with `reverie_tool=TOOL`, type `exit` after
+    /// each boot's last case, and require the Tool's report from every boot
+    /// (`reverie_narf_adapter::boot`).
+    #[arg(long, value_name = "TOOL")]
+    reverie_tool: Option<String>,
+
+    /// Run only the case whose command is exactly CMD (repeatable).
+    #[arg(long = "case", value_name = "CMD")]
+    cases: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default, Debug)]
@@ -3288,27 +3300,48 @@ fn musl_case_group(cmd: &str) -> &'static str {
 /// (e.g. "QEMU EOF before login" — GHA's TCG occasionally dies before the
 /// shell), which is the dominant musl-demo flake. A genuinely-broken case
 /// fails every attempt and returns false.
+///
+/// With `reverie`, every attempt's report check goes to `reports`.
 fn run_case_with_retry(
     build: &BuildArgs,
     case: (&str, &str),
     kernel: Option<&Path>,
     attempts: u32,
+    reverie: Option<&str>,
+    reports: &mut ReverieReports,
 ) -> bool {
     for attempt in 1..=attempts {
-        match run_interactive_multi(build, core::slice::from_ref(&case), kernel) {
-            Ok((_, 0, _)) => return true,
-            Ok((_, f, _)) => eprintln!(
-                "musl-demo: `{}` failed ({f} err) on attempt {attempt}/{attempts}",
-                case.0
-            ),
-            Err(e) => eprintln!(
-                "musl-demo: `{}` boot error on attempt {attempt}/{attempts}: {e:#}",
-                case.0
-            ),
+        let boot = format!("`{}` attempt {attempt}/{attempts}", case.0);
+        match run_interactive_multi(build, core::slice::from_ref(&case), kernel, reverie) {
+            Ok((_, f, _, report)) => {
+                if let Some(report) = report {
+                    reports.push((boot, report));
+                }
+                if f == 0 {
+                    return true;
+                }
+                eprintln!(
+                    "musl-demo: `{}` failed ({f} err) on attempt {attempt}/{attempts}",
+                    case.0
+                );
+            }
+            Err(e) => {
+                if reverie.is_some() {
+                    reports.push((boot, Err(format!("boot error: {e:#}"))));
+                }
+                eprintln!(
+                    "musl-demo: `{}` boot error on attempt {attempt}/{attempts}: {e:#}",
+                    case.0
+                );
+            }
         }
     }
     false
 }
+
+/// Each boot's Reverie report check under `musl-demo --reverie-tool`: the
+/// boot, and the report's summary or why the boot has no valid report.
+type ReverieReports = Vec<(String, Result<String, String>)>;
 
 fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     if !matches!(args.build.arch, Arch::X86_64) {
@@ -3661,6 +3694,38 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         return Ok(());
     }
 
+    for cmd in &args.cases {
+        if !lightweight
+            .iter()
+            .chain(GUI_FRESH_BOOT.iter())
+            .any(|(c, _)| *c == cmd.as_str())
+        {
+            bail!("--case `{cmd}` is not a musl-demo case");
+        }
+    }
+
+    // `--reverie-tool`: the kernel hosts getty's process tree under the Tool,
+    // and every boot must end with the Tool's report.
+    let mut build = args.build.clone();
+    let reverie = args.reverie_tool.as_deref();
+    let mut reports = ReverieReports::new();
+    if let Some(tool) = reverie {
+        ensure_feature(&mut build.features, "reverie-narf-poc");
+        let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+        if existing
+            .split_ascii_whitespace()
+            .any(|t| t.starts_with("reverie_tool="))
+        {
+            bail!("XTASK_QEMU_APPEND already sets reverie_tool; use --reverie-tool alone");
+        }
+        let combined = if existing.is_empty() {
+            format!("reverie_tool={tool}")
+        } else {
+            format!("{existing} reverie_tool={tool}")
+        };
+        std::env::set_var("XTASK_QEMU_APPEND", combined);
+    }
+
     // Resolve the kernel once: a prebuilt artifact (the per-group CI jobs
     // boot the same downloaded image) or a fresh build (run_interactive_multi
     // builds on the first call, warm-incremental after).
@@ -3681,6 +3746,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         args.group
             .as_deref()
             .is_none_or(|g| musl_case_group(cmd) == g)
+            && (args.cases.is_empty() || args.cases.iter().any(|c| c == cmd))
     };
     if let Some(g) = &args.group {
         eprintln!("xtask musl-demo: running subsystem group `{g}`");
@@ -3695,12 +3761,21 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     } else {
         let mut out = None;
         for attempt in 1..=2u32 {
-            match run_interactive_multi(&args.build, &selected, kernel_override) {
-                Ok(t) => {
-                    out = Some(t);
+            match run_interactive_multi(&build, &selected, kernel_override, reverie) {
+                Ok((passed, failed, failed_cases, report)) => {
+                    if let Some(report) = report {
+                        reports.push((format!("shared boot attempt {attempt}/2"), report));
+                    }
+                    out = Some((passed, failed, failed_cases));
                     break;
                 }
                 Err(e) if attempt < 2 => {
+                    if reverie.is_some() {
+                        reports.push((
+                            format!("shared boot attempt {attempt}/2"),
+                            Err(format!("boot error: {e:#}")),
+                        ));
+                    }
                     eprintln!("musl-demo: shared-boot error (attempt {attempt}/2): {e:#}; retrying")
                 }
                 Err(e) => return Err(e),
@@ -3716,10 +3791,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     for (cmdline, expect) in &main_failed {
         eprintln!("\nmusl-demo (retry): {cmdline}");
         if run_case_with_retry(
-            &args.build,
+            &build,
             (cmdline.as_str(), expect.as_str()),
             kernel_override,
             2,
+            reverie,
+            &mut reports,
         ) {
             // Cleared on the isolated retry → reclassify as a pass.
             passed += 1;
@@ -3732,7 +3809,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     // wl_xdg once hit a bare "QEMU EOF before login" on GHA TCG).
     for case in GUI_FRESH_BOOT.iter().filter(|t| want(t.0)) {
         eprintln!("\nmusl-demo (fresh boot): {}", case.0);
-        if run_case_with_retry(&args.build, *case, kernel_override, 3) {
+        if run_case_with_retry(&build, *case, kernel_override, 3, reverie, &mut reports) {
             passed += 1;
         } else {
             failed += 1;
@@ -3745,6 +3822,25 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         passed,
         failed
     );
+    if let Some(tool) = reverie {
+        let bad = reports.iter().filter(|(_, r)| r.is_err()).count();
+        eprintln!(
+            "musl-demo reverie reports ({tool}): {} boots, {bad} failed",
+            reports.len()
+        );
+        for (boot, report) in &reports {
+            match report {
+                Ok(summary) => eprintln!("  ok   {boot}: {summary}"),
+                Err(why) => eprintln!("  FAIL {boot}: {why}"),
+            }
+        }
+        if reports.is_empty() || bad > 0 {
+            bail!(
+                "musl-demo --reverie-tool {tool}: {bad} of {} boots have no valid report",
+                reports.len()
+            );
+        }
+    }
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
     }
@@ -6962,17 +7058,25 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
 /// and token detection are driven off the captured serial buffer; the
 /// channel carries only panic/EOF so a crash aborts fast (remaining
 /// commands are counted failed).
-/// Returns `(passed, failed, failed_cases)`. `failed_cases` is the
+/// Returns `(passed, failed, failed_cases, report)`. `failed_cases` is the
 /// `(cmdline, expect)` of every command that did not pass — including
 /// commands never reached because an earlier one killed the VM — so the
 /// caller can retry them individually (see the SMP-strand retry in
-/// `musl_demo_cmd`).
+/// `musl_demo_cmd`). With `reverie`, the Reverie Tool hosting the session,
+/// it types `exit` after the last command and `report` is the check of the
+/// Tool's report (`check_reverie_report`); otherwise `report` is `None`.
 #[allow(clippy::type_complexity)]
 fn run_interactive_multi(
     build_in: &BuildArgs,
     cases: &[(&str, &str)],
     kernel_override: Option<&Path>,
-) -> Result<(usize, usize, Vec<(String, String)>)> {
+    reverie: Option<&str>,
+) -> Result<(
+    usize,
+    usize,
+    Vec<(String, String)>,
+    Option<Result<String, String>>,
+)> {
     use std::io::{Read, Write};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
@@ -7320,6 +7424,54 @@ fn run_interactive_multi(
         let _ = cursor;
     }
 
+    // Ending the hosted session makes the kernel print the Tool's report for
+    // the whole hosted tree.
+    let report = reverie.map(|tool| {
+        if let Some(why) = &aborted {
+            return Err(format!("no report: the boot was aborted ({why})"));
+        }
+        let pre = captured.lock().map(|g| g.len()).unwrap_or(cursor);
+        let mut echo_cursor = pre;
+        for &b in b"exit" {
+            if stdin.write_all(&[b]).is_err() {
+                return Err("stdin write failed typing `exit`".to_string());
+            }
+            let _ = stdin.flush();
+            match wait_for(echo_cursor, core::slice::from_ref(&b), false, prompt_to) {
+                Wait::Found(end) => echo_cursor = end,
+                Wait::TimedOut | Wait::Died(_) => {
+                    return Err("serial echo acknowledgement failed typing `exit`".to_string())
+                }
+            }
+        }
+        if stdin.write_all(b"\n").is_err() {
+            return Err("stdin write failed typing `exit`".to_string());
+        }
+        let _ = stdin.flush();
+        let serial = || {
+            captured
+                .lock()
+                .map(|g| String::from_utf8_lossy(&g).into_owned())
+                .unwrap_or_default()
+        };
+        match wait_for(pre, b"reverie-narf-boot: report end", false, echo_to) {
+            Wait::Found(_) => check_reverie_report(&serial(), tool),
+            Wait::TimedOut => {
+                let serial = serial();
+                let waiting = serial
+                    .lines()
+                    .find(|l| l.contains("reverie-narf-boot: the root's process has exited"));
+                Err(format!(
+                    "no report within {echo_secs}s after `exit`{}",
+                    waiting
+                        .map(|l| format!(": {}", l.trim_end()))
+                        .unwrap_or_default()
+                ))
+            }
+            Wait::Died(why) => Err(format!("no report: {why} after `exit`")),
+        }
+    });
+
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader_handle.join();
@@ -7339,7 +7491,114 @@ fn run_interactive_multi(
         );
     }
 
-    Ok((passed, failed, failed_cases))
+    Ok((passed, failed, failed_cases, report))
+}
+
+/// Checks one boot's serial output for the report of Reverie Tool `tool`,
+/// which hosted the login session (`reverie_narf_adapter::boot`), and returns
+/// the report's summary or why it is missing or wrong.
+///
+/// The Tool's own count must equal the syscall events the kernel's tally
+/// expected it to see (every syscall entry of a hosted task, less park
+/// re-executions and entries the host runs without an event), and the tally
+/// and the adapter must agree on how many hosted tasks exited, with none
+/// still hosted and the run not aborted.
+fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
+    fn matching<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+    fn single<'a>(lines: &[&'a str], needle: &str) -> Result<&'a str, String> {
+        match matching(lines, needle).as_slice() {
+            [line] => Ok(*line),
+            found => Err(format!(
+                "{} lines contain `{needle}`, expected 1",
+                found.len()
+            )),
+        }
+    }
+    let lines: Vec<&str> = serial.lines().map(|l| l.trim_end_matches('\r')).collect();
+    single(
+        &lines,
+        &format!("reverie-narf-boot: {tool} installed at the syscall dispatcher"),
+    )?;
+    single(
+        &lines,
+        &format!("reverie-narf-boot: {tool} hosts the process tree of pid "),
+    )?;
+    single(&lines, "reverie-narf-boot: report end")?;
+    for needle in ["reverie-narf-boot: refused", "reverie-narf: aborting"] {
+        if let Some(line) = matching(&lines, needle).first() {
+            return Err(format!("the boot logged `{line}`"));
+        }
+    }
+    // The Tool's own report line, as reverie-examples prints it on Linux.
+    let counted: u64 = match tool {
+        "counter1" => {
+            let prefix = "counter1-global syscalls=";
+            let line = single(&lines, prefix)?;
+            let at = line.find(prefix).map_or(0, |at| at + prefix.len());
+            line[at..]
+                .trim()
+                .parse()
+                .map_err(|e| format!("bad count in `{line}`: {e}"))?
+        }
+        _ => return Err(format!("no report check for tool `{tool}`")),
+    };
+    let tally = single(&lines, "reverie-narf-boot: tally ")?;
+    let fields: std::collections::BTreeMap<&str, &str> = tally
+        .split_ascii_whitespace()
+        .filter_map(|t| t.split_once('='))
+        .collect();
+    let field = |key: &str| -> Result<String, String> {
+        fields
+            .get(key)
+            .map(|v| v.to_string())
+            .ok_or_else(|| format!("the tally has no `{key}`: `{tally}`"))
+    };
+    let num = |key: &str| -> Result<u64, String> {
+        field(key)?
+            .parse()
+            .map_err(|e| format!("bad `{key}` in `{tally}`: {e}"))
+    };
+    if field("tool")? != tool {
+        return Err(format!("the tally is for another tool: `{tally}`"));
+    }
+    let entries = num("entries")?;
+    let reexecutions = num("reexecutions")?;
+    let native_only = num("native-only")?;
+    let expected = num("expected-events")?;
+    if entries.checked_sub(reexecutions + native_only) != Some(expected) {
+        return Err(format!("the tally's arithmetic is wrong: `{tally}`"));
+    }
+    if counted == 0 || counted != expected {
+        return Err(format!(
+            "{tool} counted {counted} syscall events; the tally expected {expected}"
+        ));
+    }
+    let exited = num("tasks-exited")?;
+    let adapter_exits = num("adapter-exits")?;
+    if exited != adapter_exits {
+        return Err(format!(
+            "the tally saw {exited} hosted tasks exit, the adapter {adapter_exits}"
+        ));
+    }
+    if num("adapter-hosted")? != 0 {
+        return Err(format!("the adapter still hosts tasks: `{tally}`"));
+    }
+    if field("aborted")? != "no" {
+        return Err(format!("the run was aborted: `{tally}`"));
+    }
+    Ok(format!(
+        "{tool} counted {counted} = expected-events ({entries} entries - {reexecutions} \
+         re-executions - {native_only} native-only); {exited} tasks exited ({} unstarted), \
+         {} processes",
+        num("exited-unstarted")?,
+        num("processes")?
+    ))
 }
 
 /// Produce a Limine-bootable UEFI ISO at

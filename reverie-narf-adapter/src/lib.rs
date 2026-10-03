@@ -268,6 +268,8 @@
 extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
+pub mod boot;
+#[cfg(target_arch = "x86_64")]
 mod interceptor;
 #[cfg(target_arch = "x86_64")]
 mod services;
