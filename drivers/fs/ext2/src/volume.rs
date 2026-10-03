@@ -27,6 +27,9 @@ use narf_filesystem::{
 };
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::mutex::Mutex;
+
+/// Stripes of the page-cache miss lock (`Ext2Volume::fill_locks`).
+const FILL_STRIPES: usize = 64;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::now_wall;
 
@@ -319,12 +322,19 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// shrinker — its own internal lock serialises map access, and reclaim
     /// runs from a synchronous context that cannot take an async `Mutex`.
     page_cache: Arc<PageCache>,
-    /// Serialises page-cache miss fills so parallel dynamic-linker mmaps
-    /// coalesce (the first reader fills; the rest hit) rather than each
-    /// issuing the same block read. Held across lookup→read→insert. This is
-    /// the coalescing role the old `Mutex<PageCache>` played, split out so the
-    /// cache itself is a lock-free-to-reach `Arc`.
-    fill_lock: Mutex<()>,
+    /// Coalesce concurrent misses on the same device page (the first reader
+    /// fills; the rest hit) so parallel dynamic-linker mmaps issue one block
+    /// read, while misses on different pages proceed in parallel. Striped by
+    /// page number — Linux locks the one folio being filled, never the whole
+    /// mapping. Held across lookup→read→insert of that page only.
+    fill_locks: [Mutex<()>; FILL_STRIPES],
+    /// Cache generation, bumped by every device write after it lands. A miss
+    /// fill snapshots it before its device read and publishes (to the page
+    /// cache or the indirect cache) only if it is unchanged, so bytes read
+    /// before a racing write are returned to their caller but never cached.
+    /// Check-and-publish and bump-and-invalidate both run under this lock,
+    /// which is never held across I/O.
+    cache_generation: IrqSafeSpinLock<u64>,
     /// Serializes whole-inode read/modify/write sequences across distinct
     /// `Ext2Node` handles. Linux has one in-memory inode per on-disk inode;
     /// this volume-wide async mutex provides the same lost-update guarantee
@@ -671,7 +681,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             journal_overrides,
             indirect_cache: IrqSafeSpinLock::new(Vec::new()),
             page_cache: Arc::new(PageCache::new()),
-            fill_lock: Mutex::new(()),
+            fill_locks: [const { Mutex::new(()) }; FILL_STRIPES],
+            cache_generation: IrqSafeSpinLock::new(0),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
@@ -976,9 +987,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Ok(found.page_slice(in_page, bs));
         }
 
-        // Coalesce concurrent misses. This remains deliberately separate from
-        // the cache metadata lock, which must never be held across device I/O.
-        let _fill = self.fill_lock.lock().await;
+        // Coalesce concurrent misses on this page. This remains deliberately
+        // separate from the cache metadata lock, which must never be held
+        // across device I/O.
+        let _fill = self.fill_locks[key.page_off as usize % FILL_STRIPES]
+            .lock()
+            .await;
         if let Some(found) = self.page_cache.lookup_folio(key) {
             return Ok(found.page_slice(in_page, bs));
         }
@@ -986,13 +1000,19 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let Some(mut allocation) = CacheFolio::alloc_zeroed() else {
             return Ok(None);
         };
+        let generation = *self.cache_generation.lock();
         self.read_byte_range(first_block * bs as u64, &mut allocation[..])
             .await?;
         let folio = Folio::clean(allocation);
         let view = folio.slice(in_page, bs).ok_or(FsError::InvalidData)?;
         // A future higher-order readahead fill may win an overlapping race.
         // The private retained view is still valid even when publication loses.
-        self.page_cache.insert_folio(key, folio);
+        {
+            let current = self.cache_generation.lock();
+            if *current == generation {
+                self.page_cache.insert_folio(key, folio);
+            }
+        }
         Ok(Some(view))
     }
 
@@ -1104,21 +1124,29 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
-        // Any device write may touch an indirect block (or free/reallocate
-        // one), so drop the read cache wholesale to avoid serving stale
-        // pointers. Writes are rare next to reads; clearing 8 entries is cheap.
-        self.indirect_cache.lock().clear();
-        // Direct block writes bypass the page-cache writeback path, so they
-        // must invalidate the cached pages they overwrite before changing the
-        // device — only those: dropping the whole cache on every write made
-        // each later read on the volume go back to the device. The cache is
-        // keyed by device page (`read_block`: inode 0, page_off = byte offset
-        // / PAGE_SIZE). Take the fill lock so the invalidation can't race a
-        // concurrent miss-fill into re-inserting a now-stale page.
-        let _fill = self.fill_lock.lock().await;
+        let result = self.write_byte_range_device(byte_off, src).await;
+        // Direct block writes bypass the page-cache writeback path, so once
+        // the device has changed — even partially, on an error — drop the
+        // cached pages they overwrote. Only those: dropping the whole cache
+        // on every write made each later read on the volume go back to the
+        // device. The cache is keyed by device page (`read_block_folio`:
+        // inode 0, page_off = byte offset / PAGE_SIZE). Any write may also
+        // change an indirect block (or free/reallocate one), so the 8-entry
+        // indirect cache goes too. Bumping the generation in the same
+        // critical section stops a fill that read the old bytes from
+        // publishing them afterwards.
         let first_page = byte_off / PAGE_SIZE as u64;
         let end_page = (byte_off + src.len() as u64).div_ceil(PAGE_SIZE as u64);
-        self.page_cache.invalidate_range(0, 0, first_page, end_page);
+        {
+            let mut generation = self.cache_generation.lock();
+            *generation = generation.wrapping_add(1);
+            self.page_cache.invalidate_range(0, 0, first_page, end_page);
+            self.indirect_cache.lock().clear();
+        }
+        result
+    }
+
+    async fn write_byte_range_device(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {
@@ -2053,11 +2081,17 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         }
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
+        let generation = *self.cache_generation.lock();
         self.read_block(block_no as u64, &mut buf).await?;
         let val = entry(&buf);
         // Insert into the LRU (cap 8, evict oldest). Re-check membership: a
         // concurrent read may have inserted the same block while we awaited.
+        // Skip the insert if a write landed meanwhile (see `cache_generation`).
         {
+            let current = self.cache_generation.lock();
+            if *current != generation {
+                return Ok(val);
+            }
             let mut cache = self.indirect_cache.lock();
             if !cache.iter().any(|(b, _)| *b == block_no) {
                 if cache.len() >= 8 {
