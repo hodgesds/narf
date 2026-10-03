@@ -229,6 +229,10 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
         if t_flags & SHF_ALLOC == 0 {
             continue;
         }
+        // Unlike the encoded value (see `value_moves`), the field needs no
+        // image bound: it always lies inside its target section, and
+        // `image_extent` is the span of exactly the allocated sections at or
+        // above `base`. A field at or above `base` is therefore in the image.
         let field_moves = t_addr >= base;
 
         let entsize = if sh_entsize == 0 {
@@ -407,7 +411,9 @@ fn image_extent(
 
 /// Whether a relocation encoding `sym_value + addend` points at something the
 /// slide moves. Either form counts: a symbol in the image with an addend that
-/// steps past its end is still an image address.
+/// steps outside it is still an image address. That happens below the image
+/// as well as past its end: a PC-relative record's `-4` addend puts a call to
+/// the image's first byte four bytes under it.
 fn value_moves(image: &std::ops::RangeInclusive<u64>, sym_value: u64, addend: u64) -> bool {
     image.contains(&sym_value.wrapping_add(addend)) || image.contains(&sym_value)
 }
@@ -542,5 +548,164 @@ mod tests {
         // In the image, and one past its end (`__kernel_end`-style symbols).
         assert!(value_moves(&image, 0xFFFF_FF7F_C009_A000, 0x40));
         assert!(value_moves(&image, end, 0));
+    }
+
+    const SHT_NOBITS: u32 = 8;
+
+    /// One section of a synthetic image: `(sh_type, sh_flags, sh_addr,
+    /// sh_size, sh_link, sh_info, sh_entsize, contents)`. Allocated sections
+    /// are `SHT_NOBITS`, since `extract` reads only their address and size.
+    type Sec = (u32, u64, u64, u64, u32, u32, u64, Vec<u8>);
+
+    fn nobits(addr: u64, size: u64) -> Sec {
+        (SHT_NOBITS, SHF_ALLOC, addr, size, 0, 0, 0, Vec::new())
+    }
+
+    /// `Elf64_Sym` entries with the given values, after the null symbol.
+    fn symtab(values: &[u64]) -> Sec {
+        let mut d = vec![0u8; 24];
+        for v in values {
+            let mut e = [0u8; 24];
+            e[8..16].copy_from_slice(&v.to_le_bytes());
+            d.extend_from_slice(&e);
+        }
+        let size = d.len() as u64;
+        (SHT_SYMTAB, 0, 0, size, 0, 0, 24, d)
+    }
+
+    /// `Elf64_Rela` entries `(r_offset, r_type, symbol index, addend)`
+    /// against the symbol table in section `link`, patching section `info`.
+    fn rela(link: u32, info: u32, entries: &[(u64, u32, u64, i64)]) -> Sec {
+        let mut d = Vec::new();
+        for &(off, ty, sym, addend) in entries {
+            d.extend_from_slice(&off.to_le_bytes());
+            d.extend_from_slice(&((sym << 32) | u64::from(ty)).to_le_bytes());
+            d.extend_from_slice(&addend.to_le_bytes());
+        }
+        let size = d.len() as u64;
+        (SHT_RELA, 0, 0, size, link, info, 24, d)
+    }
+
+    /// Write a section-headers-only ELF64 image and run the real `extract`
+    /// on it. Section 0 (the null section) is supplied here.
+    fn extract_synthetic(name: &str, e_machine: u16, secs: &[Sec]) -> Result<RelocTable> {
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for s in secs {
+            offsets.push(64 + data.len() as u64);
+            data.extend_from_slice(&s.7);
+        }
+        let shoff = 64 + data.len() as u64;
+        let mut img = vec![0u8; 64];
+        img[..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2; // ELFCLASS64
+        img[5] = 1; // little-endian
+        img[6] = 1; // EV_CURRENT
+        img[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        img[0x12..0x14].copy_from_slice(&e_machine.to_le_bytes());
+        img[0x28..0x30].copy_from_slice(&shoff.to_le_bytes());
+        img[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        img[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        img[0x3C..0x3E].copy_from_slice(&(secs.len() as u16 + 1).to_le_bytes());
+        img.extend_from_slice(&data);
+        img.extend_from_slice(&[0u8; 64]); // null section header
+        for (s, off) in secs.iter().zip(offsets) {
+            let mut h = [0u8; 64];
+            h[0x04..0x08].copy_from_slice(&s.0.to_le_bytes());
+            h[0x08..0x10].copy_from_slice(&s.1.to_le_bytes());
+            h[0x10..0x18].copy_from_slice(&s.2.to_le_bytes());
+            h[0x18..0x20].copy_from_slice(&off.to_le_bytes());
+            h[0x20..0x28].copy_from_slice(&s.3.to_le_bytes());
+            h[0x28..0x2C].copy_from_slice(&s.4.to_le_bytes());
+            h[0x2C..0x30].copy_from_slice(&s.5.to_le_bytes());
+            h[0x38..0x40].copy_from_slice(&s.6.to_le_bytes());
+            img.extend_from_slice(&h);
+        }
+        let path =
+            std::env::temp_dir().join(format!("xtask-relocs-{name}-{}.elf", std::process::id()));
+        std::fs::write(&path, &img).unwrap();
+        let table = extract(&path);
+        std::fs::remove_file(&path).unwrap();
+        table
+    }
+
+    /// The aarch64 linear-map literal through the real entry point.
+    ///
+    /// `boot.S` loads `ldr x0, =stack_top_virt`: an `R_AARCH64_ABS64` in
+    /// `.boot` whose symbol lies in the linear map, above `base` but outside
+    /// the image. It must not reach `abs64_low`, or the slide moves the BSP's
+    /// stack pointer onto the linear alias of `stack_top + slide`. The same
+    /// value in a kernel-half field must not reach `abs64` either. The unit
+    /// test above calls `value_moves` directly, so it cannot see a call site
+    /// in `extract` that stops using it.
+    #[test]
+    fn extract_leaves_aarch64_linear_map_literals_unslid() {
+        const BOOT: u64 = 0x4008_0000;
+        const TEXT: u64 = 0xFFFF_FF7F_C009_A000;
+        let table = extract_synthetic(
+            "aarch64-linear",
+            EM_AARCH64,
+            &[
+                nobits(BOOT, 0x100),  // 1: .boot
+                nobits(TEXT, 0x1000), // 2: .text
+                symtab(&[
+                    TEXT + 0x100,          // 1: an image symbol (`_start_rust`)
+                    0xFFFF_FF80_4009_9000, // 2: `stack_top_virt`, linear map
+                ]),
+                rela(
+                    3,
+                    1,
+                    &[
+                        (BOOT + 0x10, R_AARCH64_ABS64, 1, 0),
+                        (BOOT + 0x18, R_AARCH64_ABS64, 2, 0),
+                    ],
+                ),
+                rela(
+                    3,
+                    2,
+                    &[
+                        (TEXT + 0x8, R_AARCH64_ABS64, 1, 0),
+                        (TEXT + 0x10, R_AARCH64_ABS64, 2, 0),
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(table.base, KIMAGE_VOFFSET_AARCH64);
+        assert_eq!(table.abs64_low, vec![BOOT + 0x10]);
+        assert_eq!(table.abs64, vec![TEXT + 0x8]);
+        assert!(table.abs32s.is_empty() && table.pcrel32_into_kernel.is_empty());
+    }
+
+    /// The `|| image.contains(&sym_value)` arm of `value_moves`.
+    ///
+    /// A PC-relative call encodes `S + A - P` with `A = -4`, so when the
+    /// target is the first byte of the image, `S + A` lies four bytes BELOW
+    /// it. The linked x86_64 kernel has such records: two `R_X86_64_PLT32`
+    /// sites whose symbol is at the image's first address with addend -4
+    /// (both within the kernel half, where the outcome is the same either
+    /// way). From the boot stub the same shape is `call _start_rust` with
+    /// `_start_rust` linked first; judged by `S + A` alone it would be
+    /// counted as low-to-low and its displacement left unpatched.
+    #[test]
+    fn extract_slides_boot_stub_call_to_first_image_byte() {
+        const BOOT: u64 = 0x100_0000;
+        const TEXT: u64 = 0xFFFF_FFFF_8101_6000;
+        let table = extract_synthetic(
+            "x86-first-byte",
+            EM_X86_64,
+            &[
+                nobits(BOOT, 0x100),  // 1: boot stub
+                nobits(TEXT, 0x1000), // 2: .text
+                symtab(&[TEXT]),      // 1: the image's first byte
+                rela(3, 1, &[(BOOT + 0x10, R_X86_64_PLT32, 1, -4)]),
+                rela(3, 2, &[(TEXT + 0x8, R_X86_64_64, 1, 0)]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(table.base, KERNEL_VIRT_BASE);
+        assert_eq!(table.pcrel32_into_kernel, vec![BOOT + 0x10]);
+        assert_eq!(table.abs64, vec![TEXT + 0x8]);
+        assert!(table.abs32s.is_empty() && table.abs64_low.is_empty());
     }
 }
