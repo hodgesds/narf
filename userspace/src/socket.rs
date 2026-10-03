@@ -725,6 +725,12 @@ pub struct SocketFile {
     /// (each end of a socketpair, each accepted connection) its own
     /// `new_inode_pseudo(sock_mnt->mnt_sb)` numbered by `get_next_ino`.
     inode: narf_filesystem::inode_id::InodeId,
+    /// Back-reference to this socket's own Arc (set by `Arc::new_cyclic` in
+    /// `new`). `FileOps::read`/`write` only receive `&self`, but the
+    /// per-family dispatchers need `&Arc<Self>` (bind registration holds
+    /// `Weak` owners); upgrading this bridges read(2)/write(2) onto the same
+    /// dispatch path as recv(2)/send(2).
+    self_weak: Weak<SocketFile>,
     state: IrqSafeSpinLock<SocketState>,
     /// Per-socket option storage. Setsockopt writes here; getsockopt
     /// reads. Values that affect packet shape (TCP_NODELAY,
@@ -1641,11 +1647,12 @@ impl SocketFile {
         } else {
             SocketState::Fresh
         };
-        let socket = Arc::new(Self {
+        let socket = Arc::new_cyclic(|self_weak| Self {
             domain,
             kind,
             protocol,
             inode: narf_filesystem::inode_id::PseudoFs::Sock.new_inode(),
+            self_weak: self_weak.clone(),
             state: IrqSafeSpinLock::new(state),
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
@@ -2816,9 +2823,14 @@ impl FileOps for SocketFile {
                     };
                 }
             }
-            let r = self.do_recv(buf, 0);
-            match r {
-                Ok((n, _)) => {
+            // Route the rest through dispatch_op (same reasoning as `write`
+            // below: wire UDP and netlink receives only exist on the
+            // per-family dispatch path; streams land back in `do_recv`).
+            let Some(me) = self.self_weak.upgrade() else {
+                return Err(FsError::Unsupported);
+            };
+            match me.dispatch_op(SocketOp::Recv { buf, flags: 0 }) {
+                SocketOpResult::Received { n, .. } => {
                     // read(2) has no ancillary-data output. If this byte range
                     // crossed an AF_UNIX stream control marker, consume and
                     // discard those rights now so a later recvmsg(2) cannot
@@ -2829,23 +2841,44 @@ impl FileOps for SocketFile {
                     self.discard_dgram_recv_ancillary();
                     Ok(n)
                 }
-                // do_recv already distinguishes empty-but-open from EOF; pass
-                // its explicit would-block result through unchanged.
-                Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
-                Err(_) => Err(FsError::Unsupported),
+                // A datagram longer than the buffer truncates silently on
+                // read(2) (no MSG_TRUNC reporting without recvmsg flags).
+                SocketOpResult::ReceivedTruncated { copied, .. } => {
+                    drop(self.unix_take_recv_fds());
+                    self.discard_dgram_recv_ancillary();
+                    Ok(copied)
+                }
+                // The dispatchers distinguish empty-but-open from EOF; pass
+                // the explicit would-block result through unchanged.
+                SocketOpResult::Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
+                SocketOpResult::Err(_) => Err(FsError::Unsupported),
+                _ => Err(FsError::Unsupported),
             }
         })
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            // POSIX `write` on a socket == `send` with flags=0.
-            let r = self.do_send(buf, 0, None);
-            match r {
-                Ok(n) => Ok(n),
-                Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
-                Err(SockError::Pipe) => Err(FsError::BrokenPipe),
-                Err(_) => Err(FsError::Unsupported),
+            // POSIX `write` on a socket == `send` with flags=0. Route through
+            // dispatch_op: the per-family send backends (wire UDP, netlink,
+            // raw) only exist there, while the legacy `do_send` knows TCP and
+            // loopback rings alone — so write(2) on a connected UDP or
+            // netlink socket EINVALed where send(2) on the same fd worked
+            // (glibc's resolver and busybox ip/nslookup use the two
+            // interchangeably).
+            let Some(me) = self.self_weak.upgrade() else {
+                return Err(FsError::Unsupported);
+            };
+            match me.dispatch_op(SocketOp::Send {
+                buf,
+                flags: 0,
+                addr: None,
+            }) {
+                SocketOpResult::Ok(n) => Ok(n as usize),
+                SocketOpResult::Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
+                SocketOpResult::Err(SockError::Pipe) => Err(FsError::BrokenPipe),
+                SocketOpResult::Err(_) => Err(FsError::Unsupported),
+                _ => Err(FsError::Unsupported),
             }
         })
     }
