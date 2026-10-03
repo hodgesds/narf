@@ -30,7 +30,8 @@ pub static NARF_X86_CACHED_CR4: AtomicU64 = AtomicU64::new(0);
 /// [`cached_cr4`] instead.
 static PER_CPU_CACHED_CR4: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
-/// Monotonic kernel-wide request to fault ring-3 `RDTSC` on every CPU.
+/// Monotonic kernel-wide request to fault ring-3 `RDTSC` and `RDTSCP` on every
+/// CPU. CR4.TSD cannot fault one without the other.
 ///
 /// CR4.TSD is per-CPU, so publication alone is insufficient: every user-task
 /// switch-in must call [`activate_requested_user_instruction_interception`].
@@ -79,7 +80,8 @@ pub const CR4_OSXSAVE: u64 = 1 << 18;
 /// remaining available to kernel emulation at CPL0.
 pub const CR4_TSD: u64 = 1 << 2;
 
-/// Request kernel interception of ring-3 `RDTSC` for the kernel lifetime.
+/// Request kernel interception of ring-3 `RDTSC` and `RDTSCP` for the kernel
+/// lifetime.
 ///
 /// This both publishes the cross-CPU request and applies it to the executing
 /// CPU. Other CPUs apply it at their next user-task switch-in.

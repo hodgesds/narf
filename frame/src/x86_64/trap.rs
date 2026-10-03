@@ -844,6 +844,42 @@ pub use narf_arch::x86_64::trap_frame::TrapFrame;
 /// load destination, but this is the trap handler and defending costs one
 /// comparison.
 #[cfg(target_arch = "x86_64")]
+/// Decode an unprefixed ring-3 `RDTSC` (`0f 31`) or `RDTSCP` (`0f 01 f9`) at
+/// `rip`, returning its family and length. The third byte is fetched only
+/// after `0f 01` so that an `RDTSC` ending exactly at a mapping boundary still
+/// decodes. Any copy fault returns `None`, preserving the ordinary #GP path.
+fn decode_user_timestamp_instruction(
+    rip: u64,
+) -> Option<(narf_userspace::NondeterministicInstruction, u64)> {
+    let mut opcode = [0u8; 3];
+    // SAFETY: the guarded copy accepts an arbitrary user pointer, catches
+    // faults, and writes at most two bytes into this local array.
+    let copied = unsafe {
+        narf_arch::x86_64::smap::copy_user_guarded(opcode.as_mut_ptr(), rip as *const u8, 2)
+    }
+    .is_ok();
+    if !copied {
+        return None;
+    }
+    match [opcode[0], opcode[1]] {
+        [0x0f, 0x31] => Some((narf_userspace::NondeterministicInstruction::Rdtsc, 2)),
+        [0x0f, 0x01] => {
+            // SAFETY: as above, writing one byte at the local array's end.
+            let copied = unsafe {
+                narf_arch::x86_64::smap::copy_user_guarded(
+                    opcode[2..].as_mut_ptr(),
+                    rip.wrapping_add(2) as *const u8,
+                    1,
+                )
+            }
+            .is_ok();
+            (copied && opcode[2] == 0xf9)
+                .then_some((narf_userspace::NondeterministicInstruction::Rdtscp, 3))
+        }
+        _ => None,
+    }
+}
+
 fn zero_trap_frame_gpr(frame: &mut TrapFrame, reg: u8) {
     match reg {
         0 => frame.rax = 0,
@@ -1401,42 +1437,38 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
-    // First-class nondeterministic-instruction interception. CR4.TSD makes a
-    // ring-3 RDTSC raise #GP while leaving CPL0 native emulation available.
-    // Decode only the exact trapped opcode; every other #GP retains the normal
-    // synchronous-fault path below. The interceptor never receives this mutable
-    // frame, so this architecture owner alone writes registers and advances RIP.
+    // First-class nondeterministic-instruction interception. CR4.TSD makes
+    // ring-3 RDTSC (`0f 31`) and RDTSCP (`0f 01 f9`) raise #GP while leaving
+    // CPL0 native execution available. Decode only those exact unprefixed
+    // encodings; every other #GP, including a prefixed timestamp read or an
+    // instruction whose bytes cannot be copied, retains the normal
+    // synchronous-fault path below. The interceptor never receives this
+    // mutable frame, so this architecture owner alone writes registers and
+    // advances RIP.
     if frame.vector == 13 && (frame.cs & 3) == 3 {
-        let mut opcode = [0u8; 2];
-        // SAFETY: the guarded copy accepts an arbitrary user pointer, catches
-        // faults, and writes at most opcode.len() bytes into this local array.
-        let copied = unsafe {
-            narf_arch::x86_64::smap::copy_user_guarded(
-                opcode.as_mut_ptr(),
-                frame.rip as *const u8,
-                opcode.len(),
-            )
-        }
-        .is_ok();
-        if copied && opcode == [0x0f, 0x31] {
-            let dispatched = narf_userspace::dispatch_instruction(
-                narf_userspace::NondeterministicInstruction::Rdtsc,
-                frame.rip,
-                || {
+        if let Some((instruction, length)) = decode_user_timestamp_instruction(frame.rip) {
+            let native = || match instruction {
+                narf_userspace::NondeterministicInstruction::Rdtscp => {
+                    let mut aux = 0u32;
+                    // SAFETY: RDTSCP remains legal at CPL0 when CR4.TSD is
+                    // set; it writes only the local `aux`.
+                    let value = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };
+                    narf_userspace::InstructionResult::Rdtscp { value, aux }
+                }
+                _ => {
                     // SAFETY: RDTSC remains legal at CPL0 when CR4.TSD is set.
                     let value = unsafe { core::arch::x86_64::_rdtsc() };
                     narf_userspace::InstructionResult::Rdtsc { value }
-                },
-            );
-            match dispatched {
-                Ok(Some(narf_userspace::InstructionResult::Rdtsc { value })) => {
-                    frame.rax = value as u32 as u64;
-                    frame.rdx = (value >> 32) as u32 as u64;
-                    frame.rip = frame.rip.wrapping_add(2);
-                    return;
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => {}
+            };
+            let result = match narf_userspace::dispatch_instruction(instruction, frame.rip, native)
+            {
+                Ok(Some(result)) => result,
+                // NARF never disables the user TSC (PR_GET_TSC reports
+                // PR_TSC_ENABLE), so a trapped family that no interceptor
+                // subscribes completes natively without entering the tool.
+                // CR4.TSD cannot trap RDTSC and RDTSCP separately.
+                Ok(None) => native(),
                 Err(error) => {
                     let _ = writeln!(
                         TrapWriter,
@@ -1445,7 +1477,36 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                     );
                     panic!("instruction interceptor failed closed");
                 }
+            };
+            match (instruction, result) {
+                (
+                    narf_userspace::NondeterministicInstruction::Rdtsc,
+                    narf_userspace::InstructionResult::Rdtsc { value },
+                ) => {
+                    frame.rax = value as u32 as u64;
+                    frame.rdx = (value >> 32) as u32 as u64;
+                }
+                (
+                    narf_userspace::NondeterministicInstruction::Rdtscp,
+                    narf_userspace::InstructionResult::Rdtscp { value, aux },
+                ) => {
+                    frame.rax = value as u32 as u64;
+                    frame.rdx = (value >> 32) as u32 as u64;
+                    frame.rcx = aux as u64;
+                }
+                _ => {
+                    // `dispatch_instruction` already rejects a result of the
+                    // wrong family; reaching here is a dispatcher defect.
+                    let _ = writeln!(
+                        TrapWriter,
+                        "instruction interceptor failed closed at rip={:#x}: result family mismatch",
+                        frame.rip
+                    );
+                    panic!("instruction interceptor failed closed");
+                }
             }
+            frame.rip = frame.rip.wrapping_add(length);
+            return;
         }
     }
 

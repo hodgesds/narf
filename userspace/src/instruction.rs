@@ -15,6 +15,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 pub enum NondeterministicInstruction {
     /// x86 `RDTSC` (`0f 31`).
     Rdtsc,
+    /// x86 `RDTSCP` (`0f 01 f9`): a timestamp plus the `IA32_TSC_AUX` value.
+    Rdtscp,
 }
 
 /// Immutable instruction-family subscription captured at installation.
@@ -28,12 +30,29 @@ pub struct InstructionSubscriptions(u64);
 impl InstructionSubscriptions {
     pub const NONE: Self = Self(0);
     pub const RDTSC: Self = Self(1 << 0);
+    pub const RDTSCP: Self = Self(1 << 1);
+
+    /// Union of two subscription sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 
     pub const fn contains(self, instruction: NondeterministicInstruction) -> bool {
         let bit = match instruction {
             NondeterministicInstruction::Rdtsc => Self::RDTSC.0,
+            NondeterministicInstruction::Rdtscp => Self::RDTSCP.0,
         };
         self.0 & bit != 0
+    }
+
+    /// Whether any subscribed family needs x86 CR4.TSD.
+    ///
+    /// CR4.TSD makes both `RDTSC` and `RDTSCP` fault at CPL>0, so subscribing
+    /// to either one arms the trap for both. The family that is not subscribed
+    /// then completes through native emulation without entering the tool; see
+    /// [`dispatch_instruction`].
+    pub const fn requires_timestamp_trap(self) -> bool {
+        self.0 & (Self::RDTSC.0 | Self::RDTSCP.0) != 0
     }
 }
 
@@ -49,13 +68,23 @@ pub struct InstructionInvocation {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InstructionResult {
-    Rdtsc { value: u64 },
+    Rdtsc {
+        value: u64,
+    },
+    /// `value` is written to EDX:EAX and `aux` to ECX. Natively, `aux` is
+    /// `IA32_TSC_AUX`, which NARF programs with the logical CPU number (the
+    /// value the vDSO `getcpu` path reads).
+    Rdtscp {
+        value: u64,
+        aux: u32,
+    },
 }
 
 impl InstructionResult {
     fn instruction(self) -> NondeterministicInstruction {
         match self {
             Self::Rdtsc { .. } => NondeterministicInstruction::Rdtsc,
+            Self::Rdtscp { .. } => NondeterministicInstruction::Rdtscp,
         }
     }
 }
@@ -145,7 +174,7 @@ pub fn try_install_instruction_interceptor(
 ) -> Result<(), Box<dyn InstructionInterceptor>> {
     let subscriptions = interceptor.subscriptions();
     #[cfg(target_arch = "x86_64")]
-    if subscriptions.contains(NondeterministicInstruction::Rdtsc)
+    if subscriptions.requires_timestamp_trap()
         && narf_lib::smp::online_count() > 1
         && !narf_lib::smp::remote_barrier_available()
     {
@@ -164,7 +193,7 @@ pub fn try_install_instruction_interceptor(
     ) {
         Ok(_) => {
             #[cfg(target_arch = "x86_64")]
-            if subscriptions.contains(NondeterministicInstruction::Rdtsc) {
+            if subscriptions.requires_timestamp_trap() {
                 narf_arch::x86_64::cr::request_user_rdtsc_interception();
                 // SAFETY: this action only reads a monotonic atomic request and
                 // updates the executing CPU's CR4 through the architecture
@@ -221,9 +250,11 @@ pub fn activate_current_cpu_instruction_interception() {
 
 /// Dispatch a trapped instruction through the installed interceptor.
 ///
-/// Returns `None` when no interceptor subscribed to this family, allowing the
-/// architecture to retain its ordinary fault behavior. `native` runs at most
-/// once and only after `Continue`.
+/// Returns `None` without entering the tool when no interceptor subscribed to
+/// this family. The architecture then completes the instruction natively:
+/// x86 CR4.TSD traps `RDTSC` and `RDTSCP` together, and NARF never disables
+/// the user TSC, so an unsubscribed timestamp family behaves as if untrapped.
+/// `native` runs at most once and only after `Continue`.
 pub fn dispatch_instruction<F>(
     instruction: NondeterministicInstruction,
     instruction_pointer: u64,

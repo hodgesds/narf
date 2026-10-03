@@ -3236,11 +3236,25 @@ fn record_cpu_with_rdtsc_trap_armed() {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn cpu_has_rdtscp() -> bool {
+    // SAFETY: CPUID is always legal at CPL0; leaf 0x8000_0000 reports the
+    // highest extended leaf before 0x8000_0001 is read.
+    unsafe {
+        core::arch::x86_64::__cpuid(0x8000_0000).eax >= 0x8000_0001
+            && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
     // Enter real ring 3 and issue the MSR-driven `syscall` instruction with an
     // unknown raw number. The interceptor completes it with a magic value.
     // User code then moves returned RAX into RDI and reports it through a known
-    // int-0x80 syscall whose handler redirects back to this harness.
+    // int-0x80 syscall whose handler redirects back to this harness. Only RDTSC
+    // is subscribed, so the RDTSCP that follows traps under the same CR4.TSD
+    // but must complete natively without entering the tool: the TSC read lies
+    // between two kernel reads and ECX is IA32_TSC_AUX, the CPU number the
+    // vDSO `getcpu` path reports.
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
@@ -3257,8 +3271,13 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
     const RDTSC_MAGIC: u64 = 0x1234_5678_9ABC_DEF0;
     static SEEN_SYSCALL_RESULT: AtomicU64 = AtomicU64::new(0);
     static SEEN_RDTSC_RESULT: AtomicU64 = AtomicU64::new(0);
+    static SEEN_RDTSCP_AUX: AtomicU64 = AtomicU64::new(0);
+    static SEEN_RDTSCP_TSC: AtomicU64 = AtomicU64::new(0);
     static FAST_ENTRIES: AtomicU64 = AtomicU64::new(0);
     static RDTSC_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static OTHER_INSTRUCTION_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static TSC_BEFORE: AtomicU64 = AtomicU64::new(0);
+    static CPU_BEFORE: AtomicU64 = AtomicU64::new(0);
     static RDTSC_SUBSCRIPTION_CALLS: AtomicU64 = AtomicU64::new(0);
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
     static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
@@ -3307,6 +3326,7 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
                     value: RDTSC_MAGIC - 1,
                 })
             } else {
+                OTHER_INSTRUCTION_ENTRIES.fetch_add(1, Ordering::Relaxed);
                 InstructionInterception::Continue
             }
         }
@@ -3341,6 +3361,8 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
         fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_SYSCALL_RESULT.store(ctx.args().arg0, Ordering::Release);
             SEEN_RDTSC_RESULT.store(ctx.args().arg1, Ordering::Release);
+            SEEN_RDTSCP_AUX.store(ctx.args().arg2, Ordering::Release);
+            SEEN_RDTSCP_TSC.store(ctx.args().arg3, Ordering::Release);
             let _ =
                 ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
         }
@@ -3348,8 +3370,11 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
 
     SEEN_SYSCALL_RESULT.store(0, Ordering::Relaxed);
     SEEN_RDTSC_RESULT.store(0, Ordering::Relaxed);
+    SEEN_RDTSCP_AUX.store(u64::MAX, Ordering::Relaxed);
+    SEEN_RDTSCP_TSC.store(0, Ordering::Relaxed);
     FAST_ENTRIES.store(0, Ordering::Relaxed);
     RDTSC_ENTRIES.store(0, Ordering::Relaxed);
+    OTHER_INSTRUCTION_ENTRIES.store(0, Ordering::Relaxed);
     RDTSC_SUBSCRIPTION_CALLS.store(0, Ordering::Relaxed);
     __test_clear_global();
     __verification_clear_instruction_interceptor();
@@ -3381,6 +3406,9 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
             );
             core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
+        // SAFETY: RDTSC is always legal at CPL0.
+        let tsc_after = unsafe { core::arch::x86_64::_rdtsc() };
+        let cpu_after = narf_lib::percpu::current_cpu() as u64;
         __test_clear_global();
         __verification_clear_instruction_interceptor();
         if FAST_ENTRIES.load(Ordering::Acquire) != 1 {
@@ -3398,9 +3426,26 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
         if SEEN_RDTSC_RESULT.load(Ordering::Acquire) != RDTSC_MAGIC {
             return TestResult::Fail("ring-3 RDTSC did not receive interceptor result");
         }
+        if OTHER_INSTRUCTION_ENTRIES.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("unsubscribed RDTSCP entered the RDTSC-only interceptor");
+        }
+        let cpu_before = CPU_BEFORE.load(Ordering::Acquire);
+        if cpu_before != cpu_after {
+            return TestResult::Fail("ring-3 side trip changed CPUs; TSC_AUX check is ambiguous");
+        }
+        if SEEN_RDTSCP_AUX.load(Ordering::Acquire) != cpu_before {
+            return TestResult::Fail("unsubscribed RDTSCP did not return native TSC_AUX (CPU id)");
+        }
+        let native = SEEN_RDTSCP_TSC.load(Ordering::Acquire);
+        if native < TSC_BEFORE.load(Ordering::Acquire) || native > tsc_after {
+            return TestResult::Fail("unsubscribed RDTSCP did not return a native TSC value");
+        }
         return TestResult::Pass;
     }
 
+    if !cpu_has_rdtscp() {
+        return TestResult::Skip("RDTSCP not supported by this CPU model");
+    }
     let mut table = SyscallTable::new();
     table.install_raw(Syscall::Sleep, "fast-syscall-unwind", UnwindHandler);
     if table
@@ -3457,12 +3502,20 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
         .ok();
 
     // mov eax,0x3fff; syscall; mov rdi,rax; rdtsc; combine edx:eax into
-    // rsi; mov eax,Sleep; int 0x80; ud2
+    // rsi; mov rcx,-1; rdtscp; combine edx:eax into r10; mov rdx,rcx;
+    // mov eax,Sleep; int 0x80; ud2
     let sleep = Syscall::Sleep.raw().to_le_bytes();
-    let code: [u8; 31] = [
-        0xB8, 0xFF, 0x3F, 0x00, 0x00, 0x0F, 0x05, 0x48, 0x89, 0xC7, 0x0F, 0x31, 0x48, 0xC1, 0xE2,
-        0x20, 0x48, 0x09, 0xD0, 0x48, 0x89, 0xC6, 0xB8, sleep[0], sleep[1], sleep[2], sleep[3],
-        0xCD, 0x80, 0x0F, 0x0B,
+    let code: [u8; 54] = [
+        0xB8, 0xFF, 0x3F, 0x00, 0x00, 0x0F, 0x05, // mov eax,0x3fff; syscall
+        0x48, 0x89, 0xC7, // mov rdi,rax
+        0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, 0x48, 0x89,
+        0xC6, // rdtsc -> rsi
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx,-1
+        0x0F, 0x01, 0xF9, // rdtscp
+        0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, // shl rdx,32; or rax,rdx
+        0x49, 0x89, 0xC2, // mov r10,rax
+        0x48, 0x89, 0xCA, // mov rdx,rcx
+        0xB8, sleep[0], sleep[1], sleep[2], sleep[3], 0xCD, 0x80, 0x0F, 0x0B,
     ];
     // SAFETY: code_frame is exclusively owned and the copy fits one page.
     unsafe {
@@ -3483,6 +3536,8 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
     // across the transition. Success returns only via resume_trampoline.
     unsafe {
         core::arch::asm!("cli");
+        CPU_BEFORE.store(narf_lib::percpu::current_cpu() as u64, Ordering::Release);
+        TSC_BEFORE.store(core::arch::x86_64::_rdtsc(), Ordering::Release);
         user_mode_enter(CODE_VADDR, STACK_VADDR + 0x1000)
     }
 }
@@ -3490,6 +3545,272 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
 kernel_test_in!(
     "verification/syscall-entry",
     smoke_frame_x86_64_user_mode_fast_syscall_interceptor
+);
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_frame_x86_64_user_mode_rdtscp_interceptor() -> TestResult {
+    // Enter real ring 3 with only RDTSCP subscribed. The interceptor completes
+    // RDTSCP with a magic timestamp and TSC_AUX; the user code preloads RCX with
+    // all ones, so the reported RCX proves the architecture zero-extends ECX.
+    // The following RDTSC shares CR4.TSD but is unsubscribed, so it must
+    // complete natively without entering the tool. An unknown fast syscall with
+    // no syscall interceptor installed must report -ENOSYS, as Linux does, and
+    // not the -EINVAL fold used for Narf-native statuses.
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        install_global, instruction::__verification_clear_instruction_interceptor,
+        syscall::__verification_clear_global as __test_clear_global,
+        try_install_instruction_interceptor, InstructionInterception, InstructionInterceptor,
+        InstructionInvocation, InstructionResult, InstructionSubscriptions,
+        NondeterministicInstruction, Syscall, SyscallHandler, SyscallTable, TrapContext,
+    };
+
+    const RDTSCP_MAGIC: u64 = 0x0FED_CBA9_8765_4321;
+    const AUX_MAGIC: u32 = 0xC0DE_CAFE;
+    const ENOSYS: u64 = (-38i64) as u64;
+    static SEEN_RDTSCP_TSC: AtomicU64 = AtomicU64::new(0);
+    static SEEN_RDTSCP_AUX: AtomicU64 = AtomicU64::new(0);
+    static SEEN_RDTSC_TSC: AtomicU64 = AtomicU64::new(0);
+    static SEEN_UNKNOWN_SYSCALL: AtomicU64 = AtomicU64::new(0);
+    static RDTSCP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static RDTSCP_RETURNS: AtomicU64 = AtomicU64::new(0);
+    static OTHER_INSTRUCTION_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static TSC_BEFORE: AtomicU64 = AtomicU64::new(0);
+    static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
+    static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
+    };
+
+    struct RdtscpProbe;
+    // SAFETY: every callback uses only preallocated atomics and typed values;
+    // it does not allocate, park, lock, await, or re-enter guest execution.
+    unsafe impl InstructionInterceptor for RdtscpProbe {
+        fn subscriptions(&self) -> InstructionSubscriptions {
+            InstructionSubscriptions::RDTSCP
+        }
+
+        fn on_instruction_enter(
+            &self,
+            invocation: &InstructionInvocation,
+        ) -> InstructionInterception {
+            if invocation.instruction == NondeterministicInstruction::Rdtscp {
+                RDTSCP_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                InstructionInterception::Complete(InstructionResult::Rdtscp {
+                    value: RDTSCP_MAGIC - 1,
+                    aux: AUX_MAGIC,
+                })
+            } else {
+                OTHER_INSTRUCTION_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                InstructionInterception::Continue
+            }
+        }
+
+        fn on_instruction_return(
+            &self,
+            _invocation: &InstructionInvocation,
+            result: InstructionResult,
+        ) -> InstructionResult {
+            match result {
+                InstructionResult::Rdtscp { value, aux } => {
+                    RDTSCP_RETURNS.fetch_add(1, Ordering::Relaxed);
+                    InstructionResult::Rdtscp {
+                        value: value.wrapping_add(1),
+                        aux,
+                    }
+                }
+                other => other,
+            }
+        }
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP,
+            lj = sym user_mode_longjmp,
+        );
+    }
+
+    struct UnwindHandler;
+    impl SyscallHandler for UnwindHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
+            SEEN_RDTSCP_TSC.store(ctx.args().arg0, Ordering::Release);
+            SEEN_RDTSCP_AUX.store(ctx.args().arg1, Ordering::Release);
+            SEEN_RDTSC_TSC.store(ctx.args().arg2, Ordering::Release);
+            SEEN_UNKNOWN_SYSCALL.store(ctx.args().arg3, Ordering::Release);
+            let _ =
+                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
+        }
+    }
+
+    SEEN_RDTSCP_TSC.store(0, Ordering::Relaxed);
+    SEEN_RDTSCP_AUX.store(0, Ordering::Relaxed);
+    SEEN_RDTSC_TSC.store(0, Ordering::Relaxed);
+    SEEN_UNKNOWN_SYSCALL.store(0, Ordering::Relaxed);
+    RDTSCP_ENTRIES.store(0, Ordering::Relaxed);
+    RDTSCP_RETURNS.store(0, Ordering::Relaxed);
+    OTHER_INSTRUCTION_ENTRIES.store(0, Ordering::Relaxed);
+    __test_clear_global();
+    __verification_clear_instruction_interceptor();
+
+    let original_cr3: u64;
+    // SAFETY: read the active kernel address space so the non-local return can
+    // restore it after the user-mode side trip.
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3.store(original_cr3, Ordering::Release);
+
+    // SAFETY: JMP is dedicated storage for this single-threaded test.
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
+    if saved != 0 {
+        // SAFETY: restore the exact kernel CR3 and GS state saved before ring 3.
+        unsafe {
+            let cr3 = SAVED_CR3.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
+        // SAFETY: RDTSC is always legal at CPL0.
+        let tsc_after = unsafe { core::arch::x86_64::_rdtsc() };
+        __test_clear_global();
+        __verification_clear_instruction_interceptor();
+        if SEEN_UNKNOWN_SYSCALL.load(Ordering::Acquire) != ENOSYS {
+            return TestResult::Fail("unknown fast syscall did not return -ENOSYS");
+        }
+        if RDTSCP_ENTRIES.load(Ordering::Acquire) != 1
+            || RDTSCP_RETURNS.load(Ordering::Acquire) != 1
+        {
+            return TestResult::Fail("ring-3 RDTSCP did not enter and return exactly once");
+        }
+        if OTHER_INSTRUCTION_ENTRIES.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("unsubscribed RDTSC entered the RDTSCP-only interceptor");
+        }
+        if SEEN_RDTSCP_TSC.load(Ordering::Acquire) != RDTSCP_MAGIC {
+            return TestResult::Fail("ring-3 RDTSCP did not receive the interceptor timestamp");
+        }
+        if SEEN_RDTSCP_AUX.load(Ordering::Acquire) != AUX_MAGIC as u64 {
+            return TestResult::Fail("ring-3 RDTSCP RCX was not the zero-extended interceptor AUX");
+        }
+        let native = SEEN_RDTSC_TSC.load(Ordering::Acquire);
+        if native < TSC_BEFORE.load(Ordering::Acquire) || native > tsc_after {
+            return TestResult::Fail("unsubscribed RDTSC did not return a native TSC value");
+        }
+        return TestResult::Pass;
+    }
+
+    if !cpu_has_rdtscp() {
+        return TestResult::Skip("RDTSCP not supported by this CPU model");
+    }
+    let mut table = SyscallTable::new();
+    table.install_raw(Syscall::Sleep, "rdtscp-unwind", UnwindHandler);
+    install_global(table);
+    if try_install_instruction_interceptor(alloc::boxed::Box::new(RdtscpProbe)).is_err() {
+        return TestResult::Fail("RDTSCP interceptor installation failed");
+    }
+    let online_cpus = narf_lib::smp::online_bitmap();
+    RDTSC_ARMED_CPUS.store(0, Ordering::Release);
+    // SAFETY: the callback only reads the local cached CR4 value and updates a
+    // lock-free atomic bitmap. It allocates, blocks, awaits, and locks nowhere.
+    if !unsafe { narf_lib::smp::remote_call(online_cpus, record_cpu_with_rdtsc_trap_armed) } {
+        return TestResult::Fail("RDTSCP post-install AP inspection rendezvous failed");
+    }
+    if RDTSC_ARMED_CPUS.load(Ordering::Acquire) & online_cpus != online_cpus {
+        return TestResult::Fail("RDTSCP-only install did not arm CR4.TSD on every online CPU");
+    }
+
+    // SAFETY: the test owns this fresh user address space until longjmp.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    let code_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc code frame"),
+    };
+    let stack_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc stack frame"),
+    };
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
+
+    let sleep = Syscall::Sleep.raw().to_le_bytes();
+    let code: [u8; 51] = [
+        0xB8, 0xFF, 0x3F, 0x00, 0x00, 0x0F, 0x05, // mov eax,0x3fff; syscall
+        0x49, 0x89, 0xC2, // mov r10,rax
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx,-1
+        0x0F, 0x01, 0xF9, // rdtscp
+        0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, // shl rdx,32; or rax,rdx
+        0x48, 0x89, 0xC7, // mov rdi,rax
+        0x48, 0x89, 0xCE, // mov rsi,rcx
+        0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xC2, // rdtsc; shl rdx,32; or rdx,rax
+        0xB8, sleep[0], sleep[1], sleep[2], sleep[3], 0xCD, 0x80, 0x0F, 0x0B,
+    ];
+    // SAFETY: code_frame is exclusively owned and the copy fits one page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code.as_ptr(),
+            code_frame.kernel_mut_ptr::<u8>(),
+            code.len(),
+        );
+    }
+    // SAFETY: materialize publishes the complete mappings constructed above.
+    if unsafe { address_space.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+    if address_space.activate().is_err() {
+        return TestResult::Fail("activate failed");
+    }
+    // SAFETY: enter mapped ring-3 code with a mapped stack and IRQs disabled
+    // across the transition. Success returns only via resume_trampoline.
+    unsafe {
+        core::arch::asm!("cli");
+        TSC_BEFORE.store(core::arch::x86_64::_rdtsc(), Ordering::Release);
+        user_mode_enter(CODE_VADDR, STACK_VADDR + 0x1000)
+    }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/syscall-entry",
+    smoke_frame_x86_64_user_mode_rdtscp_interceptor
 );
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]

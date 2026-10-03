@@ -85,21 +85,27 @@ lifecycle owners.
 
 The kernel also exposes one process-global, first-class
 `InstructionInterceptor` for subscribed nondeterministic user instructions.
-The initial x86_64 family is `RDTSC`. Publication is atomic and one-shot, and
+The x86_64 families are `RDTSC` and `RDTSCP`. Publication is atomic and one-shot, and
 the interceptor object is shared directly across CPUs. Installation calls the
 interceptor's subscription method exactly once and freezes the resulting family
 mask in the published slot; exception handlers never ask mutable tool code to
-decide trap ownership. CR4.TSD supplies the hardware trap: ring-3 `RDTSC` raises
-#GP while CPL0 retains native emulation. After publishing the slot, installation
+decide trap ownership. CR4.TSD supplies the hardware trap: ring-3 `RDTSC` and
+`RDTSCP` both raise #GP while CPL0 retains native emulation, so subscribing to
+either family arms the trap for both. A trapped family that the published mask
+does not subscribe completes natively without entering the tool; this keeps
+the vDSO `getcpu` path, which reads the CPU number from `RDTSCP`'s auxiliary
+result, correct under an `RDTSC`-only tool. After publishing the slot, installation
 raises the monotonic kernel-wide trap request and synchronously applies it on
 every currently-online CPU before returning success. A missing SMP rendezvous
 rejects installation before publication. The legacy entry path and scheduler
 also apply the request before every user entry or own-stack switch-in, covering
 CPUs brought online after installation and task migration.
-The frame owner decodes only exact opcode `0f 31`, captures immutable task/RIP
-metadata, executes native emulation at most once under `Continue` or accepts a
-typed completed value, applies a same-family return callback, writes EDX:EAX,
-and advances RIP by exactly two bytes. Interceptors never receive a mutable trap
+The frame owner decodes only the exact unprefixed opcodes `0f 31` and
+`0f 01 f9`, captures immutable task/RIP metadata, executes native emulation at
+most once under `Continue` or accepts a typed completed value, applies a
+same-family return callback, writes EDX:EAX (and, for `RDTSCP`, the
+zero-extended auxiliary value to RCX), and advances RIP by exactly the decoded
+length. Interceptors never receive a mutable trap
 frame. A mismatched result type or recursive callback fails closed by stopping
 the kernel rather than returning an uncontrolled value to the guest.
 
