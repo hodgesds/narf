@@ -792,18 +792,39 @@ fn page_phys(root: PhysAddr, va: u64) -> Option<u64> {
 /// `[base, base + count*4096)` must be pages this module mapped.
 unsafe fn unmap_and_free(base: u64, count: usize) {
     let Ok(root) = kernel_root() else { return };
+    let mut frames: Vec<PhysAddr> = Vec::with_capacity(count);
     for i in 0..count {
         let va = VirtAddr::new(base + (i as u64) * 4096);
         // SAFETY: mapped by `alloc` through this root.
         if let Ok(phys) = unsafe { crate::paging::unmap_4kb(root, va) } {
             if phys.raw() != 0 {
-                crate::frame::free_frame(PhysFrame::new(phys));
+                frames.push(phys);
             }
         }
     }
+    // Module leaves are non-GLOBAL, and `unmap_4kb`'s INVLPG (local and on
+    // every peer) drops them only for the PCID each CPU is running at that
+    // moment (SDM Vol 3 §4.10.4.1). Module code runs under its domain's PCID —
+    // `modules::domain::enter` swaps CR3 to `PCID(domain)` with NOFLUSH — so
+    // translations cached while `narf_module_init`/`_exit` ran survive the
+    // unmap, tagged with that PCID. The next module mapped at this VA gets the
+    // same frames back in a different order, and re-entering the domain then
+    // fetches through the stale entry into whichever frame now holds some
+    // other page of the new image. Drop every non-global entry in every PCID,
+    // on every CPU, before any frame or page table goes back to the buddy.
+    // Linux reaches the same point via `invalidate_other_asid()` for its
+    // non-global (PTI) kernel mappings.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: CPL=0; synchronous — returns after every peer has acked.
+    unsafe {
+        crate::paging::flush_user_tlb_all_cpus();
+    }
+    for phys in frames {
+        crate::frame::free_frame(PhysFrame::new(phys));
+    }
     // Reclaim now-empty last-level tables, once per 2 MiB granule. Every leaf
-    // above was unmapped with a broadcast invalidation, so no CPU can still
-    // walk a table we free here. The shared PDPT/PD levels are kept.
+    // above was unmapped and every PCID flushed on every CPU, so no CPU can
+    // still walk a table we free here. The shared PDPT/PD levels are kept.
     if count != 0 {
         let end = base + (count as u64) * 4096;
         let mut granule = base & !0x1F_FFFFu64;

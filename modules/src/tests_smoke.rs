@@ -1649,3 +1649,108 @@ kernel_test_in!(
     "modules/domain",
     smoke_module_scope_scrubs_dead_stack_on_exit
 );
+
+/// Unloading a module must not leave its translations cached under the
+/// module's domain PCID.
+///
+/// Under the x86_64 PCID enforcer, `domain::enter` swaps CR3 to
+/// `PCID(domain)` with NOFLUSH, so anything the module touches is cached under
+/// that tag. `module_text::free` runs in the kernel's own context, and an
+/// INVLPG there only retires entries for the PCID it runs under. If `free`
+/// stops there, the next image mapped at the same VA is reached, from inside
+/// the domain, through the OLD image's frames. That is the
+/// `smoke_module_load_real_ko_round_trip` crash: the reload's
+/// `narf_module_init` fetched its first instruction from the frame now holding
+/// the reload's `.modinfo`.
+///
+/// Reads, not calls, so a regression reports instead of executing whatever
+/// the stale frame holds. Skips where the question cannot arise (PKS narrows
+/// PKRS instead of switching CR3, or no x86 domain backend at all) or where
+/// the second image gets both of its frames back in place, which would hide
+/// a stale entry.
+fn smoke_module_text_va_reuse_not_stale_in_domain_pcid() -> TestResult {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        TestResult::Skip("PCID domain enforcer is x86_64-only")
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_lib::id::DomainId;
+        use narf_memory::module_text;
+
+        if narf_arch::x86_64::pks::is_active() || !narf_arch::x86_64::pcid::is_active() {
+            return TestResult::Skip("domain entry does not switch PCID on this CPU");
+        }
+
+        // Fill each page with its own byte, then read the first byte of every
+        // page from inside the image's domain.
+        fn fill(img: &mut module_text::ModuleImage, bytes: [u8; 2]) {
+            // SAFETY: freshly allocated, still Rw, and exclusively ours.
+            let s = unsafe { img.as_mut_slice() };
+            s[..4096].fill(bytes[0]);
+            s[4096..8192].fill(bytes[1]);
+        }
+        fn read_in_domain(img: &module_text::ModuleImage) -> [u8; 2] {
+            let scope = crate::domain::enter(DomainId::SCRATCH);
+            // SAFETY: both pages are mapped Rw in the shared module window,
+            // which every domain's PML4 clone reaches.
+            let r = unsafe {
+                [
+                    core::ptr::read_volatile(img.page_va(0) as *const u8),
+                    core::ptr::read_volatile(img.page_va(1) as *const u8),
+                ]
+            };
+            crate::domain::exit(scope);
+            r
+        }
+
+        let Ok(mut first) = module_text::alloc(2, DomainId::SCRATCH) else {
+            return TestResult::Fail("module_text::alloc(2) failed");
+        };
+        fill(&mut first, [0xA1, 0xB2]);
+        let first_base = first.entry_base();
+        let first_phys = [
+            module_text::__page_phys_for_test(&first, 0),
+            module_text::__page_phys_for_test(&first, 1),
+        ];
+        // Populates the TLB under the domain's PCID.
+        let seen_first = read_in_domain(&first);
+        // SAFETY: nothing executes from, or keeps a pointer into, the image.
+        unsafe { module_text::free(first) };
+        if seen_first != [0xA1, 0xB2] {
+            return TestResult::Fail("first image read back wrong from inside its domain");
+        }
+
+        let Ok(mut second) = module_text::alloc(2, DomainId::SCRATCH) else {
+            return TestResult::Fail("module_text::alloc(2) failed on reuse");
+        };
+        fill(&mut second, [0xC3, 0xD4]);
+        let same_va = second.entry_base() == first_base;
+        let same_frames = [
+            module_text::__page_phys_for_test(&second, 0),
+            module_text::__page_phys_for_test(&second, 1),
+        ] == first_phys;
+        let seen_second = read_in_domain(&second);
+        // SAFETY: as above.
+        unsafe { module_text::free(second) };
+
+        if !same_va {
+            return TestResult::Skip("module VA was not reused; nothing to go stale");
+        }
+        if seen_second != [0xC3, 0xD4] {
+            return TestResult::Fail(
+                "reused module VA read through the previous image's frame from inside the \
+                 domain (stale PCID-tagged TLB entry survived module_text::free)",
+            );
+        }
+        if same_frames {
+            // A stale entry would name the very frame now mapped there.
+            return TestResult::Skip("both pages got their old frames back; cannot discriminate");
+        }
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "modules/va_reuse",
+    smoke_module_text_va_reuse_not_stale_in_domain_pcid
+);
