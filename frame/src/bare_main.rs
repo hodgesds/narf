@@ -5208,9 +5208,17 @@ fn boot_userspace_init() {
     /// not.
     fn spawn_rooted_pid1(name: &'static str, path: &str, root: &str) -> bool {
         let argv = [name];
+        // systemd in container mode (container= below) evaluates
+        // ConditionKernelCommandLine= against PID 1's argv rather than
+        // /proc/cmdline, which hides every boot flag QEMU appended. Hand it
+        // the real cmdline through its documented override so cmdline-keyed
+        // units (e.g. the narf_net_check network acceptance gate) still
+        // trigger.
+        let proc_cmdline = alloc::format!("SYSTEMD_PROC_CMDLINE={}", narf_boot::cmdline());
         let envp = [
             "container=narf",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            proc_cmdline.as_str(),
         ];
         // SAFETY: boot has the loader's identity mapping and frame allocator.
         let proc = match unsafe {
