@@ -678,8 +678,15 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
 
     // Most hardware drivers register only in the capability-gated frame-ring
     // registry. Include names not represented by the legacy L3 registry so
-    // every probed NIC is visible to the control plane exactly once.
-    for nic in crate::registry().snapshots() {
+    // every probed NIC is visible to the control plane exactly once. Physical
+    // NICs live in the root namespace; a child netns must not see them in its
+    // RTM_GETLINK dump (Linux: devices appear in exactly one netns).
+    let frame_ring_nics = if net_ns_id == 0 {
+        crate::registry().snapshots()
+    } else {
+        Vec::new()
+    };
+    for nic in frame_ring_nics {
         if links.iter().any(|link| link.name == nic.name) {
             continue;
         }

@@ -5,6 +5,13 @@ echo "fedora-shell-ran"
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 export LD_LIBRARY_PATH=/usr/lib64:/lib64:/usr/lib
 export container=narf
+# systemd in container mode evaluates ConditionKernelCommandLine= against
+# PID 1's argv, not /proc/cmdline — which hides every boot flag QEMU
+# appended (e.g. the narf_net_check acceptance gate). Hand it the real
+# cmdline through its documented override; skip when /proc is not up yet
+# so an empty value cannot shadow the real file.
+narf_cmdline="$(cat /proc/cmdline 2>/dev/null)"
+[ -n "$narf_cmdline" ] && export SYSTEMD_PROC_CMDLINE="$narf_cmdline"
 mount -t tmpfs tmpfs /run 2>/dev/null
 mkdir -p /run/lock /tmp/nogen /run/systemd/system
 export SYSTEMD_GENERATOR_PATH=/tmp/nogen

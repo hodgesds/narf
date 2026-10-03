@@ -386,6 +386,41 @@ printf '%s\n' \
 ln -sfn ../narf-plasma.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma.service"
 
+# QEMU user-mode (SLIRP) resolver. enter.sh copies the BUILD HOST's
+# resolv.conf into the tree so dnf works during staging; shipping that leaks
+# LAN resolvers the guest can never reach. Point glibc at the SLIRP DNS
+# proxy instead — 10.0.2.3 forwards queries to whatever the host resolves
+# with, matching the static 10.0.2.15/24 the kernel's qemu-net feature
+# assigns to vnet0.
+printf 'nameserver 10.0.2.3\n' > "$WORK/root/etc/resolv.conf"
+
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-net-check.sh" \
+  "$WORK/root/usr/local/libexec/narf-net-check"
+
+# Network acceptance gate: prove the distro has a WORKING off-box path
+# (vnet0 visible, TCP round-trip to the host across SLIRP, DNS through
+# 10.0.2.3). Opt-in via the narf_net_check kernel cmdline flag — xtask
+# systemd-pid1 sets it for XTASK_SYSTEMD_PID1_NET_CHECK=1 runs — so
+# ordinary graphical boots never run it.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify QEMU user-network bring-up on NARF' \
+  'ConditionKernelCommandLine=narf_net_check' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-net-check' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  > "$WORK/root/etc/systemd/system/narf-net-check.service"
+install -d -m 0755 "$WORK/root/etc/systemd/system/multi-user.target.wants"
+ln -sfn ../narf-net-check.service \
+  "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-net-check.service"
+
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \
   "$WORK/root/narf-start.sh"

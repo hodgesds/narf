@@ -68,10 +68,21 @@ and CI compiler-cache integration.
   (`user-mode-e2e`, `user-mode-testbin`, and `narf-libc-validate`) so it
   always exercises the production init path.
 - `cargo xtask systemd-pid1 --arch=x86_64` — boot a systemd rootfs as real
-  PID 1 for a bounded capture. `XTASK_SYSTEMD_PID1_SUCCESS_MARKER` and
+  PID 1 for a bounded capture. The command enables the `qemu-net` static
+  configuration, exposing `vnet0` as `10.0.2.15/24` with QEMU SLIRP gateway
+  `10.0.2.2`, so graphical distro boots have an immediately usable network.
+  `XTASK_SYSTEMD_PID1_SUCCESS_MARKER` and
   `XTASK_SYSTEMD_PID1_FAILURE_MARKER` optionally make serial substrings into
   fail-fast integration assertions; the run fails if an expected success
-  marker is absent at the timeout.
+  marker is absent at the timeout. `XTASK_SYSTEMD_PID1_NET_CHECK=1` turns the
+  boot into a network acceptance run: xtask serves a token on an ephemeral
+  host port, threads `narf_net_check`/`narf_net_check_port=` onto the kernel
+  cmdline, and the rootfs's `narf-net-check.service` gate (staged by
+  `REGEN_fedora_kde_rootfs.sh`) proves vnet0 is visible, TCP round-trips to
+  the host across SLIRP, DNS resolves through `10.0.2.3`, and
+  `unshare(CLONE_NEWNET)` both works and isolates (the same host round-trip
+  must fail inside a fresh netns); its single `NARF-NET-CHECK:` verdict line
+  becomes the default success/failure marker pair.
 - `cargo xtask iso-boot --arch=x86_64` — build the removable-media
   image, boot it through a read-only OVMF pflash + Limine's
   `BOOTX64.EFI`, and require
