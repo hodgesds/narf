@@ -3729,6 +3729,11 @@ pub(crate) fn take_held_spawn_record(creator: u64) -> Option<crate::syscall::Cre
     SPAWN_HOLDS.lock().get_mut(&creator)?.records.pop_front()
 }
 
+/// Whether `task` has a spawn hold open, i.e. is inside an interceptor call.
+pub(crate) fn spawn_hold_open(task: u64) -> bool {
+    SPAWN_HOLD_COUNT.load(Ordering::Acquire) != 0 && SPAWN_HOLDS.lock().contains_key(&task)
+}
+
 /// Defer the current task's vfork wait to the release of its open hold.
 /// Returns `false`, leaving the caller to wait now, when no hold is open.
 pub(crate) fn defer_vfork_wait(child_visible_pid: u64, parent_pid: u64) -> bool {

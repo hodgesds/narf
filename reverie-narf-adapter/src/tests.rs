@@ -978,7 +978,6 @@ fn is_extra_byte_write(invocation: &SyscallInvocation) -> bool {
 /// wakes the guest parent blocked reading the gate. A one-byte write to the
 /// empty gate pipe completes on its first poll.
 fn open_gate(task_id: u64) -> bool {
-    use core::future::Future as _;
     let Some(Some(ops)) = narf_userspace::fd::with_table(task_id, |table| {
         table.get(PIPE_GATE_WRITE_FD).map(|entry| entry.ops.clone())
     }) else {

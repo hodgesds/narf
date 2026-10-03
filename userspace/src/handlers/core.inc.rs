@@ -10288,6 +10288,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
 /// live syscall context, whose return value is already set.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn vfork_parent_wait(ctx: &mut dyn TrapContext, child_visible_pid: u64, parent_pid: u64) {
+    // With this task's spawn hold open the child is off the run queues until
+    // the wait returns, so the wait could never end. The clone path defers it
+    // to the hold's release instead (`defer_vfork_wait`); fail closed rather
+    // than hang if that ever regresses.
+    assert!(
+        !crate::user_task::spawn_hold_open(current_task_id()),
+        "vfork wait inside an open spawn hold would never end"
+    );
     if let Some(uctx) = crate::user_task::current_user_task() {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if narf_scheduler::stackful::user_own_stack_enabled() {
