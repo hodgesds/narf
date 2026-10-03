@@ -45,10 +45,28 @@
 //!   (`UnsupportedThreadOwnership`) and signal-dequeue observation
 //!   (`UnsupportedSignalDequeues`) are refused the same way.
 //!
+//! ## Signal events
+//!
+//! A hosted task's signal reaches the Tool's `handle_signal_event`
+//! (`NarfToolHost::handle_signal`) only where the task returns from a
+//! `syscall` instruction, the one delivery point where the task can wait for
+//! the Tool. The kernel delivers it once the Tool answers with the same
+//! signal, and discards it if the Tool suppresses it. A Tool that answers
+//! with another signal aborts the run. At every other delivery point (a
+//! timer interrupt that hit user mode, a page fault, a park in `poll` or
+//! `epoll`, an `int 0x80` return) the signal stays pending until the task's
+//! next syscall returns, so:
+//!
+//! * A hosted task that makes no syscalls receives no signal but `SIGKILL`,
+//!   which never goes to the Tool.
+//! * A native blocking syscall the signal interrupts returns `EINTR` before
+//!   the handler runs, at that syscall's own return.
+//! * Real-time signals, which Reverie's `Signal` cannot name, and
+//!   synchronous fault signals (`SIGSEGV` from a fault, say) are delivered
+//!   without the Tool, as before signal events existed.
+//!
 //! ## Silently absent (not fail-closed)
 //!
-//! * **Signal events.** The Tool's `handle_signal_event` is never called.
-//!   The kernel delivers every signal natively, and the Tool never sees it.
 //! * **fs_base and gs_base.** `KernelServices::regs` reports `fs_base`,
 //!   `gs_base` and the `ds`/`es`/`fs`/`gs` selectors as 0. A Tool that
 //!   reads them gets 0, not the guest's TLS base.
@@ -103,6 +121,8 @@
 //! | `Rdtsc(Errno)` | `handle_rdtsc_event` failed with an errno while the task was not ending. | Only through a Tool that fails on guest input (`reverie_narf_rdtsc_tool_errno_aborts_the_tree`). |
 //! | `RdtscContextManaged` | An RDTSC callback's transition took the task's context although the task was not killed (`KernelServices::killed`, which answers only for `SIGKILL`): a tail inject parked it, or an inject ended its context, as an injected `rt_sigreturn` does: with no signal frame to restore, the kernel stages a `SIGSEGV`. | Only through a Tool that makes such a transition. |
 //! | `InjectParked`, in an RDTSC callback | As in a lifecycle callback: no guest syscall exists to re-execute. | Yes, given a Tool that makes a blocking inject there (`reverie_narf_parked_inject_in_rdtsc_aborts_the_tree`). |
+//! | `Signal(Errno)` | `handle_signal_event` failed with an errno while the task was not ending. | Only through a Tool that fails on guest input. |
+//! | `SignalContextManaged` | A signal callback's transition took the task's context although the task was not killed, as for `RdtscContextManaged`. | Only through a Tool that makes such a transition. |
 //!
 //! **Invariant: the kernel panics.** A fatal that means the kernel or the
 //! host broke its own contract leaves no state that can be trusted, so

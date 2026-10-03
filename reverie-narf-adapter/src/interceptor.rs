@@ -13,18 +13,18 @@ use core::task::{Context, Poll, Waker};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_userspace::handlers::tool_view;
 use narf_userspace::syscall::{
-    NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
-    SyscallReturn,
+    NativeSyscallTransition, SignalDelivery, SyscallInterception, SyscallInterceptor,
+    SyscallInvocation, SyscallReturn,
 };
 use narf_userspace::{
     DeferredInstruction, InstructionInterception, InstructionInterceptor, InstructionInvocation,
     InstructionResult, InstructionSubscriptions, NondeterministicInstruction,
 };
 use reverie::syscalls::Sysno;
-use reverie::{ExitStatus, GlobalTool, Pid, Rdtsc, Tool};
+use reverie::{ExitStatus, GlobalTool, Pid, Rdtsc, Signal, Tool};
 use reverie_narf_core::{
-    Disposition, NarfFatal, NarfSyscallRequest, NarfToolHost, RdtscOutcome, SyscallEntry, TaskLock,
-    TaskTable,
+    Disposition, NarfFatal, NarfSyscallRequest, NarfToolHost, RdtscOutcome, SignalOutcome,
+    SyscallEntry, TaskLock, TaskTable,
 };
 use reverie_narf_tools::LineSink;
 
@@ -76,6 +76,10 @@ pub struct TaskExitRecord {
 type Host<T> = NarfToolHost<T, IrqSpinTaskLock<TaskTable<T>>>;
 type Config<T> = <<T as Tool>::GlobalState as GlobalTool>::Config;
 
+/// What [`ReverieInterceptor::report_reapable_processes`] calls for each
+/// hosted process the kernel reports reapable, with the process's ID.
+pub type ReapReporter<T> = fn(&<T as Tool>::GlobalState, Pid);
+
 struct Inner<T: Tool> {
     host: Host<T>,
     /// Scheduler task id to Linux thread ID of every task the host tracks.
@@ -87,6 +91,12 @@ struct Inner<T: Tool> {
     aborted: AtomicBool,
     /// The first abort's reason, as logged.
     abort_reason: IrqSafeSpinLock<Option<String>>,
+    /// The kernel's process ID to Linux process ID of every hosted process
+    /// whose last thread has exited and that the kernel has not yet
+    /// reported reapable.
+    reapable: IrqSafeSpinLock<BTreeMap<u64, Pid>>,
+    /// See [`ReverieInterceptor::report_reapable_processes`].
+    reap_reporter: IrqSafeSpinLock<Option<ReapReporter<T>>>,
 }
 
 impl<T: Tool> Inner<T> {
@@ -294,7 +304,9 @@ fn fatal_kind(error: &NarfFatal) -> FatalKind {
         | NarfFatal::PostExec(_)
         | NarfFatal::TailInjectOutsideSyscall
         | NarfFatal::Rdtsc(_)
-        | NarfFatal::RdtscContextManaged => FatalKind::Contained,
+        | NarfFatal::RdtscContextManaged
+        | NarfFatal::Signal(_)
+        | NarfFatal::SignalContextManaged => FatalKind::Contained,
         NarfFatal::OriginalAlreadyExecuted
         | NarfFatal::ContinuationKernelMismatch
         | NarfFatal::UnexpectedReexecution
@@ -414,6 +426,8 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
                 exits: IrqSafeSpinLock::new(Vec::new()),
                 aborted: AtomicBool::new(false),
                 abort_reason: IrqSafeSpinLock::new(None),
+                reapable: IrqSafeSpinLock::new(BTreeMap::new()),
+                reap_reporter: IrqSafeSpinLock::new(None),
             }),
             handles: Arc::new(()),
         }
@@ -424,6 +438,17 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
     /// [`Self::spawn_background`]).
     pub fn abort_reason(&self) -> Option<String> {
         self.inner.abort_reason.lock().clone()
+    }
+
+    /// Calls `reporter` once for each hosted process the kernel reports
+    /// reapable ([`SyscallInterceptor::on_process_reapable`]), with the run's
+    /// global state and the process's Linux ID. By then the process's last
+    /// thread has exited, its zombie is published, and its parent's exit
+    /// signal is pending. Processes the host never tracked are not reported.
+    /// Detcore's boot host passes `GlobalState::complete_physical_process_exit`
+    /// (`boot.rs`). A later call replaces the reporter.
+    pub fn report_reapable_processes(&self, reporter: ReapReporter<T>) {
+        *self.inner.reap_reporter.lock() = Some(reporter);
     }
 
     /// Registers the run's root task, which must already have its Linux
@@ -642,23 +667,99 @@ impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
         }
     }
 
-    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32, process_wstatus: i32) {
+    fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32, process_wstatus: i32) {
         let Some(tid) = self.inner.hosted.lock().remove(&task_id) else {
             return;
         };
+        // Outside `hosted`: the identity lookup takes the kernel's task maps.
+        let linux_pid = tool_view::linux_task_ids(task_id).map_or_else(
+            || Pid::from_raw(pid as i32),
+            |ids| Pid::from_raw(ids.pid as i32),
+        );
         match self.inner.host.task_exited(
             tid,
             ExitStatus::from_raw(wstatus),
             ExitStatus::from_raw(process_wstatus),
         ) {
-            Ok(exit) => self.inner.exits.lock().push(TaskExitRecord {
-                task_id,
-                tid,
-                wstatus,
-                process_wstatus,
-                process_exited: exit.process_exited,
-            }),
+            Ok(exit) => {
+                if exit.process_exited {
+                    // Before the kernel's report: the thread whose exit
+                    // empties the host's table runs this ahead of its own
+                    // live-count decrement, so ahead of the one that makes
+                    // the process reapable.
+                    self.inner.reapable.lock().insert(pid, linux_pid);
+                }
+                self.inner.exits.lock().push(TaskExitRecord {
+                    task_id,
+                    tid,
+                    wstatus,
+                    process_wstatus,
+                    process_exited: exit.process_exited,
+                });
+            }
             Err(error) => self.inner.fatal("task_exited", error),
+        }
+    }
+
+    fn on_process_reapable(&self, pid: u64) {
+        let Some(linux_pid) = self.inner.reapable.lock().remove(&pid) else {
+            return;
+        };
+        let reporter = *self.inner.reap_reporter.lock();
+        if let Some(reporter) = reporter {
+            reporter(self.inner.host.global(), linux_pid);
+        }
+    }
+
+    /// A hosted task's signal goes to [`NarfToolHost::handle_signal`] where
+    /// the task returns from a `syscall` instruction (the first call, without
+    /// a transition, answers [`SignalDelivery::Wait`]), and the kernel
+    /// delivers it once the Tool answers with the same signal. Everywhere
+    /// else, where the task cannot wait for the Tool, the signal stays
+    /// pending until the task's next syscall returns. A signal Reverie's
+    /// [`Signal`] cannot name (a real-time one) is delivered without the
+    /// Tool, as before signal events existed. Signals to tasks the host does
+    /// not track are delivered at once.
+    fn on_signal_delivery(
+        &self,
+        task_id: u64,
+        signum: u32,
+        native: Option<&mut dyn NativeSyscallTransition>,
+    ) -> SignalDelivery {
+        if self.inner.hosted_tid(task_id).is_none() {
+            return SignalDelivery::Deliver;
+        }
+        // The abort's `SIGKILL` is pending; the kernel delivers it without
+        // asking.
+        if self.inner.kill_if_aborted(task_id) {
+            return SignalDelivery::Hold;
+        }
+        let Ok(signal) = Signal::try_from(signum as i32) else {
+            return SignalDelivery::Deliver;
+        };
+        let Some(native) = native else {
+            return SignalDelivery::Wait;
+        };
+        // The kernel refuses a task-creating inject here with `-ENOSYS`, so
+        // there is no created task to adopt.
+        let mut kernel = self.inner.services(task_id, native, None);
+        match self.inner.host.handle_signal(&mut kernel, signal) {
+            Ok(SignalOutcome::Deliver(answer)) if answer == signal => SignalDelivery::Deliver,
+            Ok(SignalOutcome::Deliver(answer)) => {
+                self.inner.abort_with(alloc::format!(
+                    "reverie-narf: aborting the hosted process tree: the Tool replaced \
+                     {signal:?} with {answer:?}, and the kernel delivers only the signal \
+                     it reported"
+                ));
+                SignalDelivery::Hold
+            }
+            Ok(SignalOutcome::Suppress) => SignalDelivery::Suppress,
+            // The task is ending; its pending `SIGKILL` goes first.
+            Ok(SignalOutcome::ContextManaged) => SignalDelivery::Hold,
+            Err(error) => {
+                self.inner.fatal("handle_signal", error);
+                SignalDelivery::Hold
+            }
         }
     }
 }

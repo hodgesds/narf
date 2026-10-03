@@ -404,6 +404,58 @@ pub trait SyscallInterceptor: Send + Sync {
     /// `exit(5)` before the leader's `exit_group(7)`: 5 and then 7 for the
     /// leader and the process.
     fn on_task_exit(&self, _task_id: u64, _pid: u64, _wstatus: i32, _process_wstatus: i32) {}
+
+    /// Called once when process `pid`'s last thread has finished and every
+    /// process exit observer has run: the process is a zombie its parent can
+    /// reap, and the parent's exit signal for it, if any, is pending with
+    /// its siginfo. `pid` is the process of [`Self::on_task_exit`], which
+    /// came first for each of its threads.
+    fn on_process_reapable(&self, _pid: u64) {}
+
+    /// Consulted before the kernel delivers signal `signum` to task
+    /// `task_id` on its return to user mode. `SIGKILL` is never consulted:
+    /// while one is pending the kernel delivers it first.
+    ///
+    /// The kernel first calls it with `native` `None`, and the callback must
+    /// answer at once. A callback that must wait before it can answer returns
+    /// [`SignalDelivery::Wait`]. Where the task returns from a `syscall`
+    /// instruction, with the syscall finished, on its own kernel stack, the
+    /// kernel then calls it again with `native` `Some`: the transition runs
+    /// injected requests only, with the restrictions of
+    /// [`Self::on_task_start`], and the callback may wait for other tasks
+    /// ([`NativeSyscallTransition::wait_for_repoll`]). A syscall the task had
+    /// parked to re-execute is then no longer parked: its restart is a new
+    /// entry. At every other delivery point, and from the second call, `Wait`
+    /// holds the signal.
+    ///
+    /// [`SignalDelivery::Deliver`] lets the kernel deliver the signal if it
+    /// is still the one the kernel would deliver once the callback returns;
+    /// if it is not, the kernel consults again about the one it would.
+    fn on_signal_delivery(
+        &self,
+        _task_id: u64,
+        _signum: u32,
+        _native: Option<&mut dyn NativeSyscallTransition>,
+    ) -> SignalDelivery {
+        SignalDelivery::Deliver
+    }
+}
+
+/// What the kernel does with a signal it consulted the interceptor about
+/// ([`SyscallInterceptor::on_signal_delivery`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalDelivery {
+    /// Deliver it: run its handler or its default action, or discard it if
+    /// it is ignored.
+    Deliver,
+    /// Discard it with every queued instance, as an ignored signal is
+    /// discarded.
+    Suppress,
+    /// Leave it pending and deliver no signal at this point.
+    Hold,
+    /// Ask again with a transition the callback can wait in, where there is
+    /// one; elsewhere, hold the signal.
+    Wait,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -4397,6 +4449,53 @@ pub(crate) fn notify_interceptor_task_exit(task_id: u64, pid: u64, own: Option<i
     }
 }
 
+/// Announces to the installed interceptor, if any, that process `pid` can be
+/// reaped.
+pub(crate) fn notify_interceptor_process_reapable(pid: u64) {
+    if let Some((_, interceptor)) = installed_interceptor() {
+        interceptor.on_process_reapable(pid);
+    }
+}
+
+/// Whether an interceptor is installed, which signal delivery consults.
+pub(crate) fn signal_interceptor_installed() -> bool {
+    installed_interceptor().is_some()
+}
+
+/// Asks the installed interceptor, if any, what to do with signal `signum`,
+/// which the current task `task_id` is about to be delivered on its return
+/// to user mode through `ctx`; never answers [`SignalDelivery::Wait`]. A
+/// callback that answers `Wait` is called again, with `may_wait` (on the
+/// `syscall`-instruction return path), as a deferred instruction callback
+/// runs ([`run_instruction_callback`]): it may inject and wait. The signal is
+/// held without `may_wait`, if the task cannot be switched out, if the
+/// callback's transition took the task's context (the task is being
+/// killed), or if it answers `Wait` again.
+pub(crate) fn consult_interceptor_signal(
+    ctx: &mut dyn TrapContext,
+    task_id: u64,
+    signum: u32,
+    may_wait: bool,
+) -> SignalDelivery {
+    let Some((_, interceptor)) = installed_interceptor() else {
+        return SignalDelivery::Deliver;
+    };
+    let answer = interceptor.on_signal_delivery(task_id, signum, None);
+    if answer != SignalDelivery::Wait {
+        return answer;
+    }
+    if may_wait {
+        if let Ok((answer, false)) = run_instruction_callback(ctx, task_id, |native| {
+            interceptor.on_signal_delivery(task_id, signum, Some(native))
+        }) {
+            if answer != SignalDelivery::Wait {
+                return answer;
+            }
+        }
+    }
+    SignalDelivery::Hold
+}
+
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
@@ -4909,7 +5008,9 @@ pub fn kernel_syscall_entry_plain_with_state(
         // timer IRQs keep landing at CPL=0. The no-timer common path is one
         // atomic load; the locked all-task scan runs only after a deadline.
         crate::handlers::timer_tick_raise_due_signals();
-        crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+        // The one delivery point where an interceptor's signal consult may
+        // wait (see `SyscallInterceptor::on_signal_delivery`).
+        crate::handlers::default_signal_delivery_at_syscall_return(&mut ctx);
         // TIF_NEED_RESCHED-at-syscall-exit: the tick only preempts at CPL=3, so
         // a syscall-dense task (e.g. stress-ng --sigrt's tight sigqueue loop)
         // never yields and starves its CPU's siblings — the forked RT waiters

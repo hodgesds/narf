@@ -1514,6 +1514,9 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
         for o in process.iter() {
             o(pid, tid);
         }
+        // The observers published the zombie and raised the parent's exit
+        // signal; only now can the interceptor treat the process as reapable.
+        crate::syscall::notify_interceptor_process_reapable(pid);
     }
     // CLONE_THREAD siblings are never wait4-reapable zombies. Their future
     // still owns an Arc until this poll returns, so the process registry can

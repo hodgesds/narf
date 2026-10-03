@@ -9139,7 +9139,81 @@ pub(crate) fn default_signal_delivery_restricted(
     if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
         return false;
     }
-    default_signal_delivery_restricted_active(ctx, syscall_no, restrict)
+    default_signal_delivery_restricted_active(ctx, syscall_no, restrict, false)
+}
+
+/// `default_signal_delivery` on the return path of a completed `syscall`
+/// instruction: the one delivery point where an installed interceptor's
+/// signal consult may wait (see
+/// [`crate::SyscallInterceptor::on_signal_delivery`]).
+#[inline]
+pub fn default_signal_delivery_at_syscall_return(ctx: &mut dyn TrapContext) -> bool {
+    if !ctx.returning_to_user() {
+        return false;
+    }
+    if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    default_signal_delivery_restricted_active(ctx, SYSCALL_NUM_NONE, u64::MAX, true)
+}
+
+/// How many times one delivery point consults the interceptor before it
+/// gives up and delivers nothing: once per signal number. A consult answered
+/// `Deliver` ends the loop unless the signal the kernel would deliver changed
+/// meanwhile, so only senders racing every consult reach the limit.
+const MAX_SIGNAL_CONSULTS: usize = 64;
+
+/// What delivery does once the interceptor has been consulted.
+enum Consulted {
+    /// Deliver this signal.
+    Deliver(u32),
+    /// Deliver nothing and return this from the delivery hook.
+    Return(bool),
+}
+
+/// Consults the installed interceptor about `signum`, the signal
+/// [`pick_deliverable_signal`] chose for the current task `task`, until it
+/// lets the kernel deliver the signal the kernel would deliver then.
+/// A pending `SIGKILL` is delivered unconsulted, before any other signal.
+fn consult_before_delivery(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    mut signum: u32,
+    restrict: u64,
+    may_wait: bool,
+) -> Consulted {
+    let sigkill_pending =
+        |task| signal_bits_get(&SIGNAL_PENDING, task) & restrict & sig_bit(9) != 0;
+    for _ in 0..MAX_SIGNAL_CONSULTS {
+        if sigkill_pending(task) {
+            return Consulted::Deliver(9);
+        }
+        match crate::syscall::consult_interceptor_signal(ctx, task, signum, may_wait) {
+            crate::syscall::SignalDelivery::Deliver => {}
+            crate::syscall::SignalDelivery::Suppress => {
+                let _ = pending_signal_bits_update_existing(task, |slot| {
+                    *slot &= !(sig_bit(signum));
+                });
+                purge_sigqueue(task, signum);
+                return Consulted::Return(true);
+            }
+            crate::syscall::SignalDelivery::Hold | crate::syscall::SignalDelivery::Wait => {
+                // A task killed while the interceptor waited dies now.
+                if sigkill_pending(task) {
+                    return Consulted::Deliver(9);
+                }
+                return Consulted::Return(false);
+            }
+        }
+        // The interceptor may have waited while other tasks ran: they may
+        // have sent signals, changed the mask, or taken this one.
+        match pick_deliverable_signal(task, restrict) {
+            Some(again) if again == signum => return Consulted::Deliver(signum),
+            Some(again) => signum = again,
+            None => return Consulted::Return(false),
+        }
+    }
+    Consulted::Return(false)
 }
 
 #[inline(never)]
@@ -9147,12 +9221,30 @@ fn default_signal_delivery_restricted_active(
     ctx: &mut dyn TrapContext,
     syscall_no: u32,
     restrict: u64,
+    may_wait: bool,
 ) -> bool {
     let task = current_task_id();
+    let Some(mut signum) = pick_deliverable_signal(task, restrict) else {
+        return false;
+    };
+    if signum != 9 && crate::syscall::signal_interceptor_installed() {
+        match consult_before_delivery(ctx, task, signum, restrict, may_wait) {
+            Consulted::Deliver(chosen) => signum = chosen,
+            Consulted::Return(consumed) => return consumed,
+        }
+    }
+    if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+        return true;
+    }
+    deliver_picked_signal(ctx, task, signum, syscall_no)
+}
 
+/// The lowest signal the current task `task` would be delivered now among
+/// those in `restrict`, if any.
+fn pick_deliverable_signal(task: u64, restrict: u64) -> Option<u32> {
     let pending = signal_bits_get(&SIGNAL_PENDING, task);
     if pending == 0 {
-        return false;
+        return None;
     }
     let mask = signal_bits_get(&SIGNAL_MASK, task);
     // `& !1`: bit 0 is the POSIX null signal and is NEVER deliverable. Send
@@ -9197,13 +9289,19 @@ fn default_signal_delivery_restricted_active(
     let deliverable =
         (pending & !mask & restrict & !sigwait_reserved) | (pending & restrict & kill_stop);
     if deliverable == 0 {
-        return false;
+        return None;
     }
-    let signum = sig_from_bit(deliverable);
-    if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
-        return true;
-    }
+    Some(sig_from_bit(deliverable))
+}
 
+/// Delivers `signum`, which the current task `task` is due, through its
+/// handler or its default action, or discards it if it is ignored.
+fn deliver_picked_signal(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    signum: u32,
+    syscall_no: u32,
+) -> bool {
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
         None => {

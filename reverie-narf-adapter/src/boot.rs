@@ -66,6 +66,15 @@
 //! * `backend_runs_exit_robust_list` and
 //!   `backend_supports_parked_write_signal_interruption` off: Hermit sets
 //!   them only for backends that do those things for Detcore.
+//! * `backend_reports_physical_process_exits` and
+//!   `backend_delivers_child_exit_signals` on: Narf's kernel is the only
+//!   source of a child's `SIGCHLD`. Detcore synthesizes none at a group
+//!   exit. The boot reports each hosted process to Detcore once the kernel
+//!   has published its exit and raised its parent's `SIGCHLD`
+//!   ([`ReverieInterceptor::report_reapable_processes`]), and Detcore grants
+//!   no turn until then. The parent's `SIGCHLD` then reaches Detcore through
+//!   the signal hook at the parent's next syscall return (see "Signal
+//!   events" in the crate documentation), and Detcore orders its delivery.
 //!
 //! `passthru_opt` stays off, the library default, so Detcore fails closed: it
 //! subscribes to every syscall and to RDTSC, and every syscall of a hosted
@@ -211,8 +220,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_userspace::handlers::tool_view::{self, LinuxTaskIds};
 use narf_userspace::syscall::{
-    NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
-    SyscallReturn, SyscallTable,
+    NativeSyscallTransition, SignalDelivery, SyscallInterception, SyscallInterceptor,
+    SyscallInvocation, SyscallReturn, SyscallTable,
 };
 use reverie::syscalls::Sysno;
 use reverie::{GlobalTool, Pid, Tid, Tool};
@@ -342,6 +351,11 @@ fn install_detcore(table: &mut SyscallTable) -> Result<BootHost, String> {
         <detcore::Detcore as Tool>::new,
     )
     .map_err(|error| format!("the host refused the tool: {error:?}"))?;
+    // The configuration sets `backend_reports_physical_process_exits`, so
+    // Detcore waits for this report before a reaped child's `wait4`
+    // completes, and with `backend_delivers_child_exit_signals` grants no
+    // turn while one is outstanding.
+    host.report_reapable_processes(report_detcore_reapable);
     // Detcore subscribes to RDTSC when it virtualizes time. No user task
     // exists yet, so the kernel refuses only if it already has an
     // instruction interceptor, or has several CPUs and no rendezvous to arm
@@ -362,6 +376,12 @@ fn install_detcore(table: &mut SyscallTable) -> Result<BootHost, String> {
         },
         Some(start_detcore_scheduler),
     )
+}
+
+/// Tells Detcore that hosted process `pid` is reapable: its exit is
+/// published and its parent's `SIGCHLD` is pending in the kernel.
+fn report_detcore_reapable(global: &detcore::GlobalState, pid: Pid) {
+    global.complete_physical_process_exit(pid.as_raw());
 }
 
 /// The milestone Detcore's scheduler reports once, after its first
@@ -969,5 +989,18 @@ impl<T: Tool + 'static> SyscallInterceptor for Tally<T> {
             drop(members);
             self.print_waiting(live, unstarted);
         }
+    }
+
+    fn on_process_reapable(&self, pid: u64) {
+        self.host.on_process_reapable(pid);
+    }
+
+    fn on_signal_delivery(
+        &self,
+        task_id: u64,
+        signum: u32,
+        native: Option<&mut dyn NativeSyscallTransition>,
+    ) -> SignalDelivery {
+        self.host.on_signal_delivery(task_id, signum, native)
     }
 }

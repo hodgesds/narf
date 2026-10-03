@@ -24,18 +24,18 @@ narf-userspace = { path = "../userspace" }
 narf-verification = { path = "../verification", optional = true }
 # One exact commit of the Reverie fork. `default-features = false` keeps
 # Reverie's `std` feature off; nothing in this workspace turns it on.
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
-reverie-narf-core = { git = "https://github.com/rrnewton/reverie", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
-reverie-narf-tools = { git = "https://github.com/rrnewton/reverie", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "d02efcfc973025822e7adb7f0a9357a49e8c0d77", default-features = false }
+reverie-narf-core = { git = "https://github.com/rrnewton/reverie", rev = "d02efcfc973025822e7adb7f0a9357a49e8c0d77", default-features = false }
+reverie-narf-tools = { git = "https://github.com/rrnewton/reverie", rev = "d02efcfc973025822e7adb7f0a9357a49e8c0d77", default-features = false }
 # Detcore, Hermit's deterministic Tool, for the boot's `reverie_tool=detcore`:
 # Hermit's Detcore crates as this kernel builds them without std, exported by
 # Hermit's scripts/export-detcore-kernel-crates.sh with Reverie at the commit
 # above (branch narf/detcore-kernel-crates of https://github.com/rrnewton/hermit).
 # The workspace patches crates.io's rand_pcg to the same commit.
-detcore = { package = "hermit-detcore", git = "https://github.com/rrnewton/hermit", rev = "8fa53c6db1c0f231efd81869f4680558bf9bcc4f" }
+detcore = { package = "hermit-detcore", git = "https://github.com/rrnewton/hermit", rev = "0eb205a284f6bd3ff694cce3fc50c0999e580880" }
 # The std stand-in that Detcore is built on, from the same export, for the
 # sink behind Detcore's `eprintln!` that the boot registers.
-detcore-std = { git = "https://github.com/rrnewton/hermit", rev = "8fa53c6db1c0f231efd81869f4680558bf9bcc4f" }
+detcore-std = { git = "https://github.com/rrnewton/hermit", rev = "0eb205a284f6bd3ff694cce3fc50c0999e580880" }
 # Parses the Detcore configuration the boot embeds.
 serde_json = { version = "1.0.140", default-features = false, features = ["alloc"] }
 

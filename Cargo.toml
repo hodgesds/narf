@@ -206,4 +206,4 @@ incremental     = true
 # same package, with `default-features = false` added to its serde dependency,
 # from the same commit as Detcore.
 [patch.crates-io]
-rand_pcg = { git = "https://github.com/rrnewton/hermit", rev = "8fa53c6db1c0f231efd81869f4680558bf9bcc4f" }
+rand_pcg = { git = "https://github.com/rrnewton/hermit", rev = "0eb205a284f6bd3ff694cce3fc50c0999e580880" }
