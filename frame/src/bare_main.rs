@@ -4038,6 +4038,11 @@ pub unsafe extern "C" fn _start_rust(
     // actually dispatches. The handler prints the trap frame and calls
     // exit_kernel(42). If the IDT weren't installed this would
     // triple-fault into a reset loop (blocked by `-no-reboot`).
+    //
+    // The asm is `noreturn`, so on x86_64 with idt-selftest nothing after
+    // this block can run. Every statement below it is therefore compiled
+    // out of that configuration (`not(all(target_arch = "x86_64", feature =
+    // "idt-selftest"))`) rather than left in as unreachable code.
     #[cfg(all(target_arch = "x86_64", feature = "idt-selftest"))]
     {
         let _ = writeln!(console::Writer, "  self-test: triggering #UD ...");
@@ -4055,7 +4060,7 @@ pub unsafe extern "C" fn _start_rust(
     // with a display backend (`-display gtk` / `-vnc :1`); under
     // `-display none` it still paints into FB memory but isn't
     // rendered to a host window.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "idt-selftest")))]
     {
         let arch_str = "x86_64";
         let backend = match narf_arch::effective_backend() {
@@ -4100,6 +4105,7 @@ pub unsafe extern "C" fn _start_rust(
     // That ambiguity is unresolvable from inside the guest (journald may not
     // even be up to record it), so the count is published here where the
     // serial log always captures it.
+    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
     {
         let (replay_start, seqnum, ring, overrun) = narf_filesystem::uevent::boot_replay_health();
         let _ = writeln!(
@@ -4128,10 +4134,12 @@ pub unsafe extern "C" fn _start_rust(
     // it in the common post-init path: putting this only in `run_async_demo`
     // left kernel-test mappings unretained, so their canonical file-cache
     // frame could be returned to the allocator while the VMA still named it.
+    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
     narf_memory::install_shared_frame_hooks(
         narf_userspace::retain_external_shared_frame,
         narf_userspace::release_external_shared_frame,
     );
+    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
     narf_memory::install_address_space_drop_hook(narf_userspace::drop_mapped_file_address_space);
 
     // Let a filesystem driver ask Linux's `capable()` about the calling
@@ -4145,12 +4153,17 @@ pub unsafe extern "C" fn _start_rust(
     // supposed to catch and would instead have been asserting.
     //
     // Same reasoning as `install_shared_frame_hooks` above.
+    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
     narf_filesystem::install_caller_capable_hook(narf_userspace::handlers::caller_capable);
+    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
     narf_filesystem::install_in_group_hook(narf_userspace::handlers::caller_in_group_or_capable);
 
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
-    #[cfg(feature = "kernel-test")]
+    #[cfg(all(
+        feature = "kernel-test",
+        not(all(target_arch = "x86_64", feature = "idt-selftest"))
+    ))]
     {
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
@@ -4182,7 +4195,11 @@ pub unsafe extern "C" fn _start_rust(
     // returns, so this block would be dead code there. frame/Cargo.toml
     // documents the two features as mutually exclusive, with kernel-test
     // taking the harness path; this cfg states that precedence.
-    #[cfg(all(feature = "boot-smoke", not(feature = "kernel-test")))]
+    #[cfg(all(
+        feature = "boot-smoke",
+        not(feature = "kernel-test"),
+        not(all(target_arch = "x86_64", feature = "idt-selftest"))
+    ))]
     {
         let _ = writeln!(console::Writer, "  boot-smoke: draining tasks...");
         // Same async-runtime spin pattern as run_async_demo, capped
