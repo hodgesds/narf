@@ -202,9 +202,8 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
 /// directly but always maps it first. Uncached (`Device`) for control
 /// BARs; write-combining for prefetchable windows (framebuffers/ROMs).
 ///
-/// If `ioremap` fails (or the BAR is unprogrammed), `virt` falls back
-/// to the raw phys — correct for the low BARs the boot map already
-/// covers, and no worse than the pre-ioremap behaviour otherwise.
+/// If `ioremap` fails, `virt` falls back to [`unmapped_bar_va`]. An
+/// unprogrammed BAR keeps its raw phys (0).
 ///
 /// # Safety
 /// See `read_bar`: `device` must be PCIe and the caller must hold
@@ -249,7 +248,7 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
         // and rounds the window out to whole pages.
         match unsafe { ioremap(phys, bar.size, attrs) } {
             Ok(m) => m.va(),
-            Err(_) => phys,
+            Err(_) => unmapped_bar_va(bar.phys, bar.size),
         }
     };
 
@@ -259,6 +258,29 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
         len: bar.size,
         kind: bar.kind,
     })
+}
+
+/// The address `map_bar` hands out for a BAR `ioremap` could not map.
+///
+/// On x86_64 that is the kernel direct map, which reaches every physical
+/// address below [`narf_memory::addr::DIRECT_MAP_MIN_REACH`] (1 TiB), MMIO
+/// included, through write-back 1 GiB leaves, so the memory type comes from
+/// the firmware's MTRRs, as it did through the old window. A BAR above
+/// 512 GiB used to be reached at its raw phys through an identity window in
+/// PML4[1], which is user address space and is no longer mapped. Beyond the
+/// direct map, and on aarch64, the raw phys is returned as before and nothing
+/// maps it.
+pub(crate) fn unmapped_bar_va(phys: PhysAddr, size: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if phys
+        .raw()
+        .checked_add(size)
+        .is_some_and(|end| end <= narf_memory::addr::DIRECT_MAP_MIN_REACH)
+    {
+        return phys.kernel_mut_ptr::<u8>() as u64;
+    }
+    let _ = size;
+    phys.raw()
 }
 
 /// A mapped MMIO region. `virt` is the kernel virtual address the

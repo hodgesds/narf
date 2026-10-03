@@ -329,9 +329,14 @@ impl FbScanout for AmdgpuScanout {
     unsafe fn framebuffer(&self) -> Framebuffer {
         narf_drivers_gpu::amdgpu::with_controller(|d| {
             let mode = d.current_mode().expect("amdgpu scanout without mode");
-            let base = d.vram_info().base as *mut u32;
+            // DCN scans out from `vram_info().base`, the start of VRAM in
+            // the GPU's own address space, which BAR0 exposes at offset 0.
+            // The CPU reaches it through BAR0's mapping; the MC address
+            // itself is not a CPU address (it typically falls in PML4[1],
+            // user address space, where the kernel maps nothing).
+            let base = d.fb_bar.virt as *mut u32;
             // SAFETY: amdgpu's BAR0 is mapped + DCN configured to
-            // scan out from `base`; the caller holds the FbScanout
+            // scan out from its start; the caller holds the FbScanout
             // cap that serializes writers. Stride is in pixels.
             // SAFETY: Valid memory or trusted environment
             unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride) }

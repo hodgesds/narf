@@ -566,8 +566,8 @@ before the RX caller may recycle the DMA buffer or the test-run syscall returns.
 ### x86_64
 
 - **VA layout.** BPF text and arena windows each take a dedicated PML4 slot,
-  clear of the identity map (0), high MMIO (1), the per-domain PCID slots
-  (256..=271), vmalloc (272 — note `vmalloc.rs:15`'s "273" comment is wrong),
+  clear of the identity map (0), user address space (1..=255), the per-domain
+  PCID slots (256..=271), vmalloc (272 — note `vmalloc.rs:15`'s "273" comment is wrong),
   the direct map, and the kernel image (511).
 - **Prog pack.** One 2 MiB hugepage per pack from `memory/src/hugepage.rs`
   (`alloc_hugepage_2m_on`), mapped by a single PMD entry so ~500 programs cost

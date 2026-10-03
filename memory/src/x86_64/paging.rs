@@ -264,10 +264,8 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     //   PML4[0]:       zeroed — AS-private, like PML4[2..255]. Kernel
     //                  access to physical RAM while this CR3 is active
     //                  goes through the high-half direct map instead.
-    //   PML4[1]:       fixed below with a fresh private PDPT so the
-    //                  user binary subtree (PDPT[0]) is isolated.
-    //   PML4[2..255]:  zeroed — populated on demand by `materialize`
-    //                  through private PD/PT chains for this AS.
+    //   PML4[1..255]:  zeroed — populated on demand by `materialize`
+    //                  through private PDPT/PD/PT chains for this AS.
     //   PML4[256..511]: copy from cur_pml4 — kernel high-half
     //                  (≥ 0xFFFF_8000_0000_0000); identical across
     //                  all ASes so kernel code reaches during traps.
@@ -296,104 +294,13 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         }
     }
 
-    // PML4[1] is shared between two consumers:
-    //   - Kernel high-MMIO identity (virt 512 GiB ≤ V < 1 TiB,
-    //     mapped via 1 GiB huge pages in PDPT[1..512] of the
-    //     kernel's PML4[1]). The NVMe / virtio / xHCI BARs that
-    //     UEFI assigns above 4 GiB live here (e.g. QEMU q35 places
-    //     NVMe BAR0 at phys 0xC0_0000_0000 = 768 GiB).
-    //   - User binaries link at virt 0x0000_0080_0000_1000 which
-    //     decodes to PML4[1] PDPT[0] PD[0] PT[1]. The user
-    //     `materialize` populates the PT/PD/PDPT[0] subtree.
-    //
-    // The bulk-copy above made PML4[1] point at the kernel's own
-    // PDPT, which means a user materialize would walk and *write*
-    // through to the kernel-shared PDPT — cross-AS mapping pollution
-    // and a security boundary leak.
-    //
-    // Fix: allocate a fresh PDPT for this user AS, copy the
-    // kernel's PDPT[1..512] entries (the high-MMIO 1-GiB pages)
-    // into it, leave PDPT[0] zero so the user's materialize can
-    // safely descend into a private PD/PT subtree.
-    // SAFETY: `cur_pml4` is the current (kernel) PML4's physical base,
-    // which lives in the boot identity-mapped window, so its phys value
-    // is also a valid VA. PML4[1] is at byte offset 1 * 8 = 8 (8 bytes
-    // per entry, 512 entries fit the 4 KiB table), well inside the page,
-    // and naturally aligned for a `u64` read. Volatile because the entry
-    // can be mutated by other paging code.
-    // SAFETY: Valid memory or trusted environment
-    let kernel_pml4_e1: u64 =
-        unsafe { ptr::read_volatile(PhysAddr::new(cur_pml4.raw() + 8).kernel_ptr::<u64>()) };
-    if kernel_pml4_e1 & 1 != 0 {
-        let kernel_pdpt_phys = PhysAddr::new(kernel_pml4_e1 & 0x000f_ffff_ffff_f000);
-        let user_pdpt_frame =
-            crate::frame::alloc_frame_on(node).map_err(|_| PageTableAllocError::NoFrame)?;
-        let user_pdpt_phys = user_pdpt_frame.start_address();
-        // Sanity: user_pdpt phys must differ from the PML4 phys
-        // we just allocated. If alloc handed back the same frame
-        // twice the buddy is corrupt — fail loudly here so the
-        // overlap is named instead of cascading into a later
-        // double-free.
-        if user_pdpt_phys.raw() == phys.raw() {
-            panic!(
-                "new_user_pml4_on: alloc returned PML4 phys 0x{:x} twice (as user_pdpt)",
-                phys.raw()
-            );
-        }
-        crate::frame::__pagetable_register(user_pdpt_phys.raw());
-        // Only PDPT[0] remains private/empty. Entries 1..512 are all
-        // overwritten from the fixed-width kernel snapshot below, so a
-        // whole-page zero first is redundant on every fork.
-        // SAFETY: identity-mapped freshly-allocated frame; entry 0 is aligned.
-        unsafe {
-            ptr::write_volatile(user_pdpt_phys.kernel_mut_ptr::<u64>(), 0);
-        }
-        // Copy kernel PDPT[1..512] (skip PDPT[0] — that's where the
-        // user binary lives, must stay private to this AS).
-        // SAFETY: source + destination are both identity-mapped
-        // 4 KiB-aligned page frames.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            for i in 1usize..512 {
-                let src = PhysAddr::new(kernel_pdpt_phys.raw() + i as u64 * 8).kernel_ptr::<u64>();
-                let dst =
-                    PhysAddr::new(user_pdpt_phys.raw() + i as u64 * 8).kernel_mut_ptr::<u64>();
-                ptr::write_volatile(dst, ptr::read_volatile(src));
-            }
-        }
-        // Replace PML4[1] in the user copy with a pointer at the
-        // fresh PDPT. Preserve PRESENT / WRITABLE from the kernel
-        // entry but force USER=1 — the kernel PML4[1] is U=0
-        // (kernel-only high-MMIO), but in the user AS this slot
-        // also serves the user binary at virt 0x0000_0080_0000_1000,
-        // and a CPL=3 walk requires U=1 at every level. The
-        // kernel-MMIO PDPT entries themselves carry U=0, so a
-        // user-mode access at high-MMIO virts still faults at the
-        // PDPT level — only the user's own PDPT[0] subtree is
-        // reachable from CPL=3.
-        let preserved_flags = (kernel_pml4_e1 & 0xfff) | (1 << 2); // USER bit
-        let new_e1 = user_pdpt_phys.raw() | preserved_flags;
-        // SAFETY: `phys` is the user PML4's physical base in the
-        // identity-mapped window, so it is a valid VA; PML4[1] is at byte
-        // offset 8 (entry 1, 8 bytes each), inside the page and u64-aligned.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            ptr::write_volatile(
-                PhysAddr::new(phys.raw() + 8).kernel_mut_ptr::<u64>(),
-                new_e1,
-            );
-        }
-    } else {
-        // Kernel didn't map PML4[1] at all (legacy boot path). Fall
-        // back to a clean clear so the user materialize allocates a
-        // fresh PDPT through `map_4kb`'s walker.
-        // SAFETY: same as above — `phys` is the identity-mapped user PML4
-        // base, PML4[1] is at u64-aligned byte offset 8 inside the page.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            ptr::write_volatile(PhysAddr::new(phys.raw() + 8).kernel_mut_ptr::<u64>(), 0);
-        }
-    }
+    // PML4[1] is zeroed with the rest of the user half, not rebuilt from
+    // the current root's. It used to get a fresh PDPT holding copies of the
+    // current root's PDPT[1..512], meant to be the kernel's high-MMIO
+    // identity leaves. `init_mmu` no longer maps PML4[1], so on the kernel
+    // root that copied nothing; on a user root (fork, exec) it copied that
+    // address space's own PDPT entries above 513 GiB, sharing its page
+    // tables with the new one.
 
     USER_PML4_LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(phys)
@@ -2311,8 +2218,8 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
         let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
         // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
         // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
-        // PDPT[0] PD[0] PT[1], and `new_user_pml4` allocates a fresh
-        // PDPT for that slot). Every other PML4[0..256] entry is a
+        // PDPT[0] PD[0] PT[1], and `new_user_pml4` leaves that slot
+        // empty for `materialize` to fill). Every other PML4[0..256] entry is a
         // bulk-copied pointer to a SHARED kernel page-table page —
         //   - PML4[0]: the kernel low-4-GiB identity PDPT (`PDPT_lo` in
         //     `EARLY_PAGE_TABLES`), reused by every AS for DMA / phys
@@ -2387,12 +2294,12 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
                 continue;
             }
             let pd_pa = pdpte.addr();
-            // Same AS-private guard as the PDPT level: slot 1's PDPT
-            // carries bulk-copied kernel PDPT[1..512] pointers. Those
-            // high-MMIO mappings are 1-GiB HUGE pages (skipped above), but
-            // guard against any non-huge kernel PD pointer slipping
-            // through — a kernel PD is never registered, so skip it rather
-            // than return a live kernel page table to the buddy.
+            // Same AS-private guard as the PDPT level: slot 1's PDPT once
+            // carried bulk-copied kernel PDPT[1..512] pointers (1-GiB HUGE
+            // pages, skipped above). Guard against any non-huge kernel PD
+            // pointer slipping through — a kernel PD is never registered,
+            // so skip it rather than return a live kernel page table to the
+            // buddy.
             if !crate::frame::__pagetable_is_registered(pd_pa.raw()) {
                 continue;
             }

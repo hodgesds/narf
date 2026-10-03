@@ -471,11 +471,9 @@ fn smoke_probe_catches_page_fault() -> TestResult {
     use core::arch::asm;
     use narf_arch::x86_64::probe;
 
-    // An address the kernel PML4 deliberately leaves unmapped. The low
-    // identity map now covers 0..512 GiB (PML4[0]), and PML4[1] maps the
-    // high-MMIO window 513 GiB..1 TiB but SKIPS its PDPT[0] — the
-    // 512..513 GiB slot reserved for user space — so a kernel write to
-    // 512 GiB walks a present PML4[1] into a not-present PDPT[0] and #PFs.
+    // An address the kernel PML4 deliberately leaves unmapped: PML4[1..256]
+    // is user address space and the kernel root maps nothing there, so a
+    // kernel write to 512 GiB meets a not-present PML4[1] and #PFs.
     let unmapped: u64 = 0x0000_0080_0000_0000;
 
     let recovery: u64;
@@ -2957,6 +2955,101 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_address_space_materialize);
+
+/// The user half above PML4[1]'s first GiB is ordinary, private user address
+/// space. x86_64 used to identity-map physical 513 GiB..1 TiB there with
+/// supervisor-only 1 GiB leaves in the kernel root and copy those leaves into
+/// every user root, so a user mapping at 0x81_0000_0000 could be recorded but
+/// never installed (the walk met a huge leaf), and a user pointer there with
+/// no mapping at all reached physical memory through the guarded copy.
+///
+/// A fresh user root must install a 4 KiB user leaf at the address the
+/// finding reported, and hold nothing else in that PDPT. On x86_64 the
+/// kernel root itself must map nothing in the user half beyond PML4[0]'s AP
+/// trampoline, since every user root starts from it. aarch64 user roots start
+/// empty, so there the first half is a regression pin.
+fn smoke_memory_user_root_pml4_1_window_is_private() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: paging is live; reading CR3 has no side effects.
+        let kernel_root = unsafe { crate::x86_64::paging::read_cr3() };
+        // SAFETY: the live kernel root is a valid page table reached through
+        // the direct map.
+        let kernel = unsafe { &*kernel_root.kernel_ptr::<crate::x86_64::paging::PageTable>() };
+        for (index, entry) in kernel.entries.iter().enumerate().take(256).skip(1) {
+            if entry.raw() != 0 {
+                let msg = alloc::format!(
+                    "kernel root maps user-half PML4[{index}] = {:#x}",
+                    entry.raw()
+                );
+                return TestResult::Fail(alloc::boxed::Box::leak(msg.into_boxed_str()));
+            }
+        }
+    }
+
+    // SAFETY: paging is live in the kernel-test harness; this test owns the
+    // fresh root.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let window = VirtAddr::new(0x0000_0081_0000_0000);
+    let target = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    if a.map_region(Region {
+        base: window,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![target],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region refused a page at 0x81_0000_0000");
+    }
+    // SAFETY: the fresh root is exclusively owned by this test.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize could not install a page at 0x81_0000_0000");
+    }
+    // SAFETY: `a.root` is the root just materialized.
+    match unsafe { translate_arch(a.root, window) } {
+        Some(phys) if phys == target => {}
+        Some(_) => {
+            return TestResult::Fail("0x81_0000_0000 translates to a frame it was not given")
+        }
+        None => return TestResult::Fail("0x81_0000_0000 is not mapped after materialize"),
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::x86_64::paging::{self, PageTable, PtFlags};
+        // SAFETY: `a.root` is the root just materialized.
+        match unsafe { paging::flags_at(a.root, window) } {
+            Some(f) if f.contains(PtFlags::PRESENT | PtFlags::USER) => {}
+            _ => return TestResult::Fail("the page at 0x81_0000_0000 is not a present user leaf"),
+        }
+        // SAFETY: `a.root` is the live root just materialized, reached
+        // through the direct map.
+        let root = unsafe { &*a.root.kernel_ptr::<PageTable>() };
+        // SAFETY: materialize installed PML4[1] to reach the window page, so
+        // it names a live PDPT.
+        let pdpt = unsafe { &*root.entries[1].addr().kernel_ptr::<PageTable>() };
+        let own = ((window.raw() >> 30) & 0x1ff) as usize;
+        for (index, entry) in pdpt.entries.iter().enumerate() {
+            if index != own && entry.raw() != 0 {
+                let msg = alloc::format!(
+                    "user PML4[1] PDPT[{index}] = {:#x}: not this address space's mapping",
+                    entry.raw()
+                );
+                return TestResult::Fail(alloc::boxed::Box::leak(msg.into_boxed_str()));
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_user_root_pml4_1_window_is_private);
 
 /// Per-arch `translate(root, virt)` shim so address-space tests
 /// stay portable. x86_64 lives in `x86_64::paging`, aarch64 in
@@ -13812,8 +13905,8 @@ fn smoke_memory_future_lock_policy_applies_to_new_mappings() -> TestResult {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
-    // Keep the VA in PML4[1]'s deliberately-empty 512..513 GiB user slot.
-    // Addresses at/above 0x80_4000_0000 overlap the inherited high-MMIO map.
+    // Any unmapped user VA works; this one sits in PML4[1], clear of the
+    // user image at 0x80_0000_1000.
     let eager_base = VirtAddr::new(0x0000_0080_3400_0000);
     if a.update_mlockall(None, FutureLockPolicy::Eager).is_err()
         || a.map_region(Region {

@@ -264,8 +264,8 @@ unsafe fn set_alias_writable(phys: u64, len: u64, writable: bool) -> Result<(), 
 /// text pack. Returning it anyway would hand `set_range_writable` a VA with no
 /// present leaf, failing every seal.
 ///
-/// PML4[1] (512 GiB..1 TiB) is the high-MMIO identity window and never maps
-/// RAM, so it is not a candidate either.
+/// PML4[1..256] is user address space, where the kernel maps nothing, so it
+/// is not a candidate either.
 #[cfg(target_arch = "x86_64")]
 fn alias_vas(phys: u64) -> ([u64; 2], usize) {
     let mut out = [0u64; 2];

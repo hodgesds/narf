@@ -1182,11 +1182,10 @@ x86_64 is rejected at runtime.
   registered and therefore are never reclaimed by user-address-space teardown.
 - Fresh x86_64 user roots initialize every entry before publication without
   redundant whole-page clearing: PML4[0..256] is zeroed and PML4[256..512] is
-  copied entry-by-entry from the current kernel root; the private PML4[1]
-  replacement points at a fresh PDPT whose entry 0 is zero and whose entries
-  1..512 are copied entry-by-entry from the kernel high-MMIO table. Thus no
-  stale allocator contents can become a translation even though bytes that are
-  immediately overwritten are not cleared first.
+  copied entry-by-entry from the current root. The user half inherits nothing,
+  from the kernel or from a user root that is current during fork or exec.
+  Thus no stale allocator contents can become a translation even though bytes
+  that are immediately overwritten are not cleared first.
 - Reverse maps use a 64-way sharded, open-addressed physical-frame index with
   a mixed page-number hash and a maximum 75% occupied-plus-tombstone load.
   Growth rehashes in amortized chunks; deletion beyond the reuse bound leaves
@@ -1421,9 +1420,8 @@ x86_64 is rejected at runtime.
   | Slot(s)  | Base                  | Contents                              |
   | -------- | --------------------- | ------------------------------------- |
   | 0        | `0x0`                 | AP trampoline pages *only* — see below |
-  | 1        | `0x0000_0080_0000_0000` | high MMIO window; never maps RAM    |
   | 272      | `0xFFFF_8800_0000_0000` | `vmalloc` / `ioremap`               |
-  | 384..510 | `0xFFFF_C000_0000_0000` (`KERNEL_DIRECT_MAP_BASE`) | direct map of RAM |
+  | 384..510 | `0xFFFF_C000_0000_0000` (`KERNEL_DIRECT_MAP_BASE`) | direct map of RAM, and at least physical 0..1 TiB (`DIRECT_MAP_MIN_REACH`) |
   | 511      | `0xFFFF_FFFF_8000_0000` (`KERNEL_VIRT_BASE`) | kernel image        |
 
   **The kernel does not identity-map RAM.** PML4[0] retains only

@@ -755,14 +755,14 @@ impl Arch {
     /// `phys-bits`. `-cpu max` otherwise reports the host's width (often
     /// 46-52 bits), which makes QEMU park the q35 64-bit PCI hole — and
     /// every 64-bit device BAR (NVMe, virtio) — up near the top of that
-    /// space (~14 TiB observed at -m 8192). NARF maps MMIO through the
-    /// identity window, whose high-MMIO range only covers phys
-    /// [512 GiB, 1 TiB), so a BAR above 1 TiB #PFs on first register
-    /// access once RAM is large enough to push the hole up. Capping to
-    /// 40 bits keeps the hole inside [~992 GiB, 1 TiB) — within the
-    /// mapped window — and mirrors real laptops, whose firmware already
-    /// parks BARs at 512 GiB-1016 GiB. Non-`max` explicit models
-    /// (EPYC-Rome/Genoa) are left untouched.
+    /// space (~14 TiB observed at -m 8192). NARF's fallback MMIO mapping
+    /// (the kernel direct map, when `ioremap` cannot map a BAR) only
+    /// covers phys [0, 1 TiB) on a small-RAM machine, so a BAR above
+    /// 1 TiB #PFs on first register access once RAM is large enough to
+    /// push the hole up. Capping to 40 bits keeps the hole inside
+    /// [~992 GiB, 1 TiB) — within that range — and mirrors real laptops,
+    /// whose firmware already parks BARs at 512 GiB-1016 GiB. Non-`max`
+    /// explicit models (EPYC-Rome/Genoa) are left untouched.
     fn clamp_cpu_phys_bits(cpu: String) -> String {
         if cpu.contains("max") && !cpu.contains("phys-bits") {
             format!("{cpu},phys-bits=40")

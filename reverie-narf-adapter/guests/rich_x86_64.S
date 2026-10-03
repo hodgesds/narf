@@ -8,12 +8,12 @@
 //   image (0x80_0000_1000) and far below the user stack, so its result is
 //   RICH_ADDR on every kernel; an occupied range fails with -EEXIST instead
 //   of silently replacing a mapping.
-// - RICH_ADDR is 0x200_0000_0000 (PML4 slot 4), not 0x81_0000_0000. On
-//   Narf the range 0x80_4000_0000..0x100_0000_0000 is accepted by mmap but
-//   still covered by the kernel's supervisor-only 1 GiB identity pages
-//   (PML4[1], shared into every user address space), so the first user
-//   store there faults. That is a kernel bug reported separately; this
-//   guest avoids the range instead of depending on it. Slot 4 is also
+// - RICH_ADDR is 0x200_0000_0000 (PML4 slot 4), not 0x81_0000_0000. Narf
+//   once left the range 0x80_4000_0000..0x100_0000_0000 covered by the
+//   kernel's supervisor-only 1 GiB identity pages (PML4[1], shared into
+//   every user address space), so mmap accepted it and the first user store
+//   faulted. That kernel bug is fixed and the window guest pins it; this
+//   guest keeps the address it was recorded with. Slot 4 is also
 //   clear of Narf's brk arena (from 0x1000_0000_0000), its mmap window
 //   (from 0x4080_0000_0000) and its vDSO (0x7fff_0000_0000).
 // - BAD_FD is 0x7fffffff, above Linux's NR_OPEN ceiling (2147483584), so no

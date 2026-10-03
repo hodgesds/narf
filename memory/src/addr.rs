@@ -216,9 +216,21 @@ pub const KERNEL_DIRECT_MAP_BASE: u64 = 0xFFFF_C000_0000_0000;
 /// (PML4[0], built by `init_mmu` as 512 × 1-GiB huge pages) and are
 /// reached at `phys == virt`; `kernel_mut_ptr` only applies the
 /// direct-map offset to frames at or above it. 512 GiB = the identity
-/// map's full reach before PML4[1] (user + high-MMIO) begins.
+/// map's full reach before PML4[1] (user address space) begins.
 #[cfg(target_arch = "x86_64")]
 pub const LOW_IDENTITY_LIMIT: u64 = 512u64 << 30;
+
+/// The direct map covers at least physical `[0, DIRECT_MAP_MIN_REACH)`,
+/// whatever the installed RAM: two PML4 slots, 1 TiB, the whole range a
+/// 40-bit physical address can name. `init_mmu` sizes the map to
+/// `max(installed RAM, this)`, so `kernel_mut_ptr` reaches every such
+/// address, MMIO included, from the kernel half.
+///
+/// This is where 64-bit BARs above 512 GiB are reached when `ioremap` cannot
+/// map them. They used to be reached at `phys == virt` through a PML4[1]
+/// identity window that every user address space inherited; see `init_mmu`.
+#[cfg(target_arch = "x86_64")]
+pub const DIRECT_MAP_MIN_REACH: u64 = 1u64 << 40;
 
 /// First PML4 slot of the direct map (`KERNEL_DIRECT_MAP_BASE >> 39`).
 #[cfg(target_arch = "x86_64")]

@@ -447,6 +447,74 @@ fn smoke_abi_uaccess_kernel_src_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_uaccess_kernel_src_neg);
 
+// ── the rest of PML4[1] ─────────────────────────────────────────────
+
+/// An unmapped *user-half* address fails the same way. x86_64 once shared
+/// its kernel's supervisor-only 1 GiB identity leaves for physical
+/// 513 GiB..1 TiB into PML4[1] of every address space, the kernel root
+/// included. The predicate rightly passes those addresses (they are user
+/// addresses), SMAP says nothing about a `U=0` leaf, and the guarded copy
+/// runs under `STAC` anyway: `write(2)` from a window address with nothing
+/// mapped read physical memory into the pipe, and `read(2)` into one wrote
+/// the pipe's bytes to physical memory.
+///
+/// 576 GiB is clear of every PCI BAR on the QEMU q35 machine the tests
+/// boot (all sit below 4 GiB) and of guest RAM (1 GiB), so a kernel that
+/// still has the leaves touches no device. On aarch64 the address is plain
+/// unmapped TTBR0 space and the test pins the same contract.
+fn smoke_abi_uaccess_pml4_1_window_efault() -> TestResult {
+    const PROBE: u64 = 0x0000_0090_0000_0000;
+    const PATTERN: &[u8; 16] = b"window-f1-probe\n";
+    with_setup_strict(|| {
+        // Precondition: the predicate must pass the probe, or EFAULT below
+        // would come from validation and never reach the copy.
+        if vur(PROBE, 16).is_err() {
+            return Err("the window probe failed validation; the copy is never reached");
+        }
+        let (rd, wr) = crate::pipe::pipe_pair();
+        let (r, w) = crate::fd::install_pair(
+            FAKE_TASK,
+            crate::fd::FdEntry {
+                ops: rd.clone(),
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDONLY | crate::fd::O_NONBLOCK,
+            },
+            crate::fd::FdEntry {
+                ops: wr.clone(),
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_WRONLY | crate::fd::O_NONBLOCK,
+            },
+        )
+        .ok_or("could not install the pipe")?;
+        // `write(2)` from the window: a `copy_from_user` source.
+        if call(Syscall::Write.raw(), a2(w as u64, PROBE, 16)) != Some(EFAULT) {
+            return Err("write(2) from an unmapped PML4[1] window address did not EFAULT");
+        }
+        // `read(2)` into the window: a `copy_to_user` destination. Queue
+        // bytes first so there is something to copy.
+        let queued =
+            crate::handlers::poll_blocking(narf_filesystem::FileOps::write(&*wr, 0, PATTERN));
+        if !matches!(queued, Some(Ok(16))) {
+            return Err("could not queue the pattern in the pipe");
+        }
+        if call(Syscall::Read.raw(), a2(r as u64, PROBE, 16)) != Some(EFAULT) {
+            return Err("read(2) into an unmapped PML4[1] window address did not EFAULT");
+        }
+        // The faulting read must not have consumed the bytes, and nothing
+        // from the first write may have reached the pipe ahead of them.
+        let mut got = [0u8; 32];
+        let left =
+            crate::handlers::poll_blocking(narf_filesystem::FileOps::read(&*rd, 0, &mut got));
+        if !matches!(left, Some(Ok(16))) || &got[..16] != PATTERN {
+            return Err("the pipe does not hold exactly the queued pattern after the faults");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_uaccess_pml4_1_window_efault);
+
 // ── a non-BPF write path ────────────────────────────────────────────
 
 /// The hole was never a BPF bug — `bpf(2)` was only the loudest gadget.

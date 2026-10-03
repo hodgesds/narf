@@ -2599,3 +2599,85 @@ fn reverie_narf_rich_trace_cell() -> TestResult {
     })())
 }
 kernel_test_in!("reverie-narf", reverie_narf_rich_trace_cell);
+
+// ── The PML4[1] window ────────────────────────────────────────────────────
+
+/// The window guest (guests/window_x86_64.S): unmapped-address copies and a
+/// fixed mapping in the user half above 0x80_4000_0000, each result reported
+/// as one word on fd 1.
+static WINDOW_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_WINDOW"));
+
+/// What the window guest reports on Linux, word by word (see the guest's
+/// table): the unmapped probe address faults both ways without consuming the
+/// queued bytes, and the fixed mapping at 0x81_0000_0000 is created, holds
+/// user stores, is readable by the kernel, is private to the parent across
+/// fork, and faults again once unmapped.
+const WINDOW_EXPECTED: [i64; 12] = [-14, -14, 16, 1, 0x81_0000_0000, 1, 16, 1, 1, 0, 0, -14];
+
+/// Runs every syscall natively; the window test observes only the guest.
+struct Untouched;
+
+impl SyscallInterceptor for Untouched {
+    fn on_syscall_enter(
+        &self,
+        _invocation: &SyscallInvocation,
+        _native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        SyscallInterception::Continue
+    }
+}
+
+/// The user half between 0x80_4000_0000 and 0x100_0000_0000 is ordinary
+/// user address space: nothing the kernel maps for itself is reachable
+/// there. `read(2)` and `write(2)` on an unmapped window address fail with
+/// `EFAULT` instead of copying physical memory, and a fixed mapping there
+/// works for user stores and kernel copies alike and is not shared with a
+/// forked child, as on Linux.
+fn reverie_narf_pml4_1_window_is_user_address_space() -> TestResult {
+    result_of((|| {
+        let mut tap = None;
+        let (root, reap) = run_guest_with(
+            WINDOW_GUEST,
+            Box::new(Untouched),
+            |root| {
+                tap = Some(tap_console(root.task_id, false)?);
+                Ok(())
+            },
+            Some(REAPER_GUEST),
+        )?;
+        let captured = tap
+            .ok_or("the root's fd 1 was never tapped")?
+            .captured
+            .lock()
+            .clone();
+        let words: Vec<i64> = captured
+            .chunks_exact(8)
+            .map(|word| i64::from_le_bytes(word.try_into().unwrap()))
+            .collect();
+        let wstatus = reap
+            .ok_or("the run did not reap its root")?
+            .root_wstatus(root)?;
+        let _ = writeln!(
+            Writer,
+            "    window guest wstatus {wstatus:#06x} bytes {} words {words:?}",
+            captured.len()
+        );
+        if wstatus != 0 {
+            return Err("the window guest did not exit 0");
+        }
+        if captured.len() != WINDOW_EXPECTED.len() * 8 {
+            return Err("the window guest did not report every word");
+        }
+        for (index, (got, want)) in words.iter().zip(WINDOW_EXPECTED).enumerate() {
+            if *got != want {
+                let _ = writeln!(Writer, "    word {index}: got {got:#x}, Linux {want:#x}");
+                return Err("a window observation differs from Linux");
+            }
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_pml4_1_window_is_user_address_space
+);

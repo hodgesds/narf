@@ -58,6 +58,44 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus", smoke_bus_enumerates_pcie);
 
+/// `map_bar`'s fallback for a BAR `ioremap` could not map must hand out a
+/// mapped kernel address, not the raw phys. Physical 513 GiB..1 TiB used to
+/// be identity-mapped in PML4[1], so the raw phys worked there; that range is
+/// now user address space, and the direct map has to reach it instead.
+///
+/// QEMU places every BAR below 4 GiB and `ioremap` does not fail there, so no
+/// boot exercises the fallback; this calls it directly at both ends of the
+/// old window and walks the live kernel root.
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_unmapped_bar_va_reaches_old_window() -> TestResult {
+    use narf_memory::PhysAddr;
+    const PAGE: u64 = 0x1000;
+    for phys in [
+        0x80_4000_0000,
+        narf_memory::addr::DIRECT_MAP_MIN_REACH - PAGE,
+    ] {
+        let phys = PhysAddr::new(phys);
+        let va = crate::bar::unmapped_bar_va(phys, PAGE);
+        if va < 0xffff_8000_0000_0000 {
+            return TestResult::Fail("unmapped_bar_va handed out a user-half address");
+        }
+        // SAFETY: paging is live; reading CR3 and walking the live root
+        // through the direct map has no side effects.
+        let mapped = unsafe {
+            narf_memory::x86_64::paging::translate(
+                narf_memory::x86_64::paging::read_cr3(),
+                narf_memory::VirtAddr::new(va),
+            )
+        };
+        if mapped != Some(phys) {
+            return TestResult::Fail("unmapped_bar_va's address does not map the BAR's phys");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus", smoke_bus_unmapped_bar_va_reaches_old_window);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     // The boot-time `bus::init` discovers the `pcie@10000000` node

@@ -95,8 +95,7 @@ use crate::{PhysAddr, VirtAddr};
 //
 // Occupied slots on x86_64 (verified against the tree, not assumed):
 //   0          low identity map, 0..512 GiB       (`mmu.rs` `init_mmu`)
-//   1          high MMIO 512 GiB..1 TiB + the user binary PDPT[0]
-//   2..=255    user address space
+//   1..=255    user address space (the kernel maps nothing here)
 //   256..=271  per-domain private PCID slots      (`x86_64/domain.rs`)
 //   272        vmalloc, 0xFFFF_8800_0000_0000     (`vmalloc.rs` — note that
 //              file's "273" comment is wrong; 0xFFFF_8800_0000_0000 >> 39
@@ -2336,7 +2335,7 @@ mod tests {
 
     #[test]
     fn windows_avoid_every_claimed_slot() {
-        // 0 identity, 1 high MMIO, 2..=255 user, 256..=271 per-domain PCID,
+        // 0 identity, 1..=255 user, 256..=271 per-domain PCID,
         // 272 vmalloc, 384..=510 direct map, 511 kernel image.
         for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
             assert!(slot > 272, "collides with vmalloc or lower");

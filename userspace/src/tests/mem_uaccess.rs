@@ -496,8 +496,7 @@ kernel_test_in!("userspace", smoke_uaccess_validate_canonical_holes);
 #[cfg(target_arch = "x86_64")]
 fn smoke_uaccess_guarded_copy_faults_to_efault() -> TestResult {
     // 512 GiB: canonical, and deliberately unmapped in the kernel
-    // PML4 (PML4[1] is present but its PDPT[0] — the user-reserved
-    // 512..513 GiB slot — is skipped; same address
+    // PML4 (the kernel root maps nothing in PML4[1..256]; same address
     // memory::tests::smoke_probe_catches_page_fault relies on).
     // validate_user_range passes it, so this exercises the
     // copy_user_guarded probe path end-to-end: the #PF has no
@@ -517,3 +516,39 @@ fn smoke_uaccess_guarded_copy_faults_to_efault() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_uaccess_guarded_copy_faults_to_efault);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_uaccess_guarded_copy_pml4_1_window_faults_to_efault() -> TestResult {
+    // 576 GiB: PML4[1], outside its first (user-image) GiB, and nothing is
+    // mapped there. The kernel once identity-mapped physical 513 GiB..1 TiB
+    // across this range with supervisor-only 1 GiB leaves, and the guarded
+    // copy runs under STAC, so a user pointer here reached physical memory
+    // instead of faulting. On the QEMU q35 machine the tests boot every PCI
+    // BAR sits below 4 GiB and RAM is 1 GiB, so the probe touches no device
+    // even on a kernel that still has the leaves.
+    const PROBE: u64 = 0x0000_0090_0000_0000;
+    if crate::handlers::validate_user_range(PROBE, 32).is_err() {
+        return TestResult::Fail("the window probe is not a user range; the copy is never reached");
+    }
+    let mut buf = [0u8; 32];
+    // SAFETY: dst is a live kernel buffer; surviving the bad src is the
+    // guarded copy's contract.
+    match unsafe { crate::handlers::copy_from_user(&mut buf, PROBE) } {
+        Err(14) => {}
+        Err(_) => return TestResult::Fail("copy from the window failed with a non-EFAULT errno"),
+        Ok(()) => return TestResult::Fail("copy from unmapped 576 GiB read physical memory"),
+    }
+    let src = [0xa5u8; 32];
+    // SAFETY: src is a live kernel buffer; surviving the bad dst is the
+    // guarded copy's contract.
+    match unsafe { crate::handlers::copy_to_user(PROBE, &src) } {
+        Err(14) => TestResult::Pass,
+        Err(_) => TestResult::Fail("copy to the window failed with a non-EFAULT errno"),
+        Ok(()) => TestResult::Fail("copy to unmapped 576 GiB wrote physical memory"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_uaccess_guarded_copy_pml4_1_window_faults_to_efault
+);

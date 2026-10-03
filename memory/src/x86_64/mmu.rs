@@ -1,7 +1,7 @@
 //! MMU bring-up and the `console/` §3.1 handoff protocol.
 //!
-//! Builds the kernel's final PML4 — low identity map, high MMIO window,
-//! optional high-half direct map, and the `-2 GiB` kernel window — executes
+//! Builds the kernel's final PML4 — low identity map, optional high-half
+//! direct map, and the `-2 GiB` kernel window — executes
 //! the handoff sequence in `console/` §3.1, and swaps CR3 to it.
 //!
 //! **Every leaf is `NO_EXEC` except the two ranges something demonstrably
@@ -82,7 +82,6 @@ pub const HIGHER_HALF_PDPT_INDEX: usize = 510;
 struct EarlyPageTables {
     pml4: PageTable,
     pdpt_lo: PageTable,
-    pdpt_hi_mmio: PageTable,
     pdpt_hi: PageTable,
     /// Demotion of the low identity map's first 1 GiB into 2-MiB leaves.
     pd_lo_0: PageTable,
@@ -108,8 +107,12 @@ struct EarlyPageTables {
     /// `x86_64/paging.rs` documents. Static storage takes the frame out of
     /// the allocator's reach entirely.
     ///
-    /// Chunks >= 1 (only on > 512 GiB machines) still allocate.
+    /// Chunks >= 2 (only on > 1 TiB machines) still allocate.
     pdpt_direct_0: PageTable,
+    /// PDPT for the SECOND direct-map chunk (physical [512 GiB, 1 TiB)),
+    /// present on every machine: see [`crate::addr::DIRECT_MAP_MIN_REACH`].
+    /// Static for the same reason as `pdpt_direct_0`.
+    pdpt_direct_1: PageTable,
 }
 
 const ZERO_ENTRIES: [PageTableEntry; 512] = [PageTableEntry::EMPTY; 512];
@@ -118,9 +121,6 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
         entries: ZERO_ENTRIES,
     },
     pdpt_lo: PageTable {
-        entries: ZERO_ENTRIES,
-    },
-    pdpt_hi_mmio: PageTable {
         entries: ZERO_ENTRIES,
     },
     pdpt_hi: PageTable {
@@ -136,6 +136,9 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
         entries: ZERO_ENTRIES,
     },
     pdpt_direct_0: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pdpt_direct_1: PageTable {
         entries: ZERO_ENTRIES,
     },
 };
@@ -294,8 +297,9 @@ pub unsafe fn drop_ap_trampoline_window() {
 /// `phys | base`, which equals `base + phys` only while the base has zeros in
 /// every bit a physical address can set. A `chunks`-slot map lets `phys` reach
 /// into the next `chunks - 1` slot indices, so the base must be aligned to the
-/// next power of two at or above `chunks`. With RAM under 512 GiB that is one
-/// slot and any of PML4[384..=510] will do — about 7 bits. Coarser than
+/// next power of two at or above `chunks`. The map is never smaller than
+/// [`crate::addr::DIRECT_MAP_MIN_REACH`] (two slots), so with RAM under 1 TiB
+/// any even slot of PML4[384..=509] will do — 63 choices, about 6 bits. Coarser than
 /// Linux's 1 GiB-granular randomization, which is the price of OR; switching
 /// to ADD would buy more, but the OR is deliberate (it keeps the accessor
 /// idempotent for a kernel VA a caller wrapped in a `PhysAddr`), so it stays.
@@ -353,7 +357,8 @@ fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
 ///     `0..roundup(image end)`, both of which aliased buddy RAM.
 ///
 ///   * PML4[384 + i] → the high-half **kernel direct map**: one PDPT
-///     per 512 GiB of installed RAM (`max_ram_phys`), each mapping
+///     per 512 GiB of installed RAM (`max_ram_phys`), and never fewer
+///     than [`crate::addr::DIRECT_MAP_MIN_REACH`] needs, each mapping
 ///     `KERNEL_DIRECT_MAP_BASE + P` to physical `P` via 1-GiB huge
 ///     pages. This is what lets the kernel reach RAM above 512 GiB —
 ///     the low identity map stops at PML4[0] (512 GiB) because
@@ -365,8 +370,8 @@ fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
 /// Returns the physical address of the new PML4.
 ///
 /// `max_ram_phys` is the exclusive top of installed RAM (bytes); the
-/// direct map is sized to cover `[0, max_ram_phys)` rounded up to a
-/// 512 GiB PML4-slot boundary.
+/// direct map is sized to cover `[0, max(max_ram_phys, 1 TiB))` rounded up
+/// to a 512 GiB PML4-slot boundary.
 ///
 /// This function is the *memory/* half of the `console/` §3.1
 /// handoff protocol; the caller (`frame/main.rs`) is responsible for
@@ -402,8 +407,6 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     let pml4_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pml4) } as u64;
     // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     let pdpt_lo_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_lo) } as u64;
-    // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
-    let pdpt_hi_mmio_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi_mmio) } as u64;
     // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
     let pdpt_hi_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi) } as u64;
     // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
@@ -414,7 +417,6 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     let pd_hi_kernel_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pd_hi_kernel) } as u64;
     let pml4_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pml4_virt));
     let pdpt_lo_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_lo_virt));
-    let pdpt_hi_mmio_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_hi_mmio_virt));
     let pdpt_hi_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_hi_virt));
     let pd_lo_0_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pd_lo_0_virt));
     let pt_lo_0_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pt_lo_0_virt));
@@ -422,13 +424,15 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
     let pdpt_direct_0_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_direct_0) } as u64;
     let pdpt_direct_0_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_direct_0_virt));
+    // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
+    let pdpt_direct_1_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_direct_1) } as u64;
+    let pdpt_direct_1_addr = PhysAddr::new(crate::kaslr::image_virt_to_phys(pdpt_direct_1_virt));
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
     // so the raw pointer is valid for a 4 KiB write.
     PageTable::zero_at(pml4_addr.kernel_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_lo_addr.kernel_mut_ptr::<PageTable>());
-    PageTable::zero_at(pdpt_hi_mmio_addr.kernel_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_addr.kernel_mut_ptr::<PageTable>());
     PageTable::zero_at(pd_lo_0_addr.kernel_mut_ptr::<PageTable>());
     PageTable::zero_at(pt_lo_0_addr.kernel_mut_ptr::<PageTable>());
@@ -539,33 +543,16 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
         }
 
-        // High-MMIO identity (PML4[1]: virt 512 GiB ≤ V < 1 TiB →
-        // phys 512 GiB ≤ P < 1 TiB). Covers UEFI-assigned 64-bit
-        // BARs whose phys address sits above the low-4 GiB window.
-        // OVMF on QEMU q35 places NVMe / virtio-PCI BARs around
-        // phys 0xC0_0000_0000 (768 GiB); on real consumer hardware
-        // the BARs typically sit between 0x80_0000_0000 and
-        // 0xFE_0000_0000.
-        //
-        // PDPT[0] of this PML4 slot is reserved: user-mode binaries
-        // (init / shell / testbin) link at virt
-        // 0x0000_0080_0000_1000 which decodes to PML4[1] PDPT[0]
-        // PD[0] PT[1]. Mapping PDPT[0] as a 1-GiB huge page would
-        // collide with the user `materialize`'s 4-KiB descent.
-        // Skipping it costs nothing — phys 512 GiB ≤ P < 513 GiB
-        // is RAM territory in any sane laptop, never MMIO.
-        let pml4_hi_mmio_entry = PageTableEntry::new(pdpt_hi_mmio_addr, flags_ptr);
-        // PML4[1]: entry index 1 * 8 bytes per entry = byte offset 8.
-        let pml4_hi_mmio_slot = PhysAddr::new(pml4_addr.raw() + 8);
-        write_identity::<PageTableEntry>(pml4_hi_mmio_slot, pml4_hi_mmio_entry);
-        for gib in 1u64..512 {
-            // Each PDPT entry covers virt 512 GiB + gib * 1 GiB,
-            // identity-mapped to the matching phys.
-            let phys = PhysAddr::new((512 + gib) << 30);
-            let entry = PageTableEntry::new(phys, flags_1gb);
-            let slot = PhysAddr::new(pdpt_hi_mmio_addr.raw() + gib * 8);
-            write_identity::<PageTableEntry>(slot, entry);
-        }
+        // PML4[1..256] are left EMPTY: the rest of the low half belongs to
+        // user address spaces, which start from this root
+        // (x86_64/paging.rs). PML4[1] used to identity-map physical
+        // 513 GiB..1 TiB with 1 GiB supervisor leaves for 64-bit BARs, and
+        // every user root inherited them: a user `mmap` there was accepted
+        // and then faulted on its first store, and `copy_user_guarded`,
+        // which runs under STAC so SMAP never objects to a U=0 page, read and
+        // wrote physical memory through a user pointer with nothing mapped.
+        // The direct map reaches that range from the kernel half instead
+        // (`DIRECT_MAP_MIN_REACH`), and `map_bar` goes through `ioremap`.
 
         // High-half PML4[511] + PDPT[510] → the kernel image window.
         // Virtual `kernel_virt_base() + x` maps to physical `x`, for `x` in
@@ -687,7 +674,11 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // accessors after the CR3 swap.
     let mut dmap_base: u64 = 0;
     if build_direct_map {
-        let want_chunks = max_ram_phys.div_ceil(CHUNK_BYTES).max(1);
+        // Never less than `DIRECT_MAP_MIN_REACH`, so the physical range a
+        // 64-bit BAR can occupy on a 40-bit machine is reachable too.
+        let want_chunks = max_ram_phys
+            .max(crate::addr::DIRECT_MAP_MIN_REACH)
+            .div_ceil(CHUNK_BYTES);
         let dmap_chunks = want_chunks.min(crate::addr::KERNEL_DIRECT_MAP_PML4_SLOTS as u64);
         let dmap_pml4_base = pick_direct_map_slot(dmap_chunks);
         // Sign-extend: every slot here is >= 256, so bit 47 is set and a
@@ -699,14 +690,14 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             // still armed (the caller releases it only after we return),
             // so each is < 4 GiB and reachable through the boot identity
             // map for the fill writes below. This alloc only runs on
-            // > 512 GiB machines, so a small-RAM boot's frame layout is
+            // > 1 TiB machines, so a small-RAM boot's frame layout is
             // untouched.
-            // Chunk 0 uses static storage (see `pdpt_direct_0`); only the
-            // >512 GiB chunks come from the allocator.
-            let pdpt = if chunk == 0 {
-                pdpt_direct_0_addr
-            } else {
-                crate::frame::alloc_frame()?.start_address()
+            // Chunks 0 and 1 use static storage (see `pdpt_direct_0`); only
+            // the >1 TiB chunks come from the allocator.
+            let pdpt = match chunk {
+                0 => pdpt_direct_0_addr,
+                1 => pdpt_direct_1_addr,
+                _ => crate::frame::alloc_frame()?.start_address(),
             };
             // SAFETY: `pdpt` is < 4 GiB, identity-mapped by boot.S, so the
             // raw pointer is valid for a 4 KiB zero + entry writes.
