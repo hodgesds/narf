@@ -681,10 +681,14 @@ and the perf event layer, all of which are closed.
    __text_end)` and the AP-trampoline window, demoting 1 GiB → 2 MiB → 4 KiB
    at boot so those exceptions are stated at the granularity they need. The
    demotion is built *before* the CR3/`sctlr_el1` handoff, so it never splits
-   a live mapping. `memory/src/tests.rs` pins it: a buddy frame written
-   through its identity alias and through the higher-half kernel window is
-   proved to `#PF` with the instruction-fetch bit set, and the AP-trampoline
-   window is proved executable at 4 KiB granularity with the next page NX.
+   a live mapping. `memory/src/tests.rs` pins it: a buddy frame's identity
+   alias is proved non-executable, and the AP-trampoline window is proved
+   executable at 4 KiB granularity with the next page NX. The higher-half
+   kernel window gives a buddy frame no alias at all: it maps only the kernel
+   image rounded out to 2 MiB leaves, `frame/src/bare_main.rs` keeps that
+   whole range out of the frame allocator, and
+   `memory/src/kernel_window_audit.rs` walks the live window and proves that
+   none of the frames it maps is owned by or free in the allocator.
 
    The *writable* half is now **done for hugepage-backed packs on both
    arches**, which is every pack the allocator builds unless the boot-time
@@ -695,7 +699,8 @@ and the perf event layer, all of which are closed.
 
    1. **`seal` makes the pack's alias read-only.** `text_poke::protect_ro`
       walks every kernel window that aliases the pack's frames — the low
-      identity map, the higher-half kernel window (phys 0..1 GiB), and the
+      identity map, the higher-half kernel window (the image rounded out to
+      2 MiB, which no allocator frame should reach), and the
       direct map when a >512 GiB machine has one — and clears `WRITABLE` /
       sets `AP_RO_EL1` on each. Where a live huge leaf is in the way on
       x86_64 it is split, following `__split_large_page`
