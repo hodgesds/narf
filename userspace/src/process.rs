@@ -92,6 +92,13 @@ pub struct UserProcess {
     pub entry_arg: Option<u64>,
     /// Exact PT_LOAD and stack VMAs committed by the loader.
     pub loaded_mappings: alloc::vec::Vec<LoadedMapping>,
+    /// The auxiliary vector the loader wrote onto the initial stack, as
+    /// `(key, value)` pairs without the terminating `AT_NULL`. Empty when no
+    /// SysV stack was laid out, and for fork/clone children, which inherit
+    /// the parent's published vector instead (`proc_auxv_fork`). The task
+    /// registration publishes it for `/proc/<pid>/auxv` and the interception
+    /// services' `auxv()` view.
+    pub auxv: alloc::vec::Vec<(u64, u64)>,
 }
 
 /// Errors from `load_user_process`.
@@ -608,7 +615,19 @@ pub unsafe fn load_user_process_with_root(
 
     // Lay out argc/argv/envp/auxv if anything was supplied; an
     // entirely empty (no-args) process keeps the all-zero stack.
-    let rsp = if argv.is_empty() && envp.is_empty() && final_aux.is_empty() {
+    let laid_out = !(argv.is_empty() && envp.is_empty() && final_aux.is_empty());
+    let auxv: alloc::vec::Vec<(u64, u64)> = if laid_out {
+        final_aux
+            .iter()
+            .map(|e| {
+                let (key, val) = aux_pair(e);
+                (key as u64, val)
+            })
+            .collect()
+    } else {
+        alloc::vec::Vec::new()
+    };
+    let rsp = if !laid_out {
         stack_top_v
     } else {
         // SAFETY: the stack region [stack_top_v - stack_bytes .. stack_top_v]
@@ -682,6 +701,7 @@ pub unsafe fn load_user_process_with_root(
         fs_base,
         entry_arg: None,
         loaded_mappings,
+        auxv,
     })
 }
 

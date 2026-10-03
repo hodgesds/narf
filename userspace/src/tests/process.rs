@@ -205,6 +205,7 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
             fs_base: None,
             entry_arg: None,
             loaded_mappings: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
         },
         narf_scheduler::TaskSpec::user_task(),
     );

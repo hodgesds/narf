@@ -270,6 +270,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         },
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        auxv: alloc::vec::Vec::new(),
     };
 
     // Register the child under its TaskId but defer scheduler publication
@@ -305,6 +306,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     crate::fd::fork(parent_pid, child_tid.raw());
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
+    crate::handlers::proc_auxv_fork(parent_pid, child_tid.raw());
     // chroot inheritance (see do_clone3) — child inherits the parent's root.
     root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());

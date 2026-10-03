@@ -3753,6 +3753,12 @@ fn prepare_user_process(
     let id = narf_scheduler::alloc_task_id();
     let addr_space = process.address_space.clone();
     let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
+    // Publish the loader's auxiliary vector under the new task id (the key
+    // `/proc/<pid>/auxv` and the interception `auxv()` view resolve through).
+    // Fork/clone children carry none and inherit the parent's instead.
+    if !process.auxv.is_empty() {
+        crate::handlers::set_proc_auxv_pairs(id.raw(), &process.auxv);
+    }
     PendingUserProcess {
         id,
         future: future(process, task),

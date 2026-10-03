@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use narf_console::Writer;
 use narf_filesystem::{FileOps, FsError, FsFuture, Stat};
@@ -36,6 +36,14 @@ use crate::services::{map_native_outcome, NarfKernelServices};
 static CANONICAL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_CANONICAL"));
 static PROBE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PROBE"));
 static FORK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_FORK"));
+static PIPE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PIPE"));
+static EXEC_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_EXEC"));
+static VFORK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_VFORK"));
+
+/// The single argument every guest is started with, as Linux starts a program
+/// with `argv[0]`. A non-empty argv makes the loader lay out the full SysV
+/// startup stack, auxiliary vector included.
+const GUEST_ARGV: [&str; 1] = ["reverie-narf-guest"];
 
 /// Address of the canonical guest's 16-byte message (its `.rodata`).
 const CANONICAL_MESSAGE_ADDR: u64 = 0x0000_0080_0000_3000;
@@ -154,6 +162,10 @@ fn record_exiting_space(_pid: u64, _tid: u64) {
         spaces.push(Arc::downgrade(&space));
     }
 }
+
+/// Set by a test whose root execs: its exit then reports the exec'd space, and
+/// the loaded image's space is reclaimed without an exit from it.
+static ROOT_EXECS: AtomicBool = AtomicBool::new(false);
 
 /// How many distinct address spaces the last successful [`run_guest`] saw
 /// tasks exit from, all of which it proved reclaimed.
@@ -292,13 +304,14 @@ fn run_guest_with(
 
     // SAFETY: paging and the frame allocator are live in the kernel-test
     // environment; the image is a complete static ELF.
-    let process = match unsafe { narf_userspace::load_user_process_with(elf, &[], &[], &[]) } {
-        Ok(process) => process,
-        Err(_) => {
-            teardown(original_cr3);
-            return Err("the guest ELF failed to load");
-        }
-    };
+    let process =
+        match unsafe { narf_userspace::load_user_process_with(elf, &GUEST_ARGV, &[], &[]) } {
+            Ok(process) => process,
+            Err(_) => {
+                teardown(original_cr3);
+                return Err("the guest ELF failed to load");
+            }
+        };
     let pid = process.pid.raw();
     let root_space = Arc::downgrade(&process.address_space);
     let root_frames = process
@@ -394,8 +407,16 @@ fn run_guest_with(
     } else {
         None
     };
-    let spaces = core::mem::take(&mut *EXITED_SPACES.lock());
-    if !spaces.iter().any(|space| space.ptr_eq(&root_space)) {
+    let mut spaces = core::mem::take(&mut *EXITED_SPACES.lock());
+    let root_exited_in_image = spaces.iter().any(|space| space.ptr_eq(&root_space));
+    if ROOT_EXECS.load(Ordering::Acquire) {
+        // The root replaced its image, so it exited from the new space; the
+        // loaded one must still be reclaimed.
+        if root_exited_in_image {
+            return Err("the root task exited from its loaded image although it had exec'd");
+        }
+        spaces.push(root_space);
+    } else if !root_exited_in_image {
         return Err("the root task's exit did not report its address space");
     }
     reclaim_run(&spaces, &root_frames)?;
@@ -493,6 +514,87 @@ static FIRST_ORIGINAL: AtomicI64 = AtomicI64::new(i64::MIN);
 static SECOND_ORIGINAL: AtomicU64 = AtomicU64::new(0);
 static PROBE_EXIT: AtomicI64 = AtomicI64::new(i64::MIN);
 
+/// Linux auxiliary-vector tags the services view is checked against.
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_RANDOM: u64 = 25;
+
+fn read_word(memory: &impl MemoryAccess, addr: u64) -> Option<u64> {
+    let mut word = [0u8; 8];
+    let at = Addr::<u8>::from_raw(addr as usize)?;
+    memory.read_exact(at, &mut word).ok()?;
+    Some(u64::from_le_bytes(word))
+}
+
+/// The `(key, value)` pairs of the auxiliary vector on a SysV startup stack
+/// whose `argc` is at `rsp`: `argc`, `argv[]`, NULL, `envp[]`, NULL, then the
+/// pairs up to `AT_NULL`. `None` if the stack does not parse.
+fn startup_auxv(memory: &impl MemoryAccess, rsp: u64) -> Option<Vec<(u64, u64)>> {
+    let argc = read_word(memory, rsp)?;
+    if argc > 64 {
+        return None;
+    }
+    let mut at = rsp + 8 + (argc + 1) * 8;
+    let mut envc = 0;
+    while read_word(memory, at)? != 0 {
+        envc += 1;
+        if envc > 64 {
+            return None;
+        }
+        at += 8;
+    }
+    at += 8;
+    let mut pairs = Vec::new();
+    loop {
+        let key = read_word(memory, at)?;
+        if key == 0 {
+            return Some(pairs);
+        }
+        pairs.push((key, read_word(memory, at + 8)?));
+        if pairs.len() > 64 {
+            return None;
+        }
+        at += 16;
+    }
+}
+
+/// Compares the auxiliary vector the services report with the one on the
+/// guest's startup stack (the canonical guest's `rsp` is still its initial
+/// value at its `write`). Bit 8: the kernel's recorded vector or the
+/// services' `auxv()` differs from the stack's. Bit 9: the stack holds no
+/// full vector, so the comparison would prove nothing.
+fn check_auxv(kernel: &NarfKernelServices<'_>, pid: u64, rsp: u64) -> u64 {
+    let Some(on_stack) = startup_auxv(&kernel.memory(), rsp) else {
+        return 1 << 9;
+    };
+    let value = |tag: u64| {
+        on_stack
+            .iter()
+            .find(|&&(key, _)| key == tag)
+            .map(|&(_, value)| value)
+    };
+    let mut failures = 0;
+    if value(AT_RANDOM).is_none() || value(AT_UID).is_none() {
+        failures |= 1 << 9;
+    }
+    if tool_view::auxv_pairs(pid) != on_stack {
+        failures |= 1 << 8;
+    }
+    let auxv = kernel.auxv();
+    if auxv.len() != on_stack.len()
+        || auxv.at_random().map(|addr| addr.as_raw() as u64) != value(AT_RANDOM)
+        || auxv.at_uid().map(u64::from) != value(AT_UID)
+        || auxv.at_euid().map(u64::from) != value(AT_EUID)
+        || auxv.at_gid().map(u64::from) != value(AT_GID)
+        || auxv.at_egid().map(u64::from) != value(AT_EGID)
+    {
+        failures |= 1 << 8;
+    }
+    failures
+}
+
 /// Drives [`NarfKernelServices`] directly from the guest's `write`: checks
 /// the Linux view it presents, then asks for the original twice.
 struct ServicesProbe;
@@ -546,6 +648,7 @@ impl SyscallInterceptor for ServicesProbe {
         if read.is_err() || &message != CANONICAL_MESSAGE {
             failures |= 1 << 7;
         }
+        failures |= check_auxv(&kernel, ids.pid, regs.rsp);
         VIEW_FAILURES.fetch_or(failures, Ordering::AcqRel);
 
         match kernel.execute_original() {
@@ -573,8 +676,9 @@ impl SyscallInterceptor for ServicesProbe {
 
 /// The services a Tool callback gets report the task's root-namespace Linux
 /// identity (not its scheduler id), Linux entry registers with `orig_rax`
-/// set to the syscall number, and the task's memory; and the kernel runs the
-/// original syscall at most once however often it is asked.
+/// set to the syscall number, the task's memory, and the auxiliary vector the
+/// loader wrote on the task's startup stack; and the kernel runs the original
+/// syscall at most once however often it is asked.
 fn reverie_narf_services_view_and_one_shot_original() -> TestResult {
     PROBE_TASK.store(0, Ordering::Release);
     SEEN_WRITES.store(0, Ordering::Release);
@@ -847,6 +951,401 @@ fn reverie_narf_canonical_trace_cell() -> TestResult {
     })())
 }
 kernel_test_in!("reverie-narf", reverie_narf_canonical_trace_cell);
+
+// ── Park re-execution ─────────────────────────────────────────────────────
+
+/// The pipe guest's data-pipe write end and gate-pipe write end
+/// (guests/pipe_x86_64.S fixes both).
+const PIPE_DATA_WRITE_FD: u64 = 4;
+const PIPE_GATE_WRITE_FD: u32 = 6;
+
+static PARK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Entries the dispatcher flagged as re-executions of a parked syscall.
+static PARK_FLAGGED: AtomicU64 = AtomicU64::new(0);
+/// Of those, re-executions of the child's one-byte write to the full pipe.
+static PARK_FLAGGED_EXTRA_WRITE: AtomicU64 = AtomicU64::new(0);
+/// 0: gate closed; 1: opened; 2: the gate write failed.
+static PARK_GATE: AtomicU64 = AtomicU64::new(0);
+
+/// The pipe guest child's `write(4, buf, 1)` to its full data pipe.
+fn is_extra_byte_write(invocation: &SyscallInvocation) -> bool {
+    invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK == LINUX_WRITE
+        && invocation.args.arg0 == PIPE_DATA_WRITE_FD
+        && invocation.args.arg2 == 1
+}
+
+/// Writes the gate byte through task `task_id`'s gate-pipe write end, which
+/// wakes the guest parent blocked reading the gate. A one-byte write to the
+/// empty gate pipe completes on its first poll.
+fn open_gate(task_id: u64) -> bool {
+    use core::future::Future as _;
+    let Some(Some(ops)) = narf_userspace::fd::with_table(task_id, |table| {
+        table.get(PIPE_GATE_WRITE_FD).map(|entry| entry.ops.clone())
+    }) else {
+        return false;
+    };
+    let mut write = ops.write(0, b"g");
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    matches!(write.as_mut().poll(&mut cx), core::task::Poll::Ready(Ok(1)))
+}
+
+/// Counts every syscall entry and every re-execution entry, forwards all
+/// calls to the Reverie interceptor it wraps, and opens the pipe guest's
+/// gate at the entry of the child's one-byte write, before that write runs.
+///
+/// The ordering is by blocking, with no polling or sleeping: the parent
+/// reads the data pipe only after the gate opens, and it cannot run between
+/// the gate write and the child's write finding the pipe full, because every
+/// guest task is pinned to the harness CPU (a fork inherits the pinned
+/// affinity) and Narf does not preempt kernel code. The parent therefore
+/// runs only once the child has blocked in its write.
+struct ParkWatch {
+    inner: Box<dyn SyscallInterceptor>,
+}
+
+impl SyscallInterceptor for ParkWatch {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        PARK_ENTRIES.fetch_add(1, Ordering::AcqRel);
+        if invocation.park_reexecution {
+            PARK_FLAGGED.fetch_add(1, Ordering::AcqRel);
+            if is_extra_byte_write(invocation) {
+                PARK_FLAGGED_EXTRA_WRITE.fetch_add(1, Ordering::AcqRel);
+            }
+        } else if is_extra_byte_write(invocation) && PARK_GATE.load(Ordering::Acquire) == 0 {
+            let opened = open_gate(invocation.task_id);
+            PARK_GATE.store(if opened { 1 } else { 2 }, Ordering::Release);
+        }
+        self.inner.on_syscall_enter(invocation, native)
+    }
+
+    fn on_syscall_return(
+        &self,
+        invocation: &SyscallInvocation,
+        result: SyscallReturn,
+    ) -> SyscallReturn {
+        self.inner.on_syscall_return(invocation, result)
+    }
+
+    fn on_syscall_context_managed(&self, invocation: &SyscallInvocation) {
+        self.inner.on_syscall_context_managed(invocation);
+    }
+
+    fn on_task_start(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
+        self.inner.on_task_start(task_id, native);
+    }
+
+    fn on_task_exec(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
+        self.inner.on_task_exec(task_id, native);
+    }
+
+    fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32) {
+        self.inner.on_task_exit(task_id, pid, wstatus);
+    }
+}
+
+/// A syscall that parks and is re-executed once its wait ends reaches the
+/// Tool once, not once per execution: the dispatcher flags the re-execution
+/// (`PARK_RECORDS` / `take_park_reexecution`) and the host completes the
+/// parked request without a second Tool event. counter1 counts one event per
+/// syscall it is handed, so its total must be the entries minus the flagged
+/// re-executions, and the child's one-byte write to its full pipe must be
+/// among them.
+fn reverie_narf_park_reexecution_reaches_the_tool_once() -> TestResult {
+    PARK_ENTRIES.store(0, Ordering::Release);
+    PARK_FLAGGED.store(0, Ordering::Release);
+    PARK_FLAGGED_EXTRA_WRITE.store(0, Ordering::Release);
+    PARK_GATE.store(0, Ordering::Release);
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<CounterLocal>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let watch = ParkWatch {
+            inner: interceptor.boxed(),
+        };
+        let root = run_guest(PIPE_GUEST, Box::new(watch), |root| {
+            interceptor
+                .host_root(root.task_id)
+                .map_err(|_| "register_root refused the root task")
+        })?;
+        match PARK_GATE.load(Ordering::Acquire) {
+            1 => {}
+            0 => return Err("the child never issued its one-byte write to the full pipe"),
+            _ => return Err("the gate byte could not be written"),
+        }
+        check_teardown(&interceptor, root, 2, 0)?;
+        let entries = PARK_ENTRIES.load(Ordering::Acquire);
+        let flagged = PARK_FLAGGED.load(Ordering::Acquire);
+        let total = interceptor.host().global().total();
+        let _ = writeln!(
+            Writer,
+            "    entries {entries} re-executions {flagged} counter1 total {total}"
+        );
+        if PARK_FLAGGED_EXTRA_WRITE.load(Ordering::Acquire) != 1 {
+            return Err(
+                "the parked one-byte write was not flagged as a park re-execution exactly once",
+            );
+        }
+        if total != entries - flagged {
+            return Err("a park re-execution reached the Tool as a new syscall event");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_park_reexecution_reaches_the_tool_once
+);
+
+// ── Exec ──────────────────────────────────────────────────────────────────
+
+/// Where the exec test mounts the canonical guest (guests/exec_x86_64.S).
+const EXEC_MOUNT: &str = "/rn-exec";
+/// Recorded by [`ExecWatch::handle_post_exec`].
+const POST_EXEC_MARK: u64 = u64::MAX;
+static EXEC_LOG: IrqSafeSpinLock<Vec<u64>> = IrqSafeSpinLock::new(Vec::new());
+/// 0: the new image's `write` was not seen; 1: its auxiliary vector matched;
+/// 2: it did not (see [`ExecWatch::handle_syscall_event`]).
+static EXEC_AUXV: AtomicU64 = AtomicU64::new(0);
+
+/// Records the number of every syscall it is handed and a mark for every
+/// post-exec callback, and tail-injects each syscall.
+#[derive(Debug, Default, Clone, Copy)]
+struct ExecWatch;
+
+#[reverie::tool]
+impl Tool for ExecWatch {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_post_exec<T: reverie::Guest<Self>>(
+        &self,
+        _guest: &mut T,
+    ) -> Result<(), reverie::Errno> {
+        EXEC_LOG.lock().push(POST_EXEC_MARK);
+        Ok(())
+    }
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        let number = syscall.number().id() as u64;
+        EXEC_LOG.lock().push(number);
+        if number == u64::from(LINUX_WRITE) {
+            // The exec'd canonical guest's `rsp` is still its initial value
+            // at its `write`, so the vector the new image's loader wrote is
+            // on the stack there. The kernel's recorded vector (and the
+            // Tool's `auxv()`) must be that one, not the pre-exec image's.
+            let rsp = guest.regs().await.rsp;
+            let pid = guest.pid().as_raw() as u64;
+            let matched = match startup_auxv(&guest.memory(), rsp) {
+                Some(on_stack) if !on_stack.is_empty() => {
+                    let random = on_stack
+                        .iter()
+                        .find(|&&(key, _)| key == AT_RANDOM)
+                        .map(|&(_, value)| value);
+                    let view = guest.auxv();
+                    tool_view::auxv_pairs(pid) == on_stack
+                        && view.len() == on_stack.len()
+                        && view.at_random().map(|addr| addr.as_raw() as u64) == random
+                }
+                _ => false,
+            };
+            EXEC_AUXV.store(if matched { 1 } else { 2 }, Ordering::Release);
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// A hosted task's successful execve runs after the Tool callback that
+/// requested it has returned (the dispatcher's deferred transition), the Tool
+/// then gets its post-exec callback in the new image (`on_task_exec`), and
+/// the new image's syscalls reach the Tool: execve, post-exec, write, exit.
+/// The new image's auxiliary vector replaces the old one in the kernel's
+/// record and the Tool's view.
+fn reverie_narf_exec_defers_and_reaches_post_exec() -> TestResult {
+    EXEC_LOG.lock().clear();
+    EXEC_AUXV.store(0, Ordering::Release);
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let Ok(mounted) = narf_filesystem::registry().mount(
+        &auth,
+        EXEC_MOUNT,
+        narf_filesystem::MemFs::with_seeds("rn-exec", &[("prog", CANONICAL_GUEST)]),
+    ) else {
+        return TestResult::Fail("mounting the exec target failed");
+    };
+    ROOT_EXECS.store(true, Ordering::Release);
+    let outcome = (|| {
+        let (interceptor, root) = run_hosted::<ExecWatch>(EXEC_GUEST, ())?;
+        let exits = check_teardown(&interceptor, root, 1, 0)?;
+        if !exits[0].process_exited {
+            return Err("the root's exit did not end its process in the host");
+        }
+        let log = core::mem::take(&mut *EXEC_LOG.lock());
+        if log != [59, POST_EXEC_MARK, 1, 60] {
+            let _ = writeln!(Writer, "    exec log {log:x?}");
+            return Err("the Tool did not see execve, post-exec, write, exit in order");
+        }
+        if EXEC_AUXV.load(Ordering::Acquire) != 1 {
+            return Err("the exec'd image's auxiliary vector is not the one its loader wrote");
+        }
+        Ok(TestResult::Pass)
+    })();
+    ROOT_EXECS.store(false, Ordering::Release);
+    let _ = narf_filesystem::registry().unmount(&mounted, EXEC_MOUNT);
+    result_of(outcome)
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_exec_defers_and_reaches_post_exec
+);
+
+// ── Spawn holds and the vfork wait ────────────────────────────────────────
+
+const LINUX_CLONE: u32 = 56;
+const LINUX_FORK: u32 = 57;
+const LINUX_WAIT4: u32 = 61;
+const LINUX_EXIT: u32 = 60;
+const CLONE_VFORK: u64 = 0x4000;
+
+static HOLD_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Fork-family entries the probe ran the original of.
+static HOLD_SPAWNS: AtomicU64 = AtomicU64::new(0);
+/// Task id of the vfork child, once the vfork has created it.
+static HOLD_VFORK_CHILD: AtomicU64 = AtomicU64::new(0);
+static HOLD_VFORK_CHILD_EXITED: AtomicU64 = AtomicU64::new(0);
+/// Bitmask of failed checks; 0 when all held.
+static HOLD_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// A raw interceptor on the fork guest. For each fork and vfork it runs the
+/// original inside the callback and checks the child is held back from the
+/// scheduler and reported with its identity (the spawn hold). It also checks
+/// that the vfork parent runs nothing until its child has exited (the vfork
+/// wait the dispatcher performs after the callback), and that each child
+/// inherits its parent's auxiliary vector.
+struct HoldProbe;
+
+impl SyscallInterceptor for HoldProbe {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        let number = invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
+        let task_id = invocation.task_id;
+        let root = HOLD_ROOT.load(Ordering::Acquire);
+        let vfork_child = HOLD_VFORK_CHILD.load(Ordering::Acquire);
+        if number == LINUX_EXIT && vfork_child != 0 && task_id == vfork_child {
+            HOLD_VFORK_CHILD_EXITED.store(1, Ordering::Release);
+        }
+        // The parent's first syscall after vfork: its child must be gone.
+        if number == LINUX_WAIT4
+            && task_id == root
+            && vfork_child != 0
+            && HOLD_VFORK_CHILD_EXITED.load(Ordering::Acquire) == 0
+        {
+            HOLD_FAILURES.fetch_or(1 << 4, Ordering::AcqRel);
+        }
+        let vfork = number == LINUX_CLONE && invocation.args.arg0 & CLONE_VFORK != 0;
+        if task_id != root || (number != LINUX_FORK && !vfork) {
+            return SyscallInterception::Continue;
+        }
+        HOLD_SPAWNS.fetch_add(1, Ordering::AcqRel);
+        let admitted = narf_scheduler::user_tasks_admitted();
+        let child = match native.execute_original() {
+            Ok(NativeSyscallOutcome::Returned(result)) => result.linux_abi_result(),
+            _ => {
+                HOLD_FAILURES.fetch_or(1 << 0, Ordering::AcqRel);
+                return SyscallInterception::Continue;
+            }
+        };
+        if narf_scheduler::user_tasks_admitted() != admitted {
+            HOLD_FAILURES.fetch_or(1 << 1, Ordering::AcqRel);
+        }
+        match native.take_created_task() {
+            Some(created) if created.linux_pid as i64 == child && !created.thread => {
+                if vfork {
+                    HOLD_VFORK_CHILD.store(created.task_id, Ordering::Release);
+                }
+                // The new process inherits its parent's auxiliary vector.
+                let parent = tool_view::linux_task_ids(task_id)
+                    .map(|ids| tool_view::auxv_pairs(ids.pid))
+                    .unwrap_or_default();
+                if parent.is_empty() || tool_view::auxv_pairs(created.linux_pid as u64) != parent {
+                    HOLD_FAILURES.fetch_or(1 << 5, Ordering::AcqRel);
+                }
+            }
+            _ => {
+                HOLD_FAILURES.fetch_or(1 << 2, Ordering::AcqRel);
+            }
+        }
+        if native.take_created_task().is_some() {
+            HOLD_FAILURES.fetch_or(1 << 3, Ordering::AcqRel);
+        }
+        SyscallInterception::Continue
+    }
+}
+
+/// A child created inside an interceptor callback is held back from the
+/// scheduler and reported to the interceptor exactly once, with its Linux
+/// pid; and a vfork parent does not resume until its child has exited, even
+/// though the vfork ran inside the callback (the dispatcher's deferred
+/// `vfork_parent_wait`). The guest's clone-vfork child spins before its exit
+/// so a parent released early would reach its `wait4` first; this half of
+/// the test is a timing widener, not a schedule-independent proof.
+fn reverie_narf_spawn_hold_and_vfork_wait() -> TestResult {
+    HOLD_ROOT.store(0, Ordering::Release);
+    HOLD_SPAWNS.store(0, Ordering::Release);
+    HOLD_VFORK_CHILD.store(0, Ordering::Release);
+    HOLD_VFORK_CHILD_EXITED.store(0, Ordering::Release);
+    HOLD_FAILURES.store(0, Ordering::Release);
+    result_of((|| {
+        let (_, reap) = run_guest_with(
+            VFORK_GUEST,
+            Box::new(HoldProbe),
+            |root| {
+                HOLD_ROOT.store(root.task_id, Ordering::Release);
+                Ok(())
+            },
+            true,
+        )?;
+        let reap = reap.ok_or("the run did not reap its root")?;
+        let failures = HOLD_FAILURES.load(Ordering::Acquire);
+        if failures != 0 {
+            let _ = writeln!(Writer, "    spawn-hold failures {failures:#x}");
+        }
+        if failures & 0b111 != 0 {
+            return Err("a child created inside the callback was published early or not reported with its pid");
+        }
+        if failures & (1 << 3) != 0 {
+            return Err("a created child was reported twice");
+        }
+        if failures & (1 << 4) != 0 {
+            return Err("the vfork parent resumed before its child exited");
+        }
+        if failures & (1 << 5) != 0 {
+            return Err("a forked child did not inherit its parent's auxiliary vector");
+        }
+        if HOLD_SPAWNS.load(Ordering::Acquire) != 2
+            || HOLD_VFORK_CHILD_EXITED.load(Ordering::Acquire) != 1
+        {
+            return Err(
+                "the probe did not see the fork, the clone-vfork and the vfork child's exit",
+            );
+        }
+        if reap.wstatus != 0 {
+            let _ = writeln!(Writer, "    root wstatus {:#x}", reap.wstatus);
+            return Err("the vfork guest did not exit 0");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!("reverie-narf", reverie_narf_spawn_hold_and_vfork_wait);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 

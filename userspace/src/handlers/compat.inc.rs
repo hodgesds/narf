@@ -1862,6 +1862,9 @@ fn do_execve_resolved(
     // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
     // bytes, derive comm from argv[0]'s basename (Linux convention).
     set_proc_argv(task, &argv_refs);
+    // The new image's auxiliary vector replaces the old one (Linux rewrites
+    // mm->saved_auxv in create_elf_tables).
+    set_proc_auxv_pairs(task, &new_proc.auxv);
     if let Some(first) = argv_refs.first() {
         let basename = first.rsplit('/').next().unwrap_or(first);
         set_proc_comm(task, basename);
@@ -6281,6 +6284,20 @@ pub fn set_proc_environ(pid: u64, envp: &[&str]) {
     let mut g = PROC_ENVIRON.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     map.insert(pid, packed);
+}
+
+/// Fork/clone of a new process: the child inherits the parent's recorded
+/// auxiliary vector (Linux copies `mm->saved_auxv` in `dup_mm`). `parent` is
+/// the forking task, which may be a non-leader thread; the vector is stored
+/// under the process's registered task, so resolve through its pid.
+pub fn proc_auxv_fork(parent: u64, child: u64) {
+    let src = proc_pid_to_tid(task_to_pid_raw(parent).unwrap_or(parent));
+    let mut g = PROC_AUXV.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(packed) = map.get(&src).cloned() {
+            map.insert(child, packed);
+        }
+    }
 }
 
 /// Record packed auxv (key, value) pairs for a task at execve time.

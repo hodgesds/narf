@@ -9906,6 +9906,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         },
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        auxv: alloc::vec::Vec::new(),
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 
@@ -10087,6 +10088,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
 
     if !share_fs {
         cwd_fork(parent_pid, child_tid.raw());
+    }
+    if !share_thread {
+        proc_auxv_fork(parent_pid, child_tid.raw());
     }
     // chroot: a child inherits the parent's root directory (Linux copies
     // fs->root on fork). Without this, a process exec'd inside a chroot

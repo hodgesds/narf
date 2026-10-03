@@ -3097,6 +3097,7 @@ mod aarch64_el0_preemption_e2e {
             fs_base: None,
             entry_arg: None,
             loaded_mappings: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
         })
     }
 
@@ -5590,6 +5591,7 @@ fn smoke_scheduled_user_interception_survives_ap_migration() -> TestResult {
         fs_base: None,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        auxv: alloc::vec::Vec::new(),
     };
     let mut source_spec = TaskSpec::user_task();
     source_spec.affinity = Affinity::pinned(CpuId(source_cpu as u32));
@@ -5977,6 +5979,7 @@ fn smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces() -> Test
         fs_base: None,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        auxv: alloc::vec::Vec::new(),
     };
     // Pinned here so the reap, and the executor's release of the last root
     // it installed, happen on this CPU while the waiter watches.
@@ -6954,6 +6957,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         fs_base: None,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        auxv: alloc::vec::Vec::new(),
     };
 
     // Boot the executor + wire the user-task hooks so Yield/Exit
