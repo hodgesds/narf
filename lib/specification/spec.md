@@ -237,7 +237,13 @@ it runs with ordinary IRQs masked and therefore must be allocation-free,
 non-parking, non-awaiting, non-sleeping, safe under concurrent execution, and
 independent of scheduler-task progress. It must not acquire a lock held by any
 sender. Calling `remote_call` or `remote_barrier` from an action is rejected
-with `false` before the nested operation takes an outgoing lock.
+with `false` before the nested operation takes an outgoing lock. Servicing the
+rendezvous inbox while the CPU is executing an action (from a lock spin inside
+the action, or from the rendezvous interrupt) is deferred rather than nested:
+the pending requests stay pending, and the service loop that ran the action
+claims the inbox again before it returns. An action a sender runs inline has
+no such loop; its IRQ-masked outgoing lock keeps the interrupt latched, and its
+acknowledgement spin drains the inbox.
 
 ## 4. Invariants & safety properties
 

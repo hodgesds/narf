@@ -13,6 +13,8 @@
 #![allow(incomplete_features)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod assert;
 pub mod bitmap;

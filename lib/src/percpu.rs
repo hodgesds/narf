@@ -94,11 +94,45 @@ extern "Rust" {
     fn narf_arch_cpu_id() -> usize;
 }
 
+// Host tests run on many threads that all report CPU 0 by default, so tests
+// that drive per-CPU state (the SMP rendezvous inbox, for example) would share
+// one CPU's state with every concurrently running test. A test may give its
+// own thread a distinct CPU index with `host_test_pin_cpu`.
+#[cfg(test)]
+std::thread_local! {
+    static HOST_TEST_CPU_ID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Restores the calling thread's previous host-test CPU index on drop.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct HostTestCpuPin {
+    previous: usize,
+}
+
+#[cfg(test)]
+impl Drop for HostTestCpuPin {
+    fn drop(&mut self) {
+        HOST_TEST_CPU_ID.with(|id| id.set(self.previous));
+    }
+}
+
+/// Host tests only: report `id` as the calling thread's CPU until the
+/// returned guard is dropped. Other threads are unaffected.
+#[cfg(test)]
+#[must_use = "the guard's Drop restores the thread's previous CPU index"]
+pub(crate) fn host_test_pin_cpu(id: usize) -> HostTestCpuPin {
+    assert!(id < MAX_CPUS, "host-test CPU index out of PerCpu range");
+    HostTestCpuPin {
+        previous: HOST_TEST_CPU_ID.with(|cell| cell.replace(id)),
+    }
+}
+
 #[inline]
 fn narf_arch_cpu_id_hook() -> usize {
     #[cfg(test)]
     {
-        0
+        HOST_TEST_CPU_ID.with(core::cell::Cell::get)
     }
     #[cfg(not(test))]
     {
@@ -130,6 +164,16 @@ mod host_tests {
 
     #[test]
     fn host_cpu_id_defaults_to_boot_cpu() {
+        assert_eq!(current_cpu(), 0);
+    }
+
+    #[test]
+    fn host_test_pin_is_per_thread_and_restored() {
+        let pin = host_test_pin_cpu(5);
+        assert_eq!(current_cpu(), 5);
+        let other = std::thread::spawn(current_cpu).join().unwrap();
+        assert_eq!(other, 0, "a pin leaked to another thread");
+        drop(pin);
         assert_eq!(current_cpu(), 0);
     }
 
