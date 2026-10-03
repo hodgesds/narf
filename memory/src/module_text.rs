@@ -744,6 +744,17 @@ pub fn protect(
 /// loader satisfies this by running `narf_module_exit`, sweeping the image's
 /// KSYMTAB exports, and waiting out an RCU grace period first.
 pub unsafe fn free(image: ModuleImage) {
+    // SAFETY: forwarded; same contract.
+    let _ = unsafe { free_inner(image) };
+}
+
+/// [`free`], returning what this free's own release step did with the frames
+/// it retired, so a smoke can judge one free without reading global counters
+/// that a concurrent free also moves.
+///
+/// # Safety
+/// As for [`free`].
+unsafe fn free_inner(image: ModuleImage) -> ReleaseOutcome {
     // Restore every alias we took. This has to happen before the frames go
     // back: the next owner will expect to be able to write them.
     if let Ok(root) = kernel_root() {
@@ -763,8 +774,9 @@ pub unsafe fn free(image: ModuleImage) {
 
     // SAFETY: these are this image's own pages, and the caller's contract says
     // nothing is executing from them.
-    unsafe { unmap_and_free(image.base, image.pages) };
+    let outcome = unsafe { unmap_and_free(image.base, image.pages) };
     VA_MAP.lock().free_run(image.va_page, image.pages + 1);
+    outcome
 }
 
 /// Pages currently handed out, including guard pages. For `/proc` and smokes.
@@ -791,16 +803,31 @@ fn page_phys(root: PhysAddr, va: u64) -> Option<u64> {
 /// once every CPU has finished. A frame retired when `STARTED` read `t` may go
 /// back to the buddy only once `DONE > t`: some invalidation that began after
 /// the retirement has completed everywhere.
+///
+/// What a ticket proves differs by architecture when frees run concurrently.
+/// On x86_64 every invalidation flushes every non-global entry on every CPU,
+/// so any completed invalidation covers any retired frame. On aarch64 an
+/// invalidation covers only its own free's granules, so `DONE > t` may come
+/// from another free's TLBIs that never touched this range. There the ticket
+/// is only a check on this free's step order; the protection is that order
+/// itself -- unmap, detach, then this free's own per-granule broadcast
+/// TLBI VAAE1IS (completed by its DSB) in [`invalidate_module_range_all_cpus`],
+/// and only then the release in [`release_retired`].
 static INVALIDATIONS_STARTED: AtomicU64 = AtomicU64::new(0);
 static INVALIDATIONS_DONE: AtomicU64 = AtomicU64::new(0);
 /// Frames `release_retired` withheld from the buddy because no invalidation
-/// had completed since they were retired. They are leaked, which is harmless;
-/// handing them out while a CPU can still reach them is not. Nonzero only if
-/// [`unmap_and_free`]'s ordering is broken.
+/// had completed since they were retired, summed over every free. They are
+/// leaked, which is harmless; handing them out while a CPU can still reach
+/// them is not. Nonzero only if [`unmap_and_free`]'s ordering is broken.
 static RELEASES_WITHHELD: AtomicUsize = AtomicUsize::new(0);
-/// Page-table frames `release_retired` returned to the buddy. Lets the smoke
-/// prove that its free actually took the table path.
-static TABLES_RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+/// What one call of [`release_retired`] did: frames it withheld, and
+/// page-table frames it returned to the buddy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReleaseOutcome {
+    withheld: usize,
+    tables_released: usize,
+}
 
 /// Unmap and release the first `count` pages of the run at `base`, and reclaim
 /// any last-level page table the range leaves empty.
@@ -820,10 +847,14 @@ static TABLES_RELEASED: AtomicUsize = AtomicUsize::new(0);
 /// under that PCID survives an invalidation that ran before the detach, and a
 /// walk through it would read the freed table frame after its reuse.
 ///
+/// Returns what the release step did with this call's frames.
+///
 /// # Safety
 /// `[base, base + count*4096)` must be pages this module mapped.
-unsafe fn unmap_and_free(base: u64, count: usize) {
-    let Ok(root) = kernel_root() else { return };
+unsafe fn unmap_and_free(base: u64, count: usize) -> ReleaseOutcome {
+    let Ok(root) = kernel_root() else {
+        return ReleaseOutcome::default();
+    };
     let mut frames: Vec<PhysAddr> = Vec::with_capacity(count);
     for i in 0..count {
         let va = VirtAddr::new(base + (i as u64) * 4096);
@@ -856,7 +887,7 @@ unsafe fn unmap_and_free(base: u64, count: usize) {
 
     invalidate_module_range_all_cpus(base, count);
 
-    release_retired(frames, leaves_retired_at, tables);
+    release_retired(frames, leaves_retired_at, tables)
 }
 
 /// Base of every 2 MiB granule that `[base, base + count*4096)` touches.
@@ -890,10 +921,11 @@ fn invalidate_module_range_all_cpus(base: u64, count: usize) {
         // SAFETY: CPL=0; synchronous — returns after every peer has acked.
         unsafe { crate::paging::flush_user_tlb_all_cpus() };
     }
-    // `unmap_4kb` already broadcast a last-level-inclusive TLBI VAAE1IS per
-    // leaf, but a walk-cache entry for a table descriptor detached after those
-    // can remain. One broadcast TLBI VAAE1IS per granule (all ASIDs, all
-    // levels of the walk) drops it.
+    // `unmap_4kb` already broadcast a TLBI VAALE1IS per leaf, but that form
+    // is last-level only: it drops the leaf translation and leaves walk-cache
+    // entries for the table descriptors above it, including one for a table
+    // detached after those TLBIs. One broadcast TLBI VAAE1IS per granule (all
+    // ASIDs, all levels of the walk) drops it.
     #[cfg(target_arch = "aarch64")]
     for granule in granules(base, count) {
         // SAFETY: the descriptors covering `granule` were updated (leaves
@@ -908,24 +940,34 @@ fn invalidate_module_range_all_cpus(base: u64, count: usize) {
 }
 
 /// Return retired frames to the buddy, but only those an invalidation has
-/// covered since they were retired. Anything else is withheld and counted.
-fn release_retired(leaves: Vec<PhysAddr>, leaves_retired_at: u64, tables: Vec<(PhysFrame, u64)>) {
+/// covered since they were retired. Anything else is withheld and counted,
+/// both in this call's outcome and in [`RELEASES_WITHHELD`].
+fn release_retired(
+    leaves: Vec<PhysAddr>,
+    leaves_retired_at: u64,
+    tables: Vec<(PhysFrame, u64)>,
+) -> ReleaseOutcome {
+    let mut outcome = ReleaseOutcome::default();
     let done = INVALIDATIONS_DONE.load(Ordering::SeqCst);
     if done > leaves_retired_at {
         for phys in leaves {
             crate::frame::free_frame(PhysFrame::new(phys));
         }
-    } else if !leaves.is_empty() {
-        RELEASES_WITHHELD.fetch_add(leaves.len(), Ordering::SeqCst);
+    } else {
+        outcome.withheld += leaves.len();
     }
     for (table, at) in tables {
         if done > at {
             crate::frame::free_frame(table);
-            TABLES_RELEASED.fetch_add(1, Ordering::SeqCst);
+            outcome.tables_released += 1;
         } else {
-            RELEASES_WITHHELD.fetch_add(1, Ordering::SeqCst);
+            outcome.withheld += 1;
         }
     }
+    if outcome.withheld != 0 {
+        RELEASES_WITHHELD.fetch_add(outcome.withheld, Ordering::SeqCst);
+    }
+    outcome
 }
 
 /// Make bytes just published as text fetchable on this CPU.
@@ -1411,20 +1453,23 @@ kernel_test_in!(
 /// frame whose retirement no completed invalidation follows; this fails if it
 /// had to, or if no table was reclaimed at all.
 ///
+/// Both counts are this free's own, returned by its `release_retired` call,
+/// not deltas of global counters: a module freed concurrently on another CPU
+/// cannot add a reclaimed table this free did not reclaim, or hide a frame it
+/// withheld.
+///
 /// Limits: this checks the order of the steps through the ticket each one
 /// takes. It cannot observe a paging-structure cache or walk cache directly;
 /// no emulator used here exposes one deterministically. It also cannot tell
 /// whether the invalidation primitive itself reaches every PCID.
 fn smoke_module_text_free_releases_tables_after_invalidation() -> TestResult {
-    let withheld_before = RELEASES_WITHHELD.load(Ordering::SeqCst);
-    let tables_before = TABLES_RELEASED.load(Ordering::SeqCst);
-    match alloc(1024, DomainId::SCRATCH) {
+    let outcome = match alloc(1024, DomainId::SCRATCH) {
         // SAFETY: nothing was executed from the image.
-        Ok(img) => unsafe { free(img) },
+        Ok(img) => unsafe { free_inner(img) },
         Err(_) => return TestResult::Fail("module_text::alloc(1024) failed"),
-    }
-    let withheld = RELEASES_WITHHELD.load(Ordering::SeqCst) - withheld_before;
-    let tables = TABLES_RELEASED.load(Ordering::SeqCst) - tables_before;
+    };
+    let withheld = outcome.withheld;
+    let tables = outcome.tables_released;
     if withheld != 0 {
         return TestResult::Fail(
             "module free retired a frame or page table after its last invalidation; \
