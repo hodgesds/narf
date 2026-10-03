@@ -27,6 +27,7 @@ use reverie::{Pid, Tool};
 use reverie_narf_core::{KernelServices, NarfSyscallOutcome, OriginalSyscallError};
 use reverie_narf_tools::canonical::CanonicalTrace;
 use reverie_narf_tools::counter1::CounterLocal;
+use reverie_narf_tools::counter2;
 use reverie_narf_tools::passthrough::PassThrough;
 use reverie_narf_tools::probe::Probe;
 
@@ -2728,6 +2729,217 @@ fn reverie_narf_thread_and_process_exit_statuses() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_thread_and_process_exit_statuses);
+
+// ── counter2: per-thread and per-process counts ──────────────────────────
+
+const LINUX_FUTEX: u32 = 202;
+const LINUX_SET_TID_ADDRESS: u32 = 218;
+const LINUX_EXIT_GROUP: u32 = 231;
+
+/// Every new (not re-executed) syscall entry [`EntryWatch`] saw, as
+/// `(scheduler task id, Linux syscall number)`, in order.
+static COUNTER2_ENTRIES: IrqSafeSpinLock<Vec<(u64, u32)>> = IrqSafeSpinLock::new(Vec::new());
+/// A task exit [`EntryWatch`] saw: the scheduler task id, and the Linux
+/// thread and process IDs as the exit began, if the kernel still had them.
+type WatchedExit = (u64, Option<(i32, i32)>);
+/// Every task exit [`EntryWatch`] saw, in order.
+static COUNTER2_EXITS: IrqSafeSpinLock<Vec<WatchedExit>> = IrqSafeSpinLock::new(Vec::new());
+/// Every report counter2's thread-exit reporter received, as `(thread ID,
+/// syscall count)`.
+static COUNTER2_REPORTS: IrqSafeSpinLock<Vec<(i32, u64)>> = IrqSafeSpinLock::new(Vec::new());
+
+fn record_counter2_thread_exit(tid: Pid, syscalls: u64) {
+    COUNTER2_REPORTS.lock().push((tid.as_raw(), syscalls));
+}
+
+/// Records every new syscall entry and every task exit at the dispatcher,
+/// outside the Reverie interceptor it wraps, and forwards every call to it.
+struct EntryWatch {
+    inner: Box<dyn SyscallInterceptor>,
+}
+
+impl SyscallInterceptor for EntryWatch {
+    fn intercepts_vdso_calls(&self) -> bool {
+        self.inner.intercepts_vdso_calls()
+    }
+
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        if !invocation.park_reexecution {
+            COUNTER2_ENTRIES.lock().push((
+                invocation.task_id,
+                invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK,
+            ));
+        }
+        self.inner.on_syscall_enter(invocation, native)
+    }
+
+    fn on_syscall_return(
+        &self,
+        invocation: &SyscallInvocation,
+        result: SyscallReturn,
+    ) -> SyscallReturn {
+        self.inner.on_syscall_return(invocation, result)
+    }
+
+    fn on_syscall_context_managed(&self, invocation: &SyscallInvocation) {
+        self.inner.on_syscall_context_managed(invocation);
+    }
+
+    fn on_task_start(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
+        self.inner.on_task_start(task_id, native);
+    }
+
+    fn on_task_exec(&self, task_id: u64, native: &mut dyn NativeSyscallTransition) {
+        self.inner.on_task_exec(task_id, native);
+    }
+
+    fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32, process_wstatus: i32) {
+        let ids = tool_view::linux_task_ids(task_id).map(|ids| (ids.tid as i32, ids.pid as i32));
+        self.inner
+            .on_task_exit(task_id, pid, wstatus, process_wstatus);
+        COUNTER2_EXITS.lock().push((task_id, ids));
+    }
+}
+
+/// Whether `numbers` is `before`, then zero or more futex calls, then
+/// `after`.
+fn with_futex_waits(numbers: &[u32], before: &[u32], after: &[u32]) -> bool {
+    numbers.len() >= before.len() + after.len()
+        && numbers.starts_with(before)
+        && numbers.ends_with(after)
+        && numbers[before.len()..numbers.len() - after.len()]
+            .iter()
+            .all(|&number| number == LINUX_FUTEX)
+}
+
+/// counter2, unmodified from reverie-examples, keeps a count per thread and
+/// one per process, and reaches its global totals only through its exit
+/// hooks. Over the thread exit-status guest (`guests/mtexit_x86_64.S`: two
+/// processes of two threads each), the count each thread reports at its exit
+/// is the number of syscalls that thread made, and the totals are their sum,
+/// 2 processes and 4 threads.
+///
+/// What each thread makes is read off the assembly and checked against a
+/// watch outside the Reverie interceptor: the root's leader makes fork,
+/// wait4, clone, some futex waits and exit_group, and its thread exit; the
+/// child's leader makes set_tid_address, clone and exit, and its thread some
+/// futex waits and exit. A futex wait that blocks is re-executed when woken,
+/// which the dispatcher flags and counter2 sees as the one event already in
+/// flight, so the watch leaves re-executions out.
+fn reverie_narf_counter2_thread_and_process_counts() -> TestResult {
+    COUNTER2_ENTRIES.lock().clear();
+    COUNTER2_EXITS.lock().clear();
+    COUNTER2_REPORTS.lock().clear();
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<counter2::CounterLocal>::with_tool_constructor(
+            (),
+            |pid, config| {
+                <counter2::CounterLocal as Tool>::new(pid, config)
+                    .with_thread_exit_reporter(record_counter2_thread_exit)
+            },
+        )
+        .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let root = run_guest(
+            MTEXIT_GUEST,
+            Box::new(EntryWatch {
+                inner: interceptor.boxed(),
+            }),
+            |root| {
+                interceptor
+                    .host_root(root.task_id)
+                    .map_err(|_| "register_root refused the root task")
+            },
+        )?;
+        let root_pid = root.pid as i32;
+        check_teardown(&interceptor, root, 4, 0x700)?;
+        let entries = core::mem::take(&mut *COUNTER2_ENTRIES.lock());
+        let exits = core::mem::take(&mut *COUNTER2_EXITS.lock());
+        let reports = core::mem::take(&mut *COUNTER2_REPORTS.lock());
+        // Each exited task's thread ID, process ID and syscalls, in order;
+        // the scheduler never reuses a task id.
+        let mut tasks: Vec<(i32, i32, Vec<u32>)> = Vec::new();
+        for (task_id, ids) in &exits {
+            let Some((tid, pid)) = *ids else {
+                return Err("a task's Linux IDs were gone when its exit began");
+            };
+            let numbers = entries
+                .iter()
+                .filter(|(task, _)| task == task_id)
+                .map(|(_, number)| *number)
+                .collect();
+            tasks.push((tid, pid, numbers));
+        }
+        for (tid, pid, numbers) in &tasks {
+            let _ = writeln!(
+                Writer,
+                "    thread {tid} of process {pid}: syscalls {numbers:?}"
+            );
+        }
+        for (tid, count) in &reports {
+            let _ = writeln!(Writer, "    counter2-local thread={tid} syscalls={count}");
+        }
+        if tasks.len() != 4 {
+            return Err("the watch did not see four task exits");
+        }
+        // Which of the root's leader, the root's thread, the child's leader
+        // and the child's thread each task was.
+        let mut roles = [0usize; 4];
+        for (tid, pid, numbers) in &tasks {
+            let (role, matches) = match (*pid == root_pid, tid == pid) {
+                (true, true) => (
+                    0,
+                    with_futex_waits(
+                        numbers,
+                        &[LINUX_FORK, LINUX_WAIT4, LINUX_CLONE],
+                        &[LINUX_EXIT_GROUP],
+                    ),
+                ),
+                (true, false) => (1, numbers[..] == [LINUX_EXIT]),
+                (false, true) => (
+                    2,
+                    numbers[..] == [LINUX_SET_TID_ADDRESS, LINUX_CLONE, LINUX_EXIT],
+                ),
+                (false, false) => (3, with_futex_waits(numbers, &[], &[LINUX_EXIT])),
+            };
+            if !matches {
+                return Err("a thread's syscalls are not the ones the guest's assembly makes");
+            }
+            roles[role] += 1;
+        }
+        if roles != [1, 1, 1, 1] {
+            return Err("the tree was not a leader and a thread in each of two processes");
+        }
+        if reports.len() != 4 {
+            return Err("counter2's thread-exit reporter did not report each of the four threads");
+        }
+        // Linux thread IDs are reused once reaped, so compare as multisets.
+        let mut reported = reports;
+        let mut made: Vec<(i32, u64)> = tasks
+            .iter()
+            .map(|(tid, _, numbers)| (*tid, numbers.len() as u64))
+            .collect();
+        reported.sort_unstable();
+        made.sort_unstable();
+        if reported != made {
+            return Err("counter2's per-thread counts are not the threads' syscall counts");
+        }
+        let made_total: u64 = made.iter().map(|(_, count)| count).sum();
+        let totals = interceptor.host().global().totals();
+        if totals != (made_total, 2, 4) {
+            let _ = writeln!(
+                Writer,
+                "    counter2 totals {totals:?}, expected ({made_total}, 2, 4)"
+            );
+            return Err("counter2's totals are not the tree's syscalls, 2 processes and 4 threads");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_counter2_thread_and_process_counts);
 
 // ── Task creation from lifecycle callbacks ───────────────────────────────
 

@@ -7,8 +7,16 @@
 //! typed into that shell are hosted by the Tool. Without it frame calls
 //! nothing here, and the syscall table has no interceptor.
 //!
-//! The one Tool so far is `counter1`, compiled unmodified from
-//! `reverie-examples` (`reverie_narf_tools::counter1`).
+//! The Tools are `counter1` and `counter2`, compiled unmodified from
+//! `reverie-examples` (`reverie_narf_tools::counter1` and
+//! `reverie_narf_tools::counter2`). counter2 also keeps a count per thread
+//! and one per process, which reach its global totals through its exit
+//! hooks. When each hosted thread exits it prints the line it prints on
+//! Linux, where it writes it to stderr:
+//!
+//! ```text
+//! counter2-local thread=<tid> syscalls=<n>
+//! ```
 //!
 //! # The tally
 //!
@@ -29,7 +37,8 @@
 //!   already in flight, and the core runs a new entry natively, without an
 //!   event, when Reverie's `Sysno` does not know its number or the Tool is not
 //!   subscribed to it (`NarfToolHost::handle_syscall`). So the Tool should see
-//!   `entries - reexecutions - native-only` events.
+//!   `entries - reexecutions - native-only` events. The tally also counts
+//!   those events per member task.
 //!
 //! The dispatcher calls the interceptor for every guest syscall entry, through
 //! the `syscall` instruction and `int 0x80` alike. The only entries it does not
@@ -43,13 +52,23 @@
 //! ```text
 //! counter1-global syscalls=<N>
 //! reverie-narf-boot: tally tool=counter1 entries=<E> reexecutions=<R> native-only=<U> expected-events=<E-R-U> ...
+//! reverie-narf-boot: events-by-task <tid>:<events> ...
 //! reverie-narf-boot: syscalls-by-number <nr>:<count> ... rest:<count>
 //! reverie-narf-boot: report end
 //! ```
 //!
-//! The first line is the one `reverie-examples/counter1.rs` prints after a run
-//! on Linux; a harness compares its N with `expected-events`. A number marked
-//! `*` in the by-number line runs natively, without a Tool event.
+//! The first line is the one the Tool's launcher in `reverie-examples` prints
+//! after a run on Linux; for counter2 it is
+//!
+//! ```text
+//!  [counter tool] Total system calls in process tree: <N>, from <P> processes, <T> thread(s).
+//! ```
+//!
+//! A harness compares N with `expected-events`. The events-by-task line has
+//! each member task's Linux thread ID and event count, in exit order (`?` for
+//! a thread ID the kernel no longer had); for counter2 the harness compares
+//! those pairs with the `counter2-local` lines. A number marked `*` in the
+//! by-number line runs natively, without a Tool event.
 //!
 //! A fork inside a nested PID namespace (frame's `container` feature) returns
 //! the child's inner PID, which the tally cannot match to the child's task.
@@ -66,16 +85,15 @@ use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_userspace::handlers::tool_view;
+use narf_userspace::handlers::tool_view::{self, LinuxTaskIds};
 use narf_userspace::syscall::{
     NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
     SyscallReturn, SyscallTable,
 };
 use reverie::syscalls::Sysno;
-use reverie::{GlobalTool, Tool};
+use reverie::{GlobalTool, Pid, Tid, Tool};
 use reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
-use reverie_narf_tools::counter1::CounterLocal;
-use reverie_narf_tools::LineSink;
+use reverie_narf_tools::{counter1, counter2, LineSink};
 
 use crate::interceptor::{ConsoleSink, ReverieInterceptor};
 
@@ -92,10 +110,30 @@ const BY_NUMBER: usize = 512;
 /// is unchanged.
 pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
     let installed = match name {
-        "counter1" => Tally::<CounterLocal>::install(table, "counter1", (), |host| {
-            format!("counter1-global syscalls={}", host.host().global().total())
-        }),
-        _ => Err(String::from("no such tool (known: counter1)")),
+        "counter1" => Tally::<counter1::CounterLocal>::install(
+            table,
+            "counter1",
+            (),
+            <counter1::CounterLocal as Tool>::new,
+            |host| format!("counter1-global syscalls={}", host.host().global().total()),
+        ),
+        "counter2" => Tally::<counter2::CounterLocal>::install(
+            table,
+            "counter2",
+            (),
+            |pid, config| {
+                <counter2::CounterLocal as Tool>::new(pid, config)
+                    .with_thread_exit_reporter(print_counter2_thread_exit)
+            },
+            |host| {
+                let (total, processes, threads) = host.host().global().totals();
+                format!(
+                    " [counter tool] Total system calls in process tree: {total}, from \
+                     {processes} processes, {threads} thread(s)."
+                )
+            },
+        ),
+        _ => Err(String::from("no such tool (known: counter1, counter2)")),
     };
     match installed {
         Ok(boot) => {
@@ -112,6 +150,12 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
             None
         }
     }
+}
+
+/// counter2's thread-exit reporter: prints the line counter2 writes to
+/// stderr on Linux (`on_exit_thread` in `reverie-examples/counter2_tool.rs`).
+fn print_counter2_thread_exit(tid: Tid, syscalls: u64) {
+    ConsoleSink::emit(&format!("counter2-local thread={tid} syscalls={syscalls}"));
 }
 
 /// The handle [`install`] returns, with which frame hosts the boot's root
@@ -154,6 +198,15 @@ trait Root: Send + Sync {
     fn host_root(&self, task_id: u64) -> Result<u64, String>;
 }
 
+/// A live member task.
+struct Live {
+    /// Its Linux process ID.
+    pid: u64,
+    /// The syscall events the Tool should have seen from it so far: its new
+    /// entries that do not run natively.
+    events: u64,
+}
+
 /// The hosted tree as the tally sees it.
 #[derive(Default)]
 struct Members {
@@ -164,23 +217,27 @@ struct Members {
     /// Linux thread IDs that a member's fork-like syscall returned, whose
     /// task has neither started nor exited yet.
     unstarted: BTreeSet<u64>,
-    /// Live member tasks: scheduler task id to Linux process ID.
-    live: BTreeMap<u64, u64>,
+    /// Live member tasks by scheduler task id.
+    live: BTreeMap<u64, Live>,
     /// Live member tasks per Linux process ID.
     live_per_process: BTreeMap<u64, usize>,
+    /// Each exited member task's Linux thread ID, if the kernel still had it,
+    /// and its event count, in exit order.
+    exited: Vec<(Option<u64>, u64)>,
     tasks_started: u64,
     tasks_exited: u64,
     /// Member tasks that exited without starting (killed before their first
     /// instruction); included in `tasks_exited`.
     exited_unstarted: u64,
-    /// Member processes that started (a process is counted again if its PID
-    /// is reused by a later member process).
+    /// Member processes: counted when their first task starts, or, for a
+    /// forked child killed before it started, when it exits. A process is
+    /// counted again if its PID is reused by a later member process.
     processes: u64,
 }
 
 impl Members {
     fn start(&mut self, task_id: u64, pid: u64) {
-        self.live.insert(task_id, pid);
+        self.live.insert(task_id, Live { pid, events: 0 });
         let tasks = self.live_per_process.entry(pid).or_insert(0);
         if *tasks == 0 {
             self.processes += 1;
@@ -189,24 +246,30 @@ impl Members {
         self.tasks_started += 1;
     }
 
-    /// Records the exit of task `task_id`, whose Linux thread ID is `tid`,
+    /// Records the exit of task `task_id`, whose Linux identity is `ids`,
     /// and returns whether it was a member.
-    fn exit(&mut self, task_id: u64, tid: Option<u64>) -> bool {
-        if let Some(pid) = self.live.remove(&task_id) {
+    fn exit(&mut self, task_id: u64, ids: Option<LinuxTaskIds>) -> bool {
+        if let Some(task) = self.live.remove(&task_id) {
             self.tasks_exited += 1;
-            if let Some(tasks) = self.live_per_process.get_mut(&pid) {
+            self.exited.push((ids.map(|ids| ids.tid), task.events));
+            if let Some(tasks) = self.live_per_process.get_mut(&task.pid) {
                 *tasks -= 1;
                 if *tasks == 0 {
-                    self.live_per_process.remove(&pid);
-                    if self.root.is_some_and(|(_, root_pid)| root_pid == pid) {
+                    self.live_per_process.remove(&task.pid);
+                    if self.root.is_some_and(|(_, root_pid)| root_pid == task.pid) {
                         self.root_exited = true;
                     }
                 }
             }
             true
-        } else if tid.is_some_and(|tid| self.unstarted.remove(&tid)) {
+        } else if let Some(ids) = ids.filter(|ids| self.unstarted.remove(&ids.tid)) {
             self.tasks_exited += 1;
             self.exited_unstarted += 1;
+            self.exited.push((Some(ids.tid), 0));
+            // A process's first task has its process ID as its thread ID.
+            if ids.tid == ids.pid {
+                self.processes += 1;
+            }
             true
         } else {
             false
@@ -263,13 +326,16 @@ fn creates_task(raw_number: u32) -> bool {
 }
 
 impl<T: Tool + 'static> Tally<T> {
+    /// Installs a tally around a host whose processes' Tools `new_tool`
+    /// builds, and whose report line `report` formats.
     fn install(
         table: &mut SyscallTable,
         tool: &'static str,
         config: Config<T>,
+        new_tool: fn(Pid, &Config<T>) -> T,
         report: fn(&ReverieInterceptor<T>) -> String,
     ) -> Result<BootHost, String> {
-        let host = ReverieInterceptor::<T>::new(config)
+        let host = ReverieInterceptor::<T>::with_tool_constructor(config, new_tool)
             .map_err(|error| format!("the host refused the tool: {error:?}"))?;
         let tally = Self {
             host,
@@ -300,26 +366,33 @@ impl<T: Tool + 'static> Tally<T> {
         !Sysno::new(number as usize).is_some_and(|sysno| self.host.host().is_subscribed(sysno))
     }
 
-    fn is_member(&self, task_id: u64) -> bool {
-        self.state.members.lock().live.contains_key(&task_id)
-    }
-
-    // A member's entries are counted before its exit takes `members`, and
-    // the report reads the counters after the last member's exit has taken
-    // it, so relaxed updates suffice.
+    /// Counts `invocation` if its task is a member.
     fn count_entry(&self, invocation: &SyscallInvocation) {
+        let number = invocation.raw_number & NARF_SYSCALL_NUMBER_MASK;
+        let native = !invocation.park_reexecution && self.runs_natively(number);
+        {
+            let mut members = self.state.members.lock();
+            let Some(task) = members.live.get_mut(&invocation.task_id) else {
+                return;
+            };
+            if !invocation.park_reexecution && !native {
+                task.events += 1;
+            }
+        }
+        // A member's entries are counted before its exit takes `members`, and
+        // the report reads the counters after the last member's exit has
+        // taken it, so relaxed updates suffice.
         let state = &*self.state;
         state.entries.fetch_add(1, Ordering::Relaxed);
         if invocation.park_reexecution {
             state.reexecutions.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let number = invocation.raw_number & NARF_SYSCALL_NUMBER_MASK;
         match state.by_number.get(number as usize) {
             Some(count) => count.fetch_add(1, Ordering::Relaxed),
             None => state.by_number_rest.fetch_add(1, Ordering::Relaxed),
         };
-        if self.runs_natively(number) {
+        if native {
             state.native_only.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -364,6 +437,17 @@ impl<T: Tool + 'static> Tally<T> {
                 "no"
             },
         );
+        report.push_str("\nreverie-narf-boot: events-by-task");
+        for (tid, events) in &members.exited {
+            match tid {
+                Some(tid) => {
+                    let _ = write!(report, " {tid}:{events}");
+                }
+                None => {
+                    let _ = write!(report, " ?:{events}");
+                }
+            }
+        }
         report.push_str("\nreverie-narf-boot: syscalls-by-number");
         for (number, count) in state.by_number.iter().enumerate() {
             let count = count.load(Ordering::Relaxed);
@@ -408,9 +492,7 @@ impl<T: Tool + 'static> SyscallInterceptor for Tally<T> {
         invocation: &SyscallInvocation,
         native: &mut dyn NativeSyscallTransition,
     ) -> SyscallInterception {
-        if self.is_member(invocation.task_id) {
-            self.count_entry(invocation);
-        }
+        self.count_entry(invocation);
         self.host.on_syscall_enter(invocation, native)
     }
 
@@ -452,13 +534,13 @@ impl<T: Tool + 'static> SyscallInterceptor for Tally<T> {
     }
 
     fn on_task_exit(&self, task_id: u64, pid: u64, wstatus: i32, process_wstatus: i32) {
-        let tid = tool_view::linux_task_ids(task_id).map(|ids| ids.tid);
+        let ids = tool_view::linux_task_ids(task_id);
         // The adapter records the exit first, so once the tree has ended here
         // every member's exit has reached it.
         self.host
             .on_task_exit(task_id, pid, wstatus, process_wstatus);
         let mut members = self.state.members.lock();
-        if !members.exit(task_id, tid) {
+        if !members.exit(task_id, ids) {
             return;
         }
         if members.ended() {
@@ -468,7 +550,7 @@ impl<T: Tool + 'static> SyscallInterceptor for Tally<T> {
             drop(members);
             self.print_report(&ended);
         } else if members.root_exited {
-            let live = members.live.values().copied().collect();
+            let live = members.live.values().map(|task| task.pid).collect();
             let unstarted = members.unstarted.iter().copied().collect();
             drop(members);
             self.print_waiting(live, unstarted);

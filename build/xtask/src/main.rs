@@ -496,10 +496,10 @@ struct MuslDemoArgs {
     prebuilt: Option<String>,
 
     /// Host getty's process tree (the login shell and every case typed into
-    /// it) under this unmodified Reverie Tool (`counter1`): build with
-    /// `reverie-narf-poc`, boot with `reverie_tool=TOOL`, type `exit` after
-    /// each boot's last case, and require the Tool's report from every boot
-    /// (`reverie_narf_adapter::boot`).
+    /// it) under this unmodified Reverie Tool (`counter1` or `counter2`):
+    /// build with `reverie-narf-poc`, boot with `reverie_tool=TOOL`, type
+    /// `exit` after each boot's last case, and require the Tool's report from
+    /// every boot (`reverie_narf_adapter::boot`).
     #[arg(long, value_name = "TOOL")]
     reverie_tool: Option<String>,
 
@@ -7502,7 +7502,14 @@ fn run_interactive_multi(
 /// expected it to see (every syscall entry of a hosted task, less park
 /// re-executions and entries the host runs without an event), and the tally
 /// and the adapter must agree on how many hosted tasks exited, with none
-/// still hosted and the run not aborted.
+/// still hosted and the run not aborted. The tally's per-task event counts
+/// must add up to its total.
+///
+/// counter2 also counts per thread and per process. Its process and thread
+/// totals must equal the tally's, it must print one `counter2-local` line
+/// per exited task, and those lines' (thread ID, count) pairs must equal the
+/// tally's per-task counts, compared as multisets because thread IDs are
+/// reused.
 fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
     fn matching<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
         lines
@@ -7535,16 +7542,36 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
             return Err(format!("the boot logged `{line}`"));
         }
     }
-    // The Tool's own report line, as reverie-examples prints it on Linux.
-    let counted: u64 = match tool {
+    // The Tool's own report line, as reverie-examples prints it on Linux:
+    // its syscall count and, for counter2, its process and thread counts.
+    let (counted, counter2_totals): (u64, Option<(u64, u64)>) = match tool {
         "counter1" => {
             let prefix = "counter1-global syscalls=";
             let line = single(&lines, prefix)?;
             let at = line.find(prefix).map_or(0, |at| at + prefix.len());
-            line[at..]
+            let counted = line[at..]
                 .trim()
                 .parse()
-                .map_err(|e| format!("bad count in `{line}`: {e}"))?
+                .map_err(|e| format!("bad count in `{line}`: {e}"))?;
+            (counted, None)
+        }
+        "counter2" => {
+            let prefix = "[counter tool] Total system calls in process tree: ";
+            let line = single(&lines, prefix)?;
+            let at = line.find(prefix).map_or(0, |at| at + prefix.len());
+            let parse = |rest: &str| -> Option<(u64, u64, u64)> {
+                let (total, rest) = rest.split_once(", from ")?;
+                let (processes, rest) = rest.split_once(" processes, ")?;
+                let (threads, _) = rest.split_once(" thread(s).")?;
+                Some((
+                    total.trim().parse().ok()?,
+                    processes.trim().parse().ok()?,
+                    threads.trim().parse().ok()?,
+                ))
+            };
+            let (total, processes, threads) =
+                parse(&line[at..]).ok_or_else(|| format!("bad counts in `{line}`"))?;
+            (total, Some((processes, threads)))
         }
         _ => return Err(format!("no report check for tool `{tool}`")),
     };
@@ -7592,12 +7619,98 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
     if field("aborted")? != "no" {
         return Err(format!("the run was aborted: `{tally}`"));
     }
+    let processes = num("processes")?;
+    // The tally's events per task, as (thread ID, events) in exit order.
+    let by_task_prefix = "reverie-narf-boot: events-by-task";
+    let by_task_line = single(&lines, by_task_prefix)?;
+    let at = by_task_line
+        .find(by_task_prefix)
+        .map_or(0, |at| at + by_task_prefix.len());
+    let by_task = by_task_line[at..]
+        .split_ascii_whitespace()
+        .map(|pair| {
+            pair.rsplit_once(':')
+                .and_then(|(tid, events)| Some((tid.to_string(), events.parse::<u64>().ok()?)))
+                .ok_or_else(|| format!("bad pair `{pair}` in `{by_task_line}`"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if by_task.len() as u64 != exited {
+        return Err(format!(
+            "the tally lists {} tasks' events; {exited} tasks exited",
+            by_task.len()
+        ));
+    }
+    let mut counter2_summary = String::new();
+    if let Some((tool_processes, tool_threads)) = counter2_totals {
+        if tool_processes != processes || tool_threads != exited {
+            return Err(format!(
+                "{tool} counted {tool_processes} processes and {tool_threads} threads; \
+                 the tally {processes} processes and {exited} tasks"
+            ));
+        }
+        let local_prefix = "counter2-local thread=";
+        let local = matching(&lines, local_prefix)
+            .into_iter()
+            .map(|line| {
+                let at = line
+                    .find(local_prefix)
+                    .map_or(0, |at| at + local_prefix.len());
+                line[at..]
+                    .split_once(" syscalls=")
+                    .and_then(|(tid, count)| {
+                        Some((tid.to_string(), count.trim().parse::<u64>().ok()?))
+                    })
+                    .ok_or_else(|| format!("bad counter2-local line `{line}`"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if local.len() as u64 != exited {
+            return Err(format!(
+                "{} counter2-local lines; {exited} tasks exited",
+                local.len()
+            ));
+        }
+        // How many more times each (thread ID, count) pair occurs in
+        // counter2's lines than in the tally's list.
+        let mut surplus = std::collections::BTreeMap::<&(String, u64), i64>::new();
+        for pair in &local {
+            *surplus.entry(pair).or_default() += 1;
+        }
+        for pair in &by_task {
+            *surplus.entry(pair).or_default() -= 1;
+        }
+        let side = |sign: i64| -> Vec<String> {
+            surplus
+                .iter()
+                .filter(|(_, n)| **n * sign > 0)
+                .map(|((tid, count), n)| format!("{tid}:{count} x{}", n * sign))
+                .collect()
+        };
+        let (only_tool, only_tally) = (side(1), side(-1));
+        if !only_tool.is_empty() || !only_tally.is_empty() {
+            return Err(format!(
+                "counter2's per-thread counts differ from the tally's per-task counts: \
+                 only counter2 {only_tool:?}, only the tally {only_tally:?}"
+            ));
+        }
+        counter2_summary = format!(
+            "; {tool_processes} processes and {tool_threads} threads, and {} per-thread \
+             counts, equal to the tally's",
+            local.len()
+        );
+    }
+    let by_task_sum: u64 = by_task.iter().map(|(_, events)| events).sum();
+    if by_task_sum != expected {
+        return Err(format!(
+            "the tally's per-task events add up to {by_task_sum}, its expected-events is \
+             {expected}"
+        ));
+    }
     Ok(format!(
         "{tool} counted {counted} = expected-events ({entries} entries - {reexecutions} \
-         re-executions - {native_only} native-only); {exited} tasks exited ({} unstarted), \
-         {} processes",
+         re-executions - {native_only} native-only) = the sum of {} tasks' events; {exited} \
+         tasks exited ({} unstarted), {processes} processes{counter2_summary}",
+        by_task.len(),
         num("exited-unstarted")?,
-        num("processes")?
     ))
 }
 

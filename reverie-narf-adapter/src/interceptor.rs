@@ -188,9 +188,18 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
     /// Creates the run's host and the Tool's global state from `config`,
     /// exactly once for the run.
     pub fn new(config: Config<T>) -> Result<Self, NarfFatal> {
+        Self::with_tool_constructor(config, T::new)
+    }
+
+    /// [`Self::new`], with every hosted process's Tool built by `new_tool`
+    /// instead of `T::new` (see [`NarfToolHost::with_tool_constructor`]).
+    pub fn with_tool_constructor(
+        config: Config<T>,
+        new_tool: fn(Pid, &Config<T>) -> T,
+    ) -> Result<Self, NarfFatal> {
         Ok(Self {
             inner: Arc::new(Inner {
-                host: Host::<T>::new(config)?,
+                host: Host::<T>::new(config)?.with_tool_constructor(new_tool),
                 hosted: IrqSafeSpinLock::new(BTreeMap::new()),
                 exits: IrqSafeSpinLock::new(Vec::new()),
                 aborted: AtomicBool::new(false),
