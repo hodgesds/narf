@@ -323,6 +323,12 @@ static BARRIER_PENDING: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MA
 /// has executed. The source waits for exactly the bits it selected.
 static BARRIER_ACKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// Optional IRQ-safe function each target must run before acknowledging a
+/// rendezvous from source CPU `n`. A source owns its lane under
+/// `BARRIER_OUTGOING[n]`, so the pointer remains stable until every selected
+/// target has acknowledged it.
+static BARRIER_ACTION: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
 /// Serializes nested/concurrent publishers on one CPU, and (being
 /// IRQ-safe) keeps `current_cpu()` stable for the lifetime of the lane.
 static BARRIER_OUTGOING: [crate::sync::IrqSafeSpinLock<()>; MAX_CPUS] =
@@ -371,32 +377,67 @@ pub fn remote_barrier_available() -> bool {
 /// see [`remote_barrier_available`]. Callers must not report success to
 /// userspace in that case.
 pub fn remote_barrier(targets: u64) -> bool {
+    // SAFETY: the absent action has no caller-supplied execution contract.
+    unsafe { remote_call_inner(targets, None) }
+}
+
+/// Execute `action` once on every selected online CPU and return only after
+/// all selected CPUs acknowledge completion.
+///
+/// The calling CPU executes `action` inline. Peer CPUs execute it from the
+/// memory-barrier IPI handler before publishing their acknowledgement. This is
+/// the NARF equivalent of Linux's synchronous `smp_call_function_many()` and
+/// is intended for short per-CPU architectural state changes.
+///
+/// # Safety
+/// `action` runs in interrupt context with ordinary IRQs masked. It must not
+/// allocate, park, await, take a sleepable lock, re-enter userspace, or depend
+/// on another scheduler task. It must be safe to execute concurrently on every
+/// selected CPU. These requirements continue to hold if a sender services a
+/// mutually waiting sender's action from the rendezvous spin loop.
+pub unsafe fn remote_call(targets: u64, action: fn()) -> bool {
+    // SAFETY: forwarded from this function's caller.
+    unsafe { remote_call_inner(targets, Some(action)) }
+}
+
+/// Shared rendezvous implementation for [`remote_barrier`] and [`remote_call`].
+///
+/// # Safety
+/// A present `action` satisfies [`remote_call`]'s safety contract.
+unsafe fn remote_call_inner(targets: u64, action: Option<fn()>) -> bool {
     let source = crate::percpu::current_cpu().min(MAX_CPUS - 1);
     let source_bit = 1u64 << source;
+    let targets = targets & online_bitmap() & !source_bit;
+    let poke = BARRIER_POKE.load(Ordering::Acquire);
+    if targets != 0 && poke == 0 {
+        return false;
+    }
+
+    // Serialize this source lane before publishing its action pointer. The lock
+    // also masks IRQs, keeping `source` stable until all acknowledgements arrive.
+    let _outgoing = BARRIER_OUTGOING[source].lock();
+    BARRIER_ACTION[source].store(action.map_or(0, |f| f as usize), Ordering::Release);
+
+    if let Some(action) = action {
+        action();
+    }
 
     // (a) in Linux's ordering table: the caller's own writes must precede
     // the IPI, since system-call entry is not a barrier.
     core::sync::atomic::fence(Ordering::SeqCst);
 
-    let targets = targets & online_bitmap() & !source_bit;
     if targets == 0 {
         // Nothing to rendezvous with. The fence above and the one below
         // still give the caller the local half of the guarantee.
         core::sync::atomic::fence(Ordering::SeqCst);
+        BARRIER_ACTION[source].store(0, Ordering::Release);
         return true;
     }
 
-    let poke = BARRIER_POKE.load(Ordering::Acquire);
-    if poke == 0 {
-        return false;
-    }
     // SAFETY: only `BarrierPokeFn as usize` is ever stored, and it is
     // non-null here.
     let poke: BarrierPokeFn = unsafe { core::mem::transmute(poke) };
 
-    // IRQs stay masked for the lane's lifetime, so `source` cannot change
-    // under us and a local nested publisher cannot reuse the ack cell.
-    let _outgoing = BARRIER_OUTGOING[source].lock();
     BARRIER_ACKED[source].store(0, Ordering::Relaxed);
 
     let mut pending = targets;
@@ -427,6 +468,7 @@ pub fn remote_barrier(targets: u64) -> bool {
     // barrier either, so the caller's subsequent loads must not be
     // reordered before the last ack.
     core::sync::atomic::fence(Ordering::SeqCst);
+    BARRIER_ACTION[source].store(0, Ordering::Release);
     BARRIER_SENT.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -454,23 +496,28 @@ pub fn service_pending_barriers() {
         return;
     }
 
-    // THE barrier. Claiming the batch above and acknowledging below must
-    // sandwich a full fence, or an ack could be observed by the source
-    // before this CPU's prior accesses are globally visible.
-    core::sync::atomic::fence(Ordering::SeqCst);
-
-    // Counted BEFORE the acknowledgements, not after. The ack is what
-    // releases the sender, so a counter bumped afterwards can still be
-    // invisible to it when `remote_barrier` returns — the release/acquire
-    // pair on BARRIER_ACKED is what publishes this store. Ordering it the
-    // other way made the rendezvous smoke fail on aarch64 and pass on
-    // x86_64, which is the signature of exactly this mistake.
-    BARRIER_SERVICED.fetch_add(1, Ordering::Relaxed);
-
     let mut remaining = sources;
     while remaining != 0 {
         let source = remaining.trailing_zeros() as usize;
         remaining &= remaining - 1;
+
+        let action = BARRIER_ACTION[source].load(Ordering::Acquire);
+        if action != 0 {
+            // SAFETY: only a `fn()` satisfying `remote_call`'s safety contract
+            // is published in this source lane, and the source retains its
+            // outgoing lock until this acknowledgement is visible.
+            let action: fn() = unsafe { core::mem::transmute(action) };
+            action();
+        }
+
+        // THE barrier. The action and all prior accesses on this CPU must
+        // precede its acknowledgement to this source.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        // Counted BEFORE the acknowledgement, not after. The ack is what
+        // releases the sender, so a counter bumped afterwards can still be
+        // invisible to it when the rendezvous returns.
+        BARRIER_SERVICED.fetch_add(1, Ordering::Relaxed);
         BARRIER_ACKED[source].fetch_or(1u64 << target, Ordering::Release);
     }
 }

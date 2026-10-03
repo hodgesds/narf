@@ -67,6 +67,14 @@ one.
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
 - A trap handler never allocates.
+- When CR4.TSD converts a subscribed ring-3 `RDTSC` into #GP, `frame/` decodes
+  only exact opcode `0f 31`, calls userspace's typed instruction interceptor,
+  writes the resulting low/high halves to EAX/EDX, and advances RIP by exactly
+  two bytes. Every other #GP keeps the ordinary synchronous-fault path. The
+	  callback is non-allocating and non-parking and never receives the mutable
+	  trap frame; register and control-flow mutation remain owned here. A typed
+	  result mismatch or recursive callback stops the kernel rather than resuming
+	  the guest with an uncontrolled result.
 - Anonymous user demand faults that hit the protected memory reserve may yield
   only after memory has retired the page claim, released address-space and
   allocator locks, and frame has cleared the active per-CPU mempolicy slot.

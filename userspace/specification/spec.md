@@ -68,6 +68,34 @@ possibly replaced return, and architecture return hooks retain responsibility
 for signal delivery. Interception does not replace any of those kernel
 lifecycle owners.
 
+The kernel also exposes one process-global, first-class
+`InstructionInterceptor` for subscribed nondeterministic user instructions.
+The initial x86_64 family is `RDTSC`. Publication is atomic and one-shot, and
+the interceptor object is shared directly across CPUs. Installation calls the
+interceptor's subscription method exactly once and freezes the resulting family
+mask in the published slot; exception handlers never ask mutable tool code to
+decide trap ownership. CR4.TSD supplies the hardware trap: ring-3 `RDTSC` raises
+#GP while CPL0 retains native emulation. After publishing the slot, installation
+raises the monotonic kernel-wide trap request and synchronously applies it on
+every currently-online CPU before returning success. A missing SMP rendezvous
+rejects installation before publication. The legacy entry path and scheduler
+also apply the request before every user entry or own-stack switch-in, covering
+CPUs brought online after installation and task migration.
+The frame owner decodes only exact opcode `0f 31`, captures immutable task/RIP
+metadata, executes native emulation at most once under `Continue` or accepts a
+typed completed value, applies a same-family return callback, writes EDX:EAX,
+and advances RIP by exactly two bytes. Interceptors never receive a mutable trap
+frame. A mismatched result type or recursive callback fails closed by stopping
+the kernel rather than returning an uncontrolled value to the guest.
+
+`InstructionInterceptor` is an unsafe trait because callbacks execute
+synchronously in exception context. Its safety contract forbids allocation,
+parking, awaiting, sleepable locks, guest re-entry, and recursive instruction
+dispatch. A per-CPU guard detects recursion and fails closed. Implementations
+may update preallocated lock-free or IRQ-safe process-global state. No ptrace
+stop, signal trampoline, binary rewrite, polling loop, or IPC transport is part
+of this mechanism.
+
 The interceptor object is shared directly by dispatcher calls on every CPU and
 must synchronize its own mutable state and filter task identities itself. Its
 ownership is deliberately process-global and in-address-space: this interface

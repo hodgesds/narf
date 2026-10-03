@@ -1401,6 +1401,54 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // First-class nondeterministic-instruction interception. CR4.TSD makes a
+    // ring-3 RDTSC raise #GP while leaving CPL0 native emulation available.
+    // Decode only the exact trapped opcode; every other #GP retains the normal
+    // synchronous-fault path below. The interceptor never receives this mutable
+    // frame, so this architecture owner alone writes registers and advances RIP.
+    if frame.vector == 13 && (frame.cs & 3) == 3 {
+        let mut opcode = [0u8; 2];
+        // SAFETY: the guarded copy accepts an arbitrary user pointer, catches
+        // faults, and writes at most opcode.len() bytes into this local array.
+        let copied = unsafe {
+            narf_arch::x86_64::smap::copy_user_guarded(
+                opcode.as_mut_ptr(),
+                frame.rip as *const u8,
+                opcode.len(),
+            )
+        }
+        .is_ok();
+        if copied && opcode == [0x0f, 0x31] {
+            let dispatched = narf_userspace::dispatch_instruction(
+                narf_userspace::NondeterministicInstruction::Rdtsc,
+                frame.rip,
+                || {
+                    // SAFETY: RDTSC remains legal at CPL0 when CR4.TSD is set.
+                    let value = unsafe { core::arch::x86_64::_rdtsc() };
+                    narf_userspace::InstructionResult::Rdtsc { value }
+                },
+            );
+            match dispatched {
+                Ok(Some(narf_userspace::InstructionResult::Rdtsc { value })) => {
+                    frame.rax = value as u32 as u64;
+                    frame.rdx = (value >> 32) as u32 as u64;
+                    frame.rip = frame.rip.wrapping_add(2);
+                    return;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = writeln!(
+                        TrapWriter,
+                        "instruction interceptor failed closed at rip={:#x}: {:?}",
+                        frame.rip, error
+                    );
+                    panic!("instruction interceptor failed closed");
+                }
+            }
+        }
+    }
+
     // COW write-fault recovery (user-mode only). When a fork()'d
     // process writes a shared, write-protected page for the first
     // time, #PF lands here with the present + write + user bits

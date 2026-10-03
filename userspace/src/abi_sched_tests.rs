@@ -8,6 +8,7 @@
 //! the assertion rather than relying on a file-level note.
 
 use crate::abi_test_support::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A non-canonical x86_64 address (bit 48 set, 49..63 clear). Any
 /// `copy_to_user` / `validate_user_range` against it returns EFAULT, so it's
@@ -1337,6 +1338,36 @@ fn smoke_abi_sched_membarrier_rendezvous_reaches_peers() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_membarrier_rendezvous_reaches_peers
+);
+
+static REMOTE_CALL_CPUS: AtomicU64 = AtomicU64::new(0);
+
+fn record_remote_call_cpu() {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < 64 {
+        REMOTE_CALL_CPUS.fetch_or(1u64 << cpu, Ordering::Release);
+    }
+}
+
+fn smoke_abi_sched_remote_call_runs_on_every_online_cpu() -> TestResult {
+    with_setup(|| {
+        let targets = narf_lib::smp::online_bitmap();
+        REMOTE_CALL_CPUS.store(0, Ordering::Release);
+        // SAFETY: record_remote_call_cpu performs one lock-free atomic update;
+        // it allocates, blocks, awaits, and locks nowhere.
+        if !unsafe { narf_lib::smp::remote_call(targets, record_remote_call_cpu) } {
+            return Err("remote_call unavailable for the online CPU set");
+        }
+        let observed = REMOTE_CALL_CPUS.load(Ordering::Acquire);
+        if observed & targets != targets {
+            return Err("remote_call returned before every online CPU ran its action");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/interception",
+    smoke_abi_sched_remote_call_runs_on_every_online_cpu
 );
 
 // ── set_robust_list(head*, len) / get_robust_list(pid, head**, len*) ─

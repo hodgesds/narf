@@ -17,6 +17,9 @@ narf-kernel-test = { path = "../verification/kernel-test" }
 
 [features]
 kernel-test = []
+# Exposes teardown for kernel verification that installs the one-shot user
+# instruction interception request. Production has no reset operation.
+verification-test-reset = []
 
 [lints]
 workspace = true

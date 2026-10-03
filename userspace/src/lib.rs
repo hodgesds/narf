@@ -53,6 +53,7 @@ pub mod errno;
 pub mod fd;
 pub mod handlers;
 pub mod init;
+pub mod instruction;
 pub mod interp;
 pub mod io_mux;
 pub mod keyring;
@@ -119,6 +120,13 @@ mod process_e2e_tests;
 mod shell_e2e_tests;
 mod tests;
 
+pub use instruction::{
+    activate_current_cpu_instruction_interception, dispatch_instruction,
+    instruction_interception_enabled, try_install_instruction_interceptor,
+    InstructionDispatchError, InstructionInterception, InstructionInterceptor,
+    InstructionInvocation, InstructionResult, InstructionResultMismatch, InstructionSubscriptions,
+    NondeterministicInstruction,
+};
 pub use interp::{lookup_interpreter, register_interpreter};
 
 pub use fd::{FdEntry, FdTable, FD_CLOEXEC};

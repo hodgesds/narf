@@ -5013,6 +5013,27 @@ where
     }
 }
 
+// ── Test stubs ──────────────────────────────────────────────────────
+
+#[doc(hidden)]
+pub(crate) fn __test_clear_global() {
+    clear_global_for_tests();
+}
+
+#[cfg(feature = "verification-test-reset")]
+#[doc(hidden)]
+pub fn __verification_clear_global() {
+    clear_global_for_tests();
+}
+
+fn clear_global_for_tests() {
+    // Tests reset the singleton between isolated cases. A dispatcher may have
+    // loaded the old pointer immediately before this swap, so reclamation here
+    // would be a use-after-free. Deliberately leak the retired test table; the
+    // production API has no reset operation and retains its table for boot.
+    let _retired = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+}
+
 #[cfg(test)]
 mod interception_tests {
     use super::*;
@@ -5409,27 +5430,6 @@ mod interception_kernel_tests {
         "userspace/syscall",
         smoke_syscall_interceptor_complete_and_global_publication
     );
-}
-
-// ── Test stubs ──────────────────────────────────────────────────────
-
-#[doc(hidden)]
-pub(crate) fn __test_clear_global() {
-    clear_global_for_tests();
-}
-
-#[cfg(feature = "verification-test-reset")]
-#[doc(hidden)]
-pub fn __verification_clear_global() {
-    clear_global_for_tests();
-}
-
-fn clear_global_for_tests() {
-    // Tests reset the singleton between isolated cases. A dispatcher may have
-    // loaded the old pointer immediately before this swap, so reclamation here
-    // would be a use-after-free. Deliberately leak the retired test table; the
-    // production API has no reset operation and retains its table for boot.
-    let _retired = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
 }
 
 #[cfg(feature = "kernel-test")]

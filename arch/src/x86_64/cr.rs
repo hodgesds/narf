@@ -6,7 +6,7 @@
 //! hazard the spec names.
 
 use core::arch::asm;
-use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use narf_lib::percpu::MAX_CPUS;
 
@@ -29,6 +29,14 @@ pub static NARF_X86_CACHED_CR4: AtomicU64 = AtomicU64::new(0);
 /// Rust code that needs the exact executing CPU's value must use
 /// [`cached_cr4`] instead.
 static PER_CPU_CACHED_CR4: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Monotonic kernel-wide request to fault ring-3 `RDTSC` on every CPU.
+///
+/// CR4.TSD is per-CPU, so publication alone is insufficient: every user-task
+/// switch-in must call [`activate_requested_user_instruction_interception`].
+/// Production never clears this request. The interceptor that raised it is
+/// likewise installed once for the kernel lifetime.
+static USER_RDTSC_INTERCEPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Last CR4 value written through [`write_cr4`] on the executing CPU.
 ///
@@ -67,6 +75,70 @@ pub const CR4_PCIDE: u64 = 1 << 17;
 pub const CR4_FSGSBASE: u64 = 1 << 16;
 /// CR4 bit: OSXSAVE (bit 18). Enables XSAVE and processor extended states.
 pub const CR4_OSXSAVE: u64 = 1 << 18;
+/// CR4 bit: TSD (bit 2). When set, `RDTSC` at CPL > 0 raises #GP while
+/// remaining available to kernel emulation at CPL0.
+pub const CR4_TSD: u64 = 1 << 2;
+
+/// Request kernel interception of ring-3 `RDTSC` for the kernel lifetime.
+///
+/// This both publishes the cross-CPU request and applies it to the executing
+/// CPU. Other CPUs apply it at their next user-task switch-in.
+pub fn request_user_rdtsc_interception() {
+    USER_RDTSC_INTERCEPTION_REQUESTED.store(true, Ordering::Release);
+    activate_requested_user_instruction_interception();
+}
+
+/// Apply all requested user-instruction traps to the executing CPU.
+///
+/// The scheduler calls this before every own-stack task switch-in and the
+/// legacy userspace path calls it before direct user entry. The cached fast
+/// path makes repeated calls a single CPU-local atomic load after CR4.TSD is
+/// installed.
+pub fn activate_requested_user_instruction_interception() {
+    if !USER_RDTSC_INTERCEPTION_REQUESTED.load(Ordering::Acquire) || cached_cr4() & CR4_TSD != 0 {
+        return;
+    }
+
+    // SAFETY: CR4.TSD is architectural on x86_64. The read-modify-write
+    // preserves every other CR4 feature bit and updates NARF's per-CPU cache.
+    unsafe {
+        let current = read_cr4();
+        if current & CR4_TSD == 0 {
+            write_cr4(current | CR4_TSD);
+        }
+    }
+}
+
+/// Clear the global request and current CPU's CR4.TSD for isolated verification
+/// tests. Production has no reset operation.
+#[cfg(any(feature = "kernel-test", feature = "verification-test-reset"))]
+#[doc(hidden)]
+pub fn __verification_clear_user_rdtsc_interception() {
+    USER_RDTSC_INTERCEPTION_REQUESTED.store(false, Ordering::Release);
+    // SAFETY: verification teardown runs at CPL0 and preserves every CR4 bit
+    // except TSD, which this module exclusively requested for the test.
+    unsafe {
+        let current = read_cr4();
+        if current & CR4_TSD != 0 {
+            write_cr4(current & !CR4_TSD);
+        }
+    }
+}
+
+/// Clear only the executing CPU's CR4.TSD bit while retaining the global
+/// request. This lets the kernel scheduler test model first use on a migrated
+/// CPU and prove that its switch-in path reapplies the request.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_clear_current_cpu_user_rdtsc_interception() {
+    // SAFETY: the kernel test runs at CPL0 and preserves every other CR4 bit.
+    unsafe {
+        let current = read_cr4();
+        if current & CR4_TSD != 0 {
+            write_cr4(current & !CR4_TSD);
+        }
+    }
+}
 
 /// CR0 bit: task switched. While set, an x87/MMX/SSE/AVX instruction raises
 /// `#NM`; kernels use that fault to defer restoring a task's FP/SIMD image

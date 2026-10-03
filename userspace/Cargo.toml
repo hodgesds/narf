@@ -71,7 +71,7 @@ kernel-test = []
 
 # Exposes the global syscall-table reset only to the out-of-crate kernel
 # verification harness. Production consumers never receive a public reset API.
-verification-test-reset = []
+verification-test-reset = ["narf-arch/verification-test-reset"]
 
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's

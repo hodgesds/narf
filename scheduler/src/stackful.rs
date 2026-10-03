@@ -1973,6 +1973,11 @@ impl KernelTask {
             0
         };
         if own_stack {
+            // A one-shot userspace interceptor may request CR4.TSD after AP
+            // bring-up. Apply that monotonic request on every destination CPU
+            // before a task can resume and return to ring 3. This is required
+            // after migration because the user future is not polled again.
+            narf_arch::x86_64::cr::activate_requested_user_instruction_interception();
             let top = ((self.stack.as_ptr() as u64) + self.stack.len() as u64) & !0xFu64;
             crate::retarget_kernel_stack(top);
             // Re-activate the task's user address space before switching in. A
@@ -4749,6 +4754,58 @@ pub mod tests {
         }
         if crate::current_kernel_stack_top() != baseline {
             return TestResult::Fail("kernel-entry stack baseline was not restored");
+        }
+        TestResult::Pass
+    }
+
+    /// CR4.TSD is per-CPU, while the instruction interceptor is kernel-global.
+    /// Model a task's first switch-in after migration by clearing only this
+    /// CPU's bit while retaining the global request. The real own-stack switch
+    /// path must restore TSD before task code can execute.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_instruction_interception_reapplied_on_switch() -> TestResult {
+        use core::sync::atomic::AtomicBool;
+
+        static OBSERVED_TSD: AtomicBool = AtomicBool::new(false);
+
+        struct CaptureTsd;
+        impl Future for CaptureTsd {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                OBSERVED_TSD.store(
+                    narf_arch::x86_64::cr::cached_cr4() & narf_arch::x86_64::cr::CR4_TSD != 0,
+                    Ordering::Release,
+                );
+                Poll::Ready(())
+            }
+        }
+
+        let saved_own_stack = USE_OWN_STACK.swap(true, Ordering::AcqRel);
+        OBSERVED_TSD.store(false, Ordering::Release);
+        narf_arch::x86_64::cr::request_user_rdtsc_interception();
+        narf_arch::x86_64::cr::__test_clear_current_cpu_user_rdtsc_interception();
+        if narf_arch::x86_64::cr::cached_cr4() & narf_arch::x86_64::cr::CR4_TSD != 0 {
+            narf_arch::x86_64::cr::__verification_clear_user_rdtsc_interception();
+            USE_OWN_STACK.store(saved_own_stack, Ordering::Release);
+            return TestResult::Fail("test setup did not clear current CPU CR4.TSD");
+        }
+
+        let mut task = KernelTask::new(CaptureTsd);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: the test exclusively owns the task and executor context for
+        // the complete switch round trip.
+        let result = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+
+        narf_arch::x86_64::cr::__verification_clear_user_rdtsc_interception();
+        USE_OWN_STACK.store(saved_own_stack, Ordering::Release);
+
+        if result != Poll::Ready(()) {
+            return TestResult::Fail("TSD capture task did not complete");
+        }
+        if !OBSERVED_TSD.load(Ordering::Acquire) {
+            return TestResult::Fail("own-stack switch-in did not restore CR4.TSD");
         }
         TestResult::Pass
     }
@@ -7901,6 +7958,11 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_user_own_stack_retargets_kernel_entry_stack
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_user_instruction_interception_reapplied_on_switch
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(

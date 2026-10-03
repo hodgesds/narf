@@ -131,6 +131,13 @@ pub unsafe fn x86_64::user_mode::user_fs_base_for_cpu(cpu: usize) -> u64;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn x86_64::user_mode::set_user_fs_base(fs_base: u64);
 
+/// Raise a monotonic kernel-wide request for CR4.TSD and apply it locally.
+/// Every CPU applies the request again before an own-stack user-task switch-in.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::cr::request_user_rdtsc_interception();
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::cr::activate_requested_user_instruction_interception();
+
 /// Process PCIDs are independent of the PKS/PCID domain backend. Boot calls
 /// `enable_pcide` on every CPU, then closes the global gate after SMP discovery.
 #[cfg(target_arch = "x86_64")]

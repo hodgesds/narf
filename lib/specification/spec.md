@@ -219,6 +219,24 @@ the terminal-state form: it
 wakes and logically dequeues all exclusive waiters without dropping their
 wakers.
 
+### 3.8 Synchronous cross-CPU calls
+
+```rust
+pub fn remote_barrier(targets: u64) -> bool;
+pub unsafe fn remote_call(targets: u64, action: fn()) -> bool;
+```
+
+Both operations intersect `targets` with the online-CPU bitmap, execute the
+local half inline, raise the dedicated rendezvous IPI for every selected peer,
+and return only after every peer acknowledges. `remote_barrier` executes a full
+memory barrier. `remote_call` additionally runs the supplied function once per
+selected CPU before that CPU acknowledges, matching the synchronous subset of
+Linux `smp_call_function_many()`. It returns `false` without running the action
+when a required IPI bridge is unavailable. The action is an unsafe boundary:
+it runs with ordinary IRQs masked and therefore must be allocation-free,
+non-parking, non-awaiting, non-sleeping, safe under concurrent execution, and
+independent of scheduler-task progress.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a

@@ -254,6 +254,7 @@ firmware-allow-unsigned = [
 # Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
 kernel-test  = [
     "dep:narf-verification",
+    "narf-verification/kernel-test",
     "narf-memory/kernel-test",
     "narf-audio/kernel-test",
     "narf-bluetooth/kernel-test",

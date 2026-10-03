@@ -161,6 +161,11 @@ the register file, then arms CR0.TS; the first user FP/SIMD instruction after
 resume raises `#NM`, restores that task's image, and retries. A task is always
 saved before it can migrate. Successful exec resets that task-owned image to
 architectural initial state before the replacement program enters user mode.
+Before every x86_64 own-stack switch-in, the executor also applies arch's
+monotonic user-instruction interception request to the executing CPU. This is
+what preserves CR4.TSD interception after migration even though the userspace
+future is not polled again. The scheduler neither owns nor dereferences the
+interceptor or its process-global tool state.
 A privileged consumer that must observe or replace user
 FP/SIMD state (notably signal-frame construction and sigreturn) first calls
 `materialize_current_user_fpu`; this restores a deferred task image, clears TS,

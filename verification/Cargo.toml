@@ -57,7 +57,7 @@ narf-net        = { path = "../net" }
 narf-filesystem = { path = "../filesystem" }
 narf-power      = { path = "../power" }
 narf-observability = { path = "../observability" }
-narf-userspace  = { path = "../userspace", features = ["verification-test-reset"] }
+narf-userspace  = { path = "../userspace" }
 # Optional: pulled in only under `boot-init` so default builds
 # don't trigger the busybox download + make. Falls back to an
 # empty slice when musl-gcc isn't on the host (see busybox
@@ -78,6 +78,10 @@ narf-compat-win   = { path = "../compat/win" }
 narf-modules      = { path = "../modules" }
 
 [features]
+# Compile the cross-crate kernel-test cases that temporarily replace one-shot
+# userspace interception globals. Production `boot-init` consumes this crate
+# only for embedded init/shell ELFs and does not enable this reset capability.
+kernel-test = ["narf-userspace/verification-test-reset"]
 # Opt-in end-to-end user-mode smoke tests. Enabling this adds the
 # x86_64 user-mode round-trip / yield-resume smokes plus the aarch64
 # two-task EL0 timer-preemption context-isolation smoke. The tests build
@@ -85,7 +89,7 @@ narf-modules      = { path = "../modules" }
 # filesystem input. Disabled by default because they leave subsystem state
 # that other suites do not need to pay for; enable with
 # `cargo xtask test --arch=<x86_64|aarch64> --features=user-mode-e2e`.
-user-mode-e2e = []
+user-mode-e2e = ["kernel-test"]
 # Opt-in real-Rust-binary end-to-end test. This implies
 # `user-mode-e2e` and additionally enables
 # `smoke_frame_x86_64_run_narf_testbin`, which loads the
