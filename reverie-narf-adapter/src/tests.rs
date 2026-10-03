@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use narf_console::Writer;
 use narf_filesystem::{FileOps, FsError, FsFuture, Stat};
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{KernelTest, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{AddressSpace, PhysAddr, RegionPerms};
 use narf_scheduler::{Affinity, CpuId, TaskSpec};
@@ -613,6 +613,77 @@ fn result_of(outcome: Result<TestResult, &'static str>) -> TestResult {
     }
 }
 
+// ── Global state a test must leave as it found it ────────────────────
+
+/// The kernel-global switches that a reverie-narf test may change while it
+/// runs, and must restore before the next test: the signal tables
+/// (`narf_userspace::signal_init` and `sigaction_init`), the vDSO clock
+/// routing, and user-task SMP placement with work stealing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GlobalSwitches {
+    signal_tables: narf_userspace::handlers::SignalTablesState,
+    clocks_route_through_syscalls: bool,
+    user_task_smp: bool,
+    work_stealing: bool,
+}
+
+impl GlobalSwitches {
+    fn read() -> Self {
+        Self {
+            signal_tables: narf_userspace::handlers::__test_signal_tables_state(),
+            clocks_route_through_syscalls: narf_userspace::vdso::clocks_route_through_syscalls(),
+            user_task_smp: narf_scheduler::user_task_smp_enabled(),
+            work_stealing: narf_scheduler::work_stealing_enabled(),
+        }
+    }
+}
+
+/// Runs one registered reverie-narf test and fails it by name if it left any
+/// [`GlobalSwitches`] changed, whatever the test itself returned. A leaked
+/// switch changes what every later test in the boot exercises, so the leak
+/// is reported even when the test passed.
+fn leak_checked(test: fn() -> TestResult) -> TestResult {
+    let before = GlobalSwitches::read();
+    let result = test();
+    let after = GlobalSwitches::read();
+    if after.signal_tables != before.signal_tables {
+        let _ = writeln!(
+            Writer,
+            "    leak check: signal tables {:?} -> {:?}",
+            before.signal_tables, after.signal_tables
+        );
+        return TestResult::Fail("the test left the signal tables set up");
+    }
+    if after.clocks_route_through_syscalls != before.clocks_route_through_syscalls {
+        return TestResult::Fail("the test left the vDSO clock routing changed");
+    }
+    if after.user_task_smp != before.user_task_smp {
+        return TestResult::Fail("the test left user-task SMP placement changed");
+    }
+    if after.work_stealing != before.work_stealing {
+        return TestResult::Fail("the test left work stealing changed");
+    }
+    result
+}
+
+/// Registers a reverie-narf test under [`leak_checked`].
+macro_rules! reverie_narf_test {
+    ($name:ident) => {
+        const _: () = {
+            fn run() -> TestResult {
+                leak_checked($name)
+            }
+            #[used]
+            #[link_section = "narf.tests"]
+            static ENTRY: KernelTest = KernelTest {
+                name: stringify!($name),
+                subsystem: "reverie-narf",
+                run,
+            };
+        };
+    };
+}
+
 // ── Identity, registers, memory and the one-shot original ────────────────
 
 static PROBE_TASK: AtomicU64 = AtomicU64::new(0);
@@ -824,10 +895,7 @@ fn reverie_narf_services_view_and_one_shot_original() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_services_view_and_one_shot_original
-);
+reverie_narf_test!(reverie_narf_services_view_and_one_shot_original);
 
 // ── Unmodified Tools ──────────────────────────────────────────────────────
 
@@ -849,7 +917,7 @@ fn reverie_narf_counter1_counts_and_tears_down() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_counter1_counts_and_tears_down);
+reverie_narf_test!(reverie_narf_counter1_counts_and_tears_down);
 
 /// counter1 follows a process tree: fork and vfork children are registered
 /// before their first instruction, their syscalls reach the Tool, and every
@@ -888,7 +956,7 @@ fn reverie_narf_counter1_follows_fork_and_vfork() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_counter1_follows_fork_and_vfork);
+reverie_narf_test!(reverie_narf_counter1_follows_fork_and_vfork);
 
 /// Probe returns `getpid() + 5` from a non-tail inject, which the guest
 /// checks against `gettid()`; its per-thread state persists across the
@@ -910,7 +978,7 @@ fn reverie_narf_probe_inject_and_thread_state() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_probe_inject_and_thread_state);
+reverie_narf_test!(reverie_narf_probe_inject_and_thread_state);
 
 /// PassThrough tail-injects every syscall; the guest's own check that
 /// write returned 16 is what makes it exit 0.
@@ -921,10 +989,7 @@ fn reverie_narf_passthrough_runs_guest_unchanged() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_passthrough_runs_guest_unchanged
-);
+reverie_narf_test!(reverie_narf_passthrough_runs_guest_unchanged);
 
 /// Wraps the root's fd-1 console file: forwards every call to it unchanged and
 /// keeps a copy of the bytes its `write` accepted.
@@ -1109,7 +1174,7 @@ fn reverie_narf_canonical_trace_cell() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_canonical_trace_cell);
+reverie_narf_test!(reverie_narf_canonical_trace_cell);
 
 /// Marks where the cell's canonical records may begin on the console.
 const CELL_BEGIN: &str = "NARF-CELL begin test=reverie_narf_canonical_trace_cell";
@@ -1258,10 +1323,7 @@ fn reverie_narf_park_reexecution_reaches_the_tool_once() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_park_reexecution_reaches_the_tool_once
-);
+reverie_narf_test!(reverie_narf_park_reexecution_reaches_the_tool_once);
 
 /// Canonical records the continuation test's Tool emitted, in order.
 static CONTINUATION_RECORDS: IrqSafeSpinLock<Vec<alloc::string::String>> =
@@ -1362,7 +1424,7 @@ fn reverie_narf_parked_inject_resumes_the_tool() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_parked_inject_resumes_the_tool);
+reverie_narf_test!(reverie_narf_parked_inject_resumes_the_tool);
 
 // ── Exec ──────────────────────────────────────────────────────────────────
 
@@ -1465,10 +1527,7 @@ fn reverie_narf_exec_defers_and_reaches_post_exec() -> TestResult {
     let _ = narf_filesystem::registry().unmount(&mounted, EXEC_MOUNT);
     result_of(outcome)
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_exec_defers_and_reaches_post_exec
-);
+reverie_narf_test!(reverie_narf_exec_defers_and_reaches_post_exec);
 
 // ── Spawn holds and the vfork wait ────────────────────────────────────────
 
@@ -1614,7 +1673,7 @@ fn reverie_narf_spawn_hold_and_vfork_wait() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_spawn_hold_and_vfork_wait);
+reverie_narf_test!(reverie_narf_spawn_hold_and_vfork_wait);
 
 // ── Kernel-internal re-entry ──────────────────────────────────────────────
 
@@ -1696,10 +1755,7 @@ fn reverie_narf_kernel_reentry_is_not_intercepted() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_kernel_reentry_is_not_intercepted
-);
+reverie_narf_test!(reverie_narf_kernel_reentry_is_not_intercepted);
 
 // ── Termination inside an interceptor call ────────────────────────────────
 
@@ -1824,10 +1880,7 @@ fn reverie_narf_termination_inside_callback_releases_the_hold() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_termination_inside_callback_releases_the_hold
-);
+reverie_narf_test!(reverie_narf_termination_inside_callback_releases_the_hold);
 
 // ── Signals raised inside a Tool callback ─────────────────────────────────
 
@@ -1836,14 +1889,29 @@ const LINUX_SIGTERM: i32 = 15;
 /// `ERESTARTSYS`, which the kernel never returns to user mode.
 const LINUX_ERESTARTSYS: i64 = 512;
 
-/// Creates the signal tables, as the boot path does.
+/// The signal tables, created as the boot path does and put back as they
+/// were when this is dropped, on every exit path of the test.
 ///
 /// Kernel-test boots skip the boot-time userspace init, and without the
 /// tables a raise finds no pending-bit map and is dropped: the guest's own
 /// `kill` returns 0 and nothing is pending. Only the tests that raise a
-/// signal need them.
-fn init_signal_tables() {
-    narf_userspace::signal_init();
+/// signal need them. Other subsystems' tests may already have created them,
+/// in which case they stay; tables this guard created are removed again, so
+/// the next test sees what it would have seen without this one.
+struct SignalTables(narf_userspace::handlers::SignalTablesState);
+
+impl SignalTables {
+    fn init() -> Self {
+        let before = narf_userspace::handlers::__test_signal_tables_state();
+        narf_userspace::signal_init();
+        Self(before)
+    }
+}
+
+impl Drop for SignalTables {
+    fn drop(&mut self) {
+        narf_userspace::handlers::__test_restore_signal_tables(self.0);
+    }
 }
 
 /// A Tool's inject result as the raw Linux return value.
@@ -1908,7 +1976,7 @@ fn reverie_narf_sigterm_in_callback_matches_ptrace() -> TestResult {
     for slot in [&SIGTERM_PID, &SIGTERM_KILL, &SIGTERM_POLL, &SIGTERM_GETPID] {
         slot.store(NOT_SEEN, Ordering::Release);
     }
-    init_signal_tables();
+    let _signal_tables = SignalTables::init();
     result_of((|| {
         let (interceptor, root) = run_hosted::<SigtermInCallback>(CANONICAL_GUEST, ())?;
         let holds = narf_userspace::user_task::__test_open_spawn_holds();
@@ -1939,10 +2007,7 @@ fn reverie_narf_sigterm_in_callback_matches_ptrace() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_sigterm_in_callback_matches_ptrace
-);
+reverie_narf_test!(reverie_narf_sigterm_in_callback_matches_ptrace);
 
 /// What each inject of [`SigtermThenExitGroup`] returned ([`NOT_SEEN`] until
 /// it returned), and the guest's pid as the Tool saw it.
@@ -2001,7 +2066,7 @@ fn reverie_narf_exit_group_with_sigterm_pending_runs() -> TestResult {
     ] {
         slot.store(NOT_SEEN, Ordering::Release);
     }
-    init_signal_tables();
+    let _signal_tables = SignalTables::init();
     result_of((|| {
         let (interceptor, root) = run_hosted::<SigtermThenExitGroup>(CANONICAL_GUEST, ())?;
         let holds = narf_userspace::user_task::__test_open_spawn_holds();
@@ -2029,10 +2094,7 @@ fn reverie_narf_exit_group_with_sigterm_pending_runs() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_exit_group_with_sigterm_pending_runs
-);
+reverie_narf_test!(reverie_narf_exit_group_with_sigterm_pending_runs);
 
 /// The guest's pid, whether the kill inject was issued, how many steps of
 /// [`SigkillInCallback`] ran after it, and how often its callback future was
@@ -2097,7 +2159,7 @@ fn reverie_narf_sigkill_in_callback_matches_ptrace() -> TestResult {
     SIGKILL_REACHED.store(0, Ordering::Release);
     SIGKILL_AFTER.store(0, Ordering::Release);
     SIGKILL_DROPPED.store(0, Ordering::Release);
-    init_signal_tables();
+    let _signal_tables = SignalTables::init();
     result_of((|| {
         let (interceptor, root) = run_hosted::<SigkillInCallback>(CANONICAL_GUEST, ())?;
         let holds = narf_userspace::user_task::__test_open_spawn_holds();
@@ -2124,10 +2186,7 @@ fn reverie_narf_sigkill_in_callback_matches_ptrace() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_sigkill_in_callback_matches_ptrace
-);
+reverie_narf_test!(reverie_narf_sigkill_in_callback_matches_ptrace);
 
 // ── vDSO calls reach the Tool ─────────────────────────────────────────────
 
@@ -2257,7 +2316,7 @@ fn reverie_narf_vdso_calls_reach_the_tool() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_vdso_calls_reach_the_tool);
+reverie_narf_test!(reverie_narf_vdso_calls_reach_the_tool);
 
 // ── Thread and process exit statuses ─────────────────────────────────────
 
@@ -2381,10 +2440,7 @@ fn reverie_narf_thread_and_process_exit_statuses() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_thread_and_process_exit_statuses
-);
+reverie_narf_test!(reverie_narf_thread_and_process_exit_statuses);
 
 // ── Task creation from lifecycle callbacks ───────────────────────────────
 
@@ -2480,7 +2536,7 @@ fn reverie_narf_lifecycle_spawn_is_refused() -> TestResult {
     let _ = narf_filesystem::registry().unmount(&mounted, EXEC_MOUNT);
     result_of(outcome)
 }
-kernel_test_in!("reverie-narf", reverie_narf_lifecycle_spawn_is_refused);
+reverie_narf_test!(reverie_narf_lifecycle_spawn_is_refused);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 
@@ -2512,10 +2568,7 @@ fn reverie_narf_native_outcome_uses_linux_abi_fold() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_native_outcome_uses_linux_abi_fold
-);
+reverie_narf_test!(reverie_narf_native_outcome_uses_linux_abi_fold);
 
 // ── Rich parity cell ──────────────────────────────────────────────────────
 
@@ -2613,7 +2666,7 @@ fn reverie_narf_rich_trace_cell() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!("reverie-narf", reverie_narf_rich_trace_cell);
+reverie_narf_test!(reverie_narf_rich_trace_cell);
 
 // ── The PML4[1] window ────────────────────────────────────────────────────
 
@@ -2692,7 +2745,4 @@ fn reverie_narf_pml4_1_window_is_user_address_space() -> TestResult {
         Ok(TestResult::Pass)
     })())
 }
-kernel_test_in!(
-    "reverie-narf",
-    reverie_narf_pml4_1_window_is_user_address_space
-);
+reverie_narf_test!(reverie_narf_pml4_1_window_is_user_address_space);

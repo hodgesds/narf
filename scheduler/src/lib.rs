@@ -479,6 +479,11 @@ pub fn disable_work_stealing() {
     STEAL_ENABLED.store(false, Ordering::Release);
 }
 
+/// Whether cross-CPU work stealing is enabled.
+pub fn work_stealing_enabled() -> bool {
+    STEAL_ENABLED.load(Ordering::Acquire)
+}
+
 // Wake-time placement (`wake_place_hint` — NARF's `select_task_rq`) is
 // unconditional: the scheduler policy owns the decision via
 // `Scheduler::select_task_rq` (default `None` = keep prev_cpu), so a policy
@@ -762,6 +767,16 @@ pub fn enable_user_task_smp() {
 #[inline]
 pub fn user_task_smp_enabled() -> bool {
     USER_SMP_ENABLED.load(Ordering::Acquire)
+}
+
+/// Set the user-task SMP switch and return its previous value, so a kernel
+/// test that runs user tasks the way production does can restore the boot
+/// state afterwards. Production only ever turns the switch on
+/// ([`enable_user_task_smp`]); only tests turn it back off, and only while
+/// no user task is live.
+#[doc(hidden)]
+pub fn __test_set_user_task_smp(enabled: bool) -> bool {
+    USER_SMP_ENABLED.swap(enabled, Ordering::AcqRel)
 }
 
 /// Id of the task currently being polled by the executor on each CPU,

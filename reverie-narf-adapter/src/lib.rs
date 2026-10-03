@@ -145,9 +145,15 @@
 //! ## Limits of the in-kernel tests
 //!
 //! * **`signal_init()`.** Kernel-test boots do not set up the signal tables,
-//!   so a raise there is silently dropped. The signal tests call
-//!   `narf_userspace::signal_init()` themselves. Other tests run without
-//!   signal delivery.
+//!   so a raise there is silently dropped. The three signal tests create them
+//!   with `narf_userspace::signal_init()` through a guard (`SignalTables`)
+//!   that removes, on every return path, the tables it created. Other
+//!   reverie-narf tests run without signal delivery, unless an earlier
+//!   subsystem's test in the same boot left the tables set up.
+//! * **Leak check.** Every reverie-narf test is registered through
+//!   `reverie_narf_test!`, which fails the test by name if it left the signal
+//!   tables, the vDSO clock routing, user-task SMP placement or work stealing
+//!   different from how it found them.
 //! * **Reclaim scope.** After each run, the test harness's `reclaim_run`
 //!   checks two things: every address space the guest's tasks exited from
 //!   was dropped, and the root image's private frames reached a COW count of

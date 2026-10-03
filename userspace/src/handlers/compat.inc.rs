@@ -5532,6 +5532,52 @@ pub fn __test_signal_reset() {
     *SUSPEND_SAVED_MASK.lock() = Some(BTreeMap::new());
 }
 
+/// Which signal registries exist: the per-task signal state that
+/// [`signal_init`] creates and the handler registry that [`sigaction_init`]
+/// creates. Kernel-test boots start with neither. Test hook.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalTablesState {
+    pub signals: bool,
+    pub sigactions: bool,
+}
+
+/// Report which signal registries exist. Test hook.
+#[doc(hidden)]
+pub fn __test_signal_tables_state() -> SignalTablesState {
+    SignalTablesState {
+        signals: SIGNAL_PENDING[0].values.lock().is_some(),
+        sigactions: SIGACTION_TABLE[0].map.lock().is_some(),
+    }
+}
+
+/// Drop every registry that `state` says did not exist, returning it to the
+/// state before [`signal_init`] / [`sigaction_init`] ran: exactly the
+/// registries those two create. A registry that
+/// did exist is left as it is. Test hook, for a test that created the
+/// registries and must not leave them behind; call it only while no user
+/// task is live.
+#[doc(hidden)]
+pub fn __test_restore_signal_tables(state: SignalTablesState) {
+    if !state.signals {
+        for table in [&SIGNAL_PENDING, &SIGNAL_READABLE_GEN, &SIGNAL_RAISE_GEN, &SIGNAL_MASK] {
+            for bucket in table {
+                *bucket.values.lock() = None;
+            }
+        }
+        SIGNAL_PENDING_TASKS.store(0, Ordering::Release);
+        *SIG_ALTSTACK.lock() = None;
+        for bucket in &SIGQUEUE_INFO {
+            *bucket.values.lock() = None;
+        }
+    }
+    if !state.sigactions {
+        for shard in &SIGACTION_TABLE {
+            *shard.map.lock() = None;
+        }
+    }
+}
+
 /// Diagnostic: peek the pending bitmap for `task`.
 pub fn signal_pending_of(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_PENDING, task)

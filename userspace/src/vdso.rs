@@ -222,12 +222,16 @@ pub(crate) fn __test_restore_counter_clocks() {
     update_route_reasons(|reasons| reasons & !ROUTE_TIMESTAMP_TRAP);
 }
 
-/// Restore the counter fast path while a timestamp interceptor stays
+/// Drop the timestamp-trap reason while a timestamp interceptor stays
 /// installed, so a verification smoke can trap the vDSO's own counter reads.
+/// It clears only its own reason: a syscall interceptor's reason, if one is
+/// still published, keeps the clocks on syscalls, and the smoke's own
+/// counter-mode check then fails by name instead of the reset hiding the
+/// other installer's state.
 #[cfg(feature = "verification-test-reset")]
 #[doc(hidden)]
 pub fn __verification_restore_counter_clocks() {
-    update_route_reasons(|_| 0);
+    update_route_reasons(|reasons| reasons & !ROUTE_TIMESTAMP_TRAP);
 }
 
 /// Replace the routing reasons with `update(reasons)` and publish the clock

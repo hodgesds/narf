@@ -5480,12 +5480,20 @@ fn smoke_scheduled_user_interception_survives_ap_migration() -> TestResult {
     __verification_clear_instruction_interceptor();
     narf_userspace::user_task::__test_clear_hooks();
     narf_scheduler::__reset_queues_for_test();
-    narf_scheduler::enable_user_task_smp();
     // The waiter below uses the live-task count to observe this task's reaping,
     // so it must start from zero.
     if narf_scheduler::live_user_task_count() != 0 {
         return TestResult::Fail("a user task was already live before the migration smoke");
     }
+    // Kernel-test boots leave user-task SMP off. Put the switch back on every
+    // return path, so later tests keep their boot placement.
+    struct RestoreUserSmp(bool);
+    impl Drop for RestoreUserSmp {
+        fn drop(&mut self) {
+            narf_scheduler::__test_set_user_task_smp(self.0);
+        }
+    }
+    let _restore_smp = RestoreUserSmp(narf_scheduler::__test_set_user_task_smp(true));
 
     let original_cr3: u64;
     // SAFETY: snapshot the kernel address space for defensive test cleanup.
