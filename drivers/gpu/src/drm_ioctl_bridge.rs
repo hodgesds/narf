@@ -49,14 +49,12 @@ use crate::drm_uapi::{
 /// `count_objs` field can't be used to force a huge allocation.
 const IOCTL_MAX_BUF: usize = 1024 * 1024;
 
-/// Maximum opaque VirGL command stream accepted from one EXECBUFFER ioctl.
-///
-/// The control request staging buffer in `narf-drivers-virtio` is 64 KiB and
-/// also carries the VirtIO-GPU submit header. Mesa's classic-VirGL screen
-/// initialization sends streams larger than one page (4,136, 9,504, and
-/// 18,412 bytes have all been observed), before it creates its first resource.
+/// Maximum opaque VirGL command stream accepted from one EXECBUFFER ioctl:
+/// what one SUBMIT_3D can carry (see the transport's
+/// `MAX_VIRGL_COMMAND_BYTES`). It covers a full Mesa command buffer, which
+/// Mesa flushes in one EXECBUFFER and drops on error.
 pub(crate) const VIRTGPU_EXECBUFFER_MAX_BYTES: usize =
-    64 * 1024 - narf_drivers_virtio::gpu_pci::cmd::SUBMIT_3D_PREFIX_LEN;
+    narf_drivers_virtio::gpu_pci::MAX_VIRGL_COMMAND_BYTES;
 
 /// Keep one userspace allocation bounded while allowing it to span the I/O
 /// layer's 4 MiB maximum coherent segment. This was the existing intended
@@ -664,6 +662,7 @@ static NEXT_VIRTGPU_CTX_ID: AtomicU32 = AtomicU32::new(1);
 fn map_gpu_transport_error(error: narf_drivers_virtio::pci::VirtioPciError) -> FsError {
     match error {
         narf_drivers_virtio::pci::VirtioPciError::CompletionTimeout => FsError::Busy,
+        narf_drivers_virtio::pci::VirtioPciError::OutOfMemory => FsError::OutOfMemory,
         _ => FsError::InvalidData,
     }
 }
@@ -795,8 +794,10 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
         // SAFETY: `req.cmd` is the user pointer libdrm passed; copy_in
         // SMAP-brackets the read and bounds cmd_size.
         let cmd_bytes = unsafe { copy_in(req.cmd as usize, req.cmd_size as usize)? };
-        dev.submit_virgl(state.ctx_id, None, &cmd_bytes)
-            .map_err(|_| FsError::InvalidData)?;
+        // Linux `virtio_gpu_cmd_submit` queues it without waiting; the
+        // control queue runs it before the RESOURCE_CREATE_BLOB below.
+        dev.submit_virgl_fenced(state.ctx_id, None, &cmd_bytes)
+            .map_err(map_gpu_transport_error)?;
     }
     let handle = state.allocate_handle();
     let resource_id = NEXT_VIRTGPU_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
