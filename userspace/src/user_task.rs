@@ -3654,6 +3654,9 @@ struct HeldSpawns {
     /// `(signum, core_dumped)` of a termination of the holding task that a
     /// native syscall run inside the call raised (see `defer_termination`).
     termination: Option<(u32, bool)>,
+    /// Pending-signal bits taken off the holding task while the call runs,
+    /// to be pending again once it returns (see `withhold_signal`).
+    withheld: u64,
 }
 
 static SPAWN_HOLDS: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, HeldSpawns>> =
@@ -3685,6 +3688,7 @@ impl SpawnHold {
                 records: alloc::collections::VecDeque::new(),
                 vfork_wait: None,
                 termination: None,
+                withheld: 0,
             },
         );
         SPAWN_HOLD_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -3705,6 +3709,7 @@ impl SpawnHold {
         ReleasedHold {
             vfork_wait: held.vfork_wait,
             termination: held.termination,
+            withheld: held.withheld,
         }
     }
 }
@@ -3717,6 +3722,8 @@ pub(crate) struct ReleasedHold {
     /// `(signum, core_dumped)`: the task must terminate now, and nothing else
     /// of its syscall may run.
     pub(crate) termination: Option<(u32, bool)>,
+    /// Pending-signal bits withheld from the call, to be made pending again.
+    pub(crate) withheld: u64,
 }
 
 /// Defer the termination of the current task `task` to the release of its
@@ -3739,6 +3746,34 @@ pub(crate) fn defer_termination(task: u64, signum: u32, core_dumped: bool) -> bo
         }
         None => false,
     }
+}
+
+/// Record `bit`, a pending signal just taken off the current task `task`, as
+/// withheld until its open hold is released. Returns `false`, leaving the
+/// caller to put the bit back, when `task` has no hold open.
+pub(crate) fn withhold_signal(task: u64, bit: u64) -> bool {
+    if SPAWN_HOLD_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    match SPAWN_HOLDS.lock().get_mut(&task) {
+        Some(held) => {
+            held.withheld |= bit;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The signal of a termination staged in `task`'s open hold, if any.
+pub(crate) fn staged_termination_signal(task: u64) -> Option<u32> {
+    if SPAWN_HOLD_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    SPAWN_HOLDS
+        .lock()
+        .get(&task)
+        .and_then(|held| held.termination)
+        .map(|(signum, _)| signum)
 }
 
 /// Open spawn holds, as `(count, table entries)`. Both are 0 whenever no

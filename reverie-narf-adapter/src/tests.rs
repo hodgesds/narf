@@ -1812,6 +1812,216 @@ kernel_test_in!(
     reverie_narf_termination_inside_callback_releases_the_hold
 );
 
+// ── Signals raised inside a Tool callback ─────────────────────────────────
+
+const LINUX_SIGKILL: i32 = 9;
+const LINUX_SIGTERM: i32 = 15;
+/// `ERESTARTSYS`, which the kernel never returns to user mode.
+const LINUX_ERESTARTSYS: i64 = 512;
+
+/// Creates the signal tables, as the boot path does.
+///
+/// Kernel-test boots skip the boot-time userspace init, and without the
+/// tables a raise finds no pending-bit map and is dropped: the guest's own
+/// `kill` returns 0 and nothing is pending. Only the tests that raise a
+/// signal need them.
+fn init_signal_tables() {
+    narf_userspace::signal_init();
+}
+
+/// A Tool's inject result as the raw Linux return value.
+fn raw_result(result: Result<i64, reverie::Errno>) -> i64 {
+    match result {
+        Ok(value) => value,
+        Err(errno) => -i64::from(errno.into_raw()),
+    }
+}
+
+/// The guest's pid as the Tool saw it, and what each inject of
+/// [`SigtermInCallback`] returned ([`NOT_SEEN`] until it returned).
+static SIGTERM_PID: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static SIGTERM_KILL: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static SIGTERM_POLL: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static SIGTERM_GETPID: AtomicI64 = AtomicI64::new(NOT_SEEN);
+
+/// At the canonical guest's `write`, sends the guest `SIGTERM` with an
+/// injected `kill`, then injects a `poll` with no descriptors and a 100 ms
+/// timeout, then `getpid`, then tail-injects the `write`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SigtermInCallback;
+
+#[reverie::tool]
+impl Tool for SigtermInCallback {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        if syscall.number().id() as u32 == LINUX_WRITE {
+            let pid = guest.pid().as_raw();
+            SIGTERM_PID.store(i64::from(pid), Ordering::Release);
+            let kill = reverie::syscalls::Kill::new()
+                .with_pid(pid)
+                .with_sig(LINUX_SIGTERM);
+            SIGTERM_KILL.store(raw_result(guest.inject(kill).await), Ordering::Release);
+            let poll = reverie::syscalls::Poll::new()
+                .with_fds(None)
+                .with_nfds(0)
+                .with_timeout(100);
+            SIGTERM_POLL.store(raw_result(guest.inject(poll).await), Ordering::Release);
+            let getpid = reverie::syscalls::Getpid::new();
+            SIGTERM_GETPID.store(raw_result(guest.inject(getpid).await), Ordering::Release);
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// A catchable signal with a terminating default action, raised against the
+/// task inside its Tool callback, behaves as under reverie-ptrace
+/// (`reverie-ptrace/tests/inject_signal_parity.rs`, the `kill(self,
+/// SIGTERM)` case): the `kill` returns 0, the next inject returns
+/// `-ERESTARTSYS` without running, the inject after that runs (`getpid`
+/// returns the pid), and the task dies of the signal only after the callback
+/// has returned, with its spawn hold released.
+fn reverie_narf_sigterm_in_callback_matches_ptrace() -> TestResult {
+    for slot in [&SIGTERM_PID, &SIGTERM_KILL, &SIGTERM_POLL, &SIGTERM_GETPID] {
+        slot.store(NOT_SEEN, Ordering::Release);
+    }
+    init_signal_tables();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<SigtermInCallback>(CANONICAL_GUEST, ())?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let pid = SIGTERM_PID.load(Ordering::Acquire);
+        let kill = SIGTERM_KILL.load(Ordering::Acquire);
+        let poll = SIGTERM_POLL.load(Ordering::Acquire);
+        let getpid = SIGTERM_GETPID.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    pid {pid} kill {kill} poll {poll} getpid {getpid} holds {holds:?}"
+        );
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callback");
+        }
+        if pid <= 0 || kill != 0 {
+            return Err("the injected kill(self, SIGTERM) did not return 0");
+        }
+        if poll != -LINUX_ERESTARTSYS {
+            return Err("the inject after the kill did not return -ERESTARTSYS");
+        }
+        if getpid == NOT_SEEN {
+            return Err("getpid did not run: a later inject was refused");
+        }
+        if getpid != pid {
+            return Err("the later getpid inject did not return the pid");
+        }
+        check_teardown(&interceptor, root, 1, LINUX_SIGTERM)?;
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_sigterm_in_callback_matches_ptrace
+);
+
+/// The guest's pid, whether the kill inject was issued, how many steps of
+/// [`SigkillInCallback`] ran after it, and how often its callback future was
+/// dropped.
+static SIGKILL_PID: AtomicI64 = AtomicI64::new(NOT_SEEN);
+static SIGKILL_REACHED: AtomicU64 = AtomicU64::new(0);
+static SIGKILL_AFTER: AtomicU64 = AtomicU64::new(0);
+static SIGKILL_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one drop of the callback future that owns it.
+struct DropMark;
+
+impl Drop for DropMark {
+    fn drop(&mut self) {
+        SIGKILL_DROPPED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// At the canonical guest's `write`, kills the guest with an injected
+/// `kill(self, SIGKILL)`, then counts every step that runs after it: the
+/// kill's return, a `getpid` inject, and the tail-injected `write`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SigkillInCallback;
+
+#[reverie::tool]
+impl Tool for SigkillInCallback {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        if syscall.number().id() as u32 == LINUX_WRITE {
+            let _mark = DropMark;
+            let pid = guest.pid().as_raw();
+            SIGKILL_PID.store(i64::from(pid), Ordering::Release);
+            SIGKILL_REACHED.fetch_add(1, Ordering::AcqRel);
+            let kill = reverie::syscalls::Kill::new()
+                .with_pid(pid)
+                .with_sig(LINUX_SIGKILL);
+            let _ = guest.inject(kill).await;
+            SIGKILL_AFTER.fetch_add(1, Ordering::AcqRel);
+            let _ = guest.inject(reverie::syscalls::Getpid::new()).await;
+            SIGKILL_AFTER.fetch_add(1, Ordering::AcqRel);
+            guest.tail_inject(syscall).await
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// A task killed inside its Tool callback runs nothing more, as under
+/// reverie-ptrace (`reverie-ptrace/tests/inject_signal_parity.rs`, the
+/// `kill(self, SIGKILL)` case): the injected `kill(self, SIGKILL)` never
+/// returns to the Tool, no later step runs, the callback's future is dropped
+/// exactly once at the task's exit, and the task dies of SIGKILL with its
+/// spawn hold released.
+fn reverie_narf_sigkill_in_callback_matches_ptrace() -> TestResult {
+    SIGKILL_PID.store(NOT_SEEN, Ordering::Release);
+    SIGKILL_REACHED.store(0, Ordering::Release);
+    SIGKILL_AFTER.store(0, Ordering::Release);
+    SIGKILL_DROPPED.store(0, Ordering::Release);
+    init_signal_tables();
+    result_of((|| {
+        let (interceptor, root) = run_hosted::<SigkillInCallback>(CANONICAL_GUEST, ())?;
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        let reached = SIGKILL_REACHED.load(Ordering::Acquire);
+        let after = SIGKILL_AFTER.load(Ordering::Acquire);
+        let dropped = SIGKILL_DROPPED.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    reached {reached} steps after kill {after} dropped {dropped} holds {holds:?}"
+        );
+        if holds != (0, 0) {
+            return Err("a spawn hold outlived the callback");
+        }
+        if reached != 1 || SIGKILL_PID.load(Ordering::Acquire) <= 0 {
+            return Err("the Tool never issued its kill(self, SIGKILL)");
+        }
+        if after != 0 {
+            return Err("an inject ran after the task was killed");
+        }
+        if dropped != 1 {
+            return Err("the killed task's callback future was not dropped exactly once");
+        }
+        check_teardown(&interceptor, root, 1, LINUX_SIGKILL)?;
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_sigkill_in_callback_matches_ptrace
+);
+
 // ── Return mapping ────────────────────────────────────────────────────────
 
 /// A native result reaches the Tool as the value the guest would observe:

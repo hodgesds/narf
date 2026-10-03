@@ -3740,7 +3740,82 @@ impl DispatchNativeTransition<'_, '_> {
     }
 }
 
+/// Whether the task running an interceptor callback is already dead in all
+/// but name: `SIGKILL` is pending on it (its own `kill`, a signal from
+/// elsewhere, or a sibling's `exit_group`), or a native syscall of the
+/// callback staged a `SIGKILL` termination.
+fn callback_task_killed(task_id: u64) -> bool {
+    crate::handlers::sigkill_pending(task_id)
+        || crate::user_task::staged_termination_signal(task_id) == Some(9)
+}
+
 impl DispatchNativeTransition<'_, '_> {
+    /// Answers a transition the interceptor's callback requests without
+    /// running it, when a signal already decides the task's fate. This
+    /// follows reverie-ptrace (line numbers at Reverie acae2dbc), which
+    /// reports a signal only through the inject in which its tracer sees the
+    /// signal stop: `reverie-ptrace/src/task.rs:5438-5441` puts
+    /// `-ERESTARTSYS` in place of that inject's result and keeps the signal
+    /// as `pending_signal`, which `take_pending_signal_for_resume`
+    /// (`task.rs:2731`) hands to the resume after the callback (`task.rs:4182`).
+    /// The measured reference is `reverie-ptrace/tests/inject_signal_parity.rs`.
+    ///
+    /// * a killed task (see [`callback_task_killed`]) runs nothing more. Under
+    ///   ptrace its tracer next sees `Wait::Exited` (`task.rs:5480`), which
+    ///   ends the Tool's future inside the inject. Here the transition is
+    ///   `ContextManaged`,
+    ///   so the host keeps the Tool's future without resuming it and drops it
+    ///   at the task's exit, and the dispatcher's return path delivers the
+    ///   `SIGKILL`;
+    /// * a pending signal that would terminate the task by default makes this
+    ///   transition return `-ERESTARTSYS` without running, as the ptrace
+    ///   backend returns it in place of the inject's result. The signal is
+    ///   withheld while the callback runs, so later transitions run, and it
+    ///   is pending again once the callback has returned (the ptrace backend
+    ///   keeps it as its `pending_signal` and delivers it on resume).
+    ///
+    /// A context-ending transition (exit, exec) is never withheld: it runs
+    /// after the callback anyway, and the task ends either way.
+    fn signal_gate(&mut self, variant: Option<Syscall>) -> Option<NativeSyscallOutcome> {
+        if callback_task_killed(self.task_id) {
+            self.context_managed = true;
+            return Some(NativeSyscallOutcome::ContextManaged);
+        }
+        if ends_task_context(variant) {
+            return None;
+        }
+        let bit = crate::handlers::withhold_terminating_signal(self.task_id)?;
+        if !crate::user_task::withhold_signal(self.task_id, bit) {
+            // No open hold to restore it from: leave the signal pending.
+            crate::handlers::restore_withheld_signals(self.task_id, bit);
+            return None;
+        }
+        Some(NativeSyscallOutcome::Returned(crate::errno::to_ret(
+            crate::errno::ERESTARTSYS,
+        )))
+    }
+
+    /// Runs one transition the interceptor's callback requested, through
+    /// [`Self::signal_gate`] before and the killed-task check after: a
+    /// transition that killed its own task (`kill(getpid(), SIGKILL)`) never
+    /// returns to the callback either.
+    fn run_gated(
+        &mut self,
+        variant: Option<Syscall>,
+        version: u8,
+        args: SyscallArgs,
+    ) -> NativeSyscallOutcome {
+        if let Some(outcome) = self.signal_gate(variant) {
+            return outcome;
+        }
+        let outcome = self.run(variant, version, args);
+        if outcome != NativeSyscallOutcome::ContextManaged && callback_task_killed(self.task_id) {
+            self.context_managed = true;
+            return NativeSyscallOutcome::ContextManaged;
+        }
+        outcome
+    }
+
     fn resolve(&mut self, control: SyscallInterception) -> NativeSyscallOutcome {
         match control {
             SyscallInterception::Continue if self.context_managed => {
@@ -3748,9 +3823,13 @@ impl DispatchNativeTransition<'_, '_> {
             }
             SyscallInterception::Continue => match self.original_outcome {
                 Some(outcome) => outcome,
-                None => self
-                    .execute_original()
-                    .expect("fresh native syscall transition must be executable"),
+                // The callback has returned (or the task is not hosted), so
+                // the original runs as it would without an interceptor.
+                None => {
+                    let outcome = self.run(self.variant, self.version, self.args);
+                    self.original_outcome = Some(outcome);
+                    outcome
+                }
             },
             SyscallInterception::Complete(_) if self.context_managed => {
                 NativeSyscallOutcome::ContextManaged
@@ -3768,7 +3847,7 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
         if self.context_managed {
             return Err(NativeSyscallOriginalError::ContextManaged);
         }
-        let outcome = self.run(self.variant, self.version, self.args);
+        let outcome = self.run_gated(self.variant, self.version, self.args);
         self.original_outcome = Some(outcome);
         Ok(outcome)
     }
@@ -3779,7 +3858,7 @@ impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
         }
         let version = syscall_version(request.raw_number);
         let variant = Syscall::from_raw(syscall_number(request.raw_number));
-        self.run(variant, version, request.args)
+        self.run_gated(variant, version, request.args)
     }
 
     fn take_created_task(&mut self) -> Option<CreatedNativeTask> {
@@ -5384,6 +5463,11 @@ impl SyscallTable {
             }
         }
         let released = hold.release();
+        // Signals withheld from the callback are pending again before the
+        // task can run anything else; a staged termination makes them moot.
+        if released.termination.is_none() {
+            crate::handlers::restore_withheld_signals(task_id, released.withheld);
+        }
         if let Some((signum, core_dumped)) = released.termination {
             // A native syscall the callback ran terminated the task. Its
             // children are published now; nothing else of this syscall runs

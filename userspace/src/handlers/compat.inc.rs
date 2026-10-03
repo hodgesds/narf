@@ -5174,6 +5174,68 @@ pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
     false
 }
 
+/// Takes off `task` its lowest unmasked pending signal that would terminate
+/// it by default (`SIG_DFL` with a Terminate or CoreDump default action) and
+/// returns that signal's bit, or `None` when there is no such signal.
+///
+/// `SIGKILL` is never taken: the caller refuses every transition while it is
+/// pending (see [`sigkill_pending`]). Nor is anything taken from a traced
+/// task, whose signals become ptrace stops rather than terminations. The
+/// caller must make the bit pending again with [`restore_withheld_signals`]
+/// unless the task terminates first.
+pub(crate) fn withhold_terminating_signal(task_id: u64) -> Option<u64> {
+    let pending = signal_bits_get(&SIGNAL_PENDING, task_id);
+    let mut candidates = pending & !signal_mask_of(task_id) & !sig_bit(9);
+    if candidates == 0 {
+        return None;
+    }
+    let linux_pid = task_to_linux_tid_raw(task_id)
+        .or_else(|| task_to_pid_raw(task_id))
+        .unwrap_or(task_id);
+    if crate::ptrace::is_task_traced(linux_pid) {
+        return None;
+    }
+    while candidates != 0 {
+        let signum = sig_from_bit(candidates);
+        let bit = sig_bit(signum);
+        candidates &= !bit;
+        let default = match sigaction_lookup_full(task_id, signum as usize) {
+            Some(action) if action.handler == 0 => true,
+            Some(_) => false,
+            None => true,
+        };
+        if default
+            && matches!(
+                default_signal_action(signum),
+                DefaultAction::Terminate | DefaultAction::CoreDump
+            )
+        {
+            clear_pending_signal_bits(task_id, bit);
+            return Some(bit);
+        }
+    }
+    None
+}
+
+/// Makes the signal bits `bits`, taken by [`withhold_terminating_signal`],
+/// pending on `task` again.
+pub(crate) fn restore_withheld_signals(task_id: u64, bits: u64) {
+    if bits == 0 {
+        return;
+    }
+    let was_empty = pending_signal_bits_update_or_init(task_id, |slot| {
+        let was_empty = *slot == 0;
+        *slot |= bits;
+        was_empty
+    });
+    signal_raise_notify(task_id, was_empty);
+}
+
+/// Whether `SIGKILL` is pending on `task`.
+pub(crate) fn sigkill_pending(task_id: u64) -> bool {
+    signal_bits_get(&SIGNAL_PENDING, task_id) & sig_bit(9) != 0
+}
+
 static SIGNAL_MASK: SignalBitsTable = [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 
 /// fork/clone inheritance of the signal mask (Linux `copy_process`
