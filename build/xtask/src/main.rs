@@ -7597,8 +7597,9 @@ fn reverie_tool_spec(spec: &str) -> Result<(&str, Option<ChaosOpts>), String> {
 /// tally's per-task counts, compared as multisets because thread IDs are
 /// reused.
 ///
-/// strace prints a line per syscall event instead of a count, and the report
-/// holds its lines ([`strace_output`]). Its count is its syscall lines, and
+/// strace prints a line per syscall event instead of a count, and a line per
+/// signal the kernel asks it about, and the report holds its lines
+/// ([`strace_output`]). Its count is its syscall lines, and
 /// [`check_strace_lines`] matches them to the tally's tasks.
 ///
 /// chaos prints a line per syscall event too ([`chaos_output`]), and the
@@ -7896,6 +7897,9 @@ enum StraceLine {
     /// `[pid <tid>] (<name>) = <errno>`, which a failed execve or execveat
     /// prints after its syscall line.
     FailedExec { tid: u64, name: String },
+    /// `[pid <tid>] Received signal: <signal>`, one per signal the kernel
+    /// asks strace about before delivering it to the thread.
+    Signal { tid: u64 },
     /// `Thread <tid> exited with status <status>`.
     ThreadExit { tid: u64 },
     /// `Process <pid> exited with status <status>`.
@@ -7915,6 +7919,14 @@ fn parse_strace_line(line: &str) -> Option<StraceLine> {
     if let Some(rest) = line.strip_prefix("[pid ") {
         let (tid, rest) = rest.split_once("] ")?;
         let tid = id(tid)?;
+        if let Some(signal) = rest.strip_prefix("Received signal: ") {
+            let name = signal.strip_prefix("SIG")?;
+            return (!name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+            .then_some(StraceLine::Signal { tid });
+        }
         if let Some(rest) = rest.strip_prefix('(') {
             let (name, errno) = rest.split_once(") = ")?;
             return (exec(name) && !errno.is_empty()).then(|| StraceLine::FailedExec {
@@ -8006,18 +8018,11 @@ fn tool_output<'l, 'a>(lines: &'l [&'a str], tool: &str) -> Result<&'l [&'a str]
 }
 
 /// strace's lines from one boot's report ([`tool_output`]), each of a form
-/// strace prints. A `Received signal` line is refused too: the Narf core
-/// delivers no signal events, so the checks here do not account for one.
+/// strace prints.
 fn strace_output(lines: &[&str]) -> Result<Vec<StraceLine>, String> {
     tool_output(lines, "strace")?
         .iter()
         .map(|line| {
-            if line.starts_with("[pid ") && line.contains("] Received signal: ") {
-                return Err(format!(
-                    "strace printed a signal event, which the Narf core does not deliver: \
-                     `{line}`"
-                ));
-            }
             parse_strace_line(line).ok_or_else(|| format!("strace does not print `{line}`"))
         })
         .collect()
@@ -8034,7 +8039,9 @@ fn strace_output(lines: &[&str]) -> Result<Vec<StraceLine>, String> {
 /// has no line for that syscall and fails here. Each failed execve's second
 /// line must follow that thread's execve line, and the process exit lines
 /// must be as many as the tally's processes, each after an exit line of the
-/// thread whose ID is its process ID.
+/// thread whose ID is its process ID. A signal line is not a syscall event:
+/// it counts toward no task, but its thread ID must have a task still to
+/// exit.
 fn check_strace_lines(
     output: &[StraceLine],
     by_task: &[(String, u64)],
@@ -8057,7 +8064,8 @@ fn check_strace_lines(
     let mut open = BTreeMap::<u64, u64>::new();
     let mut exec = BTreeMap::<u64, String>::new();
     let mut exited = BTreeSet::<u64>::new();
-    let (mut syscalls, mut failed, mut threads, mut process_exits) = (0u64, 0u64, 0u64, 0u64);
+    let (mut syscalls, mut failed, mut signals, mut threads, mut process_exits) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for line in output {
         match line {
             StraceLine::Syscall { tid, name } => {
@@ -8077,6 +8085,15 @@ fn check_strace_lines(
                     ));
                 }
                 failed += 1;
+            }
+            StraceLine::Signal { tid } => {
+                if tasks.get(tid).is_none_or(VecDeque::is_empty) {
+                    return Err(format!(
+                        "strace printed a signal line for thread {tid}, which has no task \
+                         still to exit in the tally"
+                    ));
+                }
+                signals += 1;
             }
             StraceLine::ThreadExit { tid } => {
                 let lines = open.remove(tid).unwrap_or(0);
@@ -8125,8 +8142,8 @@ fn check_strace_lines(
     }
     Ok(format!(
         "; strace printed {} lines: {syscalls} syscall lines, {failed} failed execve lines, \
-         {threads} thread exits and {process_exits} process exits, and each task's syscall \
-         lines equal the tally's events for it",
+         {signals} signal lines, {threads} thread exits and {process_exits} process exits, \
+         and each task's syscall lines equal the tally's events for it",
         output.len()
     ))
 }
@@ -9090,8 +9107,8 @@ mod strace_report_tests {
         let summary = check(&BODY, BY_TASK).unwrap();
         assert!(
             summary.contains(
-                "strace printed 15 lines: 8 syscall lines, 1 failed execve lines, 3 thread \
-                 exits and 3 process exits"
+                "strace printed 15 lines: 8 syscall lines, 1 failed execve lines, 0 signal \
+                 lines, 3 thread exits and 3 process exits"
             ),
             "{summary}"
         );
@@ -9123,6 +9140,10 @@ mod strace_report_tests {
             parse_strace_line(BODY[6]),
             Some(StraceLine::ProcessExit { pid: 3 })
         );
+        assert_eq!(
+            parse_strace_line("[pid 2] Received signal: SIGCHLD"),
+            Some(StraceLine::Signal { tid: 2 })
+        );
         for line in [
             "[pid 2] read(0, 0x10, 1)",
             "[pid 2] read(0, 0x10, 1) = ?",
@@ -9133,6 +9154,10 @@ mod strace_report_tests {
             "[pid 2] Fork() = 3",
             "Thread 2 exited with status ",
             "Task 2 exited with status Exited(0)",
+            "[pid 2] Received signal: ",
+            "[pid 2] Received signal: SIG",
+            "[pid 2] Received signal: sigchld",
+            "[pid 2] Received signal: 17",
         ] {
             assert_eq!(parse_strace_line(line), None, "{line}");
         }
@@ -9182,10 +9207,23 @@ mod strace_report_tests {
     }
 
     #[test]
-    fn refuses_a_signal_line() {
+    fn accepts_a_signal_line_for_a_thread_with_a_task_to_exit() {
         let mut body = BODY.to_vec();
-        body.insert(8, "[pid 2] Received signal: SIGCHLD");
-        refused(check(&body, BY_TASK), "a signal event");
+        body.insert(7, "[pid 2] Received signal: SIGCHLD");
+        let summary = check(&body, BY_TASK).unwrap();
+        assert!(
+            summary.contains(
+                "strace printed 16 lines: 8 syscall lines, 1 failed execve lines, 1 signal lines"
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_signal_line_for_a_thread_with_no_task_to_exit() {
+        let mut body = BODY.to_vec();
+        body.insert(12, "[pid 3] Received signal: SIGTERM");
+        refused(check(&body, BY_TASK), "no task still to exit");
     }
 
     #[test]
