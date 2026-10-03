@@ -2518,12 +2518,14 @@ kernel_test_in!(
 /// dumpable again, or an unrelated program is un-debuggable because of
 /// something its predecessor did.
 ///
-/// Driven through `__test_bprm_fill_uid`, which calls the same
-/// `exec_apply_credentials` the exec path does. Calling the dumpability
+/// Driven through `__test_bprm_fill_uid`, which computes and installs the
+/// credentials with the same `exec_compute_credentials` and
+/// `exec_commit_credentials` the exec path uses. Calling the dumpability
 /// step directly — which is what this case did first — verified the
 /// function and not the WIRING: removing the call from the exec path left
 /// it passing. The two steps are one function now precisely so that cannot
-/// happen.
+/// happen. That the exec path installs what it computed is
+/// `smoke_userspace_execve_commit_installs_the_setuid_credentials`'s check.
 fn smoke_abi_proc2_exec_resets_dumpable() -> TestResult {
     const OWNER: u32 = 4242;
     const CALLER: u32 = 1000;

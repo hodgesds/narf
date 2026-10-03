@@ -1512,11 +1512,11 @@ fn do_execve_resolved(
 }
 
 /// An execve prepared up to its point of no return by [`prepare_exec`]: the
-/// image is read and loaded into a fresh address space, and nothing of the
-/// caller has changed except its credentials and dumpability, which
-/// `exec_apply_credentials` sets before the load. [`commit_exec`] replaces
-/// the caller's image with it. Dropping it instead abandons the exec and
-/// frees the new address space; it does not undo the credential change.
+/// image is read and loaded into a fresh address space, the credentials it
+/// runs with are computed, and nothing of the caller has changed.
+/// [`commit_exec`] replaces the caller's image with it and installs the
+/// credentials. Dropping it instead abandons the exec and frees the new
+/// address space.
 #[derive(Debug)]
 pub struct StagedExec {
     task: u64,
@@ -1525,13 +1525,18 @@ pub struct StagedExec {
     argv: alloc::vec::Vec<alloc::string::String>,
     /// The binary actually mapped: the interpreter, for a script.
     path: alloc::string::String,
+    /// The credentials, capabilities and dumpability the new image runs
+    /// with; `None` for an image with no file behind it, which changes none
+    /// of them. Boxed, as the syscall dispatcher moves and keeps a
+    /// `StagedExec` by value.
+    creds: Option<alloc::boxed::Box<ExecCredentials>>,
 }
 
 /// The part of the execve body that can still fail back to the caller: the
 /// checks, the argv/envp copy, the image read (following `#!` lines), the
-/// set-user-ID transition and the load. On failure it sets the errno on
-/// `ctx` and returns `None`; the caller's image and process state are intact
-/// apart from the credentials noted at [`StagedExec`].
+/// new credentials (the set-user-ID transition among them) and the load. On
+/// failure it sets the errno on `ctx` and returns `None`; the caller's image,
+/// credentials and process state are intact.
 fn prepare_exec(
     ctx: &mut dyn TrapContext,
     mut path_owned: alloc::string::String,
@@ -1822,19 +1827,25 @@ fn prepare_exec(
     }
 
     // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
-    // transition, applied to the file actually being executed and only
-    // once the image is known good. `image_override` is a memfd/fd image
-    // with no mount and no inode bits behind it, so it confers nothing —
-    // as in Linux, where there is no file to read them from.
-    if image_override_used {
-        let _ = task;
+    // transition, for the file actually being executed. `image_override` is
+    // a memfd/fd image with no mount and no inode bits behind it, so it
+    // confers nothing — as in Linux, where there is no file to read them
+    // from.
+    //
+    // Only computed here. The load below can still fail the exec back to
+    // the caller, so commit_exec installs the credentials past the point of
+    // no return, as Linux installs `bprm->cred` in `begin_new_exec`: a
+    // failed exec leaves the caller's credentials, capabilities and
+    // dumpability as they were.
+    let creds = if image_override_used {
+        None
     } else {
-        // The set-user-ID transition AND `begin_new_exec`'s dumpability
-        // step, in that order because the second reads the credentials the
-        // first may have changed. One call, so the pair cannot be
-        // half-applied.
-        exec_apply_credentials(task, &cur_path, followed_shebang);
-    }
+        Some(alloc::boxed::Box::new(exec_compute_credentials(
+            task,
+            &cur_path,
+            followed_shebang,
+        )))
+    };
 
     // Step 4: load the new image. exec REPLACES this process's image, so the
     // loaded `UserProcess` carries the caller's EXISTING pid — minting a fresh
@@ -1875,6 +1886,7 @@ fn prepare_exec(
         new_proc,
         argv: cur_argv,
         path: cur_path,
+        creds,
     })
 }
 
@@ -1887,6 +1899,7 @@ pub(crate) fn commit_exec(ctx: &mut dyn TrapContext, exec: StagedExec) {
         new_proc,
         argv: cur_argv,
         path: cur_path,
+        creds,
     } = exec;
     // An interceptor callback's exec is kept until the callback has returned
     // (`TrapContext::stage_exec`). Committed inside it, the jump into the new
@@ -1928,6 +1941,12 @@ pub(crate) fn commit_exec(ctx: &mut dyn TrapContext, exec: StagedExec) {
     // across exec — an fd-table leak that is also a sandbox-escape
     // vector (a descriptor the new image was never meant to inherit).
     crate::fd::close_cloexec(task);
+    // The credentials prepare_exec computed. After the close-on-exec sweep,
+    // as in Linux's `begin_new_exec`: a process that the new dumpability
+    // admits must not find a descriptor the sweep has yet to close.
+    if let Some(creds) = creds {
+        exec_commit_credentials(task, &creds);
+    }
 
     // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
     // bytes, derive comm from argv[0]'s basename (Linux convention).

@@ -2223,12 +2223,12 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     // -ENOSYS before it loads the image or changes the caller's process
     // state, instead of halting the kernel at the post-load guard.
     //
-    // "Before" is checked at both ends of the exec's side effects. The image
-    // is set-user-ID and owned by someone else, and the caller starts
-    // dumpable, so `exec_apply_credentials` -- the first side effect after
-    // the refusal point -- would move the caller's euid to the owner and
-    // clear its dumpable flag (a privileged exec is non-dumpable). The last
-    // ones publish argv[0]'s basename as the caller's comm.
+    // "Before" is checked against the exec's side effects on the caller. The
+    // image is set-user-ID and owned by someone else, and the caller starts
+    // dumpable, so commit_exec's credential install would move the caller's
+    // euid to the owner and clear its dumpable flag (a privileged exec is
+    // non-dumpable), and its later steps publish argv[0]'s basename as the
+    // caller's comm.
     //
     // The euid and dumpable checks mean something only if those writes land.
     // A kernel-test boot runs the tests before `init_per_task_state`, so the
@@ -2380,6 +2380,149 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
 kernel_test_in!(
     "userspace",
     smoke_userspace_own_stack_execve_refuses_task_not_running_here
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_commit_installs_the_setuid_credentials() -> TestResult {
+    // prepare_exec only computes an exec's new credentials; commit_exec must
+    // install them. The syscall_abi cases for a failed exec check the first
+    // half, and would keep passing if the credentials were never installed
+    // at all, so this checks the second half through the exec path itself.
+    //
+    // The image is set-user-ID and owned by someone else, and the caller
+    // starts dumpable, so a committed exec moves the caller's euid to the
+    // owner and clears its dumpable flag (a privileged exec is non-dumpable).
+    // Without a user-task context the exec runs every commit step and then
+    // returns -ENOSYS, and a distinctive argv[0], published as the caller's
+    // comm, proves it got that far.
+    //
+    // As in the own-stack refusal test above, the credential and prctl
+    // tables may be uninitialised in a kernel-test boot, which drops every
+    // write, so the test seeds both and proves a write is visible first.
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_prctl_reset();
+    static FAKE_TID: AtomicU64 = AtomicU64::new(0xC0DE_C4ED);
+    fn task_lookup() -> u64 {
+        FAKE_TID.load(Ordering::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lookup);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let cleanup = |mounted: &Result<_, _>| {
+        if let Ok(h) = mounted {
+            let _ = narf_filesystem::registry().unmount(h, "/execve-commit-creds");
+        }
+        crate::handlers::__test_release_task_tables(FAKE_TID.load(Ordering::Relaxed));
+        crate::syscall::__test_clear_global();
+        crate::handlers::__test_reset_task_id_lookup();
+    };
+
+    let elf = build_minimal_elf_for_execve();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-commit-creds",
+        narf_filesystem::MemFs::with_seeds("execve-commit-creds", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        cleanup(&mounted);
+        return TestResult::Fail("mount of execve FS failed");
+    }
+    fn call(nr: u32, a0: u64, a1: u64, a2: u64) -> Option<SyscallReturn> {
+        let mut c = StubCtx {
+            args: SyscallArgs {
+                arg0: a0,
+                arg1: a1,
+                arg2: a2,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(nr, &mut c);
+        c.ret
+    }
+
+    // Set-user-ID, owned by OWNER, staged while the caller is still root.
+    // chown first: it clears the set-ID bits.
+    const OWNER: u64 = 4000;
+    const CALLER: u32 = 1000;
+    let path = b"/execve-commit-creds/prog\0";
+    let staged = call(Syscall::Chown.raw(), path.as_ptr() as u64, OWNER, OWNER)
+        == Some(SyscallReturn::ok(0))
+        && call(Syscall::Chmod.raw(), path.as_ptr() as u64, 0o4755, 0)
+            == Some(SyscallReturn::ok(0));
+    if !staged {
+        cleanup(&mounted);
+        return TestResult::Fail("fixture: could not stage a set-user-ID image for another owner");
+    }
+
+    // The caller becomes CALLER, and both seeded tables must show a write
+    // for it: dumpable is seeded off first because on is the default.
+    let tid = FAKE_TID.load(Ordering::Relaxed);
+    crate::handlers::__test_set_fsids(tid, CALLER, CALLER);
+    let euid_before = call(Syscall::Geteuid.raw(), 0, 0, 0);
+    crate::handlers::__test_set_dumpable_for_test(tid, false);
+    let dumpable_visible = !crate::handlers::__test_dumpable(tid);
+    crate::handlers::__test_set_dumpable_for_test(tid, true);
+    if euid_before != Some(SyscallReturn::ok(u64::from(CALLER))) || !dumpable_visible {
+        cleanup(&mounted);
+        return TestResult::Fail(
+            "fixture: a credential or dumpable write for the caller was not visible, so the \
+             checks below could not observe the exec's",
+        );
+    }
+
+    // comm keeps at most 15 characters, so the probe name fits whole.
+    let arg0 = b"/usr/bin/commitprobe\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    // Own-stack mode off for the exec only (its refusal would stop the exec
+    // in prepare_exec), then back to whatever mode this test found.
+    let own_stack_was_on = crate::user_task::__test_set_own_stack_mode(false);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+    crate::user_task::__test_set_own_stack_mode(own_stack_was_on);
+
+    let comm = crate::handlers::proc_comm_of(tid);
+    let euid_after = call(Syscall::Geteuid.raw(), 0, 0, 0);
+    let dumpable_after = crate::handlers::__test_dumpable(tid);
+    cleanup(&mounted);
+    if ctx.ret != Some(errno_ret(ENOSYS)) {
+        return TestResult::Fail("execve without a user-task context did not end with -ENOSYS");
+    }
+    if comm.as_deref() != Some("commitprobe") {
+        return TestResult::Fail("execve did not reach commit_exec's comm step");
+    }
+    if euid_after != Some(SyscallReturn::ok(OWNER)) {
+        return TestResult::Fail("a committed set-user-ID execve did not install the owner's euid");
+    }
+    if dumpable_after {
+        return TestResult::Fail("a committed set-user-ID execve left the caller dumpable");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_commit_installs_the_setuid_credentials
 );
 
 #[cfg(target_arch = "x86_64")]

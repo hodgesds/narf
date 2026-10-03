@@ -5461,7 +5461,10 @@ fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
 /// through a setuid-root binary at all. The effective set follows only
 /// when the EFFECTIVE uid is root: a binary that merely leaves the real
 /// uid at 0 gets the permissions but must raise them itself.
-fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
+///
+/// Applied to `caps`, the credential being built for the exec
+/// ([`ExecCredentials`]); nothing is written to the task.
+fn cap_exec_privileged_root(task: u64, new_ids: UidGid, caps: &mut Caps) {
     // `root_privileged()` is `!issecure(SECURE_NOROOT)`
     // (`security/commoncap.c:805`). SECURE_NOROOT says "uid 0 is just a
     // uid" — the root-gets-everything shortcut below is exactly what it
@@ -5473,12 +5476,10 @@ fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
     if issecure(task, SECURE_NOROOT) {
         return;
     }
-    let mut caps = read_caps(task);
     caps.permitted = caps.bounding | caps.inheritable;
     if new_ids.euid == 0 {
         caps.effective = caps.permitted;
     }
-    write_caps(task, caps);
 }
 
 /// The ambient half of `cap_bprm_creds_from_file`
@@ -5511,8 +5512,11 @@ fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
 /// false — which is why `pE' = pA'` here rather than the `fE ? pP' : pA'`
 /// choice, and why the `X & fP` and `pI & fI` terms of `pP'` contribute
 /// nothing. Stated rather than silently simplified.
-fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
-    let mut caps = read_caps(task);
+///
+/// Applied to `caps`, the credential being built for the exec
+/// ([`ExecCredentials`]); returns the task's new securebits. Nothing is
+/// written to the task.
+fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool, caps: &mut Caps) -> u64 {
     if id_changed {
         caps.ambient = 0;
     }
@@ -5526,12 +5530,10 @@ fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
     // the two disagree about the same exec.
     let fe = ids.euid == 0 && !issecure(task, SECURE_NOROOT);
     caps.effective = if fe { caps.permitted } else { caps.ambient };
-    write_caps(task, caps);
     // `new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS)` — KEEP_CAPS is
     // about surviving a uid change, not an exec, and leaving it set would
     // apply the previous image's choice to the new one.
-    let bits = task_securebits(task);
-    set_task_securebits(task, bits & !(1u64 << SECURE_KEEP_CAPS));
+    task_securebits(task) & !(1u64 << SECURE_KEEP_CAPS)
 }
 
 /// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID transition
@@ -5553,7 +5555,8 @@ fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
 ///     together, because S_ISGID without group-execute is the mandatory
 ///     file-locking marker, not a privilege request.
 ///
-/// Returns the new credential when a transition happened.
+/// Returns the new credential when a transition happened. It changes
+/// nothing; [`exec_commit_credentials`] installs the result.
 fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
     // Linux ignores the set-user-ID bits on a `#!` script: the kernel
     // executes the INTERPRETER, and honouring the script's bits would hand
@@ -5617,8 +5620,6 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
     // a setuid program drops and regains it (`seteuid` back to `suid`).
     new.suid = new.euid;
     new.sgid = new.egid;
-    write_uidgid(task, |e| *e = new);
-    cap_exec_privileged_root(task, new);
     Some(new)
 }
 
@@ -5648,21 +5649,37 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
 /// leaving the flag on would silently make an ordinary program
 /// un-debuggable because of something its predecessor did.
 ///
-/// Note the comparison is against the CURRENT credentials after
-/// `bprm_fill_uid` has run, not against a "was this file set-uid" flag —
-/// Linux's own comment says testing `current` is "wrong, but userspace
-/// depends on it". Matching the observable behaviour, not the intent.
+/// Note the comparison is against the ids the exec installs, after
+/// `bprm_fill_uid`, not against a "was this file set-uid" flag. Linux
+/// differs: its test reads `current`, the credentials from before the exec
+/// (its own comment calls that "wrong, but userspace depends on it"), and
+/// `commit_creds` then clears the flag when the effective or filesystem ids
+/// change or the permitted set grows.
 ///
 /// `suid_dumpable` is the `/proc/sys/fs/suid_dumpable` sysctl, whose
 /// default is 0 (`SUID_DUMP_DISABLE`); NARF has no knob for it, so the
 /// privileged case is always non-dumpable.
-fn exec_set_dumpable(task: u64) {
-    let ids = read_uidgid(task);
-    let privileged = ids.euid != ids.uid || ids.egid != ids.gid;
-    modify_prctl(task, |s| s.dumpable = !privileged);
+fn exec_dumpable(ids: UidGid) -> bool {
+    ids.euid == ids.uid && ids.egid == ids.gid
 }
 
-/// The credential half of `begin_new_exec`, as ONE step.
+/// The credentials an exec installs: Linux's `bprm->cred`, plus the
+/// dumpability `begin_new_exec` sets with it.
+///
+/// [`exec_compute_credentials`] builds it while the exec can still fail,
+/// changing nothing, and [`exec_commit_credentials`] installs it past the
+/// exec's point of no return, as `begin_new_exec`'s `commit_creds` does.
+/// An exec that fails in between leaves the caller as it was.
+#[derive(Debug)]
+struct ExecCredentials {
+    /// The set-user-ID / set-group-ID transition, when there is one.
+    ids: Option<UidGid>,
+    caps: Caps,
+    securebits: u64,
+    dumpable: bool,
+}
+
+/// The credential half of `begin_new_exec`, computed as ONE step.
 ///
 /// `bprm_fill_uid` and the dumpability reset are separate functions in
 /// Linux but a single ordered obligation: the second reads the credentials
@@ -5674,15 +5691,37 @@ fn exec_set_dumpable(task: u64) {
 /// two to remember, and so the test hook below exercises the composition
 /// instead of each piece in isolation — a case that called them separately
 /// would keep passing if the exec path stopped calling one of them.
-pub(crate) fn exec_apply_credentials(task: u64, path: &str, from_script: bool) {
-    let id_changed = bprm_fill_uid(task, path, from_script).is_some();
-    let ids = read_uidgid(task);
+fn exec_compute_credentials(task: u64, path: &str, from_script: bool) -> ExecCredentials {
+    let new_ids = bprm_fill_uid(task, path, from_script);
+    let ids = new_ids.unwrap_or_else(|| read_uidgid(task));
+    let mut caps = read_caps(task);
+    if let Some(new) = new_ids {
+        cap_exec_privileged_root(task, new, &mut caps);
+    }
     // Ambient BEFORE dumpability: it reads the credentials `bprm_fill_uid`
     // may have changed, and dumpability reads them too. Order is
     // `cap_bprm_creds_from_file` then `begin_new_exec`'s dumpability step,
     // as in Linux.
-    cap_exec_ambient(task, ids, id_changed);
-    exec_set_dumpable(task);
+    let securebits = cap_exec_ambient(task, ids, new_ids.is_some(), &mut caps);
+    ExecCredentials {
+        ids: new_ids,
+        caps,
+        securebits,
+        dumpable: exec_dumpable(ids),
+    }
+}
+
+/// Installs `creds` on `task`. The dumpability goes first, as
+/// `begin_new_exec` sets it before `commit_creds`: a task that loses its
+/// dumpability in this exec must not be seen with the new ids and the old
+/// flag.
+fn exec_commit_credentials(task: u64, creds: &ExecCredentials) {
+    modify_prctl(task, |s| s.dumpable = creds.dumpable);
+    if let Some(new) = creds.ids {
+        write_uidgid(task, |e| *e = new);
+    }
+    write_caps(task, creds.caps);
+    set_task_securebits(task, creds.securebits);
 }
 
 /// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
@@ -5813,11 +5852,23 @@ fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
 /// regeneration a setuid-root binary depends on.
 #[doc(hidden)]
 pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
-    // The whole credential step, not just `bprm_fill_uid`: this is what the
-    // exec path calls, so a case driving this hook covers the composition.
-    exec_apply_credentials(task, path, from_script);
+    // The whole credential step, not just `bprm_fill_uid`: computed and
+    // installed as the exec path does it, so a case driving this hook
+    // covers the composition.
+    exec_commit_credentials(task, &exec_compute_credentials(task, path, from_script));
     let ids = read_uidgid(task);
     (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
+/// The credentials an exec of `path` would install, computed as
+/// `prepare_exec` computes them and NOT installed. Returns `(euid, egid,
+/// dumpable, effective caps)`, so a case can prove that the exec it stages
+/// would change the caller before it checks that a failed one did not.
+#[doc(hidden)]
+pub fn __test_exec_credentials(task: u64, path: &str, from_script: bool) -> (u32, u32, bool, u64) {
+    let creds = exec_compute_credentials(task, path, from_script);
+    let ids = creds.ids.unwrap_or_else(|| read_uidgid(task));
+    (ids.euid, ids.egid, creds.dumpable, creds.caps.effective)
 }
 
 /// `PR_GET_DUMPABLE` for an explicit task — the observable the exec
@@ -13276,7 +13327,7 @@ fn console_tiocgsid() -> u64 {
 // noop_ok stubs returned, so consumers that didn't touch
 // setuid/setgid see no change.
 
-#[derive(Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 struct UidGid {
     /// Real uid/gid.
     uid: u32,

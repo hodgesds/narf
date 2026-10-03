@@ -1246,6 +1246,194 @@ kernel_test_in!(
     smoke_abi_fsx_setuid_exec_transition_and_its_guards
 );
 
+/// A failed `execve` of a set-user-ID file leaves the caller's ids and
+/// dumpability as they were.
+///
+/// Linux computes an exec's new credentials into `bprm->cred` and installs
+/// them in `begin_new_exec`, past the exec's point of no return; an execve
+/// that fails before then returns to an unchanged caller. The file here is
+/// 64 bytes, enough for execve's size check, with no ELF magic, so the load
+/// fails with -ENOEXEC after the credentials are computed.
+///
+/// The case first proves, through the compute-only hook, that this exec
+/// would move the caller's ids and clear its dumpable flag. Without that, an
+/// exec that computed no transition at all would pass the checks below.
+fn smoke_abi_fsx_failed_setuid_exec_keeps_the_callers_ids() -> TestResult {
+    use core::fmt::Write as _;
+    const OWNER: u32 = 4000;
+    const GROUP: u32 = 4100;
+    const CALLER: u32 = 1000;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const PR_SET_DUMPABLE: u64 = 4;
+    const JUNK: [u8; 64] = [0x41; 64];
+    with_memfs("/abi-suidfail", "abi-suidfail", &[("junk", &JUNK)], || {
+        let path = "/abi-suidfail/junk";
+        let cpath = b"/abi-suidfail/junk\0";
+        let task = crate::handlers::current_task_id();
+        crate::handlers::__test_uidgid_reset();
+        crate::handlers::__test_prctl_reset();
+        crate::handlers::__test_caps_reset();
+        // Everything the exec could have changed goes back on every exit.
+        let finish = |r: Result<(), &'static str>| {
+            crate::handlers::__test_prctl_reset();
+            crate::handlers::__test_uidgid_reset();
+            crate::handlers::__test_caps_reset();
+            r
+        };
+        if call(
+            Syscall::Chown.raw(),
+            a2(cpath.as_ptr() as u64, OWNER as u64, GROUP as u64),
+        ) != Some(0)
+        {
+            return finish(Err("chown of the test file failed"));
+        }
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o6755)) != Some(0) {
+            return finish(Err("chmod of the test file failed"));
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        if call(Syscall::Prctl.raw(), a1(PR_SET_DUMPABLE, 1)) != Some(0) {
+            return finish(Err("PR_SET_DUMPABLE failed"));
+        }
+        let staged = crate::handlers::__test_exec_credentials(task, path, false);
+        let euid_staged = call(Syscall::Geteuid.raw(), a0(0));
+        let dumpable_staged = call(Syscall::Prctl.raw(), a0(PR_GET_DUMPABLE));
+        let argv: [u64; 2] = [cpath.as_ptr() as u64, 0];
+        let envp: [u64; 1] = [0];
+        let ret = call(
+            Syscall::Execve.raw(),
+            a2(
+                cpath.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+            ),
+        );
+        let euid = call(Syscall::Geteuid.raw(), a0(0));
+        let egid = call(Syscall::Getegid.raw(), a0(0));
+        let dumpable = call(Syscall::Prctl.raw(), a0(PR_GET_DUMPABLE));
+        let _ = writeln!(
+            narf_console::Writer,
+            "    failed setuid execve: staged {staged:?}; ret {ret:?} \
+             euid {euid:?} egid {egid:?} dumpable {dumpable:?}"
+        );
+        if (staged.0, staged.1, staged.2) != (OWNER, GROUP, false) {
+            return finish(Err(
+                "fixture: the staged exec would not move the ids or clear the dumpable flag",
+            ));
+        }
+        if euid_staged != Some(i64::from(CALLER)) || dumpable_staged != Some(1) {
+            return finish(Err("computing an exec's credentials changed the caller"));
+        }
+        if ret != Some(ENOEXEC) {
+            return finish(Err(
+                "execve of a set-user-ID file that is not an ELF was not -ENOEXEC",
+            ));
+        }
+        if euid != Some(i64::from(CALLER)) || egid != Some(i64::from(CALLER)) {
+            return finish(Err(
+                "a failed set-user-ID execve left the caller with changed ids",
+            ));
+        }
+        if dumpable != Some(1) {
+            return finish(Err(
+                "a failed set-user-ID execve left the caller non-dumpable",
+            ));
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_failed_setuid_exec_keeps_the_callers_ids
+);
+
+/// A failed `execve` of an ordinary file leaves the caller's capabilities
+/// and dumpability as they were.
+///
+/// The capability step (`cap_bprm_creds_from_file`) and the dumpability
+/// step run on every exec, set-user-ID or not, so a failed ordinary exec
+/// must discard their results too. The task here is root with
+/// CAP_SYS_ADMIN permitted but not effective, and not dumpable, so the exec,
+/// as this kernel computes it, would raise CAP_SYS_ADMIN into the effective
+/// set and make the task dumpable. The file is 64 bytes with no ELF magic,
+/// so the load fails with -ENOEXEC after the credentials are computed. As
+/// in the set-user-ID case, the compute-only hook first proves the exec
+/// would change both.
+fn smoke_abi_fsx_failed_plain_exec_keeps_the_callers_caps() -> TestResult {
+    use core::fmt::Write as _;
+    const CAP_SYS_ADMIN: u32 = 21;
+    const JUNK: [u8; 64] = [0x41; 64];
+    with_memfs("/abi-execfail", "abi-execfail", &[("junk", &JUNK)], || {
+        let path = "/abi-execfail/junk";
+        let cpath = b"/abi-execfail/junk\0";
+        let task = crate::handlers::current_task_id();
+        crate::handlers::__test_uidgid_reset();
+        crate::handlers::__test_prctl_reset();
+        crate::handlers::__test_caps_reset();
+        let finish = |r: Result<(), &'static str>| {
+            crate::handlers::__test_prctl_reset();
+            crate::handlers::__test_uidgid_reset();
+            crate::handlers::__test_caps_reset();
+            r
+        };
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o755)) != Some(0) {
+            return finish(Err("chmod of the test file failed"));
+        }
+        crate::handlers::__test_set_caps(task, 0, 1u64 << CAP_SYS_ADMIN);
+        crate::handlers::__test_set_dumpable_for_test(task, false);
+        let before_cap = crate::handlers::__test_cap_effective(task, CAP_SYS_ADMIN);
+        let before_dumpable = crate::handlers::__test_dumpable(task);
+        let staged = crate::handlers::__test_exec_credentials(task, path, false);
+        let cap_staged = crate::handlers::__test_cap_effective(task, CAP_SYS_ADMIN);
+        let dumpable_staged = crate::handlers::__test_dumpable(task);
+        let argv: [u64; 2] = [cpath.as_ptr() as u64, 0];
+        let envp: [u64; 1] = [0];
+        let ret = call(
+            Syscall::Execve.raw(),
+            a2(
+                cpath.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+            ),
+        );
+        let cap = crate::handlers::__test_cap_effective(task, CAP_SYS_ADMIN);
+        let dumpable = crate::handlers::__test_dumpable(task);
+        let _ = writeln!(
+            narf_console::Writer,
+            "    failed plain execve: staged {staged:?}; ret {ret:?}; CAP_SYS_ADMIN \
+             effective {before_cap} -> {cap}; dumpable {before_dumpable} -> {dumpable}"
+        );
+        if before_cap || before_dumpable {
+            return finish(Err(
+                "fixture: could not stage a non-effective capability and a non-dumpable task",
+            ));
+        }
+        if !staged.2 || staged.3 & (1u64 << CAP_SYS_ADMIN) == 0 {
+            return finish(Err(
+                "fixture: the staged exec would not raise CAP_SYS_ADMIN and make the task dumpable",
+            ));
+        }
+        if cap_staged || dumpable_staged {
+            return finish(Err("computing an exec's credentials changed the caller"));
+        }
+        if ret != Some(ENOEXEC) {
+            return finish(Err("execve of a file that is not an ELF was not -ENOEXEC"));
+        }
+        if cap {
+            return finish(Err(
+                "a failed execve raised a permitted capability into the effective set",
+            ));
+        }
+        if dumpable {
+            return finish(Err("a failed execve made a non-dumpable task dumpable"));
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_failed_plain_exec_keeps_the_callers_caps
+);
+
 /// `nosuid` is what it says: a set-user-ID binary on such a mount confers
 /// nothing.
 ///
