@@ -156,15 +156,17 @@ pub async fn allocate(
         });
     }
 
-    // Clear any stale result before asking, so the status read cannot observe
-    // the previous request's outcome.
-    let _ = write(
+    // Clear any stale result before asking: the status bits are
+    // write-one-to-clear, and a leftover "succeeded" would be read back as this
+    // request's answer. If it cannot be cleared the answer cannot be trusted, so
+    // that failure propagates rather than being swallowed.
+    write(
         phy,
         aux,
         TUNNELING_STATUS,
         STATUS_REQUEST_FAILED | STATUS_REQUEST_SUCCEEDED,
     )
-    .await;
+    .await?;
     write(phy, aux, REQUESTED_BW, steps as u8).await?;
 
     let deadline = narf_time::Deadline::after_ms(STATUS_TIMEOUT_MS);

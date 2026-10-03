@@ -287,3 +287,33 @@ kernel_test_in!(
     "drivers/gpu/dp-tunnel",
     tunnel_retries_deferred_aux_and_releases_on_stop
 );
+
+fn tunnel_clears_a_stale_result_before_requesting() -> TestResult {
+    // A leftover success from an earlier request must not be read back as this
+    // request's answer, so the status is cleared first.
+    let mut router = Router::new();
+    router.set(TUNNELING_STATUS, STATUS_REQUEST_SUCCEEDED);
+    router.silent = true;
+    if run(allocate(&mut router, 0, REQUIRED_1080P)) != Err(Error::Timeout) {
+        return TestResult::Fail("stale success read back as this request's answer");
+    }
+    let cleared = router
+        .writes
+        .iter()
+        .position(|(a, v)| *a == TUNNELING_STATUS && *v & STATUS_REQUEST_SUCCEEDED != 0);
+    let requested = router.writes.iter().position(|(a, _)| *a == REQUESTED_BW);
+    if cleared.is_none() || requested.is_none() || cleared >= requested {
+        return TestResult::Fail("status not cleared before requesting");
+    }
+    // A stale failure likewise must not be mistaken for a refusal of this one.
+    let mut stale_failure = Router::new();
+    stale_failure.set(TUNNELING_STATUS, STATUS_REQUEST_FAILED);
+    if run(allocate(&mut stale_failure, 0, REQUIRED_1080P)).is_err() {
+        return TestResult::Fail("stale failure read back as a refusal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-tunnel",
+    tunnel_clears_a_stale_result_before_requesting
+);
