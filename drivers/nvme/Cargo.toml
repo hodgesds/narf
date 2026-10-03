@@ -30,7 +30,8 @@ narf-power        = { path = "../../power" }
 [features]
 # Compile the in-kernel smokes (`src/tests.rs`) and the test hooks they
 # drive. Enabled by `narf-frame/kernel-test`; production builds leave it
-# off, so the hooks do not exist there.
+# off, so the hooks do not exist there. The smokes are x86_64-only, and
+# so are the hooks.
 kernel-test = []
 
 [lints]
