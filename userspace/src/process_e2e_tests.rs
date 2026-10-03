@@ -1047,6 +1047,12 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     crate::handlers::raise_signal_pending(TID, 10); // SIGUSR1
     crate::handlers::register_signal_waker(TID, noop_waker());
     crate::handlers::register_io_waiter(TID, noop_waker());
+    // Park on the futex word the way sys_futex does: the park target goes in
+    // the task context first, and the park loop queues the waiter under that
+    // key. Exit drops the waiter by the task's park key, not by scanning
+    // every bucket, so the target must name the queued key.
+    task.uctx.futex_namespace.store(0, Ordering::Release);
+    task.uctx.futex_uaddr.store(FUTEX_UADDR, Ordering::Release);
     crate::handlers::futex_register_waiter(FUTEX_UADDR, TID, noop_waker());
     crate::handlers::set_proc_argv(TID, &["victim"]);
     crate::handlers::set_proc_comm(TID, "victim");
@@ -1076,6 +1082,11 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     let _ = task;
     crate::user_task::__test_clear_exit_observers();
     if residue != 0 {
+        narf_console::klog!(
+            "    exit_sweeps residue={:#x} (before={:#x})",
+            residue,
+            before
+        );
         return TestResult::Fail("exit left per-task table residue (see bitmask)");
     }
     if crate::posix_timer::__test_itimer_real_next_fire(TID) != 0 {
