@@ -838,33 +838,38 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
-    // The IPI-reduction headline: when no peer CPU holds an
-    // affected mapping, every shootdown collapses to a local INVPCID and
-    // shows up as a +1 in local_only_count. Bucket 63 is unused by production
-    // Marking it tracked is monotonic and safe because any future load must
-    // publish residency before its context load. A production PCID may share
-    // the bucket, in which case this diagnostic correctly skips.
-    const TEST_TAG: u16 = 63;
-    let bucket = 1u64 << pcid_bucket(TEST_TAG);
-    TRACKED_BUCKETS.fetch_or(bucket, Ordering::Release);
-    if ACTIVE_AS
+    // The IPI-reduction headline: when no peer CPU holds an affected
+    // mapping, every shootdown collapses to a local INVPCID and shows up as
+    // a +1 in local_only_count. Residency bits are never cleared, so a test
+    // that loaded an address space on a peer leaves that bucket live for the
+    // rest of the boot; the smoke uses a bucket no peer has published. A
+    // shootdown never targets the calling CPU, so the calling CPU publishes
+    // residency for that bucket itself and the filter must still send
+    // nothing. A stale residency bit costs only a spurious IPI.
+    let cpu = narf_lib::percpu::current_cpu();
+    let peer_buckets = ACTIVE_AS
         .iter()
-        .any(|slot| slot.load(Ordering::Acquire) & bucket != 0)
-    {
-        return TestResult::Skip("test PCID bucket is live");
+        .enumerate()
+        .filter(|&(peer, _)| peer != cpu)
+        .fold(0, |live, (_, slot)| live | slot.load(Ordering::Acquire));
+    if peer_buckets == u64::MAX {
+        return TestResult::Skip("every PCID bucket is live on a peer CPU");
     }
+    // Tag 64 + b hashes to bucket b and lies in the process-tag range.
+    let test_tag = 64 + (!peer_buckets).trailing_zeros() as u16;
+    set_active_as(cpu as u32, test_tag);
     let before_local = local_only_count();
     let before_targets = filtered_targets();
-    shootdown(ShootdownRequest::for_va(TEST_TAG, 0x4000));
-    shootdown(ShootdownRequest::for_tag(TEST_TAG));
-    shootdown_range(TEST_TAG, 0x8000, 4);
+    shootdown(ShootdownRequest::for_va(test_tag, 0x4000));
+    shootdown(ShootdownRequest::for_tag(test_tag));
+    shootdown_range(test_tag, 0x8000, 4);
     let after_local = local_only_count();
     let after_targets = filtered_targets();
     if after_local - before_local != 3 {
         return TestResult::Fail("local_only_count didn't advance by 3");
     }
     if after_targets - before_targets != 0 {
-        return TestResult::Fail("filtered_targets advanced on UP boot");
+        return TestResult::Fail("filtered_targets advanced with no peer resident");
     }
     TestResult::Pass
 }
