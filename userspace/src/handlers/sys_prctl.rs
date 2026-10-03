@@ -418,13 +418,19 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // (including 0) is EINVAL.
             //
             // NARF has no per-task timestamp-fault mode, so PR_TSC_SIGSEGV
-            // is refused with EINVAL, as `kernel/sys.c` does on every
-            // architecture without SET_TSC_CTL. Accepting it would tell a
-            // sandbox that RDTSC now faults while RDTSC keeps working.
-            // CR4.TSD is armed only kernel-wide, by an installed instruction
-            // interceptor, and that completes the read rather than raising
-            // SIGSEGV. PR_TSC_ENABLE is the mode PR_GET_TSC above reports,
-            // so it succeeds.
+            // is refused with EINVAL. CR4.TSD is armed only kernel-wide, by
+            // an installed instruction interceptor, and that completes the
+            // read rather than raising SIGSEGV. PR_TSC_ENABLE is the mode
+            // PR_GET_TSC above reports, so it succeeds. No Linux matches
+            // this: x86 accepts both modes, and `kernel/sys.c` without
+            // SET_TSC_CTL refuses GET and ENABLE too.
+            //
+            // Accepting and ignoring PR_TSC_SIGSEGV kept callers that set it
+            // opportunistically running, but a caller that needs it, such as
+            // Reverie's ptrace backend intercepting RDTSC, treats failure as
+            // fatal and would otherwise run on with timestamp reads it
+            // believes are trapped. Failing before the guest starts is the
+            // safe answer.
             if arg_a != 1 {
                 ctx.set_return(errno_ret(EINVAL));
                 return;

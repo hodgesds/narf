@@ -1097,7 +1097,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // broadcast through this IPI surface. After this call,
             // every unmap_4kb fans out to peer CPUs.
             narf_memory::paging::set_shootdown_hook(|va| {
-                // SAFETY: x2APIC online, IPI handler installed.
+                // SAFETY: the LAPIC is online and the IPI handler installed.
                 // tag=0 → handler uses plain INVLPG (this hook fires
                 // from kernel-side mapping mutations that don't know
                 // which PCID owns the entry).
@@ -1108,7 +1108,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             });
             // Range hook: one IPI for a contiguous run of pages.
             narf_memory::paging::set_range_shootdown_hook(|va, pages| {
-                // SAFETY: x2APIC online, IPI handler installed.
+                // SAFETY: the LAPIC is online and the IPI handler installed.
                 unsafe {
                     narf_interrupts::x86_64::ipi::shoot_range(va, pages, 0);
                 }
@@ -1119,7 +1119,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // per-page broadcast + ack-wait, which made every fork of a
             // large process take ~0.5 s (stress-ng --sigrt's "hang").
             narf_memory::paging::set_full_shootdown_hook(|| {
-                // SAFETY: x2APIC online, IPI handler installed.
+                // SAFETY: the LAPIC is online and the IPI handler installed.
                 unsafe {
                     narf_interrupts::x86_64::ipi::shoot_full();
                 }
@@ -1129,10 +1129,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // also benefits from cross-CPU dispatch.
             narf_interrupts::install_tlb_shootdown_bridge();
             // membarrier(2)'s expedited commands: a real cross-CPU barrier
-            // rendezvous, not a notification. Gated on x2APIC for the same
-            // reason as the shootdown bridge — without it there is no way to
-            // interrupt a peer, and `remote_barrier` then reports itself
-            // unavailable so the syscall stops advertising those commands.
+            // rendezvous, not a notification. Installed in both APIC modes
+            // with the rest of this block; until it is installed
+            // `remote_barrier` reports itself unavailable and the syscall
+            // does not advertise those commands.
             narf_interrupts::install_membarrier_ipi();
             // Let a CPU spinning with IRQs masked, on an IrqSafeSpinLock or
             // in a remote-call acknowledgement wait, drain a shootdown a peer

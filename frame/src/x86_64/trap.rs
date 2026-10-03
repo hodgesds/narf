@@ -827,27 +827,11 @@ mod perf_dump {
 /// Rust. Re-exported so existing frame consumers keep a stable path.
 pub use narf_arch::x86_64::trap_frame::TrapFrame;
 
-/// Zero one saved general-purpose register in a live trap frame.
-///
-/// `reg` is the x86_64 architectural register number — the same 0..=15
-/// ModRM/REX encoding the JIT already emitted for the faulting instruction's
-/// destination, so the BPF extable stores it verbatim and no translation table
-/// is needed:
-///
-/// ```text
-/// 0 rax   1 rcx   2 rdx   3 rbx   4 rsp   5 rbp   6 rsi   7 rdi
-/// 8 r8    9 r9   10 r10  11 r11  12 r12  13 r13  14 r14  15 r15
-/// ```
-///
-/// `rsp` (4) is refused: the CPU pushed it and `iretq` will reload it, so
-/// zeroing it would return to a null stack. A JIT can never name `rsp` as a
-/// load destination, but this is the trap handler and defending costs one
-/// comparison.
-#[cfg(target_arch = "x86_64")]
 /// Decode an unprefixed ring-3 `RDTSC` (`0f 31`) or `RDTSCP` (`0f 01 f9`) at
 /// `rip`, returning its family and length. The third byte is fetched only
 /// after `0f 01` so that an `RDTSC` ending exactly at a mapping boundary still
 /// decodes. Any copy fault returns `None`, preserving the ordinary #GP path.
+#[cfg(target_arch = "x86_64")]
 fn decode_user_timestamp_instruction(
     rip: u64,
 ) -> Option<(narf_userspace::NondeterministicInstruction, u64)> {
@@ -880,6 +864,23 @@ fn decode_user_timestamp_instruction(
     }
 }
 
+/// Zero one saved general-purpose register in a live trap frame.
+///
+/// `reg` is the x86_64 architectural register number — the same 0..=15
+/// ModRM/REX encoding the JIT already emitted for the faulting instruction's
+/// destination, so the BPF extable stores it verbatim and no translation table
+/// is needed:
+///
+/// ```text
+/// 0 rax   1 rcx   2 rdx   3 rbx   4 rsp   5 rbp   6 rsi   7 rdi
+/// 8 r8    9 r9   10 r10  11 r11  12 r12  13 r13  14 r14  15 r15
+/// ```
+///
+/// `rsp` (4) is refused: the CPU pushed it and `iretq` will reload it, so
+/// zeroing it would return to a null stack. A JIT can never name `rsp` as a
+/// load destination, but this is the trap handler and defending costs one
+/// comparison.
+#[cfg(target_arch = "x86_64")]
 fn zero_trap_frame_gpr(frame: &mut TrapFrame, reg: u8) {
     match reg {
         0 => frame.rax = 0,

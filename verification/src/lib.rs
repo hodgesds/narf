@@ -3841,9 +3841,11 @@ fn smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path() -> TestResult {
     // Enter real ring 3 with RDTSC subscribed. The exact `0f 31` enters the
     // tool once and completes natively. The following `66 0f 31` still faults
     // under CR4.TSD, but the frame owner does not decode it, so it must reach
-    // the ordinary synchronous-fault hook as #GP (SIGSEGV) at its own RIP
-    // without entering the tool. The recording hook resumes at a landing pad
-    // whose marker distinguishes it from the prefixed read having executed.
+    // the ordinary synchronous-fault hook as #GP at its own RIP without
+    // entering the tool. The recording hook stands in for the default
+    // delivery, which would raise SIGSEGV, so this proves the fault reaches
+    // the hook, not the signal itself. It resumes at a landing pad whose
+    // marker distinguishes it from the prefixed read having executed.
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
@@ -3851,8 +3853,8 @@ fn smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path() -> TestResult {
         install_global, install_sync_signal_hook,
         instruction::__verification_clear_instruction_interceptor, sync_signal_hook,
         syscall::__verification_clear_global as __test_clear_global,
-        try_install_instruction_interceptor, vector_to_signum, InstructionInterception,
-        InstructionInterceptor, InstructionInvocation, InstructionResult, InstructionSubscriptions,
+        try_install_instruction_interceptor, InstructionInterception, InstructionInterceptor,
+        InstructionInvocation, InstructionResult, InstructionSubscriptions,
         NondeterministicInstruction, SyncFaultInfo, Syscall, SyscallHandler, SyscallTable,
         TrapContext,
     };
@@ -3864,7 +3866,6 @@ fn smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path() -> TestResult {
     const LAND_OFFSET: u64 = 12;
     const LANDED: u64 = 0x5E6F;
     const FELL_THROUGH: u64 = 0x0BAD;
-    const SIGSEGV: u32 = 11;
     static RDTSC_ENTRIES: AtomicU64 = AtomicU64::new(0);
     static OTHER_INSTRUCTION_ENTRIES: AtomicU64 = AtomicU64::new(0);
     static FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -4002,8 +4003,8 @@ fn smoke_frame_x86_64_prefixed_rdtsc_takes_the_sync_fault_path() -> TestResult {
                 "prefixed RDTSC did not reach the sync-fault hook exactly once",
             );
         }
-        if FAULT_VECTOR.load(Ordering::Acquire) != 13 || vector_to_signum(13) != Some(SIGSEGV) {
-            return TestResult::Fail("prefixed RDTSC was not a #GP delivered as SIGSEGV");
+        if FAULT_VECTOR.load(Ordering::Acquire) != 13 {
+            return TestResult::Fail("prefixed RDTSC did not fault as #GP");
         }
         if FAULT_ADDR.load(Ordering::Acquire) != CODE_VADDR + PREFIXED_OFFSET {
             return TestResult::Fail("sync fault did not report the prefixed RDTSC address");

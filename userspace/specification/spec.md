@@ -136,7 +136,7 @@ online CPU, including the call to the subscription method. A user task spawned
 meanwhile, by any CPU or by the interceptor itself, is created and counted live
 but is placed on its run queue only when the gate reopens; the spawner never
 waits. Reopening enqueues the deferred tasks in the order they were deferred;
-a spawn that races the reopening may be enqueued before them, as concurrent
+a spawn that races the reopening may be enqueued before or among them, as concurrent
 spawns on different CPUs already are ordered by host timing. The gate's closed flag and the live count are each written before the
 other is read, both sequentially consistent, so a concurrent spawn is either
 seen live and refuses installation or sees the gate closed and defers. The
@@ -161,13 +161,21 @@ zero-extended auxiliary value to RCX), and advances RIP by exactly the decoded
 length. Interceptors never receive a mutable trap
 frame. A mismatched result type or recursive callback fails closed by stopping
 the kernel rather than returning an uncontrolled value to the guest.
-A timestamp read that is not one of those exact encodings, such as the
-operand-size-prefixed `66 0f 31`, or whose bytes cannot be read, is not
-decoded. While an interceptor is installed it takes the ordinary synchronous
-#GP path and is delivered as `SIGSEGV`, where Linux would execute it; the tool
-is not entered. This is a stated incompatibility, not a hidden one, and the
-Reverie ptrace backend has the same boundary: it enables `PR_TSC_SIGSEGV` and
-emulates only the same exact encodings.
+Completion leaves RFLAGS unchanged, so with the trap flag set the
+single-step trap that native execution raises after the read is not raised:
+the return from the fault executes the next instruction and traps after it,
+so one step covers both. This divergence from Linux is open.
+A timestamp read that is not one of those exact encodings, such as any
+prefixed form (`66 0f 31` is the tested one), or whose bytes cannot be read, is
+not decoded. While an interceptor subscribed to either timestamp family is
+installed, CR4.TSD makes every ring-3 timestamp read fault, so such a read
+takes the ordinary synchronous #GP path and is delivered as `SIGSEGV`, where
+Linux would execute it; the tool is not entered. This holds even for a tool
+subscribed only to the other family. This is a stated incompatibility, not a
+hidden one. The Reverie ptrace backend emulates the same exact encodings and
+lets any other faulting read through as `SIGSEGV`, but the signal's details
+differ: NARF reports every #GP with `si_addr` set to the faulting RIP, where
+Linux reports 0.
 
 `InstructionInterceptor` is an unsafe trait because callbacks execute
 synchronously in exception context. Its safety contract forbids allocation,
@@ -404,10 +412,15 @@ or retain NARF capabilities; authority remains capability-object based.
 and performs critical-section aborts across preemption and CPU migration;
 returning success without those semantics is forbidden on preemptive SMP.
 `PR_SET_TSC` accepts only `PR_TSC_ENABLE`, the mode `PR_GET_TSC` reports;
-`PR_TSC_SIGSEGV` fails with `EINVAL`, as on Linux architectures without
-timestamp control, because NARF has no per-task timestamp-fault mode and an
-installed instruction interceptor completes timestamp reads rather than
-raising `SIGSEGV`.
+`PR_TSC_SIGSEGV` fails with `EINVAL` because NARF has no per-task
+timestamp-fault mode and an installed instruction interceptor completes
+timestamp reads rather than raising `SIGSEGV`. No Linux configuration has this
+combination: x86 Linux accepts `PR_TSC_SIGSEGV`, and Linux without timestamp
+control refuses `PR_GET_TSC` and `PR_TSC_ENABLE` as well. The refusal is
+deliberate. A caller that needs timestamp reads to fault, such as Reverie's
+ptrace backend when it intercepts RDTSC, treats the error as fatal and stops
+before the guest starts, where accepting the request would let it run on with
+timestamp reads it believes are trapped.
 `SO_PEERSEC` and `SO_PEERPIDFD` report `ENOPROTOOPT` while NARF has no Linux
 Security Module label provider or retained peer pidfd; the compatibility layer
 never fabricates security identity. Supplementary groups are stored per task,
