@@ -7,16 +7,22 @@
 //! typed into that shell are hosted by the Tool. Without it frame calls
 //! nothing here, and the syscall table has no interceptor.
 //!
-//! The Tools are `counter1` and `counter2`, compiled unmodified from
-//! `reverie-examples` (`reverie_narf_tools::counter1` and
-//! `reverie_narf_tools::counter2`). counter2 also keeps a count per thread
-//! and one per process, which reach its global totals through its exit
-//! hooks. When each hosted thread exits it prints the line it prints on
-//! Linux, where it writes it to stderr:
+//! The Tools are `counter1`, `counter2` and `strace`, compiled from the source
+//! files `reverie-examples` builds its Linux binaries from
+//! (`reverie_narf_tools::counter1`, `reverie_narf_tools::counter2` and
+//! `reverie_narf_tools::strace`). counter2 also keeps a count per thread and
+//! one per process, which reach its global totals through its exit hooks.
+//! When each hosted thread exits it prints the line it prints on Linux, where
+//! it writes it to stderr:
 //!
 //! ```text
 //! counter2-local thread=<tid> syscalls=<n>
 //! ```
+//!
+//! strace runs with no filter, as the Linux binary does without `--trace`, so
+//! it handles every syscall Reverie's `Sysno` knows. It prints, with
+//! `eprintln!`, a line for each syscall event and one for each thread's and
+//! each process's exit, which the report holds (see below).
 //!
 //! # The tally
 //!
@@ -64,10 +70,34 @@
 //!  [counter tool] Total system calls in process tree: <N>, from <P> processes, <T> thread(s).
 //! ```
 //!
-//! A harness compares N with `expected-events`. The events-by-task line has
-//! each member task's Linux thread ID and event count, in exit order (`?` for
-//! a thread ID the kernel no longer had); for counter2 the harness compares
-//! those pairs with the `counter2-local` lines. A number marked `*` in the
+//! strace's launcher prints no such line. In its place the report has every
+//! line strace printed, in the order it printed them, formatted by the same
+//! code as on Linux:
+//!
+//! ```text
+//! reverie-narf-boot: strace output lines=<L> dropped=<D>
+//! [pid <tid>] <syscall>(<arguments>) = <value>
+//! ...
+//! Thread <tid> exited with status Exited(<code>)
+//! Process <pid> exited with status Exited(<code>)
+//! reverie-narf-boot: strace output end
+//! ```
+//!
+//! strace prints a syscall's line after the syscall has run, so the line for
+//! a command's `write` would follow the written bytes at once and, printed
+//! then, land inside the command's unfinished line of output. Held until the
+//! report, strace's output stays out of the console stream the shell and the
+//! commands write to, and a harness finds it whole. The buffer's capacity is
+//! reserved when the Tool is installed, so recording a line never allocates;
+//! once a line does not fit, it and every later line are dropped and counted
+//! in `D`, so the `L` lines printed are the first `L` strace printed.
+//!
+//! A harness compares N with `expected-events`; for strace, N is its syscall
+//! lines, all but the second line a failed `execve` prints. The
+//! events-by-task line has each member task's Linux thread ID and event
+//! count, in exit order (`?` for a thread ID the kernel no longer had); for
+//! counter2 the harness compares those pairs with the `counter2-local` lines,
+//! and for strace with its lines per thread ID. A number marked `*` in the
 //! by-number line runs natively, without a Tool event.
 //!
 //! A fork inside a nested PID namespace (frame's `container` feature) returns
@@ -93,7 +123,7 @@ use narf_userspace::syscall::{
 use reverie::syscalls::Sysno;
 use reverie::{GlobalTool, Pid, Tid, Tool};
 use reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
-use reverie_narf_tools::{counter1, counter2, LineSink};
+use reverie_narf_tools::{counter1, counter2, strace, LineSink};
 
 use crate::interceptor::{ConsoleSink, ReverieInterceptor};
 
@@ -133,7 +163,19 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
                 )
             },
         ),
-        _ => Err(String::from("no such tool (known: counter1, counter2)")),
+        "strace" => {
+            open_strace_output();
+            Tally::<strace::Strace>::install(
+                table,
+                "strace",
+                strace::Config::default(),
+                <strace::Strace as Tool>::new,
+                |_| take_strace_output(),
+            )
+        }
+        _ => Err(String::from(
+            "no such tool (known: counter1, counter2, strace)",
+        )),
     };
     match installed {
         Ok(boot) => {
@@ -156,6 +198,63 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
 /// stderr on Linux (`on_exit_thread` in `reverie-examples/counter2_tool.rs`).
 fn print_counter2_thread_exit(tid: Tid, syscalls: u64) {
     ConsoleSink::emit(&format!("counter2-local thread={tid} syscalls={syscalls}"));
+}
+
+/// The bytes of strace's lines, newlines included, that the report can hold.
+const STRACE_OUTPUT_CAPACITY: usize = 256 << 10;
+
+/// strace's lines, held until the report.
+struct StraceOutput {
+    /// The lines recorded, in order, each followed by a newline.
+    text: String,
+    /// The lines in `text`.
+    lines: u64,
+    /// The lines dropped: the first that did not fit and every one after it.
+    dropped: u64,
+}
+
+impl StraceOutput {
+    const fn new(text: String) -> Self {
+        Self {
+            text,
+            lines: 0,
+            dropped: 0,
+        }
+    }
+}
+
+static STRACE_OUTPUT: IrqSafeSpinLock<StraceOutput> =
+    IrqSafeSpinLock::new(StraceOutput::new(String::new()));
+
+/// Reserves the buffer and makes it the sink of strace's `eprintln!`.
+fn open_strace_output() {
+    let text = String::with_capacity(STRACE_OUTPUT_CAPACITY);
+    *STRACE_OUTPUT.lock() = StraceOutput::new(text);
+    reverie_narf_tools::set_eprintln_sink(record_strace_line);
+}
+
+/// strace's `eprintln!` sink: records `line` if it and every line before it
+/// fit in the reserved capacity, and otherwise counts it dropped.
+fn record_strace_line(line: &str) {
+    let mut output = STRACE_OUTPUT.lock();
+    if output.dropped == 0 && output.text.capacity() - output.text.len() > line.len() {
+        output.text.push_str(line);
+        output.text.push('\n');
+        output.lines += 1;
+    } else {
+        output.dropped += 1;
+    }
+}
+
+/// strace's part of the report: the lines recorded, between a line with
+/// their count and a closing line.
+fn take_strace_output() -> String {
+    let output = core::mem::replace(&mut *STRACE_OUTPUT.lock(), StraceOutput::new(String::new()));
+    format!(
+        "reverie-narf-boot: strace output lines={} dropped={}\n{}reverie-narf-boot: strace \
+         output end",
+        output.lines, output.dropped, output.text
+    )
 }
 
 /// The handle [`install`] returns, with which frame hosts the boot's root

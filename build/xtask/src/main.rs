@@ -496,10 +496,10 @@ struct MuslDemoArgs {
     prebuilt: Option<String>,
 
     /// Host getty's process tree (the login shell and every case typed into
-    /// it) under this unmodified Reverie Tool (`counter1` or `counter2`):
-    /// build with `reverie-narf-poc`, boot with `reverie_tool=TOOL`, type
-    /// `exit` after each boot's last case, and require the Tool's report from
-    /// every boot (`reverie_narf_adapter::boot`).
+    /// it) under this Reverie Tool from reverie-examples (`counter1`,
+    /// `counter2` or `strace`): build with `reverie-narf-poc`, boot with
+    /// `reverie_tool=TOOL`, type `exit` after each boot's last case, and
+    /// require the Tool's report from every boot (`reverie_narf_adapter::boot`).
     #[arg(long, value_name = "TOOL")]
     reverie_tool: Option<String>,
 
@@ -7510,6 +7510,10 @@ fn run_interactive_multi(
 /// per exited task, and those lines' (thread ID, count) pairs must equal the
 /// tally's per-task counts, compared as multisets because thread IDs are
 /// reused.
+///
+/// strace prints a line per syscall event instead of a count, and the report
+/// holds its lines ([`strace_output`]). Its count is its syscall lines, and
+/// [`check_strace_lines`] matches them to the tally's tasks.
 fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
     fn matching<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
         lines
@@ -7544,6 +7548,8 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
     }
     // The Tool's own report line, as reverie-examples prints it on Linux:
     // its syscall count and, for counter2, its process and thread counts.
+    // strace has no such line; its count is its syscall lines.
+    let mut strace_lines = None;
     let (counted, counter2_totals): (u64, Option<(u64, u64)>) = match tool {
         "counter1" => {
             let prefix = "counter1-global syscalls=";
@@ -7572,6 +7578,15 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
             let (total, processes, threads) =
                 parse(&line[at..]).ok_or_else(|| format!("bad counts in `{line}`"))?;
             (total, Some((processes, threads)))
+        }
+        "strace" => {
+            let output = strace_output(&lines)?;
+            let counted = output
+                .iter()
+                .filter(|line| matches!(line, StraceLine::Syscall { .. }))
+                .count() as u64;
+            strace_lines = Some(output);
+            (counted, None)
         }
         _ => return Err(format!("no report check for tool `{tool}`")),
     };
@@ -7698,6 +7713,10 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
             local.len()
         );
     }
+    let strace_summary = match &strace_lines {
+        Some(output) => check_strace_lines(output, &by_task, processes)?,
+        None => String::new(),
+    };
     let by_task_sum: u64 = by_task.iter().map(|(_, events)| events).sum();
     if by_task_sum != expected {
         return Err(format!(
@@ -7708,10 +7727,442 @@ fn check_reverie_report(serial: &str, tool: &str) -> Result<String, String> {
     Ok(format!(
         "{tool} counted {counted} = expected-events ({entries} entries - {reexecutions} \
          re-executions - {native_only} native-only) = the sum of {} tasks' events; {exited} \
-         tasks exited ({} unstarted), {processes} processes{counter2_summary}",
+         tasks exited ({} unstarted), {processes} processes{counter2_summary}{strace_summary}",
         by_task.len(),
         num("exited-unstarted")?,
     ))
+}
+
+/// One line strace printed, in a form `reverie-examples/strace/tool.rs`
+/// prints.
+#[derive(Debug, PartialEq)]
+enum StraceLine {
+    /// `[pid <tid>] <name>(<arguments>) = <value>`, one per syscall event:
+    /// ` = ?` for exit and exit_group, which print before they run, and no
+    /// value for execve and execveat, which print before they run and, if
+    /// they succeed, never return to the program.
+    Syscall { tid: u64, name: String },
+    /// `[pid <tid>] (<name>) = <errno>`, which a failed execve or execveat
+    /// prints after its syscall line.
+    FailedExec { tid: u64, name: String },
+    /// `Thread <tid> exited with status <status>`.
+    ThreadExit { tid: u64 },
+    /// `Process <pid> exited with status <status>`.
+    ProcessExit { pid: u64 },
+}
+
+/// Parses one of strace's lines, or returns `None` if strace prints nothing
+/// of that form.
+fn parse_strace_line(line: &str) -> Option<StraceLine> {
+    fn id(text: &str) -> Option<u64> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+    let exec = |name: &str| matches!(name, "execve" | "execveat");
+    if let Some(rest) = line.strip_prefix("[pid ") {
+        let (tid, rest) = rest.split_once("] ")?;
+        let tid = id(tid)?;
+        if let Some(rest) = rest.strip_prefix('(') {
+            let (name, errno) = rest.split_once(") = ")?;
+            return (exec(name) && !errno.is_empty()).then(|| StraceLine::FailedExec {
+                tid,
+                name: name.to_string(),
+            });
+        }
+        let (name, _) = rest.split_once('(')?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return None;
+        }
+        let valid = match name {
+            _ if exec(name) => true,
+            "exit" | "exit_group" => rest.ends_with(" = ?"),
+            _ => rest
+                .rsplit_once(" = ")
+                .is_some_and(|(_, value)| value.parse::<i64>().is_ok()),
+        };
+        return valid.then(|| StraceLine::Syscall {
+            tid,
+            name: name.to_string(),
+        });
+    }
+    let (kind, rest) = line.split_once(' ')?;
+    let (id_text, status) = rest.split_once(" exited with status ")?;
+    let id = id(id_text)?;
+    if status.is_empty() {
+        return None;
+    }
+    match kind {
+        "Thread" => Some(StraceLine::ThreadExit { tid: id }),
+        "Process" => Some(StraceLine::ProcessExit { pid: id }),
+        _ => None,
+    }
+}
+
+/// strace's lines from one boot's report, which prints them between
+/// `reverie-narf-boot: strace output lines=<L> dropped=<D>` and
+/// `reverie-narf-boot: strace output end` in a single console write
+/// (`reverie_narf_adapter::boot`). There must be exactly L of them, none
+/// dropped, each of a form strace prints. A `Received signal` line is
+/// refused too: the Narf core delivers no signal events, so the checks here
+/// do not account for one.
+fn strace_output(lines: &[&str]) -> Result<Vec<StraceLine>, String> {
+    let header = "reverie-narf-boot: strace output lines=";
+    let end = "reverie-narf-boot: strace output end";
+    let find = |needle: &str| -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&at| lines[at].contains(needle))
+            .collect()
+    };
+    let (starts, ends) = (find(header), find(end));
+    let (&[start], &[stop]) = (starts.as_slice(), ends.as_slice()) else {
+        return Err(format!(
+            "{} strace output headers and {} ends, expected 1 each",
+            starts.len(),
+            ends.len()
+        ));
+    };
+    if stop < start || lines[stop] != end {
+        return Err(format!("strace's output does not end with `{end}`"));
+    }
+    let head = lines[start];
+    let counts = head[head.find(header).map_or(0, |at| at + header.len())..]
+        .split_once(" dropped=")
+        .and_then(|(printed, dropped)| {
+            Some((printed.parse::<u64>().ok()?, dropped.parse::<u64>().ok()?))
+        });
+    let Some((printed, dropped)) = counts else {
+        return Err(format!("bad strace output header `{head}`"));
+    };
+    if dropped != 0 {
+        return Err(format!(
+            "strace's output overflowed the report's buffer: {dropped} lines dropped after the \
+             first {printed}"
+        ));
+    }
+    let body = &lines[start + 1..stop];
+    if body.len() as u64 != printed {
+        return Err(format!(
+            "the report has {} strace lines; its header says {printed}",
+            body.len()
+        ));
+    }
+    body.iter()
+        .map(|line| {
+            if line.starts_with("[pid ") && line.contains("] Received signal: ") {
+                return Err(format!(
+                    "strace printed a signal event, which the Narf core does not deliver: \
+                     `{line}`"
+                ));
+            }
+            parse_strace_line(line).ok_or_else(|| format!("strace does not print `{line}`"))
+        })
+        .collect()
+}
+
+/// Matches strace's lines to the tally's tasks and returns a summary.
+///
+/// strace prints each syscall event's line before the thread's exit line,
+/// and a thread ID is reused only after the thread holding it has exited, so
+/// a thread ID's syscall lines up to each of its exit lines are one task's.
+/// The k-th such group must have as many lines as the tally counted events
+/// for the k-th task with that thread ID to exit, and every task must have
+/// its exit line. A task killed while strace waited in one of its syscalls
+/// has no line for that syscall and fails here. Each failed execve's second
+/// line must follow that thread's execve line, and the process exit lines
+/// must be as many as the tally's processes, each after an exit line of the
+/// thread whose ID is its process ID.
+fn check_strace_lines(
+    output: &[StraceLine],
+    by_task: &[(String, u64)],
+    processes: u64,
+) -> Result<String, String> {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    // The events of each task, by thread ID, in exit order.
+    let mut tasks = BTreeMap::<u64, VecDeque<u64>>::new();
+    for (tid, events) in by_task {
+        let tid = tid.parse::<u64>().map_err(|_| {
+            format!(
+                "the tally has no thread ID for a task with {events} events, so strace's lines \
+                 cannot be matched to it"
+            )
+        })?;
+        tasks.entry(tid).or_default().push_back(*events);
+    }
+    // Per thread ID: the syscall lines since its last exit line, and the
+    // name of the execve its last syscall line was, if it was one.
+    let mut open = BTreeMap::<u64, u64>::new();
+    let mut exec = BTreeMap::<u64, String>::new();
+    let mut exited = BTreeSet::<u64>::new();
+    let (mut syscalls, mut failed, mut threads, mut process_exits) = (0u64, 0u64, 0u64, 0u64);
+    for line in output {
+        match line {
+            StraceLine::Syscall { tid, name } => {
+                syscalls += 1;
+                *open.entry(*tid).or_default() += 1;
+                if matches!(name.as_str(), "execve" | "execveat") {
+                    exec.insert(*tid, name.clone());
+                } else {
+                    exec.remove(tid);
+                }
+            }
+            StraceLine::FailedExec { tid, name } => {
+                if exec.remove(tid).as_ref() != Some(name) {
+                    return Err(format!(
+                        "strace's `({name}) = ` line for thread {tid} does not follow a {name} \
+                         line of that thread"
+                    ));
+                }
+                failed += 1;
+            }
+            StraceLine::ThreadExit { tid } => {
+                let lines = open.remove(tid).unwrap_or(0);
+                exec.remove(tid);
+                let Some(events) = tasks.get_mut(tid).and_then(|queue| queue.pop_front()) else {
+                    return Err(format!(
+                        "strace printed more exits for thread {tid} than the tally has tasks \
+                         with that thread ID"
+                    ));
+                };
+                if lines != events {
+                    return Err(format!(
+                        "strace printed {lines} syscall lines before an exit of thread {tid}; \
+                         the tally counted {events} events for that task"
+                    ));
+                }
+                exited.insert(*tid);
+                threads += 1;
+            }
+            StraceLine::ProcessExit { pid } => {
+                if !exited.contains(pid) {
+                    return Err(format!(
+                        "strace printed process {pid}'s exit before any exit of thread {pid}"
+                    ));
+                }
+                process_exits += 1;
+            }
+        }
+    }
+    if let Some((tid, lines)) = open.iter().find(|(_, lines)| **lines != 0) {
+        return Err(format!(
+            "strace printed {lines} syscall lines for thread {tid} after its last exit"
+        ));
+    }
+    let unmatched: usize = tasks.values().map(VecDeque::len).sum();
+    if unmatched != 0 {
+        return Err(format!(
+            "strace printed no exit line for {unmatched} of the tally's tasks"
+        ));
+    }
+    if process_exits != processes {
+        return Err(format!(
+            "strace printed {process_exits} process exits; the tally counted {processes} \
+             processes"
+        ));
+    }
+    Ok(format!(
+        "; strace printed {} lines: {syscalls} syscall lines, {failed} failed execve lines, \
+         {threads} thread exits and {process_exits} process exits, and each task's syscall \
+         lines equal the tally's events for it",
+        output.len()
+    ))
+}
+
+#[cfg(test)]
+mod strace_report_tests {
+    use super::{check_reverie_report, parse_strace_line, StraceLine};
+
+    /// strace's lines for a shell (thread 2) that runs a missing command,
+    /// whose execve fails, then a command that exits at once, and exits:
+    /// two tasks with thread ID 3, of 2 and 1 events, then thread 2's 5.
+    const BODY: [&str; 15] = [
+        "[pid 2] read(0, 0x10, 1) = 1",
+        "[pid 2] fork() = 3",
+        "[pid 3] execve(0x20 -> \"/bin/nope\", 0x30, 0x40)",
+        "[pid 3] (execve) = ENOENT",
+        "[pid 3] exit_group(127) = ?",
+        "Thread 3 exited with status Exited(127)",
+        "Process 3 exited with status Exited(127)",
+        "[pid 2] wait4(-1, 0x50, 0, 0x0) = 3",
+        "[pid 2] fork() = 3",
+        "[pid 3] exit_group(0) = ?",
+        "Thread 3 exited with status Exited(0)",
+        "Process 3 exited with status Exited(0)",
+        "[pid 2] exit_group(0) = ?",
+        "Thread 2 exited with status Exited(0)",
+        "Process 2 exited with status Exited(0)",
+    ];
+    const TALLY: &str = "reverie-narf-boot: tally tool=strace entries=10 reexecutions=2 \
+                         native-only=0 expected-events=8 tasks-started=3 tasks-exited=3 \
+                         exited-unstarted=0 processes=3 adapter-exits=3 adapter-hosted=0 \
+                         aborted=no";
+    const BY_TASK: &str = "3:2 3:1 2:5";
+
+    fn serial(header: &str, body: &[&str], tally: &str, by_task: &str) -> String {
+        let mut out = String::from(
+            "reverie-narf-boot: strace installed at the syscall dispatcher\n\
+             reverie-narf-boot: strace hosts the process tree of pid 2 (task 18)\n\
+             narf> exit\n",
+        );
+        out.push_str(header);
+        out.push('\n');
+        for line in body {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("reverie-narf-boot: strace output end\n");
+        out.push_str(tally);
+        out.push_str(&format!(
+            "\nreverie-narf-boot: events-by-task {by_task}\n\
+             reverie-narf-boot: syscalls-by-number 0:1 57:2 59:1 61:1 231:3 rest:0\n\
+             reverie-narf-boot: report end\n"
+        ));
+        out
+    }
+
+    fn check(body: &[&str], by_task: &str) -> Result<String, String> {
+        let header = format!(
+            "reverie-narf-boot: strace output lines={} dropped=0",
+            body.len()
+        );
+        check_reverie_report(&serial(&header, body, TALLY, by_task), "strace")
+    }
+
+    fn refused(result: Result<String, String>, reason: &str) {
+        match result {
+            Err(e) => assert!(e.contains(reason), "refused for another reason: {e}"),
+            Ok(summary) => panic!("accepted: {summary}"),
+        }
+    }
+
+    #[test]
+    fn accepts_lines_that_match_the_tally() {
+        let summary = check(&BODY, BY_TASK).unwrap();
+        assert!(
+            summary.contains(
+                "strace printed 15 lines: 8 syscall lines, 1 failed execve lines, 3 thread \
+                 exits and 3 process exits"
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn parses_each_form_strace_prints() {
+        let syscall = |tid, name: &str| {
+            Some(StraceLine::Syscall {
+                tid,
+                name: name.to_string(),
+            })
+        };
+        assert_eq!(parse_strace_line(BODY[1]), syscall(2, "fork"));
+        assert_eq!(parse_strace_line(BODY[2]), syscall(3, "execve"));
+        assert_eq!(parse_strace_line(BODY[4]), syscall(3, "exit_group"));
+        assert_eq!(
+            parse_strace_line(BODY[3]),
+            Some(StraceLine::FailedExec {
+                tid: 3,
+                name: "execve".to_string()
+            })
+        );
+        assert_eq!(
+            parse_strace_line(BODY[5]),
+            Some(StraceLine::ThreadExit { tid: 3 })
+        );
+        assert_eq!(
+            parse_strace_line(BODY[6]),
+            Some(StraceLine::ProcessExit { pid: 3 })
+        );
+        for line in [
+            "[pid 2] read(0, 0x10, 1)",
+            "[pid 2] read(0, 0x10, 1) = ?",
+            "[pid 2] exit_group(0) = 0",
+            "[pid 2] (read) = EINTR",
+            "[pid 2] (execve) = ",
+            "[pid x] fork() = 3",
+            "[pid 2] Fork() = 3",
+            "Thread 2 exited with status ",
+            "Task 2 exited with status Exited(0)",
+        ] {
+            assert_eq!(parse_strace_line(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn matches_reused_thread_ids_in_exit_order() {
+        refused(check(&BODY, "3:1 3:2 2:5"), "before an exit of thread 3");
+    }
+
+    #[test]
+    fn refuses_a_line_counted_for_the_wrong_task() {
+        let mut body = BODY;
+        body[0] = "[pid 3] read(0, 0x10, 1) = 1";
+        refused(check(&body, BY_TASK), "strace printed 3 syscall lines");
+    }
+
+    #[test]
+    fn refuses_a_missing_syscall_line() {
+        let body: Vec<&str> = BODY
+            .iter()
+            .copied()
+            .filter(|l| !l.contains("wait4"))
+            .collect();
+        refused(check(&body, BY_TASK), "strace counted 7 syscall events");
+    }
+
+    #[test]
+    fn refuses_a_missing_thread_exit() {
+        let mut body = BODY.to_vec();
+        body.remove(10);
+        refused(check(&body, BY_TASK), "after its last exit");
+    }
+
+    #[test]
+    fn refuses_a_missing_process_exit() {
+        let mut body = BODY.to_vec();
+        body.remove(11);
+        refused(check(&body, BY_TASK), "strace printed 2 process exits");
+    }
+
+    #[test]
+    fn refuses_a_failed_execve_line_without_its_execve() {
+        let mut body = BODY;
+        body.swap(2, 3);
+        refused(check(&body, BY_TASK), "does not follow a execve line");
+    }
+
+    #[test]
+    fn refuses_a_signal_line() {
+        let mut body = BODY.to_vec();
+        body.insert(8, "[pid 2] Received signal: SIGCHLD");
+        refused(check(&body, BY_TASK), "a signal event");
+    }
+
+    #[test]
+    fn refuses_a_line_strace_does_not_print() {
+        let mut body = BODY;
+        body[7] = "[pid 2] wait4(-1, 0x50, 0, 0x0)";
+        refused(check(&body, BY_TASK), "strace does not print");
+    }
+
+    #[test]
+    fn refuses_dropped_lines_and_a_wrong_line_count() {
+        let dropped = "reverie-narf-boot: strace output lines=15 dropped=1";
+        refused(
+            check_reverie_report(&serial(dropped, &BODY, TALLY, BY_TASK), "strace"),
+            "overflowed the report's buffer",
+        );
+        let short = "reverie-narf-boot: strace output lines=14 dropped=0";
+        refused(
+            check_reverie_report(&serial(short, &BODY, TALLY, BY_TASK), "strace"),
+            "its header says 14",
+        );
+    }
 }
 
 /// Produce a Limine-bootable UEFI ISO at

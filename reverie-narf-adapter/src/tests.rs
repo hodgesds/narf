@@ -22,7 +22,7 @@ use narf_userspace::syscall::{
     NativeSyscallOutcome, NativeSyscallRequest, NativeSyscallTransition, SyscallInterception,
     SyscallInterceptor, SyscallInvocation, SyscallReturn,
 };
-use reverie::syscalls::{Addr, MemoryAccess};
+use reverie::syscalls::{Addr, MemoryAccess, Sysno};
 use reverie::{Pid, Tool};
 use reverie_narf_core::{KernelServices, NarfSyscallOutcome, OriginalSyscallError};
 use reverie_narf_tools::canonical::CanonicalTrace;
@@ -30,6 +30,7 @@ use reverie_narf_tools::counter1::CounterLocal;
 use reverie_narf_tools::counter2;
 use reverie_narf_tools::passthrough::PassThrough;
 use reverie_narf_tools::probe::Probe;
+use reverie_narf_tools::strace;
 
 use crate::interceptor::{ConsoleSink, ReverieInterceptor, TaskExitRecord};
 use crate::services::{map_native_outcome, NarfKernelServices};
@@ -2738,12 +2739,12 @@ const LINUX_EXIT_GROUP: u32 = 231;
 
 /// Every new (not re-executed) syscall entry [`EntryWatch`] saw, as
 /// `(scheduler task id, Linux syscall number)`, in order.
-static COUNTER2_ENTRIES: IrqSafeSpinLock<Vec<(u64, u32)>> = IrqSafeSpinLock::new(Vec::new());
+static WATCHED_ENTRIES: IrqSafeSpinLock<Vec<(u64, u32)>> = IrqSafeSpinLock::new(Vec::new());
 /// A task exit [`EntryWatch`] saw: the scheduler task id, and the Linux
 /// thread and process IDs as the exit began, if the kernel still had them.
 type WatchedExit = (u64, Option<(i32, i32)>);
 /// Every task exit [`EntryWatch`] saw, in order.
-static COUNTER2_EXITS: IrqSafeSpinLock<Vec<WatchedExit>> = IrqSafeSpinLock::new(Vec::new());
+static WATCHED_EXITS: IrqSafeSpinLock<Vec<WatchedExit>> = IrqSafeSpinLock::new(Vec::new());
 /// Every report counter2's thread-exit reporter received, as `(thread ID,
 /// syscall count)`.
 static COUNTER2_REPORTS: IrqSafeSpinLock<Vec<(i32, u64)>> = IrqSafeSpinLock::new(Vec::new());
@@ -2769,7 +2770,7 @@ impl SyscallInterceptor for EntryWatch {
         native: &mut dyn NativeSyscallTransition,
     ) -> SyscallInterception {
         if !invocation.park_reexecution {
-            COUNTER2_ENTRIES.lock().push((
+            WATCHED_ENTRIES.lock().push((
                 invocation.task_id,
                 invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK,
             ));
@@ -2801,7 +2802,7 @@ impl SyscallInterceptor for EntryWatch {
         let ids = tool_view::linux_task_ids(task_id).map(|ids| (ids.tid as i32, ids.pid as i32));
         self.inner
             .on_task_exit(task_id, pid, wstatus, process_wstatus);
-        COUNTER2_EXITS.lock().push((task_id, ids));
+        WATCHED_EXITS.lock().push((task_id, ids));
     }
 }
 
@@ -2831,8 +2832,8 @@ fn with_futex_waits(numbers: &[u32], before: &[u32], after: &[u32]) -> bool {
 /// which the dispatcher flags and counter2 sees as the one event already in
 /// flight, so the watch leaves re-executions out.
 fn reverie_narf_counter2_thread_and_process_counts() -> TestResult {
-    COUNTER2_ENTRIES.lock().clear();
-    COUNTER2_EXITS.lock().clear();
+    WATCHED_ENTRIES.lock().clear();
+    WATCHED_EXITS.lock().clear();
     COUNTER2_REPORTS.lock().clear();
     result_of((|| {
         let interceptor = ReverieInterceptor::<counter2::CounterLocal>::with_tool_constructor(
@@ -2856,8 +2857,8 @@ fn reverie_narf_counter2_thread_and_process_counts() -> TestResult {
         )?;
         let root_pid = root.pid as i32;
         check_teardown(&interceptor, root, 4, 0x700)?;
-        let entries = core::mem::take(&mut *COUNTER2_ENTRIES.lock());
-        let exits = core::mem::take(&mut *COUNTER2_EXITS.lock());
+        let entries = core::mem::take(&mut *WATCHED_ENTRIES.lock());
+        let exits = core::mem::take(&mut *WATCHED_EXITS.lock());
         let reports = core::mem::take(&mut *COUNTER2_REPORTS.lock());
         // Each exited task's thread ID, process ID and syscalls, in order;
         // the scheduler never reuses a task id.
@@ -2940,6 +2941,224 @@ fn reverie_narf_counter2_thread_and_process_counts() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_counter2_thread_and_process_counts);
+
+// ── strace: a line per syscall event and per exit ────────────────────────
+
+/// Every line strace printed, in order.
+static STRACE_LINES: IrqSafeSpinLock<Vec<alloc::string::String>> = IrqSafeSpinLock::new(Vec::new());
+
+fn record_strace_line(line: &str) {
+    STRACE_LINES.lock().push(alloc::string::String::from(line));
+}
+
+/// A thread strace printed an exit line for: its thread ID, its syscall
+/// lines, the exit line's status, and the exit line's index among the thread
+/// exit lines.
+type StraceThread<'a> = (i32, Vec<&'a str>, &'a str, usize);
+
+/// strace, compiled from the source files reverie-examples builds its Linux
+/// binary from, prints a line for each syscall event and one at each
+/// thread's and each process's exit. Over the thread exit-status guest
+/// (`guests/mtexit_x86_64.S`), each thread's lines up to its exit line name,
+/// in order, the syscalls the watch outside the Reverie interceptor saw that
+/// thread make, which are the ones the assembly makes; the lines for fork,
+/// wait4, set_tid_address and clone carry the thread IDs those calls return,
+/// and each exit and exit_group line its code. Each thread's exit line
+/// carries its own status, and each process's line follows both of its
+/// threads' lines and carries the status wait4 reports for it.
+fn reverie_narf_strace_prints_each_event_and_exit() -> TestResult {
+    WATCHED_ENTRIES.lock().clear();
+    WATCHED_EXITS.lock().clear();
+    STRACE_LINES.lock().clear();
+    reverie_narf_tools::set_eprintln_sink(record_strace_line);
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<strace::Strace>::with_tool_constructor(
+            strace::Config::default(),
+            <strace::Strace as Tool>::new,
+        )
+        .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let root = run_guest(
+            MTEXIT_GUEST,
+            Box::new(EntryWatch {
+                inner: interceptor.boxed(),
+            }),
+            |root| {
+                interceptor
+                    .host_root(root.task_id)
+                    .map_err(|_| "register_root refused the root task")
+            },
+        )?;
+        let root_pid = root.pid as i32;
+        check_teardown(&interceptor, root, 4, 0x700)?;
+        let entries = core::mem::take(&mut *WATCHED_ENTRIES.lock());
+        let exits = core::mem::take(&mut *WATCHED_EXITS.lock());
+        let lines = core::mem::take(&mut *STRACE_LINES.lock());
+        for line in &lines {
+            let _ = writeln!(Writer, "    strace: {line}");
+        }
+        // Each thread ID's syscall lines since its last exit line. At each
+        // thread exit line, (thread ID, those lines, status); at each process
+        // exit line, (thread exit lines before it, pid, status).
+        let mut open = alloc::collections::BTreeMap::<i32, Vec<&str>>::new();
+        let mut threads: Vec<(i32, Vec<&str>, &str)> = Vec::new();
+        let mut processes: Vec<(usize, i32, &str)> = Vec::new();
+        let id = |text: &str| {
+            text.parse::<i32>()
+                .map_err(|_| "strace printed a malformed ID")
+        };
+        for line in &lines {
+            if let Some(rest) = line.strip_prefix("[pid ") {
+                let (tid, call) = rest
+                    .split_once("] ")
+                    .ok_or("strace printed a malformed syscall line")?;
+                open.entry(id(tid)?).or_default().push(call);
+                continue;
+            }
+            let (kind, id_text, status) = line
+                .split_once(' ')
+                .and_then(|(kind, rest)| {
+                    let (id_text, status) = rest.split_once(" exited with status ")?;
+                    Some((kind, id_text, status))
+                })
+                .ok_or("strace printed a line of no form it prints")?;
+            match kind {
+                "Thread" => {
+                    let tid = id(id_text)?;
+                    threads.push((tid, open.remove(&tid).unwrap_or_default(), status));
+                }
+                "Process" => processes.push((threads.len(), id(id_text)?, status)),
+                _ => return Err("strace printed a line of no form it prints"),
+            }
+        }
+        if open.values().any(|calls| !calls.is_empty()) {
+            return Err("strace printed a syscall line after its thread's exit line");
+        }
+        if threads.len() != 4 || exits.len() != 4 || processes.len() != 2 {
+            return Err("strace did not print four thread exits and two process exits");
+        }
+        // Each role's thread: the root's leader and thread, the child's
+        // leader and thread. A thread ID is reused only once its thread has
+        // exited, so the k-th task with a given thread ID to exit has the
+        // k-th exit line with that ID.
+        let mut used = [false; 4];
+        let mut roles: [Option<StraceThread<'_>>; 4] = Default::default();
+        for (task_id, ids) in &exits {
+            let Some((tid, pid)) = *ids else {
+                return Err("a task's Linux IDs were gone when its exit began");
+            };
+            let Some(at) = (0..threads.len()).find(|&at| !used[at] && threads[at].0 == tid) else {
+                return Err("strace printed no exit line for a task that exited");
+            };
+            used[at] = true;
+            let (_, calls, status) = &threads[at];
+            let numbers: Vec<u32> = entries
+                .iter()
+                .filter(|(task, _)| task == task_id)
+                .map(|(_, number)| *number)
+                .collect();
+            if calls.len() != numbers.len() {
+                return Err("a thread's syscall lines are not one per syscall it made");
+            }
+            for (call, number) in calls.iter().zip(&numbers) {
+                let named = Sysno::new(*number as usize).is_some_and(|sysno| {
+                    call.strip_prefix(sysno.name())
+                        .is_some_and(|rest| rest.starts_with('('))
+                });
+                if !named {
+                    return Err("a syscall line does not name the syscall the thread made");
+                }
+            }
+            let (role, made) = match (pid == root_pid, tid == pid) {
+                (true, true) => (
+                    0,
+                    with_futex_waits(
+                        &numbers,
+                        &[LINUX_FORK, LINUX_WAIT4, LINUX_CLONE],
+                        &[LINUX_EXIT_GROUP],
+                    ),
+                ),
+                (true, false) => (1, numbers[..] == [LINUX_EXIT]),
+                (false, true) => (
+                    2,
+                    numbers[..] == [LINUX_SET_TID_ADDRESS, LINUX_CLONE, LINUX_EXIT],
+                ),
+                (false, false) => (3, with_futex_waits(&numbers, &[], &[LINUX_EXIT])),
+            };
+            if !made {
+                return Err("a thread's syscalls are not the ones the guest's assembly makes");
+            }
+            if roles[role]
+                .replace((tid, calls.clone(), *status, at))
+                .is_some()
+            {
+                return Err("the tree was not a leader and a thread in each of two processes");
+            }
+        }
+        let [Some(root_leader), Some(root_thread), Some(child_leader), Some(child_thread)] = roles
+        else {
+            return Err("the tree was not a leader and a thread in each of two processes");
+        };
+        let value = |call: &str| {
+            call.rsplit_once(" = ")
+                .and_then(|(_, value)| value.parse::<i64>().ok())
+        };
+        let child = i64::from(child_leader.0);
+        let (root_calls, child_calls) = (&root_leader.1, &child_leader.1);
+        if value(root_calls[0]) != Some(child)
+            || value(root_calls[1]) != Some(child)
+            || value(root_calls[2]) != Some(i64::from(root_thread.0))
+            || root_calls.last() != Some(&"exit_group(7) = ?")
+        {
+            return Err(
+                "the root's lines do not carry fork's, wait4's and clone's results and \
+                 exit_group(7)",
+            );
+        }
+        if value(child_calls[0]) != Some(child)
+            || value(child_calls[1]) != Some(i64::from(child_thread.0))
+            || child_calls[2] != "exit(3) = ?"
+        {
+            return Err(
+                "the child's lines do not carry set_tid_address's and clone's results and \
+                 exit(3)",
+            );
+        }
+        if root_thread.1[..] != ["exit(6) = ?"] || child_thread.1.last() != Some(&"exit(5) = ?") {
+            return Err("a thread's exit line does not carry its exit code");
+        }
+        if [
+            (&root_leader, "Exited(7)"),
+            (&root_thread, "Exited(6)"),
+            (&child_leader, "Exited(3)"),
+            (&child_thread, "Exited(5)"),
+        ]
+        .iter()
+        .any(|(thread, status)| thread.2 != *status)
+        {
+            return Err("a thread's exit line does not carry its own status");
+        }
+        for (last_thread, pid, status) in [
+            (
+                child_leader.3.max(child_thread.3),
+                child_leader.0,
+                "Exited(5)",
+            ),
+            (root_leader.3.max(root_thread.3), root_pid, "Exited(7)"),
+        ] {
+            let Some(&(after, _, printed)) = processes.iter().find(|entry| entry.1 == pid) else {
+                return Err("strace printed no exit line for a process");
+            };
+            if after <= last_thread || printed != status {
+                return Err(
+                    "a process's exit line does not follow its threads' lines or carry the \
+                     status wait4 reports for it",
+                );
+            }
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_strace_prints_each_event_and_exit);
 
 // ── Task creation from lifecycle callbacks ───────────────────────────────
 
