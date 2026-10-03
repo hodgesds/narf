@@ -1291,9 +1291,10 @@ fn smoke_exit_drops_futex_waiter_moved_by_requeue() -> TestResult {
         return TestResult::Fail("exit left a perpetually moving futex waiter resident");
     }
 
-    // 6. Two registrations at once — the transient state a park-loop
-    //    registration on the stale word creates after a requeue moved the
-    //    task's earlier entry. Exit must drop both.
+    // 6. Two registrations at once. The park registrar no longer creates
+    //    this state: it refuses to register a task the index already places
+    //    under another key (see smoke_park_recheck_stays_on_requeue_moved_entry).
+    //    The unconditional test registrar still can, and exit must drop both.
     let v = park(0xF2_60);
     futex_register_waiter(dst, v.tid, counting_waker(&v.fired));
     __test_release_task_tables(v.tid);
@@ -1481,6 +1482,315 @@ fn smoke_park_exit_drops_futex_waiter_moved_by_requeue() -> TestResult {
 kernel_test_in!(
     "userspace/process",
     smoke_park_exit_drops_futex_waiter_moved_by_requeue
+);
+
+/// A park re-check that runs after a `FUTEX_REQUEUE` has moved the task's
+/// entry, but before the requeue retargets the task's context, must stay
+/// parked on the moved entry. It must not register a second entry on the
+/// stale source word. The requeue moves the entry from word1 to word2 under
+/// both bucket locks, and only later rewrites the context's `futex_uaddr`. A
+/// re-check in between read word1 and used to register the task there, next
+/// to its moved entry. `FUTEX_WAKE(word1, 1)` could then be spent on the
+/// requeued task instead of a waiter that was really on word1.
+///
+/// Drives the production park decision (`park_should_block_for`), the
+/// production move (`futex_requeue_move_racing`, which `futex_requeue_move`
+/// wraps) and the production retarget, in a fixed order. T's tid is below
+/// W's, so a stale T entry on word1 is exactly the one a one-waiter wake
+/// would pop.
+///   1. T's park snapshot matches word1's generation, so validation on word1
+///      would pass. Move, re-check, then `FUTEX_WAKE(word1, 1)` must wake W
+///      and not T, T must hold only its word2 row, and after the retarget
+///      `FUTEX_WAKE(word2, 1)` must wake T.
+///   2. The requeue's wake half has bumped word1's generation past T's
+///      snapshot (as production does before every move). The re-check must
+///      still stay parked. Validating against word1 would turn it into a
+///      spurious wake that drops the moved entry.
+///   3. A second requeue moves T on from word2 to word3, and T's re-check (its
+///      context still names word1) runs inside that move, after T's waker has
+///      left word2 and before it reaches word3. T must end with only its
+///      word3 row: the move retags the row in one step, so the re-check never
+///      sees the task without a row.
+fn smoke_park_recheck_stays_on_requeue_moved_entry() -> TestResult {
+    use crate::handlers::{
+        __test_futex_bucket_index, __test_futex_drop_task_waiters_racing,
+        __test_futex_requeue_move, __test_futex_requeue_move_racing, __test_futex_requeue_retarget,
+        __test_futex_task_index, futex_gen, futex_register_waiter, futex_wake_waiters_for_test,
+        with_kernel_buffers,
+    };
+    use crate::user_task::__test_park_should_block_for;
+    // The module-level `Arc` import is x86_64-only; this test runs on
+    // every architecture.
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU32;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: &Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: the vtable matches the Arc<AtomicU32> representation.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(counter.clone()) as *const (),
+                &VTAB,
+            ))
+        }
+    }
+
+    // Readable futex words on this stack (`with_kernel_buffers` lets the park
+    // check's word re-validation read them), picked so word1, word2 and word3
+    // sit in three different buckets: case 3 re-checks on word1 while a move
+    // holds word2's and word3's bucket locks.
+    let words: [u32; 64] = core::array::from_fn(|i| 100 + i as u32);
+    let addr = |i: usize| &words[i] as *const u32 as u64;
+    let bucket = |u: u64| __test_futex_bucket_index(0, u);
+    let word1 = addr(0);
+    let Some(i2) = (1..64).find(|&i| bucket(addr(i)) != bucket(word1)) else {
+        return TestResult::Fail("no word2 in a different futex bucket from word1");
+    };
+    let word2 = addr(i2);
+    let Some(i3) =
+        (1..64).find(|&i| bucket(addr(i)) != bucket(word1) && bucket(addr(i)) != bucket(word2))
+    else {
+        return TestResult::Fail("no word3 in a futex bucket apart from word1 and word2");
+    };
+    let word3 = addr(i3);
+    let (val1, val2, val3) = (words[0], words[i2], words[i3]);
+
+    struct Pair {
+        t: u64,
+        w: u64,
+        t_task: Arc<crate::task::Task>,
+        // Holds W's registered task alive until `finish` releases it.
+        _w_task: Arc<crate::task::Task>,
+        t_fired: Arc<AtomicU32>,
+        w_fired: Arc<AtomicU32>,
+        t_waker: Waker,
+        sleep: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    }
+    let new_pair = |t: u64, w: u64| -> Pair {
+        let t_fired = Arc::new(AtomicU32::new(0));
+        Pair {
+            t,
+            w,
+            t_task: crate::task::Task::new_registered(t, t + 1),
+            _w_task: crate::task::Task::new_registered(w, w + 1),
+            t_waker: counting_waker(&t_fired),
+            t_fired,
+            w_fired: Arc::new(AtomicU32::new(0)),
+            sleep: None,
+        }
+    };
+    // One run of T's production park decision.
+    let recheck = |p: &mut Pair| -> bool {
+        with_kernel_buffers(|| {
+            __test_park_should_block_for(p.t, &p.t_task.uctx, &p.t_waker, &mut p.sleep)
+        })
+    };
+    // T enters an untimed FUTEX_WAIT(word1) exactly as `sys_futex` publishes
+    // it, and its park loop registers it and blocks.
+    let enter_wait = |p: &mut Pair| -> bool {
+        let uc = &p.t_task.uctx;
+        uc.futex_namespace.store(0, Ordering::Release);
+        uc.futex_uaddr.store(word1, Ordering::Release);
+        uc.futex_val.store(val1, Ordering::Release);
+        uc.futex_park_gen.store(futex_gen(word1), Ordering::Release);
+        uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+        recheck(p) && __test_futex_task_index(p.t).as_slice() == [word1]
+    };
+    // `FUTEX_WAKE(word1, 1)` must wake W and not T.
+    let wake_word1_reaches_w = |p: &Pair| -> bool {
+        let t_before = p.t_fired.load(Ordering::Acquire);
+        let woken = futex_wake_waiters_for_test(word1, 1);
+        let t_hits = p.t_fired.load(Ordering::Acquire) - t_before;
+        let w_hits = p.w_fired.load(Ordering::Acquire);
+        if woken != 1 || w_hits != 1 || t_hits != 0 {
+            narf_console::klog!(
+                "    moved-row wake(word1): woken={} t_fired={} w_fired={}",
+                woken,
+                t_hits,
+                w_hits
+            );
+            return false;
+        }
+        true
+    };
+    let index_is = |p: &Pair, want: u64| -> bool {
+        let index = __test_futex_task_index(p.t);
+        if index.as_slice() != [want] {
+            narf_console::klog!(
+                "    moved-row index: T has {} rows, want only {:#x}: {:x?}",
+                index.len(),
+                want,
+                index.as_slice()
+            );
+            return false;
+        }
+        true
+    };
+    let finish = |mut p: Pair, r: Result<(), &'static str>| -> Result<(), &'static str> {
+        if let Some(h) = p.sleep.take() {
+            narf_scheduler::narf_time::timer_wheel::cancel(h);
+        }
+        for u in [word1, word2, word3] {
+            let _ = futex_wake_waiters_for_test(u, u32::MAX);
+        }
+        __test_futex_drop_task_waiters_racing(p.t, |_| {});
+        __test_futex_drop_task_waiters_racing(p.w, |_| {});
+        crate::handlers::drop_signal_waker(p.t);
+        crate::task::release_task(p.t);
+        crate::task::release_task(p.w);
+        drop(p);
+        r
+    };
+
+    // 1. Move, re-check, wake the source, retarget, wake the destination.
+    let mut p = new_pair(0xF5_10, 0xF5_20);
+    let r = (|| -> Result<(), &'static str> {
+        if !enter_wait(&mut p) {
+            return Err("case 1 setup: T's park loop did not register on word1 and block");
+        }
+        futex_register_waiter(word1, p.w, counting_waker(&p.w_fired));
+        let (moved, gen2) = __test_futex_requeue_move(word1, word2, 1);
+        if moved.as_slice() != [p.t] || p.t_task.uctx.futex_uaddr.load(Ordering::Acquire) != word1 {
+            return Err("case 1 setup: the move did not move T alone, before any retarget");
+        }
+        if !recheck(&mut p) {
+            return Err("case 1: T's park re-check between the requeue move and retarget woke T");
+        }
+        if !wake_word1_reaches_w(&p) {
+            return Err(
+                "case 1: FUTEX_WAKE(word1, 1) was spent on the requeued task instead of the \
+                 waiter still on word1",
+            );
+        }
+        if !index_is(&p, word2) {
+            return Err("case 1: T's park re-check left a registration on the stale source word");
+        }
+        __test_futex_requeue_retarget(&moved, word2, gen2, val2);
+        if p.t_task.uctx.futex_uaddr.load(Ordering::Acquire) != word2 {
+            return Err("case 1: the retarget did not point T at word2");
+        }
+        let woken = futex_wake_waiters_for_test(word2, 1);
+        if woken != 1 || p.t_fired.load(Ordering::Acquire) != 1 {
+            return Err("case 1: FUTEX_WAKE(word2, 1) did not wake the requeued task");
+        }
+        Ok(())
+    })();
+    if let Err(m) = finish(p, r) {
+        return TestResult::Fail(m);
+    }
+
+    // 2. The requeue's wake half bumped word1's generation first.
+    let mut p = new_pair(0xF5_30, 0xF5_40);
+    let r = (|| -> Result<(), &'static str> {
+        if !enter_wait(&mut p) {
+            return Err("case 2 setup: T's park loop did not register on word1 and block");
+        }
+        // `futex_requeue_waiters_keyed` bumps the source generation before it
+        // wakes `n_wake` (here 0) and moves.
+        if futex_wake_waiters_for_test(word1, 0) != 0 {
+            return Err("case 2 setup: a zero-waiter wake woke someone");
+        }
+        let (moved, gen2) = __test_futex_requeue_move(word1, word2, 1);
+        if moved.as_slice() != [p.t] {
+            return Err("case 2 setup: the move did not move T");
+        }
+        if !recheck(&mut p) {
+            return Err(
+                "case 2: a park re-check before the retarget turned the requeue into a \
+                 spurious wake of the moved task",
+            );
+        }
+        if !index_is(&p, word2) {
+            return Err("case 2: T's moved registration did not stay on word2");
+        }
+        __test_futex_requeue_retarget(&moved, word2, gen2, val2);
+        if !recheck(&mut p) || !index_is(&p, word2) {
+            return Err("case 2: T's park re-check after the retarget did not stay on word2");
+        }
+        let woken = futex_wake_waiters_for_test(word2, 1);
+        if woken != 1 || p.t_fired.load(Ordering::Acquire) != 1 {
+            return Err("case 2: FUTEX_WAKE(word2, 1) did not wake the requeued task");
+        }
+        Ok(())
+    })();
+    if let Err(m) = finish(p, r) {
+        return TestResult::Fail(m);
+    }
+
+    // 3. T's re-check runs inside a second move, word2 -> word3.
+    let mut p = new_pair(0xF5_50, 0xF5_60);
+    let r = (|| -> Result<(), &'static str> {
+        if !enter_wait(&mut p) {
+            return Err("case 3 setup: T's park loop did not register on word1 and block");
+        }
+        futex_register_waiter(word1, p.w, counting_waker(&p.w_fired));
+        let (moved1, gen2) = __test_futex_requeue_move(word1, word2, 1);
+        if moved1.as_slice() != [p.t] {
+            return Err("case 3 setup: the first move did not move T alone");
+        }
+        let mut in_window = None;
+        let (moved2, gen3) = __test_futex_requeue_move_racing(word2, word3, 1, || {
+            in_window = Some(recheck(&mut p));
+        });
+        if moved2.as_slice() != [p.t] || in_window.is_none() {
+            return Err("case 3 setup: the second move did not move T and run the re-check");
+        }
+        if in_window != Some(true) {
+            return Err("case 3: T's park re-check inside the second requeue move woke T");
+        }
+        if !wake_word1_reaches_w(&p) {
+            return Err(
+                "case 3: FUTEX_WAKE(word1, 1) was spent on the twice-requeued task instead of \
+                 the waiter still on word1",
+            );
+        }
+        if !index_is(&p, word3) {
+            return Err(
+                "case 3: T's park re-check inside a second requeue move left a registration \
+                 on the stale source word",
+            );
+        }
+        __test_futex_requeue_retarget(&moved1, word2, gen2, val2);
+        __test_futex_requeue_retarget(&moved2, word3, gen3, val3);
+        if p.t_task.uctx.futex_uaddr.load(Ordering::Acquire) != word3 {
+            return Err("case 3: the retargets did not leave T pointed at word3");
+        }
+        let woken = futex_wake_waiters_for_test(word3, 1);
+        if woken != 1 || p.t_fired.load(Ordering::Acquire) != 1 {
+            return Err("case 3: FUTEX_WAKE(word3, 1) did not wake the requeued task");
+        }
+        Ok(())
+    })();
+    if let Err(m) = finish(p, r) {
+        return TestResult::Fail(m);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_park_recheck_stays_on_requeue_moved_entry
 );
 
 /// The x86_64 legacy poll must leave the futex park on EVERY resume to

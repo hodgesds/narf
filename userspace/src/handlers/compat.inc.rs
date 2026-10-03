@@ -7584,11 +7584,16 @@ fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
 // which the context still names the source word while the waker already
 // sits under the destination word.
 //
-// A task normally owns at most one registration, but it can transiently own
-// two: the park loop can load the source word, lose the race to a requeue
-// that moves its earlier entry to the destination, and then register on the
-// source (see `futex_park_register_and_check`). So the index is a SET of
-// keys per task, not a single slot.
+// A task owns at most one production registration. Between a
+// `FUTEX_REQUEUE`'s move and its retarget, the task's context still names the
+// source word while its live entry already sits under the destination. A park
+// re-check in that window reads the source word, and it used to register a
+// second entry there. The park-loop registrar (`futex_park_register_key`) now
+// refuses to insert under a key while the index places the task under a
+// different key, and reports the task as moved instead (see
+// `futex_park_register_and_check`). The index is still a SET of keys per task:
+// the unconditional registrar behind the `futex_register_waiter` test API can
+// create two rows, and exit and the park leave drop every row they find.
 //
 // Invariant and locking:
 //   - `(tid, key)` is inserted or removed only while holding the bucket lock
@@ -7599,8 +7604,13 @@ fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
 //     takes a bucket lock while holding a shard lock, and neither lock is
 //     held across `with_user_task_ctx` (the task registry lock).
 //   - Requeue holds BOTH bucket locks (ascending bucket order) while it moves
-//     entries, so it removes `(tid, src)` and inserts `(tid, dst)` inside one
-//     critical section that any reader of either key must wait out.
+//     entries, so anyone locking either key's bucket waits out the whole move.
+//     It retags each mover's row from `(tid, src)` to `(tid, dst)` in ONE
+//     shard critical section (`futex_task_index_retag`). A registrar that
+//     holds only some third key's bucket lock therefore sees the row under
+//     exactly one of the two keys, never under neither. If it could see
+//     neither, it would take the task for unregistered and insert a second
+//     row.
 //
 // Sharded by task id (ids are monotonic, so the low bits spread), so the
 // extra lock taken per register/drop/wake/move contends only with work on
@@ -7660,6 +7670,23 @@ fn futex_task_index_remove(_bucket: &FutexWaiterMap, task_id: u64, key: FutexKey
         .keys
         .lock()
         .remove(&(task_id, key))
+}
+
+/// Move `task_id`'s row from `from` to `to` in one shard critical section (see
+/// the index notes: a row is never visible under neither key). `_from_bucket`
+/// and `_to_bucket` are the locked contents of the two keys' buckets, which
+/// may be the same map. The caller holds both locks.
+#[inline]
+fn futex_task_index_retag(
+    _from_bucket: &FutexWaiterMap,
+    _to_bucket: &FutexWaiterMap,
+    task_id: u64,
+    from: FutexKey,
+    to: FutexKey,
+) {
+    let mut index = futex_task_index_shard(task_id).keys.lock();
+    index.remove(&(task_id, from));
+    index.insert((task_id, to));
 }
 
 /// Does the index place `task_id` under `key`? Same locking rule as
@@ -7844,8 +7871,9 @@ fn futex_has_task_waiter(task_id: u64) -> bool {
     })
 }
 
-/// Register `task_id`'s waker as parked on futex word `uaddr`. Called from
-/// the user-task poll routine while a task blocks in `FUTEX_WAIT`.
+/// Register `task_id`'s waker as parked on futex word `uaddr`,
+/// unconditionally (it may give the task a second row). Test API: the park
+/// loops register through [`futex_park_register_key`].
 pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker) {
     futex_register_waiter_key(futex_key(0, uaddr), task_id, waker);
 }
@@ -7854,6 +7882,46 @@ pub(crate) fn futex_register_waiter_key(key: FutexKey, task_id: u64, waker: core
     let mut values = futex_wait_bucket(key).values.lock();
     values.entry(key).or_default().insert(task_id, waker);
     futex_task_index_insert(&values, task_id, key);
+}
+
+/// Outcome of [`futex_park_register_key`].
+enum FutexParkRegistration {
+    /// The waker is queued under the requested key (inserted, or replaced an
+    /// earlier waker of the same task under that key).
+    Registered,
+    /// Nothing was inserted: the index places the task under a different key,
+    /// so a `FUTEX_REQUEUE` has moved its live entry and not yet retargeted
+    /// the context. The task is still queued, under the destination key.
+    Moved,
+}
+
+/// The park loops' registrar: queue `task_id`'s waker under `key` unless the
+/// task already has a row under another key.
+///
+/// The check and the insert run in one critical section of `key`'s bucket
+/// lock, with the shard lock nested inside it (bucket first, then shard). A
+/// row under another key can change only under that key's bucket lock, not
+/// this one. A requeue retags a row in one shard critical section
+/// ([`futex_task_index_retag`]), so the row is always under exactly one key.
+/// A concurrent wake or leave can remove the row just after the check; the
+/// task has then been woken, or is itself leaving, and returning `Moved`
+/// costs nothing.
+fn futex_park_register_key(
+    key: FutexKey,
+    task_id: u64,
+    waker: core::task::Waker,
+) -> FutexParkRegistration {
+    let mut values = futex_wait_bucket(key).values.lock();
+    let mut index = futex_task_index_shard(task_id).keys.lock();
+    let moved = index
+        .range((task_id, FUTEX_KEY_MIN)..=(task_id, FUTEX_KEY_MAX))
+        .any(|&(_, k)| k != key);
+    if moved {
+        return FutexParkRegistration::Moved;
+    }
+    values.entry(key).or_default().insert(task_id, waker);
+    index.insert((task_id, key));
+    FutexParkRegistration::Registered
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it, by key.
@@ -7995,9 +8063,6 @@ fn futex_take_waiters(
     if set.is_empty() {
         values.remove(&key);
     }
-    for (tid, _) in &movers {
-        futex_task_index_remove(values, *tid, key);
-    }
     movers
 }
 
@@ -8011,9 +8076,6 @@ fn futex_insert_waiters(
     for (tid, waker) in movers {
         dst.insert(tid, waker);
         tids.push(tid);
-    }
-    for tid in &tids {
-        futex_task_index_insert(values, *tid, key);
     }
     tids
 }
@@ -8042,28 +8104,63 @@ fn futex_requeue_waiters_keyed(
 
 /// Move phase of [`futex_requeue_waiters_keyed`]: under both bucket locks
 /// (ascending bucket order), move up to `n_move` waiters from `key` to `key2`
-/// and move their per-task index rows with them. Returns the moved task ids.
-/// Split from the retarget phase only so the interleaving regression can run
-/// exit teardown between the two; production composes them back to back.
+/// and retag their per-task index rows. Returns the moved task ids. Split
+/// from the retarget phase only so the interleaving regressions can run exit
+/// teardown or a park re-check between the two; production composes them
+/// back to back.
 fn futex_requeue_move(key: FutexKey, key2: FutexKey, n_move: u32) -> alloc::vec::Vec<u64> {
+    futex_requeue_move_racing(key, key2, n_move, || {})
+}
+
+/// [`futex_requeue_move`] with a hook run while both bucket locks are held,
+/// after the wakers leave the source queue and before they reach the
+/// destination queue. Production passes a no-op. The park re-check regression
+/// uses the hook to register a mover's park loop in exactly that window. The
+/// hook must not lock either key's bucket.
+fn futex_requeue_move_racing(
+    key: FutexKey,
+    key2: FutexKey,
+    n_move: u32,
+    between: impl FnOnce(),
+) -> alloc::vec::Vec<u64> {
+    // Each mover's row goes from `key` to `key2` in one shard critical section
+    // (`futex_task_index_retag`) after its waker has moved. It is never
+    // removed and re-inserted in two steps, because a registrar holding a
+    // third key's bucket lock could see no row in between.
     let source_bucket = futex_bucket_index(key);
     let destination_bucket = futex_bucket_index(key2);
     if source_bucket == destination_bucket {
         let mut values = FUTEX_WAITERS[source_bucket].values.lock();
         let movers = futex_take_waiters(&mut values, key, n_move);
-        futex_insert_waiters(&mut values, key2, movers)
+        between();
+        let tids = futex_insert_waiters(&mut values, key2, movers);
+        for tid in &tids {
+            futex_task_index_retag(&values, &values, *tid, key, key2);
+        }
+        tids
     } else if source_bucket < destination_bucket {
         // A total bucket order makes opposite-direction concurrent requeues
-        // deadlock-free.
+        // deadlock-free. Each branch declares its guards in acquisition order
+        // so they drop in reverse (each guard restores the IRQ state it saved).
         let mut source = FUTEX_WAITERS[source_bucket].values.lock();
         let mut destination = FUTEX_WAITERS[destination_bucket].values.lock();
         let movers = futex_take_waiters(&mut source, key, n_move);
-        futex_insert_waiters(&mut destination, key2, movers)
+        between();
+        let tids = futex_insert_waiters(&mut destination, key2, movers);
+        for tid in &tids {
+            futex_task_index_retag(&source, &destination, *tid, key, key2);
+        }
+        tids
     } else {
         let mut destination = FUTEX_WAITERS[destination_bucket].values.lock();
         let mut source = FUTEX_WAITERS[source_bucket].values.lock();
         let movers = futex_take_waiters(&mut source, key, n_move);
-        futex_insert_waiters(&mut destination, key2, movers)
+        between();
+        let tids = futex_insert_waiters(&mut destination, key2, movers);
+        for tid in &tids {
+            futex_task_index_retag(&source, &destination, *tid, key, key2);
+        }
+        tids
     }
 }
 
@@ -8090,7 +8187,9 @@ fn futex_requeue_retarget(
     //
     // Exit teardown and park-loop exits do not depend on this retarget:
     // they find a mover through the per-task index, which the move phase
-    // already updated under both bucket locks.
+    // already retagged under both bucket locks. Nor does a park re-check in
+    // the window: its registrar sees the row under `key2` and leaves the
+    // moved entry in place rather than registering on the stale word.
     //
     // The stores are guarded: they happen only while holding `key2`'s bucket
     // lock and only if the index still places the mover under `key2`. A
@@ -8099,9 +8198,21 @@ fn futex_requeue_retarget(
     // `futex_park_leave`, so the retarget writes nothing and cannot resurrect
     // `futex_uaddr` for a task that is no longer waiting. The same check
     // skips a mover that exited and re-entered FUTEX_WAIT on another word, or
-    // that a later requeue moved on again. `with_user_task_ctx` has released
-    // the registry lock before the closure runs (it hands out an `Arc`), so
-    // taking the bucket lock inside it nests nothing under the bucket lock.
+    // that a later requeue moved on again.
+    //
+    // It does NOT skip a mover that exited and re-entered FUTEX_WAIT on this
+    // same destination word: that task holds a fresh row under `key2`, so the
+    // stores below overwrite the `futex_park_gen`/`futex_val` its own
+    // FUTEX_WAIT published with this requeue's older `gen2`/`new_val`. The
+    // cost is at most a spurious wake. `gen2` was sampled before the task
+    // re-entered, so it is no newer than the task's own snapshot, and a wake
+    // that moves the counter past either one still breaks the park. A stale
+    // `new_val` can only turn a re-check of the word into a mismatch (wake)
+    // or into the no-recheck behaviour Linux has anyway.
+    //
+    // `with_user_task_ctx` has released the registry lock before the closure
+    // runs (it hands out an `Arc`), so taking the bucket lock inside it nests
+    // nothing under the bucket lock.
     for tid in moved {
         crate::user_task::with_user_task_ctx(*tid, |uc| {
             let values = futex_wait_bucket(key2).values.lock();
@@ -8142,8 +8253,10 @@ pub(crate) enum FutexParkCheck {
     /// No futex park is active (`futex_uaddr == 0`) — fall through to the
     /// other park sources.
     NotWaiting,
-    /// Registered on the (seqlock-validated) word's wait queue and the wait
-    /// still holds — keep parking.
+    /// Keep parking. Either the task is registered on the (seqlock-validated)
+    /// word's wait queue and the wait still holds, or a `FUTEX_REQUEUE` has
+    /// moved its entry and not yet retargeted the context, and the task stays
+    /// on the moved entry without re-validating.
     Stay,
     /// A wake landed, the word changed, or a `FUTEX_REQUEUE` retarget raced
     /// the registration: the park fields are cleared and any stale queue
@@ -8161,15 +8274,19 @@ pub(crate) enum FutexParkCheck {
 /// the wait resolves as a spurious wake. Keeping this in one function keeps
 /// the ordering invariant (seq before fields; re-check after register) from
 /// drifting between the two call sites.
+///
+/// A task a requeue has moved but not yet retargeted is not re-registered on
+/// the stale source word: [`futex_park_register_key`] reports it `Moved` and
+/// the task stays parked on its moved entry.
 pub(crate) fn futex_park_register_and_check(
     uc: &crate::user_task::UserTaskCtx,
     task_id: u64,
     waker: &core::task::Waker,
 ) -> FutexParkCheck {
-    // Every Wake return leaves the park, so it drops ALL of the task's
-    // registrations through the index (`futex_park_leave`), not just the
-    // entry this call inserted: the task can also hold an entry a requeue
-    // already moved to the destination word (see the index notes above).
+    // Every Wake return leaves the park, so it drops the task's registration
+    // through the index (`futex_park_leave`), wherever it is. That need not
+    // be an entry this call inserted: it can be one a requeue already moved
+    // to the destination word (see the index notes above).
     let leave = |uc: &crate::user_task::UserTaskCtx| {
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         futex_park_leave(uc, task_id);
@@ -8184,19 +8301,38 @@ pub(crate) fn futex_park_register_and_check(
         leave(uc);
         return FutexParkCheck::Wake;
     }
-    let key = futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
-    futex_register_waiter_key(key, task_id, waker.clone());
+    // All four target fields are read inside the seq_before .. re-check
+    // bracket, so the re-check below covers every one of them. A retarget
+    // writes `futex_park_gen`, `futex_val`, `futex_namespace` and
+    // `futex_uaddr`.
+    let namespace = uc.futex_namespace.load(Ordering::Acquire);
+    let park_gen = uc.futex_park_gen.load(Ordering::Acquire);
+    let expected = uc.futex_val.load(Ordering::Acquire);
+    let key = futex_key(namespace, fu);
+    let registration = futex_park_register_key(key, task_id, waker.clone());
     if uc.futex_park_seq.load(Ordering::Acquire) != seq_before {
         // A requeue retargeted us between the field loads and the
-        // registration — the entry we just inserted names the stale word.
+        // registration. Any entry just inserted names the stale word.
         leave(uc);
         return FutexParkCheck::Wake;
     }
+    if let FutexParkRegistration::Moved = registration {
+        // A requeue moved our live entry to its destination and has not yet
+        // retargeted the context, which still names the source word. The
+        // entry stays queued there with our waker, so a wake on the
+        // destination reaches us. Keep parking without inserting a second
+        // entry on the source. Validation against the source word is
+        // skipped: the requeue bumped the source generation before its move,
+        // so validating would turn such a re-check into a spurious wake of a
+        // task that is still correctly queued. The retarget will point the
+        // context at the destination.
+        return FutexParkCheck::Stay;
+    }
     let stay = futex_park_should_stay(
         futex_gen_key(key),
-        uc.futex_park_gen.load(Ordering::Acquire),
+        park_gen,
         futex_read_user_word(fu),
-        uc.futex_val.load(Ordering::Acquire),
+        expected,
     );
     if stay {
         FutexParkCheck::Stay
@@ -8264,6 +8400,25 @@ pub fn __test_futex_requeue_move(uaddr: u64, uaddr2: u64, n_move: u32) -> (alloc
     let key2 = futex_key(0, uaddr2);
     let gen2 = futex_wake_counter_key(key2);
     (futex_requeue_move(futex_key(0, uaddr), key2, n_move), gen2)
+}
+
+/// Test-only: [`__test_futex_requeue_move`] through
+/// `futex_requeue_move_racing`, running `between()` with both bucket locks
+/// held, after the wakers leave `uaddr` and before they reach `uaddr2`.
+/// `between` must not touch either word's bucket.
+#[doc(hidden)]
+pub fn __test_futex_requeue_move_racing(
+    uaddr: u64,
+    uaddr2: u64,
+    n_move: u32,
+    between: impl FnOnce(),
+) -> (alloc::vec::Vec<u64>, u64) {
+    let key2 = futex_key(0, uaddr2);
+    let gen2 = futex_wake_counter_key(key2);
+    (
+        futex_requeue_move_racing(futex_key(0, uaddr), key2, n_move, between),
+        gen2,
+    )
 }
 
 /// Test-only: the RETARGET phase matching [`__test_futex_requeue_move`].
