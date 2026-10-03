@@ -2095,6 +2095,296 @@ impl UserTaskFuture {
     }
 }
 
+/// The park half of the x86_64 legacy (longjmp) `UserTaskFuture::poll`: the
+/// whole deadline-driven park/resume decision, run before the poll re-enters
+/// user mode. Returns `true` when the poll must return `Pending` now, and
+/// `false` when it should fall through to resume the task in userspace.
+///
+/// Split out of `poll` (which passes `current_task_id()`, constant for the
+/// whole poll) only so a kernel test can drive this exact decision without
+/// entering user mode. The body is the former inline block with only these
+/// renames: `this.task.uctx` -> `uctx`, `this.sleep_handle` -> `sleep_handle`,
+/// `current_task_id()` -> `task_id`, and `return Poll::Pending` -> `return true`.
+#[cfg(target_arch = "x86_64")]
+fn legacy_poll_park(
+    task_id: u64,
+    uctx: &UserTaskCtx,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    cx: &core::task::Context<'_>,
+) -> bool {
+    let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
+    if deadline != 0 {
+        // Watchdog liveness signal (see `UserTaskCtx::dbg_park_checks`).
+        uctx.dbg_park_checks.fetch_add(1, Ordering::Relaxed);
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        // An asynchronously-raised signal (e.g. SIGALRM from an
+        // interval timer, a cross-process kill) must break ANY park —
+        // finite deadlines included: nanosleep/futex/poll are signal-
+        // interruptible on Linux (-EINTR). The old `deadline ==
+        // u64::MAX` restriction (guarding against a busy-spin on a
+        // pending *ignored* signal) is obsolete: the return-to-user
+        // delivery path consumes SIG_IGN/default-Ignore pending bits,
+        // so the break costs one spurious re-execution at most. A
+        // finite-deadline park that ignored signals was a de-facto
+        // permanent strand when the deadline was far out (the
+        // stress-ng --futex SMP hang).
+        let signal_pending = crate::handlers::is_signal_pending(task_id);
+        if now < deadline && !signal_pending {
+            // rt_sigtimedwait park: same register-then-re-check shape as
+            // the own-stack `park_should_block` sigwait arm — register in
+            // SIGNAL_WAKERS (every raise path fires it via `wake_signal`)
+            // and break the park when a signal in the waited set (mask
+            // ignored) or any deliverable signal is pending; the rewound
+            // syscall re-executes and consumes / returns -EINTR.
+            let sw = uctx.sigwait_set.load(Ordering::Acquire);
+            if sw != 0 {
+                let tid = task_id;
+                crate::handlers::register_signal_waker(tid, cx.waker().clone());
+                if crate::handlers::sigwait_should_wake(tid, sw) {
+                    crate::handlers::drop_signal_waker(tid);
+                    uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                    uctx.sigwait_set.store(0, Ordering::Release);
+                    // Self-wake exit: the next poll skips this block, so leave
+                    // the futex park here (see `futex_park_leave`).
+                    crate::handlers::futex_park_leave(uctx, task_id);
+                    cx.waker().wake_by_ref();
+                    return true;
+                }
+            } else {
+                // Non-sigwait park — release the sticky waiter
+                // reservation (see `UserTaskCtx::sigwait_reserve`).
+                uctx.sigwait_reserve.store(0, Ordering::Release);
+                // Signal-interruptible park: register in SIGNAL_WAKERS
+                // FIRST (every raise path fires it via `wake_signal`),
+                // then RE-CHECK pending — closes the check→register
+                // window; see the own-stack `park_should_block` twin.
+                let tid = task_id;
+                crate::handlers::register_signal_waker(tid, cx.waker().clone());
+                if crate::handlers::is_signal_pending(tid) {
+                    crate::handlers::drop_signal_waker(tid);
+                    uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                    if let Some(h) = sleep_handle.take() {
+                        narf_scheduler::narf_time::timer_wheel::cancel(h);
+                    }
+                    // Self-wake exit: the next poll skips this block, so leave
+                    // the futex park here (see `futex_park_leave`).
+                    crate::handlers::futex_park_leave(uctx, task_id);
+                    cx.waker().wake_by_ref();
+                    return true;
+                }
+            }
+            // Parking on a blocking wait. If `sys_epoll_wait`/
+            // `sys_poll` flagged this as a net I/O wait, register
+            // our waker so inbound TCP data wakes us immediately
+            // (crate::handlers::wake_io_waiters via the net
+            // readiness hook) instead of waiting out the deadline.
+            let durable_io_wait = uctx.durable_io_wait.load(Ordering::Acquire);
+            if uctx.net_io_wait.load(Ordering::Acquire) && !durable_io_wait {
+                if crate::handlers::register_io_waiter(task_id, cx.waker().clone()) {
+                    // A targeted wake landed in the scan→register window and
+                    // was latched; re-execute instead of parking. Closes the
+                    // lost-wake race for the TARGETED wake path.
+                    uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                    // Self-wake exit: the next poll skips this block, so leave
+                    // the futex park here (see `futex_park_leave`).
+                    crate::handlers::futex_park_leave(uctx, task_id);
+                    cx.waker().wake_by_ref();
+                    return true;
+                }
+                // Close the window for the UNTARGETED / broadcast wake too
+                // (net/src/readiness.rs contract): the scan site snapshotted
+                // the pre-scan readiness generation into `epoll_park_gen`.
+                let encoded_epfd = uctx.epoll_wait_fd.load(Ordering::Acquire);
+                if encoded_epfd != 0 {
+                    // EPOLL: the per-fd ready-list re-check is authoritative,
+                    // so advance the snapshot and consult it (no coarse-
+                    // generation re-exec that would spin on unrelated fds).
+                    uctx.epoll_park_gen
+                        .store(narf_net::readiness::generation(), Ordering::Release);
+                    if crate::epoll::epoll_fd_has_ready(task_id, (encoded_epfd - 1) as u32) {
+                        crate::handlers::drop_io_waiter(task_id);
+                        uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        // Self-wake exit: the next poll skips this block, so leave
+                        // the futex park here (see `futex_park_leave`).
+                        crate::handlers::futex_park_leave(uctx, task_id);
+                        cx.waker().wake_by_ref();
+                        return true;
+                    }
+                } else if crate::poll::installed_poll_files_ready(task_id) {
+                    // NON-epoll poll(2)/select: authoritatively re-check THIS
+                    // waiter's own installed poll files (not the coarse global
+                    // generation) — re-execute iff one is ready now (including a
+                    // readiness that raced the scan→register window), else park.
+                    // Exact per-fd: no 100% spin on unrelated fd activity, no
+                    // dropped wake. A blocking recv (no poll files) returns false
+                    // and parks on its socket's targeted io-owner wake.
+                    crate::handlers::drop_io_waiter(task_id);
+                    uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                    // Self-wake exit: the next poll skips this block, so leave
+                    // the futex park here (see `futex_park_leave`).
+                    crate::handlers::futex_park_leave(uctx, task_id);
+                    cx.waker().wake_by_ref();
+                    return true;
+                }
+            }
+            if uctx.sem_wait_pending.load(Ordering::Acquire) {
+                match crate::sysvipc::register_sem_wait_waker_at(
+                    task_id,
+                    uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
+                    uctx.sem_wait_id.load(Ordering::Relaxed),
+                    cx.waker().clone(),
+                ) {
+                    crate::sysvipc::SemParkState::Pending => {}
+                    crate::sysvipc::SemParkState::Ready => {
+                        crate::handlers::drop_signal_waker(task_id);
+                        uctx.sem_wait_pending.store(false, Ordering::Release);
+                        uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        // Self-wake exit: the next poll skips this block, so leave
+                        // the futex park here (see `futex_park_leave`).
+                        crate::handlers::futex_park_leave(uctx, task_id);
+                        cx.waker().wake_by_ref();
+                        return true;
+                    }
+                    crate::sysvipc::SemParkState::NotWaiting => {
+                        uctx.sem_wait_pending.store(false, Ordering::Release);
+                    }
+                }
+            }
+            if uctx.msg_wait_pending.load(Ordering::Acquire) {
+                match crate::sysvipc::register_msg_wait_waker(task_id, cx.waker().clone()) {
+                    crate::sysvipc::MsgParkState::Pending => {}
+                    crate::sysvipc::MsgParkState::Ready => {
+                        crate::handlers::drop_signal_waker(task_id);
+                        uctx.msg_wait_pending.store(false, Ordering::Release);
+                        uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        // Self-wake exit: the next poll skips this block, so leave
+                        // the futex park here (see `futex_park_leave`).
+                        crate::handlers::futex_park_leave(uctx, task_id);
+                        cx.waker().wake_by_ref();
+                        return true;
+                    }
+                    crate::sysvipc::MsgParkState::NotWaiting => {
+                        uctx.msg_wait_pending.store(false, Ordering::Release);
+                    }
+                }
+            }
+            // FUTEX_WAIT: `sys_futex` published the futex word here.
+            // Register our waker on the per-uaddr wait queue so a
+            // `FUTEX_WAKE` on that word wakes us promptly (a real blocking
+            // futex). Same lost-wakeup guard as net I/O: if the per-uaddr
+            // wake counter advanced since the syscall's snapshot, a wake
+            // raced us — clear the park and self-wake to re-enter user
+            // mode (musl re-checks the word) instead of sleeping it out.
+            // FUTEX_WAIT registration + stay decision, seqlocked against
+            // a concurrent FUTEX_REQUEUE retarget — shared protocol in
+            // `futex_park_register_and_check` (see `futex_park_seq`).
+            {
+                let waker = cx.waker().clone();
+                match crate::handlers::futex_park_register_and_check(uctx, task_id, &waker) {
+                    crate::handlers::FutexParkCheck::NotWaiting
+                    | crate::handlers::FutexParkCheck::Stay => {}
+                    crate::handlers::FutexParkCheck::Wake => {
+                        cx.waker().wake_by_ref();
+                        return true;
+                    }
+                }
+            }
+            if deadline == u64::MAX {
+                // Infinite park (pause / blocking poll/epoll/futex wait).
+                // Earlier this BUSY-SPUN for 1 ms per poll running the
+                // sleep pumps, then self-woke. That had two bad effects
+                // under a real HLT-ing executor (KVM): (1) the 1 ms spin
+                // charged a full burst against the fair-share budget every
+                // poll, so an I/O-bound task (epoll-parked redis) looked
+                // like a CPU hog and got Throttled — after which only an
+                // external wake, NOT the timer tick, could revive it, so a
+                // single lost readiness wake wedged it permanently; and
+                // (2) the self-wake tick-paced its re-poll, gating off-box
+                // round-trips at ~16.7 ms. NO lost-wake backstop: every
+                // infinite park — futex/signal (word/gen re-check), per-fd
+                // Readiness (durable arm-vs-set lock), AND now generic
+                // NET_IO_WAIT (targeted latch + generation compare / epoll
+                // ready-list re-check above) — closes its own check→register
+                // race, so none needs a fallback timer. Arm NO timer and rely
+                // purely on the durable wake. sleep_pumps still run in the
+                // executor's own idle path.
+                return true;
+            }
+            // Finite sleep (sys_sleep / nanosleep): PARK on the timer
+            // wheel instead of self-waking. The wheel fires our waker at
+            // the deadline (via the timer IRQ → take_due → deferred_wake,
+            // or the executor idle path's fire_due fallback), so the
+            // executor can round-robin other tasks / idle instead of
+            // re-polling us every 1ms. Register once; refresh across any
+            // spurious re-poll so we never leak a slot.
+
+            // Finite io-wait park (poll/epoll with a real timeout): arm the
+            // wheel at its REAL deadline. No lost-wake clamp — the io-waiter
+            // fires a durable wake that normally revives us long before the
+            // timeout, and the check→register race is closed above.
+            let fire_ns = deadline;
+            let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
+            // `refresh_waker_at` — see the infinite-park note above.
+            let refreshed = sleep_handle.is_some_and(|h| {
+                narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
+                    h,
+                    deadline_cycles,
+                    cx.waker().clone(),
+                )
+            });
+            if !refreshed {
+                *sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
+                    deadline_cycles,
+                    cx.waker().clone(),
+                )
+                .ok();
+                if sleep_handle.is_none() {
+                    // Wheel full or no arm callback: fall
+                    // back to a self-wake so the task still makes
+                    // progress (degraded, never wedged).
+                    cx.waker().wake_by_ref();
+                }
+            }
+            return true;
+        }
+        // Deadline reached or a signal is pending — clear so the next
+        // sys_sleep call doesn't see stale state, cancel any wheel slot,
+        // then fall through to the normal resume path (which re-enters
+        // user mode; a pending signal is delivered on the next return).
+        // Drop any signal-waker entry this park registered (no-op if
+        // `wake_signal` already consumed it when it fired us).
+        crate::handlers::drop_signal_waker(task_id);
+        uctx.sleep_deadline_ns.store(0, Ordering::Release);
+        uctx.net_io_wait.store(false, Ordering::Release);
+        uctx.durable_io_wait.store(false, Ordering::Release);
+        uctx.sem_wait_pending.store(false, Ordering::Release);
+        uctx.msg_wait_pending.store(false, Ordering::Release);
+        // Unqueue every futex waiter this task holds (see the own-stack
+        // twin above): Linux's futex_unqueue removes it on timeout/signal
+        // too, so a later FUTEX_WAKE(1) can't pop a ghost. Found through
+        // the per-task index, not `futex_uaddr`.
+        crate::handlers::futex_park_leave(uctx, task_id);
+        uctx.sigwait_set.store(0, Ordering::Release);
+        if let Some(h) = sleep_handle.take() {
+            narf_scheduler::narf_time::timer_wheel::cancel(h);
+        }
+    }
+    false
+}
+
+/// Test-only: drive [`legacy_poll_park`], the park decision of the x86_64
+/// legacy `UserTaskFuture::poll`, for an explicit task.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_legacy_poll_park(
+    task_id: u64,
+    uctx: &UserTaskCtx,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    cx: &core::task::Context<'_>,
+) -> bool {
+    legacy_poll_park(task_id, uctx, sleep_handle, cx)
+}
+
 #[cfg(target_arch = "x86_64")]
 impl core::future::Future for UserTaskFuture {
     type Output = ();
@@ -2162,325 +2452,13 @@ impl core::future::Future for UserTaskFuture {
         // then return Pending. The scale is tuned for ~1 ms per
         // park iteration: short enough not to perturb other tasks,
         // long enough to keep heap pressure flat.
-        let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
-        if deadline != 0 {
-            // Watchdog liveness signal (see `UserTaskCtx::dbg_park_checks`).
-            this.task
-                .uctx
-                .dbg_park_checks
-                .fetch_add(1, Ordering::Relaxed);
-            let now = narf_scheduler::narf_time::monotonic_ns();
-            // An asynchronously-raised signal (e.g. SIGALRM from an
-            // interval timer, a cross-process kill) must break ANY park —
-            // finite deadlines included: nanosleep/futex/poll are signal-
-            // interruptible on Linux (-EINTR). The old `deadline ==
-            // u64::MAX` restriction (guarding against a busy-spin on a
-            // pending *ignored* signal) is obsolete: the return-to-user
-            // delivery path consumes SIG_IGN/default-Ignore pending bits,
-            // so the break costs one spurious re-execution at most. A
-            // finite-deadline park that ignored signals was a de-facto
-            // permanent strand when the deadline was far out (the
-            // stress-ng --futex SMP hang).
-            let signal_pending =
-                crate::handlers::is_signal_pending(crate::handlers::current_task_id());
-            if now < deadline && !signal_pending {
-                // rt_sigtimedwait park: same register-then-re-check shape as
-                // the own-stack `park_should_block` sigwait arm — register in
-                // SIGNAL_WAKERS (every raise path fires it via `wake_signal`)
-                // and break the park when a signal in the waited set (mask
-                // ignored) or any deliverable signal is pending; the rewound
-                // syscall re-executes and consumes / returns -EINTR.
-                let sw = this.task.uctx.sigwait_set.load(Ordering::Acquire);
-                if sw != 0 {
-                    let tid = crate::handlers::current_task_id();
-                    crate::handlers::register_signal_waker(tid, cx.waker().clone());
-                    if crate::handlers::sigwait_should_wake(tid, sw) {
-                        crate::handlers::drop_signal_waker(tid);
-                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        this.task.uctx.sigwait_set.store(0, Ordering::Release);
-                        // Self-wake exit: the next poll skips this block, so leave
-                        // the futex park here (see `futex_park_leave`).
-                        crate::handlers::futex_park_leave(
-                            &this.task.uctx,
-                            crate::handlers::current_task_id(),
-                        );
-                        cx.waker().wake_by_ref();
-                        return core::task::Poll::Pending;
-                    }
-                } else {
-                    // Non-sigwait park — release the sticky waiter
-                    // reservation (see `UserTaskCtx::sigwait_reserve`).
-                    this.task.uctx.sigwait_reserve.store(0, Ordering::Release);
-                    // Signal-interruptible park: register in SIGNAL_WAKERS
-                    // FIRST (every raise path fires it via `wake_signal`),
-                    // then RE-CHECK pending — closes the check→register
-                    // window; see the own-stack `park_should_block` twin.
-                    let tid = crate::handlers::current_task_id();
-                    crate::handlers::register_signal_waker(tid, cx.waker().clone());
-                    if crate::handlers::is_signal_pending(tid) {
-                        crate::handlers::drop_signal_waker(tid);
-                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        if let Some(h) = this.sleep_handle.take() {
-                            narf_scheduler::narf_time::timer_wheel::cancel(h);
-                        }
-                        // Self-wake exit: the next poll skips this block, so leave
-                        // the futex park here (see `futex_park_leave`).
-                        crate::handlers::futex_park_leave(
-                            &this.task.uctx,
-                            crate::handlers::current_task_id(),
-                        );
-                        cx.waker().wake_by_ref();
-                        return core::task::Poll::Pending;
-                    }
-                }
-                // Parking on a blocking wait. If `sys_epoll_wait`/
-                // `sys_poll` flagged this as a net I/O wait, register
-                // our waker so inbound TCP data wakes us immediately
-                // (crate::handlers::wake_io_waiters via the net
-                // readiness hook) instead of waiting out the deadline.
-                let durable_io_wait = this.task.uctx.durable_io_wait.load(Ordering::Acquire);
-                if this.task.uctx.net_io_wait.load(Ordering::Acquire) && !durable_io_wait {
-                    if crate::handlers::register_io_waiter(
-                        crate::handlers::current_task_id(),
-                        cx.waker().clone(),
-                    ) {
-                        // A targeted wake landed in the scan→register window and
-                        // was latched; re-execute instead of parking. Closes the
-                        // lost-wake race for the TARGETED wake path.
-                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        // Self-wake exit: the next poll skips this block, so leave
-                        // the futex park here (see `futex_park_leave`).
-                        crate::handlers::futex_park_leave(
-                            &this.task.uctx,
-                            crate::handlers::current_task_id(),
-                        );
-                        cx.waker().wake_by_ref();
-                        return core::task::Poll::Pending;
-                    }
-                    // Close the window for the UNTARGETED / broadcast wake too
-                    // (net/src/readiness.rs contract): the scan site snapshotted
-                    // the pre-scan readiness generation into `epoll_park_gen`.
-                    let encoded_epfd = this.task.uctx.epoll_wait_fd.load(Ordering::Acquire);
-                    if encoded_epfd != 0 {
-                        // EPOLL: the per-fd ready-list re-check is authoritative,
-                        // so advance the snapshot and consult it (no coarse-
-                        // generation re-exec that would spin on unrelated fds).
-                        this.task
-                            .uctx
-                            .epoll_park_gen
-                            .store(narf_net::readiness::generation(), Ordering::Release);
-                        if crate::epoll::epoll_fd_has_ready(
-                            crate::handlers::current_task_id(),
-                            (encoded_epfd - 1) as u32,
-                        ) {
-                            crate::handlers::drop_io_waiter(crate::handlers::current_task_id());
-                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                            // Self-wake exit: the next poll skips this block, so leave
-                            // the futex park here (see `futex_park_leave`).
-                            crate::handlers::futex_park_leave(
-                                &this.task.uctx,
-                                crate::handlers::current_task_id(),
-                            );
-                            cx.waker().wake_by_ref();
-                            return core::task::Poll::Pending;
-                        }
-                    } else if crate::poll::installed_poll_files_ready(
-                        crate::handlers::current_task_id(),
-                    ) {
-                        // NON-epoll poll(2)/select: authoritatively re-check THIS
-                        // waiter's own installed poll files (not the coarse global
-                        // generation) — re-execute iff one is ready now (including a
-                        // readiness that raced the scan→register window), else park.
-                        // Exact per-fd: no 100% spin on unrelated fd activity, no
-                        // dropped wake. A blocking recv (no poll files) returns false
-                        // and parks on its socket's targeted io-owner wake.
-                        crate::handlers::drop_io_waiter(crate::handlers::current_task_id());
-                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        // Self-wake exit: the next poll skips this block, so leave
-                        // the futex park here (see `futex_park_leave`).
-                        crate::handlers::futex_park_leave(
-                            &this.task.uctx,
-                            crate::handlers::current_task_id(),
-                        );
-                        cx.waker().wake_by_ref();
-                        return core::task::Poll::Pending;
-                    }
-                }
-                if this.task.uctx.sem_wait_pending.load(Ordering::Acquire) {
-                    match crate::sysvipc::register_sem_wait_waker_at(
-                        crate::handlers::current_task_id(),
-                        this.task.uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
-                        this.task.uctx.sem_wait_id.load(Ordering::Relaxed),
-                        cx.waker().clone(),
-                    ) {
-                        crate::sysvipc::SemParkState::Pending => {}
-                        crate::sysvipc::SemParkState::Ready => {
-                            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
-                            this.task
-                                .uctx
-                                .sem_wait_pending
-                                .store(false, Ordering::Release);
-                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                            // Self-wake exit: the next poll skips this block, so leave
-                            // the futex park here (see `futex_park_leave`).
-                            crate::handlers::futex_park_leave(
-                                &this.task.uctx,
-                                crate::handlers::current_task_id(),
-                            );
-                            cx.waker().wake_by_ref();
-                            return core::task::Poll::Pending;
-                        }
-                        crate::sysvipc::SemParkState::NotWaiting => {
-                            this.task
-                                .uctx
-                                .sem_wait_pending
-                                .store(false, Ordering::Release);
-                        }
-                    }
-                }
-                if this.task.uctx.msg_wait_pending.load(Ordering::Acquire) {
-                    match crate::sysvipc::register_msg_wait_waker(
-                        crate::handlers::current_task_id(),
-                        cx.waker().clone(),
-                    ) {
-                        crate::sysvipc::MsgParkState::Pending => {}
-                        crate::sysvipc::MsgParkState::Ready => {
-                            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
-                            this.task
-                                .uctx
-                                .msg_wait_pending
-                                .store(false, Ordering::Release);
-                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                            // Self-wake exit: the next poll skips this block, so leave
-                            // the futex park here (see `futex_park_leave`).
-                            crate::handlers::futex_park_leave(
-                                &this.task.uctx,
-                                crate::handlers::current_task_id(),
-                            );
-                            cx.waker().wake_by_ref();
-                            return core::task::Poll::Pending;
-                        }
-                        crate::sysvipc::MsgParkState::NotWaiting => {
-                            this.task
-                                .uctx
-                                .msg_wait_pending
-                                .store(false, Ordering::Release);
-                        }
-                    }
-                }
-                // FUTEX_WAIT: `sys_futex` published the futex word here.
-                // Register our waker on the per-uaddr wait queue so a
-                // `FUTEX_WAKE` on that word wakes us promptly (a real blocking
-                // futex). Same lost-wakeup guard as net I/O: if the per-uaddr
-                // wake counter advanced since the syscall's snapshot, a wake
-                // raced us — clear the park and self-wake to re-enter user
-                // mode (musl re-checks the word) instead of sleeping it out.
-                // FUTEX_WAIT registration + stay decision, seqlocked against
-                // a concurrent FUTEX_REQUEUE retarget — shared protocol in
-                // `futex_park_register_and_check` (see `futex_park_seq`).
-                {
-                    let waker = cx.waker().clone();
-                    match crate::handlers::futex_park_register_and_check(
-                        &this.task.uctx,
-                        crate::handlers::current_task_id(),
-                        &waker,
-                    ) {
-                        crate::handlers::FutexParkCheck::NotWaiting
-                        | crate::handlers::FutexParkCheck::Stay => {}
-                        crate::handlers::FutexParkCheck::Wake => {
-                            cx.waker().wake_by_ref();
-                            return core::task::Poll::Pending;
-                        }
-                    }
-                }
-                if deadline == u64::MAX {
-                    // Infinite park (pause / blocking poll/epoll/futex wait).
-                    // Earlier this BUSY-SPUN for 1 ms per poll running the
-                    // sleep pumps, then self-woke. That had two bad effects
-                    // under a real HLT-ing executor (KVM): (1) the 1 ms spin
-                    // charged a full burst against the fair-share budget every
-                    // poll, so an I/O-bound task (epoll-parked redis) looked
-                    // like a CPU hog and got Throttled — after which only an
-                    // external wake, NOT the timer tick, could revive it, so a
-                    // single lost readiness wake wedged it permanently; and
-                    // (2) the self-wake tick-paced its re-poll, gating off-box
-                    // round-trips at ~16.7 ms. NO lost-wake backstop: every
-                    // infinite park — futex/signal (word/gen re-check), per-fd
-                    // Readiness (durable arm-vs-set lock), AND now generic
-                    // NET_IO_WAIT (targeted latch + generation compare / epoll
-                    // ready-list re-check above) — closes its own check→register
-                    // race, so none needs a fallback timer. Arm NO timer and rely
-                    // purely on the durable wake. sleep_pumps still run in the
-                    // executor's own idle path.
-                    return core::task::Poll::Pending;
-                }
-                // Finite sleep (sys_sleep / nanosleep): PARK on the timer
-                // wheel instead of self-waking. The wheel fires our waker at
-                // the deadline (via the timer IRQ → take_due → deferred_wake,
-                // or the executor idle path's fire_due fallback), so the
-                // executor can round-robin other tasks / idle instead of
-                // re-polling us every 1ms. Register once; refresh across any
-                // spurious re-poll so we never leak a slot.
-
-                // Finite io-wait park (poll/epoll with a real timeout): arm the
-                // wheel at its REAL deadline. No lost-wake clamp — the io-waiter
-                // fires a durable wake that normally revives us long before the
-                // timeout, and the check→register race is closed above.
-                let fire_ns = deadline;
-                let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
-                // `refresh_waker_at` — see the infinite-park note above.
-                let refreshed = this.sleep_handle.is_some_and(|h| {
-                    narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
-                        h,
-                        deadline_cycles,
-                        cx.waker().clone(),
-                    )
-                });
-                if !refreshed {
-                    this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
-                        deadline_cycles,
-                        cx.waker().clone(),
-                    )
-                    .ok();
-                    if this.sleep_handle.is_none() {
-                        // Wheel full or no arm callback: fall
-                        // back to a self-wake so the task still makes
-                        // progress (degraded, never wedged).
-                        cx.waker().wake_by_ref();
-                    }
-                }
-                return core::task::Poll::Pending;
-            }
-            // Deadline reached or a signal is pending — clear so the next
-            // sys_sleep call doesn't see stale state, cancel any wheel slot,
-            // then fall through to the normal resume path (which re-enters
-            // user mode; a pending signal is delivered on the next return).
-            // Drop any signal-waker entry this park registered (no-op if
-            // `wake_signal` already consumed it when it fired us).
-            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
-            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-            this.task.uctx.net_io_wait.store(false, Ordering::Release);
-            this.task
-                .uctx
-                .durable_io_wait
-                .store(false, Ordering::Release);
-            this.task
-                .uctx
-                .sem_wait_pending
-                .store(false, Ordering::Release);
-            this.task
-                .uctx
-                .msg_wait_pending
-                .store(false, Ordering::Release);
-            // Unqueue every futex waiter this task holds (see the own-stack
-            // twin above): Linux's futex_unqueue removes it on timeout/signal
-            // too, so a later FUTEX_WAKE(1) can't pop a ghost. Found through
-            // the per-task index, not `futex_uaddr`.
-            crate::handlers::futex_park_leave(&this.task.uctx, crate::handlers::current_task_id());
-            this.task.uctx.sigwait_set.store(0, Ordering::Release);
-            if let Some(h) = this.sleep_handle.take() {
-                narf_scheduler::narf_time::timer_wheel::cancel(h);
-            }
+        if legacy_poll_park(
+            crate::handlers::current_task_id(),
+            &this.task.uctx,
+            &mut this.sleep_handle,
+            cx,
+        ) {
+            return core::task::Poll::Pending;
         }
 
         // sys_wait4 cooperative parking: when a blocking wait4 finds
