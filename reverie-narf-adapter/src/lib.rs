@@ -161,12 +161,22 @@
 //!   `VDSO_MAP_BASE`, whose masters hold a permanent reference. Frames that
 //!   forked children or exec'd images allocate are not checked, so a leak
 //!   there goes unnoticed.
-//! * **`reclaim_run` waits on one CPU.** `narf_rcu::sync_until` waits for
-//!   every CPU to pass the grace period, but it drains only the calling
-//!   CPU's drop bucket. A continuation retired on another CPU is freed only
-//!   at that CPU's next quiescent point. With more than one CPU, the 4 x 1 s
-//!   budget can expire first, which fails the test. This is a flake risk,
-//!   not a leak.
+//! * **Placement.** Kernel-test boots turn on neither user-task SMP nor work
+//!   stealing. Each guest run turns both on for its length, as a production
+//!   boot does (`ProductionPlacement`), so the root starts where
+//!   `TaskSpec::user_task` prefers (an application processor; on a two-CPU
+//!   machine, either CPU), a fork child goes where `fork_cpu` puts it, and
+//!   idle CPUs steal runnable guest tasks. Each run prints the CPUs its tasks
+//!   exited on. The pipe tests open their gate from the kernel's
+//!   descriptor-park observer, once the write has parked, so they do not
+//!   depend on where the parent and child run.
+//! * **Reclaim timing.** With guest tasks on several CPUs, a peer CPU can
+//!   still be running an address space's destructor when `reclaim_run`
+//!   checks: the space's `Weak` count reads 0 once `Drop` starts, and its
+//!   frames' COW counts fall while `Drop` runs. `reclaim_run` therefore
+//!   drives grace periods until everything is reclaimed, within 4 s of wall
+//!   time, not for a fixed number of grace periods, which complete at once
+//!   when every peer is idle.
 //! * **The `cow::__test_clear` guard.** It refuses to wipe the COW count of
 //!   a frame that some address space still maps, but it finds such frames
 //!   only through the reverse map. If the reverse map misses a mapping (an

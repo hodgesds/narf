@@ -1,10 +1,12 @@
 // Pipe guest: a forked child fills a pipe to capacity (64 KiB) and then
 // writes one more byte, which cannot complete until someone reads. The parent
 // reads the pipe only after a byte arrives on a second, gate pipe, which the
-// kernel test writes once it has seen the child's one-byte write park. The
-// parent then drains the data pipe to EOF, expects exactly 65537 bytes, reaps
-// the child, and exits 0. Any unexpected result exits with a distinct status
-// in 120..=130.
+// kernel test writes, through the child's gate write end, once the child's
+// one-byte write has found the pipe full and parked. The parent closes its own
+// gate write end, so a child that dies first ends the parent's gate read with
+// EOF (exit 126) instead of leaving it blocked. The parent then drains the
+// data pipe to EOF, expects exactly 65537 bytes, reaps the child, and exits 0.
+// Any unexpected result exits with a distinct status in 120..=130.
 //
 // File descriptors are fixed so the test can find the gate: data pipe 3
 // (read) / 4 (write), gate pipe 5 (read) / 6 (write).
@@ -73,6 +75,11 @@ parent:
     mov     eax, 3              # close(4): EOF follows the child's exit
     mov     edi, 4
     syscall
+    test    rax, rax
+    jnz     close_failed
+    mov     eax, 3              # close(6): only the child holds the gate's
+    mov     edi, 6              # write end, so if the child dies before the
+    syscall                     # gate opens, the gate read returns EOF
     test    rax, rax
     jnz     close_failed
     xor     eax, eax            # read(5, gate, 1): wait for the gate

@@ -11440,6 +11440,35 @@ fn park_reexecute_on_io_until(
     false
 }
 
+/// Verification-only observer of descriptor-readiness parks (see
+/// [`__verification_swap_fd_park_observer`]).
+#[cfg(feature = "verification-test-reset")]
+static FD_PARK_OBSERVER: narf_lib::sync::IrqSafeSpinLock<Option<fn(u64)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install `observer` (or none), returning the previous one. The observer
+/// runs with the parking task's id in [`park_reexecute_on_fd`], after the
+/// task's waker is armed on the descriptor's readiness cell and before the
+/// task stops running, so an in-kernel test can order a peer's action after
+/// a syscall has parked without polling for it. Anything the observer
+/// causes that frees the descriptor wakes the armed waker, exactly as a peer
+/// on another CPU could at that point. Compiled only into the verification
+/// harness build.
+#[cfg(feature = "verification-test-reset")]
+#[doc(hidden)]
+pub fn __verification_swap_fd_park_observer(observer: Option<fn(u64)>) -> Option<fn(u64)> {
+    core::mem::replace(&mut *FD_PARK_OBSERVER.lock(), observer)
+}
+
+#[cfg(feature = "verification-test-reset")]
+fn notify_fd_park_observer(task: u64) {
+    // Copied out so the observer runs without the registry lock held.
+    let observer = *FD_PARK_OBSERVER.lock();
+    if let Some(observer) = observer {
+        observer(task);
+    }
+}
+
 /// Park a blocking syscall on one descriptor's durable readiness cell, then
 /// re-execute the syscall from its original user arguments.  The readiness arm
 /// happens before the task becomes unrunnable, so a peer that frees space in
@@ -11478,6 +11507,8 @@ pub(crate) fn park_reexecute_on_fd(
             // The provider checked the level and installed this task's waker
             // under the same per-fd lock used by `Readiness::set`.
             // There is no lost-wake window to poll with a 1 ms timer.
+            #[cfg(feature = "verification-test-reset")]
+            notify_fd_park_observer(task);
             let parked = park_reexecute_on_io_until(ctx, u64::MAX, true);
             ops.disarm_readiness(task);
             parked

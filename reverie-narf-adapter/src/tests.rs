@@ -203,20 +203,34 @@ fn staged_of(slot: &AtomicI64, missing: &'static str) -> Result<Option<i32>, &'s
     }
 }
 
-/// Grace periods [`run_guest`] may drive while reclaiming a run's address
-/// spaces. Reclaiming a task takes one; the address-space destructors it runs
-/// may retire more, which the next one reclaims.
-const RECLAIM_GRACE_PERIODS: u32 = 4;
-/// Budget for one of those grace periods.
+/// Wall-clock budget for reclaiming one run after its tasks were reaped.
+///
+/// Reclaiming a task takes a grace period, and the address-space destructor
+/// it runs may retire more, which a later one reclaims. With the guest's
+/// tasks on several CPUs, a peer CPU may also be running one of those
+/// destructors at the moment this CPU checks: a space's `Weak` count reads 0
+/// as soon as its `Drop` starts, and the COW counts of its frames fall while
+/// `Drop` runs. So the budget is time, not a count of grace periods, which
+/// complete immediately when every peer is idle.
+const RECLAIM_BUDGET_NS: u64 = 4_000_000_000;
+/// Budget for one grace period.
 const RECLAIM_GRACE_PERIOD_NS: u64 = 1_000_000_000;
 
 /// Every distinct address space a task of the current run exited from: the
 /// root's and each forked or vforked child's.
 static EXITED_SPACES: IrqSafeSpinLock<Vec<Weak<AddressSpace>>> = IrqSafeSpinLock::new(Vec::new());
 
+/// The CPUs the current run's tasks exited on, one bit per CPU, printed
+/// after each run as evidence of where [`ProductionPlacement`] put them.
+static EXIT_CPUS: AtomicU64 = AtomicU64::new(0);
+
 /// Thread-exit observer: records the exiting task's address space, which is
-/// still the active one while its exit fans out.
+/// still the active one while its exit fans out, and the CPU it exits on.
 fn record_exiting_space(_pid: u64, _tid: u64) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < 64 {
+        EXIT_CPUS.fetch_or(1 << cpu, Ordering::AcqRel);
+    }
     let Some(space) = narf_scheduler::current_address_space() else {
         return;
     };
@@ -261,26 +275,67 @@ fn reclaim_run(spaces: &[Weak<AddressSpace>], frames: &[PhysAddr]) -> Result<(),
                 .iter()
                 .all(|frame| narf_memory::frame::cow::count(*frame) == 0)
     };
-    let mut periods = 0;
+    let budget_end = narf_time::monotonic_ns().saturating_add(RECLAIM_BUDGET_NS);
     while !reclaimed() {
-        if periods == RECLAIM_GRACE_PERIODS {
+        let now = narf_time::monotonic_ns();
+        if now >= budget_end {
             return Err(
-                "the guest's address spaces or COW frames outlived the reclaim grace-period budget after its tasks were reaped",
+                "the guest's address spaces or COW frames outlived the reclaim budget after its tasks were reaped",
             );
         }
-        let deadline = narf_time::monotonic_ns().saturating_add(RECLAIM_GRACE_PERIOD_NS);
-        if !narf_rcu::sync_until(deadline) {
+        let deadline = now.saturating_add(RECLAIM_GRACE_PERIOD_NS).min(budget_end);
+        if !narf_rcu::sync_until(deadline) && narf_time::monotonic_ns() < budget_end {
             return Err(
                 "an RCU grace period did not elapse within 1 s while reclaiming the guest's address spaces",
             );
         }
-        periods += 1;
     }
     Ok(())
 }
 
+/// User-task placement as a production boot sets it up, for the length of
+/// one guest run.
+///
+/// A production boot with application processors online turns on work
+/// stealing and user-task SMP (`frame/src/bare_main.rs`, the
+/// `enable_work_stealing` / `enable_user_task_smp` block); a kernel-test boot
+/// turns on neither, so without this every guest task would run pinned to
+/// the boot CPU. With both on, [`TaskSpec::user_task`] prefers the
+/// application processors for a new process (either CPU on a two-CPU
+/// machine), a fork child goes where `fork_cpu` puts it
+/// (`sys_fork.rs`: a fresh `TaskSpec::user_task()`, not the parent's
+/// affinity), and idle CPUs steal runnable user tasks. Dropping this puts
+/// both switches back as they were, after the run's last task was reaped.
+struct ProductionPlacement {
+    user_task_smp: bool,
+    work_stealing: bool,
+}
+
+impl ProductionPlacement {
+    fn enable() -> Self {
+        let work_stealing = narf_scheduler::work_stealing_enabled();
+        narf_scheduler::enable_work_stealing();
+        let user_task_smp = narf_scheduler::__test_set_user_task_smp(true);
+        Self {
+            user_task_smp,
+            work_stealing,
+        }
+    }
+}
+
+impl Drop for ProductionPlacement {
+    fn drop(&mut self) {
+        narf_scheduler::__test_set_user_task_smp(self.user_task_smp);
+        if !self.work_stealing {
+            narf_scheduler::disable_work_stealing();
+        }
+    }
+}
+
 /// Runs `elf` as a fresh scheduled user process with `interceptor` installed
 /// in the live syscall table, until every task it created has been reaped.
+/// The guest's tasks are placed as in production ([`ProductionPlacement`]),
+/// so they run on any online CPU.
 ///
 /// `register` runs after the root task has its Linux identity and before it
 /// is runnable. The root is an orphan, which the kernel releases at exit.
@@ -327,6 +382,7 @@ fn run_guest_with(
     narf_userspace::handlers::__test_wait_reset();
     narf_userspace::handlers::wait_init();
     EXITED_SPACES.lock().clear();
+    EXIT_CPUS.store(0, Ordering::Release);
     RECLAIMED_SPACES.store(0, Ordering::Release);
     narf_userspace::user_task::register_thread_exit_observer(record_exiting_space);
     ROOT_WATCH.store(0, Ordering::Release);
@@ -401,9 +457,11 @@ fn run_guest_with(
         .filter(|frame| frame.raw() != 0)
         .collect::<Vec<_>>();
     let live_before = narf_scheduler::live_user_task_count();
-    let mut spec = TaskSpec::user_task();
-    spec.affinity = Affinity::pinned(CpuId(cpu as u32));
-    let pending = narf_userspace::user_task::prepare_user_process_initial(process, spec);
+    // Held until the function returns, which is after the run's last task
+    // was reaped.
+    let _placement = ProductionPlacement::enable();
+    let pending =
+        narf_userspace::user_task::prepare_user_process_initial(process, TaskSpec::user_task());
     let task_id = pending.task_id().raw();
     narf_userspace::handlers::register_pid_task_mapping(pid, task_id);
     let root = Root { task_id, pid };
@@ -426,9 +484,8 @@ fn run_guest_with(
             }
         };
         let parent_pid = process.pid.raw();
-        let mut spec = TaskSpec::user_task();
-        spec.affinity = Affinity::pinned(CpuId(cpu as u32));
-        let parent_pending = narf_userspace::user_task::prepare_user_process_initial(process, spec);
+        let parent_pending =
+            narf_userspace::user_task::prepare_user_process_initial(process, TaskSpec::user_task());
         let parent_task = parent_pending.task_id().raw();
         narf_userspace::handlers::register_pid_task_mapping(parent_pid, parent_task);
         let tap = match tap_console(parent_task, false) {
@@ -458,18 +515,25 @@ fn run_guest_with(
     static WAITER_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
     WAITER_TIMED_OUT.store(0, Ordering::Release);
     let deadline = narf_time::Instant::now().plus_cycles(WAITER_BUDGET_CYCLES);
-    narf_scheduler::spawn(async move {
-        loop {
-            if narf_scheduler::live_user_task_count() <= live_before {
-                return;
+    // The waiter stays on this CPU, whose `run_until_empty` below returns
+    // only once the waiter has seen every guest task reaped.
+    let mut waiter = TaskSpec::unthrottled();
+    waiter.affinity = Affinity::pinned(CpuId(cpu as u32));
+    narf_scheduler::spawn_with_spec(
+        async move {
+            loop {
+                if narf_scheduler::live_user_task_count() <= live_before {
+                    return;
+                }
+                if narf_time::Instant::now() >= deadline {
+                    WAITER_TIMED_OUT.store(1, Ordering::Release);
+                    return;
+                }
+                narf_scheduler::yield_now().await;
             }
-            if narf_time::Instant::now() >= deadline {
-                WAITER_TIMED_OUT.store(1, Ordering::Release);
-                return;
-            }
-            narf_scheduler::yield_now().await;
-        }
-    });
+        },
+        waiter,
+    );
     narf_scheduler::run_until_empty();
     // Before `teardown`, whose wait-table reset would hide a leftover link.
     let released = parent
@@ -518,6 +582,11 @@ fn run_guest_with(
             })
         }
     };
+    let _ = writeln!(
+        Writer,
+        "    guest tasks exited on CPUs {:#x} (harness CPU {cpu})",
+        EXIT_CPUS.load(Ordering::Acquire)
+    );
     let mut spaces = core::mem::take(&mut *EXITED_SPACES.lock());
     let root_exited_in_image = spaces.iter().any(|space| space.ptr_eq(&root_space));
     if ROOT_EXECS.load(Ordering::Acquire) {
@@ -1195,6 +1264,8 @@ static PARK_FLAGGED: AtomicU64 = AtomicU64::new(0);
 static PARK_FLAGGED_EXTRA_WRITE: AtomicU64 = AtomicU64::new(0);
 /// 0: gate closed; 1: opened; 2: the gate write failed.
 static PARK_GATE: AtomicU64 = AtomicU64::new(0);
+/// The task that entered the child's one-byte write, or 0.
+static PARK_WRITER: AtomicU64 = AtomicU64::new(0);
 
 /// The pipe guest child's `write(4, buf, 1)` to its full data pipe.
 fn is_extra_byte_write(invocation: &SyscallInvocation) -> bool {
@@ -1218,15 +1289,24 @@ fn open_gate(task_id: u64) -> bool {
 }
 
 /// Counts every syscall entry and every re-execution entry, forwards all
-/// calls to the Reverie interceptor it wraps, and opens the pipe guest's
-/// gate at the entry of the child's one-byte write, before that write runs.
+/// calls to the Reverie interceptor it wraps, and remembers which task
+/// entered the pipe guest child's one-byte write, so that [`GateOnPark`]
+/// opens the gate when that write parks.
 ///
-/// The ordering is by blocking, with no polling or sleeping: the parent
-/// reads the data pipe only after the gate opens, and it cannot run between
-/// the gate write and the child's write finding the pipe full, because every
-/// guest task is pinned to the harness CPU (a fork inherits the pinned
-/// affinity) and Narf does not preempt kernel code. The parent therefore
-/// runs only once the child has blocked in its write.
+/// The ordering is by blocking, with no polling or sleeping, and does not
+/// depend on where the tasks run. The parent reads the data pipe only after
+/// the gate opens. The Tool's inject (a tail inject for counter1, a non-tail
+/// one for the canonical-trace Tool) runs the write on the kernel's native
+/// transition, which blocks inside the callback until the write can be
+/// re-executed, so the gate cannot be opened from this interceptor: before
+/// the call nothing has checked the pipe, and after it the wait is over. The
+/// kernel's descriptor-park observer runs in between, once the write has
+/// found the pipe full and armed its waker and before the task stops
+/// running; however soon the parent then drains the pipe, on this CPU or
+/// another, the wake reaches the armed waker and the write is re-executed.
+/// If the write never parks, the gate stays closed, the child's exit closes
+/// the gate's only write end (the parent closed its own), and the parent's
+/// gate read ends with EOF (exit 126, guests/pipe_x86_64.S).
 struct ParkWatch {
     inner: Box<dyn SyscallInterceptor>,
 }
@@ -1243,9 +1323,8 @@ impl SyscallInterceptor for ParkWatch {
             if is_extra_byte_write(invocation) {
                 PARK_FLAGGED_EXTRA_WRITE.fetch_add(1, Ordering::AcqRel);
             }
-        } else if is_extra_byte_write(invocation) && PARK_GATE.load(Ordering::Acquire) == 0 {
-            let opened = open_gate(invocation.task_id);
-            PARK_GATE.store(if opened { 1 } else { 2 }, Ordering::Release);
+        } else if is_extra_byte_write(invocation) {
+            PARK_WRITER.store(invocation.task_id, Ordering::Release);
         }
         self.inner.on_syscall_enter(invocation, native)
     }
@@ -1276,6 +1355,44 @@ impl SyscallInterceptor for ParkWatch {
     }
 }
 
+/// Installs the kernel's descriptor-park observer for one pipe-guest run,
+/// and restores the previous observer when dropped.
+///
+/// The observer opens the gate once, when the task [`ParkWatch`] saw enter
+/// the child's one-byte write parks on the full data pipe. It runs on that
+/// task's kernel path after its waker was armed
+/// (`narf_userspace::handlers::__verification_swap_fd_park_observer`).
+struct GateOnPark(Option<fn(u64)>);
+
+impl GateOnPark {
+    fn install() -> Self {
+        PARK_WRITER.store(0, Ordering::Release);
+        PARK_GATE.store(0, Ordering::Release);
+        Self(
+            narf_userspace::handlers::__verification_swap_fd_park_observer(Some(open_gate_on_park)),
+        )
+    }
+}
+
+impl Drop for GateOnPark {
+    fn drop(&mut self) {
+        narf_userspace::handlers::__verification_swap_fd_park_observer(self.0);
+    }
+}
+
+fn open_gate_on_park(task_id: u64) {
+    if task_id == 0 || task_id != PARK_WRITER.load(Ordering::Acquire) {
+        return;
+    }
+    if PARK_GATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && !open_gate(task_id)
+    {
+        PARK_GATE.store(2, Ordering::Release);
+    }
+}
+
 /// A syscall that parks and is re-executed once its wait ends reaches the
 /// Tool once, not once per execution: the dispatcher flags the re-execution
 /// (`PARK_RECORDS` / `take_park_reexecution`) and the host completes the
@@ -1294,14 +1411,16 @@ fn reverie_narf_park_reexecution_reaches_the_tool_once() -> TestResult {
         let watch = ParkWatch {
             inner: interceptor.boxed(),
         };
+        let gate = GateOnPark::install();
         let root = run_guest(PIPE_GUEST, Box::new(watch), |root| {
             interceptor
                 .host_root(root.task_id)
                 .map_err(|_| "register_root refused the root task")
         })?;
+        drop(gate);
         match PARK_GATE.load(Ordering::Acquire) {
             1 => {}
-            0 => return Err("the child never issued its one-byte write to the full pipe"),
+            0 => return Err("the child's one-byte write never parked on the full pipe"),
             _ => return Err("the gate byte could not be written"),
         }
         check_teardown(&interceptor, root, 2, 0)?;
@@ -1358,8 +1477,8 @@ fn records_digest(records: &[alloc::string::String]) -> u64 {
 /// The canonical-trace Tool runs every `write` as `guest.inject(..).await`
 /// and records the result. The pipe guest's child writes one byte to its
 /// full pipe; that inject parks until the parent drains the pipe, which the
-/// parent does only after [`ParkWatch`] opens the gate at the entry of that
-/// write (ordering by blocking, see [`ParkWatch`]). The Tool must record the
+/// parent does only after [`ParkWatch`] opens the gate once that write has
+/// parked (ordering by blocking, see [`ParkWatch`]). The Tool must record the
 /// write's result, 1, after the re-execution, and the run must end with both
 /// tasks exiting 0. The records are printed with a digest so repeated runs
 /// can be compared.
@@ -1375,11 +1494,13 @@ fn reverie_narf_parked_inject_resumes_the_tool() -> TestResult {
         let watch = ParkWatch {
             inner: interceptor.boxed(),
         };
+        let gate = GateOnPark::install();
         let root = run_guest(PIPE_GUEST, Box::new(watch), |root| {
             interceptor
                 .host_root(root.task_id)
                 .map_err(|_| "register_root refused the root task")
         })?;
+        drop(gate);
         let records = core::mem::take(&mut *CONTINUATION_RECORDS.lock());
         // Printed without the canonical prefix: only the two parity cells may
         // put that prefix on the console, between their begin and
@@ -1398,7 +1519,7 @@ fn reverie_narf_parked_inject_resumes_the_tool() -> TestResult {
         );
         match PARK_GATE.load(Ordering::Acquire) {
             1 => {}
-            0 => return Err("the child never issued its one-byte write to the full pipe"),
+            0 => return Err("the child's one-byte write never parked on the full pipe"),
             _ => return Err("the gate byte could not be written"),
         }
         if PARK_FLAGGED_EXTRA_WRITE.load(Ordering::Acquire) != 1 {
