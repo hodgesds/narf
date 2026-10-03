@@ -2466,7 +2466,7 @@ dependencies = [
 [[package]]
 name = "reverie-core"
 version = "0.2.0"
-source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=acae2dbc6fab408eea13ef67bad6bc794a5ea538#acae2dbc6fab408eea13ef67bad6bc794a5ea538"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2483,7 +2483,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.2.0"
-source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=acae2dbc6fab408eea13ef67bad6bc794a5ea538#acae2dbc6fab408eea13ef67bad6bc794a5ea538"
 dependencies = [
  "syscalls",
 ]
@@ -2509,7 +2509,7 @@ dependencies = [
 [[package]]
 name = "reverie-narf-core"
 version = "0.2.0"
-source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=acae2dbc6fab408eea13ef67bad6bc794a5ea538#acae2dbc6fab408eea13ef67bad6bc794a5ea538"
 dependencies = [
  "async-trait",
  "reverie-core",
@@ -2518,7 +2518,7 @@ dependencies = [
 [[package]]
 name = "reverie-narf-tools"
 version = "0.2.0"
-source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=acae2dbc6fab408eea13ef67bad6bc794a5ea538#acae2dbc6fab408eea13ef67bad6bc794a5ea538"
 dependencies = [
  "reverie-core",
  "serde",
@@ -2528,7 +2528,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.2.0"
-source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=acae2dbc6fab408eea13ef67bad6bc794a5ea538#acae2dbc6fab408eea13ef67bad6bc794a5ea538"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
@@ -2538,7 +2538,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.2.0"
-source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023#26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023"
+source = "git+file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie?rev=acae2dbc6fab408eea13ef67bad6bc794a5ea538#acae2dbc6fab408eea13ef67bad6bc794a5ea538"
 dependencies = [
  "bitflags 2.13.2",
  "derive_more",

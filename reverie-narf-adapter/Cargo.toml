@@ -22,9 +22,9 @@ narf-time = { path = "../time" }
 narf-userspace = { path = "../userspace" }
 # One exact commit of the Reverie fork. `default-features = false` keeps
 # Reverie's `std` feature off; nothing in this workspace turns it on.
-reverie = { package = "reverie-core", git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023", default-features = false }
-reverie-narf-core = { git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023", default-features = false }
-reverie-narf-tools = { git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "26a2bc3ca56bbeb1a6d4c558f7fa8198efa51023", default-features = false }
+reverie = { package = "reverie-core", git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "acae2dbc6fab408eea13ef67bad6bc794a5ea538", default-features = false }
+reverie-narf-core = { git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "acae2dbc6fab408eea13ef67bad6bc794a5ea538", default-features = false }
+reverie-narf-tools = { git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "acae2dbc6fab408eea13ef67bad6bc794a5ea538", default-features = false }
 
 [features]
 # Registers the adapter's in-kernel tests (subsystem `reverie-narf`) and

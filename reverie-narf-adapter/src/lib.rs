@@ -15,8 +15,11 @@
 //!   events to it.
 //!
 //! There is no IPC, ptrace emulation, signal, binary rewriting or polling: the
-//! kernel calls the interceptor, the interceptor polls the Tool's future once,
-//! and every Tool-to-kernel operation is a direct call.
+//! kernel calls the interceptor, the interceptor polls the Tool's future once
+//! per kernel entry, and every Tool-to-kernel operation is a direct call. A
+//! Tool whose inject parks the task (a blocking read, say) keeps its future in
+//! the host, which polls it again, on the task's own stack, when the kernel
+//! re-executes the parked syscall.
 //!
 //! The crate is x86_64-only because Reverie's syscall layer is defined
 //! without `std` only for x86_64; on any other target it is empty.

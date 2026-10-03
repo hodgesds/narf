@@ -148,8 +148,10 @@ impl core::fmt::Debug for NarfKernelServices<'_> {
 }
 
 // SAFETY: a `NarfKernelServices` lives on the trapping task's kernel stack for
-// the duration of one interceptor call. The core polls the Tool's future once,
-// synchronously, on that stack and drops it before returning, so the borrowed
+// the duration of one interceptor call. The core lends it to the Tool's future
+// only while it polls that future, synchronously, on that stack; a future the
+// core keeps across a park holds no reference to it (reverie-narf-core's
+// `FrameSlot` is cleared on every exit from the poll). So the borrowed
 // transition is never reached from another CPU or after the call returns.
 unsafe impl Send for NarfKernelServices<'_> {}
 // SAFETY: as above; no shared reference escapes the single synchronous poll.
