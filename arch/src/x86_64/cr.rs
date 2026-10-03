@@ -128,7 +128,7 @@ pub fn __verification_clear_user_rdtsc_interception() {
 /// Clear only the executing CPU's CR4.TSD bit while retaining the global
 /// request. This lets the kernel scheduler test model first use on a migrated
 /// CPU and prove that its switch-in path reapplies the request.
-#[cfg(feature = "kernel-test")]
+#[cfg(any(feature = "kernel-test", feature = "verification-test-reset"))]
 #[doc(hidden)]
 pub fn __test_clear_current_cpu_user_rdtsc_interception() {
     // SAFETY: the kernel test runs at CPL0 and preserves every other CR4 bit.

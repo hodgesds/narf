@@ -235,7 +235,9 @@ Linux `smp_call_function_many()`. It returns `false` without running the action
 when a required IPI bridge is unavailable. The action is an unsafe boundary:
 it runs with ordinary IRQs masked and therefore must be allocation-free,
 non-parking, non-awaiting, non-sleeping, safe under concurrent execution, and
-independent of scheduler-task progress.
+independent of scheduler-task progress. It must not acquire a lock held by any
+sender. Calling `remote_call` or `remote_barrier` from an action is rejected
+with `false` before the nested operation takes an outgoing lock.
 
 ## 4. Invariants & safety properties
 

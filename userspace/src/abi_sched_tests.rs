@@ -8,7 +8,7 @@
 //! the assertion rather than relying on a file-level note.
 
 use crate::abi_test_support::*;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A non-canonical x86_64 address (bit 48 set, 49..63 clear). Any
 /// `copy_to_user` / `validate_user_range` against it returns EFAULT, so it's
@@ -1341,12 +1341,20 @@ kernel_test_in!(
 );
 
 static REMOTE_CALL_CPUS: AtomicU64 = AtomicU64::new(0);
+static NESTED_REMOTE_CALL_REFUSED: AtomicBool = AtomicBool::new(false);
 
 fn record_remote_call_cpu() {
     let cpu = narf_lib::percpu::current_cpu();
     if cpu < 64 {
         REMOTE_CALL_CPUS.fetch_or(1u64 << cpu, Ordering::Release);
     }
+}
+
+fn attempt_nested_remote_barrier() {
+    NESTED_REMOTE_CALL_REFUSED.store(
+        !narf_lib::smp::remote_barrier(narf_lib::smp::online_bitmap()),
+        Ordering::Release,
+    );
 }
 
 fn smoke_abi_sched_remote_call_runs_on_every_online_cpu() -> TestResult {
@@ -1368,6 +1376,31 @@ fn smoke_abi_sched_remote_call_runs_on_every_online_cpu() -> TestResult {
 kernel_test_in!(
     "syscall_abi/interception",
     smoke_abi_sched_remote_call_runs_on_every_online_cpu
+);
+
+fn smoke_abi_sched_nested_remote_call_is_refused() -> TestResult {
+    with_setup(|| {
+        NESTED_REMOTE_CALL_REFUSED.store(false, Ordering::Release);
+        // SAFETY: the callback performs one nested refusal probe and one
+        // lock-free atomic store. The nested rendezvous must return before it
+        // acquires the already-owned source lane.
+        if !unsafe {
+            narf_lib::smp::remote_call(
+                1u64 << narf_lib::percpu::current_cpu(),
+                attempt_nested_remote_barrier,
+            )
+        } {
+            return Err("outer remote_call unexpectedly failed");
+        }
+        if !NESTED_REMOTE_CALL_REFUSED.load(Ordering::Acquire) {
+            return Err("nested remote_barrier was not refused");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/interception",
+    smoke_abi_sched_nested_remote_call_is_refused
 );
 
 // ── set_robust_list(head*, len) / get_robust_list(pid, head**, len*) ─

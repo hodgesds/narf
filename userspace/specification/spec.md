@@ -38,12 +38,27 @@ second installation is rejected and a published table never swaps interceptor
 identity. For every known or unknown wire number, the dispatcher snapshots the
 raw number (including version bits), canonical variant when one exists, six
 register arguments, task identity, user instruction pointer, and user stack
-pointer. It then invokes `on_syscall_enter`, executes the native handler at
-most once unless entry supplied a complete result, and invokes exactly one of
-`on_syscall_return` or `on_syscall_context_managed`. Interceptors receive only
-the immutable invocation snapshot, never the mutable trap context. A return
-callback may replace its exact `SyscallReturn`; the context-managed callback is
-observation-only, so a park/redirection cannot become a fabricated completion.
+pointer. It then invokes `on_syscall_enter` with the immutable snapshot and a
+borrowed `NativeSyscallTransition`. Its first `execute_original()` bypasses
+interception, runs the original native handler synchronously, and returns either
+`Returned(SyscallReturn)` or `ContextManaged`; every later original call returns
+`NativeSyscallOriginalError::AlreadyExecuted` without running the handler. Its
+`execute_injected(NativeSyscallRequest)` presents the request's exact wire
+number and six arguments to the native table, bypasses interception, returns the
+same typed outcome, and may be called repeatedly for distinct or repeated
+injections until any transition becomes context-managed. That terminal outcome
+is then sticky: later injection attempts return `ContextManaged` without
+executing, and an original not yet executed returns
+`NativeSyscallOriginalError::ContextManaged` because the live context is no
+longer available. Injected normal returns do not consume the original
+transition or write the live guest return registers. If the interceptor returns `Continue`
+without having executed the original, the dispatcher executes it once. If it
+already executed the original, `Continue` consumes that saved outcome rather
+than executing twice. `Complete` suppresses an unexecuted original or replaces
+the return from an executed one, but it cannot turn an executed context-managed
+park/redirection into a fabricated completion. The dispatcher then invokes
+exactly one of `on_syscall_return` or `on_syscall_context_managed`.
+Interceptors never receive the mutable trap context.
 Unknown syscalls traverse the same layer and retain Linux
 `-ENOSYS`/NARF `InvalidOp` unless the interceptor explicitly replaces them.
 

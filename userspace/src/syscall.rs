@@ -141,10 +141,69 @@ pub struct SyscallInvocation {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SyscallInterception {
-    /// Execute the native NARF handler exactly once.
+    /// Use the native transition's result, executing it exactly once if the
+    /// interceptor has not already done so.
     Continue,
     /// Skip the native handler and publish this result.
     Complete(SyscallReturn),
+}
+
+/// Result of the kernel-owned native transition for one intercepted syscall.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeSyscallOutcome {
+    /// The native handler returned normally with this typed result.
+    Returned(SyscallReturn),
+    /// The native handler parked, exited, execed, or redirected the task and
+    /// therefore did not publish a normal return value.
+    ContextManaged,
+}
+
+/// Why the original native transition is no longer executable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeSyscallOriginalError {
+    /// The original handler already executed once.
+    AlreadyExecuted,
+    /// An original or injected handler already took ownership of the live
+    /// context by parking, exiting, execing, or redirecting the task.
+    ContextManaged,
+}
+
+/// Raw syscall request for a nested native injection.
+#[derive(Copy, Clone, Debug)]
+pub struct NativeSyscallRequest {
+    /// Exact NARF wire value, including version bits.
+    pub raw_number: u32,
+    /// Six register arguments presented to the injected handler.
+    pub args: SyscallArgs,
+}
+
+impl NativeSyscallRequest {
+    pub const fn new(raw_number: u32, args: SyscallArgs) -> Self {
+        Self { raw_number, args }
+    }
+}
+
+/// Kernel-owned capability for executing the intercepted syscall's native
+/// handler.
+///
+/// The dispatcher lends one capability to one interceptor entry callback. The
+/// first [`execute_original`](NativeSyscallTransition::execute_original) call
+/// executes the intercepted handler synchronously and returns its typed outcome;
+/// every later original call returns
+/// [`NativeSyscallOriginalError::AlreadyExecuted`] without executing anything.
+/// [`execute_injected`](NativeSyscallTransition::execute_injected) runs an
+/// explicit request exactly once per call and may be called repeatedly until
+/// any transition becomes context-managed. After that terminal outcome,
+/// further injected calls return `ContextManaged`, and an unexecuted original
+/// returns [`NativeSyscallOriginalError::ContextManaged`], without executing
+/// anything.
+/// Both operations bypass interception, so a Reverie `Guest::inject`
+/// implementation can use them from inside the Tool callback without recursively
+/// trapping its own injected syscall.
+pub trait NativeSyscallTransition {
+    fn execute_original(&mut self) -> Result<NativeSyscallOutcome, NativeSyscallOriginalError>;
+
+    fn execute_injected(&mut self, request: NativeSyscallRequest) -> NativeSyscallOutcome;
 }
 
 /// First-class middleware at NARF's live syscall dispatcher.
@@ -164,7 +223,11 @@ pub enum SyscallInterception {
 /// a context-managed park or redirection is observable but immutable.
 pub trait SyscallInterceptor: Send + Sync {
     /// Observes one syscall before native dispatch and chooses whether it runs.
-    fn on_syscall_enter(&self, _invocation: &SyscallInvocation) -> SyscallInterception {
+    fn on_syscall_enter(
+        &self,
+        _invocation: &SyscallInvocation,
+        _native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
         SyscallInterception::Continue
     }
 
@@ -3472,13 +3535,15 @@ impl TrapContext for IoAccountCtx<'_> {
 /// `ContextManaged` instead of fabricating a value for an interceptor.
 struct InterceptCtx<'a> {
     inner: &'a mut dyn TrapContext,
+    args: SyscallArgs,
     result: Option<SyscallReturn>,
 }
 
 impl<'a> InterceptCtx<'a> {
-    fn new(inner: &'a mut dyn TrapContext) -> Self {
+    fn new(inner: &'a mut dyn TrapContext, args: SyscallArgs) -> Self {
         Self {
             inner,
+            args,
             result: None,
         }
     }
@@ -3486,12 +3551,11 @@ impl<'a> InterceptCtx<'a> {
 
 impl TrapContext for InterceptCtx<'_> {
     fn args(&self) -> &SyscallArgs {
-        self.inner.args()
+        &self.args
     }
 
     fn set_return(&mut self, ret: SyscallReturn) {
         self.result = Some(ret);
-        self.inner.set_return(ret);
     }
 
     fn user_rsp(&self) -> u64 {
@@ -3534,6 +3598,77 @@ impl TrapContext for InterceptCtx<'_> {
 
     fn dump_gprs(&self) {
         self.inner.dump_gprs()
+    }
+}
+
+struct DispatchNativeTransition<'table, 'ctx> {
+    table: &'table SyscallTable,
+    variant: Option<Syscall>,
+    version: u8,
+    args: SyscallArgs,
+    ctx: &'ctx mut dyn TrapContext,
+    original_outcome: Option<NativeSyscallOutcome>,
+    context_managed: bool,
+}
+
+impl DispatchNativeTransition<'_, '_> {
+    fn resolve(&mut self, control: SyscallInterception) -> NativeSyscallOutcome {
+        match control {
+            SyscallInterception::Continue if self.context_managed => {
+                NativeSyscallOutcome::ContextManaged
+            }
+            SyscallInterception::Continue => match self.original_outcome {
+                Some(outcome) => outcome,
+                None => self
+                    .execute_original()
+                    .expect("fresh native syscall transition must be executable"),
+            },
+            SyscallInterception::Complete(_) if self.context_managed => {
+                NativeSyscallOutcome::ContextManaged
+            }
+            SyscallInterception::Complete(result) => NativeSyscallOutcome::Returned(result),
+        }
+    }
+}
+
+impl NativeSyscallTransition for DispatchNativeTransition<'_, '_> {
+    fn execute_original(&mut self) -> Result<NativeSyscallOutcome, NativeSyscallOriginalError> {
+        if self.original_outcome.is_some() {
+            return Err(NativeSyscallOriginalError::AlreadyExecuted);
+        }
+        if self.context_managed {
+            return Err(NativeSyscallOriginalError::ContextManaged);
+        }
+        let mut capture = InterceptCtx::new(self.ctx, self.args);
+        self.table
+            .dispatch_native(self.variant, self.version, &mut capture);
+        let outcome = match capture.result {
+            Some(result) => NativeSyscallOutcome::Returned(result),
+            None => NativeSyscallOutcome::ContextManaged,
+        };
+        self.original_outcome = Some(outcome);
+        if outcome == NativeSyscallOutcome::ContextManaged {
+            self.context_managed = true;
+        }
+        Ok(outcome)
+    }
+
+    fn execute_injected(&mut self, request: NativeSyscallRequest) -> NativeSyscallOutcome {
+        if self.context_managed {
+            return NativeSyscallOutcome::ContextManaged;
+        }
+        let version = syscall_version(request.raw_number);
+        let variant = Syscall::from_raw(syscall_number(request.raw_number));
+        let mut capture = InterceptCtx::new(self.ctx, request.args);
+        self.table.dispatch_native(variant, version, &mut capture);
+        let outcome = match capture.result {
+            Some(result) => NativeSyscallOutcome::Returned(result),
+            None => NativeSyscallOutcome::ContextManaged,
+        };
+        if outcome == NativeSyscallOutcome::ContextManaged {
+            self.context_managed = true;
+        }
+        outcome
     }
 }
 
@@ -4666,6 +4801,22 @@ impl SyscallReturn {
             status: abi::NarfStatus::Unsupported,
         }
     }
+
+    /// Linux-ABI value placed in the guest's primary result register.
+    ///
+    /// This is the Rust counterpart of the x86_64 fast-syscall epilogue: an
+    /// `Ok` status preserves `value`, while every Narf-native error status
+    /// folds to `-EINVAL`. The epilogue separately restores the guest's saved
+    /// argument registers, so this signed value is the complete result seen by
+    /// a Linux-ABI caller. In-kernel interposition adapters must use this
+    /// conversion rather than discarding `status` and republishing `value` as
+    /// an unconditional success.
+    pub const fn linux_abi_result(self) -> i64 {
+        match self.status {
+            abi::NarfStatus::Ok => self.value as i64,
+            _ => -22,
+        }
+    }
     /// A syscall number this kernel does not implement.
     ///
     /// Carries BOTH answers, because two ABIs read this struct and each
@@ -4921,20 +5072,26 @@ impl SyscallTable {
             instruction_pointer: ctx.rip(),
             stack_pointer: ctx.user_rsp(),
         };
-        let control = interceptor.on_syscall_enter(&invocation);
-        let result = {
-            let mut capture = InterceptCtx::new(ctx);
-            match control {
-                SyscallInterception::Continue => {
-                    self.dispatch_native(variant, version, &mut capture)
-                }
-                SyscallInterception::Complete(ret) => capture.set_return(ret),
-            }
-            capture.result
+        let outcome = {
+            let mut native = DispatchNativeTransition {
+                table: self,
+                variant,
+                version,
+                args: invocation.args,
+                ctx,
+                original_outcome: None,
+                context_managed: false,
+            };
+            let control = interceptor.on_syscall_enter(&invocation, &mut native);
+            native.resolve(control)
         };
-        match result {
-            Some(result) => ctx.set_return(interceptor.on_syscall_return(&invocation, result)),
-            None => interceptor.on_syscall_context_managed(&invocation),
+        match outcome {
+            NativeSyscallOutcome::Returned(result) => {
+                ctx.set_return(interceptor.on_syscall_return(&invocation, result));
+            }
+            NativeSyscallOutcome::ContextManaged => {
+                interceptor.on_syscall_context_managed(&invocation);
+            }
         }
     }
 
@@ -5056,7 +5213,11 @@ mod interception_tests {
     struct Probe(Arc<ProbeState>);
 
     impl SyscallInterceptor for Probe {
-        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn NativeSyscallTransition,
+        ) -> SyscallInterception {
             self.0.entries.fetch_add(1, Ordering::Relaxed);
             self.0
                 .raw_number
@@ -5209,7 +5370,11 @@ mod interception_tests {
     fn complete_skips_native_handler() {
         struct CompleteProbe;
         impl SyscallInterceptor for CompleteProbe {
-            fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            fn on_syscall_enter(
+                &self,
+                invocation: &SyscallInvocation,
+                _native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
                 if invocation.syscall == Some(Syscall::GetUid) {
                     SyscallInterception::Complete(SyscallReturn::ok(77))
                 } else {
@@ -5232,6 +5397,135 @@ mod interception_tests {
 
         assert_eq!(context.ret, Some(SyscallReturn::ok(77)));
         assert_eq!(native_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn interceptor_can_execute_native_once_without_dispatcher_reexecution() {
+        struct TransitionProbe;
+        impl SyscallInterceptor for TransitionProbe {
+            fn on_syscall_enter(
+                &self,
+                _invocation: &SyscallInvocation,
+                native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
+                assert_eq!(
+                    native.execute_original(),
+                    Ok(NativeSyscallOutcome::Returned(SyscallReturn::ok(11)))
+                );
+                assert_eq!(
+                    native.execute_original(),
+                    Err(NativeSyscallOriginalError::AlreadyExecuted)
+                );
+                // Native side effects persist, but the interceptor still owns
+                // the final return value just as a Reverie Tool does.
+                SyscallInterception::Complete(SyscallReturn::ok(77))
+            }
+        }
+
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let native_calls_for_handler = Arc::clone(&native_calls);
+        let mut table = SyscallTable::new();
+        table.install_fn(Syscall::GetUid, "getuid", move |_| {
+            native_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(11)
+        });
+        assert!(table.install_interceptor(Box::new(TransitionProbe)).is_ok());
+
+        let mut context = TestContext::default();
+        table.dispatch(Syscall::GetUid, &mut context);
+
+        assert_eq!(native_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(context.ret, Some(SyscallReturn::ok(77)));
+    }
+
+    #[test]
+    fn interceptor_can_execute_repeated_explicit_injected_requests() {
+        struct InjectionProbe;
+        impl SyscallInterceptor for InjectionProbe {
+            fn on_syscall_enter(
+                &self,
+                _invocation: &SyscallInvocation,
+                native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
+                let first = native.execute_injected(NativeSyscallRequest::new(
+                    Syscall::GetUid.raw(),
+                    SyscallArgs {
+                        arg0: 21,
+                        ..SyscallArgs::default()
+                    },
+                ));
+                let second = native.execute_injected(NativeSyscallRequest::new(
+                    Syscall::GetUid.raw(),
+                    SyscallArgs {
+                        arg0: 22,
+                        ..SyscallArgs::default()
+                    },
+                ));
+                assert_eq!(first, NativeSyscallOutcome::Returned(SyscallReturn::ok(42)));
+                assert_eq!(
+                    second,
+                    NativeSyscallOutcome::Returned(SyscallReturn::ok(44))
+                );
+                SyscallInterception::Complete(SyscallReturn::ok(86))
+            }
+        }
+
+        let original_calls = Arc::new(AtomicUsize::new(0));
+        let original_calls_for_handler = Arc::clone(&original_calls);
+        let injected_calls = Arc::new(AtomicUsize::new(0));
+        let injected_calls_for_handler = Arc::clone(&injected_calls);
+        let mut table = SyscallTable::new();
+        table.install_fn(Syscall::GetPid, "getpid", move |_| {
+            original_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(999)
+        });
+        table.install_fn(Syscall::GetUid, "getuid", move |args| {
+            injected_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(args.arg0 * 2)
+        });
+        assert!(table.install_interceptor(Box::new(InjectionProbe)).is_ok());
+
+        let mut context = TestContext::default();
+        table.dispatch(Syscall::GetPid, &mut context);
+
+        assert_eq!(original_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(injected_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(context.ret, Some(SyscallReturn::ok(86)));
+    }
+
+    #[test]
+    fn context_managed_native_transition_cannot_be_fabricated_into_return() {
+        struct ContextProbe(Arc<AtomicUsize>);
+        impl SyscallInterceptor for ContextProbe {
+            fn on_syscall_enter(
+                &self,
+                _invocation: &SyscallInvocation,
+                native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
+                assert_eq!(
+                    native.execute_original(),
+                    Ok(NativeSyscallOutcome::ContextManaged)
+                );
+                SyscallInterception::Complete(SyscallReturn::ok(77))
+            }
+
+            fn on_syscall_context_managed(&self, _invocation: &SyscallInvocation) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let completions = Arc::new(AtomicUsize::new(0));
+        let mut table = SyscallTable::new();
+        table.install_raw_fn(Syscall::Yield, "yield", |_| {});
+        assert!(table
+            .install_interceptor(Box::new(ContextProbe(Arc::clone(&completions))))
+            .is_ok());
+
+        let mut context = TestContext::default();
+        table.dispatch(Syscall::Yield, &mut context);
+
+        assert_eq!(context.ret, None);
+        assert_eq!(completions.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -5257,7 +5551,11 @@ mod interception_kernel_tests {
     struct Probe(Arc<Counts>);
 
     impl SyscallInterceptor for Probe {
-        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn NativeSyscallTransition,
+        ) -> SyscallInterception {
             self.0.entries.fetch_add(1, Ordering::Relaxed);
             if invocation.syscall.is_none() {
                 self.0.unknown.fetch_add(1, Ordering::Relaxed);
@@ -5380,7 +5678,11 @@ mod interception_kernel_tests {
     fn smoke_syscall_interceptor_complete_and_global_publication() -> TestResult {
         struct CompleteProbe;
         impl SyscallInterceptor for CompleteProbe {
-            fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+            fn on_syscall_enter(
+                &self,
+                invocation: &SyscallInvocation,
+                _native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
                 if invocation.syscall == Some(Syscall::GetUid) {
                     SyscallInterception::Complete(SyscallReturn::ok(77))
                 } else {
@@ -5425,10 +5727,188 @@ mod interception_kernel_tests {
         TestResult::Pass
     }
 
+    fn smoke_syscall_native_transition_is_at_most_once() -> TestResult {
+        struct TransitionProbe(Arc<AtomicUsize>);
+        impl SyscallInterceptor for TransitionProbe {
+            fn on_syscall_enter(
+                &self,
+                _invocation: &SyscallInvocation,
+                native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
+                if native.execute_original()
+                    != Ok(NativeSyscallOutcome::Returned(SyscallReturn::ok(11)))
+                {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+                if native.execute_original() != Err(NativeSyscallOriginalError::AlreadyExecuted) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+                let first = native.execute_injected(NativeSyscallRequest::new(
+                    Syscall::GetUid.raw(),
+                    SyscallArgs {
+                        arg0: 11,
+                        ..SyscallArgs::default()
+                    },
+                ));
+                let second = native.execute_injected(NativeSyscallRequest::new(
+                    Syscall::GetUid.raw(),
+                    SyscallArgs {
+                        arg0: 12,
+                        ..SyscallArgs::default()
+                    },
+                ));
+                if first != NativeSyscallOutcome::Returned(SyscallReturn::ok(22))
+                    || second != NativeSyscallOutcome::Returned(SyscallReturn::ok(24))
+                {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+                SyscallInterception::Complete(SyscallReturn::ok(77))
+            }
+        }
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let original_calls = Arc::new(AtomicUsize::new(0));
+        let original_calls_for_handler = Arc::clone(&original_calls);
+        let injected_calls = Arc::new(AtomicUsize::new(0));
+        let injected_calls_for_handler = Arc::clone(&injected_calls);
+        let mut table = SyscallTable::new();
+        table.install_fn(Syscall::GetPid, "getpid", move |_| {
+            original_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(11)
+        });
+        table.install_fn(Syscall::GetUid, "getuid", move |args| {
+            injected_calls_for_handler.fetch_add(1, Ordering::Relaxed);
+            SyscallReturn::ok(args.arg0 * 2)
+        });
+        if table
+            .install_interceptor(Box::new(TransitionProbe(Arc::clone(&failures))))
+            .is_err()
+        {
+            return TestResult::Fail("native-transition interceptor install failed");
+        }
+
+        let mut context = Context::default();
+        table.dispatch(Syscall::GetPid, &mut context);
+        if failures.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("native transition returned an incorrect typed outcome");
+        }
+        if original_calls.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("native transition executed the handler more than once");
+        }
+        if injected_calls.load(Ordering::Relaxed) != 2 {
+            return TestResult::Fail(
+                "explicit injected requests did not each execute exactly once",
+            );
+        }
+        if context.ret != Some(SyscallReturn::ok(77)) {
+            return TestResult::Fail("interceptor did not retain final-return ownership");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_terminal_injection_keeps_original_state_distinct() -> TestResult {
+        struct TerminalProbe {
+            failures: Arc<AtomicUsize>,
+            managed: Arc<AtomicUsize>,
+        }
+
+        impl SyscallInterceptor for TerminalProbe {
+            fn on_syscall_enter(
+                &self,
+                invocation: &SyscallInvocation,
+                native: &mut dyn NativeSyscallTransition,
+            ) -> SyscallInterception {
+                let injected = native.execute_injected(NativeSyscallRequest::new(
+                    Syscall::Yield.raw(),
+                    SyscallArgs::default(),
+                ));
+                if injected != NativeSyscallOutcome::ContextManaged {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                }
+                if native.execute_original() != Err(NativeSyscallOriginalError::ContextManaged) {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                }
+                if invocation.syscall == Some(Syscall::GetPid) {
+                    SyscallInterception::Continue
+                } else {
+                    SyscallInterception::Complete(SyscallReturn::ok(77))
+                }
+            }
+
+            fn on_syscall_context_managed(&self, _invocation: &SyscallInvocation) {
+                self.managed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let managed = Arc::new(AtomicUsize::new(0));
+        let original_calls = Arc::new(AtomicUsize::new(0));
+        let mut table = SyscallTable::new();
+        for syscall in [Syscall::GetPid, Syscall::GetUid] {
+            let original_calls = Arc::clone(&original_calls);
+            table.install_fn(syscall, "must-not-run", move |_| {
+                original_calls.fetch_add(1, Ordering::Relaxed);
+                SyscallReturn::ok(11)
+            });
+        }
+        table.install_raw_fn(Syscall::Yield, "terminal-injected", |_| {});
+        if table
+            .install_interceptor(Box::new(TerminalProbe {
+                failures: Arc::clone(&failures),
+                managed: Arc::clone(&managed),
+            }))
+            .is_err()
+        {
+            return TestResult::Fail("terminal-transition interceptor install failed");
+        }
+
+        let mut continued = Context::default();
+        table.dispatch(Syscall::GetPid, &mut continued);
+        let mut completed = Context::default();
+        table.dispatch(Syscall::GetUid, &mut completed);
+        if continued.ret.is_some() || completed.ret.is_some() {
+            return TestResult::Fail("terminal injection fabricated a normal return");
+        }
+        if failures.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("terminal transition reported the wrong original state");
+        }
+        if original_calls.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("terminal injection executed an unavailable original");
+        }
+        if managed.load(Ordering::Relaxed) != 2 {
+            return TestResult::Fail("Continue/Complete lost terminal context ownership");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_linux_abi_result_folds_native_status() -> TestResult {
+        if SyscallReturn::ok((-38i64) as u64).linux_abi_result() != -38 {
+            return TestResult::Fail("Ok status did not preserve the signed Linux value");
+        }
+        if SyscallReturn::not_implemented().linux_abi_result() != -22
+            || SyscallReturn::invalid_op().linux_abi_result() != -22
+        {
+            return TestResult::Fail("non-Ok status did not match the architecture -EINVAL fold");
+        }
+        TestResult::Pass
+    }
+
     kernel_test_in!("userspace/syscall", smoke_syscall_interceptor_contract);
     kernel_test_in!(
         "userspace/syscall",
         smoke_syscall_interceptor_complete_and_global_publication
+    );
+    kernel_test_in!(
+        "userspace/syscall-transition",
+        smoke_syscall_native_transition_is_at_most_once
+    );
+    kernel_test_in!(
+        "userspace/syscall-transition",
+        smoke_terminal_injection_keeps_original_state_distinct
+    );
+    kernel_test_in!(
+        "userspace/syscall-transition",
+        smoke_linux_abi_result_folds_native_status
     );
 }
 

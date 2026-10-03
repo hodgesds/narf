@@ -2513,7 +2513,11 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
 
     struct Probe;
     impl SyscallInterceptor for Probe {
-        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn narf_userspace::NativeSyscallTransition,
+        ) -> SyscallInterception {
             ENTERS.fetch_add(1, Ordering::Relaxed);
             if invocation.syscall.is_none() {
                 UNKNOWN.fetch_add(1, Ordering::Relaxed);
@@ -2630,7 +2634,11 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
 
     struct Probe;
     impl SyscallInterceptor for Probe {
-        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn narf_userspace::NativeSyscallTransition,
+        ) -> SyscallInterception {
             ENTERS.fetch_add(1, Ordering::Relaxed);
             if invocation.syscall.is_none() {
                 UNKNOWN.fetch_add(1, Ordering::Relaxed);
@@ -3266,7 +3274,11 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
 
     struct Probe;
     impl SyscallInterceptor for Probe {
-        fn on_syscall_enter(&self, invocation: &SyscallInvocation) -> SyscallInterception {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn narf_userspace::NativeSyscallTransition,
+        ) -> SyscallInterception {
             if invocation.raw_number == 0x3fff && invocation.syscall.is_none() {
                 FAST_ENTRIES.fetch_add(1, Ordering::Relaxed);
                 SyscallInterception::Complete(SyscallReturn::ok(SYSCALL_MAGIC))
@@ -3478,6 +3490,350 @@ fn smoke_frame_x86_64_user_mode_fast_syscall_interceptor() -> TestResult {
 kernel_test_in!(
     "verification/syscall-entry",
     smoke_frame_x86_64_user_mode_fast_syscall_interceptor
+);
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_scheduled_user_interception_survives_ap_migration() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_scheduler::{Affinity, CpuId, CpuSet, TaskSpec};
+    use narf_userspace::instruction::{
+        __verification_clear_instruction_interceptor, try_install_instruction_interceptor,
+        InstructionInterception, InstructionInterceptor, InstructionInvocation, InstructionResult,
+        InstructionSubscriptions,
+    };
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_task_id_lookup,
+        syscall::__verification_clear_global as __test_clear_global, Syscall, SyscallInterception,
+        SyscallInterceptor, SyscallInvocation, SyscallReturn, SyscallTable, UserProcess,
+    };
+
+    const UNKNOWN_NR: u32 = 0x3fff;
+    const RDTSC_MAGIC: u64 = 0x1122_3344_5566_7788;
+    const SYSCALL_MAGIC: u64 = 0x7abc_def0;
+
+    static EXPECTED_TASK: AtomicU64 = AtomicU64::new(0);
+    static YIELD_TASK: AtomicU64 = AtomicU64::new(0);
+    static YIELD_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static RDTSC_TASK: AtomicU64 = AtomicU64::new(0);
+    static RDTSC_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static SYSCALL_TASK: AtomicU64 = AtomicU64::new(0);
+    static SYSCALL_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static SYSCALL_ARG0: AtomicU64 = AtomicU64::new(0);
+    static EXIT_TASK: AtomicU64 = AtomicU64::new(0);
+    static EXIT_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static EXIT_ARG0: AtomicU64 = AtomicU64::new(0);
+    static CONTROLLER_ERROR: AtomicU64 = AtomicU64::new(0);
+    static DESTINATION_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static CLEARED_CPUS: AtomicU64 = AtomicU64::new(0);
+
+    struct SyscallProbe;
+    impl SyscallInterceptor for SyscallProbe {
+        fn on_syscall_enter(
+            &self,
+            invocation: &SyscallInvocation,
+            _native: &mut dyn narf_userspace::NativeSyscallTransition,
+        ) -> SyscallInterception {
+            let cpu = narf_lib::percpu::current_cpu();
+            match invocation.raw_number {
+                number if number == Syscall::Yield.raw() => {
+                    YIELD_TASK.store(invocation.task_id, Ordering::Release);
+                    YIELD_CPU.store(cpu, Ordering::Release);
+                    let destination = DESTINATION_CPU.load(Ordering::Acquire);
+                    if destination == usize::MAX
+                        || narf_scheduler::set_task_affinity(
+                            narf_scheduler::TaskId(invocation.task_id),
+                            CpuSet::single(CpuId(destination as u32)),
+                        )
+                        .is_err()
+                    {
+                        CONTROLLER_ERROR.store(2, Ordering::Release);
+                    }
+                    SyscallInterception::Continue
+                }
+                UNKNOWN_NR => {
+                    SYSCALL_TASK.store(invocation.task_id, Ordering::Release);
+                    SYSCALL_CPU.store(cpu, Ordering::Release);
+                    SYSCALL_ARG0.store(invocation.args.arg0, Ordering::Release);
+                    SyscallInterception::Complete(SyscallReturn::ok(SYSCALL_MAGIC))
+                }
+                number if number == Syscall::ExitTask.raw() => {
+                    EXIT_TASK.store(invocation.task_id, Ordering::Release);
+                    EXIT_CPU.store(cpu, Ordering::Release);
+                    EXIT_ARG0.store(invocation.args.arg0, Ordering::Release);
+                    SyscallInterception::Continue
+                }
+                _ => SyscallInterception::Continue,
+            }
+        }
+    }
+
+    struct RdtscProbe;
+    // SAFETY: the callback performs only lock-free atomic stores and returns a
+    // typed value. It does not allocate, park, await, lock, or re-enter guest
+    // execution.
+    unsafe impl InstructionInterceptor for RdtscProbe {
+        fn subscriptions(&self) -> InstructionSubscriptions {
+            InstructionSubscriptions::RDTSC
+        }
+
+        fn on_instruction_enter(
+            &self,
+            invocation: &InstructionInvocation,
+        ) -> InstructionInterception {
+            RDTSC_TASK.store(invocation.task_id, Ordering::Release);
+            RDTSC_CPU.store(narf_lib::percpu::current_cpu(), Ordering::Release);
+            InstructionInterception::Complete(InstructionResult::Rdtsc { value: RDTSC_MAGIC })
+        }
+    }
+
+    fn clear_and_record_tsd() {
+        narf_arch::x86_64::cr::__test_clear_current_cpu_user_rdtsc_interception();
+        if narf_arch::x86_64::cr::cached_cr4() & narf_arch::x86_64::cr::CR4_TSD == 0 {
+            let cpu = narf_lib::percpu::current_cpu();
+            if cpu < 64 {
+                CLEARED_CPUS.fetch_or(1u64 << cpu, Ordering::Release);
+            }
+        }
+    }
+
+    let source_cpu = narf_lib::percpu::current_cpu();
+    let online = narf_lib::smp::online_bitmap();
+    let peers = online & !(1u64 << source_cpu);
+    if peers == 0 {
+        return TestResult::Skip("scheduled interception migration needs an online AP");
+    }
+    let destination_cpu = peers.trailing_zeros() as usize;
+    DESTINATION_CPU.store(destination_cpu, Ordering::Release);
+
+    for atomic in [
+        &EXPECTED_TASK,
+        &YIELD_TASK,
+        &RDTSC_TASK,
+        &SYSCALL_TASK,
+        &SYSCALL_ARG0,
+        &EXIT_TASK,
+        &EXIT_ARG0,
+        &CONTROLLER_ERROR,
+        &CLEARED_CPUS,
+    ] {
+        atomic.store(0, Ordering::Relaxed);
+    }
+    for atomic in [&YIELD_CPU, &RDTSC_CPU, &SYSCALL_CPU, &EXIT_CPU] {
+        atomic.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    __test_clear_global();
+    __verification_clear_instruction_interceptor();
+    narf_userspace::user_task::__test_clear_hooks();
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::enable_user_task_smp();
+
+    let original_cr3: u64;
+    // SAFETY: snapshot the kernel address space for defensive test cleanup.
+    unsafe {
+        core::arch::asm!("mov {value}, cr3", value = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+
+    // SAFETY: this test exclusively owns the fresh address space until the
+    // scheduled task exits.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    let code_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc code frame"),
+    };
+    let stack_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Fail("alloc stack frame"),
+    };
+    if address_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: VirtAddr::new(STACK_VADDR),
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![stack_frame],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("map user regions failed");
+    }
+
+    let yield_nr = Syscall::Yield.raw().to_le_bytes();
+    let exit_nr = Syscall::ExitTask.raw().to_le_bytes();
+    let unknown_nr = UNKNOWN_NR.to_le_bytes();
+    // Yield on the source CPU. After the controller moves this task, execute
+    // RDTSC, pass its result as arg0 to an unknown fast syscall, then pass that
+    // syscall's Tool result as the exit status.
+    let code: [u8; 38] = [
+        0xB8,
+        yield_nr[0],
+        yield_nr[1],
+        yield_nr[2],
+        yield_nr[3], // mov eax,Yield
+        0xCD,
+        0x80, // int 0x80
+        0x0F,
+        0x31, // rdtsc
+        0x48,
+        0xC1,
+        0xE2,
+        0x20, // shl rdx,32
+        0x48,
+        0x09,
+        0xD0, // or rax,rdx
+        0x48,
+        0x89,
+        0xC7, // mov rdi,rax
+        0xB8,
+        unknown_nr[0],
+        unknown_nr[1],
+        unknown_nr[2],
+        unknown_nr[3], // mov eax,unknown
+        0x0F,
+        0x05, // syscall
+        0x48,
+        0x89,
+        0xC7, // mov rdi,rax
+        0xB8,
+        exit_nr[0],
+        exit_nr[1],
+        exit_nr[2],
+        exit_nr[3], // mov eax,ExitTask
+        0xCD,
+        0x80, // int 0x80
+        0xEB,
+        0xFE, // jmp $
+    ];
+    // SAFETY: the frame is exclusively owned and the program fits one page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code.as_ptr(),
+            code_frame.kernel_mut_ptr::<u8>(),
+            code.len(),
+        );
+    }
+    // SAFETY: materialize publishes the complete mappings above.
+    if unsafe { address_space.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    if table
+        .install_interceptor(alloc::boxed::Box::new(SyscallProbe))
+        .is_err()
+    {
+        return TestResult::Fail("syscall interceptor install failed");
+    }
+    install_global(table);
+    if try_install_instruction_interceptor(alloc::boxed::Box::new(RdtscProbe)).is_err() {
+        __test_clear_global();
+        return TestResult::Fail("instruction interceptor install failed");
+    }
+
+    CLEARED_CPUS.store(0, Ordering::Release);
+    // SAFETY: the callback only clears one test-owned CR4 bit and records the
+    // executing CPU in an atomic bitmap.
+    if !unsafe { narf_lib::smp::remote_call(1u64 << destination_cpu, clear_and_record_tsd) }
+        || CLEARED_CPUS.load(Ordering::Acquire) & (1u64 << destination_cpu) == 0
+    {
+        __verification_clear_instruction_interceptor();
+        __test_clear_global();
+        return TestResult::Fail("destination CPU TSD reset did not execute");
+    }
+
+    install_task_id_lookup(|| narf_scheduler::current_task_id().raw());
+    narf_userspace::install_user_task_hooks();
+    let process = UserProcess {
+        pid: narf_userspace::alloc_pid(),
+        address_space: Arc::new(address_space),
+        entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
+        stack_top: VirtAddr::new(STACK_VADDR + 0x1000),
+        fs_base: None,
+        entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
+    };
+    let mut source_spec = TaskSpec::user_task();
+    source_spec.affinity = Affinity::pinned(CpuId(source_cpu as u32));
+    let user_id = narf_userspace::user_task::spawn_user_process(process, source_spec);
+    EXPECTED_TASK.store(user_id.raw(), Ordering::Release);
+
+    narf_scheduler::spawn(async {
+        while EXIT_TASK.load(Ordering::Acquire) == 0 {
+            narf_scheduler::yield_now().await;
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+
+    // SAFETY: restore the exact kernel CR3 and kernel-GS state after the user
+    // task has exited, matching the neighboring scheduled-user smoke cleanup.
+    unsafe {
+        core::arch::asm!("mov cr3, {value}", value = in(reg) original_cr3,
+            options(nostack, preserves_flags));
+        const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_KERNEL_GS_BASE,
+            in("eax") 0u32,
+            in("edx") 0u32,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    narf_userspace::user_task::__test_clear_hooks();
+    narf_userspace::handlers::__test_reset_task_id_lookup();
+    __verification_clear_instruction_interceptor();
+    __test_clear_global();
+
+    let expected_task = EXPECTED_TASK.load(Ordering::Acquire);
+    match CONTROLLER_ERROR.load(Ordering::Acquire) {
+        0 => {}
+        1 => return TestResult::Fail("migration waiter failed before guest exit"),
+        2 => return TestResult::Fail("scheduler rejected the destination affinity"),
+        _ => return TestResult::Fail("migration controller reported an unknown failure"),
+    }
+    if expected_task == 0
+        || YIELD_TASK.load(Ordering::Acquire) != expected_task
+        || RDTSC_TASK.load(Ordering::Acquire) != expected_task
+        || SYSCALL_TASK.load(Ordering::Acquire) != expected_task
+        || EXIT_TASK.load(Ordering::Acquire) != expected_task
+    {
+        return TestResult::Fail("interception did not retain one nonzero scheduled task identity");
+    }
+    if YIELD_CPU.load(Ordering::Acquire) != source_cpu
+        || RDTSC_CPU.load(Ordering::Acquire) != destination_cpu
+        || SYSCALL_CPU.load(Ordering::Acquire) != destination_cpu
+        || EXIT_CPU.load(Ordering::Acquire) != destination_cpu
+    {
+        return TestResult::Fail("user task did not cross the requested CPU boundary");
+    }
+    if SYSCALL_ARG0.load(Ordering::Acquire) != RDTSC_MAGIC
+        || EXIT_ARG0.load(Ordering::Acquire) != SYSCALL_MAGIC
+    {
+        return TestResult::Fail("intercepted results did not reach the migrated guest");
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/interception-migration",
+    smoke_scheduled_user_interception_survives_ap_migration
 );
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]

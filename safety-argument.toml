@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
-agent = "OpenAI Codex GPT-5"
-prompt_hash = "3a766ac1ed4f30a34907fc8d2d907aa0a026c4fbd749627511c74ba3a6e51ad8"
+agent = "OpenAI Codex GPT-5.6 family"
+prompt_hash = "63dcbcfb87cdffdc08f9b445d6e4ee7a765a69a96b1da32e3d1a362af6e13b59"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1183,3 +1183,15 @@ argument = "Saturated fork locality remains inside the existing scheduler execut
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The fork selector still considers only allowed online CPUs and still derives its decision from scheduler-owned queue, wake-inbox, and current-task state. The current CPU wins only when every sampled candidate is occupied and it is tied for the minimum load; an idle CPU always wins, and an affinity-excluded current CPU has no load entry and cannot be selected. Admission and dispatch retain the existing affinity, lifecycle, address-space, TLS, domain-state, and FP/SIMD validation and restore paths."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Syscall policy remains outside the enumerated framekernel TCB: userspace owns an immutable interceptor object, while frame and the native syscall dispatcher retain sole ownership of trap frames, register mutation, task redirection, parking, signal delivery, and user return. The interceptor deliberately receives callback-bounded authority to invoke arbitrary native syscall numbers and arguments as the current task, including mapping and lifecycle operations; those calls run through the ordinary native handlers with that task's existing identity, capabilities, address space, and pointer checks. The interceptor cannot name another task as the caller, retain the transition past the callback borrow, bypass a native handler, or directly access the trap frame, capability table, domain handle, or mutable return context."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The x86 RDTSC path traps only an exact ring-3 0f31 instruction after the frame trap prologue has entered the trusted domain. Frame validates the typed result, writes only the saved EAX/EDX fields, and advances RIP by exactly two bytes; every mismatch or recursive callback stops the kernel. The interceptor cannot access the trap frame, and CR4.TSD is armed synchronously on every online CPU before installation succeeds and again at each later user entry. The cross-CPU action pointer is a static fn(), is published under the sender's per-CPU outgoing lock, remains stable until every target acknowledges, and is cleared before that lock is released. Each target runs the action before its release acknowledgement. Actions may not take a sender-held lock; nested remote_call/remote_barrier publication is detected per CPU and refused before acquiring the outgoing lock."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The scheduler change performs only the idempotent per-CPU CR4.TSD activation immediately before an existing user-task switch-in. It does not select, wake, reorder, migrate, park, resume, or alter the saved domain, address space, affinity, budget, or lifecycle of any task. Installation preflight rejects a missing SMP rendezvous before publication; if the bridge disappears after publication, the installer stops the kernel rather than return success with a partially armed CPU set. The monotonic request makes every later CPU apply TSD before its first user-task entry."

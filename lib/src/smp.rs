@@ -17,7 +17,7 @@
 //! of that: primitives that were vacuous on a uniprocessor kernel now have
 //! to be real.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub use crate::percpu::MAX_CPUS;
 
@@ -329,6 +329,11 @@ static BARRIER_ACKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_
 /// target has acknowledged it.
 static BARRIER_ACTION: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
+/// True while this CPU is executing a remote-call action. A nested publisher
+/// must refuse before taking its per-source outgoing lock, or a local action
+/// could deadlock by recursively acquiring the same non-reentrant lock.
+static BARRIER_ACTION_ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
 /// Serializes nested/concurrent publishers on one CPU, and (being
 /// IRQ-safe) keeps `current_cpu()` stable for the lifetime of the lane.
 static BARRIER_OUTGOING: [crate::sync::IrqSafeSpinLock<()>; MAX_CPUS] =
@@ -392,9 +397,12 @@ pub fn remote_barrier(targets: u64) -> bool {
 /// # Safety
 /// `action` runs in interrupt context with ordinary IRQs masked. It must not
 /// allocate, park, await, take a sleepable lock, re-enter userspace, or depend
-/// on another scheduler task. It must be safe to execute concurrently on every
-/// selected CPU. These requirements continue to hold if a sender services a
-/// mutually waiting sender's action from the rendezvous spin loop.
+/// on another scheduler task. It must not acquire a lock held by any sender.
+/// It must be safe to execute concurrently on every selected CPU. These
+/// requirements continue to hold if a sender services a mutually waiting
+/// sender's action from the rendezvous spin loop. A nested [`remote_call`] or
+/// [`remote_barrier`] is refused with `false` before acquiring an outgoing
+/// lock.
 pub unsafe fn remote_call(targets: u64, action: fn()) -> bool {
     // SAFETY: forwarded from this function's caller.
     unsafe { remote_call_inner(targets, Some(action)) }
@@ -406,6 +414,9 @@ pub unsafe fn remote_call(targets: u64, action: fn()) -> bool {
 /// A present `action` satisfies [`remote_call`]'s safety contract.
 unsafe fn remote_call_inner(targets: u64, action: Option<fn()>) -> bool {
     let source = crate::percpu::current_cpu().min(MAX_CPUS - 1);
+    if BARRIER_ACTION_ACTIVE[source].load(Ordering::Acquire) {
+        return false;
+    }
     let source_bit = 1u64 << source;
     let targets = targets & online_bitmap() & !source_bit;
     let poke = BARRIER_POKE.load(Ordering::Acquire);
@@ -419,7 +430,7 @@ unsafe fn remote_call_inner(targets: u64, action: Option<fn()>) -> bool {
     BARRIER_ACTION[source].store(action.map_or(0, |f| f as usize), Ordering::Release);
 
     if let Some(action) = action {
-        action();
+        run_remote_action(action);
     }
 
     // (a) in Linux's ordering table: the caller's own writes must precede
@@ -495,6 +506,7 @@ pub fn service_pending_barriers() {
     if sources == 0 {
         return;
     }
+    BARRIER_SERVICED.fetch_add(1, Ordering::Relaxed);
 
     let mut remaining = sources;
     while remaining != 0 {
@@ -507,7 +519,7 @@ pub fn service_pending_barriers() {
             // is published in this source lane, and the source retains its
             // outgoing lock until this acknowledgement is visible.
             let action: fn() = unsafe { core::mem::transmute(action) };
-            action();
+            run_remote_action(action);
         }
 
         // THE barrier. The action and all prior accesses on this CPU must
@@ -517,9 +529,18 @@ pub fn service_pending_barriers() {
         // Counted BEFORE the acknowledgement, not after. The ack is what
         // releases the sender, so a counter bumped afterwards can still be
         // invisible to it when the rendezvous returns.
-        BARRIER_SERVICED.fetch_add(1, Ordering::Relaxed);
         BARRIER_ACKED[source].fetch_or(1u64 << target, Ordering::Release);
     }
+}
+
+fn run_remote_action(action: fn()) {
+    let cpu = crate::percpu::current_cpu().min(MAX_CPUS - 1);
+    assert!(
+        !BARRIER_ACTION_ACTIVE[cpu].swap(true, Ordering::AcqRel),
+        "recursive remote-call action execution"
+    );
+    action();
+    BARRIER_ACTION_ACTIVE[cpu].store(false, Ordering::Release);
 }
 
 /// Completed [`remote_barrier`] rendezvous since boot.

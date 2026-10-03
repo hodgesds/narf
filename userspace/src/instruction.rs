@@ -290,6 +290,8 @@ pub(crate) fn __test_clear_instruction_interceptor() {
         // Keep the slot published until every online CPU has stopped trapping.
         // The verification harness owns the machine while resetting this
         // singleton, so no user task can cross this teardown boundary.
+        // SAFETY: the reset harness is single-owner and quiescent, and the
+        // callback only clears CR4.TSD on each selected online CPU.
         let cleared = unsafe {
             narf_lib::smp::remote_call(
                 narf_lib::smp::online_bitmap(),
