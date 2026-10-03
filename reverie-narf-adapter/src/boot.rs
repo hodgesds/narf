@@ -39,6 +39,50 @@
 //! reverie-narf-boot: chaos options ChaosOpts { skip: <N>, no_read: <bool>, no_recv: <bool>, no_interrupt: <bool> }
 //! ```
 //!
+//! # Detcore
+//!
+//! `reverie_tool=detcore` hosts the tree under Detcore, the Tool Hermit runs
+//! programs under, built without std from Hermit's sources (the `detcore`
+//! dependency in this crate's manifest). It takes no options. Its
+//! configuration is `detcore-config.json`, next to this file: Hermit's
+//! `Config::default()` (`detcore-model/src/config.rs`) as the host build
+//! writes it out, with these changes for this backend:
+//!
+//! * `sequentialize_threads`: Detcore's scheduler runs one hosted thread at a
+//!   time. It runs in a kernel task beside the callbacks
+//!   ([`ReverieInterceptor::spawn_background`]), started once the root is
+//!   hosted, which Detcore's `init_for_external_scheduler` requires.
+//! * `passthru_opt`: Detcore subscribes to the syscalls its policy models or
+//!   refuses, and to the time syscalls and RDTSC, instead of to everything.
+//!   Everything includes CPUID, which Narf cannot deliver. A syscall outside
+//!   that set runs natively and is not charged virtual time.
+//! * `virtualize_cpuid` off, for the same reason.
+//! * `max_timeslice` none: Narf gives Detcore no performance counter to
+//!   preempt a thread with, so a thread runs until its next event.
+//! * `cancel_killed_thread_rpcs` on, as for Hermit's DBT and KVM backends:
+//!   Detcore answers a killed thread's pending request itself instead of
+//!   relying on ptrace's exit-group teardown.
+//! * `backend_runs_exit_robust_list` and
+//!   `backend_supports_parked_write_signal_interruption` off: Hermit sets
+//!   them only for backends that do those things for Detcore.
+//!
+//! The epoch stays the library default, 2026-01-01T00:00:00Z, where
+//! `hermit run` would use the host's time when the run starts.
+//!
+//! Detcore virtualizes time, so the boot also installs the host's
+//! [`crate::RdtscInterceptor`] as the kernel's instruction interceptor, and
+//! every hosted `rdtsc` and `rdtscp` goes to Detcore.
+//!
+//! Detcore prints no count of its own. Its scheduler reports its milestones
+//! to the boot, which prints each as
+//! `reverie-narf-boot: detcore scheduler: <milestone>` except the one after
+//! every scheduling turn, which it counts. Its line in the report is that
+//! count, as it stands when the report is printed:
+//!
+//! ```text
+//! detcore-scheduler turns=<N>
+//! ```
+//!
 //! # The tally
 //!
 //! [`install`] wraps the [`ReverieInterceptor`] in a `Tally` that counts the
@@ -122,7 +166,8 @@
 //!
 //! A harness compares N with `expected-events`; for strace, N is its syscall
 //! lines, all but the second line a failed `execve` prints, and for chaos,
-//! which prints one line per event, all its lines. The events-by-task line
+//! which prints one line per event, all its lines. Detcore has no N. The
+//! events-by-task line
 //! has each member task's Linux thread ID and event count, in exit order (`?`
 //! for a thread ID the kernel no longer had); for counter2 the harness
 //! compares those pairs with the `counter2-local` lines, and for strace with
@@ -154,7 +199,7 @@ use reverie::{GlobalTool, Pid, Tid, Tool};
 use reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
 use reverie_narf_tools::{chaos, counter1, counter2, strace, LineSink};
 
-use crate::interceptor::{ConsoleSink, ReverieInterceptor};
+use crate::interceptor::{BackgroundFuture, ConsoleSink, ReverieInterceptor};
 
 type Config<T> = <<T as Tool>::GlobalState as GlobalTool>::Config;
 
@@ -168,7 +213,8 @@ const BY_NUMBER: usize = 512;
 ///
 /// If `name` is not a known Tool, its options are not ones the Tool takes,
 /// the host refuses the Tool, or the table already has an interceptor, it
-/// prints why and returns `None`, and `table` is unchanged.
+/// prints why and returns `None`, and `table` is unchanged. For Detcore the
+/// kernel may also refuse its RDTSC interceptor ([`install_detcore`]).
 pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
     let (tool, options) = match name.split_once(':') {
         Some((tool, options)) => (tool, Some(options)),
@@ -177,7 +223,9 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
     // The options a Tool runs with, printed once it is installed.
     let mut options_line = None;
     let installed = match (tool, options) {
-        ("counter1" | "counter2" | "strace", Some(_)) => Err(format!("{tool} takes no options")),
+        ("counter1" | "counter2" | "strace" | "detcore", Some(_)) => {
+            Err(format!("{tool} takes no options"))
+        }
         ("counter1", None) => Tally::<counter1::CounterLocal>::install(
             table,
             "counter1",
@@ -222,8 +270,9 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
                 |_| take_tool_output("chaos"),
             )
         }),
+        ("detcore", None) => install_detcore(table),
         _ => Err(String::from(
-            "no such tool (known: counter1, counter2, strace, chaos)",
+            "no such tool (known: counter1, counter2, strace, chaos, detcore)",
         )),
     };
     match installed {
@@ -247,6 +296,82 @@ pub fn install(table: &mut SyscallTable, name: &str) -> Option<BootHost> {
             None
         }
     }
+}
+
+/// Detcore's configuration (see the module documentation).
+const DETCORE_CONFIG: &str = include_str!("detcore-config.json");
+
+/// Installs Detcore as [`install`] installs the other Tools, with the host's
+/// RDTSC interceptor installed in the kernel, and Detcore's scheduler started
+/// once the root is hosted.
+///
+/// The RDTSC interceptor is installed before the table's interceptor, so if
+/// the kernel refuses it the table is unchanged. If the table then refused
+/// its interceptor, the kernel would keep the RDTSC interceptor, with a host
+/// that hosts no task: each `rdtsc` would trap and then run natively.
+fn install_detcore(table: &mut SyscallTable) -> Result<BootHost, String> {
+    let mut config: detcore::Config = serde_json::from_str(DETCORE_CONFIG)
+        .map_err(|error| format!("its configuration does not parse: {error}"))?;
+    // As `hermit run` does with the configuration it parses.
+    config.validate();
+    let global = detcore::GlobalState::init_for_external_scheduler(&config);
+    let (host, rdtsc) = ReverieInterceptor::<detcore::Detcore>::with_global_state_and_rdtsc(
+        config,
+        global,
+        <detcore::Detcore as Tool>::new,
+    )
+    .map_err(|error| format!("the host refused the tool: {error:?}"))?;
+    // Detcore subscribes to RDTSC when it virtualizes time. No user task
+    // exists yet, so the kernel refuses only if it already has an
+    // instruction interceptor, or has several CPUs and no rendezvous to arm
+    // the trap on all of them.
+    if let Some(rdtsc) = rdtsc {
+        narf_userspace::try_install_instruction_interceptor(Box::new(rdtsc))
+            .map_err(|_| String::from("the kernel refused Detcore's RDTSC interceptor"))?;
+    }
+    Tally::install_host(
+        table,
+        "detcore",
+        host,
+        |_| {
+            format!(
+                "detcore-scheduler turns={}",
+                DETCORE_TURNS.load(Ordering::Relaxed)
+            )
+        },
+        Some(start_detcore_scheduler),
+    )
+}
+
+/// The milestone Detcore's scheduler reports after each scheduling turn
+/// (`sched_loop_inner` in `detcore/src/scheduler.rs`).
+const DETCORE_TURN: &str = "completed a deterministic scheduling turn";
+
+/// The scheduling turns Detcore's scheduler has reported.
+static DETCORE_TURNS: AtomicU64 = AtomicU64::new(0);
+
+/// The observer of Detcore's scheduler: counts its turns and prints its
+/// other milestones.
+fn observe_detcore_scheduler(milestone: &'static str) {
+    if milestone == DETCORE_TURN {
+        DETCORE_TURNS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ConsoleSink::emit(&format!(
+            "reverie-narf-boot: detcore scheduler: {milestone}"
+        ));
+    }
+}
+
+/// Starts Detcore's scheduler in a background task. The boot's host keeps a
+/// handle in the syscall table for good, so this runs only once the root is
+/// hosted (see [`ReverieInterceptor::spawn_background`]).
+fn start_detcore_scheduler(host: &ReverieInterceptor<detcore::Detcore>) {
+    host.spawn_background(run_detcore_scheduler);
+}
+
+/// Detcore's scheduler, on the run's global state.
+fn run_detcore_scheduler(global: &detcore::GlobalState) -> BackgroundFuture<'_> {
+    Box::pin(global.run_external_scheduler(Arc::new(observe_detcore_scheduler)))
 }
 
 /// counter2's thread-exit reporter: prints the line counter2 writes to
@@ -499,6 +624,8 @@ struct Tally<T: Tool> {
     tool: &'static str,
     /// Formats the Tool's own report line from the host.
     report: fn(&ReverieInterceptor<T>) -> String,
+    /// Runs once the root is hosted.
+    after_root: Option<fn(&ReverieInterceptor<T>)>,
 }
 
 impl<T: Tool> Clone for Tally<T> {
@@ -508,6 +635,7 @@ impl<T: Tool> Clone for Tally<T> {
             state: self.state.clone(),
             tool: self.tool,
             report: self.report,
+            after_root: self.after_root,
         }
     }
 }
@@ -532,6 +660,18 @@ impl<T: Tool + 'static> Tally<T> {
     ) -> Result<BootHost, String> {
         let host = ReverieInterceptor::<T>::with_tool_constructor(config, new_tool)
             .map_err(|error| format!("the host refused the tool: {error:?}"))?;
+        Self::install_host(table, tool, host, report, None)
+    }
+
+    /// [`Self::install`] around `host`, which the caller built, with
+    /// `after_root` run once the root is hosted.
+    fn install_host(
+        table: &mut SyscallTable,
+        tool: &'static str,
+        host: ReverieInterceptor<T>,
+        report: fn(&ReverieInterceptor<T>) -> String,
+        after_root: Option<fn(&ReverieInterceptor<T>)>,
+    ) -> Result<BootHost, String> {
         let tally = Self {
             host,
             state: Arc::new(TallyState {
@@ -545,6 +685,7 @@ impl<T: Tool + 'static> Tally<T> {
             }),
             tool,
             report,
+            after_root,
         };
         table
             .install_interceptor(Box::new(tally.clone()))
@@ -673,6 +814,9 @@ impl<T: Tool + 'static> Root for Tally<T> {
             .host_root(task_id)
             .map_err(|error| format!("the host refused the root: {error:?}"))?;
         self.state.members.lock().root = Some((task_id, ids.pid));
+        if let Some(after_root) = self.after_root {
+            after_root(&self.host);
+        }
         Ok(ids.pid)
     }
 }

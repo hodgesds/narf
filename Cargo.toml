@@ -200,3 +200,10 @@ incremental     = true
 
 # Reproducible builds: build/specification/spec.md §4.
 # SOURCE_DATE_EPOCH is honoured by rustc 1.85+; path remapping is in .cargo/config.toml.
+
+# crates.io's rand_pcg 0.10.2 turns on serde's default features, which need
+# std. Detcore (reverie-narf-adapter's `detcore`) takes it with them off: the
+# same package, with `default-features = false` added to its serde dependency,
+# from the same commit as Detcore.
+[patch.crates-io]
+rand_pcg = { git = "https://github.com/rrnewton/hermit", rev = "73ba8dcf5c9d83d09fb557d7afdd41b259455345" }

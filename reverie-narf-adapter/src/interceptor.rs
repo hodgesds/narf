@@ -358,13 +358,41 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
         new_tool: fn(Pid, &Config<T>) -> T,
     ) -> Result<(Self, Option<RdtscInterceptor<T>>), NarfFatal> {
         let delivers = T::subscriptions(&config).has_rdtsc();
-        let this = Self::from_host(
-            Host::<T>::new_delivering_rdtsc(config)?.with_tool_constructor(new_tool),
-        );
+        let host = Host::<T>::new_delivering_rdtsc(config)?;
+        Ok(Self::delivering_rdtsc(
+            host.with_tool_constructor(new_tool),
+            delivers,
+        ))
+    }
+
+    /// [`Self::with_rdtsc`], hosting `global`, a global state the caller
+    /// created for `config`, instead of creating one (see
+    /// [`NarfToolHost::with_global_state`]): for a Tool whose global state
+    /// is made another way, such as Detcore's, whose scheduler runs in a
+    /// future beside the callbacks ([`Self::spawn_background`]). Refuses the
+    /// same Tools as [`Self::with_rdtsc`], dropping `global`.
+    pub fn with_global_state_and_rdtsc(
+        config: Config<T>,
+        global: T::GlobalState,
+        new_tool: fn(Pid, &Config<T>) -> T,
+    ) -> Result<(Self, Option<RdtscInterceptor<T>>), NarfFatal> {
+        let delivers = T::subscriptions(&config).has_rdtsc();
+        let host = Host::<T>::with_global_state_delivering_rdtsc(config, global)?;
+        Ok(Self::delivering_rdtsc(
+            host.with_tool_constructor(new_tool),
+            delivers,
+        ))
+    }
+
+    /// The interceptor for `host`, built to deliver RDTSC events, and, if
+    /// `delivers` (the Tool subscribed to them), the [`RdtscInterceptor`]
+    /// that delivers them.
+    fn delivering_rdtsc(host: Host<T>, delivers: bool) -> (Self, Option<RdtscInterceptor<T>>) {
+        let this = Self::from_host(host);
         let rdtsc = delivers.then(|| RdtscInterceptor {
             inner: this.inner.clone(),
         });
-        Ok((this, rdtsc))
+        (this, rdtsc)
     }
 
     fn from_host(host: Host<T>) -> Self {

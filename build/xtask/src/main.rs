@@ -496,10 +496,11 @@ struct MuslDemoArgs {
     prebuilt: Option<String>,
 
     /// Host getty's process tree (the login shell and every case typed into
-    /// it) under this Reverie Tool from reverie-examples (`counter1`,
+    /// it) under this Reverie Tool: one from reverie-examples (`counter1`,
     /// `counter2`, `strace` or `chaos`, which also takes the Linux binary's
     /// flags as `chaos:<options>`, e.g. `chaos:no-interrupt` or
-    /// `chaos:skip=5,no-read`): build with `reverie-narf-poc`, boot with
+    /// `chaos:skip=5,no-read`) or Hermit's `detcore`: build with
+    /// `reverie-narf-poc`, boot with
     /// `reverie_tool=TOOL`, type `exit` after each boot's last case, and
     /// require the Tool's report from every boot (`reverie_narf_adapter::boot`).
     #[arg(long, value_name = "TOOL")]
@@ -7525,7 +7526,8 @@ impl ChaosOpts {
 /// options it gives, which are the defaults unless the value is
 /// `chaos:<options>`. `<options>` is one or more comma-separated words, each
 /// at most once: `skip=<N>` with `<N>` in decimal digits, `no-read`,
-/// `no-recv` and `no-interrupt`. The other Tools take no options. The kernel
+/// `no-recv` and `no-interrupt`. The other Tools, detcore included, take no
+/// options. The kernel
 /// parses `reverie_tool=` by the same rules and refuses what they refuse
 /// (`reverie_narf_adapter::boot::install`); checking here refuses a bad value
 /// before any boot.
@@ -7535,14 +7537,14 @@ fn reverie_tool_spec(spec: &str) -> Result<(&str, Option<ChaosOpts>), String> {
         None => (spec, None),
     };
     let options = match (tool, options) {
-        ("counter1" | "counter2" | "strace", None) => return Ok((tool, None)),
-        ("counter1" | "counter2" | "strace", Some(_)) => {
+        ("counter1" | "counter2" | "strace" | "detcore", None) => return Ok((tool, None)),
+        ("counter1" | "counter2" | "strace" | "detcore", Some(_)) => {
             return Err(format!("{tool} takes no options"))
         }
         ("chaos", options) => options,
         _ => {
             return Err(String::from(
-                "no such tool (known: counter1, counter2, strace, chaos)",
+                "no such tool (known: counter1, counter2, strace, chaos, detcore)",
             ))
         }
     };
@@ -7604,6 +7606,10 @@ fn reverie_tool_spec(spec: &str) -> Result<(&str, Option<ChaosOpts>), String> {
 /// `spec` gives. Its count is its lines, and [`check_chaos_lines`] checks
 /// them against those options and the tally.
 ///
+/// Detcore prints no count, so nothing is compared with the tally's
+/// expected events. Its line counts its scheduler's turns, which must be at
+/// least one; every other check applies.
+///
 /// `spec` is the `--reverie-tool` value ([`reverie_tool_spec`]).
 fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
     fn matching<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
@@ -7655,7 +7661,10 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
     // lines, and chaos's all its lines.
     let mut strace_lines = None;
     let mut chaos_lines = None;
-    let (counted, counter2_totals): (u64, Option<(u64, u64)>) = match tool {
+    // `None` for a Tool that prints no count (Detcore), with what its line
+    // says instead.
+    let mut uncounted = None;
+    let (counted, counter2_totals): (Option<u64>, Option<(u64, u64)>) = match tool {
         "counter1" => {
             let prefix = "counter1-global syscalls=";
             let line = single(&lines, prefix)?;
@@ -7664,7 +7673,7 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
                 .trim()
                 .parse()
                 .map_err(|e| format!("bad count in `{line}`: {e}"))?;
-            (counted, None)
+            (Some(counted), None)
         }
         "counter2" => {
             let prefix = "[counter tool] Total system calls in process tree: ";
@@ -7682,7 +7691,7 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
             };
             let (total, processes, threads) =
                 parse(&line[at..]).ok_or_else(|| format!("bad counts in `{line}`"))?;
-            (total, Some((processes, threads)))
+            (Some(total), Some((processes, threads)))
         }
         "strace" => {
             let output = strace_output(&lines)?;
@@ -7691,13 +7700,29 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
                 .filter(|line| matches!(line, StraceLine::Syscall { .. }))
                 .count() as u64;
             strace_lines = Some(output);
-            (counted, None)
+            (Some(counted), None)
         }
         "chaos" => {
             let output = chaos_output(&lines)?;
             let counted = output.len() as u64;
             chaos_lines = Some(output);
-            (counted, None)
+            (Some(counted), None)
+        }
+        "detcore" => {
+            let prefix = "detcore-scheduler turns=";
+            let line = single(&lines, prefix)?;
+            let at = line.find(prefix).map_or(0, |at| at + prefix.len());
+            let turns: u64 = line[at..]
+                .trim()
+                .parse()
+                .map_err(|e| format!("bad turn count in `{line}`: {e}"))?;
+            if turns == 0 {
+                return Err(String::from(
+                    "Detcore's scheduler completed no scheduling turn",
+                ));
+            }
+            uncounted = Some(format!("detcore ran {turns} scheduling turns"));
+            (None, None)
         }
         _ => return Err(format!("no report check for tool `{tool}`")),
     };
@@ -7727,10 +7752,12 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
     if entries.checked_sub(reexecutions + native_only) != Some(expected) {
         return Err(format!("the tally's arithmetic is wrong: `{tally}`"));
     }
-    if counted == 0 || counted != expected {
-        return Err(format!(
-            "{tool} counted {counted} syscall events; the tally expected {expected}"
-        ));
+    if let Some(counted) = counted {
+        if counted == 0 || counted != expected {
+            return Err(format!(
+                "{tool} counted {counted} syscall events; the tally expected {expected}"
+            ));
+        }
     }
     let exited = num("tasks-exited")?;
     let adapter_exits = num("adapter-exits")?;
@@ -7839,11 +7866,15 @@ fn check_reverie_report(serial: &str, spec: &str) -> Result<String, String> {
              {expected}"
         ));
     }
+    let head = match (counted, uncounted) {
+        (Some(counted), _) => format!("{tool} counted {counted} = expected-events"),
+        (None, Some(line)) => format!("{line}; expected-events"),
+        (None, None) => format!("{tool} counted nothing; expected-events"),
+    };
     Ok(format!(
-        "{tool} counted {counted} = expected-events ({entries} entries - {reexecutions} \
-         re-executions - {native_only} native-only) = the sum of {} tasks' events; {exited} \
-         tasks exited ({} unstarted), {processes} processes{counter2_summary}{strace_summary}\
-         {chaos_summary}",
+        "{head} ({entries} entries - {reexecutions} re-executions - {native_only} \
+         native-only) = the sum of {} tasks' events; {exited} tasks exited ({} unstarted), \
+         {processes} processes{counter2_summary}{strace_summary}{chaos_summary}",
         by_task.len(),
         num("exited-unstarted")?,
     ))
@@ -8841,6 +8872,7 @@ mod chaos_report_tests {
             ("counter1", "counter1", None),
             ("counter2", "counter2", None),
             ("strace", "strace", None),
+            ("detcore", "detcore", None),
             ("chaos", "chaos", opts(0, false, false, false)),
             ("chaos:no-interrupt", "chaos", opts(0, false, false, true)),
             ("chaos:no-read", "chaos", opts(0, true, false, false)),
@@ -8897,23 +8929,88 @@ mod chaos_report_tests {
             ),
             ("strace:no-read", "strace takes no options"),
             ("counter1:", "counter1 takes no options"),
+            ("detcore:seed=1", "detcore takes no options"),
             (
                 "counter3",
-                "no such tool (known: counter1, counter2, strace, chaos)",
+                "no such tool (known: counter1, counter2, strace, chaos, detcore)",
             ),
             (
                 "",
-                "no such tool (known: counter1, counter2, strace, chaos)",
+                "no such tool (known: counter1, counter2, strace, chaos, detcore)",
             ),
             (
                 "Chaos",
-                "no such tool (known: counter1, counter2, strace, chaos)",
+                "no such tool (known: counter1, counter2, strace, chaos, detcore)",
             ),
         ]
         .map(|(spec, reason)| (spec.to_string(), reason.to_string()));
         for (spec, reason) in unknown.into_iter().chain(other) {
             assert_eq!(reverie_tool_spec(&spec), Err(reason), "{spec}");
         }
+    }
+}
+
+#[cfg(test)]
+mod detcore_report_tests {
+    use super::check_reverie_report;
+
+    /// A boot whose shell (process 2) forks a command (process 3) that
+    /// exits, and then exits, under Detcore, whose scheduler reports `turns`.
+    fn serial(turns: &str, tally: &str) -> String {
+        format!(
+            "reverie-narf-boot: detcore installed at the syscall dispatcher\n\
+             reverie-narf-boot: detcore hosts the process tree of pid 2 (task 18)\n\
+             reverie-narf-boot: detcore scheduler: daemon task starting; waiting for guest thread\n\
+             narf> exit\n\
+             detcore-scheduler turns={turns}\n\
+             {tally}\n\
+             reverie-narf-boot: events-by-task 3:4 2:6\n\
+             reverie-narf-boot: syscalls-by-number 0:3 1:2 57:1 59:1 61:1 231:2 rest:0\n\
+             reverie-narf-boot: report end\n"
+        )
+    }
+
+    const TALLY: &str = "reverie-narf-boot: tally tool=detcore entries=11 reexecutions=1 \
+                         native-only=0 expected-events=10 tasks-started=2 tasks-exited=2 \
+                         exited-unstarted=0 processes=2 adapter-exits=2 adapter-hosted=0 \
+                         aborted=no";
+
+    #[test]
+    fn a_report_with_turns_is_accepted_without_a_count() {
+        assert_eq!(
+            check_reverie_report(&serial("37", TALLY), "detcore"),
+            Ok(String::from(
+                "detcore ran 37 scheduling turns; expected-events (11 entries - 1 \
+                 re-executions - 0 native-only) = the sum of 2 tasks' events; 2 tasks exited \
+                 (0 unstarted), 2 processes"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_report_is_refused_without_turns_or_with_a_wrong_tally() {
+        assert_eq!(
+            check_reverie_report(&serial("0", TALLY), "detcore"),
+            Err(String::from(
+                "Detcore's scheduler completed no scheduling turn"
+            ))
+        );
+        assert_eq!(
+            check_reverie_report(&serial("x", TALLY), "detcore"),
+            Err(String::from(
+                "bad turn count in `detcore-scheduler turns=x`: invalid digit found in string"
+            ))
+        );
+        let hosted = TALLY.replace("adapter-hosted=0", "adapter-hosted=1");
+        assert_eq!(
+            check_reverie_report(&serial("37", &hosted), "detcore"),
+            Err(format!("the adapter still hosts tasks: `{hosted}`"))
+        );
+        let short = TALLY.replace("expected-events=10", "expected-events=9");
+        assert_eq!(
+            check_reverie_report(&serial("37", &short), "detcore"),
+            Err(format!("the tally's arithmetic is wrong: `{short}`"))
+        );
     }
 }
 

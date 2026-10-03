@@ -27,6 +27,14 @@ narf-verification = { path = "../verification", optional = true }
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
 reverie-narf-core = { git = "https://github.com/rrnewton/reverie", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
 reverie-narf-tools = { git = "https://github.com/rrnewton/reverie", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
+# Detcore, Hermit's deterministic Tool, for the boot's `reverie_tool=detcore`:
+# Hermit's Detcore crates as this kernel builds them without std, exported by
+# Hermit's scripts/export-detcore-kernel-crates.sh with Reverie at the commit
+# above (branch narf/detcore-kernel-crates of https://github.com/rrnewton/hermit).
+# The workspace patches crates.io's rand_pcg to the same commit.
+detcore = { package = "hermit-detcore", git = "https://github.com/rrnewton/hermit", rev = "73ba8dcf5c9d83d09fb557d7afdd41b259455345" }
+# Parses the Detcore configuration the boot embeds.
+serde_json = { version = "1.0.140", default-features = false, features = ["alloc"] }
 
 [features]
 # Registers the adapter's in-kernel tests (subsystem `reverie-narf`) and
