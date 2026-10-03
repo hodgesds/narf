@@ -6232,7 +6232,9 @@ kernel_test_in!(
 /// ([`narf_userspace::InstructionInterceptor::on_instruction_deferred`]) on a
 /// scheduled user task: what the callback's transitions answer, the syscall
 /// park a delivered instruction ends, and a `SIGKILL` raised in the callback
-/// ending the task at the trap instead of letting it run on.
+/// ending the task at the trap instead of letting it run on. A terminating
+/// signal the callback's signal gate withheld, and a termination staged
+/// during the callback, end the task once the callback has returned.
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 mod deferred_rdtsc_e2e {
     use alloc::boxed::Box;
@@ -6287,6 +6289,8 @@ mod deferred_rdtsc_e2e {
     const SCRIPT_TRANSITIONS: u64 = 1;
     const SCRIPT_KILLED_ELSEWHERE: u64 = 2;
     const SCRIPT_TWO_GUESTS: u64 = 3;
+    const SCRIPT_WITHHELD: u64 = 4;
+    const SCRIPT_BAD_SIGRETURN: u64 = 5;
 
     // Checks the callbacks make. `FAILURE` holds the first that failed, as an
     // index into `FAILURES`; 0 is none.
@@ -6312,7 +6316,11 @@ mod deferred_rdtsc_e2e {
     const CALL_UNSCRIPTED: usize = 20;
     const OTHER_OUTSIDE_WAIT: usize = 21;
     const OTHER_NOT_RUN: usize = 22;
-    const FAILURES: [&str; 23] = [
+    const SIGTERM_NOT_SENT: usize = 23;
+    const NOT_WITHHELD: usize = 24;
+    const SIGRETURN_RETURNED: usize = 25;
+    const LATCH_BYPASSED: usize = 26;
+    const FAILURES: [&str; 27] = [
         "",
         "a probe ran on a task other than the guest",
         "a seed named no scripted park",
@@ -6336,6 +6344,10 @@ mod deferred_rdtsc_e2e {
         "a deferred call or return the script does not have",
         "the second guest's RDTSC trapped outside the first guest's deferred wait",
         "the second guest's RDTSC did not complete while the first guest's callback waited",
+        "the guest's injected SIGTERM to itself did not return 0",
+        "an inject did not answer -ERESTARTSYS while a terminating SIGTERM was pending",
+        "an injected sigreturn without a signal frame did not take the task's context",
+        "an inject ran after a transition had taken the task's context",
     ];
 
     static SCRIPT: AtomicU64 = AtomicU64::new(0);
@@ -6372,9 +6384,18 @@ mod deferred_rdtsc_e2e {
     static IN_WAIT: AtomicBool = AtomicBool::new(false);
     /// Set once the second guest's RDTSC has completed.
     static OTHER_DONE: AtomicBool = AtomicBool::new(false);
+    /// The guest's wait status from `on_task_exit`, with bit 32 set once it
+    /// was reported.
+    static EXIT_WSTATUS: AtomicU64 = AtomicU64::new(0);
 
     fn fail(check: usize) {
         let _ = FAILURE.compare_exchange(0, check, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The guest's wait status, once `on_task_exit` has reported it.
+    fn exit_wstatus() -> Option<i32> {
+        let reported = EXIT_WSTATUS.load(Ordering::Acquire);
+        (reported >> 32 != 0).then_some(reported as u32 as i32)
     }
 
     fn reset(script: u64) {
@@ -6391,6 +6412,7 @@ mod deferred_rdtsc_e2e {
             &WAITER_ERROR,
             &TASK_B,
             &OTHER_PROBE,
+            &EXIT_WSTATUS,
         ] {
             atomic.store(0, Ordering::Release);
         }
@@ -6479,6 +6501,12 @@ mod deferred_rdtsc_e2e {
                 _ => SyscallInterception::Continue,
             }
         }
+
+        fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32, _process_wstatus: i32) {
+            if task_id == TASK.load(Ordering::Acquire) {
+                EXIT_WSTATUS.store((1 << 32) | u64::from(wstatus as u32), Ordering::Release);
+            }
+        }
     }
 
     struct Deferrer;
@@ -6543,6 +6571,8 @@ mod deferred_rdtsc_e2e {
                 (SCRIPT_TRANSITIONS, 3) => kill_through_inject(native),
                 (SCRIPT_KILLED_ELSEWHERE, 1) => killed_elsewhere(native),
                 (SCRIPT_TWO_GUESTS, 1) => wait_for_the_other_guest(native),
+                (SCRIPT_WITHHELD, 1) => withheld_sigterm(native),
+                (SCRIPT_BAD_SIGRETURN, 1) => bad_sigreturn(native),
                 _ => {
                     fail(CALL_UNSCRIPTED);
                     DeferredInstruction::Native
@@ -6570,7 +6600,7 @@ mod deferred_rdtsc_e2e {
                         value: value.wrapping_add(1),
                     }
                 }
-                (SCRIPT_TRANSITIONS, 1, InstructionResult::Rdtsc { value }) => {
+                (SCRIPT_TRANSITIONS | SCRIPT_WITHHELD, 1, InstructionResult::Rdtsc { value }) => {
                     if value != RDTSC_MAGIC {
                         fail(RETURN_VALUE);
                     }
@@ -6753,6 +6783,82 @@ mod deferred_rdtsc_e2e {
         DeferredInstruction::Complete(InstructionResult::Rdtsc { value: RDTSC_MAGIC })
     }
 
+    /// Deferred call 1 of `SCRIPT_WITHHELD`: the guest sends itself `SIGTERM`
+    /// through an inject. Its default action ends the task, so the next
+    /// inject meets the signal gate, which withholds the signal and answers
+    /// `-ERESTARTSYS`; the inject after that runs, and the callback completes
+    /// a value. The signal is restored once the callback has returned.
+    fn withheld_sigterm(native: &mut dyn NativeSyscallTransition) -> DeferredInstruction {
+        let completed =
+            DeferredInstruction::Complete(InstructionResult::Rdtsc { value: RDTSC_MAGIC });
+        if native.task_killed() {
+            fail(LIVE_KILLED);
+            return completed;
+        }
+        let pid = PID.load(Ordering::Acquire);
+        if pid == 0 {
+            // kill(0) would signal the whole process group.
+            fail(NO_PROCESS);
+            return completed;
+        }
+        let kill = native.execute_injected(request(
+            Syscall::Kill,
+            SyscallArgs {
+                arg0: pid,
+                arg1: 15,
+                ..SyscallArgs::default()
+            },
+        ));
+        KILLED.store(true, Ordering::Release);
+        if kill != NativeSyscallOutcome::Returned(SyscallReturn::ok(0)) {
+            fail(SIGTERM_NOT_SENT);
+            return completed;
+        }
+        let restart = NativeSyscallOutcome::Returned(narf_userspace::errno::to_ret(
+            narf_userspace::errno::ERESTARTSYS,
+        ));
+        if native.execute_injected(request(Syscall::GetPid, SyscallArgs::default())) != restart {
+            fail(NOT_WITHHELD);
+            return completed;
+        }
+        if native.execute_injected(request(Syscall::GetPid, SyscallArgs::default()))
+            != NativeSyscallOutcome::Returned(SyscallReturn::ok(PROBES[0].load(Ordering::Acquire)))
+        {
+            fail(GETPID);
+            return completed;
+        }
+        if native.task_killed() {
+            fail(LIVE_KILLED);
+        }
+        completed
+    }
+
+    /// Deferred call 1 of `SCRIPT_BAD_SIGRETURN`: an injected `rt_sigreturn`
+    /// with no signal frame forces `SIGSEGV`, whose termination the
+    /// callback's spawn hold defers until the callback has returned. That
+    /// inject takes the task's context, so it and every inject after it
+    /// answer `ContextManaged`. The value is ignored.
+    fn bad_sigreturn(native: &mut dyn NativeSyscallTransition) -> DeferredInstruction {
+        let ignored = DeferredInstruction::Complete(InstructionResult::Rdtsc { value: 0 });
+        if native.task_killed() {
+            fail(LIVE_KILLED);
+            return ignored;
+        }
+        let sigreturn =
+            native.execute_injected(request(Syscall::Sigreturn, SyscallArgs::default()));
+        KILLED.store(true, Ordering::Release);
+        if sigreturn != NativeSyscallOutcome::ContextManaged {
+            fail(SIGRETURN_RETURNED);
+            return ignored;
+        }
+        if native.execute_injected(request(Syscall::GetPid, SyscallArgs::default()))
+            != NativeSyscallOutcome::ContextManaged
+        {
+            fail(LATCH_BYPASSED);
+        }
+        ignored
+    }
+
     /// A straight-line guest program at `CODE_VADDR`.
     struct Guest(Vec<u8>);
 
@@ -6933,11 +7039,16 @@ mod deferred_rdtsc_e2e {
         if !signal_tables.sigactions {
             narf_userspace::sigaction_init();
         }
+        // They skip the boot-time wait init too, and without its wait-status
+        // tables a guest's death stages no status and its exit reports 0.
+        let wait_status_tables = narf_userspace::handlers::__test_wait_status_tables_state();
+        narf_userspace::handlers::__test_wait_status_tables_init();
         install_task_id_lookup(|| narf_scheduler::current_task_id().raw());
         narf_scheduler::__reset_queues_for_test();
         narf_userspace::install_user_task_hooks();
         let live_before = narf_scheduler::live_user_task_count();
         let mut pids = Vec::new();
+        let mut tids = Vec::new();
         let mut pending = Vec::new();
         for (address_space, task_slot) in address_spaces.into_iter().zip([&TASK, &TASK_B]) {
             let pid = narf_userspace::alloc_pid();
@@ -6963,9 +7074,11 @@ mod deferred_rdtsc_e2e {
             narf_userspace::handlers::register_pid_task_mapping(pid_raw, task);
             task_slot.store(task, Ordering::Release);
             pids.push(pid_raw);
+            tids.push(task);
             pending.push(prepared);
         }
         PID.store(pids[0], Ordering::Release);
+        let waiter_pids = pids.clone();
         for prepared in pending {
             let _ = prepared.spawn();
         }
@@ -6995,7 +7108,7 @@ mod deferred_rdtsc_e2e {
                         }
                         let code = if KILLED.load(Ordering::Acquire) { 2 } else { 1 };
                         WAITER_ERROR.store(code, Ordering::Release);
-                        for &pid in &pids {
+                        for &pid in &waiter_pids {
                             let _ = narf_userspace::handlers::tool_view::kill_process_sigkill(pid);
                         }
                         killed_here = true;
@@ -7032,6 +7145,11 @@ mod deferred_rdtsc_e2e {
         // keeps the tables it may still use.
         if narf_scheduler::live_user_task_count() <= live_before {
             narf_userspace::handlers::__test_restore_signal_tables(signal_tables);
+            narf_userspace::handlers::__test_restore_wait_status_tables(
+                wait_status_tables,
+                &pids,
+                &tids,
+            );
         }
         Ok(())
     }
@@ -7120,6 +7238,9 @@ mod deferred_rdtsc_e2e {
         if !KILLED.load(Ordering::Acquire) || EXITS.load(Ordering::Acquire) != 0 {
             return TestResult::Fail("the guest was not killed at its third RDTSC");
         }
+        if exit_wstatus() != Some(9) {
+            return TestResult::Fail("the guest did not die of SIGKILL");
+        }
         TestResult::Pass
     }
     kernel_test_in!(
@@ -7157,6 +7278,9 @@ mod deferred_rdtsc_e2e {
         }
         if !KILLED.load(Ordering::Acquire) || EXITS.load(Ordering::Acquire) != 0 {
             return TestResult::Fail("the guest was not killed at its RDTSC");
+        }
+        if exit_wstatus() != Some(9) {
+            return TestResult::Fail("the guest did not die of SIGKILL");
         }
         TestResult::Pass
     }
@@ -7213,6 +7337,92 @@ mod deferred_rdtsc_e2e {
     kernel_test_in!(
         "verification/instruction-defer",
         smoke_deferred_rdtsc_wait_lets_another_guest_trap_on_its_cpu
+    );
+
+    /// A guest whose deferred RDTSC callback sends it `SIGTERM`: the signal
+    /// gate withholds the signal from the next inject, the callback
+    /// completes a value, and the restored signal ends the guest at the
+    /// RDTSC with wait status 15.
+    fn smoke_deferred_rdtsc_withheld_sigterm_ends_guest_after_callback() -> TestResult {
+        reset(SCRIPT_WITHHELD);
+        let mut guest = Guest(Vec::new());
+        guest.probe_pid(); // probe 0
+        let first = guest.rdtsc();
+        guest.probe_rax();
+        guest.exit();
+        RDTSC_IPS[1].store(first, Ordering::Release);
+
+        if let Err(reason) = run_guest(&guest.0) {
+            return TestResult::Fail(reason);
+        }
+        if let Some(reason) = recorded_failure() {
+            return TestResult::Fail(reason);
+        }
+        if ENTERS.load(Ordering::Acquire) != 1
+            || DEFERS.load(Ordering::Acquire) != 1
+            || RETURNS.load(Ordering::Acquire) != 1
+        {
+            return TestResult::Fail("the guest did not trap one RDTSC and complete it");
+        }
+        if PROBE_COUNT.load(Ordering::Acquire) != 1 || EXITS.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("the guest ran on past its RDTSC");
+        }
+        if exit_wstatus() != Some(15) {
+            return TestResult::Fail("the guest did not die of the withheld SIGTERM");
+        }
+        if narf_userspace::user_task::__test_open_spawn_holds() != (0, 0) {
+            return TestResult::Fail("a spawn hold outlived the deferred callback");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "verification/instruction-defer",
+        smoke_deferred_rdtsc_withheld_sigterm_ends_guest_after_callback
+    );
+
+    /// A guest whose deferred RDTSC callback injects `rt_sigreturn` with no
+    /// signal frame: the forced `SIGSEGV` takes the task's context, so the
+    /// inject after it does not run, and once the callback has returned the
+    /// guest dies of `SIGSEGV` at the RDTSC without completing it.
+    fn smoke_deferred_rdtsc_bad_sigreturn_terminates_guest_after_callback() -> TestResult {
+        reset(SCRIPT_BAD_SIGRETURN);
+        let mut guest = Guest(Vec::new());
+        guest.probe_pid(); // probe 0
+        let first = guest.rdtsc();
+        guest.probe(MARK_AFTER_KILL);
+        guest.exit();
+        RDTSC_IPS[1].store(first, Ordering::Release);
+
+        if let Err(reason) = run_guest(&guest.0) {
+            return TestResult::Fail(reason);
+        }
+        if let Some(reason) = recorded_failure() {
+            return TestResult::Fail(reason);
+        }
+        if ENTERS.load(Ordering::Acquire) != 1
+            || DEFERS.load(Ordering::Acquire) != 1
+            || RETURNS.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("the terminated guest's RDTSC completed or trapped again");
+        }
+        if PROBE_COUNT.load(Ordering::Acquire) != 1 || EXITS.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("the terminated guest ran on past its RDTSC");
+        }
+        // SIGSEGV, with or without the core-dump flag (0x80). Narf sets the
+        // flag whenever the signal's default action dumps core; Linux sets it
+        // only once a core is written, and the default RLIMIT_CORE of 0
+        // writes none.
+        if exit_wstatus().map(|wstatus| wstatus & !0x80) != Some(11) {
+            return TestResult::Fail("the guest did not die of SIGSEGV");
+        }
+        if narf_userspace::user_task::__test_open_spawn_holds() != (0, 0) {
+            return TestResult::Fail("a spawn hold outlived the deferred callback");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "verification/instruction-defer",
+        smoke_deferred_rdtsc_bad_sigreturn_terminates_guest_after_callback
     );
 }
 

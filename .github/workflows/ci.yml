@@ -879,7 +879,9 @@ jobs:
             'verification/own-stack-exec / smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces' \
             'verification/instruction-defer / smoke_deferred_rdtsc_transitions_park_and_self_kill' \
             'verification/instruction-defer / smoke_deferred_rdtsc_killed_elsewhere_meets_signal_gate_first' \
-            'verification/instruction-defer / smoke_deferred_rdtsc_wait_lets_another_guest_trap_on_its_cpu'
+            'verification/instruction-defer / smoke_deferred_rdtsc_wait_lets_another_guest_trap_on_its_cpu' \
+            'verification/instruction-defer / smoke_deferred_rdtsc_withheld_sigterm_ends_guest_after_callback' \
+            'verification/instruction-defer / smoke_deferred_rdtsc_bad_sigreturn_terminates_guest_after_callback'
           do
             grep -qF "[ OK ] $t" interception-smp2.log || { echo "::error::not OK: $t"; exit 1; }
           done

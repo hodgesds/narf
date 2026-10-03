@@ -11080,6 +11080,64 @@ pub fn __test_wait_reset() {
     crate::user_task::__test_wait_child_waker_reset();
 }
 
+/// Which wait-status registries exist: `PENDING_TERMINATION`, the status a
+/// group exit or a fatal signal stages for a process, and
+/// `THREAD_EXIT_STATUS`, each thread's own exit status. [`wait_init`]
+/// creates both at boot. Kernel-test boots start with neither, so there a
+/// staged status is dropped and a task's exit is reported with status 0.
+/// Test hook.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitStatusTablesState {
+    pub terminations: bool,
+    pub thread_exits: bool,
+}
+
+/// Report which wait-status registries exist. Test hook.
+#[doc(hidden)]
+pub fn __test_wait_status_tables_state() -> WaitStatusTablesState {
+    WaitStatusTablesState {
+        terminations: PENDING_TERMINATION.lock().is_some(),
+        thread_exits: THREAD_EXIT_STATUS.lock().is_some(),
+    }
+}
+
+/// Create each wait-status registry that does not exist, as [`wait_init`]
+/// does at boot, without the rest of its exit bookkeeping. An existing one is
+/// left as it is. Test hook, for a test whose tasks must report how they
+/// ended.
+#[doc(hidden)]
+pub fn __test_wait_status_tables_init() {
+    PENDING_TERMINATION.lock().get_or_insert_with(BTreeMap::new);
+    THREAD_EXIT_STATUS.lock().get_or_insert_with(BTreeMap::new);
+}
+
+/// Return the wait-status registries to `state`: drop each one that did not
+/// exist, and remove from each one that did the rows of the test's processes
+/// `pids` and threads `tids`, which nothing drains without the exit observers
+/// that [`wait_init`] registers. Test hook; call it only while none of those
+/// tasks is live.
+#[doc(hidden)]
+pub fn __test_restore_wait_status_tables(state: WaitStatusTablesState, pids: &[u64], tids: &[u64]) {
+    restore_status_rows(&PENDING_TERMINATION, state.terminations, pids);
+    restore_status_rows(&THREAD_EXIT_STATUS, state.thread_exits, tids);
+}
+
+fn restore_status_rows(
+    table: &narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>>,
+    existed: bool,
+    keys: &[u64],
+) {
+    let mut rows = table.lock();
+    if !existed {
+        *rows = None;
+    } else if let Some(m) = rows.as_mut() {
+        for key in keys {
+            m.remove(key);
+        }
+    }
+}
+
 /// Encode a POSIX wstatus for a signal-induced termination.
 /// Low 7 bits = signum, bit 7 = WCOREDUMP.
 #[inline]
