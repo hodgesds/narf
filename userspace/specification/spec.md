@@ -97,9 +97,14 @@ the vDSO `getcpu` path, which reads the CPU number from `RDTSCP`'s auxiliary
 result, correct under an `RDTSC`-only tool. After publishing the slot, installation
 raises the monotonic kernel-wide trap request and synchronously applies it on
 every currently-online CPU before returning success. A missing SMP rendezvous
-rejects installation before publication. The legacy entry path and scheduler
-also apply the request before every user entry or own-stack switch-in, covering
-CPUs brought online after installation and task migration.
+rejects installation before publication. The request is also applied
+at exactly these points, which covers CPUs brought online after installation
+and task migration: the `UserTaskFuture` poll (first user entry and the legacy
+longjmp re-entry), the scheduler's own-stack switch-in, and its direct
+task-to-task handoff. A return to ring 3 from a trap or syscall stays on the
+CPU on which the task entered the kernel, which one of these points or the
+installation rendezvous has already armed. CR4.TSD is sticky: no production
+path clears it once set.
 The frame owner decodes only the exact unprefixed opcodes `0f 31` and
 `0f 01 f9`, captures immutable task/RIP metadata, executes native emulation at
 most once under `Continue` or accepts a typed completed value, applies a

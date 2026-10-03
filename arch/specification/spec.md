@@ -133,7 +133,9 @@ pub unsafe fn x86_64::user_mode::set_user_fs_base(fs_base: u64);
 
 /// Raise a monotonic kernel-wide request for CR4.TSD (which faults ring-3
 /// RDTSC and RDTSCP) and apply it locally.
-/// Every CPU applies the request again before an own-stack user-task switch-in.
+/// The installer applies it on every online CPU; a CPU also applies it at the
+/// userspace user-task poll, the own-stack switch-in and the direct handoff.
+/// No production path clears CR4.TSD once set.
 #[cfg(target_arch = "x86_64")]
 pub fn x86_64::cr::request_user_rdtsc_interception();
 #[cfg(target_arch = "x86_64")]

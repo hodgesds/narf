@@ -2603,9 +2603,9 @@ impl core::future::Future for UserTaskFuture {
         let _ = this.process.address_space.activate();
 
         // CR4.TSD is per-CPU. The own-stack scheduler repeats this operation
-        // before every switch-in, including migration; this call covers the
-        // first entry and the legacy longjmp model, which can re-enter user
-        // mode without an own-stack switch.
+        // before every switch-in and direct handoff, including migration; this
+        // call covers the first entry and the legacy longjmp model, which can
+        // re-enter user mode without an own-stack switch.
         crate::instruction::activate_current_cpu_instruction_interception();
 
         // Own-stack model: publish the just-loaded CR3 so the scheduler can

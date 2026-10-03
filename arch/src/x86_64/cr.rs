@@ -33,10 +33,28 @@ static PER_CPU_CACHED_CR4: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) };
 /// Monotonic kernel-wide request to fault ring-3 `RDTSC` and `RDTSCP` on every
 /// CPU. CR4.TSD cannot fault one without the other.
 ///
-/// CR4.TSD is per-CPU, so publication alone is insufficient: every user-task
-/// switch-in must call [`activate_requested_user_instruction_interception`].
-/// Production never clears this request. The interceptor that raised it is
-/// likewise installed once for the kernel lifetime.
+/// CR4.TSD is per-CPU, so publication alone is insufficient. A user task
+/// reaches ring 3 on a CPU only after one of these activation points has run
+/// [`activate_requested_user_instruction_interception`] on that CPU:
+/// - the installation rendezvous, on every CPU online at installation;
+/// - the userspace `UserTaskFuture` poll, before the first user entry and the
+///   legacy longjmp re-entry;
+/// - the scheduler's own-stack switch-in (`poll_to_yield`);
+/// - the scheduler's direct task-to-task handoff (`prepare_direct_arch_state`).
+///
+/// A return to ring 3 from a trap or syscall stays on the CPU where the task
+/// entered the kernel, which one of the points above has already armed.
+///
+/// CR4.TSD is sticky once set. Production never clears this request or the
+/// bit. While the request is published, [`write_cr4`] ORs CR4.TSD into every
+/// value it writes, with interrupts masked from that check through the write,
+/// so a caller's read-modify-write that raced an arming rendezvous IPI cannot
+/// undo it. The private CET/LAM writers read-modify-write the live register
+/// during feature enablement, the boot and AP trampolines run once per CPU
+/// before it can run a user task, and S3 resume restores the CR4 value
+/// captured immediately before suspend. Only the `kernel-test` and
+/// `verification-test-reset` hooks below clear it. The interceptor that
+/// raised the request is likewise installed once for the kernel lifetime.
 static USER_RDTSC_INTERCEPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Last CR4 value written through [`write_cr4`] on the executing CPU.
@@ -84,7 +102,9 @@ pub const CR4_TSD: u64 = 1 << 2;
 /// lifetime.
 ///
 /// This both publishes the cross-CPU request and applies it to the executing
-/// CPU. Other CPUs apply it at their next user-task switch-in.
+/// CPU. The userspace installer then applies it on every other online CPU
+/// through the SMP rendezvous; CPUs brought online later apply it at the
+/// activation points listed on `USER_RDTSC_INTERCEPTION_REQUESTED`.
 pub fn request_user_rdtsc_interception() {
     USER_RDTSC_INTERCEPTION_REQUESTED.store(true, Ordering::Release);
     activate_requested_user_instruction_interception();
@@ -92,10 +112,11 @@ pub fn request_user_rdtsc_interception() {
 
 /// Apply all requested user-instruction traps to the executing CPU.
 ///
-/// The scheduler calls this before every own-stack task switch-in and the
-/// legacy userspace path calls it before direct user entry. The cached fast
-/// path makes repeated calls a single CPU-local atomic load after CR4.TSD is
-/// installed.
+/// Called at each activation point listed on
+/// `USER_RDTSC_INTERCEPTION_REQUESTED`: the installation rendezvous, the
+/// `UserTaskFuture` poll, the own-stack switch-in and the direct handoff. The
+/// cached fast path makes repeated calls a single CPU-local atomic load after
+/// CR4.TSD is installed.
 pub fn activate_requested_user_instruction_interception() {
     if !USER_RDTSC_INTERCEPTION_REQUESTED.load(Ordering::Acquire) || cached_cr4() & CR4_TSD != 0 {
         return;
@@ -129,7 +150,8 @@ pub fn __verification_clear_user_rdtsc_interception() {
 
 /// Clear only the executing CPU's CR4.TSD bit while retaining the global
 /// request. This lets the kernel scheduler test model first use on a migrated
-/// CPU and prove that its switch-in path reapplies the request.
+/// CPU and prove that its switch-in path reapplies the request. It bypasses
+/// [`write_cr4`], which would keep the requested bit set.
 #[cfg(any(feature = "kernel-test", feature = "verification-test-reset"))]
 #[doc(hidden)]
 pub fn __test_clear_current_cpu_user_rdtsc_interception() {
@@ -137,7 +159,7 @@ pub fn __test_clear_current_cpu_user_rdtsc_interception() {
     unsafe {
         let current = read_cr4();
         if current & CR4_TSD != 0 {
-            write_cr4(current & !CR4_TSD);
+            write_cr4_and_cache(current & !CR4_TSD);
         }
     }
 }
@@ -220,8 +242,41 @@ pub unsafe fn read_cr4() -> u64 {
 /// - Only bits documented as writable may be set.
 /// - Enabling new features may require other setup first (e.g. CR4.PKS
 ///   requires CPUID.(07h:0).ECX:31=1, else `#GP`).
+///
+/// While the kernel-wide user RDTSC interception request is published, the
+/// written value always includes CR4.TSD. Interrupts are masked from that
+/// check until the cached copy is updated, so an arming rendezvous IPI either
+/// completes before the check or runs after this write and sees the new value.
 #[inline]
 pub unsafe fn write_cr4(value: u64) {
+    let rflags = crate::x86_64::asm::read_rflags();
+    // SAFETY: CLI is legal at CPL0; the saved IF is restored below.
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+    }
+    let value = if USER_RDTSC_INTERCEPTION_REQUESTED.load(Ordering::Acquire) {
+        value | CR4_TSD
+    } else {
+        value
+    };
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        write_cr4_and_cache(value);
+    }
+    if rflags & (1 << 9) != 0 {
+        // SAFETY: interrupts were enabled on entry.
+        unsafe {
+            asm!("sti", options(nomem, nostack));
+        }
+    }
+}
+
+/// Write CR4 exactly as given and update the cached copies.
+///
+/// # Safety
+/// As for [`write_cr4`].
+#[inline]
+unsafe fn write_cr4_and_cache(value: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller verified feature availability.
     unsafe {

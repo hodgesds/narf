@@ -839,6 +839,39 @@ jobs:
           cargo xtask test --arch=x86_64 --features cgroup-all,container \
             --subsystem interrupts
 
+      # Syscall and nondeterministic-instruction interception on two CPUs.
+      # `user-mode-e2e` is not in the full-suite feature set above, so without
+      # this step no CI run executes these tests at all. SMP 2 is required:
+      # the migration test moves a user task to an AP and needs the
+      # destination CPU's CR4.TSD re-armed there, and it Skips when no AP is
+      # online. A Skip is not coverage, so the step fails unless each named
+      # test prints `[ OK ]` and the suite summary reports zero skips.
+      - name: cargo xtask test — interception, SMP 2 (skip is failure)
+        if: matrix.arch == 'x86_64'
+        timeout-minutes: 25
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "900"
+          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "900"
+          NARF_QEMU_SMP: "2"
+        run: |
+          set -o pipefail
+          cargo xtask test --arch=x86_64 --features user-mode-e2e --hw-profile minimal \
+            --subsystem verification/syscall-entry,verification/interception-migration \
+            2>&1 | tee interception-smp2.log
+          for t in \
+            'verification/syscall-entry / smoke_frame_x86_64_user_mode_fast_syscall_interceptor' \
+            'verification/syscall-entry / smoke_frame_x86_64_user_mode_rdtscp_interceptor' \
+            'verification/syscall-entry / smoke_x86_64_cr4_writes_keep_requested_tsd' \
+            'verification/interception-migration / smoke_scheduled_user_interception_survives_ap_migration'
+          do
+            grep -qF "[ OK ] $t" interception-smp2.log || { echo "::error::not OK: $t"; exit 1; }
+          done
+          grep -q '── summary:' interception-smp2.log \
+            || { echo "::error::interception suite printed no summary"; exit 1; }
+          if grep '── summary:' interception-smp2.log | grep -vqE ' pass, 0 fail, 0 skip ──'; then
+            echo "::error::interception suite reported a failure or skip"; exit 1
+          fi
+
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
     needs: changes

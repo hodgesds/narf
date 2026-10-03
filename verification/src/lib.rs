@@ -3813,6 +3813,60 @@ kernel_test_in!(
     smoke_frame_x86_64_user_mode_rdtscp_interceptor
 );
 
+/// While user RDTSC interception is requested, no CR4 write may clear CR4.TSD.
+/// A read-modify-write whose read preceded the arming rendezvous IPI writes a
+/// value without TSD; `write_cr4` must keep the bit, in the register and in
+/// the cached copy, and must leave every other bit as given.
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_x86_64_cr4_writes_keep_requested_tsd() -> TestResult {
+    use narf_arch::x86_64::cr;
+    use narf_userspace::instruction::__verification_clear_instruction_interceptor;
+
+    __verification_clear_instruction_interceptor();
+    // SAFETY: CR4 reads and writes of the value just read are legal at CPL0.
+    let stale = unsafe { cr::read_cr4() };
+    if stale & cr::CR4_TSD != 0 {
+        return TestResult::Fail("CR4.TSD set with no interception request");
+    }
+    // Control: with no request, the value is written unchanged.
+    // SAFETY: rewrites the value just read.
+    unsafe { cr::write_cr4(stale) };
+    // SAFETY: as above.
+    if unsafe { cr::read_cr4() } & cr::CR4_TSD != 0 {
+        return TestResult::Fail("write_cr4 set CR4.TSD with no request");
+    }
+
+    cr::request_user_rdtsc_interception();
+    // SAFETY: as above.
+    let armed = unsafe { cr::read_cr4() };
+    // SAFETY: writes back the pre-request value, as a stale read-modify-write
+    // would; only TSD differs from the live register.
+    unsafe { cr::write_cr4(stale) };
+    // SAFETY: as above.
+    let after = unsafe { cr::read_cr4() };
+    let cached = cr::cached_cr4();
+    __verification_clear_instruction_interceptor();
+
+    if armed & cr::CR4_TSD == 0 {
+        return TestResult::Fail("request did not arm the executing CPU");
+    }
+    if after & cr::CR4_TSD == 0 {
+        return TestResult::Fail("write_cr4 cleared requested CR4.TSD");
+    }
+    if cached & cr::CR4_TSD == 0 {
+        return TestResult::Fail("cached CR4 lost requested CR4.TSD");
+    }
+    if after & !cr::CR4_TSD != stale {
+        return TestResult::Fail("write_cr4 altered a CR4 bit other than TSD");
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/syscall-entry",
+    smoke_x86_64_cr4_writes_keep_requested_tsd
+);
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_scheduled_user_interception_survives_ap_migration() -> TestResult {
     use alloc::sync::Arc;
@@ -4094,8 +4148,18 @@ fn smoke_scheduled_user_interception_survives_ap_migration() -> TestResult {
     let user_id = narf_userspace::user_task::spawn_user_process(process, source_spec);
     EXPECTED_TASK.store(user_id.raw(), Ordering::Release);
 
-    narf_scheduler::spawn(async {
+    // The waiter keeps the executor alive until the guest's ExitTask. It is
+    // bounded so a guest that dies without reaching ExitTask fails this test
+    // with a diagnosis instead of hanging the suite until the QEMU timeout.
+    // 3e10 cycles is about 10 s at 3 GHz.
+    const WAITER_BUDGET_CYCLES: u64 = 30_000_000_000;
+    let waiter_deadline = narf_time::Instant::now().plus_cycles(WAITER_BUDGET_CYCLES);
+    narf_scheduler::spawn(async move {
         while EXIT_TASK.load(Ordering::Acquire) == 0 {
+            if narf_time::Instant::now() >= waiter_deadline {
+                CONTROLLER_ERROR.store(1, Ordering::Release);
+                return;
+            }
             narf_scheduler::yield_now().await;
         }
     });
@@ -4125,7 +4189,7 @@ fn smoke_scheduled_user_interception_survives_ap_migration() -> TestResult {
     let expected_task = EXPECTED_TASK.load(Ordering::Acquire);
     match CONTROLLER_ERROR.load(Ordering::Acquire) {
         0 => {}
-        1 => return TestResult::Fail("migration waiter failed before guest exit"),
+        1 => return TestResult::Fail("guest did not reach ExitTask within the waiter budget"),
         2 => return TestResult::Fail("scheduler rejected the destination affinity"),
         _ => return TestResult::Fail("migration controller reported an unknown failure"),
     }
