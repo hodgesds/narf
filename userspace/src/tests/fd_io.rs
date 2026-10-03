@@ -872,9 +872,29 @@ kernel_test_in!("userspace", smoke_userspace_fcntl_status_flags);
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     use crate::fd::locks;
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    struct LockedFile;
+    impl FileOps for LockedFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
     locks::__test_reset();
-    // Same key, two owners, overlapping write requests.
-    let key: usize = 0xDEAD_BEEF;
+    // Same file, two owners, overlapping write requests.
+    let file: alloc::sync::Arc<dyn FileOps> = alloc::sync::Arc::new(LockedFile);
+    let file = &file;
     let a = locks::Lock {
         kind: locks::LockKind::Posix,
         dev: 0,
@@ -893,16 +913,16 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
         start: 50,
         len: 100,
     };
-    if locks::try_set(key, a).is_err() {
+    if locks::try_set(file, a).is_err() {
         return TestResult::Fail("first lock install must succeed");
     }
-    match locks::try_set(key, b) {
+    match locks::try_set(file, b) {
         Err(blocker) if blocker.owner == 1 => {}
         Ok(()) => return TestResult::Fail("overlapping write lock must conflict"),
         Err(_) => return TestResult::Fail("blocker should be owner 1"),
     }
     // Probe must surface the same blocker.
-    match locks::probe(key, b) {
+    match locks::probe(file, b) {
         Some(l) if l.owner == 1 && l.ty == locks::F_WRLCK => {}
         _ => return TestResult::Fail("probe did not surface blocker"),
     }
@@ -926,13 +946,13 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
         start: 50,
         len: 100,
     };
-    if locks::try_set(key, r1).is_err() || locks::try_set(key, r2).is_err() {
+    if locks::try_set(file, r1).is_err() || locks::try_set(file, r2).is_err() {
         return TestResult::Fail("overlapping read locks must coexist");
     }
     // Release on owner-exit clears the bucket.
     locks::release_owner(1);
     locks::release_owner(2);
-    if locks::probe(key, r1).is_some() {
+    if locks::probe(file, r1).is_some() {
         return TestResult::Fail("release_owner did not drain locks");
     }
     locks::__test_reset();

@@ -1871,7 +1871,10 @@ pub fn live_task_count() -> usize {
 //
 // `fcntl(F_SETLK/F_SETLKW/F_GETLK)` advisory range locks. Keyed by
 // the underlying open-file object identity (`Arc::as_ptr` cast to
-// usize), so two fds that point at the same inode share locks.
+// usize), so two fds that point at the same inode share locks. Each
+// file's bucket holds a `Weak` to that object, which keeps the address
+// from being handed to another file while any record is keyed by it —
+// see `Bucket`.
 // Conflict rule: a write lock conflicts with any other lock on an
 // overlapping range; a read lock conflicts only with a write lock.
 // `owner` is the holding task id — same owner replaces / extends.
@@ -1924,10 +1927,10 @@ pub mod locks {
         /// is taken.
         ///
         /// `/proc/locks` prints `MAJOR:MINOR:ino` per Linux's
-        /// `lock_get_status`, and the table is keyed by a `FileOps`
-        /// POINTER — which cannot be dereferenced later, because nothing
-        /// here keeps the `Arc` alive. Recording the identity at
-        /// acquisition is what makes the file renderable at all.
+        /// `lock_get_status`, and the table only holds a `Weak` to the
+        /// `FileOps` — which pins its address but does not keep the file
+        /// alive to be asked later. Recording the identity at acquisition
+        /// is what makes the file renderable at all.
         pub dev: u64,
         pub ino: u64,
     }
@@ -1964,7 +1967,49 @@ pub mod locks {
         }
     }
 
-    static TABLE: IrqSafeSpinLock<Option<BTreeMap<usize, Vec<Lock>>>> = IrqSafeSpinLock::new(None);
+    /// One file's record locks.
+    ///
+    /// The table is keyed by the ADDRESS of the file's `FileOps`
+    /// allocation, and a record can outlive every descriptor to that file:
+    /// a POSIX lock is released when its process exits, not when the
+    /// process closes the file (Linux's close-time `locks_remove_posix` is
+    /// not implemented here). Once the last `Arc` went away, the allocator
+    /// was free to hand the same address to an unrelated file — which then
+    /// inherited the dead file's locks. `smoke_abi_fdio_fcntl_ofd_locks_are_granted`
+    /// was refused a lock on a file it had just created for exactly that
+    /// reason: the preceding test's POSIX record, keyed by a freed memfs
+    /// file, answered for the new file at the same address.
+    ///
+    /// `file` closes that hole by construction. A `Weak` keeps the
+    /// allocation — though not the file — alive, so while this bucket
+    /// exists no other `FileOps` can be placed at its key, and a lookup
+    /// through a live `Arc` can only ever find its own file's records.
+    /// Buckets whose file is gone are unreachable and are reclaimed on the
+    /// next `try_set`; nothing reads them in between except `snapshot`,
+    /// which skips them.
+    struct Bucket {
+        file: Weak<dyn FileOps>,
+        locks: Vec<Lock>,
+    }
+
+    impl Bucket {
+        /// Whether the file this bucket describes still exists. Uses the
+        /// strong count rather than `upgrade`, so that no `Arc` is ever
+        /// dropped — and no `FileOps` destructor run — under `TABLE`.
+        fn file_alive(&self) -> bool {
+            self.file.strong_count() > 0
+        }
+    }
+
+    static TABLE: IrqSafeSpinLock<Option<BTreeMap<usize, Bucket>>> = IrqSafeSpinLock::new(None);
+
+    /// The table key for `file`: its `FileOps` allocation address.
+    ///
+    /// Also the key of the F_SETLKW waiter queue, which `user_task`
+    /// carries as a plain `usize`.
+    pub fn key_of(file: &Arc<dyn FileOps>) -> usize {
+        Arc::as_ptr(file) as *const () as usize
+    }
 
     fn ensure() {
         let mut g = TABLE.lock();
@@ -1973,26 +2018,39 @@ pub mod locks {
         }
     }
 
-    /// Attempt to install `req`. Returns Ok if installed, Err with
-    /// the first conflicting lock if not.
-    pub fn try_set(key: usize, req: Lock) -> Result<(), Lock> {
+    /// Attempt to install `req` on `file`. Returns Ok if installed, Err
+    /// with the first conflicting lock if not.
+    pub fn try_set(file: &Arc<dyn FileOps>, req: Lock) -> Result<(), Lock> {
         ensure();
+        let key = key_of(file);
         let mut g = TABLE.lock();
         let map = g.as_mut().unwrap();
-        let bucket = map.entry(key).or_default();
-        if req.ty == F_UNLCK {
-            bucket.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
-            return Ok(());
-        }
-        for l in bucket.iter() {
-            if l.conflicts(&req) {
-                return Err(*l);
+        // Records on files that no longer exist can never be reached again
+        // (their pinned addresses cannot be reissued); release the pins.
+        map.retain(|_, b| b.file_alive());
+        let result = {
+            let bucket = map.entry(key).or_insert_with(|| Bucket {
+                file: Arc::downgrade(file),
+                locks: Vec::new(),
+            });
+            let locks = &mut bucket.locks;
+            if req.ty == F_UNLCK {
+                locks.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
+                Ok(())
+            } else if let Some(l) = locks.iter().find(|l| l.conflicts(&req)) {
+                Err(*l)
+            } else {
+                // Merge with same-owner locks of the same type, drop covered.
+                locks.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
+                locks.push(req);
+                Ok(())
             }
+        };
+        // An empty bucket would pin the allocation for nothing.
+        if map.get(&key).is_some_and(|b| b.locks.is_empty()) {
+            map.remove(&key);
         }
-        // Merge with same-owner locks of the same type, drop covered.
-        bucket.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
-        bucket.push(req);
-        Ok(())
+        result
     }
 
     /// Every record lock currently held, for `/proc/locks`.
@@ -2000,21 +2058,26 @@ pub mod locks {
     /// Flattened across files: the caller renders one line each, and the
     /// key (a `FileOps` pointer) is deliberately not exposed — the
     /// `(dev, ino)` on each lock is the identity userspace is given.
+    /// Records on a file that no longer exists are not held by anything
+    /// userspace can name, and are omitted.
     pub fn snapshot() -> Vec<Lock> {
         let g = TABLE.lock();
         let Some(map) = g.as_ref() else {
             return Vec::new();
         };
-        map.values().flat_map(|v| v.iter().copied()).collect()
+        map.values()
+            .filter(|b| b.file_alive())
+            .flat_map(|b| b.locks.iter().copied())
+            .collect()
     }
 
-    /// Probe `req`. If a conflict exists, returns the blocker; else
-    /// returns None (caller should report F_UNLCK).
-    pub fn probe(key: usize, req: Lock) -> Option<Lock> {
+    /// Probe `req` on `file`. If a conflict exists, returns the blocker;
+    /// else returns None (caller should report F_UNLCK).
+    pub fn probe(file: &Arc<dyn FileOps>, req: Lock) -> Option<Lock> {
         let g = TABLE.lock();
         let map = g.as_ref()?;
-        let bucket = map.get(&key)?;
-        bucket.iter().copied().find(|l| l.conflicts(&req))
+        let bucket = map.get(&key_of(file))?;
+        bucket.locks.iter().copied().find(|l| l.conflicts(&req))
     }
 
     /// Drop every lock owned by `owner`. Call on task exit so leaked
@@ -2041,13 +2104,15 @@ pub mod locks {
         };
         let mut touched = Vec::new();
         for (key, bucket) in map.iter_mut() {
-            let before = bucket.len();
-            bucket.retain(|l| !(l.kind == kind && l.owner == owner));
-            if bucket.len() != before {
+            let before = bucket.locks.len();
+            bucket
+                .locks
+                .retain(|l| !(l.kind == kind && l.owner == owner));
+            if bucket.locks.len() != before {
                 touched.push(*key);
             }
         }
-        map.retain(|_, v| !v.is_empty());
+        map.retain(|_, b| !b.locks.is_empty());
         touched
     }
 
@@ -2102,6 +2167,18 @@ pub mod locks {
             .and_then(|m| m.remove(&key))
             .map(|set| set.into_iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Every record in the table, including records on files that no
+    /// longer exist — what a test asserts is zero before it starts, so a
+    /// predecessor's leaked lock is reported by name rather than as a
+    /// refused acquire.
+    #[doc(hidden)]
+    pub fn __test_record_count() -> usize {
+        TABLE
+            .lock()
+            .as_ref()
+            .map_or(0, |m| m.values().map(|b| b.locks.len()).sum())
     }
 
     #[doc(hidden)]

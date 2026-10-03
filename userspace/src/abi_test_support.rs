@@ -218,6 +218,14 @@ pub fn teardown() {
     crate::namespaces::__test_reset_all();
     __test_clear_global();
     fd::__test_reset();
+    // Record locks are the same hole. Every case runs as FAKE_TASK, which
+    // never exits, so the exit sweep that releases a real process's POSIX
+    // locks never runs for it: a case that returns while holding one — on
+    // an early `Err`, or simply by not unlocking — leaves the record in the
+    // global table for the rest of the image. That cost
+    // `smoke_abi_fdio_fcntl_ofd_locks_are_granted` its first acquire when
+    // `smoke_abi_fdio_setlkw_conflict_paths` ran just before it.
+    fd::locks::__test_reset();
     *TEST_AS.lock() = None;
     crate::handlers::restore_address_space_lookup(*SAVED_AS_LOOKUP.lock());
 }

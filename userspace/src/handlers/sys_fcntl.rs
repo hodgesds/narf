@@ -717,12 +717,8 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // whoever opened it); `owner_desc` is the description identity,
             // which is what an OFD lock is owned BY.
             let ops_key = fd::with_table(task, |t| {
-                t.get(fd).map(|e| {
-                    (
-                        e.ops.clone(),
-                        alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize,
-                    )
-                })
+                t.get(fd)
+                    .map(|e| (e.ops.clone(), crate::fd::locks::key_of(&e.ops)))
             });
             let (ops, key) = match ops_key {
                 Some(Some(v)) => v,
@@ -875,7 +871,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         return;
                     }
                 }
-                let blocker = crate::fd::locks::probe(key, req);
+                let blocker = crate::fd::locks::probe(&ops, req);
                 let mut out = uf;
                 match blocker {
                     None => out.l_type = crate::fd::locks::F_UNLCK,
@@ -920,7 +916,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             }
-            match crate::fd::locks::try_set(key, req) {
+            match crate::fd::locks::try_set(&ops, req) {
                 Ok(()) => {
                     // A re-executed SETLKW arrives here with the uctx
                     // routing still set — clear it so a later unrelated

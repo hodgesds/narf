@@ -4196,9 +4196,8 @@ fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
         // A FOREIGN owner's conflicting write lock: install directly in
         // the lock table (the harness has one task id, so the syscall
         // path can't create a second owner).
-        let key = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
-            t.get(fd as u32)
-                .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+        let file = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
+            t.get(fd as u32).map(|e| e.ops.clone())
         })
         .flatten()
         .ok_or("fd should resolve to an ops key")?;
@@ -4212,7 +4211,7 @@ fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
             start: 0,
             len: 0,
         };
-        if crate::fd::locks::try_set(key, foreign).is_err() {
+        if crate::fd::locks::try_set(&file, foreign).is_err() {
             return Err("installing the foreign holder should succeed");
         }
         // F_SETLKW against the foreign holder: no executor in the
@@ -4243,6 +4242,14 @@ fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
         ) != Some(0)
         {
             return Err("F_SETLKW must succeed once the dead holder's locks are released");
+        }
+        // Give the lock back. The harness task never exits, so nothing else
+        // would: this record used to outlive the test and its memfs file,
+        // and the next test to allocate a file at the freed address was
+        // refused a lock on it.
+        let fl_un: [i64; 4] = [2, 0, 0, 0]; // F_UNLCK
+        if call(Syscall::Fcntl.raw(), a2(fd, F_SETLK, fl_un.as_ptr() as u64)) != Some(0) {
+            return Err("F_UNLCK of the acquired lock should return 0");
         }
         Ok(())
     })
@@ -4347,9 +4354,8 @@ fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("open(/lk/f, O_RDWR) should succeed"),
         };
-        let key = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
-            t.get(fd as u32)
-                .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+        let file = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
+            t.get(fd as u32).map(|e| e.ops.clone())
         })
         .flatten()
         .ok_or("fd should resolve to an ops key")?;
@@ -4368,7 +4374,7 @@ fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
             start: 0,
             len: 0,
         };
-        if crate::fd::locks::try_set(key, foreign).is_err() {
+        if crate::fd::locks::try_set(&file, foreign).is_err() {
             return Err("installing the foreign holder should succeed");
         }
 
@@ -4487,6 +4493,13 @@ fn smoke_abi_fdio_fcntl_ofd_locks_are_granted() -> TestResult {
     const F_UNLCK: i16 = 2;
     const SEEK_SET: i16 = 0;
     with_memfs("/abi-fcntl-ofd", "abi-fcntl-ofd", &[("f", b"xxxx")], || {
+        // A record left by an earlier case would make the first acquire
+        // below fail as "an unexpected error"; name it instead.
+        if crate::fd::locks::__test_record_count() != 0 {
+            return Err(
+                "the record-lock table is not empty at entry: an earlier case leaked a lock",
+            );
+        }
         // O_RDWR (2).
         let fd = open_fd_flags(b"/abi-fcntl-ofd/f\0", 2)?;
         let other = open_fd_flags(b"/abi-fcntl-ofd/f\0", 2)?;
@@ -4534,6 +4547,131 @@ fn smoke_abi_fdio_fcntl_ofd_locks_are_granted() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_ofd_locks_are_granted);
+
+/// A file for [`smoke_abi_fdio_record_lock_dies_with_its_file`]: nothing but
+/// an allocation whose address can be watched. The payload puts it in a
+/// slab class (2 KiB) that the lock and close paths do not otherwise touch,
+/// so the allocator's most recently freed block of that class is the file
+/// the test just released.
+struct LockProbeFile {
+    _payload: [u8; 1500],
+}
+
+impl narf_filesystem::FileOps for LockProbeFile {
+    fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Ok(0) })
+    }
+    fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        let n = b.len();
+        alloc::boxed::Box::pin(async move { Ok(n) })
+    }
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+}
+
+/// Install a fresh [`LockProbeFile`] as an O_RDWR descriptor of the harness
+/// task; return the fd and the file's address. The table holds the only
+/// strong reference, so closing the fd frees the file.
+fn install_lock_probe_file() -> Result<(u32, usize), &'static str> {
+    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+        alloc::sync::Arc::new(LockProbeFile {
+            _payload: [0; 1500],
+        });
+    let addr = crate::fd::locks::key_of(&ops);
+    let fd = crate::fd::install(
+        FAKE_TASK,
+        crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: crate::fd::O_RDWR,
+        },
+    )
+    .ok_or("could not install a lock probe file")?;
+    Ok((fd, addr))
+}
+
+/// A record lock must die with the file it locks. It must never be
+/// inherited by a later file that happens to get the same address.
+///
+/// The lock table is keyed by the file object's address, and a POSIX lock
+/// outlives the descriptor it was taken through. It is released at process
+/// exit, not at close, and close-time release is not implemented. So a
+/// process that locks a file and closes it leaves a record behind, and the
+/// file itself can be freed. Nothing stopped the allocator handing the freed
+/// address to the next file, which then answered every conflicting acquire
+/// with EAGAIN on the dead file's behalf. That is how
+/// `smoke_abi_fdio_fcntl_ofd_locks_are_granted` was refused a lock on a file
+/// it had just created.
+///
+/// This drives the production path end to end: `fcntl(F_SETLK)` and
+/// `close(2)` through the syscall table on the dying file, then
+/// `fcntl(F_OFD_SETLK)` on each successor. An OFD lock is owned by the
+/// description, not the process, so it conflicts with the harness task's own
+/// POSIX record. That makes it the probe that sees an inherited lock. The
+/// successors are kept open until one of them lands on the freed address. A
+/// run in which none does has not tested the property, and fails instead of
+/// passing vacuously.
+fn smoke_abi_fdio_record_lock_dies_with_its_file() -> TestResult {
+    const F_SETLK: u64 = 6;
+    const F_OFD_SETLK: u64 = 37;
+    const SUCCESSORS: usize = 64;
+    with_setup(|| {
+        if crate::fd::locks::__test_record_count() != 0 {
+            return Err(
+                "the record-lock table is not empty at entry: an earlier case leaked a lock",
+            );
+        }
+        // Whole-file write lock: l_type = F_WRLCK (1), SEEK_SET, 0, 0.
+        let mut wr = [0u8; 32];
+        wr[0..2].copy_from_slice(&1i16.to_le_bytes());
+        let (dying, dead_addr) = install_lock_probe_file()?;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(dying as u64, F_SETLK, wr.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_SETLK on the file about to be freed should succeed");
+        }
+        if call(Syscall::Close.raw(), a0(dying as u64)) != Some(0) {
+            return Err("closing the locked file should succeed");
+        }
+        let mut successors = alloc::vec::Vec::new();
+        let mut reused = false;
+        for _ in 0..SUCCESSORS {
+            let (fd, addr) = install_lock_probe_file()?;
+            successors.push(fd);
+            let mut req = wr;
+            match call(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, F_OFD_SETLK, req.as_mut_ptr() as u64),
+            ) {
+                Some(0) => {}
+                Some(v) if v == EAGAIN => {
+                    return Err(
+                        "a new file inherited the POSIX lock of a freed file at the same address",
+                    );
+                }
+                _ => return Err("F_OFD_SETLK on a fresh file returned an unexpected error"),
+            }
+            if addr == dead_addr {
+                reused = true;
+                break;
+            }
+        }
+        if !reused {
+            return Err("no successor was allocated at the freed file's address; the aliasing case was not exercised");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_record_lock_dies_with_its_file);
 
 /// Linux f_owner state is shared by dup aliases, and O_ASYNC on a pollable fd
 /// turns a readiness event into the F_SETSIG signal with SIGPOLL siginfo.
