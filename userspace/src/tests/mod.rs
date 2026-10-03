@@ -24,6 +24,18 @@ fn lookup_parent_as() -> Option<Arc<AddressSpace>> {
     PARENT_AS.lock().clone()
 }
 
+/// Discards every queued task when dropped. A test that spawns a child and
+/// never runs it to exit holds one from its opening queue reset, so the
+/// child does not outlive the test on any return path; the harness fails a
+/// test that leaves a live user task behind.
+pub(crate) struct DiscardQueuedTasks;
+
+impl Drop for DiscardQueuedTasks {
+    fn drop(&mut self) {
+        narf_scheduler::__reset_queues_for_test();
+    }
+}
+
 /// Synthetic TrapContext used in handler-only tests (no ring-3
 /// entry). Captures the args going in and the return going out.
 struct StubCtx {

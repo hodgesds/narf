@@ -859,6 +859,7 @@ fn smoke_shell_fork_wait4_exit_status() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
 
     SHELL_TASK.store(PARENT, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);

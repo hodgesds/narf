@@ -1284,6 +1284,7 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
     crate::handlers::__test_sigaction_reset();
     crate::sigaction_init();
     crate::handlers::pid_task_map_init();

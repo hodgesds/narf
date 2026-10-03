@@ -217,6 +217,7 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
     const PARENT: u64 = 0xF0_01;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -436,6 +437,7 @@ fn smoke_process_fork_return_values() -> TestResult {
     const PARENT: u64 = 0xF0_02;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -1845,6 +1847,7 @@ fn smoke_wave35_fork_returns_nonzero_child_pid() -> TestResult {
     const PARENT: u64 = 0xF0_13;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -2084,6 +2087,7 @@ fn smoke_wave35_getppid_differs_from_getpid() -> TestResult {
     const PARENT: u64 = 0xF0_17;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -2656,6 +2660,7 @@ fn smoke_wave38_fork_registers_mapping() -> TestResult {
     const PARENT: u64 = 0xF0_24;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -2743,6 +2748,7 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
     const PARENT: u64 = 0xF0_25;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -3980,6 +3986,7 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     const PARENT: u64 = 0xF0_65;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
@@ -4350,6 +4357,7 @@ fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
     const SIGUSR1: usize = 10;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
     crate::handlers::register_pid_task_mapping(PARENT, PARENT);
 
@@ -4541,6 +4549,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     const PARENT: u64 = 0xF0_67;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
     crate::handlers::__test_reset_clear_child_tid();
 
@@ -4708,6 +4717,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     const PARENT: u64 = 0xF0_02;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: new_for_user only requires paging to be enabled
@@ -5008,6 +5018,7 @@ fn smoke_process_ptrace_syscall_stop() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: new_for_user only requires paging to be enabled.
@@ -5313,6 +5324,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     const PARENT: u64 = 0xF0_02;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
     // Start from the default rlimit rows. Production never needs this —
     // reap removes a task's row and TaskIds are never reused — but the
@@ -5794,6 +5806,7 @@ fn smoke_process_fork_child_pid_identity() -> TestResult {
     const PARENT: u64 = 0xF0_60;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
@@ -5926,6 +5939,7 @@ fn smoke_process_clone_thread_shares_pid() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
 
     // SAFETY: see the fork test above — paging is live by the time smokes run.
@@ -6040,6 +6054,7 @@ fn smoke_process_clone_thread_shares_rlimit() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
     crate::handlers::__test_rlimit_reset();
 
@@ -6139,6 +6154,7 @@ fn smoke_process_fork_copies_rlimit() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = crate::tests::DiscardQueuedTasks;
     setup_process_state(PARENT);
     crate::handlers::__test_rlimit_reset();
 

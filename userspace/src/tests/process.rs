@@ -16,6 +16,7 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
@@ -943,6 +944,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
@@ -1290,6 +1292,7 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
@@ -1518,6 +1521,7 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
     //       (thread-style sharing — the entire point of clone vs fork).
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
@@ -1655,6 +1659,7 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
     crate::handlers::__test_cwd_reset();
     crate::handlers::cwd_init();
 
@@ -1767,6 +1772,7 @@ fn smoke_userspace_fork_multiple_distinct_address_spaces() -> TestResult {
     // handler memoised the clone result.
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    let _discard = DiscardQueuedTasks;
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
