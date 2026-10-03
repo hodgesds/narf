@@ -270,6 +270,19 @@ pub struct CreatedNativeTask {
 /// park, redirection, and signal state. A normal return may be replaced, while
 /// a context-managed park or redirection is observable but immutable.
 pub trait SyscallInterceptor: Send + Sync {
+    /// Whether the guest's vDSO `clock_gettime`, `gettimeofday`, `time` and
+    /// `getcpu` calls must reach this interceptor as syscalls.
+    ///
+    /// Read once, when [`try_install_global`] publishes the table. When it is
+    /// `true` the publication switches the vDSO to its syscall clock mode
+    /// ([`crate::vdso::route_clocks_for_syscall_interceptor`]), so a guest
+    /// that reads the clock or its CPU through the vDSO enters the kernel and
+    /// the interceptor sees the syscall. An interceptor that must observe
+    /// every syscall the guest makes (a Reverie Tool host) returns `true`.
+    fn intercepts_vdso_calls(&self) -> bool {
+        false
+    }
+
     /// Observes one syscall before native dispatch and chooses whether it runs.
     fn on_syscall_enter(
         &self,
@@ -5226,7 +5239,15 @@ pub fn install_global(table: SyscallTable) {
 /// ```compile_fail
 /// narf_userspace::syscall::__test_clear_global();
 /// ```
+///
+/// A table whose interceptor asks for the guest's vDSO calls
+/// ([`SyscallInterceptor::intercepts_vdso_calls`]) also switches the vDSO
+/// clock entry points and `getcpu` to their syscalls when it is published.
 pub fn try_install_global(table: SyscallTable) -> Result<(), SyscallTable> {
+    let routes_vdso = table
+        .interceptor
+        .as_ref()
+        .is_some_and(|interceptor| interceptor.intercepts_vdso_calls());
     let ptr = Box::into_raw(Box::new(table));
     match GLOBAL_TABLE.compare_exchange(
         core::ptr::null_mut(),
@@ -5234,7 +5255,12 @@ pub fn try_install_global(table: SyscallTable) -> Result<(), SyscallTable> {
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            if routes_vdso {
+                crate::vdso::route_clocks_for_syscall_interceptor();
+            }
+            Ok(())
+        }
         Err(_) => {
             // SAFETY: publication failed, so no other thread can observe this
             // freshly allocated pointer and ownership remains with this call.
@@ -5595,6 +5621,9 @@ fn clear_global_for_tests() {
     // would be a use-after-free. Deliberately leak the retired test table; the
     // production API has no reset operation and retains its table for boot.
     let _retired = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    // The next case starts from the counter clock path unless a timestamp
+    // interceptor still routes the vDSO through syscalls.
+    crate::vdso::__test_release_syscall_interceptor_clocks();
 }
 
 #[cfg(test)]

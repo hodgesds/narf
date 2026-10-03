@@ -20,6 +20,8 @@ narf-rcu = { path = "../rcu" }
 narf-scheduler = { path = "../scheduler" }
 narf-time = { path = "../time" }
 narf-userspace = { path = "../userspace" }
+# Only for the kernel tests: the vDSO image (`NARF_VDSO_ELF`) a guest calls.
+narf-verification = { path = "../verification", optional = true }
 # One exact commit of the Reverie fork. `default-features = false` keeps
 # Reverie's `std` feature off; nothing in this workspace turns it on.
 reverie = { package = "reverie-core", git = "file:///home/newton/work/dev-hermit/worktrees/slots/narf-opus-reverie", rev = "acae2dbc6fab408eea13ef67bad6bc794a5ea538", default-features = false }
@@ -29,7 +31,7 @@ reverie-narf-tools = { git = "file:///home/newton/work/dev-hermit/worktrees/slot
 [features]
 # Registers the adapter's in-kernel tests (subsystem `reverie-narf`) and
 # assembles the guests they run. Enabled by frame's `kernel-test`.
-kernel-test = ["narf-userspace/verification-test-reset"]
+kernel-test = ["narf-userspace/verification-test-reset", "dep:narf-verification"]
 
 [lints]
 workspace = true

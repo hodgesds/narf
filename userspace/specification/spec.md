@@ -124,6 +124,13 @@ reaches the guest behind it, matching Reverie's ptrace backend, which replaces
 every vDSO entry with its syscall. In counter mode the vDSO orders each
 counter read after its preceding loads with `LFENCE`, as Linux's
 `rdtsc_ordered()` does.
+Publishing a syscall table whose syscall interceptor asks for the guest's
+vDSO calls (`SyscallInterceptor::intercepts_vdso_calls`) selects the same
+syscall mode, so the interceptor sees those four calls as syscalls; the
+Reverie adapter asks when its tool subscribes any one of them, and the mode
+then routes all four. The kernel keeps one reason per requester and
+publishes counter mode only while no reason is set, so a verification reset
+of one requester does not return the other's calls to the counter path.
 
 Installation is a pre-guest operation. Slot publication, the vDSO mode switch,
 the trap request, and the per-CPU rendezvous are separate steps, and a guest

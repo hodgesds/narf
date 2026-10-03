@@ -2501,6 +2501,7 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-userspace",
+ "narf-verification",
  "reverie-core",
  "reverie-narf-core",
  "reverie-narf-tools",

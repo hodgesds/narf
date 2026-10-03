@@ -42,6 +42,7 @@ static VFORK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_VFORK"));
 static RING_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RING"));
 static BADFRAME_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_BADFRAME"));
 static REAPER_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_REAPER"));
+static VDSO_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_VDSO"));
 
 /// The single argument every guest is started with, as Linux starts a program
 /// with `argv[0]`. A non-empty argv makes the loader lay out the full SysV
@@ -391,6 +392,10 @@ fn run_guest_with(
         .regions_snapshot()
         .into_iter()
         .filter(|region| !region.perms.contains(RegionPerms::SHARED))
+        // The vDSO code page is a private COW mapping whose masters hold a
+        // permanent COW reference (`narf_userspace::vdso`), so its frames
+        // never reach a zero count and are not the guest's to reclaim.
+        .filter(|region| region.base.as_u64() < narf_userspace::vdso::VDSO_MAP_BASE)
         .flat_map(|region| region.phys)
         .filter(|frame| frame.raw() != 0)
         .collect::<Vec<_>>();
@@ -2021,6 +2026,136 @@ kernel_test_in!(
     "reverie-narf",
     reverie_narf_sigkill_in_callback_matches_ptrace
 );
+
+// ── vDSO calls reach the Tool ─────────────────────────────────────────────
+
+const LINUX_CLOCK_GETTIME: u32 = 228;
+const LINUX_GETTIMEOFDAY: u32 = 96;
+const LINUX_TIME: u32 = 201;
+const LINUX_GETCPU: u32 = 309;
+/// What [`VdsoCalls`] returns for `time`; the vDSO guest exits 0 only if its
+/// `__vdso_time` call returned it.
+const VDSO_TIME_FROM_TOOL: i64 = 4242;
+
+/// The vDSO syscalls [`VdsoCalls`] saw, in order (numbers, 0 past the end),
+/// and the first argument of the first `clock_gettime`.
+static VDSO_SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static VDSO_SEEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static VDSO_CLOCK_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Records every `clock_gettime`, `gettimeofday`, `time` and `getcpu` the
+/// guest makes, answers `time` with [`VDSO_TIME_FROM_TOOL`], and runs every
+/// other syscall unchanged.
+#[derive(Debug, Default, Clone, Copy)]
+struct VdsoCalls;
+
+#[reverie::tool]
+impl Tool for VdsoCalls {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        let (sysno, args) = syscall.into_parts();
+        let number = sysno.id() as u32;
+        if [
+            LINUX_CLOCK_GETTIME,
+            LINUX_GETTIMEOFDAY,
+            LINUX_TIME,
+            LINUX_GETCPU,
+        ]
+        .contains(&number)
+        {
+            let index = VDSO_SEEN_COUNT.fetch_add(1, Ordering::AcqRel) as usize;
+            if let Some(slot) = VDSO_SEEN.get(index) {
+                slot.store(u64::from(number), Ordering::Release);
+            }
+            if number == LINUX_CLOCK_GETTIME {
+                let _ = VDSO_CLOCK_ID.compare_exchange(
+                    u64::MAX,
+                    args.arg0 as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            if number == LINUX_TIME {
+                return Ok(VDSO_TIME_FROM_TOOL);
+            }
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// With a Reverie interceptor installed for a Tool subscribed to the vDSO's
+/// syscalls, a guest that calls the vDSO's `clock_gettime`, `gettimeofday`,
+/// `time` and `getcpu` (found through `AT_SYSINFO_EHDR`, as a libc finds
+/// them) makes those syscalls, the Tool sees each once and in order, and the
+/// Tool's `time` result is what the guest's vDSO call returns. This is
+/// reverie-ptrace's behaviour, which rewrites the subscribed vDSO entry points
+/// into syscalls (`reverie-ptrace/src/vdso.rs`). The harness's reset of the
+/// syscall table afterwards restores the counter fast path.
+fn reverie_narf_vdso_calls_reach_the_tool() -> TestResult {
+    for slot in &VDSO_SEEN {
+        slot.store(0, Ordering::Release);
+    }
+    VDSO_SEEN_COUNT.store(0, Ordering::Release);
+    VDSO_CLOCK_ID.store(u64::MAX, Ordering::Release);
+    if narf_verification::NARF_VDSO_ELF.is_empty() {
+        return TestResult::Fail("the kernel was built without a vDSO image");
+    }
+    // Kernel-test boots skip the boot-time vDSO registration.
+    narf_userspace::vdso::register_vdso_image(
+        narf_verification::NARF_VDSO_ELF,
+        narf_scheduler::narf_time::cycles_per_ns(),
+    );
+    result_of((|| {
+        if narf_userspace::vdso::clocks_route_through_syscalls() {
+            return Err("vDSO clocks already used syscalls before the interceptor");
+        }
+        let (interceptor, root) = run_hosted::<VdsoCalls>(VDSO_GUEST, ())?;
+        let count = VDSO_SEEN_COUNT.load(Ordering::Acquire);
+        let seen: Vec<u64> = VDSO_SEEN
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .collect();
+        let clock_id = VDSO_CLOCK_ID.load(Ordering::Acquire);
+        let _ = writeln!(
+            Writer,
+            "    vdso syscalls seen {count} {seen:?} clock id {clock_id:#x}"
+        );
+        if count == 0 {
+            return Err("the Tool saw none of the guest's vDSO calls");
+        }
+        let expected = [
+            LINUX_CLOCK_GETTIME,
+            LINUX_GETTIMEOFDAY,
+            LINUX_TIME,
+            LINUX_GETCPU,
+        ];
+        if count != expected.len() as u64
+            || seen
+                .iter()
+                .zip(expected.iter())
+                .any(|(&seen, &want)| seen != u64::from(want))
+        {
+            return Err("the Tool did not see each vDSO call exactly once, in order");
+        }
+        if clock_id != 1 {
+            return Err("the Tool's clock_gettime did not carry CLOCK_MONOTONIC");
+        }
+        let exits = check_teardown(&interceptor, root, 1, 0);
+        if narf_userspace::vdso::clocks_route_through_syscalls() {
+            return Err("the syscall table reset did not restore the vDSO counter path");
+        }
+        exits?;
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!("reverie-narf", reverie_narf_vdso_calls_reach_the_tool);
 
 // ── Return mapping ────────────────────────────────────────────────────────
 

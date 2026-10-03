@@ -12,6 +12,7 @@ use narf_userspace::syscall::{
     NativeSyscallTransition, SyscallInterception, SyscallInterceptor, SyscallInvocation,
     SyscallReturn,
 };
+use reverie::syscalls::Sysno;
 use reverie::{ExitStatus, GlobalTool, Pid, Tool};
 use reverie_narf_core::{
     Disposition, NarfFatal, NarfSyscallRequest, NarfToolHost, SyscallEntry, TaskLock, TaskTable,
@@ -97,6 +98,15 @@ impl<T: Tool> core::fmt::Debug for ReverieInterceptor<T> {
             .finish_non_exhaustive()
     }
 }
+
+/// The syscalls Narf's vDSO answers without entering the kernel unless its
+/// clock mode routes them through syscalls (`verification/data/vdso/vdso.c`).
+const VDSO_SYSCALLS: [Sysno; 4] = [
+    Sysno::clock_gettime,
+    Sysno::gettimeofday,
+    Sysno::time,
+    Sysno::getcpu,
+];
 
 /// Stops the run on a fatal host error.
 ///
@@ -191,6 +201,22 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
 }
 
 impl<T: Tool + 'static> SyscallInterceptor for ReverieInterceptor<T> {
+    /// A Tool subscribed to a syscall the vDSO answers (`clock_gettime`,
+    /// `gettimeofday`, `time`, `getcpu`) must see the guest's vDSO calls to it,
+    /// which would otherwise never enter the kernel. reverie-ptrace rewrites
+    /// the subscribed vDSO entry points into syscalls for the same reason
+    /// (`reverie-ptrace/src/vdso.rs`, `is_patch_required` and `vdso_patch`,
+    /// re-exported as `patch_current_vdso` at `reverie-ptrace/src/lib.rs:76`).
+    /// Narf's switch is the vvar clock mode, which covers all four entry
+    /// points at once: a subscription to any one makes the others syscalls
+    /// too, which the Tool does not see and whose results are unchanged.
+    /// `clock_getres` already uses its syscall in Narf's vDSO.
+    fn intercepts_vdso_calls(&self) -> bool {
+        VDSO_SYSCALLS
+            .iter()
+            .any(|&sysno| self.inner.host.is_subscribed(sysno))
+    }
+
     fn on_syscall_enter(
         &self,
         invocation: &SyscallInvocation,

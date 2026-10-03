@@ -72,6 +72,16 @@ const CLOCK_MODE_SYSCALL: u32 = 1;
 /// concurrent [`update_wall_offset`] republishes the current value.
 static CLOCK_MODE: AtomicU32 = AtomicU32::new(CLOCK_MODE_COUNTER);
 
+/// Why the clock entry points issue their syscall: a set of `ROUTE_*` bits,
+/// changed only under [`VDSO`]'s lock together with [`CLOCK_MODE`]. The mode
+/// is [`CLOCK_MODE_SYSCALL`] exactly while a reason is set, so a verification
+/// reset of one installer cannot restore the counter under the other.
+static ROUTE_REASONS: AtomicU32 = AtomicU32::new(0);
+/// A timestamp instruction interceptor is installed.
+const ROUTE_TIMESTAMP_TRAP: u32 = 1 << 0;
+/// The published syscall table has a syscall interceptor.
+const ROUTE_SYSCALL_INTERCEPTOR: u32 = 1 << 1;
+
 struct VdsoImage {
     vvar_frame: PhysAddr,
     vdso_frames: Vec<PhysAddr>,
@@ -170,7 +180,34 @@ pub fn update_wall_offset(offset_ns: i64) {
 /// section, so a counter read that follows the publication belongs to a
 /// snapshot that retries.
 pub fn route_clocks_through_syscalls() {
-    set_clock_mode(CLOCK_MODE_SYSCALL);
+    update_route_reasons(|reasons| reasons | ROUTE_TIMESTAMP_TRAP);
+}
+
+/// Make every vDSO clock entry point, and `getcpu`, issue its syscall because
+/// the published syscall table has a syscall interceptor.
+///
+/// A syscall interceptor (the Reverie backend's among them) must see every
+/// syscall the guest makes, and a guest reaches `clock_gettime`,
+/// `gettimeofday`, `time` and `getcpu` through the vDSO without entering the
+/// kernel. reverie-ptrace closes the same gap by patching each tracee's vDSO
+/// entry points into syscalls (`reverie-ptrace/src/vdso.rs`,
+/// `patch_current_vdso`); here the vvar clock mode does it for every process
+/// at once. [`crate::syscall::try_install_global`] calls this when it
+/// publishes a table whose interceptor asks for the guest's vDSO calls
+/// ([`crate::syscall::SyscallInterceptor::intercepts_vdso_calls`]).
+/// Publication happens once, at boot before the first user task
+/// (verification harnesses republish only while no user task runs), so no
+/// vDSO call is in flight across the switch. The mode is sticky in
+/// production, like the table.
+pub fn route_clocks_for_syscall_interceptor() {
+    update_route_reasons(|reasons| reasons | ROUTE_SYSCALL_INTERCEPTOR);
+}
+
+/// Drop the syscall-interceptor reason for routing clocks through syscalls,
+/// restoring the counter fast path unless a timestamp interceptor still needs
+/// the syscalls. Only the test reset of the global syscall table calls this.
+pub(crate) fn __test_release_syscall_interceptor_clocks() {
+    update_route_reasons(|reasons| reasons & !ROUTE_SYSCALL_INTERCEPTOR);
 }
 
 /// Whether vDSO clock entry points currently issue their syscall.
@@ -182,7 +219,7 @@ pub fn clocks_route_through_syscalls() -> bool {
 /// instruction interceptor calls this.
 #[cfg(feature = "verification-test-reset")]
 pub(crate) fn __test_restore_counter_clocks() {
-    set_clock_mode(CLOCK_MODE_COUNTER);
+    update_route_reasons(|reasons| reasons & !ROUTE_TIMESTAMP_TRAP);
 }
 
 /// Restore the counter fast path while a timestamp interceptor stays
@@ -190,11 +227,20 @@ pub(crate) fn __test_restore_counter_clocks() {
 #[cfg(feature = "verification-test-reset")]
 #[doc(hidden)]
 pub fn __verification_restore_counter_clocks() {
-    __test_restore_counter_clocks();
+    update_route_reasons(|_| 0);
 }
 
-fn set_clock_mode(mode: u32) {
+/// Replace the routing reasons with `update(reasons)` and publish the clock
+/// mode they imply.
+fn update_route_reasons(update: impl FnOnce(u32) -> u32) {
     let g = VDSO.lock();
+    let reasons = update(ROUTE_REASONS.load(Ordering::Acquire));
+    ROUTE_REASONS.store(reasons, Ordering::Release);
+    let mode = if reasons == 0 {
+        CLOCK_MODE_COUNTER
+    } else {
+        CLOCK_MODE_SYSCALL
+    };
     CLOCK_MODE.store(mode, Ordering::Release);
     if let Some(img) = g.as_ref() {
         let cpns = read_u32(img.vvar_frame, VVAR_CPNS);
