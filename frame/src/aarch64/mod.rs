@@ -35,6 +35,15 @@ pub unsafe fn init_traps() {
     }
 }
 
+/// Kernel exit code for a failed [`assert_on_boot_stack`].
+///
+/// Distinct from the 42 every aarch64 trap exit uses (`trap.rs`), so a run's
+/// exit status alone tells "BSP booted on the wrong stack" from "synchronous
+/// exception". aarch64 exits through semihosting and QEMU reports the kernel
+/// code directly; xtask treats every status but 0 as failure, and 43 is not
+/// the suite's 1 either.
+pub const BOOT_STACK_CHECK_EXIT_CODE: u32 = 43;
+
 /// Refuse to run the BSP anywhere but its own boot stack.
 ///
 /// `lo_phys`/`hi_phys` are `stack_bottom`/`stack_top` as `boot.S` computed
@@ -48,8 +57,9 @@ pub unsafe fn init_traps() {
 /// as unrelated crashes. Comparing against a derivation no relocation touches
 /// turns that into one deterministic failure, before the heap exists.
 ///
-/// Exits like the trap path rather than panicking: `panic_sink` halts
-/// forever, which a test harness can only see as its own timeout.
+/// Exits, as the trap path does, rather than panicking: `panic_sink` halts
+/// forever, which a test harness can only see as its own timeout. The code is
+/// [`BOOT_STACK_CHECK_EXIT_CODE`], not the trap path's 42.
 pub fn assert_on_boot_stack(lo_phys: u64, hi_phys: u64) {
     use core::fmt::Write as _;
     let sp: u64;
@@ -70,5 +80,5 @@ pub fn assert_on_boot_stack(lo_phys: u64, hi_phys: u64) {
          was the stack_top_virt literal slid by KASLR?"
     );
     // SAFETY: exit is our fail path, as in `trap::rust_aarch64_sync`.
-    unsafe { narf_arch::exit_kernel(42) }
+    unsafe { narf_arch::exit_kernel(BOOT_STACK_CHECK_EXIT_CODE) }
 }
