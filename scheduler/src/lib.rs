@@ -3789,6 +3789,15 @@ pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
 ///
 /// Returns None if no slot with that id is on any ready queue.
 pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+    // `TaskId::NONE` names no task, so there is no slot to attach to. It
+    // must not reach the in-poll branch below: outside any poll this CPU's
+    // `current_task_slot()` is also NONE, so the comparison would match and
+    // park `new_arc` in `ACTIVE_USER_AS` plus a `PENDING_SLOT_AS` entry keyed
+    // by a task id no poll ever pops — keeping the address space alive with
+    // no owner until some later NONE-keyed replacement displaces it.
+    if id == TaskId::NONE {
+        return None;
+    }
     // Wave-49fu: when execve fires from inside a user task's poll
     // body (the normal case), the slot has been popped from the
     // ready queue and lives on the executor's stack — the queue
