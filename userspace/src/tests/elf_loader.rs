@@ -2222,6 +2222,13 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     // lookup names a task that is not running here: execve must refuse with
     // -ENOSYS before it loads the image or changes the caller's process
     // state, instead of halting the kernel at the post-load guard.
+    //
+    // "Before" is checked at both ends of the exec's side effects. The image
+    // is set-user-ID and owned by someone else, and the caller starts
+    // dumpable, so `exec_apply_credentials` -- the first side effect after
+    // the refusal point -- would move the caller's euid to the owner and
+    // clear its dumpable flag (a privileged exec is non-dumpable). The last
+    // ones publish argv[0]'s basename as the caller's comm.
     use core::sync::atomic::{AtomicU64, Ordering};
 
     let _kbuf = crate::handlers::kernel_buffers_guard();
@@ -2251,9 +2258,48 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
         return TestResult::Fail("mount of execve FS failed");
     }
 
+    // Everything the fixture seeds for FAKE_TID goes with it on every exit.
+    let cleanup = |mounted: &Result<_, _>| {
+        if let Ok(h) = mounted {
+            let _ = narf_filesystem::registry().unmount(h, "/execve-own-stack");
+        }
+        crate::handlers::__test_release_task_tables(FAKE_TID.load(Ordering::Relaxed));
+        crate::syscall::__test_clear_global();
+        crate::handlers::__test_reset_task_id_lookup();
+    };
+    fn call(nr: u32, a0: u64, a1: u64, a2: u64) -> Option<SyscallReturn> {
+        let mut c = StubCtx {
+            args: SyscallArgs {
+                arg0: a0,
+                arg1: a1,
+                arg2: a2,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(nr, &mut c);
+        c.ret
+    }
+
+    // Set-user-ID, owned by OWNER. chown first: it clears the set-ID bits.
+    const OWNER: u64 = 4000;
+    let path = b"/execve-own-stack/prog\0";
+    let staged = call(Syscall::Chown.raw(), path.as_ptr() as u64, OWNER, OWNER)
+        == Some(SyscallReturn::ok(0))
+        && call(Syscall::Chmod.raw(), path.as_ptr() as u64, 0o4755, 0)
+            == Some(SyscallReturn::ok(0));
+    let tid = FAKE_TID.load(Ordering::Relaxed);
+    crate::handlers::__test_set_dumpable_for_test(tid, true);
+    let euid_before = call(Syscall::Geteuid.raw(), 0, 0, 0);
+    if !staged || euid_before.is_none() || euid_before == Some(SyscallReturn::ok(OWNER)) {
+        cleanup(&mounted);
+        return TestResult::Fail("fixture: could not stage a set-user-ID image for another owner");
+    }
+
     // A distinctive argv[0]: an exec that got as far as Step 4 publishes its
     // basename as the caller's comm.
-    let path = b"/execve-own-stack/prog\0";
     let arg0 = b"/usr/bin/ownstackprobe\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
     let envp: [u64; 1] = [0];
@@ -2273,15 +2319,23 @@ fn smoke_userspace_own_stack_execve_refuses_task_not_running_here() -> TestResul
     #[cfg(feature = "kernel-test")]
     narf_scheduler::stackful::__reset_user_own_stack_for_test();
 
-    let comm = crate::handlers::proc_comm_of(FAKE_TID.load(Ordering::Relaxed));
-    if let Ok(h) = mounted {
-        let _ = narf_filesystem::registry().unmount(&h, "/execve-own-stack");
-    }
-    crate::syscall::__test_clear_global();
-    crate::handlers::__test_reset_task_id_lookup();
+    let comm = crate::handlers::proc_comm_of(tid);
+    let euid_after = call(Syscall::Geteuid.raw(), 0, 0, 0);
+    let dumpable_after = crate::handlers::__test_dumpable(tid);
+    cleanup(&mounted);
     if ctx.ret != Some(errno_ret(ENOSYS)) {
         return TestResult::Fail(
             "own-stack execve for a task not running here did not return -ENOSYS",
+        );
+    }
+    if euid_after != euid_before {
+        return TestResult::Fail(
+            "own-stack execve refused only after applying the set-user-ID transition",
+        );
+    }
+    if !dumpable_after {
+        return TestResult::Fail(
+            "own-stack execve refused only after clearing the caller's dumpable flag",
         );
     }
     if comm.as_deref() == Some("ownstackprobe") {
