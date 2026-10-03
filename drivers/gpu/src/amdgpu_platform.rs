@@ -300,9 +300,10 @@ async fn arm(display: &mut Display, sinks: &[crate::amdgpu_usbc::Sink]) {
         };
         // Black, not whatever this VRAM held, before any pixel is sent.
         scanout.clear().await;
+        let mut platform = None;
         let brought_up = async {
             pipeline.start().await?;
-            let platform = crate::amdgpu::with_controller(|gpu| {
+            let constants = crate::amdgpu::with_controller(|gpu| {
                 // SAFETY: live PCI authority and the retained VBIOS snapshot.
                 unsafe {
                     pipeline
@@ -312,18 +313,26 @@ async fn arm(display: &mut Display, sinks: &[crate::amdgpu_usbc::Sink]) {
             })
             .flatten()
             .ok_or(crate::amdgpu_dcn_display::Error::Unsupported)?;
+            platform = Some(constants);
             pipeline
                 .enable(
                     &mut display.loader,
                     &scanout,
                     &timing,
-                    &platform,
+                    &constants,
                     Depth::Bpc8,
                     sink.dpcd,
                 )
                 .await
         }
         .await;
+        let Some(platform) = platform else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu-usbc: external modeset failed, display left alone: {brought_up:?}"
+            );
+            return;
+        };
         match brought_up {
             Ok(()) => {
                 let _ = writeln!(
@@ -332,7 +341,14 @@ async fn arm(display: &mut Display, sinks: &[crate::amdgpu_usbc::Sink]) {
                     timing.h_active,
                     timing.v_active
                 );
-                display.stream = Some((pipeline, scanout));
+                display.stream = Some(Stream {
+                    pipeline,
+                    scanout,
+                    timing,
+                    platform,
+                    depth: Depth::Bpc8,
+                    caps: sink.dpcd,
+                });
             }
             Err(error) => {
                 // enable() already tore the stream back down, so the existing
@@ -347,12 +363,24 @@ async fn arm(display: &mut Display, sinks: &[crate::amdgpu_usbc::Sink]) {
     }
 }
 
+/// A running external stream, with everything needed to put it back after a
+/// suspend. The mode, platform constants and sink capabilities are retained
+/// rather than re-derived, so a replay cannot land on a different mode than the
+/// one that was validated.
+struct Stream {
+    pipeline: Pipeline,
+    /// The scanout outlives the pipe that fetches from it.
+    scanout: Scanout,
+    timing: crate::amdgpu_dml::Timing,
+    platform: crate::amdgpu_dcn_display::Platform,
+    depth: Depth,
+    caps: [u8; 16],
+}
 struct Display {
     loader: Loader,
     // Every future scanout allocation must share this pool.
     pool: Arc<Pool>,
-    /// The scanout outlives the pipe that fetches from it.
-    stream: Option<(Pipeline, Scanout)>,
+    stream: Option<Stream>,
     attempted: bool,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
@@ -444,13 +472,13 @@ pub(crate) fn suspend() -> bool {
     let Display { loader, stream, .. } = display;
     // Stop the stream before the firmware: a pipe left fetching across a GPU
     // suspend would read scanout memory the resume path has not re-established.
-    // There is no replay yet, so the attempt is not refreshed for resume.
-    if let Some((pipeline, _)) = stream.as_mut() {
-        if narf_scheduler::block_on_spin(pipeline.disable(loader)).is_err() {
+    // The stream itself is kept, with the mode it was validated for, so resume
+    // puts back the same one rather than re-deriving a possibly different mode.
+    if let Some(stream) = stream.as_mut() {
+        if narf_scheduler::block_on_spin(stream.pipeline.disable(loader)).is_err() {
             return false;
         }
     }
-    *stream = None;
     narf_scheduler::block_on_spin(loader.stop()).is_ok()
 }
 pub(crate) fn resume() -> bool {
@@ -463,11 +491,47 @@ pub(crate) fn resume() -> bool {
     if narf_scheduler::current_task_id().raw() != 0 {
         return false;
     }
-    narf_scheduler::block_on_spin(async {
-        display.loader.boot(Default::default()).await?;
-        display.loader.enable_notifications().await
+    use core::fmt::Write as _;
+    let Display { loader, stream, .. } = display;
+    if narf_scheduler::block_on_spin(async {
+        loader.boot(Default::default()).await?;
+        loader.enable_notifications().await
     })
-    .is_ok()
+    .is_err()
+    {
+        return false;
+    }
+    // Put the stream back on the mode it was validated for. The clock levels are
+    // re-latched because the firmware has just rebooted, and the surface is
+    // re-cleared because VRAM contents do not survive a suspend.
+    if let Some(running) = stream.as_mut() {
+        let replayed = narf_scheduler::block_on_spin(async {
+            running.scanout.clear().await;
+            running.pipeline.start().await?;
+            running
+                .pipeline
+                .enable(
+                    loader,
+                    &running.scanout,
+                    &running.timing,
+                    &running.platform,
+                    running.depth,
+                    running.caps,
+                )
+                .await
+        });
+        if let Err(error) = replayed {
+            // `enable` has already torn its own stream down and unpublished the
+            // scanout, so the console is back on the boot framebuffer. Drop the
+            // stream rather than leave a half-replayed one behind.
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu-usbc: external stream not replayed after resume: {error:?}"
+            );
+            *stream = None;
+        }
+    }
+    true
 }
 
 #[cfg(feature = "kernel-test")]

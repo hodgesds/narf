@@ -413,8 +413,21 @@ static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<
 /// obligation, which is the kind of ordering rule that quietly breaks.
 static GENERIC_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The generic FB as first registered, so adopting an external scanout can be
+/// undone when that stream goes away. Kept separately from `GENERIC_FB`, which
+/// is what the console actually draws to and therefore moves.
+static BOOT_GENERIC: narf_lib::sync::IrqSafeSpinLock<
+    Option<narf_graphics_driver::generic::GenericFb>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
     narf_drivers_gpu::amdgpu_platform::record_boot_framebuffer(fb);
+    {
+        let mut boot = BOOT_GENERIC.lock();
+        if boot.is_none() {
+            *boot = Some(fb);
+        }
+    }
     GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
     *GENERIC_FB.lock() = Some(fb);
 }
@@ -434,12 +447,41 @@ pub fn adopt_external_scanout() -> bool {
     let Some(fb) = narf_drivers_gpu::amdgpu_dcn_display::active_scanout() else {
         return false;
     };
+    adopt(fb)
+}
+fn adopt(fb: narf_graphics_driver::generic::GenericFb) -> bool {
     if fb.addr == 0 || fb.width == 0 || fb.height == 0 || fb.pitch == 0 {
         return false;
     }
     GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
     *GENERIC_FB.lock() = Some(fb);
     true
+}
+/// Put the console back on the framebuffer it booted with. Used when an adopted
+/// external scanout goes away: its memory is about to be released, so continuing
+/// to draw there would write into whatever claims it next.
+pub fn restore_boot_scanout() -> bool {
+    let Some(fb) = *BOOT_GENERIC.lock() else {
+        return false;
+    };
+    adopt(fb)
+}
+/// Observer for the AMD display pipeline's external scanout.
+///
+/// Moving the console to a newly lit external display is this layer's policy
+/// call, not the GPU driver's: a laptop user plugging in a monitor wants output
+/// there, and the internal panel keeps showing its last frame rather than
+/// blanking. When the stream goes away the console goes back to the boot
+/// framebuffer, because the scanout memory is about to be released.
+fn external_scanout_changed(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
+    match scanout {
+        Some(fb) => {
+            adopt(fb);
+        }
+        None => {
+            restore_boot_scanout();
+        }
+    }
 }
 
 /// Rebase the generic-FB's base address to a remapped virt (e.g.
@@ -1017,6 +1059,13 @@ pub fn register_initcalls() {
     // can blit into the live scanout without a circular crate dependency.
     // The hook is a function pointer; installing it once during Stage::Late
     // (single-CPU, non-IRQ) is safe.
+    // Follow the external display the AMD pipeline brings up. Same shape as the
+    // DRM fbdev hook below: a function pointer installed once during Stage::Late,
+    // so the dependency on the GPU driver stays one-way.
+    narf_init::register(Stage::Late, "fb-external-scanout", || {
+        narf_drivers_gpu::amdgpu_dcn_display::register_scanout_observer(external_scanout_changed);
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "drm-fb-hook", || {
         fn query() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
             let info = fbdev_info()?;

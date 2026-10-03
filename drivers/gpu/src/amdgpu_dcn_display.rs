@@ -48,6 +48,8 @@ pub enum Error {
     Link(crate::amdgpu_dp_training::Error),
     /// The platform's own tables could not answer for something.
     Inventory(inventory::Error),
+    /// The USB4 tunnel will not carry this mode.
+    Tunnel(crate::amdgpu_dp_tunnel::Error),
 }
 impl From<dml::Error> for Error {
     fn from(error: dml::Error) -> Self {
@@ -194,12 +196,51 @@ impl Scanout {
     }
 }
 
-/// The active external scanout, for a layer that can attach it to a console.
-/// The framebuffer crate calls into this driver, so this driver cannot call
-/// back into it; publishing here is the boundary between the two.
+/// The active external scanout, and whoever wants to be told when it changes.
+///
+/// The framebuffer crate calls into this driver, so this driver cannot call back
+/// into it. An observer is how the dependency stays one-way: that crate installs
+/// a function pointer, the same way it installs the DRM fbdev hook, and this
+/// module calls it when a stream comes up or goes down.
+/// Told when the active external scanout appears or goes away.
+pub type ScanoutObserver = fn(Option<GenericFb>);
 static ACTIVE: IrqSafeSpinLock<Option<GenericFb>> = IrqSafeSpinLock::new(None);
+static OBSERVER: IrqSafeSpinLock<Option<ScanoutObserver>> = IrqSafeSpinLock::new(None);
 pub fn active_scanout() -> Option<GenericFb> {
     *ACTIVE.lock()
+}
+/// Install the observer. Called once during Late init, before any stream exists.
+/// If a stream somehow already runs, the observer is told about it immediately so
+/// it cannot miss the edge.
+pub fn register_scanout_observer(observer: ScanoutObserver) {
+    *OBSERVER.lock() = Some(observer);
+    let current = *ACTIVE.lock();
+    if current.is_some() {
+        observer(current);
+    }
+}
+/// Install an observer and recover the previous one, so a test can put the
+/// running system's observer back when it is done.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn swap_scanout_observer_for_test(
+    observer: Option<ScanoutObserver>,
+) -> Option<ScanoutObserver> {
+    let previous = *OBSERVER.lock();
+    *OBSERVER.lock() = observer;
+    previous
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn publish_for_test(scanout: Option<GenericFb>) {
+    publish(scanout);
+}
+/// Publish a change and notify. The locks are released before the observer runs,
+/// so an observer that reads `active_scanout` cannot deadlock against this.
+fn publish(scanout: Option<GenericFb>) {
+    *ACTIVE.lock() = scanout;
+    let observer = *OBSERVER.lock();
+    if let Some(observer) = observer {
+        observer(scanout);
+    }
 }
 
 /// Everything one external DisplayPort stream needs, on one pipe.
@@ -414,7 +455,7 @@ impl Pipeline {
         {
             Ok(()) => {
                 self.streaming = true;
-                *ACTIVE.lock() = Some(scanout.generic_fb());
+                publish(Some(scanout.generic_fb()));
                 Ok(())
             }
             Err(error) => {
@@ -478,9 +519,13 @@ impl Pipeline {
         // what the sink needs to see before and during training.
         self.otg.enable()?;
 
-        // 6. Train the link. The pixel clock and depth bound what rate and lane
-        // count are acceptable, so an untrainable mode fails here.
-        let limits = Limits {
+        // 6. On a tunnel, ask the host router for the bandwidth this mode needs
+        // before the link comes up. A tunnel shares its router with USB data and
+        // the other endpoints, so the bandwidth has to be asked for; an endpoint
+        // that does no allocation keeps the fixed allocation it was created with,
+        // which is not a failure. The endpoint's own non-reduced maxima then
+        // bound training, independently of what the sink reports.
+        let mut limits = Limits {
             rate: 30,
             lanes: 4,
             pixel_clock_khz: timing.pixel_clock_khz,
@@ -489,12 +534,32 @@ impl Pipeline {
             // whether the link is tunnelled.
             dpia: false,
         };
+        if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
+            let required = timing
+                .pixel_clock_khz
+                .saturating_mul(depth.bits_per_pixel());
+            match crate::amdgpu_dp_tunnel::allocate(loader, self.route.aux, required).await {
+                Ok(allocation) => {
+                    if allocation.max_link_rate != 0 {
+                        limits.rate = limits.rate.min(allocation.max_link_rate);
+                    }
+                    if allocation.max_lanes != 0 {
+                        limits.lanes = limits.lanes.min(allocation.max_lanes);
+                    }
+                }
+                Err(crate::amdgpu_dp_tunnel::Error::Unsupported) => {}
+                Err(error) => return Err(Error::Tunnel(error)),
+            }
+        }
+
+        // 7. Train the link. The pixel clock and depth bound what rate and lane
+        // count are acceptable, so an untrainable mode fails here.
         let settings = self.source.train(loader, sink_caps, limits).await?;
 
-        // 7. Describe the stream to the sink at the rate training settled on.
+        // 8. Describe the stream to the sink at the rate training settled on.
         self.stream.program(timing, depth, settings.rate)?;
 
-        // 8. Release pixels: the pipe first, then the encoder, then the
+        // 9. Release pixels: the pipe first, then the encoder, then the
         // formatter. Unblanking the formatter last means the sink never sees a
         // frame the pipe was not yet fetching for.
         self.hubp.unblank().await?;
@@ -515,6 +580,15 @@ impl Pipeline {
         record(self.stream.blank().await.map_err(Error::Hardware));
         record(self.hubp.blank().await.map_err(Error::Hardware));
         record(self.source.disable(loader).await.map_err(Error::Link));
+        if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
+            // Hand the tunnel's bandwidth back, or the other endpoints on this
+            // router never see it again.
+            record(
+                crate::amdgpu_dp_tunnel::release(loader, self.route.aux)
+                    .await
+                    .map_err(Error::Tunnel),
+            );
+        }
         record(self.otg.disable().await.map_err(Error::Hardware));
         record(self.mpc.release(self.pipe).map_err(Error::Hardware));
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
@@ -528,7 +602,7 @@ impl Pipeline {
             );
         }
         self.streaming = false;
-        *ACTIVE.lock() = None;
+        publish(None);
         first
     }
     /// Take the stream down. The scanout is safe to release once this returns.

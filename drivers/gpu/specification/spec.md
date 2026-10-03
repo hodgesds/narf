@@ -502,12 +502,29 @@ a transmitter. `Pipeline::for_sink` and `Pipeline::platform` feed these into the
 bring-up, so a caller no longer assembles a route by hand.
 
 A tunnelled stream additionally needs DTBCLK and its endpoint's stream clock
-routed, which the bring-up requests and programs. It does **not** negotiate USB4
-bandwidth allocation: the tunnel must already carry enough for the mode, which is
-the USB4 driver's business, not this one's.
+routed, which the bring-up requests and programs.
+
+`amdgpu_dp_tunnel::allocate` negotiates the tunnel's bandwidth before the link
+comes up, over the sink's AUX channel, following the USB4 DP tunnelling DPCD
+space and Linux `link_dp_dpia_bw.c`. A tunnel shares its host router with USB
+data and with the router's other endpoints, so the bandwidth a mode needs is
+asked for rather than assumed. An endpoint that does not implement allocation
+reports `Unsupported`, which is not a failure: the tunnel then carries the fixed
+allocation it was created with and the bring-up proceeds on that, and nothing is
+written to an endpoint that cannot answer. A request is rounded **up** to a whole
+allocation step, because rounding down leaves the stream short by up to a step,
+and the reserved granularity encoding is refused rather than guessed since
+guessing it scales every request. Where Linux clamps an over-large request down
+to the router's estimate, this refuses the mode instead: a clamped request puts a
+stream on a tunnel that cannot carry it, which tears rather than fails. The
+router's own granted figure is believed over the request, so a router that
+reports success while granting less is still a refusal. The endpoint's
+non-reduced maximum rate and lane count then bound training, independently of
+what the sink reports. `release` hands the bandwidth back when the stream stops,
+so the router's other endpoints see it again.
 
 The Late worker arms the bring-up once per boot, on the first discovered sink
-the board can answer for. It claims only a pipe whose hub pixel pipe is blanked
+the board can answer for, native or tunnelled. It claims only a pipe whose hub pixel pipe is blanked
 and whose timing generator is stopped — the same two signals the boot inventory
 uses to decide a surface is in use — so claiming one cannot disturb the internal
 panel. The reserved surface is zeroed before any pixel is sent, because a
@@ -518,25 +535,39 @@ the attach-only behaviour that was there before.
 The attempt is deliberately one-shot. The clock manager publishes a table buffer
 to firmware, so a retried failure would quarantine another reservation each time,
 and re-running a sequence that failed once is unlikely to do better. A sink whose
-EDID declares no usable mode does not spend the attempt. Suspend stops the stream
-before the firmware, since a pipe left fetching across a GPU suspend would read
-scanout memory the resume path has not re-established; there is no replay, so the
-stream does not come back on resume.
+EDID declares no usable mode does not spend the attempt.
 
-A brought-up stream shows black until something draws to it. Publishing the
-scanout does not move the console to it: `narf_fb::adopt_external_scanout` is a
-pull, and whether the console or a compositor should follow is that layer's
-policy, not this driver's.
+Suspend stops the stream before the firmware, since a pipe left fetching across a
+GPU suspend would read scanout memory the resume path has not re-established, but
+it keeps the stream — the mode, platform constants and sink capabilities it was
+validated for — so resume puts back that same mode rather than re-deriving a
+possibly different one. Resume re-latches the clock levels, because the firmware
+has just rebooted, and re-clears the surface, because VRAM contents do not survive
+a suspend. A replay that fails drops the stream rather than leaving half of one
+behind; `enable` has already unpublished the scanout by then, so the console is
+back on the boot framebuffer before its memory is released.
 
-None of this pipeline has run on silicon.
+A brought-up stream is published, and the framebuffer crate follows it. Because
+that crate calls into this driver and the dependency runs one way, it installs an
+observer — a function pointer, the same shape as the DRM fbdev hook — which this
+module calls on both edges; the locks are released first, so an observer that
+reads the published scanout cannot deadlock against the publish that woke it, and
+an observer installed while a stream already runs is told immediately rather than
+missing the edge. Moving the console is that crate's policy call, not this
+driver's: it adopts a newly lit external display, leaving the internal panel
+showing its last frame, and goes back to the boot framebuffer when the stream
+goes away, since the scanout memory is about to be released.
+
+None of this pipeline has run on silicon. That is the one remaining gap, and it
+is not one more code can close: the Lenovo 50ee is the only thing that can say
+whether the watermarks, the deadlines and the training are right.
 
 Neither the attach worker nor a booted loader **programs the stream pipeline or
 exposes new active DRM/KMS scanouts**. A successful firmware boot, sink read,
 trained link, clock update, mode calculation or programmed divider does not
-prove monitor output. The Late worker now arms the sequence for a native or
-tunnelled DisplayPort sink, but a brought-up stream shows black until a layer that
-owns console policy adopts it, USB4 bandwidth allocation is not negotiated, and
-nothing here has been confirmed on silicon.
+prove monitor output. The Late worker arms the sequence for a native or tunnelled
+DisplayPort sink, the console follows a lit display and a stream survives suspend,
+but nothing here has been confirmed on silicon.
 The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_dm_dmub.c`, `dmub_srv.c`, `dmub_cmd.h`, `dmub_dcn31.c`,
 `dmub_dcn314.c`, `dcn314_resource.c`, `psp_gfx_if.h`, `psp_v13_0_4.c`,

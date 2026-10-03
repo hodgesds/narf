@@ -110,11 +110,17 @@ Tunnelled USB4 sinks are driven too. A tunnelled link has no board-wired
 transmitter, so one is borrowed from the five DIGs, preferring those the board
 wired to no connector; a wired transmitter is still usable while its own
 connector is idle, which the backend enable bit decides rather than a guess.
-**External monitor output is still not complete:** a brought-up stream shows
-black until a layer that owns console policy adopts the published scanout, USB4
-bandwidth allocation is not negotiated so the tunnel must already carry enough
-for the mode, and firmware replay over suspend remains open. Physical Lenovo 50ee
-USB-C/USB4 validation is pending, and none of this path has run on silicon.
+A tunnelled stream negotiates its host router's bandwidth before the link comes
+up, rounding a request up to a whole allocation step and refusing a mode the
+tunnel cannot carry rather than clamping it down to a starved allocation; the
+bandwidth is handed back when the stream stops. The console follows a lit external
+display through an observer the framebuffer layer installs, and returns to the
+boot framebuffer when the stream goes away. A stream survives suspend: the mode it
+was validated for is retained and replayed on resume, with the clock levels
+re-latched and the surface re-cleared.
+**The one remaining gap is silicon.** Physical Lenovo 50ee USB-C/USB4 validation
+is pending; nothing in this path has run on real hardware, so the watermarks,
+deadlines and link training are unconfirmed.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 

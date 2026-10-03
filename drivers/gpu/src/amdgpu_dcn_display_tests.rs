@@ -250,3 +250,73 @@ kernel_test_in!(
     "drivers/gpu/dcn-display",
     display_scanout_clear_blacks_the_surface
 );
+
+/// What the test observer saw: 0 nothing, 1 a scanout, 2 its removal.
+static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Width the observer read back out of `active_scanout` while being called,
+/// which would deadlock if `publish` still held its locks.
+static READBACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn observer(scanout: Option<GenericFb>) {
+    use core::sync::atomic::Ordering;
+    match scanout {
+        Some(_) => {
+            SEEN.store(1, Ordering::Release);
+            // Reading the published value from inside the notification must not
+            // deadlock against the publish that caused it.
+            READBACK.store(
+                active_scanout().map(|fb| fb.width).unwrap_or(0),
+                Ordering::Release,
+            );
+        }
+        None => SEEN.store(2, Ordering::Release),
+    }
+}
+
+fn display_scanout_observer_sees_both_edges() -> TestResult {
+    use core::sync::atomic::Ordering;
+    SEEN.store(0, Ordering::Release);
+    READBACK.store(0, Ordering::Release);
+    // Take over the observer, remembering whoever had it, so the running
+    // system's console policy is put back afterwards.
+    let previous = swap_scanout_observer_for_test(Some(observer));
+    let restore = |result: TestResult| {
+        publish_for_test(None);
+        swap_scanout_observer_for_test(previous);
+        result
+    };
+    let fb = GenericFb::new(0x1234_0000, 1920, 1080, 1920 * 4, 32);
+    publish_for_test(Some(fb));
+    if SEEN.load(Ordering::Acquire) != 1 {
+        return restore(TestResult::Fail("observer not told about a new scanout"));
+    }
+    if READBACK.load(Ordering::Acquire) != 1920 {
+        return restore(TestResult::Fail(
+            "observer could not read the published scanout",
+        ));
+    }
+    if active_scanout().map(|fb| fb.width) != Some(1920) {
+        return restore(TestResult::Fail("scanout not published"));
+    }
+    publish_for_test(None);
+    if SEEN.load(Ordering::Acquire) != 2 {
+        return restore(TestResult::Fail("observer not told the scanout went away"));
+    }
+    if active_scanout().is_some() {
+        return restore(TestResult::Fail("scanout still published"));
+    }
+    // Installing an observer while a scanout already runs must not miss the
+    // edge that already happened.
+    SEEN.store(0, Ordering::Release);
+    publish_for_test(Some(fb));
+    swap_scanout_observer_for_test(None);
+    SEEN.store(0, Ordering::Release);
+    register_scanout_observer(observer);
+    if SEEN.load(Ordering::Acquire) != 1 {
+        return restore(TestResult::Fail("late observer missed a running scanout"));
+    }
+    restore(TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-display",
+    display_scanout_observer_sees_both_edges
+);
