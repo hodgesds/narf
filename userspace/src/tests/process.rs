@@ -1114,6 +1114,10 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
 
     *PARENT_AS.lock() = None;
     crate::syscall::__test_clear_global();
+    // Release this test's references before the reset, which refuses to wipe
+    // the counts of frames a live space still maps.
+    drop(child_as);
+    drop(parent_as);
     narf_memory::frame::cow::__test_clear();
     TestResult::Pass
 }

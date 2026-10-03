@@ -2495,6 +2495,8 @@ dependencies = [
  "narf-console",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
+ "narf-rcu",
  "narf-scheduler",
  "narf-time",
  "narf-userspace",

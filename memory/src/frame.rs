@@ -3077,11 +3077,97 @@ pub mod cow {
         counts
     }
 
+    /// A COW-registered frame that a live address space still maps, found by
+    /// [`__test_live_registered_owner`].
+    #[doc(hidden)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LiveRegisteredOwner {
+        /// The registered frame.
+        pub phys: PhysAddr,
+        /// Its recorded owner count.
+        pub count: u32,
+        /// How many mappings the reverse map records for it.
+        pub mappings: usize,
+        /// One of those mappings.
+        pub owner: crate::rmap::Owner,
+    }
+
+    /// Test query: the first frame that has a recorded COW owner count and is
+    /// still mapped by some address space, or `None` if there is none.
+    ///
+    /// A recorded count on a mapped frame is live ownership state: the
+    /// count-aware frees of the address spaces that map the frame depend on
+    /// it. Candidates are collected under each table lock and checked against
+    /// the reverse map after the lock is released, so no COW shard lock is
+    /// ever held across an rmap shard lock.
+    #[doc(hidden)]
+    pub fn __test_live_registered_owner() -> Option<LiveRegisteredOwner> {
+        let mut candidates: Vec<(u64, u32)> = Vec::new();
+        let ptr = FLAT.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            let frames = FLAT_FRAMES.load(Ordering::Relaxed);
+            for index in 0..frames {
+                // SAFETY: `ptr` holds `frames` published entries.
+                let state = unsafe { &*ptr.add(index) }.state.load(Ordering::Acquire);
+                let count = (state & FLAT_COUNT_MASK) as u32;
+                if count != 0 {
+                    candidates.push(((index as u64) << super::PAGE_SHIFT, count));
+                }
+            }
+        }
+        for shard in &REFCOUNTS {
+            if let Some(map) = shard.map.lock().as_ref() {
+                for slot in &map.slots {
+                    if let RefSlot::Occupied { key, count, .. } = slot {
+                        if *count != 0 {
+                            candidates.push((*key, *count));
+                        }
+                    }
+                }
+            }
+        }
+        for (key, count) in candidates {
+            let phys = PhysAddr::new(key);
+            let mut first = None;
+            crate::rmap::for_each_owner(phys, |owner| {
+                first.get_or_insert(owner);
+            });
+            if let Some(owner) = first {
+                return Some(LiveRegisteredOwner {
+                    phys,
+                    count,
+                    mappings: crate::rmap::owner_count(phys),
+                    owner,
+                });
+            }
+        }
+        None
+    }
+
     /// Test hook — drop every recorded refcount. Tests that
     /// exercise inc/dec sequences should call this to start from
     /// a clean slate.
+    ///
+    /// # Panics
+    ///
+    /// If any registered frame is still mapped by an address space. Wiping
+    /// that count turns the owners' later count-aware frees into a double free
+    /// of a frame the allocator has already handed out again, so a test that
+    /// leaks a live address space into this reset is refused by name instead
+    /// of silently corrupting memory for whichever test runs next.
     #[doc(hidden)]
+    #[track_caller]
     pub fn __test_clear() {
+        if let Some(live) = __test_live_registered_owner() {
+            panic!(
+                "cow::__test_clear would wipe the COW count {} of frame {:#x}, which address space {:#x} still maps at {:#x} ({} mappings): a test leaked a live address space into this reset",
+                live.count,
+                live.phys.raw(),
+                live.owner.root.raw(),
+                live.owner.va.as_u64(),
+                live.mappings,
+            );
+        }
         let ptr = FLAT.load(Ordering::Acquire);
         if !ptr.is_null() {
             let frames = FLAT_FRAMES.load(Ordering::Relaxed);

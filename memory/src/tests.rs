@@ -10679,8 +10679,10 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
         return TestResult::Fail("child's private frame did not retain write");
     }
 
-    let _ = parent;
-    let _ = child;
+    // `let _ = x` would not drop: both spaces must be gone before the reset,
+    // which refuses to wipe the counts of frames a live space still maps.
+    drop(child);
+    drop(parent);
     cow::__test_clear();
     TestResult::Pass
 }
@@ -10782,8 +10784,10 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
         return TestResult::Fail("parent split leaked into child's frame");
     }
 
-    let _ = parent;
-    let _ = child;
+    // `let _ = x` would not drop: both spaces must be gone before the reset,
+    // which refuses to wipe the counts of frames a live space still maps.
+    drop(child);
+    drop(parent);
     cow::__test_clear();
     TestResult::Pass
 }

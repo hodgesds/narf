@@ -6,12 +6,15 @@
 //! the guest has been reaped.
 
 use alloc::boxed::Box;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use narf_console::Writer;
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::{AddressSpace, PhysAddr, RegionPerms};
 use narf_scheduler::{Affinity, CpuId, TaskSpec};
 use narf_userspace::handlers::tool_view;
 use narf_userspace::syscall::{
@@ -50,6 +53,74 @@ struct Root {
     pid: u64,
 }
 
+/// Grace periods [`run_guest`] may drive while reclaiming a run's address
+/// spaces. Reclaiming a task takes one; the address-space destructors it runs
+/// may retire more, which the next one reclaims.
+const RECLAIM_GRACE_PERIODS: u32 = 4;
+/// Budget for one of those grace periods.
+const RECLAIM_GRACE_PERIOD_NS: u64 = 1_000_000_000;
+
+/// Every distinct address space a task of the current run exited from: the
+/// root's and each forked or vforked child's.
+static EXITED_SPACES: IrqSafeSpinLock<Vec<Weak<AddressSpace>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Thread-exit observer: records the exiting task's address space, which is
+/// still the active one while its exit fans out.
+fn record_exiting_space(_pid: u64, _tid: u64) {
+    let Some(space) = narf_scheduler::current_address_space() else {
+        return;
+    };
+    let mut spaces = EXITED_SPACES.lock();
+    if !spaces
+        .iter()
+        .any(|seen| seen.as_ptr() == Arc::as_ptr(&space))
+    {
+        spaces.push(Arc::downgrade(&space));
+    }
+}
+
+/// How many distinct address spaces the last successful [`run_guest`] saw
+/// tasks exit from, all of which it proved reclaimed.
+static RECLAIMED_SPACES: AtomicU64 = AtomicU64::new(0);
+
+fn exited_space_count() -> u64 {
+    RECLAIMED_SPACES.load(Ordering::Acquire)
+}
+
+/// Waits until nothing of a finished run is left: every address space its
+/// tasks exited from has been dropped, and no frame of the root image still
+/// has a recorded COW owner.
+///
+/// A reaped task is not yet reclaimed. The scheduler retires its stackful
+/// continuation through RCU, and that continuation owns the future holding the
+/// task's address space, so the space outlives the task by one grace period.
+/// In the kernel the executor keeps running and its per-round
+/// `advance_epoch_if_pending` ends that grace period. `run_until_empty`
+/// returns as soon as the run queue drains, so the grace period must be driven
+/// here; otherwise the spaces survive into the next test, still sharing COW
+/// frames, and any reset of the COW table in between turns their eventual
+/// frees into double frees.
+fn reclaim_run(spaces: &[Weak<AddressSpace>], frames: &[PhysAddr]) -> Result<(), &'static str> {
+    let reclaimed = || {
+        spaces.iter().all(|space| space.strong_count() == 0)
+            && frames
+                .iter()
+                .all(|frame| narf_memory::frame::cow::count(*frame) == 0)
+    };
+    let mut periods = 0;
+    while !reclaimed() {
+        if periods == RECLAIM_GRACE_PERIODS {
+            return Err("the guest's address spaces or COW frames outlived the reclaim grace-period budget after its tasks were reaped");
+        }
+        let deadline = narf_time::monotonic_ns().saturating_add(RECLAIM_GRACE_PERIOD_NS);
+        if !narf_rcu::sync_until(deadline) {
+            return Err("an RCU grace period did not elapse within 1 s while reclaiming the guest's address spaces");
+        }
+        periods += 1;
+    }
+    Ok(())
+}
+
 /// Runs `elf` as a fresh scheduled user process with `interceptor` installed
 /// in the live syscall table, until every task it created has been reaped.
 ///
@@ -79,6 +150,9 @@ fn run_guest(
     narf_userspace::user_task::__test_clear_exit_observers();
     narf_userspace::handlers::__test_wait_reset();
     narf_userspace::handlers::wait_init();
+    EXITED_SPACES.lock().clear();
+    RECLAIMED_SPACES.store(0, Ordering::Release);
+    narf_userspace::user_task::register_thread_exit_observer(record_exiting_space);
     let original_as_lookup = narf_userspace::address_space_lookup();
     narf_userspace::install_address_space_lookup(|| {
         narf_scheduler::current_address_space()
@@ -129,6 +203,15 @@ fn run_guest(
         }
     };
     let pid = process.pid.raw();
+    let root_space = Arc::downgrade(&process.address_space);
+    let root_frames = process
+        .address_space
+        .regions_snapshot()
+        .into_iter()
+        .filter(|region| !region.perms.contains(RegionPerms::SHARED))
+        .flat_map(|region| region.phys)
+        .filter(|frame| frame.raw() != 0)
+        .collect::<Vec<_>>();
     let live_before = narf_scheduler::live_user_task_count();
     let mut spec = TaskSpec::user_task();
     spec.affinity = Affinity::pinned(CpuId(cpu as u32));
@@ -164,6 +247,12 @@ fn run_guest(
     if WAITER_TIMED_OUT.load(Ordering::Acquire) != 0 {
         return Err("the guest's tasks were not reaped within the budget");
     }
+    let spaces = core::mem::take(&mut *EXITED_SPACES.lock());
+    if !spaces.iter().any(|space| space.ptr_eq(&root_space)) {
+        return Err("the root task's exit did not report its address space");
+    }
+    reclaim_run(&spaces, &root_frames)?;
+    RECLAIMED_SPACES.store(spaces.len() as u64, Ordering::Release);
     Ok(root)
 }
 
@@ -410,6 +499,12 @@ fn reverie_narf_counter1_follows_fork_and_vfork() -> TestResult {
         let exits = check_teardown(&interceptor, root, 3, 0)?;
         if exits.iter().filter(|exit| exit.process_exited).count() != 3 {
             return Err("each of the three processes did not end exactly once");
+        }
+        // Narf implements vfork as a copy, so the tree has three address
+        // spaces, and run_guest proved each one reclaimed.
+        if exited_space_count() != 3 {
+            let _ = writeln!(Writer, "    exited address spaces {}", exited_space_count());
+            return Err("the run did not reclaim the parent's, fork child's and vfork child's address spaces");
         }
         let children = exits
             .iter()
