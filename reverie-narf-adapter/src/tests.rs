@@ -13,14 +13,14 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use narf_console::Writer;
 use narf_filesystem::{FileOps, FsError, FsFuture, Stat};
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{TestResult, kernel_test_in};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{AddressSpace, PhysAddr, RegionPerms};
 use narf_scheduler::{Affinity, CpuId, TaskSpec};
 use narf_userspace::handlers::tool_view;
 use narf_userspace::syscall::{
-    NativeSyscallOutcome, NativeSyscallTransition, SyscallInterception, SyscallInterceptor,
-    SyscallInvocation, SyscallReturn,
+    NativeSyscallOutcome, NativeSyscallRequest, NativeSyscallTransition, SyscallInterception,
+    SyscallInterceptor, SyscallInvocation, SyscallReturn,
 };
 use reverie::syscalls::{Addr, MemoryAccess};
 use reverie::{Pid, Tool};
@@ -31,7 +31,7 @@ use reverie_narf_tools::passthrough::PassThrough;
 use reverie_narf_tools::probe::Probe;
 
 use crate::interceptor::{ConsoleSink, ReverieInterceptor, TaskExitRecord};
-use crate::services::{map_native_outcome, NarfKernelServices};
+use crate::services::{NarfKernelServices, map_native_outcome};
 
 static CANONICAL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_CANONICAL"));
 static PROBE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PROBE"));
@@ -40,6 +40,7 @@ static PIPE_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_PIPE"));
 static EXEC_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_EXEC"));
 static VFORK_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_VFORK"));
 static RING_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_RING"));
+static BADFRAME_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_BADFRAME"));
 
 /// The single argument every guest is started with, as Linux starts a program
 /// with `argv[0]`. A non-empty argv makes the loader lay out the full SysV
@@ -199,11 +200,15 @@ fn reclaim_run(spaces: &[Weak<AddressSpace>], frames: &[PhysAddr]) -> Result<(),
     let mut periods = 0;
     while !reclaimed() {
         if periods == RECLAIM_GRACE_PERIODS {
-            return Err("the guest's address spaces or COW frames outlived the reclaim grace-period budget after its tasks were reaped");
+            return Err(
+                "the guest's address spaces or COW frames outlived the reclaim grace-period budget after its tasks were reaped",
+            );
         }
         let deadline = narf_time::monotonic_ns().saturating_add(RECLAIM_GRACE_PERIOD_NS);
         if !narf_rcu::sync_until(deadline) {
-            return Err("an RCU grace period did not elapse within 1 s while reclaiming the guest's address spaces");
+            return Err(
+                "an RCU grace period did not elapse within 1 s while reclaiming the guest's address spaces",
+            );
         }
         periods += 1;
     }
@@ -390,7 +395,7 @@ fn run_guest_with(
         let wstatus = match ROOT_REAPED.load(Ordering::Acquire) {
             NOT_SEEN => return Err("the harness parent's wait never reaped the root"),
             OTHER_CHILD_REAPED => {
-                return Err("the harness parent's wait reaped a task other than the root")
+                return Err("the harness parent's wait reaped a task other than the root");
             }
             status => status as i32,
         };
@@ -756,7 +761,9 @@ fn reverie_narf_counter1_follows_fork_and_vfork() -> TestResult {
         // spaces, and run_guest proved each one reclaimed.
         if exited_space_count() != 3 {
             let _ = writeln!(Writer, "    exited address spaces {}", exited_space_count());
-            return Err("the run did not reclaim the parent's, fork child's and vfork child's address spaces");
+            return Err(
+                "the run did not reclaim the parent's, fork child's and vfork child's address spaces",
+            );
         }
         let children = exits
             .iter()
@@ -1320,7 +1327,9 @@ fn reverie_narf_spawn_hold_and_vfork_wait() -> TestResult {
             let _ = writeln!(Writer, "    spawn-hold failures {failures:#x}");
         }
         if failures & 0b111 != 0 {
-            return Err("a child created inside the callback was published early or not reported with its pid");
+            return Err(
+                "a child created inside the callback was published early or not reported with its pid",
+            );
         }
         if failures & (1 << 3) != 0 {
             return Err("a created child was reported twice");
@@ -1428,6 +1437,132 @@ fn reverie_narf_kernel_reentry_is_not_intercepted() -> TestResult {
 kernel_test_in!(
     "reverie-narf",
     reverie_narf_kernel_reentry_is_not_intercepted
+);
+
+// ── Termination inside an interceptor call ────────────────────────────────
+
+const LINUX_RT_SIGRETURN: u32 = 15;
+const LINUX_SIGSEGV: i32 = 11;
+/// What the bad-frame guest's fork child exits with.
+const BADFRAME_CHILD_CODE: u64 = 42;
+
+static BADFRAME_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Task id of the child forked inside the rt_sigreturn callback.
+static BADFRAME_CHILD: AtomicU64 = AtomicU64::new(0);
+/// The exit code the child passed to `exit`, once it ran.
+static BADFRAME_CHILD_EXIT: AtomicI64 = AtomicI64::new(NOT_SEEN);
+/// The child's wait status as its exit reached the interceptor.
+static BADFRAME_CHILD_WSTATUS: AtomicI64 = AtomicI64::new(NOT_SEEN);
+/// Bitmask of failed checks inside the callback; 0 when all held.
+static BADFRAME_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Forks from inside the bad-frame guest's rt_sigreturn callback, then lets
+/// the original run: it forces SIGSEGV on the task while the callback's
+/// spawn hold is open and holding the child.
+struct BadFrameProbe;
+
+impl SyscallInterceptor for BadFrameProbe {
+    fn on_syscall_enter(
+        &self,
+        invocation: &SyscallInvocation,
+        native: &mut dyn NativeSyscallTransition,
+    ) -> SyscallInterception {
+        let number = invocation.raw_number & reverie_narf_core::NARF_SYSCALL_NUMBER_MASK;
+        let task_id = invocation.task_id;
+        if number == LINUX_EXIT && task_id == BADFRAME_CHILD.load(Ordering::Acquire) {
+            BADFRAME_CHILD_EXIT.store(invocation.args.arg0 as i64, Ordering::Release);
+        }
+        if number != LINUX_RT_SIGRETURN || task_id != BADFRAME_ROOT.load(Ordering::Acquire) {
+            return SyscallInterception::Continue;
+        }
+        let fork = NativeSyscallRequest::new(LINUX_FORK, Default::default());
+        match native.execute_injected(fork) {
+            NativeSyscallOutcome::Returned(result) if result.linux_abi_result() > 0 => {}
+            _ => {
+                BADFRAME_FAILURES.fetch_or(1 << 0, Ordering::AcqRel);
+                return SyscallInterception::Continue;
+            }
+        }
+        match native.take_created_task() {
+            Some(created) if !created.thread => {
+                BADFRAME_CHILD.store(created.task_id, Ordering::Release)
+            }
+            _ => {
+                BADFRAME_FAILURES.fetch_or(1 << 1, Ordering::AcqRel);
+            }
+        }
+        // The original: a sigreturn whose frame cannot be read.
+        SyscallInterception::Continue
+    }
+
+    fn on_task_exit(&self, task_id: u64, _pid: u64, wstatus: i32) {
+        if task_id != 0 && task_id == BADFRAME_CHILD.load(Ordering::Acquire) {
+            BADFRAME_CHILD_WSTATUS.store(i64::from(wstatus), Ordering::Release);
+        }
+    }
+}
+
+/// A task terminated by a native syscall its interceptor callback ran (a
+/// sigreturn bad frame forcing SIGSEGV) terminates after the callback has
+/// returned, with its spawn hold released: the hold table and count are
+/// clear, the child the callback forked is published and runs to its own
+/// exit, and the task dies of SIGSEGV without returning to user mode.
+fn reverie_narf_termination_inside_callback_releases_the_hold() -> TestResult {
+    BADFRAME_ROOT.store(0, Ordering::Release);
+    BADFRAME_CHILD.store(0, Ordering::Release);
+    BADFRAME_CHILD_EXIT.store(NOT_SEEN, Ordering::Release);
+    BADFRAME_CHILD_WSTATUS.store(NOT_SEEN, Ordering::Release);
+    BADFRAME_FAILURES.store(0, Ordering::Release);
+    let holds_before = narf_userspace::user_task::__test_open_spawn_holds();
+    result_of((|| {
+        if holds_before != (0, 0) {
+            return Err("a spawn hold was open before the run");
+        }
+        let run = run_guest_with(
+            BADFRAME_GUEST,
+            Box::new(BadFrameProbe),
+            |root| {
+                BADFRAME_ROOT.store(root.task_id, Ordering::Release);
+                Ok(())
+            },
+            true,
+        );
+        // Checked before the run's own result: a leaked hold also strands the
+        // held child, which the harness then reports only as unreclaimed
+        // memory.
+        let holds = narf_userspace::user_task::__test_open_spawn_holds();
+        if holds != (0, 0) {
+            let _ = writeln!(Writer, "    open spawn holds (count, entries) {holds:?}");
+            return Err("the spawn hold outlived the task terminated inside its callback");
+        }
+        let (_, reap) = run?;
+        let reap = reap.ok_or("the run did not reap its root")?;
+        let failures = BADFRAME_FAILURES.load(Ordering::Acquire);
+        if failures != 0 {
+            let _ = writeln!(Writer, "    bad-frame failures {failures:#x}");
+            return Err("the callback's fork did not create and report a child");
+        }
+        let child_exit = BADFRAME_CHILD_EXIT.load(Ordering::Acquire);
+        let child_wstatus = BADFRAME_CHILD_WSTATUS.load(Ordering::Acquire);
+        if child_exit != BADFRAME_CHILD_CODE as i64
+            || child_wstatus != (BADFRAME_CHILD_CODE as i64) << 8
+        {
+            let _ = writeln!(
+                Writer,
+                "    child exit arg {child_exit:#x} wstatus {child_wstatus:#x}"
+            );
+            return Err("the child forked inside the terminating callback never ran to its exit");
+        }
+        if reap.wstatus & 0x7f != LINUX_SIGSEGV {
+            let _ = writeln!(Writer, "    root wstatus {:#x}", reap.wstatus);
+            return Err("the task did not die of SIGSEGV");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!(
+    "reverie-narf",
+    reverie_narf_termination_inside_callback_releases_the_hold
 );
 
 // ── Return mapping ────────────────────────────────────────────────────────

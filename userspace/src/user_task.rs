@@ -773,8 +773,8 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 
 #[cfg(feature = "kernel-test")]
 mod current_user_task_source_tests {
-    use super::{current_user_task_source, CurrentTaskSource};
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use super::{CurrentTaskSource, current_user_task_source};
+    use narf_kernel_test::{TestResult, kernel_test_in};
 
     /// C1 regression. In the own-stack model `current_user_task` must resolve
     /// the current `UserTaskCtx` ONLY from the scheduler-published owner
@@ -3651,6 +3651,9 @@ struct HeldSpawns {
     records: alloc::collections::VecDeque<crate::syscall::CreatedNativeTask>,
     /// `(child_visible_pid, parent_pid)` of a vfork whose wait was deferred.
     vfork_wait: Option<(u64, u64)>,
+    /// `(signum, core_dumped)` of a termination of the holding task that a
+    /// native syscall run inside the call raised (see `defer_termination`).
+    termination: Option<(u32, bool)>,
 }
 
 static SPAWN_HOLDS: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, HeldSpawns>> =
@@ -3681,6 +3684,7 @@ impl SpawnHold {
                 children: alloc::vec::Vec::new(),
                 records: alloc::collections::VecDeque::new(),
                 vfork_wait: None,
+                termination: None,
             },
         );
         SPAWN_HOLD_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -3688,16 +3692,63 @@ impl SpawnHold {
     }
 
     /// Close the hold: publish every held child in creation order and return
-    /// the deferred vfork wait, if any, which the caller must now perform.
-    pub(crate) fn release(self) -> Option<(u64, u64)> {
+    /// what was deferred to this point, which the caller must now perform.
+    pub(crate) fn release(self) -> ReleasedHold {
         let held = SPAWN_HOLDS.lock().remove(&self.creator);
         SPAWN_HOLD_COUNT.fetch_sub(1, Ordering::AcqRel);
-        let held = held?;
+        let Some(held) = held else {
+            return ReleasedHold::default();
+        };
         for child in held.children {
             child.publish();
         }
-        held.vfork_wait
+        ReleasedHold {
+            vfork_wait: held.vfork_wait,
+            termination: held.termination,
+        }
     }
+}
+
+/// What a released [`SpawnHold`] hands back to the dispatcher.
+#[derive(Default)]
+pub(crate) struct ReleasedHold {
+    /// `(child_visible_pid, parent_pid)`: a vfork wait to perform now.
+    pub(crate) vfork_wait: Option<(u64, u64)>,
+    /// `(signum, core_dumped)`: the task must terminate now, and nothing else
+    /// of its syscall may run.
+    pub(crate) termination: Option<(u32, bool)>,
+}
+
+/// Defer the termination of the current task `task` to the release of its
+/// open hold. Returns `false`, leaving the caller to terminate it now, when
+/// `task` is not the current task or has no hold open.
+///
+/// A task terminated from inside an interceptor call (a sigreturn bad frame
+/// forcing SIGSEGV in a native syscall the callback ran) must not diverge
+/// there: its hold would never be released, leaking the hold and its count
+/// and never publishing the children it holds, and the interceptor would
+/// never return. The first termination recorded wins.
+pub(crate) fn defer_termination(task: u64, signum: u32, core_dumped: bool) -> bool {
+    if SPAWN_HOLD_COUNT.load(Ordering::Acquire) == 0 || crate::handlers::current_task_id() != task {
+        return false;
+    }
+    match SPAWN_HOLDS.lock().get_mut(&task) {
+        Some(held) => {
+            held.termination.get_or_insert((signum, core_dumped));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Open spawn holds, as `(count, table entries)`. Both are 0 whenever no
+/// task is inside an interceptor call.
+#[doc(hidden)]
+pub fn __test_open_spawn_holds() -> (usize, usize) {
+    (
+        SPAWN_HOLD_COUNT.load(Ordering::Acquire),
+        SPAWN_HOLDS.lock().len(),
+    )
 }
 
 fn hold_spawn(creator: u64, child: PendingUserProcess) -> narf_scheduler::TaskId {

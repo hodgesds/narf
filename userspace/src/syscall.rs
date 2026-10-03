@@ -5383,7 +5383,15 @@ impl SyscallTable {
                 interceptor.on_syscall_context_managed(&invocation);
             }
         }
-        let vfork_wait = hold.release();
+        let released = hold.release();
+        if let Some((signum, core_dumped)) = released.termination {
+            // A native syscall the callback ran terminated the task. Its
+            // children are published now; nothing else of this syscall runs
+            // (no vfork wait, no deferred transition, no park record).
+            crate::handlers::terminate_current_task(ctx, task_id, signum, core_dumped);
+            return;
+        }
+        let vfork_wait = released.vfork_wait;
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if let Some((child_pid, parent_pid)) = vfork_wait {
             crate::handlers::vfork_parent_wait(ctx, child_pid, parent_pid);

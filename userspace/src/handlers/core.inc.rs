@@ -8693,6 +8693,13 @@ pub(crate) fn terminate_current_task(
     signum: u32,
     core_dumped: bool,
 ) {
+    // Inside an interceptor call the task's spawn hold is open, holding back
+    // the children the call created, and the interceptor has not returned.
+    // The dispatcher runs this termination once the call has returned and
+    // the hold is released; the caller returns without re-entering user mode.
+    if crate::user_task::defer_termination(task, signum, core_dumped) {
+        return;
+    }
     let pid = task_to_pid_raw(task).unwrap_or(task);
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
