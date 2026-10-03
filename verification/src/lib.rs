@@ -5687,6 +5687,379 @@ kernel_test_in!(
     smoke_scheduled_user_interception_survives_ap_migration
 );
 
+/// The own-stack execve path is the production one, and it diverges into the
+/// new image after dropping every local reference to both address spaces by
+/// hand. A reference it forgets is never dropped, because the frame holding it
+/// is abandoned; a reference it drops too early frees page tables that are
+/// live in CR3. Drive a scheduled user task through a real own-stack execve
+/// into an image that marks itself and exits, and require that the new image
+/// ran on its own root and that, once the task is reaped, neither the pre-exec
+/// nor the post-exec address space survives.
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces() -> TestResult {
+    use alloc::sync::{Arc, Weak};
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_scheduler::{Affinity, CpuId, TaskSpec};
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_task_id_lookup,
+        syscall::__verification_clear_global as __test_clear_global, Syscall, SyscallReturn,
+        SyscallTable, UserProcess,
+    };
+
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    const PATH_OFFSET: usize = 0x200;
+    const NEW_IMAGE_MARK: u64 = 0x600D;
+    const OLD_IMAGE_MARK: u64 = 0x0BAD;
+    const ROOT_MASK: u64 = 0x000f_ffff_ffff_f000;
+    // About 10 s at 3 GHz, as in the migration smoke above.
+    const WAITER_BUDGET_CYCLES: u64 = 30_000_000_000;
+
+    static NEW_IMAGE_RAN: AtomicU64 = AtomicU64::new(0);
+    static NEW_IMAGE_ON_OWN_ROOT: AtomicU64 = AtomicU64::new(0);
+    static EXECVE_RETURNED: AtomicU64 = AtomicU64::new(0);
+    static WAITER_ERROR: AtomicU64 = AtomicU64::new(0);
+    static OLD_AS: narf_lib::sync::IrqSafeSpinLock<Option<Weak<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    static NEW_AS: narf_lib::sync::IrqSafeSpinLock<Option<Weak<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    NEW_IMAGE_RAN.store(0, Ordering::Release);
+    NEW_IMAGE_ON_OWN_ROOT.store(0, Ordering::Release);
+    EXECVE_RETURNED.store(0, Ordering::Release);
+    WAITER_ERROR.store(0, Ordering::Release);
+    *OLD_AS.lock() = None;
+    *NEW_AS.lock() = None;
+
+    fn alive(cell: &narf_lib::sync::IrqSafeSpinLock<Option<Weak<AddressSpace>>>) -> bool {
+        cell.lock().as_ref().is_some_and(|w| w.strong_count() != 0)
+    }
+
+    // The image execve loads: one R|X PT_LOAD at 0x80_0000_1000 whose entry
+    // reports NEW_IMAGE_MARK through Sleep and then exits.
+    let sleep_n = Syscall::Sleep.raw().to_le_bytes();
+    let exit_n = Syscall::ExitTask.raw().to_le_bytes();
+    let execve_n = Syscall::Execve.raw().to_le_bytes();
+    let new_mark = (NEW_IMAGE_MARK as u32).to_le_bytes();
+    let old_mark = (OLD_IMAGE_MARK as u32).to_le_bytes();
+    let new_code: [u8; 32] = [
+        0x48,
+        0xC7,
+        0xC7,
+        new_mark[0],
+        new_mark[1],
+        new_mark[2],
+        new_mark[3], // mov rdi, NEW_IMAGE_MARK
+        0x48,
+        0xC7,
+        0xC0,
+        sleep_n[0],
+        sleep_n[1],
+        sleep_n[2],
+        sleep_n[3], // mov rax, Sleep
+        0xCD,
+        0x80, // int 0x80
+        0x48,
+        0xC7,
+        0xC0,
+        exit_n[0],
+        exit_n[1],
+        exit_n[2],
+        exit_n[3], // mov rax, ExitTask
+        0xCD,
+        0x80, // int 0x80
+        0xEB,
+        0xFE, // jmp $
+        0x90,
+        0x90,
+        0x90,
+        0x90,
+        0x90,
+    ];
+    const ENTRY: u64 = 0x0000_0080_0000_1111;
+    const PH_OFFSET: usize = 64 + 56;
+    let mut elf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(PH_OFFSET + 0x1000);
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type ET_EXEC
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine x86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&ENTRY.to_le_bytes()); // e_entry
+    elf.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type PT_LOAD
+    elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags R|X
+    elf.extend_from_slice(&(PH_OFFSET as u64).to_le_bytes()); // p_offset
+    elf.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    elf.resize(PH_OFFSET + 0x1000, 0);
+    let entry_off = PH_OFFSET + (ENTRY - 0x0000_0080_0000_1000) as usize;
+    elf[entry_off..entry_off + new_code.len()].copy_from_slice(&new_code);
+
+    // The pre-exec image: execve(path, NULL, NULL). Execve returns only on
+    // failure, and then the old image reports OLD_IMAGE_MARK with the error
+    // in rsi and exits.
+    let path_vaddr = (CODE_VADDR + PATH_OFFSET as u64).to_le_bytes();
+    let old_code: [u8; 51] = [
+        0x48,
+        0xBF,
+        path_vaddr[0],
+        path_vaddr[1],
+        path_vaddr[2],
+        path_vaddr[3],
+        path_vaddr[4],
+        path_vaddr[5],
+        path_vaddr[6],
+        path_vaddr[7], // mov rdi, path
+        0x31,
+        0xF6, // xor esi, esi
+        0x31,
+        0xD2, // xor edx, edx
+        0x48,
+        0xC7,
+        0xC0,
+        execve_n[0],
+        execve_n[1],
+        execve_n[2],
+        execve_n[3], // mov rax, Execve
+        0xCD,
+        0x80, // int 0x80
+        0x48,
+        0x89,
+        0xC6, // mov rsi, rax
+        0x48,
+        0xC7,
+        0xC7,
+        old_mark[0],
+        old_mark[1],
+        old_mark[2],
+        old_mark[3], // mov rdi, OLD_IMAGE_MARK
+        0x48,
+        0xC7,
+        0xC0,
+        sleep_n[0],
+        sleep_n[1],
+        sleep_n[2],
+        sleep_n[3], // mov rax, Sleep
+        0xCD,
+        0x80, // int 0x80
+        0x48,
+        0xC7,
+        0xC0,
+        exit_n[0],
+        exit_n[1],
+        exit_n[2],
+        exit_n[3], // mov rax, ExitTask
+        0xCD,
+        0x80, // int 0x80
+    ];
+    let path = b"/own-stack-exec/prog\0";
+
+    let cpu = narf_lib::percpu::current_cpu();
+    let original_cr3: u64;
+    // SAFETY: reading CR3 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    __test_clear_global();
+    narf_userspace::user_task::__test_clear_hooks();
+
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let Ok(mount) = narf_filesystem::registry().mount(
+        &auth,
+        "/own-stack-exec",
+        narf_filesystem::MemFs::with_seeds("own-stack-exec", &[("prog", elf.as_slice())]),
+    ) else {
+        return TestResult::Fail("mount of the execve image failed");
+    };
+
+    // SAFETY: paging is live in the kernel-test environment.
+    let Ok(addr_space) = (unsafe { AddressSpace::new_for_user() }) else {
+        let _ = narf_filesystem::registry().unmount(&mount, "/own-stack-exec");
+        return TestResult::Fail("new_for_user");
+    };
+    let (Ok(code_frame), Ok(stack_frame)) =
+        (narf_memory::alloc_frame(), narf_memory::alloc_frame())
+    else {
+        let _ = narf_filesystem::registry().unmount(&mount, "/own-stack-exec");
+        return TestResult::Fail("frame allocation failed");
+    };
+    let (code_frame, stack_frame) = (code_frame.start_address(), stack_frame.start_address());
+    if addr_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC,
+            phys: alloc::vec![code_frame],
+        })
+        .is_err()
+        || addr_space
+            .map_region(Region {
+                base: VirtAddr::new(STACK_VADDR),
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![stack_frame],
+            })
+            .is_err()
+    {
+        let _ = narf_filesystem::registry().unmount(&mount, "/own-stack-exec");
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: the frame is exclusively owned; code and path fit one page.
+    unsafe {
+        let page = code_frame.kernel_mut_ptr::<u8>();
+        core::ptr::write_bytes(page, 0, 0x1000);
+        core::ptr::copy_nonoverlapping(old_code.as_ptr(), page, old_code.len());
+        core::ptr::copy_nonoverlapping(path.as_ptr(), page.add(PATH_OFFSET), path.len());
+    }
+    // SAFETY: materialize publishes the complete mappings above.
+    if unsafe { addr_space.materialize() }.is_err() {
+        let _ = narf_filesystem::registry().unmount(&mount, "/own-stack-exec");
+        return TestResult::Fail("materialize failed");
+    }
+    let addr_space = Arc::new(addr_space);
+    *OLD_AS.lock() = Some(Arc::downgrade(&addr_space));
+
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    table.install_fn(Syscall::Sleep, "own-stack-exec-mark", |args| {
+        match args.arg0 {
+            NEW_IMAGE_MARK => {
+                NEW_IMAGE_RAN.fetch_add(1, Ordering::AcqRel);
+                if let Some(active) = narf_scheduler::current_address_space() {
+                    let cr3: u64;
+                    // SAFETY: reading CR3 has no side effects.
+                    unsafe {
+                        core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+                            options(nostack, nomem, preserves_flags));
+                    }
+                    let on_own_root = cr3 & ROOT_MASK == active.root.as_u64() & ROOT_MASK
+                        && !alive_is(&OLD_AS, &active);
+                    NEW_IMAGE_ON_OWN_ROOT.store(on_own_root as u64, Ordering::Release);
+                    *NEW_AS.lock() = Some(Arc::downgrade(&active));
+                }
+            }
+            OLD_IMAGE_MARK => EXECVE_RETURNED.store(args.arg1 | 1 << 63, Ordering::Release),
+            _ => {}
+        }
+        SyscallReturn::ok(0)
+    });
+    fn alive_is(
+        cell: &narf_lib::sync::IrqSafeSpinLock<Option<Weak<AddressSpace>>>,
+        active: &Arc<AddressSpace>,
+    ) -> bool {
+        cell.lock()
+            .as_ref()
+            .is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(active)))
+    }
+    install_global(table);
+
+    // execve's task id must be the scheduler's current task, as at boot.
+    install_task_id_lookup(|| narf_scheduler::current_task_id().raw());
+    narf_scheduler::__reset_queues_for_test();
+    narf_userspace::install_user_task_hooks();
+    let live_before = narf_scheduler::live_user_task_count();
+    let process = UserProcess {
+        pid: narf_userspace::alloc_pid(),
+        address_space: addr_space,
+        entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
+        stack_top: VirtAddr::new(STACK_VADDR + 0x1000),
+        fs_base: None,
+        entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
+    };
+    // Pinned here so the reap, and the executor's release of the last root
+    // it installed, happen on this CPU while the waiter watches.
+    let mut spec = TaskSpec::user_task();
+    spec.affinity = Affinity::pinned(CpuId(cpu as u32));
+    let _user_id = narf_userspace::user_task::spawn_user_process(process, spec);
+
+    // The waiter keeps this CPU's executor alive until the task is reaped and
+    // both address spaces are released, or the budget runs out.
+    let deadline = narf_time::Instant::now().plus_cycles(WAITER_BUDGET_CYCLES);
+    narf_scheduler::spawn(async move {
+        loop {
+            let reaped = narf_scheduler::live_user_task_count() <= live_before;
+            let old_alive = alive(&OLD_AS);
+            let new_alive = alive(&NEW_AS);
+            if reaped && !old_alive && !new_alive {
+                return;
+            }
+            if narf_time::Instant::now() >= deadline {
+                let code = if !reaped {
+                    1
+                } else if new_alive {
+                    2
+                } else {
+                    3
+                };
+                WAITER_ERROR.store(code, Ordering::Release);
+                return;
+            }
+            narf_scheduler::yield_now().await;
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+
+    // SAFETY: restore the kernel CR3 and kernel-GS state after the user task
+    // has exited, matching the neighbouring scheduled-user smokes.
+    unsafe {
+        core::arch::asm!("mov cr3, {value}", value = in(reg) original_cr3,
+            options(nostack, preserves_flags));
+        const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_KERNEL_GS_BASE,
+            in("eax") 0u32,
+            in("edx") 0u32,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    narf_userspace::user_task::__test_clear_hooks();
+    narf_userspace::handlers::__test_reset_task_id_lookup();
+    __test_clear_global();
+    let _ = narf_filesystem::registry().unmount(&mount, "/own-stack-exec");
+
+    let returned = EXECVE_RETURNED.load(Ordering::Acquire);
+    if returned != 0 {
+        let _ = writeln!(
+            Writer,
+            "    own-stack execve returned {:#x} to the old image",
+            returned & !(1 << 63)
+        );
+        return TestResult::Fail("own-stack execve returned to the old image");
+    }
+    if NEW_IMAGE_RAN.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("the new image did not run exactly once");
+    }
+    if NEW_IMAGE_ON_OWN_ROOT.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("the new image did not run on its own published address space");
+    }
+    match WAITER_ERROR.load(Ordering::Acquire) {
+        0 => TestResult::Pass,
+        1 => TestResult::Fail("the exec'd task was not reaped within the budget"),
+        2 => TestResult::Fail("the post-exec address space outlived its task"),
+        _ => TestResult::Fail("the pre-exec address space outlived its task"),
+    }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "verification/own-stack-exec",
+    smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_remote_call_completes_while_target_waits_for_shootdown_ack() -> TestResult {
     // Two IRQ-masked acknowledgement spins waiting on each other: the AP is a

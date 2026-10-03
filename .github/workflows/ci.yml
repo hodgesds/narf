@@ -846,6 +846,8 @@ jobs:
       # destination CPU's CR4.TSD re-armed there, and it Skips when no AP is
       # online. The rendezvous test also needs an AP: the AP's TLB-shootdown
       # wait and this CPU's remote-call wait must be forced onto each other.
+      # The own-stack execve test runs here because it needs a scheduled
+      # user task, which only `user-mode-e2e` builds can create.
       # A Skip is not coverage, so the step fails unless each named test
       # prints `[ OK ]` and the suite summary reports zero skips.
       - name: cargo xtask test — interception, SMP 2 (skip is failure)
@@ -858,7 +860,7 @@ jobs:
         run: |
           set -o pipefail
           cargo xtask test --arch=x86_64 --features user-mode-e2e --hw-profile minimal \
-            --subsystem verification/syscall-entry,verification/interception-migration,verification/smp-rendezvous \
+            --subsystem verification/syscall-entry,verification/interception-migration,verification/smp-rendezvous,verification/own-stack-exec \
             2>&1 | tee interception-smp2.log
           for t in \
             'verification/syscall-entry / smoke_frame_x86_64_user_mode_fast_syscall_interceptor' \
@@ -871,7 +873,8 @@ jobs:
             'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_requires_no_live_user_task' \
             'verification/syscall-entry / smoke_x86_64_instruction_interceptor_install_defers_concurrent_user_spawn' \
             'verification/interception-migration / smoke_scheduled_user_interception_survives_ap_migration' \
-            'verification/smp-rendezvous / smoke_remote_call_completes_while_target_waits_for_shootdown_ack'
+            'verification/smp-rendezvous / smoke_remote_call_completes_while_target_waits_for_shootdown_ack' \
+            'verification/own-stack-exec / smoke_own_stack_execve_runs_new_image_and_frees_both_address_spaces'
           do
             grep -qF "[ OK ] $t" interception-smp2.log || { echo "::error::not OK: $t"; exit 1; }
           done
