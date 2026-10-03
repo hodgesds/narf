@@ -15110,9 +15110,14 @@ pub fn hostname_init() {
             g.push_str("narf");
         }
     }
-    let mut g = DOMAINNAME.lock();
-    if g.is_empty() {
-        g.push_str("(none)");
+    // With the `container` feature a fresh `UtsNamespace` already starts at
+    // "(none)", and the static does not exist.
+    #[cfg(not(feature = "container"))]
+    {
+        let mut g = DOMAINNAME.lock();
+        if g.is_empty() {
+            g.push_str("(none)");
+        }
     }
 }
 
@@ -15131,11 +15136,18 @@ pub fn __test_hostname_reset() {
 /// image. Since `/proc/sys/kernel/domainname` and `uname(2)` both resolve
 /// here, that made `smoke_kernel_domainname_default` fail whenever it ran
 /// after `smoke_abi_creds_setdomainname_pos`.
+///
+/// With the `container` feature there is no static to reset: the harness's
+/// `namespaces::__test_reset_all()` drops every UTS namespace, and the fresh
+/// one reports "(none)".
 #[doc(hidden)]
 pub fn __test_domainname_reset() {
-    let mut g = DOMAINNAME.lock();
-    g.clear();
-    g.push_str("(none)");
+    #[cfg(not(feature = "container"))]
+    {
+        let mut g = DOMAINNAME.lock();
+        g.clear();
+        g.push_str("(none)");
+    }
 }
 
 // ── Wave-72 — uname(2), setdomainname(2), SysV IPC get-by-key ─────
