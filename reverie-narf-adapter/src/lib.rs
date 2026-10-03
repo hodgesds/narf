@@ -90,7 +90,11 @@
 //! **Invariant: the kernel panics.** A fatal that means the kernel or the
 //! host broke its own contract leaves no state that can be trusted, so
 //! `fatal` panics (`reverie-narf fatal in <callback>: <fatal>`). The panic
-//! handler (`console::panic_sink`) logs it and halts the kernel. These are
+//! handler (`console::panic_sink`) logs it and halts the panicking CPU
+//! (`halt_forever`). It does not stop the other CPUs, so on an SMP boot
+//! they keep running around the halted one, and any task or lock that
+//! CPU held is never released; a later panic on another CPU halts that
+//! CPU without logging (`IN_PANIC`). These are
 //! `OriginalAlreadyExecuted`, `ContinuationKernelMismatch` (this adapter has
 //! one memory type, `NarfMemory`), `UnexpectedReexecution`,
 //! `ReexecutionMismatch`, `RecursiveEntry`, `UnknownTask`, `DuplicateTask`,
@@ -166,6 +170,46 @@
 //!    (`reverie_narf_exit_group_with_sigterm_pending_runs`). Under
 //!    reverie-ptrace the same `exit_group` returns `-ERESTARTSYS` without
 //!    running, the next inject runs, and the task dies of `SIGTERM`.
+//!
+//! **Signals during a parked inject.** A Tool's non-tail inject that blocks
+//! parks the task, and the host resumes the Tool only if the task's next
+//! entry re-executes exactly that syscall: same instruction pointer, number
+//! and arguments (`take_park_reexecution` in `narf_userspace::syscall`).
+//! What a signal does to the park depends on its disposition:
+//! * **Handled.** The park ends and the handler runs on the syscall's
+//!   return path, with no user code in between. The handler's first syscall (at the latest its
+//!   `rt_sigreturn`) is another entry, so the inject returns `-ERESTARTSYS`,
+//!   as under ptrace, and the Tool gets one more poll in which it must
+//!   finish without running a syscall (reverie-narf-core `interrupt`); a
+//!   syscall there aborts the run with `TransitionAfterInterruption` (see
+//!   "Run aborts"). Whatever the callback then returns is discarded. After
+//!   the handler, the guest's syscall runs again and the Tool sees it as a
+//!   new syscall, so its callback runs again and repeats any side effects it
+//!   made before the inject. The syscall runs again even without
+//!   `SA_RESTART`: the park rewound the instruction pointer to the `syscall`
+//!   instruction (`park_reexecute_on_io_until`), and handler delivery on
+//!   that return path keeps that pointer (`deliver_signal_into_state`). Under Linux, and so under reverie-ptrace, a `read`
+//!   interrupted without `SA_RESTART` returns `-EINTR` instead, and the
+//!   callback does not run again.
+//! * **Ignored** (`SIG_IGN`, or `SIG_DFL` with an Ignore default such as
+//!   `SIGCHLD`). A pending ignored signal does not end the park
+//!   (`has_interrupting_signal`). One raised after that check can end it
+//!   once, through the raw pending recheck that follows the waker
+//!   registration (`park_should_block_decide`); the return path then
+//!   discards the signal, the task re-enters the same syscall, and the
+//!   inject continues. The Tool sees nothing.
+//! * **Stop** (default action). The park ends, and the task stops on the
+//!   syscall's return path before it runs any user code
+//!   (`enter_stopped`). While stopped it stays parked until `SIGCONT`,
+//!   unless `SIGKILL` is pending (`park_should_block_decide`).
+//!   `enter_stopped` stores 0 as the syscall's return value, which on the
+//!   rewound frame is the syscall-number register, so after `SIGCONT` the
+//!   task enters syscall 0 (`read`) with the parked call's arguments. For a
+//!   parked `read` that is the parked syscall, and the inject continues.
+//!   For any other parked syscall the entry does not match, the inject
+//!   returns `-ERESTARTSYS`, and a `read` with the other call's arguments
+//!   runs. This follows from the code; no test exercises a stop during a
+//!   parked inject.
 //!
 //! ## Limits of the in-kernel tests
 //!
