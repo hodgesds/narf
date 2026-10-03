@@ -3,9 +3,12 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Waker};
 
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_userspace::handlers::tool_view;
@@ -72,11 +75,27 @@ struct Inner<T: Tool> {
     host: Host<T>,
     /// Scheduler task id to Linux thread ID of every task the host tracks.
     hosted: IrqSafeSpinLock<BTreeMap<u64, Pid>>,
+    /// Set once the root is in `hosted` (see [`ReverieInterceptor::host_root`]).
+    root_hosted: AtomicBool,
     exits: IrqSafeSpinLock<Vec<TaskExitRecord>>,
     /// Set once a contained fatal has aborted the run (see [`FatalKind`]).
     aborted: AtomicBool,
     /// The first abort's reason, as logged.
     abort_reason: IrqSafeSpinLock<Option<String>>,
+}
+
+impl<T: Tool> Inner<T> {
+    /// Why a background task must stop now, if it must (see
+    /// [`ReverieInterceptor::spawn_background`]).
+    fn background_stop(&self, handles: &Weak<()>) -> Option<BackgroundEnd> {
+        if self.root_hosted.load(Ordering::Acquire) && self.hosted.lock().is_empty() {
+            return Some(BackgroundEnd::RunOver);
+        }
+        if handles.strong_count() == 0 {
+            return Some(BackgroundEnd::HandlesDropped);
+        }
+        None
+    }
 }
 
 /// Hosts Tool `T` for one run at Narf's syscall dispatcher.
@@ -88,12 +107,17 @@ struct Inner<T: Tool> {
 /// another to inspect the Tool's global state.
 pub struct ReverieInterceptor<T: Tool> {
     inner: Arc<Inner<T>>,
+    /// Shared by every handle and held by nothing else: a background task
+    /// keeps only a [`Weak`] to it, so it can tell when the last handle is
+    /// gone (see [`Self::spawn_background`]).
+    handles: Arc<()>,
 }
 
 impl<T: Tool> Clone for ReverieInterceptor<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            handles: self.handles.clone(),
         }
     }
 }
@@ -104,6 +128,35 @@ impl<T: Tool> core::fmt::Debug for ReverieInterceptor<T> {
             .field("hosted", &*self.inner.hosted.lock())
             .field("exits", &*self.inner.exits.lock())
             .finish_non_exhaustive()
+    }
+}
+
+/// Why a task started by [`ReverieInterceptor::spawn_background`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundEnd {
+    /// Its future completed.
+    Completed,
+    /// The run was over first; the future was dropped unfinished.
+    RunOver,
+    /// Every handle to the interceptor was gone first; the future was
+    /// dropped unfinished.
+    HandlesDropped,
+}
+
+/// The future a background task polls, borrowing the run's global state.
+pub type BackgroundFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// A task started by [`ReverieInterceptor::spawn_background`]. The task runs
+/// on whether or not this is kept.
+#[derive(Clone, Debug)]
+pub struct BackgroundTask {
+    end: Arc<IrqSafeSpinLock<Option<BackgroundEnd>>>,
+}
+
+impl BackgroundTask {
+    /// Why the task ended, or `None` while it runs.
+    pub fn end(&self) -> Option<BackgroundEnd> {
+        *self.end.lock()
     }
 }
 
@@ -201,10 +254,12 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
             inner: Arc::new(Inner {
                 host: Host::<T>::new(config)?.with_tool_constructor(new_tool),
                 hosted: IrqSafeSpinLock::new(BTreeMap::new()),
+                root_hosted: AtomicBool::new(false),
                 exits: IrqSafeSpinLock::new(Vec::new()),
                 aborted: AtomicBool::new(false),
                 abort_reason: IrqSafeSpinLock::new(None),
             }),
+            handles: Arc::new(()),
         })
     }
 
@@ -282,7 +337,51 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
             .host
             .register_root(tid, Pid::from_raw(ids.pid as i32))?;
         self.inner.hosted.lock().insert(task_id, tid);
+        // After the insert, so a background task never sees the root hosted
+        // and `hosted` still empty.
+        self.inner.root_hosted.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Starts a kernel task that polls the future `start` makes from the
+    /// run's global state, for a Tool whose global state does its work in a
+    /// future of its own beside the callbacks. Detcore's scheduler, which
+    /// runs that way on an external executor (`run_external_scheduler` in
+    /// `detcore/src/tool_global.rs`), is the intended user.
+    ///
+    /// The task polls as detcore-dbt's `run_cooperative`
+    /// (`detcore-dbt/src/lib.rs`) does: with a no-op waker, and, while the
+    /// future is pending, yielding to the other tasks between two polls. The
+    /// yield is busy: the task stays runnable, and `narf_scheduler::spawn`
+    /// pins it to the boot CPU, which does not idle while it runs.
+    ///
+    /// Before each poll, the task stops, dropping the future unfinished, if
+    /// either holds:
+    /// * the run is over: the root was hosted (see [`Self::host_root`]) and
+    ///   no hosted task is left. The last task's exit hooks may still be
+    ///   running on another CPU; they are polled once, so none can wait for
+    ///   the future.
+    /// * every handle to this interceptor is gone, the syscall table's
+    ///   included.
+    ///
+    /// An aborted run needs no rule of its own: the abort kills every hosted
+    /// process, so the run is over once they have exited.
+    ///
+    /// The future runs on the scheduler's own page tables, not on any hosted
+    /// task's, so a [`crate::NarfMemory`] it uses reaches no guest memory.
+    pub fn spawn_background<F>(&self, start: F) -> BackgroundTask
+    where
+        F: for<'a> FnOnce(&'a T::GlobalState) -> BackgroundFuture<'a> + Send + 'static,
+    {
+        let end = Arc::new(IrqSafeSpinLock::new(None));
+        let task = BackgroundTask { end: end.clone() };
+        let inner = self.inner.clone();
+        let handles = Arc::downgrade(&self.handles);
+        narf_scheduler::spawn(async move {
+            let reason = run_background(&inner, &handles, start).await;
+            *end.lock() = Some(reason);
+        });
+        task
     }
 
     /// The run's host.
@@ -328,6 +427,29 @@ impl<T: Tool + 'static> ReverieInterceptor<T> {
                 hosted.insert(task_id, tid);
             }
         }
+    }
+}
+
+/// The body of a background task (see [`ReverieInterceptor::spawn_background`]).
+/// The future is dropped here, before the task releases `inner`.
+async fn run_background<T, F>(inner: &Inner<T>, handles: &Weak<()>, start: F) -> BackgroundEnd
+where
+    T: Tool,
+    F: for<'a> FnOnce(&'a T::GlobalState) -> BackgroundFuture<'a>,
+{
+    let mut future = start(inner.host.global());
+    loop {
+        if let Some(end) = inner.background_stop(handles) {
+            return end;
+        }
+        if future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return BackgroundEnd::Completed;
+        }
+        narf_scheduler::yield_now().await;
     }
 }
 

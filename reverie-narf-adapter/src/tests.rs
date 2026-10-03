@@ -34,7 +34,10 @@ use reverie_narf_tools::passthrough::PassThrough;
 use reverie_narf_tools::probe::Probe;
 use reverie_narf_tools::strace;
 
-use crate::interceptor::{ConsoleSink, ReverieInterceptor, TaskExitRecord};
+use crate::interceptor::{
+    BackgroundEnd, BackgroundFuture, BackgroundTask, ConsoleSink, ReverieInterceptor,
+    TaskExitRecord,
+};
 use crate::services::{map_native_outcome, NarfKernelServices};
 
 static CANONICAL_GUEST: &[u8] = include_bytes!(env!("REVERIE_NARF_GUEST_CANONICAL"));
@@ -3266,6 +3269,296 @@ fn reverie_narf_kill_ends_a_wait_without_running_its_syscall() -> TestResult {
     })())
 }
 reverie_narf_test!(reverie_narf_kill_ends_a_wait_without_running_its_syscall);
+
+// ── Background futures ────────────────────────────────────────────────────
+
+/// [`run_hosted`], with a background task started from `start` once the root
+/// is hosted. It is started in `register`, after the harness has cleared the
+/// run queues, which would discard a task started earlier.
+fn run_hosted_with_background<T, F>(
+    elf: &[u8],
+    config: <T::GlobalState as reverie::GlobalTool>::Config,
+    start: F,
+) -> Result<(ReverieInterceptor<T>, Root, BackgroundTask), &'static str>
+where
+    T: Tool + 'static,
+    F: for<'a> FnOnce(&'a T::GlobalState) -> BackgroundFuture<'a> + Send + 'static,
+{
+    let interceptor = match ReverieInterceptor::<T>::new(config) {
+        Ok(interceptor) => interceptor,
+        Err(_) => return Err("NarfToolHost::new refused the Tool"),
+    };
+    let mut background = None;
+    let root = run_guest(elf, interceptor.boxed(), |root| {
+        interceptor
+            .host_root(root.task_id)
+            .map_err(|_| "register_root refused the root task")?;
+        background = Some(interceptor.spawn_background(start));
+        Ok(())
+    })?;
+    let background = background.ok_or("the background task was never started")?;
+    Ok((interceptor, root, background))
+}
+
+/// Where [`Relayed`]'s child callback and the background future meet.
+#[derive(Debug, Default)]
+struct Relay {
+    /// The child's callback has started.
+    callback_started: AtomicBool,
+    /// The background future has seen it start.
+    released: AtomicBool,
+    /// Polls of the background future's and of the child callback's wait.
+    background_polls: AtomicU64,
+    callback_polls: AtomicU64,
+}
+
+impl Relay {
+    /// The background future: waits until the child's callback has started,
+    /// then releases it. Pending on its first poll whatever the order.
+    async fn release_waiting_callback(&self) {
+        if wait_for(&self.callback_started, &self.background_polls, true).await {
+            self.released.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for Relay {
+    type Request = u64;
+    type Response = i64;
+    type Config = ();
+
+    async fn init_global_state(_: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, request: u64) -> i64 {
+        if request == MEET_PARENT {
+            return MEET_PARENT_VALUE;
+        }
+        self.callback_started.store(true, Ordering::Release);
+        if wait_for(&self.released, &self.callback_polls, false).await {
+            MEET_CHILD_VALUE
+        } else {
+            WAIT_GAVE_UP
+        }
+    }
+}
+
+/// Sends the rendezvous guest's child `getuid` and parent `getgid` to
+/// [`Relay`]: the child's waits until the background future releases it,
+/// and the parent's returns at once. Everything else is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct Relayed;
+
+#[reverie::tool]
+impl Tool for Relayed {
+    type GlobalState = Relay;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        match syscall.number().id() as u32 {
+            LINUX_GETUID => Ok(guest.send_rpc(MEET_CHILD).await),
+            LINUX_GETGID => Ok(guest.send_rpc(MEET_PARENT).await),
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// A background future run by the host releases a callback that waits for
+/// it, as Detcore's scheduler releases a thread waiting for its turn: the
+/// rendezvous guest's child `getuid` waits until [`Relay`]'s background
+/// future has seen it start, the child gets its value and exits 0, and the
+/// parent reaps it and exits 0. The background future is pending on its
+/// first poll, so it must be polled again; were it not, the child's wait
+/// would give up.
+fn reverie_narf_background_future_releases_a_waiting_callback() -> TestResult {
+    result_of((|| {
+        let (interceptor, root, background) =
+            run_hosted_with_background::<Relayed, _>(RENDEZVOUS_GUEST, (), |relay: &Relay| {
+                Box::pin(relay.release_waiting_callback())
+            })?;
+        let relay = interceptor.host().global();
+        let background_polls = relay.background_polls.load(Ordering::Acquire);
+        let callback_polls = relay.callback_polls.load(Ordering::Acquire);
+        let end = background.end();
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    background polls {background_polls} callback polls {callback_polls} \
+             end {end:?} abort reason {reason:?}"
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        if background_polls < 2 {
+            return Err("the background future was not polled again after it was pending");
+        }
+        if end != Some(BackgroundEnd::Completed) {
+            return Err("the background task did not end with its future completed");
+        }
+        let exits = check_teardown(&interceptor, root, 2, 0)?;
+        if exits.iter().any(|exit| exit.wstatus != 0) {
+            return Err("a task of the rendezvous guest did not exit 0");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_background_future_releases_a_waiting_callback);
+
+/// Answers the rendezvous guest's child `getuid` and parent `getgid` at
+/// once; everything else is tail-injected.
+#[derive(Debug, Default, Clone, Copy)]
+struct Answer;
+
+#[reverie::tool]
+impl Tool for Answer {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo as _;
+        match syscall.number().id() as u32 {
+            LINUX_GETUID => Ok(MEET_CHILD_VALUE),
+            LINUX_GETGID => Ok(MEET_PARENT_VALUE),
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// The flag [`wait_unreleased`] waits for, which nothing sets; the polls of
+/// its wait; how often it went on past the wait; and how often a started
+/// one was dropped.
+static BACKGROUND_NEVER: AtomicBool = AtomicBool::new(false);
+static BACKGROUND_POLLS: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_AFTER: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Clears what [`wait_unreleased`] records, before a run.
+fn reset_background() {
+    BACKGROUND_NEVER.store(false, Ordering::Release);
+    for counter in [&BACKGROUND_POLLS, &BACKGROUND_AFTER, &BACKGROUND_DROPPED] {
+        counter.store(0, Ordering::Release);
+    }
+}
+
+/// A background future that does not finish before its wait gives up: it
+/// waits for [`BACKGROUND_NEVER`], pending on its first poll, and counts
+/// that it went on past the wait. Once started, its drop is counted.
+fn wait_unreleased(_: &()) -> BackgroundFuture<'_> {
+    Box::pin(async {
+        let _mark = CountDrop(&BACKGROUND_DROPPED);
+        let _ = wait_for(&BACKGROUND_NEVER, &BACKGROUND_POLLS, true).await;
+        BACKGROUND_AFTER.fetch_add(1, Ordering::AcqRel);
+    })
+}
+
+/// A background future that has not finished when the run is over is
+/// dropped then: the rendezvous guest runs with [`Answer`] and exits 0, and
+/// the background task, once the last hosted task has exited, stops and
+/// drops [`wait_unreleased`]'s future in its wait. A background future
+/// started after that is stopped before its first poll.
+fn reverie_narf_background_future_ends_with_the_run() -> TestResult {
+    reset_background();
+    result_of((|| {
+        let (interceptor, root, background) =
+            run_hosted_with_background::<Answer, _>(RENDEZVOUS_GUEST, (), wait_unreleased)?;
+        let polls = BACKGROUND_POLLS.load(Ordering::Acquire);
+        let after = BACKGROUND_AFTER.load(Ordering::Acquire);
+        let dropped = BACKGROUND_DROPPED.load(Ordering::Acquire);
+        let end = background.end();
+        let reason = interceptor.abort_reason();
+        let _ = writeln!(
+            Writer,
+            "    background polls {polls} after {after} dropped {dropped} end {end:?} \
+             abort reason {reason:?}"
+        );
+        if reason.is_some() {
+            return Err("the run was aborted");
+        }
+        if polls == 0 {
+            return Err("the background future was never polled");
+        }
+        if end != Some(BackgroundEnd::RunOver) {
+            return Err("the background task did not end with the run");
+        }
+        if after != 0 || dropped != 1 {
+            return Err("the background future was not dropped in its wait");
+        }
+        let exits = check_teardown(&interceptor, root, 2, 0)?;
+        if exits.iter().any(|exit| exit.wstatus != 0) {
+            return Err("a task of the rendezvous guest did not exit 0");
+        }
+        let late = interceptor.spawn_background(wait_unreleased);
+        narf_scheduler::run_until_empty();
+        let late_end = late.end();
+        let late_polls = BACKGROUND_POLLS.load(Ordering::Acquire) - polls;
+        let late_dropped = BACKGROUND_DROPPED.load(Ordering::Acquire) - dropped;
+        let _ = writeln!(
+            Writer,
+            "    late background polls {late_polls} dropped {late_dropped} end {late_end:?}"
+        );
+        if late_end != Some(BackgroundEnd::RunOver) {
+            return Err("a background task started after the run did not end with it");
+        }
+        if late_polls != 0 || late_dropped != 0 {
+            return Err("a background future started after the run was polled");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_background_future_ends_with_the_run);
+
+/// A background task stops once every handle to its interceptor is gone,
+/// and before a root is hosted that is its only rule: with no guest at all,
+/// another kernel task drops the last handle once the background future has
+/// been polled, and the background task stops and drops the future in its
+/// wait.
+fn reverie_narf_background_future_ends_when_every_handle_is_dropped() -> TestResult {
+    reset_background();
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<Answer>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        narf_scheduler::__reset_queues_for_test();
+        let background = interceptor.spawn_background(wait_unreleased);
+        narf_scheduler::spawn(async move {
+            let deadline = narf_time::Deadline::after_cycles(CALLBACK_WAIT_CYCLES);
+            while BACKGROUND_POLLS.load(Ordering::Acquire) == 0 && !deadline.expired() {
+                narf_scheduler::yield_now().await;
+            }
+            drop(interceptor);
+        });
+        narf_scheduler::run_until_empty();
+        let polls = BACKGROUND_POLLS.load(Ordering::Acquire);
+        let after = BACKGROUND_AFTER.load(Ordering::Acquire);
+        let dropped = BACKGROUND_DROPPED.load(Ordering::Acquire);
+        let end = background.end();
+        let _ = writeln!(
+            Writer,
+            "    background polls {polls} after {after} dropped {dropped} end {end:?}"
+        );
+        if polls == 0 {
+            return Err("the background future was never polled");
+        }
+        if end != Some(BackgroundEnd::HandlesDropped) {
+            return Err("the background task did not end when its last handle was dropped");
+        }
+        if after != 0 || dropped != 1 {
+            return Err("the background future was not dropped in its wait");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+reverie_narf_test!(reverie_narf_background_future_ends_when_every_handle_is_dropped);
 
 // ── vDSO calls reach the Tool─────────────────────────────────────────────
 

@@ -149,6 +149,28 @@
 //!   `handle_thread_start`, `handle_post_exec`, the exit hooks, the poll
 //!   after a signal interrupted a parked inject, and `init_global_state`.
 //!
+//! **Background futures.** Under reverie-ptrace, a global state with work
+//! of its own spawns it on the tracer's tokio runtime, as Detcore's
+//! scheduler does (`tokio::spawn(sched_loop(..))` in
+//! `detcore/src/tool_global.rs`). There is no such runtime here:
+//! `ReverieInterceptor::spawn_background` starts a kernel task that polls
+//! the future, the backend executor Detcore's `run_external_scheduler`
+//! expects.
+//! * The task polls with a no-op waker and yields between two polls, as
+//!   detcore-dbt's `run_cooperative` does. The yield is busy: the task stays
+//!   runnable, pinned to the boot CPU, which does not idle while it runs
+//!   (`reverie_narf_background_future_releases_a_waiting_callback`).
+//! * The task stops, dropping the future unfinished, once the run is over:
+//!   the root was hosted and no hosted task is left. A future started after
+//!   that is never polled (`reverie_narf_background_future_ends_with_the_run`).
+//!   An aborted run ends this way too, once the abort's `SIGKILL` has ended
+//!   every hosted process.
+//! * The task also stops once every handle to the interceptor is gone, the
+//!   only rule before a root is hosted
+//!   (`reverie_narf_background_future_ends_when_every_handle_is_dropped`).
+//! * The future runs on the scheduler's own page tables, so a `NarfMemory`
+//!   used there reaches no guest's memory.
+//!
 //! **vDSO calls.** Installing the interceptor for a Tool subscribed to any
 //! one of `clock_gettime`, `gettimeofday`, `time` or `getcpu` routes all four
 //! vDSO entries through syscalls. The route is one vvar clock-mode word, so
@@ -320,6 +342,9 @@ mod services;
 mod tests;
 
 #[cfg(target_arch = "x86_64")]
-pub use interceptor::{ConsoleSink, IrqSpinTaskLock, ReverieInterceptor, TaskExitRecord};
+pub use interceptor::{
+    BackgroundEnd, BackgroundFuture, BackgroundTask, ConsoleSink, IrqSpinTaskLock,
+    ReverieInterceptor, TaskExitRecord,
+};
 #[cfg(target_arch = "x86_64")]
 pub use services::{map_native_outcome, NarfKernelServices, NarfMemory};

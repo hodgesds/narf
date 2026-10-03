@@ -58,7 +58,10 @@ fn pid(raw: u64) -> Pid {
 /// Valid while the task it was obtained for is the one running, which holds
 /// whenever the core polls that task's callback, after a repoll wait too.
 /// The handle names no task: a copy kept in the global state and used from
-/// another task's callback reaches that task's address space. Every access
+/// another task's callback reaches that task's address space, and one used
+/// from a background future
+/// ([`crate::ReverieInterceptor::spawn_background`]), which runs on the
+/// scheduler's own page tables, reaches no guest's memory. Every access
 /// goes through the kernel's checked user-copy primitives, so a bad address
 /// is an `EFAULT`, never a kernel access.
 #[derive(Clone, Copy, Debug)]
