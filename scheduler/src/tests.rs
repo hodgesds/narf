@@ -1418,12 +1418,14 @@ fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestRes
     extern crate alloc;
     use crate::{spawn, spawn_user, TaskSpec};
     use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use narf_memory::AddressSpace;
 
     static REPLACEMENT: AtomicU64 = AtomicU64::new(0);
     static OLD_MM_SUCCESSOR: AtomicU64 = AtomicU64::new(0);
     static KERNEL: AtomicU64 = AtomicU64::new(0);
+    static STORED: AtomicBool = AtomicBool::new(false);
+    STORED.store(false, Ordering::Relaxed);
     REPLACEMENT.store(0, Ordering::Relaxed);
     OLD_MM_SUCCESSOR.store(0, Ordering::Relaxed);
     KERNEL.store(0, Ordering::Relaxed);
@@ -1453,8 +1455,10 @@ fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestRes
             // Exercise execve's real current-task replacement path. The task
             // completes in this same poll, so no later dispatch exists to
             // consume the deferred slot update.
-            let _ =
-                crate::replace_address_space(replacement_task, Arc::clone(&replacement_for_poll));
+            let stored =
+                crate::replace_address_space(replacement_task, Arc::clone(&replacement_for_poll))
+                    .is_ok();
+            STORED.store(stored, Ordering::Release);
             let _ = replacement_for_poll.activate();
             // SAFETY: user futures are polled by the executor at CPL0/EL1.
             REPLACEMENT.store(
@@ -1493,6 +1497,9 @@ fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestRes
     drop(old_mm);
     drop(replacement);
 
+    if !STORED.load(Ordering::Acquire) {
+        return TestResult::Fail("in-poll replacement reported that no slot took the new AS");
+    }
     if replacement_seen & ROOT_MASK != replacement_root & ROOT_MASK {
         return TestResult::Fail("in-poll replacement root was not activated");
     }
@@ -1511,6 +1518,58 @@ fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestRes
 kernel_test_in!(
     "scheduler",
     smoke_scheduler_address_space_handoff_reconciles_in_poll_replace
+);
+
+/// A replacement with no slot to take it must hand the address space back.
+/// The own-stack execve path drops every other reference before running on
+/// the new AS and relies on `Ok` meaning the slot holds one. Outside any poll
+/// this CPU's current task is `TaskId::NONE`, so a NONE id matched the
+/// in-poll comparison and was parked where no poll ever collects it; an id
+/// that is neither current nor queued stores nothing either.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_scheduler_replace_address_space_without_slot_returns_it() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use narf_memory::AddressSpace;
+
+    crate::__reset_queues_for_test();
+    if crate::current_task_id() != crate::TaskId::NONE {
+        return TestResult::Fail("fixture drifted: test body ran inside a task poll");
+    }
+    // SAFETY: paging is live in the kernel-test environment.
+    let addr_space = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc AS"));
+    let cases: [(crate::TaskId, &'static str, &'static str); 2] = [
+        (
+            crate::TaskId::NONE,
+            "replacement for TaskId::NONE claimed a slot took the AS",
+            "replacement for TaskId::NONE kept a reference to the AS",
+        ),
+        (
+            crate::alloc_task_id(),
+            "replacement for an unqueued id claimed a slot took the AS",
+            "replacement for an unqueued id kept a reference to the AS",
+        ),
+    ];
+    for (id, claimed, kept) in cases {
+        match crate::replace_address_space(id, Arc::clone(&addr_space)) {
+            Err(back) if Arc::ptr_eq(&back, &addr_space) => drop(back),
+            Err(_) => return TestResult::Fail("no-slot replacement returned a different AS"),
+            Ok(_) => {
+                crate::__reset_queues_for_test();
+                return TestResult::Fail(claimed);
+            }
+        }
+        if Arc::strong_count(&addr_space) != 1 {
+            crate::__reset_queues_for_test();
+            return TestResult::Fail(kept);
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_replace_address_space_without_slot_returns_it
 );
 
 // ── relocated from verification ──

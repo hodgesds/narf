@@ -2285,8 +2285,8 @@ fn smoke_abi_proc2_prctl_closed_value_sets_are_einval() -> TestResult {
             return Err("PR_SET_TSC must accept PR_TSC_ENABLE");
         }
         // NARF has no per-task timestamp-fault mode, so PR_TSC_SIGSEGV is
-        // the same closed-set refusal `kernel/sys.c` gives on architectures
-        // without SET_TSC_CTL; success would claim RDTSC now faults.
+        // refused where x86 Linux accepts it, a deliberate divergence the
+        // userspace spec states; success would claim RDTSC now faults.
         if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 2)) != Some(EINVAL) {
             return Err("PR_SET_TSC(PR_TSC_SIGSEGV) must be -EINVAL");
         }

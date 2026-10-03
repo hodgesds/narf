@@ -3787,8 +3787,15 @@ pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
 /// bookkeeping (fd table, brk, sigaction handlers) all stay
 /// keyed to the same id.
 ///
-/// Returns None if no slot with that id is on any ready queue.
-pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+/// `Ok` means the slot now holds `new_arc`; its payload is the displaced
+/// Arc, if any. `Err` hands `new_arc` back when `id` is neither the task
+/// this CPU is polling nor on any ready queue, and nothing was stored: a
+/// caller about to drop its own references to `new_arc` (the own-stack
+/// execve path) must not proceed on `Err`.
+pub fn replace_address_space(
+    id: TaskId,
+    new_arc: Arc<AddressSpace>,
+) -> Result<Option<Arc<AddressSpace>>, Arc<AddressSpace>> {
     // `TaskId::NONE` names no task, so there is no slot to attach to. It
     // must not reach the in-poll branch below: outside any poll this CPU's
     // `current_task_slot()` is also NONE, so the comparison would match and
@@ -3796,7 +3803,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
     // by a task id no poll ever pops — keeping the address space alive with
     // no owner until some later NONE-keyed replacement displaces it.
     if id == TaskId::NONE {
-        return None;
+        return Err(new_arc);
     }
     // Wave-49fu: when execve fires from inside a user task's poll
     // body (the normal case), the slot has been popped from the
@@ -3829,7 +3836,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         p.retain(|(k, _)| *k != id.raw());
         p.push((id.raw(), new_arc));
         PENDING_SLOT_AS_LEN[task_affinity_shard(id)].store(p.len(), Ordering::Release);
-        return prev;
+        return Ok(prev);
     }
     for q in READY.iter() {
         let mut g = q.lock();
@@ -3837,11 +3844,11 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             if let Some(slot) = dq.iter_mut().find(|s| s.id == id) {
                 let prev = slot.addr_space.take();
                 slot.addr_space = Some(new_arc);
-                return prev;
+                return Ok(prev);
             }
         }
     }
-    None
+    Err(new_arc)
 }
 
 /// Wave-49fu: pending slot AS updates queued by `replace_address_

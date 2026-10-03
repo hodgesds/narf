@@ -1861,7 +1861,7 @@ fn do_execve_resolved(
     // Step 5: swap the scheduler slot's AS Arc. Without this the
     // poll path's later activate() would still target the old AS
     // until the future's process.address_space update lands.
-    let prev_slot_as = narf_scheduler::replace_address_space(
+    let slot_swap = narf_scheduler::replace_address_space(
         narf_scheduler::TaskId(task),
         new_proc.address_space.clone(),
     );
@@ -1883,6 +1883,15 @@ fn do_execve_resolved(
     // "memory allocation of N bytes failed" kernel-heap OOM panic.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled() {
+        // Every local reference to the new AS, `new_proc`'s and `new_as`
+        // below, is dropped before the jump, so the slot's is the only one
+        // left while the new image runs on it. If Step 5 stored nothing,
+        // the last drop would free page tables that are live in CR3. The
+        // exec is already past the point where it could fail back to the
+        // old image, so stop here, before any of those drops.
+        let Ok(prev_slot_as) = slot_swap else {
+            panic!("own-stack execve: task {task} has no scheduler slot to hold its new address space");
+        };
         let entry = new_proc.entry.0.as_u64();
         let rsp = new_proc.stack_top.as_u64();
         #[cfg(target_arch = "x86_64")]
@@ -1967,8 +1976,10 @@ fn do_execve_resolved(
         Some(p) => p,
         None => {
             // No active user-task ctx — execve called outside a
-            // polling future (e.g. from a kernel-test stub). Roll
-            // back the slot AS swap and bail.
+            // polling future (e.g. from a kernel-test stub). Bail
+            // without undoing Step 5: outside any poll it stored
+            // the new AS only if the stub's task id names a queued
+            // slot.
             //
             // -ENOSYS, not the old `invalid_op()`. `invalid_op` leaves
             // `value` at 0, and 0 from execve means the exec SUCCEEDED —
@@ -2025,7 +2036,7 @@ fn do_execve_resolved(
         drop(argv_strs);
         drop(envp_strs);
         drop(path_owned);
-        drop(prev_slot_as);
+        drop(slot_swap);
         // SAFETY: hook is a fn ptr installed at boot; uctx is live.
         unsafe { h(uctx_ptr) };
         // longjmp doesn't return; if it does (no jmp buf installed),
