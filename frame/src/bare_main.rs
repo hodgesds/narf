@@ -4039,10 +4039,15 @@ pub unsafe extern "C" fn _start_rust(
     // exit_kernel(42). If the IDT weren't installed this would
     // triple-fault into a reset loop (blocked by `-no-reboot`).
     //
-    // The asm is `noreturn`, so on x86_64 with idt-selftest nothing after
-    // this block can run. Every statement below it is therefore compiled
-    // out of that configuration (`not(all(target_arch = "x86_64", feature =
-    // "idt-selftest"))`) rather than left in as unreachable code.
+    // aarch64 runs the analogue: `udf #0`, a permanently-undefined
+    // instruction, taken as a current-EL synchronous exception with
+    // `ESR_EL1.EC == 0`. `rust_aarch64_sync_dispatch` names it as the
+    // self-test and exits through the same fatal path, also with 42.
+    //
+    // Both are `noreturn`, so with idt-selftest nothing after this block can
+    // run on either arch. Every statement below it is therefore compiled out
+    // of that configuration (`not(feature = "idt-selftest")`) rather than
+    // left in as unreachable code.
     #[cfg(all(target_arch = "x86_64", feature = "idt-selftest"))]
     {
         let _ = writeln!(console::Writer, "  self-test: triggering #UD ...");
@@ -4052,6 +4057,14 @@ pub unsafe extern "C" fn _start_rust(
         unsafe {
             core::arch::asm!("ud2", options(noreturn));
         }
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "idt-selftest"))]
+    {
+        let _ = writeln!(console::Writer, "  self-test: triggering UDF (EC=0) ...");
+        // SAFETY: the EL1 vector table is installed by this point, and the
+        // current-EL synchronous handler exits through exit_kernel(42), so
+        // this call never returns.
+        unsafe { aarch64::trap::idt_selftest_udf() }
     }
 
     // End-of-boot splash. Composes a one-screen "kernel up" panel
@@ -4105,7 +4118,7 @@ pub unsafe extern "C" fn _start_rust(
     // That ambiguity is unresolvable from inside the guest (journald may not
     // even be up to record it), so the count is published here where the
     // serial log always captures it.
-    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
+    #[cfg(not(feature = "idt-selftest"))]
     {
         let (replay_start, seqnum, ring, overrun) = narf_filesystem::uevent::boot_replay_health();
         let _ = writeln!(
@@ -4134,12 +4147,12 @@ pub unsafe extern "C" fn _start_rust(
     // it in the common post-init path: putting this only in `run_async_demo`
     // left kernel-test mappings unretained, so their canonical file-cache
     // frame could be returned to the allocator while the VMA still named it.
-    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
+    #[cfg(not(feature = "idt-selftest"))]
     narf_memory::install_shared_frame_hooks(
         narf_userspace::retain_external_shared_frame,
         narf_userspace::release_external_shared_frame,
     );
-    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
+    #[cfg(not(feature = "idt-selftest"))]
     narf_memory::install_address_space_drop_hook(narf_userspace::drop_mapped_file_address_space);
 
     // Let a filesystem driver ask Linux's `capable()` about the calling
@@ -4153,17 +4166,14 @@ pub unsafe extern "C" fn _start_rust(
     // supposed to catch and would instead have been asserting.
     //
     // Same reasoning as `install_shared_frame_hooks` above.
-    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
+    #[cfg(not(feature = "idt-selftest"))]
     narf_filesystem::install_caller_capable_hook(narf_userspace::handlers::caller_capable);
-    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
+    #[cfg(not(feature = "idt-selftest"))]
     narf_filesystem::install_in_group_hook(narf_userspace::handlers::caller_in_group_or_capable);
 
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
-    #[cfg(all(
-        feature = "kernel-test",
-        not(all(target_arch = "x86_64", feature = "idt-selftest"))
-    ))]
+    #[cfg(all(feature = "kernel-test", not(feature = "idt-selftest")))]
     {
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
@@ -4198,7 +4208,7 @@ pub unsafe extern "C" fn _start_rust(
     #[cfg(all(
         feature = "boot-smoke",
         not(feature = "kernel-test"),
-        not(all(target_arch = "x86_64", feature = "idt-selftest"))
+        not(feature = "idt-selftest")
     ))]
     {
         let _ = writeln!(console::Writer, "  boot-smoke: draining tasks...");

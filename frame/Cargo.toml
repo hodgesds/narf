@@ -231,8 +231,9 @@ default = ["user-task-smp"]
 # Full musl-demo (82/82) + boot-smoke soak clean under migration.
 user-task-smp = []
 
-# Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
-# Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
+# Self-test: trigger a #UD (x86_64) or `udf #0` (aarch64) at end-of-boot to
+# prove the exception vectors dispatch; the handler exits with 42.
+# Off by default; enable with `cargo xtask run --arch=<arch> --features idt-selftest`.
 idt-selftest = []
 # Full-boot smoke: exercise the real init flow (not the kernel-test
 # harness), then ACPI-shutdown cleanly via `narf_arch::exit_kernel(0)`

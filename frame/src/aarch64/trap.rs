@@ -245,8 +245,43 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // a JIT bug, and resuming anyway would turn it into a corrupt register.
     }
 
+    // The `idt-selftest` UDF: report it as the self-test, then take the same
+    // fatal path as any other unknown exception, which exits with 42 as the
+    // x86_64 #UD self-test does. The address check keeps a stray undefined
+    // instruction anywhere else from being reported as the self-test.
+    #[cfg(feature = "idt-selftest")]
+    {
+        /// `ESR_EL1.EC` for an exception with an unknown reason, which is what
+        /// a permanently-undefined instruction such as `udf` raises.
+        const EC_UNKNOWN: u64 = 0b00_0000;
+        if ec == EC_UNKNOWN && frame.elr == idt_selftest_udf as usize as u64 {
+            let _ = writeln!(
+                Writer,
+                "  self-test: caught EC=0 (unknown reason) at the idt-selftest UDF, ELR={:#x}",
+                frame.elr
+            );
+        }
+    }
+
     // Non-recoverable synchronous exception — fatal.
     rust_aarch64_sync(frame);
+}
+
+/// The aarch64 analogue of the x86_64 `idt-selftest` `ud2`: a permanently
+/// undefined instruction, `udf #0`, which traps to the current-EL synchronous
+/// vector with `ESR_EL1.EC == 0`.
+///
+/// A naked function so that its address is the address of the `udf` itself,
+/// which is what `ELR_EL1` holds when the exception is taken;
+/// `rust_aarch64_sync_dispatch` compares the two to recognise the self-test.
+///
+/// # Safety
+/// Never returns. The EL1 vector table must be installed, or the exception
+/// has nowhere to go.
+#[cfg(feature = "idt-selftest")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn idt_selftest_udf() -> ! {
+    core::arch::naked_asm!("udf #0")
 }
 
 /// Whether `a` is a canonical user-half (lower) address on aarch64.
