@@ -124,6 +124,8 @@ pub enum VirtioPciError {
     /// A bounded controlQ request cannot hold the caller's command stream.
     /// Callers must split work at a protocol boundary instead of truncating.
     RequestTooLarge,
+    /// A DMA buffer for the request could not be allocated.
+    OutOfMemory,
 }
 
 /// Walk the standard cap list looking for the four virtio caps and

@@ -771,15 +771,19 @@ kernel_test_in!(
     smoke_dri_card_virtgpu_version_matches_linux
 );
 
-/// The ioctl gate must admit the multi-page command streams Mesa submits
-/// while creating a classic-VirGL screen, while retaining a finite cap.
+/// The ioctl gate must admit every command buffer Mesa submits: the
+/// multi-page streams of classic-VirGL screen creation, and a full Mesa
+/// command buffer — VIRGL_MAX_CMDBUF_DWORDS = 64 Ki + 1024 dwords
+/// (virgl_winsys.h) — which Mesa flushes in one EXECBUFFER and drops on
+/// error ("expect bad rendering"). A finite cap is still kept.
 fn smoke_virtgpu_execbuffer_capacity_covers_mesa_init() -> TestResult {
-    for size in [4_136, 9_504, 18_412] {
+    const VIRGL_MAX_CMDBUF_BYTES: usize = ((64 * 1024) + 1024) * 4;
+    for size in [4_136, 9_504, 18_412, VIRGL_MAX_CMDBUF_BYTES] {
         if size > crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES {
-            return TestResult::Fail("Mesa VirGL initialization execbuffer is rejected");
+            return TestResult::Fail("a Mesa VirGL command buffer size is rejected");
         }
     }
-    if crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES >= 1024 * 1024 {
+    if crate::drm_ioctl_bridge::VIRTGPU_EXECBUFFER_MAX_BYTES > 4 * 1024 * 1024 {
         return TestResult::Fail("VirtGPU execbuffer bound is not meaningfully constrained");
     }
     TestResult::Pass

@@ -118,14 +118,17 @@ const FMT_B8G8R8X8_UNORM: u32 = 1;
 const MAX_SCANOUTS: usize = 16;
 const HDR_LEN: usize = 24;
 
-/// DMA staging capacity for one VirtIO-GPU control request.
-///
-/// Classic-VirGL Mesa sends multi-page initialization command streams before
-/// creating its first resource (up to 18,412 bytes in the CachyOS guest), so a
-/// single 4 KiB page is not sufficient. Keep the allocation bounded while
-/// leaving room for normal shader/capability initialization batches.
+/// DMA staging capacity for one VirtIO-GPU control request (headers, inline
+/// mem-entry arrays). A VirGL command stream does not travel in it: it gets
+/// its own data descriptor (see [`VirtioGpuPci::submit_virgl_fenced`]).
 const CONTROL_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_VIRGL_COMMAND_BYTES: usize = CONTROL_REQUEST_BYTES - cmd::SUBMIT_3D_PREFIX_LEN;
+/// Largest VirGL command stream one SUBMIT_3D carries: one coherent DMA
+/// segment, the I/O layer's largest contiguous allocation. Mesa flushes up to
+/// VIRGL_MAX_CMDBUF_DWORDS = 64 Ki + 1024 dwords (~260 KiB) per EXECBUFFER.
+// LINUX-GAP: Linux `vmemdup_user`s any size and sends it as a scatterlist;
+// NARF sends one contiguous segment and answers a larger stream -ENOMEM, the
+// errno Linux gives when that copy cannot be allocated.
+pub const MAX_VIRGL_COMMAND_BYTES: usize = 4 * 1024 * 1024;
 
 const fn virgl_command_fits(len: usize) -> bool {
     len <= MAX_VIRGL_COMMAND_BYTES
@@ -146,6 +149,9 @@ const FENCE_RESP_BYTES: usize = 64;
 struct FenceSlot {
     req: DmaBuffer,
     resp: DmaBuffer,
+    /// This submission's command stream, in its own DMA buffer for the
+    /// device to read; held until the device retires the chain.
+    data: Option<DmaBuffer>,
     in_flight: bool,
     /// Descriptor-chain head this in-flight submission occupies — how a
     /// consumed used-ring element is routed back to its slot.
@@ -847,39 +853,6 @@ impl VirtioGpuPci {
         Ok(())
     }
 
-    /// Submit one opaque virgl command stream to the render context.
-    ///
-    /// The stream is bounded by the pre-allocated controlQ request DMA buffer.
-    /// It is copied before the virtqueue notify, so callers may reuse their
-    /// source buffer as soon as this synchronous method returns.
-    pub fn submit_virgl(
-        &self,
-        ctx_id: u32,
-        ring_idx: Option<u8>,
-        commands: &[u8],
-    ) -> Result<(), VirtioPciError> {
-        if !self.virgl_enabled() {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        if !virgl_command_fits(commands.len()) {
-            return Err(VirtioPciError::RequestTooLarge);
-        }
-        let _gate = ReqGate::acquire(&self.req_gate);
-        let request_len = cmd::SUBMIT_3D_PREFIX_LEN + commands.len();
-        // The bound above proves this dynamic-sized request fits in the fixed
-        // coherent staging buffer. Build it in temporary owned memory, then
-        // copy it to DMA; a large fixed array would overflow a kernel stack.
-        let mut request = alloc::vec![0u8; request_len];
-        cmd::build_submit_3d(&mut request, ctx_id, ring_idx, commands);
-        self.write_raw_request(&request);
-        // SAFETY: gate protects the shared request/response buffers.
-        unsafe { self.submit(request_len, HDR_LEN)? };
-        if self.response_type() != RESP_OK_NODATA {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        Ok(())
-    }
-
     /// Allocate the fenced-submission slot pool on first use. The caller
     /// holds `req_gate`, which serialises pool creation; the whole pool is
     /// built before publication so an allocation failure leaves it empty and
@@ -897,6 +870,7 @@ impl VirtioGpuPci {
             pool.push(FenceSlot {
                 req,
                 resp,
+                data: None,
                 in_flight: false,
                 head: 0,
                 fence: None,
@@ -942,8 +916,11 @@ impl VirtioGpuPci {
         // chain identity remains authoritative even for an error response
         // that omits the echo.
         let fence = slot.fence.take();
+        let data = slot.data.take();
         slot.in_flight = false;
         drop(slots);
+        // The device has consumed the chain; its command buffer can go.
+        drop(data);
         if let Some(fence) = fence {
             fence.signal();
         }
@@ -1036,47 +1013,83 @@ impl VirtioGpuPci {
             return Err(VirtioPciError::AddBufferFailed);
         }
         let fence = SubmittedFence::new(fence_id);
-        let request_len = cmd::SUBMIT_3D_PREFIX_LEN + commands.len();
-        // Build in temporary owned memory, then copy to the slot's DMA — a
-        // fixed 64 KiB array would overflow a kernel stack (see submit_virgl).
-        let mut request = alloc::vec![0u8; request_len];
-        cmd::build_submit_3d_fenced(&mut request, ctx_id, ring_idx, fence_id, commands);
-        let descs = {
-            let mut slots = self.fence_slots.lock();
-            let slot = &mut slots[slot_index];
-            // SAFETY: the slot's DMA pair is coherent kernel-mapped memory;
-            // `request_len` is bounded to CONTROL_REQUEST_BYTES above, and
-            // the gate plus `in_flight == false` give exclusive slot access.
-            // The response header is cleared so a stale prior completion
-            // cannot be misread as this submission's echo.
+        // The command stream travels in its own descriptor, as Linux
+        // `virtio_gpu_cmd_submit` sends it: header + submit body in the slot's
+        // request buffer, then the stream, then the response. The device reads
+        // the device-readable descriptors as one concatenated request, so the
+        // stream is not bounded by the control staging buffer.
+        let data = if commands.is_empty() {
+            None
+        } else {
+            let buf = alloc_coherent(commands.len(), DomainId::DRIVER_0)
+                .map_err(|_| VirtioPciError::OutOfMemory)?;
+            // SAFETY: `buf` is a fresh coherent kernel-mapped allocation of
+            // exactly `commands.len()` bytes, owned here until it is parked
+            // in the slot below.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    request.as_ptr(),
+                    commands.as_ptr(),
+                    buf.cpu_mut_ptr::<u8>(),
+                    commands.len(),
+                );
+            }
+            Some(buf)
+        };
+        let mut header = [0u8; cmd::SUBMIT_3D_PREFIX_LEN];
+        cmd::build_submit_3d_header(
+            &mut header,
+            ctx_id,
+            ring_idx,
+            Some(fence_id),
+            commands.len() as u32,
+        );
+        let mut descs: [VirtqDesc; 3] = [VirtqDesc::default(); 3];
+        let ndesc;
+        {
+            let mut slots = self.fence_slots.lock();
+            let slot = &mut slots[slot_index];
+            // SAFETY: the slot's DMA pair is coherent kernel-mapped memory
+            // sized for the header and response, and the gate plus
+            // `in_flight == false` give exclusive slot access. The response
+            // header is cleared so a stale prior completion cannot be misread
+            // as this submission's echo.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    header.as_ptr(),
                     slot.req.cpu_mut_ptr::<u8>(),
-                    request_len,
+                    header.len(),
                 );
                 core::ptr::write_bytes(slot.resp.cpu_mut_ptr::<u8>(), 0, HDR_LEN);
             }
-            [
-                VirtqDesc {
-                    addr: slot.req.dma_addr().raw(),
-                    len: request_len as u32,
+            descs[0] = VirtqDesc {
+                addr: slot.req.dma_addr().raw(),
+                len: header.len() as u32,
+                flags: VIRTQ_DESC_F_NEXT,
+                next: 0, // patched by Virtqueue::add_buffer
+            };
+            let mut n = 1;
+            if let Some(buf) = data.as_ref() {
+                descs[n] = VirtqDesc {
+                    addr: buf.dma_addr().raw(),
+                    len: commands.len() as u32,
                     flags: VIRTQ_DESC_F_NEXT,
-                    next: 0, // patched by Virtqueue::add_buffer
-                },
-                VirtqDesc {
-                    addr: slot.resp.dma_addr().raw(),
-                    len: HDR_LEN as u32,
-                    flags: VIRTQ_DESC_F_WRITE,
                     next: 0,
-                },
-            ]
-        };
+                };
+                n += 1;
+            }
+            descs[n] = VirtqDesc {
+                addr: slot.resp.dma_addr().raw(),
+                len: HDR_LEN as u32,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            };
+            ndesc = n + 1;
+        }
         let (head, kick) = {
             let mut g = self.ctrl_q.lock();
             let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
             let head = q
-                .add_buffer(&descs)
+                .add_buffer(&descs[..ndesc])
                 .ok_or(VirtioPciError::AddBufferFailed)?;
             (head, q.needs_kick())
         };
@@ -1088,6 +1101,7 @@ impl VirtioGpuPci {
             let slot = &mut slots[slot_index];
             slot.head = head;
             slot.fence = Some(fence.clone());
+            slot.data = data;
             slot.in_flight = true;
         }
         compiler_fence(Ordering::SeqCst);

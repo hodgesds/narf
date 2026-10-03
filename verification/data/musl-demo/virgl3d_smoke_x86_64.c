@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -86,6 +87,7 @@ struct vg_resource_create_blob {
 
 // ── VirGL protocol ──
 #define VIRGL_CMD0(cmd, obj, len) ((cmd) | ((obj) << 8) | ((uint32_t)(len) << 16))
+#define CCMD_NOP 0
 #define CCMD_CREATE_OBJECT 1
 #define CCMD_BIND_OBJECT 2
 #define CCMD_SET_VIEWPORT_STATE 4
@@ -567,6 +569,59 @@ int main(void)
         }
         printf("virgl3d: blob draw bgra=%02x%02x%02x%02x\n", px[0], px[1], px[2], px[3]);
         if (check_pixels(px, 0, 255, 0, 255, "blob-draw"))
+            return 1;
+    }
+
+    // ── Phase 4: one command buffer as large as Mesa's ──
+    // Mesa's virgl winsys flushes a command buffer of up to
+    // VIRGL_MAX_CMDBUF_DWORDS = 64 Ki + 1024 dwords (~260 KiB) in ONE
+    // EXECBUFFER, and on an ioctl error only logs "expect bad rendering" and
+    // drops the commands — later draws then name objects the host never
+    // created ("Illegal handle"). Submit ~200 KiB of NOPs ending in a clear to
+    // blue, and read the blue back: the whole stream reached the host, in order.
+    {
+        enum { NOP_RUN = 1023, RUNS = 50 };
+        size_t dwords = (size_t)RUNS * (NOP_RUN + 1) + 9;
+        uint32_t *big = calloc(dwords, 4);
+        if (!big) {
+            printf("virgl3d-fail big-alloc\n");
+            return 1;
+        }
+        size_t k = 0;
+        for (int r = 0; r < RUNS; r++) {
+            big[k++] = VIRGL_CMD0(CCMD_NOP, 0, NOP_RUN);
+            k += NOP_RUN;
+        }
+        big[k++] = VIRGL_CMD0(CCMD_CLEAR, 0, 8);
+        big[k++] = PIPE_CLEAR_COLOR0;
+        big[k++] = f2u(0.0f);
+        big[k++] = f2u(0.0f);
+        big[k++] = f2u(1.0f);
+        big[k++] = f2u(1.0f);
+        big[k++] = 0;
+        big[k++] = 0;
+        big[k++] = 0;
+        struct vg_execbuffer ebig = {
+            .size = (uint32_t)(k * 4),
+            .command = (uint64_t)(uintptr_t)big,
+            .fence_fd = -1,
+        };
+        if (ioctl(fd, VIRTGPU_EXECBUFFER, &ebig)) {
+            printf("virgl3d-fail big-execbuffer size=%u errno=%d\n", ebig.size, errno);
+            return 1;
+        }
+        free(big);
+        if (ioctl(fd, VIRTGPU_TRANSFER_FROM_HOST, &tf)) {
+            printf("virgl3d-fail big-transfer errno=%d\n", errno);
+            return 1;
+        }
+        if (ioctl(fd, VIRTGPU_WAIT, &wt)) {
+            printf("virgl3d-fail big-wait errno=%d\n", errno);
+            return 1;
+        }
+        printf("virgl3d: big cmdbuf %u bytes bgra=%02x%02x%02x%02x\n", ebig.size, px[0], px[1],
+               px[2], px[3]);
+        if (check_pixels(px, 255, 0, 0, 255, "big-cmdbuf"))
             return 1;
     }
 
