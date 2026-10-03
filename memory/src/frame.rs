@@ -346,6 +346,12 @@ struct HotplugRange {
 
 static HOTPLUG_RANGES: IrqSafeSpinLock<Vec<HotplugRange>> = IrqSafeSpinLock::new(Vec::new());
 static BOOT_MEMORY_RANGES: IrqSafeSpinLock<Vec<(u64, u64)>> = IrqSafeSpinLock::new(Vec::new());
+/// Byte ranges `[start, end)` that `init_from_map` actually gave the buddy:
+/// the usable map minus every exclude and the low reservation. Written once,
+/// at the end of the donation pass. This is what "the allocator owns this
+/// frame" means for boot RAM, independent of whether the frame happens to be
+/// free or allocated at the moment someone asks.
+static BOOT_DONATED_RANGES: IrqSafeSpinLock<Vec<(u64, u64)>> = IrqSafeSpinLock::new(Vec::new());
 static ONLINE_NODE_MASK: AtomicU64 = AtomicU64::new(1);
 static MEMORY_HOTPLUG_HOOK: AtomicUsize = AtomicUsize::new(0);
 
@@ -444,14 +450,16 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     // excluded range. Each exclude is (lo_byte, hi_byte) — a
     // half-open byte range. Sub-divide each region accordingly
     // so the buddy gets contiguous sub-ranges to coalesce.
+    let mut donated: Vec<(u64, u64)> = Vec::new();
     for r in usable {
         let region_start = (r.start.raw() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let region_end = (r.start.raw() + r.len) & !(PAGE_SIZE - 1);
         if region_start >= region_end {
             continue;
         }
-        donate_around_excludes(&mut zone0, region_start, region_end, exclude);
+        donate_around_excludes(&mut zone0, region_start, region_end, exclude, &mut donated);
     }
+    *BOOT_DONATED_RANGES.lock() = donated;
     for node in 0..MAX_NUMA_NODES {
         ALLOC.node_total_frames[node].store(0, Ordering::Relaxed);
         ALLOC.node_free_frames[node].store(0, Ordering::Relaxed);
@@ -579,7 +587,13 @@ fn ensure_bootstrap_headroom(need: usize) {
 /// Donate the byte range `[start, end)` to `zone`, splitting around
 /// any excluded sub-ranges. Aligns each sub-range to page boundaries
 /// before donating.
-fn donate_around_excludes(zone: &mut BuddyZone, start: u64, end: u64, exclude: &[(u64, u64)]) {
+fn donate_around_excludes(
+    zone: &mut BuddyZone,
+    start: u64,
+    end: u64,
+    exclude: &[(u64, u64)],
+    donated: &mut Vec<(u64, u64)>,
+) {
     // Walk left to right, emitting sub-ranges between excludes.
     let mut cursor = start;
     // Collect overlapping excludes, sorted by start.
@@ -596,12 +610,12 @@ fn donate_around_excludes(zone: &mut BuddyZone, start: u64, end: u64, exclude: &
         let lo_page = lo & !(PAGE_SIZE - 1);
         let hi_page = (hi + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if cursor < lo_page {
-            donate_range(zone, cursor, lo_page);
+            donate_range(zone, cursor, lo_page, donated);
         }
         cursor = hi_page.max(cursor);
     }
     if cursor < end {
-        donate_range(zone, cursor, end);
+        donate_range(zone, cursor, end, donated);
     }
 }
 
@@ -621,8 +635,9 @@ fn donate_around_excludes(zone: &mut BuddyZone, start: u64, end: u64, exclude: &
 pub(crate) const LOW_RESERVED_BYTES: u64 = 0x100000;
 
 /// Donate `[start, end)` (page-aligned) to `zone` as a single contiguous run.
-/// Skips the first MiB of phys (BIOS / SMP trampoline territory).
-fn donate_range(zone: &mut BuddyZone, start: u64, end: u64) {
+/// Skips the first MiB of phys (BIOS / SMP trampoline territory). The byte
+/// range actually donated is appended to `donated`.
+fn donate_range(zone: &mut BuddyZone, start: u64, end: u64, donated: &mut Vec<(u64, u64)>) {
     debug_assert_eq!(start & (PAGE_SIZE - 1), 0);
     debug_assert_eq!(end & (PAGE_SIZE - 1), 0);
     if end <= start {
@@ -635,6 +650,7 @@ fn donate_range(zone: &mut BuddyZone, start: u64, end: u64) {
     let first_frame = start >> PAGE_SHIFT;
     let frame_count = (end - start) >> PAGE_SHIFT;
     zone.donate(first_frame, frame_count);
+    donated.push((start, end));
 }
 
 fn is_excluded(addr: u64, exclude: &[(u64, u64)]) -> bool {
@@ -3207,6 +3223,67 @@ pub fn stats() -> FrameStats {
         free: 0,
         reserved: 0,
     })
+}
+
+/// Overlap of `[lo, hi)` with `[a, b)`, in whole frames. Both are byte
+/// ranges; the query range is page-aligned by the callers below.
+fn overlap_frames(lo: u64, hi: u64, a: u64, b: u64) -> u64 {
+    let s = lo.max(a);
+    let e = hi.min(b);
+    if s < e {
+        (e - s) >> PAGE_SHIFT
+    } else {
+        0
+    }
+}
+
+/// How many frames of the physical byte range `[start, end)` the frame
+/// allocator has been given ownership of: the RAM `init_from_map` donated
+/// plus every hotplug range currently online.
+///
+/// Ownership, not availability — a frame counts whether it is free or
+/// allocated right now. A range that must never back an allocation (the
+/// kernel image window, say) should answer 0 here at every point after
+/// boot, regardless of which frames earlier code happened to take.
+pub fn allocator_owned_frames_in(start: u64, end: u64) -> u64 {
+    let start = start & !(PAGE_SIZE - 1);
+    let end = end & !(PAGE_SIZE - 1);
+    let mut n = 0u64;
+    for &(a, b) in BOOT_DONATED_RANGES.lock().iter() {
+        n += overlap_frames(start, end, a, b);
+    }
+    for r in HOTPLUG_RANGES.lock().iter().filter(|r| r.online) {
+        n += overlap_frames(start, end, r.start, r.start.saturating_add(r.len));
+    }
+    n
+}
+
+/// How many frames of the physical byte range `[start, end)` the frame
+/// allocator could hand out right now: frames in any zone's free lists plus
+/// frames parked in any CPU's order-0 cache.
+///
+/// Reads the lists and caches themselves, one lock at a time (never a cache
+/// and a zone together, so the drain -> cache -> zone order is not
+/// involved). The two reads are not one atomic snapshot: a frame moving
+/// between a cache and its zone during the call can be missed. Callers that
+/// need an exact answer pair this with [`allocator_owned_frames_in`].
+pub fn free_frames_in(start: u64, end: u64) -> u64 {
+    let lo = start >> PAGE_SHIFT;
+    let hi = end.div_ceil(PAGE_SIZE);
+    let mut n = 0u64;
+    for zone in &ZONES {
+        n += zone.0.lock().free_frames_in(lo, hi);
+    }
+    for cpu_cache in &FRAME_CACHES {
+        let cache = cpu_cache.0.lock();
+        for node in cache.nodes.iter() {
+            n += node.frames[..node.len]
+                .iter()
+                .filter(|&&f| (lo..hi).contains(&f))
+                .count() as u64;
+        }
+    }
+    n
 }
 
 /// One-past-the-end of the highest boot-donated RAM byte, or 0 before

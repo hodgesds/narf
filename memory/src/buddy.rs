@@ -901,6 +901,29 @@ impl BuddyZone {
         self.free_frames
     }
 
+    /// Free frames of this zone that lie in frame numbers `[lo, hi)`: every
+    /// free block of every order and migratetype, clipped to the range.
+    ///
+    /// Reads the free lists themselves rather than any counter, so it answers
+    /// "could the allocator hand one of these out right now" for a specific
+    /// range. No allocation; O(free blocks).
+    pub fn free_frames_in(&self, lo: u64, hi: u64) -> u64 {
+        let mut n = 0u64;
+        for lists in &self.free_lists {
+            for (order, list) in lists.iter().enumerate() {
+                let span = order_frames(order as u8);
+                for &start in list {
+                    let a = start.max(lo);
+                    let b = start.saturating_add(span).min(hi);
+                    if a < b {
+                        n += b - a;
+                    }
+                }
+            }
+        }
+        n
+    }
+
     /// Number of free buddy blocks at `order` (not base pages), summed
     /// across every migratetype partition.
     pub fn free_block_count(&self, order: u8) -> usize {

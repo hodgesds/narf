@@ -16065,60 +16065,25 @@ kernel_test_in!(
 );
 
 /// The same question asked of the higher-half kernel window, which is the
-/// answer the identity map alone does not give.
+/// answer the identity map alone does not give — now asked of the whole
+/// window on both architectures: no frame the image window maps may be owned
+/// by, or free in, the frame allocator (`crate::kernel_window_audit`).
 ///
-/// `PML4[511]/PDPT[510]` used to be one 1 GiB RWX huge page over physical
-/// 0..1 GiB — precisely where a small machine's buddy allocates — so NXing
-/// only the identity map would have left a complete, equally reachable
-/// replacement alias at `KERNEL_VIRT_BASE + phys`. Demoting it to 2 MiB leaves
-/// and NXing everything outside kernel text was the first answer, and this
-/// case used to assert exactly that: probe the alias, expect an NX fault.
-///
-/// The window now maps only the kernel image, so a buddy frame has no
-/// higher-half alias at all. That is strictly stronger than an NX one — there
-/// is nothing to mark non-executable — and it is what this asserts instead.
-/// Keeping the old probe would test nothing: it would fault not-present rather
-/// than NX, for a reason unrelated to executability.
-#[cfg(target_arch = "x86_64")]
+/// This registration is the late one. It sits where the single-frame version
+/// sat, thousands of cases into a full run, where that version's probe came
+/// back above 1 GiB and it passed having examined nothing. The early one, in
+/// `frame/src/kernel_window_audit.rs`, prints what the walk found; this one
+/// can only return the verdict, since this crate has no console.
 fn smoke_kernel_window_does_not_alias_buddy_frames() -> TestResult {
-    use crate::paging::{leaf_flags_at, read_cr3};
-    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
-
-    let frame = match alloc_frame() {
-        Ok(f) => f,
-        Err(FrameAllocError::Uninitialised) => {
-            return TestResult::Skip("frame allocator not initialised")
-        }
-        Err(_) => return TestResult::Fail("alloc_frame failed"),
-    };
-    let phys = frame.start_address().raw();
-    // Past the window's own 1 GiB PD no alias can exist by construction, and
-    // the VA would run off the top of the address space.
-    if phys >= (1u64 << 30) {
-        free_frame(frame);
-        return TestResult::Pass;
-    }
-
-    // Walk the live tables rather than asking `kernel_window_covers`: that is
-    // the predicate the mapping code itself uses, so a test built on it would
-    // agree with `init_mmu` even if both were wrong. The window maps
-    // `kernel_virt_base() + phys`, slide included.
-    let va = crate::kaslr::kernel_virt_base().wrapping_add(phys);
-    // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
-    let cr3 = unsafe { read_cr3() };
-    // SAFETY: the live PML4 is reachable through the direct map.
-    let flags = unsafe { leaf_flags_at(cr3, VirtAddr::new(va)) };
-    free_frame(frame);
-    match flags {
-        None => TestResult::Pass,
-        // A present leaf here means the buddy handed out a frame the image
-        // window maps — either the window is oversized again, or the frame
-        // allocator is handing out kernel image memory.
-        Some(_) => TestResult::Fail("buddy frame still has a higher-half kernel-window alias"),
+    match crate::kernel_window_audit::check() {
+        Ok(audit) => audit.verdict(),
+        Err(r) => r,
     }
 }
-#[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_kernel_window_does_not_alias_buddy_frames);
+kernel_test_in!(
+    "memory/kernel_window",
+    smoke_kernel_window_does_not_alias_buddy_frames
+);
 
 /// Positive control for the demotion: the AP trampoline window is still
 /// executable, at 4 KiB granularity, and the page just past it is not.

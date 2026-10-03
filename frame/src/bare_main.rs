@@ -281,6 +281,10 @@ pub mod aarch64;
 
 mod canary;
 mod cross_crate_init;
+/// Early, printing registration of the kernel image window audit; the
+/// audit itself is `narf_memory::kernel_window_audit`.
+#[cfg(feature = "kernel-test")]
+mod kernel_window_audit;
 mod measure;
 mod reclaim_wait;
 mod secure_boot;

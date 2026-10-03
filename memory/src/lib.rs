@@ -40,6 +40,9 @@ pub mod hugepage;
 #[cfg(feature = "kasan")]
 pub mod kasan;
 pub mod kaslr;
+/// Whole-window audit of the higher-half kernel image mapping against the
+/// frame allocator, shared by the early and late test registrations.
+pub mod kernel_window_audit;
 pub mod mempolicy;
 pub mod migrate;
 pub mod module_text;
