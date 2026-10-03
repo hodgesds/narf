@@ -471,6 +471,8 @@ pub enum AmdgpuError {
     FirmwareMissing,
     /// PSP firmware-load handshake didn't complete.
     FirmwareLoadFailed,
+    /// This device requires the PSP command-ring loader, not the legacy helper.
+    UnsupportedFirmwareLoad,
     /// SMU bring-up failed — TestMessage echo mismatch, driver-IF
     /// schema mismatch, or mailbox timeout. The MP1 base may be
     /// wrong (IP discovery missing MP1) or SMU firmware never
@@ -518,6 +520,8 @@ pub struct AmdGpu {
     /// garbage (typical on QEMU / older chips); callers fall
     /// back to the hardcoded `Family::mp0_base()` table.
     pub ip_blocks: Vec<IpBlock>,
+    /// Immutable platform VBIOS captured at probe, when available.
+    pub vbios: Option<crate::amdgpu_vbios::Vbios>,
 }
 
 impl core::fmt::Debug for AmdGpu {
@@ -607,6 +611,7 @@ impl AmdGpu {
             mode: None,
             fw_loaded: false,
             ip_blocks,
+            vbios: None,
         })
     }
 
@@ -865,7 +870,10 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        if crate::amdgpu_usbc::owns_dmub() {
+        if self.chip.family == Family::Phoenix {
+            return Err(AmdgpuError::UnsupportedFirmwareLoad);
+        }
+        if crate::amdgpu_usbc::firmware_busy() {
             return Err(AmdgpuError::DisplayFirmwareBusy);
         }
         // Prefer the discovery-driven MP0 base (true for every
@@ -1120,7 +1128,10 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
-        if crate::amdgpu_usbc::owns_dmub() {
+        if self.chip.family == Family::Phoenix {
+            return Err(AmdgpuError::UnsupportedFirmwareLoad);
+        }
+        if crate::amdgpu_usbc::firmware_busy() {
             return Err(AmdgpuError::DisplayFirmwareBusy);
         }
         // Fall through to the single-blob path for chips whose IP
@@ -1676,6 +1687,11 @@ unsafe fn read_vbios_version_from_rom(
 // ── Driver-match registration ───────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
+static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
+    IrqSafeSpinLock::new(None);
+pub(crate) fn pci_authority() -> Option<Cap<BusDeviceCap, Write>> {
+    *PCI_AUTHORITY.lock()
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -1696,10 +1712,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
-    let dev = match unsafe { AmdGpu::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { AmdGpu::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
+    dev.vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) }.ok();
+    let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
+    let is_apu = matches!(dev.chip.family, Family::Renoir | Family::Phoenix);
+    *PCI_AUTHORITY.lock() = Some(cap);
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("amdgpu"),
@@ -1708,16 +1729,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
-    // Attempt to read the VBIOS image from the PCI expansion ROM BAR
-    // and parse the ATOMBIOS version string. Falls back to None on
-    // any failure without affecting probe success.
-    //
-    let vbios_version: Option<alloc::string::String> =
+    // APUs use the retained VFCT/VRAM image. Preserve the existing ROM-version
+    // fallback for discrete GPUs; that path is not used as a loader image.
+    let vbios_version: Option<alloc::string::String> = if vbios_version.is_some() || is_apu {
+        vbios_version
+    } else {
         // SAFETY: caller-authority over the device. ROM BAR is read-only
         // from the CPU side once the phys address is known.
         // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { read_vbios_version_from_rom(&cap, &device) };
+        unsafe { read_vbios_version_from_rom(&cap, &device) }
+    };
 
     // Register with the DRM card registry so /sys/class/drm/card<N>/
     // and /dev/dri/card<N> appear after Stage::Late.
@@ -1835,7 +1857,10 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
             unsafe { d.set_mode(mode) }
         });
     }
-    crate::amdgpu_usbc::resume();
+    if !crate::amdgpu_usbc::resume() {
+        PM_SUSPENDED.store(true, core::sync::atomic::Ordering::Release);
+        return Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+    }
     Ok(())
 }
 

@@ -26,6 +26,7 @@ narf-drivers-usbpd   = { path = "../usbpd" }
 narf-usbpd           = { path = "../../usbpd" }
 narf-firmware        = { path = "../../firmware" }
 narf-bus             = { path = "../../bus" }
+narf-acpi            = { path = "../../acpi" }
 narf-memory          = { path = "../../memory" }
 narf-init            = { path = "../../init" }
 narf-scheduler       = { path = "../../scheduler" }

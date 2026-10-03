@@ -3,8 +3,6 @@
 //! All smokes work against a synthetic in-memory VBIOS image so they
 //! run on every build without real hardware.
 
-#![cfg(target_arch = "x86_64")]
-
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── synthetic image builder ────────────────────────────────────────────────
@@ -23,6 +21,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 /// - At 0x0200: NUL-terminated "FAKE BIOS VERSION 1.0".
 fn build_synthetic_image() -> alloc::vec::Vec<u8> {
     let mut img = alloc::vec![0u8; 0x300];
+    img[..2].copy_from_slice(&[0x55, 0xaa]);
 
     // ROM header pointer at 0x48.
     let hdr_ptr: u16 = 0x0100;
@@ -31,15 +30,16 @@ fn build_synthetic_image() -> alloc::vec::Vec<u8> {
 
     // ATOM_ROM_HEADER at 0x0100.
     let h = 0x0100usize;
-    img[h..h + 4].copy_from_slice(b"ATOM");
-    // bios_bootup_message_offset at header+0x0C.
+    img[h..h + 4].copy_from_slice(&[36, 0, 1, 1]);
+    img[h + 4..h + 8].copy_from_slice(b"ATOM");
+    // bios_bootup_message_offset at header+0x10.
     let msg_off: u16 = 0x0200;
-    img[h + 0x0C] = (msg_off & 0xFF) as u8;
-    img[h + 0x0D] = (msg_off >> 8) as u8;
-    // master_data_table_offset at header+0x1C.
+    img[h + 0x10] = (msg_off & 0xFF) as u8;
+    img[h + 0x11] = (msg_off >> 8) as u8;
+    // master_data_table_offset at header+0x20.
     let mdt_off: u16 = 0x0180;
-    img[h + 0x1C] = (mdt_off & 0xFF) as u8;
-    img[h + 0x1D] = (mdt_off >> 8) as u8;
+    img[h + 0x20] = (mdt_off & 0xFF) as u8;
+    img[h + 0x21] = (mdt_off >> 8) as u8;
 
     // Master data table at 0x0180: size=6, format_rev=1, content_rev=0,
     // 1 entry → 0x0140.
@@ -73,7 +73,7 @@ fn smoke_atombios_parse_valid_header() -> TestResult {
         )),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_parse_valid_header);
+kernel_test_in!("drivers/gpu/atombios", smoke_atombios_parse_valid_header);
 
 // ── Smoke 2: bad signature → InvalidVbios ──────────────────────────────────
 
@@ -81,7 +81,7 @@ fn smoke_atombios_bad_atom_signature() -> TestResult {
     use crate::atombios::{parse, AtomBiosError};
     let mut img = build_synthetic_image();
     // Corrupt the "ATOM" signature.
-    img[0x0100] = b'X';
+    img[0x0104] = b'X';
     match parse(&img) {
         Err(AtomBiosError::BadAtomSignature) => TestResult::Pass,
         other => TestResult::Fail(alloc::boxed::Box::leak(
@@ -89,7 +89,7 @@ fn smoke_atombios_bad_atom_signature() -> TestResult {
         )),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_bad_atom_signature);
+kernel_test_in!("drivers/gpu/atombios", smoke_atombios_bad_atom_signature);
 
 // ── Smoke 3: too-short image → InvalidVbios ────────────────────────────────
 
@@ -104,7 +104,7 @@ fn smoke_atombios_too_short_image() -> TestResult {
         )),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_too_short_image);
+kernel_test_in!("drivers/gpu/atombios", smoke_atombios_too_short_image);
 
 // ── Smoke 4: extract_version returns the right string ──────────────────────
 
@@ -127,7 +127,10 @@ fn smoke_atombios_extract_version_correct() -> TestResult {
         None => TestResult::Fail("version is None"),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_extract_version_correct);
+kernel_test_in!(
+    "drivers/gpu/atombios",
+    smoke_atombios_extract_version_correct
+);
 
 // ── Smoke 5: missing NUL terminator handled gracefully ─────────────────────
 
@@ -161,7 +164,7 @@ fn smoke_atombios_no_nul_terminator() -> TestResult {
         )),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_no_nul_terminator);
+kernel_test_in!("drivers/gpu/atombios", smoke_atombios_no_nul_terminator);
 
 // ── Smoke 6: vbios_version() via DrmCard ───────────────────────────────────
 
@@ -195,7 +198,10 @@ fn smoke_atombios_drm_card_vbios_version() -> TestResult {
         None => TestResult::Fail("DrmCard::vbios_version() returned None"),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_drm_card_vbios_version);
+kernel_test_in!(
+    "drivers/gpu/atombios",
+    smoke_atombios_drm_card_vbios_version
+);
 
 // ── Smoke 7: sysfs vbios_version format includes trailing newline ──────────
 
@@ -210,7 +216,7 @@ fn smoke_atombios_sysfs_version_format() -> TestResult {
         TestResult::Fail("sysfs format wrong")
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_sysfs_version_format);
+kernel_test_in!("drivers/gpu/atombios", smoke_atombios_sysfs_version_format);
 
 // ── Smoke 8: master data table offset validates (in-bounds) ────────────────
 
@@ -233,7 +239,10 @@ fn smoke_atombios_master_data_table_in_bounds() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_master_data_table_in_bounds);
+kernel_test_in!(
+    "drivers/gpu/atombios",
+    smoke_atombios_master_data_table_in_bounds
+);
 
 // ── Smoke 9: bootup message offset out of bounds → None ────────────────────
 
@@ -243,8 +252,8 @@ fn smoke_atombios_bootup_msg_out_of_bounds() -> TestResult {
     // Point bios_bootup_message_offset past end of image.
     let h = 0x0100usize;
     let bad_off: u16 = 0xFFFF;
-    img[h + 0x0C] = (bad_off & 0xFF) as u8;
-    img[h + 0x0D] = (bad_off >> 8) as u8;
+    img[h + 0x10] = (bad_off & 0xFF) as u8;
+    img[h + 0x11] = (bad_off >> 8) as u8;
     let atom = match parse(&img) {
         Ok(a) => a,
         Err(e) => {
@@ -261,7 +270,10 @@ fn smoke_atombios_bootup_msg_out_of_bounds() -> TestResult {
         TestResult::Fail("expected None for out-of-bounds msg offset")
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_bootup_msg_out_of_bounds);
+kernel_test_in!(
+    "drivers/gpu/atombios",
+    smoke_atombios_bootup_msg_out_of_bounds
+);
 
 // ── Smoke 10: ROM header pointer itself out of bounds → InvalidVbios ────────
 
@@ -279,4 +291,7 @@ fn smoke_atombios_rom_header_ptr_out_of_bounds() -> TestResult {
         )),
     }
 }
-kernel_test_in!("drivers/gpu", smoke_atombios_rom_header_ptr_out_of_bounds);
+kernel_test_in!(
+    "drivers/gpu/atombios",
+    smoke_atombios_rom_header_ptr_out_of_bounds
+);

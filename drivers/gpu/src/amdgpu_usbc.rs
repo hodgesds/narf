@@ -27,24 +27,146 @@ static GENERATION: AtomicU32 = AtomicU32::new(0);
 pub fn sinks() -> Vec<Sink> {
     SINKS.lock().clone()
 }
-pub(crate) fn owns_dmub() -> bool {
-    OWNED.load(Ordering::Acquire)
+pub(crate) fn firmware_busy() -> bool {
+    OWNED.load(Ordering::Acquire) || PHASE.load(Ordering::Acquire) == 2
 }
 pub(crate) fn suspend() -> bool {
-    !owns_dmub()
-        || PHASE
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    if PHASE
+        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    if !crate::amdgpu_platform::suspend() {
+        PHASE.store(0, Ordering::Release);
+        return false;
+    }
+    true
 }
-pub(crate) fn resume() {
+
+/// Excludes the attach worker, generic firmware replacement and GPU PM.
+/// A loader leaves PHASE busy for its whole lifetime until resume replay exists.
+#[derive(Debug)]
+pub(crate) struct LoaderOwnership;
+fn claim(owned: &AtomicBool, phase: &AtomicU8) -> bool {
+    if owned
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    if phase
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        owned.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+pub(crate) fn claim_loader() -> Option<LoaderOwnership> {
+    // Construct lazily: dropping a guard for a failed claim would release the
+    // existing owner's state (including a suspended GPU).
+    claim(&OWNED, &PHASE).then(|| LoaderOwnership)
+}
+
+#[cfg(feature = "kernel-test")]
+mod ownership_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn dmub_loader_cannot_enter_suspended_or_owned_gpu() -> TestResult {
+        let owned = AtomicBool::new(false);
+        let phase = AtomicU8::new(2);
+        if claim(&owned, &phase)
+            || owned.load(Ordering::Acquire)
+            || phase.load(Ordering::Acquire) != 2
+        {
+            return TestResult::Fail("loader entered or cleared suspended state");
+        }
+        phase.store(0, Ordering::Release);
+        if !claim(&owned, &phase)
+            || claim(&owned, &phase)
+            || phase
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return TestResult::Fail("loader ownership failed to exclude attach/suspend");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu-dmub",
+        dmub_loader_cannot_enter_suspended_or_owned_gpu
+    );
+    fn dmub_failed_claim_does_not_release_existing_owner() -> TestResult {
+        if super::super::amdgpu::is_probed() {
+            return TestResult::Skip("requires no physical AMD GPU owner");
+        }
+        let Some(owner) = claim_loader() else {
+            return TestResult::Fail("initial loader claim");
+        };
+        let protected = claim_loader().is_none() && firmware_busy() && !suspend();
+        drop(owner);
+        if !protected {
+            return TestResult::Fail("failed claim dropped existing ownership");
+        }
+        if !suspend() {
+            return TestResult::Fail("released loader still blocks suspend");
+        }
+        let protected =
+            claim_loader().is_none() && firmware_busy() && PHASE.load(Ordering::Acquire) == 2;
+        resume();
+        if !protected || firmware_busy() {
+            return TestResult::Fail("failed claim released suspended state");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu-dmub",
+        dmub_failed_claim_does_not_release_existing_owner
+    );
+}
+impl Drop for LoaderOwnership {
+    fn drop(&mut self) {
+        PHASE.store(0, Ordering::Release);
+        OWNED.store(false, Ordering::Release);
+    }
+}
+pub(crate) fn resume() -> bool {
     if PHASE.load(Ordering::Acquire) != 2 {
-        return;
+        return true;
+    }
+    if !crate::amdgpu_platform::resume() {
+        return false;
     }
     GENERATION.fetch_add(1, Ordering::AcqRel);
     PHASE.store(0, Ordering::Release);
     DIRTY.store(true, Ordering::Release);
+    true
 }
 struct Observer;
+pub(crate) fn observe_connectors() {
+    narf_drivers_usbpd::ucsi::register_observer(Arc::new(Observer));
+}
+pub(crate) fn begin_cycle() -> bool {
+    PHASE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+pub(crate) fn finish_cycle() {
+    PHASE.store(0, Ordering::Release);
+}
+pub(crate) fn publish_sinks(found: Vec<Sink>) {
+    *SINKS.lock() = found;
+}
+pub(crate) async fn wait_for_rescan() {
+    for _ in 0..10 {
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(100).as_instant()).await;
+        if DIRTY.swap(false, Ordering::AcqRel) {
+            break;
+        }
+    }
+}
 impl narf_drivers_usbpd::ucsi::ConnectorObserver for Observer {
     fn changed(&self, _: &narf_drivers_usbpd::ucsi::Connector) {
         DIRTY.store(true, Ordering::Release);
@@ -131,7 +253,7 @@ async fn edid(dmub: &mut Dmub, channel: Channel, instance: u8) -> Result<Vec<u8>
     result
 }
 
-async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
+pub(crate) async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
     let mut result = Vec::new();
     // DCN314 exposes four DPIAs (dcn314_resource.c), independently of the
     // number of NHI PCI functions or physical receptacles. Native AUX channels
@@ -166,24 +288,30 @@ async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
     Ok(result)
 }
 pub(crate) fn start() -> narf_init::InitResult {
-    if !super::amdgpu::is_probed() || OWNED.swap(true, Ordering::AcqRel) {
+    if !super::amdgpu::is_probed() {
         return narf_init::InitResult::NotPresent;
     }
-    PHASE.store(1, Ordering::Release);
+    if crate::amdgpu_platform::start() {
+        return narf_init::InitResult::Ok;
+    }
+    let Some(ownership) = claim_loader() else {
+        return narf_init::InitResult::NotPresent;
+    };
     let dmub = super::amdgpu::with_controller(|gpu| {
         // SAFETY: OWNED excludes firmware replacement and GPU suspend while
         // a mailbox cycle is in progress. This is the sole DMUB client.
         unsafe { Dmub::attach(gpu) }
     });
     let Some(Ok(mut dmub)) = dmub else {
-        PHASE.store(0, Ordering::Release);
-        OWNED.store(false, Ordering::Release);
         let _ = writeln!(
             narf_console::Writer,
             "amdgpu-usbc: native DCN314 DAL firmware/mailbox unavailable: {dmub:?}"
         );
         return narf_init::InitResult::NotPresent;
     };
+    // The existing attach worker owns the mailbox for the rest of boot,
+    // including poisoned-channel failures where late replies are possible.
+    core::mem::forget(ownership);
     narf_drivers_usbpd::ucsi::register_observer(Arc::new(Observer));
     narf_scheduler::spawn(async move {
         let mut generation = GENERATION.load(Ordering::Acquire);

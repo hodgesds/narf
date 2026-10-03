@@ -14,10 +14,10 @@
 //! +0x48-0x49      u16 (LE) → offset of ATOM_ROM_HEADER within image
 //!
 //! ATOM_ROM_HEADER (at the pointer above):
-//! +0x00  "ATOM"                  4-byte ASCII signature
-//! +0x0C  bios_bootup_message_offset  u16 → NUL-terminated version string
-//! +0x1A  master_command_table_offset u16 → command table directory
-//! +0x1C  master_data_table_offset    u16 → data table directory
+//! +0x04  "ATOM"                  4-byte ASCII signature
+//! +0x10  bios_bootup_message_offset  u16 → NUL-terminated version string
+//! +0x1E  master_command_table_offset u16 → command table directory
+//! +0x20  master_data_table_offset    u16 → data table directory
 //! ...
 //! ```
 //!
@@ -62,7 +62,7 @@ pub enum AtomBiosError {
     InvalidVbios,
     /// ROM header pointer is out of bounds (points past the image end).
     InvalidVbios2,
-    /// The 4-byte ATOM signature at the ROM header offset is not "ATOM".
+    /// The signature at ROM header +4 is neither "ATOM" nor "MOTA".
     BadAtomSignature,
     /// Master data table directory is out of bounds or malformed.
     BadDataTableDir,

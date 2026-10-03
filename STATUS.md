@@ -55,9 +55,72 @@ Memory-backed tests exercise DMA ownership, acknowledgements, path drainage
 and rollback without touching host devices.
 
 The AMD DCN 3.1.4 DMUB transport can attach to running DAL firmware for HPD,
-AUX and EDID discovery. **External monitor output is not complete:** cold-boot
-display firmware loading, source encoder setup, link training and KMS
-integration remain open. Physical Lenovo 50ee USB-C/USB4 validation is pending.
+AUX and EDID discovery. Firmware preparation now selects the DCN314 blob
+from IP discovery, validates DMCUB containers and metadata, separates PSP
+packaging, and stages a bounded seven-window image in RAM. An explicit
+direct-load lifecycle now reserves from caller-owned VRAM, stops DMCUB,
+uploads/flushes the image, programs cache windows and validates boot readiness.
+Failed stop/cancellation retains memory until shutdown is verified. Loader
+ownership excludes the attach worker, firmware replacement and suspend.
+GPU probe now retains a bounded, device-matched VBIOS snapshot from ACPI VFCT
+or the APU VRAM shadow, using corrected PCI/ATOM header and directory parsing.
+DMUB preparation can consume that snapshot. An explicit boot-memory path now
+builds a pool with permanent exclusions from VBIOS reservations, current DMUB
+windows and caller-supplied boot/client ranges; it never infers ownership
+from BAR capacity.
+A Phoenix PSP 13.0.4 GPCOM ring now installs the TMR and loads DMCUB through
+the PSP, leaving the secure instruction and stack windows under PSP ownership;
+Phoenix rejects the legacy firmware-load helpers so nothing races that ring.
+The boot handoff assembles the owner: it records the boot framebuffer geometry,
+refuses a GPU with live firmware, a live mode or any VM context, inventories
+every enabled linear-RGB surface and cursor including latched and draining
+addresses, and rejects DCC/YUV/stereo layouts rather than overlooking metadata.
+The Late worker takes this owned path when it succeeds and otherwise falls back
+to attaching to running firmware.
+DisplayPort link training and the DIO link encoder are implemented: async
+8b/10b clock recovery and equalization program source and sink as one
+transaction, fall back only on recovery/equalization failure, clamp lanes to
+the reported Type-C pin assignment, and leave a transparent USB4 DPIA to train
+its own remote PHY.
+The DCN314 stream pipeline is now implemented end to end. A fixed-point port
+of DML derives the detile geometry, the required clocks, the urgent, p-state and
+stutter watermarks and the prefetch schedule, and encodes them into the HUBP
+request, latency and throttle registers, refusing any value a field cannot hold.
+The display clock manager latches the firmware's own DPM table and applies
+clocks in Linux's order; the clock generator divides them per pipe and routes a
+tunnelled stream's clock. The timing generator, hub pixel pipe, DPP, combiner,
+output formatter and DisplayPort stream encoder are all programmed, and a
+bring-up sequence drives them in the enable-stream order, trains the link, and
+unblanks the pipe, encoder and formatter last. A completed stream publishes its
+scanout for the framebuffer layer to adopt.
+The platform inventory the sequence needs is now read from the platform's own
+tables: the display topology and each connector's transmitter and hot-plug line,
+the memory type, channel count and data rate, the DCHUB reference clock and the
+DENTIST VCO. None of it is defaulted — the memory configuration multiplies into
+every watermark and the reference clock scales every latency register — and a
+table that is missing, the wrong revision or self-inconsistent fails closed. A
+native DisplayPort route is derived and validated against the board rather than
+trusted from the sink's index.
+The Late worker now arms the bring-up once per boot for the first native
+DisplayPort sink the board can answer for, claiming only a pipe that is blanked
+with its timing generator stopped and zeroing the surface before any pixel is
+sent. A failure leaves the display alone and falls back to the previous
+attach-only behaviour; suspend stops the stream before the firmware.
+Tunnelled USB4 sinks are driven too. A tunnelled link has no board-wired
+transmitter, so one is borrowed from the five DIGs, preferring those the board
+wired to no connector; a wired transmitter is still usable while its own
+connector is idle, which the backend enable bit decides rather than a guess.
+A tunnelled stream negotiates its host router's bandwidth before the link comes
+up, rounding a request up to a whole allocation step and refusing a mode the
+tunnel cannot carry rather than clamping it down to a starved allocation; the
+bandwidth is handed back when the stream stops. The console follows a lit external
+display through an observer the framebuffer layer installs, and returns to the
+boot framebuffer when the stream goes away. A stream survives suspend: the mode it
+was validated for is retained and replayed on resume, with the clock levels
+re-latched and the surface re-cleared.
+**The one remaining gap is silicon.** Physical Lenovo 50ee USB-C/USB4 validation
+is pending; nothing in this path has run on real hardware, so the watermarks,
+deadlines and link training are unconfirmed.
 See the USBPD, Thunderbolt and GPU subsystem specifications for the supported
 interfaces and limits.
 
