@@ -212,11 +212,11 @@ impl PhysAddr {
 #[cfg(target_arch = "x86_64")]
 pub const KERNEL_DIRECT_MAP_BASE: u64 = 0xFFFF_C000_0000_0000;
 
-/// Physical addresses below this are covered by the low identity map
-/// (PML4[0], built by `init_mmu` as 512 × 1-GiB huge pages) and are
-/// reached at `phys == virt`; `kernel_mut_ptr` only applies the
-/// direct-map offset to frames at or above it. 512 GiB = the identity
-/// map's full reach before PML4[1] (user address space) begins.
+/// 512 GiB, the reach of one PML4 slot. `kernel_mut_ptr` used to gate
+/// the direct-map offset on this limit and reach lower frames at
+/// `phys == virt` through a PML4[0] identity map. It no longer does:
+/// once the direct map is live, every frame takes the offset (see
+/// `kernel_mut_ptr`), and PML4[0] belongs to user space.
 #[cfg(target_arch = "x86_64")]
 pub const LOW_IDENTITY_LIMIT: u64 = 512u64 << 30;
 

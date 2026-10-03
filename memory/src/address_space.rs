@@ -11053,11 +11053,12 @@ impl AddressSpace {
                 // SAFETY: both huge frames are exclusively owned and their
                 // equal size bounds the copy. Addressed through
                 // `kernel_ptr` / `kernel_mut_ptr`, NOT as raw physical
-                // addresses: a bare `phys as *const u8` is only dereferenceable
-                // where the identity map makes physical equal virtual, which is
-                // x86_64 (and only below `LOW_IDENTITY_LIMIT`). On aarch64 a
-                // physical address resolves through TTBR0 — user space — so
-                // every private huge fork faulted. The 4 KiB COW path below
+                // addresses: a bare `phys as *const u8` is dereferenceable only
+                // where an identity map makes physical equal virtual, and
+                // neither arch keeps one once its direct map is live (the user
+                // half, x86_64 PML4[0] included, belongs to user space). On
+                // aarch64 a physical address resolves through TTBR0 — user
+                // space — so every private huge fork faulted. The 4 KiB COW path below
                 // already resolves this correctly and says so; this one was
                 // missed.
                 unsafe {

@@ -2216,47 +2216,30 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
         let _pt_guard = pt_lock_for(pml4_phys).lock();
         // SAFETY: identity-reachable per caller contract.
         let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
-        // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
-        // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
-        // PDPT[0] PD[0] PT[1], and `new_user_pml4` leaves that slot
-        // empty for `materialize` to fill). Every other PML4[0..256] entry is a
-        // bulk-copied pointer to a SHARED kernel page-table page —
-        //   - PML4[0]: the kernel low-4-GiB identity PDPT (`PDPT_lo` in
-        //     `EARLY_PAGE_TABLES`), reused by every AS for DMA / phys
-        //     access from kernel mode.
-        //   - PML4[2..=255]: currently reserved-zero, but if the kernel
-        //     ever lights one up it'll be shared too.
-        // Walking those and freeing the PDPT they point at returns
-        // kernel page tables to the buddy allocator; the next
-        // `alloc_coherent` hands the freed PDPT to a driver, `memset`
-        // zeros it, and the huge-page entries vanish mid-write — the
-        // exact #PF that surfaced the audio probe regression.
-        // Walk EVERY user-half PML4 slot (1..=255), not a hardcoded pair.
-        // A real process lights up far more than slots 1 + 129:
-        //   slot 1   — user binary  (0x0000_0080_0000_0000)
+        // The whole user half, PML4[0..256], is AS-private: `new_user_pml4_on`
+        // zeroes every slot below 256 and copies only PML4[256..512], the
+        // kernel high half, from the active root. `materialize` and
+        // `ensure_next_table` fill user slots on demand with private
+        // PDPT/PD/PT chains, and register every table they allocate in
+        // PT_REGISTRY. A real process lights up many slots, for example:
+        //   slot 0   — a Linux ET_EXEC binary (PT_LOAD at 0x400000)
+        //   slot 1   — Narf user binaries (0x0000_0080_0000_0000)
         //   slot 128 — ELF interpreter / ld-musl bias (0x0000_4000_0000_0000)
         //   slot 129 — mmap arena    (0x0000_4080_0000_0000)
         //   slot 160 — vDSO + brk heap (0x0000_5000_0000_0000)
         //   slot 255 — user stack    (0x0000_7FFF_FFFC_0000)
-        // The old `[1, 129]` list LEAKED the slot-128/160/255 page tables —
-        // and, worse, never `__pagetable_unregister`'d them, so their stale
-        // registrations accumulated in PT_REGISTRY and accelerated the
-        // ring-wrap clobber behind the "marginal-buddy" double-free.
+        // An older hardcoded `[1, 129]` list LEAKED the other slots' page
+        // tables and never `__pagetable_unregister`'d them, so their stale
+        // registrations accumulated in PT_REGISTRY.
         //
-        // Slot 0 (kernel low-4-GiB identity) and slots 256..512 (kernel
-        // high-half) are SHARED — `new_user_pml4_on` bulk-copies the kernel
-        // PDPT pointers into them, so freeing them would return kernel page
-        // tables to the buddy. The loop bound (1..256) excludes both. As an
-        // extra guard against a future kernel mapping inside the user half,
-        // only AS-private PDPTs are walked: those are the ones recorded in
-        // PT_REGISTRY (`new_user_pml4_on` / `ensure_next_table` register
-        // every table they allocate); a kernel-shared PDPT is never
-        // registered, so the `__pagetable_is_registered` check below skips
-        // it.
-        // Slot 0 is included: it is AS-private now that the kernel identity
-        // map no longer lives there. The `__pagetable_is_registered` check
-        // below still protects any kernel-shared PDPT, which is never
-        // registered, so widening the bound cannot free a kernel table.
+        // Slots 256..512 are the shared kernel high half; the loop bound
+        // excludes them, because freeing them would return kernel page
+        // tables to the buddy allocator (the next `alloc_coherent` would
+        // hand one to a driver that zeroes it mid-use). As an extra guard
+        // against a future kernel mapping inside the user half, only
+        // PT_REGISTRY-recorded PDPTs are detached: a kernel-shared PDPT is
+        // never registered, so the `__pagetable_is_registered` check below
+        // skips it.
         for slot in 0usize..256 {
             let pml4e = pml4.entries[slot];
             if !pml4e.is_present() {
