@@ -1251,6 +1251,102 @@ kernel_test_in!(
     reverie_narf_park_reexecution_reaches_the_tool_once
 );
 
+/// Canonical records the continuation test's Tool emitted, in order.
+static CONTINUATION_RECORDS: IrqSafeSpinLock<Vec<alloc::string::String>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Collects canonical records instead of printing them as they happen.
+#[derive(Debug)]
+struct CaptureSink;
+
+impl reverie_narf_tools::LineSink for CaptureSink {
+    fn emit(line: &str) {
+        CONTINUATION_RECORDS.lock().push(line.into());
+    }
+}
+
+/// FNV-1a over the records, each followed by a newline.
+fn records_digest(records: &[alloc::string::String]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in records
+        .iter()
+        .flat_map(|record| record.bytes().chain(Some(b'\n')))
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A Tool whose non-tail inject parks the task keeps its callback across the
+/// park and resumes it at the kernel's re-execution with the parked
+/// syscall's result.
+///
+/// The canonical-trace Tool runs every `write` as `guest.inject(..).await`
+/// and records the result. The pipe guest's child writes one byte to its
+/// full pipe; that inject parks until the parent drains the pipe, which the
+/// parent does only after [`ParkWatch`] opens the gate at the entry of that
+/// write (ordering by blocking, see [`ParkWatch`]). The Tool must record the
+/// write's result, 1, after the re-execution, and the run must end with both
+/// tasks exiting 0. The records are printed with a digest so repeated runs
+/// can be compared.
+fn reverie_narf_parked_inject_resumes_the_tool() -> TestResult {
+    PARK_ENTRIES.store(0, Ordering::Release);
+    PARK_FLAGGED.store(0, Ordering::Release);
+    PARK_FLAGGED_EXTRA_WRITE.store(0, Ordering::Release);
+    PARK_GATE.store(0, Ordering::Release);
+    CONTINUATION_RECORDS.lock().clear();
+    result_of((|| {
+        let interceptor = ReverieInterceptor::<CanonicalTrace<CaptureSink>>::new(())
+            .map_err(|_| "NarfToolHost::new refused the Tool")?;
+        let watch = ParkWatch {
+            inner: interceptor.boxed(),
+        };
+        let root = run_guest(PIPE_GUEST, Box::new(watch), |root| {
+            interceptor
+                .host_root(root.task_id)
+                .map_err(|_| "register_root refused the root task")
+        })?;
+        let records = core::mem::take(&mut *CONTINUATION_RECORDS.lock());
+        for record in &records {
+            let _ = writeln!(Writer, "    record {record}");
+        }
+        let _ = writeln!(
+            Writer,
+            "    records {} digest {:#018x}",
+            records.len(),
+            records_digest(&records)
+        );
+        match PARK_GATE.load(Ordering::Acquire) {
+            1 => {}
+            0 => return Err("the child never issued its one-byte write to the full pipe"),
+            _ => return Err("the gate byte could not be written"),
+        }
+        if PARK_FLAGGED_EXTRA_WRITE.load(Ordering::Acquire) != 1 {
+            return Err("the parked one-byte write was not re-executed exactly once");
+        }
+        check_teardown(&interceptor, root, 2, 0)?;
+        let prefix = reverie_narf_tools::canonical::PREFIX;
+        let enter = records.iter().position(|record| {
+            record.starts_with(prefix)
+                && record.contains(" phase=enter nr=1 a0=4 ")
+                && record.ends_with(" a2=1")
+        });
+        let Some(enter) = enter else {
+            return Err("the Tool never recorded the child's one-byte write");
+        };
+        let seq = records[enter]
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split(' ').next())
+            .ok_or("the one-byte write's record has no seq")?;
+        let expected = alloc::format!("{prefix}{seq} phase=return result=1");
+        if !records[enter + 1..].contains(&expected) {
+            return Err("the Tool did not resume with the parked write's result 1");
+        }
+        Ok(TestResult::Pass)
+    })())
+}
+kernel_test_in!("reverie-narf", reverie_narf_parked_inject_resumes_the_tool);
+
 // ── Exec ──────────────────────────────────────────────────────────────────
 
 /// Where the exec test mounts the canonical guest (guests/exec_x86_64.S).
