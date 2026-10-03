@@ -31,6 +31,9 @@ extern crate alloc;
 pub mod admin;
 pub mod mi;
 
+// The smokes and the test hooks they drive exist only in kernel-test
+// builds; a production kernel carries neither.
+#[cfg(feature = "kernel-test")]
 mod tests;
 
 use core::cell::UnsafeCell;
@@ -1762,6 +1765,7 @@ impl Controller {
             bar0.write32(io.sq_db_off(), io.sq_tail as u32);
         }
 
+        #[cfg(feature = "kernel-test")]
         if TEST_SPURIOUS_IRQ.load(Ordering::Relaxed) {
             // Test hook: a fire on this vector that is not this
             // command's completion (see `__test_spurious_irq`).
@@ -1829,9 +1833,9 @@ impl Controller {
     /// Test hook: make [`Controller::submit_io_irq`] dispatch one
     /// synthetic interrupt on its vector right after ringing the SQ
     /// doorbell, before the device can have posted the completion.
-    /// Production code never calls this.
-    #[doc(hidden)]
-    pub fn __test_spurious_irq(on: bool) {
+    /// Compiled only with `kernel-test`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_spurious_irq(on: bool) {
         TEST_SPURIOUS_IRQ.store(on, Ordering::Relaxed);
     }
 
@@ -1864,18 +1868,19 @@ impl Controller {
 
     /// Test hook: override the I/O completion timeout on every I/O
     /// queue. The regression smoke uses 0 to force a timeout on a
-    /// healthy device; production code never calls this.
-    #[doc(hidden)]
-    pub fn __test_set_io_timeout_ms(&mut self, ms: u64) {
+    /// healthy device. Compiled only with `kernel-test`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_set_io_timeout_ms(&mut self, ms: u64) {
         for q in self.io_queues.iter_mut() {
             q.timeout_ms = ms;
         }
     }
 
     /// Restore the production I/O completion timeout after
-    /// [`Controller::__test_set_io_timeout_ms`].
-    #[doc(hidden)]
-    pub fn __test_reset_io_timeout(&mut self) {
+    /// [`Controller::__test_set_io_timeout_ms`]. Compiled only with
+    /// `kernel-test`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_reset_io_timeout(&mut self) {
         self.__test_set_io_timeout_ms(IO_TIMEOUT_MS);
     }
 
@@ -2060,6 +2065,7 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
 }
 
 /// See [`Controller::__test_spurious_irq`].
+#[cfg(feature = "kernel-test")]
 static TEST_SPURIOUS_IRQ: AtomicBool = AtomicBool::new(false);
 
 /// Read the CQ entry at `index` without polling. Used by the
@@ -2525,9 +2531,10 @@ fn probed_controller() -> Option<ControllerGuard> {
 }
 
 /// The installed slot's address, or `None` before probe. Test hook for
-/// the install-once invariant `probed_controller` relies on.
-#[doc(hidden)]
-pub fn dbg_slot_addr() -> Option<usize> {
+/// the install-once invariant `probed_controller` relies on. Compiled
+/// only with `kernel-test`.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn dbg_slot_addr() -> Option<usize> {
     (*CONTROLLER.lock()).map(|s| s as *const InstalledController as usize)
 }
 
