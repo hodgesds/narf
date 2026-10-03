@@ -2886,6 +2886,23 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     init_per_task_state();
     crate::install_task_id_lookup(caller_lookup);
 
+    // Everything installed above, and the group member registered below, is
+    // undone when this guard drops, so an early `return` leaves no syscall
+    // table, caller lookup, task registration or pgid row behind for the
+    // next test. The explicit cleanup this replaces ran fully only on the
+    // pass path: the failure returns skipped the table and pgid resets.
+    const GROUP_MEMBER: u64 = 7;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            crate::task::release_task(GROUP_MEMBER);
+            crate::handlers::__test_reset_task_id_lookup();
+            crate::handlers::__test_pgid_reset();
+            __test_clear_global();
+        }
+    }
+    let _cleanup = Cleanup;
+
     fn call(s: Syscall, arg0: u64, arg1: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
             args: SyscallArgs {
@@ -2903,12 +2920,10 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     // reports the TaskId itself and `pid` is also the key the tables use.
     let pid = call(Syscall::GetPid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if pid != CALLER {
-        crate::handlers::__test_reset_task_id_lookup();
         return TestResult::Fail("getpid did not report the installed caller");
     }
     let p0 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if p0 != pid {
-        crate::handlers::__test_reset_task_id_lookup();
         return TestResult::Fail("default pgid != pid");
     }
 
@@ -2919,7 +2934,6 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     // only because the handler validated nothing and inserted whatever it was
     // given, so the group has to be made real first: a registered task, put
     // in group 7, sharing the caller's session the way a fork would.
-    const GROUP_MEMBER: u64 = 7;
     crate::task::release_task(GROUP_MEMBER);
     let _member = crate::task::Task::new_registered(GROUP_MEMBER, GROUP_MEMBER);
     crate::handlers::__test_set_pgid(GROUP_MEMBER, GROUP_MEMBER);
@@ -2927,8 +2941,6 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     let _ = call(Syscall::Setpgid, 0, 7);
     let p1 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if p1 != 7 {
-        crate::task::release_task(GROUP_MEMBER);
-        crate::handlers::__test_reset_task_id_lookup();
         return TestResult::Fail("setpgid(7) did not stick");
     }
 
@@ -2936,14 +2948,10 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     // a fresh group leader).
     let _ = call(Syscall::Setpgid, 0, 0);
     let p2 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
-    crate::task::release_task(GROUP_MEMBER);
-    crate::handlers::__test_reset_task_id_lookup();
     if p2 != pid {
         return TestResult::Fail("setpgid(0,0) did not resolve to pid");
     }
 
-    crate::handlers::__test_pgid_reset();
-    __test_clear_global();
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_userspace_pgid_round_trip);
