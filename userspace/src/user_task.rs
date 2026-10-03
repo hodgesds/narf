@@ -1533,6 +1533,12 @@ pub fn __test_clear_hooks() {
 /// `kernel-test` feature the mode can only be switched on, as production
 /// boot does; a request to switch it off then changes nothing (no kernel
 /// test runs in that build).
+///
+/// Not gated on `kernel-test`: `lib.rs` compiles the test modules
+/// unconditionally (`mod process_e2e_tests;`, `mod tests;`), so its callers
+/// are present in production images. Of this hook and
+/// [`__test_swap_yield_hook`], only the latter can change production
+/// behaviour if called.
 #[doc(hidden)]
 pub fn __test_set_own_stack_mode(on: bool) -> bool {
     #[cfg(feature = "kernel-test")]
@@ -1551,6 +1557,12 @@ pub fn __test_set_own_stack_mode(on: bool) -> bool {
 
 /// Test-only: install `hook` (or none) as the yield hook and return the one
 /// it replaced, so a test with its own longjmp hook can restore the old one.
+///
+/// Not gated on `kernel-test`: `lib.rs` compiles the test modules that call
+/// it unconditionally, so it and its callers are present in production
+/// images. Of this hook and [`__test_set_own_stack_mode`], this is the one
+/// that can change production behaviour if called: it replaces, or with
+/// `None` uninstalls, the production yield hook.
 #[doc(hidden)]
 pub fn __test_swap_yield_hook(hook: Option<ExitHook>) -> Option<ExitHook> {
     let prev = yield_hook();
