@@ -2286,6 +2286,102 @@ kernel_test_in!(
     reverie_narf_thread_and_process_exit_statuses
 );
 
+// ── Task creation from lifecycle callbacks ───────────────────────────────
+
+/// Phase marks in [`LIFECYCLE_SPAWN_LOG`].
+const THREAD_START_MARK: i64 = 1000;
+const POST_EXEC_SPAWN_MARK: i64 = 2000;
+const LINUX_ENOSYS: i64 = 38;
+
+/// A phase mark followed by what each of the phase's fork, vfork, clone
+/// and clone3 injects returned.
+static LIFECYCLE_SPAWN_LOG: IrqSafeSpinLock<Vec<i64>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Injects every task-creating syscall from its thread-start and post-exec
+/// callbacks, and runs every syscall unchanged.
+#[derive(Debug, Default, Clone, Copy)]
+struct LifecycleSpawns;
+
+impl LifecycleSpawns {
+    async fn spawn_all<T: reverie::Guest<Self>>(guest: &mut T, mark: i64) {
+        let fork = raw_result(guest.inject(reverie::syscalls::Fork::new()).await);
+        let vfork = raw_result(guest.inject(reverie::syscalls::Vfork::new()).await);
+        let clone = raw_result(guest.inject(reverie::syscalls::Clone::new()).await);
+        let clone3 = raw_result(guest.inject(reverie::syscalls::Clone3::new()).await);
+        LIFECYCLE_SPAWN_LOG
+            .lock()
+            .extend([mark, fork, vfork, clone, clone3]);
+    }
+}
+
+#[reverie::tool]
+impl Tool for LifecycleSpawns {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_thread_start<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::Error> {
+        Self::spawn_all(guest, THREAD_START_MARK).await;
+        Ok(())
+    }
+
+    async fn handle_post_exec<T: reverie::Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::Errno> {
+        Self::spawn_all(guest, POST_EXEC_SPAWN_MARK).await;
+        Ok(())
+    }
+}
+
+/// A task-creating syscall a Tool injects from `handle_thread_start` or
+/// `handle_post_exec` is refused with `ENOSYS` without running: the task has
+/// no user frame there for a child to start from, so the kernel creates no
+/// task, the Tool gets the errno back, and the guest runs on unchanged
+/// (execve, then the new image's write and exit, reaped with status 0 and
+/// no other task).
+fn reverie_narf_lifecycle_spawn_is_refused() -> TestResult {
+    LIFECYCLE_SPAWN_LOG.lock().clear();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let Ok(mounted) = narf_filesystem::registry().mount(
+        &auth,
+        EXEC_MOUNT,
+        narf_filesystem::MemFs::with_seeds("rn-exec", &[("prog", CANONICAL_GUEST)]),
+    ) else {
+        return TestResult::Fail("mounting the exec target failed");
+    };
+    ROOT_EXECS.store(true, Ordering::Release);
+    let outcome = (|| {
+        let (interceptor, root) = run_hosted::<LifecycleSpawns>(EXEC_GUEST, ())?;
+        let log = core::mem::take(&mut *LIFECYCLE_SPAWN_LOG.lock());
+        let _ = writeln!(Writer, "    lifecycle spawn log {log:?}");
+        check_teardown(&interceptor, root, 1, 0)?;
+        let refused = -LINUX_ENOSYS;
+        let expected = [
+            THREAD_START_MARK,
+            refused,
+            refused,
+            refused,
+            refused,
+            POST_EXEC_SPAWN_MARK,
+            refused,
+            refused,
+            refused,
+            refused,
+        ];
+        if log != expected {
+            return Err("a lifecycle callback's task-creating inject was not refused with ENOSYS");
+        }
+        Ok(TestResult::Pass)
+    })();
+    ROOT_EXECS.store(false, Ordering::Release);
+    let _ = narf_filesystem::registry().unmount(&mounted, EXEC_MOUNT);
+    result_of(outcome)
+}
+kernel_test_in!("reverie-narf", reverie_narf_lifecycle_spawn_is_refused);
+
 // ── Return mapping ────────────────────────────────────────────────────────
 
 /// A native result reaches the Tool as the value the guest would observe:

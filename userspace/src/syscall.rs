@@ -3716,6 +3716,19 @@ fn ends_task_context(variant: Option<Syscall>) -> bool {
     )
 }
 
+/// Whether `variant` creates a task. A new task starts from a copy of its
+/// creator's user frame, which a lifecycle callback does not have (the task
+/// has not entered user mode yet, or has just been given a new image): the
+/// fork handlers would start the child from a zero entry point, and nothing
+/// would hold it back for the interceptor to adopt. [`LifecycleTransition`]
+/// therefore refuses these with `-ENOSYS` without running them.
+fn creates_task(variant: Option<Syscall>) -> bool {
+    matches!(
+        variant,
+        Some(Syscall::Clone | Syscall::Clone3 | Syscall::Fork | Syscall::Vfork)
+    )
+}
+
 struct DispatchNativeTransition<'table, 'ctx> {
     table: &'table SyscallTable,
     variant: Option<Syscall>,
@@ -3910,9 +3923,9 @@ impl NativeSyscallTransition for LifecycleTransition<'_> {
         }
         let version = syscall_version(request.raw_number);
         let variant = Syscall::from_raw(syscall_number(request.raw_number));
-        if ends_task_context(variant) {
-            // No frame exists to exit from or exec into here: refuse without
-            // running anything.
+        if ends_task_context(variant) || creates_task(variant) {
+            // No frame exists to exit from or exec into here, and none for a
+            // new task to start from: refuse without running anything.
             return NativeSyscallOutcome::Returned(SyscallReturn::not_implemented());
         }
         let mut ctx = ArgsOnlyCtx::new(request.args, core::ptr::null_mut());
