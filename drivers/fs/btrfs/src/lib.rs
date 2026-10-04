@@ -53,7 +53,7 @@ pub fn register_initcalls() {
             narf_block::fs_detect::FsType::Btrfs,
             btrfs_factory,
         );
-        narf_filesystem::register_fstype("btrfs", btrfs_fstype_builder);
+        register_fstypes();
         InitResult::Ok
     });
 }
@@ -125,4 +125,9 @@ fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstanc
         subvol,
     ))?;
     Ok(volume)
+}
+
+/// Register the named mount constructor without building a volume.
+pub fn register_fstypes() {
+    narf_filesystem::register_block_fstype("btrfs", btrfs_fstype_builder);
 }

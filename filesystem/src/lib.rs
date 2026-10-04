@@ -125,7 +125,10 @@ pub use devfs::{
 };
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
 pub use efivarfs::EfivarFs;
-pub use fs_registry::{lookup_fstype, register_fstype, FsBuilder};
+pub use fs_registry::{
+    lookup_fstype, register_block_fstype, register_fs_type, register_fstype, registered_fstypes,
+    FileSystemType, FsBuilder, FsInit, MountRequest,
+};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,

@@ -12,6 +12,14 @@ name = "narf_userspace"
 path = "src/lib.rs"
 
 [dependencies]
+narf-drivers-fs-ext2 = { path = "../drivers/fs/ext2" }
+narf-drivers-fs-btrfs = { path = "../drivers/fs/btrfs" }
+narf-drivers-fs-squashfs = { path = "../drivers/fs/squashfs" }
+narf-drivers-fs-exfat = { path = "../drivers/fs/exfat" }
+narf-drivers-fs-minix = { path = "../drivers/fs/minix" }
+narf-drivers-fs-iso9660 = { path = "../drivers/fs/iso9660" }
+narf-drivers-fs-udf = { path = "../drivers/fs/udf" }
+
 narf-lib          = { path = "../lib" }
 narf-rcu          = { path = "../rcu" }
 narf-arch         = { path = "../arch" }

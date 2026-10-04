@@ -45,3 +45,5 @@ pub(crate) use crate::errno::*;
 include!("core.inc.rs");
 include!("compat.inc.rs");
 include!("sched_policy.inc.rs");
+
+pub(crate) mod mount_types;

@@ -1477,3 +1477,50 @@ kernel_test_in!(
     "filesystem",
     smoke_sysfs_inode_identity_is_stable_and_distinct
 );
+
+fn smoke_sysfs_provider_shared_views_without_mount_reinit() -> TestResult {
+    use crate::sysfs::{register_provider, SysfsProvider};
+    use crate::{FsInstance, SysFs};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn populate() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let class = crate::sysfs::class_register("provider-fixture");
+        crate::sysfs::class_device_register(class, "device0");
+        // A provider may register another callback while it runs.
+        register_provider(SysfsProvider {
+            name: "nested-fixture",
+            populate: || {},
+        });
+    }
+    crate::sysfs::__reset_for_test();
+    CALLS.store(0, Ordering::Relaxed);
+    let old_view = SysFs::new().root();
+    register_provider(SysfsProvider {
+        name: "fixture",
+        populate,
+    });
+    register_provider(SysfsProvider {
+        name: "fixture",
+        populate,
+    });
+    crate::sysfs::populate_all();
+    let new_view = SysFs::new().root();
+    let visible = [old_view, new_view].iter().all(|root| {
+        root.lookup_dir("class")
+            .and_then(|class| class.lookup_dir("provider-fixture"))
+            .and_then(|class| class.lookup_dir("device0"))
+            .is_some()
+    });
+    let once = CALLS.load(Ordering::Relaxed) == 1;
+    crate::sysfs::__reset_for_test();
+    if visible && once {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("sysfs provider duplicated or views do not share registration")
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_provider_shared_views_without_mount_reinit
+);

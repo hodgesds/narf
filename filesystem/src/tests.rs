@@ -3060,7 +3060,14 @@ fn smoke_fs_registry_custom_fstype_mounts() -> TestResult {
         None => return TestResult::Fail("lookup_fstype(smokefs) returned None after register"),
     };
 
-    let fs = match builder("some-source", "some-data") {
+    let fs = match builder.init(&crate::MountRequest {
+        fs_type: "smokefs",
+        source: "some-source",
+        options: "some-data",
+        uid: 0,
+        gid: 0,
+        initial_namespace: true,
+    }) {
         Ok(fs) => fs,
         Err(_) => return TestResult::Fail("smokefs builder returned Err"),
     };
@@ -6196,4 +6203,65 @@ fn smoke_overlay_initramfs_lower_file_is_not_a_dir() -> TestResult {
 kernel_test_in!(
     "filesystem",
     smoke_overlay_initramfs_lower_file_is_not_a_dir
+);
+
+fn smoke_devfs_provider_live_lookup_and_both_listings() -> TestResult {
+    use crate::{devfs, DevFs, FsInstance};
+    use alloc::sync::Arc;
+    fn lookup(name: &str) -> Option<Arc<dyn crate::FileOps>> {
+        if name == "provider-device" {
+            DevFs::new().root().lookup("null")
+        } else {
+            None
+        }
+    }
+    fn enumerate() -> alloc::vec::Vec<(alloc::string::String, crate::FileType)> {
+        alloc::vec![("provider-device".into(), crate::FileType::Special)]
+    }
+    let roots = [DevFs::new().root(), DevFs::new().root()];
+    devfs::register_provider(devfs::DeviceProvider {
+        name: "fixture",
+        lookup_dir: |_| None,
+        lookup,
+        enumerate,
+    });
+    // Re-registration must not duplicate directory entries.
+    devfs::register_provider(devfs::DeviceProvider {
+        name: "fixture",
+        lookup_dir: |_| None,
+        lookup,
+        enumerate,
+    });
+    let result = roots.iter().all(|root| {
+        root.lookup("provider-device").is_some()
+            && root
+                .enumerate(0, usize::MAX)
+                .iter()
+                .filter(|(name, _)| name == "provider-device")
+                .count()
+                == 1
+            && root
+                .iter()
+                .filter(|entry| entry.name == "provider-device")
+                .count()
+                == 1
+            && root
+                .enumerate(0, usize::MAX)
+                .iter()
+                .any(|(name, _)| name == "tty2")
+    });
+    devfs::unregister_provider("fixture");
+    if result
+        && roots
+            .iter()
+            .all(|root| root.lookup("provider-device").is_none())
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("devfs provider lookup/listing/hot-unregister disagree")
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_devfs_provider_live_lookup_and_both_listings
 );

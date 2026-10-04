@@ -15,6 +15,11 @@ This driver provides a clean-room implementation of the FAT (File Allocation Tab
 
 ## 3. Public interface
 
+`register_fstypes()` installs `fat`, `vfat`, `fat16`, `fat32` in the shared named-mount
+registry without constructing a volume. Both mount syscall APIs invoke the
+registered constructor with a block source and options, then attach its returned
+`Arc<dyn FsInstance>` in the caller's namespace.
+
 The driver implements the `FileSystem` trait from `narf-filesystem`.
 
 ### Key Structs

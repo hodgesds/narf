@@ -124,34 +124,6 @@ fn strndup_user_errno(errno: i64) -> i64 {
     }
 }
 
-/// Split legacy overlayfs `lowerdir=` values. Linux treats an unescaped colon
-/// as a layer separator and permits `\:` and `\\` in pathnames.
-fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string::String>> {
-    let mut layers = alloc::vec::Vec::new();
-    let mut layer = alloc::string::String::new();
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            layer.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == ':' {
-            if layer.is_empty() {
-                return None;
-            }
-            layers.push(core::mem::take(&mut layer));
-        } else {
-            layer.push(ch);
-        }
-    }
-    if escaped || layer.is_empty() {
-        return None;
-    }
-    layers.push(layer);
-    Some(layers)
-}
-
 /// Map an `FsError` raised while ATTACHING a built filesystem (or a bind) at
 /// the target onto the errno `fs/namespace.c::do_add_mount` / `graft_tree`
 /// would report. Notably not EFAULT: an attach failure has nothing to do with
@@ -159,17 +131,7 @@ fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string:
 /// helper hunting for a buffer bug that does not exist (this is exactly how
 /// xdg-document-portal's "fuse: mount failed: Bad address" arose).
 fn mount_attach_errno(e: narf_filesystem::FsError) -> SyscallReturn {
-    use narf_filesystem::FsError;
-    let code: i64 = match e {
-        FsError::NotFound => ENOENT,
-        FsError::Busy => EBUSY,
-        FsError::PermissionDenied => EPERM,
-        FsError::OperationNotPermitted => EPERM,
-        FsError::NoSpace => ENOSPC,
-        FsError::Unsupported => EOPNOTSUPP,
-        _ => EINVAL,
-    };
-    errno_ret(code)
+    errno_ret(crate::mount_api::mount_error_errno(e))
 }
 
 // `include/uapi/linux/mount.h`. Neither bit is in the shared `MS_*` block
@@ -511,7 +473,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     }
 
     let auth = narf_filesystem::bootstrap_mount_authority();
-    let domain = narf_lib::id::DomainId::DRIVER_0;
 
     // MS_BIND outranks MS_MOVE in `path_mount`'s dispatch.
     if (flags & MS_MOVE) != 0 && (flags & MS_BIND) == 0 {
@@ -639,311 +600,30 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         };
     }
 
-    // Pseudo / in-memory filesystems: tmpfs, proc, sysfs, devtmpfs, cgroup2,
-    // devpts, mqueue, securityfs, debugfs, … The shared dispatch
-    // (mount_api::build_fs) returns a real backend where NARF has one
-    // (proc/sysfs/cgroup2 are global singletons whose content attaches at the
-    // caller's target, e.g. a chroot's /proc or /sys/fs/cgroup) and a minimal
-    // empty directory for the rest; only a genuinely unknown fstype returns
-    // None. This is the same dispatch the new mount API (fsopen → fsconfig)
-    // uses, so both entry points recognize identical filesystems. Block-device
-    // fstypes (fat/vfat/ext…) fall through below because build_fs can't
-    // synthesize them without a device.
-    //
-    // `do_new_mount`: `if (!fstype) return -EINVAL;` — a NULL type pointer,
-    // as opposed to an empty or unknown name, which `get_fs_type` answers
-    // with -ENODEV below.
+    // A NULL type differs from an unknown registered name.
     if args.arg2 == 0 {
         ctx.set_return(einval);
         return;
     }
-    {
-        let (mount_uid, mount_gid) = current_fs_ids();
-        match crate::mount_api::build_fs_with_options(
-            fstype.as_str(),
-            data.as_str(),
-            mount_uid,
-            mount_gid,
-        ) {
-            Ok(Some(fs)) => {
-                // A new filesystem's root is a directory, so `graft_tree`
-                // refuses a non-directory mountpoint with -ENOTDIR.
-                if target_is_non_dir(target.as_str()) {
-                    ctx.set_return(errno_ret(ENOTDIR));
-                    return;
-                }
-                return match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
-                    Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
-                };
-            }
-            Err(narf_filesystem::FsError::NoSpace) => {
-                ctx.set_return(errno_ret(ENOSPC));
-                return;
-            }
-            Err(narf_filesystem::FsError::Unsupported) => {
-                ctx.set_return(errno_ret(EOPNOTSUPP));
-                return;
-            }
-            Err(_) => {
-                ctx.set_return(einval);
-                return;
-            }
-            Ok(None) => {}
-        }
-    }
-
-    // overlayfs (union mount). Prefer Linux's `data` argument. The old NARF
-    // ABI placed options in `source`, so retain that as a compatibility
-    // fallback when `data` is empty.
-    if fstype == "overlay" || fstype == "overlayfs" {
-        let opts = if data.is_empty() {
-            source.as_str()
-        } else {
-            data.as_str()
-        };
-        let mut lowerdirs: Option<alloc::vec::Vec<alloc::string::String>> = None;
-        let mut upperdir: Option<&str> = None;
-        let mut workdir: Option<&str> = None;
-        let mut valid_options = true;
-        for kv in opts.split(',') {
-            let kv = kv.trim();
-            if let Some(v) = kv.strip_prefix("lowerdir=") {
-                // Colon-separated, highest-priority first (Linux order).
-                if lowerdirs.is_some() {
-                    valid_options = false;
-                    break;
-                }
-                lowerdirs = parse_overlay_lowerdirs(v);
-                if lowerdirs.is_none() {
-                    valid_options = false;
-                    break;
-                }
-            } else if let Some(v) = kv.strip_prefix("upperdir=") {
-                if upperdir.is_some() || v.is_empty() {
-                    valid_options = false;
-                    break;
-                }
-                upperdir = Some(v);
-            } else if let Some(v) = kv.strip_prefix("workdir=") {
-                if workdir.is_some() || v.is_empty() {
-                    valid_options = false;
-                    break;
-                }
-                workdir = Some(v);
-            } else if !kv.is_empty() {
-                // Do not silently claim support for overlay features whose
-                // persistence/security semantics NARF does not implement.
-                valid_options = false;
-                break;
-            }
-        }
-        let lowerdirs = match (valid_options, lowerdirs) {
-            (true, Some(layers)) if !layers.is_empty() => layers,
-            _ => {
-                ctx.set_return(einval);
-                return;
-            }
-        };
-        if upperdir.is_some() != workdir.is_some() {
-            ctx.set_return(einval);
-            return;
-        }
-
-        let mut lowers: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::DirOps>> =
-            alloc::vec::Vec::new();
-        let mut resolved_lower_paths = alloc::vec::Vec::new();
-        for lp in &lowerdirs {
-            let abs = apply_chroot(lp.as_str());
-            match resolve_dir_absolute(abs.as_str()) {
-                Some(d) => {
-                    resolved_lower_paths.push(abs);
-                    lowers.push(d);
-                }
-                None => {
-                    ctx.set_return(enoent);
-                    return;
-                }
-            }
-        }
-        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = match (upperdir, workdir) {
-            (Some(upper_path), Some(work_path)) => {
-                let upper_path = apply_chroot(upper_path);
-                let work_path = apply_chroot(work_path);
-                // Linux requires separate work/upper subtrees. NARF does not
-                // yet expose a filesystem identity through DirOps, so the
-                // stronger same-superblock check remains an audited gap.
-                if upper_path == work_path
-                    || resolved_lower_paths
-                        .iter()
-                        .any(|lower| lower == &upper_path || lower == &work_path)
-                {
-                    ctx.set_return(einval);
-                    return;
-                }
-                let upper = match resolve_dir_absolute(upper_path.as_str()) {
-                    Some(dir) => dir,
-                    None => {
-                        ctx.set_return(enoent);
-                        return;
-                    }
-                };
-                let work = match resolve_dir_absolute(work_path.as_str()) {
-                    Some(dir) => dir,
-                    None => {
-                        ctx.set_return(enoent);
-                        return;
-                    }
-                };
-                if !work.enumerate(0, 1).is_empty() {
-                    ctx.set_return(einval);
-                    return;
-                }
-                alloc::sync::Arc::new(narf_filesystem::OverlayFs::new("overlay", upper, lowers))
-            }
-            (None, None) => {
-                alloc::sync::Arc::new(narf_filesystem::OverlayFs::new_read_only("overlay", lowers))
-            }
-            _ => unreachable!(),
-        };
-        return match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(e) => ctx.set_return(mount_attach_errno(e)),
-        };
-    }
-
-    // FUSE mounts: `fstype == "fuse"` or `"fuse.<subtype>"`. Options carry
-    // `fd=N` naming the open `/dev/fuse` connection. Parse fd, recover the
-    // connection, build a FuseFs, drive FUSE_INIT. Linux: fuse_fill_super.
-    //
-    // The options live in `data` — mount(2)'s 5th argument — NOT `source`.
-    // `source` is the device (`/dev/fuse`) or an arbitrary daemon-chosen
-    // label. This arm read them out of `source` for as long as NARF's mount
-    // ABI really was `(ptr, len, ...)` with no `data` register; that ABI was
-    // converted to the Linux shape above, and the arm was left behind. The
-    // result was that `fd=` was never found in any real caller's `source`,
-    // so EVERY fuse mount took the failure path — and returned EFAULT, which
-    // xdg-document-portal reports verbatim as "fuse: mount failed: Bad
-    // address" before spinning on the descriptors it had staged for it.
-    //
-    // The errnos are Linux's, not a bare fallback: `fuse_fill_super` rejects
-    // missing/unparsable options and an `fd` that is absent or is not a
-    // /dev/fuse connection with EINVAL. EFAULT means "unreadable user
-    // pointer" and misdirects a daemon (and anyone reading its log) toward
-    // an addressing bug.
-    if fstype == "fuse" || fstype.starts_with("fuse.") {
-        let fd_opt = data
-            .split(',')
-            .find_map(|kv| kv.trim().strip_prefix("fd="))
-            .and_then(|v| v.trim().parse::<u32>().ok());
-        let fd = match fd_opt {
-            Some(fd) => fd,
-            None => {
-                ctx.set_return(einval);
-                return;
-            }
-        };
-        let task = current_task_id();
-        let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
-        let conn = match ops {
-            Some(Some(o)) => match narf_filesystem::fuse_conn::DevFuse::connection_of(&o) {
-                Some(c) => c,
-                None => {
-                    ctx.set_return(einval);
-                    return;
-                }
-            },
-            _ => {
-                ctx.set_return(einval);
-                return;
-            }
-        };
-        let subtype = fstype.strip_prefix("fuse.").unwrap_or("fuse");
-        let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
-        // FUSE_INIT is driven in the BACKGROUND, and the mount is published
-        // without waiting for it — this is what Linux does.
-        // `fuse_fill_super` calls `fuse_send_init()`, which submits INIT via
-        // `fuse_simple_background()` and returns; `process_init_reply()`
-        // later sets `fc->initialized` from the reply callback
-        // (`fs/fuse/inode.c`).
-        //
-        // Awaiting INIT inline here deadlocked every real mount. The only
-        // process that can answer FUSE_INIT is the daemon, and a daemon
-        // that issues mount(2) from the same thread it services /dev/fuse
-        // on — which libfuse's `fuse_mount` does — is sitting inside THIS
-        // syscall. Nobody reads the request, the bounded synchronous bridge
-        // expires, and the mount fails: xdg-document-portal's
-        // "fuse init failed: Can't mount path /run/narf-plasma/doc" on
-        // every Fedora Plasma boot, after which it span on the descriptors
-        // it had staged for the mount and burned a core through session
-        // startup.
-        //
-        // `init()`'s own doc says it must be awaited CONCURRENTLY with the
-        // daemon; a spawned task is what makes that true. INIT is enqueued
-        // ahead of any later request, so the daemon still negotiates before
-        // it serves traffic, and a failed negotiation leaves the connection
-        // uninitialized exactly as an aborted Linux connection would.
-        let init_fs = alloc::sync::Arc::clone(&fs);
-        narf_scheduler::spawn(async move {
-            let _ = init_fs.init().await;
-        });
-        let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
-        return match current_mount_arc_with_flags(&auth, target.as_str(), fs_dyn, mnt_flags) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(e) => ctx.set_return(mount_attach_errno(e)),
-        };
-    }
-
-    // Extensibility fallback: an out-of-tree crate may have registered a
-    // constructor for this fstype via `register_fstype`. Built-in arms above
-    // keep priority; consulted only for otherwise-unknown types, before the
-    // block-device fallthrough. Options are passed via source/data.
-    if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
-        return match builder(source_resolved.as_str(), data.as_str()) {
-            Ok(fs) => match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
-                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-                Err(e) => ctx.set_return(mount_attach_errno(e)),
-            },
-            // The out-of-tree constructor rejected the source/options it was
-            // handed — Linux's `fill_super` failure, which surfaces as the
-            // filesystem's own errno, never EFAULT.
-            Err(e) => ctx.set_return(mount_attach_errno(e)),
-        };
-    }
-
-    // Block-device-backed mounts: resolve `source` as a registered
-    // block-device name. Strip a leading "/dev/" so callers can
-    // pass either form.
-    let dev_name = source.strip_prefix("/dev/").unwrap_or(source.as_str());
-    let dev = match narf_block::find_block_device(dev_name) {
-        Some(dev) => dev,
-        None => {
-            // No backend, no register_fstype builder, and no such device: a
-            // known block fstype with a missing device is ENOENT; a genuinely
-            // unknown fstype is ENODEV (matching Linux, never a bare -1).
-            match fstype.as_str() {
-                "fat" | "vfat" | "fat16" | "fat32" | "ext2" | "ext3" | "ext4" | "xfs" | "btrfs"
-                | "iso9660" | "squashfs" | "9p" | "virtiofs" => ctx.set_return(enoent),
-                _ => ctx.set_return(enodev),
-            }
-            return;
-        }
+    super::mount_types::register_mount_types();
+    let Some(fs_type) = narf_filesystem::lookup_fstype(&fstype) else {
+        ctx.set_return(enodev);
+        return;
     };
-
-    let result = match fstype.as_str() {
-        "fat" | "vfat" | "fat16" | "fat32" => {
-            let dev = narf_block::SyncBlock::new(dev.clone());
-            let fut = narf_drivers_fs_fat::mount_fat(&auth, target.as_str(), dev, domain);
-            poll_blocking(fut)
-        }
-        _ => {
-            // A registered device but an unrecognized fstype for it.
-            ctx.set_return(enodev);
-            return;
-        }
-    };
-
-    match result {
-        Some(Ok(_handle)) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(einval),
+    if target_is_non_dir(&target) {
+        ctx.set_return(errno_ret(ENOTDIR));
+        return;
     }
+    let (uid, gid) = current_fs_ids();
+    let request = narf_filesystem::MountRequest {
+        fs_type: &fstype, source: &source_resolved, options: &data,
+        uid, gid, initial_namespace: current_mount_namespace().is_none(),
+    };
+    ctx.set_return(match fs_type.init(&request) {
+        Ok(fs) => match current_mount_arc_with_flags(&auth, &target, fs, mnt_flags) {
+            Ok(_) => SyscallReturn::ok(0),
+            Err(error) => mount_attach_errno(error),
+        },
+        Err(error) => mount_attach_errno(error),
+    });
 }

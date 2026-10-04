@@ -12,6 +12,7 @@ name = "narf_drivers_fs_iso9660"
 path = "src/lib.rs"
 
 [dependencies]
+narf-scheduler = { path = "../../../scheduler" }
 narf-lib          = { path = "../../../lib" }
 narf-arch         = { path = "../../../arch" }
 narf-drivers      = { path = "../../" }

@@ -2668,34 +2668,15 @@ fn gen_loadavg() -> String {
 }
 
 fn gen_filesystems() -> String {
-    use alloc::collections::BTreeSet;
     use core::fmt::Write as _;
-    // Distinct fs.name() values from currently-mounted instances.
-    let mut names: BTreeSet<String> = crate::registry()
-        .list_with_names()
-        .into_iter()
-        .map(|(_p, n)| n)
-        .collect();
-    // Linux lists *registered* filesystem types, not just mounted ones. The
-    // pseudo-filesystems NARF always provides are present whether or not an
-    // instance happens to be mounted in this address space.
-    for n in [
-        "sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "ramfs", "9p",
-    ] {
-        names.insert(String::from(n));
+    let mut types = crate::registered_fstypes();
+    types.sort_by_key(|entry| entry.name);
+    let mut text = String::new();
+    for entry in types {
+        let prefix = if entry.requires_device { "" } else { "nodev" };
+        let _ = writeln!(text, "{}\t{}", prefix, entry.name);
     }
-    let nodev = [
-        "sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "ramfs", "9p",
-    ];
-    let mut s = String::new();
-    for n in names {
-        if nodev.contains(&n.as_str()) {
-            let _ = writeln!(s, "nodev\t{}", n);
-        } else {
-            let _ = writeln!(s, "\t{}", n);
-        }
-    }
-    s
+    text
 }
 
 /// `/proc/stat` — system-wide kernel/scheduler stats. `top`, `uptime`,

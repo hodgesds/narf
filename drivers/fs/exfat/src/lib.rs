@@ -47,3 +47,24 @@ pub mod upcase;
 pub mod volume;
 
 mod tests;
+
+/// Register the named mount constructor without probing a device.
+pub fn register_fstypes() {
+    narf_filesystem::register_block_fstype("exfat", build_named);
+}
+
+fn build_named(
+    source: &str,
+    options: &str,
+) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
+    if !options.is_empty() {
+        return Err(narf_filesystem::FsError::Unsupported);
+    }
+    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
+    let fs = narf_scheduler::block_on(volume::ExfatVolume::mount(
+        narf_block::SyncBlock::new(dev),
+        narf_driver_runtime::DomainId::DRIVER_0,
+    ))?;
+    Ok(fs)
+}

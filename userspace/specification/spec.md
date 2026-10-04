@@ -77,6 +77,25 @@ internal four-argument callers emit generic `epoll_pwait` number 22, whose
 zero-sigmask behavior shares the same handler; reverse lookup canonically
 returns `EpollPwait`.
 
+`mount(2)`, `fsopen(2)` and `fsconfig(FSCONFIG_CMD_CREATE)` use the
+filesystem type registry. `fsopen` performs lookup only, so probing a supported
+storage type succeeds without a device and has no construction side effects.
+`fsconfig` retains `source` separately from filesystem options and builds only
+at CMD_CREATE. It marks the context as constructing, releases its IRQ-safe
+lock, invokes the constructor, then publishes success or failure. Competing
+configuration calls see EBUSY while construction is in progress. Both mount
+APIs attach instances through the caller's mount namespace and report shared
+construction errors (including ENOENT for a missing registered block source).
+Bind, move, remount and propagation operate on existing mount objects.
+
+The Linux ABI installation registers the linked FAT aliases, ext2/3/4,
+btrfs, SquashFS, exFAT, MINIX, ISO9660 and UDF constructors. Filesystem-owned
+constructors parse their options; overlay, FUSE and mqueue adapters retain
+access to the calling task's namespace or descriptors. FUSE subtype lookup is
+registry metadata and its INIT exchange still runs asynchronously. Names
+without a usable constructor, including XFS and the unconnected 9p/virtiofs
+transports, return ENODEV and are absent from `/proc/filesystems`.
+
 The Linux new-mount compatibility surface includes `open_tree_attr(2)` at
 wire number 467 on x86_64 and aarch64. It preserves Linux's error ordering:
 the exceptional null-attribute/nonzero-size pair is rejected before path

@@ -30,6 +30,11 @@ NARF.
 
 ## 3. Public interface
 
+`register_fstypes()` installs `ext2`, `ext3`, `ext4` in the shared named-mount
+registry without constructing a volume. Both mount syscall APIs invoke the
+registered constructor with a block source and options, then attach its returned
+`Arc<dyn FsInstance>` in the caller's namespace.
+
 The driver implements `narf_filesystem::FsInstance` for `Ext2Volume`.
 Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 `DirOps`.

@@ -28,6 +28,11 @@ profile-on-top).
 
 ## 3. Public interface
 
+`register_fstypes()` installs `udf` in the shared named-mount
+registry without constructing a volume. Both mount syscall APIs invoke the
+registered constructor with a block source and options, then attach its returned
+`Arc<dyn FsInstance>` in the caller's namespace.
+
 The driver implements `narf_filesystem::FsInstance`, with per-node
 `FileOps` and `DirOps`.
 
