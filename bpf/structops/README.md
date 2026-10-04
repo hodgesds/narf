@@ -1,0 +1,46 @@
+# bpf/structops — struct_ops Program Support
+
+`narf-bpf-structops` provides NARF's `struct_ops` mechanism: the ability for a
+subsystem to expose a pluggable set of operations — a trait's worth of methods
+— whose implementations are supplied at runtime as verified BPF programs. The
+crate carries the `struct_ops!` extension macro, the descriptors that macro
+emits describing each pluggable trait and its methods, and the
+capability-gated registry that validates and installs a verified set of
+programs against one of those traits.
+
+## Why it is its own crate
+
+The crate is split out from the parent `narf-bpf` runtime so that a subsystem
+wanting a BPF-supplied policy — for example a power-management idle governor
+driven by BPF — depends only on this seam rather than on the whole BPF runtime,
+and so that `narf-bpf` in turn stays ignorant of the subsystems that plug into
+it. This keeps the dependency graph acyclic and the coupling narrow: the
+consumer side sees just the extension surface it needs. The macro requires a
+handful of runtime types at expansion time, and the crate re-exports exactly
+those so the macro's generated paths resolve here rather than forcing a direct
+dependency on the full runtime.
+
+## How it fits the subsystem
+
+A `struct_ops` trait declaration produces descriptors into a dedicated link
+section, and because this crate holds the only writers of that section, a
+force-link anchor keeps the descriptor table from being dropped at link time so
+the set of compiled-in traits is actually present in the image. When a
+userspace loader submits an implementation, each method's program is verified
+through the BPF verifier against the method's expected context and return
+types, and installation is gated on a capability grant before the registry
+records the verified program set as live. The macro derives each method's
+context tuple and return type from the parent runtime's Rust type descriptors,
+so the method signatures a subsystem declares in Rust are what the verifier
+checks the supplied programs against — the same Rust-types-carry-semantics
+principle the rest of NARF's BPF uses in place of BTF.
+
+## Relationships and no_std
+
+This crate depends on the parent `narf-bpf` runtime (for the interpreter entry
+and type descriptors it re-exports), on `bpf/verifier` to prove each supplied
+program, and on the capability system to gate installation; subsystems that
+offer `struct_ops` policies depend on it rather than on `narf-bpf`. It is
+`no_std`. The `kernel-test` feature gates in-kernel smoke tests registered
+through `narf-kernel-test`; because those smokes must assemble the BPF programs
+they load, the feature also pulls in the ISA assembly helpers from `bpf/isa`.
