@@ -48,6 +48,15 @@ fn split(vector: u8) -> (usize, u64) {
     (word, bit)
 }
 
+/// A newly allocated vector starts enabled, whatever its previous owner left.
+/// Linux's `irq_startup` resets `desc->depth` to 0 when a new owner requests
+/// the line, so a `disable_irq` before `free_irq` never reaches the next
+/// owner. Here a teardown that soft-masks its vector and then frees it would
+/// otherwise hand the next owner a vector `on_irq` silently drops.
+fn start_enabled(vector: u8) {
+    crate::dispatch::enable_irq(vector);
+}
+
 /// Reserve and return a free vector in `ALLOC_BASE..=ALLOC_MAX`.
 /// Linear scan; collisions are CAS-resolved.
 pub fn alloc() -> Result<u8, VectorError> {
@@ -61,7 +70,10 @@ pub fn alloc() -> Result<u8, VectorError> {
             }
             match USED[w].compare_exchange_weak(cur, cur | bit, Ordering::AcqRel, Ordering::Relaxed)
             {
-                Ok(_) => return Ok(v),
+                Ok(_) => {
+                    start_enabled(v);
+                    return Ok(v);
+                }
                 Err(actual) => cur = actual,
             }
         }
@@ -114,6 +126,9 @@ pub fn alloc_block(n: u8) -> Result<u8, VectorError> {
                 continue 'outer;
             }
             owned += 1;
+        }
+        for i in 0..n {
+            start_enabled(base + i);
         }
         return Ok(base);
     }
