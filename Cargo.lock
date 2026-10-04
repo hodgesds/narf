@@ -2687,6 +2687,7 @@ dependencies = [
  "blake3",
  "clap",
  "ed25519-dalek",
+ "proc-macro2",
  "serde_json",
  "sha2",
  "wait-timeout",

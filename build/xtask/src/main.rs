@@ -28,6 +28,7 @@ mod affected;
 mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
+mod ci_clippy;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod relocs;
@@ -63,8 +64,11 @@ enum Cmd {
     /// affect, from the git diff against a base ref + the workspace
     /// reverse-dependency closure. Emits JSON (default) or GitHub Actions
     /// outputs (`--github`). Hub-crate / build-infra / unknown-path
-    /// changes and push-to-main / nightly events force a full run.
+    /// changes and nightly / manual events force a full run.
     Affected(affected::AffectedArgs),
+
+    /// Lint changed packages, without linting their dependencies.
+    ClippyChanged(ci_clippy::Args),
     /// Extract the kernel's relocation table for KASLR and report what a
     /// boot-time slide would have to patch. Requires a kernel linked with
     /// `--emit-relocs`.
@@ -1089,13 +1093,16 @@ impl Arch {
                             "bochs-display,id=bochs0".into(),
                         ]);
                     }
+                    // Separate HDA and VirtIO audio sinks. Sharing one QEMU
+                    // mixer lets an idle VirtIO voice stall HDA DMA after a
+                    // VirtIO playback test, making audio tests order-dependent.
                     args.extend_from_slice(&[
                         "-audiodev".into(),
-                        "none,id=snd0".into(),
+                        "none,id=hda0".into(),
                         "-device".into(),
                         "intel-hda".into(),
                         "-device".into(),
-                        "hda-duplex,audiodev=snd0".into(),
+                        "hda-duplex,audiodev=hda0".into(),
                     ]);
                 }
 
@@ -1199,9 +1206,7 @@ impl Arch {
                         ]);
                     }
                     args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
-                    if !legacy {
-                        args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
-                    }
+                    args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
@@ -8150,6 +8155,58 @@ mod kernel_test_feature_tests {
     }
 
     #[test]
+    fn audio_controllers_have_independent_qemu_backends() {
+        use super::{Arch, GpuBackend, HwProfile};
+        use std::collections::BTreeSet;
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for profile in [
+                HwProfile::Full,
+                HwProfile::VirtioOnly,
+                HwProfile::LegacyOnly,
+                HwProfile::Minimal,
+            ] {
+                let args = arch.qemu_args(
+                    std::path::Path::new("kernel"),
+                    "none",
+                    profile,
+                    GpuBackend::Virtio2d,
+                );
+                let backends: Vec<_> = args
+                    .windows(2)
+                    .filter(|w| w[0] == "-audiodev")
+                    .filter_map(|w| w[1].split(',').find_map(|p| p.strip_prefix("id=")))
+                    .collect();
+                assert_eq!(
+                    backends.len(),
+                    backends.iter().collect::<BTreeSet<_>>().len(),
+                    "duplicate audio backend IDs"
+                );
+                let voices: Vec<_> = args
+                    .windows(2)
+                    .filter(|w| w[0] == "-device")
+                    .filter_map(|w| w[1].split(',').find_map(|p| p.strip_prefix("audiodev=")))
+                    .collect();
+                assert!(
+                    voices.iter().all(|v| backends.contains(v)),
+                    "audio device references a missing backend"
+                );
+                assert_eq!(
+                    voices.len(),
+                    voices.iter().collect::<BTreeSet<_>>().len(),
+                    "independent controllers must not share a mixer"
+                );
+                if matches!(arch, Arch::X86_64) && matches!(profile, HwProfile::Full) {
+                    assert_eq!(
+                        voices.len(),
+                        2,
+                        "full x86 fixture must test HDA and VirtIO together"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn subsystem_filter_validation_covers_lists_and_metacharacters() {
         assert!(validate_test_subsystems("userspace,net/ipv6,memory/kaslr.foo-bar").is_ok());
         assert!(validate_test_subsystems("").is_err());
@@ -10242,6 +10299,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::ClippyChanged(args) => ci_clippy::run(&args, &workspace_root()?),
         Cmd::Affected(args) => {
             let root = workspace_root()?;
             affected::affected_cmd(&args, &root)

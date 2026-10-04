@@ -43,8 +43,42 @@ and CI compiler-cache integration.
   keyboard and pointer to the guest's virtio input devices as soon as the
   pointer enters the window; `Ctrl-Alt-G` still releases the grab.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
-- `cargo xtask test --arch=x86_64 --subsystem userspace` — run one exact
-  in-kernel subsystem, then perform the normal whole-kernel boot smoke.
+- `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
+  and its `/`-delimited children, then perform the normal whole-kernel boot
+  smoke. Comma-separated filters select the union of those subtrees.
+- `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
+  directly changed packages, reverse-dependent packages, and kernel subsystem
+  filters from Cargo metadata and Rust registration tokens. PRs use their head
+  and base SHAs; pushes compare the event's before/after SHAs directly, including force pushes. Nightly, manual,
+  `--force-full`/`ci-full`, infrastructure, hub-crate, and unknown-input changes
+  retain full-test fallbacks. Failed diffs or inventory scans also fall back.
+  Embedded userspace images are build inputs to `narf-verification`, even
+  though their manifests are outside the kernel workspace.
+  `--github` emits Actions outputs; the default is JSON. `changed_crates`
+  contains direct workspace owners; `crates` contains affected test owners.
+  `clippy_crates` and `host_clippy_crates` are JSON arrays of lint targets.
+  `subsystems` is a JSON array (a comma-separated string for Actions); an empty
+  filter with `run_kernel_test=true` means all tests. Prefix compaction may
+  shorten a filter only when it adds no unselected registration; a 1024-byte
+  filter budget replaces the former arbitrary tag-count limit.
+  `run_large_memory`, `run_xapic`, `run_virtio_mmio`, `run_user_mode`, and
+  `run_uefi` gate secondary configurations independently. Kernel lint and test
+  jobs retain both architectures. Shared compiler/configuration changes and
+  explicit full runs lint all packages; ordinary crate edits lint direct
+  owners even when their tests require a full run.
+- `cargo xtask clippy-changed --arch=x86_64 --packages '["narf-audio"]'`
+  lints selected packages with `--no-deps` in Cargo-resolved production,
+  container, and user-mode-e2e feature contexts. The pinned nightly's unit
+  graph separates target features from host build-script features; metadata
+  alone merges those contexts and can wrongly enable `std` on bare metal.
+  Identical selected-package
+  and direct-dependency feature sets are checked once. Dependencies still
+  compile. `--arch=host` checks selected host tools with `--all-targets`;
+  `--dry-run` prints commands without running Clippy. Debug kernel linking
+  remains a boot-job check, independent of package lint selection.
+- QEMU's HDA and VirtIO sound devices use distinct audio backends. A shared
+  mixer can stall HDA DMA after a VirtIO test leaves an idle playback voice;
+  the combined `audio` subsystem run covers this ordering regression.
 - `cargo xtask test --arch=x86_64 --subsystem userspace --kernel-tests-only`
   — run only the selected in-kernel tests. This is for secondary CI
   configuration shards after a primary invocation for that architecture has
