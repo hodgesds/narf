@@ -93,10 +93,35 @@ bpf-bench`.
 | `&mut MaybeUninit<T>` | callee initialises | `__uninit` |
 | `ArenaPtr<T>` | arena-space pointer | `KF_ARENA_ARG*` |
 | `Const<N>` | verified constant | `__k` |
-| `Guard<'_>` | critical-section guard; linear, never sleep-safe | `bpf_spin_lock` |
+| `Guard<'_, L>` | typed critical-section guard; structurally linear through `PtrKind::LockGuard`, independently sleep-unsafe through `NonPreemptible`, and `!Send` in kernel Rust | `bpf_spin_lock` |
 
 Descriptors go into a `narf.kfuncs` link section, collected at boot exactly as
 `narf-kernel-test` collects `narf.tests`.
+
+`unsafe trait BpfLock` binds a guard to one lock class. Its `TYPE_NAME` derives
+the non-zero `TypeKey` carried in both acquire and release descriptors; the
+unsafe implementation must ensure that derived key is kernel-wide unique among
+lock classes. `release` must be non-sleeping, non-allocating, non-panicking, and
+able to touch all required state while the BPF hardware domain is active. An
+untyped guard descriptor is malformed, and the verifier rejects passing
+`Guard<'_, L>` to a release kfunc for any other lock class. A successful acquire
+constructs `Guard::from_acquired_token` under its documented safety contract.
+Returning it through a kfunc transfers ownership into the raw BPF token without
+running `Drop`; the matching release shim reconstructs the typed guard, whose
+`Drop` invokes `L::release`. Thus consuming the verifier reference and
+performing the kernel unlock are the same typed operation rather than two
+conventions a release-kfunc body must keep in sync. Guard acquisition must
+return `Option<Guard<'_, L>>`; a non-nullable guard descriptor is malformed.
+
+Every BPF domain run or sleepable poll also owns one fixed per-CPU cleanup slot.
+Raw guard transfer arms it with the token and monomorphised `L::release` hook;
+normal `Guard::drop` disarms it. Fuel exhaustion, a recovered native fault, or
+another abnormal terminal outcome drops the domain scope with the slot still
+armed and therefore releases the lock. Slots form an eight-entry per-CPU stack
+to preserve nested BPF execution without allocation or locking. Exceeding that
+defensive depth or trying to register a different second live guard releases
+the new acquisition immediately and returns null, which is sound because guard
+acquisition is required to be fallible.
 
 Plain `kfunc!` functions use the uniform synchronous shim. Writing `async fn`
 selects a distinct `Pin<Box<dyn Future<Output = u64> + Send>>` shim and forces
@@ -629,7 +654,17 @@ At an await point, every live register whose `ValidityDomain` fails
 `survives_await()` is killed. A `may_suspend` kfunc also rejects such a pointer
 in its argument registers even when the register is dead after the call,
 because the boxed shim future can retain its converted Rust argument while
-pending. No separate lock-held check, no `bpf_rcu_read_lock` equivalent.
+pending. `Guard<'_, L>` is additionally `!Send`, so the macro's `Send` future
+bound prevents a kernel-side async kfunc implementation from carrying one
+across its own `.await`. This is a backstop for Rust code, not a replacement
+for verifying hostile BPF. No separate lock-held check, no
+`bpf_rcu_read_lock` equivalent.
+
+A runtime stop is also an exit for lock discipline. The BPF domain scope keeps
+the typed cleanup hook for the one live guard and invokes it if the program
+terminates without reaching the verified release site. Static linearity covers
+ordinary CFG exits; this cleanup covers fuel exhaustion and recovered native
+faults that are not CFG edges.
 
 **4.5 — Sleepability is declared by the hook, not by the program.** A program
 verified for `Context::Atomic` cannot attach to a sleepable hook or vice
@@ -971,14 +1006,25 @@ and the perf event layer, all of which are closed.
    `interp::drive` remains a test/benchmark helper only for self-waking futures;
    real I/O waits run on the executor through a future-returning hook such as
    sleepable struct ops.
-10. **A `Guard` cannot be both linear and sleep-unsafe under the Phase-0
-    contract.** `ArgDesc::consumes_in_arg_position` requires
-    `domain.requires_release()`, which only `ValidityDomain::Owned` satisfies —
-    but `KfuncDesc::validate` rejects a `PtrKind::LockGuard` return whose
-    domain survives an await, and `Owned` does. §1.11's three properties want
-    both. The fix is probably for linearity to key on `PtrKind::LockGuard`
-    directly rather than on the validity domain; it should land with the
-    abstract interpreter, which is the first consumer that cares.
+10. **Guard linearity and sleep safety (resolved).** These are orthogonal
+    properties. `ArgDesc::consumes_in_arg_position` keys guard linearity on
+    `PtrKind::LockGuard`, while the guard's `ValidityDomain::NonPreemptible`
+    makes it die at every await. Acquisition therefore creates a tracked
+    reference that must be consumed before exit, without falsely granting the
+    await survival of `ValidityDomain::Owned`. `KfuncDesc::validate` rejects a
+    lock-guard argument or return whose domain survives an await. Macro/registry
+    smokes derive both descriptors from the public `Guard<'_, L>` Rust type and
+    exercise balanced release, leak rejection, and await rejection through a
+    real program load; verifier host tests separately pin the structural rule.
+    The Rust wrapper is also `!Send`, making an async kfunc that captures it
+    across `.await` fail the macro's `Send` future bound at compile time. Its
+    `BpfLock` parameter supplies a non-zero verifier type key and an RAII
+    release operation: wrong-lock release is a signature error, raw transfer
+    suppresses `Drop`, and reconstruction by the matching release shim drops
+    exactly once. A per-run/poll cleanup slot releases an armed guard on
+    abnormal runtime termination, including fuel exhaustion, and the descriptor
+    validator requires nullable acquisition so cleanup-slot conflict can fail
+    closed without manufacturing a dangling non-null guard.
 11. **`bpf(2)` load latency has no yield point, and verification dominates
     it.** Measured by `cargo xtask bpf-bench` (N = 60, same runner caveat as
     item 7), for one `BpfProg::load` of a 64-instruction straight-line

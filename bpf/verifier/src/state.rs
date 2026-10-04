@@ -21,7 +21,7 @@
 //! ## References, locks, and sleep safety are one mechanism
 //!
 //! [`Ref`] tracks anything that must be released before exit. A refcounted
-//! `Owned<T>` and a lock `Guard<'_>` are the same kind of entry, differing
+//! `Owned<T>` and a lock `Guard<'_, L>` are the same kind of entry, differing
 //! only in their [`ValidityDomain`] — and that domain is what decides whether
 //! the value survives an await. So "no sleeping with a lock held", "no
 //! `Trusted<T>` across a yield", and "every acquired reference is released"
