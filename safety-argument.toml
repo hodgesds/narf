@@ -1308,3 +1308,17 @@ argument = "A struct-ops program is verified against one immutable versioned met
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Installation requires the existing live policy capability and publishes only after validation and fallible preparation. The owning link is generation-tagged, so a displaced link cannot detach its replacement. Arc-backed live slots release their IRQ-masking lock before invoking BPF and move displaced objects out before destruction. Idle results are width-validated and rechecked against the live latency and residency constraints before power enters a state."
+
+# Sleepable struct-ops continuation. The dedicated security-review skill was
+# not available in this session; human security review remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The async extension remains inside the existing untrusted BPF runtime and struct-ops seam. It changes no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and adds no subsystem to the TCB. Sleepable hooks return ordinary Send futures consumed by the existing executor contract."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A sleepable program is loaded and dispatched only through an exact immutable method contract with a closed kfunc allowlist, scalar-only context, bounded fuel, and Context::Sleepable. NonPreemptible and RcuRead values remain verifier errors across every sleepable kfunc call. The future owns its heap stack; BPF domain rights are entered for each poll and restored before Pending, so no CPU-local stack lease or hardware-rights snapshot migrates."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The object-safe hook exposes only a boxed Send future and generates no synchronous block_on path. Dropping it cancels the VM and nested kfunc future by ownership. Link close and replacement release-store a shared admission gate: calls admitted earlier may finish from retained Arc state, while later calls take the declared async fallback without entering BPF. No pointer-bearing context or physical-to-frame translation API is introduced."

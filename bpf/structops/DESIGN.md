@@ -1,18 +1,17 @@
 # Struct Ops Hardening and Sleepable Execution Requirements
 
 This document defines the security, lifecycle, and execution requirements for
-runtime-supplied implementations of NARF kernel traits. The immediate delivery
-target is hardened atomic `struct_ops`. Sleepable `struct_ops` is a separate
-extension: the verifier already models await points, but its public hook and
-caller ABI must be asynchronous before sleepable attachment is enabled.
+runtime-supplied implementations of NARF kernel traits. Atomic and sleepable
+targets share one contract and attachment lifecycle, but have deliberately
+different Rust call surfaces.
 
 The design treats every BPF program as hostile. A successful verifier verdict
 does not grant ambient kernel access, and a struct-ops attachment does not make
 the program equivalent to a trusted kernel module.
 
-Current status: the atomic requirements below are implemented. Sleepable
-attachment remains disabled pending the asynchronous hook ABI and its
-additional acceptance tests.
+Current status: the atomic requirements and the initial interpreted sleepable
+ABI below are implemented. Mixed-context targets and native continuation-style
+lowering remain deferred.
 
 ## Shared method contract
 
@@ -87,7 +86,7 @@ Sleepable methods require an asynchronous call surface. A verifier can prove
 that bytecode is safe across suspension, but it cannot make a synchronous Rust
 caller drive a future that returned `Pending`.
 
-The initial sleepable design should classify an entire target as sleepable;
+The initial sleepable design classifies an entire target as sleepable;
 mixed atomic and sleepable methods in one trait are deferred. A dynamically
 replaceable target uses NARF's existing object-safe future convention:
 
@@ -96,13 +95,16 @@ pub type StructOpsFuture<'a, T> =
     Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ```
 
-A sleepable adapter awaits `BpfProg::run_sleepable`. A synchronous caller may
-not hide the operation behind `block_on`, especially from an executor poll or
-while holding `IrqSafeSpinLock`. Hooks that require an immediate decision—idle
+A `struct_ops!` target opts in with `#[context(Sleepable)]` and declares its
+methods with `async fn`. The macro lowers those declarations to
+`StructOpsFuture`; the generated adapter awaits the exact-contract
+`BpfProg::run_struct_ops_sleepable` dispatcher. A synchronous caller may not
+hide the operation behind `block_on`, especially from an executor poll or while
+holding `IrqSafeSpinLock`. Hooks that require an immediate decision—idle
 selection, scheduler pick-next, interrupt filtering, and XDP—therefore cannot
 be sleepable.
 
-Before sleepable attachment is enabled, all of the following must hold:
+The sleepable implementation enforces all of the following:
 
 - the hook contract and loaded program both declare `Context::Sleepable`;
 - each sleepable kfunc call remains an await point in the verifier;
@@ -119,6 +121,11 @@ Before sleepable attachment is enabled, all of the following must hold:
   resources; and
 - closing the owning link prevents new calls while already-created futures
   retain their adapter and finish normally.
+
+The adapter and link share an atomic admission gate. Invocation creation reads
+the gate once: a successful read defines an in-flight call. Link close and
+replacement close the old generation's gate, so a retained `Arc` can no longer
+start BPF after detach and instead takes the declared fallback.
 
 Sleepable fallbacks must themselves have an async-compatible interface. Result
 validation occurs after the BPF future completes and before its value reaches
@@ -150,15 +157,15 @@ Atomic support is complete only when tests demonstrate:
 - the idle governor rejects states that violate current latency or residency
   constraints.
 
-Sleepable support additionally requires tests for a genuine multi-poll kfunc,
-reference rejection across await, cancellation by future drop, domain-state
-restoration on every `Pending`, detachment with an in-flight future, and a
-compile-time or API-level prohibition on synchronous invocation.
+Sleepable coverage includes a genuine multi-poll kfunc, verifier rejection of
+references across await, cancellation by future drop, domain-state restoration
+on every `Pending`, detachment with an in-flight future, rejection of calls
+created after detach, async fallback validation, and a `Send` future-only API.
 
 ## Deferred choices
 
-The first sleepable implementation may use boxed futures because NARF already
-uses that object-safe ABI. A pooled or explicit `poll` ABI may remove the
-per-call allocation later, but it must preserve cancellation and ownership
-semantics. Whether a future macro mirrors an existing trait or declares a
-dedicated trait also remains open; neither choice weakens the contract above.
+The first sleepable implementation uses boxed futures because NARF already uses
+that object-safe ABI. A pooled or explicit `poll` ABI may remove the per-call
+allocation later, but it must preserve cancellation and ownership semantics.
+The macro re-declares the target trait: `async fn` is declaration syntax, while
+the emitted object-safe trait returns `StructOpsFuture`.

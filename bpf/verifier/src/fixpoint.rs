@@ -1505,13 +1505,12 @@ impl Analysis<'_, '_> {
         // that delivers sleep safety, lock discipline, and reference validity
         // at once.
         //
-        // The runtime is currently narrower than this: the uniform kfunc shim
-        // returns a `u64`, so a kfunc cannot suspend through it and
-        // `narf_yield()` is an interpreter intrinsic. Treating *every*
-        // `Context::Sleepable` kfunc as an await point is therefore a strict
-        // over-approximation of what can actually suspend today — it rejects
-        // more, never less — and it means the rule needs no revisiting when
-        // the shim grows a suspending form.
+        // The runtime has distinct synchronous and boxed-future shim shapes.
+        // A synchronous shim may still declare `Context::Sleepable` when its
+        // lock/context requirements forbid atomic callers, so treating every
+        // sleepable descriptor as an await remains intentionally conservative:
+        // it may reject a value the particular shim would not suspend with,
+        // but can never admit one across a real suspension.
         if desc.context == Context::Sleepable {
             for (reg, domain) in st.kill_at_await() {
                 // Liveness turns a silent kill into a diagnostic: report only

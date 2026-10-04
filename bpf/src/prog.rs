@@ -105,8 +105,8 @@ pub enum LoadError {
     TypedProbeTooLarge,
     /// XDP frames are borrowed only for an atomic classifier callback.
     XdpRequiresAtomic,
-    /// Synchronous struct-ops adapters currently provide only atomic hooks.
-    StructOpsRequiresAtomic,
+    /// The load request and struct-ops method declare different contexts.
+    StructOpsContextMismatch,
     /// A struct-ops contract was malformed or exposed a non-scalar context.
     BadStructOpsContract,
     /// A struct-ops contract named a kfunc that is not registered.
@@ -534,8 +534,8 @@ impl BpfProg {
         req: LoadRequest,
         contract: StructOpsContract,
     ) -> Result<Arc<Self>, LoadError> {
-        if req.context != contract.context || contract.context != Context::Atomic {
-            return Err(LoadError::StructOpsRequiresAtomic);
+        if req.context != contract.context {
+            return Err(LoadError::StructOpsContextMismatch);
         }
         if contract.target_id == 0
             || contract.method_id == 0
@@ -1661,8 +1661,33 @@ impl BpfProg {
         if self.struct_ops.is_some() {
             return None;
         }
+        self.run_sleepable_inner(ctx, ctx_len).await
+    }
+
+    /// Run through the exact sleepable struct-ops method this program was
+    /// verified for.
+    pub async fn run_struct_ops_sleepable(
+        &self,
+        contract: StructOpsContract,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
+        if self.struct_ops != Some(contract)
+            || contract.context != Context::Sleepable
+            || ctx_len != contract.ctx.len()
+            || ctx_len > MAX_CTX_WORDS
+        {
+            return None;
+        }
+        self.run_sleepable_inner(ctx, ctx_len).await
+    }
+
+    async fn run_sleepable_inner(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
         let stack = HeapStack::new(self.stack_bytes as usize);
-        let frame = stack.acquire(self.stack_bytes as usize)?;
         let registry = crate::kfunc::registry()?;
         let mut vm = Vm::new(
             crate::interp::VmProgram {
@@ -1674,7 +1699,7 @@ impl BpfProg {
             },
             ctx,
             ctx_len,
-            frame,
+            stack,
             registry,
         )
         .with_arenas(self.arenas())

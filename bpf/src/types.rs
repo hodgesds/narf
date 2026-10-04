@@ -50,7 +50,7 @@ use narf_bpf_verifier::kfunc::{ArgDesc, ArgFlags, PtrKind, TypeKey, TypeKind, Va
 /// [`TypeKey`] is derived from the name rather than assigned by a boot-time
 /// registry, so it is stable across boots and across link orders — which
 /// matters because a program's kfunc references travel with the program.
-pub trait BpfObject: 'static {
+pub trait BpfObject: Send + Sync + 'static {
     /// The name the verifier and diagnostics use. Must be unique kernel-wide.
     const TYPE_NAME: &'static str;
 
@@ -374,6 +374,10 @@ pub struct Owned<T: BpfObject> {
     ptr: NonNull<T>,
 }
 
+// SAFETY: `BpfObject` requires `Send + Sync`; this handle owns one transferable
+// reference and releases it through the object's type-level callback.
+unsafe impl<T: BpfObject> Send for Owned<T> {}
+
 impl<T: BpfObject> Owned<T> {
     /// Wrap a pointer whose refcount the caller has already incremented.
     ///
@@ -515,6 +519,11 @@ pub struct SleepableRcu<'g, T: BpfObject> {
     ptr: NonNull<T>,
     _guard: PhantomData<&'g T>,
 }
+
+// SAFETY: sleepable-RCU reservations are migration-safe and `BpfObject`
+// requires a thread-safe pointee. The verifier admits this domain across
+// awaits precisely because the backing reservation remains live.
+unsafe impl<T: BpfObject> Send for SleepableRcu<'_, T> {}
 
 impl<T: BpfObject> SleepableRcu<'_, T> {
     /// The raw pointer.

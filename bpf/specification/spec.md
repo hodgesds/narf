@@ -97,6 +97,12 @@ bpf-bench`.
 Descriptors go into a `narf.kfuncs` link section, collected at boot exactly as
 `narf-kernel-test` collects `narf.tests`.
 
+Plain `kfunc!` functions use the uniform synchronous shim. Writing `async fn`
+selects a distinct `Pin<Box<dyn Future<Output = u64> + Send>>` shim and forces
+`Context::Sleepable`; it cannot be mislabeled atomic. The interpreter awaits
+that shim directly. `BpfObject` requires `Send + Sync`, and the `Owned` and
+`SleepableRcu` handles admitted across awaits are movable with the executor.
+
 #### LED command kfunc
 
 `narf_led_submit(idx: u32, action: u32, value: u32) -> i64` is an
@@ -171,8 +177,9 @@ pub const fn bytes_per_level() -> u64;      // the verifier's stack bound
 slot on drop, so preemption cannot double-lease a slice. On x86_64 PKS systems,
 the mapped stack leaves carry `DomainId::BPF` in their PTE protection-key field;
 FRAME-neutral execution and BPF confinement can access them, while unrelated
-confined domains cannot. Sleepable programs use a future-owned heap stack
-instead (§4.8), so this is not the only path.
+confined domains cannot. Sleepable programs use a future-owned `Send` heap
+stack instead (§4.8), so the whole interpreter continuation can migrate
+between polls without moving a CPU-local lease.
 
 ```rust
 // bpf/src/domain.rs — execution confinement
@@ -477,6 +484,23 @@ arguments initially implement the scalar-only `BpfCtxArg` interface, so this
 surface carries no raw kernel or physical pointer and provides no generic
 physical-to-frame translation API.
 
+```rust
+pub type StructOpsFuture<'a, T> =
+    Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+impl BpfProg {
+    pub async fn run_struct_ops_sleepable(
+        &self,
+        contract: StructOpsContract,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome>;
+}
+```
+
+`StructOpsDesc::context` classifies the whole target. Every method descriptor
+must carry the same context; mixed atomic/sleepable targets are rejected.
+
 The macro emits a target-specific program builder and installation returns an
 owning, generation-tagged `StructOpsLink`. Closing or dropping the link detaches
 only its generation. Live slots use `Arc` snapshots so the subsystem lock is
@@ -484,11 +508,18 @@ released before a callback runs and displaced values are destroyed outside the
 lock. Every method has an explicit fallback and validates raw results before
 conversion.
 
-Atomic methods are the only implemented form. Sleepable methods require an
-object-safe future-returning hook and must await `BpfProg::run_sleepable`; a
-synchronous adapter may not conceal that requirement with `block_on`. The full
-atomic and sleepable requirements, cancellation semantics, and acceptance
-tests are in [`bpf/structops/DESIGN.md`](../structops/DESIGN.md).
+Atomic methods use an ordinary trait call. A target marked
+`#[context(Sleepable)]` declares only `async fn` methods; `struct_ops!` lowers
+those to the object-safe `StructOpsFuture<'a, T>` ABI and dispatches through
+`BpfProg::run_struct_ops_sleepable`. The future is `Send`, owns its heap stack,
+and may be cancelled by drop. A synchronous adapter may not conceal it with
+`block_on`.
+
+The owning link and adapter share an invocation-admission gate. Close or
+replacement prevents a retained adapter from starting another BPF invocation,
+while a future admitted before the close retains its VM and finishes normally.
+The full atomic and sleepable requirements and acceptance tests are in
+[`bpf/structops/DESIGN.md`](../structops/DESIGN.md).
 
 ## 4. Invariants
 
@@ -538,11 +569,14 @@ At an await point, every live register whose `ValidityDomain` fails
 verified for `Context::Atomic` cannot attach to a sleepable hook or vice
 versa; the mismatch is a type error at attach, not a runtime flag check.
 
-**4.6 — A running program may not allocate.** Permitted: `try_alloc_atomic`
-(handling `None`), `atomic_pool`. Forbidden: the global allocator,
-`alloc_frame`, any `IrqSafeSpinLock` a caller might hold, and all of
-`narf_tracing::dispatch::*` (§4.7). Map values live in slabs pre-sized at
-creation, so `map_update_elem` never allocates.
+**4.6 — An atomic running program may not allocate.** Permitted:
+`try_alloc_atomic` (handling `None`), `atomic_pool`. Forbidden on atomic paths:
+the global allocator, `alloc_frame`, any `IrqSafeSpinLock` a caller might hold,
+and all of `narf_tracing::dispatch::*` (§4.7). Map values live in slabs
+pre-sized at creation, so `map_update_elem` never allocates. Sleepable
+invocations may allocate their owned stack and boxed kfunc futures in process
+context; they may not retain an IRQ-safe lock or CPU-local lease across an
+await.
 
 **4.7 — BPF programs must not re-enter the probe dispatcher.**
 `tracing::dispatch::fire()` invokes handlers *while holding* `TABLE.inner`
@@ -695,8 +729,9 @@ and the perf event layer, all of which are closed.
    are §4.6 amendments, not follow-ups to this item.
 3. **Nested locks.** v1 permits one live `Guard` at a time. Nesting under a
    declared lock-order lattice is deferred.
-4. **`struct_ops!` form.** Whether it re-declares traits or mirrors existing
-   ones via `struct_ops_for!(path::Trait { … })`.
+4. **`struct_ops!` form (resolved).** The macro re-declares the target trait so
+   the Rust signature is also the verifier contract. Sleepable declarations
+   use `async fn` syntax and lower to the object-safe `StructOpsFuture` return.
 5. **Continuation-style JIT lowering for sleepable programs**, replacing "
    sleepable ⇒ interpreted".
 6. **Making JIT text unwritable, not merely un-aliased-executable.** The first
@@ -843,17 +878,12 @@ and the perf event layer, all of which are closed.
 8. **aarch64 `probe.rs`.** Porting the x86_64 recoverable-probe module would
    let `memory/src/tests.rs`'s four `probe::arm` sites stop being x86-only.
    Optional scope, but adjacent.
-9. **An ABI for kfuncs that await.** The kfunc calling convention is one
-   uniform `extern "C" fn(u64, u64, u64, u64, u64) -> u64`, which is what lets
-   the interpreter transmute a shim address once and the JIT emit one call
-   sequence — but a `u64` is not a future, so a sleepable kfunc cannot go
-   through it. `narf_yield()` is currently an interpreter intrinsic recognised
-   by id (`interp::Vm::call_kfunc`). A second sleepable kfunc, or any kfunc
-   that parks on real I/O rather than yielding to itself, needs a real answer:
-   either a second shim shape returning `Poll`, or a registry flag routing
-   sleepable kfuncs through a boxed-future path. Related: `interp::drive`
-   spins because `YieldNow` wakes itself, which is only sound while `yield` is
-   the sole await point.
+9. **Awaiting kfunc ABI (resolved).** `KfuncShim` has distinct synchronous and
+   sleepable variants. An `async fn` declaration produces a boxed `Send`
+   future, is always described as `Context::Sleepable`, and is awaited only by
+   the interpreter. The JIT rejects such call sites. `interp::drive` remains a
+   test/benchmark helper only for self-waking futures; real I/O waits run on
+   the executor through a future-returning hook such as sleepable struct ops.
 10. **A `Guard` cannot be both linear and sleep-unsafe under the Phase-0
     contract.** `ArgDesc::consumes_in_arg_position` requires
     `domain.requires_release()`, which only `ValidityDomain::Owned` satisfies —

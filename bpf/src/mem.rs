@@ -48,6 +48,25 @@ pub trait BpfStack {
     fn acquire(&self, bytes: usize) -> Option<StackFrame<'_>>;
 }
 
+/// Byte storage owned by one interpreter invocation.
+///
+/// Kept separate from [`BpfStack`]: atomic providers lend a CPU-local
+/// [`StackFrame`], while a sleepable invocation moves an owned [`HeapStack`]
+/// with its future. The latter must be `Send` so the executor may resume it on
+/// another CPU after an await.
+pub trait VmStack {
+    /// Mutable stack bytes.
+    fn bytes_mut(&mut self) -> &mut [u8];
+
+    /// Frame length in bytes.
+    fn len(&self) -> usize;
+
+    /// Whether the frame has no usable bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// A borrowed BPF stack frame. Releasing is `Drop`, so an early return from
 /// the interpreter cannot leak a per-CPU slot.
 ///
@@ -127,6 +146,18 @@ impl StackFrame<'_> {
         self.lease
             .as_ref()
             .map(narf_memory::bpf_stack::StackLease::cpu)
+    }
+}
+
+impl VmStack for StackFrame<'_> {
+    #[inline]
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.bytes_mut()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len()
     }
 }
 
@@ -351,6 +382,20 @@ impl HeapStack {
     }
 }
 
+impl VmStack for HeapStack {
+    #[inline]
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: this method requires `&mut self`, so no frame borrowed
+        // through `BpfStack::acquire` can coexist with this access.
+        unsafe { &mut *self.bytes.get() }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 impl BpfStack for HeapStack {
     fn acquire(&self, bytes: usize) -> Option<StackFrame<'_>> {
         if bytes > self.len {
@@ -373,11 +418,9 @@ impl BpfStack for HeapStack {
             bytes: frame,
             release: None,
             lease: None,
-            // A heap stack is owned by the future and is not per-CPU, so it
-            // would be safe to move. It inherits `!Send` anyway rather than
-            // splitting the type — a sleepable program's frame moving between
-            // CPUs is fine, but nothing needs it to, and one shape is easier
-            // to reason about than two.
+            // This borrowed form is used by synchronous benchmarks and keeps
+            // the conservative `!Send` shape. Sleepable execution moves the
+            // `HeapStack` itself into `Vm`, where its owned storage is `Send`.
             _not_send: core::marker::PhantomData,
         })
     }

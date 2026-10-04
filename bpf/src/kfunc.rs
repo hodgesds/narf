@@ -68,7 +68,7 @@ pub type SyncShim = extern "C" fn(u64, u64, u64, u64, u64) -> u64;
 /// program, which by definition runs as an ordinary executor task in
 /// preemptible context — spec §4.6's "a running program may not allocate"
 /// governs the atomic path, where no sleepable kfunc can be called at all.
-pub type SleepShim = fn(u64, u64, u64, u64, u64) -> Pin<Box<dyn Future<Output = u64>>>;
+pub type SleepShim = fn(u64, u64, u64, u64, u64) -> Pin<Box<dyn Future<Output = u64> + Send>>;
 
 /// How the runtime enters a kfunc.
 ///
@@ -455,7 +455,9 @@ macro_rules! kfunc {
                 a2: u64,
                 a3: u64,
                 a4: u64,
-            ) -> ::core::pin::Pin<alloc::boxed::Box<dyn ::core::future::Future<Output = u64>>> {
+            ) -> ::core::pin::Pin<
+                alloc::boxed::Box<dyn ::core::future::Future<Output = u64> + Send>
+            > {
                 alloc::boxed::Box::pin(async move {
                     let __raw = [a0, a1, a2, a3, a4];
                     #[allow(unused_mut)]
