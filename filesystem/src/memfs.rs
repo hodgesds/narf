@@ -2579,6 +2579,10 @@ impl FileOps for MemFile {
         true
     }
 
+    fn supports_mmap_fault(&self) -> bool {
+        true
+    }
+
     fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
         let index = offset / PAGE_SIZE;
         let uid = self.uid.load(Ordering::Relaxed);

@@ -670,7 +670,7 @@ pub fn __test_swap_as_for_task_lookup(lookup: Option<AsForTaskLookupFn>) -> Opti
     }
 }
 
-fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
+pub(crate) fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
     (*ALL_AS_LOOKUP.lock())
         .map(|lookup| lookup())
         .unwrap_or_default()
@@ -9819,6 +9819,9 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
 }
 
 pub fn retain_external_shared_frame(phys: u64) {
+    if narf_filesystem::page_cache::retain_mapped_folio(phys) {
+        return;
+    }
     if let Some(vtable) = shmem_vtable() {
         if (vtable.retain_frame)(phys) {
             return;
@@ -9828,6 +9831,9 @@ pub fn retain_external_shared_frame(phys: u64) {
 }
 
 pub fn release_external_shared_frame(phys: u64) {
+    if narf_filesystem::page_cache::release_mapped_folio(phys) {
+        return;
+    }
     if let Some(vtable) = shmem_vtable() {
         if (vtable.release_frame)(phys) {
             return;

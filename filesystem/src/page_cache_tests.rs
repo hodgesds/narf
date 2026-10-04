@@ -11,7 +11,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::page_cache::{
     default_capacity_pages, set_default_capacity_pages, set_free_pages_hook,
-    set_low_watermark_pages, CacheFolio, Folio, PageCache, PageKey,
+    set_low_watermark_pages, CacheFolio, FileMapping, PageCache, PageKey,
 };
 
 fn key(page_off: u64) -> PageKey {
@@ -22,17 +22,17 @@ fn key(page_off: u64) -> PageKey {
     }
 }
 
-fn clean_folio(fill: u8) -> Folio {
+fn clean_folio(fill: u8) -> CacheFolio {
     let mut folio = CacheFolio::alloc_zeroed().expect("cache folio frame for test");
     folio[..].fill(fill);
-    Folio::clean(folio)
+    folio
 }
 
-fn clean_order_folio(order: u8, fill: u8) -> Folio {
+fn clean_order_folio(order: u8, fill: u8) -> CacheFolio {
     let mut folio =
         CacheFolio::alloc_order_zeroed(order).expect("ordered cache folio frame for test");
     folio[..].fill(fill);
-    Folio::clean(folio)
+    folio
 }
 
 /// Restore the process-global watermark + free-page hook so a test
@@ -48,12 +48,12 @@ fn smoke_page_cache_hard_cap_evicts_clean() -> TestResult {
     reset_globals();
     let cache = PageCache::with_capacity(4);
     for i in 0..4 {
-        cache.insert_folio(key(i), clean_folio(i as u8));
+        cache.__insert_folio_for_test(key(i), clean_folio(i as u8));
     }
     if cache.len() != 4 {
         return TestResult::Fail("fill to capacity should hold 4 pages");
     }
-    cache.insert_folio(key(4), clean_folio(4));
+    cache.__insert_folio_for_test(key(4), clean_folio(4));
     if cache.len() != 4 {
         return TestResult::Fail("cache exceeded its capacity ceiling");
     }
@@ -72,14 +72,14 @@ kernel_test_in!(
 fn smoke_page_cache_clock_second_chance() -> TestResult {
     reset_globals();
     let cache = PageCache::with_capacity(3);
-    cache.insert_folio(key(0), clean_folio(0));
-    cache.insert_folio(key(1), clean_folio(1));
-    cache.insert_folio(key(2), clean_folio(2));
+    cache.__insert_folio_for_test(key(0), clean_folio(0));
+    cache.__insert_folio_for_test(key(1), clean_folio(1));
+    cache.__insert_folio_for_test(key(2), clean_folio(2));
     // Reference the oldest page — it must NOT be the one evicted next.
     if cache.lookup_folio(key(0)).is_none() {
         return TestResult::Fail("key 0 should be resident before the sweep");
     }
-    cache.insert_folio(key(3), clean_folio(3)); // overflow → one eviction
+    cache.__insert_folio_for_test(key(3), clean_folio(3)); // overflow → one eviction
     if cache.len() != 3 {
         return TestResult::Fail("capacity ceiling not held");
     }
@@ -101,24 +101,57 @@ kernel_test_in!(
 fn smoke_page_cache_never_evicts_dirty() -> TestResult {
     reset_globals();
     let cache = PageCache::with_capacity(2);
-    cache.insert_folio(key(0), clean_folio(0));
-    cache.insert_folio(key(1), clean_folio(1));
+    cache.__insert_folio_for_test(key(0), clean_folio(0));
+    cache.__insert_folio_for_test(key(1), clean_folio(1));
     if !cache.mark_dirty(key(0)) {
         return TestResult::Fail("mark_dirty on a resident page must succeed");
     }
     for i in 2..20 {
-        cache.insert_folio(key(i), clean_folio(i as u8));
+        cache.__insert_folio_for_test(key(i), clean_folio(i as u8));
     }
     if cache.lookup_folio(key(0)).is_none() {
         return TestResult::Fail("a dirty page must never be evicted");
     }
-    let drained = cache.drain_dirty();
+    let drained = cache.take_dirty(0, 0, 0, u64::MAX);
     if drained.len() != 1 || drained[0].0 != key(0) {
         return TestResult::Fail("dirty page's writeback obligation was lost");
     }
     TestResult::Pass
 }
 kernel_test_in!("filesystem/page_cache", smoke_page_cache_never_evicts_dirty);
+
+/// A page installed in a borrowed user PTE carries an external folio hold.
+/// Reclaim may evict it only after the last PTE releases that hold.
+fn smoke_page_cache_mapped_folio_is_pinned_until_unmap() -> TestResult {
+    reset_globals();
+    let cache = alloc::sync::Arc::new(PageCache::with_capacity(0));
+    let mapping = FileMapping::new(cache.clone(), 7, 42);
+    cache.__insert_folio_for_test(
+        PageKey {
+            fs_id: 7,
+            inode: 42,
+            page_off: 0,
+        },
+        clean_folio(0x5a),
+    );
+    let folio = mapping.lookup(0).expect("inserted file folio");
+    let phys = folio.mmap_frame();
+    drop(folio);
+    if cache.shrink(1) != 0 || cache.is_empty() {
+        return TestResult::Fail("reclaim evicted a user-mapped cache folio");
+    }
+    if !crate::page_cache::release_mapped_folio(phys) {
+        return TestResult::Fail("unmap did not release the mapped folio");
+    }
+    if cache.shrink(1) != 1 || !cache.is_empty() {
+        return TestResult::Fail("unmapped clean folio did not become reclaimable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_mapped_folio_is_pinned_until_unmap
+);
 
 /// Free-memory watermark: with no hard cap, a cache under the free
 /// watermark sheds clean pages toward the reclaim floor; the same
@@ -134,7 +167,7 @@ fn smoke_page_cache_watermark_reclaim() -> TestResult {
     set_free_pages_hook(Some(plenty));
     let relaxed = PageCache::with_capacity(0);
     for i in 0..600 {
-        relaxed.insert_folio(key(i), clean_folio(0));
+        relaxed.__insert_folio_for_test(key(i), clean_folio(0));
     }
     if relaxed.len() != 600 {
         reset_globals();
@@ -148,7 +181,7 @@ fn smoke_page_cache_watermark_reclaim() -> TestResult {
     set_free_pages_hook(Some(starved));
     let pressed = PageCache::with_capacity(0);
     for i in 0..600 {
-        pressed.insert_folio(key(i), clean_folio(0));
+        pressed.__insert_folio_for_test(key(i), clean_folio(0));
     }
     let n = pressed.len();
     reset_globals();
@@ -171,7 +204,7 @@ fn smoke_page_cache_new_follows_global_default() -> TestResult {
     set_default_capacity_pages(4);
     let cache = PageCache::new();
     for i in 0..10 {
-        cache.insert_folio(key(i), clean_folio(0));
+        cache.__insert_folio_for_test(key(i), clean_folio(0));
     }
     let n = cache.len();
     set_default_capacity_pages(saved); // restore boot's RAM-sized value
@@ -191,7 +224,7 @@ fn smoke_page_cache_shrink_evicts_clean_keeps_dirty() -> TestResult {
     reset_globals();
     let cache = PageCache::with_capacity(0); // unbounded: isolate shrink()
     for i in 0..10 {
-        cache.insert_folio(key(i), clean_folio(0));
+        cache.__insert_folio_for_test(key(i), clean_folio(0));
     }
     cache.mark_dirty(key(3));
     cache.mark_dirty(key(7));
@@ -224,7 +257,7 @@ fn smoke_page_cache_zero_capacity_unbounded() -> TestResult {
     reset_globals();
     let cache = PageCache::with_capacity(0);
     for i in 0..1000 {
-        cache.insert_folio(key(i), clean_folio(0));
+        cache.__insert_folio_for_test(key(i), clean_folio(0));
     }
     if cache.len() != 1000 {
         return TestResult::Fail("capacity 0 + no watermark should disable eviction");
@@ -246,7 +279,7 @@ fn smoke_page_cache_ordered_folio_lookup_accounting_and_reclaim() -> TestResult 
         CacheFolio::alloc_order_zeroed(1).expect("order-1 cache folio frame for test");
     allocation[..4096].fill(0x11);
     allocation[4096..].fill(0x22);
-    if !cache.insert_folio(key(8), Folio::clean(allocation)) {
+    if !cache.__insert_folio_for_test(key(8), allocation) {
         return TestResult::Fail("aligned order-1 folio insertion failed");
     }
     if cache.len() != 2 || cache.folio_count() != 1 {
@@ -266,10 +299,17 @@ fn smoke_page_cache_ordered_folio_lookup_accounting_and_reclaim() -> TestResult 
     if !cache.mark_dirty(key(9)) || cache.reclaimable() != 0 || cache.shrink(2) != 0 {
         return TestResult::Fail("tail dirtying did not protect the complete folio");
     }
-    let dirty = cache.drain_dirty();
+    let dirty = cache.take_dirty(0, 0, 0, u64::MAX);
     if dirty.len() != 1 || dirty[0].0 != key(8) || dirty[0].1.order() != 1 {
         return TestResult::Fail("writeback did not receive the complete folio at its head");
     }
+    // A folio someone still references (the lookup and the writeback batch)
+    // is in use as the cache's copy and is not reclaimable.
+    if cache.reclaimable() != 0 || cache.shrink(2) != 0 {
+        return TestResult::Fail("reclaim evicted a folio that was still referenced");
+    }
+    drop(tail);
+    drop(dirty);
     if cache.shrink(1) != 0 || cache.len() != 2 {
         return TestResult::Fail("reclaim split a folio to satisfy a one-page request");
     }
@@ -287,13 +327,13 @@ kernel_test_in!(
 fn smoke_page_cache_rejects_misaligned_and_overlapping_folios() -> TestResult {
     reset_globals();
     let cache = PageCache::with_capacity(0);
-    if cache.insert_folio(key(3), clean_order_folio(1, 0x33)) {
+    if cache.__insert_folio_for_test(key(3), clean_order_folio(1, 0x33)) {
         return TestResult::Fail("misaligned order-1 folio was published");
     }
-    if !cache.insert_folio(key(8), clean_order_folio(1, 0x44)) {
+    if !cache.__insert_folio_for_test(key(8), clean_order_folio(1, 0x44)) {
         return TestResult::Fail("aligned order-1 folio insertion failed");
     }
-    if cache.insert_folio(key(9), clean_folio(0x55)) {
+    if cache.__insert_folio_for_test(key(9), clean_folio(0x55)) {
         return TestResult::Fail("tail-page insertion overlapped a resident folio");
     }
     if cache.len() != 2 || cache.folio_count() != 1 {
@@ -317,11 +357,11 @@ fn smoke_page_cache_invalidate_range_is_exact() -> TestResult {
         page_off,
     };
     for p in [0u64, 1, 2, 3, 6] {
-        cache.insert_folio(key(p), clean_folio(p as u8));
-        cache.insert_folio(other(p), clean_folio(0xee));
+        cache.__insert_folio_for_test(key(p), clean_folio(p as u8));
+        cache.__insert_folio_for_test(other(p), clean_folio(0xee));
     }
     // An order-1 folio over pages 4-5 straddles the range's start (5).
-    if !cache.insert_folio(key(4), clean_order_folio(1, 4)) {
+    if !cache.__insert_folio_for_test(key(4), clean_order_folio(1, 4)) {
         return TestResult::Fail("order-1 folio at page 4 was not inserted");
     }
     // Drop [1, 3) and [5, 6).
@@ -356,3 +396,239 @@ kernel_test_in!(
     "filesystem/page_cache",
     smoke_page_cache_invalidate_range_is_exact
 );
+
+// ── The fill protocol (`get_or_fill`) ──────────────────────────────
+
+mod fill_protocol {
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    use crate::page_cache::Filled;
+    use crate::FsError;
+
+    fn noop_waker() -> Waker {
+        fn raw() -> RawWaker {
+            unsafe fn clone(_: *const ()) -> RawWaker {
+                raw()
+            }
+            unsafe fn noop(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        // SAFETY: every vtable entry is a no-op or rebuilds the same waker;
+        // the null data pointer is never dereferenced.
+        unsafe { Waker::from_raw(raw()) }
+    }
+
+    type FillFuture<'a> = Pin<Box<dyn Future<Output = Result<Filled, FsError>> + 'a>>;
+
+    /// A fill that parks until `gate` opens, counts its runs in `runs`, and
+    /// writes `byte` over the whole folio (or fails when `fail` is set).
+    fn gated_fill<'a>(
+        cache: &'a PageCache,
+        page: u64,
+        gate: &'a AtomicBool,
+        runs: &'a AtomicUsize,
+        byte: u8,
+        fail: bool,
+    ) -> FillFuture<'a> {
+        Box::pin(
+            cache.get_or_fill(key(page), 0, move |mut folio| async move {
+                runs.fetch_add(1, Ordering::Relaxed);
+                core::future::poll_fn(|_| {
+                    if gate.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                if fail {
+                    return Err(FsError::Io(narf_block::BlockError::IOError));
+                }
+                folio[..].fill(byte);
+                Ok(folio)
+            }),
+        )
+    }
+
+    fn poll(fut: &mut FillFuture<'_>) -> Poll<Result<Filled, FsError>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        fut.as_mut().poll(&mut cx)
+    }
+
+    /// Concurrent misses on one page issue ONE fill; the second caller parks
+    /// on the ticket and then takes the published folio (Linux: the second
+    /// reader sleeps on the locked folio instead of reading it again).
+    fn smoke_page_cache_get_or_fill_coalesces_concurrent_misses() -> TestResult {
+        let cache = PageCache::with_capacity(0);
+        let gate = AtomicBool::new(false);
+        let runs = AtomicUsize::new(0);
+        let mut first = gated_fill(&cache, 3, &gate, &runs, 0xa1, false);
+        let mut second = gated_fill(&cache, 3, &gate, &runs, 0xb2, false);
+        if poll(&mut first).is_ready() || poll(&mut second).is_ready() {
+            return TestResult::Fail("a gated fill completed before its device");
+        }
+        if runs.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("two concurrent misses on one page both filled");
+        }
+        gate.store(true, Ordering::Release);
+        let a = match poll(&mut first) {
+            Poll::Ready(Ok(a)) => a,
+            _ => return TestResult::Fail("the filler did not finish once released"),
+        };
+        let b = match poll(&mut second) {
+            Poll::Ready(Ok(b)) => b,
+            _ => return TestResult::Fail("the parked caller did not take the published folio"),
+        };
+        if !a.published() || !b.published() {
+            return TestResult::Fail("an uncontested fill was not published");
+        }
+        if a.folio().page_bytes()[0] != 0xa1 || b.folio().page_bytes()[0] != 0xa1 {
+            return TestResult::Fail("the waiter saw different bytes than the fill");
+        }
+        if runs.load(Ordering::Relaxed) != 1 || cache.len() != 1 {
+            return TestResult::Fail("the waiter refilled or the folio was not cached once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/page_cache",
+        smoke_page_cache_get_or_fill_coalesces_concurrent_misses
+    );
+
+    /// Invalidation is per key. A write that invalidates the page being
+    /// filled voids THAT fill (its bytes are returned to its caller but never
+    /// cached, and a parked waiter refills); a write to another page voids
+    /// nothing.
+    fn smoke_page_cache_invalidation_voids_only_overlapping_fills() -> TestResult {
+        let cache = PageCache::with_capacity(0);
+        let gate = AtomicBool::new(false);
+        let runs = AtomicUsize::new(0);
+        let mut hit_fill = gated_fill(&cache, 5, &gate, &runs, 0x11, false);
+        let mut spared_fill = gated_fill(&cache, 9, &gate, &runs, 0x22, false);
+        let mut waiter = gated_fill(&cache, 5, &gate, &runs, 0x33, false);
+        if poll(&mut hit_fill).is_ready()
+            || poll(&mut spared_fill).is_ready()
+            || poll(&mut waiter).is_ready()
+        {
+            return TestResult::Fail("a gated fill completed before its device");
+        }
+        if runs.load(Ordering::Relaxed) != 2 {
+            return TestResult::Fail("expected one fill per page");
+        }
+        // The "write" lands on page 5 only.
+        cache.invalidate_range(0, 0, 5, 6);
+        // The waiter re-probes, finds no ticket, and starts its own fill.
+        if poll(&mut waiter).is_ready() || runs.load(Ordering::Relaxed) != 3 {
+            return TestResult::Fail("the waiter on an invalidated fill did not refill");
+        }
+        gate.store(true, Ordering::Release);
+        let voided = match poll(&mut hit_fill) {
+            Poll::Ready(Ok(v)) => v,
+            _ => return TestResult::Fail("the invalidated fill did not complete"),
+        };
+        if voided.published() || voided.folio().page_bytes()[0] != 0x11 {
+            return TestResult::Fail("an invalidated fill published its pre-write bytes");
+        }
+        let spared = match poll(&mut spared_fill) {
+            Poll::Ready(Ok(v)) => v,
+            _ => return TestResult::Fail("the unrelated fill did not complete"),
+        };
+        if !spared.published() {
+            return TestResult::Fail("a write to page 5 voided the fill of page 9");
+        }
+        let refilled = match poll(&mut waiter) {
+            Poll::Ready(Ok(v)) => v,
+            _ => return TestResult::Fail("the refill did not complete"),
+        };
+        if !refilled.published() || refilled.folio().page_bytes()[0] != 0x33 {
+            return TestResult::Fail("the post-write refill was not the cached copy");
+        }
+        match cache.lookup_folio(key(5)) {
+            Some(found) if found.page_bytes()[0] == 0x33 => TestResult::Pass,
+            _ => TestResult::Fail("page 5 does not hold the post-write fill"),
+        }
+    }
+    kernel_test_in!(
+        "filesystem/page_cache",
+        smoke_page_cache_invalidation_voids_only_overlapping_fills
+    );
+
+    /// A failed fill and a dropped (cancelled) fill both release their
+    /// ticket: nothing is cached and a parked waiter proceeds to fill itself
+    /// instead of sleeping forever.
+    fn smoke_page_cache_failed_or_dropped_fill_releases_its_waiters() -> TestResult {
+        let cache = PageCache::with_capacity(0);
+        let gate = AtomicBool::new(false);
+        let runs = AtomicUsize::new(0);
+
+        let mut failing = gated_fill(&cache, 1, &gate, &runs, 0, true);
+        let mut waiter = gated_fill(&cache, 1, &gate, &runs, 0x44, false);
+        if poll(&mut failing).is_ready() || poll(&mut waiter).is_ready() {
+            return TestResult::Fail("a gated fill completed before its device");
+        }
+        gate.store(true, Ordering::Release);
+        if !matches!(poll(&mut failing), Poll::Ready(Err(FsError::Io(_)))) {
+            return TestResult::Fail("the failing fill did not report its error");
+        }
+        match poll(&mut waiter) {
+            Poll::Ready(Ok(v)) if v.published() && v.folio().page_bytes()[0] == 0x44 => {}
+            _ => return TestResult::Fail("the waiter of a failed fill did not fill itself"),
+        }
+
+        gate.store(false, Ordering::Release);
+        let mut dropped = gated_fill(&cache, 2, &gate, &runs, 0x55, false);
+        let mut waiter = gated_fill(&cache, 2, &gate, &runs, 0x66, false);
+        if poll(&mut dropped).is_ready() || poll(&mut waiter).is_ready() {
+            return TestResult::Fail("a gated fill completed before its device");
+        }
+        drop(dropped);
+        gate.store(true, Ordering::Release);
+        match poll(&mut waiter) {
+            Poll::Ready(Ok(v)) if v.published() && v.folio().page_bytes()[0] == 0x66 => {}
+            _ => return TestResult::Fail("the waiter of a dropped fill was stranded"),
+        }
+        if cache.len() != 2 {
+            return TestResult::Fail("cache should hold exactly the two successful fills");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/page_cache",
+        smoke_page_cache_failed_or_dropped_fill_releases_its_waiters
+    );
+
+    /// Reclaim never touches a fill ticket (it owns no frame yet) and the
+    /// later publication accounts the folio exactly once.
+    fn smoke_page_cache_reclaim_skips_fill_tickets() -> TestResult {
+        let cache = Arc::new(PageCache::with_capacity(0));
+        let gate = AtomicBool::new(false);
+        let runs = AtomicUsize::new(0);
+        let mut fill = gated_fill(&cache, 7, &gate, &runs, 0x77, false);
+        if poll(&mut fill).is_ready() {
+            return TestResult::Fail("a gated fill completed before its device");
+        }
+        if cache.reclaimable() != 0 || cache.shrink(16) != 0 || !cache.is_empty() {
+            return TestResult::Fail("reclaim counted or evicted an in-flight fill");
+        }
+        gate.store(true, Ordering::Release);
+        if !matches!(poll(&mut fill), Poll::Ready(Ok(ref v)) if v.published()) {
+            return TestResult::Fail("the fill did not publish");
+        }
+        if cache.len() != 1 || cache.reclaimable() != 1 {
+            return TestResult::Fail("the published folio was not accounted once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/page_cache",
+        smoke_page_cache_reclaim_skips_fill_tickets
+    );
+}

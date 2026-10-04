@@ -1079,6 +1079,20 @@ pub fn __reset_lru_for_test() {
     state.sweep_count = 0;
 }
 
+/// Whether `GlobalAlloc::alloc` may run shrinkers (or any other reclaim
+/// callback) inline. It does not: a failed global allocation only publishes
+/// a background request (`heap::alloc_once_or_request`).
+///
+/// This is a cross-crate invariant, not a tuning knob. Caches that allocate
+/// while holding the very lock their shrinker takes — the filesystem page
+/// cache (`narf_filesystem::page_cache`) — `const`-assert it is `false`, so
+/// changing the allocator to reclaim inline must flip this flag, which in
+/// turn refuses to compile those caches until their lock discipline is
+/// revisited. The behaviour itself is pinned by
+/// `heap::allocation_failure_tests::smoke_global_alloc_failure_has_no_inline_reclaim_or_retry`,
+/// which checks this flag against what the allocator actually did.
+pub const GLOBAL_ALLOC_RUNS_SHRINKERS: bool = false;
+
 /// Free up to `target` reclaimable pages for a policy-aware caller under
 /// pressure. Returns the number freed.
 ///

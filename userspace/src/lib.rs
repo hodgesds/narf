@@ -99,6 +99,7 @@ mod abi_creds_tests;
 mod abi_drm_prime_tests;
 mod abi_fdio2_tests;
 mod abi_fdio_tests;
+mod abi_filemap_tests;
 mod abi_fsx2_tests;
 mod abi_fsx_tests;
 mod abi_inode_identity_tests;
@@ -156,6 +157,9 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // range policies are, so it dies with the address space too.
     handlers::drop_address_space_numa_cursor(address_space_id);
 }
+
+/// Filesystem truncation bridge installed during common boot init.
+pub use mapped_file::truncate_file_mappings;
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{

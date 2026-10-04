@@ -30,13 +30,14 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
 use narf_filesystem::{
-    DirEntry as VfsDirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
+    DirEntry as VfsDirEntry, DirOps, FileFolio, FileMapping, FileOps, FileType, FsError, FsFuture,
+    Mode, Stat, PAGE_SIZE,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -53,36 +54,59 @@ pub struct Ext2NodeState {
     pub inode: Option<Inode>,
 }
 
+/// The in-memory inode of one ext2 inode. Only ever constructed by the
+/// volume's inode cache (`Ext2Volume::iget`), so there is at most one live
+/// node per on-disk inode and every path to the file shares it.
 #[derive(Debug)]
-pub struct Ext2Node<B: BlockDevice> {
+pub struct Ext2Node<B: BlockDevice + 'static> {
     pub volume: Arc<Ext2Volume<B>>,
     inode_no: u32,
+    /// This node's own `Arc`, for handing out `Arc<dyn …>` views of it
+    /// (`as_dir`) without minting a second node.
+    self_weak: Weak<Ext2Node<B>>,
     pub state: IrqSafeSpinLock<Ext2NodeState>,
+    /// This inode's page cache (Linux `inode->i_mapping`). Regular-file
+    /// `read`, `write` and `truncate` all go through it, so every holder of
+    /// the inode sees one copy of each file page. Keyed by this node's
+    /// incarnation as well as the inode number, so a freed-and-reused inode
+    /// number can never alias a still-live node's pages.
+    mapping: FileMapping,
+}
+
+impl<B: BlockDevice + 'static> Drop for Ext2Node<B> {
+    fn drop(&mut self) {
+        self.volume.icache_evict(self.inode_no, self as *const Self);
+        // `evict` -> `truncate_inode_pages_final`: the in-memory inode's
+        // pages go with it.
+        self.mapping.remove_from(0);
+    }
 }
 
 impl<B: BlockDevice + 'static> Ext2Node<B> {
-    pub fn new(volume: Arc<Ext2Volume<B>>, inode_no: u32, stat: Stat) -> Self {
-        Self {
-            volume,
+    /// Build the cache's node for `inode_no`. Called by `Ext2Volume` under
+    /// its icache lock; nothing else may construct a node.
+    pub(crate) fn new_cached(volume: Arc<Ext2Volume<B>>, inode_no: u32, inode: Inode) -> Arc<Self> {
+        let mapping = volume.new_file_mapping(inode_no);
+        Arc::new_cyclic(|self_weak| Self {
             inode_no,
-            state: IrqSafeSpinLock::new(Ext2NodeState {
-                inode_no,
-                stat,
-                inode: None,
-            }),
-        }
-    }
-
-    pub(crate) fn from_inode(volume: Arc<Ext2Volume<B>>, inode_no: u32, inode: Inode) -> Self {
-        Self {
-            inode_no,
+            self_weak: self_weak.clone(),
+            mapping,
             state: IrqSafeSpinLock::new(Ext2NodeState {
                 inode_no,
                 stat: Self::stat_from_inode(&volume, &inode),
                 inode: Some(inode),
             }),
             volume,
-        }
+        })
+    }
+
+    /// Replace the cached inode with what was just written to disk. Called
+    /// by the volume's inode write funnel for every inode write.
+    pub(crate) fn set_cached_inode(&self, inode: Inode) {
+        let stat = Self::stat_from_inode(&self.volume, &inode);
+        let mut state = self.state.lock();
+        state.inode = Some(inode);
+        state.stat = stat;
     }
 
     /// Translate an on-disk inode into a VFS `Stat`. Block count is
@@ -129,9 +153,12 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         Ok(inode)
     }
 
-    /// Read `dst.len()` bytes from `inode` starting at logical
-    /// offset `offset`. Stops short of `dst.len()` only if EOF is
-    /// reached. Holes (zero block-pointers) yield zero-bytes.
+    /// Read `dst.len()` bytes of a DIRECTORY's blocks starting at `offset`,
+    /// through the block-device mapping where directory blocks live (they
+    /// are rewritten by `dir_mut` with block writes, which invalidate
+    /// exactly that mapping). Regular-file data goes through the inode's
+    /// page cache instead (`read_file`). Stops short of `dst.len()` only at
+    /// EOF; holes read as zero.
     async fn read_inode_at(
         &self,
         inode: &Inode,
@@ -175,6 +202,181 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             to_read -= chunk as u64;
         }
         Ok(total)
+    }
+
+    /// File page `page`, from the inode's page cache or read in by
+    /// `->read_folio` (`Ext2Volume::read_file_page`). The fill reads the
+    /// cached inode only after it owns the page's fill ticket, so it sees
+    /// every block a completed write allocated.
+    async fn file_page(&self, page: u64) -> Result<FileFolio, FsError> {
+        self.mapping
+            .get_or_fill(page, |mut folio| async move {
+                let inode = self.load_inode().await?;
+                self.volume
+                    .read_file_page(&inode, page, &mut folio[..PAGE_SIZE])
+                    .await?;
+                Ok(folio)
+            })
+            .await
+    }
+
+    /// `filemap_read`: copy `[offset, offset + dst.len())` out of the page
+    /// cache, clamped at EOF. Under memory pressure (no folio frame) a page
+    /// is read uncached instead — it cannot be resident, so it holds no
+    /// newer bytes than the disk.
+    async fn read_file(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
+        let size = u64::from(self.load_inode().await?.size);
+        if offset >= size {
+            return Ok(0);
+        }
+        let len = (dst.len() as u64).min(size - offset) as usize;
+        let mut done = 0usize;
+        while done < len {
+            let pos = offset + done as u64;
+            let page = pos / PAGE_SIZE as u64;
+            let in_page = (pos % PAGE_SIZE as u64) as usize;
+            let n = (PAGE_SIZE - in_page).min(len - done);
+            match self.file_page(page).await {
+                Ok(folio) => folio.read(in_page, &mut dst[done..done + n]),
+                Err(FsError::OutOfMemory) => {
+                    let mut bytes = Vec::new();
+                    bytes
+                        .try_reserve_exact(PAGE_SIZE)
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    bytes.resize(PAGE_SIZE, 0);
+                    let inode = self.load_inode().await?;
+                    self.volume.read_file_page(&inode, page, &mut bytes).await?;
+                    dst[done..done + n].copy_from_slice(&bytes[in_page..in_page + n]);
+                }
+                Err(error) => return Err(error),
+            }
+            done += n;
+        }
+        Ok(len)
+    }
+
+    /// `generic_perform_write`, write-through: copy each chunk into the
+    /// cached page (reading the page first when it is not resident, like
+    /// `write_begin`), then write the filesystem blocks it touched straight
+    /// from that page. Readers and mappings see the new bytes as soon as
+    /// they are in the page; the disk has them before this returns, so a
+    /// write needs no later writeback and fsync only has mapped stores to
+    /// flush. The caller holds `inode_update_lock` and persists `inode`.
+    ///
+    /// Returns the bytes written; a failure after some progress reports the
+    /// progress (Linux returns a short write). A page whose block write
+    /// failed keeps the new bytes and is marked dirty, so the cache never
+    /// silently reverts and writeback retries it.
+    async fn write_file(
+        &self,
+        inode: &mut Inode,
+        offset: u64,
+        src: &[u8],
+    ) -> Result<usize, FsError> {
+        let inode_no = self.inode_no;
+        let mut done = 0usize;
+        while done < src.len() {
+            let pos = offset + done as u64;
+            let page = pos / PAGE_SIZE as u64;
+            let in_page = (pos % PAGE_SIZE as u64) as usize;
+            let n = (PAGE_SIZE - in_page).min(src.len() - done);
+            // Only a fill that raced a removal of this very page can come
+            // back unpublished; truncation and eviction are excluded by the
+            // caller's lock and our own reference, so retrying converges.
+            let folio = loop {
+                match self.file_page(page).await {
+                    Ok(folio) if folio.published() => break folio,
+                    Ok(_) => continue,
+                    Err(error) if done == 0 => return Err(error),
+                    Err(_) => return Ok(done),
+                }
+            };
+            folio.write(in_page, &src[done..done + n]);
+            let written = self
+                .volume
+                .write_file_page(inode_no, inode, page, &folio, in_page, in_page + n, true)
+                .await;
+            if let Err(error) = written {
+                self.mapping.mark_dirty(page);
+                if done == 0 {
+                    return Err(error);
+                }
+                return Ok(done);
+            }
+            done += n;
+            let end = pos + n as u64;
+            if end > u64::from(inode.size) {
+                inode.size = end as u32;
+            }
+            // Publish the new block map and size to concurrent page fills
+            // before this page's reference is dropped (after which reclaim
+            // could evict it and a fill would reread the blocks).
+            self.set_cached_inode(*inode);
+        }
+        Ok(done)
+    }
+
+    /// `block_truncate_page` + `truncate_inode_partial_folio`: zero the
+    /// bytes from `new_size` to the end of its page in the cache and write
+    /// the block(s) of that page from `new_size` on to the disk.
+    async fn zero_tail_after(&self, inode: &mut Inode, new_size: u64) -> Result<(), FsError> {
+        let in_page = (new_size % PAGE_SIZE as u64) as usize;
+        if in_page == 0 {
+            return Ok(());
+        }
+        let page = new_size / PAGE_SIZE as u64;
+        let folio = loop {
+            let folio = self.file_page(page).await?;
+            if folio.published() {
+                break folio;
+            }
+        };
+        folio.zero(in_page, PAGE_SIZE - in_page);
+        let inode_no = self.inode_no;
+        self.volume
+            .write_file_page(inode_no, inode, page, &folio, in_page, PAGE_SIZE, false)
+            .await
+    }
+
+    /// Write the dirty pages in `[first_page, end_page)` to disk (Linux
+    /// `filemap_write_and_wait_range` over `->writepages`): every block of
+    /// each page inside EOF, allocating holes, then persist the inode if
+    /// that allocated anything. A page whose write fails is re-marked dirty
+    /// and the error is returned.
+    pub(crate) async fn write_back_dirty(
+        &self,
+        first_page: u64,
+        end_page: u64,
+    ) -> Result<(), FsError> {
+        let _update = self.volume.inode_update_lock.lock().await;
+        let dirty = self.mapping.take_dirty(first_page, end_page);
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let inode_no = self.inode_no;
+        let mut inode = self.volume.read_inode(inode_no).await?;
+        let before = (inode.blocks, inode.block);
+        let size = u64::from(inode.size);
+        let mut result = Ok(());
+        for folio in &dirty {
+            let page_start = folio.page() * PAGE_SIZE as u64;
+            if page_start >= size {
+                continue; // wholly past EOF: nothing of it is file data
+            }
+            let hi = (size - page_start).min(PAGE_SIZE as u64) as usize;
+            if let Err(error) = self
+                .volume
+                .write_file_page(inode_no, &mut inode, folio.page(), folio, 0, hi, true)
+                .await
+            {
+                self.mapping.mark_dirty(folio.page());
+                result = Err(error);
+            }
+        }
+        if (inode.blocks, inode.block) != before {
+            self.volume.write_inode(inode_no, &inode).await?;
+        }
+        result
     }
 
     /// Walk `inode`'s directory bytes calling `f` for each entry.
@@ -244,38 +446,83 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
                 buf[..n].copy_from_slice(&target[start..start + n]);
                 return Ok(n);
             }
-            self.read_inode_at(&inode, offset, buf).await
+            if inode.is_dir() {
+                return self.read_inode_at(&inode, offset, buf).await;
+            }
+            self.read_file(offset, buf).await
         })
     }
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let _update = self.volume.inode_update_lock.lock().await;
-            // Mutations must start from the current on-disk inode. Distinct
-            // open handles have independent read caches; writing a cached
-            // whole inode here could otherwise undo a chmod/chown completed
-            // through another handle.
+            // Mutations start from the current on-disk inode.
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
-            let n = self
-                .volume
-                .write_inode_data(inode_no, &mut inode, offset, buf)
-                .await?;
-            self.volume.write_inode(inode_no, &inode).await?;
-            // Refresh cached state.
-            let stat = Self::stat_from_inode(&self.volume, &inode);
-            let mut g = self.state.lock();
-            g.inode = Some(inode);
-            g.stat = stat;
-            Ok(n)
+            let result = self.write_file(&mut inode, offset, buf).await;
+            let persisted = match &result {
+                // Nothing reached the file: leave the inode as it was.
+                Err(_) => Ok(()),
+                Ok(_) => self.volume.write_inode(inode_no, &inode).await,
+            };
+            if persisted.is_err() || result.is_err() {
+                // The cached inode ran ahead of the disk while the write was
+                // in progress; put it back to what the disk holds.
+                if let Ok(on_disk) = self.volume.read_inode(inode_no).await {
+                    self.set_cached_inode(on_disk);
+                }
+            }
+            persisted?;
+            result
+        })
+    }
+
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            // `ext4_sync_file`: write back this inode's dirty pages, then
+            // flush the device's volatile cache so the data is durable.
+            self.write_back_dirty(0, u64::MAX).await?;
+            self.volume.device.flush().await;
+            Ok(())
         })
     }
 
     fn stat(&self) -> Stat {
         self.state.lock().stat
+    }
+
+    fn mmap_is_ram(&self) -> bool {
+        true
+    }
+
+    fn supports_mmap_fault(&self) -> bool {
+        true
+    }
+
+    /// `filemap_fault`: expose the same canonical folio used by read/write.
+    /// The mapping is conservatively dirty from its first fault because NARF
+    /// does not yet collect hardware PTE dirty bits for filesystem writeback.
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
+        if offset % PAGE_SIZE as u64 != 0 || offset >= self.stat().size {
+            return Err(FsError::InvalidData);
+        }
+        let page = offset / PAGE_SIZE as u64;
+        loop {
+            let folio = narf_scheduler::block_on_spin(self.file_page(page))?;
+            // A concurrent shrink publishes its new i_size before removing
+            // folios. Never install a newly-obsolete page after that point.
+            if offset >= self.stat().size {
+                return Err(FsError::InvalidData);
+            }
+            if !folio.published() {
+                continue;
+            }
+            assert!(self.mapping.mark_dirty(page));
+            return Ok(folio.mmap_frame());
+        }
     }
 
     fn ino(&self) -> u64 {
@@ -300,27 +547,56 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let new_size = u32::try_from(len).map_err(|_| FsError::InvalidData)?;
             let _update = self.volume.inode_update_lock.lock().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
-            if len == 0 {
-                self.volume.truncate_inode(&mut inode).await?;
-            } else if (len as u32) <= inode.size {
-                // Shrink — bookkeeping only, leaves blocks allocated
-                // past the new end. Matches the simple semantics
-                // Linux uses for non-aligned truncates.
-                inode.size = len as u32;
-            } else {
-                inode.size = len as u32;
+            let old_size = u64::from(inode.size);
+            if len < old_size {
+                // Publish i_size first so a racing fault at/after the new EOF
+                // fails. Then revoke every existing borrowed PTE before cache
+                // folios are removed or block ownership changes.
+                let mut visible = inode;
+                visible.size = new_size;
+                self.set_cached_inode(visible);
+                if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
+                    self.set_cached_inode(inode);
+                    return Err(error);
+                }
             }
-            self.volume.write_inode(inode_no, &inode).await?;
-            let stat = Self::stat_from_inode(&self.volume, &inode);
-            let mut g = self.state.lock();
-            g.inode = Some(inode);
-            g.stat = stat;
+            if len == 0 {
+                if let Err(error) = self.volume.truncate_inode(&mut inode).await {
+                    self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
+                    return Err(error);
+                }
+            } else {
+                // Shrinking keeps the blocks past the new end allocated (no
+                // partial block-tree truncation yet); growing is size only.
+                inode.size = new_size;
+            }
+            if len < old_size {
+                // `ext2_setsize` -> `block_truncate_page`: zero the rest of
+                // the block holding the new EOF, in the cache and on disk,
+                // so a later extension reads zeros there rather than the old
+                // bytes. Done before the size shrinks in the cached inode so
+                // the page still fills with the pre-truncate contents.
+                if let Err(error) = self.zero_tail_after(&mut inode, len).await {
+                    self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self.volume.write_inode(inode_no, &inode).await {
+                self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
+                return Err(error);
+            }
+            if len < old_size {
+                // `truncate_pagecache`: drop every page wholly past the new
+                // EOF, so nothing beyond it can be read back from the cache.
+                self.mapping.remove_from(len.div_ceil(PAGE_SIZE as u64));
+            }
             Ok(())
         })
     }
@@ -388,18 +664,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     /// `lookup_async`), so `open(dir, O_DIRECTORY)` installs that
     /// FileOps in the fd table; `sys_getdents64` then needs `as_dir()`
     /// to recover the `DirOps` view. Returns `None` for non-directories
-    /// so `getdents64` on a regular-file fd is ENOTDIR. The fresh node
-    /// shares the same volume + inode number.
+    /// so `getdents64` on a regular-file fd is ENOTDIR. The view is this
+    /// same node: one in-memory inode per on-disk inode.
     fn as_dir(&self) -> Option<Arc<dyn DirOps>> {
-        let st = self.state.lock();
-        if st.stat.mode.file_type != FileType::Dir {
+        if self.state.lock().stat.mode.file_type != FileType::Dir {
             return None;
         }
-        Some(Arc::new(Ext2Node {
-            volume: self.volume.clone(),
-            inode_no: st.inode_no,
-            state: IrqSafeSpinLock::new(*st),
-        }) as Arc<dyn DirOps>)
+        self.self_weak.upgrade().map(|node| node as Arc<dyn DirOps>)
     }
 }
 
@@ -444,11 +715,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
             let (found_ino, _) = self.volume.dir_lookup(&inode, name.as_bytes()).await?;
-            let target = self.volume.read_inode(found_ino).await?;
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
-                    as Arc<dyn FileOps>,
-            )
+            Ok(self.volume.iget(found_ino).await? as Arc<dyn FileOps>)
         })
     }
 
@@ -462,17 +729,14 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
             let (found_ino, found_type) = self.volume.dir_lookup(&inode, name.as_bytes()).await?;
-            let target = self.volume.read_inode(found_ino).await?;
+            let node = self.volume.iget(found_ino).await?;
             // Honour the on-disk inode mode rather than the rev-0
             // dirent type byte, which is unreliable on rev-0 volumes
             // (overlap with the high byte of `name_len`).
-            if !target.is_dir() && found_type != ftype::DIR {
+            if !node.load_inode().await?.is_dir() && found_type != ftype::DIR {
                 return Err(FsError::NotFound);
             }
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
-                    as Arc<dyn DirOps>,
-            )
+            Ok(node as Arc<dyn DirOps>)
         })
     }
 
@@ -576,11 +840,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .volume
                 .dir_create_regular(parent_ino, name.as_bytes(), 0o644)
                 .await?;
-            let target = self.volume.read_inode(new_ino).await?;
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), new_ino, target))
-                    as Arc<dyn FileOps>,
-            )
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn FileOps>)
         })
     }
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -591,11 +851,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .volume
                 .dir_create_directory(parent_ino, name.as_bytes(), 0o755)
                 .await?;
-            let target = self.volume.read_inode(new_ino).await?;
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), new_ino, target))
-                    as Arc<dyn DirOps>,
-            )
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn DirOps>)
         })
     }
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
@@ -634,12 +890,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .volume
                 .dir_create_symlink(parent_ino, name.as_bytes(), target.as_bytes())
                 .await?;
-            let target_inode = self.volume.read_inode(new_ino).await?;
-            Ok(Arc::new(Ext2Node::from_inode(
-                self.volume.clone(),
-                new_ino,
-                target_inode,
-            )) as Arc<dyn FileOps>)
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn FileOps>)
         })
     }
 

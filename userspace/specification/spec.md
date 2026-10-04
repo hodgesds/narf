@@ -1235,6 +1235,17 @@ it after cancellation. A block-backed read may park the own-stack task from
 the page-fault continuation; the scheduler runs the executor IRQ-enabled while
 preserving the interrupt-gate continuation's masked state.
 
+Files which advertise `supports_mmap_fault` bypass the generic copy cache:
+each fault aliases the filesystem's own page-cache folio. The filesystem
+fault answer has already acquired the external alias reference that memory
+releases on failed publication, `munmap`, replacement, or address-space
+teardown. `msync(MS_SYNC)` drives the mapped file's `fsync`, which writes
+dirty direct folios before returning. On shrink, the filesystem calls the
+installed truncation bridge; it walks every live address-space owner bucket
+and, under VMA → shared-owner ordering, unmaps every complete page beyond
+the new EOF before the filesystem can evict that folio. The partial EOF page
+remains aliased and is zeroed by the filesystem.
+
 The equivalent internal bridge for `AF_NETLINK`/`NETLINK_NETFILTER` accepts
 only a live `NetfilterAdminHandle` whose immutable namespace id equals the
 socket creator's network namespace. It rejects other netlink protocols,

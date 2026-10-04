@@ -842,7 +842,6 @@ fn smoke_ext2_block_write_invalidates_only_its_pages() -> TestResult {
         ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
         CancelResult, LbaRange,
     };
-    use narf_filesystem::FsInstance;
     use narf_lib::id::DomainId;
 
     use crate::volume::Ext2Volume;
@@ -894,17 +893,16 @@ fn smoke_ext2_block_write_invalidates_only_its_pages() -> TestResult {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("mount failed"),
     };
-    let file = match poll_once(volume.root().lookup_async("data")) {
-        Some(Ok(f)) => f,
-        _ => return TestResult::Fail("lookup failed"),
-    };
-    let mut buf = [0u8; 10];
-    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) {
-        return TestResult::Fail("first read failed");
+    // Block 10 (4 KiB device page 2, blocks 8-11) through the block-device
+    // mapping. File data has its own per-inode mapping, which device writes
+    // do not touch — on Linux too, writing the block device under a mounted
+    // filesystem is not coherent with the files' page cache.
+    let mut block = [0u8; BS as usize];
+    if !matches!(poll_once(volume.read_block(10, &mut block)), Some(Ok(()))) {
+        return TestResult::Fail("first block read failed");
     }
 
-    // The file's data is block 10: 4 KiB page 2 (blocks 8-11). Block 20 is
-    // page 5, which the file does not touch.
+    // Block 20 is device page 5, which block 10 does not share.
     if !matches!(
         poll_once(volume.write_byte_range(20 * BS, &[0xa5; 16])),
         Some(Ok(()))
@@ -912,21 +910,25 @@ fn smoke_ext2_block_write_invalidates_only_its_pages() -> TestResult {
         return TestResult::Fail("write to an unrelated block failed");
     }
     let reads_before = device.reads.load(Ordering::Relaxed);
-    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) || &buf != b"page cache" {
+    if !matches!(poll_once(volume.read_block(10, &mut block)), Some(Ok(())))
+        || &block[..10] != b"page cache"
+    {
         return TestResult::Fail("read after an unrelated write failed");
     }
     if device.reads.load(Ordering::Relaxed) != reads_before {
-        return TestResult::Fail("a write to another page evicted the file's cached block");
+        return TestResult::Fail("a write to another page evicted the cached block");
     }
 
-    // A write over the file's own block must not leave the old bytes cached.
+    // A write over the block itself must not leave the old bytes cached.
     if !matches!(
         poll_once(volume.write_byte_range(10 * BS, b"PAGE")),
         Some(Ok(()))
     ) {
-        return TestResult::Fail("write over the file's block failed");
+        return TestResult::Fail("write over the cached block failed");
     }
-    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(10))) || &buf != b"PAGE cache" {
+    if !matches!(poll_once(volume.read_block(10, &mut block)), Some(Ok(())))
+        || &block[..10] != b"PAGE cache"
+    {
         return TestResult::Fail("a write over a cached block left the stale bytes visible");
     }
     TestResult::Pass
@@ -1092,6 +1094,165 @@ kernel_test_in!(
     smoke_ext2_page_cache_reuses_1k_data_block
 );
 
+/// A block device that counts reads and can hold every read at the device
+/// (`held`). Shared by the page-cache concurrency smokes below.
+pub(crate) struct GatedCountingBlock {
+    pub(crate) inner: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
+    pub(crate) held: core::sync::atomic::AtomicBool,
+    pub(crate) reads: core::sync::atomic::AtomicUsize,
+}
+
+impl GatedCountingBlock {
+    pub(crate) fn new(image: Vec<u8>) -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            inner: narf_block::ram::RamBlockDevice::from_image(512, image),
+            held: core::sync::atomic::AtomicBool::new(false),
+            reads: core::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+impl narf_block::BlockDevice for GatedCountingBlock {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        self.inner.supports(feature)
+    }
+    fn submit(
+        &self,
+        request: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let gated = matches!(request.op, narf_block::BlockOp::Read);
+        if gated {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        async move {
+            if gated {
+                core::future::poll_fn(|_| {
+                    if self.held.load(Ordering::Acquire) {
+                        core::task::Poll::Pending
+                    } else {
+                        core::task::Poll::Ready(())
+                    }
+                })
+                .await;
+            }
+            self.inner.submit(request).await
+        }
+    }
+    fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.flush()
+    }
+    fn discard(
+        &self,
+        range: narf_block::LbaRange,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.discard(range)
+    }
+    fn cancel(
+        &self,
+        tag: u64,
+    ) -> impl core::future::Future<Output = narf_block::CancelResult> + Send {
+        self.inner.cancel(tag)
+    }
+}
+
+/// A waker whose wake is a no-op, for hand-polling futures in smokes.
+pub(crate) fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    fn raw() -> RawWaker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        unsafe fn noop(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    // SAFETY: every vtable function is a no-op or rebuilds the same RawWaker;
+    // the null data pointer is never dereferenced.
+    unsafe { Waker::from_raw(raw()) }
+}
+
+/// A write to one page does not void a concurrent fill of a DIFFERENT page.
+/// Linux invalidates exactly the written range (`invalidate_mapping_pages`,
+/// the locked folio being filled); a fill whose own page was not written
+/// publishes normally. The volume used to snapshot one volume-global
+/// generation before every fill and refuse to publish if ANY write landed
+/// meanwhile, so on a busy volume a fill's work was thrown away and the very
+/// next read of that page went back to the device.
+fn smoke_ext2_write_elsewhere_does_not_void_a_concurrent_fill() -> TestResult {
+    use alloc::boxed::Box;
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::{Context, Poll};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const BS: u64 = 1024;
+    let device = GatedCountingBlock::new(build_ext2_image(b"page cache"));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Stall a miss on block 40 (page 10) at the device.
+    device.held.store(true, Ordering::Release);
+    let mut buf = [0u8; BS as usize];
+    let mut fill = Box::pin(volume.read_block(40, &mut buf));
+    if fill.as_mut().poll(&mut cx).is_ready() {
+        return TestResult::Fail("the gated read completed without the device");
+    }
+    // A whole-sector write to block 20 (page 5): no read-modify-write read.
+    let sector = [0x5au8; 512];
+    let mut other = Box::pin(volume.write_byte_range(20 * BS, &sector));
+    if !matches!(other.as_mut().poll(&mut cx), Poll::Ready(Ok(()))) {
+        return TestResult::Fail("write to another page did not complete");
+    }
+    drop(other);
+    device.held.store(false, Ordering::Release);
+    let mut finished = false;
+    for _ in 0..16 {
+        if let Poll::Ready(r) = fill.as_mut().poll(&mut cx) {
+            if r.is_err() {
+                return TestResult::Fail("the stalled read failed");
+            }
+            finished = true;
+            break;
+        }
+    }
+    drop(fill);
+    if !finished {
+        return TestResult::Fail("the stalled read never finished after release");
+    }
+
+    // Page 10 was never written, so the fill must have been cached.
+    let reads_before = device.reads.load(Ordering::Relaxed);
+    let mut again = [0u8; BS as usize];
+    if !matches!(poll_once(volume.read_block(40, &mut again)), Some(Ok(()))) {
+        return TestResult::Fail("re-read of the filled block failed");
+    }
+    if device.reads.load(Ordering::Relaxed) != reads_before {
+        return TestResult::Fail(
+            "a write to another page voided the concurrent fill: the re-read went to the device",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_write_elsewhere_does_not_void_a_concurrent_fill
+);
 fn smoke_ext2_directory_lookup_stops_at_matching_folio() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -4706,4 +4867,176 @@ fn smoke_ext2_rename_replaces_existing_destination() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_rename_replaces_existing_destination
+);
+
+/// Linux keeps one in-memory inode per on-disk inode (`fs/inode.c`,
+/// `iget_locked`): every lookup of every name of a file — including a hard
+/// link — and every `root()` returns the same inode, which is what lets the
+/// inode's page cache be shared. ext2 used to build a fresh node per
+/// lookup, so two names of one file were two unrelated in-memory inodes.
+fn smoke_ext2_icache_one_node_per_inode() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, testing::hard_link_image(b"one inode"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let (data, link) = match (
+        poll_once(root.lookup_async("data")),
+        poll_once(root.lookup_async("link")),
+    ) {
+        (Some(Ok(data)), Some(Ok(link))) => (data, link),
+        _ => return TestResult::Fail("lookup of the two names failed"),
+    };
+    if !Arc::ptr_eq(&data, &link) {
+        return TestResult::Fail("two names of one inode resolved to two in-memory inodes");
+    }
+    let again = match poll_once(root.lookup_async("data")) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if !Arc::ptr_eq(&data, &again) {
+        return TestResult::Fail("a repeated lookup built a second in-memory inode");
+    }
+    let root_again = volume.root();
+    if !core::ptr::eq(
+        Arc::as_ptr(&root) as *const (),
+        Arc::as_ptr(&root_again) as *const (),
+    ) {
+        return TestResult::Fail("root() built a second in-memory root inode");
+    }
+    // A change made through one holder is the inode every holder sees.
+    if poll_once(link.set_perms(0o600)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("chmod through the hard link failed");
+    }
+    if data.stat().mode.perms != 0o600 {
+        return TestResult::Fail("chmod through one name is invisible through the other");
+    }
+    // Once nothing holds it, the inode leaves the cache (Linux evict).
+    drop((data, link, again));
+    if volume.icache_get(testing::FILE_INO).is_some() {
+        return TestResult::Fail("an unreferenced inode stayed pinned in the inode cache");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_icache_one_node_per_inode);
+
+/// `write(2)` updates the cached page in place (Linux
+/// `generic_perform_write` copies into the page-cache folio) and writes it
+/// through to the blocks: a read after the write is served from the same
+/// page with no device read, and the disk holds the new bytes. ext2 used to
+/// write the device and then drop the cached copy, so every write forced the
+/// next read of that page back to the disk — and a mapping of the page could
+/// never have seen the write.
+fn smoke_ext2_write_updates_the_cached_page_in_place() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let content: Vec<u8> = (0..6000).map(|i| (i % 251) as u8).collect();
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let mut buf = [0u8; 16];
+    if !matches!(poll_once(file.read(4096, &mut buf)), Some(Ok(16))) {
+        return TestResult::Fail("first read failed");
+    }
+    if !matches!(poll_once(file.write(4100, b"NEW!")), Some(Ok(4))) {
+        return TestResult::Fail("write failed");
+    }
+    let reads_before = device.reads.load(Ordering::Relaxed);
+    if !matches!(poll_once(file.read(4096, &mut buf)), Some(Ok(16))) {
+        return TestResult::Fail("read after write failed");
+    }
+    if device.reads.load(Ordering::Relaxed) != reads_before {
+        return TestResult::Fail("the write dropped the cached page: the next read hit the device");
+    }
+    if &buf[4..8] != b"NEW!" || buf[..4] != content[4096..4100] || buf[8..] != content[4104..4112] {
+        return TestResult::Fail("the cached page does not hold the written bytes");
+    }
+    // File offset 4100 is block FILE_FIRST_BLOCK + 4, byte 4.
+    let mut disk = [0u8; testing::BLOCK_SIZE];
+    let block = u64::from(testing::FILE_FIRST_BLOCK) + 4;
+    if !matches!(poll_once(volume.read_block(block, &mut disk)), Some(Ok(())))
+        || &disk[4..8] != b"NEW!"
+    {
+        return TestResult::Fail("write(2) did not reach the disk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_write_updates_the_cached_page_in_place
+);
+
+/// Truncation zeroes the rest of the new last block (Linux `ext2_setsize`
+/// -> `block_truncate_page`), so growing the file again reads zeros there,
+/// never the bytes that were cut off. ext2's shrink only rewrote `i_size`, so
+/// a shrink followed by a grow resurrected the old tail.
+fn smoke_ext2_truncate_then_extend_reads_zeros() -> TestResult {
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let mut buf = [0u8; 6000];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000))) {
+        return TestResult::Fail("initial read failed");
+    }
+    if poll_once(file.truncate(5000)).is_none_or(|r| r.is_err())
+        || poll_once(file.truncate(6000)).is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("truncate failed");
+    }
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000))) {
+        return TestResult::Fail("read after re-extension failed");
+    }
+    if buf[..5000].iter().any(|&b| b != 0x5a) {
+        return TestResult::Fail("truncate damaged the bytes before the new EOF");
+    }
+    if buf[5000..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("re-extending a truncated file resurrected the cut-off bytes");
+    }
+    // Not just the cache: the block on disk was zeroed past the cut too.
+    let mut disk = [0u8; testing::BLOCK_SIZE];
+    let block = u64::from(testing::FILE_FIRST_BLOCK) + 4; // bytes 4096..5120
+    if !matches!(poll_once(volume.read_block(block, &mut disk)), Some(Ok(())))
+        || disk[..5000 - 4096].iter().any(|&b| b != 0x5a)
+        || disk[5000 - 4096..].iter().any(|&b| b != 0)
+    {
+        return TestResult::Fail("the cut-off tail of the last block survived on disk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_truncate_then_extend_reads_zeros
 );

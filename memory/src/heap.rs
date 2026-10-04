@@ -533,6 +533,14 @@ mod allocation_failure_tests {
         if backend_calls != 1 {
             return TestResult::Fail("global allocator retried its backend");
         }
+        // `reclaim::GLOBAL_ALLOC_RUNS_SHRINKERS` is the advertised form of
+        // this behaviour that other crates (the page cache) build on; the
+        // advertisement and the behaviour must agree.
+        if (shrinker_calls != 0) != crate::reclaim::GLOBAL_ALLOC_RUNS_SHRINKERS {
+            return TestResult::Fail(
+                "GLOBAL_ALLOC_RUNS_SHRINKERS disagrees with whether the allocator ran a shrinker",
+            );
+        }
         if shrinker_calls != 0 {
             return TestResult::Fail("global allocator invoked a shrinker inline");
         }

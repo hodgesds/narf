@@ -23,13 +23,11 @@ use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{
-    CacheFolio, DirOps, Folio, FolioSlice, FsError, FsInstance, PageCache, PageKey, PAGE_SIZE,
+    BlockMapping, CacheFolio, DirOps, FolioSlice, FsError, FsInstance, PageCache, PAGE_SIZE,
 };
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::mutex::Mutex;
 
-/// Stripes of the page-cache miss lock (`Ext2Volume::fill_locks`).
-const FILL_STRIPES: usize = 64;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::now_wall;
 
@@ -40,6 +38,7 @@ use super::metadata_csum;
 use super::superblock::{ExtFlavour, Superblock};
 
 mod extent_write;
+mod file_data;
 pub(crate) mod xattr;
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
@@ -290,7 +289,7 @@ pub(super) fn __test_scratch_waitqueue_wakes_and_handoffs() -> bool {
 
 /// One mounted ext2 volume.
 #[derive(Debug)]
-pub struct Ext2Volume<B: BlockDevice> {
+pub struct Ext2Volume<B: BlockDevice + 'static> {
     pub device: Arc<B>,
     pub superblock: Superblock,
     pub group_descs: Vec<GroupDesc>,
@@ -309,36 +308,28 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// state without ever touching the disk. Empty on clean
     /// volumes and on ext2 (which has no journal).
     journal_overrides: BTreeMap<u64, Vec<u8>>,
-    /// Small LRU of recently-read indirect blocks (device block_no → its
-    /// `block_size` contents). A sequential `map_block` walk of a large file
-    /// hits the same indirect block(s) for every data block; without this
-    /// each data block re-reads its indirect block from disk (O(n·depth)
-    /// device reads — mmap'ing a 161 MiB DSO took minutes). Invalidated
-    /// wholesale on any block write so a freed/rewritten indirect block can't
-    /// be served stale. Capacity covers triple-indirect's live set (l3/l2/l1).
-    indirect_cache: IrqSafeSpinLock<Vec<(u32, Vec<u8>)>>,
-    /// Clean filesystem data blocks. An `Arc` (not `Mutex<PageCache>`) so the
-    /// cache can also be registered with the central memory reclaimer as a
-    /// shrinker — its own internal lock serialises map access, and reclaim
-    /// runs from a synchronous context that cannot take an async `Mutex`.
+    /// The volume's page cache: one tree for the block-device mapping
+    /// (`bdev_mapping`, inode 0 — metadata keyed by device page). An `Arc`
+    /// so it can also be registered with the central memory reclaimer as a
+    /// shrinker. The fill protocol (miss coalescing, per-page invalidation of
+    /// in-flight fills) lives in the cache itself; see
+    /// `narf_filesystem::page_cache`.
     page_cache: Arc<PageCache>,
-    /// Coalesce concurrent misses on the same device page (the first reader
-    /// fills; the rest hit) so parallel dynamic-linker mmaps issue one block
-    /// read, while misses on different pages proceed in parallel. Striped by
-    /// page number — Linux locks the one folio being filled, never the whole
-    /// mapping. Held across lookup→read→insert of that page only.
-    fill_locks: [Mutex<()>; FILL_STRIPES],
-    /// Cache generation, bumped by every device write after it lands. A miss
-    /// fill snapshots it before its device read and publishes (to the page
-    /// cache or the indirect cache) only if it is unchanged, so bytes read
-    /// before a racing write are returned to their caller but never cached.
-    /// Check-and-publish and bump-and-invalidate both run under this lock,
-    /// which is never held across I/O.
-    cache_generation: IrqSafeSpinLock<u64>,
-    /// Serializes whole-inode read/modify/write sequences across distinct
-    /// `Ext2Node` handles. Linux has one in-memory inode per on-disk inode;
-    /// this volume-wide async mutex provides the same lost-update guarantee
-    /// until NARF grows a keyed inode cache.
+    /// Linux's `bdev` inode mapping over `page_cache`. Device writes
+    /// (`write_byte_range`) invalidate exactly the device pages they cover.
+    bdev_mapping: BlockMapping,
+    /// The inode cache (Linux `fs/inode.c` icache): at most one live
+    /// `Ext2Node` per on-disk inode, so every lookup, open, hard link and
+    /// `FsInstance::root` of one inode shares one in-memory inode — and,
+    /// through it, one page-cache mapping. Weak, so an unreferenced node is
+    /// evicted when its last `Arc` drops (`Ext2Node::drop` removes its own
+    /// entry). Never held while a node is dropped or across an `.await`.
+    icache: IrqSafeSpinLock<BTreeMap<u32, Weak<super::node::Ext2Node<B>>>>,
+    /// Source of node incarnations; see [`Self::new_file_mapping`].
+    incarnations: core::sync::atomic::AtomicU32,
+    /// Serializes whole-inode read/modify/write sequences. Directory
+    /// mutations rewrite inodes (parent, target) that have no node in hand,
+    /// so this stays volume-wide rather than per node.
     pub(crate) inode_update_lock: Mutex<()>,
     /// Serializes bitmap + group-descriptor + superblock counter updates.
     /// These three writes form one allocation transaction; allowing two
@@ -671,6 +662,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
         let read_only = !superblock.write_features_supported();
 
+        let page_cache = Arc::new(PageCache::new());
         let volume = Arc::new_cyclic(|self_weak| Ext2Volume {
             device,
             superblock,
@@ -679,10 +671,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             journal_overrides,
-            indirect_cache: IrqSafeSpinLock::new(Vec::new()),
-            page_cache: Arc::new(PageCache::new()),
-            fill_locks: [const { Mutex::new(()) }; FILL_STRIPES],
-            cache_generation: IrqSafeSpinLock::new(0),
+            page_cache: page_cache.clone(),
+            bdev_mapping: BlockMapping::new(page_cache, 0),
+            icache: IrqSafeSpinLock::new(BTreeMap::new()),
+            incarnations: core::sync::atomic::AtomicU32::new(1),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
@@ -966,7 +958,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     return Ok(None);
                 };
                 allocation[..bs].copy_from_slice(override_data);
-                return Ok(Folio::clean(allocation).slice(0, bs));
+                return Ok(allocation.into_private_slice(0, bs));
             }
         }
         if bs > PAGE_SIZE || PAGE_SIZE % bs != 0 {
@@ -974,46 +966,27 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         }
 
         let blocks_per_page = PAGE_SIZE / bs;
-        let first_block = block_no / blocks_per_page as u64 * blocks_per_page as u64;
-        let in_page = (block_no - first_block) as usize * bs;
-        let key = PageKey {
-            fs_id: 0,
-            inode: 0,
-            page_off: first_block / blocks_per_page as u64,
-        };
-        // Hits never queue behind an unrelated device miss. lookup_folio()
-        // retains the allocation under the cache lock and returns immediately.
-        if let Some(found) = self.page_cache.lookup_folio(key) {
-            return Ok(found.page_slice(in_page, bs));
-        }
-
-        // Coalesce concurrent misses on this page. This remains deliberately
-        // separate from the cache metadata lock, which must never be held
-        // across device I/O.
-        let _fill = self.fill_locks[key.page_off as usize % FILL_STRIPES]
-            .lock()
+        let page = block_no / blocks_per_page as u64;
+        let in_page = (block_no % blocks_per_page as u64) as usize * bs;
+        // Lookup, miss coalescing, and publish-unless-invalidated are the
+        // cache's protocol; this only says how to read one device page.
+        let filled = self
+            .bdev_mapping
+            .get_or_fill(page, |mut folio| async move {
+                self.read_byte_range(page * PAGE_SIZE as u64, &mut folio[..])
+                    .await?;
+                Ok(folio)
+            })
             .await;
-        if let Some(found) = self.page_cache.lookup_folio(key) {
-            return Ok(found.page_slice(in_page, bs));
+        match filled {
+            // A fill that raced a write of this page returns its private
+            // pre-write bytes, a read that linearises before that write; the
+            // cache never kept them.
+            Ok(filled) => Ok(filled.folio().page_slice(in_page, bs)),
+            // No frame for a folio: degrade to a bounded uncached read.
+            Err(FsError::OutOfMemory) => Ok(None),
+            Err(error) => Err(error),
         }
-
-        let Some(mut allocation) = CacheFolio::alloc_zeroed() else {
-            return Ok(None);
-        };
-        let generation = *self.cache_generation.lock();
-        self.read_byte_range(first_block * bs as u64, &mut allocation[..])
-            .await?;
-        let folio = Folio::clean(allocation);
-        let view = folio.slice(in_page, bs).ok_or(FsError::InvalidData)?;
-        // A future higher-order readahead fill may win an overlapping race.
-        // The private retained view is still valid even when publication loses.
-        {
-            let current = self.cache_generation.lock();
-            if *current == generation {
-                self.page_cache.insert_folio(key, folio);
-            }
-        }
-        Ok(Some(view))
     }
 
     /// Read one block as a retained view. This is the preferred metadata and
@@ -1125,24 +1098,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::ReadOnly);
         }
         let result = self.write_byte_range_device(byte_off, src).await;
-        // Direct block writes bypass the page-cache writeback path, so once
-        // the device has changed — even partially, on an error — drop the
-        // cached pages they overwrote. Only those: dropping the whole cache
-        // on every write made each later read on the volume go back to the
-        // device. The cache is keyed by device page (`read_block_folio`:
-        // inode 0, page_off = byte offset / PAGE_SIZE). Any write may also
-        // change an indirect block (or free/reallocate one), so the 8-entry
-        // indirect cache goes too. Bumping the generation in the same
-        // critical section stops a fill that read the old bytes from
-        // publishing them afterwards.
+        // Direct block writes bypass the page cache, so once the device has
+        // changed — even partially, on an error — drop the cached device
+        // pages they overwrote, and void any fill of exactly those pages that
+        // may have read the old bytes (Linux `invalidate_mapping_pages` on
+        // the bdev mapping). Only those: a fill of any other page publishes
+        // normally.
         let first_page = byte_off / PAGE_SIZE as u64;
         let end_page = (byte_off + src.len() as u64).div_ceil(PAGE_SIZE as u64);
-        {
-            let mut generation = self.cache_generation.lock();
-            *generation = generation.wrapping_add(1);
-            self.page_cache.invalidate_range(0, 0, first_page, end_page);
-            self.indirect_cache.lock().clear();
-        }
+        self.bdev_mapping.invalidate(first_page, end_page);
         result
     }
 
@@ -1314,7 +1278,74 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode_no == super::EXT2_ROOT_INO {
             *self.root_inode.lock() = Some(*inode);
         }
+        // The cached in-memory inode is the one every holder of this inode
+        // reads; keep it identical to what was just written. The upgrade's
+        // icache guard is released before the node is touched or dropped.
+        let live = self.icache_get(inode_no);
+        if let Some(node) = live {
+            node.set_cached_inode(*inode);
+        }
         Ok(())
+    }
+
+    /// The live node of `inode_no`, if any (no I/O).
+    pub(crate) fn icache_get(&self, inode_no: u32) -> Option<Arc<super::node::Ext2Node<B>>> {
+        self.icache.lock().get(&inode_no).and_then(Weak::upgrade)
+    }
+
+    /// Linux `iget_locked`: the one in-memory inode for `inode_no`, reading
+    /// it from disk only when no node is live.
+    pub async fn iget(&self, inode_no: u32) -> Result<Arc<super::node::Ext2Node<B>>, FsError> {
+        if let Some(node) = self.icache_get(inode_no) {
+            return Ok(node);
+        }
+        let inode = self.read_inode(inode_no).await?;
+        Ok(self.iget_with(inode_no, inode))
+    }
+
+    /// [`Self::iget`] when the caller has just read or written `inode`. A
+    /// node that became live meanwhile wins (its cached inode was refreshed
+    /// by the write funnel), so two racing lookups still share one node.
+    pub(crate) fn iget_with(&self, inode_no: u32, inode: Inode) -> Arc<super::node::Ext2Node<B>> {
+        let volume = self
+            .self_weak
+            .upgrade()
+            .expect("ext2 iget on a volume being dropped");
+        let mut icache = self.icache.lock();
+        if let Some(node) = icache.get(&inode_no).and_then(Weak::upgrade) {
+            return node;
+        }
+        let node = super::node::Ext2Node::new_cached(volume, inode_no, inode);
+        icache.insert(inode_no, Arc::downgrade(&node));
+        node
+    }
+
+    /// A fresh page-cache mapping for a new in-memory inode of `inode_no`.
+    /// The key carries a per-node incarnation in its high half, so the pages
+    /// of a node that outlived its on-disk inode (freed while still open)
+    /// can never be found through the node of a NEW inode that reuses the
+    /// number, and vice versa.
+    pub(crate) fn new_file_mapping(&self, inode_no: u32) -> narf_filesystem::FileMapping {
+        let incarnation = self
+            .incarnations
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        narf_filesystem::FileMapping::new(
+            self.page_cache.clone(),
+            0,
+            (u64::from(incarnation) << 32) | u64::from(inode_no),
+        )
+    }
+
+    /// `evict`: forget the icache entry of `inode_no` if it still names the
+    /// node at `node` (a racing `iget` may already have replaced it).
+    pub(crate) fn icache_evict(&self, inode_no: u32, node: *const super::node::Ext2Node<B>) {
+        let mut icache = self.icache.lock();
+        if icache
+            .get(&inode_no)
+            .is_some_and(|weak| core::ptr::eq(weak.as_ptr(), node))
+        {
+            icache.remove(&inode_no);
+        }
     }
 
     // ── Bitmap allocator (Linux fs/ext2/balloc.c + ialloc.c) ─────
@@ -1648,6 +1679,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Before the allocation lock — releasing frees a block, which takes
         // it too.
         self.xattr_release_on_free(inode_no).await?;
+        // The number is about to become reusable: a node still held for the
+        // freed inode must not be what a later `iget` of a NEW inode with the
+        // same number returns. Unhash it (Linux `remove_inode_hash`).
+        let unhashed = self.icache.lock().remove(&inode_no);
+        drop(unhashed);
         let _allocation = self.allocation_lock.lock().await;
         let (group, index) = self
             .inode_group_and_index(inode_no)
@@ -1902,41 +1938,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
-    /// Write `src` to `inode` starting at `offset`. Allocates blocks
-    /// as needed via `map_block_alloc`. Extends `inode.size`.
-    pub async fn write_inode_data(
-        &self,
-        inode_no: u32,
-        inode: &mut Inode,
-        offset: u64,
-        src: &[u8],
-    ) -> Result<usize, FsError> {
-        let bs = self.block_size() as u64;
-        let mut total = 0usize;
-        let mut remaining = src.len();
-        let mut cur_off = offset;
-        while remaining > 0 {
-            let logical = cur_off / bs;
-            let in_block = (cur_off % bs) as usize;
-            let n = core::cmp::min(remaining, bs as usize - in_block);
-            let phys = self.map_block_alloc(inode_no, inode, logical).await?;
-            // RMW the block.
-            let mut bbuf = vec![0u8; bs as usize];
-            if in_block != 0 || n != bs as usize {
-                self.read_block(phys, &mut bbuf).await?;
-            }
-            bbuf[in_block..in_block + n].copy_from_slice(&src[total..total + n]);
-            self.write_block(phys, &bbuf).await?;
-            total += n;
-            remaining -= n;
-            cur_off += n as u64;
-        }
-        if cur_off > inode.size as u64 {
-            inode.size = cur_off as u32;
-        }
-        Ok(total)
-    }
-
     /// Read the on-disk inode `inode_no`.
     pub async fn read_inode(&self, inode_no: u32) -> Result<Inode, FsError> {
         let (group, index) = self
@@ -2069,38 +2070,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         let off = (index as usize) * 4;
-        let entry =
-            |buf: &[u8]| u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-        // Fast path: serve from the indirect-block cache. The lock is dropped
-        // before any await (never held across the device read below).
-        {
-            let cache = self.indirect_cache.lock();
-            if let Some((_, buf)) = cache.iter().find(|(b, _)| *b == block_no) {
-                return Ok(entry(buf));
-            }
-        }
-        let bs = self.block_size();
-        let mut buf = vec![0u8; bs];
-        let generation = *self.cache_generation.lock();
-        self.read_block(block_no as u64, &mut buf).await?;
-        let val = entry(&buf);
-        // Insert into the LRU (cap 8, evict oldest). Re-check membership: a
-        // concurrent read may have inserted the same block while we awaited.
-        // Skip the insert if a write landed meanwhile (see `cache_generation`).
-        {
-            let current = self.cache_generation.lock();
-            if *current != generation {
-                return Ok(val);
-            }
-            let mut cache = self.indirect_cache.lock();
-            if !cache.iter().any(|(b, _)| *b == block_no) {
-                if cache.len() >= 8 {
-                    cache.remove(0);
-                }
-                cache.push((block_no, buf));
-            }
-        }
-        Ok(val)
+        // Indirect blocks are ordinary bdev-mapping pages: a sequential walk
+        // of a large file hits the same cached page for every data block.
+        let block = self.read_block_view(u64::from(block_no)).await?;
+        Ok(u32::from_le_bytes([
+            block[off],
+            block[off + 1],
+            block[off + 2],
+            block[off + 3],
+        ]))
     }
 }
 
@@ -2125,13 +2103,7 @@ impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
     fn root(&self) -> Arc<dyn DirOps> {
         let inode =
             (*self.root_inode.lock()).expect("mounted ext2 volume lost root inode metadata");
-        Arc::new(super::node::Ext2Node::from_inode(
-            self.self_weak
-                .upgrade()
-                .expect("Ext2Volume root called after drop"),
-            super::EXT2_ROOT_INO,
-            inode,
-        ))
+        self.iget_with(super::EXT2_ROOT_INO, inode)
     }
 
     fn name(&self) -> &str {

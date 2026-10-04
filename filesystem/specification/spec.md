@@ -254,6 +254,10 @@ pub trait FileOps {
     fn acknowledge_poll_readiness(&self, readiness: u32);
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
+    fn mmap_is_ram(&self) -> bool;
+    fn supports_mmap_fault(&self) -> bool;
+    fn mmap_backing_identity(&self) -> usize;
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>;
     fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
     fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError>;
@@ -290,6 +294,8 @@ pub enum FileType {
     Socket,
     Fifo,
 }
+pub fn install_mmap_truncate_hook(hook: fn(&dyn FileOps, u64) -> Result<(), FsError>);
+pub fn unmap_mapping_range(file: &dyn FileOps, new_len: u64) -> Result<(), FsError>;
 ```
 
 `DirOps::create_with_attrs` publishes a new inode with the requested owner and
@@ -782,6 +788,17 @@ only while its recorded generation matches. The cache keeps only a weak file
 reference, never discards a dirty page, and files returning `None` retain the
 conservative final-unmap reclamation behavior.
 
+`supports_mmap_fault` is the side-effect-free capability check for direct
+demand backing. It is deliberately separate from `mmap_fault`: a refusal at
+an offset beyond the current EOF must not make `mmap(2)` select the generic
+copy fallback for the whole VMA. A filesystem shrinking such a direct-mapped
+file calls `unmap_mapping_range` before retiring its cache folios; userspace
+installs the VMA-owning hook during common boot, while standalone filesystem
+tests with no userspace mappings safely observe a no-op.
+`mmap_backing_identity` identifies the live object owning those pages;
+forwarding wrappers preserve the underlying value so a truncate issued by the
+backing filesystem still finds and revokes VMAs owned by the wrapper.
+
 Ordinary unlocked generic shared mappings are demand-backed: VMA publication
 records absent page slots and first access resolves the canonical cache page.
 `MAP_LOCKED` and blocking `MAP_POPULATE` retain eager materialization; combining
@@ -795,16 +812,69 @@ consumer can recognise aliases of the same `(filesystem, inode)` pair.
 
 - Default behaviour: read-modify-write path goes through a unified
   page cache sized by `memory/` policy.
-- The cache's native resident unit is `Folio`, backed by `CacheFolio`: a
-  physically contiguous, naturally aligned run of `2^order` base pages.
-  `PageKey` remains a base-page index. `PageCache::lookup_folio(key)` finds
-  the folio containing that index and returns a retained `FolioRef`; its
-  `FolioSlice` views keep the allocation alive without copying or holding the
-  cache lock. `PageCache::insert_folio` rejects misaligned or overlapping
-  heads rather than publishing two owners for one page-cache index.
+- The cache's native resident unit is `CacheFolio`: a physically
+  contiguous, naturally aligned run of `2^order` base pages. `PageKey`
+  remains a base-page index `(fs_id, inode, page_off)`; inode 0 is the
+  filesystem's block-device mapping (Linux's `bdev` inode). A lookup returns
+  a retained `FolioRef`; its `FolioSlice` views keep the allocation alive
+  without copying or holding the cache lock.
+- **The fill protocol is the cache's, not the filesystem's.**
+  `PageCache::get_or_fill(key, order, fill)` (Linux `filemap_read_folio`)
+  does lookup → miss coalescing → fill → publish: the first miss installs a
+  *fill ticket* for exactly the folio's page range under the cache lock,
+  concurrent misses on any covered page park on it, the caller's async
+  `fill` runs unlocked, and the folio replaces the ticket only if the ticket
+  is still the one it installed. A failed or dropped fill removes its ticket
+  and wakes its waiters. `Filled::published()` is `false` when the caller's
+  own fill was invalidated mid-read: the bytes are a valid read for that
+  caller but were never cached and must not be handed out as the shared
+  copy. `OutOfMemory` (no folio frame) lets the caller degrade to a bounded
+  uncached read.
+- **Invalidation is per key.** `PageCache::invalidate_range(fs, inode,
+  first, end)` (Linux `invalidate_mapping_pages`) drops the clean resident
+  folios overlapping the range *and* removes the overlapping fill tickets,
+  so a fill refuses to publish exactly when its own pages were written while
+  it read them; writes elsewhere never void it. There is no volume-global
+  generation. Dirty folios are kept.
+- `BlockMapping` is the typed facade for a filesystem's bdev mapping
+  (metadata keyed by device page). Its folios are never modified in place —
+  a device write invalidates the pages it covers — which is what makes
+  zero-copy `&[u8]` views of them sound. Raw insertion
+  (`__insert_folio_for_test`) is test-only; production publication goes
+  through `get_or_fill`.
+- `FileMapping` is one inode's page cache (Linux `struct address_space`):
+  the single set of folios through which `read(2)`, `write(2)` and every
+  `MAP_SHARED` mapping of the inode see its bytes; a filesystem keeps one per
+  in-memory inode. Its folios are updated in place, so it never hands out
+  `&[u8]`: `FileFolio::read`/`write`/`zero` copy. `get_or_fill` is the same
+  protocol as above (the filesystem's `->read_folio` is the `fill`);
+  `mark_dirty`/`take_dirty` drive writeback; `remove_from(page)` is
+  `truncate_inode_pages` (`PageCache::remove_range`: removes dirty folios and
+  voids fills too — the bytes cease to exist). `FileFolio::mmap_frame`
+  returns the physical cache page and acquires one external alias reference;
+  failed PTE publication or later unmap releases it through the shared-frame
+  hook. One strong folio hold spans all aliases, so a borrowed user PTE can
+  never outlive or race reclaim of its cache frame.
+- Reclaim evicts only clean folios whose sole reference is the cache's own.
+  A folio someone holds is in use *as the cache's copy* (a writer updating
+  it, a reader copying out, a user mapping) — evicting it would let the next
+  lookup refill a second, divergent copy (Linux reclaim likewise fails to
+  freeze such a folio's refcount).
+- Lock order / reclaim: the cache lock is an `IrqSafeSpinLock` never held
+  across `.await` or while waking; allocation under it relies on
+  `narf_memory::reclaim::GLOBAL_ALLOC_RUNS_SHRINKERS == false`, which the
+  page cache `const`-asserts and memory's
+  `smoke_global_alloc_failure_has_no_inline_reclaim_or_retry` pins. The
+  shrinker entry points (`shrink`, `reclaimable`) only `try_lock` the cache,
+  so reclaim can never deadlock against it. Registry order is
+  `PAGE_CACHE_REGISTRY` → cache lock. The mapped-folio physical registry
+  does not nest with either and drops its last strong hold after unlocking.
 - Capacity, watermark reclaim, and shrinker counts are expressed in base
   pages, not folio heads. CLOCK recency and dirty/writeback state are per
-  folio; reclaim never splits a folio and never evicts a dirty folio.
+  folio; reclaim never splits a folio and never evicts a dirty folio or a
+  fill ticket. `PageCache::take_dirty(fs, inode, first, end)` hands dirty
+  folios to writeback and clears their dirty bit (a failed writeback
+  re-marks with `mark_dirty`).
 - Order-zero allocation is the guaranteed fast path. Higher-order allocation
   is opportunistic: callers must fall back to a smaller folio or a bounded
   uncached read when contiguous memory is unavailable. Cache metadata locks

@@ -1281,6 +1281,14 @@ impl FileOps for OverlayFile {
         self.active().mmap_is_ram()
     }
 
+    fn supports_mmap_fault(&self) -> bool {
+        self.active().supports_mmap_fault()
+    }
+
+    fn mmap_backing_identity(&self) -> usize {
+        self.active().mmap_backing_identity()
+    }
+
     fn splice_read_page(
         &self,
         offset: u64,
