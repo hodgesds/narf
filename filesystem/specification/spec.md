@@ -1194,6 +1194,25 @@ decoders are available. The complete compatibility matrix and fixture
 coverage are recorded in
 `drivers/fs/squashfs/SQUASHFS_LINUX_COMPAT_AUDIT.md`.
 
+### 3.13 Pid sysctls
+
+`procfs::sys_kernel` owns `kernel.pid_max` and serves `kernel.ns_last_pid`
+for the pid allocator in narf-userspace:
+
+```rust
+pub const PID_MAX_MIN: u32;       // RESERVED_PIDS + 1 = 301
+pub const PID_MAX_LIMIT: u32;     // 4 Mi
+pub fn pid_max() -> u32;          // the allocator's live, exclusive bound
+pub fn set_pid_max(n: u32) -> Result<(), FsError>;   // [PID_MAX_MIN, PID_MAX_LIMIT]
+pub fn install_ns_last_pid_hooks(read: fn() -> i64, write: fn(&str) -> Result<(), FsError>);
+pub fn parse_dointvec_minmax(v: &str, min: i64, max: i64) -> Result<i64, FsError>;
+```
+
+`pid_max` writes are `proc_dointvec_minmax` over `[301, 4194304]`.
+`ns_last_pid` is registered 0666 in every build; the installed hooks resolve
+the caller's pid namespace and perform the capability check. Before the hooks
+are installed it reads `0` and refuses writes.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can
