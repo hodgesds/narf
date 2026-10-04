@@ -14,6 +14,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -76,6 +77,10 @@ pub(crate) struct OpenFileDescription {
     /// alias closes. Weak avoids a description -> file -> waker -> description
     /// cycle; the callback itself also retains only a Weak description.
     fasync_ops: Weak<dyn FileOps>,
+    /// The path this description was opened on and whether it names a
+    /// directory, for the inotify/fanotify close event `__fput` sends
+    /// (`fsnotify_close`). Recorded when the opening fd's path is registered.
+    close_notify: IrqSafeSpinLock<Option<(String, bool)>>,
 }
 
 impl core::fmt::Debug for OpenFileDescription {
@@ -153,6 +158,18 @@ impl Drop for OpenFileDescription {
         // at exactly the same moment — `locks_remove_flock` runs from
         // `filp_close`/`__fput`, not from any earlier close of an alias.
         crate::handlers::release_flock_owner(self.lock_owner());
+        // `__fput` → `fsnotify_close`: IN_CLOSE_WRITE when the description
+        // was opened for writing (FMODE_WRITE, which `OPEN_FMODE` gives
+        // O_WRONLY and O_RDWR but not access mode 3), IN_CLOSE_NOWRITE
+        // otherwise, and nothing for O_PATH (FMODE_NONOTIFY).
+        let flags = self.status_flags.load(Ordering::Acquire);
+        if flags & O_PATH == 0 {
+            if let Some((path, is_dir)) = self.close_notify.lock().take() {
+                let accmode = flags & O_ACCMODE;
+                let writable = accmode == O_WRONLY || accmode == O_RDWR;
+                crate::mqueue::notify_close(&path, writable, is_dir);
+            }
+        }
     }
 }
 
@@ -228,6 +245,15 @@ impl OpenFileDescription {
 
     pub(crate) fn set_status_flags(&self, status_flags: u32) {
         self.status_flags.store(status_flags, Ordering::Release);
+    }
+
+    /// Record the path (and directory-ness) the close event will name. The
+    /// first registration wins: a description is opened on one path.
+    pub(crate) fn set_close_notify(&self, path: &str, is_dir: bool) {
+        let mut slot = self.close_notify.lock();
+        if slot.is_none() {
+            *slot = Some((String::from(path), is_dir));
+        }
     }
 
     pub(crate) fn fasync_waiter_id(&self) -> u64 {
@@ -610,6 +636,7 @@ impl FdTable {
             }),
             fasync_waiter_id: next_fasync_waiter_id(),
             fasync_ops: Arc::downgrade(&entry.ops),
+            close_notify: IrqSafeSpinLock::new(None),
         })
     }
 

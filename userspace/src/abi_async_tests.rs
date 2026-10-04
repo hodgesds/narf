@@ -2314,3 +2314,92 @@ kernel_test_in!(
     "syscall_abi/async",
     smoke_abi_async_aio_max_nr_limits_contexts
 );
+
+/// inotify close events follow Linux's `fsnotify_close`, sent from `__fput`
+/// when the LAST reference to the open file description goes: IN_CLOSE_WRITE
+/// only for a description opened for writing (FMODE_WRITE), IN_CLOSE_NOWRITE
+/// otherwise, and nothing for an O_PATH description (FMODE_NONOTIFY). NARF sent
+/// IN_CLOSE_WRITE from every close(2) — read-only and dup'd ones included — so
+/// avahi-daemon, which reloads on IN_CLOSE_WRITE in /etc/avahi and re-reads
+/// those files while reloading, reloaded itself in a loop.
+fn smoke_abi_async_inotify_close_events_follow_fput() -> TestResult {
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_CLOSE_WRITE: u32 = 0x8;
+    const IN_CLOSE_NOWRITE: u32 = 0x10;
+    const O_WRONLY: u64 = 1;
+    const O_PATH: u64 = 0o10000000;
+    /// Masks of the queued events naming `f`.
+    fn drain(ifd: u64) -> alloc::vec::Vec<u32> {
+        let mut buf = [0u8; 1024];
+        let mut out = alloc::vec::Vec::new();
+        let Some(n) = call(
+            Syscall::Read.raw(),
+            a2(ifd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) else {
+            return out;
+        };
+        let mut at = 0usize;
+        while n > 0 && at + 16 <= n as usize {
+            let mask = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().unwrap());
+            let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
+            let name = &buf[at + 16..at + 16 + len];
+            if name.split(|&b| b == 0).next() == Some(&b"f"[..]) {
+                out.push(mask);
+            }
+            at += 16 + len;
+        }
+        out
+    }
+    with_memfs("/abi-close", "abi-close", &[("f", b"x")], || {
+        let ifd = match call(Syscall::InotifyInit1.raw(), a0(IN_NONBLOCK)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("inotify_init1 failed"),
+        };
+        let dir = b"/abi-close\0";
+        let mask = u64::from(IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+        match call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(ifd, dir.as_ptr() as u64, mask),
+        ) {
+            Some(wd) if wd >= 1 => {}
+            _ => return Err("inotify_add_watch on the directory failed"),
+        }
+        let path = b"/abi-close/f\0";
+        let open = |flags: u64| match call_open(path.as_ptr() as u64, flags) {
+            Some(fd) if fd >= 0 => Ok(fd as u64),
+            _ => Err("open of the watched file failed"),
+        };
+
+        let ro = open(0)?;
+        let _ = call(Syscall::Close.raw(), a0(ro));
+        if drain(ifd) != [IN_CLOSE_NOWRITE] {
+            return Err("closing a read-only open must queue exactly IN_CLOSE_NOWRITE");
+        }
+
+        let wr = open(O_WRONLY)?;
+        let dup = match call(Syscall::Dup.raw(), a0(wr)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("dup failed"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(wr));
+        if !drain(ifd).is_empty() {
+            return Err("closing one of two descriptors of a description queued a close event");
+        }
+        let _ = call(Syscall::Close.raw(), a0(dup));
+        if drain(ifd) != [IN_CLOSE_WRITE] {
+            return Err("the last close of a write open must queue exactly IN_CLOSE_WRITE");
+        }
+
+        let opath = open(O_PATH)?;
+        let _ = call(Syscall::Close.raw(), a0(opath));
+        if !drain(ifd).is_empty() {
+            return Err("closing an O_PATH descriptor queued a close event");
+        }
+        let _ = call(Syscall::Close.raw(), a0(ifd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_close_events_follow_fput
+);
