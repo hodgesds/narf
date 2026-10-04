@@ -160,7 +160,7 @@ impl Device {
         {
             let mut active = ACTIVE.lock();
             if active.is_some() {
-                return Err("wlan0 already registered");
+                return Err("iwlwifi interface already registered");
             }
             *active = Some(self.clone());
         }
@@ -356,7 +356,7 @@ fn queue_ethernet(
 
 impl Interface for Device {
     fn name(&self) -> &str {
-        "wlan0"
+        super::iwl_ifname()
     }
     fn mac(&self) -> [u8; 6] {
         self.mac

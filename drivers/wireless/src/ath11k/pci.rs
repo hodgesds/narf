@@ -75,9 +75,15 @@ pub struct Ath11kDevice {
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+/// The `wlan%d` name reserved for this device (`dev_alloc_name`). ath11k
+/// creates no network interface yet — it has no MAC read from hardware or
+/// data path — but its wireless-registry entry must not take a name another
+/// device holds.
+static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
+
 impl Interface for Ath11kDevice {
     fn name(&self) -> &str {
-        "wlan1"
+        *IFNAME.lock()
     }
     fn mac(&self) -> [u8; 6] {
         self.mac_addr
@@ -252,6 +258,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
     });
 
+    if IFNAME.lock().is_empty() {
+        *IFNAME.lock() = narf_net::iface::reserve_name("wlan%d");
+    }
     narf_wireless::registry::register(device.clone());
 
     // TODO: Spawn pumps for ath11k

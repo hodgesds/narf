@@ -121,7 +121,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    narf_net::iface::register("wlan0", mac, send_frame);
+    narf_net::iface::register("wlan%d", mac, send_frame);
 
     spawn_pumps(arc_dev);
 

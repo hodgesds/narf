@@ -255,9 +255,23 @@ impl core::fmt::Debug for IwlDevice {
     }
 }
 
+/// This adapter's interface name, `wlan%d` as Linux `dev_alloc_name` picks
+/// it. Reserved the first time either view of the adapter needs it — the
+/// wireless-registry `IwlDevice` at probe or the netdev `device::Device` —
+/// and shared by both, so the card has one name.
+static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
+
+pub(crate) fn iwl_ifname() -> &'static str {
+    let mut name = IFNAME.lock();
+    if name.is_empty() {
+        *name = narf_net::iface::reserve_name("wlan%d");
+    }
+    *name
+}
+
 impl Interface for IwlDevice {
     fn name(&self) -> &str {
-        "wlan0" // TODO: dynamic naming
+        iwl_ifname()
     }
     fn mac(&self) -> [u8; 6] {
         self.mac_addr

@@ -209,7 +209,8 @@ registry gets one from the same counter on first sight. The link dump,
 `SIOCGIFINDEX`, `/sys/class/net/<dev>/ifindex`, the BPF XDP attach path and
 `iface::send_on_ifindex` all use that one number. A name containing `%d` takes
 the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
-`eth%d`, each device under one name in both registries. The link dump lists
+`eth%d` and wireless drivers as `wlan%d`, each device under one name in both
+registries (a driver needing its name before registering reserves it). The link dump lists
 exactly one loopback, `lo`, and a running device reports `IFF_LOWER_UP`
 (`dev_get_flags`).
 
