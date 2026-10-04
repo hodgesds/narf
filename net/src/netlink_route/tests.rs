@@ -700,6 +700,7 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
             ext_ack: true,
             cap_ack: true,
             strict_check: false,
+            net_admin: false,
         },
     )
     .unwrap();

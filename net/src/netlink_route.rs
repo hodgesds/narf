@@ -1136,18 +1136,54 @@ fn resolve_link(request: &[u8], msg_type: u16, flags: u16) -> Result<alloc::stri
     }
 }
 
-fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<(), i32> {
+/// Who may change interface `iface` with this request. Linux
+/// `rtnetlink_rcv_msg` refuses every non-GET request with -EPERM unless the
+/// sender is `netlink_net_capable(skb, CAP_NET_ADMIN)` in the socket's network
+/// namespace, and then lets it change any device of that namespace. NARF also
+/// honours a delegated per-interface handle (a stack daemon's grant), which
+/// covers exactly its one interface.
+struct MutationAuthority<'a> {
+    delegated: Option<&'a crate::AdminHandle>,
+    net_admin: bool,
+    net_ns_id: u64,
+}
+
+impl MutationAuthority<'_> {
+    fn any(&self) -> bool {
+        self.delegated.is_some() || self.net_admin
+    }
+
+    /// The handle that changes `iface`, or the errno refusing it.
+    fn for_iface(&self, iface: &str) -> Result<crate::AdminHandle, i32> {
+        if let Some(admin) = self.delegated {
+            if admin.iface_name() == iface {
+                return Ok(admin.clone());
+            }
+        }
+        if self.net_admin {
+            // A CAP_NET_ADMIN sender reaches only its own namespace's devices
+            // (`__dev_get_by_index(sock_net(skb->sk), ...)` -> -ENODEV).
+            if iface != "lo" && crate::iface::lookup_in(self.net_ns_id, iface).is_none() {
+                return Err(ENODEV);
+            }
+            return crate::stack::kernel_admin(iface).ok_or(ENODEV);
+        }
+        Err(EPERM)
+    }
+}
+
+fn apply_mutation(request: &[u8], authority: &MutationAuthority<'_>) -> Result<(), i32> {
     let hdr = parse_hdr(request).ok_or(EINVAL)?;
-    let admin = admin.ok_or(EPERM)?;
+    if !authority.any() {
+        return Err(EPERM);
+    }
     match hdr.msg_type {
         RTM_NEWLINK | RTM_SETLINK => {
             if request.len() < NLMSG_HDRLEN + 16 {
                 return Err(EINVAL);
             }
             let iface_name = resolve_link(request, hdr.msg_type, hdr.flags)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             let flags = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
             let change = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
             if change & IFF_UP != 0 {
@@ -1185,9 +1221,7 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             }
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             let addr = find_attr(request, 8, IFA_LOCAL)
                 .or_else(|| find_attr(request, 8, IFA_ADDRESS))
                 .ok_or(EINVAL)?;
@@ -1267,9 +1301,7 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             }
             let ifindex = u32::from_ne_bytes(oif.try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             if family == AF_INET6 {
                 if table != crate::route::TABLE_MAIN {
                     return Err(EOPNOTSUPP);
@@ -1372,9 +1404,7 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             let family = request[NLMSG_HDRLEN];
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             let state = u16::from_ne_bytes(request[24..26].try_into().map_err(|_| EINVAL)?);
             let flags = request[26];
             let dst = find_attr(request, 12, NDA_DST).ok_or(EINVAL)?;
@@ -1479,6 +1509,9 @@ pub struct ReplyOptions {
     pub ext_ack: bool,
     pub cap_ack: bool,
     pub strict_check: bool,
+    /// The sender is `netlink_net_capable(CAP_NET_ADMIN)` in the socket's
+    /// network namespace: it may change any of that namespace's devices.
+    pub net_admin: bool,
 }
 
 pub fn build_replies_with_options(
@@ -1541,7 +1574,12 @@ pub fn build_replies_with_options_in(
             continue;
         }
         if is_mutation(hdr.msg_type) {
-            match apply_mutation(request, admin) {
+            let authority = MutationAuthority {
+                delegated: admin,
+                net_admin: options.net_admin,
+                net_ns_id,
+            };
+            match apply_mutation(request, &authority) {
                 Ok(()) => {
                     if wants_ack {
                         replies.push(build_ack(hdr.seq, request));

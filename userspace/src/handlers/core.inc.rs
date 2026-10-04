@@ -5215,7 +5215,7 @@ pub(crate) const CAP_CHECKPOINT_RESTORE: u32 = 40;
 
 /// `CAP_FULL_SET` — every capability up to and including `CAP_LAST_CAP`
 /// (`include/linux/capability.h`: `CAP_VALID_MASK`).
-const CAP_FULL_SET: u64 = if CAP_LAST_CAP >= 63 {
+pub(crate) const CAP_FULL_SET: u64 = if CAP_LAST_CAP >= 63 {
     u64::MAX
 } else {
     (1u64 << (CAP_LAST_CAP + 1)) - 1

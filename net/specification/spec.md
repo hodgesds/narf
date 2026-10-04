@@ -158,21 +158,23 @@ caches, the canonical local/main/default IPv4 policy rules, and each
 interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
-`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
-administration path. A route socket must first be explicitly delegated an
-interface-bound `AdminHandle`; undelegated or cross-interface writes return
-`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
+`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests follow
+`rtnetlink_rcv_msg`: a non-GET request needs
+`netlink_net_capable(skb, CAP_NET_ADMIN)` — CAP_NET_ADMIN over the socket's
+network namespace (its owning user namespace), held both by the socket's
+opener (recorded at `socket()`, the `file_ns_capable` half) and by the sending
+task — or the reply is `NLMSG_ERROR(-EPERM)`. A capable sender may change any
+device of that namespace (another namespace's device is `-ENODEV`) through
+kernel-held interface handles minted once per interface
+(`stack::kernel_admin`). A route socket may also be delegated an
+interface-bound `AdminHandle`, which authorizes exactly that interface.
+`RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
 `RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
 typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
 The stack-daemon launcher performs delegation as a kernel-held transfer from a
 successful `StackAttachReply` to a route socket in the attaching task's fd
-table. During bootstrap, when outer PID 1 opens a `NETLINK_ROUTE` socket in
-the initial network namespace, the kernel attaches a separate `lo`-only
-handle so systemd can issue its idempotent `RTM_SETLINK(IFF_UP)` loopback
-request. This handle cannot administer another interface or namespace, and
-all other route sockets remain undelegated. The Linux syscall surface never
-accepts raw admin-handle bytes.
+table. The Linux syscall surface never accepts raw admin-handle bytes.
 
 Successful mutations emit kernel-originated sequence-zero notifications to
 the Linux rtnetlink multicast group for the changed object (link, neighbor,

@@ -859,6 +859,11 @@ pub struct SocketFile {
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
+    /// The opener held CAP_NET_ADMIN over this socket's network namespace when
+    /// it created the socket — the `file_ns_capable(file, ...)` half of Linux
+    /// `netlink_net_capable`, which judges the socket's `f_cred`, not only the
+    /// task sending on it.
+    opener_net_admin: AtomicBool,
     netfilter_admin: IrqSafeSpinLock<Option<narf_net::netfilter::NetfilterAdminHandle>>,
     /// Userspace-to-userspace unicast datagrams, independent of each
     /// protocol's kernel reply queue so sender port IDs remain attributable.
@@ -1695,6 +1700,7 @@ impl SocketFile {
             netlink_reply_groups: IrqSafeSpinLock::new(VecDeque::new()),
             netlink_last_recv_group: AtomicU32::new(0),
             netlink_admin: IrqSafeSpinLock::new(None),
+            opener_net_admin: AtomicBool::new(false),
             netfilter_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
             netlink_uevent_subscribed: AtomicBool::new(false),
@@ -1704,6 +1710,33 @@ impl SocketFile {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         socket
+    }
+
+    /// Does `task` hold CAP_NET_ADMIN over this socket's network namespace —
+    /// `ns_capable(net->user_ns, CAP_NET_ADMIN)`?
+    pub(crate) fn task_net_admin(&self, task: u64) -> bool {
+        #[cfg(feature = "container")]
+        if let Some(ns) = self.net_namespace.lock().as_ref() {
+            return crate::handlers::task_ns_capable(
+                task,
+                &ns.owner_user_ns(),
+                crate::handlers::CAP_NET_ADMIN,
+            );
+        }
+        crate::handlers::task_capable(task, crate::handlers::CAP_NET_ADMIN)
+    }
+
+    /// Record the opener's CAP_NET_ADMIN verdict (see `opener_net_admin`).
+    pub(crate) fn record_opener_net_admin(&self, task: u64) {
+        self.opener_net_admin
+            .store(self.task_net_admin(task), Ordering::Release);
+    }
+
+    /// Linux `netlink_net_capable(skb, CAP_NET_ADMIN)`: both the socket's
+    /// opener and the sending task are capable in its network namespace.
+    fn netlink_net_admin(&self) -> bool {
+        self.opener_net_admin.load(Ordering::Acquire)
+            && self.task_net_admin(crate::handlers::current_task_id())
     }
 
     pub fn delegate_netlink_admin(&self, admin: narf_net::AdminHandle) -> Result<(), SockError> {
@@ -2945,6 +2978,23 @@ impl FileOps for SocketFile {
             let name = String::from(
                 core::str::from_utf8(&ifreq[..name_len]).map_err(|_| FsError::NotFound)?,
             );
+            // The setters need a delegated handle for this very device, or
+            // Linux `dev_ioctl`'s `ns_capable(net->user_ns, CAP_NET_ADMIN)`
+            // for the caller, which reaches any device of the socket's
+            // namespace. Linux checks the capability before it looks the
+            // device up, so a refused caller gets -EPERM even for a name
+            // that does not exist.
+            let delegated = if matches!(cmd, SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR) {
+                let delegated = self.netlink_admin.lock().clone().filter(|admin| {
+                    admin.iface_name() == name && admin.net_ns_id().ok() == Some(self.net_ns_id())
+                });
+                if delegated.is_none() && !self.task_net_admin(crate::handlers::current_task_id()) {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                delegated
+            } else {
+                None
+            };
             let iface =
                 narf_net::iface::lookup_in(self.net_ns_id(), &name).ok_or(FsError::NotFound)?;
             match cmd {
@@ -2997,16 +3047,10 @@ impl FileOps for SocketFile {
                     ifreq[16..20].copy_from_slice(&(index as i32).to_ne_bytes());
                 }
                 SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR => {
-                    let admin = self
-                        .netlink_admin
-                        .lock()
-                        .clone()
-                        .ok_or(FsError::OperationNotPermitted)?;
-                    if admin.iface_name() != name
-                        || admin.net_ns_id().map_err(map_admin_ioctl_error)? != self.net_ns_id()
-                    {
-                        return Err(FsError::OperationNotPermitted);
-                    }
+                    let admin = match delegated {
+                        Some(admin) => admin,
+                        None => narf_net::kernel_admin(&name).ok_or(FsError::NotFound)?,
+                    };
                     match cmd {
                         SIOCSIFFLAGS => {
                             const IFF_UP: i16 = 0x1;
@@ -3737,6 +3781,7 @@ impl SocketFile {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
                         cap_ack: self.netlink_cap_ack.load(Ordering::Acquire),
                         strict_check: self.netlink_strict_check.load(Ordering::Acquire),
+                        net_admin: self.netlink_net_admin(),
                     },
                 ) {
                     Ok(msgs) => msgs,
@@ -8467,7 +8512,7 @@ kernel_test_in!(
     smoke_socket_ioctl_reports_network_interface
 );
 
-fn smoke_socket_mutation_ioctl_requires_delegated_admin() -> TestResult {
+fn smoke_socket_mutation_ioctl_needs_net_admin() -> TestResult {
     let _kernel_buffers = crate::handlers::kernel_buffers_guard();
     narf_net::iface::register_loopback_iface();
     const SIOCSIFFLAGS: u32 = 0x8914;
@@ -8475,29 +8520,37 @@ fn smoke_socket_mutation_ioctl_requires_delegated_admin() -> TestResult {
     ifreq[..2].copy_from_slice(b"lo");
     ifreq[16..18].copy_from_slice(&1i16.to_ne_bytes());
 
+    // Linux `dev_ioctl`: SIOCSIFFLAGS needs CAP_NET_ADMIN over the socket's
+    // network namespace; a delegated per-interface handle also suffices.
+    let task = crate::handlers::current_task_id();
+    let full = crate::handlers::CAP_FULL_SET;
+    crate::handlers::__test_set_caps(task, full & !(1 << crate::handlers::CAP_NET_ADMIN), full);
     let plain = SocketFile::new(AF_INET, SOCK_DGRAM);
-    if plain
-        .ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize)
-        .is_ok()
-    {
-        return TestResult::Fail("SIOCSIFFLAGS accepted ambient authority");
-    }
-
+    let unprivileged = plain.ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize);
     let route = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    if route
+    let delegated = route
         .delegate_netlink_admin(narf_net::initial_loopback_admin())
-        .is_err()
-        || route
+        .is_ok()
+        && route
             .ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize)
-            .is_err()
-    {
+            .is_ok();
+    crate::handlers::__test_set_caps(task, full, full);
+    let privileged = plain.ioctl(SIOCSIFFLAGS, ifreq.as_mut_ptr() as usize);
+    crate::handlers::__test_caps_reset();
+    if !matches!(unprivileged, Err(FsError::OperationNotPermitted)) {
+        return TestResult::Fail("SIOCSIFFLAGS without CAP_NET_ADMIN was not EPERM");
+    }
+    if !delegated {
         return TestResult::Fail("delegated SIOCSIFFLAGS failed");
+    }
+    if privileged.is_err() {
+        return TestResult::Fail("SIOCSIFFLAGS with CAP_NET_ADMIN failed");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "userspace/socket",
-    smoke_socket_mutation_ioctl_requires_delegated_admin
+    smoke_socket_mutation_ioctl_needs_net_admin
 );
 
 fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {

@@ -5567,8 +5567,9 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
 
         // The NLMSG_ERROR ack path: RTM_NEWADDR(127.0.0.1/8 on lo) with
         // NLM_F_ACK — the exact request systemd's loopback_setup enqueues. It
-        // fails with EPERM here (no admin capability), but the error ack must
-        // still carry our port id so the caller's wait loop can complete.
+        // fails with EEXIST (Linux creates the loopback addresses itself),
+        // and the error ack must carry our port id so the caller's wait loop
+        // can complete.
         let mut add = [0u8; 32];
         add[0..4].copy_from_slice(&32u32.to_le_bytes());
         add[4..6].copy_from_slice(&RTM_NEWADDR.to_le_bytes());
@@ -5594,10 +5595,8 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
         if nlmsg_type_of(&ack) != NLMSG_ERROR {
             return Err("RTM_NEWADDR ack was not NLMSG_ERROR");
         }
-        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap())
-            != EPERM as i32
-        {
-            return Err("ordinary route socket gained loopback admin authority");
+        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != -17 {
+            return Err("RTM_NEWADDR of the built-in loopback address was not EEXIST");
         }
         let ack_pid = u32::from_ne_bytes(ack[12..16].try_into().unwrap());
         if ack_pid != portid {
@@ -5704,6 +5703,110 @@ fn smoke_abi_netlink_pid1_can_start_loopback() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_pid1_can_start_loopback
+);
+
+/// rtnetlink changes follow Linux `rtnetlink_rcv_msg`: every non-GET request
+/// needs `netlink_net_capable(skb, CAP_NET_ADMIN)` — CAP_NET_ADMIN over the
+/// socket's network namespace held by BOTH the socket's opener (its f_cred)
+/// and the sending task — and then reaches any device of that namespace.
+/// NARF used to refuse every caller without an explicitly delegated
+/// per-interface handle, so NetworkManager (root, CAP_NET_ADMIN) could never
+/// bring an interface up: "do-change-link: Operation not permitted".
+fn smoke_abi_netlink_route_mutation_needs_cap_net_admin() -> TestResult {
+    with_setup(|| {
+        const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+        const FULL: u64 = crate::handlers::CAP_FULL_SET;
+        let set_link_up = |seq: u32| {
+            let mut m = [0u8; 32];
+            m[0..4].copy_from_slice(&32u32.to_ne_bytes());
+            m[4..6].copy_from_slice(&RTM_SETLINK.to_ne_bytes());
+            m[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+            m[8..12].copy_from_slice(&seq.to_ne_bytes());
+            m[20..24].copy_from_slice(&1i32.to_ne_bytes()); // lo
+            m[24..28].copy_from_slice(&1u32.to_ne_bytes()); // IFF_UP
+            m[28..32].copy_from_slice(&1u32.to_ne_bytes()); // change IFF_UP
+            m
+        };
+        let ack_errno = |fd: u64, req: &[u8]| -> Result<i32, &'static str> {
+            if netlink_send(fd, req).ok_or("send")? != req.len() as i64 {
+                return Err("RTM_SETLINK send failed");
+            }
+            let mut ack = [0u8; 512];
+            let n = netlink_recv(fd, &mut ack).ok_or("recv")?;
+            if n < (NLMSG_HDRLEN + 4) as i64 || nlmsg_type_of(&ack) != NLMSG_ERROR {
+                return Err("RTM_SETLINK did not get an NLMSG_ERROR ack");
+            }
+            Ok(i32::from_ne_bytes(
+                ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap(),
+            ))
+        };
+        let caps = |effective: u64| crate::handlers::__test_set_caps(FAKE_TASK, effective, FULL);
+        let restore = crate::handlers::__test_caps_reset;
+
+        let result = (|| {
+            // Root (any task, not just PID 1) on an ordinary socket.
+            caps(FULL);
+            let fd = open_netlink(NETLINK_ROUTE)?;
+            if ack_errno(fd, &set_link_up(301))? != 0 {
+                return Err("a CAP_NET_ADMIN task could not set a link up");
+            }
+            // The sender loses CAP_NET_ADMIN: refused.
+            caps(FULL & !CAP_NET_ADMIN_BIT);
+            if ack_errno(fd, &set_link_up(302))? != EPERM as i32 {
+                return Err("a sender without CAP_NET_ADMIN changed a link");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+
+            // Opened without CAP_NET_ADMIN, sent with it: still refused (the
+            // opener's credential is half of the check).
+            let fd = open_netlink(NETLINK_ROUTE)?;
+            caps(FULL);
+            if ack_errno(fd, &set_link_up(303))? != EPERM as i32 {
+                return Err("a socket opened without CAP_NET_ADMIN changed a link");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+
+            // `dev_ioctl` SIOCSIFFLAGS: ns_capable(CAP_NET_ADMIN) for the
+            // caller, checked before the device lookup.
+            const SIOCSIFFLAGS: u64 = 0x8914;
+            // Boot registers `lo` with the stack (`install_net_stack`); the
+            // kernel-test boot does not run that path, so do it here.
+            narf_net::iface::register_loopback_iface();
+            let sock = call(Syscall::SocketOpen.raw(), a2(2, 2, 0)).ok_or("socket status")? as u64;
+            let set_flags = |dev: &str| {
+                let mut ifreq = [0u8; 40];
+                ifreq[..dev.len()].copy_from_slice(dev.as_bytes());
+                ifreq[16..18].copy_from_slice(&1i16.to_ne_bytes()); // IFF_UP
+                call(
+                    Syscall::Ioctl.raw(),
+                    a2(sock, SIOCSIFFLAGS, ifreq.as_mut_ptr() as u64),
+                )
+            };
+            caps(FULL);
+            let root_lo = set_flags("lo");
+            let root_missing = set_flags("nosuchdev0");
+            caps(FULL & !CAP_NET_ADMIN_BIT);
+            let user_lo = set_flags("lo");
+            let user_missing = set_flags("nosuchdev0");
+            let _ = call(Syscall::Close.raw(), a0(sock));
+            if root_lo != Some(0) {
+                return Err("a CAP_NET_ADMIN caller could not SIOCSIFFLAGS lo up");
+            }
+            if root_missing != Some(ENODEV) {
+                return Err("SIOCSIFFLAGS on a missing device must be ENODEV");
+            }
+            if user_lo != Some(EPERM) || user_missing != Some(EPERM) {
+                return Err("SIOCSIFFLAGS without CAP_NET_ADMIN must be EPERM, before the lookup");
+            }
+            Ok(())
+        })();
+        restore();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_mutation_needs_cap_net_admin
 );
 
 /// Every RTM_NEWLINK of a link dump: `(ifindex, ifi_type, ifi_flags, name)`.

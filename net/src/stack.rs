@@ -89,6 +89,37 @@ pub fn initial_loopback_admin() -> AdminHandle {
     AdminHandle::new(Cap::<AdminCap, Invoke>::bootstrap(), String::from("lo"))
 }
 
+/// Kernel-held administrative handles, one per interface name, minted on
+/// first use and cached (minting allocates a capability slot, so it must not
+/// happen per request). These carry the authority a Linux caller holding
+/// CAP_NET_ADMIN over the interface's network namespace exercises through
+/// rtnetlink; the netlink layer decides who may use them.
+static KERNEL_ADMIN: narf_lib::sync::IrqSafeSpinLock<
+    alloc::collections::BTreeMap<String, AdminHandle>,
+> = narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// The kernel-held handle for `iface`, or `None` if no such interface exists.
+pub fn kernel_admin(iface: &str) -> Option<AdminHandle> {
+    if iface != "lo" && crate::iface::lookup(iface).is_none() {
+        return None;
+    }
+    if let Some(handle) = KERNEL_ADMIN.lock().get(iface) {
+        return Some(handle.clone());
+    }
+    let minted = if iface == "lo" {
+        initial_loopback_admin()
+    } else {
+        AdminHandle::new(Cap::<AdminCap, Invoke>::bootstrap(), String::from(iface))
+    };
+    Some(
+        KERNEL_ADMIN
+            .lock()
+            .entry(String::from(iface))
+            .or_insert(minted)
+            .clone(),
+    )
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AdminIpv4Route {
     pub dst: [u8; 4],
