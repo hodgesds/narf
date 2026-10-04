@@ -798,6 +798,30 @@ pub fn install_mountinfo_hook(mountinfo: MountinfoFn) {
     NS_MOUNTINFO_HOOK.store(mountinfo as usize, Ordering::Release);
 }
 
+/// Scoped install of a mountinfo renderer: the previous hook (including
+/// "none installed") is restored on drop. The hook is global state, so a test
+/// that installs one and returns leaves every later `/proc/mounts` and
+/// `/proc/<pid>/mountinfo` reader rendering through it.
+#[derive(Debug)]
+#[must_use = "the previous hook is restored when the guard drops"]
+pub struct MountinfoHookGuard {
+    prev: usize,
+}
+
+impl MountinfoHookGuard {
+    pub fn install(mountinfo: MountinfoFn) -> Self {
+        Self {
+            prev: NS_MOUNTINFO_HOOK.swap(mountinfo as usize, Ordering::AcqRel),
+        }
+    }
+}
+
+impl Drop for MountinfoHookGuard {
+    fn drop(&mut self) {
+        NS_MOUNTINFO_HOOK.store(self.prev, Ordering::Release);
+    }
+}
+
 /// Wire the per-namespace mount-table generation used for mountinfo poll
 /// notifications. Kept separate from the renderer hook so existing early
 /// boot users of the renderer continue to have a safe zero-generation
@@ -2465,8 +2489,59 @@ fn gen_meminfo() -> String {
     s
 }
 
-/// `(path, fs_name)` for every mount visible to `pid`, preferring that task's
-/// private mount namespace and falling back to the global registry.
+/// Bytes `fs/proc_namespace.c::mangle()` escapes in a device name or
+/// filesystem type: `seq_escape(m, s, " \t\n\\#")`.
+pub(crate) const MANGLE_NAME: &[u8] = b" \t\n\\#";
+/// Bytes `seq_path_root(.., " \t\n\\")` escapes in a mount point.
+pub(crate) const MANGLE_PATH: &[u8] = b" \t\n\\";
+
+/// Append `s` to `out`, writing each byte in `esc` as a backslash followed
+/// by three octal digits — Linux `ESCAPE_OCTAL` (`lib/string_helpers.c::
+/// escape_octal`) and `fs/seq_file.c::mangle_path` both use this form, which
+/// is what `getmntent(3)` decodes. Every byte in `esc` is ASCII, so a
+/// multi-byte UTF-8 sequence never matches and passes through intact.
+pub(crate) fn mangle_into(out: &mut String, s: &str, esc: &[u8]) {
+    for c in s.chars() {
+        match u8::try_from(c) {
+            Ok(b) if esc.contains(&b) => {
+                out.push('\\');
+                out.push(char::from(b'0' + (b >> 6)));
+                out.push(char::from(b'0' + ((b >> 3) & 7)));
+                out.push(char::from(b'0' + (b & 7)));
+            }
+            _ => out.push(c),
+        }
+    }
+}
+
+/// The `/proc/mounts` options column for one mount, built in
+/// `show_vfsmnt`'s order: `ro` if the mount OR its superblock is read-only
+/// (`__mnt_is_readonly`) else `rw`, then `show_sb_opts` (`,sync`, ...), then
+/// `show_vfsmnt_opts` (`,nosuid`, ...), then the filesystem's
+/// `show_options` text (which carries its own leading commas).
+///
+/// `mnt_opts` and `super_opts` are the rendered `MNT_*` / `SB_*` sets, each
+/// starting with its own `rw`/`ro` token.
+fn vfsmnt_options(mnt_opts: &str, show_options: &str, super_opts: &str) -> String {
+    fn split_rw(opts: &str) -> (&str, &str) {
+        match opts.find(',') {
+            Some(i) => (&opts[..i], &opts[i..]),
+            None => (opts, ""),
+        }
+    }
+    let (mnt_rw, mnt_rest) = split_rw(mnt_opts);
+    let (sb_rw, sb_rest) = split_rw(super_opts);
+    let ro = mnt_rw == "ro" || sb_rw == "ro";
+    let mut out = String::from(if ro { "ro" } else { "rw" });
+    out.push_str(sb_rest);
+    out.push_str(mnt_rest);
+    out.push_str(show_options);
+    out
+}
+
+/// `(path, fs_name, options)` for every mount visible to `pid`, preferring
+/// that task's private mount namespace and falling back to the global
+/// registry. `options` is the finished `/proc/mounts` options column.
 ///
 /// Both `/proc/mounts` and `/proc/<pid>/mountinfo` must answer from the SAME
 /// list. They did not: `mountinfo` consulted the per-namespace hook while
@@ -2482,23 +2557,28 @@ fn gen_meminfo() -> String {
 /// util-linux) prefers `mountinfo`, while `df` and many shell tools read
 /// `/proc/mounts` — a split view makes them disagree about whether something
 /// is a mount point at all.
-pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String, String)> {
+pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
     if let Some(rows) = hook_ns_mountinfo(pid) {
-        // Hook rows are
-        // "id\tparent\tpath\tfsname\tmount-options\tsuper-options".
-        let parsed: Vec<(String, String, String, String)> = rows
+        // Hook rows are "id\tparent\tpath\tfsname\tmount-options\t
+        // show-options\tsuper-options" — SEVEN fields; the last three are
+        // optional (older rows stop after fsname). Splitting fewer than seven
+        // leaves "show-options\tsuper-options" in one field, which put a tab
+        // and a seventh column into every /proc/mounts line.
+        let parsed: Vec<(String, String, String)> = rows
             .lines()
             .filter_map(|line| {
-                let mut it = line.splitn(6, '\t');
+                let mut it = line.splitn(7, '\t');
                 let _id = it.next()?;
                 let _parent = it.next()?;
                 let path = it.next()?;
                 let fs_name = it.next()?;
+                let mnt_opts = it.next().unwrap_or("rw");
+                let show_options = it.next().unwrap_or("");
+                let super_opts = it.next().unwrap_or("rw");
                 Some((
                     String::from(path),
                     String::from(fs_name),
-                    String::from(it.next().unwrap_or("rw")),
-                    String::from(it.next().unwrap_or("")),
+                    vfsmnt_options(mnt_opts, show_options, super_opts),
                 ))
             })
             .collect();
@@ -2506,7 +2586,16 @@ pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String, String)> {
             return parsed;
         }
     }
-    crate::registry().list_with_options()
+    crate::registry()
+        .list_mountinfo()
+        .into_iter()
+        .map(
+            |(_, _, path, fs_name, mnt_opts, show_options, super_opts)| {
+                let options = vfsmnt_options(&mnt_opts, &show_options, &super_opts);
+                (path, fs_name, options)
+            },
+        )
+        .collect()
 }
 
 /// `/proc/mounts` — Linux `fs/proc_namespace.c::show_vfsmnt`.
@@ -2517,16 +2606,34 @@ pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String, String)> {
 /// there — as this did — hides every tmpfs limit from `df`-adjacent
 /// tooling and from anything that parses the size out of /proc/mounts.
 fn gen_mounts() -> String {
-    let mut s = String::new();
     // Linux `/proc/mounts` is `/proc/self/mounts`: the CALLER's namespace.
-    for (path, fs_name, mnt_opts, sb_opts) in ns_mounts_for(current_pid()) {
-        let _ = core::fmt::Write::write_fmt(
-            &mut s,
-            format_args!(
-                "{} {} {} {}{} 0 0\n",
-                fs_name, path, fs_name, mnt_opts, sb_opts
-            ),
-        );
+    render_proc_mounts(current_pid())
+}
+
+/// `/proc/<pid>/mounts` body for `pid`'s mount namespace, one
+/// `show_vfsmnt` row per mount: `device mountpoint fstype options 0 0`.
+///
+/// NARF records no separate mount source, so the filesystem name stands in
+/// for `mnt_devname`; an absent one prints `none`, as `alloc_vfsmnt` stores
+/// for a NULL source. Device and type go through `mangle()` and the mount
+/// point through `seq_path_root`'s escape set, so whitespace or a backslash
+/// in any field cannot split the row.
+pub(crate) fn render_proc_mounts(pid: u64) -> String {
+    let mut s = String::new();
+    for (path, fs_name, options) in ns_mounts_for(pid) {
+        let devname = if fs_name.is_empty() {
+            "none"
+        } else {
+            fs_name.as_str()
+        };
+        mangle_into(&mut s, devname, MANGLE_NAME);
+        s.push(' ');
+        mangle_into(&mut s, &path, MANGLE_PATH);
+        s.push(' ');
+        mangle_into(&mut s, &fs_name, MANGLE_NAME);
+        s.push(' ');
+        s.push_str(&options);
+        s.push_str(" 0 0\n");
     }
     s
 }
@@ -4125,15 +4232,15 @@ fn mounts_ns_hook_for_consistency_test(pid: u64) -> Option<alloc::string::String
 }
 
 fn smoke_proc_mounts_matches_mountinfo_namespace_view() -> TestResult {
-    install_mountinfo_hook(mounts_ns_hook_for_consistency_test);
+    let _hook = MountinfoHookGuard::install(mounts_ns_hook_for_consistency_test);
     let rows = ns_mounts_for(0x4d4e);
     if rows.len() != 3 {
         return TestResult::Fail("ns_mounts_for did not read the installed namespace hook");
     }
     // The exact regression: /run present in the namespace view must not be
     // dropped on the /proc/mounts side.
-    if !rows.iter().any(|(path, fs, mnt, sb)| {
-        path == "/run" && fs == "tmpfs" && mnt == "ro,nosuid,nodev" && sb == ",size=8192k,inode64"
+    if !rows.iter().any(|(path, fs, opts)| {
+        path == "/run" && fs == "tmpfs" && opts == "ro,nosuid,nodev,size=8192k,inode64"
     }) {
         return TestResult::Fail("/proc/mounts view lost the namespace's /run tmpfs");
     }
@@ -4141,7 +4248,7 @@ fn smoke_proc_mounts_matches_mountinfo_namespace_view() -> TestResult {
     // read-write default with no super options.
     if !rows
         .iter()
-        .any(|(path, _, mnt, sb)| path == "/" && mnt == "rw" && sb.is_empty())
+        .any(|(path, _, opts)| path == "/" && opts == "rw")
     {
         return TestResult::Fail("a hook row without option fields did not parse");
     }
@@ -4154,6 +4261,77 @@ kernel_test_in!(
     "filesystem/procfs",
     smoke_proc_mounts_matches_mountinfo_namespace_view
 );
+
+/// The production namespace hook emits SEVEN tab-separated fields per row
+/// (`id parent path fstype mnt-opts show_options super-opts`). Rendering
+/// `/proc/mounts` from it must yield Linux `show_vfsmnt`'s six columns, with
+/// the options column composed exactly as `fs/proc_namespace.c` builds it:
+/// `rw`/`ro` (`__mnt_is_readonly`: mount OR superblock read-only), then
+/// `show_sb_opts`, then `show_vfsmnt_opts`, then the filesystem's
+/// `show_options`. Splitting only six fields glued `\t<super-opts>` onto the
+/// options column — a seventh whitespace column on every line.
+fn mounts_ns_hook_seven_field_rows(pid: u64) -> Option<alloc::string::String> {
+    (pid == 0x4d4f).then(|| {
+        alloc::string::String::from(
+            "7\t1\t/run\ttmpfs\trw,nosuid,nodev\t,size=8192k,inode64\trw,sync\n\
+             8\t1\t/ro-sb\text2\trw\t\tro\n",
+        )
+    })
+}
+
+fn smoke_proc_mounts_from_seven_field_hook_rows_is_linux_shape() -> TestResult {
+    let _hook = MountinfoHookGuard::install(mounts_ns_hook_seven_field_rows);
+    let got = render_proc_mounts(0x4d4f);
+    let want = "tmpfs /run tmpfs rw,sync,nosuid,nodev,size=8192k,inode64 0 0\n\
+                ext2 /ro-sb ext2 ro 0 0\n";
+    if got != want {
+        return TestResult::Fail("/proc/mounts row is not show_vfsmnt's six-column shape");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_proc_mounts_from_seven_field_hook_rows_is_linux_shape
+);
+
+/// `show_vfsmnt` passes the device name and fstype through `mangle()`
+/// (`seq_escape(.., " \t\n\\#")`) and the mount point through
+/// `seq_path_root(.., " \t\n\\")`: each listed byte becomes a backslash and
+/// three octal digits. Unescaped, a space in a mount point or fstype splits
+/// the row into extra columns for every `getmntent` caller.
+fn mounts_ns_hook_needs_mangling(pid: u64) -> Option<alloc::string::String> {
+    (pid == 0x4d50)
+        .then(|| alloc::string::String::from("9\t1\t/mnt/a b\\c#d\tfuse.my fs#1\trw\t\trw\n"))
+}
+
+fn smoke_proc_mounts_mangles_like_show_vfsmnt() -> TestResult {
+    let _hook = MountinfoHookGuard::install(mounts_ns_hook_needs_mangling);
+    let got = render_proc_mounts(0x4d50);
+    let want = "fuse.my\\040fs\\0431 /mnt/a\\040b\\134c#d fuse.my\\040fs\\0431 rw 0 0\n";
+    if got != want {
+        return TestResult::Fail("/proc/mounts fields are not octal-escaped like mangle()");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_proc_mounts_mangles_like_show_vfsmnt
+);
+
+/// The two escape sets differ only in `#`, and tab / newline (which cannot
+/// travel through the tab-separated namespace hook rows) still come out as
+/// `\011` / `\012`. Non-ASCII passes through byte-for-byte.
+fn smoke_mangle_matches_linux_escape_sets() -> TestResult {
+    let mut path = String::new();
+    mangle_into(&mut path, "/a\tb\nc\\d e#f\u{e9}", MANGLE_PATH);
+    let mut name = String::new();
+    mangle_into(&mut name, "x#y z", MANGLE_NAME);
+    if path != "/a\\011b\\012c\\134d\\040e#f\u{e9}" || name != "x\\043y\\040z" {
+        return TestResult::Fail("mangle_into does not match seq_escape/mangle_path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_mangle_matches_linux_escape_sets);
 
 /// procfs inode identity: the root is `PROCFS_ROOT_INO`, one entry looked
 /// up twice is one inode, siblings differ, and a directory's stat-able

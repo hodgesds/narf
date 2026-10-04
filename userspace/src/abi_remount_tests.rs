@@ -64,7 +64,8 @@ fn umount(target: &[u8]) {
 /// The `/proc/self/mountinfo` line whose mount point is `path`, read the
 /// way userspace reads it (open + read).
 fn mountinfo_line(path: &str) -> Option<alloc::string::String> {
-    narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+    let _mountinfo_hook =
+        narf_filesystem::procfs::MountinfoHookGuard::install(crate::handlers::proc_ns_mountinfo);
     let file = b"/proc/self/mountinfo\0";
     let fd = call(
         Syscall::Openat.raw(),

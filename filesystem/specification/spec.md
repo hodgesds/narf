@@ -677,6 +677,14 @@ This per-task mountinfo projection is wired for every Linux-compat build,
 independently of optional container namespaces: service managers use
 `CLONE_NEWNS` for sandboxing and must observe private stacked file binds before
 they remount them read-only.
+`/proc/mounts` and `/proc/<pid>/mounts` render `show_vfsmnt` rows from the
+same per-task view (the namespace hook's seven tab-separated fields, else
+`list_mountinfo`): options are `rw`/`ro` (mount or superblock read-only), then
+the superblock options, then the mount options, then `show_options`. Device
+and fstype are octal-escaped with `mangle()`'s set (`" \t\n\\#"`) and mount
+points with `seq_path_root`'s (`" \t\n\\"`), in both those files and
+`mountinfo`. The mountinfo hook is global state; `MountinfoHookGuard::install`
+installs one for a scope and restores the previous hook on drop.
 An already-open `/proc/<pid>/mountinfo` file reports a `POLLPRI` edge after an
 attach, detach, or move in that task's visible mount namespace; unrelated
 namespace mutations do not advance its generation. This lets libmount rescan
